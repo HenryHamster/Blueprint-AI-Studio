@@ -1,4 +1,5 @@
 """Autonomous research spawning functions."""
+
 import asyncio
 import logging
 import os
@@ -10,20 +11,38 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.models import (
-    Task, Project, TaskHistory, TaskStatus, Alert, AlertSeverity,
+    Task,
+    Project,
+    TaskHistory,
+    TaskStatus,
+    Alert,
+    AlertSeverity,
 )
 from app.database import AsyncSessionLocal
-from app.payload_schemas import validate_internal_payload, ALL_TASK_TYPES, PayloadTooLargeError
+from app.payload_schemas import (
+    validate_internal_payload,
+    ALL_TASK_TYPES,
+    PayloadTooLargeError,
+)
 import app.shared_state as _shared_state
 from app.shared_state import runtime_config as _runtime_config
 from app.max_plan_pool import _max_plan_pools, _account_available_for_model
 from app.time_utils import _utcnow
 from app.autonomous_research_diagnosis import _spawn_direction_diagnosis  # noqa: F401 — re-export for backwards compat
-from app.direction_mode import append_prompt_suffix, is_pause_mode, mode_prompt_hint, normalized_recommended_mode
-from app.playbook_learning import RECENT_SUCCESSES_TASK_TYPES, summarize_recent_successes
+from app.direction_mode import (
+    append_prompt_suffix,
+    is_pause_mode,
+    mode_prompt_hint,
+    normalized_recommended_mode,
+)
+from app.playbook_learning import (
+    RECENT_SUCCESSES_TASK_TYPES,
+    summarize_recent_successes,
+)
 
 logger = logging.getLogger(__name__)
 _spawn_locks: dict[str, asyncio.Lock] = {}
+
 
 def _get_spawn_lock(project_id: str) -> asyncio.Lock:
     if project_id not in _spawn_locks:
@@ -53,10 +72,18 @@ from app.self_audit_dispatch import (  # noqa: E402, F401 — re-export
 async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     """Inner implementation — always called under the per-project spawn lock."""
     from app.main import _maybe_create_circuit_breaker_alert
-    from app.research_completion import _compute_momentum_factor, _compute_productivity_score, _compute_acceptance_rate
-    from app.direction_metrics import _compute_direction_quality_score, _compute_difficulty_index
+    from app.research_completion import (
+        _compute_momentum_factor,
+        _compute_productivity_score,
+        _compute_acceptance_rate,
+    )
+    from app.direction_metrics import (
+        _compute_direction_quality_score,
+        _compute_difficulty_index,
+    )
     from app.anomaly_detection import _compute_research_anomalies, check_anomaly_actions
     from app.direction_lifecycle import _process_direction_lifecycle
+
     # Guard: autonomous must be enabled
     if not project.autonomous_enabled:
         return
@@ -68,17 +95,27 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     # Guard: don't spawn if user has no available accounts (avoids immediate failure)
     user_pool = _max_plan_pools.get(project.user_id, [])
     research_model = _runtime_config.get("task_type_models", {}).get("research")
-    has_available = any(_account_available_for_model(a, research_model) for a in user_pool) or bool(os.getenv("ANTHROPIC_API_KEY"))
+    has_available = any(
+        _account_available_for_model(a, research_model) for a in user_pool
+    ) or bool(os.getenv("ANTHROPIC_API_KEY"))
     if not has_available:
-        logger.info(f"[AUTONOMOUS] Skipping research for {project.name} — no available accounts")
+        logger.info(
+            f"[AUTONOMOUS] Skipping research for {project.name} — no available accounts"
+        )
         return
     # Guard: circuit breaker must allow spawning
     breaker = _shared_state.get_circuit_breaker(str(project.id))
     if breaker["state"] == "OPEN":
         # Check if cooldown has elapsed → transition to HALF-OPEN
-        if breaker["opened_at"] and (_utcnow() - breaker["opened_at"]).total_seconds() >= breaker["cooldown_seconds"]:
+        if (
+            breaker["opened_at"]
+            and (_utcnow() - breaker["opened_at"]).total_seconds()
+            >= breaker["cooldown_seconds"]
+        ):
             breaker["state"] = "HALF_OPEN"
-            logger.warning(f"[CIRCUIT BREAKER] OPEN → HALF-OPEN for {project.id} (cooldown elapsed, allowing one test task)")
+            logger.warning(
+                f"[CIRCUIT BREAKER] OPEN → HALF-OPEN for {project.id} (cooldown elapsed, allowing one test task)"
+            )
         else:
             logger.warning(
                 f"[CIRCUIT BREAKER] Skipping autonomous research spawn for project={project.id} "
@@ -90,26 +127,36 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         test_id = breaker.get("half_open_task_id")
         if test_id:
             test_task = await session.get(Task, uuid.UUID(test_id))
-            if test_task and test_task.started_at and (_utcnow() - test_task.started_at).total_seconds() > 1800:
-                logger.warning(f"[CIRCUIT BREAKER] HALF_OPEN test task {test_id} stuck for 30m+, treating as failure → OPEN")
+            if (
+                test_task
+                and test_task.started_at
+                and (_utcnow() - test_task.started_at).total_seconds() > 1800
+            ):
+                logger.warning(
+                    f"[CIRCUIT BREAKER] HALF_OPEN test task {test_id} stuck for 30m+, treating as failure → OPEN"
+                )
                 breaker["state"] = "OPEN"
                 breaker["opened_at"] = _utcnow()
                 breaker["cooldown_seconds"] = min(breaker["cooldown_seconds"] * 2, 7200)
                 breaker["half_open_task_id"] = None
                 await _maybe_create_circuit_breaker_alert(
-                    project.id, session,
-                    f"HALF_OPEN test task stuck for 30m+ — circuit breaker re-opened (cooldown: {breaker['cooldown_seconds']}s)"
+                    project.id,
+                    session,
+                    f"HALF_OPEN test task stuck for 30m+ — circuit breaker re-opened (cooldown: {breaker['cooldown_seconds']}s)",
                 )
                 return  # Back to cooldown
             elif not test_task:
-                logger.warning(f"[CIRCUIT BREAKER] HALF_OPEN test task {test_id} no longer exists (deleted/reaped) → OPEN")
+                logger.warning(
+                    f"[CIRCUIT BREAKER] HALF_OPEN test task {test_id} no longer exists (deleted/reaped) → OPEN"
+                )
                 breaker["state"] = "OPEN"
                 breaker["opened_at"] = _utcnow()
                 breaker["cooldown_seconds"] = min(breaker["cooldown_seconds"] * 2, 7200)
                 breaker["half_open_task_id"] = None
                 await _maybe_create_circuit_breaker_alert(
-                    project.id, session,
-                    f"HALF_OPEN test task deleted/reaped — circuit breaker re-opened (cooldown: {breaker['cooldown_seconds']}s)"
+                    project.id,
+                    session,
+                    f"HALF_OPEN test task deleted/reaped — circuit breaker re-opened (cooldown: {breaker['cooldown_seconds']}s)",
                 )
                 return  # Back to cooldown
     # Guard: must have active directions that aren't in cooldown or mid-cycle
@@ -138,26 +185,41 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     # already-resurrected) won't match and won't block.
     from sqlalchemy import or_, and_  # noqa: PLC0415
     from app.failure_classification import INFRA_CLASSES  # noqa: PLC0415
+
     busy_direction_ids: set = set()
     resurrection_lookback = now - timedelta(hours=2)
-    active_research = (await session.execute(
-        select(Task).where(
-            Task.project_id == project.id,
-            or_(
-                Task.status.in_([
-                    TaskStatus.QUEUED, TaskStatus.PROVISIONING,
-                    TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING,
-                ]),
-                and_(
-                    Task.status == TaskStatus.FAILED,
-                    Task.updated_at >= resurrection_lookback,
-                    Task.context["failure_category"].as_string().in_(list(INFRA_CLASSES)),
-                    ~Task.context.has_key("_resurrection_count"),
-                ),
-            ),
+    active_research = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.project_id == project.id,
+                    or_(
+                        Task.status.in_(
+                            [
+                                TaskStatus.QUEUED,
+                                TaskStatus.PROVISIONING,
+                                TaskStatus.IN_PROGRESS,
+                                TaskStatus.EVALUATING,
+                            ]
+                        ),
+                        and_(
+                            Task.status == TaskStatus.FAILED,
+                            Task.updated_at >= resurrection_lookback,
+                            Task.context["failure_category"]
+                            .as_string()
+                            .in_(list(INFRA_CLASSES)),
+                            ~Task.context.has_key("_resurrection_count"),
+                        ),
+                    ),
+                )
+            )
         )
-    )).scalars().all()
-    evaluating_timeout_minutes = _runtime_config.get("evaluating_pipeline_timeout_minutes", 30)
+        .scalars()
+        .all()
+    )
+    evaluating_timeout_minutes = _runtime_config.get(
+        "evaluating_pipeline_timeout_minutes", 30
+    )
 
     # Pipelining cap: when a long-EVALUATING parent triggers the staleness
     # skip below, we still want to allow at most ONE additional pipelined
@@ -171,15 +233,22 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     # accounts for legitimately long-running research/merge cycles where
     # a second concurrent spawn would risk big merge conflicts.
     pipelining_window_minutes = _runtime_config.get(
-        "research_pipelining_window_minutes", 240,
+        "research_pipelining_window_minutes",
+        240,
     )
     pipelining_cutoff = now - timedelta(minutes=pipelining_window_minutes)
-    recently_spawned = (await session.execute(
-        select(Task).where(
-            Task.project_id == project.id,
-            Task.created_at >= pipelining_cutoff,
+    recently_spawned = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.project_id == project.id,
+                    Task.created_at >= pipelining_cutoff,
+                )
+            )
         )
-    )).scalars().all()
+        .scalars()
+        .all()
+    )
     recent_research_by_direction: dict[str, list] = {}
     for rt in recently_spawned:
         rpayload = rt.first_payload
@@ -211,7 +280,8 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                     # Count OTHER recent research on this direction (any
                     # status, including CANCELLED) — exclude self.
                     recent_others = [
-                        rid for rid in recent_research_by_direction.get(current_did, [])
+                        rid
+                        for rid in recent_research_by_direction.get(current_did, [])
                         if rid != t.id
                     ]
                     if not recent_others:
@@ -220,7 +290,11 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
             busy_direction_ids.add(current_did)
 
     active_directions = await _process_direction_lifecycle(
-        project, session, cooldown_minutes, busy_direction_ids, now,
+        project,
+        session,
+        cooldown_minutes,
+        busy_direction_ids,
+        now,
     )
     # Allow strategic cycles to proceed even without active directions (they create directions).
     # Stop forcing after 3 consecutive strategic failures to prevent infinite loops.
@@ -231,21 +305,31 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         failures_at = vision_data.get("_strategic_failures_at")
         if failures_at:
             try:
-                last_failure = datetime.fromisoformat(failures_at.replace('Z', '+00:00'))
+                last_failure = datetime.fromisoformat(
+                    failures_at.replace("Z", "+00:00")
+                )
                 if (_utcnow() - last_failure).total_seconds() > 48 * 3600:
                     strategic_failures = 0
-                    logger.info(f"[STRATEGIC] Auto-decayed _strategic_failures for project {project.id} (last failure: {failures_at})")
+                    logger.info(
+                        f"[STRATEGIC] Auto-decayed _strategic_failures for project {project.id} (last failure: {failures_at})"
+                    )
             except (ValueError, TypeError):
                 pass  # malformed timestamp, keep current value
     # Check if ANY direction is active in the project (ignoring cooldown filter).
     # active_directions only contains non-cooldown directions, so a project with
     # active-but-cooling directions should not trigger a strategic cycle.
-    any_active_in_project = any(d.get("status") == "active" for d in (project.directions or []))
+    any_active_in_project = any(
+        d.get("status") == "active" for d in (project.directions or [])
+    )
     all_dirs_saturated = any_active_in_project and all(
-        d.get("possibly_saturated") for d in (project.directions or []) if d.get("status") == "active"
+        d.get("possibly_saturated")
+        for d in (project.directions or [])
+        if d.get("status") == "active"
     )
     force_strategic = strategic_failures < 3 and (
-        not vision_data.get("purpose") or not any_active_in_project or all_dirs_saturated
+        not vision_data.get("purpose")
+        or not any_active_in_project
+        or all_dirs_saturated
     )
     if not active_directions and not force_strategic:
         return
@@ -265,7 +349,9 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         sid = d.get("system_id")
         if not sid:
             return len(vision_priorities)  # neutral — don't penalize untagged
-        return vision_priority_index.get(sid, len(vision_priorities) + 1)  # unlisted slightly below neutral
+        return vision_priority_index.get(
+            sid, len(vision_priorities) + 1
+        )  # unlisted slightly below neutral
 
     # Sort all eligible directions by priority for greedy selection
     chosen_directions: list[dict] = []
@@ -288,7 +374,9 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
             else:
                 difficulty_bonus = 0
             is_new = 0 if d.get("last_researched_at") else -1  # small novelty bonus
-            category_bonus = -1 if d.get("category") == "product" else 0  # product directions preferred
+            category_bonus = (
+                -1 if d.get("category") == "product" else 0
+            )  # product directions preferred
             # Vision rank matters: top vision priority = 0, unlisted = N.
             # Placed after priority+category but BEFORE productivity so the
             # strategic agent's vision.priorities actually steer selection
@@ -296,15 +384,19 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
             v_rank = _vision_rank(d)
             return (
                 priority_rank.get(d.get("priority", "medium"), 1),
-                category_bonus,                                  # product category within same priority
-                is_new,                                          # novelty bonus within same priority
-                v_rank,                                          # vision priority drives selection
-                difficulty_bonus,                                # easy boost / hard deprioritization
-                -(productivity_score * momentum),                # productivity within same vision rank
-                -quality_score,                                  # taxonomy-based quality; higher = earlier
-                -(acceptance_rate if acceptance_rate is not None else 0.5),  # low acceptance = deprioritized
-                1 if d.get("possibly_saturated") else 0,         # saturated last
-                d.get("last_researched_at") or "",               # staleness
+                category_bonus,  # product category within same priority
+                is_new,  # novelty bonus within same priority
+                v_rank,  # vision priority drives selection
+                difficulty_bonus,  # easy boost / hard deprioritization
+                -(
+                    productivity_score * momentum
+                ),  # productivity within same vision rank
+                -quality_score,  # taxonomy-based quality; higher = earlier
+                -(
+                    acceptance_rate if acceptance_rate is not None else 0.5
+                ),  # low acceptance = deprioritized
+                1 if d.get("possibly_saturated") else 0,  # saturated last
+                d.get("last_researched_at") or "",  # staleness
             )
 
         active_directions.sort(key=_direction_score)
@@ -315,23 +407,30 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         # at the same time regardless of which was picked first.
         blocked_ids: set = set(busy_direction_ids)
         # Expand blocked set from already-running directions' conflicts
-        all_dir_map = {d.get("id"): d for d in (project.directions or []) if d.get("id")}
+        all_dir_map = {
+            d.get("id"): d for d in (project.directions or []) if d.get("id")
+        }
         for did in busy_direction_ids:
             d = all_dir_map.get(did)
             if d:
                 blocked_ids.update(d.get("conflicts_with") or [])
-        for d in (project.directions or []):
-            if any(rid in (d.get("conflicts_with") or []) for rid in busy_direction_ids):
+        for d in project.directions or []:
+            if any(
+                rid in (d.get("conflicts_with") or []) for rid in busy_direction_ids
+            ):
                 blocked_ids.add(d.get("id"))
 
         # Cross-instance serialization for concurrent orchestrator instances.
         from sqlalchemy import text as _sql_text
+
         _lock_key = abs(hash(f"research_spawn:{project.id}")) % (2**31)
         try:
-            _got_lock = (await session.execute(
-                _sql_text("SELECT pg_try_advisory_xact_lock(:k)"),
-                {"k": _lock_key},
-            )).scalar()
+            _got_lock = (
+                await session.execute(
+                    _sql_text("SELECT pg_try_advisory_xact_lock(:k)"),
+                    {"k": _lock_key},
+                )
+            ).scalar()
         except Exception:  # noqa: BLE001 — SQLite/test dialects raise NotSupportedError; treat as "no contention"
             _got_lock = True  # non-Postgres dialect (tests) — skip serialization
         if not _got_lock:
@@ -347,7 +446,11 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
             if is_pause_mode(d):
                 logger.info(
                     "[AUTONOMOUS] skipped direction due to recommended_mode",
-                    extra={"direction_id": did, "recommended_mode": "pause", "reason": "mode_pause"},
+                    extra={
+                        "direction_id": did,
+                        "recommended_mode": "pause",
+                        "reason": "mode_pause",
+                    },
                 )
                 continue
             if did in blocked_ids:
@@ -370,11 +473,17 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                 productivity_score = _compute_productivity_score(d)
                 momentum = _compute_momentum_factor(d)
                 category = d.get("category", "unset")
-                logger.debug(f"[RESEARCH] Selected direction {did} category={category} productivity_score={productivity_score:.2f} momentum={momentum:.1f} vision_rank={_vision_rank(d)}")
+                logger.debug(
+                    f"[RESEARCH] Selected direction {did} category={category} productivity_score={productivity_score:.2f} momentum={momentum:.1f} vision_rank={_vision_rank(d)}"
+                )
     elif not force_strategic:
         return  # No directions and not a strategic cycle — nothing to do
 
-    if not chosen_directions and active_directions and all(is_pause_mode(d) for d in active_directions):
+    if (
+        not chosen_directions
+        and active_directions
+        and all(is_pause_mode(d) for d in active_directions)
+    ):
         logger.info(
             "[AUTONOMOUS] skipping tactical research: all active directions recommended_mode=pause"
         )
@@ -389,20 +498,29 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     # Check for a pending strategic review from a previously failed chain.
     # If the design_doc → strategic_review spawn failed last cycle, retry it now
     # rather than waiting up to 6 more research spawns (~3+ hours).
-    pending_sr = (project.vision or {}).get('_pending_strategic_review')
+    pending_sr = (project.vision or {}).get("_pending_strategic_review")
     if pending_sr:
         try:
             from app.strategic_spawning import _spawn_strategic_review
-            if await _spawn_strategic_review(project, session, cycle_id=pending_sr.get('cycle_id')):
+
+            if await _spawn_strategic_review(
+                project, session, cycle_id=pending_sr.get("cycle_id")
+            ):
                 project.vision = {**project.vision}
-                project.vision.pop('_pending_strategic_review', None)
-                flag_modified(project, 'vision')
+                project.vision.pop("_pending_strategic_review", None)
+                flag_modified(project, "vision")
                 session.add(project)
-                logger.info(f'[STRATEGIC] Retried pending strategic review for project {project.id} (originally failed at {pending_sr.get("failed_at")})')
+                logger.info(
+                    f"[STRATEGIC] Retried pending strategic review for project {project.id} (originally failed at {pending_sr.get('failed_at')})"
+                )
             else:
-                logger.warning(f'[STRATEGIC] Pending SR retry skipped (active strategic task) for project {project.id}')
+                logger.warning(
+                    f"[STRATEGIC] Pending SR retry skipped (active strategic task) for project {project.id}"
+                )
         except Exception:
-            logger.exception(f'[STRATEGIC] Retry of pending strategic review failed for project {project.id}')
+            logger.exception(
+                f"[STRATEGIC] Retry of pending strategic review failed for project {project.id}"
+            )
         return  # Don't spawn tactical research this cycle
 
     # Mode-aware self_audit dispatch. Runs BEFORE strategic dispatch so a stale
@@ -432,7 +550,9 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     # Strategic cycle check — runs BEFORE the research blocking guard so it's
     # never blocked by an active tactical research task.  The design_doc_update
     # and strategic_review use their own task types and run in parallel.
-    all_active_directions = [d for d in (project.directions or []) if d.get("status") == "active"]
+    all_active_directions = [
+        d for d in (project.directions or []) if d.get("status") == "active"
+    ]
     # Use a stored spawn counter instead of derived research_history count.
     # The history-based count doesn't increment when cycles produce no novel
     # findings, causing undirected/strategic cycles to repeat indefinitely.
@@ -440,18 +560,27 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     research_spawn_count = (project.vision or {}).get("_research_spawn_count")
     if research_spawn_count is None:
         research_spawn_count = sum(
-            len(d.get("research_history", [])) + d.get("history_aggregate", {}).get("total_cycles", 0)
+            len(d.get("research_history", []))
+            + d.get("history_aggregate", {}).get("total_cycles", 0)
             for d in all_active_directions
         )
-        project.vision = {**(project.vision or {}), "_research_spawn_count": research_spawn_count}
+        project.vision = {
+            **(project.vision or {}),
+            "_research_spawn_count": research_spawn_count,
+        }
         flag_modified(project, "vision")
         session.add(project)
-        logger.info(f"[RESEARCH] Seeded _research_spawn_count={research_spawn_count} from research_history")
-    strategic_frequency = (project.vision or {}).get("_strategic_frequency_override") or _runtime_config.get("strategic_research_frequency", 6)
+        logger.info(
+            f"[RESEARCH] Seeded _research_spawn_count={research_spawn_count} from research_history"
+        )
+    strategic_frequency = (project.vision or {}).get(
+        "_strategic_frequency_override"
+    ) or _runtime_config.get("strategic_research_frequency", 6)
     is_strategic = (
-        (strategic_frequency > 0 and research_spawn_count > 0 and research_spawn_count % strategic_frequency == 0)
-        or force_strategic
-    )
+        strategic_frequency > 0
+        and research_spawn_count > 0
+        and research_spawn_count % strategic_frequency == 0
+    ) or force_strategic
     # 2026-05-03: gate strategic spawn on (a) no-active-strategic AND
     # (b) no recent strategic spawn (regardless of terminal state).
     #
@@ -468,32 +597,53 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     #     Cooldown gates this regardless of force_strategic.
     if is_strategic:
         from sqlalchemy import func as _strat_func
-        has_active_strategic = (await session.execute(
-            select(_strat_func.count()).select_from(Task).where(
-                Task.project_id == project.id,
-                Task.payloads[0]["type"].as_string().in_(["strategic_review", "design_doc_update"]),
-                Task.status.in_([
-                    TaskStatus.QUEUED, TaskStatus.PROVISIONING,
-                    TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING,
-                ]),
+
+        has_active_strategic = (
+            await session.execute(
+                select(_strat_func.count())
+                .select_from(Task)
+                .where(
+                    Task.project_id == project.id,
+                    Task.payloads[0]["type"]
+                    .as_string()
+                    .in_(["strategic_review", "design_doc_update"]),
+                    Task.status.in_(
+                        [
+                            TaskStatus.QUEUED,
+                            TaskStatus.PROVISIONING,
+                            TaskStatus.IN_PROGRESS,
+                            TaskStatus.EVALUATING,
+                        ]
+                    ),
+                )
             )
-        )).scalar() or 0
+        ).scalar() or 0
         if has_active_strategic > 0:
             logger.debug(
                 f"[STRATEGIC] Skipping strategic spawn — {has_active_strategic} active "
                 f"strategic task(s) exist for project {project.id}; falling through to tactical"
             )
-            is_strategic = False  # skip the spawn block; tactical research below may still fire
+            is_strategic = (
+                False  # skip the spawn block; tactical research below may still fire
+            )
         else:
-            cooldown_minutes = _runtime_config.get("strategic_spawn_cooldown_minutes", 30)
+            cooldown_minutes = _runtime_config.get(
+                "strategic_spawn_cooldown_minutes", 30
+            )
             cooldown_cutoff = _utcnow() - timedelta(minutes=cooldown_minutes)
-            recent_strategic = (await session.execute(
-                select(_strat_func.count()).select_from(Task).where(
-                    Task.project_id == project.id,
-                    Task.payloads[0]["type"].as_string().in_(["strategic_review", "design_doc_update"]),
-                    Task.created_at >= cooldown_cutoff,
+            recent_strategic = (
+                await session.execute(
+                    select(_strat_func.count())
+                    .select_from(Task)
+                    .where(
+                        Task.project_id == project.id,
+                        Task.payloads[0]["type"]
+                        .as_string()
+                        .in_(["strategic_review", "design_doc_update"]),
+                        Task.created_at >= cooldown_cutoff,
+                    )
                 )
-            )).scalar() or 0
+            ).scalar() or 0
             if recent_strategic > 0:
                 logger.info(
                     f"[STRATEGIC] Skipping strategic spawn — {recent_strategic} strategic "
@@ -505,26 +655,36 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     if is_strategic:
         # Determine if this strategic cycle should also include architecture review.
         # Architecture stabilizes faster than strategy, so it runs less frequently.
-        strategic_cycle_count = (project.vision or {}).get("_strategic_cycle_count", 0) + 1
+        strategic_cycle_count = (project.vision or {}).get(
+            "_strategic_cycle_count", 0
+        ) + 1
         arch_frequency = _runtime_config.get("architecture_review_frequency", 3)
-        is_architecture_cycle = arch_frequency > 0 and strategic_cycle_count % arch_frequency == 0
+        is_architecture_cycle = (
+            arch_frequency > 0 and strategic_cycle_count % arch_frequency == 0
+        )
 
         spawned = False
         try:
             if is_architecture_cycle:
                 # Full pipeline: Phase 1 (architecture) → Phase 2 (strategic) via completion handler
                 from app.strategic_spawning import _spawn_design_doc_update
+
                 spawned = await _spawn_design_doc_update(project, session)
                 if spawned:
-                    logger.info(f"[AUTONOMOUS] Spawned design doc update (strategic cycle #{strategic_cycle_count}, "
-                                f"vision rev {(project.vision or {}).get('revision', 0)})")
+                    logger.info(
+                        f"[AUTONOMOUS] Spawned design doc update (strategic cycle #{strategic_cycle_count}, "
+                        f"vision rev {(project.vision or {}).get('revision', 0)})"
+                    )
             else:
                 # Strategy-only: skip architecture, go straight to strategic review
                 from app.strategic_spawning import _spawn_strategic_review
+
                 spawned = await _spawn_strategic_review(project, session)
                 if spawned:
-                    logger.info(f"[AUTONOMOUS] Spawned strategic review without architecture "
-                                f"(cycle #{strategic_cycle_count}, arch runs every {arch_frequency})")
+                    logger.info(
+                        f"[AUTONOMOUS] Spawned strategic review without architecture "
+                        f"(cycle #{strategic_cycle_count}, arch runs every {arch_frequency})"
+                    )
         except PayloadTooLargeError as e:
             # The strategic payload outgrew the 256 KB cap (problem_model + design_doc
             # carry most of the weight). Without this catch, the exception bubbles up
@@ -536,32 +696,43 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                 f"[STRATEGIC] Skipping strategic spawn for project {project.id}: {e}. "
                 f"Tactical research will continue."
             )
-            existing_alert = (await session.execute(
-                select(Alert).where(
-                    Alert.project_id == project.id,
-                    Alert.title == "Strategic review skipped: payload too large",
-                    Alert.dismissed_at.is_(None),
+            existing_alert = (
+                (
+                    await session.execute(
+                        select(Alert).where(
+                            Alert.project_id == project.id,
+                            Alert.title
+                            == "Strategic review skipped: payload too large",
+                            Alert.dismissed_at.is_(None),
+                        )
+                    )
                 )
-            )).scalars().first()
+                .scalars()
+                .first()
+            )
             if not existing_alert:
-                session.add(Alert(
-                    project_id=project.id,
-                    severity=AlertSeverity.WARNING,
-                    title="Strategic review skipped: payload too large",
-                    message=(
-                        f"Strategic spawn payload exceeds the 256 KB limit "
-                        f"({e.size} bytes, top contributors: "
-                        f"{', '.join(f'{k}={n}B' for k, n in e.top_keys[:3])}). "
-                        "Tactical research continues, but strategic refresh is paused "
-                        "until the design_doc/problem_model/conversation_thread shrink."
-                    ),
-                ))
+                session.add(
+                    Alert(
+                        project_id=project.id,
+                        severity=AlertSeverity.WARNING,
+                        title="Strategic review skipped: payload too large",
+                        message=(
+                            f"Strategic spawn payload exceeds the 256 KB limit "
+                            f"({e.size} bytes, top contributors: "
+                            f"{', '.join(f'{k}={n}B' for k, n in e.top_keys[:3])}). "
+                            "Tactical research continues, but strategic refresh is paused "
+                            "until the design_doc/problem_model/conversation_thread shrink."
+                        ),
+                    )
+                )
 
         if spawned:
             research_spawn_count += 1
-            project.vision = {**(project.vision or {}),
-                              "_research_spawn_count": research_spawn_count,
-                              "_strategic_cycle_count": strategic_cycle_count}
+            project.vision = {
+                **(project.vision or {}),
+                "_research_spawn_count": research_spawn_count,
+                "_strategic_cycle_count": strategic_cycle_count,
+            }
             flag_modified(project, "vision")
             session.add(project)
             # 2026-05-03: commit BEFORE the tactical-research early-returns
@@ -577,13 +748,27 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     # Guard: limit parallel research tasks per project.
     # EVALUATING parents are just waiting on children — they don't block new research.
     max_parallel = _runtime_config.get("max_parallel_research_per_project", 3)
-    active_tasks = (await session.execute(
-        select(Task).where(
-            Task.project_id == project.id,
-            Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]),
+    active_tasks = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.project_id == project.id,
+                    Task.status.in_(
+                        [
+                            TaskStatus.QUEUED,
+                            TaskStatus.PROVISIONING,
+                            TaskStatus.IN_PROGRESS,
+                        ]
+                    ),
+                )
+            )
         )
-    )).scalars().all()
-    active_research_count = sum(1 for t in active_tasks if (t.first_payload).get("type") == "research")
+        .scalars()
+        .all()
+    )
+    active_research_count = sum(
+        1 for t in active_tasks if (t.first_payload).get("type") == "research"
+    )
     if active_research_count >= max_parallel:
         return
     # Second cap: total research in any non-terminal state (including
@@ -592,16 +777,28 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     # base. This cap prevents the pile-up that makes downstream merges
     # incrementally more conflict-prone.
     max_total = _runtime_config.get("max_total_research_per_project", 5)
-    total_tasks = (await session.execute(
-        select(Task).where(
-            Task.project_id == project.id,
-            Task.status.in_([
-                TaskStatus.QUEUED, TaskStatus.PROVISIONING,
-                TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING,
-            ]),
+    total_tasks = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.project_id == project.id,
+                    Task.status.in_(
+                        [
+                            TaskStatus.QUEUED,
+                            TaskStatus.PROVISIONING,
+                            TaskStatus.IN_PROGRESS,
+                            TaskStatus.EVALUATING,
+                        ]
+                    ),
+                )
+            )
         )
-    )).scalars().all()
-    total_research_count = sum(1 for t in total_tasks if (t.first_payload).get("type") == "research")
+        .scalars()
+        .all()
+    )
+    total_research_count = sum(
+        1 for t in total_tasks if (t.first_payload).get("type") == "research"
+    )
     if total_research_count >= max_total:
         logger.info(
             f"[AUTONOMOUS] Total research cap reached: {total_research_count}/{max_total} "
@@ -609,39 +806,59 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         )
         return
     # Reduce chosen_directions to the smaller of the two remaining budgets
-    remaining_slots = min(max_parallel - active_research_count,
-                          max_total - total_research_count)
+    remaining_slots = min(
+        max_parallel - active_research_count, max_total - total_research_count
+    )
     chosen_directions = chosen_directions[:remaining_slots]
     # Guard: global rate limit across ALL projects
     from sqlalchemy import func
+
     one_hour_ago = _utcnow() - timedelta(hours=1)
-    global_max = _runtime_config.get("max_global_autonomous_tasks_per_hour",
-                                      _runtime_config["max_autonomous_tasks_per_hour"] * 10)
-    global_recent = (await session.execute(
-        select(func.count()).select_from(Task).where(
-            Task.created_by == "ORCHESTRATOR",
-            Task.created_at >= one_hour_ago,
+    global_max = _runtime_config.get(
+        "max_global_autonomous_tasks_per_hour",
+        _runtime_config["max_autonomous_tasks_per_hour"] * 10,
+    )
+    global_recent = (
+        await session.execute(
+            select(func.count())
+            .select_from(Task)
+            .where(
+                Task.created_by == "ORCHESTRATOR",
+                Task.created_at >= one_hour_ago,
+            )
         )
-    )).scalar() or 0
+    ).scalar() or 0
     if global_recent >= global_max:
-        logger.warning(f"[AUTONOMOUS] Global rate limit reached: {global_recent}/{global_max} tasks/hour")
+        logger.warning(
+            f"[AUTONOMOUS] Global rate limit reached: {global_recent}/{global_max} tasks/hour"
+        )
         return
     # Guard: per-project rate limit for research spawns
-    recent_research = (await session.execute(
-        select(Task).where(
-            Task.project_id == project.id,
-            Task.created_by == "ORCHESTRATOR",
-            Task.created_at >= one_hour_ago,
+    recent_research = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.project_id == project.id,
+                    Task.created_by == "ORCHESTRATOR",
+                    Task.created_at >= one_hour_ago,
+                )
+            )
         )
-    )).scalars().all()
-    recent_research_count = sum(1 for t in recent_research if (t.first_payload).get("type") == "research")
+        .scalars()
+        .all()
+    )
+    recent_research_count = sum(
+        1 for t in recent_research if (t.first_payload).get("type") == "research"
+    )
     if recent_research_count >= _runtime_config["max_autonomous_tasks_per_hour"]:
         return
 
     # Also cap by per-project rate limit
-    rate_limit_remaining = _runtime_config["max_autonomous_tasks_per_hour"] - recent_research_count
+    rate_limit_remaining = (
+        _runtime_config["max_autonomous_tasks_per_hour"] - recent_research_count
+    )
     if rate_limit_remaining < len(chosen_directions):
-        chosen_directions = chosen_directions[:max(0, rate_limit_remaining)]
+        chosen_directions = chosen_directions[: max(0, rate_limit_remaining)]
 
     # If no active directions exist (e.g., all paused), only strategic runs (already spawned above).
     if not chosen_directions and not active_directions:
@@ -657,11 +874,17 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
 
     # Use per-type defaults
     research_model = _runtime_config.get("task_type_models", {}).get("research") or None
-    research_effort = _runtime_config.get("task_type_efforts", {}).get("research") or None
+    research_effort = (
+        _runtime_config.get("task_type_efforts", {}).get("research") or None
+    )
     research_suffix = _runtime_config.get("agent_prompt_suffixes", {}).get("research")
     # Every Nth cycle is "undirected" for cross-cutting analysis.
     undirected_frequency = _runtime_config.get("undirected_research_frequency", 12)
-    is_undirected = undirected_frequency > 0 and research_spawn_count > 0 and research_spawn_count % undirected_frequency == 0
+    is_undirected = (
+        undirected_frequency > 0
+        and research_spawn_count > 0
+        and research_spawn_count % undirected_frequency == 0
+    )
     # Don't run undirected on strategic cycles
     if is_strategic:
         is_undirected = False
@@ -676,6 +899,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     if anomaly_action["action"] != "none":
         from app.broadcast import broadcast_to_project
         from app.notification_dispatch import dispatch_external_notification
+
         await broadcast_to_project(
             str(project.id),
             "anomaly_adjustment",
@@ -697,16 +921,19 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                 ),
             )
             session.add(alert)
-            asyncio.ensure_future(dispatch_external_notification(  # noqa: RUF006 — fire-and-forget notification
-                str(project.id),
-                "ANOMALY_ADJUSTMENT",
-                {
-                    "max_concurrent_vms": new_vms,
-                    "failure_gate_threshold": gate,
-                    "trigger_anomalies": anomaly_action.get("trigger_anomalies") or [],
-                    "pre_adjustment_max_vms": pre_vms,
-                },
-            ))
+            asyncio.ensure_future(
+                dispatch_external_notification(  # noqa: RUF006 — fire-and-forget notification
+                    str(project.id),
+                    "ANOMALY_ADJUSTMENT",
+                    {
+                        "max_concurrent_vms": new_vms,
+                        "failure_gate_threshold": gate,
+                        "trigger_anomalies": anomaly_action.get("trigger_anomalies")
+                        or [],
+                        "pre_adjustment_max_vms": pre_vms,
+                    },
+                )
+            )
         elif anomaly_action["action"] == "restored":
             new_vms = anomaly_action["max_concurrent_vms"]
             gate = anomaly_action["failure_gate_threshold"]
@@ -720,17 +947,21 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                 ),
             )
             session.add(alert)
-            asyncio.ensure_future(dispatch_external_notification(  # noqa: RUF006 — fire-and-forget notification
-                str(project.id),
-                "ANOMALY_RESTORED",
-                {
-                    "max_concurrent_vms": new_vms,
-                    "failure_gate_threshold": gate,
-                },
-            ))
+            asyncio.ensure_future(
+                dispatch_external_notification(  # noqa: RUF006 — fire-and-forget notification
+                    str(project.id),
+                    "ANOMALY_RESTORED",
+                    {
+                        "max_concurrent_vms": new_vms,
+                        "failure_gate_threshold": gate,
+                    },
+                )
+            )
 
     # Build and spawn research tasks — one per chosen direction (or one undirected)
-    directions_to_spawn = chosen_directions if chosen_directions else [None]  # None = undirected
+    directions_to_spawn = (
+        chosen_directions if chosen_directions else [None]
+    )  # None = undirected
     if is_undirected:
         directions_to_spawn = [None]  # Undirected replaces directed for this cycle
 
@@ -741,7 +972,10 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
             if await _spawn_self_audit_task(
                 project,
                 session,
-                {"focus_systems": [chosen_direction.get("system_id")], "max_systems": 1},
+                {
+                    "focus_systems": [chosen_direction.get("system_id")],
+                    "max_systems": 1,
+                },
             ):
                 continue
 
@@ -750,15 +984,25 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         # Full histories are available via the API. This keeps the payload under
         # the OS E2BIG limit (~128KB).
         _HISTORY_NUMERIC_FIELDS = {
-            "tasks_created", "prs_merged", "tasks_failed",
-            "failed_task_details", "scope_breakdown", "avg_time_to_merge_hours",
-            "median_review_iterations", "avg_review_iterations",
+            "tasks_created",
+            "prs_merged",
+            "tasks_failed",
+            "failed_task_details",
+            "scope_breakdown",
+            "avg_time_to_merge_hours",
+            "median_review_iterations",
+            "avg_review_iterations",
         }
         _AGGREGATE_FIELDS = {
-            "total_cycles", "total_tasks_created", "total_prs_merged",
-            "total_tasks_failed", "total_prs_rejected",
+            "total_cycles",
+            "total_tasks_created",
+            "total_prs_merged",
+            "total_tasks_failed",
+            "total_prs_rejected",
         }
-        current_dir_id = None if chosen_direction is None else chosen_direction.get("id")
+        current_dir_id = (
+            None if chosen_direction is None else chosen_direction.get("id")
+        )
         direction_summaries = []
         for d in all_active_directions:
             summary: dict = {
@@ -807,7 +1051,9 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                     sorted_m = sorted(recent_medians)
                     n = len(sorted_m)
                     summary["rolling_median_review_iterations"] = (
-                        sorted_m[n // 2] if n % 2 else (sorted_m[n // 2 - 1] + sorted_m[n // 2]) / 2
+                        sorted_m[n // 2]
+                        if n % 2
+                        else (sorted_m[n // 2 - 1] + sorted_m[n // 2]) / 2
                     )
             direction_summaries.append(summary)
 
@@ -815,7 +1061,11 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         # Agent can fetch specific sections via ./design-doc get <key>.
         doc = project.design_doc or {}
         design_doc_summary: dict = {
-            "_keys": [k for k in doc if not k.startswith("_") and not k.startswith("playbook/")],
+            "_keys": [
+                k
+                for k in doc
+                if not k.startswith("_") and not k.startswith("playbook/")
+            ],
         }
         # Include playbook entries (small, operationally critical).
         # Skip pending_source entries — those are mid-flight writes whose
@@ -830,7 +1080,9 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         research_payload: dict = {
             "type": "research",
             "directions": direction_summaries,
-            "current_direction_id": None if chosen_direction is None else chosen_direction.get("id"),
+            "current_direction_id": None
+            if chosen_direction is None
+            else chosen_direction.get("id"),
             "design_doc": design_doc_summary,
             "base_branch": base_branch,
             **({"model": research_model} if research_model else {}),
@@ -850,8 +1102,13 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         # Inject failure-mode coaching derived from direction's first-attempt rejection history
         if chosen_direction:
             from app.spawn_calibration import _get_failure_coaching_suffix  # noqa: PLC0415
+
             _dir_id = chosen_direction.get("id")
-            _coaching = _get_failure_coaching_suffix(str(_dir_id), project.design_doc or {}) if _dir_id else None
+            _coaching = (
+                _get_failure_coaching_suffix(str(_dir_id), project.design_doc or {})
+                if _dir_id
+                else None
+            )
             if _coaching:
                 append_prompt_suffix(research_payload, _coaching)
         # Surface 'what has compounded here' from prior playbook/success-research-* entries.
@@ -873,43 +1130,65 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                 doc_systems = doc.get("systems", [])
                 doc_capabilities = doc.get("capabilities", {})
                 relevant: dict = {"system_id": dir_system_id}
-                for sys in (doc_systems if isinstance(doc_systems, list) else []):
+                for sys in doc_systems if isinstance(doc_systems, list) else []:
                     if isinstance(sys, dict) and sys.get("id") == dir_system_id:
                         relevant["system"] = sys
                         break
                 if isinstance(doc_capabilities, dict):
                     related_caps = {
-                        cap_name: cap_val for cap_name, cap_val in doc_capabilities.items()
-                        if isinstance(cap_val, dict) and cap_val.get("status") in ("missing", "partial")
+                        cap_name: cap_val
+                        for cap_name, cap_val in doc_capabilities.items()
+                        if isinstance(cap_val, dict)
+                        and cap_val.get("status") in ("missing", "partial")
                     }
                     if related_caps:
                         relevant["missing_capabilities"] = related_caps
                 research_payload["direction_design_context"] = relevant
             if chosen_direction.get("possibly_complete"):
                 research_payload["direction_possibly_complete"] = True
-                research_payload["completion_suggestion"] = chosen_direction.get("completion_suggestion", "")
+                research_payload["completion_suggestion"] = chosen_direction.get(
+                    "completion_suggestion", ""
+                )
         if chosen_direction is None:
             if anomalies:
                 research_payload["anomaly_signals"] = anomalies
             direction_text = "Cross-cutting codebase analysis"
-            logger.info(f"[AUTONOMOUS] Spawning UNDIRECTED research cycle (cycle #{research_spawn_count})")
+            logger.info(
+                f"[AUTONOMOUS] Spawning UNDIRECTED research cycle (cycle #{research_spawn_count})"
+            )
         else:
-            direction_text = (chosen_direction.get("text") or "general improvement")[:200]
+            direction_text = (chosen_direction.get("text") or "general improvement")[
+                :200
+            ]
 
         if project.build_config:
             research_payload["build_config"] = project.build_config
-        research_payload = validate_internal_payload(research_payload, "autonomous_research:research")
+        research_payload = validate_internal_payload(
+            research_payload, "autonomous_research:research"
+        )
 
         # Recover deferred findings from recent completed research tasks.
         task_context: dict = {}
-        prev_research_rows = (await session.execute(
-            select(Task).where(
-                Task.project_id == project.id,
-                Task.status == TaskStatus.COMPLETED,
-            ).order_by(Task.created_at.desc()).limit(20)
-        )).scalars().all()
-        prev_research_rows = [r for r in prev_research_rows if (r.context or {}).get("deferred_findings")]
+        prev_research_rows = (
+            (
+                await session.execute(
+                    select(Task)
+                    .where(
+                        Task.project_id == project.id,
+                        Task.status == TaskStatus.COMPLETED,
+                    )
+                    .order_by(Task.created_at.desc())
+                    .limit(20)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        prev_research_rows = [
+            r for r in prev_research_rows if (r.context or {}).get("deferred_findings")
+        ]
         from app.finding_deduplication import finding_hash as _finding_hash
+
         _deferred_ttl_days = int(_runtime_config.get("deferred_finding_ttl_days", 7))
         _ttl_cutoff = _utcnow() - timedelta(days=_deferred_ttl_days)
         dir_deferred: list[dict] = []
@@ -983,8 +1262,9 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         # strategic review #2 with zero findings to consume. The increment
         # now lives in _handle_research_completion (research_completion.py).
         history = TaskHistory(
-            task_id=new_task.id, action="SPAWNED",
-            details={"spawned_by": "AUTONOMOUS_LOOP", "trigger": "post_merge_or_idle"}
+            task_id=new_task.id,
+            action="SPAWNED",
+            details={"spawned_by": "AUTONOMOUS_LOOP", "trigger": "post_merge_or_idle"},
         )
         session.add(history)
         spawned_tasks.append(new_task)
@@ -996,9 +1276,13 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         breaker["half_open_task_id"] = str(spawned_tasks[0].id)
 
     for t in spawned_tasks:
-        logger.info(f"[AUTONOMOUS] Spawned research task {t.id} for project {project.id}")
+        logger.info(
+            f"[AUTONOMOUS] Spawned research task {t.id} for project {project.id}"
+        )
     if len(spawned_tasks) > 1:
-        logger.info(f"[AUTONOMOUS] Spawned {len(spawned_tasks)} parallel research tasks for project {project.id}")
+        logger.info(
+            f"[AUTONOMOUS] Spawned {len(spawned_tasks)} parallel research tasks for project {project.id}"
+        )
 
 
 async def _spawn_periodic_task(project: Project, task_type: str, session: AsyncSession):
@@ -1008,15 +1292,23 @@ async def _spawn_periodic_task(project: Project, task_type: str, session: AsyncS
 
     # Guard: task_type must be a known type
     if task_type not in ALL_TASK_TYPES:
-        logger.warning(f"[AUTONOMOUS] Unknown task_type '{task_type}' in _spawn_periodic_task, skipping")
+        logger.warning(
+            f"[AUTONOMOUS] Unknown task_type '{task_type}' in _spawn_periodic_task, skipping"
+        )
         return
 
     # Guard: circuit breaker must allow spawning
     breaker = _shared_state.get_circuit_breaker(str(project.id))
     if breaker["state"] == "OPEN":
-        if breaker["opened_at"] and (_utcnow() - breaker["opened_at"]).total_seconds() >= breaker["cooldown_seconds"]:
+        if (
+            breaker["opened_at"]
+            and (_utcnow() - breaker["opened_at"]).total_seconds()
+            >= breaker["cooldown_seconds"]
+        ):
             breaker["state"] = "HALF_OPEN"
-            logger.warning(f"[CIRCUIT BREAKER] OPEN → HALF-OPEN for {project.id} (cooldown elapsed, allowing one test task)")
+            logger.warning(
+                f"[CIRCUIT BREAKER] OPEN → HALF-OPEN for {project.id} (cooldown elapsed, allowing one test task)"
+            )
         else:
             logger.warning(
                 f"[CIRCUIT BREAKER] Skipping periodic task spawn (type={task_type}) for project={project.id} "
@@ -1027,66 +1319,108 @@ async def _spawn_periodic_task(project: Project, task_type: str, session: AsyncS
         test_id = breaker.get("half_open_task_id")
         if test_id:
             test_task = await session.get(Task, uuid.UUID(test_id))
-            if test_task and test_task.started_at and (_utcnow() - test_task.started_at).total_seconds() > 1800:
-                logger.warning(f"[CIRCUIT BREAKER] HALF_OPEN test task {test_id} stuck for 30m+, treating as failure → OPEN")
+            if (
+                test_task
+                and test_task.started_at
+                and (_utcnow() - test_task.started_at).total_seconds() > 1800
+            ):
+                logger.warning(
+                    f"[CIRCUIT BREAKER] HALF_OPEN test task {test_id} stuck for 30m+, treating as failure → OPEN"
+                )
                 breaker["state"] = "OPEN"
                 breaker["opened_at"] = _utcnow()
                 breaker["cooldown_seconds"] = min(breaker["cooldown_seconds"] * 2, 7200)
                 breaker["half_open_task_id"] = None
                 await _maybe_create_circuit_breaker_alert(
-                    project.id, session,
-                    f"HALF_OPEN test task stuck for 30m+ — circuit breaker re-opened (cooldown: {breaker['cooldown_seconds']}s)"
+                    project.id,
+                    session,
+                    f"HALF_OPEN test task stuck for 30m+ — circuit breaker re-opened (cooldown: {breaker['cooldown_seconds']}s)",
                 )
                 return
 
-    periodic_cfg = _runtime_config.get("autonomous_periodic_tasks", {}).get(task_type, {})
+    periodic_cfg = _runtime_config.get("autonomous_periodic_tasks", {}).get(
+        task_type, {}
+    )
     if not periodic_cfg.get("enabled", False):
         return
 
     interval_hours = periodic_cfg.get("interval_hours", 168)
 
     # Guard: no task of this type already QUEUED/PROVISIONING/IN_PROGRESS
-    active_tasks = (await session.execute(
-        select(Task).where(
-            Task.project_id == project.id,
-            Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]),
+    active_tasks = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.project_id == project.id,
+                    Task.status.in_(
+                        [
+                            TaskStatus.QUEUED,
+                            TaskStatus.PROVISIONING,
+                            TaskStatus.IN_PROGRESS,
+                        ]
+                    ),
+                )
+            )
         )
-    )).scalars().all()
+        .scalars()
+        .all()
+    )
     for t in active_tasks:
         if (t.first_payload).get("type") == task_type:
             return
 
     # Guard: global rate limit across ALL projects
     one_hour_ago = _utcnow() - timedelta(hours=1)
-    global_max = _runtime_config.get("max_global_autonomous_tasks_per_hour",
-                                      _runtime_config["max_autonomous_tasks_per_hour"] * 10)
-    global_recent = (await session.execute(
-        select(func.count()).select_from(Task).where(
-            Task.created_by == "ORCHESTRATOR",
-            Task.created_at >= one_hour_ago,
+    global_max = _runtime_config.get(
+        "max_global_autonomous_tasks_per_hour",
+        _runtime_config["max_autonomous_tasks_per_hour"] * 10,
+    )
+    global_recent = (
+        await session.execute(
+            select(func.count())
+            .select_from(Task)
+            .where(
+                Task.created_by == "ORCHESTRATOR",
+                Task.created_at >= one_hour_ago,
+            )
         )
-    )).scalar() or 0
+    ).scalar() or 0
     if global_recent >= global_max:
-        logger.warning(f"[AUTONOMOUS] Global rate limit reached: {global_recent}/{global_max} tasks/hour")
+        logger.warning(
+            f"[AUTONOMOUS] Global rate limit reached: {global_recent}/{global_max} tasks/hour"
+        )
         return
     # Guard: per-project rate limit
-    recent_auto = (await session.execute(
-        select(func.count()).select_from(Task).where(
-            Task.project_id == project.id,
-            Task.created_by == "ORCHESTRATOR",
-            Task.created_at >= one_hour_ago,
+    recent_auto = (
+        await session.execute(
+            select(func.count())
+            .select_from(Task)
+            .where(
+                Task.project_id == project.id,
+                Task.created_by == "ORCHESTRATOR",
+                Task.created_at >= one_hour_ago,
+            )
         )
-    )).scalar() or 0
+    ).scalar() or 0
     if recent_auto >= _runtime_config["max_autonomous_tasks_per_hour"]:
         return
 
     # Check when this type last ran (most recent completed task of this type)
-    completed_tasks = (await session.execute(
-        select(Task).where(
-            Task.project_id == project.id,
-            Task.status == TaskStatus.COMPLETED,
-        ).order_by(Task.created_at.desc()).limit(100)
-    )).scalars().all()
+    completed_tasks = (
+        (
+            await session.execute(
+                select(Task)
+                .where(
+                    Task.project_id == project.id,
+                    Task.status == TaskStatus.COMPLETED,
+                )
+                .order_by(Task.created_at.desc())
+                .limit(100)
+            )
+        )
+        .scalars()
+        .all()
+    )
     last_run = None
     for t in completed_tasks:
         if (t.first_payload).get("type") == task_type:
@@ -1100,11 +1434,23 @@ async def _spawn_periodic_task(project: Project, task_type: str, session: AsyncS
             return
 
     # Infer base_branch from the most recent task in this project
-    recent_task = (await session.execute(
-        select(Task).where(Task.project_id == project.id)
-        .order_by(Task.created_at.desc()).limit(1)
-    )).scalars().first()
-    base_branch = (recent_task.first_payload).get("base_branch", "main") if recent_task else "main"
+    recent_task = (
+        (
+            await session.execute(
+                select(Task)
+                .where(Task.project_id == project.id)
+                .order_by(Task.created_at.desc())
+                .limit(1)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    base_branch = (
+        (recent_task.first_payload).get("base_branch", "main")
+        if recent_task
+        else "main"
+    )
 
     task_model = _runtime_config.get("task_type_models", {}).get(task_type) or None
     task_effort = _runtime_config.get("task_type_efforts", {}).get(task_type) or None
@@ -1118,7 +1464,9 @@ async def _spawn_periodic_task(project: Project, task_type: str, session: AsyncS
         **({"effort": task_effort} if task_effort else {}),
         **({"prompt_suffix": task_suffix} if task_suffix else {}),
     }
-    payload = validate_internal_payload(payload, "autonomous_research:periodic:" + task_type)
+    payload = validate_internal_payload(
+        payload, "autonomous_research:periodic:" + task_type
+    )
     new_task = Task(
         project_id=project.id,
         title=f"{task_type.upper()} scan: autonomous periodic",
@@ -1130,8 +1478,13 @@ async def _spawn_periodic_task(project: Project, task_type: str, session: AsyncS
     )
     session.add(new_task)
     history = TaskHistory(
-        task_id=new_task.id, action="SPAWNED",
-        details={"spawned_by": "AUTONOMOUS_LOOP", "trigger": "periodic_schedule", "task_type": task_type}
+        task_id=new_task.id,
+        action="SPAWNED",
+        details={
+            "spawned_by": "AUTONOMOUS_LOOP",
+            "trigger": "periodic_schedule",
+            "task_type": task_type,
+        },
     )
     session.add(history)
     await session.commit()
@@ -1140,43 +1493,63 @@ async def _spawn_periodic_task(project: Project, task_type: str, session: AsyncS
     if breaker["state"] == "HALF_OPEN":
         breaker["half_open_task_id"] = str(new_task.id)
 
-    logger.info(f"[AUTONOMOUS] Spawned periodic {task_type} task {new_task.id} for project {project.id}")
+    logger.info(
+        f"[AUTONOMOUS] Spawned periodic {task_type} task {new_task.id} for project {project.id}"
+    )
 
 
 async def _check_autonomous_research(owner: str, repo: str):
     """Post-merge hook: check if we should spawn a research task."""
     try:
         async with AsyncSessionLocal() as session:
-            projects = (await session.execute(
-                select(Project).where(
-                    Project.github_owner == owner,
-                    Project.github_repo == repo,
-                    Project.autonomous_enabled.is_(True),
+            projects = (
+                (
+                    await session.execute(
+                        select(Project).where(
+                            Project.github_owner == owner,
+                            Project.github_repo == repo,
+                            Project.autonomous_enabled.is_(True),
+                        )
+                    )
                 )
-            )).scalars().all()
+                .scalars()
+                .all()
+            )
             if not projects:
                 return
 
             # Spawn if VM slots are available (PROVISIONING + IN_PROGRESS, not blocked QUEUED)
             from sqlalchemy import func
-            vm_consuming = (await session.execute(
-                select(func.count()).select_from(Task).where(
-                    Task.status.in_([TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]),
+
+            vm_consuming = (
+                await session.execute(
+                    select(func.count())
+                    .select_from(Task)
+                    .where(
+                        Task.status.in_(
+                            [TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]
+                        ),
+                    )
                 )
-            )).scalar() or 0
+            ).scalar() or 0
 
             if vm_consuming < _runtime_config["max_concurrent_vms"]:
                 for project in projects:
                     await _spawn_research_task(project, session)
     except Exception as e:
-        logger.error(f"[AUTONOMOUS] Error checking research trigger for {owner}/{repo}: {e}", exc_info=True)
+        logger.error(
+            f"[AUTONOMOUS] Error checking research trigger for {owner}/{repo}: {e}",
+            exc_info=True,
+        )
 
 
 _MAX_ACTIVE_INVESTIGATIONS_PER_DIRECTION = 3
 
 
 async def _recent_investigation_exists(
-    project_id: uuid.UUID, direction_id: str, session: AsyncSession,
+    project_id: uuid.UUID,
+    direction_id: str,
+    session: AsyncSession,
     error_fingerprint: str | None = None,
 ) -> bool:
     """Return True if an investigate-type task already targets this direction.
@@ -1194,22 +1567,27 @@ async def _recent_investigation_exists(
     resource exhaustion.
     """
     from sqlalchemy import or_
+
     active_statuses = (
-        TaskStatus.QUEUED, TaskStatus.PROVISIONING,
-        TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING,
+        TaskStatus.QUEUED,
+        TaskStatus.PROVISIONING,
+        TaskStatus.IN_PROGRESS,
+        TaskStatus.EVALUATING,
     )
     cutoff = _utcnow() - timedelta(hours=24)
-    rows = (await session.execute(
-        select(Task.id, Task.context, Task.status).where(
-            Task.project_id == project_id,
-            Task.payloads[0]["type"].as_string() == "investigate",
-            Task.context["direction_id"].as_string() == str(direction_id),
-            or_(
-                Task.status.in_(active_statuses),
-                Task.created_at >= cutoff,
-            ),
+    rows = (
+        await session.execute(
+            select(Task.id, Task.context, Task.status).where(
+                Task.project_id == project_id,
+                Task.payloads[0]["type"].as_string() == "investigate",
+                Task.context["direction_id"].as_string() == str(direction_id),
+                or_(
+                    Task.status.in_(active_statuses),
+                    Task.created_at >= cutoff,
+                ),
+            )
         )
-    )).all()
+    ).all()
 
     active_count = sum(1 for _id, _ctx, status in rows if status in active_statuses)
     if active_count >= _MAX_ACTIVE_INVESTIGATIONS_PER_DIRECTION:
@@ -1225,7 +1603,9 @@ async def _recent_investigation_exists(
     return False
 
 
-async def _spawn_direction_hold_investigation(project: Project, session: AsyncSession) -> int:
+async def _spawn_direction_hold_investigation(
+    project: Project, session: AsyncSession
+) -> int:
     """Auto-spawn an investigate-type task for each held direction in the project.
 
     A direction enters the held state after 3 consecutive CODE_ERROR failures (see
@@ -1235,6 +1615,7 @@ async def _spawn_direction_hold_investigation(project: Project, session: AsyncSe
     which can then drive targeted remediation.
     """
     from app.anomaly_detection import _error_fingerprint
+
     held = _shared_state.get_held_directions()
     if not held:
         return 0
@@ -1249,14 +1630,25 @@ async def _spawn_direction_hold_investigation(project: Project, session: AsyncSe
         direction = direction_map.get(direction_id)
         if not direction:
             continue
-        recent_failed = (await session.execute(
-            select(Task).where(
-                Task.project_id == project.id,
-                Task.status == TaskStatus.FAILED,
-            ).order_by(Task.created_at.desc()).limit(30)
-        )).scalars().all()
+        recent_failed = (
+            (
+                await session.execute(
+                    select(Task)
+                    .where(
+                        Task.project_id == project.id,
+                        Task.status == TaskStatus.FAILED,
+                    )
+                    .order_by(Task.created_at.desc())
+                    .limit(30)
+                )
+            )
+            .scalars()
+            .all()
+        )
         dir_failures = [
-            t for t in recent_failed if (t.context or {}).get("direction_id") == direction_id
+            t
+            for t in recent_failed
+            if (t.context or {}).get("direction_id") == direction_id
         ][:5]
 
         failure_lines = []
@@ -1266,11 +1658,18 @@ async def _spawn_direction_hold_investigation(project: Project, session: AsyncSe
             fp = _error_fingerprint(err)
             fingerprints.append(fp)
             failure_lines.append(f"- [{str(t.id)[:8]}] fp={fp} | {err}")
-        failure_block = "\n".join(failure_lines) if failure_lines else "(no recent failure details available)"
+        failure_block = (
+            "\n".join(failure_lines)
+            if failure_lines
+            else "(no recent failure details available)"
+        )
 
         dominant_fp = fingerprints[0] if fingerprints else None
         if await _recent_investigation_exists(
-            project.id, direction_id, session, error_fingerprint=dominant_fp,
+            project.id,
+            direction_id,
+            session,
+            error_fingerprint=dominant_fp,
         ):
             continue
 
@@ -1308,10 +1707,16 @@ async def _spawn_direction_hold_investigation(project: Project, session: AsyncSe
             created_by="ORCHESTRATOR",
         )
         session.add(new_task)
-        session.add(TaskHistory(
-            task_id=new_task.id, action="SPAWNED",
-            details={"spawned_by": "DIRECTION_HOLD_INVESTIGATION", "direction_id": direction_id},
-        ))
+        session.add(
+            TaskHistory(
+                task_id=new_task.id,
+                action="SPAWNED",
+                details={
+                    "spawned_by": "DIRECTION_HOLD_INVESTIGATION",
+                    "direction_id": direction_id,
+                },
+            )
+        )
         logger.info(
             f"[DIRECTION HEALTH] Spawned investigation task {new_task.id} for held direction {direction_id}"
         )
@@ -1323,7 +1728,8 @@ async def _spawn_direction_hold_investigation(project: Project, session: AsyncSe
 
 
 async def _spawn_task_failure_investigation(
-    task: Task, session: AsyncSession,
+    task: Task,
+    session: AsyncSession,
 ) -> bool:
     """Spawn an investigate task when a directed task exhausts retries with
     a CODE_ERROR / code_defect failure.
@@ -1335,8 +1741,12 @@ async def _spawn_task_failure_investigation(
     function adds 24h dedup per direction and builds the investigation prompt.
     """
     from app.failure_classification import (
-        AGENT_TIMEOUT, CODE_ERROR, REVIEW_QUALITY_STREAK_THRESHOLD,
-        TAXONOMY_CODE_DEFECT, TAXONOMY_INFRA_RELATED, TAXONOMY_REVIEW_QUALITY,
+        AGENT_TIMEOUT,
+        CODE_ERROR,
+        REVIEW_QUALITY_STREAK_THRESHOLD,
+        TAXONOMY_CODE_DEFECT,
+        TAXONOMY_INFRA_RELATED,
+        TAXONOMY_REVIEW_QUALITY,
         classify_failure_taxonomy,
         should_trigger_code_defect_investigation,
         should_trigger_review_quality_investigation,
@@ -1346,7 +1756,8 @@ async def _spawn_task_failure_investigation(
     is_code_defect = should_trigger_code_defect_investigation(task)
     is_timeout = (not is_code_defect) and should_trigger_timeout_investigation(task)
     is_review_quality = (
-        (not is_code_defect) and (not is_timeout)
+        (not is_code_defect)
+        and (not is_timeout)
         and should_trigger_review_quality_investigation(task)
     )
     if not (is_code_defect or is_timeout or is_review_quality):
@@ -1378,20 +1789,25 @@ async def _spawn_task_failure_investigation(
         )
         try:
             from app.models import ProjectMessage, MessageType
-            session.add(ProjectMessage(
-                project_id=task.project_id,
-                message_type=MessageType.NOTE,
-                from_type="orchestrator",
-                content=(
-                    f"Investigation chain depth limit ({MAX_INVESTIGATION_DEPTH}) "
-                    f"reached for direction {direction_id or 'undirected'}. "
-                    f"Failed task: {task.id} ({(task.title or '?')[:80]}). "
-                    f"Auto-remediation has tried multiple times without converging — "
-                    f"operator review is needed before spawning further investigations."
-                ),
-            ))
+
+            session.add(
+                ProjectMessage(
+                    project_id=task.project_id,
+                    message_type=MessageType.NOTE,
+                    from_type="orchestrator",
+                    content=(
+                        f"Investigation chain depth limit ({MAX_INVESTIGATION_DEPTH}) "
+                        f"reached for direction {direction_id or 'undirected'}. "
+                        f"Failed task: {task.id} ({(task.title or '?')[:80]}). "
+                        f"Auto-remediation has tried multiple times without converging — "
+                        f"operator review is needed before spawning further investigations."
+                    ),
+                )
+            )
         except Exception as _msg_exc:
-            logger.warning(f"[TASK FAILURE INVESTIGATION] Failed to post depth-cap message: {_msg_exc}")
+            logger.warning(
+                f"[TASK FAILURE INVESTIGATION] Failed to post depth-cap message: {_msg_exc}"
+            )
         return False
 
     if is_review_quality:
@@ -1408,40 +1824,59 @@ async def _spawn_task_failure_investigation(
         # chronic review-quality problems — lower the count requirement by
         # 1 so we trigger faster on repeat offenders.
         convergence_cutoff = _utcnow() - timedelta(days=7)
-        convergence_recent = (await session.execute(
-            select(Task).where(
-                Task.project_id == task.project_id,
-                Task.created_at >= convergence_cutoff,
+        convergence_recent = (
+            (
+                await session.execute(
+                    select(Task).where(
+                        Task.project_id == task.project_id,
+                        Task.created_at >= convergence_cutoff,
+                    )
+                )
             )
-        )).scalars().all()
+            .scalars()
+            .all()
+        )
         has_convergence = any(
             (t.context or {}).get("direction_id") == direction_id
-            and (t.context or {}).get("spawned_by") == "review_convergence_investigation"
+            and (t.context or {}).get("spawned_by")
+            == "review_convergence_investigation"
             for t in convergence_recent
         )
         if has_convergence:
             required_count = max(1, required_count - 1)
 
-        recent = (await session.execute(
-            select(Task).where(
-                Task.project_id == task.project_id,
-                Task.status == TaskStatus.FAILED,
-                Task.id != task.id,
-            ).order_by(Task.created_at.desc()).limit(60)
-        )).scalars().all()
+        recent = (
+            (
+                await session.execute(
+                    select(Task)
+                    .where(
+                        Task.project_id == task.project_id,
+                        Task.status == TaskStatus.FAILED,
+                        Task.id != task.id,
+                    )
+                    .order_by(Task.created_at.desc())
+                    .limit(60)
+                )
+            )
+            .scalars()
+            .all()
+        )
         dir_recent = [
             t for t in recent if (t.context or {}).get("direction_id") == direction_id
         ][:WINDOW_SIZE]
         if len(dir_recent) < required_count:
             return False
         review_quality_count = sum(
-            1 for t in dir_recent
+            1
+            for t in dir_recent
             if classify_failure_taxonomy(t) == TAXONOMY_REVIEW_QUALITY
         )
         if review_quality_count < required_count:
             return False
 
-    last_failure_class = CODE_ERROR if (is_code_defect or is_review_quality) else AGENT_TIMEOUT
+    last_failure_class = (
+        CODE_ERROR if (is_code_defect or is_review_quality) else AGENT_TIMEOUT
+    )
     if is_code_defect:
         failure_taxonomy = TAXONOMY_CODE_DEFECT
     elif is_review_quality:
@@ -1451,16 +1886,22 @@ async def _spawn_task_failure_investigation(
     # Audit W1: previous_error_fingerprint is now a column.
     prev_fp = task.previous_error_fingerprint or ""
     if await _recent_investigation_exists(
-        task.project_id, direction_id, session,
+        task.project_id,
+        direction_id,
+        session,
         error_fingerprint=prev_fp or None,
     ):
         return False
 
     if prev_fp:
         from app.task_completion import _find_sibling_fingerprint_investigation
+
         sibling_cutoff = _utcnow() - timedelta(hours=24)
         shared_id = await _find_sibling_fingerprint_investigation(
-            task.project_id, prev_fp, sibling_cutoff, session,
+            task.project_id,
+            prev_fp,
+            sibling_cutoff,
+            session,
         )
         if shared_id is not None:
             logger.info(
@@ -1474,15 +1915,22 @@ async def _spawn_task_failure_investigation(
     if direction_id:
         project = await session.get(Project, task.project_id)
         if project is not None:
-            direction = next(
-                (d for d in (project.directions or []) if d.get("id") == direction_id),
-                {},
-            ) or {}
+            direction = (
+                next(
+                    (
+                        d
+                        for d in (project.directions or [])
+                        if d.get("id") == direction_id
+                    ),
+                    {},
+                )
+                or {}
+            )
 
     payload = task.first_payload or {}
     ttype = payload.get("type") or ""
     status_msg = (task.latest_status_message or "(no message)")[:400]
-    tool_trace = (ctx.get("_tool_trace") or "")
+    tool_trace = ctx.get("_tool_trace") or ""
     if isinstance(tool_trace, list):
         tool_trace = "\n".join(str(x) for x in tool_trace)
     tool_trace = str(tool_trace)[:1500]
@@ -1568,21 +2016,28 @@ async def _spawn_task_failure_investigation(
             "failure_taxonomy": failure_taxonomy,
             "failure_fingerprints": [prev_fp] if prev_fp else [],
             "investigation_depth": next_depth,
-            **({"diagnosis_fingerprint": prev_fp, "error_fingerprint": prev_fp} if prev_fp else {}),
+            **(
+                {"diagnosis_fingerprint": prev_fp, "error_fingerprint": prev_fp}
+                if prev_fp
+                else {}
+            ),
         },
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
         status=TaskStatus.QUEUED,
         created_by="ORCHESTRATOR",
     )
     session.add(new_task)
-    session.add(TaskHistory(
-        task_id=new_task.id, action="SPAWNED",
-        details={
-            "spawned_by": "TASK_FAILURE_INVESTIGATION",
-            "direction_id": direction_id,
-            "source_task_id": str(task.id),
-        },
-    ))
+    session.add(
+        TaskHistory(
+            task_id=new_task.id,
+            action="SPAWNED",
+            details={
+                "spawned_by": "TASK_FAILURE_INVESTIGATION",
+                "direction_id": direction_id,
+                "source_task_id": str(task.id),
+            },
+        )
+    )
     logger.info(
         f"[TASK FAILURE INVESTIGATION] Spawned investigation {new_task.id} for "
         f"failed task {task.id} (direction {direction_id})"
@@ -1628,11 +2083,13 @@ async def _spawn_review_convergence_investigation(
 
     fp_source = (orig_task.latest_status_message or "").strip()
     if not fp_source:
-        history_for_fp = review_history or (orig_task.context or {}).get(
-            "review_loop", {}
-        ).get("review_history") or []
+        history_for_fp = (
+            review_history
+            or (orig_task.context or {}).get("review_loop", {}).get("review_history")
+            or []
+        )
         for entry in reversed(history_for_fp):
-            for iss in (entry.get("issues") or []):
+            for iss in entry.get("issues") or []:
                 desc = (iss.get("description") or "").strip()
                 if desc:
                     fp_source = desc
@@ -1648,7 +2105,10 @@ async def _spawn_review_convergence_investigation(
     if diagnosis_fingerprint:
         sibling_cutoff = _utcnow() - timedelta(hours=24)
         shared_id = await _find_sibling_fingerprint_investigation(
-            orig_task.project_id, diagnosis_fingerprint, sibling_cutoff, session,
+            orig_task.project_id,
+            diagnosis_fingerprint,
+            sibling_cutoff,
+            session,
         )
         if shared_id is not None:
             logger.info(
@@ -1658,7 +2118,11 @@ async def _spawn_review_convergence_investigation(
             )
             return None
 
-    history = review_history or (orig_task.context or {}).get("review_loop", {}).get("review_history") or []
+    history = (
+        review_history
+        or (orig_task.context or {}).get("review_loop", {}).get("review_history")
+        or []
+    )
     issues_lines: list[str] = []
     for entry in history[-3:]:
         it = entry.get("iteration", "?")
@@ -1670,9 +2134,15 @@ async def _spawn_review_convergence_investigation(
                 issues_lines.append(f"  - [iter {it}] [{sev}] {desc}")
         if not issues and entry.get("feedback"):
             issues_lines.append(f"  - [iter {it}] {str(entry.get('feedback'))[:200]}")
-    issues_block = "\n".join(issues_lines) if issues_lines else "(no structured review issues captured)"
+    issues_block = (
+        "\n".join(issues_lines)
+        if issues_lines
+        else "(no structured review issues captured)"
+    )
 
-    trigger_label = "cap exhausted" if trigger == "review_cap_exhausted" else "stuck cycle"
+    trigger_label = (
+        "cap exhausted" if trigger == "review_cap_exhausted" else "stuck cycle"
+    )
     prompt = (
         f"Review-fix convergence failure on PR #{pr_number} ({trigger_label}) after "
         f"{iterations} iterations. Diagnose why the review loop could not converge.\n\n"
@@ -1704,24 +2174,33 @@ async def _spawn_review_convergence_investigation(
             "convergence_detail": detail,
             "last_failure_class": CODE_ERROR,
             "failure_taxonomy": TAXONOMY_REVIEW_QUALITY,
-            "failure_fingerprints": [diagnosis_fingerprint] if diagnosis_fingerprint else [],
-            **({"diagnosis_fingerprint": diagnosis_fingerprint} if diagnosis_fingerprint else {}),
+            "failure_fingerprints": [diagnosis_fingerprint]
+            if diagnosis_fingerprint
+            else [],
+            **(
+                {"diagnosis_fingerprint": diagnosis_fingerprint}
+                if diagnosis_fingerprint
+                else {}
+            ),
         },
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
         status=TaskStatus.QUEUED,
         created_by="ORCHESTRATOR",
     )
     session.add(new_task)
-    session.add(TaskHistory(
-        task_id=new_task.id, action="SPAWNED",
-        details={
-            "spawned_by": "REVIEW_CONVERGENCE_INVESTIGATION",
-            "direction_id": direction_id,
-            "source_task_id": str(orig_task.id),
-            "pr_number": pr_number,
-            "trigger": trigger,
-        },
-    ))
+    session.add(
+        TaskHistory(
+            task_id=new_task.id,
+            action="SPAWNED",
+            details={
+                "spawned_by": "REVIEW_CONVERGENCE_INVESTIGATION",
+                "direction_id": direction_id,
+                "source_task_id": str(orig_task.id),
+                "pr_number": pr_number,
+                "trigger": trigger,
+            },
+        )
+    )
     logger.info(
         f"[REVIEW CONVERGENCE] Spawned investigation {new_task.id} for "
         f"PR #{pr_number} ({trigger}, direction {direction_id})"
@@ -1740,6 +2219,7 @@ async def _infer_fingerprint_audit_system(
     Returns None when the mapping is ambiguous (no direction link, multiple systems, or unset mode).
     """
     from app.models import SystemMaturity
+
     dir_to_system: dict[str, str] = {
         d["id"]: d["system_id"]
         for d in (project.directions or [])
@@ -1755,9 +2235,7 @@ async def _infer_fingerprint_audit_system(
             pass
     if not uuids:
         return None
-    rows = (await session.execute(
-        select(Task.context).where(Task.id.in_(uuids))
-    )).all()
+    rows = (await session.execute(select(Task.context).where(Task.id.in_(uuids)))).all()
     system_ids: set[str] = set()
     for (ctx,) in rows:
         did = (ctx or {}).get("direction_id")
@@ -1766,16 +2244,20 @@ async def _infer_fingerprint_audit_system(
     if len(system_ids) != 1:
         return None
     sid = next(iter(system_ids))
-    mat = (await session.execute(
-        select(SystemMaturity).where(
-            SystemMaturity.project_id == project.id,
-            SystemMaturity.system_id == sid,
+    mat = (
+        await session.execute(
+            select(SystemMaturity).where(
+                SystemMaturity.project_id == project.id,
+                SystemMaturity.system_id == sid,
+            )
         )
-    )).scalar_one_or_none()
+    ).scalar_one_or_none()
     return sid if mat and mat.recommended_mode in ("audit", "fundamentals") else None
 
 
-async def _spawn_residual_fingerprint_remediation(project: Project, session: AsyncSession) -> int:
+async def _spawn_residual_fingerprint_remediation(
+    project: Project, session: AsyncSession
+) -> int:
     """Spawn a create-type remediation task for the top uncooled residual CODE_ERROR fingerprint.
 
     Scans get_top_residual_fingerprints() and spawns at most one create task per
@@ -1804,14 +2286,16 @@ async def _spawn_residual_fingerprint_remediation(project: Project, session: Asy
     # drive the per-fingerprint cooldown. Row count for REMEDIATING
     # also drives the project-wide concurrency cap (see below).
     case_rows_result = await session.execute(
-        select(ResidualRemediationCase.fingerprint,
-               ResidualRemediationCase.status,
-               ResidualRemediationCase.last_spawned_at)
-        .where(ResidualRemediationCase.project_id == project.id)
+        select(
+            ResidualRemediationCase.fingerprint,
+            ResidualRemediationCase.status,
+            ResidualRemediationCase.last_spawned_at,
+        ).where(ResidualRemediationCase.project_id == project.id)
     )
     case_rows = case_rows_result.all()
     blocked_fingerprints: set[str] = {
-        fp for fp, status, _ in case_rows
+        fp
+        for fp, status, _ in case_rows
         if status in (ResidualCaseStatus.IGNORED, ResidualCaseStatus.SUSPENDED)
     }
     last_spawned_by_fp: dict[str, datetime] = {
@@ -1824,14 +2308,15 @@ async def _spawn_residual_fingerprint_remediation(project: Project, session: Asy
     # The DB row count is authoritative; old in-memory dedup is gone.
     max_concurrent = int(_runtime_config.get("max_concurrent_auto_remediations", 2))
     active_count = sum(
-        1 for _, status, _ in case_rows
-        if status == ResidualCaseStatus.REMEDIATING
+        1 for _, status, _ in case_rows if status == ResidualCaseStatus.REMEDIATING
     )
     if active_count >= max_concurrent:
         logger.info(
             "[AUTO REMEDIATION] %d residual case(s) already REMEDIATING, "
             "at or above cap (%d); skipping spawn (project %s).",
-            active_count, max_concurrent, project.id,
+            active_count,
+            max_concurrent,
+            project.id,
         )
         return 0
 
@@ -1842,7 +2327,9 @@ async def _spawn_residual_fingerprint_remediation(project: Project, session: Asy
     # PROVISION_PROGRESS, etc. — and no error line surfaced from the logs).
     # A single one-off task dying with such a status is noise; many tasks
     # dying with the same heartbeat is a real signal worth investigating.
-    no_error_min_count = int(_runtime_config.get("residual_remediation_no_error_min_count", 20))
+    no_error_min_count = int(
+        _runtime_config.get("residual_remediation_no_error_min_count", 20)
+    )
     now_dt = _utcnow()
     cooldown_delta = timedelta(seconds=cooldown_seconds)
 
@@ -1851,7 +2338,8 @@ async def _spawn_residual_fingerprint_remediation(project: Project, session: Asy
         if fp in blocked_fingerprints:
             logger.debug(
                 "[AUTO REMEDIATION] Skipping IGNORED/SUSPENDED fingerprint %s (project %s).",
-                fp[:32], project.id,
+                fp[:32],
+                project.id,
             )
             continue
         last_spawned = last_spawned_by_fp.get(fp)
@@ -1866,18 +2354,25 @@ async def _spawn_residual_fingerprint_remediation(project: Project, session: Asy
             logger.info(
                 "[AUTO REMEDIATION] Deferring fingerprint %s: system %r is in "
                 "audit/fundamentals mode (project %s).",
-                fp[:32], _audit_sid, project.id,
+                fp[:32],
+                _audit_sid,
+                project.id,
             )
             await _record_residual_audit_deferral(session, project.id, fp, _audit_sid)
             continue
 
         # Require a high count before remediating non-error-shaped clusters.
-        if not fp_entry.get("is_error_shaped", True) and fp_entry.get("count", 0) < no_error_min_count:
+        if (
+            not fp_entry.get("is_error_shaped", True)
+            and fp_entry.get("count", 0) < no_error_min_count
+        ):
             logger.info(
                 "[AUTO REMEDIATION] Skipping fingerprint %s: heartbeat-only cluster "
                 "(no error-shaped contribution) at count=%d, threshold=%d. "
                 "Sample: %.80s",
-                fp[:32], fp_entry.get("count", 0), no_error_min_count,
+                fp[:32],
+                fp_entry.get("count", 0),
+                no_error_min_count,
                 (fp_entry.get("sample_message") or "")[:80],
             )
             continue
@@ -1897,8 +2392,12 @@ async def _spawn_residual_fingerprint_remediation(project: Project, session: Asy
         # has already been addressed and spawning another remediation task
         # would waste capacity and trigger an identical cycle 24 h later.
         if sample_messages:
-            from app.failure_classification import classify_failure as _rfc, CODE_ERROR as _CE
+            from app.failure_classification import (
+                classify_failure as _rfc,
+                CODE_ERROR as _CE,
+            )
             import types as _types
+
             _probe = _types.SimpleNamespace(
                 context={},
                 latest_status_message=sample_messages[0],
@@ -1909,7 +2408,8 @@ async def _spawn_residual_fingerprint_remediation(project: Project, session: Asy
                     "[AUTO REMEDIATION] Skipping fingerprint %s: primary sample "
                     "no longer classifies as CODE_ERROR (underlying fix already deployed). "
                     "Sample: %.80s",
-                    fp[:32], sample_messages[0],
+                    fp[:32],
+                    sample_messages[0],
                 )
                 continue
 
@@ -1934,7 +2434,8 @@ async def _spawn_residual_fingerprint_remediation(project: Project, session: Asy
         samples_block = _render_samples("Sample error message(s)", sample_messages)
         # Status context — show only those that differ from the error lines.
         distinct_statuses = [
-            s for s in sample_statuses
+            s
+            for s in sample_statuses
             if s and not any(s.strip() == m.strip() for m in sample_messages)
         ]
         status_block = _render_samples(
@@ -1981,17 +2482,26 @@ async def _spawn_residual_fingerprint_remediation(project: Project, session: Asy
         source_max_depth = 0
         if task_ids:
             try:
-                rows = (await session.execute(
-                    select(Task.context).where(
-                        Task.id.in_([uuid.UUID(t) if isinstance(t, str) else t for t in task_ids[:5]])
+                rows = (
+                    await session.execute(
+                        select(Task.context).where(
+                            Task.id.in_(
+                                [
+                                    uuid.UUID(t) if isinstance(t, str) else t
+                                    for t in task_ids[:5]
+                                ]
+                            )
+                        )
                     )
-                )).all()
+                ).all()
                 for (rc,) in rows:
                     d = int((rc or {}).get("investigation_depth") or 0)
                     if d > source_max_depth:
                         source_max_depth = d
             except Exception as _depth_exc:
-                logger.debug(f"[AUTO REMEDIATION] depth lookup failed for {fp[:32]}: {_depth_exc}")
+                logger.debug(
+                    f"[AUTO REMEDIATION] depth lookup failed for {fp[:32]}: {_depth_exc}"
+                )
         remediation_context = {
             "auto_remediation": True,
             "spawned_by": "residual_fingerprint_remediation",
@@ -2011,26 +2521,34 @@ async def _spawn_residual_fingerprint_remediation(project: Project, session: Asy
             created_by="ORCHESTRATOR",
         )
         session.add(new_task)
-        session.add(TaskHistory(
-            task_id=new_task.id, action="SPAWNED",
-            details={
-                "spawned_by": "RESIDUAL_FINGERPRINT_REMEDIATION",
-                "error_fingerprint": fp,
-            },
-        ))
+        session.add(
+            TaskHistory(
+                task_id=new_task.id,
+                action="SPAWNED",
+                details={
+                    "spawned_by": "RESIDUAL_FINGERPRINT_REMEDIATION",
+                    "error_fingerprint": fp,
+                },
+            )
+        )
         # Stamp REMEDIATING + last_spawned_* on the case row and emit the
         # spawn message. Subsequent ticks read the same row to enforce the
         # per-fingerprint cooldown — no in-memory dedup dict.
         from app.notification_dispatch import post_residual_fix_spawned_message
+
         try:
             await post_residual_fix_spawned_message(
-                session, project.id, fingerprint=fp,
-                sample_message=primary_sample, task_id=new_task.id,
+                session,
+                project.id,
+                fingerprint=fp,
+                sample_message=primary_sample,
+                task_id=new_task.id,
             )
         except Exception as _spawn_msg_exc:
             logger.warning(
                 "[AUTO REMEDIATION] Failed to post spawned message for %s: %s",
-                fp[:32], _spawn_msg_exc,
+                fp[:32],
+                _spawn_msg_exc,
             )
         logger.info(
             f"[AUTO REMEDIATION] Spawned create task {new_task.id} for residual "
@@ -2045,9 +2563,12 @@ async def _spawn_residual_fingerprint_remediation(project: Project, session: Asy
 async def _check_idle_research():
     """Periodic check: spawn research if projects are idle with active directions."""
     from app.anomaly_detection import _expire_stale_proposals, _check_anomaly_proposals
+
     now = _utcnow()
     interval_minutes = _runtime_config.get("autonomous_research_interval_minutes", 30)
-    if _shared_state.last_idle_check and (now - _shared_state.last_idle_check) < timedelta(minutes=interval_minutes):
+    if _shared_state.last_idle_check and (
+        now - _shared_state.last_idle_check
+    ) < timedelta(minutes=interval_minutes):
         return
     _shared_state.last_idle_check = now
 
@@ -2058,32 +2579,56 @@ async def _check_idle_research():
             # Expire stale proposals before processing
             await _expire_stale_proposals(session)
 
-            projects = (await session.execute(
-                select(Project).where(Project.autonomous_enabled.is_(True))
-            )).scalars().all()
+            projects = (
+                (
+                    await session.execute(
+                        select(Project).where(Project.autonomous_enabled.is_(True))
+                    )
+                )
+                .scalars()
+                .all()
+            )
 
             for project in projects:
                 # Log pending proposals awaiting review
-                pending_proposals = [d for d in (project.directions or []) if d.get("status") == "proposed"]
+                pending_proposals = [
+                    d
+                    for d in (project.directions or [])
+                    if d.get("status") == "proposed"
+                ]
                 if pending_proposals:
-                    logger.info(f"[DIRECTIONS] Project {project.name} has {len(pending_proposals)} pending direction proposals awaiting review")
+                    logger.info(
+                        f"[DIRECTIONS] Project {project.name} has {len(pending_proposals)} pending direction proposals awaiting review"
+                    )
 
-                active_directions = [d for d in (project.directions or []) if d.get("status") == "active"]
+                active_directions = [
+                    d for d in (project.directions or []) if d.get("status") == "active"
+                ]
                 # Allow projects with no directions through if vision needs bootstrapping
                 vision_needs_bootstrap = not (project.vision or {}).get("purpose")
                 strategic_recovery_needed = not active_directions and (
                     (project.vision or {}).get("_strategic_failures", 0) < 3
                 )
-                if not active_directions and not vision_needs_bootstrap and not strategic_recovery_needed:
+                if (
+                    not active_directions
+                    and not vision_needs_bootstrap
+                    and not strategic_recovery_needed
+                ):
                     continue
 
                 # Spawn if VM slots are available — count only tasks consuming VMs,
                 # not QUEUED tasks blocked on dependencies
-                vm_consuming = (await session.execute(
-                    select(func.count()).select_from(Task).where(
-                        Task.status.in_([TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]),
+                vm_consuming = (
+                    await session.execute(
+                        select(func.count())
+                        .select_from(Task)
+                        .where(
+                            Task.status.in_(
+                                [TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]
+                            ),
+                        )
                     )
-                )).scalar() or 0
+                ).scalar() or 0
 
                 if vm_consuming < _runtime_config["max_concurrent_vms"]:
                     await _spawn_research_task(project, session)

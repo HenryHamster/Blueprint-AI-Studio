@@ -1,4 +1,5 @@
 """Task status grouping and transition policy helpers."""
+
 from __future__ import annotations
 
 from app.models import TaskStatus

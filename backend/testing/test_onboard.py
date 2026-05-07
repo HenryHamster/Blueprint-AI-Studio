@@ -1,4 +1,5 @@
 """Tests for onboarding endpoint — build config detection and auto_remediation defaults."""
+
 import pytest
 from unittest.mock import AsyncMock, patch
 from httpx import AsyncClient
@@ -24,17 +25,34 @@ def override_auth():
 
 class TestOnboardAutoRemediation:
     @pytest.mark.asyncio
-    async def test_onboard_sets_auto_remediation_defaults(self, client: AsyncClient, db_session):
+    async def test_onboard_sets_auto_remediation_defaults(
+        self, client: AsyncClient, db_session
+    ):
         """Onboarding initializes _auto_remediation in design_doc with sensible defaults."""
         with (
-            patch("app.routers.admin_onboard._detect_build_config", new_callable=AsyncMock, return_value={"language": "python"}),
-            patch("app.github.get_repo_installation_token", new_callable=AsyncMock, return_value="tok"),
-            patch("app.github.get_repo_default_branch", new_callable=AsyncMock, return_value="main"),
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+                return_value={"language": "python"},
+            ),
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="tok",
+            ),
+            patch(
+                "app.github.get_repo_default_branch",
+                new_callable=AsyncMock,
+                return_value="main",
+            ),
         ):
-            resp = await client.post("/api/admin/projects/onboard", json={
-                "github_owner": "acme",
-                "github_repo": "myrepo",
-            })
+            resp = await client.post(
+                "/api/admin/projects/onboard",
+                json={
+                    "github_owner": "acme",
+                    "github_repo": "myrepo",
+                },
+            )
 
         assert resp.status_code == 200
         data = resp.json()
@@ -52,17 +70,34 @@ class TestOnboardAutoRemediation:
         assert ar["require_review"] is True
 
     @pytest.mark.asyncio
-    async def test_onboard_custom_default_branch_added_to_whitelist(self, client: AsyncClient, db_session):
+    async def test_onboard_custom_default_branch_added_to_whitelist(
+        self, client: AsyncClient, db_session
+    ):
         """When default branch is not 'main' or 'master', it is prepended to branch_whitelist."""
         with (
-            patch("app.routers.admin_onboard._detect_build_config", new_callable=AsyncMock, return_value={}),
-            patch("app.github.get_repo_installation_token", new_callable=AsyncMock, return_value="tok"),
-            patch("app.github.get_repo_default_branch", new_callable=AsyncMock, return_value="develop"),
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+                return_value={},
+            ),
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="tok",
+            ),
+            patch(
+                "app.github.get_repo_default_branch",
+                new_callable=AsyncMock,
+                return_value="develop",
+            ),
         ):
-            resp = await client.post("/api/admin/projects/onboard", json={
-                "github_owner": "acme",
-                "github_repo": "myrepo2",
-            })
+            resp = await client.post(
+                "/api/admin/projects/onboard",
+                json={
+                    "github_owner": "acme",
+                    "github_repo": "myrepo2",
+                },
+            )
 
         assert resp.status_code == 200
         data = resp.json()

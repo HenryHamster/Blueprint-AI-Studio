@@ -7,6 +7,7 @@ reaper, services, routers/agent, admin) previously needed deferred imports
 from app.main just to call broadcast_to_project.  Now they import directly
 from this module at the top level.
 """
+
 import asyncio
 import ipaddress
 import logging
@@ -58,7 +59,9 @@ class ConnectionManager:
         client_ip = _get_websocket_client_ip(websocket)
         if client_ip != "unknown":
             if self.ip_connections.get(client_ip, 0) >= self.MAX_CONNECTIONS_PER_IP:
-                await websocket.close(code=1008, reason="Too many connections from this IP")
+                await websocket.close(
+                    code=1008, reason="Too many connections from this IP"
+                )
                 return False
             self.ip_connections[client_ip] = self.ip_connections.get(client_ip, 0) + 1
         return True
@@ -111,7 +114,9 @@ class ConnectionManager:
                 if now - self.last_activity.get(ws, now) > max_idle_seconds
             ]
         for ws, pid in idle:
-            logger.info(f"[WS] Closing idle connection (project={pid}, idle>{max_idle_seconds:.0f}s)")
+            logger.info(
+                f"[WS] Closing idle connection (project={pid}, idle>{max_idle_seconds:.0f}s)"
+            )
             # Skip close() if the socket already closed itself out-of-band.
             # Calling close() on a DISCONNECTED websocket raises starlette's
             # `RuntimeError: Cannot call "send" once a close message has been
@@ -127,9 +132,13 @@ class ConnectionManager:
                 except RuntimeError as _close_exc:
                     # Race: client closed between the state check and the
                     # close() call. Benign — just clean up our bookkeeping.
-                    logger.debug(f"[WS] Idle close race for project {pid}: {_close_exc}")
+                    logger.debug(
+                        f"[WS] Idle close race for project {pid}: {_close_exc}"
+                    )
                 except Exception:
-                    logger.exception(f"[WS] Failed to close idle connection for project {pid}")
+                    logger.exception(
+                        f"[WS] Failed to close idle connection for project {pid}"
+                    )
             await self.disconnect(ws, pid)
 
     async def broadcast(self, project_id: str, event_type: str, data: dict):
@@ -148,10 +157,14 @@ class ConnectionManager:
             try:
                 await asyncio.wait_for(connection.send_json(message), timeout=5.0)
             except asyncio.TimeoutError:
-                logger.warning(f"[WS] Send timeout for client (project={project_id}, event={event_type})")
+                logger.warning(
+                    f"[WS] Send timeout for client (project={project_id}, event={event_type})"
+                )
                 await self.disconnect(connection, project_id)
             except Exception as e:
-                logger.warning(f"[WS] Failed to send message to client (project={project_id}, event={event_type}): {e}")
+                logger.warning(
+                    f"[WS] Failed to send message to client (project={project_id}, event={event_type}): {e}"
+                )
                 await self.disconnect(connection, project_id)
 
     async def broadcast_to_all(self, event_type: str, data: dict):
@@ -171,21 +184,28 @@ async def broadcast_to_project(project_id: str, event_type: str, data: dict):
     try:
         await manager.broadcast(project_id, event_type, data)
     except Exception as e:
-        logger.warning(f"[WS] Broadcast failed (project={project_id}, event={event_type}): {e}")
+        logger.warning(
+            f"[WS] Broadcast failed (project={project_id}, event={event_type}): {e}"
+        )
 
 
 # Log sanitization patterns — mirrors agent/src/index.ts sanitize() to catch secrets
 # that bypass agent-side sanitization (compromised agent, direct WS injection)
 _SANITIZE_PATTERNS = [
-    (re.compile(r'https://x-access-token:[^@]+@'), 'https://x-access-token:***@'),
-    (re.compile(r'ghp_[A-Za-z0-9_]+'), 'ghp_***'),
-    (re.compile(r'ghs_[A-Za-z0-9_]+'), 'ghs_***'),
-    (re.compile(r'github_pat_[A-Za-z0-9_]+'), 'github_pat_***'),
-    (re.compile(r'sk-ant-[A-Za-z0-9_\-]+'), 'sk-ant-***'),
-    (re.compile(r'eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+'), 'eyJ***'),
-    (re.compile(r'Bearer\s+[^\s,\'"]+', re.IGNORECASE), 'Bearer ***'),
-    (re.compile(r'oauth_token[=:]\s*[^\s&\'"]+', re.IGNORECASE), 'oauth_token=***'),
-    (re.compile(r'-----BEGIN[A-Z\s]+PRIVATE\s+KEY-----[\s\S]*?-----END[A-Z\s]+PRIVATE\s+KEY-----'), '***PRIVATE KEY***'),
+    (re.compile(r"https://x-access-token:[^@]+@"), "https://x-access-token:***@"),
+    (re.compile(r"ghp_[A-Za-z0-9_]+"), "ghp_***"),
+    (re.compile(r"ghs_[A-Za-z0-9_]+"), "ghs_***"),
+    (re.compile(r"github_pat_[A-Za-z0-9_]+"), "github_pat_***"),
+    (re.compile(r"sk-ant-[A-Za-z0-9_\-]+"), "sk-ant-***"),
+    (re.compile(r"eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+"), "eyJ***"),
+    (re.compile(r'Bearer\s+[^\s,\'"]+', re.IGNORECASE), "Bearer ***"),
+    (re.compile(r'oauth_token[=:]\s*[^\s&\'"]+', re.IGNORECASE), "oauth_token=***"),
+    (
+        re.compile(
+            r"-----BEGIN[A-Z\s]+PRIVATE\s+KEY-----[\s\S]*?-----END[A-Z\s]+PRIVATE\s+KEY-----"
+        ),
+        "***PRIVATE KEY***",
+    ),
 ]
 
 

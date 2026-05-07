@@ -3,6 +3,7 @@
 These tests do not require a database — all DB calls are mocked.
 Run with: bash scripts/test-backend.sh testing/test_anomaly_detection.py --standalone
 """
+
 import uuid
 from datetime import timedelta
 
@@ -41,13 +42,16 @@ def _make_session(tasks: list, project: Project, all_tasks_72h: list | None = No
     project_result = MagicMock()
     project_result.scalar_one_or_none.return_value = project
 
-    session.execute = AsyncMock(side_effect=[tasks_result, all72_result, project_result])
+    session.execute = AsyncMock(
+        side_effect=[tasks_result, all72_result, project_result]
+    )
     return session
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Empty / no-data cases
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_empty_task_history_returns_empty_list():
@@ -88,6 +92,7 @@ async def test_few_failures_below_threshold_no_anomaly():
 # ─────────────────────────────────────────────────────────────────────────────
 # Rising failure counts
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_rising_failure_count_produces_high_severity_anomaly():
@@ -192,6 +197,7 @@ async def test_provision_failures_detected_separately_from_code_errors():
 # ─────────────────────────────────────────────────────────────────────────────
 # classify_failure — agent crash report classification
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def test_classify_failure_uncaught_exception_is_agent_timeout():
     """[FATAL:uncaughtException] crash reports must classify as AGENT_TIMEOUT, not CODE_ERROR."""
@@ -323,6 +329,7 @@ def test_classify_failure_stuck_in_ci_wait_is_agent_timeout():
 # Declining merge rates
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_declining_merge_rate_produces_medium_anomaly():
     """Direction with consistently declining merge rate → medium anomaly."""
@@ -344,7 +351,9 @@ async def test_declining_merge_rate_produces_medium_anomaly():
 
     result = await _compute_research_anomalies(project_id, session)
 
-    medium = [a for a in result if a["severity"] == "medium" and "d-test0001" in a["signal"]]
+    medium = [
+        a for a in result if a["severity"] == "medium" and "d-test0001" in a["signal"]
+    ]
     assert len(medium) >= 1
     assert "merge rate declining" in medium[0]["signal"]
 
@@ -400,6 +409,7 @@ async def test_fewer_than_3_history_cycles_no_merge_rate_anomaly():
 # High task failure rate per direction
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_high_direction_failure_rate_produces_high_anomaly():
     """Direction with >50% failure rate in last 2 cycles → high severity anomaly."""
@@ -420,7 +430,9 @@ async def test_high_direction_failure_rate_produces_high_anomaly():
 
     result = await _compute_research_anomalies(project_id, session)
 
-    high = [a for a in result if a["severity"] == "high" and "d-faildir1" in a["signal"]]
+    high = [
+        a for a in result if a["severity"] == "high" and "d-faildir1" in a["signal"]
+    ]
     assert len(high) >= 1
     assert "failure rate" in high[0]["signal"]
 
@@ -445,7 +457,9 @@ async def test_low_direction_failure_rate_no_anomaly():
 
     result = await _compute_research_anomalies(project_id, session)
 
-    assert not any("d-lowfail1" in a["signal"] and "failure rate" in a["signal"] for a in result)
+    assert not any(
+        "d-lowfail1" in a["signal"] and "failure rate" in a["signal"] for a in result
+    )
 
 
 @pytest.mark.asyncio
@@ -474,6 +488,7 @@ async def test_paused_directions_excluded_from_analysis():
 # ─────────────────────────────────────────────────────────────────────────────
 # Combined scenarios
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_multiple_anomalies_returned_when_multiple_signals_present():
@@ -529,6 +544,7 @@ async def test_multiple_anomalies_returned_when_multiple_signals_present():
 # Cross-direction systemic fingerprint pattern
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_cross_direction_fingerprint_emits_systemic_anomaly():
     """Same normalized error across 2+ directions with 3+ total failures → systemic anomaly."""
@@ -540,18 +556,24 @@ async def test_cross_direction_fingerprint_emits_systemic_anomaly():
     shared_msg = "ImportError: cannot import name 'Foo' from 'app.bar'"
     tasks = [
         make_task(
-            project_id=project_id, status=TaskStatus.FAILED,
-            latest_status_message=shared_msg, context={"direction_id": "d-aaa"},
+            project_id=project_id,
+            status=TaskStatus.FAILED,
+            latest_status_message=shared_msg,
+            context={"direction_id": "d-aaa"},
             created_at=now - timedelta(hours=2),
         ),
         make_task(
-            project_id=project_id, status=TaskStatus.FAILED,
-            latest_status_message=shared_msg, context={"direction_id": "d-bbb"},
+            project_id=project_id,
+            status=TaskStatus.FAILED,
+            latest_status_message=shared_msg,
+            context={"direction_id": "d-bbb"},
             created_at=now - timedelta(hours=3),
         ),
         make_task(
-            project_id=project_id, status=TaskStatus.FAILED,
-            latest_status_message=shared_msg, context={"direction_id": "d-ccc"},
+            project_id=project_id,
+            status=TaskStatus.FAILED,
+            latest_status_message=shared_msg,
+            context={"direction_id": "d-ccc"},
             created_at=now - timedelta(hours=4),
         ),
     ]
@@ -559,7 +581,9 @@ async def test_cross_direction_fingerprint_emits_systemic_anomaly():
 
     result = await _compute_research_anomalies(project_id, session)
 
-    systemic = [a for a in result if a["signal"].startswith("CrossDirectionFingerprint_")]
+    systemic = [
+        a for a in result if a["signal"].startswith("CrossDirectionFingerprint_")
+    ]
     assert len(systemic) == 1
     anomaly = systemic[0]
     assert anomaly["severity"] == "high"
@@ -577,8 +601,10 @@ async def test_single_direction_fingerprint_no_systemic_anomaly():
     shared_msg = "AttributeError: 'NoneType' has no attribute 'x'"
     tasks = [
         make_task(
-            project_id=project_id, status=TaskStatus.FAILED,
-            latest_status_message=shared_msg, context={"direction_id": "d-only"},
+            project_id=project_id,
+            status=TaskStatus.FAILED,
+            latest_status_message=shared_msg,
+            context={"direction_id": "d-only"},
             created_at=now - timedelta(hours=i + 1),
         )
         for i in range(5)
@@ -600,13 +626,17 @@ async def test_cross_direction_below_count_threshold_no_anomaly():
     shared_msg = "KeyError: 'missing_key'"
     tasks = [
         make_task(
-            project_id=project_id, status=TaskStatus.FAILED,
-            latest_status_message=shared_msg, context={"direction_id": "d-a"},
+            project_id=project_id,
+            status=TaskStatus.FAILED,
+            latest_status_message=shared_msg,
+            context={"direction_id": "d-a"},
             created_at=now - timedelta(hours=1),
         ),
         make_task(
-            project_id=project_id, status=TaskStatus.FAILED,
-            latest_status_message=shared_msg, context={"direction_id": "d-b"},
+            project_id=project_id,
+            status=TaskStatus.FAILED,
+            latest_status_message=shared_msg,
+            context={"direction_id": "d-b"},
             created_at=now - timedelta(hours=2),
         ),
     ]
@@ -638,6 +668,7 @@ def _make_proactive_session(active_proactive_count: int = 0):
 
     def _add(obj):
         adds.append(obj)
+
     session.add = MagicMock(side_effect=_add)
     session.commit = AsyncMock()
     session.flush = AsyncMock()
@@ -676,8 +707,10 @@ async def test_proactive_fingerprint_spawns_investigation(monkeypatch):
 
     async def _no_recent(*args, **kwargs):
         return False
+
     monkeypatch.setattr(
-        "app.autonomous_research._recent_investigation_exists", _no_recent,
+        "app.autonomous_research._recent_investigation_exists",
+        _no_recent,
     )
 
     session, adds = _make_proactive_session(active_proactive_count=0)
@@ -719,8 +752,10 @@ async def test_proactive_fingerprint_dedup_flag(monkeypatch):
 
     async def _no_recent(*args, **kwargs):
         return False
+
     monkeypatch.setattr(
-        "app.autonomous_research._recent_investigation_exists", _no_recent,
+        "app.autonomous_research._recent_investigation_exists",
+        _no_recent,
     )
 
     session, adds = _make_proactive_session(active_proactive_count=0)
@@ -753,8 +788,10 @@ async def test_proactive_fingerprint_respects_recent_investigation_exists(monkey
 
     async def _yes_recent(*args, **kwargs):
         return True
+
     monkeypatch.setattr(
-        "app.autonomous_research._recent_investigation_exists", _yes_recent,
+        "app.autonomous_research._recent_investigation_exists",
+        _yes_recent,
     )
 
     session, adds = _make_proactive_session(active_proactive_count=0)
@@ -775,23 +812,29 @@ async def test_proactive_fingerprint_per_project_cap(monkeypatch):
     _shared_state.persistent_anomalies.clear()
     _shared_state.persistent_anomalies[str(project_id)] = {
         "CrossDirectionFingerprint_fp1aaa": {
-            "severity": "high", "occurrence_count": 1,
+            "severity": "high",
+            "occurrence_count": 1,
             "fingerprint": "fp1aaa",
             "affected_directions": ["d-a", "d-b"],
-            "failure_count": 4, "example_message": "e1",
+            "failure_count": 4,
+            "example_message": "e1",
         },
         "CrossDirectionFingerprint_fp2bbb": {
-            "severity": "high", "occurrence_count": 1,
+            "severity": "high",
+            "occurrence_count": 1,
             "fingerprint": "fp2bbb",
             "affected_directions": ["d-c", "d-d"],
-            "failure_count": 4, "example_message": "e2",
+            "failure_count": 4,
+            "example_message": "e2",
         },
     }
 
     async def _no_recent(*args, **kwargs):
         return False
+
     monkeypatch.setattr(
-        "app.autonomous_research._recent_investigation_exists", _no_recent,
+        "app.autonomous_research._recent_investigation_exists",
+        _no_recent,
     )
 
     session, adds = _make_proactive_session(active_proactive_count=0)
@@ -812,17 +855,21 @@ async def test_proactive_fingerprint_system_concurrent_cap(monkeypatch):
     _shared_state.persistent_anomalies.clear()
     _shared_state.persistent_anomalies[str(project_id)] = {
         f"CrossDirectionFingerprint_{fp}": {
-            "severity": "high", "occurrence_count": 1,
+            "severity": "high",
+            "occurrence_count": 1,
             "fingerprint": fp,
             "affected_directions": ["d-m", "d-n"],
-            "failure_count": 5, "example_message": "err",
+            "failure_count": 5,
+            "example_message": "err",
         }
     }
 
     async def _no_recent(*args, **kwargs):
         return False
+
     monkeypatch.setattr(
-        "app.autonomous_research._recent_investigation_exists", _no_recent,
+        "app.autonomous_research._recent_investigation_exists",
+        _no_recent,
     )
 
     session, adds = _make_proactive_session(active_proactive_count=2)
@@ -853,8 +900,10 @@ async def test_intra_direction_fingerprint_emits_anomaly():
     msg = "TypeError: unhashable type: 'list' at app/foo.py"
     tasks = [
         make_task(
-            project_id=project_id, status=TaskStatus.FAILED,
-            latest_status_message=msg, context={"direction_id": "d-only"},
+            project_id=project_id,
+            status=TaskStatus.FAILED,
+            latest_status_message=msg,
+            context={"direction_id": "d-only"},
             created_at=now - timedelta(hours=i + 1),
         )
         for i in range(3)
@@ -879,23 +928,31 @@ async def test_intra_direction_suppressed_when_cross_direction_fires():
     msg = "ImportError: cannot import name 'Bar'"
     tasks = [
         make_task(
-            project_id=project_id, status=TaskStatus.FAILED,
-            latest_status_message=msg, context={"direction_id": "d-a"},
+            project_id=project_id,
+            status=TaskStatus.FAILED,
+            latest_status_message=msg,
+            context={"direction_id": "d-a"},
             created_at=now - timedelta(hours=1),
         ),
         make_task(
-            project_id=project_id, status=TaskStatus.FAILED,
-            latest_status_message=msg, context={"direction_id": "d-a"},
+            project_id=project_id,
+            status=TaskStatus.FAILED,
+            latest_status_message=msg,
+            context={"direction_id": "d-a"},
             created_at=now - timedelta(hours=2),
         ),
         make_task(
-            project_id=project_id, status=TaskStatus.FAILED,
-            latest_status_message=msg, context={"direction_id": "d-a"},
+            project_id=project_id,
+            status=TaskStatus.FAILED,
+            latest_status_message=msg,
+            context={"direction_id": "d-a"},
             created_at=now - timedelta(hours=3),
         ),
         make_task(
-            project_id=project_id, status=TaskStatus.FAILED,
-            latest_status_message=msg, context={"direction_id": "d-b"},
+            project_id=project_id,
+            status=TaskStatus.FAILED,
+            latest_status_message=msg,
+            context={"direction_id": "d-b"},
             created_at=now - timedelta(hours=4),
         ),
     ]
@@ -925,8 +982,10 @@ async def test_proactive_intra_direction_spawns_investigation(monkeypatch):
 
     async def _no_recent(*args, **kwargs):
         return False
+
     monkeypatch.setattr(
-        "app.autonomous_research._recent_investigation_exists", _no_recent,
+        "app.autonomous_research._recent_investigation_exists",
+        _no_recent,
     )
 
     session, adds = _make_proactive_session(active_proactive_count=0)
@@ -956,16 +1015,21 @@ async def test_proactive_intra_direction_system_cap(monkeypatch):
     _shared_state.persistent_anomalies.clear()
     _shared_state.persistent_anomalies[str(project_id)] = {
         f"IntraDirectionFingerprint_{fp}_{did}": {
-            "severity": "high", "occurrence_count": 1,
-            "fingerprint": fp, "direction_id": did,
-            "failure_count": 3, "example_message": "e",
+            "severity": "high",
+            "occurrence_count": 1,
+            "fingerprint": fp,
+            "direction_id": did,
+            "failure_count": 3,
+            "example_message": "e",
         }
     }
 
     async def _no_recent(*args, **kwargs):
         return False
+
     monkeypatch.setattr(
-        "app.autonomous_research._recent_investigation_exists", _no_recent,
+        "app.autonomous_research._recent_investigation_exists",
+        _no_recent,
     )
 
     session, adds = _make_proactive_session(active_proactive_count=2)
@@ -981,6 +1045,7 @@ async def test_proactive_intra_direction_system_cap(monkeypatch):
 # ─────────────────────────────────────────────────────────────────────────────
 # Failure rate momentum
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def _make_status_task(project_id, status, hours_ago):
     return make_task(
@@ -1118,6 +1183,7 @@ async def test_seed_task_results_from_db_populates_deque():
 # ─────────────────────────────────────────────────────────────────────────────
 # Persistence boundary: _compute_research_anomalies calls persist_anomaly_snapshot
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_compute_research_anomalies_persists_snapshot():

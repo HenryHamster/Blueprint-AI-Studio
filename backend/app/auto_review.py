@@ -5,6 +5,7 @@ registered project with auto-review enabled, this module applies guard rails
 (rate limit, duplicate detection, concurrent limit) and spawns a review-type
 task.
 """
+
 import logging
 import uuid
 from datetime import timedelta
@@ -51,7 +52,11 @@ async def _handle_auto_review(
     except Exception as exc:
         logger.error(
             "[AUTO-REVIEW] Error handling PR #%d on %s/%s: %s",
-            pr_number, owner, repo, exc, exc_info=True,
+            pr_number,
+            owner,
+            repo,
+            exc,
+            exc_info=True,
         )
 
 
@@ -74,55 +79,69 @@ async def _handle_auto_review_inner(
 
     # ── Guard: rate limit ──
     one_hour_ago = now - timedelta(hours=1)
-    recent_tasks = (await session.execute(
-        select(Task).where(
-            Task.project_id == project_id,
-            Task.created_at >= one_hour_ago,
+    recent_tasks = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.project_id == project_id,
+                    Task.created_at >= one_hour_ago,
+                )
+            )
         )
-    )).scalars().all()
+        .scalars()
+        .all()
+    )
     recent_review_count = sum(
-        1 for t in recent_tasks
-        if (t.context or {}).get("auto_review") is True
+        1 for t in recent_tasks if (t.context or {}).get("auto_review") is True
     )
     if recent_review_count >= max_per_hour:
         logger.info(
             "[AUTO-REVIEW] Rate limit hit (%d/%d in last hour) for project %s",
-            recent_review_count, max_per_hour, project_id,
+            recent_review_count,
+            max_per_hour,
+            project_id,
         )
         return
 
     # ── Guard: duplicate detection (same PR number, active review task) ──
     active_statuses = [
-        TaskStatus.QUEUED, TaskStatus.PROVISIONING,
-        TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING,
+        TaskStatus.QUEUED,
+        TaskStatus.PROVISIONING,
+        TaskStatus.IN_PROGRESS,
+        TaskStatus.EVALUATING,
     ]
-    active_tasks = (await session.execute(
-        select(Task).where(
-            Task.project_id == project_id,
-            Task.status.in_(active_statuses),
+    active_tasks = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.project_id == project_id,
+                    Task.status.in_(active_statuses),
+                )
+            )
         )
-    )).scalars().all()
+        .scalars()
+        .all()
+    )
     for t in active_tasks:
         ctx = t.context or {}
-        if (
-            ctx.get("auto_review") is True
-            and ctx.get("pr_number") == pr_number
-        ):
+        if ctx.get("auto_review") is True and ctx.get("pr_number") == pr_number:
             logger.info(
                 "[AUTO-REVIEW] Duplicate: active task %s already covers PR #%d",
-                t.id, pr_number,
+                t.id,
+                pr_number,
             )
             return
 
     # ── Guard: concurrent limit ──
     active_review_count = sum(
-        1 for t in active_tasks
-        if (t.context or {}).get("auto_review") is True
+        1 for t in active_tasks if (t.context or {}).get("auto_review") is True
     )
     if active_review_count >= max_concurrent:
         logger.info(
             "[AUTO-REVIEW] Concurrent limit hit (%d/%d) for project %s",
-            active_review_count, max_concurrent, project_id,
+            active_review_count,
+            max_concurrent,
+            project_id,
         )
         return
 
@@ -130,12 +149,14 @@ async def _handle_auto_review_inner(
     task = Task(
         project_id=project_id,
         title=f"Review PR #{pr_number}: {pr_title[:80]}",
-        payloads=[{
-            "type": "review",
-            "pr_number": pr_number,
-            "branch": branch,
-            "base_branch": base_branch,
-        }],
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": pr_number,
+                "branch": branch,
+                "base_branch": base_branch,
+            }
+        ],
         context={
             "auto_review": True,
             "pr_number": pr_number,
@@ -149,5 +170,8 @@ async def _handle_auto_review_inner(
     await session.commit()
     logger.info(
         "[AUTO-REVIEW] Spawned task %s for PR #%d on %s/%s",
-        task.id, pr_number, owner, repo,
+        task.id,
+        pr_number,
+        owner,
+        repo,
     )

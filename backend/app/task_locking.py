@@ -25,6 +25,7 @@ paths (returns 429 Retry-After on contention); ``project_lock`` is the
 context-manager variant for background / post-commit chains that need
 ``skip_locked`` + structured retry.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -102,7 +103,9 @@ async def task_lock(
     except asyncio.TimeoutError as e:
         logger.warning(
             "[task_lock] timeout acquiring lock on task %s after %.1fs (skip_locked=%s)",
-            task_id, timeout, skip_locked,
+            task_id,
+            timeout,
+            skip_locked,
         )
         raise OperationalError("task_lock acquisition timed out", None, e) from e
     yield result.scalar_one_or_none()
@@ -134,9 +137,12 @@ async def deployment_state_lock(
     except asyncio.TimeoutError as e:
         logger.warning(
             "[deployment_state_lock] timeout after %.1fs (skip_locked=%s)",
-            timeout, skip_locked,
+            timeout,
+            skip_locked,
         )
-        raise OperationalError("deployment_state_lock acquisition timed out", None, e) from e
+        raise OperationalError(
+            "deployment_state_lock acquisition timed out", None, e
+        ) from e
     ds = result.scalar_one_or_none()
     if ds is None:
         yield None
@@ -172,15 +178,17 @@ async def lock_project_or_429(
     HTTPException, use ``project_lock`` instead.
     """
     result = await session.execute(
-        select(Project).where(Project.id == project_id).with_for_update(skip_locked=True)
+        select(Project)
+        .where(Project.id == project_id)
+        .with_for_update(skip_locked=True)
     )
     project = result.scalars().first()
     if project is not None:
         return project
     # Distinguish "row locked" from "row missing" with a non-locking read.
-    exists = (await session.execute(
-        select(Project.id).where(Project.id == project_id)
-    )).first()
+    exists = (
+        await session.execute(select(Project.id).where(Project.id == project_id))
+    ).first()
     if exists is None:
         raise HTTPException(status_code=404, detail="Project not found")
     raise HTTPException(
@@ -270,7 +278,9 @@ async def project_lock(
     except asyncio.TimeoutError as e:
         logger.warning(
             "[project_lock] timeout acquiring lock on project %s after %.1fs (skip_locked=%s)",
-            project_id, timeout, skip_locked,
+            project_id,
+            timeout,
+            skip_locked,
         )
         raise OperationalError("project_lock acquisition timed out", None, e) from e
     yield result.scalar_one_or_none()
@@ -328,12 +338,15 @@ async def lock_project_then_task(
     )
     try:
         project_result = await asyncio.wait_for(
-            session.execute(project_stmt), timeout=timeout,
+            session.execute(project_stmt),
+            timeout=timeout,
         )
     except asyncio.TimeoutError as e:
         logger.warning(
             "[lock_project_then_task] timeout acquiring project %s after %.1fs (skip_locked=%s)",
-            project_id, timeout, skip_locked,
+            project_id,
+            timeout,
+            skip_locked,
         )
         raise OperationalError("project lock acquisition timed out", None, e) from e
     project = project_result.scalar_one_or_none()
@@ -344,18 +357,19 @@ async def lock_project_then_task(
         yield (None, None)
         return
     task_stmt = (
-        select(Task)
-        .where(Task.id == task_id)
-        .with_for_update(skip_locked=skip_locked)
+        select(Task).where(Task.id == task_id).with_for_update(skip_locked=skip_locked)
     )
     try:
         task_result = await asyncio.wait_for(
-            session.execute(task_stmt), timeout=timeout,
+            session.execute(task_stmt),
+            timeout=timeout,
         )
     except asyncio.TimeoutError as e:
         logger.warning(
             "[lock_project_then_task] timeout acquiring task %s after %.1fs (skip_locked=%s)",
-            task_id, timeout, skip_locked,
+            task_id,
+            timeout,
+            skip_locked,
         )
         raise OperationalError("task lock acquisition timed out", None, e) from e
     task = task_result.scalar_one_or_none()
@@ -408,9 +422,7 @@ async def lock_project_for_strategic_transition(
             return project
         # Distinguish "held" from "missing" with a non-locking probe.
         exists = (
-            await session.execute(
-                select(Project.id).where(Project.id == project_id)
-            )
+            await session.execute(select(Project.id).where(Project.id == project_id))
         ).first()
         if exists is None:
             return None  # genuinely missing

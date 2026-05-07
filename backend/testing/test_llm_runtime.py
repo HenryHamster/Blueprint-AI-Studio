@@ -9,7 +9,10 @@ from app.max_plan_pool import (
     clear_task_llm_runtime_context,
     select_llm_runtime_for_task,
 )
-from app.orchestrator import _resolve_env_runtime_fallback, _sync_task_payload_runtime_fields
+from app.orchestrator import (
+    _resolve_env_runtime_fallback,
+    _sync_task_payload_runtime_fields,
+)
 
 
 _TEST_USER = "runtime-user"
@@ -36,7 +39,9 @@ def _task(*, payload=None, context=None):
 
 
 @pytest.mark.asyncio
-async def test_select_llm_runtime_for_task_uses_explicit_model_provider(clean_runtime_pool):
+async def test_select_llm_runtime_for_task_uses_explicit_model_provider(
+    clean_runtime_pool,
+):
     entry = {
         "id": "acct-anthropic",
         "user_id": _TEST_USER,
@@ -53,9 +58,21 @@ async def test_select_llm_runtime_for_task_uses_explicit_model_provider(clean_ru
 
     runtime_config = {
         "provider_tier_model_map": {
-            "anthropic": {"opus": "claude-opus-4-7", "sonnet": "claude-sonnet-4-6", "haiku": "claude-haiku-4-5-20251001"},
-            "openai": {"opus": "gpt-5.4", "sonnet": "gpt-5.3-codex", "haiku": "gpt-5.4-mini"},
-            "gemini": {"opus": "gemini-2.5-pro", "sonnet": "gemini-2.5-flash", "haiku": "gemini-2.5-flash-lite"},
+            "anthropic": {
+                "opus": "claude-opus-4-7",
+                "sonnet": "claude-sonnet-4-6",
+                "haiku": "claude-haiku-4-5-20251001",
+            },
+            "openai": {
+                "opus": "gpt-5.4",
+                "sonnet": "gpt-5.3-codex",
+                "haiku": "gpt-5.4-mini",
+            },
+            "gemini": {
+                "opus": "gemini-2.5-pro",
+                "sonnet": "gemini-2.5-flash",
+                "haiku": "gemini-2.5-flash-lite",
+            },
         },
         "task_type_provider_preference": {"create": ["anthropic", "openai"]},
     }
@@ -73,7 +90,9 @@ async def test_select_llm_runtime_for_task_uses_explicit_model_provider(clean_ru
 
 
 @pytest.mark.asyncio
-async def test_select_llm_runtime_for_task_uses_quality_tier_mapping(clean_runtime_pool):
+async def test_select_llm_runtime_for_task_uses_quality_tier_mapping(
+    clean_runtime_pool,
+):
     entry = {
         "id": "acct-anthropic",
         "user_id": _TEST_USER,
@@ -90,7 +109,11 @@ async def test_select_llm_runtime_for_task_uses_quality_tier_mapping(clean_runti
 
     runtime_config = {
         "provider_tier_model_map": {
-            "anthropic": {"opus": "claude-opus-4-7", "sonnet": "claude-sonnet-4-6", "haiku": "claude-haiku-4-5-20251001"},
+            "anthropic": {
+                "opus": "claude-opus-4-7",
+                "sonnet": "claude-sonnet-4-6",
+                "haiku": "claude-haiku-4-5-20251001",
+            },
         },
         "task_type_provider_preference": {"create": ["anthropic"]},
     }
@@ -108,7 +131,9 @@ async def test_select_llm_runtime_for_task_uses_quality_tier_mapping(clean_runti
 
 
 @pytest.mark.asyncio
-async def test_select_llm_runtime_for_task_resolves_settings_bag_per_task_type(clean_runtime_pool):
+async def test_select_llm_runtime_for_task_resolves_settings_bag_per_task_type(
+    clean_runtime_pool,
+):
     """Task-type override in the settings bag surfaces on the resolved
     LLMSelectionResult. Replaces the old execution_mode test since modes
     were retired in favor of schema-driven per-provider settings."""
@@ -128,7 +153,11 @@ async def test_select_llm_runtime_for_task_resolves_settings_bag_per_task_type(c
 
     runtime_config = {
         "provider_tier_model_map": {
-            "anthropic": {"opus": "claude-opus-4-7", "sonnet": "claude-sonnet-4-6", "haiku": "claude-haiku-4-5-20251001"},
+            "anthropic": {
+                "opus": "claude-opus-4-7",
+                "sonnet": "claude-sonnet-4-6",
+                "haiku": "claude-haiku-4-5-20251001",
+            },
         },
         "task_type_provider_preference": {"research": ["anthropic"]},
         "provider_settings_defaults": {"anthropic": {"effort": "medium"}},
@@ -146,7 +175,9 @@ async def test_select_llm_runtime_for_task_resolves_settings_bag_per_task_type(c
 
 
 @pytest.mark.asyncio
-async def test_select_llm_runtime_for_task_prefers_concrete_model_overrides(clean_runtime_pool):
+async def test_select_llm_runtime_for_task_prefers_concrete_model_overrides(
+    clean_runtime_pool,
+):
     openai = {
         "id": "acct-openai",
         "user_id": _TEST_USER,
@@ -175,8 +206,16 @@ async def test_select_llm_runtime_for_task_prefers_concrete_model_overrides(clea
 
     runtime_config = {
         "provider_tier_model_map": {
-            "anthropic": {"opus": "claude-opus-4-7", "sonnet": "claude-sonnet-4-6", "haiku": "claude-haiku-4-5-20251001"},
-            "openai": {"opus": "gpt-5.4", "sonnet": "gpt-5.3-codex", "haiku": "gpt-5.4-mini"},
+            "anthropic": {
+                "opus": "claude-opus-4-7",
+                "sonnet": "claude-sonnet-4-6",
+                "haiku": "claude-haiku-4-5-20251001",
+            },
+            "openai": {
+                "opus": "gpt-5.4",
+                "sonnet": "gpt-5.3-codex",
+                "haiku": "gpt-5.4-mini",
+            },
         },
         "task_type_provider_preference": {"create": ["anthropic", "openai"]},
         "task_type_model_preferences": {
@@ -200,7 +239,9 @@ async def test_select_llm_runtime_for_task_prefers_concrete_model_overrides(clea
 
 
 @pytest.mark.asyncio
-async def test_select_llm_runtime_for_task_respects_disabled_cross_provider_fallback(clean_runtime_pool):
+async def test_select_llm_runtime_for_task_respects_disabled_cross_provider_fallback(
+    clean_runtime_pool,
+):
     openai = {
         "id": "acct-openai",
         "user_id": _TEST_USER,
@@ -230,8 +271,16 @@ async def test_select_llm_runtime_for_task_respects_disabled_cross_provider_fall
     runtime_config = {
         "cross_provider_fallback_enabled": False,
         "provider_tier_model_map": {
-            "anthropic": {"opus": "claude-opus-4-7", "sonnet": "claude-sonnet-4-6", "haiku": "claude-haiku-4-5-20251001"},
-            "openai": {"opus": "gpt-5.4", "sonnet": "gpt-5.3-codex", "haiku": "gpt-5.4-mini"},
+            "anthropic": {
+                "opus": "claude-opus-4-7",
+                "sonnet": "claude-sonnet-4-6",
+                "haiku": "claude-haiku-4-5-20251001",
+            },
+            "openai": {
+                "opus": "gpt-5.4",
+                "sonnet": "gpt-5.3-codex",
+                "haiku": "gpt-5.4-mini",
+            },
         },
         "task_type_provider_preference": {"create": ["anthropic", "openai"]},
     }
@@ -248,7 +297,9 @@ async def test_select_llm_runtime_for_task_respects_disabled_cross_provider_fall
 
 
 @pytest.mark.asyncio
-async def test_select_llm_runtime_for_task_keeps_explicit_provider_when_fallback_disabled(clean_runtime_pool):
+async def test_select_llm_runtime_for_task_keeps_explicit_provider_when_fallback_disabled(
+    clean_runtime_pool,
+):
     anthropic = {
         "id": "acct-anthropic",
         "user_id": _TEST_USER,
@@ -266,8 +317,16 @@ async def test_select_llm_runtime_for_task_keeps_explicit_provider_when_fallback
     runtime_config = {
         "cross_provider_fallback_enabled": False,
         "provider_tier_model_map": {
-            "anthropic": {"opus": "claude-opus-4-7", "sonnet": "claude-sonnet-4-6", "haiku": "claude-haiku-4-5-20251001"},
-            "openai": {"opus": "gpt-5.4", "sonnet": "gpt-5.3-codex", "haiku": "gpt-5.4-mini"},
+            "anthropic": {
+                "opus": "claude-opus-4-7",
+                "sonnet": "claude-sonnet-4-6",
+                "haiku": "claude-haiku-4-5-20251001",
+            },
+            "openai": {
+                "opus": "gpt-5.4",
+                "sonnet": "gpt-5.3-codex",
+                "haiku": "gpt-5.4-mini",
+            },
         },
         "task_type_provider_preference": {"create": ["anthropic", "openai"]},
     }
@@ -285,7 +344,9 @@ async def test_select_llm_runtime_for_task_keeps_explicit_provider_when_fallback
 
 
 @pytest.mark.asyncio
-async def test_select_llm_runtime_for_task_preserves_unknown_explicit_model(clean_runtime_pool):
+async def test_select_llm_runtime_for_task_preserves_unknown_explicit_model(
+    clean_runtime_pool,
+):
     openai = {
         "id": "acct-openai",
         "user_id": _TEST_USER,
@@ -303,8 +364,16 @@ async def test_select_llm_runtime_for_task_preserves_unknown_explicit_model(clea
     runtime_config = {
         "cross_provider_fallback_enabled": False,
         "provider_tier_model_map": {
-            "anthropic": {"opus": "claude-opus-4-7", "sonnet": "claude-sonnet-4-6", "haiku": "claude-haiku-4-5-20251001"},
-            "openai": {"opus": "gpt-5.4", "sonnet": "gpt-5.3-codex", "haiku": "gpt-5.4-mini"},
+            "anthropic": {
+                "opus": "claude-opus-4-7",
+                "sonnet": "claude-sonnet-4-6",
+                "haiku": "claude-haiku-4-5-20251001",
+            },
+            "openai": {
+                "opus": "gpt-5.4",
+                "sonnet": "gpt-5.3-codex",
+                "haiku": "gpt-5.4-mini",
+            },
         },
         "task_type_provider_preference": {"create": ["openai", "anthropic"]},
     }
@@ -322,7 +391,9 @@ async def test_select_llm_runtime_for_task_preserves_unknown_explicit_model(clea
 
 
 @pytest.mark.asyncio
-async def test_select_llm_runtime_balanced_mode_picks_less_loaded_provider(clean_runtime_pool):
+async def test_select_llm_runtime_balanced_mode_picks_less_loaded_provider(
+    clean_runtime_pool,
+):
     """Balanced mode flattens accounts across listed providers and picks by
     (health_score, -active_tasks). With zero-history accounts the health score
     ties, so the provider with fewer active tasks should win — no bias by
@@ -356,8 +427,16 @@ async def test_select_llm_runtime_balanced_mode_picks_less_loaded_provider(clean
     runtime_config = {
         "provider_selection_mode": "balanced",
         "provider_tier_model_map": {
-            "anthropic": {"opus": "claude-opus-4-7", "sonnet": "claude-sonnet-4-6", "haiku": "claude-haiku-4-5-20251001"},
-            "openai": {"opus": "gpt-5.4", "sonnet": "gpt-5.3-codex", "haiku": "gpt-5.4-mini"},
+            "anthropic": {
+                "opus": "claude-opus-4-7",
+                "sonnet": "claude-sonnet-4-6",
+                "haiku": "claude-haiku-4-5-20251001",
+            },
+            "openai": {
+                "opus": "gpt-5.4",
+                "sonnet": "gpt-5.3-codex",
+                "haiku": "gpt-5.4-mini",
+            },
         },
         # Anthropic listed first — balanced must NOT honor list order when load differs.
         "task_type_provider_preference": {"create": ["anthropic", "openai"]},
@@ -408,8 +487,16 @@ async def test_select_llm_runtime_preferred_mode_honors_list_order(clean_runtime
     runtime_config = {
         "provider_selection_mode": "preferred",
         "provider_tier_model_map": {
-            "anthropic": {"opus": "claude-opus-4-7", "sonnet": "claude-sonnet-4-6", "haiku": "claude-haiku-4-5-20251001"},
-            "openai": {"opus": "gpt-5.4", "sonnet": "gpt-5.3-codex", "haiku": "gpt-5.4-mini"},
+            "anthropic": {
+                "opus": "claude-opus-4-7",
+                "sonnet": "claude-sonnet-4-6",
+                "haiku": "claude-haiku-4-5-20251001",
+            },
+            "openai": {
+                "opus": "gpt-5.4",
+                "sonnet": "gpt-5.3-codex",
+                "haiku": "gpt-5.4-mini",
+            },
         },
         "task_type_provider_preference": {"create": ["anthropic", "openai"]},
     }
@@ -426,7 +513,9 @@ async def test_select_llm_runtime_preferred_mode_honors_list_order(clean_runtime
 
 
 @pytest.mark.asyncio
-async def test_resolve_provider_preference_falls_through_category_to_default(clean_runtime_pool):
+async def test_resolve_provider_preference_falls_through_category_to_default(
+    clean_runtime_pool,
+):
     """Resolution layers (most specific wins): per-task ctx → per-type →
     category → _default → ALL_PROVIDERS. Verify the category tier by
     configuring just a category override."""
@@ -458,7 +547,9 @@ async def test_resolve_provider_preference_falls_through_category_to_default(cle
 
 
 @pytest.mark.asyncio
-async def test_resolve_provider_preference_per_task_override_wins_over_category(clean_runtime_pool):
+async def test_resolve_provider_preference_per_task_override_wins_over_category(
+    clean_runtime_pool,
+):
     """A per-task-type entry in task_type_provider_preference beats the
     category-level default even when the category also has a value."""
     from app.max_plan_pool import resolve_task_provider_preference
@@ -484,7 +575,9 @@ async def test_resolve_provider_preference_per_task_override_wins_over_category(
 
 
 @pytest.mark.asyncio
-async def test_select_llm_runtime_balanced_mode_honors_narrowed_allow_list(clean_runtime_pool):
+async def test_select_llm_runtime_balanced_mode_honors_narrowed_allow_list(
+    clean_runtime_pool,
+):
     """Narrowing task_type_provider_preference to one provider must keep that
     provider even under balanced mode — the mode controls how to pick among
     listed providers, not which providers are listed."""
@@ -517,8 +610,16 @@ async def test_select_llm_runtime_balanced_mode_honors_narrowed_allow_list(clean
     runtime_config = {
         "provider_selection_mode": "balanced",
         "provider_tier_model_map": {
-            "anthropic": {"opus": "claude-opus-4-7", "sonnet": "claude-sonnet-4-6", "haiku": "claude-haiku-4-5-20251001"},
-            "openai": {"opus": "gpt-5.4", "sonnet": "gpt-5.3-codex", "haiku": "gpt-5.4-mini"},
+            "anthropic": {
+                "opus": "claude-opus-4-7",
+                "sonnet": "claude-sonnet-4-6",
+                "haiku": "claude-haiku-4-5-20251001",
+            },
+            "openai": {
+                "opus": "gpt-5.4",
+                "sonnet": "gpt-5.3-codex",
+                "haiku": "gpt-5.4-mini",
+            },
         },
         # research pinned to anthropic only.
         "task_type_provider_preference": {"research": ["anthropic"]},
@@ -536,7 +637,9 @@ async def test_select_llm_runtime_balanced_mode_honors_narrowed_allow_list(clean
 
 
 @pytest.mark.asyncio
-async def test_select_llm_runtime_legacy_fallback_false_maps_to_exclusive(clean_runtime_pool):
+async def test_select_llm_runtime_legacy_fallback_false_maps_to_exclusive(
+    clean_runtime_pool,
+):
     """The legacy cross_provider_fallback_enabled=False boolean should behave
     as exclusive mode — first listed provider only, no cross-provider pickup."""
     openai = {
@@ -557,8 +660,16 @@ async def test_select_llm_runtime_legacy_fallback_false_maps_to_exclusive(clean_
         # No provider_selection_mode set — legacy deployment.
         "cross_provider_fallback_enabled": False,
         "provider_tier_model_map": {
-            "anthropic": {"opus": "claude-opus-4-7", "sonnet": "claude-sonnet-4-6", "haiku": "claude-haiku-4-5-20251001"},
-            "openai": {"opus": "gpt-5.4", "sonnet": "gpt-5.3-codex", "haiku": "gpt-5.4-mini"},
+            "anthropic": {
+                "opus": "claude-opus-4-7",
+                "sonnet": "claude-sonnet-4-6",
+                "haiku": "claude-haiku-4-5-20251001",
+            },
+            "openai": {
+                "opus": "gpt-5.4",
+                "sonnet": "gpt-5.3-codex",
+                "haiku": "gpt-5.4-mini",
+            },
         },
         "task_type_provider_preference": {"create": ["anthropic", "openai"]},
     }
@@ -578,14 +689,16 @@ async def test_select_llm_runtime_legacy_fallback_false_maps_to_exclusive(clean_
 
 
 def test_clear_task_llm_runtime_context_strips_all_runtime_keys():
-    cleared = clear_task_llm_runtime_context({
-        "llm_account_id": "acct-1",
-        "llm_provider": "anthropic",
-        "llm_auth_mode": "oauth",
-        "llm_model": "claude-opus-4-7",
-        "max_plan_account_id": "acct-1",
-        "scope": "small",
-    })
+    cleared = clear_task_llm_runtime_context(
+        {
+            "llm_account_id": "acct-1",
+            "llm_provider": "anthropic",
+            "llm_auth_mode": "oauth",
+            "llm_model": "claude-opus-4-7",
+            "max_plan_account_id": "acct-1",
+            "scope": "small",
+        }
+    )
 
     assert "llm_account_id" not in cleared
     assert "llm_provider" not in cleared
@@ -596,7 +709,9 @@ def test_clear_task_llm_runtime_context_strips_all_runtime_keys():
 
 def test_sync_task_payload_runtime_fields_overwrites_stale_values():
     task = SimpleNamespace(
-        payloads=[{"type": "create", "model": "claude-opus-4-7", "execution_mode": "default"}]
+        payloads=[
+            {"type": "create", "model": "claude-opus-4-7", "execution_mode": "default"}
+        ]
     )
 
     changed = _sync_task_payload_runtime_fields(
@@ -613,12 +728,14 @@ def test_sync_task_payload_runtime_fields_overwrites_stale_values():
 def test_resolve_env_runtime_fallback_prefers_openai_env(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test-openai")
 
-    secret, provider, auth_mode, model, execution_mode, metadata = _resolve_env_runtime_fallback(
-        provider="openai",
-        model="gpt-5.4",
-        execution_mode=None,
-        task=_task(payload={"type": "create"}),
-        runtime_config={},
+    secret, provider, auth_mode, model, execution_mode, metadata = (
+        _resolve_env_runtime_fallback(
+            provider="openai",
+            model="gpt-5.4",
+            execution_mode=None,
+            task=_task(payload={"type": "create"}),
+            runtime_config={},
+        )
     )
 
     assert secret == "sk-test-openai"
@@ -631,19 +748,23 @@ def test_resolve_env_runtime_fallback_prefers_openai_env(monkeypatch):
     assert metadata == {}
 
 
-def test_resolve_env_runtime_fallback_reads_openai_oauth_from_codex_home(tmp_path, monkeypatch):
+def test_resolve_env_runtime_fallback_reads_openai_oauth_from_codex_home(
+    tmp_path, monkeypatch
+):
     codex_home = tmp_path / "codex"
     codex_home.mkdir()
     auth_file = codex_home / "auth.json"
     auth_file.write_text('{"access_token":"test"}', encoding="utf-8")
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
 
-    secret, provider, auth_mode, model, execution_mode, metadata = _resolve_env_runtime_fallback(
-        provider="openai",
-        model="gpt-5.4",
-        execution_mode=None,
-        task=_task(payload={"type": "create"}),
-        runtime_config={},
+    secret, provider, auth_mode, model, execution_mode, metadata = (
+        _resolve_env_runtime_fallback(
+            provider="openai",
+            model="gpt-5.4",
+            execution_mode=None,
+            task=_task(payload={"type": "create"}),
+            runtime_config={},
+        )
     )
 
     assert secret == '{"access_token":"test"}'
@@ -654,19 +775,26 @@ def test_resolve_env_runtime_fallback_reads_openai_oauth_from_codex_home(tmp_pat
     assert metadata == {}
 
 
-def test_resolve_env_runtime_fallback_reads_gemini_service_account(tmp_path, monkeypatch):
+def test_resolve_env_runtime_fallback_reads_gemini_service_account(
+    tmp_path, monkeypatch
+):
     service_account_path = tmp_path / "sa.json"
-    service_account_path.write_text('{"type":"service_account","client_email":"agent@test","private_key":"abc"}', encoding="utf-8")
+    service_account_path.write_text(
+        '{"type":"service_account","client_email":"agent@test","private_key":"abc"}',
+        encoding="utf-8",
+    )
     monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", str(service_account_path))
     monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "demo-project")
     monkeypatch.setenv("GOOGLE_CLOUD_LOCATION", "us-central1")
 
-    secret, provider, auth_mode, model, execution_mode, metadata = _resolve_env_runtime_fallback(
-        provider="gemini",
-        model="gemini-2.5-pro",
-        execution_mode=None,
-        task=_task(payload={"type": "research"}),
-        runtime_config={},
+    secret, provider, auth_mode, model, execution_mode, metadata = (
+        _resolve_env_runtime_fallback(
+            provider="gemini",
+            model="gemini-2.5-pro",
+            execution_mode=None,
+            task=_task(payload={"type": "research"}),
+            runtime_config={},
+        )
     )
 
     assert '"type":"service_account"' in secret
@@ -677,19 +805,26 @@ def test_resolve_env_runtime_fallback_reads_gemini_service_account(tmp_path, mon
     assert metadata == {"project": "demo-project", "location": "us-central1"}
 
 
-def test_resolve_env_runtime_fallback_rejects_gemini_service_account_without_project_location(tmp_path, monkeypatch):
+def test_resolve_env_runtime_fallback_rejects_gemini_service_account_without_project_location(
+    tmp_path, monkeypatch
+):
     service_account_path = tmp_path / "sa.json"
-    service_account_path.write_text('{"type":"service_account","client_email":"agent@test","private_key":"abc"}', encoding="utf-8")
+    service_account_path.write_text(
+        '{"type":"service_account","client_email":"agent@test","private_key":"abc"}',
+        encoding="utf-8",
+    )
     monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", str(service_account_path))
     monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
     monkeypatch.delenv("GOOGLE_CLOUD_LOCATION", raising=False)
 
-    secret, provider, auth_mode, model, execution_mode, metadata = _resolve_env_runtime_fallback(
-        provider="gemini",
-        model="gemini-2.5-pro",
-        execution_mode=None,
-        task=_task(payload={"type": "research"}),
-        runtime_config={},
+    secret, provider, auth_mode, model, execution_mode, metadata = (
+        _resolve_env_runtime_fallback(
+            provider="gemini",
+            model="gemini-2.5-pro",
+            execution_mode=None,
+            task=_task(payload={"type": "research"}),
+            runtime_config={},
+        )
     )
 
     assert secret is None

@@ -14,6 +14,7 @@ real table (``StrategicCycle``) so:
 
 This module is the single source of truth for cycle reads/writes.
 """
+
 from __future__ import annotations
 
 import logging
@@ -37,12 +38,14 @@ logger = logging.getLogger(__name__)
 DEFAULT_AGENT_CONTEXT_WINDOW = 10
 
 # Outcomes still in progress (used by stalled-cycle reaper).
-ACTIVE_OUTCOMES: frozenset[str] = frozenset({
-    "in_progress",
-    "phase1_running",
-    "phase1_done",
-    "phase2_running",
-})
+ACTIVE_OUTCOMES: frozenset[str] = frozenset(
+    {
+        "in_progress",
+        "phase1_running",
+        "phase1_done",
+        "phase2_running",
+    }
+)
 
 OUTCOME_IN_PROGRESS = "in_progress"
 OUTCOME_PHASE1_RUNNING = "phase1_running"
@@ -130,7 +133,10 @@ async def recent_for_agent_context(
 
 
 async def all_for_project(
-    session: AsyncSession, project_id, *, limit: int = 200,
+    session: AsyncSession,
+    project_id,
+    *,
+    limit: int = 200,
 ) -> list[StrategicCycle]:
     stmt = (
         select(StrategicCycle)
@@ -142,7 +148,10 @@ async def all_for_project(
 
 
 async def mark_phase1_completed(
-    session: AsyncSession, cycle_id: str, *, phase2_task_id=None,
+    session: AsyncSession,
+    cycle_id: str,
+    *,
+    phase2_task_id=None,
 ) -> Optional[StrategicCycle]:
     """Phase 1 task reached a terminal status. If phase 2 is being spawned,
     pass its task id; this also flips outcome to phase2_running."""
@@ -161,7 +170,11 @@ async def mark_phase1_completed(
 
 
 async def mark_failure(
-    session: AsyncSession, cycle_id: str, *, phase: str, reason: str,
+    session: AsyncSession,
+    cycle_id: str,
+    *,
+    phase: str,
+    reason: str,
     outcome_override: Optional[str] = None,
 ) -> Optional[StrategicCycle]:
     """Mark cycle as failed at ``phase`` (``"phase1"`` | ``"phase2"`` | ``"phase2_spawn"``).
@@ -243,11 +256,17 @@ def _to_legacy_dict(cycle: StrategicCycle) -> dict[str, Any]:
     """
     out: dict[str, Any] = {
         "cycle_id": cycle.id,
-        "started_at": cycle.phase1_started_at.isoformat() if cycle.phase1_started_at else None,
+        "started_at": cycle.phase1_started_at.isoformat()
+        if cycle.phase1_started_at
+        else None,
         "phase1_task_id": str(cycle.phase1_task_id) if cycle.phase1_task_id else None,
-        "phase1_completed_at": cycle.phase1_completed_at.isoformat() if cycle.phase1_completed_at else None,
+        "phase1_completed_at": cycle.phase1_completed_at.isoformat()
+        if cycle.phase1_completed_at
+        else None,
         "phase2_task_id": str(cycle.phase2_task_id) if cycle.phase2_task_id else None,
-        "phase2_completed_at": cycle.phase2_completed_at.isoformat() if cycle.phase2_completed_at else None,
+        "phase2_completed_at": cycle.phase2_completed_at.isoformat()
+        if cycle.phase2_completed_at
+        else None,
         "directions_created": int(cycle.directions_created),
         "directions_retired": int(cycle.directions_retired),
         "tasks_spawned": int(cycle.tasks_spawned),
@@ -290,10 +309,14 @@ async def find_stalled(
     stmt = (
         select(StrategicCycle)
         .where(
-            StrategicCycle.outcome.in_([
-                OUTCOME_IN_PROGRESS, OUTCOME_PHASE1_RUNNING,
-                OUTCOME_PHASE1_DONE, OUTCOME_PHASE2_RUNNING,
-            ]),
+            StrategicCycle.outcome.in_(
+                [
+                    OUTCOME_IN_PROGRESS,
+                    OUTCOME_PHASE1_RUNNING,
+                    OUTCOME_PHASE1_DONE,
+                    OUTCOME_PHASE2_RUNNING,
+                ]
+            ),
         )
         .order_by(StrategicCycle.phase1_started_at)
         .limit(limit * 4)  # over-fetch so phase-2 stall checks find candidates
@@ -301,8 +324,16 @@ async def find_stalled(
     candidates = (await session.execute(stmt)).scalars().all()
     stalled: list[StrategicCycle] = []
     for c in candidates:
-        if c.outcome in (OUTCOME_IN_PROGRESS, OUTCOME_PHASE1_RUNNING, OUTCOME_PHASE1_DONE):
-            if c.phase1_started_at and c.phase1_started_at < phase1_cutoff and c.phase2_started_at is None:
+        if c.outcome in (
+            OUTCOME_IN_PROGRESS,
+            OUTCOME_PHASE1_RUNNING,
+            OUTCOME_PHASE1_DONE,
+        ):
+            if (
+                c.phase1_started_at
+                and c.phase1_started_at < phase1_cutoff
+                and c.phase2_started_at is None
+            ):
                 stalled.append(c)
         elif c.outcome == OUTCOME_PHASE2_RUNNING:
             ref = c.phase2_started_at or c.phase1_started_at

@@ -32,7 +32,7 @@ import { SystemMaturityCard, type SystemMaturityRow } from './SystemMaturityCard
 import { DirectionPortfolioSection, type DirectionProgress } from './DirectionPortfolioSection';
 import { SrTrendBreakdown, SrMissedRetrospective, SrReviewerDisagreementsPanel, EdgesTrendBreakdown, type SrTrendData, type SrMissedTask, type SrReviewerDisagreementsData, type EdgesTrend } from './SrTrendBreakdown'; // EdgesTrend used in DigestData
 import { TAXONOMY_COLORS, TAXONOMY_LABELS, TAXONOMY_ORDER } from './dashboardConstants';
-import { ManualInterventionPanel } from './PipelineRegressionsPanel';
+import { ManualInterventionPanel, AutoRecoveredPanel } from './PipelineRegressionsPanel';
 import { RecentlyResolvedRegressionsPanel } from './RecentlyResolvedRegressionsPanel';
 import type { Task } from '../types/task';
 import type { ProjectDiagnostics } from '../types/diagnostics';
@@ -911,6 +911,9 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
 
       {/* Manual Intervention Cases */}
       {selectedProjectId && <ManualInterventionPanel projectId={selectedProjectId} />}
+
+      {/* Auto-Recovered Regression Cases */}
+      {selectedProjectId && <AutoRecoveredPanel projectId={selectedProjectId} />}
 
       {/* Recently Resolved Regressions */}
       {selectedProjectId && <RecentlyResolvedRegressionsPanel projectId={selectedProjectId} />}

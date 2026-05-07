@@ -1,4 +1,5 @@
 """GitHub OAuth, PAT registration, and webhook endpoints."""
+
 import asyncio
 import hashlib
 import hmac
@@ -26,7 +27,14 @@ from app.github import (
     get_user_installations,
     validate_fine_grained_pat,
 )
-from app.models import Artifact, ArtifactType, Project, Task, TaskStatus, UserIntegration
+from app.models import (
+    Artifact,
+    ArtifactType,
+    Project,
+    Task,
+    TaskStatus,
+    UserIntegration,
+)
 from app.secrets_manager import store_user_secret
 from app.shared_state import limiter
 from app.time_utils import _utcnow
@@ -36,7 +44,9 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/github", tags=["github"])
 
 # Webhook dedup: track recent GitHub delivery IDs to prevent duplicate processing
-_webhook_delivery_ids: OrderedDict = OrderedDict()  # id -> timestamp (in-memory fallback)
+_webhook_delivery_ids: OrderedDict = (
+    OrderedDict()
+)  # id -> timestamp (in-memory fallback)
 _webhook_dedup_lock = asyncio.Lock()
 _WEBHOOK_DEDUP_MAX = 1000
 _WEBHOOK_DEDUP_TTL = 600  # 10 minutes
@@ -52,7 +62,7 @@ async def register_github_pat(
     request: Request,
     req: GitHubPATInstallRequest,
     session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
 ):
     """
     Registers a GitHub Fine-Grained PAT for the current user.
@@ -62,12 +72,19 @@ async def register_github_pat(
 
     # Store the PAT securely in GCP Secret Manager
     try:
-        secret_name = await store_user_secret(current_user["user_id"], "github-pat", req.pat)
+        secret_name = await store_user_secret(
+            current_user["user_id"], "github-pat", req.pat
+        )
     except Exception as e:
         logger.error(f"[PAT] Secret Manager unavailable: {e}")
-        raise HTTPException(status_code=503, detail="Secret storage temporarily unavailable, please retry")
+        raise HTTPException(
+            status_code=503,
+            detail="Secret storage temporarily unavailable, please retry",
+        )
 
-    stmt = select(UserIntegration).where(UserIntegration.user_id == current_user["user_id"])
+    stmt = select(UserIntegration).where(
+        UserIntegration.user_id == current_user["user_id"]
+    )
     integration = (await session.execute(stmt)).scalars().first()
 
     if integration:
@@ -75,14 +92,14 @@ async def register_github_pat(
         integration.updated_at = _utcnow()
     else:
         integration = UserIntegration(
-            user_id=current_user["user_id"],
-            github_pat=secret_name
+            user_id=current_user["user_id"], github_pat=secret_name
         )
 
     session.add(integration)
     await session.commit()
 
     return {"status": "success", "message": "GitHub PAT registered successfully."}
+
 
 @router.get("/oauth/authorize")
 @limiter.limit("10/minute")
@@ -96,12 +113,17 @@ async def github_oauth_authorize(
     A signed state token ties the OAuth flow to the authenticated user.
     """
     if not GITHUB_CLIENT_ID:
-        raise HTTPException(status_code=500, detail="GitHub OAuth not configured (GITHUB_CLIENT_ID missing)")
+        raise HTTPException(
+            status_code=500,
+            detail="GitHub OAuth not configured (GITHUB_CLIENT_ID missing)",
+        )
 
     # Default to ADMIN_UI_URL when the caller did not pass one. A dynamic value is
     # accepted so localhost dev and PR-preview hosts can come back to themselves,
     # but it must clear an allowlist or we'd be a happy open-redirect helper.
-    default_admin_url = os.getenv("ADMIN_UI_URL", "https://blueprint-admin-9c6b7.web.app")
+    default_admin_url = os.getenv(
+        "ADMIN_UI_URL", "https://blueprint-admin-9c6b7.web.app"
+    )
     admin_url = default_admin_url
     if redirect_uri is not None and redirect_uri != "":
         parsed_redirect = urllib.parse.urlparse(redirect_uri)
@@ -114,12 +136,15 @@ async def github_oauth_authorize(
             parsed_redirect.scheme not in ("http", "https")
             or parsed_redirect.netloc not in allowed_hosts
         ):
-            raise HTTPException(status_code=400, detail="Invalid redirect_uri: host not in allowlist")
+            raise HTTPException(
+                status_code=400, detail="Invalid redirect_uri: host not in allowlist"
+            )
         admin_url = redirect_uri
 
     # Sign a state token so the callback can verify which user initiated the flow.
     import jwt as pyjwt
     from app.auth import AGENT_JWT_ALGORITHM, AGENT_JWT_SECRET
+
     state_claims: dict[str, object] = {
         "type": "github_oauth",
         "sub": current_user["user_id"],
@@ -158,9 +183,12 @@ async def github_oauth_callback(
     # Hoist the fallback URL up so we don't repeat the env lookup in every except.
     import jwt as pyjwt
     from app.auth import AGENT_JWT_ALGORITHM, AGENT_JWT_SECRET
+
     fallback_admin = os.getenv("ADMIN_UI_URL", "https://blueprint-admin-9c6b7.web.app")
     try:
-        state_payload = pyjwt.decode(state, AGENT_JWT_SECRET, algorithms=[AGENT_JWT_ALGORITHM])
+        state_payload = pyjwt.decode(
+            state, AGENT_JWT_SECRET, algorithms=[AGENT_JWT_ALGORITHM]
+        )
     except pyjwt.ExpiredSignatureError:
         return RedirectResponse(url=f"{fallback_admin}?github_error=state_expired")
     except pyjwt.PyJWTError:
@@ -190,16 +218,23 @@ async def github_oauth_callback(
             install_redirect: str | None = None
             try:
                 from app.github import get_app_info
+
                 app_info = await get_app_info()
                 app_slug = app_info.get("slug")
                 if app_slug:
-                    install_redirect = f"https://github.com/apps/{app_slug}/installations/new"
+                    install_redirect = (
+                        f"https://github.com/apps/{app_slug}/installations/new"
+                    )
                     logger.info(
                         "[GITHUB OAUTH] User %s has no installations; sending to install page for app %r",
-                        firebase_user_id, app_slug,
+                        firebase_user_id,
+                        app_slug,
                     )
             except Exception as app_err:
-                logger.warning("Could not look up GitHub App slug for install redirect: %s", app_err)
+                logger.warning(
+                    "Could not look up GitHub App slug for install redirect: %s",
+                    app_err,
+                )
 
             if install_redirect:
                 return RedirectResponse(url=install_redirect)
@@ -214,7 +249,9 @@ async def github_oauth_callback(
         account_name = ", ".join(all_account_names)
 
         # Save to UserIntegration
-        stmt = select(UserIntegration).where(UserIntegration.user_id == firebase_user_id)
+        stmt = select(UserIntegration).where(
+            UserIntegration.user_id == firebase_user_id
+        )
         integration = (await session.execute(stmt)).scalars().first()
 
         if integration:
@@ -225,7 +262,7 @@ async def github_oauth_callback(
             integration = UserIntegration(
                 user_id=firebase_user_id,
                 github_installation_id=installation_id,
-                github_account_name=account_name
+                github_account_name=account_name,
             )
 
         session.add(integration)
@@ -238,26 +275,30 @@ async def github_oauth_callback(
         logger.error(f"[GITHUB OAUTH] Error: {e}", exc_info=True)
         return RedirectResponse(url=f"{admin_url}?github_error=failed")
 
+
 @router.post("/webhook")
 @limiter.limit("120/minute")
 async def github_webhook(
     request: Request,
     background_tasks: BackgroundTasks,
-    session: AsyncSession = Depends(get_session)
+    session: AsyncSession = Depends(get_session),
 ):
     """
     Receives webhooks from the GitHub App (e.g., push, pull_request).
     """
     signature = request.headers.get("x-hub-signature-256")
     if not signature or not GITHUB_WEBHOOK_SECRET:
-        raise HTTPException(status_code=401, detail="Missing signature or webhook secret")
+        raise HTTPException(
+            status_code=401, detail="Missing signature or webhook secret"
+        )
 
     payload = await request.body()
 
     # Verify signature
-    expected_signature = "sha256=" + hmac.new(
-        GITHUB_WEBHOOK_SECRET.encode(), payload, hashlib.sha256
-    ).hexdigest()
+    expected_signature = (
+        "sha256="
+        + hmac.new(GITHUB_WEBHOOK_SECRET.encode(), payload, hashlib.sha256).hexdigest()
+    )
 
     if not hmac.compare_digest(signature, expected_signature):
         raise HTTPException(status_code=401, detail="Invalid signature")
@@ -269,15 +310,22 @@ async def github_webhook(
         raise HTTPException(status_code=400, detail="Missing X-GitHub-Delivery header")
     if delivery_id:
         from app.redis_client import get_redis as _get_redis
+
         _r = await _get_redis()
         if _r:
             try:
-                was_new = await _r.set(f"webhook:{delivery_id}", "1", nx=True, ex=_WEBHOOK_DEDUP_TTL)
+                was_new = await _r.set(
+                    f"webhook:{delivery_id}", "1", nx=True, ex=_WEBHOOK_DEDUP_TTL
+                )
                 if not was_new:
-                    logger.info(f"[WEBHOOK] Duplicate delivery {delivery_id}, skipping (Redis)")
+                    logger.info(
+                        f"[WEBHOOK] Duplicate delivery {delivery_id}, skipping (Redis)"
+                    )
                     return {"status": "duplicate", "delivery_id": delivery_id}
             except Exception:
-                logger.exception(f"[WEBHOOK] Redis dedup check failed for delivery {delivery_id}; falling through to in-memory")
+                logger.exception(
+                    f"[WEBHOOK] Redis dedup check failed for delivery {delivery_id}; falling through to in-memory"
+                )
         else:
             async with _webhook_dedup_lock:
                 now = time.time()
@@ -317,9 +365,12 @@ async def github_webhook(
                 )
                 project = project_check.scalars().first()
                 if not project:
-                    logger.info(f"[WEBHOOK] Ignoring event for unregistered repo {repo_full}")
+                    logger.info(
+                        f"[WEBHOOK] Ignoring event for unregistered repo {repo_full}"
+                    )
                     return {"status": "ignored"}
                 from app.autonomous_research import _check_autonomous_research
+
                 background_tasks.add_task(_check_autonomous_research, owner, repo)
 
                 # Propagate pr_merged to tasks that created this PR
@@ -327,7 +378,9 @@ async def github_webhook(
                 if pr_number:
                     pr_url_suffix = f"/{owner}/{repo}/pull/{pr_number}"
                     art_result = await session.execute(
-                        select(Artifact).join(Task, Artifact.task_id == Task.id).where(
+                        select(Artifact)
+                        .join(Task, Artifact.task_id == Task.id)
+                        .where(
                             Task.project_id == project.id,
                             Artifact.artifact_type == ArtifactType.PULL_REQUEST,
                             Artifact.pr_url.ilike(f"%{pr_url_suffix}"),
@@ -335,50 +388,72 @@ async def github_webhook(
                     )
                     pr_artifacts = art_result.scalars().all()
                     if not pr_artifacts:
-                        logger.info(f"[WEBHOOK] PR {pr_url_suffix} merged but no matching artifacts found — agent may not have reported yet")
+                        logger.info(
+                            f"[WEBHOOK] PR {pr_url_suffix} merged but no matching artifacts found — agent may not have reported yet"
+                        )
                     affected_tasks = []
                     for art in pr_artifacts:
                         pr_task = await session.get(Task, art.task_id)
                         if pr_task and not (pr_task.context or {}).get("pr_merged"):
-                            pr_task.context = {**(pr_task.context or {}), "pr_merged": True}
+                            pr_task.context = {
+                                **(pr_task.context or {}),
+                                "pr_merged": True,
+                            }
                             session.add(pr_task)
                             affected_tasks.append(pr_task)
-                            logger.info(f"[WEBHOOK] Set pr_merged on task {pr_task.id} (PR #{pr_number})")
+                            logger.info(
+                                f"[WEBHOOK] Set pr_merged on task {pr_task.id} (PR #{pr_number})"
+                            )
                     if affected_tasks:
                         await session.commit()
                         from app.rollup_management import _check_and_trigger_rollup
+
                         for at in affected_tasks:
                             await _check_and_trigger_rollup(at, session)
                         try:
-                            from app.notification_dispatch import dispatch_external_notification  # noqa: PLC0415
+                            from app.notification_dispatch import (
+                                dispatch_external_notification,
+                            )  # noqa: PLC0415
+
                             for at in affected_tasks:
-                                at_ctx = at.context if isinstance(at.context, dict) else {}
+                                at_ctx = (
+                                    at.context if isinstance(at.context, dict) else {}
+                                )
                                 at_payload = at.first_payload or {}
                                 raw_changed = at_ctx.get("_pr_changed_files")
                                 changed_files_count = (
                                     len([f for f in raw_changed if isinstance(f, str)])
-                                    if isinstance(raw_changed, list) else 0
+                                    if isinstance(raw_changed, list)
+                                    else 0
                                 )
                                 direction_text = (
                                     at_ctx.get("direction_text")
-                                    or at_payload.get("direction_text") or ""
+                                    or at_payload.get("direction_text")
+                                    or ""
                                 )
-                                asyncio.ensure_future(dispatch_external_notification(
-                                    at.project_id,
-                                    "PR_MERGED",
-                                    {
-                                        "task_id": str(at.id),
-                                        "task_title": at.title or str(at.id)[:8],
-                                        "pr_number": pr_number,
-                                        "repo": f"{owner}/{repo}",
-                                        "direction_id": at_ctx.get("direction_id") or "",
-                                        "direction_text": direction_text[:200],
-                                        "scope": at_ctx.get("scope") or at_payload.get("scope") or "",
-                                        "changed_files": changed_files_count,
-                                    },
-                                ))
+                                asyncio.ensure_future(
+                                    dispatch_external_notification(
+                                        at.project_id,
+                                        "PR_MERGED",
+                                        {
+                                            "task_id": str(at.id),
+                                            "task_title": at.title or str(at.id)[:8],
+                                            "pr_number": pr_number,
+                                            "repo": f"{owner}/{repo}",
+                                            "direction_id": at_ctx.get("direction_id")
+                                            or "",
+                                            "direction_text": direction_text[:200],
+                                            "scope": at_ctx.get("scope")
+                                            or at_payload.get("scope")
+                                            or "",
+                                            "changed_files": changed_files_count,
+                                        },
+                                    )
+                                )
                         except Exception as _ne:
-                            logger.warning(f"[NOTIFY] PR_MERGED dispatch setup failed: {_ne}")
+                            logger.warning(
+                                f"[NOTIFY] PR_MERGED dispatch setup failed: {_ne}"
+                            )
 
         elif action in ("opened", "synchronize"):
             # Auto-review: spawn a review task when a PR is opened or pushed to
@@ -387,19 +462,28 @@ async def github_webhook(
             pr_number = pr_data.get("number")
             if "/" in repo_full and pr_number:
                 ar_owner, ar_repo = repo_full.split("/", 1)
-                auto_review_project = (await session.execute(
-                    select(Project).where(
-                        Project.github_owner == ar_owner,
-                        Project.github_repo == ar_repo,
+                auto_review_project = (
+                    (
+                        await session.execute(
+                            select(Project).where(
+                                Project.github_owner == ar_owner,
+                                Project.github_repo == ar_repo,
+                            )
+                        )
                     )
-                )).scalars().first()
+                    .scalars()
+                    .first()
+                )
                 if auto_review_project:
-                    auto_review_config = (auto_review_project.design_doc or {}).get("_auto_review", {})
+                    auto_review_config = (auto_review_project.design_doc or {}).get(
+                        "_auto_review", {}
+                    )
                     if auto_review_config.get("enabled"):
                         branch = pr_data.get("head", {}).get("ref", "")
                         base_branch = pr_data.get("base", {}).get("ref", "main")
                         pr_title = pr_data.get("title", "")
                         from app.auto_review import _handle_auto_review  # noqa: PLC0415
+
                         background_tasks.add_task(
                             _handle_auto_review,
                             owner=ar_owner,
@@ -427,13 +511,17 @@ async def github_webhook(
                 )
                 closed_project = project_check.scalars().first()
                 if not closed_project:
-                    logger.info(f"[WEBHOOK] Ignoring PR close event for unregistered repo {repo_full}")
+                    logger.info(
+                        f"[WEBHOOK] Ignoring PR close event for unregistered repo {repo_full}"
+                    )
                     return {"status": "ignored"}
                 pr_number = data["pull_request"].get("number")
                 if pr_number:
                     pr_url_suffix = f"/{owner}/{repo}/pull/{pr_number}"
                     art_result = await session.execute(
-                        select(Artifact).join(Task, Artifact.task_id == Task.id).where(
+                        select(Artifact)
+                        .join(Task, Artifact.task_id == Task.id)
+                        .where(
                             Task.project_id == closed_project.id,
                             Artifact.artifact_type == ArtifactType.PULL_REQUEST,
                             Artifact.pr_url.ilike(f"%{pr_url_suffix}"),
@@ -445,39 +533,54 @@ async def github_webhook(
                         rejection_note = pr_body[:500] if pr_body else None
                         for art in pr_artifacts:
                             pr_task = await session.get(Task, art.task_id)
-                            if pr_task and not (pr_task.context or {}).get("pr_rejected"):
+                            if pr_task and not (pr_task.context or {}).get(
+                                "pr_rejected"
+                            ):
                                 update: dict = {"pr_rejected": True}
                                 if rejection_note:
                                     update["pr_rejection_note"] = rejection_note
                                 pr_task.context = {**(pr_task.context or {}), **update}
                                 session.add(pr_task)
-                                logger.info(f"[WEBHOOK] Set pr_rejected on task {pr_task.id} (PR #{pr_number})")
+                                logger.info(
+                                    f"[WEBHOOK] Set pr_rejected on task {pr_task.id} (PR #{pr_number})"
+                                )
                         await session.commit()
 
-    elif event_type == 'check_run':
-        action = data.get('action')
-        if action != 'completed':
-            return {'status': 'ignored'}
+    elif event_type == "check_run":
+        action = data.get("action")
+        if action != "completed":
+            return {"status": "ignored"}
 
-        check_run = data.get('check_run', {})
-        head_sha = check_run.get('head_sha')
-        repo_full = data.get('repository', {}).get('full_name', '')
-        if '/' not in repo_full or not head_sha:
-            return {'status': 'ignored'}
+        check_run = data.get("check_run", {})
+        head_sha = check_run.get("head_sha")
+        repo_full = data.get("repository", {}).get("full_name", "")
+        if "/" not in repo_full or not head_sha:
+            return {"status": "ignored"}
 
-        owner, repo = repo_full.split('/', 1)
+        owner, repo = repo_full.split("/", 1)
 
         # Find ci_waiting tasks matching this commit SHA, scoped to this repo's project
         project_result = await session.execute(
-            select(Project).where(Project.github_owner == owner, Project.github_repo == repo)
+            select(Project).where(
+                Project.github_owner == owner, Project.github_repo == repo
+            )
         )
         project = project_result.scalars().first()
         if not project:
-            return {'status': 'ignored', 'reason': 'unregistered_repo'}
+            return {"status": "ignored", "reason": "unregistered_repo"}
 
-        ci_tasks = (await session.execute(
-            select(Task).where(Task.status == TaskStatus.EVALUATING, Task.project_id == project.id)
-        )).scalars().all()
+        ci_tasks = (
+            (
+                await session.execute(
+                    select(Task).where(
+                        Task.status == TaskStatus.EVALUATING,
+                        Task.project_id == project.id,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
 
         # Match strategies (in order of specificity):
         #   1. head_sha equality — the original precise match, set by the review
@@ -490,51 +593,58 @@ async def github_webhook(
         #      pr_number lets the webhook handle rollup CI completions too.
         # GitHub puts the PR list at check_run.pull_requests and historically
         # also under check_run.check_suite.pull_requests — accept either.
-        _pr_candidates = (check_run.get('pull_requests') or []) + (
-            (check_run.get('check_suite') or {}).get('pull_requests') or []
+        _pr_candidates = (check_run.get("pull_requests") or []) + (
+            (check_run.get("check_suite") or {}).get("pull_requests") or []
         )
         webhook_pr_numbers = {
-            pr.get('number') for pr in _pr_candidates
-            if pr.get('number') is not None
+            pr.get("number") for pr in _pr_candidates if pr.get("number") is not None
         }
         matching = []
         for t in ci_tasks:
-            rl = (t.context or {}).get('review_loop', {}) or {}
-            if not rl.get('ci_waiting'):
+            rl = (t.context or {}).get("review_loop", {}) or {}
+            if not rl.get("ci_waiting"):
                 continue
-            if rl.get('head_sha') == head_sha:
+            if rl.get("head_sha") == head_sha:
                 matching.append(t)
                 continue
-            task_pr = rl.get('pr_number')
+            task_pr = rl.get("pr_number")
             if task_pr is not None and task_pr in webhook_pr_numbers:
                 matching.append(t)
                 # Backfill head_sha so future webhooks hit strategy (1) directly
                 # and the orchestrator's poll-skip can use head_sha too.
-                rl['head_sha'] = head_sha
-                t.context = {**(t.context or {}), 'review_loop': rl}
+                rl["head_sha"] = head_sha
+                t.context = {**(t.context or {}), "review_loop": rl}
                 session.add(t)
 
         if not matching:
             # No EVALUATING tasks match — check if this is a protected-branch CI failure
-            conclusion = check_run.get('conclusion')
-            head_branch = (check_run.get('check_suite') or {}).get('head_branch')
-            if conclusion == 'failure' and head_branch:
+            conclusion = check_run.get("conclusion")
+            head_branch = (check_run.get("check_suite") or {}).get("head_branch")
+            if conclusion == "failure" and head_branch:
                 # Validate branch name from webhook before passing downstream
                 from app.payload_schemas import _validate_branch_name  # noqa: PLC0415
+
                 try:
                     _validate_branch_name(head_branch)
                 except Exception:
-                    logger.warning(f"[WEBHOOK] Rejecting invalid head_branch: {head_branch!r}")
-                    return {'status': 'ignored_invalid_branch'}
+                    logger.warning(
+                        f"[WEBHOOK] Rejecting invalid head_branch: {head_branch!r}"
+                    )
+                    return {"status": "ignored_invalid_branch"}
                 # Read auto-remediation config from project
-                auto_remediation_config = (project.design_doc or {}).get('_auto_remediation', {})
-                enabled = auto_remediation_config.get('enabled', False)
-                branch_whitelist = auto_remediation_config.get('branch_whitelist', ['main', 'master'])
+                auto_remediation_config = (project.design_doc or {}).get(
+                    "_auto_remediation", {}
+                )
+                enabled = auto_remediation_config.get("enabled", False)
+                branch_whitelist = auto_remediation_config.get(
+                    "branch_whitelist", ["main", "master"]
+                )
 
                 if not enabled or head_branch not in branch_whitelist:
-                    return {'status': 'ignored_auto_remediation_disabled'}
+                    return {"status": "ignored_auto_remediation_disabled"}
 
                 from app.auto_remediation import _handle_main_branch_ci_failure
+
                 background_tasks.add_task(
                     _handle_main_branch_ci_failure,
                     owner=owner,
@@ -544,9 +654,9 @@ async def github_webhook(
                     project_id=project.id,
                     config=auto_remediation_config,
                 )
-                return {'status': 'auto_remediation_triggered'}
+                return {"status": "auto_remediation_triggered"}
 
-            return {'status': 'no_match'}
+            return {"status": "no_match"}
 
         # Fetch full check status for this SHA once — every matching sibling
         # shares the same head_sha, so the cached variant collapses N calls
@@ -558,71 +668,105 @@ async def github_webhook(
 
         for task in matching:
             try:
-                gh_token, gh_owner, gh_repo = await get_github_token_for_task(task.id, session)
-                ci_result = await get_check_runs_cached(gh_token, gh_owner, gh_repo, head_sha, project_id=str(task.project_id))
+                gh_token, gh_owner, gh_repo = await get_github_token_for_task(
+                    task.id, session
+                )
+                ci_result = await get_check_runs_cached(
+                    gh_token,
+                    gh_owner,
+                    gh_repo,
+                    head_sha,
+                    project_id=str(task.project_id),
+                )
 
-                if ci_result['status'] != 'completed':
+                if ci_result["status"] != "completed":
                     # Some checks still pending — more webhooks will come
-                    logger.info(f'[WEBHOOK] check_run for {head_sha[:8]}: some checks still pending, waiting')
+                    logger.info(
+                        f"[WEBHOOK] check_run for {head_sha[:8]}: some checks still pending, waiting"
+                    )
                     continue
 
-                await handle_ci_completion(task, ci_result, gh_token, gh_owner, gh_repo, session, source='webhook')
-                logger.info(f'[WEBHOOK] CI completed for {head_sha[:8]} — handled task {task.id} via webhook')
+                await handle_ci_completion(
+                    task,
+                    ci_result,
+                    gh_token,
+                    gh_owner,
+                    gh_repo,
+                    session,
+                    source="webhook",
+                )
+                logger.info(
+                    f"[WEBHOOK] CI completed for {head_sha[:8]} — handled task {task.id} via webhook"
+                )
             except Exception as e:
                 # Fallback: reduce polling interval so orchestrator picks it up soon
-                logger.error(f'[WEBHOOK] Error handling CI completion for task {task.id}: {e}', exc_info=True)
-                loop = (task.context or {}).get('review_loop', {})
-                loop['ci_poll_interval'] = 15
-                loop['ci_last_polled'] = None
-                task.context = {**(task.context or {}), 'review_loop': loop}
+                logger.error(
+                    f"[WEBHOOK] Error handling CI completion for task {task.id}: {e}",
+                    exc_info=True,
+                )
+                loop = (task.context or {}).get("review_loop", {})
+                loop["ci_poll_interval"] = 15
+                loop["ci_last_polled"] = None
+                task.context = {**(task.context or {}), "review_loop": loop}
                 session.add(task)
                 await session.commit()
 
-    elif event_type == 'pull_request_review':
-        action = data.get('action')
+    elif event_type == "pull_request_review":
+        action = data.get("action")
         # Only process submitted and dismissed actions; ignore edits
-        if action not in ('submitted', 'dismissed'):
-            return {'status': 'ignored'}
+        if action not in ("submitted", "dismissed"):
+            return {"status": "ignored"}
 
-        review = data.get('review', {})
-        review_state = review.get('state', '')
-        pull_request_data = data.get('pull_request', {})
-        pr_number = pull_request_data.get('number')
-        repo_full = data.get('repository', {}).get('full_name', '')
+        review = data.get("review", {})
+        review_state = review.get("state", "")
+        pull_request_data = data.get("pull_request", {})
+        pr_number = pull_request_data.get("number")
+        repo_full = data.get("repository", {}).get("full_name", "")
 
-        if not pr_number or '/' not in repo_full:
-            return {'status': 'ignored'}
+        if not pr_number or "/" not in repo_full:
+            return {"status": "ignored"}
 
-        owner, repo_name = repo_full.split('/', 1)
-        project = (await session.execute(
-            select(Project).where(
-                Project.github_owner == owner,
-                Project.github_repo == repo_name,
+        owner, repo_name = repo_full.split("/", 1)
+        project = (
+            (
+                await session.execute(
+                    select(Project).where(
+                        Project.github_owner == owner,
+                        Project.github_repo == repo_name,
+                    )
+                )
             )
-        )).scalars().first()
+            .scalars()
+            .first()
+        )
         if not project:
-            logger.info(f'[WEBHOOK] pull_request_review for unregistered repo {repo_full}')
-            return {'status': 'ignored'}
+            logger.info(
+                f"[WEBHOOK] pull_request_review for unregistered repo {repo_full}"
+            )
+            return {"status": "ignored"}
 
         # Find original create task via the PR artifact
-        pr_url_suffix = f'/{owner}/{repo_name}/pull/{pr_number}'
+        pr_url_suffix = f"/{owner}/{repo_name}/pull/{pr_number}"
         art_result = await session.execute(
-            select(Artifact).join(Task, Artifact.task_id == Task.id).where(
+            select(Artifact)
+            .join(Task, Artifact.task_id == Task.id)
+            .where(
                 Task.project_id == project.id,
                 Artifact.artifact_type == ArtifactType.PULL_REQUEST,
-                Artifact.pr_url.ilike(f'%{pr_url_suffix}'),
+                Artifact.pr_url.ilike(f"%{pr_url_suffix}"),
             )
         )
         pr_artifacts = art_result.scalars().all()
         if not pr_artifacts:
-            logger.info(f'[WEBHOOK] pull_request_review for PR {pr_url_suffix}: no matching artifact')
-            return {'status': 'ignored'}
+            logger.info(
+                f"[WEBHOOK] pull_request_review for PR {pr_url_suffix}: no matching artifact"
+            )
+            return {"status": "ignored"}
 
-        review_user = review.get('user', {})
-        is_bot_review = (
-            review_user.get('type') == 'Bot'
-            or str(review_user.get('login', '')).endswith('[bot]')
-        )
+        review_user = review.get("user", {})
+        is_bot_review = review_user.get("type") == "Bot" or str(
+            review_user.get("login", "")
+        ).endswith("[bot]")
 
         signals_recorded = []
         for art in pr_artifacts:
@@ -630,43 +774,53 @@ async def github_webhook(
             if not pr_task:
                 continue
 
-            blueprint_verdict = (pr_task.context or {}).get('blueprint_review_verdict')
+            blueprint_verdict = (pr_task.context or {}).get("blueprint_review_verdict")
             update: dict = {}
             signal: str | None = None
             detail: str | None = None
 
-            if action == 'dismissed' and is_bot_review:
+            if action == "dismissed" and is_bot_review:
                 # A Blueprint review was dismissed by a user
-                dismissed_info = review.get('dismissed_review', {})
-                dismissal_message = (dismissed_info.get('dismissal_message') or '')[:500]
-                update['review_dismissed'] = True
+                dismissed_info = review.get("dismissed_review", {})
+                dismissal_message = (dismissed_info.get("dismissal_message") or "")[
+                    :500
+                ]
+                update["review_dismissed"] = True
                 if dismissal_message:
-                    update['review_dismissal_message'] = dismissal_message
-                signal = 'review_dismissed'
+                    update["review_dismissal_message"] = dismissal_message
+                signal = "review_dismissed"
                 detail = dismissal_message or None
                 logger.info(
-                    f'[REVIEW QUALITY] PR #{pr_number}: Blueprint review dismissed '
-                    f'on task {pr_task.id}'
+                    f"[REVIEW QUALITY] PR #{pr_number}: Blueprint review dismissed "
+                    f"on task {pr_task.id}"
                 )
 
-            elif action == 'submitted' and review_state == 'approved' and blueprint_verdict == 'REQUEST_CHANGES':
+            elif (
+                action == "submitted"
+                and review_state == "approved"
+                and blueprint_verdict == "REQUEST_CHANGES"
+            ):
                 # User approved after Blueprint requested changes — disagreement signal
-                if not (pr_task.context or {}).get('user_overrode_review'):
-                    update['user_overrode_review'] = True
-                    signal = 'user_overrode_review'
+                if not (pr_task.context or {}).get("user_overrode_review"):
+                    update["user_overrode_review"] = True
+                    signal = "user_overrode_review"
                     logger.info(
-                        f'[REVIEW QUALITY] PR #{pr_number}: User approved after Blueprint '
-                        f'REQUEST_CHANGES on task {pr_task.id}'
+                        f"[REVIEW QUALITY] PR #{pr_number}: User approved after Blueprint "
+                        f"REQUEST_CHANGES on task {pr_task.id}"
                     )
 
-            elif action == 'submitted' and review_state == 'changes_requested' and blueprint_verdict == 'APPROVE':
+            elif (
+                action == "submitted"
+                and review_state == "changes_requested"
+                and blueprint_verdict == "APPROVE"
+            ):
                 # User caught issues on a PR that Blueprint approved
-                if not (pr_task.context or {}).get('user_caught_issues'):
-                    update['user_caught_issues'] = True
-                    signal = 'user_caught_issues'
+                if not (pr_task.context or {}).get("user_caught_issues"):
+                    update["user_caught_issues"] = True
+                    signal = "user_caught_issues"
                     logger.info(
-                        f'[REVIEW QUALITY] PR #{pr_number}: User caught issues after Blueprint '
-                        f'APPROVE on task {pr_task.id}'
+                        f"[REVIEW QUALITY] PR #{pr_number}: User caught issues after Blueprint "
+                        f"APPROVE on task {pr_task.id}"
                     )
 
             if update:
@@ -678,6 +832,7 @@ async def github_webhook(
             # Post in-app message for the first signal before committing
             try:
                 from app.notification_dispatch import post_review_feedback_message  # noqa: PLC0415
+
                 first_task_id = pr_artifacts[0].task_id
                 await post_review_feedback_message(
                     session,
@@ -688,49 +843,63 @@ async def github_webhook(
                     task_id=first_task_id,
                 )
             except Exception as _ne:
-                logger.warning(f'[REVIEW QUALITY] In-app message failed: {_ne}')
+                logger.warning(f"[REVIEW QUALITY] In-app message failed: {_ne}")
             await session.commit()
             # Fire-and-forget external notification for each signal
             try:
                 from app.notification_dispatch import dispatch_external_notification  # noqa: PLC0415
+
                 for sig in signals_recorded:
-                    asyncio.ensure_future(dispatch_external_notification(
-                        project.id,
-                        'REVIEW_FEEDBACK',
-                        {
-                            'pr_number': pr_number,
-                            'repo': f'{owner}/{repo_name}',
-                            'signal': sig,
-                            'task_id': str(pr_artifacts[0].task_id),
-                        },
-                    ))
+                    asyncio.ensure_future(
+                        dispatch_external_notification(
+                            project.id,
+                            "REVIEW_FEEDBACK",
+                            {
+                                "pr_number": pr_number,
+                                "repo": f"{owner}/{repo_name}",
+                                "signal": sig,
+                                "task_id": str(pr_artifacts[0].task_id),
+                            },
+                        )
+                    )
             except Exception as _ne:
-                logger.warning(f'[REVIEW QUALITY] External notification failed: {_ne}')
+                logger.warning(f"[REVIEW QUALITY] External notification failed: {_ne}")
 
     # NOTE: The 'issues' event must be enabled in the GitHub App's webhook settings.
-    elif event_type == 'issues':
-        action = data.get('action')
-        if action == 'labeled':
-            issue = data.get('issue', {})
-            label = data.get('label', {})
-            repo_data = data.get('repository', {})
-            repo_full = repo_data.get('full_name', '')
-            issue_number = issue.get('number')
-            issue_title = issue.get('title', '')
-            label_name = label.get('name', '')
+    elif event_type == "issues":
+        action = data.get("action")
+        if action == "labeled":
+            issue = data.get("issue", {})
+            label = data.get("label", {})
+            repo_data = data.get("repository", {})
+            repo_full = repo_data.get("full_name", "")
+            issue_number = issue.get("number")
+            issue_title = issue.get("title", "")
+            label_name = label.get("name", "")
 
-            if '/' in repo_full and issue_number:
-                owner, repo_name = repo_full.split('/', 1)
-                project = (await session.execute(
-                    select(Project).where(
-                        Project.github_owner == owner,
-                        Project.github_repo == repo_name,
+            if "/" in repo_full and issue_number:
+                owner, repo_name = repo_full.split("/", 1)
+                project = (
+                    (
+                        await session.execute(
+                            select(Project).where(
+                                Project.github_owner == owner,
+                                Project.github_repo == repo_name,
+                            )
+                        )
                     )
-                )).scalars().first()
+                    .scalars()
+                    .first()
+                )
                 if project:
-                    config = (project.design_doc or {}).get('_issue_implementation', {})
-                    if config.get('enabled') and label_name == config.get('trigger_label', 'blueprint:implement'):
-                        from app.issue_implementation import _handle_issue_implementation
+                    config = (project.design_doc or {}).get("_issue_implementation", {})
+                    if config.get("enabled") and label_name == config.get(
+                        "trigger_label", "blueprint:implement"
+                    ):
+                        from app.issue_implementation import (
+                            _handle_issue_implementation,
+                        )
+
                         background_tasks.add_task(
                             _handle_issue_implementation,
                             owner=owner,
@@ -740,6 +909,6 @@ async def github_webhook(
                             project_id=project.id,
                             config=config,
                         )
-                        return {'status': 'issue_implementation_triggered'}
+                        return {"status": "issue_implementation_triggered"}
 
     return {"status": "received"}

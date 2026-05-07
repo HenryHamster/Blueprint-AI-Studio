@@ -1,4 +1,5 @@
 """Tests for admin_orchestrator_errors recent-orchestrator-errors endpoint."""
+
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -41,7 +42,9 @@ def _clear_errors_cache():
 
 class TestRecentOrchestratorErrors:
     @pytest.mark.asyncio
-    async def test_buckets_entries_by_exception_class_and_source(self, client: AsyncClient):
+    async def test_buckets_entries_by_exception_class_and_source(
+        self, client: AsyncClient
+    ):
         """Entries from two exception classes bucket correctly with counts."""
         now = _utcnow()
         entries = [
@@ -49,8 +52,14 @@ class TestRecentOrchestratorErrors:
             _make_entry(ATTR_TRACEBACK, now - timedelta(minutes=3)),
             _make_entry(LOCK_TRACEBACK, now - timedelta(minutes=1)),
         ]
-        with patch.object(admin_orchestrator_errors, "_fetch_orchestrator_error_entries", return_value=entries):
-            resp = await client.get("/api/admin/recent-orchestrator-errors?hours=1&limit=20")
+        with patch.object(
+            admin_orchestrator_errors,
+            "_fetch_orchestrator_error_entries",
+            return_value=entries,
+        ):
+            resp = await client.get(
+                "/api/admin/recent-orchestrator-errors?hours=1&limit=20"
+            )
 
         assert resp.status_code == 200
         body = resp.json()
@@ -68,12 +77,19 @@ class TestRecentOrchestratorErrors:
         assert "123" in by_class["AttributeError"]["source"]
 
     @pytest.mark.asyncio
-    async def test_logging_client_failure_returns_error_field(self, client: AsyncClient):
+    async def test_logging_client_failure_returns_error_field(
+        self, client: AsyncClient
+    ):
         """Cloud Logging exceptions produce a graceful error response, not HTTP 500."""
+
         def _raise(_hours: int):
             raise RuntimeError("permission denied on logs")
 
-        with patch.object(admin_orchestrator_errors, "_fetch_orchestrator_error_entries", side_effect=_raise):
+        with patch.object(
+            admin_orchestrator_errors,
+            "_fetch_orchestrator_error_entries",
+            side_effect=_raise,
+        ):
             resp = await client.get("/api/admin/recent-orchestrator-errors")
 
         assert resp.status_code == 200
@@ -85,7 +101,11 @@ class TestRecentOrchestratorErrors:
     @pytest.mark.asyncio
     async def test_zero_entries_returns_empty_buckets(self, client: AsyncClient):
         """No log entries yields an empty buckets array with no error field."""
-        with patch.object(admin_orchestrator_errors, "_fetch_orchestrator_error_entries", return_value=[]):
+        with patch.object(
+            admin_orchestrator_errors,
+            "_fetch_orchestrator_error_entries",
+            return_value=[],
+        ):
             resp = await client.get("/api/admin/recent-orchestrator-errors")
 
         assert resp.status_code == 200
@@ -97,6 +117,7 @@ class TestRecentOrchestratorErrors:
     @pytest.mark.asyncio
     async def test_non_admin_returns_403(self, override_get_session):
         """Non-admin callers are rejected by require_admin."""
+
         async def non_admin():
             return {"user_id": "u2", "email": "u2@example.com", "role": "user"}
 
@@ -126,9 +147,17 @@ class TestRecentOrchestratorErrors:
             call_count["n"] += 1
             return entries
 
-        with patch.object(admin_orchestrator_errors, "_fetch_orchestrator_error_entries", side_effect=_fake):
-            resp1 = await client.get("/api/admin/recent-orchestrator-errors?hours=1&limit=20")
-            resp2 = await client.get("/api/admin/recent-orchestrator-errors?hours=1&limit=20")
+        with patch.object(
+            admin_orchestrator_errors,
+            "_fetch_orchestrator_error_entries",
+            side_effect=_fake,
+        ):
+            resp1 = await client.get(
+                "/api/admin/recent-orchestrator-errors?hours=1&limit=20"
+            )
+            resp2 = await client.get(
+                "/api/admin/recent-orchestrator-errors?hours=1&limit=20"
+            )
 
         assert resp1.status_code == 200
         assert resp2.status_code == 200

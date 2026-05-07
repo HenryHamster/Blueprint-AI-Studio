@@ -3,6 +3,7 @@
 Audit 2026-04-25 W2 — backstop coverage for cycle promotion from JSONB to
 real table.
 """
+
 from __future__ import annotations
 
 from datetime import timedelta
@@ -16,6 +17,7 @@ from app.time_utils import _utcnow
 
 
 # --- helpers ---------------------------------------------------------------
+
 
 async def _make_project(session, name: str = "W2 Test Project") -> Project:
     p = Project(name=name, user_id="test-user-w2")
@@ -31,9 +33,14 @@ async def _make_project(session, name: str = "W2 Test Project") -> Project:
 @pytest.mark.asyncio
 async def test_create_inserts_row_with_baseline(db_session):
     project = await _make_project(db_session)
-    baseline = {"purpose": "ship pipeline", "systems": [{"id": "s1", "status": "active"}]}
+    baseline = {
+        "purpose": "ship pipeline",
+        "systems": [{"id": "s1", "status": "active"}],
+    }
     cycle = await strategic_cycle.create(
-        db_session, project_id=project.id, baseline_vision=baseline,
+        db_session,
+        project_id=project.id,
+        baseline_vision=baseline,
     )
     await db_session.commit()
     fetched = await strategic_cycle.get(db_session, cycle.id)
@@ -47,11 +54,13 @@ async def test_create_inserts_row_with_baseline(db_session):
 async def test_mark_phase1_completed_with_phase2_spawn(db_session):
     project = await _make_project(db_session)
     phase1 = Task(
-        project_id=project.id, payloads=[{"type": "design_doc_update"}],
+        project_id=project.id,
+        payloads=[{"type": "design_doc_update"}],
         status=TaskStatus.COMPLETED,
     )
     phase2 = Task(
-        project_id=project.id, payloads=[{"type": "strategic_review"}],
+        project_id=project.id,
+        payloads=[{"type": "strategic_review"}],
         status=TaskStatus.QUEUED,
     )
     db_session.add_all([phase1, phase2])
@@ -60,12 +69,16 @@ async def test_mark_phase1_completed_with_phase2_spawn(db_session):
     await db_session.refresh(phase2)
 
     cycle = await strategic_cycle.create(
-        db_session, project_id=project.id, phase1_task_id=phase1.id,
+        db_session,
+        project_id=project.id,
+        phase1_task_id=phase1.id,
     )
     await db_session.commit()
 
     updated = await strategic_cycle.mark_phase1_completed(
-        db_session, cycle.id, phase2_task_id=phase2.id,
+        db_session,
+        cycle.id,
+        phase2_task_id=phase2.id,
     )
     await db_session.commit()
     assert updated is not None
@@ -81,7 +94,10 @@ async def test_mark_failure_records_reason(db_session):
     cycle = await strategic_cycle.create(db_session, project_id=project.id)
     await db_session.commit()
     updated = await strategic_cycle.mark_failure(
-        db_session, cycle.id, phase="phase1", reason="task crashed mid-run",
+        db_session,
+        cycle.id,
+        phase="phase1",
+        reason="task crashed mid-run",
     )
     await db_session.commit()
     assert updated.outcome == strategic_cycle.OUTCOME_FAILED_PHASE1
@@ -97,7 +113,9 @@ async def test_get_by_task_finds_cycle(db_session):
     await db_session.commit()
     await db_session.refresh(phase1)
     cycle = await strategic_cycle.create(
-        db_session, project_id=project.id, phase1_task_id=phase1.id,
+        db_session,
+        project_id=project.id,
+        phase1_task_id=phase1.id,
     )
     await db_session.commit()
     found = await strategic_cycle.get_by_task(db_session, phase1.id)
@@ -110,7 +128,9 @@ async def test_recent_for_agent_context_returns_legacy_shape(db_session):
     for _ in range(3):
         await strategic_cycle.create(db_session, project_id=project.id)
         await db_session.commit()
-    history = await strategic_cycle.recent_for_agent_context(db_session, project.id, limit=5)
+    history = await strategic_cycle.recent_for_agent_context(
+        db_session, project.id, limit=5
+    )
     assert len(history) == 3
     # Shape mirrors the legacy JSONB cycle_history entry — has cycle_id, outcome, etc.
     for entry in history:
@@ -166,10 +186,12 @@ def test_merge_vision_keeps_user_on_conflict_logs_rejection():
 
 def test_merge_vision_user_unchanged_takes_agent_for_lists():
     baseline = {"systems": [{"id": "s1", "name": "Auth", "status": "planned"}]}
-    agent = {"systems": [
-        {"id": "s1", "name": "Auth", "status": "active"},
-        {"id": "s2", "name": "Billing", "status": "planned"},
-    ]}
+    agent = {
+        "systems": [
+            {"id": "s1", "name": "Auth", "status": "active"},
+            {"id": "s2", "name": "Billing", "status": "planned"},
+        ]
+    }
     current = {"systems": [{"id": "s1", "name": "Auth", "status": "planned"}]}
     merged, rejected = vision_merge.merge_vision(baseline, agent, current)
     sys_by_id = {s["id"]: s for s in merged["systems"]}
@@ -201,7 +223,9 @@ def test_append_rejected_edits_caps_list():
     vision = {vision_merge.REJECTED_EDITS_KEY: [{"x": i} for i in range(50)]}
     new = [{"x": 100}, {"x": 101}]
     vision_merge.append_rejected_edits(vision, new)
-    assert len(vision[vision_merge.REJECTED_EDITS_KEY]) == vision_merge.REJECTED_EDITS_MAX
+    assert (
+        len(vision[vision_merge.REJECTED_EDITS_KEY]) == vision_merge.REJECTED_EDITS_MAX
+    )
     # Newest at the end.
     assert vision[vision_merge.REJECTED_EDITS_KEY][-1] == {"x": 101}
 
@@ -215,6 +239,7 @@ async def test_cycle_row_created_on_phase1_spawn(db_session, mocker):
     Task.strategic_cycle_id column on the spawned phase 1 task, and snapshots
     the project's vision into cycle_metadata.baseline_vision."""
     from app.strategic_spawning import _spawn_design_doc_update
+
     project = await _make_project(db_session)
     project.vision = {"purpose": "test purpose", "revision": 1}
     db_session.add(project)
@@ -224,9 +249,15 @@ async def test_cycle_row_created_on_phase1_spawn(db_session, mocker):
     assert spawned is True
 
     # Verify cycle row exists
-    cycles = (await db_session.execute(
-        select(StrategicCycle).where(StrategicCycle.project_id == project.id)
-    )).scalars().all()
+    cycles = (
+        (
+            await db_session.execute(
+                select(StrategicCycle).where(StrategicCycle.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
     assert len(cycles) == 1
     cycle = cycles[0]
     assert cycle.outcome == strategic_cycle.OUTCOME_PHASE1_RUNNING

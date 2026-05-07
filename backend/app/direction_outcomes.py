@@ -5,6 +5,7 @@ Contains _update_direction_research_outcomes, called whenever a child task
 of a research cycle reaches a terminal status so that research_history
 entries accumulate live outcome statistics.
 """
+
 import statistics
 import uuid
 
@@ -93,13 +94,11 @@ def compute_direction_autonomy_state(direction: dict) -> dict:
     """
     history = direction.get("research_history") or []
     agg = direction.get("history_aggregate") or {}
-    lifetime_autonomous = (
-        sum(h.get("autonomous_prs_merged", h.get("prs_merged", 0)) for h in history)
-        + (agg.get("total_autonomous_prs_merged") or 0)
-    )
-    lifetime_op_actions = (
-        sum(h.get("operator_action_count", 0) for h in history)
-        + (agg.get("total_operator_actions") or 0)
+    lifetime_autonomous = sum(
+        h.get("autonomous_prs_merged", h.get("prs_merged", 0)) for h in history
+    ) + (agg.get("total_autonomous_prs_merged") or 0)
+    lifetime_op_actions = sum(h.get("operator_action_count", 0) for h in history) + (
+        agg.get("total_operator_actions") or 0
     )
     return {
         "lifetime_autonomous_prs_merged": lifetime_autonomous,
@@ -134,7 +133,9 @@ def _longest_chain_length(deps_map: dict[str, list[str]]) -> int:
     return max((depth(n, frozenset()) for n in nodes), default=0)
 
 
-def _update_cochange_index(project: Project, merged_files_lists: list[list[str]]) -> None:
+def _update_cochange_index(
+    project: Project, merged_files_lists: list[list[str]]
+) -> None:
     """Update the co-change affinity index in project.design_doc.
 
     For each merged PR's file list, records which files changed together.
@@ -169,7 +170,7 @@ def _update_cochange_index(project: Project, merged_files_lists: list[list[str]]
         if len(unique_files) < 2:
             continue
         for i, file_a in enumerate(unique_files):
-            for file_b in unique_files[i + 1:]:
+            for file_b in unique_files[i + 1 :]:
                 if file_a not in index:
                     index[file_a] = {}
                 index[file_a][file_b] = round(index[file_a].get(file_b, 0.0) + 1.0, 3)
@@ -187,7 +188,9 @@ def _update_cochange_index(project: Project, merged_files_lists: list[list[str]]
     # Cap total tracked files
     if len(index) > MAX_FILES:
         file_scores = {f: sum(v.values()) for f, v in index.items()}
-        top_files = sorted(file_scores.keys(), key=lambda f: file_scores[f], reverse=True)[:MAX_FILES]
+        top_files = sorted(
+            file_scores.keys(), key=lambda f: file_scores[f], reverse=True
+        )[:MAX_FILES]
         index = {f: index[f] for f in top_files}
 
     design_doc["cochange_index"] = index
@@ -196,7 +199,10 @@ def _update_cochange_index(project: Project, merged_files_lists: list[list[str]]
 
 
 async def _update_direction_research_outcomes(
-    project_id: uuid.UUID, direction_id: str, research_task_id: str, session: AsyncSession
+    project_id: uuid.UUID,
+    direction_id: str,
+    research_task_id: str,
+    session: AsyncSession,
 ) -> None:
     """Update a direction's research_history entry with child task outcome counts.
 
@@ -231,6 +237,7 @@ async def _update_direction_research_outcomes(
     # for older rows. Tasks missing both provider and model bucket under
     # "unknown|unknown" so legacy entries degrade without dropping cost.
     from app.routers.admin_analytics import ON_DEMAND_RATE, SPOT_RATE  # noqa: PLC0415
+
     cost_by_provider_model: dict[str, float] = {}
     cycle_cost_total = 0.0
     for ct in child_tasks_rows:
@@ -243,43 +250,63 @@ async def _update_direction_research_outcomes(
         provider_key = ct.provider or "unknown"
         model_key = ct.model or "unknown"
         bucket_key = f"{provider_key}|{model_key}"
-        cost_by_provider_model[bucket_key] = cost_by_provider_model.get(bucket_key, 0.0) + t_cost
+        cost_by_provider_model[bucket_key] = (
+            cost_by_provider_model.get(bucket_key, 0.0) + t_cost
+        )
         cycle_cost_total += t_cost
     if cost_by_provider_model:
-        entry["cost_by_provider_model"] = {k: round(v, 4) for k, v in cost_by_provider_model.items()}
+        entry["cost_by_provider_model"] = {
+            k: round(v, 4) for k, v in cost_by_provider_model.items()
+        }
         entry["estimated_cost_usd"] = round(cycle_cost_total, 4)
 
-    entry["tasks_completed"] = sum(1 for ct in child_tasks_rows if ct.status == TaskStatus.COMPLETED)
-    entry["tasks_failed"] = sum(1 for ct in child_tasks_rows if ct.status == TaskStatus.FAILED)
-    entry["tasks_cancelled"] = sum(1 for ct in child_tasks_rows if ct.status == TaskStatus.CANCELLED)
+    entry["tasks_completed"] = sum(
+        1 for ct in child_tasks_rows if ct.status == TaskStatus.COMPLETED
+    )
+    entry["tasks_failed"] = sum(
+        1 for ct in child_tasks_rows if ct.status == TaskStatus.FAILED
+    )
+    entry["tasks_cancelled"] = sum(
+        1 for ct in child_tasks_rows if ct.status == TaskStatus.CANCELLED
+    )
     entry["prs_merged"] = sum(
-        1 for ct in child_tasks_rows
+        1
+        for ct in child_tasks_rows
         if ct.status == TaskStatus.COMPLETED and (ct.context or {}).get("pr_merged")
     )
     entry["prs_rejected"] = sum(
-        1 for ct in child_tasks_rows
+        1
+        for ct in child_tasks_rows
         if ct.status == TaskStatus.COMPLETED and (ct.context or {}).get("pr_rejected")
     )
     _merged_rows = [
-        ct for ct in child_tasks_rows
+        ct
+        for ct in child_tasks_rows
         if ct.status == TaskStatus.COMPLETED and (ct.context or {}).get("pr_merged")
     ]
-    entry["autonomous_prs_merged"] = sum(1 for ct in _merged_rows if is_autonomous_merge(ct))
-    entry["assisted_prs_merged"] = sum(1 for ct in _merged_rows if not is_autonomous_merge(ct))
+    entry["autonomous_prs_merged"] = sum(
+        1 for ct in _merged_rows if is_autonomous_merge(ct)
+    )
+    entry["assisted_prs_merged"] = sum(
+        1 for ct in _merged_rows if not is_autonomous_merge(ct)
+    )
     # operator_action_count: tasks in this cycle with any detectable operator intervention
     entry["operator_action_count"] = sum(
-        1 for ct in child_tasks_rows
+        1
+        for ct in child_tasks_rows
         if (ct.created_by or "").upper() == "USER"
         or (ct.context or {}).get("review_dismissed")
         or (ct.context or {}).get("user_overrode_review")
     )
     _prev_rows = [
-        ct for ct in child_tasks_rows
+        ct
+        for ct in child_tasks_rows
         if (ct.context or {}).get("has_preventive_context") is True
     ]
     entry["preventive_context_tasks_created"] = len(_prev_rows)
     entry["preventive_context_tasks_merged"] = sum(
-        1 for ct in _prev_rows
+        1
+        for ct in _prev_rows
         if ct.status == TaskStatus.COMPLETED and (ct.context or {}).get("pr_merged")
     )
     entry["preventive_context_tasks_failed"] = sum(
@@ -289,13 +316,15 @@ async def _update_direction_research_outcomes(
     # separately so research agents can see the remediation burden — a
     # direction merging emergency fixes is not the same as one merging features.
     _remediation_rows = [
-        ct for ct in child_tasks_rows
+        ct
+        for ct in child_tasks_rows
         if (ct.context or {}).get("diagnosis_task_id")
         or (ct.context or {}).get("auto_remediation") is True
     ]
     entry["remediation_tasks_created"] = len(_remediation_rows)
     entry["remediation_tasks_merged"] = sum(
-        1 for ct in _remediation_rows
+        1
+        for ct in _remediation_rows
         if ct.status == TaskStatus.COMPLETED and (ct.context or {}).get("pr_merged")
     )
     entry["remediation_tasks_failed"] = sum(
@@ -310,44 +339,58 @@ async def _update_direction_research_outcomes(
         and (ct.context or {}).get("_pr_changed_files")
     ]
     _tasks_created = entry.get("tasks_created", 0)
-    entry["conversion_rate"] = round(entry["prs_merged"] / _tasks_created, 3) if _tasks_created > 0 else None
+    entry["conversion_rate"] = (
+        round(entry["prs_merged"] / _tasks_created, 3) if _tasks_created > 0 else None
+    )
     # Review quality signals: track how users respond to Blueprint's reviews
     entry["reviews_dismissed"] = sum(
-        1 for ct in child_tasks_rows
-        if ct.status == TaskStatus.COMPLETED and (ct.context or {}).get("review_dismissed")
+        1
+        for ct in child_tasks_rows
+        if ct.status == TaskStatus.COMPLETED
+        and (ct.context or {}).get("review_dismissed")
     )
     entry["reviews_overridden"] = sum(
-        1 for ct in child_tasks_rows
-        if ct.status == TaskStatus.COMPLETED and (ct.context or {}).get("user_overrode_review")
+        1
+        for ct in child_tasks_rows
+        if ct.status == TaskStatus.COMPLETED
+        and (ct.context or {}).get("user_overrode_review")
     )
     entry["user_issues_caught"] = sum(
-        1 for ct in child_tasks_rows
-        if (ct.context or {}).get("user_caught_issues")
+        1 for ct in child_tasks_rows if (ct.context or {}).get("user_caught_issues")
     )
     # avg_time_to_merge_hours: mean of (vm_stopped_at - created_at) for merged tasks.
     # created_at is TIMESTAMPTZ since 0061; vm_stopped_at is naive — normalize both.
     from app.time_utils import _to_naive_utc
+
     merge_durations = [
-        (_to_naive_utc(ct.vm_stopped_at) - _to_naive_utc(ct.created_at)).total_seconds() / 3600
+        (_to_naive_utc(ct.vm_stopped_at) - _to_naive_utc(ct.created_at)).total_seconds()
+        / 3600
         for ct in child_tasks_rows
         if ct.status == TaskStatus.COMPLETED
         and (ct.context or {}).get("pr_merged")
         and ct.vm_stopped_at is not None
         and ct.created_at is not None
     ]
-    entry["avg_time_to_merge_hours"] = round(sum(merge_durations) / len(merge_durations), 2) if merge_durations else None
+    entry["avg_time_to_merge_hours"] = (
+        round(sum(merge_durations) / len(merge_durations), 2)
+        if merge_durations
+        else None
+    )
     # avg_implementation_hours: time the agent spent producing a PR
     # (vm_stopped_at - created_at) across ALL completed children, not
     # just merged ones. Pairs with avg_review_hours below to split
     # avg_time_to_merge_hours into implementation vs review-pipeline time.
     impl_durations = [
-        (_to_naive_utc(ct.vm_stopped_at) - _to_naive_utc(ct.created_at)).total_seconds() / 3600
+        (_to_naive_utc(ct.vm_stopped_at) - _to_naive_utc(ct.created_at)).total_seconds()
+        / 3600
         for ct in child_tasks_rows
         if ct.status == TaskStatus.COMPLETED
         and ct.vm_stopped_at is not None
         and ct.created_at is not None
     ]
-    entry["avg_implementation_hours"] = round(sum(impl_durations) / len(impl_durations), 2) if impl_durations else None
+    entry["avg_implementation_hours"] = (
+        round(sum(impl_durations) / len(impl_durations), 2) if impl_durations else None
+    )
     # avg_review_hours: time from implementation finish to PR merge.
     # PR merge timestamp isn't stored; approximate via the matching
     # review child's vm_stopped_at (latest if multiple iterations),
@@ -380,7 +423,11 @@ async def _update_direction_research_outcomes(
         vm_stop_n = _to_naive_utc(ct.vm_stopped_at)
         if end_ts_n is not None and vm_stop_n is not None and end_ts_n >= vm_stop_n:
             review_durations.append((end_ts_n - vm_stop_n).total_seconds() / 3600)
-    entry["avg_review_hours"] = round(sum(review_durations) / len(review_durations), 2) if review_durations else None
+    entry["avg_review_hours"] = (
+        round(sum(review_durations) / len(review_durations), 2)
+        if review_durations
+        else None
+    )
     # Review iteration counts per child task — lets research agents see
     # prompt-quality outcomes (fewer iterations = clearer prompt).
     review_iters = [
@@ -413,14 +460,16 @@ async def _update_direction_research_outcomes(
             taxonomy_summary[taxonomy] = taxonomy_summary.get(taxonomy, 0) + 1
             effort_attempted = (ct.first_payload or {}).get("effort")
             scope_calibrated_from = (ct.context or {}).get("scope_calibrated_from")
-            failed_details.append({
-                "title": ct.title or "",
-                "reason": reason,
-                "category": category,
-                "taxonomy": taxonomy,
-                "effort_attempted": effort_attempted,
-                "scope_calibrated_from": scope_calibrated_from,
-            })
+            failed_details.append(
+                {
+                    "title": ct.title or "",
+                    "reason": reason,
+                    "category": category,
+                    "taxonomy": taxonomy,
+                    "effort_attempted": effort_attempted,
+                    "scope_calibrated_from": scope_calibrated_from,
+                }
+            )
             if category in INFRA_CLASSES and not _is_review_cap_exhausted(ct):
                 infra_failures += 1
     entry["failed_task_details"] = failed_details[:5]  # cap at 5 to avoid bloat
@@ -445,18 +494,19 @@ async def _update_direction_research_outcomes(
     # tasks_required_approval: non-completed tasks that required manual approval
     # Exclude tasks already counted as CODE_ERROR to avoid double-counting
     sd_required_approval = sum(
-        1 for ct in child_tasks_rows
+        1
+        for ct in child_tasks_rows
         if ct.requires_approval
         and ct.status not in (TaskStatus.COMPLETED,)
         and ct.id not in sd_code_error_ids
     )
     research_task_obj = await session.get(Task, research_task_uuid)
     rollup_failed = (
-        research_task_obj is not None
-        and research_task_obj.status == TaskStatus.FAILED
+        research_task_obj is not None and research_task_obj.status == TaskStatus.FAILED
     )
     sd_staging_only = sum(
-        1 for ct in child_tasks_rows
+        1
+        for ct in child_tasks_rows
         if ct.status == TaskStatus.COMPLETED
         and (ct.context or {}).get("pr_merged")
         and rollup_failed
@@ -492,7 +542,9 @@ async def _update_direction_research_outcomes(
     entry["type_distribution"] = type_counts
     entry["type_breakdown"] = type_breakdown
     total_typed = product_count + structural_count
-    entry["product_ratio"] = round(product_count / total_typed, 2) if total_typed > 0 else 0.0
+    entry["product_ratio"] = (
+        round(product_count / total_typed, 2) if total_typed > 0 else 0.0
+    )
     entry["structural_count"] = structural_count
 
     # Track per-scope merge rates so research agents can calibrate scope assignments.
@@ -514,13 +566,19 @@ async def _update_direction_research_outcomes(
     def _ensure_scope(s: str) -> None:
         if s not in scope_breakdown:
             scope_breakdown[s] = {
-                "created": 0, "merged": 0, "merged_cross_module": 0,
-                "failed": 0, "failed_infra": 0,
-                "failed_code_error": 0, "failed_scope_overflow": 0,
+                "created": 0,
+                "merged": 0,
+                "merged_cross_module": 0,
+                "failed": 0,
+                "failed_infra": 0,
+                "failed_code_error": 0,
+                "failed_scope_overflow": 0,
                 "failed_analysis_overflow": 0,
                 "scope_trim_count": 0,
-                "calibrated_in": 0, "calibrated_out": 0,
-                "exploration_created": 0, "exploration_merged": 0,
+                "calibrated_in": 0,
+                "calibrated_out": 0,
+                "exploration_created": 0,
+                "exploration_merged": 0,
                 "exploration_failed": 0,
                 "failure_stages": {},
             }
@@ -622,8 +680,12 @@ async def _update_direction_research_outcomes(
                 # Failed tasks (especially SCOPE_OVERFLOW) are the exact scenario
                 # the expansion predictor tries to prevent — track separately so
                 # scope calibration has a conservative signal.
-                expansion_failed_sums[scope] = expansion_failed_sums.get(scope, 0.0) + ratio
-                expansion_failed_counts[scope] = expansion_failed_counts.get(scope, 0) + 1
+                expansion_failed_sums[scope] = (
+                    expansion_failed_sums.get(scope, 0.0) + ratio
+                )
+                expansion_failed_counts[scope] = (
+                    expansion_failed_counts.get(scope, 0) + 1
+                )
     for scope_key, count in expansion_counts.items():
         if count > 0:
             avg = round(expansion_sums[scope_key] / count, 2)
@@ -651,19 +713,24 @@ async def _update_direction_research_outcomes(
             cplx_failed_n[scope2] = cplx_failed_n.get(scope2, 0) + 1
     for sk, n in cplx_merged_n.items():
         if n > 0 and sk in scope_breakdown:
-            scope_breakdown[sk]["avg_complexity_merged"] = round(cplx_merged_sum[sk] / n, 2)
+            scope_breakdown[sk]["avg_complexity_merged"] = round(
+                cplx_merged_sum[sk] / n, 2
+            )
     for sk, n in cplx_failed_n.items():
         if n > 0 and sk in scope_breakdown:
-            scope_breakdown[sk]["avg_complexity_failed"] = round(cplx_failed_sum[sk] / n, 2)
+            scope_breakdown[sk]["avg_complexity_failed"] = round(
+                cplx_failed_sum[sk] / n, 2
+            )
     skip_counts = (
         (research_task_obj.context or {}).get("skipped_low_confidence_by_scope", {})
-        if research_task_obj else {}
+        if research_task_obj
+        else {}
     )
     for sk, cnt in (skip_counts or {}).items():
         _ensure_scope(sk)
-        scope_breakdown[sk]["skipped_low_confidence"] = (
-            scope_breakdown[sk].get("skipped_low_confidence", 0) + int(cnt)
-        )
+        scope_breakdown[sk]["skipped_low_confidence"] = scope_breakdown[sk].get(
+            "skipped_low_confidence", 0
+        ) + int(cnt)
     entry["scope_breakdown"] = scope_breakdown
     entry["escalation_outcomes"] = escalation_outcomes
 
@@ -691,11 +758,14 @@ async def _update_direction_research_outcomes(
         if bucket_name not in ("merged", "failed") and len(items) < 2:
             continue
         n = len(items)
+
         def _avg(key: str):
             vals = [i.get(key) for i in items if isinstance(i.get(key), (int, float))]
             return round(sum(vals) / len(vals), 2) if vals else None
+
         def _frac(key: str) -> float:
             return round(sum(1 for i in items if i.get(key)) / n, 3)
+
         prompt_telemetry_summary[bucket_name] = {
             "count": n,
             "avg_char_count": _avg("char_count"),
@@ -711,28 +781,40 @@ async def _update_direction_research_outcomes(
     # can correlate decomposition shape (breadth, file overlap, cross-module
     # coupling, dep depth) with subtask merge success.
     plan_child_ids = [
-        ct.id for ct in child_tasks_rows
+        ct.id
+        for ct in child_tasks_rows
         if (ct.first_payload or {}).get("type") == "plan"
         and ct.status in (TaskStatus.COMPLETED, TaskStatus.FAILED)
     ]
     decomposition_quality: list = []
     if plan_child_ids:
-        subtask_rows = (await session.execute(
-            select(Task).where(Task.parent_task_id.in_(plan_child_ids))
-        )).scalars().all()
+        subtask_rows = (
+            (
+                await session.execute(
+                    select(Task).where(Task.parent_task_id.in_(plan_child_ids))
+                )
+            )
+            .scalars()
+            .all()
+        )
         by_parent: dict = {}
         for st in subtask_rows:
             by_parent.setdefault(st.parent_task_id, []).append(st)
         for plan_id, sts in by_parent.items():
             merged_ct = sum(
-                1 for st in sts
-                if st.status == TaskStatus.COMPLETED and (st.context or {}).get("pr_merged")
+                1
+                for st in sts
+                if st.status == TaskStatus.COMPLETED
+                and (st.context or {}).get("pr_merged")
             )
             failed_nc = sum(
-                1 for st in sts
+                1
+                for st in sts
                 if _counts_as_failure(st)
-                and (_classify_failure(st) not in INFRA_CLASSES
-                     or _is_review_cap_exhausted(st))
+                and (
+                    _classify_failure(st) not in INFRA_CLASSES
+                    or _is_review_cap_exhausted(st)
+                )
             )
             file_counts = [
                 len((st.context or {}).get("_pr_changed_files") or [])
@@ -740,39 +822,53 @@ async def _update_direction_research_outcomes(
                 if (st.context or {}).get("_pr_changed_files")
             ]
             cross_mod = sum(
-                1 for st in sts
-                if len({
-                    f.split("/", 1)[0]
-                    for f in ((st.context or {}).get("_pr_changed_files") or [])
-                    if "/" in f
-                }) >= 2
+                1
+                for st in sts
+                if len(
+                    {
+                        f.split("/", 1)[0]
+                        for f in ((st.context or {}).get("_pr_changed_files") or [])
+                        if "/" in f
+                    }
+                )
+                >= 2
             )
             deps_map = {str(st.id): list(st.depends_on or []) for st in sts}
             denom = merged_ct + failed_nc
-            decomposition_quality.append({
-                "plan_task_id": str(plan_id),
-                "subtask_count": len(sts),
-                "subtask_merge_rate": round(merged_ct / denom, 3) if denom > 0 else None,
-                "avg_files_per_subtask": round(sum(file_counts) / len(file_counts), 2) if file_counts else 0.0,
-                "max_files_in_subtask": max(file_counts) if file_counts else 0,
-                "dependency_depth": _longest_chain_length(deps_map),
-                "cross_module_count": cross_mod,
-            })
+            decomposition_quality.append(
+                {
+                    "plan_task_id": str(plan_id),
+                    "subtask_count": len(sts),
+                    "subtask_merge_rate": round(merged_ct / denom, 3)
+                    if denom > 0
+                    else None,
+                    "avg_files_per_subtask": round(
+                        sum(file_counts) / len(file_counts), 2
+                    )
+                    if file_counts
+                    else 0.0,
+                    "max_files_in_subtask": max(file_counts) if file_counts else 0,
+                    "dependency_depth": _longest_chain_length(deps_map),
+                    "cross_module_count": cross_mod,
+                }
+            )
         # Sentinel entries for plans that reached terminal state without producing
         # any subtasks — otherwise these decomposition failures leave no data in
         # decomposition_quality and _poor_decomp_history stays blind to them.
         for plan_id in plan_child_ids:
             if plan_id in by_parent:
                 continue
-            decomposition_quality.append({
-                "plan_task_id": str(plan_id),
-                "subtask_count": 0,
-                "subtask_merge_rate": 0.0,
-                "avg_files_per_subtask": 0.0,
-                "max_files_in_subtask": 0,
-                "dependency_depth": 0,
-                "cross_module_count": 0,
-            })
+            decomposition_quality.append(
+                {
+                    "plan_task_id": str(plan_id),
+                    "subtask_count": 0,
+                    "subtask_merge_rate": 0.0,
+                    "avg_files_per_subtask": 0.0,
+                    "max_files_in_subtask": 0,
+                    "dependency_depth": 0,
+                    "cross_module_count": 0,
+                }
+            )
     entry["decomposition_quality"] = decomposition_quality
 
     # Co-change auto-decomposition outcomes: track merge rate of
@@ -780,18 +876,19 @@ async def _update_direction_research_outcomes(
     # spawn_calibration can factor in whether splitting medium findings
     # into smaller ones actually improves conversion.
     _decomp_stats = (
-        ((research_task_obj.context or {}) if research_task_obj else {})
-        .get("cochange_decomposition_stats") or {}
+        ((research_task_obj.context or {}) if research_task_obj else {}).get(
+            "cochange_decomposition_stats"
+        )
+        or {}
     ).get(direction_id)
     if _decomp_stats:
         _decomposed = [
-            ct for ct in child_tasks_rows
-            if (ct.context or {}).get("auto_decomposed")
+            ct for ct in child_tasks_rows if (ct.context or {}).get("auto_decomposed")
         ]
         _sub_merged = sum(
-            1 for ct in _decomposed
-            if ct.status == TaskStatus.COMPLETED
-            and (ct.context or {}).get("pr_merged")
+            1
+            for ct in _decomposed
+            if ct.status == TaskStatus.COMPLETED and (ct.context or {}).get("pr_merged")
         )
         _sub_total = len(_decomposed)
         entry["cochange_decomposition"] = {
@@ -799,7 +896,9 @@ async def _update_direction_research_outcomes(
             "sub_findings_produced": _decomp_stats.get("sub_findings_produced", 0),
             "sub_findings_merged": _sub_merged,
             "sub_findings_total": _sub_total,
-            "merge_rate": round(_sub_merged / _sub_total, 3) if _sub_total > 0 else None,
+            "merge_rate": round(_sub_merged / _sub_total, 3)
+            if _sub_total > 0
+            else None,
         }
 
     # Maintain research_context: promote proposed findings based on outcomes
@@ -813,12 +912,16 @@ async def _update_direction_research_outcomes(
             if _counts_as_failure(ct):
                 # Move matching proposed finding to Failed Approaches
                 reason = (ct.latest_status_message or "")[:120]
-                category = (ct.context or {}).get("failure_category") or _classify_failure(ct)
+                category = (ct.context or {}).get(
+                    "failure_category"
+                ) or _classify_failure(ct)
                 ts = ct.vm_stopped_at or ct.updated_at
                 failed_at_iso = ts.date().isoformat() if ts else ""
-                stage = (ct.context or {}).get("_previous_failure_stage") or _derive_failure_stage(
-                    category, ct.latest_status_message or ""
-                ) or ""
+                stage = (
+                    (ct.context or {}).get("_previous_failure_stage")
+                    or _derive_failure_stage(category, ct.latest_status_message or "")
+                    or ""
+                )
                 meta_parts = []
                 if failed_at_iso:
                     meta_parts.append(f"at={failed_at_iso}")
@@ -839,12 +942,16 @@ async def _update_direction_research_outcomes(
                         new_established.append(item)
                 if moved:
                     parsed["established"] = new_established
-            elif ct.status == TaskStatus.COMPLETED and (ct.context or {}).get("pr_merged"):
+            elif ct.status == TaskStatus.COMPLETED and (ct.context or {}).get(
+                "pr_merged"
+            ):
                 # Promote (proposed) finding to (confirmed)
                 new_established = []
                 for item in parsed["established"]:
                     if title.lower() in item.lower() and "(proposed)" in item:
-                        new_established.append(item.replace("(proposed)", "(confirmed)"))
+                        new_established.append(
+                            item.replace("(proposed)", "(confirmed)")
+                        )
                     else:
                         new_established.append(item)
                 parsed["established"] = new_established
@@ -988,9 +1095,9 @@ def summarize_review_quality_feedback(
         result["note"] = note
     if isinstance(first_attempt_feedback, dict):
         cat_counts = {
-            k: v for k, v in first_attempt_feedback.items()
-            if k not in ("total", "last_updated")
-            and isinstance(v, int) and v > 0
+            k: v
+            for k, v in first_attempt_feedback.items()
+            if k not in ("total", "last_updated") and isinstance(v, int) and v > 0
         }
         if sum(cat_counts.values()) >= 3:
             top = sorted(cat_counts.items(), key=lambda kv: -kv[1])[:3]
@@ -1022,8 +1129,12 @@ def synthesize_prompt_quality_patterns(history: list) -> list[str]:
         if not (m and f):
             continue
         cycles_with_both += 1
-        for key in ("avg_char_count", "avg_related_file_count",
-                    "frac_mentions_tests", "frac_mentions_symbols"):
+        for key in (
+            "avg_char_count",
+            "avg_related_file_count",
+            "frac_mentions_tests",
+            "frac_mentions_symbols",
+        ):
             mv, fv = m.get(key), f.get(key)
             if isinstance(mv, (int, float)):
                 merged_acc.setdefault(key, []).append(float(mv))
@@ -1036,27 +1147,39 @@ def synthesize_prompt_quality_patterns(history: list) -> list[str]:
     def _avg(vals: list[float]) -> float | None:
         return sum(vals) / len(vals) if vals else None
 
-    mc, fc = _avg(merged_acc.get("avg_char_count", [])), _avg(failed_acc.get("avg_char_count", []))
+    mc, fc = (
+        _avg(merged_acc.get("avg_char_count", [])),
+        _avg(failed_acc.get("avg_char_count", [])),
+    )
     if mc is not None and fc is not None and max(mc, fc) > 0:
         if abs(mc - fc) / max(mc, fc) >= 0.2:
             notes.append(
                 f"Merged prompts averaged {int(mc)} chars vs {int(fc)} for failed — "
                 f"{'aim for more detail' if mc > fc else 'keep prompts tighter'}."
             )
-    mr, fr = _avg(merged_acc.get("avg_related_file_count", [])), _avg(failed_acc.get("avg_related_file_count", []))
+    mr, fr = (
+        _avg(merged_acc.get("avg_related_file_count", [])),
+        _avg(failed_acc.get("avg_related_file_count", [])),
+    )
     if mr is not None and fr is not None and max(mr, fr) > 0:
         if abs(mr - fr) >= 1.0:
             notes.append(
                 f"Merged prompts referenced {round(mr, 1)} related files on average vs {round(fr, 1)} for failed — "
                 f"{'cite more concrete files' if mr > fr else 'avoid over-listing files'}."
             )
-    mt, ft = _avg(merged_acc.get("frac_mentions_tests", [])), _avg(failed_acc.get("frac_mentions_tests", []))
+    mt, ft = (
+        _avg(merged_acc.get("frac_mentions_tests", [])),
+        _avg(failed_acc.get("frac_mentions_tests", [])),
+    )
     if mt is not None and ft is not None and abs(mt - ft) >= 0.2:
         notes.append(
             f"{int(mt * 100)}% of merged prompts mentioned tests vs {int(ft * 100)}% of failed — "
             f"{'emphasize test expectations' if mt > ft else 'test mentions did not correlate with merge here'}."
         )
-    ms, fs = _avg(merged_acc.get("frac_mentions_symbols", [])), _avg(failed_acc.get("frac_mentions_symbols", []))
+    ms, fs = (
+        _avg(merged_acc.get("frac_mentions_symbols", [])),
+        _avg(failed_acc.get("frac_mentions_symbols", [])),
+    )
     if ms is not None and fs is not None and abs(ms - fs) >= 0.2:
         notes.append(
             f"{int(ms * 100)}% of merged prompts named specific symbols vs {int(fs * 100)}% of failed — "
@@ -1077,9 +1200,13 @@ def synthesize_prompt_quality_patterns(history: list) -> list[str]:
                 continue
             m_seg = pt.get(f"merged_{scope}")
             f_seg = pt.get(f"failed_{scope}")
-            if isinstance(m_seg, dict) and isinstance(m_seg.get("avg_char_count"), (int, float)):
+            if isinstance(m_seg, dict) and isinstance(
+                m_seg.get("avg_char_count"), (int, float)
+            ):
                 m_chars.append(float(m_seg["avg_char_count"]))
-            if isinstance(f_seg, dict) and isinstance(f_seg.get("avg_char_count"), (int, float)):
+            if isinstance(f_seg, dict) and isinstance(
+                f_seg.get("avg_char_count"), (int, float)
+            ):
                 f_chars.append(float(f_seg["avg_char_count"]))
         if not m_chars or not f_chars:
             continue
@@ -1103,7 +1230,8 @@ def summarize_failure_hotspots(direction: dict, project_id) -> dict | None:
     if not isinstance(direction, dict):
         return None
     hotspot_files = [
-        f for f in (direction.get("diagnosed_affected_files") or [])
+        f
+        for f in (direction.get("diagnosed_affected_files") or [])
         if isinstance(f, str)
     ]
     failure_hotspots: dict = {}
@@ -1117,21 +1245,25 @@ def summarize_failure_hotspots(direction: dict, project_id) -> dict | None:
             failure_hotspots["last_remediation_fingerprint"] = last_fp
     try:
         from app import shared_state as _ss_anom
+
         _anoms = _ss_anom.persistent_anomalies.get(str(project_id)) or {}
         if _anoms:
             active_anomalies = []
             for key, info in list(_anoms.items())[:5]:
                 details = (info.get("latest_details") or "")[:140]
-                active_anomalies.append({
-                    "key": key,
-                    "occurrence_count": info.get("occurrence_count", 0),
-                    "severity": info.get("severity"),
-                    "details": details,
-                })
+                active_anomalies.append(
+                    {
+                        "key": key,
+                        "occurrence_count": info.get("occurrence_count", 0),
+                        "severity": info.get("severity"),
+                        "details": details,
+                    }
+                )
             if active_anomalies:
                 failure_hotspots["active_anomalies"] = active_anomalies
     except Exception:
         import logging
+
         logging.getLogger(__name__).exception(
             "Failed to surface active anomalies (non-critical)"
         )

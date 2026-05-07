@@ -16,6 +16,7 @@ perspective, so this is acceptable.
 
 Kept separate from routers/agent.py to keep that file under its size guardrail.
 """
+
 import logging
 import uuid
 from typing import Dict
@@ -73,13 +74,19 @@ async def rotate_agent_credentials(
         provider = LLMProviderName(provider_raw)
         auth_mode = LLMAuthMode(auth_mode_raw)
     except ValueError:
-        return {"rotated": False, "reason": f"unknown provider/auth_mode {provider_raw}/{auth_mode_raw}"}
+        return {
+            "rotated": False,
+            "reason": f"unknown provider/auth_mode {provider_raw}/{auth_mode_raw}",
+        }
 
     # Only openai/oauth rotates on the agent today. Anthropic OAuth tokens
     # don't auto-refresh in Claude Code CLI, and Gemini SA has no refresh
     # mechanism. Silent no-op so the agent can call unconditionally.
     if provider != LLMProviderName.OPENAI or auth_mode != LLMAuthMode.OAUTH:
-        return {"rotated": False, "reason": "provider/auth_mode does not support agent-side rotation"}
+        return {
+            "rotated": False,
+            "reason": "provider/auth_mode does not support agent-side rotation",
+        }
 
     account = await session.get(MaxPlanAccount, uuid.UUID(account_id))
     if not account:
@@ -97,13 +104,17 @@ async def rotate_agent_credentials(
             account.provider_metadata or {},
         )
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=f"Invalid rotated secret: {exc}") from exc
+        raise HTTPException(
+            status_code=400, detail=f"Invalid rotated secret: {exc}"
+        ) from exc
 
     secret_name = f"llm-account-{account.id}"
     try:
         new_ref = await store_user_secret("system", secret_name, result.secret)
     except Exception as exc:  # noqa: BLE001 — Secret Manager fallback mirrors the create path
-        logger.warning(f"[ROTATE] Secret Manager unavailable; storing inline for account {account.id}: {exc}")
+        logger.warning(
+            f"[ROTATE] Secret Manager unavailable; storing inline for account {account.id}: {exc}"
+        )
         new_ref = result.secret
 
     account.secret_blob_ref = new_ref

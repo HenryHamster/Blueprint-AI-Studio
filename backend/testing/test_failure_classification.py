@@ -1,4 +1,5 @@
 """Tests for failure_classification subtype helpers and classify_failure()."""
+
 import uuid
 from unittest.mock import MagicMock
 
@@ -69,7 +70,9 @@ def test_invalid_provider_auth_marks_context_instead_of_silent_fallback():
 
     assert _resolve_task_provider_auth(task) == (None, None)
     assert task.context["llm_runtime_resolution_failed"] is True
-    assert task.context["llm_runtime_resolution_error"] == "invalid_provider_or_auth_mode"
+    assert (
+        task.context["llm_runtime_resolution_error"] == "invalid_provider_or_auth_mode"
+    )
     assert task.context["llm_provider_raw"] == "not-a-provider"
 
 
@@ -78,30 +81,55 @@ class TestTimeoutSubtypeFromMessage:
         assert _timeout_subtype_from_message("exit 137 out of memory") == TIMEOUT_OOM
 
     def test_heartbeat_lost(self):
-        assert _timeout_subtype_from_message("No heartbeat received after 300s") == TIMEOUT_HEARTBEAT_LOST
+        assert (
+            _timeout_subtype_from_message("No heartbeat received after 300s")
+            == TIMEOUT_HEARTBEAT_LOST
+        )
 
     def test_iteration_limit(self):
-        assert _timeout_subtype_from_message("review-fix cycle limit reached") == TIMEOUT_ITERATION_LIMIT
-        assert _timeout_subtype_from_message("iteration cap exceeded") == TIMEOUT_ITERATION_LIMIT
+        assert (
+            _timeout_subtype_from_message("review-fix cycle limit reached")
+            == TIMEOUT_ITERATION_LIMIT
+        )
+        assert (
+            _timeout_subtype_from_message("iteration cap exceeded")
+            == TIMEOUT_ITERATION_LIMIT
+        )
 
     def test_cascade_via_cancelled_prefix(self):
-        assert _timeout_subtype_from_message("Cancelled: parent evaluation timeout") == TIMEOUT_CASCADE
+        assert (
+            _timeout_subtype_from_message("Cancelled: parent evaluation timeout")
+            == TIMEOUT_CASCADE
+        )
 
     def test_cascade_via_superseded(self):
-        assert _timeout_subtype_from_message("task superseded by newer revision") == TIMEOUT_CASCADE
+        assert (
+            _timeout_subtype_from_message("task superseded by newer revision")
+            == TIMEOUT_CASCADE
+        )
 
     def test_cascade_precedes_heartbeat(self):
         # cascade signal should win over a concurrent heartbeat keyword
-        assert _timeout_subtype_from_message("Cancelled: no heartbeat") == TIMEOUT_CASCADE
+        assert (
+            _timeout_subtype_from_message("Cancelled: no heartbeat") == TIMEOUT_CASCADE
+        )
 
     def test_process_crash(self):
-        assert _timeout_subtype_from_message("agent process crashed unexpectedly") == TIMEOUT_PROCESS_CRASH
+        assert (
+            _timeout_subtype_from_message("agent process crashed unexpectedly")
+            == TIMEOUT_PROCESS_CRASH
+        )
 
     def test_execution_timeout(self):
-        assert _timeout_subtype_from_message("execution timed out after 3600s") == TIMEOUT_EXECUTION
+        assert (
+            _timeout_subtype_from_message("execution timed out after 3600s")
+            == TIMEOUT_EXECUTION
+        )
 
     def test_unknown(self):
-        assert _timeout_subtype_from_message("something weird happened") == TIMEOUT_UNKNOWN
+        assert (
+            _timeout_subtype_from_message("something weird happened") == TIMEOUT_UNKNOWN
+        )
 
     def test_empty(self):
         assert _timeout_subtype_from_message("") == TIMEOUT_UNKNOWN
@@ -114,7 +142,10 @@ class TestClassifyTimeoutSubtypeDelegates:
 
     def test_combines_logs(self):
         task = _FakeTask("")
-        assert classify_timeout_subtype(task, logs="No heartbeat received") == TIMEOUT_HEARTBEAT_LOST
+        assert (
+            classify_timeout_subtype(task, logs="No heartbeat received")
+            == TIMEOUT_HEARTBEAT_LOST
+        )
 
     def test_none_status(self):
         task = _FakeTask(None)  # type: ignore[arg-type]
@@ -137,7 +168,9 @@ class TestPersistFailureCategoryTimeoutSubtype:
 
     def test_agent_timeout_combines_logs(self):
         task = _task("")
-        persist_failure_category(task, AGENT_TIMEOUT, logs="No heartbeat received after 300s")
+        persist_failure_category(
+            task, AGENT_TIMEOUT, logs="No heartbeat received after 300s"
+        )
         assert task.context["timeout_subtype"] == TIMEOUT_HEARTBEAT_LOST
 
     def test_non_timeout_does_not_write_subtype(self):
@@ -160,7 +193,10 @@ class TestNormalizeAgentFailureCategory:
 
         assert normalize_agent_failure_category("fatal", task) == RATE_LIMIT
         assert task.context["rate_limit_kind"] == "rate_limit"
-        assert task.context["rate_limit_matched_pattern"] == "quota exceeded for quota metric"
+        assert (
+            task.context["rate_limit_matched_pattern"]
+            == "quota exceeded for quota metric"
+        )
 
     def test_specific_code_label_stays_authoritative(self):
         msg = "pytest failed while docs mention quota exceeded for quota metric"
@@ -187,7 +223,9 @@ class TestNormalizeAgentFailureCategory:
             "=== Building backend image ==="
         )
         task = _task(msg)
-        assert normalize_agent_failure_category("build_failed", task) == PROVISION_FAILURE
+        assert (
+            normalize_agent_failure_category("build_failed", task) == PROVISION_FAILURE
+        )
 
     def test_build_failed_routes_to_provision_failure_via_classify_failure(self):
         """End-to-end: classify_failure sees build_failed in context and routes
@@ -202,12 +240,15 @@ class TestNormalizeAgentFailureCategory:
 class TestClassifyFailureCodeError:
     """Non-keyword failures fall through to CODE_ERROR (the default)."""
 
-    @pytest.mark.parametrize("msg", [
-        "AssertionError: expected 3, got 4",
-        "TypeError: unsupported operand type(s) for +: 'int' and 'str'",
-        "NameError: name 'foo' is not defined",
-        "SyntaxError: invalid syntax at line 42",
-    ])
+    @pytest.mark.parametrize(
+        "msg",
+        [
+            "AssertionError: expected 3, got 4",
+            "TypeError: unsupported operand type(s) for +: 'int' and 'str'",
+            "NameError: name 'foo' is not defined",
+            "SyntaxError: invalid syntax at line 42",
+        ],
+    )
     def test_generic_python_errors(self, msg):
         assert classify_failure(_task(msg)) == CODE_ERROR
 
@@ -226,7 +267,10 @@ class TestClassifyFailureWithConfidence:
         assert result.confidence == 0.9
 
     def test_provider_rate_limit_and_provision_and_external_api_are_medium_high(self):
-        rate_task = _task("quota exceeded for quota metric", ctx={"llm_provider": "gemini", "llm_auth_mode": "api_key"})
+        rate_task = _task(
+            "quota exceeded for quota metric",
+            ctx={"llm_provider": "gemini", "llm_auth_mode": "api_key"},
+        )
         assert classify_failure_with_confidence(rate_task).confidence == 0.8
 
         provision_task = _task("failed to provision VM in zone us-central1")
@@ -249,25 +293,31 @@ class TestClassifyFailureWithConfidence:
 
     def test_legacy_shim_matches_dataclass_failure_class(self):
         task = _task("No heartbeat received after 300s")
-        assert classify_failure(task) == classify_failure_with_confidence(task).failure_class
+        assert (
+            classify_failure(task)
+            == classify_failure_with_confidence(task).failure_class
+        )
 
 
 class TestClassifyFailureProvision:
-    @pytest.mark.parametrize("msg", [
-        "failed to provision VM in zone us-central1",
-        "Provisioning failed: instance group unreachable",
-        "VM provisioning timed out",
-        "CPUS_ALL_REGIONS quota exceeded",
-        "IN_USE_ADDRESSES quota exceeded in region",
-        "sshd: connection closed by remote host",
-        "startup script exited non-zero",
-        "no space left on device",
-        "disk quota exceeded on /var",
-        "filesystem is full",
-        "vm failed to start after 120s",
-        "compute.googleapis.com returned 500",
-        "container killed by platform",
-    ])
+    @pytest.mark.parametrize(
+        "msg",
+        [
+            "failed to provision VM in zone us-central1",
+            "Provisioning failed: instance group unreachable",
+            "VM provisioning timed out",
+            "CPUS_ALL_REGIONS quota exceeded",
+            "IN_USE_ADDRESSES quota exceeded in region",
+            "sshd: connection closed by remote host",
+            "startup script exited non-zero",
+            "no space left on device",
+            "disk quota exceeded on /var",
+            "filesystem is full",
+            "vm failed to start after 120s",
+            "compute.googleapis.com returned 500",
+            "container killed by platform",
+        ],
+    )
     def test_provision_keywords(self, msg):
         assert classify_failure(_task(msg)) == PROVISION_FAILURE
 
@@ -284,31 +334,34 @@ class TestClassifyFailureProvision:
 
 
 class TestClassifyFailureAgentTimeout:
-    @pytest.mark.parametrize("msg", [
-        "No heartbeat received for 600s",
-        "task reaped by orchestrator",
-        "VM never started",
-        "execution timed out after 2700s",
-        "received SIGTERM",
-        "out of memory: killed by kernel",
-        "oom-kill triggered on cgroup",
-        "exit code 137",
-        "exit code 143",
-        "cannot allocate memory",
-        "memory limit exceeded",
-        "node process killed",
-        "[FATAL:uncaughtException] TypeError",
-        "process crashed during clone",
-        "iteration cap reached",
-        "ci wait exceeded",
-        "stuck in ci-wait",
-        "backstop timeout fired",
-        "waiting on dependency PR",
-        "Waiting: serializing migration — task 7af4d393 is already producing a migration in this project",
-        "Cancelled: parent evaluation timeout",
-        "Cancelled: some new orchestrator reason",
-        "Superseded by fix on PR #1234",
-    ])
+    @pytest.mark.parametrize(
+        "msg",
+        [
+            "No heartbeat received for 600s",
+            "task reaped by orchestrator",
+            "VM never started",
+            "execution timed out after 2700s",
+            "received SIGTERM",
+            "out of memory: killed by kernel",
+            "oom-kill triggered on cgroup",
+            "exit code 137",
+            "exit code 143",
+            "cannot allocate memory",
+            "memory limit exceeded",
+            "node process killed",
+            "[FATAL:uncaughtException] TypeError",
+            "process crashed during clone",
+            "iteration cap reached",
+            "ci wait exceeded",
+            "stuck in ci-wait",
+            "backstop timeout fired",
+            "waiting on dependency PR",
+            "Waiting: serializing migration — task 7af4d393 is already producing a migration in this project",
+            "Cancelled: parent evaluation timeout",
+            "Cancelled: some new orchestrator reason",
+            "Superseded by fix on PR #1234",
+        ],
+    )
     def test_timeout_keywords(self, msg):
         assert classify_failure(_task(msg)) == AGENT_TIMEOUT
 
@@ -321,13 +374,16 @@ class TestClassifyFailureAgentTimeout:
         msg = "[13.6MB] Creating pull request for blueprint/task-df8cfed3..."
         assert classify_failure(_task(msg)) == AGENT_TIMEOUT
 
-    @pytest.mark.parametrize("msg", [
-        "[12.1MB] Using tool: Grep",
-        "[13.7MB] Using tool: Grep",
-        "[8.4MB] Using tool: Read",
-        "[10.2MB] Using tool: Edit",
-        "[9.5MB cg:512.0MB] Using tool: Bash",
-    ])
+    @pytest.mark.parametrize(
+        "msg",
+        [
+            "[12.1MB] Using tool: Grep",
+            "[13.7MB] Using tool: Grep",
+            "[8.4MB] Using tool: Read",
+            "[10.2MB] Using tool: Edit",
+            "[9.5MB cg:512.0MB] Using tool: Bash",
+        ],
+    )
     def test_tool_call_heartbeat_is_agent_timeout(self, msg):
         """Regression: tasks reaped mid-tool-call (OOM of Claude subprocess, VM kill,
         network drop) leave 'Using tool: <Name>' as their latest_status_message. Without
@@ -344,64 +400,73 @@ class TestClassifyFailureAgentTimeout:
 
 
 class TestClassifyFailureExternalApi:
-    @pytest.mark.parametrize("msg", [
-        "GitHub API rate limit exceeded",
-        "api.github.com returned 429 too many requests",
-        "api.anthropic.com returned 500",
-        "500 Internal Server Error",
-        "502 Bad Gateway from upstream",
-        "503 Service Unavailable",
-        "Claude API returned 500",
-        "connection timed out to upstream",
-        "SSL handshake failed",
-        "certificate verification failed",
-        "could not resolve hostname api.github.com",
-        "name resolution failed",
-        "network unreachable",
-        "context_length_exceeded on request",
-        "token limit exceeded",
-        "failed to create pull request",
-        "failed to create branch feat/x",
-        "merge blocked by branch protection",
-        "merge conflicts detected",
-        "PR #42 merge failed 15 times (>= 15): server error — giving up, needs manual intervention",
-        "PR #42 merge hard-capped after 15 failures — manual action required",
-        "required status check missing",
-        "401 Unauthorized",
-        "Bad credentials returned from GitHub",
-        "token expired",
-        "Error: Overloaded",
-        # Provider model-config rejections — upstream 400s (not code defects,
-        # not rate limits, not auth failures). Our OpenAI/Gemini adapter
-        # gates known-bad combos at settings_to_cli but the classifier is
-        # the safety net for unknown incompatibilities that slip through.
-        "ModelNotFoundError: models/gemini-3.1-flash-preview is not found for API version v1beta",
-        "model not found: gpt-5-experimental",
-        "is not found for API version v1beta, or is not supported for generateContent",
-        "is not supported for generateContent",
-        "Unsupported service_tier: flex",
-        "400: Unsupported value: 'service_tier' does not support 'flex' with this model",
-    ])
+    @pytest.mark.parametrize(
+        "msg",
+        [
+            "GitHub API rate limit exceeded",
+            "api.github.com returned 429 too many requests",
+            "api.anthropic.com returned 500",
+            "500 Internal Server Error",
+            "502 Bad Gateway from upstream",
+            "503 Service Unavailable",
+            "Claude API returned 500",
+            "connection timed out to upstream",
+            "SSL handshake failed",
+            "certificate verification failed",
+            "could not resolve hostname api.github.com",
+            "name resolution failed",
+            "network unreachable",
+            "context_length_exceeded on request",
+            "token limit exceeded",
+            "failed to create pull request",
+            "failed to create branch feat/x",
+            "merge blocked by branch protection",
+            "merge conflicts detected",
+            "PR #42 merge failed 15 times (>= 15): server error — giving up, needs manual intervention",
+            "PR #42 merge hard-capped after 15 failures — manual action required",
+            "required status check missing",
+            "401 Unauthorized",
+            "Bad credentials returned from GitHub",
+            "token expired",
+            "Error: Overloaded",
+            # Provider model-config rejections — upstream 400s (not code defects,
+            # not rate limits, not auth failures). Our OpenAI/Gemini adapter
+            # gates known-bad combos at settings_to_cli but the classifier is
+            # the safety net for unknown incompatibilities that slip through.
+            "ModelNotFoundError: models/gemini-3.1-flash-preview is not found for API version v1beta",
+            "model not found: gpt-5-experimental",
+            "is not found for API version v1beta, or is not supported for generateContent",
+            "is not supported for generateContent",
+            "Unsupported service_tier: flex",
+            "400: Unsupported value: 'service_tier' does not support 'flex' with this model",
+        ],
+    )
     def test_external_api_keywords(self, msg):
         assert classify_failure(_task(msg)) == EXTERNAL_API
 
     def test_database_error_is_external_api(self):
         assert classify_failure(_task("psycopg.OperationalError")) == EXTERNAL_API
-        assert classify_failure(_task("asyncpg.exceptions.ConnectionFailure")) == EXTERNAL_API
+        assert (
+            classify_failure(_task("asyncpg.exceptions.ConnectionFailure"))
+            == EXTERNAL_API
+        )
 
 
 class TestClassifyFailureMigration:
-    @pytest.mark.parametrize("msg", [
-        "alembic.util.exc.CommandError: Can't locate revision identified by '0042abc'",
-        "RevisionError: revision 'abc123' not found",
-        "Multiple head revisions are present for given argument 'head'",
-        "Only a single head supported, found 2",
-        "Multiple heads are present in the migration history",
-        "psycopg.errors.UndefinedColumn: column tasks.new_field does not exist",
-        "asyncpg.exceptions.UndefinedColumnError: column does not exist",
-        "Schema version mismatch: expected 0042 got 0041",
-        "EXPECTED_SCHEMA_REVISION mismatch on startup",
-    ])
+    @pytest.mark.parametrize(
+        "msg",
+        [
+            "alembic.util.exc.CommandError: Can't locate revision identified by '0042abc'",
+            "RevisionError: revision 'abc123' not found",
+            "Multiple head revisions are present for given argument 'head'",
+            "Only a single head supported, found 2",
+            "Multiple heads are present in the migration history",
+            "psycopg.errors.UndefinedColumn: column tasks.new_field does not exist",
+            "asyncpg.exceptions.UndefinedColumnError: column does not exist",
+            "Schema version mismatch: expected 0042 got 0041",
+            "EXPECTED_SCHEMA_REVISION mismatch on startup",
+        ],
+    )
     def test_migration_keywords(self, msg):
         assert classify_failure(_task(msg)) == MIGRATION_ERROR
 
@@ -415,11 +480,20 @@ class TestClassifyFailureMigration:
 
     def test_generic_db_error_not_migration(self):
         """Plain psycopg connectivity errors must stay EXTERNAL_API."""
-        assert classify_failure(_task("psycopg.OperationalError: connection refused")) == EXTERNAL_API
-        assert classify_failure(_task("could not connect to server: timeout")) == EXTERNAL_API
+        assert (
+            classify_failure(_task("psycopg.OperationalError: connection refused"))
+            == EXTERNAL_API
+        )
+        assert (
+            classify_failure(_task("could not connect to server: timeout"))
+            == EXTERNAL_API
+        )
 
     def test_generic_operator_does_not_exist_not_migration(self):
-        assert classify_failure(_task("operator does not exist: text = int")) == EXTERNAL_API
+        assert (
+            classify_failure(_task("operator does not exist: text = int"))
+            == EXTERNAL_API
+        )
 
     def test_migration_taxonomy_is_code_defect(self):
         t = _task("RevisionError: cannot locate")
@@ -427,13 +501,16 @@ class TestClassifyFailureMigration:
 
 
 class TestClassifyFailureRateLimit:
-    @pytest.mark.parametrize("msg", [
-        "API Error: Rate limit reached",
-        "You've hit your limit · resets 5am",
-        "Claude AI usage limit reached",
-        "5-hour limit reached",
-        "This request would exceed your account's rate limit.",
-    ])
+    @pytest.mark.parametrize(
+        "msg",
+        [
+            "API Error: Rate limit reached",
+            "You've hit your limit · resets 5am",
+            "Claude AI usage limit reached",
+            "5-hour limit reached",
+            "This request would exceed your account's rate limit.",
+        ],
+    )
     def test_verbatim_claude_rate_limit_phrases(self, msg):
         assert classify_failure(_task(msg)) == RATE_LIMIT
 
@@ -476,7 +553,9 @@ class TestClassifyFailureRateLimit:
             "Error: 429 You exceeded your current quota, please check your plan "
             "and billing details."
         )
-        task = _task(openai_err, ctx={"llm_provider": "openai", "llm_auth_mode": "api_key"})
+        task = _task(
+            openai_err, ctx={"llm_provider": "openai", "llm_auth_mode": "api_key"}
+        )
         result = classify_failure(task, logs=openai_err)
         assert result != PROVISION_FAILURE
 
@@ -540,6 +619,7 @@ class TestClassifyFailureBlockedPrecondition:
         """BLOCKED_PRECONDITION is infra-class so direction-health/research-productivity
         analytics don't penalize the agent for correctly pausing."""
         from app.failure_classification import INFRA_CLASSES
+
         assert BLOCKED_PRECONDITION in INFRA_CLASSES
 
 
@@ -590,7 +670,9 @@ class TestClassifyFailurePipelineRateLimitMessages:
         assert classify_failure(t) == RATE_LIMIT
 
     def test_all_accounts_in_rate_limit_cooldown(self):
-        t = _task("all accounts in rate-limit cooldown (earliest recovery: 2026-04-24T12:30:00+00:00)")
+        t = _task(
+            "all accounts in rate-limit cooldown (earliest recovery: 2026-04-24T12:30:00+00:00)"
+        )
         assert classify_failure(t) == RATE_LIMIT
 
     def test_auto_failed_with_rate_limit_pool_state(self):
@@ -684,7 +766,9 @@ class TestClassifyFailureTaxonomyEdges:
         assert classify_failure_taxonomy(t) == TAXONOMY_SCOPE_RELATED
 
 
-def _code_defect_task(task_type: str = "create", direction_id: str | None = "d-1") -> Task:
+def _code_defect_task(
+    task_type: str = "create", direction_id: str | None = "d-1"
+) -> Task:
     ctx: dict = {"scope": "small"}
     if direction_id is not None:
         ctx["direction_id"] = direction_id
@@ -698,13 +782,28 @@ class TestShouldTriggerCodeDefectInvestigation:
         assert should_trigger_code_defect_investigation(_code_defect_task()) is True
 
     def test_no_direction_skipped(self):
-        assert should_trigger_code_defect_investigation(_code_defect_task(direction_id=None)) is False
+        assert (
+            should_trigger_code_defect_investigation(
+                _code_defect_task(direction_id=None)
+            )
+            is False
+        )
 
     def test_investigate_type_skipped(self):
-        assert should_trigger_code_defect_investigation(_code_defect_task(task_type="investigate")) is False
+        assert (
+            should_trigger_code_defect_investigation(
+                _code_defect_task(task_type="investigate")
+            )
+            is False
+        )
 
     def test_smoketest_type_skipped(self):
-        assert should_trigger_code_defect_investigation(_code_defect_task(task_type="smoketest")) is False
+        assert (
+            should_trigger_code_defect_investigation(
+                _code_defect_task(task_type="smoketest")
+            )
+            is False
+        )
 
     def test_review_quality_taxonomy_skipped(self):
         t = _task("pytest failures in test_foo", {"direction_id": "d-1"})
@@ -717,7 +816,9 @@ class TestShouldTriggerCodeDefectInvestigation:
         assert should_trigger_code_defect_investigation(t) is False
 
 
-def _timeout_task(subtype: str, task_type: str = "create", direction_id: str | None = "d-1") -> Task:
+def _timeout_task(
+    subtype: str, task_type: str = "create", direction_id: str | None = "d-1"
+) -> Task:
     ctx: dict = {"timeout_subtype": subtype}
     if direction_id is not None:
         ctx["direction_id"] = direction_id
@@ -731,30 +832,56 @@ class TestShouldTriggerTimeoutInvestigation:
         assert should_trigger_timeout_investigation(_timeout_task("oom")) is True
 
     def test_process_crash_triggers(self):
-        assert should_trigger_timeout_investigation(_timeout_task("process_crash")) is True
+        assert (
+            should_trigger_timeout_investigation(_timeout_task("process_crash")) is True
+        )
 
     def test_heartbeat_lost_triggers(self):
-        assert should_trigger_timeout_investigation(_timeout_task("heartbeat_lost")) is True
+        assert (
+            should_trigger_timeout_investigation(_timeout_task("heartbeat_lost"))
+            is True
+        )
 
     def test_cascade_skipped(self):
-        assert should_trigger_timeout_investigation(_timeout_task("cascade_cancellation")) is False
+        assert (
+            should_trigger_timeout_investigation(_timeout_task("cascade_cancellation"))
+            is False
+        )
 
     def test_iteration_limit_skipped(self):
-        assert should_trigger_timeout_investigation(_timeout_task("iteration_limit")) is False
+        assert (
+            should_trigger_timeout_investigation(_timeout_task("iteration_limit"))
+            is False
+        )
 
     def test_no_direction_skipped(self):
-        assert should_trigger_timeout_investigation(_timeout_task("oom", direction_id=None)) is False
+        assert (
+            should_trigger_timeout_investigation(
+                _timeout_task("oom", direction_id=None)
+            )
+            is False
+        )
 
     def test_investigate_type_skipped(self):
-        assert should_trigger_timeout_investigation(_timeout_task("oom", task_type="investigate")) is False
+        assert (
+            should_trigger_timeout_investigation(
+                _timeout_task("oom", task_type="investigate")
+            )
+            is False
+        )
 
     def test_non_timeout_failure_skipped(self):
-        t = _task("AttributeError: NoneType has no 'x'", {"direction_id": "d-1", "timeout_subtype": "oom"})
+        t = _task(
+            "AttributeError: NoneType has no 'x'",
+            {"direction_id": "d-1", "timeout_subtype": "oom"},
+        )
         t.payloads = [{"type": "create", "prompt": "p"}]
         assert should_trigger_timeout_investigation(t) is False
 
 
-def _review_quality_task(task_type: str = "create", direction_id: str | None = "d-1") -> Task:
+def _review_quality_task(
+    task_type: str = "create", direction_id: str | None = "d-1"
+) -> Task:
     ctx: dict = {"scope": "small"}
     if direction_id is not None:
         ctx["direction_id"] = direction_id
@@ -765,16 +892,33 @@ def _review_quality_task(task_type: str = "create", direction_id: str | None = "
 
 class TestShouldTriggerReviewQualityInvestigation:
     def test_review_quality_with_direction_triggers(self):
-        assert should_trigger_review_quality_investigation(_review_quality_task()) is True
+        assert (
+            should_trigger_review_quality_investigation(_review_quality_task()) is True
+        )
 
     def test_no_direction_skipped(self):
-        assert should_trigger_review_quality_investigation(_review_quality_task(direction_id=None)) is False
+        assert (
+            should_trigger_review_quality_investigation(
+                _review_quality_task(direction_id=None)
+            )
+            is False
+        )
 
     def test_investigate_type_skipped(self):
-        assert should_trigger_review_quality_investigation(_review_quality_task(task_type="investigate")) is False
+        assert (
+            should_trigger_review_quality_investigation(
+                _review_quality_task(task_type="investigate")
+            )
+            is False
+        )
 
     def test_smoketest_type_skipped(self):
-        assert should_trigger_review_quality_investigation(_review_quality_task(task_type="smoketest")) is False
+        assert (
+            should_trigger_review_quality_investigation(
+                _review_quality_task(task_type="smoketest")
+            )
+            is False
+        )
 
     def test_code_defect_taxonomy_skipped(self):
         t = _task("AttributeError: NoneType has no 'x'", {"direction_id": "d-1"})
@@ -790,13 +934,13 @@ class TestShouldTriggerReviewQualityInvestigation:
 class TestFingerprintMessage:
     def test_strips_uuid(self):
         fp = _fingerprint_message("task 550e8400-e29b-41d4-a716-446655440000 failed")
-        assert '<id>' in fp
-        assert '550e8400' not in fp
+        assert "<id>" in fp
+        assert "550e8400" not in fp
 
     def test_strips_numbers(self):
         fp = _fingerprint_message("exit code 137 after 300s")
-        assert '<n>' in fp
-        assert '137' not in fp
+        assert "<n>" in fp
+        assert "137" not in fp
 
     def test_strips_memory_prefixes(self):
         msg1 = "[16mb] using tool: bash"
@@ -844,12 +988,14 @@ class TestFingerprintMessage:
 class TestResidualStore:
     def setup_method(self):
         import app.failure_classification as fc
+
         fc._residual_store.clear()
         fc._residual_seen_task_ids.clear()
         fc._residual_closed_fingerprints.clear()
 
     def _task_with_id(self, msg: str, task_id: str, status=None) -> "Task":
         from app.models import TaskStatus
+
         t = MagicMock(spec=Task)
         t.latest_status_message = msg
         t.context = {}
@@ -864,15 +1010,15 @@ class TestResidualStore:
         record_residual_fingerprint(t, logs="AttributeError: NoneType has no attr 'x'")
         results = get_top_residual_fingerprints(window_seconds=3600)
         assert len(results) == 1
-        assert results[0]['count'] == 1
-        assert results[0]['task_ids'] == ['task-1']
+        assert results[0]["count"] == 1
+        assert results[0]["task_ids"] == ["task-1"]
 
     def test_dedup_same_task_id(self):
         t = self._task_with_id("[10.5MB] Cloning...", "task-abc")
         record_residual_fingerprint(t, logs="TypeError: some error")
         record_residual_fingerprint(t, logs="TypeError: some error")
         results = get_top_residual_fingerprints()
-        assert results[0]['count'] == 1
+        assert results[0]["count"] == 1
 
     def test_near_duplicates_cluster(self):
         t1 = self._task_with_id("[10.5MB] Cloning...", "task-1")
@@ -881,7 +1027,7 @@ class TestResidualStore:
         record_residual_fingerprint(t2, logs="AttributeError: expected 9, got 12")
         results = get_top_residual_fingerprints()
         assert len(results) == 1
-        assert results[0]['count'] == 2
+        assert results[0]["count"] == 2
 
     def test_classify_failure_fallthrough_records(self):
         t = self._task_with_id("[10.5MB] Cloning...", "task-ff")
@@ -890,7 +1036,9 @@ class TestResidualStore:
         result = classify_failure(t, logs="AttributeError: NoneType has no attr 'x'")
         assert result == CODE_ERROR
         results = get_top_residual_fingerprints()
-        assert any(r['task_ids'] == ['task-ff'] or 'task-ff' in r['task_ids'] for r in results)
+        assert any(
+            r["task_ids"] == ["task-ff"] or "task-ff" in r["task_ids"] for r in results
+        )
 
     def test_non_failed_status_does_not_record(self):
         """Gate 1: classify_failure may be called from analytics paths on
@@ -898,6 +1046,7 @@ class TestResidualStore:
         Those calls must NOT pollute the residual store with success-shape
         inputs (rollup messages, plan output JSON, review approvals)."""
         from app.models import TaskStatus
+
         for non_failed_status in (
             TaskStatus.COMPLETED,
             TaskStatus.CANCELLED,
@@ -905,6 +1054,7 @@ class TestResidualStore:
             TaskStatus.IN_PROGRESS,
         ):
             import app.failure_classification as fc
+
             fc._residual_store.clear()
             fc._residual_seen_task_ids.clear()
             t = self._task_with_id(
@@ -925,7 +1075,9 @@ class TestResidualStore:
         t = self._task_with_id("[10.5MB] Cloning org/repo...", "task-noerr")
         record_residual_fingerprint(t)  # no logs at all
         assert get_top_residual_fingerprints() == []
-        record_residual_fingerprint(t, logs="just some progress info\nnothing exceptional")
+        record_residual_fingerprint(
+            t, logs="just some progress info\nnothing exceptional"
+        )
         assert get_top_residual_fingerprints() == []
 
     def test_json_output_does_not_record_even_with_exception_keyword(self):
@@ -964,7 +1116,7 @@ class TestResidualStore:
         record_residual_fingerprint(t2, logs=err_logs)
         results = get_top_residual_fingerprints()
         assert len(results) == 1, f"expected 1 fingerprint, got {len(results)}"
-        assert results[0]['count'] == 2
+        assert results[0]["count"] == 2
 
     def test_status_message_retained_as_context(self):
         """Even when fingerprint is driven by the error line, the agent
@@ -975,38 +1127,52 @@ class TestResidualStore:
         results = get_top_residual_fingerprints()
         assert len(results) == 1
         # sample_message = error line (fingerprint source)
-        assert "AssertionError" in results[0]['sample_message']
+        assert "AssertionError" in results[0]["sample_message"]
         # sample_status = original heartbeat (human context)
-        assert "Running tests" in results[0].get('sample_status', '')
+        assert "Running tests" in results[0].get("sample_status", "")
 
     def test_window_filter_excludes_old(self):
         import app.failure_classification as fc
-        fc._residual_store['old-fp'] = {
-            'count': 5,
-            'first_seen': 0.0,
-            'last_seen': 0.0,
-            'sample_message': 'old error',
-            'task_ids': ['t-old'],
+
+        fc._residual_store["old-fp"] = {
+            "count": 5,
+            "first_seen": 0.0,
+            "last_seen": 0.0,
+            "sample_message": "old error",
+            "task_ids": ["t-old"],
         }
         results = get_top_residual_fingerprints(window_seconds=60)
-        assert all(r['fingerprint'] != 'old-fp' for r in results)
+        assert all(r["fingerprint"] != "old-fp" for r in results)
 
     def test_sorted_by_count_descending(self):
         import app.failure_classification as fc
         import time
+
         now = time.time()
-        fc._residual_store['fp-a'] = {'count': 3, 'first_seen': now, 'last_seen': now, 'sample_message': 'a', 'task_ids': []}
-        fc._residual_store['fp-b'] = {'count': 10, 'first_seen': now, 'last_seen': now, 'sample_message': 'b', 'task_ids': []}
+        fc._residual_store["fp-a"] = {
+            "count": 3,
+            "first_seen": now,
+            "last_seen": now,
+            "sample_message": "a",
+            "task_ids": [],
+        }
+        fc._residual_store["fp-b"] = {
+            "count": 10,
+            "first_seen": now,
+            "last_seen": now,
+            "sample_message": "b",
+            "task_ids": [],
+        }
         results = get_top_residual_fingerprints()
-        assert results[0]['fingerprint'] == 'fp-b'
-        assert results[1]['fingerprint'] == 'fp-a'
+        assert results[0]["fingerprint"] == "fp-b"
+        assert results[1]["fingerprint"] == "fp-a"
 
     def test_no_record_for_non_code_error(self):
         t = self._task_with_id("No heartbeat received after 300s", "task-timeout")
         result = classify_failure(t)
         assert result == AGENT_TIMEOUT
         results = get_top_residual_fingerprints()
-        assert not any('task-timeout' in r['task_ids'] for r in results)
+        assert not any("task-timeout" in r["task_ids"] for r in results)
 
     def test_heartbeat_only_contributions_do_not_record(self):
         """Reversed from prior behavior (2026-05-04): heartbeat-only
@@ -1027,6 +1193,7 @@ class TestResidualStore:
             "DIAGNOSTIC_TEST",
         ):
             import app.failure_classification as fc
+
             fc._residual_store.clear()
             fc._residual_seen_task_ids.clear()
             t = self._task_with_id(benign, f"task-benign-{hash(benign)}")
@@ -1043,7 +1210,7 @@ class TestResidualStore:
         record_residual_fingerprint(t, logs="[ERROR] connection refused after 30s")
         results = get_top_residual_fingerprints()
         assert len(results) == 1
-        assert results[0]['is_error_shaped'] is True
+        assert results[0]["is_error_shaped"] is True
 
     def test_logs_with_real_error_mark_cluster_error_shaped(self):
         """A heartbeat-shaped status combined with an error-shaped log
@@ -1054,8 +1221,8 @@ class TestResidualStore:
         record_residual_fingerprint(t, logs=err_logs)
         results = get_top_residual_fingerprints()
         assert len(results) == 1
-        assert results[0]['is_error_shaped'] is True
-        assert "TypeError" in results[0]['sample_message']
+        assert results[0]["is_error_shaped"] is True
+        assert "TypeError" in results[0]["sample_message"]
 
     def test_repeat_error_contributions_cluster_and_stay_error_shaped(self):
         """Two FAILED tasks with the same error line cluster into one
@@ -1068,8 +1235,8 @@ class TestResidualStore:
         record_residual_fingerprint(t2, logs=err)
         results = get_top_residual_fingerprints()
         assert len(results) == 1
-        assert results[0]['count'] == 2
-        assert results[0]['is_error_shaped'] is True
+        assert results[0]["count"] == 2
+        assert results[0]["is_error_shaped"] is True
 
     def test_looks_like_error_predicate(self):
         # Real error-shaped lines.
@@ -1122,33 +1289,41 @@ class TestResidualStore:
         """Fingerprints whose case has been closed must be absent from results."""
         import app.failure_classification as fc
         import time
+
         now = time.time()
-        fc._residual_store['open-fp'] = {
-            'count': 5, 'first_seen': now, 'last_seen': now,
-            'sample_message': 'open error', 'task_ids': ['t1'],
+        fc._residual_store["open-fp"] = {
+            "count": 5,
+            "first_seen": now,
+            "last_seen": now,
+            "sample_message": "open error",
+            "task_ids": ["t1"],
         }
-        fc._residual_store['closed-fp'] = {
-            'count': 8, 'first_seen': now, 'last_seen': now,
-            'sample_message': 'closed error', 'task_ids': ['t2'],
+        fc._residual_store["closed-fp"] = {
+            "count": 8,
+            "first_seen": now,
+            "last_seen": now,
+            "sample_message": "closed error",
+            "task_ids": ["t2"],
         }
-        fc._mark_residual_case_closed('closed-fp')
+        fc._mark_residual_case_closed("closed-fp")
 
         results = get_top_residual_fingerprints()
 
-        fps = [r['fingerprint'] for r in results]
-        assert 'open-fp' in fps
-        assert 'closed-fp' not in fps
+        fps = [r["fingerprint"] for r in results]
+        assert "open-fp" in fps
+        assert "closed-fp" not in fps
 
     def test_record_residual_fingerprint_reactivates_closed_case(self):
         """A new occurrence of a closed fingerprint removes it from the closed set."""
         import app.failure_classification as fc
-        fc._mark_residual_case_closed('some-fp')
-        assert 'some-fp' in fc._residual_closed_fingerprints
+
+        fc._mark_residual_case_closed("some-fp")
+        assert "some-fp" in fc._residual_closed_fingerprints
 
         t = self._task_with_id("[10.5MB] Cloning...", "task-reactivate")
         err = "AttributeError: some-fp error text"
         # Seed the store with the existing fingerprint so the update path runs
-        fp = fc._fingerprint_message(err) or '<empty>'
+        fp = fc._fingerprint_message(err) or "<empty>"
         fc._mark_residual_case_closed(fp)
         record_residual_fingerprint(t, logs=err)
 
@@ -1165,7 +1340,8 @@ class TestPipelineRegressionCloseLoop:
     """
 
     def _make_case(self, status: str | None = None):
-        from app.models import RegressionRemediationCase, RegressionCaseStatus
+        from app.models import RegressionRemediationCase
+
         case = RegressionRemediationCase(
             project_id=uuid.uuid4(),
             regression_class="sr_catch_rate_drop",
@@ -1176,6 +1352,7 @@ class TestPipelineRegressionCloseLoop:
 
     def test_mark_merged_happy_path(self):
         from app.models import RegressionCaseStatus
+
         case = self._make_case()
         snapshot = {"value": 0.75, "threshold": 0.7}
         case.mark_merged(pr_number=42, signal_snapshot=snapshot)
@@ -1189,6 +1366,7 @@ class TestPipelineRegressionCloseLoop:
 
     def test_mark_closed_signal_recovery(self):
         from app.models import RegressionCaseStatus
+
         case = self._make_case(status=RegressionCaseStatus.MERGED)
         case.mark_closed()
         assert case.status == RegressionCaseStatus.CLOSED
@@ -1196,6 +1374,7 @@ class TestPipelineRegressionCloseLoop:
 
     def test_re_arm_below_cap_reactivates(self):
         from app.models import RegressionCaseStatus
+
         case = self._make_case()
         case.re_arm(max_attempts=3)
         assert case.status == RegressionCaseStatus.ACTIVE
@@ -1204,6 +1383,7 @@ class TestPipelineRegressionCloseLoop:
 
     def test_re_arm_at_cap_escalates(self):
         from app.models import RegressionCaseStatus
+
         case = self._make_case()
         case.attempts = 2
         case.re_arm(max_attempts=3)
@@ -1212,6 +1392,7 @@ class TestPipelineRegressionCloseLoop:
 
     def test_re_arm_after_merged_recurrence(self):
         from app.models import RegressionCaseStatus
+
         case = self._make_case(status=RegressionCaseStatus.MERGED)
         case.re_arm(max_attempts=3)
         assert case.status == RegressionCaseStatus.ACTIVE
@@ -1242,7 +1423,10 @@ class TestPipelineRegressionCloseLoop:
         assert "PRIOR ATTEMPT CONTEXT" in suffix
         assert "#5678" in suffix
         assert "65.0%" in suffix
-        assert "different angle" in suffix.lower() or "different contributing" in suffix.lower()
+        assert (
+            "different angle" in suffix.lower()
+            or "different contributing" in suffix.lower()
+        )
 
     def test_prior_attempt_context_suffix_no_pr_no_pr_reference(self):
         """attempts >= 2 but no prior PR: suffix must not mention a PR number."""
@@ -1268,89 +1452,182 @@ class TestDeriveFailureStageMigration:
 
     def test_revision_error(self):
         from app.failure_stage import _derive_failure_stage
-        assert _derive_failure_stage(
-            "MIGRATION_ERROR", "alembic.script.revision.RevisionError: foo"
-        ) == "migration"
+
+        assert (
+            _derive_failure_stage(
+                "MIGRATION_ERROR", "alembic.script.revision.RevisionError: foo"
+            )
+            == "migration"
+        )
 
     def test_multiple_heads(self):
         from app.failure_stage import _derive_failure_stage
-        assert _derive_failure_stage(
-            "MIGRATION_ERROR", "Multiple heads are present for given argument 'head'"
-        ) == "migration"
+
+        assert (
+            _derive_failure_stage(
+                "MIGRATION_ERROR",
+                "Multiple heads are present for given argument 'head'",
+            )
+            == "migration"
+        )
 
     def test_undefined_column_maps_to_migration_not_integration(self):
         from app.failure_stage import _derive_failure_stage
+
         # UndefinedColumnError would match the import-error bank; migration
         # must be checked first.
-        assert _derive_failure_stage(
-            "MIGRATION_ERROR", "psycopg.errors.UndefinedColumnError: column x does not exist"
-        ) == "migration"
+        assert (
+            _derive_failure_stage(
+                "MIGRATION_ERROR",
+                "psycopg.errors.UndefinedColumnError: column x does not exist",
+            )
+            == "migration"
+        )
 
     def test_schema_version_mismatch(self):
         from app.failure_stage import _derive_failure_stage
-        assert _derive_failure_stage(
-            "MIGRATION_ERROR", "schema version mismatch: expected_schema_revision=0037"
-        ) == "migration"
+
+        assert (
+            _derive_failure_stage(
+                "MIGRATION_ERROR",
+                "schema version mismatch: expected_schema_revision=0037",
+            )
+            == "migration"
+        )
 
     def test_alembic_command_error(self):
         from app.failure_stage import _derive_failure_stage
-        assert _derive_failure_stage(
-            "MIGRATION_ERROR", "alembic.util.exc.CommandError: can't locate revision"
-        ) == "migration"
+
+        assert (
+            _derive_failure_stage(
+                "MIGRATION_ERROR",
+                "alembic.util.exc.CommandError: can't locate revision",
+            )
+            == "migration"
+        )
 
 
 class TestExternalApiSubtypeFromMessage:
     def test_db_connectivity(self):
-        assert _external_api_subtype_from_message("psycopg.OperationalError: connection refused") == EXTERNAL_API_SUBTYPE_DB_CONNECTIVITY
+        assert (
+            _external_api_subtype_from_message(
+                "psycopg.OperationalError: connection refused"
+            )
+            == EXTERNAL_API_SUBTYPE_DB_CONNECTIVITY
+        )
 
     def test_db_connectivity_asyncpg(self):
-        assert _external_api_subtype_from_message("asyncpg.exceptions.ConnectionFailure: too many clients") == EXTERNAL_API_SUBTYPE_DB_CONNECTIVITY
+        assert (
+            _external_api_subtype_from_message(
+                "asyncpg.exceptions.ConnectionFailure: too many clients"
+            )
+            == EXTERNAL_API_SUBTYPE_DB_CONNECTIVITY
+        )
 
     def test_db_connectivity_could_not_connect(self):
-        assert _external_api_subtype_from_message("could not connect to server: Connection refused") == EXTERNAL_API_SUBTYPE_DB_CONNECTIVITY
+        assert (
+            _external_api_subtype_from_message(
+                "could not connect to server: Connection refused"
+            )
+            == EXTERNAL_API_SUBTYPE_DB_CONNECTIVITY
+        )
 
     def test_provider_model_config(self):
         msg = "ModelNotFoundError: models/gemini-3.1-flash-preview is not found for API version v1beta"
-        assert _external_api_subtype_from_message(msg) == EXTERNAL_API_SUBTYPE_PROVIDER_MODEL_CONFIG
+        assert (
+            _external_api_subtype_from_message(msg)
+            == EXTERNAL_API_SUBTYPE_PROVIDER_MODEL_CONFIG
+        )
 
     def test_provider_auth_unauthorized(self):
-        assert _external_api_subtype_from_message("401 Unauthorized from api.anthropic.com") == EXTERNAL_API_SUBTYPE_PROVIDER_AUTH
+        assert (
+            _external_api_subtype_from_message(
+                "401 Unauthorized from api.anthropic.com"
+            )
+            == EXTERNAL_API_SUBTYPE_PROVIDER_AUTH
+        )
 
     def test_provider_auth_bad_credentials(self):
-        assert _external_api_subtype_from_message("Bad credentials returned from GitHub") == EXTERNAL_API_SUBTYPE_PROVIDER_AUTH
+        assert (
+            _external_api_subtype_from_message("Bad credentials returned from GitHub")
+            == EXTERNAL_API_SUBTYPE_PROVIDER_AUTH
+        )
 
     def test_provider_auth_token_expired(self):
-        assert _external_api_subtype_from_message("token expired, please re-authenticate") == EXTERNAL_API_SUBTYPE_PROVIDER_AUTH
+        assert (
+            _external_api_subtype_from_message("token expired, please re-authenticate")
+            == EXTERNAL_API_SUBTYPE_PROVIDER_AUTH
+        )
 
     def test_github_pr_create(self):
-        assert _external_api_subtype_from_message("failed to create pull request: 422 Unprocessable Entity") == EXTERNAL_API_SUBTYPE_GITHUB_PR_CREATE
+        assert (
+            _external_api_subtype_from_message(
+                "failed to create pull request: 422 Unprocessable Entity"
+            )
+            == EXTERNAL_API_SUBTYPE_GITHUB_PR_CREATE
+        )
 
     def test_github_pr_create_rollup(self):
-        assert _external_api_subtype_from_message("rollup pr creation failed on main") == EXTERNAL_API_SUBTYPE_GITHUB_PR_CREATE
+        assert (
+            _external_api_subtype_from_message("rollup pr creation failed on main")
+            == EXTERNAL_API_SUBTYPE_GITHUB_PR_CREATE
+        )
 
     def test_github_pr_create_merge_blocked(self):
-        assert _external_api_subtype_from_message("merge blocked by branch protection rules") == EXTERNAL_API_SUBTYPE_GITHUB_PR_CREATE
+        assert (
+            _external_api_subtype_from_message(
+                "merge blocked by branch protection rules"
+            )
+            == EXTERNAL_API_SUBTYPE_GITHUB_PR_CREATE
+        )
 
     def test_provider_quota_overloaded(self):
-        assert _external_api_subtype_from_message("Error: Overloaded") == EXTERNAL_API_SUBTYPE_PROVIDER_QUOTA
+        assert (
+            _external_api_subtype_from_message("Error: Overloaded")
+            == EXTERNAL_API_SUBTYPE_PROVIDER_QUOTA
+        )
 
     def test_provider_quota_context_length(self):
-        assert _external_api_subtype_from_message("context_length_exceeded on model request") == EXTERNAL_API_SUBTYPE_PROVIDER_QUOTA
+        assert (
+            _external_api_subtype_from_message(
+                "context_length_exceeded on model request"
+            )
+            == EXTERNAL_API_SUBTYPE_PROVIDER_QUOTA
+        )
 
     def test_provider_quota_github_rate_limit(self):
-        assert _external_api_subtype_from_message("api.github.com returned 429 too many requests") == EXTERNAL_API_SUBTYPE_PROVIDER_QUOTA
+        assert (
+            _external_api_subtype_from_message(
+                "api.github.com returned 429 too many requests"
+            )
+            == EXTERNAL_API_SUBTYPE_PROVIDER_QUOTA
+        )
 
     def test_network_transient_503(self):
-        assert _external_api_subtype_from_message("503 service unavailable from upstream") == EXTERNAL_API_SUBTYPE_NETWORK_TRANSIENT
+        assert (
+            _external_api_subtype_from_message("503 service unavailable from upstream")
+            == EXTERNAL_API_SUBTYPE_NETWORK_TRANSIENT
+        )
 
     def test_network_transient_ssl(self):
-        assert _external_api_subtype_from_message("SSL handshake failed during connection") == EXTERNAL_API_SUBTYPE_NETWORK_TRANSIENT
+        assert (
+            _external_api_subtype_from_message("SSL handshake failed during connection")
+            == EXTERNAL_API_SUBTYPE_NETWORK_TRANSIENT
+        )
 
     def test_network_transient_dns(self):
-        assert _external_api_subtype_from_message("could not resolve hostname api.example.com") == EXTERNAL_API_SUBTYPE_NETWORK_TRANSIENT
+        assert (
+            _external_api_subtype_from_message(
+                "could not resolve hostname api.example.com"
+            )
+            == EXTERNAL_API_SUBTYPE_NETWORK_TRANSIENT
+        )
 
     def test_other_fallback(self):
-        assert _external_api_subtype_from_message("some unknown external api error") == EXTERNAL_API_SUBTYPE_OTHER
+        assert (
+            _external_api_subtype_from_message("some unknown external api error")
+            == EXTERNAL_API_SUBTYPE_OTHER
+        )
 
     def test_empty_is_other(self):
         assert _external_api_subtype_from_message("") == EXTERNAL_API_SUBTYPE_OTHER
@@ -1359,11 +1636,16 @@ class TestExternalApiSubtypeFromMessage:
 class TestClassifyExternalApiSubtype:
     def test_delegates_to_helper(self):
         task = _FakeTask("psycopg.OperationalError: connection refused")
-        assert classify_external_api_subtype(task) == EXTERNAL_API_SUBTYPE_DB_CONNECTIVITY
+        assert (
+            classify_external_api_subtype(task) == EXTERNAL_API_SUBTYPE_DB_CONNECTIVITY
+        )
 
     def test_combines_logs(self):
         task = _FakeTask("")
-        assert classify_external_api_subtype(task, logs="asyncpg connection failure") == EXTERNAL_API_SUBTYPE_DB_CONNECTIVITY
+        assert (
+            classify_external_api_subtype(task, logs="asyncpg connection failure")
+            == EXTERNAL_API_SUBTYPE_DB_CONNECTIVITY
+        )
 
     def test_none_status(self):
         task = _FakeTask(None)  # type: ignore[arg-type]
@@ -1375,17 +1657,26 @@ class TestPersistFailureCategoryExternalApiSubtype:
         task = _task("psycopg.OperationalError: connection refused")
         persist_failure_category(task, EXTERNAL_API)
         assert task.context["failure_category"] == EXTERNAL_API
-        assert task.context["external_api_subtype"] == EXTERNAL_API_SUBTYPE_DB_CONNECTIVITY
+        assert (
+            task.context["external_api_subtype"] == EXTERNAL_API_SUBTYPE_DB_CONNECTIVITY
+        )
 
     def test_external_api_persists_auth_subtype(self):
         task = _task("401 Unauthorized")
         persist_failure_category(task, EXTERNAL_API)
-        assert task.context["external_api_subtype"] == EXTERNAL_API_SUBTYPE_PROVIDER_AUTH
+        assert (
+            task.context["external_api_subtype"] == EXTERNAL_API_SUBTYPE_PROVIDER_AUTH
+        )
 
     def test_external_api_persists_model_config_subtype(self):
-        task = _task("400: Unsupported value: 'service_tier' does not support 'flex' with this model")
+        task = _task(
+            "400: Unsupported value: 'service_tier' does not support 'flex' with this model"
+        )
         persist_failure_category(task, EXTERNAL_API)
-        assert task.context["external_api_subtype"] == EXTERNAL_API_SUBTYPE_PROVIDER_MODEL_CONFIG
+        assert (
+            task.context["external_api_subtype"]
+            == EXTERNAL_API_SUBTYPE_PROVIDER_MODEL_CONFIG
+        )
 
     def test_non_external_api_does_not_write_subtype(self):
         task = _task("No heartbeat received")
@@ -1396,6 +1687,7 @@ class TestPersistFailureCategoryExternalApiSubtype:
 class TestAccountFailureClassTracking:
     def setup_method(self):
         import app.failure_classification as fc
+
         fc._account_failure_log.clear()
 
     def test_record_and_retrieve_counts(self):
@@ -1415,6 +1707,7 @@ class TestAccountFailureClassTracking:
     def test_window_filter_excludes_old_events(self):
         import app.failure_classification as fc
         import time
+
         fc._account_failure_log["acct-2"] = [(CODE_ERROR, 0.5, time.time() - 90000)]
         counts = get_account_failure_class_counts("acct-2", window_seconds=86400)
         assert counts[CODE_ERROR] == 0
@@ -1490,12 +1783,18 @@ class TestResidualFingerprintDbWrite:
         await _upsert_residual_case_async(project_id, "fp-new", now_dt, "some error")
 
         async with session_factory() as session:
-            row = (await session.execute(
-                select(ResidualRemediationCase).where(
-                    ResidualRemediationCase.project_id == project_id,
-                    ResidualRemediationCase.fingerprint == "fp-new",
+            row = (
+                (
+                    await session.execute(
+                        select(ResidualRemediationCase).where(
+                            ResidualRemediationCase.project_id == project_id,
+                            ResidualRemediationCase.fingerprint == "fp-new",
+                        )
+                    )
                 )
-            )).scalars().first()
+                .scalars()
+                .first()
+            )
         assert row is not None
         assert row.hit_count == 1
         assert row.status == ResidualCaseStatus.ACTIVE
@@ -1517,12 +1816,18 @@ class TestResidualFingerprintDbWrite:
         await _upsert_residual_case_async(project_id, "fp-bump", now_dt, "err2")
 
         async with session_factory() as session:
-            rows = (await session.execute(
-                select(ResidualRemediationCase).where(
-                    ResidualRemediationCase.project_id == project_id,
-                    ResidualRemediationCase.fingerprint == "fp-bump",
+            rows = (
+                (
+                    await session.execute(
+                        select(ResidualRemediationCase).where(
+                            ResidualRemediationCase.project_id == project_id,
+                            ResidualRemediationCase.fingerprint == "fp-bump",
+                        )
+                    )
                 )
-            )).scalars().all()
+                .scalars()
+                .all()
+            )
         assert len(rows) == 1
         assert rows[0].hit_count == 2
 
@@ -1541,29 +1846,43 @@ class TestResidualFingerprintDbWrite:
         await _upsert_residual_case_async(project_id, "fp-closed", now_dt, "err")
         async with session_factory() as session:
             async with session.begin():
-                row = (await session.execute(
-                    select(ResidualRemediationCase).where(
-                        ResidualRemediationCase.project_id == project_id,
-                        ResidualRemediationCase.fingerprint == "fp-closed",
+                row = (
+                    (
+                        await session.execute(
+                            select(ResidualRemediationCase).where(
+                                ResidualRemediationCase.project_id == project_id,
+                                ResidualRemediationCase.fingerprint == "fp-closed",
+                            )
+                        )
                     )
-                )).scalars().first()
+                    .scalars()
+                    .first()
+                )
                 row.status = ResidualCaseStatus.CLOSED_ORGANICALLY
                 session.add(row)
 
         await _upsert_residual_case_async(project_id, "fp-closed", now_dt, "err again")
 
         async with session_factory() as session:
-            row = (await session.execute(
-                select(ResidualRemediationCase).where(
-                    ResidualRemediationCase.project_id == project_id,
-                    ResidualRemediationCase.fingerprint == "fp-closed",
+            row = (
+                (
+                    await session.execute(
+                        select(ResidualRemediationCase).where(
+                            ResidualRemediationCase.project_id == project_id,
+                            ResidualRemediationCase.fingerprint == "fp-closed",
+                        )
+                    )
                 )
-            )).scalars().first()
+                .scalars()
+                .first()
+            )
         assert row.status == ResidualCaseStatus.ACTIVE
         assert row.hit_count == 2
 
     @pytest.mark.asyncio
-    async def test_ignored_status_preserved_on_rehit(self, session_factory, monkeypatch):
+    async def test_ignored_status_preserved_on_rehit(
+        self, session_factory, monkeypatch
+    ):
         from datetime import datetime, timezone
         import app.database as db_mod
         from app.failure_classification import _upsert_residual_case_async
@@ -1577,29 +1896,43 @@ class TestResidualFingerprintDbWrite:
         await _upsert_residual_case_async(project_id, "fp-ignored", now_dt, "err")
         async with session_factory() as session:
             async with session.begin():
-                row = (await session.execute(
-                    select(ResidualRemediationCase).where(
-                        ResidualRemediationCase.project_id == project_id,
-                        ResidualRemediationCase.fingerprint == "fp-ignored",
+                row = (
+                    (
+                        await session.execute(
+                            select(ResidualRemediationCase).where(
+                                ResidualRemediationCase.project_id == project_id,
+                                ResidualRemediationCase.fingerprint == "fp-ignored",
+                            )
+                        )
                     )
-                )).scalars().first()
+                    .scalars()
+                    .first()
+                )
                 row.status = ResidualCaseStatus.IGNORED
                 session.add(row)
 
         await _upsert_residual_case_async(project_id, "fp-ignored", now_dt, "err2")
 
         async with session_factory() as session:
-            row = (await session.execute(
-                select(ResidualRemediationCase).where(
-                    ResidualRemediationCase.project_id == project_id,
-                    ResidualRemediationCase.fingerprint == "fp-ignored",
+            row = (
+                (
+                    await session.execute(
+                        select(ResidualRemediationCase).where(
+                            ResidualRemediationCase.project_id == project_id,
+                            ResidualRemediationCase.fingerprint == "fp-ignored",
+                        )
+                    )
                 )
-            )).scalars().first()
+                .scalars()
+                .first()
+            )
         assert row.status == ResidualCaseStatus.IGNORED
         assert row.hit_count == 2
 
     @pytest.mark.asyncio
-    async def test_repeated_hits_are_not_undercounted(self, session_factory, monkeypatch):
+    async def test_repeated_hits_are_not_undercounted(
+        self, session_factory, monkeypatch
+    ):
         """N sequential record calls must produce hit_count == N (SQL atomic increment).
 
         The SQL-level UPDATE hit_count = hit_count + 1 (not Python read-modify-write)
@@ -1621,11 +1954,17 @@ class TestResidualFingerprintDbWrite:
             await _upsert_residual_case_async(project_id, "fp-repeated", now_dt, "err")
 
         async with session_factory() as session:
-            row = (await session.execute(
-                select(ResidualRemediationCase).where(
-                    ResidualRemediationCase.project_id == project_id,
-                    ResidualRemediationCase.fingerprint == "fp-repeated",
+            row = (
+                (
+                    await session.execute(
+                        select(ResidualRemediationCase).where(
+                            ResidualRemediationCase.project_id == project_id,
+                            ResidualRemediationCase.fingerprint == "fp-repeated",
+                        )
+                    )
                 )
-            )).scalars().first()
+                .scalars()
+                .first()
+            )
         assert row is not None
         assert row.hit_count == N

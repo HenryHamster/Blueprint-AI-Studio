@@ -4,6 +4,7 @@ When a GitHub issue receives the configured trigger label (default: 'blueprint:i
 this module fetches issue context and spawns a create-type task.  Guard rails prevent
 runaway spawning (rate limit, duplicate detection, concurrent limit).
 """
+
 import logging
 import re
 import uuid
@@ -54,7 +55,11 @@ async def _handle_issue_implementation(
     except Exception as exc:
         logger.error(
             "[ISSUE-IMPL] Error handling issue #%d on %s/%s: %s",
-            issue_number, owner, repo, exc, exc_info=True,
+            issue_number,
+            owner,
+            repo,
+            exc,
+            exc_info=True,
         )
 
 
@@ -75,34 +80,49 @@ async def _handle_issue_implementation_inner(
 
     # ── Guard: rate limit ──
     one_hour_ago = now - timedelta(hours=1)
-    recent_tasks = (await session.execute(
-        select(Task).where(
-            Task.project_id == project_id,
-            Task.created_at >= one_hour_ago,
+    recent_tasks = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.project_id == project_id,
+                    Task.created_at >= one_hour_ago,
+                )
+            )
         )
-    )).scalars().all()
+        .scalars()
+        .all()
+    )
     recent_impl_count = sum(
-        1 for t in recent_tasks
-        if (t.context or {}).get("issue_implementation") is True
+        1 for t in recent_tasks if (t.context or {}).get("issue_implementation") is True
     )
     if recent_impl_count >= max_per_hour:
         logger.info(
             "[ISSUE-IMPL] Rate limit hit (%d/%d in last hour) for project %s",
-            recent_impl_count, max_per_hour, project_id,
+            recent_impl_count,
+            max_per_hour,
+            project_id,
         )
         return
 
     # ── Guard: duplicate detection (same issue number) ──
     active_statuses = [
-        TaskStatus.QUEUED, TaskStatus.PROVISIONING,
-        TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING,
+        TaskStatus.QUEUED,
+        TaskStatus.PROVISIONING,
+        TaskStatus.IN_PROGRESS,
+        TaskStatus.EVALUATING,
     ]
-    active_tasks = (await session.execute(
-        select(Task).where(
-            Task.project_id == project_id,
-            Task.status.in_(active_statuses),
+    active_tasks = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.project_id == project_id,
+                    Task.status.in_(active_statuses),
+                )
+            )
         )
-    )).scalars().all()
+        .scalars()
+        .all()
+    )
     for t in active_tasks:
         ctx = t.context or {}
         if (
@@ -111,19 +131,21 @@ async def _handle_issue_implementation_inner(
         ):
             logger.info(
                 "[ISSUE-IMPL] Duplicate: active task %s already covers issue #%d",
-                t.id, issue_number,
+                t.id,
+                issue_number,
             )
             return
 
     # ── Guard: concurrent limit ──
     active_impl_count = sum(
-        1 for t in active_tasks
-        if (t.context or {}).get("issue_implementation") is True
+        1 for t in active_tasks if (t.context or {}).get("issue_implementation") is True
     )
     if active_impl_count >= max_concurrent:
         logger.info(
             "[ISSUE-IMPL] Concurrent limit hit (%d/%d) for project %s",
-            active_impl_count, max_concurrent, project_id,
+            active_impl_count,
+            max_concurrent,
+            project_id,
         )
         return
 
@@ -139,16 +161,21 @@ async def _handle_issue_implementation_inner(
     requires_approval = False
     try:
         from app.security import _scan_text  # noqa: PLC0415
+
         scan_targets = [issue_title, issue_context.get("body", "")]
         for text in scan_targets:
             if text:
                 findings = _scan_text(text)
                 if any(f.get("severity") == "high" for f in findings):
                     requires_approval = True
-                    logger.warning(f"[ISSUE-IMPL] Prompt injection detected in issue #{issue_number}: {findings}")
+                    logger.warning(
+                        f"[ISSUE-IMPL] Prompt injection detected in issue #{issue_number}: {findings}"
+                    )
                     break
     except Exception as scan_exc:
-        logger.warning(f"[ISSUE-IMPL] Security scan failed for issue #{issue_number}: {scan_exc}")
+        logger.warning(
+            f"[ISSUE-IMPL] Security scan failed for issue #{issue_number}: {scan_exc}"
+        )
 
     # ── Build agent prompt ──
     prompt = _build_issue_prompt(issue_context, issue_number, issue_title)
@@ -157,13 +184,15 @@ async def _handle_issue_implementation_inner(
     task = Task(
         project_id=project_id,
         title=f"Implement: #{issue_number} {issue_title[:80]}",
-        payloads=[{
-            "type": "create",
-            "effort": config.get("default_effort", "high"),
-            "base_branch": config.get("base_branch", "main"),
-            "title": f"feat: {issue_title[:60]}",
-            "prompt": prompt,
-        }],
+        payloads=[
+            {
+                "type": "create",
+                "effort": config.get("default_effort", "high"),
+                "base_branch": config.get("base_branch", "main"),
+                "title": f"feat: {issue_title[:60]}",
+                "prompt": prompt,
+            }
+        ],
         context={
             "issue_implementation": True,
             "issue_number": issue_number,
@@ -180,7 +209,11 @@ async def _handle_issue_implementation_inner(
     # ── Notifications ──
     try:
         await post_issue_implementation_spawned_message(
-            session, project_id, issue_number, issue_title, task.id,
+            session,
+            project_id,
+            issue_number,
+            issue_title,
+            task.id,
         )
     except Exception as exc:
         logger.warning("[ISSUE-IMPL] Failed to post event message: %s", exc)
@@ -188,17 +221,27 @@ async def _handle_issue_implementation_inner(
     await session.commit()
     logger.info(
         "[ISSUE-IMPL] Spawned task %s for issue #%d on %s/%s",
-        task.id, issue_number, owner, repo,
+        task.id,
+        issue_number,
+        owner,
+        repo,
     )
 
     # ── Post acknowledgment comment on the issue (after commit, so task exists) ──
     try:
         await create_issue_comment(
-            token, owner, repo, issue_number,
+            token,
+            owner,
+            repo,
+            issue_number,
             "Blueprint is on it! A PR will be opened when the implementation is ready.",
         )
     except Exception as exc:
-        logger.warning("[ISSUE-IMPL] Failed to post acknowledgment comment on issue #%d: %s", issue_number, exc)
+        logger.warning(
+            "[ISSUE-IMPL] Failed to post acknowledgment comment on issue #%d: %s",
+            issue_number,
+            exc,
+        )
 
 
 async def _extract_issue_context(
@@ -217,7 +260,9 @@ async def _extract_issue_context(
     linked_prs = list(set(re.findall(r"#(\d+)", body)))
 
     # Fetch comments (capped to 10, each capped at 1000 chars)
-    raw_comments = await get_issue_comments(token, owner, repo, issue_number, per_page=10)
+    raw_comments = await get_issue_comments(
+        token, owner, repo, issue_number, per_page=10
+    )
     comments = []
     for c in raw_comments[:10]:
         comment_body = (c.get("body") or "")[:1000]

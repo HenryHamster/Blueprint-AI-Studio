@@ -1,4 +1,5 @@
 """Project onboarding endpoint with build config auto-detection."""
+
 import logging
 from datetime import datetime, timezone
 from typing import Dict, Any
@@ -18,7 +19,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(
     prefix="/api/admin",
     tags=["admin-onboard"],
-    dependencies=[Depends(get_current_user)]
+    dependencies=[Depends(get_current_user)],
 )
 
 
@@ -34,11 +35,15 @@ async def _detect_build_config(token: str, owner: str, repo: str) -> Dict[str, A
 
     # Fetch root directory listing
     resp = await _github_request(
-        "GET", f"https://api.github.com/repos/{owner}/{repo}/contents/", headers,
+        "GET",
+        f"https://api.github.com/repos/{owner}/{repo}/contents/",
+        headers,
         max_retries=2,
     )
     if resp.status_code != 200:
-        logger.warning(f"[ONBOARD] Failed to list repo contents for {owner}/{repo}: {resp.status_code}")
+        logger.warning(
+            f"[ONBOARD] Failed to list repo contents for {owner}/{repo}: {resp.status_code}"
+        )
         return {}
 
     root_files = {item["name"]: item for item in resp.json() if isinstance(item, dict)}
@@ -48,81 +53,104 @@ async def _detect_build_config(token: str, owner: str, repo: str) -> Dict[str, A
     languages: list[str] = []
 
     # Detect Python project
-    if "pyproject.toml" in root_names or "setup.py" in root_names or "setup.cfg" in root_names:
+    if (
+        "pyproject.toml" in root_names
+        or "setup.py" in root_names
+        or "setup.cfg" in root_names
+    ):
         languages.append("python")
-        directories.append({
-            "path": "./",
-            "type": "python",
-            "lint_cmd": "ruff check ." if "pyproject.toml" in root_names else None,
-            "test_cmd": "pytest",
-        })
+        directories.append(
+            {
+                "path": "./",
+                "type": "python",
+                "lint_cmd": "ruff check ." if "pyproject.toml" in root_names else None,
+                "test_cmd": "pytest",
+            }
+        )
 
     # Detect Node/TypeScript project (root-level)
     if "package.json" in root_names:
         languages.append("typescript")
-        directories.append({
-            "path": "./",
-            "type": "node",
-            "install_cmd": "npm ci",
-            "lint_cmd": "npx eslint .",
-            "build_cmd": "npm run build",
-            "test_cmd": "npm test",
-        })
+        directories.append(
+            {
+                "path": "./",
+                "type": "node",
+                "install_cmd": "npm ci",
+                "lint_cmd": "npx eslint .",
+                "build_cmd": "npm run build",
+                "test_cmd": "npm test",
+            }
+        )
 
     # Detect Go project
     if "go.mod" in root_names:
         languages.append("go")
-        directories.append({
-            "path": "./",
-            "type": "go",
-            "lint_cmd": "go vet ./...",
-            "test_cmd": "go test ./...",
-        })
+        directories.append(
+            {
+                "path": "./",
+                "type": "go",
+                "lint_cmd": "go vet ./...",
+                "test_cmd": "go test ./...",
+            }
+        )
 
     # Detect Rust project
     if "Cargo.toml" in root_names:
         languages.append("rust")
-        directories.append({
-            "path": "./",
-            "type": "rust",
-            "lint_cmd": "cargo clippy",
-            "build_cmd": "cargo build",
-            "test_cmd": "cargo test",
-        })
+        directories.append(
+            {
+                "path": "./",
+                "type": "rust",
+                "lint_cmd": "cargo clippy",
+                "build_cmd": "cargo build",
+                "test_cmd": "cargo test",
+            }
+        )
 
     # Scan subdirectories for multi-project repos
-    subdirs = [item["name"] for item in resp.json()
-               if isinstance(item, dict) and item.get("type") == "dir"]
+    subdirs = [
+        item["name"]
+        for item in resp.json()
+        if isinstance(item, dict) and item.get("type") == "dir"
+    ]
 
     for subdir in subdirs:
         sub_resp = await _github_request(
-            "GET", f"https://api.github.com/repos/{owner}/{repo}/contents/{subdir}",
-            headers, max_retries=1,
+            "GET",
+            f"https://api.github.com/repos/{owner}/{repo}/contents/{subdir}",
+            headers,
+            max_retries=1,
         )
         if sub_resp.status_code != 200:
             continue
         sub_files = {item["name"] for item in sub_resp.json() if isinstance(item, dict)}
 
-        if "package.json" in sub_files and not any(d["path"] == f"{subdir}/" for d in directories):
-            directories.append({
-                "path": f"{subdir}/",
-                "type": "node",
-                "install_cmd": "npm ci",
-                "lint_cmd": "npx eslint .",
-                "build_cmd": "npm run build",
-            })
+        if "package.json" in sub_files and not any(
+            d["path"] == f"{subdir}/" for d in directories
+        ):
+            directories.append(
+                {
+                    "path": f"{subdir}/",
+                    "type": "node",
+                    "install_cmd": "npm ci",
+                    "lint_cmd": "npx eslint .",
+                    "build_cmd": "npm run build",
+                }
+            )
             if "typescript" not in languages:
                 languages.append("typescript")
 
         if ("pyproject.toml" in sub_files or "setup.py" in sub_files) and not any(
             d["path"] == f"{subdir}/" for d in directories
         ):
-            directories.append({
-                "path": f"{subdir}/",
-                "type": "python",
-                "lint_cmd": "ruff check .",
-                "test_cmd": "pytest",
-            })
+            directories.append(
+                {
+                    "path": f"{subdir}/",
+                    "type": "python",
+                    "lint_cmd": "ruff check .",
+                    "test_cmd": "pytest",
+                }
+            )
             if "python" not in languages:
                 languages.append("python")
 
@@ -181,13 +209,23 @@ async def onboard_project(
     token = None
     try:
         from app.github import get_repo_installation_token
-        token = await get_repo_installation_token(payload.github_owner, payload.github_repo)
+
+        token = await get_repo_installation_token(
+            payload.github_owner, payload.github_repo
+        )
         if token:
-            build_config = await _detect_build_config(token, payload.github_owner, payload.github_repo)
+            build_config = await _detect_build_config(
+                token, payload.github_owner, payload.github_repo
+            )
         else:
-            logger.warning(f"[ONBOARD] No GitHub token available for {payload.github_owner}/{payload.github_repo}")
+            logger.warning(
+                f"[ONBOARD] No GitHub token available for {payload.github_owner}/{payload.github_repo}"
+            )
     except Exception as e:
-        logger.error(f"[ONBOARD] Build config detection failed for {payload.github_owner}/{payload.github_repo}: {e}", exc_info=True)
+        logger.error(
+            f"[ONBOARD] Build config detection failed for {payload.github_owner}/{payload.github_repo}: {e}",
+            exc_info=True,
+        )
 
     # Merge override on top of detected config (validate shape)
     if payload.build_config_override:
@@ -195,8 +233,11 @@ async def onboard_project(
 
     # Validate final build_config structure
     from app.schemas import BuildConfig as BuildConfigSchema  # noqa: PLC0415
+
     try:
-        validated = BuildConfigSchema(**build_config) if build_config else BuildConfigSchema()
+        validated = (
+            BuildConfigSchema(**build_config) if build_config else BuildConfigSchema()
+        )
         project.build_config = validated.model_dump(exclude_none=True)
     except Exception:
         # Detection + override produced invalid shape — store raw but log warning
@@ -206,40 +247,43 @@ async def onboard_project(
     session.add(project)
 
     # Detect default branch and initialize auto_remediation config
-    default_branch = 'main'
+    default_branch = "main"
     try:
         from app.github import get_repo_default_branch
-        if token:
-            default_branch = await get_repo_default_branch(token, payload.github_owner, payload.github_repo)
-    except Exception as e:
-        logger.warning(f'[ONBOARD] Default branch detection failed: {e}')
 
-    branch_whitelist = ['main', 'master']
+        if token:
+            default_branch = await get_repo_default_branch(
+                token, payload.github_owner, payload.github_repo
+            )
+    except Exception as e:
+        logger.warning(f"[ONBOARD] Default branch detection failed: {e}")
+
+    branch_whitelist = ["main", "master"]
     if default_branch and default_branch not in branch_whitelist:
         branch_whitelist.insert(0, default_branch)
     design_doc = dict(project.design_doc or {})
-    design_doc['_auto_remediation'] = {
-        'enabled': False,
-        'branch_whitelist': branch_whitelist,
-        'max_per_hour': 2,
-        'max_concurrent': 2,
-        'require_review': True,
+    design_doc["_auto_remediation"] = {
+        "enabled": False,
+        "branch_whitelist": branch_whitelist,
+        "max_per_hour": 2,
+        "max_concurrent": 2,
+        "require_review": True,
     }
-    design_doc['_issue_implementation'] = {
-        'enabled': False,
-        'trigger_label': 'blueprint:implement',
-        'max_per_hour': 3,
-        'max_concurrent': 3,
-        'base_branch': default_branch or 'main',
-        'default_effort': 'high',
+    design_doc["_issue_implementation"] = {
+        "enabled": False,
+        "trigger_label": "blueprint:implement",
+        "max_per_hour": 3,
+        "max_concurrent": 3,
+        "base_branch": default_branch or "main",
+        "default_effort": "high",
     }
-    design_doc['_auto_review'] = {
-        'enabled': False,
-        'max_per_hour': 5,
-        'max_concurrent': 3,
+    design_doc["_auto_review"] = {
+        "enabled": False,
+        "max_per_hour": 5,
+        "max_concurrent": 3,
     }
     project.design_doc = design_doc
-    flag_modified(project, 'design_doc')
+    flag_modified(project, "design_doc")
 
     await session.commit()
     await session.refresh(project)

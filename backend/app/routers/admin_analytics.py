@@ -1,4 +1,5 @@
 """Residual admin analytics endpoints (direction auto-pause, task duration, failing task types, open PRs)."""
+
 import time
 import uuid
 import logging
@@ -13,8 +14,13 @@ from sqlmodel import select
 
 from app.database import get_session
 from app.models import (
-    Task, TaskStatus, Project, Artifact, ArtifactType,
-    ProjectMessage, _utcnow,
+    Task,
+    TaskStatus,
+    Project,
+    Artifact,
+    ArtifactType,
+    ProjectMessage,
+    _utcnow,
 )
 from app.auth import get_current_user, require_admin
 
@@ -32,6 +38,7 @@ def _derive_completed_at(t: "Task") -> datetime:
     `t._projected_completed_at_ts` (see admin_digest.py), use that instead of
     materializing the heavy `status_log` JSONB column.
     """
+
     def _strip_tz(d: datetime) -> datetime:
         return d.replace(tzinfo=None) if d.tzinfo is not None else d
 
@@ -57,7 +64,7 @@ SPOT_RATE = 0.020 / 3600  # $/sec
 router = APIRouter(
     prefix="/api/admin",
     tags=["admin-analytics"],
-    dependencies=[Depends(get_current_user)]
+    dependencies=[Depends(get_current_user)],
 )
 
 
@@ -116,7 +123,7 @@ def _compute_direction_auto_pause_stats(
     # Currently auto-paused (live state — not window-bounded) so operators know active load.
     currently_auto_paused = 0
     for proj in projects:
-        for d in (proj.directions or []):
+        for d in proj.directions or []:
             if d.get("status") == "paused" and d.get("auto_paused"):
                 currently_auto_paused += 1
 
@@ -176,7 +183,11 @@ async def get_direction_auto_pause_stats(
             ProjectMessage.created_at >= earliest,
         ]
 
-    events = (await session.execute(select(ProjectMessage).where(*msg_filters))).scalars().all()
+    events = (
+        (await session.execute(select(ProjectMessage).where(*msg_filters)))
+        .scalars()
+        .all()
+    )
     return _compute_direction_auto_pause_stats(projects, events, now, window_hours)
 
 
@@ -201,15 +212,25 @@ async def get_task_duration_stats(
     dialect_name = session.bind.dialect.name if session.bind else "postgresql"
     if dialect_name != "postgresql":
         # Test harness path: compute in Python (test dataset sizes are tiny).
-        filters = [Task.status == TaskStatus.COMPLETED, Task.started_at.is_not(None), Task.created_at >= cutoff]
+        filters = [
+            Task.status == TaskStatus.COMPLETED,
+            Task.started_at.is_not(None),
+            Task.created_at >= cutoff,
+        ]
         if project_id:
             filters.append(Task.project_id == project_id)
-        completed = (await session.execute(select(Task).where(*filters))).scalars().all()
+        completed = (
+            (await session.execute(select(Task).where(*filters))).scalars().all()
+        )
         type_durations: dict = defaultdict(list)
         scope_durations: dict = defaultdict(list)
         for t in completed:
             try:
-                cat = datetime.fromisoformat(t.status_log[-1]["t"]) if t.status_log else t.created_at
+                cat = (
+                    datetime.fromisoformat(t.status_log[-1]["t"])
+                    if t.status_log
+                    else t.created_at
+                )
             except Exception:
                 cat = t.created_at
             dur = (cat - t.started_at).total_seconds()
@@ -223,7 +244,12 @@ async def get_task_duration_stats(
             if len(durs) >= 3:
                 sd = sorted(durs)
                 mid = len(sd) // 2
-                stats[tt] = {"p50_seconds": sd[mid] if len(sd) % 2 else (sd[mid - 1] + sd[mid]) / 2, "sample_count": len(durs)}
+                stats[tt] = {
+                    "p50_seconds": sd[mid]
+                    if len(sd) % 2
+                    else (sd[mid - 1] + sd[mid]) / 2,
+                    "sample_count": len(durs),
+                }
         scope_stats: dict = {}
         for sc, durs in scope_durations.items():
             if len(durs) >= 3:
@@ -231,7 +257,11 @@ async def get_task_duration_stats(
                 n = len(sd)
                 mid = n // 2
                 p50 = sd[mid] if n % 2 else (sd[mid - 1] + sd[mid]) / 2
-                scope_stats[sc] = {"p50_seconds": p50, "p90_seconds": sd[min(n - 1, int(0.9 * n))], "sample_size": n}
+                scope_stats[sc] = {
+                    "p50_seconds": p50,
+                    "p90_seconds": sd[min(n - 1, int(0.9 * n))],
+                    "sample_size": n,
+                }
         provisioning_durs: list = []
         execution_durs: list = []
         for t in completed:
@@ -242,14 +272,21 @@ async def get_task_duration_stats(
                     provisioning_durs.append(prov)
                     execution_durs.append(execd)
         phase_duration_stats: dict = {}
-        for name, durs in (("provisioning", provisioning_durs), ("execution", execution_durs)):
+        for name, durs in (
+            ("provisioning", provisioning_durs),
+            ("execution", execution_durs),
+        ):
             if len(durs) >= 3:
                 sd = sorted(durs)
                 n = len(sd)
                 mid = n // 2
                 p50 = sd[mid] if n % 2 else (sd[mid - 1] + sd[mid]) / 2
                 phase_duration_stats[name] = {"p50_seconds": p50, "sample_size": n}
-        return {"stats": stats, "scope_duration_stats": scope_stats, "phase_duration_stats": phase_duration_stats}
+        return {
+            "stats": stats,
+            "scope_duration_stats": scope_stats,
+            "phase_duration_stats": phase_duration_stats,
+        }
     sql = text(
         """
         WITH base AS (
@@ -320,9 +357,12 @@ async def get_task_duration_stats(
         SELECT kind, key, p50, p90, n FROM phase_agg
         """
     )
-    rows = (await session.execute(
-        sql, {"cutoff": cutoff, "project_id": str(project_id) if project_id else None}
-    )).all()
+    rows = (
+        await session.execute(
+            sql,
+            {"cutoff": cutoff, "project_id": str(project_id) if project_id else None},
+        )
+    ).all()
     stats: dict = {}
     scope_stats: dict = {}
     phase_duration_stats: dict = {}
@@ -336,8 +376,15 @@ async def get_task_duration_stats(
                 "sample_size": int(r.n),
             }
         elif r.kind == "phase":
-            phase_duration_stats[r.key] = {"p50_seconds": float(r.p50), "sample_size": int(r.n)}
-    return {"stats": stats, "scope_duration_stats": scope_stats, "phase_duration_stats": phase_duration_stats}
+            phase_duration_stats[r.key] = {
+                "p50_seconds": float(r.p50),
+                "sample_size": int(r.n),
+            }
+    return {
+        "stats": stats,
+        "scope_duration_stats": scope_stats,
+        "phase_duration_stats": phase_duration_stats,
+    }
 
 
 @router.get("/failing-task-types")
@@ -353,6 +400,7 @@ async def get_failing_task_types(
     whether anomaly response has tightened it (0.6) vs the default (0.8).
     """
     from app import shared_state as _ss
+
     PER_TYPE_THRESHOLD = 0.7
     PER_TYPE_MIN_SAMPLES = 3
     WINDOW_MINUTES = 15
@@ -363,14 +411,18 @@ async def get_failing_task_types(
 
     gated: List[Dict[str, Any]] = []
     for ttype in sorted(seen_types):
-        rate, sample_size = _ss.get_task_type_failure_rate(ttype, window_minutes=WINDOW_MINUTES)
+        rate, sample_size = _ss.get_task_type_failure_rate(
+            ttype, window_minutes=WINDOW_MINUTES
+        )
         if sample_size >= PER_TYPE_MIN_SAMPLES and rate >= PER_TYPE_THRESHOLD:
-            gated.append({
-                "task_type": ttype,
-                "failure_rate": round(rate, 3),
-                "sample_size": sample_size,
-                "threshold": PER_TYPE_THRESHOLD,
-            })
+            gated.append(
+                {
+                    "task_type": ttype,
+                    "failure_rate": round(rate, 3),
+                    "sample_size": sample_size,
+                    "threshold": PER_TYPE_THRESHOLD,
+                }
+            )
 
     global_threshold = _ss.anomaly_adjustments.get("failure_gate_threshold", 0.8)
     return {
@@ -387,8 +439,10 @@ async def get_failing_task_types(
 # ---------------------------------------------------------------------------
 
 _ACTIVE_STATUSES = {
-    TaskStatus.QUEUED, TaskStatus.PROVISIONING,
-    TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING,
+    TaskStatus.QUEUED,
+    TaskStatus.PROVISIONING,
+    TaskStatus.IN_PROGRESS,
+    TaskStatus.EVALUATING,
 }
 
 
@@ -410,9 +464,11 @@ async def get_open_prs(
     from app.services import _get_project_github_token
     from app.github import get_open_pull_requests
 
-    project = (await session.execute(
-        select(Project).where(Project.id == project_id)
-    )).scalars().first()
+    project = (
+        (await session.execute(select(Project).where(Project.id == project_id)))
+        .scalars()
+        .first()
+    )
     if not project or not project.github_owner or not project.github_repo:
         return {"open_prs": []}
 
@@ -441,16 +497,18 @@ async def get_open_prs(
     pr_task_map: Dict[int, Dict[uuid.UUID, Task]] = {}
 
     # Source 1: PR artifacts (agent-created PRs — extract number from URL)
-    artifact_rows = (await session.execute(
-        select(Artifact, Task)
-        .join(Task, Artifact.task_id == Task.id)
-        .where(
-            Artifact.artifact_type == ArtifactType.PULL_REQUEST,
-            Artifact.pr_url.isnot(None),
-            Task.project_id == project_id,
-            Task.status.in_(list(_ACTIVE_STATUSES)),
+    artifact_rows = (
+        await session.execute(
+            select(Artifact, Task)
+            .join(Task, Artifact.task_id == Task.id)
+            .where(
+                Artifact.artifact_type == ArtifactType.PULL_REQUEST,
+                Artifact.pr_url.isnot(None),
+                Task.project_id == project_id,
+                Task.status.in_(list(_ACTIVE_STATUSES)),
+            )
         )
-    )).all()
+    ).all()
     for art, task in artifact_rows:
         try:
             pr_num = int(art.pr_url.rstrip("/").split("/")[-1])
@@ -459,17 +517,22 @@ async def get_open_prs(
         pr_task_map.setdefault(pr_num, {})[task.id] = task
 
     # Source 2: Tasks with pr_number in context (review/fix pipeline + rollups)
-    active_tasks = (await session.execute(
-        select(Task).where(
-            Task.project_id == project_id,
-            Task.status.in_(list(_ACTIVE_STATUSES)),
+    active_tasks = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.project_id == project_id,
+                    Task.status.in_(list(_ACTIVE_STATUSES)),
+                )
+            )
         )
-    )).scalars().all()
+        .scalars()
+        .all()
+    )
     for t in active_tasks:
         ctx = t.context or {}
-        pr_num = (
-            (ctx.get("review_loop") or {}).get("pr_number")
-            or ctx.get("rollup_pr_number")
+        pr_num = (ctx.get("review_loop") or {}).get("pr_number") or ctx.get(
+            "rollup_pr_number"
         )
         if pr_num and isinstance(pr_num, int):
             pr_task_map.setdefault(pr_num, {})[t.id] = t
@@ -489,15 +552,17 @@ async def get_open_prs(
             }
             for t in linked
         ]
-        result.append({
-            "pr_number": gh_pr.get("number"),
-            "pr_url": pr_url,
-            "pr_title": gh_pr.get("title", ""),
-            "pr_branch": (gh_pr.get("head") or {}).get("ref", ""),
-            "pr_created_at": gh_pr.get("created_at"),
-            "tasks": tasks_payload,
-            "is_orphaned": len(tasks_payload) == 0,
-        })
+        result.append(
+            {
+                "pr_number": gh_pr.get("number"),
+                "pr_url": pr_url,
+                "pr_title": gh_pr.get("title", ""),
+                "pr_branch": (gh_pr.get("head") or {}).get("ref", ""),
+                "pr_created_at": gh_pr.get("created_at"),
+                "tasks": tasks_payload,
+                "is_orphaned": len(tasks_payload) == 0,
+            }
+        )
 
     payload = {"open_prs": result}
     _open_prs_cache[project_id] = (time.time(), payload)

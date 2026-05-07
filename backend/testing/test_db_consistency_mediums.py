@@ -5,11 +5,18 @@ from sqlalchemy import CheckConstraint, UniqueConstraint
 from sqlalchemy.exc import IntegrityError
 
 from app.models import (
-    Project, ResidualCaseStatus, ResidualRemediationCase,
-    Task, TaskStatus, UserIntegration,
+    Project,
+    ResidualCaseStatus,
+    ResidualRemediationCase,
+    Task,
+    TaskStatus,
+    UserIntegration,
 )
 from app.orchestrator import _lock_provisioning_task_for_vm
-from app.review_pipeline import _get_active_pipeline_task_by_key, _pipeline_task_idempotency_key
+from app.review_pipeline import (
+    _get_active_pipeline_task_by_key,
+    _pipeline_task_idempotency_key,
+)
 
 
 def test_userintegration_user_id_has_named_unique_constraint():
@@ -24,7 +31,8 @@ def test_userintegration_user_id_has_named_unique_constraint():
 
 def test_task_active_idempotency_key_index_declared():
     index = next(
-        idx for idx in Task.__table__.indexes
+        idx
+        for idx in Task.__table__.indexes
         if idx.name == "ux_task_active_idempotency_key"
     )
     assert index.unique is True
@@ -113,6 +121,7 @@ async def test_provisioning_vm_lock_rejects_stale_vm_result(db_session):
 
 # ── ResidualRemediationCase lifecycle (migration 0054) ──────────────────────
 
+
 def test_residual_case_status_enum_includes_lifecycle_values():
     """Migration 0054 added REMEDIATING/MERGED/FAILED/SUSPENDED for the
     autonomous-remediation lifecycle, mirroring CI auto-fix states.
@@ -132,8 +141,7 @@ def test_residual_case_status_check_constraint_declared():
     UI's filter would silently miss."""
     constraints = ResidualRemediationCase.__table__.constraints
     assert any(
-        isinstance(c, CheckConstraint)
-        and c.name == "ck_residualremediationcase_status"
+        isinstance(c, CheckConstraint) and c.name == "ck_residualremediationcase_status"
         for c in constraints
     )
 
@@ -158,9 +166,14 @@ def test_residual_case_lifecycle_columns_declared():
     we read the right shape from the DB but never write it back."""
     cols = ResidualRemediationCase.__table__.columns
     expected = {
-        "last_spawned_task_id", "last_spawned_pr_number", "last_spawned_at",
-        "consecutive_failure_count", "suspended_at",
-        "sample_messages", "sample_statuses", "task_ids",
+        "last_spawned_task_id",
+        "last_spawned_pr_number",
+        "last_spawned_at",
+        "consecutive_failure_count",
+        "suspended_at",
+        "sample_messages",
+        "sample_statuses",
+        "task_ids",
     }
     assert expected <= set(cols.keys())
 
@@ -170,9 +183,7 @@ def test_residual_case_last_spawned_task_fk_set_null_on_task_delete():
     cascade from project deletion), the case row must NOT cascade-
     delete with it. The case is still useful state about the
     fingerprint independent of the historical spawn task."""
-    fks = list(
-        ResidualRemediationCase.__table__.c.last_spawned_task_id.foreign_keys
-    )
+    fks = list(ResidualRemediationCase.__table__.c.last_spawned_task_id.foreign_keys)
     assert len(fks) == 1
     assert fks[0].target_fullname == "task.id"
     assert fks[0].ondelete == "SET NULL"
@@ -188,13 +199,15 @@ async def test_residual_case_unique_constraint_blocks_duplicate(db_session):
     await db_session.refresh(project)
 
     case_a = ResidualRemediationCase(
-        project_id=project.id, fingerprint="fp-abc",
+        project_id=project.id,
+        fingerprint="fp-abc",
     )
     db_session.add(case_a)
     await db_session.commit()
 
     case_b = ResidualRemediationCase(
-        project_id=project.id, fingerprint="fp-abc",
+        project_id=project.id,
+        fingerprint="fp-abc",
     )
     db_session.add(case_b)
     with pytest.raises(IntegrityError):
@@ -212,7 +225,9 @@ async def test_residual_case_status_check_blocks_unknown_value(db_session):
     await db_session.refresh(project)
 
     case = ResidualRemediationCase(
-        project_id=project.id, fingerprint="fp-xyz", status="remediated",
+        project_id=project.id,
+        fingerprint="fp-xyz",
+        status="remediated",
     )
     db_session.add(case)
     with pytest.raises(IntegrityError):

@@ -10,6 +10,7 @@ logger = logging.getLogger(__name__)
 GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID", "your-gcp-project-id")
 ARTIFACT_BUCKET_NAME = os.getenv("ARTIFACT_BUCKET_NAME", "blueprint-agent-artifacts")
 
+
 async def upload_json_payload(task_id: str, payload_data: list | dict) -> str:
     """
     Uploads a JSON payload to GCS and returns the gs:// URI.
@@ -23,8 +24,7 @@ async def upload_json_payload(task_id: str, payload_data: list | dict) -> str:
         bucket = storage_client.bucket(ARTIFACT_BUCKET_NAME)
         blob = bucket.blob(object_name)
         blob.upload_from_string(
-            data=json.dumps(payload_data),
-            content_type="application/json"
+            data=json.dumps(payload_data), content_type="application/json"
         )
         return f"gs://{ARTIFACT_BUCKET_NAME}/{object_name}"
 
@@ -35,7 +35,10 @@ async def upload_json_payload(task_id: str, payload_data: list | dict) -> str:
         logger.exception("Failed to upload payload to GCS")
         raise
 
-async def generate_upload_signed_url(task_id: str, filename: str, expiration_minutes: int = 15) -> str:
+
+async def generate_upload_signed_url(
+    task_id: str, filename: str, expiration_minutes: int = 15
+) -> str:
     """
     Generates a v4 signed URL for uploading an object to GCS.
     This allows the agent VM to upload files directly to Cloud Storage
@@ -44,7 +47,9 @@ async def generate_upload_signed_url(task_id: str, filename: str, expiration_min
     # Sanitize filename to prevent path traversal
     safe_filename = os.path.basename(filename)
     object_name = f"tasks/{task_id}/{safe_filename}"
-    logger.info(f"Generating upload signed URL for gs://{ARTIFACT_BUCKET_NAME}/{object_name}")
+    logger.info(
+        f"Generating upload signed URL for gs://{ARTIFACT_BUCKET_NAME}/{object_name}"
+    )
 
     def _generate():
         storage_client = storage.Client(project=GCP_PROJECT_ID)
@@ -54,7 +59,7 @@ async def generate_upload_signed_url(task_id: str, filename: str, expiration_min
             version="v4",
             expiration=datetime.timedelta(minutes=expiration_minutes),
             method="PUT",
-            content_type="application/octet-stream", # Can be overridden by client
+            content_type="application/octet-stream",  # Can be overridden by client
         )
 
     try:

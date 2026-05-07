@@ -8,6 +8,7 @@ Tests cover:
 - task-counts endpoint: counts research tasks per direction
 - Status/priority validation: invalid values return 400
 """
+
 import uuid
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock
@@ -19,8 +20,20 @@ from sqlalchemy import select
 from app.models import Alert, AlertSeverity, Project, Task, TaskStatus
 from app.autonomous_research import _spawn_research_task
 from app.direction_lifecycle import _process_direction_lifecycle
-from app.research_completion import _handle_research_completion, _calibrate_scope, predict_spawn_success, _poor_decomp_history
-from app.direction_metrics import _compute_acceptance_rate, _compute_autonomy_threshold_state, _compute_direction_quality_score, _compute_momentum_factor, _compute_productivity_score, _compute_rolling_median_review_iterations
+from app.research_completion import (
+    _handle_research_completion,
+    _calibrate_scope,
+    predict_spawn_success,
+    _poor_decomp_history,
+)
+from app.direction_metrics import (
+    _compute_acceptance_rate,
+    _compute_autonomy_threshold_state,
+    _compute_direction_quality_score,
+    _compute_momentum_factor,
+    _compute_productivity_score,
+    _compute_rolling_median_review_iterations,
+)
 from app.max_plan_pool import _max_plan_pools, _account_by_id
 
 
@@ -28,12 +41,23 @@ from app.max_plan_pool import _max_plan_pools, _account_by_id
 def _ensure_test_account_pool():
     """Ensure _spawn_research_task finds an available account for the test user."""
     uid = "test-user-123"
-    entry = {"id": "test-acct", "user_id": uid, "name": "test", "enabled": True, "active_tasks": 0,
-             "oauth_token": "sk-ant-test", "total_tasks": 0, "token_created_at": None, "claude_config_json": None}
+    entry = {
+        "id": "test-acct",
+        "user_id": uid,
+        "name": "test",
+        "enabled": True,
+        "active_tasks": 0,
+        "oauth_token": "sk-ant-test",
+        "total_tasks": 0,
+        "token_created_at": None,
+        "claude_config_json": None,
+    }
     _max_plan_pools.setdefault(uid, []).append(entry)
     _account_by_id["test-acct"] = entry
     yield
-    _max_plan_pools.get(uid, [])[:] = [a for a in _max_plan_pools.get(uid, []) if a["id"] != "test-acct"]
+    _max_plan_pools.get(uid, [])[:] = [
+        a for a in _max_plan_pools.get(uid, []) if a["id"] != "test-acct"
+    ]
     _account_by_id.pop("test-acct", None)
 
 
@@ -41,7 +65,10 @@ def _ensure_test_account_pool():
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def _deploy_project(client: AsyncClient, mocker, name: str = "Test Project") -> str:
+
+async def _deploy_project(
+    client: AsyncClient, mocker, name: str = "Test Project"
+) -> str:
     """Create a project via the deploy API and return its project_id string."""
     mocker.patch("app.main.provision_agent_vm", return_value=None)
     resp = await client.post(
@@ -72,6 +99,7 @@ async def _add_direction(
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. CRUD
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_get_directions_empty(client: AsyncClient, mocker):
@@ -106,7 +134,9 @@ async def test_create_direction(client: AsyncClient, mocker):
 async def test_get_directions_returns_created(client: AsyncClient, mocker):
     """GET returns directions that were previously POSTed."""
     project_id = await _deploy_project(client, mocker)
-    direction = await _add_direction(client, project_id, text="Direction A", priority="low")
+    direction = await _add_direction(
+        client, project_id, text="Direction A", priority="low"
+    )
 
     resp = await client.get(f"/api/admin/projects/{project_id}/directions")
     assert resp.status_code == 200
@@ -121,7 +151,9 @@ async def test_get_directions_includes_hold_timing_fields(client: AsyncClient, m
     import app.shared_state as _ss
 
     project_id = await _deploy_project(client, mocker)
-    direction = await _add_direction(client, project_id, text="Direction A", priority="low")
+    direction = await _add_direction(
+        client, project_id, text="Direction A", priority="low"
+    )
     did = direction["id"]
 
     _ss.direction_failure_streaks.clear()
@@ -141,7 +173,9 @@ async def test_get_directions_includes_hold_timing_fields(client: AsyncClient, m
 
 
 @pytest.mark.asyncio
-async def test_get_directions_includes_null_hold_timing_when_not_held(client: AsyncClient, mocker):
+async def test_get_directions_includes_null_hold_timing_when_not_held(
+    client: AsyncClient, mocker
+):
     """GET includes held_at/held_until as null when direction is not held."""
     project_id = await _deploy_project(client, mocker)
     await _add_direction(client, project_id, text="Direction A", priority="low")
@@ -159,6 +193,7 @@ async def test_get_directions_includes_null_hold_timing_when_not_held(client: As
 async def test_unhold_direction_clears_hold(client: AsyncClient, mocker):
     """POST /unhold clears an existing direction hold and reports was_held=True."""
     import app.shared_state as _ss
+
     project_id = await _deploy_project(client, mocker)
     direction = await _add_direction(client, project_id)
     did = direction["id"]
@@ -187,6 +222,7 @@ async def test_unhold_direction_clears_hold(client: AsyncClient, mocker):
 async def test_unhold_direction_idempotent_when_not_held(client: AsyncClient, mocker):
     """POST /unhold on a healthy direction returns 200 with was_held=False."""
     import app.shared_state as _ss
+
     project_id = await _deploy_project(client, mocker)
     direction = await _add_direction(client, project_id)
 
@@ -214,14 +250,21 @@ async def test_create_direction_with_cost_budget(client: AsyncClient, mocker):
     project_id = await _deploy_project(client, mocker)
     resp = await client.post(
         f"/api/admin/projects/{project_id}/directions",
-        json={"text": "budgeted", "priority": "low", "paths": ["src/"], "cost_budget_usd": 12.5},
+        json={
+            "text": "budgeted",
+            "priority": "low",
+            "paths": ["src/"],
+            "cost_budget_usd": 12.5,
+        },
     )
     assert resp.status_code == 200, resp.text
     assert resp.json()["direction"]["cost_budget_usd"] == 12.5
 
 
 @pytest.mark.asyncio
-async def test_create_direction_rejects_negative_cost_budget(client: AsyncClient, mocker):
+async def test_create_direction_rejects_negative_cost_budget(
+    client: AsyncClient, mocker
+):
     """POST rejects negative cost_budget_usd via pydantic ge=0 validator."""
     project_id = await _deploy_project(client, mocker)
     resp = await client.post(
@@ -253,7 +296,9 @@ async def test_update_direction_cost_budget_set_and_clear(client: AsyncClient, m
 
 
 @pytest.mark.asyncio
-async def test_update_direction_rejects_invalid_cost_budget(client: AsyncClient, mocker):
+async def test_update_direction_rejects_invalid_cost_budget(
+    client: AsyncClient, mocker
+):
     """PATCH rejects non-numeric and negative cost_budget_usd."""
     project_id = await _deploy_project(client, mocker)
     direction = await _add_direction(client, project_id)
@@ -345,7 +390,9 @@ async def test_delete_direction_removes_it(client: AsyncClient, mocker):
 
 
 @pytest.mark.asyncio
-async def test_delete_direction_cancels_queued_tasks(client: AsyncClient, db_session, mocker):
+async def test_delete_direction_cancels_queued_tasks(
+    client: AsyncClient, db_session, mocker
+):
     """DELETE cancels QUEUED tasks whose context.direction_id matches the deleted direction."""
     project_id = await _deploy_project(client, mocker)
     direction = await _add_direction(client, project_id, text="Direction to delete")
@@ -355,7 +402,9 @@ async def test_delete_direction_cancels_queued_tasks(client: AsyncClient, db_ses
     task = Task(
         project_id=uuid.UUID(project_id),
         title="Autonomous research task",
-        payloads=[{"type": "research", "directions": [direction], "base_branch": "main"}],
+        payloads=[
+            {"type": "research", "directions": [direction], "base_branch": "main"}
+        ],
         context={"direction_id": direction_id},
         status=TaskStatus.QUEUED,
         created_by="ORCHESTRATOR",
@@ -379,6 +428,7 @@ async def test_delete_direction_cancels_queued_tasks(client: AsyncClient, db_ses
 # 2. Cooldown Filter (_spawn_research_task)
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_cooldown_filter_excludes_recently_researched_direction(db_session):
     """A direction researched 1 hour ago (within 4-hour cooldown) should not trigger a task."""
@@ -386,16 +436,22 @@ async def test_cooldown_filter_excludes_recently_researched_direction(db_session
         name="Cooldown Test — Recent",
         user_id="test-user-123",
         autonomous_enabled=True,
-        directions=[{
-            "id": "d-recent01",
-            "text": "Researched recently",
-            "status": "active",
-            "priority": "medium",
-            "paths": [],
-            "added_at": "2026-01-01T00:00:00",
-            "last_researched_at": (datetime.utcnow() - timedelta(hours=1)).isoformat(),
-        }],
-        vision={"purpose": "test"},  # Non-empty vision so force_strategic doesn't bypass
+        directions=[
+            {
+                "id": "d-recent01",
+                "text": "Researched recently",
+                "status": "active",
+                "priority": "medium",
+                "paths": [],
+                "added_at": "2026-01-01T00:00:00",
+                "last_researched_at": (
+                    datetime.utcnow() - timedelta(hours=1)
+                ).isoformat(),
+            }
+        ],
+        vision={
+            "purpose": "test"
+        },  # Non-empty vision so force_strategic doesn't bypass
     )
     db_session.add(project)
     await db_session.commit()
@@ -405,7 +461,9 @@ async def test_cooldown_filter_excludes_recently_researched_direction(db_session
 
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
     tasks = result.scalars().all()
-    assert len(tasks) == 0, "No task should be spawned for a recently-researched direction"
+    assert len(tasks) == 0, (
+        "No task should be spawned for a recently-researched direction"
+    )
 
 
 @pytest.mark.asyncio
@@ -415,16 +473,22 @@ async def test_cooldown_filter_includes_direction_past_cooldown(db_session):
         name="Cooldown Test — Past",
         user_id="test-user-123",
         autonomous_enabled=True,
-        directions=[{
-            "id": "d-past0001",
-            "text": "Researched long ago",
-            "status": "active",
-            "priority": "medium",
-            "paths": [],
-            "added_at": "2026-01-01T00:00:00",
-            "last_researched_at": (datetime.utcnow() - timedelta(hours=5)).isoformat(),
-        }],
-        vision={"purpose": "test"},  # Non-empty vision so force_strategic doesn't bypass
+        directions=[
+            {
+                "id": "d-past0001",
+                "text": "Researched long ago",
+                "status": "active",
+                "priority": "medium",
+                "paths": [],
+                "added_at": "2026-01-01T00:00:00",
+                "last_researched_at": (
+                    datetime.utcnow() - timedelta(hours=5)
+                ).isoformat(),
+            }
+        ],
+        vision={
+            "purpose": "test"
+        },  # Non-empty vision so force_strategic doesn't bypass
     )
     db_session.add(project)
     await db_session.commit()
@@ -434,8 +498,12 @@ async def test_cooldown_filter_includes_direction_past_cooldown(db_session):
 
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
     tasks = result.scalars().all()
-    research_tasks = [t for t in tasks if (t.payloads or [{}])[0].get("type") == "research"]
-    assert len(research_tasks) == 1, "A research task should be spawned when past cooldown"
+    research_tasks = [
+        t for t in tasks if (t.payloads or [{}])[0].get("type") == "research"
+    ]
+    assert len(research_tasks) == 1, (
+        "A research task should be spawned when past cooldown"
+    )
 
 
 @pytest.mark.asyncio
@@ -445,16 +513,20 @@ async def test_cooldown_filter_includes_direction_never_researched(db_session):
         name="Cooldown Test — Never",
         user_id="test-user-123",
         autonomous_enabled=True,
-        directions=[{
-            "id": "d-never001",
-            "text": "Never been researched",
-            "status": "active",
-            "priority": "high",
-            "paths": [],
-            "added_at": "2026-01-01T00:00:00",
-            # no last_researched_at key
-        }],
-        vision={"purpose": "test"},  # Non-empty vision so force_strategic doesn't bypass
+        directions=[
+            {
+                "id": "d-never001",
+                "text": "Never been researched",
+                "status": "active",
+                "priority": "high",
+                "paths": [],
+                "added_at": "2026-01-01T00:00:00",
+                # no last_researched_at key
+            }
+        ],
+        vision={
+            "purpose": "test"
+        },  # Non-empty vision so force_strategic doesn't bypass
     )
     db_session.add(project)
     await db_session.commit()
@@ -464,8 +536,12 @@ async def test_cooldown_filter_includes_direction_never_researched(db_session):
 
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
     tasks = result.scalars().all()
-    research_tasks = [t for t in tasks if (t.payloads or [{}])[0].get("type") == "research"]
-    assert len(research_tasks) == 1, "A research task should be spawned for a never-researched direction"
+    research_tasks = [
+        t for t in tasks if (t.payloads or [{}])[0].get("type") == "research"
+    ]
+    assert len(research_tasks) == 1, (
+        "A research task should be spawned for a never-researched direction"
+    )
 
 
 @pytest.mark.asyncio
@@ -475,14 +551,16 @@ async def test_spawn_skipped_when_autonomous_disabled(db_session):
         name="Autonomous Disabled",
         user_id="test-user-123",
         autonomous_enabled=False,
-        directions=[{
-            "id": "d-dis00001",
-            "text": "Should not be researched",
-            "status": "active",
-            "priority": "high",
-            "paths": [],
-            "added_at": "2026-01-01T00:00:00",
-        }],
+        directions=[
+            {
+                "id": "d-dis00001",
+                "text": "Should not be researched",
+                "status": "active",
+                "priority": "high",
+                "paths": [],
+                "added_at": "2026-01-01T00:00:00",
+            }
+        ],
     )
     db_session.add(project)
     await db_session.commit()
@@ -499,8 +577,11 @@ async def test_spawn_skipped_when_autonomous_disabled(db_session):
 # 3. last_researched_at Update (_handle_research_completion)
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
-async def test_handle_research_completion_updates_last_researched_at(db_session, mocker):
+async def test_handle_research_completion_updates_last_researched_at(
+    db_session, mocker
+):
     """After _handle_research_completion runs, the researched direction gets last_researched_at set."""
     direction_id = "d-resrch01"
     direction = {
@@ -525,11 +606,13 @@ async def test_handle_research_completion_updates_last_researched_at(db_session,
     task = Task(
         project_id=project.id,
         title="Research: Improve logging",
-        payloads=[{
-            "type": "research",
-            "directions": [direction],
-            "base_branch": "main",
-        }],
+        payloads=[
+            {
+                "type": "research",
+                "directions": [direction],
+                "base_branch": "main",
+            }
+        ],
         context={"research_depth": 0},
         status=TaskStatus.IN_PROGRESS,
         created_by="ORCHESTRATOR",
@@ -544,10 +627,14 @@ async def test_handle_research_completion_updates_last_researched_at(db_session,
         "app.task_completion.get_github_token_for_task",
         new=AsyncMock(return_value=("fake-token", "owner", "repo")),
     )
-    mocker.patch("app.task_completion.get_branch_sha", new=AsyncMock(return_value="abc123sha"))
+    mocker.patch(
+        "app.task_completion.get_branch_sha", new=AsyncMock(return_value="abc123sha")
+    )
     mocker.patch("app.task_completion.create_branch", new=AsyncMock(return_value=None))
     mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
-    mocker.patch("app.research_completion._validate_plan_dependencies", return_value=True)
+    mocker.patch(
+        "app.research_completion._validate_plan_dependencies", return_value=True
+    )
     mocker.patch("app.research_completion._log_file_overlaps", return_value=[])
     mocker.patch(
         "app.research_completion._apply_structural_actionability_downgrade",
@@ -555,16 +642,18 @@ async def test_handle_research_completion_updates_last_researched_at(db_session,
     )
     mocker.patch(
         "app.research_completion._parse_research_findings",
-        return_value=[{
-            "title": "Add unit tests for directions",
-            "description": "Improve coverage of the directions module",
-            "prompt": "Write unit tests for the directions CRUD endpoints",
-            "priority": "medium",
-            "scope": "small",
-            "risk": "low",
-            "type": "improvement",
-            "direction_id": direction_id,
-        }],
+        return_value=[
+            {
+                "title": "Add unit tests for directions",
+                "description": "Improve coverage of the directions module",
+                "prompt": "Write unit tests for the directions CRUD endpoints",
+                "priority": "medium",
+                "scope": "small",
+                "risk": "low",
+                "type": "improvement",
+                "direction_id": direction_id,
+            }
+        ],
     )
 
     before = datetime.utcnow()
@@ -576,11 +665,17 @@ async def test_handle_research_completion_updates_last_researched_at(db_session,
     assert updated_directions is not None
 
     researched = next((d for d in updated_directions if d["id"] == direction_id), None)
-    assert researched is not None, "Direction should still exist after research completion"
-    assert "last_researched_at" in researched, "last_researched_at should be set after completion"
+    assert researched is not None, (
+        "Direction should still exist after research completion"
+    )
+    assert "last_researched_at" in researched, (
+        "last_researched_at should be set after completion"
+    )
 
     last_ts = datetime.fromisoformat(researched["last_researched_at"])
-    assert last_ts >= before, "last_researched_at should be set to a time after the test started"
+    assert last_ts >= before, (
+        "last_researched_at should be set to a time after the test started"
+    )
 
 
 @pytest.mark.asyncio
@@ -609,7 +704,9 @@ async def test_handle_research_completion_no_findings_skips_update(db_session, m
     task = Task(
         project_id=project.id,
         title="Research: Direction with no findings",
-        payloads=[{"type": "research", "directions": [direction], "base_branch": "main"}],
+        payloads=[
+            {"type": "research", "directions": [direction], "base_branch": "main"}
+        ],
         context={"research_depth": 0},
         status=TaskStatus.IN_PROGRESS,
         created_by="ORCHESTRATOR",
@@ -619,7 +716,9 @@ async def test_handle_research_completion_no_findings_skips_update(db_session, m
     await db_session.commit()
     await db_session.refresh(task)
 
-    mocker.patch("app.research_completion._parse_research_findings", return_value=[])  # no findings
+    mocker.patch(
+        "app.research_completion._parse_research_findings", return_value=[]
+    )  # no findings
 
     await _handle_research_completion(task, "", db_session)
 
@@ -639,7 +738,9 @@ async def test_handle_research_completion_no_findings_skips_update(db_session, m
 
 
 @pytest.mark.asyncio
-async def test_handle_research_completion_direction_update_sets_pending_update(db_session, mocker):
+async def test_handle_research_completion_direction_update_sets_pending_update(
+    db_session, mocker
+):
     """A direction_update finding stores pending_update on the target direction and creates no task."""
     direction_id = "d-dupdate1"
     direction = {
@@ -664,7 +765,9 @@ async def test_handle_research_completion_direction_update_sets_pending_update(d
     task = Task(
         project_id=project.id,
         title="Research: Old direction text",
-        payloads=[{"type": "research", "directions": [direction], "base_branch": "main"}],
+        payloads=[
+            {"type": "research", "directions": [direction], "base_branch": "main"}
+        ],
         context={"research_depth": 0},
         status=TaskStatus.IN_PROGRESS,
         created_by="ORCHESTRATOR",
@@ -674,24 +777,33 @@ async def test_handle_research_completion_direction_update_sets_pending_update(d
     await db_session.commit()
     await db_session.refresh(task)
 
-    mocker.patch("app.task_completion.get_github_token_for_task", new=AsyncMock(return_value=("tok", "o", "r")))
-    mocker.patch("app.task_completion.get_branch_sha", new=AsyncMock(return_value="abc123sha"))
+    mocker.patch(
+        "app.task_completion.get_github_token_for_task",
+        new=AsyncMock(return_value=("tok", "o", "r")),
+    )
+    mocker.patch(
+        "app.task_completion.get_branch_sha", new=AsyncMock(return_value="abc123sha")
+    )
     mocker.patch("app.task_completion.create_branch", new=AsyncMock(return_value=None))
     mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
-    mocker.patch("app.research_completion._validate_plan_dependencies", return_value=True)
+    mocker.patch(
+        "app.research_completion._validate_plan_dependencies", return_value=True
+    )
     mocker.patch("app.research_completion._log_file_overlaps", return_value=[])
     mocker.patch(
         "app.research_completion._parse_research_findings",
-        return_value=[{
-            "type": "direction_update",
-            "direction_id": direction_id,
-            "title": "Refine direction scope",
-            "description": "The direction is too broad; narrow it to authentication only.",
-            "suggested_text": "Focus on authentication module",
-            "suggested_priority": "high",
-            "suggested_paths": ["backend/app/auth.py"],
-            "prompt": "",  # direction_update findings have no task prompt
-        }],
+        return_value=[
+            {
+                "type": "direction_update",
+                "direction_id": direction_id,
+                "title": "Refine direction scope",
+                "description": "The direction is too broad; narrow it to authentication only.",
+                "suggested_text": "Focus on authentication module",
+                "suggested_priority": "high",
+                "suggested_paths": ["backend/app/auth.py"],
+                "prompt": "",  # direction_update findings have no task prompt
+            }
+        ],
     )
 
     await _handle_research_completion(task, "", db_session)
@@ -703,7 +815,9 @@ async def test_handle_research_completion_direction_update_sets_pending_update(d
     assert target is not None
 
     # pending_update should be set
-    assert "pending_update" in target, "pending_update should be written to the direction"
+    assert "pending_update" in target, (
+        "pending_update should be written to the direction"
+    )
     pu = target["pending_update"]
     assert pu["suggested_text"] == "Focus on authentication module"
     assert pu["suggested_priority"] == "high"
@@ -716,12 +830,15 @@ async def test_handle_research_completion_direction_update_sets_pending_update(d
         select(Task).where(Task.project_id == project.id, Task.id != task.id)
     )
     child_tasks = result.scalars().all()
-    assert len(child_tasks) == 0, "direction_update findings must not create child tasks"
-
+    assert len(child_tasks) == 0, (
+        "direction_update findings must not create child tasks"
+    )
 
 
 @pytest.mark.asyncio
-async def test_handle_research_completion_direction_note_appends_note(db_session, mocker):
+async def test_handle_research_completion_direction_note_appends_note(
+    db_session, mocker
+):
     """A direction_note finding appends a note to the target direction and creates no task."""
     direction_id = "d-dnote01"
     direction = {
@@ -746,7 +863,9 @@ async def test_handle_research_completion_direction_note_appends_note(db_session
     task = Task(
         project_id=project.id,
         title="Research: Improve logging coverage",
-        payloads=[{"type": "research", "directions": [direction], "base_branch": "main"}],
+        payloads=[
+            {"type": "research", "directions": [direction], "base_branch": "main"}
+        ],
         context={"research_depth": 0},
         status=TaskStatus.IN_PROGRESS,
         created_by="ORCHESTRATOR",
@@ -756,21 +875,30 @@ async def test_handle_research_completion_direction_note_appends_note(db_session
     await db_session.commit()
     await db_session.refresh(task)
 
-    mocker.patch("app.task_completion.get_github_token_for_task", new=AsyncMock(return_value=("tok", "o", "r")))
-    mocker.patch("app.task_completion.get_branch_sha", new=AsyncMock(return_value="abc123sha"))
+    mocker.patch(
+        "app.task_completion.get_github_token_for_task",
+        new=AsyncMock(return_value=("tok", "o", "r")),
+    )
+    mocker.patch(
+        "app.task_completion.get_branch_sha", new=AsyncMock(return_value="abc123sha")
+    )
     mocker.patch("app.task_completion.create_branch", new=AsyncMock(return_value=None))
     mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
-    mocker.patch("app.research_completion._validate_plan_dependencies", return_value=True)
+    mocker.patch(
+        "app.research_completion._validate_plan_dependencies", return_value=True
+    )
     mocker.patch("app.research_completion._log_file_overlaps", return_value=[])
     mocker.patch(
         "app.research_completion._parse_research_findings",
-        return_value=[{
-            "type": "direction_note",
-            "direction_id": direction_id,
-            "title": "Logging observation",
-            "description": "Found that request errors are not logged at the middleware level.",
-            "prompt": "",  # direction_note findings have no task prompt
-        }],
+        return_value=[
+            {
+                "type": "direction_note",
+                "direction_id": direction_id,
+                "title": "Logging observation",
+                "description": "Found that request errors are not logged at the middleware level.",
+                "prompt": "",  # direction_note findings have no task prompt
+            }
+        ],
     )
 
     await _handle_research_completion(task, "", db_session)
@@ -785,7 +913,10 @@ async def test_handle_research_completion_direction_note_appends_note(db_session
     assert "notes" in target, "notes list should be written to the direction"
     assert len(target["notes"]) == 1
     note = target["notes"][0]
-    assert note["text"] == "Found that request errors are not logged at the middleware level."
+    assert (
+        note["text"]
+        == "Found that request errors are not logged at the middleware level."
+    )
     assert "added_at" in note
     assert "added_by_task" in note
 
@@ -800,6 +931,7 @@ async def test_handle_research_completion_direction_note_appends_note(db_session
 # ─────────────────────────────────────────────────────────────────────────────
 # 4. Task-Counts Endpoint
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_task_counts_empty(client: AsyncClient, mocker):
@@ -836,8 +968,12 @@ async def test_task_counts_multiple_directions(client: AsyncClient, mocker):
     dir_a = await _add_direction(client, project_id, text="Direction A")
     dir_b = await _add_direction(client, project_id, text="Direction B")
 
-    await client.post(f"/api/admin/projects/{project_id}/directions/{dir_a['id']}/research")
-    await client.post(f"/api/admin/projects/{project_id}/directions/{dir_b['id']}/research")
+    await client.post(
+        f"/api/admin/projects/{project_id}/directions/{dir_a['id']}/research"
+    )
+    await client.post(
+        f"/api/admin/projects/{project_id}/directions/{dir_b['id']}/research"
+    )
 
     resp = await client.get(f"/api/admin/projects/{project_id}/directions/task-counts")
     assert resp.status_code == 200
@@ -889,12 +1025,14 @@ async def test_task_counts_context_direction_id_preferred_over_payload(
         Task(
             project_id=uuid.UUID(project_id),
             title="Research: mixed",
-            payloads=[{
-                "type": "research",
-                "current_direction_id": dir_payload["id"],
-                "directions": [dir_payload],
-                "base_branch": "main",
-            }],
+            payloads=[
+                {
+                    "type": "research",
+                    "current_direction_id": dir_payload["id"],
+                    "directions": [dir_payload],
+                    "base_branch": "main",
+                }
+            ],
             context={"direction_id": dir_ctx["id"]},
             status=TaskStatus.IN_PROGRESS,
             created_by="ORCHESTRATOR",
@@ -923,11 +1061,13 @@ async def test_task_counts_payload_fallback_when_context_missing(
         Task(
             project_id=uuid.UUID(project_id),
             title="Research: legacy",
-            payloads=[{
-                "type": "research",
-                "current_direction_id": direction_id,
-                "base_branch": "main",
-            }],
+            payloads=[
+                {
+                    "type": "research",
+                    "current_direction_id": direction_id,
+                    "base_branch": "main",
+                }
+            ],
             context={},
             status=TaskStatus.IN_PROGRESS,
             created_by="ORCHESTRATOR",
@@ -942,9 +1082,7 @@ async def test_task_counts_payload_fallback_when_context_missing(
 
 
 @pytest.mark.asyncio
-async def test_task_counts_by_type_breakdown(
-    client: AsyncClient, db_session, mocker
-):
+async def test_task_counts_by_type_breakdown(client: AsyncClient, db_session, mocker):
     """counts_by_type reports per-type counts for mixed task types on a direction."""
     project_id = await _deploy_project(client, mocker)
     direction = await _add_direction(client, project_id, text="Mixed types")
@@ -973,17 +1111,23 @@ async def test_task_counts_by_type_breakdown(
 
 
 @pytest.mark.asyncio
-async def test_task_counts_excludes_cancelled_and_failed(client: AsyncClient, db_session, mocker):
+async def test_task_counts_excludes_cancelled_and_failed(
+    client: AsyncClient, db_session, mocker
+):
     """task-counts must not count CANCELLED or FAILED research tasks."""
     project_id = await _deploy_project(client, mocker)
-    direction = await _add_direction(client, project_id, text="Direction for cancelled test")
+    direction = await _add_direction(
+        client, project_id, text="Direction for cancelled test"
+    )
     direction_id = direction["id"]
 
     # Insert a CANCELLED research task directly into the DB
     cancelled_task = Task(
         project_id=uuid.UUID(project_id),
         title="Research: cancelled",
-        payloads=[{"type": "research", "directions": [direction], "base_branch": "main"}],
+        payloads=[
+            {"type": "research", "directions": [direction], "base_branch": "main"}
+        ],
         context={"direction_id": direction_id},
         status=TaskStatus.CANCELLED,
         created_by="ORCHESTRATOR",
@@ -993,7 +1137,9 @@ async def test_task_counts_excludes_cancelled_and_failed(client: AsyncClient, db
     failed_task = Task(
         project_id=uuid.UUID(project_id),
         title="Research: failed",
-        payloads=[{"type": "research", "directions": [direction], "base_branch": "main"}],
+        payloads=[
+            {"type": "research", "directions": [direction], "base_branch": "main"}
+        ],
         context={"direction_id": direction_id},
         status=TaskStatus.FAILED,
         created_by="ORCHESTRATOR",
@@ -1023,6 +1169,7 @@ async def test_task_counts_project_not_found(client: AsyncClient):
 # 5. Status and Priority Validation
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_update_direction_invalid_status_returns_400(client: AsyncClient, mocker):
     """PATCH with an unrecognised status value returns 400."""
@@ -1037,7 +1184,9 @@ async def test_update_direction_invalid_status_returns_400(client: AsyncClient, 
 
 
 @pytest.mark.asyncio
-async def test_update_direction_invalid_priority_returns_400(client: AsyncClient, mocker):
+async def test_update_direction_invalid_priority_returns_400(
+    client: AsyncClient, mocker
+):
     """PATCH with an unrecognised priority value returns 400."""
     project_id = await _deploy_project(client, mocker)
     direction = await _add_direction(client, project_id)
@@ -1095,6 +1244,7 @@ async def test_delete_nonexistent_direction_returns_404(client: AsyncClient, moc
 # 7. max_parallel_research_per_project settings
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_get_settings_returns_max_parallel_default(client: AsyncClient):
     """GET /api/admin/settings returns max_parallel_research_per_project with default 6."""
@@ -1108,7 +1258,9 @@ async def test_get_settings_returns_max_parallel_default(client: AsyncClient):
 @pytest.mark.asyncio
 async def test_patch_settings_max_parallel_persists(client: AsyncClient):
     """PATCH /api/admin/settings with max_parallel_research_per_project updates the value."""
-    resp = await client.patch("/api/admin/settings", json={"max_parallel_research_per_project": 5})
+    resp = await client.patch(
+        "/api/admin/settings", json={"max_parallel_research_per_project": 5}
+    )
     assert resp.status_code == 200
 
     resp2 = await client.get("/api/admin/settings")
@@ -1119,16 +1271,21 @@ async def test_patch_settings_max_parallel_persists(client: AsyncClient):
 @pytest.mark.asyncio
 async def test_patch_settings_max_parallel_invalid_returns_400(client: AsyncClient):
     """PATCH /api/admin/settings with out-of-range max_parallel_research_per_project returns 400."""
-    resp = await client.patch("/api/admin/settings", json={"max_parallel_research_per_project": 0})
+    resp = await client.patch(
+        "/api/admin/settings", json={"max_parallel_research_per_project": 0}
+    )
     assert resp.status_code == 400
 
-    resp2 = await client.patch("/api/admin/settings", json={"max_parallel_research_per_project": 21})
+    resp2 = await client.patch(
+        "/api/admin/settings", json={"max_parallel_research_per_project": 21}
+    )
     assert resp2.status_code == 400
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Standalone tests for _compute_productivity_score (no DB required)
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 class TestComputeMergeRate:
     """Unit tests for _compute_productivity_score — pure function, no DB."""
@@ -1197,17 +1354,20 @@ class TestComputeMergeRate:
         }
 
         directions = [low_rate, high_rate]
-        directions.sort(key=lambda d: (
-            priority_rank.get(d.get("priority", "medium"), 1),
-            1 if d.get("possibly_saturated") else 0,
-            -_compute_productivity_score(d),
-            d.get("last_researched_at") or "",
-        ))
+        directions.sort(
+            key=lambda d: (
+                priority_rank.get(d.get("priority", "medium"), 1),
+                1 if d.get("possibly_saturated") else 0,
+                -_compute_productivity_score(d),
+                d.get("last_researched_at") or "",
+            )
+        )
         assert directions[0]["id"] == "high"
 
     def test_never_researched_takes_precedence_over_merge_rate(self):
         """Directions with no last_researched_at are picked first (never_researched path)."""
         import random
+
         random.seed(42)
 
         # Simulate the never_researched branch: a direction with high merge rate
@@ -1220,8 +1380,12 @@ class TestComputeMergeRate:
             "research_history": [{"prs_merged": 5}],
         }
 
-        never_researched = [d for d in [never, productive] if not d.get("last_researched_at")]
-        assert never_researched == [never], "Only the never-researched direction qualifies"
+        never_researched = [
+            d for d in [never, productive] if not d.get("last_researched_at")
+        ]
+        assert never_researched == [never], (
+            "Only the never-researched direction qualifies"
+        )
 
     def test_saturated_deprioritized_regardless_of_merge_rate(self):
         """Saturated directions sort after non-saturated ones even with higher merge rate."""
@@ -1244,12 +1408,14 @@ class TestComputeMergeRate:
         }
 
         directions = [saturated_high, unsaturated_low]
-        directions.sort(key=lambda d: (
-            priority_rank.get(d.get("priority", "medium"), 1),
-            1 if d.get("possibly_saturated") else 0,
-            -_compute_productivity_score(d),
-            d.get("last_researched_at") or "",
-        ))
+        directions.sort(
+            key=lambda d: (
+                priority_rank.get(d.get("priority", "medium"), 1),
+                1 if d.get("possibly_saturated") else 0,
+                -_compute_productivity_score(d),
+                d.get("last_researched_at") or "",
+            )
+        )
         assert directions[0]["id"] == "unsat"
 
 
@@ -1258,7 +1424,10 @@ class TestComputeAcceptanceRate:
 
     def test_no_data_returns_none(self):
         assert _compute_acceptance_rate({}) is None
-        assert _compute_acceptance_rate({"research_history": [], "history_aggregate": {}}) is None
+        assert (
+            _compute_acceptance_rate({"research_history": [], "history_aggregate": {}})
+            is None
+        )
 
     def test_only_merges_returns_one(self):
         d = {"research_history": [{"prs_merged": 2, "prs_rejected": 0}]}
@@ -1325,9 +1494,14 @@ class TestComputeDirectionQualityScore:
         d = {
             "research_history": [
                 {
-                    "tasks_created": 2, "prs_merged": 1,
-                    "taxonomy_summary": {"code_defect": 2, "scope_related": 1,
-                                         "infra_related": 0, "review_quality": 0},
+                    "tasks_created": 2,
+                    "prs_merged": 1,
+                    "taxonomy_summary": {
+                        "code_defect": 2,
+                        "scope_related": 1,
+                        "infra_related": 0,
+                        "review_quality": 0,
+                    },
                 }
             ]
         }
@@ -1339,9 +1513,14 @@ class TestComputeDirectionQualityScore:
         d = {
             "research_history": [
                 {
-                    "tasks_created": 2, "prs_merged": 0,
-                    "taxonomy_summary": {"code_defect": 0, "scope_related": 0,
-                                         "infra_related": 2, "review_quality": 1},
+                    "tasks_created": 2,
+                    "prs_merged": 0,
+                    "taxonomy_summary": {
+                        "code_defect": 0,
+                        "scope_related": 0,
+                        "infra_related": 2,
+                        "review_quality": 1,
+                    },
                 }
             ]
         }
@@ -1352,9 +1531,14 @@ class TestComputeDirectionQualityScore:
         d = {
             "research_history": [
                 {
-                    "tasks_created": 1, "prs_merged": 1,
-                    "taxonomy_summary": {"code_defect": 1, "scope_related": 5,
-                                         "infra_related": 0, "review_quality": 0},
+                    "tasks_created": 1,
+                    "prs_merged": 1,
+                    "taxonomy_summary": {
+                        "code_defect": 1,
+                        "scope_related": 5,
+                        "infra_related": 0,
+                        "review_quality": 0,
+                    },
                 }
             ]
         }
@@ -1365,55 +1549,103 @@ class TestComputeDirectionQualityScore:
         """Recent cycle weighted 3x: new healthy cycle dominates stale unhealthy ones."""
         d_recent_good = {
             "research_history": [
-                {"tasks_created": 1, "prs_merged": 0,
-                 "taxonomy_summary": {"code_defect": 0, "scope_related": 0,
-                                      "infra_related": 3, "review_quality": 0}},
-                {"tasks_created": 1, "prs_merged": 1,
-                 "taxonomy_summary": {"code_defect": 1, "scope_related": 0,
-                                      "infra_related": 0, "review_quality": 0}},
+                {
+                    "tasks_created": 1,
+                    "prs_merged": 0,
+                    "taxonomy_summary": {
+                        "code_defect": 0,
+                        "scope_related": 0,
+                        "infra_related": 3,
+                        "review_quality": 0,
+                    },
+                },
+                {
+                    "tasks_created": 1,
+                    "prs_merged": 1,
+                    "taxonomy_summary": {
+                        "code_defect": 1,
+                        "scope_related": 0,
+                        "infra_related": 0,
+                        "review_quality": 0,
+                    },
+                },
             ]
         }
         d_recent_bad = {
             "research_history": [
-                {"tasks_created": 1, "prs_merged": 1,
-                 "taxonomy_summary": {"code_defect": 1, "scope_related": 0,
-                                      "infra_related": 0, "review_quality": 0}},
-                {"tasks_created": 1, "prs_merged": 0,
-                 "taxonomy_summary": {"code_defect": 0, "scope_related": 0,
-                                      "infra_related": 3, "review_quality": 0}},
+                {
+                    "tasks_created": 1,
+                    "prs_merged": 1,
+                    "taxonomy_summary": {
+                        "code_defect": 1,
+                        "scope_related": 0,
+                        "infra_related": 0,
+                        "review_quality": 0,
+                    },
+                },
+                {
+                    "tasks_created": 1,
+                    "prs_merged": 0,
+                    "taxonomy_summary": {
+                        "code_defect": 0,
+                        "scope_related": 0,
+                        "infra_related": 3,
+                        "review_quality": 0,
+                    },
+                },
             ]
         }
-        assert _compute_direction_quality_score(d_recent_good) > _compute_direction_quality_score(d_recent_bad)
+        assert _compute_direction_quality_score(
+            d_recent_good
+        ) > _compute_direction_quality_score(d_recent_bad)
 
     def test_direction_sort_respects_quality_tiebreak(self):
         """Two directions with equal productivity: higher-quality sorts first."""
         from app.failure_classification import (
-            TAXONOMY_CODE_DEFECT, TAXONOMY_INFRA_RELATED,
+            TAXONOMY_CODE_DEFECT,
+            TAXONOMY_INFRA_RELATED,
         )
+
         now = "2026-01-01T00:00:00"
         high_q = {
-            "id": "high_q", "priority": "medium", "last_researched_at": now,
+            "id": "high_q",
+            "priority": "medium",
+            "last_researched_at": now,
             "research_history": [
-                {"prs_merged": 1, "tasks_created": 1,
-                 "taxonomy_summary": {TAXONOMY_CODE_DEFECT: 1}},
+                {
+                    "prs_merged": 1,
+                    "tasks_created": 1,
+                    "taxonomy_summary": {TAXONOMY_CODE_DEFECT: 1},
+                },
             ],
         }
         low_q = {
-            "id": "low_q", "priority": "medium", "last_researched_at": now,
+            "id": "low_q",
+            "priority": "medium",
+            "last_researched_at": now,
             "research_history": [
-                {"prs_merged": 1, "tasks_created": 2,
-                 "taxonomy_summary": {TAXONOMY_INFRA_RELATED: 3}},
+                {
+                    "prs_merged": 1,
+                    "tasks_created": 2,
+                    "taxonomy_summary": {TAXONOMY_INFRA_RELATED: 3},
+                },
             ],
         }
         # Equivalent productivity (both have prs_merged=1 over 1 cycle)
-        assert _compute_productivity_score(high_q) == pytest.approx(_compute_productivity_score(low_q))
+        assert _compute_productivity_score(high_q) == pytest.approx(
+            _compute_productivity_score(low_q)
+        )
         # Quality score should differentiate
-        assert _compute_direction_quality_score(high_q) > _compute_direction_quality_score(low_q)
+        assert _compute_direction_quality_score(
+            high_q
+        ) > _compute_direction_quality_score(low_q)
         directions = [low_q, high_q]
-        directions.sort(key=lambda d: (
-            -_compute_productivity_score(d),
-            -_compute_direction_quality_score(d),
-        ))
+        directions.sort(
+            key=lambda d: (
+                -_compute_productivity_score(d),
+                -_compute_direction_quality_score(d),
+            )
+        )
         assert directions[0]["id"] == "high_q"
 
 
@@ -1422,7 +1654,9 @@ class TestRollingMedianReviewIterations:
 
     def test_no_history_returns_none(self):
         assert _compute_rolling_median_review_iterations({}) is None
-        assert _compute_rolling_median_review_iterations({"research_history": []}) is None
+        assert (
+            _compute_rolling_median_review_iterations({"research_history": []}) is None
+        )
 
     def test_no_recorded_values_returns_none(self):
         d = {"research_history": [{"cycle_id": "c1"}, {"cycle_id": "c2"}]}
@@ -1433,29 +1667,35 @@ class TestRollingMedianReviewIterations:
         assert _compute_rolling_median_review_iterations(d) == 4.0
 
     def test_odd_count_returns_middle(self):
-        d = {"research_history": [
-            {"median_review_iterations": 2},
-            {"median_review_iterations": 8},
-            {"median_review_iterations": 5},
-        ]}
+        d = {
+            "research_history": [
+                {"median_review_iterations": 2},
+                {"median_review_iterations": 8},
+                {"median_review_iterations": 5},
+            ]
+        }
         assert _compute_rolling_median_review_iterations(d) == 5.0
 
     def test_even_count_averages_middle(self):
         # Only last 3 considered; with just 2 values present in window, average them.
-        d = {"research_history": [
-            {"cycle_id": "c1"},  # no iteration recorded
-            {"median_review_iterations": 3},
-            {"median_review_iterations": 7},
-        ]}
+        d = {
+            "research_history": [
+                {"cycle_id": "c1"},  # no iteration recorded
+                {"median_review_iterations": 3},
+                {"median_review_iterations": 7},
+            ]
+        }
         assert _compute_rolling_median_review_iterations(d) == 5.0
 
     def test_only_last_three_cycles_considered(self):
-        d = {"research_history": [
-            {"median_review_iterations": 100},  # older, ignored
-            {"median_review_iterations": 1},
-            {"median_review_iterations": 2},
-            {"median_review_iterations": 3},
-        ]}
+        d = {
+            "research_history": [
+                {"median_review_iterations": 100},  # older, ignored
+                {"median_review_iterations": 1},
+                {"median_review_iterations": 2},
+                {"median_review_iterations": 3},
+            ]
+        }
         assert _compute_rolling_median_review_iterations(d) == 2.0
 
 
@@ -1469,23 +1709,33 @@ class TestComputeAutonomyThresholdState:
         assert result["retirement_eligible"] is False
 
     def test_below_threshold_not_eligible(self):
-        d = {"research_history": [
-            {"autonomous_prs_merged": 3, "operator_action_count": 0},
-            {"autonomous_prs_merged": 5, "operator_action_count": 0},
-        ]}
+        d = {
+            "research_history": [
+                {"autonomous_prs_merged": 3, "operator_action_count": 0},
+                {"autonomous_prs_merged": 5, "operator_action_count": 0},
+            ]
+        }
         result = _compute_autonomy_threshold_state(d)
         assert result["lifetime_autonomous_prs_merged"] == 8
         assert result["lifetime_operator_actions"] == 0
         assert result["retirement_eligible"] is False
 
     def test_at_threshold_eligible(self):
-        d = {"research_history": [{"autonomous_prs_merged": 10, "operator_action_count": 0}]}
+        d = {
+            "research_history": [
+                {"autonomous_prs_merged": 10, "operator_action_count": 0}
+            ]
+        }
         result = _compute_autonomy_threshold_state(d)
         assert result["lifetime_autonomous_prs_merged"] == 10
         assert result["retirement_eligible"] is True
 
     def test_operator_action_blocks_eligibility(self):
-        d = {"research_history": [{"autonomous_prs_merged": 12, "operator_action_count": 1}]}
+        d = {
+            "research_history": [
+                {"autonomous_prs_merged": 12, "operator_action_count": 1}
+            ]
+        }
         result = _compute_autonomy_threshold_state(d)
         assert result["lifetime_autonomous_prs_merged"] == 12
         assert result["lifetime_operator_actions"] == 1
@@ -1494,7 +1744,10 @@ class TestComputeAutonomyThresholdState:
     def test_from_aggregate_only(self):
         d = {
             "research_history": [],
-            "history_aggregate": {"total_autonomous_prs_merged": 12, "total_operator_actions": 0},
+            "history_aggregate": {
+                "total_autonomous_prs_merged": 12,
+                "total_operator_actions": 0,
+            },
         }
         result = _compute_autonomy_threshold_state(d)
         assert result["lifetime_autonomous_prs_merged"] == 12
@@ -1502,8 +1755,13 @@ class TestComputeAutonomyThresholdState:
 
     def test_combines_history_and_aggregate(self):
         d = {
-            "research_history": [{"autonomous_prs_merged": 3, "operator_action_count": 0}],
-            "history_aggregate": {"total_autonomous_prs_merged": 7, "total_operator_actions": 0},
+            "research_history": [
+                {"autonomous_prs_merged": 3, "operator_action_count": 0}
+            ],
+            "history_aggregate": {
+                "total_autonomous_prs_merged": 7,
+                "total_operator_actions": 0,
+            },
         }
         result = _compute_autonomy_threshold_state(d)
         assert result["lifetime_autonomous_prs_merged"] == 10
@@ -1516,8 +1774,13 @@ class TestComputeAutonomyThresholdState:
 
     def test_aggregate_operator_actions_also_block_eligibility(self):
         d = {
-            "research_history": [{"autonomous_prs_merged": 10, "operator_action_count": 0}],
-            "history_aggregate": {"total_autonomous_prs_merged": 0, "total_operator_actions": 1},
+            "research_history": [
+                {"autonomous_prs_merged": 10, "operator_action_count": 0}
+            ],
+            "history_aggregate": {
+                "total_autonomous_prs_merged": 0,
+                "total_operator_actions": 1,
+            },
         }
         result = _compute_autonomy_threshold_state(d)
         assert result["lifetime_operator_actions"] == 1
@@ -1527,6 +1790,7 @@ class TestComputeAutonomyThresholdState:
 # ─────────────────────────────────────────────────────────────────────────────
 # 8. Direction Cap, completion_criteria, and merge_rate in list
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_direction_cap_blocks_excess_active(client: AsyncClient, mocker):
@@ -1612,7 +1876,9 @@ async def test_direction_cap_on_reactivation(client: AsyncClient, mocker):
 
 
 @pytest.mark.asyncio
-async def test_reactivation_clears_manual_intervention_state(client: AsyncClient, db_session, mocker):
+async def test_reactivation_clears_manual_intervention_state(
+    client: AsyncClient, db_session, mocker
+):
     """Operator reactivating a flagged direction clears escalation/intervention state."""
     from sqlalchemy.orm.attributes import flag_modified
 
@@ -1621,9 +1887,11 @@ async def test_reactivation_clears_manual_intervention_state(client: AsyncClient
     direction_id = direction["id"]
 
     # Simulate an escalated / flagged state (as set by remediation monitoring).
-    project = (await db_session.execute(
-        select(Project).where(Project.id == uuid.UUID(project_id))
-    )).scalar_one()
+    project = (
+        await db_session.execute(
+            select(Project).where(Project.id == uuid.UUID(project_id))
+        )
+    ).scalar_one()
     for d in project.directions:
         if d["id"] == direction_id:
             d["status"] = "paused"
@@ -1663,6 +1931,7 @@ async def test_merge_rate_in_list(client: AsyncClient, db_session, mocker):
     # Directly set research_history on the direction in the DB
     from app.models import Project as ProjectModel
     from sqlmodel import select as sa_select
+
     result = await db_session.execute(
         sa_select(ProjectModel).where(ProjectModel.id == uuid.UUID(project_id))
     )
@@ -1672,6 +1941,7 @@ async def test_merge_rate_in_list(client: AsyncClient, db_session, mocker):
         if d["id"] == direction_id:
             d["research_history"] = [{"prs_merged": 1}, {"prs_merged": 0}]
     from sqlalchemy.orm.attributes import flag_modified
+
     project.directions = updated_directions
     flag_modified(project, "directions")
     db_session.add(project)
@@ -1691,7 +1961,11 @@ async def test_completion_criteria_stored(client: AsyncClient, mocker):
     project_id = await _deploy_project(client, mocker)
     resp = await client.post(
         f"/api/admin/projects/{project_id}/directions",
-        json={"text": "Direction with criteria", "priority": "medium", "completion_criteria": "All auth tests pass"},
+        json={
+            "text": "Direction with criteria",
+            "priority": "medium",
+            "completion_criteria": "All auth tests pass",
+        },
     )
     assert resp.status_code == 200
     d = resp.json()["direction"]
@@ -1718,12 +1992,20 @@ async def test_completion_criteria_optional(client: AsyncClient, mocker):
 
 
 @pytest.mark.asyncio
-async def test_put_directions_with_valid_completion_criteria(client: AsyncClient, mocker):
+async def test_put_directions_with_valid_completion_criteria(
+    client: AsyncClient, mocker
+):
     """PUT directions with valid completion_criteria succeeds."""
     project_id = await _deploy_project(client, mocker)
     resp = await client.put(
         f"/api/admin/projects/{project_id}/directions",
-        json=[{"text": "Direction A", "priority": "medium", "completion_criteria": "All tests pass"}],
+        json=[
+            {
+                "text": "Direction A",
+                "priority": "medium",
+                "completion_criteria": "All tests pass",
+            }
+        ],
     )
     assert resp.status_code == 200
     dirs = resp.json()["directions"]
@@ -1736,7 +2018,13 @@ async def test_put_directions_completion_criteria_too_long(client: AsyncClient, 
     project_id = await _deploy_project(client, mocker)
     resp = await client.put(
         f"/api/admin/projects/{project_id}/directions",
-        json=[{"text": "Direction A", "priority": "medium", "completion_criteria": "x" * 501}],
+        json=[
+            {
+                "text": "Direction A",
+                "priority": "medium",
+                "completion_criteria": "x" * 501,
+            }
+        ],
     )
     assert resp.status_code == 400
 
@@ -1744,6 +2032,7 @@ async def test_put_directions_completion_criteria_too_long(client: AsyncClient, 
 # ─────────────────────────────────────────────────────────────────────────────
 # Auto-completion
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_auto_completion_triggers(db_session, mocker):
@@ -1757,9 +2046,24 @@ async def test_auto_completion_triggers(db_session, mocker):
         "paths": [],
         "added_at": "2026-01-01T00:00:00",
         "research_history": [
-            {"timestamp": "2026-01-01T01:00:00", "task_id": "t1", "tasks_created": 2, "prs_merged": 1},
-            {"timestamp": "2026-01-02T01:00:00", "task_id": "t2", "tasks_created": 1, "prs_merged": 1},
-            {"timestamp": "2026-01-03T01:00:00", "task_id": "t3", "tasks_created": 1, "prs_merged": 1},
+            {
+                "timestamp": "2026-01-01T01:00:00",
+                "task_id": "t1",
+                "tasks_created": 2,
+                "prs_merged": 1,
+            },
+            {
+                "timestamp": "2026-01-02T01:00:00",
+                "task_id": "t2",
+                "tasks_created": 1,
+                "prs_merged": 1,
+            },
+            {
+                "timestamp": "2026-01-03T01:00:00",
+                "task_id": "t3",
+                "tasks_created": 1,
+                "prs_merged": 1,
+            },
         ],
     }
 
@@ -1776,7 +2080,9 @@ async def test_auto_completion_triggers(db_session, mocker):
     task = Task(
         project_id=project.id,
         title="Research: Autocompletion target",
-        payloads=[{"type": "research", "directions": [direction], "base_branch": "main"}],
+        payloads=[
+            {"type": "research", "directions": [direction], "base_branch": "main"}
+        ],
         context={"research_depth": 0},
         status=TaskStatus.IN_PROGRESS,
         created_by="ORCHESTRATOR",
@@ -1790,10 +2096,14 @@ async def test_auto_completion_triggers(db_session, mocker):
         "app.task_completion.get_github_token_for_task",
         new=AsyncMock(return_value=("fake-token", "owner", "repo")),
     )
-    mocker.patch("app.task_completion.get_branch_sha", new=AsyncMock(return_value="abc123sha"))
+    mocker.patch(
+        "app.task_completion.get_branch_sha", new=AsyncMock(return_value="abc123sha")
+    )
     mocker.patch("app.task_completion.create_branch", new=AsyncMock(return_value=None))
     mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
-    mocker.patch("app.research_completion._validate_plan_dependencies", return_value=True)
+    mocker.patch(
+        "app.research_completion._validate_plan_dependencies", return_value=True
+    )
     mocker.patch("app.research_completion._log_file_overlaps", return_value=[])
     mocker.patch(
         "app.research_completion._apply_structural_actionability_downgrade",
@@ -1801,16 +2111,18 @@ async def test_auto_completion_triggers(db_session, mocker):
     )
     mocker.patch(
         "app.research_completion._parse_research_findings",
-        return_value=[{
-            "title": "Final improvement",
-            "description": "Last polish",
-            "prompt": "Do the thing",
-            "priority": "medium",
-            "scope": "small",
-            "risk": "low",
-            "type": "improvement",
-            "direction_id": direction_id,
-        }],
+        return_value=[
+            {
+                "title": "Final improvement",
+                "description": "Last polish",
+                "prompt": "Do the thing",
+                "priority": "medium",
+                "scope": "small",
+                "risk": "low",
+                "type": "improvement",
+                "direction_id": direction_id,
+            }
+        ],
     )
 
     await _handle_research_completion(task, "", db_session)
@@ -1846,8 +2158,18 @@ async def test_auto_completion_skips_unsaturated(db_session, mocker):
         "paths": [],
         "added_at": "2026-01-01T00:00:00",
         "research_history": [
-            {"timestamp": "2026-01-01T01:00:00", "task_id": "t1", "tasks_created": 5, "prs_merged": 2},
-            {"timestamp": "2026-01-02T01:00:00", "task_id": "t2", "tasks_created": 4, "prs_merged": 2},
+            {
+                "timestamp": "2026-01-01T01:00:00",
+                "task_id": "t1",
+                "tasks_created": 5,
+                "prs_merged": 2,
+            },
+            {
+                "timestamp": "2026-01-02T01:00:00",
+                "task_id": "t2",
+                "tasks_created": 4,
+                "prs_merged": 2,
+            },
         ],
     }
 
@@ -1864,7 +2186,9 @@ async def test_auto_completion_skips_unsaturated(db_session, mocker):
     task = Task(
         project_id=project.id,
         title="Research: Unsaturated direction",
-        payloads=[{"type": "research", "directions": [direction], "base_branch": "main"}],
+        payloads=[
+            {"type": "research", "directions": [direction], "base_branch": "main"}
+        ],
         context={"research_depth": 0},
         status=TaskStatus.IN_PROGRESS,
         created_by="ORCHESTRATOR",
@@ -1878,23 +2202,29 @@ async def test_auto_completion_skips_unsaturated(db_session, mocker):
         "app.task_completion.get_github_token_for_task",
         new=AsyncMock(return_value=("fake-token", "owner", "repo")),
     )
-    mocker.patch("app.task_completion.get_branch_sha", new=AsyncMock(return_value="abc123sha"))
+    mocker.patch(
+        "app.task_completion.get_branch_sha", new=AsyncMock(return_value="abc123sha")
+    )
     mocker.patch("app.task_completion.create_branch", new=AsyncMock(return_value=None))
     mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
-    mocker.patch("app.research_completion._validate_plan_dependencies", return_value=True)
+    mocker.patch(
+        "app.research_completion._validate_plan_dependencies", return_value=True
+    )
     mocker.patch("app.research_completion._log_file_overlaps", return_value=[])
     mocker.patch(
         "app.research_completion._parse_research_findings",
-        return_value=[{
-            "title": "Active finding",
-            "description": "Lots to do",
-            "prompt": "Keep going",
-            "priority": "medium",
-            "scope": "medium",
-            "risk": "low",
-            "type": "improvement",
-            "direction_id": direction_id,
-        }],
+        return_value=[
+            {
+                "title": "Active finding",
+                "description": "Lots to do",
+                "prompt": "Keep going",
+                "priority": "medium",
+                "scope": "medium",
+                "risk": "low",
+                "type": "improvement",
+                "direction_id": direction_id,
+            }
+        ],
     )
 
     await _handle_research_completion(task, "", db_session)
@@ -1918,9 +2248,24 @@ async def test_auto_completion_skips_insufficient_prs(db_session, mocker):
         "added_at": "2026-01-01T00:00:00",
         # 3 cycles with <=1 tasks each triggers saturation, but only 2 PRs merged
         "research_history": [
-            {"timestamp": "2026-01-01T01:00:00", "task_id": "t1", "tasks_created": 1, "prs_merged": 1},
-            {"timestamp": "2026-01-02T01:00:00", "task_id": "t2", "tasks_created": 1, "prs_merged": 1},
-            {"timestamp": "2026-01-03T01:00:00", "task_id": "t3", "tasks_created": 0, "prs_merged": 0},
+            {
+                "timestamp": "2026-01-01T01:00:00",
+                "task_id": "t1",
+                "tasks_created": 1,
+                "prs_merged": 1,
+            },
+            {
+                "timestamp": "2026-01-02T01:00:00",
+                "task_id": "t2",
+                "tasks_created": 1,
+                "prs_merged": 1,
+            },
+            {
+                "timestamp": "2026-01-03T01:00:00",
+                "task_id": "t3",
+                "tasks_created": 0,
+                "prs_merged": 0,
+            },
         ],
     }
 
@@ -1937,7 +2282,9 @@ async def test_auto_completion_skips_insufficient_prs(db_session, mocker):
     task = Task(
         project_id=project.id,
         title="Research: Few PRs direction",
-        payloads=[{"type": "research", "directions": [direction], "base_branch": "main"}],
+        payloads=[
+            {"type": "research", "directions": [direction], "base_branch": "main"}
+        ],
         context={"research_depth": 0},
         status=TaskStatus.IN_PROGRESS,
         created_by="ORCHESTRATOR",
@@ -1951,23 +2298,29 @@ async def test_auto_completion_skips_insufficient_prs(db_session, mocker):
         "app.task_completion.get_github_token_for_task",
         new=AsyncMock(return_value=("fake-token", "owner", "repo")),
     )
-    mocker.patch("app.task_completion.get_branch_sha", new=AsyncMock(return_value="abc123sha"))
+    mocker.patch(
+        "app.task_completion.get_branch_sha", new=AsyncMock(return_value="abc123sha")
+    )
     mocker.patch("app.task_completion.create_branch", new=AsyncMock(return_value=None))
     mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
-    mocker.patch("app.research_completion._validate_plan_dependencies", return_value=True)
+    mocker.patch(
+        "app.research_completion._validate_plan_dependencies", return_value=True
+    )
     mocker.patch("app.research_completion._log_file_overlaps", return_value=[])
     mocker.patch(
         "app.research_completion._parse_research_findings",
-        return_value=[{
-            "title": "Small finding",
-            "description": "Minor tweak",
-            "prompt": "Fix the thing",
-            "priority": "low",
-            "scope": "small",
-            "risk": "low",
-            "type": "improvement",
-            "direction_id": direction_id,
-        }],
+        return_value=[
+            {
+                "title": "Small finding",
+                "description": "Minor tweak",
+                "prompt": "Fix the thing",
+                "priority": "low",
+                "scope": "small",
+                "risk": "low",
+                "type": "improvement",
+                "direction_id": direction_id,
+            }
+        ],
     )
 
     await _handle_research_completion(task, "", db_session)
@@ -1982,50 +2335,61 @@ async def test_auto_completion_skips_insufficient_prs(db_session, mocker):
 # Momentum factor
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 class TestComputeMomentumFactor:
     """Unit tests for _compute_momentum_factor — pure function, no DB needed."""
 
     def test_momentum_factor_hot_streak(self):
         """Last 2 cycles both productive → 2.0 multiplier."""
-        d = {"research_history": [
-            {"tasks_created": 3},
-            {"tasks_created": 2},
-        ]}
+        d = {
+            "research_history": [
+                {"tasks_created": 3},
+                {"tasks_created": 2},
+            ]
+        }
         assert _compute_momentum_factor(d) == 2.0
 
     def test_momentum_factor_hot_streak_longer_history(self):
         """Hot streak detected even with older stalled entries."""
-        d = {"research_history": [
-            {"tasks_created": 0},
-            {"tasks_created": 0},
-            {"tasks_created": 5},
-            {"tasks_created": 1},
-        ]}
+        d = {
+            "research_history": [
+                {"tasks_created": 0},
+                {"tasks_created": 0},
+                {"tasks_created": 5},
+                {"tasks_created": 1},
+            ]
+        }
         assert _compute_momentum_factor(d) == 2.0
 
     def test_momentum_factor_stalled(self):
         """Last 3 cycles all empty → 0.5 multiplier."""
-        d = {"research_history": [
-            {"tasks_created": 0},
-            {"tasks_created": 0},
-            {"tasks_created": 0},
-        ]}
+        d = {
+            "research_history": [
+                {"tasks_created": 0},
+                {"tasks_created": 0},
+                {"tasks_created": 0},
+            ]
+        }
         assert _compute_momentum_factor(d) == 0.5
 
     def test_momentum_factor_neutral_mixed(self):
         """Mixed history → 1.0 multiplier."""
-        d = {"research_history": [
-            {"tasks_created": 3},
-            {"tasks_created": 0},
-            {"tasks_created": 2},
-        ]}
+        d = {
+            "research_history": [
+                {"tasks_created": 3},
+                {"tasks_created": 0},
+                {"tasks_created": 2},
+            ]
+        }
         assert _compute_momentum_factor(d) == 1.0
 
     def test_momentum_factor_neutral_short_history(self):
         """Only 1 entry — too short for either streak → 1.0."""
-        d = {"research_history": [
-            {"tasks_created": 0},
-        ]}
+        d = {
+            "research_history": [
+                {"tasks_created": 0},
+            ]
+        }
         assert _compute_momentum_factor(d) == 1.0
 
     def test_momentum_factor_empty_history(self):
@@ -2042,7 +2406,10 @@ class TestComputeMomentumFactor:
 # Auto-recovery of auto-paused directions
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _make_paused_direction(did: str, hours_ago: float, healthy_after_cooldown: bool = True) -> dict:
+
+def _make_paused_direction(
+    did: str, hours_ago: float, healthy_after_cooldown: bool = True
+) -> dict:
     """Build a direction that is auto-paused at the given age."""
     paused_at = (datetime.utcnow() - timedelta(hours=hours_ago)).isoformat()
     history = []
@@ -2067,7 +2434,9 @@ def _make_paused_direction(did: str, hours_ago: float, healthy_after_cooldown: b
 @pytest.mark.asyncio
 async def test_auto_recovery_after_cooldown(db_session):
     """Auto-paused direction recovers when health improves after the cooldown."""
-    direction = _make_paused_direction("d-recov001", hours_ago=50, healthy_after_cooldown=True)
+    direction = _make_paused_direction(
+        "d-recov001", hours_ago=50, healthy_after_cooldown=True
+    )
     project = Project(
         name="Auto-Recovery Test",
         user_id="test-user-123",
@@ -2083,7 +2452,9 @@ async def test_auto_recovery_after_cooldown(db_session):
 
     await db_session.refresh(project)
     recovered = next(d for d in project.directions if d["id"] == "d-recov001")
-    assert recovered["status"] == "active", "Direction should be reactivated after cooldown"
+    assert recovered["status"] == "active", (
+        "Direction should be reactivated after cooldown"
+    )
     assert "auto_paused" not in recovered, "auto_paused flag should be removed"
     assert "paused_reason" not in recovered, "paused_reason should be cleared"
     assert "paused_at" not in recovered, "paused_at should be cleared"
@@ -2092,7 +2463,9 @@ async def test_auto_recovery_after_cooldown(db_session):
 @pytest.mark.asyncio
 async def test_auto_recovery_stays_paused_when_still_unhealthy(db_session):
     """Auto-paused direction stays paused when still unhealthy at cooldown."""
-    direction = _make_paused_direction("d-unhlt001", hours_ago=50, healthy_after_cooldown=False)
+    direction = _make_paused_direction(
+        "d-unhlt001", hours_ago=50, healthy_after_cooldown=False
+    )
     project = Project(
         name="Still Unhealthy Test",
         user_id="test-user-123",
@@ -2115,7 +2488,9 @@ async def test_auto_recovery_stays_paused_when_still_unhealthy(db_session):
 @pytest.mark.asyncio
 async def test_auto_recovery_before_cooldown_stays_paused(db_session):
     """Auto-paused direction is not recovered before the cooldown expires."""
-    direction = _make_paused_direction("d-early001", hours_ago=10, healthy_after_cooldown=True)
+    direction = _make_paused_direction(
+        "d-early001", hours_ago=10, healthy_after_cooldown=True
+    )
     project = Project(
         name="Early Recovery Test",
         user_id="test-user-123",
@@ -2131,7 +2506,9 @@ async def test_auto_recovery_before_cooldown_stays_paused(db_session):
 
     await db_session.refresh(project)
     d = next(x for x in project.directions if x["id"] == "d-early001")
-    assert d["status"] == "paused", "Direction should stay paused before cooldown expires"
+    assert d["status"] == "paused", (
+        "Direction should stay paused before cooldown expires"
+    )
 
 
 @pytest.mark.asyncio
@@ -2170,10 +2547,13 @@ async def test_user_paused_direction_never_auto_recovered(db_session):
 async def test_auto_recovery_respects_custom_cooldown(db_session, monkeypatch):
     """direction_auto_recovery_hours runtime config is respected."""
     import app.shared_state as _ss
+
     monkeypatch.setitem(_ss.runtime_config, "direction_auto_recovery_hours", 100)
 
     # Paused 50 hours ago — within the custom 100h cooldown
-    direction = _make_paused_direction("d-cstmcld1", hours_ago=50, healthy_after_cooldown=True)
+    direction = _make_paused_direction(
+        "d-cstmcld1", hours_ago=50, healthy_after_cooldown=True
+    )
     project = Project(
         name="Custom Cooldown Test",
         user_id="test-user-123",
@@ -2189,13 +2569,17 @@ async def test_auto_recovery_respects_custom_cooldown(db_session, monkeypatch):
 
     await db_session.refresh(project)
     d = next(x for x in project.directions if x["id"] == "d-cstmcld1")
-    assert d["status"] == "paused", "Direction should stay paused within the custom 100h cooldown"
+    assert d["status"] == "paused", (
+        "Direction should stay paused within the custom 100h cooldown"
+    )
 
 
 @pytest.mark.asyncio
 async def test_auto_recovery_starts_remediation_monitoring(db_session):
     """Auto-recovery of a direction with a merged remediation starts an effectiveness window."""
-    direction = _make_paused_direction("d-remed001", hours_ago=50, healthy_after_cooldown=True)
+    direction = _make_paused_direction(
+        "d-remed001", hours_ago=50, healthy_after_cooldown=True
+    )
     direction["last_remediation_result"] = "merged"
     direction["remediation_attempts"] = 1
     direction["error_fingerprint"] = "abc123def456"
@@ -2215,7 +2599,9 @@ async def test_auto_recovery_starts_remediation_monitoring(db_session):
     await db_session.refresh(project)
     d = next(x for x in project.directions if x["id"] == "d-remed001")
     assert d["status"] == "active"
-    assert d.get("remediation_monitor_started_at"), "monitoring window should be set on recovery"
+    assert d.get("remediation_monitor_started_at"), (
+        "monitoring window should be set on recovery"
+    )
     # Tracking fields from the prior remediation must be preserved for fingerprint matching
     assert d.get("last_remediation_result") == "merged"
     assert d.get("error_fingerprint") == "abc123def456"
@@ -2233,7 +2619,9 @@ async def test_re_pause_during_monitoring_flags_manual_intervention(db_session):
         "added_at": "2026-01-01T00:00:00",
         "research_history": [{"tasks_created": 0}] * 5,  # unhealthy → will re-pause
         "possibly_saturated": True,
-        "remediation_monitor_started_at": (datetime.utcnow() - timedelta(hours=1)).isoformat(),
+        "remediation_monitor_started_at": (
+            datetime.utcnow() - timedelta(hours=1)
+        ).isoformat(),
         "remediation_attempts": 3,
         "last_remediation_result": "merged",
     }
@@ -2253,7 +2641,9 @@ async def test_re_pause_during_monitoring_flags_manual_intervention(db_session):
     await db_session.refresh(project)
     d = next(x for x in project.directions if x["id"] == "d-escal001")
     assert d["status"] == "paused"
-    assert d.get("needs_manual_intervention") is True, "should flag for operator when attempts ≥ 3"
+    assert d.get("needs_manual_intervention") is True, (
+        "should flag for operator when attempts ≥ 3"
+    )
 
 
 @pytest.mark.asyncio
@@ -2318,8 +2708,11 @@ async def test_stuck_manual_intervention_cleared_after_ttl(db_session):
     await db_session.refresh(project)
 
     await _process_direction_lifecycle(
-        project, db_session, cooldown_minutes=60.0,
-        busy_direction_ids=set(), now=datetime.utcnow(),
+        project,
+        db_session,
+        cooldown_minutes=60.0,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
     )
 
     await db_session.refresh(project)
@@ -2345,7 +2738,9 @@ async def test_stuck_manual_intervention_preserved_when_monitor_active(db_sessio
         "research_history": [],
         "needs_manual_intervention": True,
         "needs_manual_intervention_at": flagged_at,
-        "remediation_monitor_started_at": (datetime.utcnow() - timedelta(hours=1)).isoformat(),
+        "remediation_monitor_started_at": (
+            datetime.utcnow() - timedelta(hours=1)
+        ).isoformat(),
     }
     project = Project(
         name="Stuck Intervention Monitor Test",
@@ -2359,8 +2754,11 @@ async def test_stuck_manual_intervention_preserved_when_monitor_active(db_sessio
     await db_session.refresh(project)
 
     await _process_direction_lifecycle(
-        project, db_session, cooldown_minutes=60.0,
-        busy_direction_ids=set(), now=datetime.utcnow(),
+        project,
+        db_session,
+        cooldown_minutes=60.0,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
     )
 
     await db_session.refresh(project)
@@ -2456,12 +2854,14 @@ async def test_diagnosis_not_respawned_when_active(db_session):
     existing = Task(
         project_id=project.id,
         title="Diagnosis: existing",
-        payloads=[{
-            "type": "research",
-            "research_mode": "diagnosis",
-            "current_direction_id": did,
-            "base_branch": "main",
-        }],
+        payloads=[
+            {
+                "type": "research",
+                "research_mode": "diagnosis",
+                "current_direction_id": did,
+                "base_branch": "main",
+            }
+        ],
         context={"diagnosis_for_direction": did, "direction_id": did},
         status=TaskStatus.IN_PROGRESS,
         created_by="ORCHESTRATOR",
@@ -2497,7 +2897,12 @@ async def test_auto_retire_skips_diagnosis_spawn(db_session):
     # Replace Rule-2 "Unproductive" history with Rule-3 "High code failure rate"
     # so the new pause counts toward retirement.
     direction["research_history"] = [
-        {"tasks_created": 4, "tasks_failed": 4, "tasks_failed_infra": 0, "prs_merged": 0}
+        {
+            "tasks_created": 4,
+            "tasks_failed": 4,
+            "tasks_failed_infra": 0,
+            "prs_merged": 0,
+        }
         for _ in range(3)
     ]
     project = Project(
@@ -2597,6 +3002,7 @@ async def test_diagnosis_payload_includes_failure_context(db_session):
 # Direction cap enforcement in autonomous creation paths
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_strategic_batch_create_respects_cap(db_session, mocker):
     """_handle_strategic_completion batch creates should not exceed max_active_directions."""
@@ -2613,8 +3019,14 @@ async def test_strategic_batch_create_respects_cap(db_session, mocker):
     try:
         # Project already has 3 active directions (at cap)
         existing_dirs = [
-            {"id": f"d-exist{i}", "text": f"Existing {i}", "status": "active", "priority": "medium",
-             "notes": [], "research_history": []}
+            {
+                "id": f"d-exist{i}",
+                "text": f"Existing {i}",
+                "status": "active",
+                "priority": "medium",
+                "notes": [],
+                "research_history": [],
+            }
             for i in range(3)
         ]
         project = Project(
@@ -2629,8 +3041,13 @@ async def test_strategic_batch_create_respects_cap(db_session, mocker):
 
         task = Task(
             project_id=project.id,
-            payloads=[{"type": "strategic_review", "prompt": "review",
-                       "vision": {"revision": 1}}],
+            payloads=[
+                {
+                    "type": "strategic_review",
+                    "prompt": "review",
+                    "vision": {"revision": 1},
+                }
+            ],
             context={},
         )
         db_session.add(task)
@@ -2639,19 +3056,36 @@ async def test_strategic_batch_create_respects_cap(db_session, mocker):
 
         # Log output tries to create 2 new directions
         import json
-        logs = json.dumps({
-            "vision": {"purpose": "test", "revision": 2},
-            "direction_operations": [
-                {"op": "create", "text": "New direction A", "priority": "medium", "rationale": "needed"},
-                {"op": "create", "text": "New direction B", "priority": "low", "rationale": "needed"},
-            ],
-        })
+
+        logs = json.dumps(
+            {
+                "vision": {"purpose": "test", "revision": 2},
+                "direction_operations": [
+                    {
+                        "op": "create",
+                        "text": "New direction A",
+                        "priority": "medium",
+                        "rationale": "needed",
+                    },
+                    {
+                        "op": "create",
+                        "text": "New direction B",
+                        "priority": "low",
+                        "rationale": "needed",
+                    },
+                ],
+            }
+        )
 
         await _handle_strategic_completion(task, logs, db_session)
 
         await db_session.refresh(project)
-        active_count = sum(1 for d in (project.directions or []) if d.get("status") == "active")
-        assert active_count <= 3, f"Expected at most 3 active directions, got {active_count}"
+        active_count = sum(
+            1 for d in (project.directions or []) if d.get("status") == "active"
+        )
+        assert active_count <= 3, (
+            f"Expected at most 3 active directions, got {active_count}"
+        )
     finally:
         if original_cap is None:
             _runtime_config.pop("max_active_directions", None)
@@ -2676,8 +3110,14 @@ async def test_strategic_api_create_direction_respects_cap(db_session, mocker):
     try:
         # Project with 2 active directions (at cap)
         existing_dirs = [
-            {"id": f"d-sapi{i}", "text": f"Strategic API Dir {i}", "status": "active", "priority": "medium",
-             "notes": [], "research_history": []}
+            {
+                "id": f"d-sapi{i}",
+                "text": f"Strategic API Dir {i}",
+                "status": "active",
+                "priority": "medium",
+                "notes": [],
+                "research_history": [],
+            }
             for i in range(2)
         ]
         project = Project(
@@ -2707,16 +3147,27 @@ async def test_strategic_api_create_direction_respects_cap(db_session, mocker):
             yield db_session
 
         app.dependency_overrides[get_session] = _override_session
-        app.dependency_overrides[verify_agent_token] = lambda: {"sub": task_id, "task_type": "strategic_review"}
+        app.dependency_overrides[verify_agent_token] = lambda: {
+            "sub": task_id,
+            "task_type": "strategic_review",
+        }
 
         try:
-            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as ac:
                 resp = await ac.post(
                     "/api/agent/strategic",
-                    json={"op": "create_direction", "task_id": task_id,
-                          "data": {"text": "Overcap direction", "priority": "medium",
-                                   "success_evidence": "No overcap errors",
-                                   "retirement_condition": "Cap resolved"}},
+                    json={
+                        "op": "create_direction",
+                        "task_id": task_id,
+                        "data": {
+                            "text": "Overcap direction",
+                            "priority": "medium",
+                            "success_evidence": "No overcap errors",
+                            "retirement_condition": "Cap resolved",
+                        },
+                    },
                 )
             assert resp.status_code == 409, resp.text
             body = resp.json()
@@ -2728,7 +3179,9 @@ async def test_strategic_api_create_direction_respects_cap(db_session, mocker):
 
         # Confirm no new direction was added
         await db_session.refresh(project)
-        active_count = sum(1 for d in (project.directions or []) if d.get("status") == "active")
+        active_count = sum(
+            1 for d in (project.directions or []) if d.get("status") == "active"
+        )
         assert active_count == 2, f"Expected 2 active directions, got {active_count}"
     finally:
         if original_cap is None:
@@ -2748,8 +3201,14 @@ async def test_strategic_api_create_direction_skips_duplicate(db_session, mocker
     mocker.patch("app.main.provision_agent_vm", return_value=None)
 
     existing_dirs = [
-        {"id": "d-dup001", "text": "Increase automated test coverage across all service modules",
-         "status": "active", "priority": "medium", "notes": [], "research_history": []}
+        {
+            "id": "d-dup001",
+            "text": "Increase automated test coverage across all service modules",
+            "status": "active",
+            "priority": "medium",
+            "notes": [],
+            "research_history": [],
+        }
     ]
     project = Project(
         name="P-strategic-dup",
@@ -2778,16 +3237,27 @@ async def test_strategic_api_create_direction_skips_duplicate(db_session, mocker
         yield db_session
 
     app.dependency_overrides[get_session] = _override_session
-    app.dependency_overrides[verify_agent_token] = lambda: {"sub": task_id, "task_type": "strategic_review"}
+    app.dependency_overrides[verify_agent_token] = lambda: {
+        "sub": task_id,
+        "task_type": "strategic_review",
+    }
 
     try:
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
             resp = await ac.post(
                 "/api/agent/strategic",
-                json={"op": "create_direction", "task_id": task_id,
-                      "data": {"text": "Increase automated test coverage across all service modules",
-                               "priority": "high", "success_evidence": "Coverage above 80%",
-                               "retirement_condition": "Coverage stable for 2 cycles"}},
+                json={
+                    "op": "create_direction",
+                    "task_id": task_id,
+                    "data": {
+                        "text": "Increase automated test coverage across all service modules",
+                        "priority": "high",
+                        "success_evidence": "Coverage above 80%",
+                        "retirement_condition": "Coverage stable for 2 cycles",
+                    },
+                },
             )
         assert resp.status_code == 409, resp.text
         body = resp.json()
@@ -2813,11 +3283,18 @@ async def test_strategic_api_accumulates_direction_ids(db_session, mocker):
     mocker.patch("app.main.provision_agent_vm", return_value=None)
 
     existing = [
-        {"id": "d-retire-me", "text": "Old direction", "status": "active", "priority": "medium",
-         "notes": [], "research_history": []}
+        {
+            "id": "d-retire-me",
+            "text": "Old direction",
+            "status": "active",
+            "priority": "medium",
+            "notes": [],
+            "research_history": [],
+        }
     ]
     project = Project(
-        name="P-sapi-ids", user_id="u1",
+        name="P-sapi-ids",
+        user_id="u1",
         vision={"purpose": "test", "revision": 1},
         directions=existing,
     )
@@ -2826,7 +3303,9 @@ async def test_strategic_api_accumulates_direction_ids(db_session, mocker):
     await db_session.refresh(project)
 
     task = Task(
-        project_id=project.id, user_id="u1", task_type="strategic_review",
+        project_id=project.id,
+        user_id="u1",
+        task_type="strategic_review",
         status=TaskStatus.IN_PROGRESS,
         payloads=[{"command": "review", "vision": {"revision": 1}}],
     )
@@ -2839,29 +3318,55 @@ async def test_strategic_api_accumulates_direction_ids(db_session, mocker):
         yield db_session
 
     app.dependency_overrides[get_session] = _override_session
-    app.dependency_overrides[verify_agent_token] = lambda: {"sub": task_id, "task_type": "strategic_review"}
+    app.dependency_overrides[verify_agent_token] = lambda: {
+        "sub": task_id,
+        "task_type": "strategic_review",
+    }
 
     try:
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
-            r1 = await ac.post("/api/agent/strategic", json={
-                "op": "create_direction", "task_id": task_id,
-                "data": {"text": "New direction alpha", "priority": "medium",
-                         "success_evidence": "Alpha outcome achieved",
-                         "retirement_condition": "Alpha gap closed"}})
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            r1 = await ac.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "create_direction",
+                    "task_id": task_id,
+                    "data": {
+                        "text": "New direction alpha",
+                        "priority": "medium",
+                        "success_evidence": "Alpha outcome achieved",
+                        "retirement_condition": "Alpha gap closed",
+                    },
+                },
+            )
             assert r1.status_code == 200, r1.text
             new_id_1 = r1.json()["direction_id"]
 
-            r2 = await ac.post("/api/agent/strategic", json={
-                "op": "create_direction", "task_id": task_id,
-                "data": {"text": "New direction beta", "priority": "low",
-                         "success_evidence": "Beta outcome achieved",
-                         "retirement_condition": "Beta gap closed"}})
+            r2 = await ac.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "create_direction",
+                    "task_id": task_id,
+                    "data": {
+                        "text": "New direction beta",
+                        "priority": "low",
+                        "success_evidence": "Beta outcome achieved",
+                        "retirement_condition": "Beta gap closed",
+                    },
+                },
+            )
             assert r2.status_code == 200, r2.text
             new_id_2 = r2.json()["direction_id"]
 
-            r3 = await ac.post("/api/agent/strategic", json={
-                "op": "retire_direction", "task_id": task_id,
-                "data": {"direction_id": "d-retire-me", "rationale": "obsolete"}})
+            r3 = await ac.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "retire_direction",
+                    "task_id": task_id,
+                    "data": {"direction_id": "d-retire-me", "rationale": "obsolete"},
+                },
+            )
             assert r3.status_code == 200, r3.text
 
         await db_session.refresh(task)
@@ -2876,7 +3381,9 @@ async def test_strategic_api_accumulates_direction_ids(db_session, mocker):
 
 
 @pytest.mark.asyncio
-async def test_strategic_api_create_direction_rejects_missing_structured_fields(db_session, mocker):
+async def test_strategic_api_create_direction_rejects_missing_structured_fields(
+    db_session, mocker
+):
     """create_direction returns 400 when success_evidence or retirement_condition is absent."""
     from httpx import AsyncClient, ASGITransport
     from app.main import app
@@ -2911,33 +3418,54 @@ async def test_strategic_api_create_direction_rejects_missing_structured_fields(
         yield db_session
 
     app.dependency_overrides[get_session] = _override_session
-    app.dependency_overrides[verify_agent_token] = lambda: {"sub": task_id, "task_type": "strategic_review"}
+    app.dependency_overrides[verify_agent_token] = lambda: {
+        "sub": task_id,
+        "task_type": "strategic_review",
+    }
 
     try:
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
             # Missing success_evidence
-            resp_no_evidence = await ac.post("/api/agent/strategic", json={
-                "op": "create_direction", "task_id": task_id,
-                "data": {"text": "Direction without evidence", "priority": "medium",
-                         "retirement_condition": "Gap closed"},
-            })
+            resp_no_evidence = await ac.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "create_direction",
+                    "task_id": task_id,
+                    "data": {
+                        "text": "Direction without evidence",
+                        "priority": "medium",
+                        "retirement_condition": "Gap closed",
+                    },
+                },
+            )
             assert resp_no_evidence.status_code == 400, resp_no_evidence.text
             msg_no_ev = resp_no_evidence.json().get("error", {}).get("message", "")
             assert "success_evidence" in msg_no_ev
 
             # Missing retirement_condition
-            resp_no_retirement = await ac.post("/api/agent/strategic", json={
-                "op": "create_direction", "task_id": task_id,
-                "data": {"text": "Direction without retirement", "priority": "medium",
-                         "success_evidence": "Outcome achieved"},
-            })
+            resp_no_retirement = await ac.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "create_direction",
+                    "task_id": task_id,
+                    "data": {
+                        "text": "Direction without retirement",
+                        "priority": "medium",
+                        "success_evidence": "Outcome achieved",
+                    },
+                },
+            )
             assert resp_no_retirement.status_code == 400, resp_no_retirement.text
             msg_no_ret = resp_no_retirement.json().get("error", {}).get("message", "")
             assert "retirement_condition" in msg_no_ret
 
         # Neither direction should have been created
         await db_session.refresh(project)
-        assert len(project.directions or []) == 0, "No directions should be created without required fields"
+        assert len(project.directions or []) == 0, (
+            "No directions should be created without required fields"
+        )
     finally:
         app.dependency_overrides.pop(get_session, None)
         app.dependency_overrides.pop(verify_agent_token, None)
@@ -2960,7 +3488,9 @@ async def _make_strategic_project_and_task(db_session):
     await db_session.refresh(project)
 
     task = Task(
-        project_id=project.id, user_id="u1", task_type="strategic_review",
+        project_id=project.id,
+        user_id="u1",
+        task_type="strategic_review",
         status=TaskStatus.IN_PROGRESS,
         payloads=[{"command": "review", "vision": {"revision": 1}}],
     )
@@ -2974,7 +3504,8 @@ async def _make_strategic_project_and_task(db_session):
 
     app.dependency_overrides[get_session] = _override_session
     app.dependency_overrides[verify_agent_token] = lambda: {
-        "sub": task_id, "task_type": "strategic_review",
+        "sub": task_id,
+        "task_type": "strategic_review",
     }
     return project, task_id
 
@@ -2999,19 +3530,28 @@ async def test_strategic_api_set_problem_model_happy_path(db_session):
         async with AsyncClient(
             transport=ASGITransport(app=app), base_url="http://test"
         ) as ac:
-            resp = await ac.post("/api/agent/strategic", json={
-                "op": "set_problem_model", "task_id": task_id,
-                "data": {
-                    "intent": {
-                        "purpose": "Build an autonomous dev studio.",
-                        "current_focus": "Stabilize the review loop.",
+            resp = await ac.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "set_problem_model",
+                    "task_id": task_id,
+                    "data": {
+                        "intent": {
+                            "purpose": "Build an autonomous dev studio.",
+                            "current_focus": "Stabilize the review loop.",
+                        },
+                        "gaps": [
+                            {
+                                "id": "g-mem",
+                                "name": "No cross-cycle memory",
+                                "size": "large",
+                                "priority": "high",
+                                "status": "active",
+                            },
+                        ],
                     },
-                    "gaps": [
-                        {"id": "g-mem", "name": "No cross-cycle memory",
-                         "size": "large", "priority": "high", "status": "active"},
-                    ],
                 },
-            })
+            )
         assert resp.status_code == 200, resp.text
         body = resp.json()
         assert body["op"] == "set_problem_model"
@@ -3039,10 +3579,16 @@ async def test_strategic_api_set_problem_model_rejects_malformed(db_session):
             transport=ASGITransport(app=app), base_url="http://test"
         ) as ac:
             # size="enormous" is not a valid GapSize literal
-            resp = await ac.post("/api/agent/strategic", json={
-                "op": "set_problem_model", "task_id": task_id,
-                "data": {"gaps": [{"id": "g-bad", "name": "x", "size": "enormous"}]},
-            })
+            resp = await ac.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "set_problem_model",
+                    "task_id": task_id,
+                    "data": {
+                        "gaps": [{"id": "g-bad", "name": "x", "size": "enormous"}]
+                    },
+                },
+            )
         assert resp.status_code == 400
         body = resp.json()
         msg = body.get("detail") or body.get("error", {}).get("message", "")
@@ -3066,11 +3612,17 @@ async def test_strategic_api_set_running_update(db_session):
         async with AsyncClient(
             transport=ASGITransport(app=app), base_url="http://test"
         ) as ac:
-            doc = "## What's going on\nShipping problem_model v1.\n\n## Next\nMerge #103."
-            resp = await ac.post("/api/agent/strategic", json={
-                "op": "set_running_update", "task_id": task_id,
-                "data": {"markdown": doc},
-            })
+            doc = (
+                "## What's going on\nShipping problem_model v1.\n\n## Next\nMerge #103."
+            )
+            resp = await ac.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "set_running_update",
+                    "task_id": task_id,
+                    "data": {"markdown": doc},
+                },
+            )
         assert resp.status_code == 200, resp.text
         body = resp.json()
         assert body["op"] == "set_running_update"
@@ -3093,10 +3645,14 @@ async def test_strategic_api_set_running_update_requires_markdown_field(db_sessi
         async with AsyncClient(
             transport=ASGITransport(app=app), base_url="http://test"
         ) as ac:
-            resp = await ac.post("/api/agent/strategic", json={
-                "op": "set_running_update", "task_id": task_id,
-                "data": {"other_field": "nope"},
-            })
+            resp = await ac.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "set_running_update",
+                    "task_id": task_id,
+                    "data": {"other_field": "nope"},
+                },
+            )
         assert resp.status_code == 400
     finally:
         _cleanup_strategic_overrides()
@@ -3113,14 +3669,22 @@ async def test_strategic_api_set_running_update_replaces(db_session):
         async with AsyncClient(
             transport=ASGITransport(app=app), base_url="http://test"
         ) as ac:
-            await ac.post("/api/agent/strategic", json={
-                "op": "set_running_update", "task_id": task_id,
-                "data": {"markdown": "first"},
-            })
-            resp = await ac.post("/api/agent/strategic", json={
-                "op": "set_running_update", "task_id": task_id,
-                "data": {"markdown": "second"},
-            })
+            await ac.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "set_running_update",
+                    "task_id": task_id,
+                    "data": {"markdown": "first"},
+                },
+            )
+            resp = await ac.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "set_running_update",
+                    "task_id": task_id,
+                    "data": {"markdown": "second"},
+                },
+            )
         assert resp.status_code == 200
         await db_session.refresh(project)
         assert project.running_update == "second"
@@ -3139,14 +3703,18 @@ async def test_strategic_api_reflect(db_session):
         async with AsyncClient(
             transport=ASGITransport(app=app), base_url="http://test"
         ) as ac:
-            resp = await ac.post("/api/agent/strategic", json={
-                "op": "reflect", "task_id": task_id,
-                "data": {
-                    "what_was_hard": "Couldn't tell two near-duplicate directions apart.",
-                    "missing_context": "Direction outcome doesn't include user rejection reason.",
-                    "proposed_self_improvement": "Add rejection_reason to direction outcomes.",
+            resp = await ac.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "reflect",
+                    "task_id": task_id,
+                    "data": {
+                        "what_was_hard": "Couldn't tell two near-duplicate directions apart.",
+                        "missing_context": "Direction outcome doesn't include user rejection reason.",
+                        "proposed_self_improvement": "Add rejection_reason to direction outcomes.",
+                    },
                 },
-            })
+            )
         assert resp.status_code == 200, resp.text
         body = resp.json()
         assert body["op"] == "reflect"
@@ -3172,14 +3740,18 @@ async def test_strategic_api_pending_confirm(db_session):
         async with AsyncClient(
             transport=ASGITransport(app=app), base_url="http://test"
         ) as ac:
-            resp = await ac.post("/api/agent/strategic", json={
-                "op": "pending_confirm", "task_id": task_id,
-                "data": {
-                    "type": "credentials_needed",
-                    "proposal": "Need OpenAI key with higher rate limit.",
-                    "rationale": "Strategic cycles hitting 429s consistently.",
+            resp = await ac.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "pending_confirm",
+                    "task_id": task_id,
+                    "data": {
+                        "type": "credentials_needed",
+                        "proposal": "Need OpenAI key with higher rate limit.",
+                        "rationale": "Strategic cycles hitting 429s consistently.",
+                    },
                 },
-            })
+            )
         assert resp.status_code == 200, resp.text
         body = resp.json()
         assert body["op"] == "pending_confirm"
@@ -3208,10 +3780,14 @@ async def test_strategic_api_pending_confirm_rejects_invalid_type(db_session):
         async with AsyncClient(
             transport=ASGITransport(app=app), base_url="http://test"
         ) as ac:
-            resp = await ac.post("/api/agent/strategic", json={
-                "op": "pending_confirm", "task_id": task_id,
-                "data": {"type": "some_made_up_type", "proposal": "x"},
-            })
+            resp = await ac.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "pending_confirm",
+                    "task_id": task_id,
+                    "data": {"type": "some_made_up_type", "proposal": "x"},
+                },
+            )
         assert resp.status_code == 400
         body = resp.json()
         msg = body.get("detail") or body.get("error", {}).get("message", "")
@@ -3221,7 +3797,9 @@ async def test_strategic_api_pending_confirm_rejects_invalid_type(db_session):
 
 
 @pytest.mark.asyncio
-async def test_strategic_api_approve_direction_flips_proposed_to_active(db_session, mocker):
+async def test_strategic_api_approve_direction_flips_proposed_to_active(
+    db_session, mocker
+):
     """POST /api/agent/strategic with op=approve_direction promotes a proposal to active."""
     from httpx import AsyncClient, ASGITransport
     from app.main import app
@@ -3231,11 +3809,24 @@ async def test_strategic_api_approve_direction_flips_proposed_to_active(db_sessi
     mocker.patch("app.main.provision_agent_vm", return_value=None)
 
     existing_dirs = [
-        {"id": "d-act01", "text": "Existing active", "status": "active", "priority": "medium",
-         "notes": [], "research_history": []},
-        {"id": "d-prop01", "text": "Proposed from research", "status": "proposed", "priority": "high",
-         "proposed_by": "some-task-id", "proposal_rationale": "research found gap",
-         "notes": [], "research_history": []},
+        {
+            "id": "d-act01",
+            "text": "Existing active",
+            "status": "active",
+            "priority": "medium",
+            "notes": [],
+            "research_history": [],
+        },
+        {
+            "id": "d-prop01",
+            "text": "Proposed from research",
+            "status": "proposed",
+            "priority": "high",
+            "proposed_by": "some-task-id",
+            "proposal_rationale": "research found gap",
+            "notes": [],
+            "research_history": [],
+        },
     ]
     project = Project(
         name="P-strategic-approve",
@@ -3264,14 +3855,25 @@ async def test_strategic_api_approve_direction_flips_proposed_to_active(db_sessi
         yield db_session
 
     app.dependency_overrides[get_session] = _override_session
-    app.dependency_overrides[verify_agent_token] = lambda: {"sub": task_id, "task_type": "strategic_review"}
+    app.dependency_overrides[verify_agent_token] = lambda: {
+        "sub": task_id,
+        "task_type": "strategic_review",
+    }
 
     try:
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
             resp = await ac.post(
                 "/api/agent/strategic",
-                json={"op": "approve_direction", "task_id": task_id,
-                      "data": {"direction_id": "d-prop01", "rationale": "fits current focus"}},
+                json={
+                    "op": "approve_direction",
+                    "task_id": task_id,
+                    "data": {
+                        "direction_id": "d-prop01",
+                        "rationale": "fits current focus",
+                    },
+                },
             )
         assert resp.status_code == 200, resp.text
         body = resp.json()
@@ -3283,7 +3885,10 @@ async def test_strategic_api_approve_direction_flips_proposed_to_active(db_sessi
         approved = next(d for d in project.directions if d["id"] == "d-prop01")
         assert approved["status"] == "active"
         assert "activated_at" in approved
-        assert any("Approved by strategic review" in (n.get("text") or "") for n in approved.get("notes", []))
+        assert any(
+            "Approved by strategic review" in (n.get("text") or "")
+            for n in approved.get("notes", [])
+        )
 
         await db_session.refresh(task)
         assert task.context.get("_strategic_proposals_approved") == 1
@@ -3307,23 +3912,41 @@ async def test_strategic_api_approve_direction_respects_cap(db_session, mocker):
     _runtime_config["max_active_directions"] = 2
     try:
         existing_dirs = [
-            {"id": f"d-act{i}", "text": f"Active {i}", "status": "active", "priority": "medium",
-             "notes": [], "research_history": []} for i in range(2)
+            {
+                "id": f"d-act{i}",
+                "text": f"Active {i}",
+                "status": "active",
+                "priority": "medium",
+                "notes": [],
+                "research_history": [],
+            }
+            for i in range(2)
         ] + [
-            {"id": "d-pend01", "text": "Pending proposal", "status": "proposed", "priority": "high",
-             "proposed_by": "t-x", "notes": [], "research_history": []},
+            {
+                "id": "d-pend01",
+                "text": "Pending proposal",
+                "status": "proposed",
+                "priority": "high",
+                "proposed_by": "t-x",
+                "notes": [],
+                "research_history": [],
+            },
         ]
         project = Project(
-            name="P-strategic-approve-cap", user_id="u1",
-            vision={"purpose": "test", "revision": 1}, directions=existing_dirs,
+            name="P-strategic-approve-cap",
+            user_id="u1",
+            vision={"purpose": "test", "revision": 1},
+            directions=existing_dirs,
         )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
 
         task = Task(
-            project_id=project.id, user_id="u1",
-            task_type="strategic_review", status=TaskStatus.IN_PROGRESS,
+            project_id=project.id,
+            user_id="u1",
+            task_type="strategic_review",
+            status=TaskStatus.IN_PROGRESS,
             payloads=[{"command": "review"}],
         )
         db_session.add(task)
@@ -3333,15 +3956,24 @@ async def test_strategic_api_approve_direction_respects_cap(db_session, mocker):
 
         async def _override_session():
             yield db_session
+
         app.dependency_overrides[get_session] = _override_session
-        app.dependency_overrides[verify_agent_token] = lambda: {"sub": task_id, "task_type": "strategic_review"}
+        app.dependency_overrides[verify_agent_token] = lambda: {
+            "sub": task_id,
+            "task_type": "strategic_review",
+        }
 
         try:
-            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as ac:
                 resp = await ac.post(
                     "/api/agent/strategic",
-                    json={"op": "approve_direction", "task_id": task_id,
-                          "data": {"direction_id": "d-pend01", "rationale": "x"}},
+                    json={
+                        "op": "approve_direction",
+                        "task_id": task_id,
+                        "data": {"direction_id": "d-pend01", "rationale": "x"},
+                    },
                 )
             assert resp.status_code == 409, resp.text
             body = resp.json()
@@ -3349,8 +3981,12 @@ async def test_strategic_api_approve_direction_respects_cap(db_session, mocker):
             assert "cap" in body.get("reason", "").lower()
 
             await db_session.refresh(project)
-            still_proposed = next(d for d in project.directions if d["id"] == "d-pend01")
-            assert still_proposed["status"] == "proposed", "Proposal should stay proposed when cap is reached"
+            still_proposed = next(
+                d for d in project.directions if d["id"] == "d-pend01"
+            )
+            assert still_proposed["status"] == "proposed", (
+                "Proposal should stay proposed when cap is reached"
+            )
         finally:
             app.dependency_overrides.pop(get_session, None)
             app.dependency_overrides.pop(verify_agent_token, None)
@@ -3372,20 +4008,30 @@ async def test_strategic_api_approve_direction_rejects_non_proposed(db_session, 
     mocker.patch("app.main.provision_agent_vm", return_value=None)
 
     existing_dirs = [
-        {"id": "d-act01", "text": "Already active", "status": "active", "priority": "medium",
-         "notes": [], "research_history": []},
+        {
+            "id": "d-act01",
+            "text": "Already active",
+            "status": "active",
+            "priority": "medium",
+            "notes": [],
+            "research_history": [],
+        },
     ]
     project = Project(
-        name="P-strategic-approve-wrongstatus", user_id="u1",
-        vision={"purpose": "test", "revision": 1}, directions=existing_dirs,
+        name="P-strategic-approve-wrongstatus",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=existing_dirs,
     )
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
 
     task = Task(
-        project_id=project.id, user_id="u1",
-        task_type="strategic_review", status=TaskStatus.IN_PROGRESS,
+        project_id=project.id,
+        user_id="u1",
+        task_type="strategic_review",
+        status=TaskStatus.IN_PROGRESS,
         payloads=[{"command": "review"}],
     )
     db_session.add(task)
@@ -3395,15 +4041,24 @@ async def test_strategic_api_approve_direction_rejects_non_proposed(db_session, 
 
     async def _override_session():
         yield db_session
+
     app.dependency_overrides[get_session] = _override_session
-    app.dependency_overrides[verify_agent_token] = lambda: {"sub": task_id, "task_type": "strategic_review"}
+    app.dependency_overrides[verify_agent_token] = lambda: {
+        "sub": task_id,
+        "task_type": "strategic_review",
+    }
 
     try:
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
             resp = await ac.post(
                 "/api/agent/strategic",
-                json={"op": "approve_direction", "task_id": task_id,
-                      "data": {"direction_id": "d-act01", "rationale": "x"}},
+                json={
+                    "op": "approve_direction",
+                    "task_id": task_id,
+                    "data": {"direction_id": "d-act01", "rationale": "x"},
+                },
             )
         assert resp.status_code == 409, resp.text
         assert "proposed" in resp.json().get("reason", "").lower()
@@ -3424,12 +4079,21 @@ async def test_strategic_api_reject_direction_creates_tombstone(db_session, mock
     mocker.patch("app.main._ensure_vm_deleted", return_value=True)
 
     existing_dirs = [
-        {"id": "d-prop01", "text": "Noisy proposal to reject", "status": "proposed", "priority": "medium",
-         "proposed_by": "t-research", "notes": [], "research_history": []},
+        {
+            "id": "d-prop01",
+            "text": "Noisy proposal to reject",
+            "status": "proposed",
+            "priority": "medium",
+            "proposed_by": "t-research",
+            "notes": [],
+            "research_history": [],
+        },
     ]
     project = Project(
-        name="P-strategic-reject", user_id="u1",
-        vision={"purpose": "test", "revision": 1}, directions=existing_dirs,
+        name="P-strategic-reject",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=existing_dirs,
     )
     db_session.add(project)
     await db_session.commit()
@@ -3437,14 +4101,18 @@ async def test_strategic_api_reject_direction_creates_tombstone(db_session, mock
 
     # Strategic-review task that will issue the reject op
     strategic_task = Task(
-        project_id=project.id, user_id="u1",
-        task_type="strategic_review", status=TaskStatus.IN_PROGRESS,
+        project_id=project.id,
+        user_id="u1",
+        task_type="strategic_review",
+        status=TaskStatus.IN_PROGRESS,
         payloads=[{"command": "review"}],
     )
     # A QUEUED task tied to the proposal — should get cancelled
     queued_task = Task(
-        project_id=project.id, user_id="u1",
-        task_type="research", status=TaskStatus.QUEUED,
+        project_id=project.id,
+        user_id="u1",
+        task_type="research",
+        status=TaskStatus.QUEUED,
         payloads=[{"command": "research"}],
         context={"direction_id": "d-prop01"},
         vm_instance_id="vm-prop01",
@@ -3458,15 +4126,27 @@ async def test_strategic_api_reject_direction_creates_tombstone(db_session, mock
 
     async def _override_session():
         yield db_session
+
     app.dependency_overrides[get_session] = _override_session
-    app.dependency_overrides[verify_agent_token] = lambda: {"sub": task_id, "task_type": "strategic_review"}
+    app.dependency_overrides[verify_agent_token] = lambda: {
+        "sub": task_id,
+        "task_type": "strategic_review",
+    }
 
     try:
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
             resp = await ac.post(
                 "/api/agent/strategic",
-                json={"op": "reject_direction", "task_id": task_id,
-                      "data": {"direction_id": "d-prop01", "rationale": "duplicate of existing work"}},
+                json={
+                    "op": "reject_direction",
+                    "task_id": task_id,
+                    "data": {
+                        "direction_id": "d-prop01",
+                        "rationale": "duplicate of existing work",
+                    },
+                },
             )
         assert resp.status_code == 200, resp.text
         body = resp.json()
@@ -3495,6 +4175,7 @@ async def test_strategic_api_reject_direction_creates_tombstone(db_session, mock
 # Standalone tests for _calibrate_scope (no DB required)
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 class TestCalibrateScope:
     """Unit tests for _calibrate_scope — pure function, no DB."""
 
@@ -3511,6 +4192,7 @@ class TestCalibrateScope:
     def test_no_history_returns_unchanged(self, monkeypatch):
         """Direction with no research_history + no baselines → scope unchanged."""
         from app.shared_state import runtime_config as _rc
+
         monkeypatch.setitem(_rc, "pipeline_scope_baseline_rates", {})
         d = {"id": "d1"}
         assert _calibrate_scope("medium", d) == ("medium", None)
@@ -3518,31 +4200,38 @@ class TestCalibrateScope:
     def test_empty_history_returns_unchanged(self, monkeypatch):
         """Explicit empty research_history + no baselines → scope unchanged."""
         from app.shared_state import runtime_config as _rc
+
         monkeypatch.setitem(_rc, "pipeline_scope_baseline_rates", {})
         d = {"id": "d1", "research_history": []}
         assert _calibrate_scope("medium", d) == ("medium", None)
 
     def test_insufficient_data_points_returns_unchanged(self):
         """Less than 3 total tasks across history → no calibration (insufficient signal)."""
-        d = self._direction([
-            {"small": {"created": 1, "merged": 0, "failed": 1}},
-            {"small": {"created": 1, "merged": 0, "failed": 1}},
-        ])
+        d = self._direction(
+            [
+                {"small": {"created": 1, "merged": 0, "failed": 1}},
+                {"small": {"created": 1, "merged": 0, "failed": 1}},
+            ]
+        )
         # total_data_points = 2 < 3
         assert _calibrate_scope("small", d) == ("small", None)
 
     def test_acceptable_rate_returns_unchanged(self):
         """Proposed scope at >= 40% merge rate → no downgrade."""
-        d = self._direction([
-            {"medium": {"created": 5, "merged": 2, "failed": 3}},  # 40%
-        ])
+        d = self._direction(
+            [
+                {"medium": {"created": 5, "merged": 2, "failed": 3}},  # 40%
+            ]
+        )
         assert _calibrate_scope("medium", d) == ("medium", None)
 
     def test_exactly_40_percent_returns_unchanged(self):
         """Exactly 40% merge rate → not downgraded (rate >= 0.4 threshold)."""
-        d = self._direction([
-            {"medium": {"created": 5, "merged": 2, "failed": 3}},  # 40% exactly
-        ])
+        d = self._direction(
+            [
+                {"medium": {"created": 5, "merged": 2, "failed": 3}},  # 40% exactly
+            ]
+        )
         result_scope, calibrated_from = _calibrate_scope("medium", d)
         assert result_scope == "medium"
         assert calibrated_from is None
@@ -3553,30 +4242,36 @@ class TestCalibrateScope:
         Uses 'large' scope to exercise the downgrade path without triggering the
         medium→large(decompose) upgrade.
         """
-        d = self._direction([
-            {"large": {"created": 10, "merged": 3, "failed": 7}},   # 30% < 40%
-            {"medium": {"created": 5, "merged": 3, "failed": 2}},   # 60% >= 40%
-        ])
+        d = self._direction(
+            [
+                {"large": {"created": 10, "merged": 3, "failed": 7}},  # 30% < 40%
+                {"medium": {"created": 5, "merged": 3, "failed": 2}},  # 60% >= 40%
+            ]
+        )
         result_scope, calibrated_from = _calibrate_scope("large", d)
         assert result_scope == "medium"
         assert calibrated_from == "large"
 
     def test_smaller_scope_also_bad_returns_unchanged(self):
         """Proposed scope below 40% but no smaller scope has acceptable rate → no downgrade."""
-        d = self._direction([
-            {"medium": {"created": 10, "merged": 2, "failed": 8}},  # 20%
-            {"small": {"created": 5, "merged": 1, "failed": 4}},    # 20%
-        ])
+        d = self._direction(
+            [
+                {"medium": {"created": 10, "merged": 2, "failed": 8}},  # 20%
+                {"small": {"created": 5, "merged": 1, "failed": 4}},  # 20%
+            ]
+        )
         result_scope, calibrated_from = _calibrate_scope("medium", d)
         assert result_scope == "medium"
         assert calibrated_from is None
 
     def test_smaller_scope_with_no_data_is_acceptable(self):
         """Smaller scope with no historical data (rate=None) is treated as acceptable."""
-        d = self._direction([
-            {"medium": {"created": 10, "merged": 2, "failed": 8}},  # 20% < 40%
-            # no "small" data
-        ])
+        d = self._direction(
+            [
+                {"medium": {"created": 10, "merged": 2, "failed": 8}},  # 20% < 40%
+                # no "small" data
+            ]
+        )
         result_scope, calibrated_from = _calibrate_scope("medium", d)
         assert result_scope == "small"
         assert calibrated_from == "medium"
@@ -3586,30 +4281,40 @@ class TestCalibrateScope:
 
         Uses 'large' scope to bypass the medium→large(decompose) upgrade path.
         """
-        d = self._direction([
-            {"large": {"created": 10, "merged": 3, "failed": 7}},   # 30% — triggers downgrade search
-            {"medium": {"created": 5, "merged": 2, "failed": 3}},   # 40% — should be accepted (>= 0.4)
-        ])
+        d = self._direction(
+            [
+                {
+                    "large": {"created": 10, "merged": 3, "failed": 7}
+                },  # 30% — triggers downgrade search
+                {
+                    "medium": {"created": 5, "merged": 2, "failed": 3}
+                },  # 40% — should be accepted (>= 0.4)
+            ]
+        )
         result_scope, calibrated_from = _calibrate_scope("large", d)
         assert result_scope == "medium"
         assert calibrated_from == "large"
 
     def test_large_scope_downgrades_through_medium_to_small(self):
         """Large scope below threshold downgrades: picks first smaller scope with acceptable rate."""
-        d = self._direction([
-            {"large": {"created": 10, "merged": 2, "failed": 8}},   # 20%
-            {"medium": {"created": 10, "merged": 2, "failed": 8}},  # 20%
-            {"small": {"created": 5, "merged": 3, "failed": 2}},    # 60%
-        ])
+        d = self._direction(
+            [
+                {"large": {"created": 10, "merged": 2, "failed": 8}},  # 20%
+                {"medium": {"created": 10, "merged": 2, "failed": 8}},  # 20%
+                {"small": {"created": 5, "merged": 3, "failed": 2}},  # 60%
+            ]
+        )
         result_scope, calibrated_from = _calibrate_scope("large", d)
         assert result_scope == "small"
         assert calibrated_from == "large"
 
     def test_small_scope_cannot_be_downgraded(self):
         """Small is the smallest scope — even with low rate, no downgrade possible."""
-        d = self._direction([
-            {"small": {"created": 10, "merged": 1, "failed": 9}},  # 10%
-        ])
+        d = self._direction(
+            [
+                {"small": {"created": 10, "merged": 1, "failed": 9}},  # 10%
+            ]
+        )
         result_scope, calibrated_from = _calibrate_scope("small", d)
         assert result_scope == "small"
         assert calibrated_from is None
@@ -3617,9 +4322,19 @@ class TestCalibrateScope:
     def test_uses_only_last_3_history_entries(self):
         """Only the last 3 history entries are considered; older entries are ignored."""
         # Older entries show bad rate for small, recent entries show good rate for medium
-        older_bad = {"small": {"created": 100, "merged": 0, "failed": 100}}   # very bad
+        older_bad = {"small": {"created": 100, "merged": 0, "failed": 100}}  # very bad
         recent_good = {"medium": {"created": 5, "merged": 4, "failed": 1}}  # 80% good
-        d = self._direction([older_bad, older_bad, older_bad, older_bad, recent_good, recent_good, recent_good])
+        d = self._direction(
+            [
+                older_bad,
+                older_bad,
+                older_bad,
+                older_bad,
+                recent_good,
+                recent_good,
+                recent_good,
+            ]
+        )
         # Only last 3 (recent_good x3) used → medium rate 80%, no downgrade
         assert _calibrate_scope("medium", d) == ("medium", None)
 
@@ -3627,36 +4342,57 @@ class TestCalibrateScope:
         """High failed_scope_overflow rate escalates to larger scope despite acceptable merge rate."""
         # medium: 10 created, 6 merged (60%), 4 failed incl. 4 overflow → 40% overflow
         # Merge rate alone would not trigger downgrade/upgrade, but overflow rate does.
-        d = self._direction([
-            {"medium": {
-                "created": 10, "merged": 6, "failed": 4,
-                "failed_infra": 4, "failed_scope_overflow": 4,
-            }},
-        ])
+        d = self._direction(
+            [
+                {
+                    "medium": {
+                        "created": 10,
+                        "merged": 6,
+                        "failed": 4,
+                        "failed_infra": 4,
+                        "failed_scope_overflow": 4,
+                    }
+                },
+            ]
+        )
         result_scope, calibrated_from = _calibrate_scope("medium", d)
         assert result_scope == "large"
         assert calibrated_from == "medium"
 
     def test_low_overflow_rate_does_not_escalate(self):
         """Overflow rate below 30% does not trigger escalation."""
-        d = self._direction([
-            {"medium": {
-                "created": 10, "merged": 7, "failed": 3,
-                "failed_infra": 1, "failed_scope_overflow": 1,
-            }},
-        ])
+        d = self._direction(
+            [
+                {
+                    "medium": {
+                        "created": 10,
+                        "merged": 7,
+                        "failed": 3,
+                        "failed_infra": 1,
+                        "failed_scope_overflow": 1,
+                    }
+                },
+            ]
+        )
         assert _calibrate_scope("medium", d) == ("medium", None)
 
     def test_overflow_escalation_requires_3_data_points(self):
         """Fewer than 3 created at scope → overflow escalation does not fire."""
         # Only 2 medium tasks; project fallback also insufficient → cold-start path
-        d = self._direction([
-            {"medium": {
-                "created": 2, "merged": 0, "failed": 2,
-                "failed_infra": 2, "failed_scope_overflow": 2,
-            },
-             "small": {"created": 3, "merged": 2, "failed": 1}},
-        ])
+        d = self._direction(
+            [
+                {
+                    "medium": {
+                        "created": 2,
+                        "merged": 0,
+                        "failed": 2,
+                        "failed_infra": 2,
+                        "failed_scope_overflow": 2,
+                    },
+                    "small": {"created": 3, "merged": 2, "failed": 1},
+                },
+            ]
+        )
         # 2 medium created < 3 → overflow escalation skipped; medium effective
         # denominator also < 3 so merge rate is None → returns unchanged.
         assert _calibrate_scope("medium", d) == ("medium", None)
@@ -3665,42 +4401,63 @@ class TestCalibrateScope:
         """50%+ analysis_overflow rate at medium → hard-escalate medium→large."""
         # 4 medium created, 2 analysis_overflow failures (50%), merge rate 50%
         # (acceptable), scope_overflow below 30% → only analysis signal triggers.
-        d = self._direction([
-            {"medium": {
-                "created": 4, "merged": 2, "failed": 2,
-                "failed_infra": 2, "failed_scope_overflow": 0,
-                "failed_analysis_overflow": 2,
-            }},
-        ])
+        d = self._direction(
+            [
+                {
+                    "medium": {
+                        "created": 4,
+                        "merged": 2,
+                        "failed": 2,
+                        "failed_infra": 2,
+                        "failed_scope_overflow": 0,
+                        "failed_analysis_overflow": 2,
+                    }
+                },
+            ]
+        )
         result_scope, calibrated_from = _calibrate_scope("medium", d)
         assert result_scope == "large"
         assert calibrated_from == "medium"
 
     def test_overflow_escalation_skipped_for_large_scope(self):
         """Large scope has no larger scope to escalate to → no-op."""
-        d = self._direction([
-            {"large": {
-                "created": 10, "merged": 6, "failed": 4,
-                "failed_infra": 4, "failed_scope_overflow": 4,
-            }},
-        ])
+        d = self._direction(
+            [
+                {
+                    "large": {
+                        "created": 10,
+                        "merged": 6,
+                        "failed": 4,
+                        "failed_infra": 4,
+                        "failed_scope_overflow": 4,
+                    }
+                },
+            ]
+        )
         # 60% merge rate, 40% overflow, but no scope larger than "large"
         assert _calibrate_scope("large", d) == ("large", None)
 
     def test_unknown_scope_returns_unchanged(self):
         """Unrecognized scope string → no downgrade (not in SCOPE_ORDER)."""
-        d = self._direction([
-            {"xlarge": {"created": 10, "merged": 0}},
-        ])
+        d = self._direction(
+            [
+                {"xlarge": {"created": 10, "merged": 0}},
+            ]
+        )
         assert _calibrate_scope("xlarge", d) == ("xlarge", None)
 
     def _project(self, dirs_history: list[list[dict]]):
         """Build a minimal project stub with .directions populated."""
+
         class _P:
             pass
+
         p = _P()
         p.directions = [
-            {"id": f"d{i}", "research_history": [{"scope_breakdown": bd} for bd in hist]}
+            {
+                "id": f"d{i}",
+                "research_history": [{"scope_breakdown": bd} for bd in hist],
+            }
             for i, hist in enumerate(dirs_history)
         ]
         return p
@@ -3714,12 +4471,18 @@ class TestCalibrateScope:
         d = self._direction([])  # no direction history
         # Project-wide large scope: 10 created / 1 merged = 10% < 30%
         # Project-wide medium scope: 5 created / 4 merged = 80% — acceptable target
-        project = self._project([
-            [{"large": {"created": 5, "merged": 0, "failed": 5}},
-             {"medium": {"created": 3, "merged": 3, "failed": 0}}],
-            [{"large": {"created": 5, "merged": 1, "failed": 4}},
-             {"medium": {"created": 2, "merged": 1, "failed": 1}}],
-        ])
+        project = self._project(
+            [
+                [
+                    {"large": {"created": 5, "merged": 0, "failed": 5}},
+                    {"medium": {"created": 3, "merged": 3, "failed": 0}},
+                ],
+                [
+                    {"large": {"created": 5, "merged": 1, "failed": 4}},
+                    {"medium": {"created": 2, "merged": 1, "failed": 1}},
+                ],
+            ]
+        )
         result_scope, calibrated_from = _calibrate_scope("large", d, project)
         assert result_scope == "medium"
         assert calibrated_from == "large"
@@ -3728,9 +4491,11 @@ class TestCalibrateScope:
         """Project-wide rate at exactly 30% → not downgraded (threshold >= 0.3)."""
         d = self._direction([])
         # Project-wide medium: 10 created / 3 merged = 30% (not below threshold)
-        project = self._project([
-            [{"medium": {"created": 10, "merged": 3, "failed": 7}}],
-        ])
+        project = self._project(
+            [
+                [{"medium": {"created": 10, "merged": 3, "failed": 7}}],
+            ]
+        )
         result_scope, calibrated_from = _calibrate_scope("medium", d, project)
         assert result_scope == "medium"
         assert calibrated_from is None
@@ -3739,25 +4504,34 @@ class TestCalibrateScope:
         """Direction has >= 3 data points → use direction-specific 40% threshold,
         ignore project-wide data."""
         # Direction medium: 5 created / 2 merged = 40% — acceptable at direction threshold
-        d = self._direction([
-            {"medium": {"created": 5, "merged": 2, "failed": 3}},
-        ])
+        d = self._direction(
+            [
+                {"medium": {"created": 5, "merged": 2, "failed": 3}},
+            ]
+        )
         # Project-wide medium would be 0% (very bad), but should be ignored
-        project = self._project([
-            [{"medium": {"created": 100, "merged": 0, "failed": 100}}],
-        ])
+        project = self._project(
+            [
+                [{"medium": {"created": 100, "merged": 0, "failed": 100}}],
+            ]
+        )
         result_scope, calibrated_from = _calibrate_scope("medium", d, project)
         assert result_scope == "medium"
         assert calibrated_from is None
 
-    def test_project_fallback_returns_unchanged_when_project_data_also_thin(self, monkeypatch):
+    def test_project_fallback_returns_unchanged_when_project_data_also_thin(
+        self, monkeypatch
+    ):
         """Both direction and project-wide data insufficient + no baselines → no calibration."""
         from app.shared_state import runtime_config as _rc
+
         monkeypatch.setitem(_rc, "pipeline_scope_baseline_rates", {})
         d = self._direction([])
-        project = self._project([
-            [{"medium": {"created": 1, "merged": 0, "failed": 1}}],
-        ])  # project-wide total = 1 < 3
+        project = self._project(
+            [
+                [{"medium": {"created": 1, "merged": 0, "failed": 1}}],
+            ]
+        )  # project-wide total = 1 < 3
         result_scope, calibrated_from = _calibrate_scope("medium", d, project)
         assert result_scope == "medium"
         assert calibrated_from is None
@@ -3765,15 +4539,21 @@ class TestCalibrateScope:
     def test_project_fallback_omitted_returns_unchanged(self, monkeypatch):
         """No project passed AND direction insufficient + no baselines → unchanged (back-compat)."""
         from app.shared_state import runtime_config as _rc
+
         monkeypatch.setitem(_rc, "pipeline_scope_baseline_rates", {})
         d = self._direction([])
         assert _calibrate_scope("medium", d) == ("medium", None)
 
-    def test_cold_start_upgrades_medium_when_pipeline_baseline_below_threshold(self, monkeypatch):
+    def test_cold_start_upgrades_medium_when_pipeline_baseline_below_threshold(
+        self, monkeypatch
+    ):
         """No direction/project history + baseline medium < 40% + small healthy → upgrade medium→large."""
         from app.shared_state import runtime_config as _rc
+
         monkeypatch.setitem(
-            _rc, "pipeline_scope_baseline_rates", {"small": 0.75, "medium": 0.04, "large": 0.50},
+            _rc,
+            "pipeline_scope_baseline_rates",
+            {"small": 0.75, "medium": 0.04, "large": 0.50},
         )
         d = self._direction([])
         result_scope, calibrated_from = _calibrate_scope("medium", d)
@@ -3783,13 +4563,18 @@ class TestCalibrateScope:
     def test_cold_start_upgrades_medium_when_project_data_thin(self, monkeypatch):
         """Direction empty + project < 3 data points + baseline says medium failing → upgrade."""
         from app.shared_state import runtime_config as _rc
+
         monkeypatch.setitem(
-            _rc, "pipeline_scope_baseline_rates", {"small": 0.75, "medium": 0.04, "large": 0.50},
+            _rc,
+            "pipeline_scope_baseline_rates",
+            {"small": 0.75, "medium": 0.04, "large": 0.50},
         )
         d = self._direction([])
-        project = self._project([
-            [{"medium": {"created": 1, "merged": 0, "failed": 1}}],
-        ])
+        project = self._project(
+            [
+                [{"medium": {"created": 1, "merged": 0, "failed": 1}}],
+            ]
+        )
         result_scope, calibrated_from = _calibrate_scope("medium", d, project)
         assert result_scope == "large"
         assert calibrated_from == "medium"
@@ -3797,8 +4582,11 @@ class TestCalibrateScope:
     def test_cold_start_no_upgrade_when_baseline_medium_healthy(self, monkeypatch):
         """Cold-start + baseline medium >= 40% → no upgrade (pipeline-wide medium is fine)."""
         from app.shared_state import runtime_config as _rc
+
         monkeypatch.setitem(
-            _rc, "pipeline_scope_baseline_rates", {"small": 0.75, "medium": 0.50, "large": 0.50},
+            _rc,
+            "pipeline_scope_baseline_rates",
+            {"small": 0.75, "medium": 0.50, "large": 0.50},
         )
         d = self._direction([])
         result_scope, calibrated_from = _calibrate_scope("medium", d)
@@ -3808,8 +4596,11 @@ class TestCalibrateScope:
     def test_cold_start_no_upgrade_when_baseline_small_unhealthy(self, monkeypatch):
         """Cold-start + baseline small < 40% → no upgrade (decompose target is unproven)."""
         from app.shared_state import runtime_config as _rc
+
         monkeypatch.setitem(
-            _rc, "pipeline_scope_baseline_rates", {"small": 0.20, "medium": 0.04, "large": 0.50},
+            _rc,
+            "pipeline_scope_baseline_rates",
+            {"small": 0.20, "medium": 0.04, "large": 0.50},
         )
         d = self._direction([])
         result_scope, calibrated_from = _calibrate_scope("medium", d)
@@ -3819,8 +4610,11 @@ class TestCalibrateScope:
     def test_cold_start_no_upgrade_for_non_medium_scope(self, monkeypatch):
         """Cold-start upgrade only fires for medium — small/large pass through unchanged."""
         from app.shared_state import runtime_config as _rc
+
         monkeypatch.setitem(
-            _rc, "pipeline_scope_baseline_rates", {"small": 0.75, "medium": 0.04, "large": 0.50},
+            _rc,
+            "pipeline_scope_baseline_rates",
+            {"small": 0.75, "medium": 0.04, "large": 0.50},
         )
         d = self._direction([])
         assert _calibrate_scope("small", d) == ("small", None)
@@ -3829,6 +4623,7 @@ class TestCalibrateScope:
     def test_cold_start_no_upgrade_when_baselines_missing(self, monkeypatch):
         """Cold-start + no baseline configured → returns unchanged (no implicit defaults applied)."""
         from app.shared_state import runtime_config as _rc
+
         monkeypatch.setitem(_rc, "pipeline_scope_baseline_rates", {"small": 0.75})
         d = self._direction([])
         result_scope, calibrated_from = _calibrate_scope("medium", d)
@@ -3843,10 +4638,14 @@ class TestCalibrateScope:
         calibrated_from as a scope key (direction_outcomes bookkeeping,
         prompt.ts calibration note, admin analytics) receive a valid scope.
         """
-        d = self._direction([
-            {"medium": {"created": 10, "merged": 2, "failed": 8}},  # 20% < 40%
-            {"small": {"created": 5, "merged": 4, "failed": 1}},    # 80% >= 40% (healthy)
-        ])
+        d = self._direction(
+            [
+                {"medium": {"created": 10, "merged": 2, "failed": 8}},  # 20% < 40%
+                {
+                    "small": {"created": 5, "merged": 4, "failed": 1}
+                },  # 80% >= 40% (healthy)
+            ]
+        )
         result_scope, calibrated_from = _calibrate_scope("medium", d)
         assert result_scope == "large"
         assert calibrated_from == "medium"
@@ -3856,10 +4655,12 @@ class TestCalibrateScope:
 
         Falls through to downgrade loop; since small also fails, returns unchanged.
         """
-        d = self._direction([
-            {"medium": {"created": 10, "merged": 2, "failed": 8}},  # 20%
-            {"small": {"created": 5, "merged": 1, "failed": 4}},    # 20% < 40%
-        ])
+        d = self._direction(
+            [
+                {"medium": {"created": 10, "merged": 2, "failed": 8}},  # 20%
+                {"small": {"created": 5, "merged": 1, "failed": 4}},  # 20% < 40%
+            ]
+        )
         result_scope, calibrated_from = _calibrate_scope("medium", d)
         assert result_scope == "medium"
         assert calibrated_from is None
@@ -3870,10 +4671,12 @@ class TestCalibrateScope:
         Without proven small-scope success, decomposition is not justified. Falls
         through to existing downgrade behavior (which treats no-data as acceptable).
         """
-        d = self._direction([
-            {"medium": {"created": 10, "merged": 2, "failed": 8}},  # 20%
-            # no "small" data
-        ])
+        d = self._direction(
+            [
+                {"medium": {"created": 10, "merged": 2, "failed": 8}},  # 20%
+                # no "small" data
+            ]
+        )
         result_scope, calibrated_from = _calibrate_scope("medium", d)
         assert result_scope == "small"
         assert calibrated_from == "medium"
@@ -3886,10 +4689,12 @@ class TestCalibrateScope:
         medium→large upgrade and the function returned early at medium, skipping
         the downgrade loop entirely.
         """
-        d = self._direction([
-            {"medium": {"created": 10, "merged": 2, "failed": 8}},  # 20% < 40%
-            {"small": {"created": 5, "merged": 4, "failed": 1}},    # 80% healthy
-        ])
+        d = self._direction(
+            [
+                {"medium": {"created": 10, "merged": 2, "failed": 8}},  # 20% < 40%
+                {"small": {"created": 5, "merged": 4, "failed": 1}},  # 80% healthy
+            ]
+        )
         d["research_history"][-1]["decomposition_quality"] = [
             {"subtask_merge_rate": 0.1, "subtask_count": 5},
         ]
@@ -3899,11 +4704,15 @@ class TestCalibrateScope:
 
     def test_large_does_not_upgrade(self):
         """Upgrade path only fires for medium — large below threshold still downgrades normally."""
-        d = self._direction([
-            {"large": {"created": 10, "merged": 2, "failed": 8}},   # 20%
-            {"medium": {"created": 5, "merged": 1, "failed": 4}},   # 20% — bad, skipped
-            {"small": {"created": 5, "merged": 4, "failed": 1}},    # 80% — healthy
-        ])
+        d = self._direction(
+            [
+                {"large": {"created": 10, "merged": 2, "failed": 8}},  # 20%
+                {
+                    "medium": {"created": 5, "merged": 1, "failed": 4}
+                },  # 20% — bad, skipped
+                {"small": {"created": 5, "merged": 4, "failed": 1}},  # 80% — healthy
+            ]
+        )
         result_scope, calibrated_from = _calibrate_scope("large", d)
         # Despite small being healthy (the trigger condition for upgrade), large
         # only ever downgrades — calibrated_from is the bare scope, not a "→...(decompose)" marker.
@@ -3918,14 +4727,16 @@ class TestCalibrateScope:
         `created`. Terminal-outcome denominator (merged + failed - true_infra)
         restores the honest 1/4 = 25% rate.
         """
-        d = self._direction([
-            # 16 medium spawned, 12 still in-flight (not in merged/failed counters);
-            # 5 small with 4 merged (healthy) to trigger the decompose-upgrade path.
-            {
-                "medium": {"created": 16, "merged": 1, "failed": 3},
-                "small": {"created": 5, "merged": 4, "failed": 1},
-            },
-        ])
+        d = self._direction(
+            [
+                # 16 medium spawned, 12 still in-flight (not in merged/failed counters);
+                # 5 small with 4 merged (healthy) to trigger the decompose-upgrade path.
+                {
+                    "medium": {"created": 16, "merged": 1, "failed": 3},
+                    "small": {"created": 5, "merged": 4, "failed": 1},
+                },
+            ]
+        )
         # With the old formula, medium rate = 1/16 = 6% < 40% (in-flight bias).
         # With the terminal denominator, rate = 1/4 = 25% < 40%. Medium still
         # downgrades here, but the *reason* is the honest terminal rate, not
@@ -3938,12 +4749,14 @@ class TestCalibrateScope:
     def test_in_flight_bias_does_not_force_downgrade(self):
         """Early-cycle medium task (many in-flight, few terminal) is not downgraded
         prematurely by an artificially low rate."""
-        d = self._direction([
-            # 10 spawned, only 2 terminal: both merged (100% true rate).
-            # Old formula: rate = 2/10 = 20% → would downgrade.
-            # New formula: rate = 2/(2+0) = 100% but effective=2 < 3 → rate=None → unchanged.
-            {"medium": {"created": 10, "merged": 2, "failed": 0}},
-        ])
+        d = self._direction(
+            [
+                # 10 spawned, only 2 terminal: both merged (100% true rate).
+                # Old formula: rate = 2/10 = 20% → would downgrade.
+                # New formula: rate = 2/(2+0) = 100% but effective=2 < 3 → rate=None → unchanged.
+                {"medium": {"created": 10, "merged": 2, "failed": 0}},
+            ]
+        )
         # direction_data_points uses created (10 >= 3), so we enter calibration.
         # effective denominator = 2 + 0 - 0 = 2 < 3 → rate=None → unchanged.
         result_scope, calibrated_from = _calibrate_scope("medium", d)
@@ -3955,12 +4768,18 @@ class TestCalibrateScope:
 # Pipeline awareness: stalled-cycle detection and research failure recording
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 class TestDirectionHealthRule4:
     """Rule 4 pauses a direction after 3 consecutive failing cycles."""
 
-    def _make_entry(self, *, research_task_failed: bool = False,
-                    tasks_failed: int = 0, prs_merged: int = 0,
-                    tasks_created: int = 0) -> dict:
+    def _make_entry(
+        self,
+        *,
+        research_task_failed: bool = False,
+        tasks_failed: int = 0,
+        prs_merged: int = 0,
+        tasks_created: int = 0,
+    ) -> dict:
         return {
             "timestamp": "2026-04-15T00:00:00",
             "tasks_created": tasks_created,
@@ -3971,7 +4790,12 @@ class TestDirectionHealthRule4:
 
     def test_rule4_three_research_task_failures_trips(self):
         from app.strategic_completion import _check_direction_health
-        d = {"research_history": [self._make_entry(research_task_failed=True) for _ in range(3)]}
+
+        d = {
+            "research_history": [
+                self._make_entry(research_task_failed=True) for _ in range(3)
+            ]
+        }
         reason = _check_direction_health(d)
         assert reason is not None
         assert "Recent stall" in reason
@@ -3984,10 +4808,14 @@ class TestDirectionHealthRule4:
         pattern that Rule 3 would miss.
         """
         from app.strategic_completion import _check_direction_health
-        d = {"research_history": [
-            # 5 created, 1 failed = 20% — below Rule 3's 70% — but 0 merged triggers Rule 4
-            self._make_entry(tasks_created=5, tasks_failed=1, prs_merged=0) for _ in range(3)
-        ]}
+
+        d = {
+            "research_history": [
+                # 5 created, 1 failed = 20% — below Rule 3's 70% — but 0 merged triggers Rule 4
+                self._make_entry(tasks_created=5, tasks_failed=1, prs_merged=0)
+                for _ in range(3)
+            ]
+        }
         reason = _check_direction_health(d)
         assert reason is not None
         assert "Recent stall" in reason
@@ -3995,18 +4823,28 @@ class TestDirectionHealthRule4:
     def test_rule4_mixed_with_merge_does_not_trip(self):
         """If any of the last 3 cycles has a merge, Rule 4 does not trip."""
         from app.strategic_completion import _check_direction_health
-        d = {"research_history": [
-            self._make_entry(tasks_created=5, tasks_failed=1, prs_merged=0),
-            self._make_entry(tasks_created=5, tasks_failed=1, prs_merged=1),  # has a merge
-            self._make_entry(tasks_created=5, tasks_failed=1, prs_merged=0),
-        ]}
+
+        d = {
+            "research_history": [
+                self._make_entry(tasks_created=5, tasks_failed=1, prs_merged=0),
+                self._make_entry(
+                    tasks_created=5, tasks_failed=1, prs_merged=1
+                ),  # has a merge
+                self._make_entry(tasks_created=5, tasks_failed=1, prs_merged=0),
+            ]
+        }
         reason = _check_direction_health(d)
         # Rules 1-3 should not trip either on this short history
         assert reason is None
 
     def test_rule4_fewer_than_three_entries_does_not_trip(self):
         from app.strategic_completion import _check_direction_health
-        d = {"research_history": [self._make_entry(research_task_failed=True) for _ in range(2)]}
+
+        d = {
+            "research_history": [
+                self._make_entry(research_task_failed=True) for _ in range(2)
+            ]
+        }
         assert _check_direction_health(d) is None
 
     def test_rule4_mixed_failure_modes_trip(self):
@@ -4016,11 +4854,14 @@ class TestDirectionHealthRule4:
         is the check that actually catches the pattern.
         """
         from app.strategic_completion import _check_direction_health
-        d = {"research_history": [
-            self._make_entry(research_task_failed=True),
-            self._make_entry(tasks_created=5, tasks_failed=1, prs_merged=0),
-            self._make_entry(research_task_failed=True),
-        ]}
+
+        d = {
+            "research_history": [
+                self._make_entry(research_task_failed=True),
+                self._make_entry(tasks_created=5, tasks_failed=1, prs_merged=0),
+                self._make_entry(research_task_failed=True),
+            ]
+        }
         reason = _check_direction_health(d)
         assert reason is not None
         assert "Recent stall" in reason
@@ -4117,12 +4958,14 @@ async def test_record_research_task_failure_no_direction_is_noop(db_session):
 # Standalone tests for predict_spawn_success (no DB required)
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 class TestPredictSpawnSuccessPipelineSignal:
     """Unit tests for the pipeline-wide scope merge rate fallback signal."""
 
     def test_no_data_no_pipeline_rate_returns_neutral(self):
         """With no signals at all, returns 0.5 — preserves prior fallback behavior."""
         from app.shared_state import runtime_config
+
         runtime_config["pipeline_scope_merge_rates"] = {}
         try:
             assert predict_spawn_success("medium", {}) == 0.5
@@ -4134,6 +4977,7 @@ class TestPredictSpawnSuccessPipelineSignal:
         to the global rate so a 4% medium rate triggers the low_confidence gate
         instead of collapsing to a neutral 0.5 that always passes."""
         from app.shared_state import runtime_config
+
         runtime_config["pipeline_scope_merge_rates"] = {"medium": 0.04}
         try:
             p = predict_spawn_success("medium", {})
@@ -4144,6 +4988,7 @@ class TestPredictSpawnSuccessPipelineSignal:
     def test_pipeline_rate_does_not_apply_to_other_scopes(self):
         """A medium pipeline rate must not influence small-scope predictions."""
         from app.shared_state import runtime_config
+
         runtime_config["pipeline_scope_merge_rates"] = {"medium": 0.04}
         try:
             assert predict_spawn_success("small", {}) == 0.5
@@ -4154,11 +4999,16 @@ class TestPredictSpawnSuccessPipelineSignal:
         """Direction-level signal (weight 2.0) must dominate the pipeline-wide
         fallback (weight 0.5) when both are present."""
         from app.shared_state import runtime_config
+
         runtime_config["pipeline_scope_merge_rates"] = {"medium": 0.0}
         try:
             d = {
                 "research_history": [
-                    {"scope_breakdown": {"medium": {"created": 5, "merged": 5, "failed": 0}}},
+                    {
+                        "scope_breakdown": {
+                            "medium": {"created": 5, "merged": 5, "failed": 0}
+                        }
+                    },
                 ],
             }
             # Signal 1: 1.0 (weight 2.0); Signal 4: 0.0 (weight 0.5).
@@ -4171,6 +5021,7 @@ class TestPredictSpawnSuccessPipelineSignal:
     def test_pipeline_rate_clamped_to_unit_interval(self):
         """Out-of-range pipeline rates are clamped to [0.0, 1.0]."""
         from app.shared_state import runtime_config
+
         runtime_config["pipeline_scope_merge_rates"] = {"medium": 1.5}
         try:
             assert predict_spawn_success("medium", {}) == pytest.approx(1.0)
@@ -4182,6 +5033,7 @@ class TestPredictSpawnSuccessPipelineSignal:
     def test_pipeline_rate_ignores_non_numeric(self):
         """Non-numeric values (e.g. None, strings) are ignored — falls back to neutral."""
         from app.shared_state import runtime_config
+
         runtime_config["pipeline_scope_merge_rates"] = {"medium": None}
         try:
             assert predict_spawn_success("medium", {}) == 0.5
@@ -4230,10 +5082,12 @@ class TestPredictSpawnSuccessDecompositionSignal:
     def test_decomposition_signal_averages_recent_plans(self):
         d = {
             "research_history": [
-                {"decomposition_quality": [
-                    {"subtask_merge_rate": 0.4},
-                    {"subtask_merge_rate": 0.8},
-                ]},
+                {
+                    "decomposition_quality": [
+                        {"subtask_merge_rate": 0.4},
+                        {"subtask_merge_rate": 0.8},
+                    ]
+                },
             ],
         }
         # Only signal 5: average = 0.6
@@ -4247,10 +5101,12 @@ class TestPredictSpawnSuccessDecompositionSignal:
     def test_decomposition_signal_skips_none_rates(self):
         d = {
             "research_history": [
-                {"decomposition_quality": [
-                    {"subtask_merge_rate": None},
-                    {"subtask_merge_rate": 0.5},
-                ]},
+                {
+                    "decomposition_quality": [
+                        {"subtask_merge_rate": None},
+                        {"subtask_merge_rate": 0.5},
+                    ]
+                },
             ],
         }
         assert predict_spawn_success("large", d) == pytest.approx(0.5)
@@ -4259,7 +5115,9 @@ class TestPredictSpawnSuccessDecompositionSignal:
         d = {
             "research_history": [
                 {
-                    "scope_breakdown": {"large": {"created": 2, "merged": 2, "failed": 0}},
+                    "scope_breakdown": {
+                        "large": {"created": 2, "merged": 2, "failed": 0}
+                    },
                     "decomposition_quality": [{"subtask_merge_rate": 0.0}],
                 },
             ],
@@ -4331,7 +5189,11 @@ class TestPredictSpawnSuccessDiagnosisSignal:
         """
         d = {
             "research_history": [
-                {"scope_breakdown": {"medium": {"created": 5, "merged": 5, "failed": 0}}},
+                {
+                    "scope_breakdown": {
+                        "medium": {"created": 5, "merged": 5, "failed": 0}
+                    }
+                },
             ],
             "diagnosis_in_progress": True,
         }
@@ -4382,20 +5244,32 @@ class TestPredictSpawnSuccessAcceptanceSignal:
 
     def test_related_files_small_count_no_penalty(self):
         """1-2 related_files emit no file-count signal."""
-        assert predict_spawn_success("small", {}, related_files=["backend/app/a.py"]) == 0.5
-        assert predict_spawn_success(
-            "small", {}, related_files=["backend/app/a.py", "backend/app/b.py"],
-        ) == 0.5
+        assert (
+            predict_spawn_success("small", {}, related_files=["backend/app/a.py"])
+            == 0.5
+        )
+        assert (
+            predict_spawn_success(
+                "small",
+                {},
+                related_files=["backend/app/a.py", "backend/app/b.py"],
+            )
+            == 0.5
+        )
 
     def test_related_files_moderate_penalty(self):
         """3-4 files → moderate 0.6 penalty at weight 1.0."""
         files = [f"backend/app/f{i}.py" for i in range(3)]
-        assert predict_spawn_success("small", {}, related_files=files) == pytest.approx(0.6)
+        assert predict_spawn_success("small", {}, related_files=files) == pytest.approx(
+            0.6
+        )
 
     def test_related_files_strong_penalty(self):
         """5+ files → strong 0.3 penalty at weight 1.0."""
         files = [f"backend/app/f{i}.py" for i in range(5)]
-        assert predict_spawn_success("small", {}, related_files=files) == pytest.approx(0.3)
+        assert predict_spawn_success("small", {}, related_files=files) == pytest.approx(
+            0.3
+        )
 
     def test_cross_module_span_penalty(self):
         """Cross-module span is intentionally NOT a separate spawn signal — the
@@ -4403,7 +5277,9 @@ class TestPredictSpawnSuccessAcceptanceSignal:
         Only the file-count penalty (0.6 for 3 files at small scope) fires.
         """
         files = ["backend/app/a.py", "agent/src/b.ts", "admin-ui/src/c.ts"]
-        assert predict_spawn_success("small", {}, related_files=files) == pytest.approx(0.6)
+        assert predict_spawn_success("small", {}, related_files=files) == pytest.approx(
+            0.6
+        )
 
     def test_two_module_span_no_cross_module_penalty(self):
         """2-module findings stay at medium scope (per escalation threshold), so
@@ -4428,7 +5304,9 @@ class TestPredictSpawnSuccessAcceptanceSignal:
         assert medium_score > small_score
         # Medium with 7 files hits the strong 0.3 penalty.
         files7 = [f"backend/app/f{i}.py" for i in range(7)]
-        assert predict_spawn_success("medium", {}, related_files=files7) == pytest.approx(0.3)
+        assert predict_spawn_success(
+            "medium", {}, related_files=files7
+        ) == pytest.approx(0.3)
 
     def test_analysis_overflow_dominance_penalizes_medium(self):
         """50%+ of medium failures being analysis_overflow triggers 0.2 penalty."""
@@ -4439,8 +5317,11 @@ class TestPredictSpawnSuccessAcceptanceSignal:
                 {
                     "scope_breakdown": {
                         "medium": {
-                            "created": 2, "merged": 0, "failed": 2,
-                            "failed_infra": 2, "failed_scope_overflow": 2,
+                            "created": 2,
+                            "merged": 0,
+                            "failed": 2,
+                            "failed_infra": 2,
+                            "failed_scope_overflow": 2,
                             "failed_analysis_overflow": 2,
                         },
                     },
@@ -4460,8 +5341,11 @@ class TestPredictSpawnSuccessAcceptanceSignal:
                 {
                     "scope_breakdown": {
                         "medium": {
-                            "created": 5, "merged": 1, "failed": 4,
-                            "failed_infra": 4, "failed_scope_overflow": 4,
+                            "created": 5,
+                            "merged": 1,
+                            "failed": 4,
+                            "failed_infra": 4,
+                            "failed_scope_overflow": 4,
                             "failed_analysis_overflow": 1,
                         },
                     },
@@ -4478,8 +5362,11 @@ class TestPredictSpawnSuccessAcceptanceSignal:
                 {
                     "scope_breakdown": {
                         "medium": {
-                            "created": 1, "merged": 0, "failed": 1,
-                            "failed_infra": 1, "failed_scope_overflow": 1,
+                            "created": 1,
+                            "merged": 0,
+                            "failed": 1,
+                            "failed_infra": 1,
+                            "failed_scope_overflow": 1,
                             "failed_analysis_overflow": 1,
                         },
                     },
@@ -4496,8 +5383,11 @@ class TestPredictSpawnSuccessAcceptanceSignal:
                 {
                     "scope_breakdown": {
                         "small": {
-                            "created": 2, "merged": 0, "failed": 2,
-                            "failed_infra": 2, "failed_scope_overflow": 2,
+                            "created": 2,
+                            "merged": 0,
+                            "failed": 2,
+                            "failed_infra": 2,
+                            "failed_scope_overflow": 2,
                             "failed_analysis_overflow": 2,
                         },
                     },
@@ -4530,11 +5420,17 @@ class TestPredictSpawnSuccessAcceptanceSignal:
         # (weight 1.5) so the review-iter signal (0.5, weight 1.0) is observable.
         d_mid = {"research_history": [{"median_review_iterations": 3}]}
         # (0.9*1.5 + 0.5*1.0) / 2.5 = 1.85/2.5 = 0.74
-        assert predict_spawn_success("small", d_mid, complexity_score=0.9) == pytest.approx(0.74)
+        assert predict_spawn_success(
+            "small", d_mid, complexity_score=0.9
+        ) == pytest.approx(0.74)
         d_mid2 = {"research_history": [{"median_review_iterations": 4}]}
-        assert predict_spawn_success("small", d_mid2, complexity_score=0.9) == pytest.approx(0.74)
+        assert predict_spawn_success(
+            "small", d_mid2, complexity_score=0.9
+        ) == pytest.approx(0.74)
         # Without the review-iter penalty, the same complexity would yield 0.9.
-        assert predict_spawn_success("small", d_low, complexity_score=0.9) == pytest.approx(0.9)
+        assert predict_spawn_success(
+            "small", d_low, complexity_score=0.9
+        ) == pytest.approx(0.9)
         # Strong penalty at 5+ iterations.
         d_high = {"research_history": [{"median_review_iterations": 6}]}
         assert predict_spawn_success("small", d_high) == pytest.approx(0.2)
@@ -4543,6 +5439,7 @@ class TestPredictSpawnSuccessAcceptanceSignal:
 # ─────────────────────────────────────────────────────────────────────────────
 # _poor_decomp_history helper unit tests (suppression signal)
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 class TestPoorDecompHistory:
     """Unit tests for _poor_decomp_history: suppression signal shared by
@@ -4553,42 +5450,73 @@ class TestPoorDecompHistory:
         assert _poor_decomp_history({}) is False
 
     def test_insufficient_subtask_count_returns_false(self):
-        d = {"research_history": [{"decomposition_quality": [
-            {"subtask_merge_rate": 0.0, "subtask_count": 2},
-        ]}]}
+        d = {
+            "research_history": [
+                {
+                    "decomposition_quality": [
+                        {"subtask_merge_rate": 0.0, "subtask_count": 2},
+                    ]
+                }
+            ]
+        }
         assert _poor_decomp_history(d) is False
 
     def test_poor_weighted_avg_returns_true(self):
-        d = {"research_history": [{"decomposition_quality": [
-            {"subtask_merge_rate": 0.1, "subtask_count": 4},
-        ]}]}
+        d = {
+            "research_history": [
+                {
+                    "decomposition_quality": [
+                        {"subtask_merge_rate": 0.1, "subtask_count": 4},
+                    ]
+                }
+            ]
+        }
         assert _poor_decomp_history(d) is True
 
     def test_healthy_weighted_avg_returns_false(self):
-        d = {"research_history": [{"decomposition_quality": [
-            {"subtask_merge_rate": 0.5, "subtask_count": 4},
-        ]}]}
+        d = {
+            "research_history": [
+                {
+                    "decomposition_quality": [
+                        {"subtask_merge_rate": 0.5, "subtask_count": 4},
+                    ]
+                }
+            ]
+        }
         assert _poor_decomp_history(d) is False
 
     def test_weighted_averaging_across_entries(self):
         # 2*0.8 + 3*0.1 = 1.9 over 5 subtasks = 0.38 >= 0.3 → healthy
-        d = {"research_history": [{"decomposition_quality": [
-            {"subtask_merge_rate": 0.8, "subtask_count": 2},
-            {"subtask_merge_rate": 0.1, "subtask_count": 3},
-        ]}]}
+        d = {
+            "research_history": [
+                {
+                    "decomposition_quality": [
+                        {"subtask_merge_rate": 0.8, "subtask_count": 2},
+                        {"subtask_merge_rate": 0.1, "subtask_count": 3},
+                    ]
+                }
+            ]
+        }
         assert _poor_decomp_history(d) is False
 
     def test_skips_non_numeric_rates(self):
-        d = {"research_history": [{"decomposition_quality": [
-            {"subtask_merge_rate": None, "subtask_count": 10},
-            {"subtask_merge_rate": 0.1, "subtask_count": 3},
-        ]}]}
+        d = {
+            "research_history": [
+                {
+                    "decomposition_quality": [
+                        {"subtask_merge_rate": None, "subtask_count": 10},
+                        {"subtask_merge_rate": 0.1, "subtask_count": 3},
+                    ]
+                }
+            ]
+        }
         assert _poor_decomp_history(d) is True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Low-confidence medium auto-escalation gate (integration via _handle_research_completion)
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 async def _setup_escalation_project(db_session, direction_id, decomp_quality):
     # Empty research_history keeps _calibrate_scope a no-op (cold-start falls through);
@@ -4604,15 +5532,21 @@ async def _setup_escalation_project(db_session, direction_id, decomp_quality):
             [{"decomposition_quality": decomp_quality}] if decomp_quality else []
         ),
     }
-    project = Project(name="Escalation test", user_id="test-user-123",
-                      autonomous_enabled=True, directions=[direction])
+    project = Project(
+        name="Escalation test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
     task = Task(
         project_id=project.id,
         title="Research: low-conf",
-        payloads=[{"type": "research", "directions": [direction], "base_branch": "main"}],
+        payloads=[
+            {"type": "research", "directions": [direction], "base_branch": "main"}
+        ],
         context={"research_depth": 0},
         status=TaskStatus.IN_PROGRESS,
         created_by="ORCHESTRATOR",
@@ -4625,12 +5559,18 @@ async def _setup_escalation_project(db_session, direction_id, decomp_quality):
 
 
 def _mock_escalation_externals(mocker, direction_id):
-    mocker.patch("app.task_completion.get_github_token_for_task",
-                 new=AsyncMock(return_value=("fake-token", "owner", "repo")))
-    mocker.patch("app.task_completion.get_branch_sha", new=AsyncMock(return_value="abc123sha"))
+    mocker.patch(
+        "app.task_completion.get_github_token_for_task",
+        new=AsyncMock(return_value=("fake-token", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.task_completion.get_branch_sha", new=AsyncMock(return_value="abc123sha")
+    )
     mocker.patch("app.task_completion.create_branch", new=AsyncMock(return_value=None))
     mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
-    mocker.patch("app.research_completion._validate_plan_dependencies", return_value=True)
+    mocker.patch(
+        "app.research_completion._validate_plan_dependencies", return_value=True
+    )
     mocker.patch("app.research_completion._log_file_overlaps", return_value=[])
     # Disable structural-actionability gate so simplified test findings (without
     # claims/sources/long descriptions) are not deferred as low_actionability.
@@ -4640,16 +5580,18 @@ def _mock_escalation_externals(mocker, direction_id):
     )
     mocker.patch(
         "app.research_completion._parse_research_findings",
-        return_value=[{
-            "title": "Medium improvement",
-            "description": "Some work",
-            "prompt": "Do the work",
-            "priority": "medium",
-            "scope": "medium",
-            "risk": "low",
-            "type": "improvement",
-            "direction_id": direction_id,
-        }],
+        return_value=[
+            {
+                "title": "Medium improvement",
+                "description": "Some work",
+                "prompt": "Do the work",
+                "priority": "medium",
+                "scope": "medium",
+                "risk": "low",
+                "type": "improvement",
+                "direction_id": direction_id,
+            }
+        ],
     )
 
 
@@ -4662,11 +5604,15 @@ async def test_low_confidence_medium_auto_escalates_to_large(db_session, mocker)
     _mock_escalation_externals(mocker, direction_id)
     mocker.patch("app.research_completion.predict_spawn_success", return_value=0.15)
     # Disable exploration-bypass randomness so the escalation path is deterministic.
-    mocker.patch.dict("app.shared_state.runtime_config", {"medium_exploration_fraction": 0})
+    mocker.patch.dict(
+        "app.shared_state.runtime_config", {"medium_exploration_fraction": 0}
+    )
 
     await _handle_research_completion(task, "", db_session)
 
-    result = await db_session.execute(select(Task).where(Task.parent_task_id == task.id))
+    result = await db_session.execute(
+        select(Task).where(Task.parent_task_id == task.id)
+    )
     children = result.scalars().all()
     assert len(children) == 1
     child = children[0]
@@ -4692,19 +5638,29 @@ async def test_exploration_floor_prevents_zero_collapse(db_session, mocker):
         "priority": "medium",
         "paths": [],
         "added_at": "2026-01-01T00:00:00",
-        "research_history": [{
-            "scope_breakdown": {"medium": {"exploration_created": 2, "exploration_merged": 0}},
-        }],
+        "research_history": [
+            {
+                "scope_breakdown": {
+                    "medium": {"exploration_created": 2, "exploration_merged": 0}
+                },
+            }
+        ],
     }
-    project = Project(name="Floor test", user_id="test-user-123",
-                      autonomous_enabled=True, directions=[direction])
+    project = Project(
+        name="Floor test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
     task = Task(
         project_id=project.id,
         title="Research: floor",
-        payloads=[{"type": "research", "directions": [direction], "base_branch": "main"}],
+        payloads=[
+            {"type": "research", "directions": [direction], "base_branch": "main"}
+        ],
         context={"research_depth": 0},
         status=TaskStatus.IN_PROGRESS,
         created_by="ORCHESTRATOR",
@@ -4722,7 +5678,9 @@ async def test_exploration_floor_prevents_zero_collapse(db_session, mocker):
 
     await _handle_research_completion(task, "", db_session)
 
-    result = await db_session.execute(select(Task).where(Task.parent_task_id == task.id))
+    result = await db_session.execute(
+        select(Task).where(Task.parent_task_id == task.id)
+    )
     children = result.scalars().all()
     assert len(children) == 1
     assert children[0].context["scope"] == "medium"
@@ -4741,19 +5699,29 @@ async def test_exploration_floor_skipped_when_proven_unviable(db_session, mocker
         "priority": "medium",
         "paths": [],
         "added_at": "2026-01-01T00:00:00",
-        "research_history": [{
-            "scope_breakdown": {"medium": {"exploration_created": 5, "exploration_merged": 0}},
-        }],
+        "research_history": [
+            {
+                "scope_breakdown": {
+                    "medium": {"exploration_created": 5, "exploration_merged": 0}
+                },
+            }
+        ],
     }
-    project = Project(name="Unviable test", user_id="test-user-123",
-                      autonomous_enabled=True, directions=[direction])
+    project = Project(
+        name="Unviable test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
     task = Task(
         project_id=project.id,
         title="Research: unviable",
-        payloads=[{"type": "research", "directions": [direction], "base_branch": "main"}],
+        payloads=[
+            {"type": "research", "directions": [direction], "base_branch": "main"}
+        ],
         context={"research_depth": 0},
         status=TaskStatus.IN_PROGRESS,
         created_by="ORCHESTRATOR",
@@ -4770,7 +5738,9 @@ async def test_exploration_floor_skipped_when_proven_unviable(db_session, mocker
 
     await _handle_research_completion(task, "", db_session)
 
-    result = await db_session.execute(select(Task).where(Task.parent_task_id == task.id))
+    result = await db_session.execute(
+        select(Task).where(Task.parent_task_id == task.id)
+    )
     children = result.scalars().all()
     assert len(children) == 1
     child = children[0]
@@ -4786,6 +5756,7 @@ async def test_exploration_floor_skipped_when_pipeline_unviable(db_session, mock
     exploration floor is skipped even for a new direction with no history —
     pipeline evidence is sufficient proof of unviability."""
     from app.shared_state import runtime_config
+
     direction_id = "d-pipeline-unviable-1"
     direction = {
         "id": direction_id,
@@ -4796,15 +5767,21 @@ async def test_exploration_floor_skipped_when_pipeline_unviable(db_session, mock
         "added_at": "2026-01-01T00:00:00",
         "research_history": [],
     }
-    project = Project(name="Pipeline unviable test", user_id="test-user-123",
-                      autonomous_enabled=True, directions=[direction])
+    project = Project(
+        name="Pipeline unviable test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
     task = Task(
         project_id=project.id,
         title="Research: pipeline unviable",
-        payloads=[{"type": "research", "directions": [direction], "base_branch": "main"}],
+        payloads=[
+            {"type": "research", "directions": [direction], "base_branch": "main"}
+        ],
         context={"research_depth": 0},
         status=TaskStatus.IN_PROGRESS,
         created_by="ORCHESTRATOR",
@@ -4822,7 +5799,9 @@ async def test_exploration_floor_skipped_when_pipeline_unviable(db_session, mock
     finally:
         runtime_config["pipeline_scope_merge_rates"] = {}
 
-    result = await db_session.execute(select(Task).where(Task.parent_task_id == task.id))
+    result = await db_session.execute(
+        select(Task).where(Task.parent_task_id == task.id)
+    )
     children = result.scalars().all()
     assert len(children) == 1
     child = children[0]
@@ -4847,15 +5826,21 @@ async def test_complexity_modulates_medium_exploration_fraction(db_session, mock
         "added_at": "2026-01-01T00:00:00",
         "research_history": [],
     }
-    project = Project(name="Complexity mod test", user_id="test-user-123",
-                      autonomous_enabled=True, directions=[direction])
+    project = Project(
+        name="Complexity mod test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
     task = Task(
         project_id=project.id,
         title="Research: complexity mod",
-        payloads=[{"type": "research", "directions": [direction], "base_branch": "main"}],
+        payloads=[
+            {"type": "research", "directions": [direction], "base_branch": "main"}
+        ],
         context={"research_depth": 0},
         status=TaskStatus.IN_PROGRESS,
         created_by="ORCHESTRATOR",
@@ -4865,12 +5850,18 @@ async def test_complexity_modulates_medium_exploration_fraction(db_session, mock
     await db_session.commit()
     await db_session.refresh(task)
 
-    mocker.patch("app.task_completion.get_github_token_for_task",
-                 new=AsyncMock(return_value=("fake-token", "owner", "repo")))
-    mocker.patch("app.task_completion.get_branch_sha", new=AsyncMock(return_value="abc123sha"))
+    mocker.patch(
+        "app.task_completion.get_github_token_for_task",
+        new=AsyncMock(return_value=("fake-token", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.task_completion.get_branch_sha", new=AsyncMock(return_value="abc123sha")
+    )
     mocker.patch("app.task_completion.create_branch", new=AsyncMock(return_value=None))
     mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
-    mocker.patch("app.research_completion._validate_plan_dependencies", return_value=True)
+    mocker.patch(
+        "app.research_completion._validate_plan_dependencies", return_value=True
+    )
     mocker.patch("app.research_completion._log_file_overlaps", return_value=[])
     mocker.patch(
         "app.research_completion._apply_structural_actionability_downgrade",
@@ -4925,7 +5916,9 @@ async def test_complexity_modulates_medium_exploration_fraction(db_session, mock
 
     await _handle_research_completion(task, "", db_session)
 
-    result = await db_session.execute(select(Task).where(Task.parent_task_id == task.id))
+    result = await db_session.execute(
+        select(Task).where(Task.parent_task_id == task.id)
+    )
     children = result.scalars().all()
     by_title = {c.title: c for c in children}
     high = next(c for t, c in by_title.items() if "High-complexity" in t)
@@ -4941,6 +5934,7 @@ async def test_hard_skip_below_threshold_drops_finding(db_session, mocker):
     dropped entirely (no child task spawned) and recorded in deferred_findings
     with skip_reason='ultra_low_confidence'."""
     from app.shared_state import runtime_config
+
     direction_id = "d-hardskip-1"
     project, task, _ = await _setup_escalation_project(db_session, direction_id, None)
     _mock_escalation_externals(mocker, direction_id)
@@ -4952,6 +5946,7 @@ async def test_hard_skip_below_threshold_drops_finding(db_session, mocker):
         {"scope_breakdown": {"medium": {"tasks_created": 1, "prs_merged": 0}}}
     ]
     from sqlalchemy.orm.attributes import flag_modified as _fm1
+
     _fm1(project, "directions")
     await db_session.commit()
     try:
@@ -4959,7 +5954,9 @@ async def test_hard_skip_below_threshold_drops_finding(db_session, mocker):
     finally:
         runtime_config.pop("medium_hard_skip_threshold", None)
 
-    result = await db_session.execute(select(Task).where(Task.parent_task_id == task.id))
+    result = await db_session.execute(
+        select(Task).where(Task.parent_task_id == task.id)
+    )
     children = result.scalars().all()
     assert len(children) == 0
     await db_session.refresh(task)
@@ -4976,17 +5973,21 @@ async def test_hard_skip_above_threshold_runs_normal_path(db_session, mocker):
     """Finding above hard_skip threshold but below confidence_threshold still
     follows the normal exploration/escalation path."""
     from app.shared_state import runtime_config
+
     direction_id = "d-hardskip-2"
     project, task, _ = await _setup_escalation_project(db_session, direction_id, None)
     _mock_escalation_externals(mocker, direction_id)
     # 0.15 is above hard_skip (0.10) but below confidence_threshold (default 0.25)
     mocker.patch("app.research_completion.predict_spawn_success", return_value=0.15)
-    mocker.patch.dict("app.shared_state.runtime_config", {"medium_exploration_fraction": 0})
+    mocker.patch.dict(
+        "app.shared_state.runtime_config", {"medium_exploration_fraction": 0}
+    )
     runtime_config["medium_hard_skip_threshold"] = 0.10
     project.directions[0]["research_history"] = [
         {"scope_breakdown": {"medium": {"tasks_created": 1, "prs_merged": 0}}}
     ]
     from sqlalchemy.orm.attributes import flag_modified as _fm2
+
     _fm2(project, "directions")
     await db_session.commit()
     try:
@@ -4994,7 +5995,9 @@ async def test_hard_skip_above_threshold_runs_normal_path(db_session, mocker):
     finally:
         runtime_config.pop("medium_hard_skip_threshold", None)
 
-    result = await db_session.execute(select(Task).where(Task.parent_task_id == task.id))
+    result = await db_session.execute(
+        select(Task).where(Task.parent_task_id == task.id)
+    )
     children = result.scalars().all()
     assert len(children) == 1
     # Escalated to large+plan via the normal low-confidence path.
@@ -5010,6 +6013,7 @@ async def test_hard_skip_bypassed_for_data_starved_direction(db_session, mocker)
     is data-starved — the hard-skip gate is bypassed so the exploration lottery
     can run, breaking the self-reinforcing loop where medium is never attempted."""
     from app.shared_state import runtime_config
+
     direction_id = "d-hardskip-starved"
     _, task, _ = await _setup_escalation_project(db_session, direction_id, None)
     _mock_escalation_externals(mocker, direction_id)
@@ -5027,7 +6031,9 @@ async def test_hard_skip_bypassed_for_data_starved_direction(db_session, mocker)
     finally:
         runtime_config.pop("medium_hard_skip_threshold", None)
 
-    result = await db_session.execute(select(Task).where(Task.parent_task_id == task.id))
+    result = await db_session.execute(
+        select(Task).where(Task.parent_task_id == task.id)
+    )
     children = result.scalars().all()
     # A child was spawned (hard-skip was bypassed) and no deferral was recorded.
     assert len(children) == 1
@@ -5043,6 +6049,7 @@ async def test_hard_skip_counter_in_scope_breakdown(db_session, mocker):
     runs."""
     from app.shared_state import runtime_config
     from app.direction_outcomes import _update_direction_research_outcomes
+
     direction_id = "d-hardskip-3"
     project, task, _ = await _setup_escalation_project(db_session, direction_id, None)
     _mock_escalation_externals(mocker, direction_id)
@@ -5051,12 +6058,15 @@ async def test_hard_skip_counter_in_scope_breakdown(db_session, mocker):
     # Seed a research_history entry so _update_direction_research_outcomes finds it.
     # Includes medium scope_breakdown so the hard-skip gate is not bypassed for
     # data-starved directions.
-    project.directions[0]["research_history"] = [{
-        "task_id": str(task.id),
-        "tasks_created": 0,
-        "scope_breakdown": {"medium": {"tasks_created": 1, "prs_merged": 0}},
-    }]
+    project.directions[0]["research_history"] = [
+        {
+            "task_id": str(task.id),
+            "tasks_created": 0,
+            "scope_breakdown": {"medium": {"tasks_created": 1, "prs_merged": 0}},
+        }
+    ]
     from sqlalchemy.orm.attributes import flag_modified
+
     flag_modified(project, "directions")
     db_session.add(project)
     await db_session.commit()
@@ -5080,7 +6090,9 @@ async def test_hard_skip_counter_in_scope_breakdown(db_session, mocker):
     db_session.add(dummy_child)
     await db_session.commit()
 
-    await _update_direction_research_outcomes(project.id, direction_id, str(task.id), db_session)
+    await _update_direction_research_outcomes(
+        project.id, direction_id, str(task.id), db_session
+    )
     await db_session.refresh(project)
     sb = project.directions[0]["research_history"][0]["scope_breakdown"]
     assert sb["medium"]["skipped_low_confidence"] == 1
@@ -5092,7 +6104,8 @@ async def test_auto_escalate_suppressed_by_poor_decomp_history(db_session, mocke
     decompositions merged poorly (shares suppression with _calibrate_scope)."""
     direction_id = "d-suppressed"
     _, task, _ = await _setup_escalation_project(
-        db_session, direction_id,
+        db_session,
+        direction_id,
         [{"subtask_merge_rate": 0.1, "subtask_count": 5}],
     )
     _mock_escalation_externals(mocker, direction_id)
@@ -5100,7 +6113,9 @@ async def test_auto_escalate_suppressed_by_poor_decomp_history(db_session, mocke
 
     await _handle_research_completion(task, "", db_session)
 
-    result = await db_session.execute(select(Task).where(Task.parent_task_id == task.id))
+    result = await db_session.execute(
+        select(Task).where(Task.parent_task_id == task.id)
+    )
     children = result.scalars().all()
     assert len(children) == 1
     child = children[0]
@@ -5142,8 +6157,11 @@ async def test_completion_suggestion_toggles_off_when_no_longer_complete(db_sess
     await db_session.refresh(project)
 
     active = await _process_direction_lifecycle(
-        project, db_session, cooldown_minutes=60.0,
-        busy_direction_ids=set(), now=datetime.utcnow(),
+        project,
+        db_session,
+        cooldown_minutes=60.0,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
     )
 
     # Direction stays active and eligible.
@@ -5164,7 +6182,9 @@ async def test_completion_suggestion_toggles_off_when_no_longer_complete(db_sess
 
 
 @pytest.mark.asyncio
-async def test_tiered_unproductive_cooldown_escalates_with_consecutive_failures(db_session):
+async def test_tiered_unproductive_cooldown_escalates_with_consecutive_failures(
+    db_session,
+):
     """1st unproductive cycle waits 0.375x base; 3rd+ waits full base."""
     base_cooldown = 240.0
     now = datetime.utcnow()
@@ -5201,10 +6221,19 @@ async def test_tiered_unproductive_cooldown_escalates_with_consecutive_failures(
     await db_session.refresh(project)
 
     active = await _process_direction_lifecycle(
-        project, db_session, cooldown_minutes=base_cooldown,
-        busy_direction_ids=set(), now=now,
+        project,
+        db_session,
+        cooldown_minutes=base_cooldown,
+        busy_direction_ids=set(),
+        now=now,
     )
     active_ids = {d["id"] for d in active}
-    assert "d-tier-1st-pass" in active_ids, "1 consecutive unproductive cycle should use 0.375x cooldown"
-    assert "d-tier-1st-fail" not in active_ids, "80m < 90m (0.375 * 240) — still cooling down"
-    assert "d-tier-3rd-fail" not in active_ids, "3+ consecutive unproductive cycles should use full base cooldown"
+    assert "d-tier-1st-pass" in active_ids, (
+        "1 consecutive unproductive cycle should use 0.375x cooldown"
+    )
+    assert "d-tier-1st-fail" not in active_ids, (
+        "80m < 90m (0.375 * 240) — still cooling down"
+    )
+    assert "d-tier-3rd-fail" not in active_ids, (
+        "3+ consecutive unproductive cycles should use full base cooldown"
+    )

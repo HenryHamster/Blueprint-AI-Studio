@@ -12,7 +12,9 @@ async def test_list_users_empty(client: AsyncClient):
 
 @pytest.mark.asyncio
 async def test_add_user(client: AsyncClient):
-    response = await client.post("/api/admin/users", json={"email": "alice@example.com", "role": "user"})
+    response = await client.post(
+        "/api/admin/users", json={"email": "alice@example.com", "role": "user"}
+    )
     assert response.status_code == 201
     data = response.json()
     assert data["email"] == "alice@example.com"
@@ -24,14 +26,18 @@ async def test_add_user(client: AsyncClient):
 
 @pytest.mark.asyncio
 async def test_add_user_admin_role(client: AsyncClient):
-    response = await client.post("/api/admin/users", json={"email": "bob@example.com", "role": "admin"})
+    response = await client.post(
+        "/api/admin/users", json={"email": "bob@example.com", "role": "admin"}
+    )
     assert response.status_code == 201
     assert response.json()["role"] == "admin"
 
 
 @pytest.mark.asyncio
 async def test_add_user_default_role(client: AsyncClient):
-    response = await client.post("/api/admin/users", json={"email": "carol@example.com"})
+    response = await client.post(
+        "/api/admin/users", json={"email": "carol@example.com"}
+    )
     assert response.status_code == 201
     assert response.json()["role"] == "user"
 
@@ -45,19 +51,25 @@ async def test_add_user_duplicate(client: AsyncClient):
 
 @pytest.mark.asyncio
 async def test_add_user_invalid_email(client: AsyncClient):
-    response = await client.post("/api/admin/users", json={"email": "not-an-email", "role": "user"})
+    response = await client.post(
+        "/api/admin/users", json={"email": "not-an-email", "role": "user"}
+    )
     assert response.status_code == 422
 
 
 @pytest.mark.asyncio
 async def test_add_user_invalid_role(client: AsyncClient):
-    response = await client.post("/api/admin/users", json={"email": "x@example.com", "role": "superadmin"})
+    response = await client.post(
+        "/api/admin/users", json={"email": "x@example.com", "role": "superadmin"}
+    )
     assert response.status_code == 422
 
 
 @pytest.mark.asyncio
 async def test_update_user_role(client: AsyncClient):
-    create = await client.post("/api/admin/users", json={"email": "upd@example.com", "role": "user"})
+    create = await client.post(
+        "/api/admin/users", json={"email": "upd@example.com", "role": "user"}
+    )
     user_id = create.json()["id"]
 
     response = await client.patch(f"/api/admin/users/{user_id}", json={"role": "admin"})
@@ -96,7 +108,9 @@ async def test_delete_user_not_found(client: AsyncClient):
 @pytest.mark.asyncio
 async def test_delete_self_blocked(client: AsyncClient):
     # The auth override returns email "test@example.com" — create a user with that email
-    create = await client.post("/api/admin/users", json={"email": "test@example.com", "role": "admin"})
+    create = await client.post(
+        "/api/admin/users", json={"email": "test@example.com", "role": "admin"}
+    )
     user_id = create.json()["id"]
 
     response = await client.delete(f"/api/admin/users/{user_id}")
@@ -106,8 +120,12 @@ async def test_delete_self_blocked(client: AsyncClient):
 
 @pytest.mark.asyncio
 async def test_list_users_populated(client: AsyncClient):
-    await client.post("/api/admin/users", json={"email": "a@example.com", "role": "admin"})
-    await client.post("/api/admin/users", json={"email": "b@example.com", "role": "user"})
+    await client.post(
+        "/api/admin/users", json={"email": "a@example.com", "role": "admin"}
+    )
+    await client.post(
+        "/api/admin/users", json={"email": "b@example.com", "role": "user"}
+    )
 
     response = await client.get("/api/admin/users")
     assert response.status_code == 200

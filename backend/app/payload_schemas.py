@@ -9,6 +9,7 @@ Provides:
   - validate_internal_payload() — fail-open for schema, fail-closed for size
   - PayloadTooLargeError — raised when serialized payload exceeds the budget
 """
+
 from __future__ import annotations
 
 import json
@@ -56,7 +57,7 @@ def _validate_branch_name(v: str | None) -> str | None:
         return v
     if not v.strip():
         raise ValueError("Branch name cannot be empty")
-    if not re.match(r'^[a-zA-Z0-9_./-]+$', v):
+    if not re.match(r"^[a-zA-Z0-9_./-]+$", v):
         raise ValueError(f"Branch name contains invalid characters: {v!r}")
     # Reject leading dash (e.g. -bad-branch)
     if v.startswith("-"):
@@ -91,6 +92,7 @@ class BasePayload(BaseModel):
 # ---------------------------------------------------------------------------
 # Types that require `prompt`
 # ---------------------------------------------------------------------------
+
 
 class _PromptRequired(BasePayload):
     prompt: str = Field(..., min_length=1)
@@ -135,6 +137,7 @@ class InvestigatePayload(_PromptRequired):
 # review — requires pr_number + branch; prompt optional
 # ---------------------------------------------------------------------------
 
+
 class ReviewPayload(BasePayload):
     pr_number: int = Field(..., gt=0)
     branch: str = Field(..., min_length=1)
@@ -152,6 +155,7 @@ class ReviewPayload(BasePayload):
 # fix — requires prompt + pr_number + branch
 # ---------------------------------------------------------------------------
 
+
 class FixPayload(BasePayload):
     prompt: str = Field(..., min_length=1)
     pr_number: int = Field(..., gt=0)
@@ -168,6 +172,7 @@ class FixPayload(BasePayload):
 # ---------------------------------------------------------------------------
 # System-populated types — no required fields beyond base
 # ---------------------------------------------------------------------------
+
 
 class _SystemPopulated(BasePayload):
     """Backend populates required fields; no extra constraints at ingestion."""
@@ -363,7 +368,8 @@ def pack_under_budget(
         if priority not in _TIER_RANK:
             logger.warning(
                 "pack_under_budget: unknown priority %r for key %r — treating as 'low'",
-                priority, key,
+                priority,
+                key,
             )
             priority = "low"
         try:
@@ -372,23 +378,28 @@ def pack_under_budget(
         except (TypeError, ValueError) as exc:
             logger.warning(
                 "pack_under_budget: key %r not JSON-serializable (%s) — will be dropped",
-                key, exc,
+                key,
+                exc,
             )
             full_size = None
             unserializable = True
-        parts.append({
-            "key": key,
-            "value": value,
-            "priority": priority,
-            "size": full_size,
-            "unserializable": unserializable,
-            "summarize": entry.get("summarize"),
-        })
+        parts.append(
+            {
+                "key": key,
+                "value": value,
+                "priority": priority,
+                "size": full_size,
+                "unserializable": unserializable,
+                "summarize": entry.get("summarize"),
+            }
+        )
 
-    parts.sort(key=lambda p: (
-        -_TIER_RANK[p["priority"]],
-        p["size"] if p["size"] is not None else float("inf"),
-    ))
+    parts.sort(
+        key=lambda p: (
+            -_TIER_RANK[p["priority"]],
+            p["size"] if p["size"] is not None else float("inf"),
+        )
+    )
 
     packed: dict = {}
     used = 0
@@ -412,7 +423,8 @@ def pack_under_budget(
             except Exception as exc:  # noqa: BLE001 — summarize fns must not crash the packer
                 logger.warning(
                     "pack_under_budget: summarize for key %r raised %s — dropping",
-                    key, exc,
+                    key,
+                    exc,
                 )
             else:
                 try:
@@ -420,7 +432,8 @@ def pack_under_budget(
                 except (TypeError, ValueError) as exc:
                     logger.warning(
                         "pack_under_budget: trimmed value for key %r not serializable (%s) — dropping",
-                        key, exc,
+                        key,
+                        exc,
                     )
                     trimmed_size = None
                 if trimmed_size is not None:
@@ -430,20 +443,26 @@ def pack_under_budget(
                     if trimmed_size > p["size"]:
                         logger.warning(
                             "pack_under_budget: summarize for key %r grew value (%d > %d) — using original",
-                            key, trimmed_size, p["size"],
+                            key,
+                            trimmed_size,
+                            p["size"],
                         )
                         trimmed_value = p["value"]
                         trimmed_size = p["size"]
                     if trimmed_size <= remaining:
                         packed[key] = trimmed_value
                         used += trimmed_size
-                        if isinstance(p["value"], list) and isinstance(trimmed_value, list):
-                            trimmed.append({
-                                "key": key,
-                                "kind": "list_trimmed",
-                                "shown": len(trimmed_value),
-                                "total": len(p["value"]),
-                            })
+                        if isinstance(p["value"], list) and isinstance(
+                            trimmed_value, list
+                        ):
+                            trimmed.append(
+                                {
+                                    "key": key,
+                                    "kind": "list_trimmed",
+                                    "shown": len(trimmed_value),
+                                    "total": len(p["value"]),
+                                }
+                            )
                         else:
                             trimmed.append({"key": key, "kind": "summarized"})
                         included = True
@@ -455,13 +474,16 @@ def pack_under_budget(
                     reverse=True,
                 )
                 raise PayloadTooLargeError(used + (p["size"] or 0), budget, top_keys)
-            dropped.append({
-                "key": key,
-                "reason": (
-                    "exceeds remaining budget even after summarize"
-                    if p["summarize"] else "exceeds remaining budget (no summarize_fn)"
-                ),
-            })
+            dropped.append(
+                {
+                    "key": key,
+                    "reason": (
+                        "exceeds remaining budget even after summarize"
+                        if p["summarize"]
+                        else "exceeds remaining budget (no summarize_fn)"
+                    ),
+                }
+            )
 
     packed["_packer_meta"] = {
         "budget_total": budget,

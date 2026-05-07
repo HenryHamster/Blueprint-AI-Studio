@@ -17,7 +17,12 @@ from sqlmodel import select
 
 from app.database import AsyncSessionLocal
 from app.models import (
-    Task, TaskStatus, Artifact, ArtifactType, Alert, AlertSeverity,
+    Task,
+    TaskStatus,
+    Artifact,
+    ArtifactType,
+    Alert,
+    AlertSeverity,
 )
 import app.shared_state as _shared_state
 from app.broadcast import broadcast_to_project
@@ -47,18 +52,18 @@ async def gcp_cleanup_service():
                 # Run cleanup with hard timeout (2 minutes)
                 try:
                     cleanup_result = await asyncio.wait_for(
-                        cleanup_orphaned_vms(active_vm_ids),
-                        timeout=120
+                        cleanup_orphaned_vms(active_vm_ids), timeout=120
                     )
                     # Log divergence and partial failures from structured result
-                    if hasattr(cleanup_result, 'failed') and cleanup_result.failed:
+                    if hasattr(cleanup_result, "failed") and cleanup_result.failed:
                         logger.warning(
                             f"[GCP CLEANUP] Partial failure: deleted {len(cleanup_result.deleted)}, "
                             f"failed {len(cleanup_result.failed)}: {cleanup_result.failed}"
                         )
                     # Cache total GCP VM count for orchestrator concurrency check
-                    if hasattr(cleanup_result, 'total_gcp_vms'):
+                    if hasattr(cleanup_result, "total_gcp_vms"):
                         import app.main as _app_main
+
                         _app_main._last_gcp_vm_count = cleanup_result.total_gcp_vms
                         _app_main._last_gcp_vm_check = time.time()
                 except asyncio.TimeoutError:
@@ -98,7 +103,9 @@ async def gcp_image_cleanup_service():
         try:
             keep = int(_runtime_config.get("max_retained_images", 10))
             if keep < 1:
-                logger.warning(f"[IMAGE CLEANUP] max_retained_images={keep} invalid; skipping cycle")
+                logger.warning(
+                    f"[IMAGE CLEANUP] max_retained_images={keep} invalid; skipping cycle"
+                )
             else:
                 result = await asyncio.wait_for(
                     cleanup_old_images(keep=keep, family=AGENT_IMAGE_FAMILY),
@@ -144,11 +151,14 @@ async def account_availability_refresh_service():
         try:
             async with _max_plan_pool_lock:
                 stale_ids = [
-                    acct["id"] for acct in _account_by_id.values()
+                    acct["id"]
+                    for acct in _account_by_id.values()
                     if account_availability_is_stale(acct)
                 ]
             if stale_ids:
-                logger.info(f"[AVAILABILITY] Refreshing {len(stale_ids)} stale account(s)")
+                logger.info(
+                    f"[AVAILABILITY] Refreshing {len(stale_ids)} stale account(s)"
+                )
                 refreshed = 0
                 for acct_id in stale_ids:
                     acct = _account_by_id.get(acct_id)
@@ -160,7 +170,9 @@ async def account_availability_refresh_service():
                             timeout=30,
                         )
                     except Exception as e:
-                        logger.warning(f"[AVAILABILITY] Refresh failed for {acct_id}: {e}")
+                        logger.warning(
+                            f"[AVAILABILITY] Refresh failed for {acct_id}: {e}"
+                        )
                         continue
                     # refresh_account_available_models mutates acct['provider_metadata']
                     # in place (success or error). Persist the snapshot so a restart
@@ -174,11 +186,15 @@ async def account_availability_refresh_service():
                                 ps.add(row)
                                 await ps.commit()
                     except Exception as e:
-                        logger.warning(f"[AVAILABILITY] Persist failed for {acct_id}: {e}")
+                        logger.warning(
+                            f"[AVAILABILITY] Persist failed for {acct_id}: {e}"
+                        )
                         continue
                     if result is not None:
                         refreshed += 1
-                logger.info(f"[AVAILABILITY] Refreshed {refreshed}/{len(stale_ids)} accounts")
+                logger.info(
+                    f"[AVAILABILITY] Refreshed {refreshed}/{len(stale_ids)} accounts"
+                )
         except asyncio.CancelledError:
             logger.info("[AVAILABILITY] Service shutting down.")
             break
@@ -205,8 +221,7 @@ async def secret_reconciliation_service():
                 active_vm_ids = {vid for vid in active_vm_ids if vid}
 
             recon_result = await asyncio.wait_for(
-                reconcile_orphaned_secrets(active_vm_ids),
-                timeout=120
+                reconcile_orphaned_secrets(active_vm_ids), timeout=120
             )
             if recon_result and recon_result.get("deleted"):
                 logger.info(f"[SECRET RECONCILIATION] {recon_result}")
@@ -240,8 +255,8 @@ _STALE_BRANCH_AGE_DAYS = 2
 # Skip an entire cleanup cycle when either quota bucket is low — leaves
 # headroom for task spawning and CI polling, and prevents the branch cleanup
 # from being the last straw when something else has already burned the budget.
-_QUOTA_FLOOR = 500       # install-token (5000/hr bucket)
-_JWT_QUOTA_FLOOR = 10    # App-JWT (~60/hr bucket)
+_QUOTA_FLOOR = 500  # install-token (5000/hr bucket)
+_JWT_QUOTA_FLOOR = 10  # App-JWT (~60/hr bucket)
 
 # Branch naming conventions these prefixes emit:
 #   blueprint/{task|fix|refactor|docs|deps|migrate}-{short_id}
@@ -255,9 +270,13 @@ _BRANCH_SHORT_ID_RE = re.compile(
 
 # Statuses a task can sit in after it's done. Only branches owned by tasks in
 # one of these states are eligible for stale-branch cleanup.
-_TERMINAL_TASK_STATUSES = frozenset({
-    TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED,
-})
+_TERMINAL_TASK_STATUSES = frozenset(
+    {
+        TaskStatus.COMPLETED,
+        TaskStatus.FAILED,
+        TaskStatus.CANCELLED,
+    }
+)
 
 
 def _extract_branch_short_id(branch_name: str) -> str | None:
@@ -322,7 +341,9 @@ async def _get_project_github_token(project, session):
     )
     from app.secrets_manager import get_user_secret
     from app.routers.agent import (
-        _github_token_cache, _github_token_cache_lock, _GITHUB_TOKEN_TTL,
+        _github_token_cache,
+        _github_token_cache_lock,
+        _GITHUB_TOKEN_TTL,
     )
 
     project_id_str = str(project.id)
@@ -331,12 +352,23 @@ async def _get_project_github_token(project, session):
     # valid for 50min (3000s) to leave safety margin for clock skew.
     async with _github_token_cache_lock:
         cached = _github_token_cache.get(project_id_str)
-        if cached and (_utcnow() - cached["fetched_at"]).total_seconds() < _GITHUB_TOKEN_TTL:
+        if (
+            cached
+            and (_utcnow() - cached["fetched_at"]).total_seconds() < _GITHUB_TOKEN_TTL
+        ):
             return cached["token"]
 
-    integration = (await session.execute(
-        select(UserIntegration).where(UserIntegration.user_id == project.user_id)
-    )).scalars().first()
+    integration = (
+        (
+            await session.execute(
+                select(UserIntegration).where(
+                    UserIntegration.user_id == project.user_id
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
 
     token: str | None = None
     if integration and integration.github_installation_id:
@@ -349,7 +381,9 @@ async def _get_project_github_token(project, session):
         # keeps every code path symmetric.
         token = await get_user_secret(integration.github_pat)
     else:
-        token = await get_repo_installation_token(project.github_owner, project.github_repo)
+        token = await get_repo_installation_token(
+            project.github_owner, project.github_repo
+        )
 
     if token and project.github_owner and project.github_repo:
         async with _github_token_cache_lock:
@@ -401,32 +435,44 @@ async def _run_stale_branch_cleanup():
 
     async with AsyncSessionLocal() as session:
         # Projects with GitHub repos configured
-        projects = (await session.execute(
-            select(Project).where(
-                Project.github_owner.is_not(None),
-                Project.github_repo.is_not(None),
+        projects = (
+            (
+                await session.execute(
+                    select(Project).where(
+                        Project.github_owner.is_not(None),
+                        Project.github_repo.is_not(None),
+                    )
+                )
             )
-        )).scalars().all()
+            .scalars()
+            .all()
+        )
 
         ACTIVE_STATUSES = [
-            TaskStatus.QUEUED, TaskStatus.PROVISIONING,
-            TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING,
+            TaskStatus.QUEUED,
+            TaskStatus.PROVISIONING,
+            TaskStatus.IN_PROGRESS,
+            TaskStatus.EVALUATING,
         ]
         now = _utcnow()
 
         for project in projects:
             if total_deleted >= _MAX_DELETES_TOTAL:
-                logger.info(f"[BRANCH CLEANUP] Global cap ({_MAX_DELETES_TOTAL}) reached, stopping")
+                logger.info(
+                    f"[BRANCH CLEANUP] Global cap ({_MAX_DELETES_TOTAL}) reached, stopping"
+                )
                 break
 
             # Collect branch names referenced by this project's active tasks only,
             # selecting only the columns needed to avoid loading large JSONB payloads.
-            active_task_rows = (await session.execute(
-                select(Task.id, Task.context, Task.payloads).where(
-                    Task.status.in_(ACTIVE_STATUSES),
-                    Task.project_id == project.id,
+            active_task_rows = (
+                await session.execute(
+                    select(Task.id, Task.context, Task.payloads).where(
+                        Task.status.in_(ACTIVE_STATUSES),
+                        Task.project_id == project.id,
+                    )
                 )
-            )).all()
+            ).all()
 
             active_branches: set = set()
             for row in active_task_rows:
@@ -441,7 +487,7 @@ async def _run_stale_branch_cleanup():
                     if b:
                         active_branches.add(b)
                 # Payload branches
-                for payload in (row.payloads or []):
+                for payload in row.payloads or []:
                     pb = payload.get("branch")
                     if pb:
                         active_branches.add(pb)
@@ -449,8 +495,12 @@ async def _run_stale_branch_cleanup():
                 first_payload = (row.payloads or [{}])[0]
                 task_type = first_payload.get("type", "task")
                 type_prefix = {
-                    "create": "task", "fix": "fix", "refactor": "refactor",
-                    "docs": "docs", "deps": "deps", "migrate": "migrate",
+                    "create": "task",
+                    "fix": "fix",
+                    "refactor": "refactor",
+                    "docs": "docs",
+                    "deps": "deps",
+                    "migrate": "migrate",
                 }.get(task_type, "task")
                 short_id = str(row.id).replace("-", "")[:8]
                 active_branches.add(f"blueprint/{type_prefix}-{short_id}")
@@ -458,40 +508,51 @@ async def _run_stale_branch_cleanup():
             try:
                 token = await _get_project_github_token(project, session)
                 if not token:
-                    logger.warning(f"[BRANCH CLEANUP] No token for project {project.id}, skipping")
+                    logger.warning(
+                        f"[BRANCH CLEANUP] No token for project {project.id}, skipping"
+                    )
                     continue
             except Exception as e:
-                logger.warning(f"[BRANCH CLEANUP] Token error for project {project.id}: {e}")
+                logger.warning(
+                    f"[BRANCH CLEANUP] Token error for project {project.id}: {e}"
+                )
                 continue
 
             owner, repo = project.github_owner, project.github_repo
 
             try:
                 branches = await list_branches(
-                    token, owner, repo,
+                    token,
+                    owner,
+                    repo,
                     prefixes=list(_STALE_BRANCH_PREFIXES),
                     max_branches=1000,
                 )
             except Exception as e:
-                logger.warning(f"[BRANCH CLEANUP] Failed to list branches for {owner}/{repo}: {e}")
+                logger.warning(
+                    f"[BRANCH CLEANUP] Failed to list branches for {owner}/{repo}: {e}"
+                )
                 continue
 
             # Batch-load task metadata for every branch whose name matches our
             # known short_id shape. One SQL query replaces ~N GitHub calls.
             branch_short_ids = {
-                sid for b in branches
-                if (sid := _extract_branch_short_id(b["name"]))
+                sid for b in branches if (sid := _extract_branch_short_id(b["name"]))
             }
             # short_id -> (status, context). context is loaded so Gate 5.5 can
             # check for PR closure markers before deleting the branch.
             task_meta: dict[str, tuple] = {}
             if branch_short_ids:
-                rows = (await session.execute(
-                    select(Task.id, Task.status, Task.context).where(
-                        Task.project_id == project.id,
-                        func.substr(cast(Task.id, String), 1, 8).in_(branch_short_ids),
+                rows = (
+                    await session.execute(
+                        select(Task.id, Task.status, Task.context).where(
+                            Task.project_id == project.id,
+                            func.substr(cast(Task.id, String), 1, 8).in_(
+                                branch_short_ids
+                            ),
+                        )
                     )
-                )).all()
+                ).all()
                 for row in rows:
                     sid = str(row.id).replace("-", "")[:8]
                     task_meta[sid] = (row.status, row.context)
@@ -545,7 +606,9 @@ async def _run_stale_branch_cleanup():
                 # Gate 6: commit-date age check. Uses the branch HEAD commit
                 # date from GitHub — external and immutable, unlike
                 # task.updated_at which any row-write can reset.
-                commit_date = await get_commit_date(token, owner, repo, branch_info["sha"])
+                commit_date = await get_commit_date(
+                    token, owner, repo, branch_info["sha"]
+                )
                 if commit_date is None:
                     # API error or missing commit — leave the branch alone;
                     # next cycle will retry.
@@ -590,11 +653,18 @@ async def _run_stale_branch_cleanup():
                     session.add(alert)
                     await session.commit()
                     await broadcast_to_project(
-                        str(project.id), "alert_created",
-                        {"alert_id": str(alert.id), "severity": "INFO", "title": alert.title},
+                        str(project.id),
+                        "alert_created",
+                        {
+                            "alert_id": str(alert.id),
+                            "severity": "INFO",
+                            "title": alert.title,
+                        },
                     )
                 except Exception as e:
-                    logger.warning(f"[BRANCH CLEANUP] Failed to create cleanup alert: {e}")
+                    logger.warning(
+                        f"[BRANCH CLEANUP] Failed to create cleanup alert: {e}"
+                    )
 
     if total_deleted > 0:
         logger.info(f"[BRANCH CLEANUP] Total deleted this cycle: {total_deleted}")
@@ -611,7 +681,9 @@ async def stale_branch_cleanup_service():
         except Exception as e:
             logger.error(f"[BRANCH CLEANUP] Error: {e}", exc_info=True)
 
-        interval_minutes = _shared_state.runtime_config.get("branch_cleanup_interval_minutes", 360)
+        interval_minutes = _shared_state.runtime_config.get(
+            "branch_cleanup_interval_minutes", 360
+        )
         try:
             await asyncio.sleep(interval_minutes * 60)
         except asyncio.CancelledError:
@@ -634,9 +706,12 @@ async def _run_auto_archive_cycle() -> Dict[str, int]:
     held by the orchestrator. Returns {"age": n, "count": n} for logging.
     """
     age_days = _shared_state.runtime_config.get("auto_archive_terminal_after_days", 7)
-    per_project_cap = int(_shared_state.runtime_config.get(
-        "auto_archive_max_terminal_tasks_per_project", 0
-    ) or 0)
+    per_project_cap = int(
+        _shared_state.runtime_config.get(
+            "auto_archive_max_terminal_tasks_per_project", 0
+        )
+        or 0
+    )
     cutoff = _utcnow() - timedelta(days=age_days)
     # Task.updated_at is TIMESTAMP WITHOUT TIME ZONE; asyncpg rejects tz-aware
     # comparands. See get_all_tasks's created_after handling for the same fix.
@@ -663,11 +738,16 @@ async def _run_auto_archive_cycle() -> Dict[str, int]:
             # while the lock is held, so the lock window is bounded by Postgres
             # round-trip time. Keep skip_locked=True so a concurrent writer on
             # one row doesn't stall the rest of the batch.
-            select_stmt = select(Task.id).where(
-                Task.archived.is_(False),
-                Task.status.in_(terminal),
-                Task.updated_at < cutoff,
-            ).limit(_AUTO_ARCHIVE_BATCH_SIZE).with_for_update(skip_locked=True)
+            select_stmt = (
+                select(Task.id)
+                .where(
+                    Task.archived.is_(False),
+                    Task.status.in_(terminal),
+                    Task.updated_at < cutoff,
+                )
+                .limit(_AUTO_ARCHIVE_BATCH_SIZE)
+                .with_for_update(skip_locked=True)
+            )
             ids = (await session.execute(select_stmt)).scalars().all()
             if not ids:
                 break
@@ -676,7 +756,9 @@ async def _run_auto_archive_cycle() -> Dict[str, int]:
             # column as a forensic counter — bumping it here preserves
             # "concurrent writes can be detected by version drift" semantics.
             await session.execute(
-                update(Task).where(Task.id.in_(ids)).values(
+                update(Task)
+                .where(Task.id.in_(ids))
+                .values(
                     archived=True,
                     version=Task.version + 1,
                 )
@@ -716,9 +798,11 @@ async def _run_auto_archive_cycle() -> Dict[str, int]:
         async with AsyncSessionLocal() as session:
             candidate_ids = [
                 row[0]
-                for row in (await session.execute(
-                    candidate_sql, {"cap": per_project_cap, "archived_false": False}
-                )).all()
+                for row in (
+                    await session.execute(
+                        candidate_sql, {"cap": per_project_cap, "archived_false": False}
+                    )
+                ).all()
             ]
         for i in range(0, len(candidate_ids), _AUTO_ARCHIVE_BATCH_SIZE):
             batch = candidate_ids[i : i + _AUTO_ARCHIVE_BATCH_SIZE]
@@ -726,18 +810,26 @@ async def _run_auto_archive_cycle() -> Dict[str, int]:
             async with AsyncSessionLocal() as session:
                 # Re-acquire row locks with skip_locked before updating so a
                 # row held by the orchestrator is deferred, not blocked.
-                lockable = (await session.execute(
-                    select(Task.id)
-                    .where(Task.id.in_(batch))
-                    .with_for_update(skip_locked=True)
-                )).scalars().all()
+                lockable = (
+                    (
+                        await session.execute(
+                            select(Task.id)
+                            .where(Task.id.in_(batch))
+                            .with_for_update(skip_locked=True)
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
                 if not lockable:
                     continue
                 # Wave F4 C4: see Pass 1 note — bump `version` so forensic
                 # counter reflects this bulk archive even though the mapper
                 # `version_id_col` enforcement was dropped in F1.
                 await session.execute(
-                    update(Task).where(Task.id.in_(lockable)).values(
+                    update(Task)
+                    .where(Task.id.in_(lockable))
+                    .values(
                         archived=True,
                         version=Task.version + 1,
                     )
@@ -761,8 +853,12 @@ async def auto_archive_service():
                 archived = await _run_auto_archive_cycle()
                 total = archived["age"] + archived["count"]
                 if total:
-                    age_days = _shared_state.runtime_config.get("auto_archive_terminal_after_days", 7)
-                    cap = _shared_state.runtime_config.get("auto_archive_max_terminal_tasks_per_project", 0)
+                    age_days = _shared_state.runtime_config.get(
+                        "auto_archive_terminal_after_days", 7
+                    )
+                    cap = _shared_state.runtime_config.get(
+                        "auto_archive_max_terminal_tasks_per_project", 0
+                    )
                     logger.info(
                         f"[AUTO-ARCHIVE] Archived {total} task(s): "
                         f"{archived['age']} older than {age_days}d, "
@@ -774,7 +870,9 @@ async def auto_archive_service():
         except Exception as e:
             logger.error(f"[AUTO-ARCHIVE] Error: {e}", exc_info=True)
 
-        interval_minutes = _shared_state.runtime_config.get("auto_archive_interval_minutes", 60)
+        interval_minutes = _shared_state.runtime_config.get(
+            "auto_archive_interval_minutes", 60
+        )
         try:
             await asyncio.sleep(max(interval_minutes, 1) * 60)
         except asyncio.CancelledError:
@@ -872,12 +970,24 @@ async def _chain_has_active_pipeline_work(
     if not pr_number:
         return False
     try:
-        candidates = (await session.execute(
-            select(Task).where(
-                Task.project_id == parent.project_id,
-                Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]),
+        candidates = (
+            (
+                await session.execute(
+                    select(Task).where(
+                        Task.project_id == parent.project_id,
+                        Task.status.in_(
+                            [
+                                TaskStatus.QUEUED,
+                                TaskStatus.PROVISIONING,
+                                TaskStatus.IN_PROGRESS,
+                            ]
+                        ),
+                    )
+                )
             )
-        )).scalars().all()
+            .scalars()
+            .all()
+        )
         cutoff = _utcnow() - timedelta(seconds=stale_seconds)
         for t in candidates:
             fp = t.first_payload
@@ -921,9 +1031,11 @@ async def _chain_has_recoverable_failed_work(parent: Task, session) -> bool:
     """
     from app.failure_classification import INFRA_CLASSES
 
-    direct_children = (await session.execute(
-        select(Task).where(Task.parent_task_id == parent.id)
-    )).scalars().all()
+    direct_children = (
+        (await session.execute(select(Task).where(Task.parent_task_id == parent.id)))
+        .scalars()
+        .all()
+    )
     direct_child_ids = {str(c.id) for c in direct_children}
 
     for c in direct_children:
@@ -939,13 +1051,19 @@ async def _chain_has_recoverable_failed_work(parent: Task, session) -> bool:
     # Pipeline / descendant tasks whose original_task_id points at one of our
     # direct children — covers review/fix tasks attached to create children.
     try:
-        candidates = (await session.execute(
-            select(Task)
-            .where(Task.project_id == parent.project_id)
-            .where(Task.status == TaskStatus.FAILED)
-            .order_by(Task.created_at.desc())
-            .limit(500)
-        )).scalars().all()
+        candidates = (
+            (
+                await session.execute(
+                    select(Task)
+                    .where(Task.project_id == parent.project_id)
+                    .where(Task.status == TaskStatus.FAILED)
+                    .order_by(Task.created_at.desc())
+                    .limit(500)
+                )
+            )
+            .scalars()
+            .all()
+        )
         for t in candidates:
             orig = t.first_payload.get("original_task_id") or ""
             if orig not in direct_child_ids:
@@ -977,22 +1095,33 @@ async def _summarize_latest_review_for_chain(parent: Task, session) -> dict | No
         # Bound the candidate set: filter to relevant statuses and recent rows.
         # Payload-based filtering (type/pr_number/original_task_id) still happens
         # in Python since these live in JSONB.
-        candidates = (await session.execute(
-            select(Task)
-            .where(Task.project_id == parent.project_id)
-            .where(Task.status.in_((
-                TaskStatus.QUEUED,
-                TaskStatus.PROVISIONING,
-                TaskStatus.IN_PROGRESS,
-                TaskStatus.EVALUATING,
-                TaskStatus.COMPLETED,
-                TaskStatus.FAILED,
-            )))
-            .order_by(Task.created_at.desc())
-            .limit(100)
-        )).scalars().all()
+        candidates = (
+            (
+                await session.execute(
+                    select(Task)
+                    .where(Task.project_id == parent.project_id)
+                    .where(
+                        Task.status.in_(
+                            (
+                                TaskStatus.QUEUED,
+                                TaskStatus.PROVISIONING,
+                                TaskStatus.IN_PROGRESS,
+                                TaskStatus.EVALUATING,
+                                TaskStatus.COMPLETED,
+                                TaskStatus.FAILED,
+                            )
+                        )
+                    )
+                    .order_by(Task.created_at.desc())
+                    .limit(100)
+                )
+            )
+            .scalars()
+            .all()
+        )
         matches = [
-            t for t in candidates
+            t
+            for t in candidates
             if t.first_payload.get("type") == "review"
             and t.first_payload.get("pr_number") == pr_number
             and (t.first_payload.get("original_task_id") or "") == original_id
@@ -1002,7 +1131,11 @@ async def _summarize_latest_review_for_chain(parent: Task, session) -> dict | No
         # datetime.min is a naive sentinel matching our naive-UTC column convention;
         # only used when created_at is unset (should not happen — DB sets a default).
         latest = max(matches, key=lambda t: t.created_at or datetime.min)  # noqa: DTZ901
-        status_val = latest.status.value if hasattr(latest.status, "value") else str(latest.status)
+        status_val = (
+            latest.status.value
+            if hasattr(latest.status, "value")
+            else str(latest.status)
+        )
         return {
             "id": str(latest.id),
             "short_id": str(latest.id)[:8],
@@ -1041,13 +1174,20 @@ async def _supersede_long_queued_pipeline_tasks(
     Returns the count of tasks superseded so the caller can log it.
     """
     from app.failure_classification import AGENT_TIMEOUT, persist_failure_category
+
     cutoff = _utcnow() - timedelta(seconds=_QUEUED_PIPELINE_SUPERSEDE_AFTER_SECONDS)
-    candidates = (await session.execute(
-        select(Task).where(
-            Task.project_id == parent.project_id,
-            Task.status == TaskStatus.QUEUED,
+    candidates = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.project_id == parent.project_id,
+                    Task.status == TaskStatus.QUEUED,
+                )
+            )
         )
-    )).scalars().all()
+        .scalars()
+        .all()
+    )
     superseded = 0
     for t in candidates:
         if t.id == parent.id:
@@ -1082,7 +1222,9 @@ async def _supersede_long_queued_pipeline_tasks(
     return superseded
 
 
-async def _attempt_ci_backstop_recovery(parent: Task, session, review_loop: dict) -> bool:
+async def _attempt_ci_backstop_recovery(
+    parent: Task, session, review_loop: dict
+) -> bool:
     """One-shot attempt to unstick a parent whose review gate never closed.
 
     Used when CI has passed but review_approved is absent — typically because
@@ -1099,6 +1241,7 @@ async def _attempt_ci_backstop_recovery(parent: Task, session, review_loop: dict
     wait window and skip the hard kill for this tick).
     """
     from app.review_pipeline import _spawn_pipeline_task
+
     pr_number = review_loop.get("pr_number")
     branch = review_loop.get("branch")
     base_branch = review_loop.get("base_branch", "main")
@@ -1107,10 +1250,18 @@ async def _attempt_ci_backstop_recovery(parent: Task, session, review_loop: dict
         return False
     try:
         await _supersede_long_queued_pipeline_tasks(
-            parent, session, pr_number, original_task_id,
+            parent,
+            session,
+            pr_number,
+            original_task_id,
         )
         review_task, _ = await _spawn_pipeline_task(
-            parent, "review", session, pr_number, branch, base_branch,
+            parent,
+            "review",
+            session,
+            pr_number,
+            branch,
+            base_branch,
             original_prompt=(parent.description or parent.title or ""),
             original_task_id=original_task_id,
         )
@@ -1136,7 +1287,7 @@ async def _check_evaluating_timeouts():
     from app.rollup_management import _check_and_trigger_rollup
     from app.shared_state import runtime_config as _runtime_config
 
-    EVALUATING_WARN_SECONDS = 2 * 3600   # 2 hours
+    EVALUATING_WARN_SECONDS = 2 * 3600  # 2 hours
     # Default backstop bumped to 48h while silent-death v2 stabilizes
     # (2026-05-04): tasks reaped mid-flight by the 6h wall-clock were getting
     # cascade-killed during operator-intervention windows. Runtime knob
@@ -1159,7 +1310,9 @@ async def _check_evaluating_timeouts():
     # premature kill that cancels in-flight children. 60 min is the default
     # because realistic cycles routinely run 30-50 min; 30 min was firing
     # mid-iteration during pipeline-throttled periods.
-    CI_BACKSTOP_SECONDS = int(_runtime_config.get("ci_backstop_timeout_minutes", 60)) * 60
+    CI_BACKSTOP_SECONDS = (
+        int(_runtime_config.get("ci_backstop_timeout_minutes", 60)) * 60
+    )
     # Approval-gate companion timeout: parents flagged requires_approval can
     # otherwise stall indefinitely when _chain_has_active_pipeline_work defers
     # the EVALUATING_FAIL backstop. 2h gives operators a reasonable window
@@ -1171,6 +1324,7 @@ async def _check_evaluating_timeouts():
         async with AsyncSessionLocal() as session:
             from app import pause_clock
             from app.models import DeploymentState
+
             now = _utcnow()
             # Fetch DeployState once per cycle so CI backstop can subtract
             # pause windows from elapsed (admin pause + auto-pause both count).
@@ -1179,21 +1333,41 @@ async def _check_evaluating_timeouts():
             # loop only reads context/payloads/status_log of the heavy JSONB
             # columns. status_log is consumed at lines ~1216 and ~1384 to find
             # the last EVALUATING transition, so it must remain loaded.
-            evaluating_tasks = (await session.execute(
-                select(Task)
-                .options(load_only(
-                    Task.id, Task.status, Task.title, Task.project_id,
-                    Task.parent_task_id, Task.archived, Task.requires_approval,
-                    Task.created_at, Task.started_at, Task.updated_at,
-                    Task.latest_status_message, Task.context, Task.payloads,
-                    Task.status_log, Task.last_heartbeat, Task.attempt_count,
-                    Task.account_id, Task.vm_instance_id,
-                ))
-                .where(
-                    Task.status == TaskStatus.EVALUATING,
-                    Task.archived.is_(False),
+            evaluating_tasks = (
+                (
+                    await session.execute(
+                        select(Task)
+                        .options(
+                            load_only(
+                                Task.id,
+                                Task.status,
+                                Task.title,
+                                Task.project_id,
+                                Task.parent_task_id,
+                                Task.archived,
+                                Task.requires_approval,
+                                Task.created_at,
+                                Task.started_at,
+                                Task.updated_at,
+                                Task.latest_status_message,
+                                Task.context,
+                                Task.payloads,
+                                Task.status_log,
+                                Task.last_heartbeat,
+                                Task.attempt_count,
+                                Task.account_id,
+                                Task.vm_instance_id,
+                            )
+                        )
+                        .where(
+                            Task.status == TaskStatus.EVALUATING,
+                            Task.archived.is_(False),
+                        )
+                    )
                 )
-            )).scalars().all()
+                .scalars()
+                .all()
+            )
 
             # Phase B4 (H-P2): batch-fetch children for all evaluating parents
             # in a single ``IN (...)`` query. The previous code fired one query
@@ -1204,11 +1378,21 @@ async def _check_evaluating_timeouts():
             _eval_children_by_parent: Dict[uuid.UUID, list] = {}
             if evaluating_tasks:
                 _eval_parent_ids = [t.id for t in evaluating_tasks]
-                _eval_all_children = (await session.execute(
-                    select(Task).where(Task.parent_task_id.in_(_eval_parent_ids))
-                )).scalars().all()
+                _eval_all_children = (
+                    (
+                        await session.execute(
+                            select(Task).where(
+                                Task.parent_task_id.in_(_eval_parent_ids)
+                            )
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
                 for _ec in _eval_all_children:
-                    _eval_children_by_parent.setdefault(_ec.parent_task_id, []).append(_ec)
+                    _eval_children_by_parent.setdefault(_ec.parent_task_id, []).append(
+                        _ec
+                    )
 
             for task in evaluating_tasks:
                 ctx = task.context or {}
@@ -1221,7 +1405,9 @@ async def _check_evaluating_timeouts():
                 # leaving the flag stuck and no review task spawned. Without
                 # this consumer the task sits until the 48h reaper backstop.
                 if ctx.get("_pr_state_check_pending"):
-                    pr_num = (ctx.get("review_loop") or {}).get("pr_number") or ctx.get("rollup_pr_number")
+                    pr_num = (ctx.get("review_loop") or {}).get("pr_number") or ctx.get(
+                        "rollup_pr_number"
+                    )
                     if not pr_num:
                         for entry in reversed(task.status_log or []):
                             m = re.search(r"open PR #(\d+)", entry.get("msg", "") or "")
@@ -1240,6 +1426,7 @@ async def _check_evaluating_timeouts():
                         continue
 
                     from sqlalchemy.orm.attributes import flag_modified
+
                     _ctx2 = dict(ctx)
                     _ctx2.pop("_pr_state_check_pending", None)
 
@@ -1257,8 +1444,13 @@ async def _check_evaluating_timeouts():
                         try:
                             from app.routers.agent import get_github_token_for_task  # noqa: PLC0415
                             from app.github import get_pull_request  # noqa: PLC0415
-                            gh_token, owner, repo = await get_github_token_for_task(task.id, session)
-                            pr_data = await get_pull_request(gh_token, owner, repo, pr_num)
+
+                            gh_token, owner, repo = await get_github_token_for_task(
+                                task.id, session
+                            )
+                            pr_data = await get_pull_request(
+                                gh_token, owner, repo, pr_num
+                            )
                             gh_pr_state = pr_data.get("state") or "open"
                             gh_pr_merged = bool(pr_data.get("merged"))
                         except Exception as gh_exc:
@@ -1272,42 +1464,56 @@ async def _check_evaluating_timeouts():
                             task.status = TaskStatus.COMPLETED
                             task.vm_instance_id = None
                             task.last_heartbeat = None
-                            task.latest_status_message = (
-                                f"Recovered _pr_state_check_pending: PR #{pr_num} merged out-of-band"
-                            )
+                            task.latest_status_message = f"Recovered _pr_state_check_pending: PR #{pr_num} merged out-of-band"
                             _ctx2["pr_merged"] = True
                         elif gh_pr_state == "closed" and not gh_pr_merged:
                             task.status = TaskStatus.FAILED
                             task.vm_instance_id = None
                             task.last_heartbeat = None
-                            task.latest_status_message = (
-                                f"Recovered _pr_state_check_pending: PR #{pr_num} closed without merge"
-                            )
+                            task.latest_status_message = f"Recovered _pr_state_check_pending: PR #{pr_num} closed without merge"
                             _ctx2["pr_closed_unmerged"] = True
                         else:
                             task.vm_instance_id = None
                             task.last_heartbeat = None
                             try:
                                 from app.review_pipeline import _spawn_pipeline_task  # noqa: PLC0415
+
                                 short_id = str(task.id).replace("-", "")[:8]
-                                task_type_str = (task.first_payload or {}).get("type", "") or ""
+                                task_type_str = (task.first_payload or {}).get(
+                                    "type", ""
+                                ) or ""
                                 type_prefix_map = {
-                                    "docs": "docs", "deps": "deps", "migrate": "migrate",
-                                    "refactor": "refactor", "perf": "task", "qa": "task",
-                                    "security_audit": "task", "debug": "task", "smoketest": "task",
+                                    "docs": "docs",
+                                    "deps": "deps",
+                                    "migrate": "migrate",
+                                    "refactor": "refactor",
+                                    "perf": "task",
+                                    "qa": "task",
+                                    "security_audit": "task",
+                                    "debug": "task",
+                                    "smoketest": "task",
                                 }
-                                branch_prefix = type_prefix_map.get(task_type_str, "task")
+                                branch_prefix = type_prefix_map.get(
+                                    task_type_str, "task"
+                                )
                                 branch = f"blueprint/{branch_prefix}-{short_id}"
-                                base_branch = (task.first_payload or {}).get("base_branch", "main")
-                                original_prompt = (task.first_payload or {}).get("prompt", task.description or "")
+                                base_branch = (task.first_payload or {}).get(
+                                    "base_branch", "main"
+                                )
+                                original_prompt = (task.first_payload or {}).get(
+                                    "prompt", task.description or ""
+                                )
                                 await _spawn_pipeline_task(
-                                    task, "review", session, pr_num, branch, base_branch,
+                                    task,
+                                    "review",
+                                    session,
+                                    pr_num,
+                                    branch,
+                                    base_branch,
                                     original_prompt=original_prompt,
                                     original_task_id=str(task.id),
                                 )
-                                task.latest_status_message = (
-                                    f"Recovered _pr_state_check_pending: spawned review for PR #{pr_num}"
-                                )
+                                task.latest_status_message = f"Recovered _pr_state_check_pending: spawned review for PR #{pr_num}"
                             except Exception as spawn_exc:
                                 logger.warning(
                                     f"[EVAL TIMEOUT pr_check] Review spawn failed for "
@@ -1315,16 +1521,15 @@ async def _check_evaluating_timeouts():
                                     f"{spawn_exc}",
                                     exc_info=True,
                                 )
-                                task.latest_status_message = (
-                                    f"Recovered _pr_state_check_pending: review spawn failed, will retry"
-                                )
+                                task.latest_status_message = "Recovered _pr_state_check_pending: review spawn failed, will retry"
 
                         task.context = _ctx2
                         flag_modified(task, "context")
                         session.add(task)
                         await session.commit()
                         await broadcast_to_project(
-                            str(task.project_id), "task_updated",
+                            str(task.project_id),
+                            "task_updated",
                             {"task_id": str(task.id), "status": task.status},
                         )
                         continue
@@ -1338,6 +1543,7 @@ async def _check_evaluating_timeouts():
                     approval_set_at = ctx.get("_approval_set_at")
                     if not approval_set_at:
                         from sqlalchemy.orm.attributes import flag_modified
+
                         task.context = {**ctx, "_approval_set_at": now.isoformat()}
                         flag_modified(task, "context")
                         session.add(task)
@@ -1360,23 +1566,31 @@ async def _check_evaluating_timeouts():
                             f"Approval-gate timeout after {hours}h — no manual "
                             f"approval received, escalating to FAILED"
                         )
-                        from app.failure_classification import classify_failure, persist_failure_category
+                        from app.failure_classification import (
+                            classify_failure,
+                            persist_failure_category,
+                        )
                         from app.routers.agent_status import record_task_result
+
                         _fc = classify_failure(task)
                         persist_failure_category(task, _fc)
                         record_task_result(
-                            success=False, failure_class=_fc, task_id=str(task.id),
+                            success=False,
+                            failure_class=_fc,
+                            task_id=str(task.id),
                             task_type=task.first_payload.get("type", ""),
                         )
                         session.add(task)
                         await _maybe_create_failure_alert(
-                            task, session,
+                            task,
+                            session,
                             f"Approval-gate timeout after {hours}h — parent failed "
                             f"without manual resolution",
                         )
                         await session.commit()
                         await broadcast_to_project(
-                            str(task.project_id), "task_updated",
+                            str(task.project_id),
+                            "task_updated",
                             {"task_id": str(task.id), "status": task.status},
                         )
                         continue
@@ -1411,8 +1625,12 @@ async def _check_evaluating_timeouts():
                         for entry in reversed(task.status_log or []):
                             msg = entry.get("msg", "")
                             if "→ EVALUATING" in msg:
-                                with contextlib.suppress(KeyError, ValueError, TypeError):
-                                    evaluating_since = datetime.fromisoformat(entry["t"])
+                                with contextlib.suppress(
+                                    KeyError, ValueError, TypeError
+                                ):
+                                    evaluating_since = datetime.fromisoformat(
+                                        entry["t"]
+                                    )
                                 break
                     if evaluating_since is None:
                         evaluating_since = task.started_at or task.created_at
@@ -1421,9 +1639,15 @@ async def _check_evaluating_timeouts():
                     # occurred since the timer started. Legacy timers without
                     # a stashed baseline fall back to raw elapsed.
                     _ci_baseline = rl.get("ci_wait_pause_baseline")
-                    elapsed = pause_clock.active_elapsed(
-                        _deploy_state, evaluating_since, _ci_baseline,
-                    ) if _deploy_state else (now - evaluating_since).total_seconds()
+                    elapsed = (
+                        pause_clock.active_elapsed(
+                            _deploy_state,
+                            evaluating_since,
+                            _ci_baseline,
+                        )
+                        if _deploy_state
+                        else (now - evaluating_since).total_seconds()
+                    )
                     # Early trigger: if CI has passed but review_approved is
                     # missing AND the review child task is already terminal
                     # (FAILED/CANCELLED), the review VM died silently — we
@@ -1443,8 +1667,13 @@ async def _check_evaluating_timeouts():
                         and not rl_review_approved
                         and not rl_recovery_attempted
                     ):
-                        _early_summary = await _summarize_latest_review_for_chain(task, session)
-                        if _early_summary and _early_summary["status"] in ("FAILED", "CANCELLED"):
+                        _early_summary = await _summarize_latest_review_for_chain(
+                            task, session
+                        )
+                        if _early_summary and _early_summary["status"] in (
+                            "FAILED",
+                            "CANCELLED",
+                        ):
                             early_recovery_eligible = True
                     if elapsed <= CI_BACKSTOP_SECONDS and not early_recovery_eligible:
                         # Under backstop threshold — let normal CI timeout handle it
@@ -1460,9 +1689,14 @@ async def _check_evaluating_timeouts():
                         continue
                     hours = round(elapsed / 3600, 1)
                     ci_passed = bool(rl.get("ci_passed"))
-                    review_approved = bool(rl.get("review_approved")) or rl.get("verdict") == "APPROVE"
+                    review_approved = (
+                        bool(rl.get("review_approved"))
+                        or rl.get("verdict") == "APPROVE"
+                    )
                     recovery_attempted = bool(rl.get("review_recovery_attempted"))
-                    review_summary = await _summarize_latest_review_for_chain(task, session)
+                    review_summary = await _summarize_latest_review_for_chain(
+                        task, session
+                    )
 
                     # Compose an honest reason. The historic "CI polling stalled after
                     # escalation" was a lie when the actual blocker was a missing review
@@ -1478,34 +1712,42 @@ async def _check_evaluating_timeouts():
                                 f"{review_summary['status']} without verdict callback"
                             )
                         else:
-                            reason = "CI passed but no review task exists for this chain"
+                            reason = (
+                                "CI passed but no review task exists for this chain"
+                            )
                     elif review_approved and not ci_passed:
                         reason = "review approved but CI never completed within backstop window"
                     elif was_escalated:
                         reason = "both gates unmet after 20-min escalation"
                     else:
-                        reason = "neither CI nor review completed within backstop window"
+                        reason = (
+                            "neither CI nor review completed within backstop window"
+                        )
 
                     # One-shot recovery: if CI passed but the review-approved gate never
                     # closed (common when the review VM died before POSTing status),
                     # spawn a fresh review and reset the CI-wait clock instead of hard
                     # killing. The dedup guard will supersede any stale corpse.
-                    if (
-                        ci_passed and not review_approved
-                        and not recovery_attempted
-                    ):
-                        recovered = await _attempt_ci_backstop_recovery(task, session, rl)
+                    if ci_passed and not review_approved and not recovery_attempted:
+                        recovered = await _attempt_ci_backstop_recovery(
+                            task, session, rl
+                        )
                         if recovered:
                             from sqlalchemy.orm.attributes import flag_modified
+
                             new_rl = dict(rl)
                             new_rl["review_recovery_attempted"] = True
                             new_rl["review_recovery_at"] = _utcnow().isoformat()
                             new_rl["ci_wait_started"] = _utcnow().isoformat()
                             new_rl["ci_wait_pause_baseline"] = (
                                 pause_clock.total_paused_seconds(_deploy_state)
-                                if _deploy_state else 0.0
+                                if _deploy_state
+                                else 0.0
                             )
-                            task.context = {**(task.context or {}), "review_loop": new_rl}
+                            task.context = {
+                                **(task.context or {}),
+                                "review_loop": new_rl,
+                            }
                             flag_modified(task, "context")
                             task.latest_status_message = (
                                 f"CI passed on PR #{new_rl.get('pr_number')} but review never "
@@ -1514,7 +1756,8 @@ async def _check_evaluating_timeouts():
                             session.add(task)
                             await session.commit()
                             await broadcast_to_project(
-                                str(task.project_id), "task_updated",
+                                str(task.project_id),
+                                "task_updated",
                                 {"task_id": str(task.id), "status": task.status},
                             )
                             logger.warning(
@@ -1532,16 +1775,28 @@ async def _check_evaluating_timeouts():
                     task.latest_status_message = (
                         f"CI wait backstop timeout after {hours}h ({reason})"
                     )
-                    from app.failure_classification import classify_failure, persist_failure_category
+                    from app.failure_classification import (
+                        classify_failure,
+                        persist_failure_category,
+                    )
                     from app.routers.agent_status import record_task_result
+
                     _fc = classify_failure(task)
                     persist_failure_category(task, _fc)
-                    record_task_result(success=False, failure_class=_fc, task_id=str(task.id), task_type=task.first_payload.get("type", ""))
+                    record_task_result(
+                        success=False,
+                        failure_class=_fc,
+                        task_id=str(task.id),
+                        task_type=task.first_payload.get("type", ""),
+                    )
                     session.add(task)
                     children = _eval_children_by_parent.get(task.id, [])
                     from app.main import _ensure_vm_deleted
                     from app.max_plan_pool import release_max_plan_account
-                    non_terminal_children = [c for c in children if c.status not in TERMINAL]
+
+                    non_terminal_children = [
+                        c for c in children if c.status not in TERMINAL
+                    ]
                     vms_to_delete = []
                     child_cancel_msg = f"Cancelled: parent CI wait backstop timeout after {hours}h ({reason})"
                     for child in non_terminal_children:
@@ -1554,17 +1809,20 @@ async def _check_evaluating_timeouts():
                             await release_max_plan_account(child_acct)
                         session.add(child)
                     await _maybe_create_failure_alert(
-                        task, session,
+                        task,
+                        session,
                         f"CI wait backstop timeout after {hours}h — {reason}",
                     )
                     await session.commit()
                     await broadcast_to_project(
-                        str(task.project_id), "task_updated",
+                        str(task.project_id),
+                        "task_updated",
                         {"task_id": str(task.id), "status": task.status},
                     )
                     for child in non_terminal_children:
                         await broadcast_to_project(
-                            str(task.project_id), "task_updated",
+                            str(task.project_id),
+                            "task_updated",
                             {"task_id": str(child.id), "status": child.status},
                         )
                     for child_vm in vms_to_delete:
@@ -1635,7 +1893,9 @@ async def _check_evaluating_timeouts():
                                 first_defer_at = None
                         except (ValueError, TypeError):
                             first_defer_at = None
-                    has_recoverable = await _chain_has_recoverable_failed_work(task, session)
+                    has_recoverable = await _chain_has_recoverable_failed_work(
+                        task, session
+                    )
                     if has_recoverable:
                         if first_defer_at:
                             try:
@@ -1648,7 +1908,7 @@ async def _check_evaluating_timeouts():
                                     f"[EVAL TIMEOUT] Task {str(task.id)[:8]} past "
                                     f"{EVALUATING_FAIL_SECONDS // 3600}h but chain "
                                     f"has recoverable FAILED children — deferring "
-                                    f"({round(defer_elapsed/3600, 1)}h into "
+                                    f"({round(defer_elapsed / 3600, 1)}h into "
                                     f"{EVAL_DEFER_WINDOW_HOURS}h window)"
                                 )
                                 continue
@@ -1660,7 +1920,11 @@ async def _check_evaluating_timeouts():
                             # fall through to existing kill
                         else:
                             from sqlalchemy.orm.attributes import flag_modified
-                            task.context = {**ctx, "_eval_timeout_first_defer_at": now.isoformat()}
+
+                            task.context = {
+                                **ctx,
+                                "_eval_timeout_first_defer_at": now.isoformat(),
+                            }
                             flag_modified(task, "context")
                             session.add(task)
                             logger.warning(
@@ -1670,7 +1934,8 @@ async def _check_evaluating_timeouts():
                                 f"for up to {EVAL_DEFER_WINDOW_HOURS}h"
                             )
                             await _maybe_create_failure_alert(
-                                task, session,
+                                task,
+                                session,
                                 f"Evaluation past {EVALUATING_FAIL_SECONDS // 3600}h with "
                                 f"recoverable infra failures in chain — deferring "
                                 f"cascade-cancel for up to {EVAL_DEFER_WINDOW_HOURS}h",
@@ -1688,19 +1953,33 @@ async def _check_evaluating_timeouts():
                         f"Evaluation timeout — children did not complete "
                         f"within {EVALUATING_FAIL_SECONDS // 3600} hours"
                     )
-                    from app.failure_classification import classify_failure, persist_failure_category
+                    from app.failure_classification import (
+                        classify_failure,
+                        persist_failure_category,
+                    )
                     from app.routers.agent_status import record_task_result
+
                     _fc = classify_failure(task)
                     persist_failure_category(task, _fc)
-                    record_task_result(success=False, failure_class=_fc, task_id=str(task.id), task_type=task.first_payload.get("type", ""))
+                    record_task_result(
+                        success=False,
+                        failure_class=_fc,
+                        task_id=str(task.id),
+                        task_type=task.first_payload.get("type", ""),
+                    )
                     session.add(task)
 
                     # Cascade-cancel non-terminal children
                     from app.main import _ensure_vm_deleted
                     from app.max_plan_pool import release_max_plan_account
-                    non_terminal_children = [c for c in children if c.status not in TERMINAL]
+
+                    non_terminal_children = [
+                        c for c in children if c.status not in TERMINAL
+                    ]
                     vms_to_delete = []
-                    hard_timeout_cancel_msg = f"Cancelled: parent evaluation timeout after {hours}h"
+                    hard_timeout_cancel_msg = (
+                        f"Cancelled: parent evaluation timeout after {hours}h"
+                    )
                     for child in non_terminal_children:
                         child.status = TaskStatus.CANCELLED
                         child.latest_status_message = hard_timeout_cancel_msg
@@ -1718,30 +1997,45 @@ async def _check_evaluating_timeouts():
 
                     # Close orphaned rollup PRs from CI-waiting children
                     from app.github import close_pull_request
+
                     for child in children:
-                        child_pr = (child.context or {}).get("review_loop", {}).get("pr_number")
+                        child_pr = (
+                            (child.context or {})
+                            .get("review_loop", {})
+                            .get("pr_number")
+                        )
                         if child_pr and not (child.context or {}).get("pr_merged"):
                             try:
                                 from app.routers.agent import get_github_token_for_task
-                                _gh, _owner, _repo = await get_github_token_for_task(child.id, session)
+
+                                _gh, _owner, _repo = await get_github_token_for_task(
+                                    child.id, session
+                                )
                                 await close_pull_request(_gh, _owner, _repo, child_pr)
-                                logger.info(f"[EVAL TIMEOUT] Closed orphaned PR #{child_pr} from child {str(child.id)[:8]}")
+                                logger.info(
+                                    f"[EVAL TIMEOUT] Closed orphaned PR #{child_pr} from child {str(child.id)[:8]}"
+                                )
                             except Exception as pr_err:
-                                logger.warning(f"[EVAL TIMEOUT] Failed to close PR #{child_pr}: {pr_err}")
+                                logger.warning(
+                                    f"[EVAL TIMEOUT] Failed to close PR #{child_pr}: {pr_err}"
+                                )
 
                     # Create ERROR alert (deduplicated by _maybe_create_failure_alert)
                     await _maybe_create_failure_alert(
-                        task, session,
+                        task,
+                        session,
                         f"Evaluation timeout after {hours}h — children did not complete",
                     )
                     await session.commit()
                     await broadcast_to_project(
-                        str(task.project_id), "task_updated",
+                        str(task.project_id),
+                        "task_updated",
                         {"task_id": str(task.id), "status": task.status},
                     )
                     for child in non_terminal_children:
                         await broadcast_to_project(
-                            str(task.project_id), "task_updated",
+                            str(task.project_id),
+                            "task_updated",
                             {"task_id": str(child.id), "status": child.status},
                         )
                     for child_vm in vms_to_delete:
@@ -1754,15 +2048,21 @@ async def _check_evaluating_timeouts():
                     # Deduplicate: skip if an undismissed alert exists OR one was
                     # dismissed within the last 2 hours (prevents re-firing after dismiss).
                     dismiss_cooldown = _utcnow() - timedelta(hours=2)
-                    existing = (await session.execute(
-                        select(Alert).where(
-                            Alert.task_id == task.id,
-                            or_(
-                                Alert.dismissed_at.is_(None),
-                                Alert.dismissed_at >= dismiss_cooldown,
-                            ),
+                    existing = (
+                        (
+                            await session.execute(
+                                select(Alert).where(
+                                    Alert.task_id == task.id,
+                                    or_(
+                                        Alert.dismissed_at.is_(None),
+                                        Alert.dismissed_at >= dismiss_cooldown,
+                                    ),
+                                )
+                            )
                         )
-                    )).scalars().first()
+                        .scalars()
+                        .first()
+                    )
                     if existing is None:
                         logger.warning(
                             f"[EVAL TIMEOUT] Task {str(task.id)[:8]} has been EVALUATING "
@@ -1781,11 +2081,18 @@ async def _check_evaluating_timeouts():
                         session.add(alert)
                         await session.commit()
                         await broadcast_to_project(
-                            str(task.project_id), "alert_created",
-                            {"alert_id": str(alert.id), "severity": "WARNING", "title": alert.title},
+                            str(task.project_id),
+                            "alert_created",
+                            {
+                                "alert_id": str(alert.id),
+                                "severity": "WARNING",
+                                "title": alert.title,
+                            },
                         )
     except Exception as e:
-        logger.error(f"[EVAL TIMEOUT] Evaluating timeout sweep failed: {e}", exc_info=True)
+        logger.error(
+            f"[EVAL TIMEOUT] Evaluating timeout sweep failed: {e}", exc_info=True
+        )
 
 
 async def _sweep_post_commit_pending():
@@ -1829,30 +2136,47 @@ async def _sweep_post_commit_pending():
             # CANCELLED tasks with post_commit_pending=True are cleaned up
             # below as a separate sub-query so the flag doesn't keep
             # reappearing in the sweep candidate set.
-            tasks = (await session.execute(
-                select(Task).where(
-                    Task.post_commit_pending.is_(True),
-                    Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
-                    Task.archived.is_(False),
-                ).limit(50)
-            )).scalars().all()
+            tasks = (
+                (
+                    await session.execute(
+                        select(Task)
+                        .where(
+                            Task.post_commit_pending.is_(True),
+                            Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
+                            Task.archived.is_(False),
+                        )
+                        .limit(50)
+                    )
+                )
+                .scalars()
+                .all()
+            )
 
             # Clear the pending flag on admin-cancelled tasks — the admin
             # cancel is sticky; we don't retry post-commit and we don't
             # want this row to clutter future sweeps.
-            cancelled_pending = (await session.execute(
-                select(Task).where(
-                    Task.post_commit_pending.is_(True),
-                    Task.status == TaskStatus.CANCELLED,
-                    Task.archived.is_(False),
-                ).limit(50)
-            )).scalars().all()
+            cancelled_pending = (
+                (
+                    await session.execute(
+                        select(Task)
+                        .where(
+                            Task.post_commit_pending.is_(True),
+                            Task.status == TaskStatus.CANCELLED,
+                            Task.archived.is_(False),
+                        )
+                        .limit(50)
+                    )
+                )
+                .scalars()
+                .all()
+            )
             for task in cancelled_pending:
                 logger.info(
                     f"[POST_COMMIT SWEEP] Task {str(task.id)[:8]} is CANCELLED — "
                     f"clearing post_commit_pending without retry"
                 )
                 from sqlalchemy.orm.attributes import flag_modified
+
                 new_ctx = dict(task.context or {})
                 new_ctx.pop("_post_commit_pending_meta", None)
                 task.context = new_ctx
@@ -1865,7 +2189,9 @@ async def _sweep_post_commit_pending():
             if not tasks:
                 return
 
-            logger.info(f"[POST_COMMIT SWEEP] Found {len(tasks)} task(s) with post_commit_pending")
+            logger.info(
+                f"[POST_COMMIT SWEEP] Found {len(tasks)} task(s) with post_commit_pending"
+            )
 
             for task in tasks:
                 ctx = task.context or {}
@@ -1891,6 +2217,7 @@ async def _sweep_post_commit_pending():
                     task.post_commit_pending = False
                     task.post_commit_failed = True
                     from sqlalchemy.orm.attributes import flag_modified
+
                     flag_modified(task, "context")
                     session.add(task)
                     await session.commit()
@@ -1912,6 +2239,7 @@ async def _sweep_post_commit_pending():
                     task.post_commit_pending = False
                     task.post_commit_failed = True
                     from sqlalchemy.orm.attributes import flag_modified
+
                     flag_modified(task, "context")
                     session.add(task)
                     await session.commit()
@@ -1941,10 +2269,13 @@ async def _sweep_post_commit_pending():
                             new_ctx.pop("_post_commit_pending_meta", None)
                             refreshed.context = new_ctx
                             from sqlalchemy.orm.attributes import flag_modified
+
                             flag_modified(refreshed, "context")
                             clear_session.add(refreshed)
                             await clear_session.commit()
-                    logger.info(f"[POST_COMMIT SWEEP] Task {str(task.id)[:8]} recovered")
+                    logger.info(
+                        f"[POST_COMMIT SWEEP] Task {str(task.id)[:8]} recovered"
+                    )
                 except Exception as e:
                     # Failure — bump attempts so we eventually give up.  The
                     # retry path in _process_post_commit's exception handler
@@ -1965,19 +2296,28 @@ async def _sweep_post_commit_pending():
                             # Postgres-only fast-fail on row contention; on
                             # SQLite (test DB) SET LOCAL is a no-op syntax
                             # error, so dialect-gate it.
-                            if bump_session.bind and bump_session.bind.dialect.name == "postgresql":
+                            if (
+                                bump_session.bind
+                                and bump_session.bind.dialect.name == "postgresql"
+                            ):
                                 await bump_session.execute(
                                     text("SET LOCAL lock_timeout = '5s'")
                                 )
                             refreshed = await bump_session.get(Task, task.id)
                             if refreshed:
                                 new_ctx = dict(refreshed.context or {})
-                                new_pending = dict(new_ctx.get("_post_commit_pending_meta") or pending_meta)
-                                new_pending["attempts"] = int(new_pending.get("attempts", attempts)) + 1
+                                new_pending = dict(
+                                    new_ctx.get("_post_commit_pending_meta")
+                                    or pending_meta
+                                )
+                                new_pending["attempts"] = (
+                                    int(new_pending.get("attempts", attempts)) + 1
+                                )
                                 new_pending["last_retry_at"] = _utcnow().isoformat()
                                 new_ctx["_post_commit_pending_meta"] = new_pending
                                 refreshed.context = new_ctx
                                 from sqlalchemy.orm.attributes import flag_modified
+
                                 flag_modified(refreshed, "context")
                                 bump_session.add(refreshed)
                                 await bump_session.commit()
@@ -2007,36 +2347,54 @@ async def _recover_orphaned_tasks():
             # Phase B4 (H-P6): drop status_log/plan_output JSONB. The recovery
             # loop only reads first_payload / context / description / project_id /
             # id and writes context. status_log is not consumed in this branch.
-            candidates = (await session.execute(
-                select(Task)
-                .options(load_only(
-                    Task.id, Task.status, Task.project_id,
-                    Task.created_by, Task.created_at,
-                    Task.description, Task.payloads, Task.context,
-                ))
-                .where(
-                    Task.status == TaskStatus.COMPLETED,
-                    Task.created_by == "ORCHESTRATOR",
-                    Task.created_at <= five_min_ago,
-                    Task.created_at >= one_hour_ago,  # Only check recent tasks, not entire history
+            candidates = (
+                (
+                    await session.execute(
+                        select(Task)
+                        .options(
+                            load_only(
+                                Task.id,
+                                Task.status,
+                                Task.project_id,
+                                Task.created_by,
+                                Task.created_at,
+                                Task.description,
+                                Task.payloads,
+                                Task.context,
+                            )
+                        )
+                        .where(
+                            Task.status == TaskStatus.COMPLETED,
+                            Task.created_by == "ORCHESTRATOR",
+                            Task.created_at <= five_min_ago,
+                            Task.created_at
+                            >= one_hour_ago,  # Only check recent tasks, not entire history
+                        )
+                    )
                 )
-            )).scalars().all()
+                .scalars()
+                .all()
+            )
 
             cand_ids = [t.id for t in candidates]
             if cand_ids:
-                artifact_rows = (await session.execute(
-                    select(Artifact.task_id).where(
-                        Artifact.task_id.in_(cand_ids),
-                        Artifact.artifact_type == ArtifactType.PULL_REQUEST,
+                artifact_rows = (
+                    await session.execute(
+                        select(Artifact.task_id).where(
+                            Artifact.task_id.in_(cand_ids),
+                            Artifact.artifact_type == ArtifactType.PULL_REQUEST,
+                        )
                     )
-                )).all()
+                ).all()
                 tasks_with_pr = {row[0] for row in artifact_rows}
 
-                child_rows = (await session.execute(
-                    select(Task.parent_task_id, Task.payloads).where(
-                        Task.parent_task_id.in_(cand_ids)
+                child_rows = (
+                    await session.execute(
+                        select(Task.parent_task_id, Task.payloads).where(
+                            Task.parent_task_id.in_(cand_ids)
+                        )
                     )
-                )).all()
+                ).all()
                 children_by_parent: dict = {}
                 for parent_id, payloads in child_rows:
                     children_by_parent.setdefault(parent_id, []).append(payloads)
@@ -2046,7 +2404,14 @@ async def _recover_orphaned_tasks():
 
             for task in candidates:
                 task_type = task.first_payload.get("type", "")
-                if task_type not in ("create", "refactor", "fix", "docs", "deps", "migrate"):
+                if task_type not in (
+                    "create",
+                    "refactor",
+                    "fix",
+                    "docs",
+                    "deps",
+                    "migrate",
+                ):
                     continue
 
                 # Check if PR artifact exists
@@ -2055,7 +2420,10 @@ async def _recover_orphaned_tasks():
 
                 # Check if review child exists
                 child_payloads_list = children_by_parent.get(task.id, [])
-                if any((payloads or [{}])[0].get("type") == "review" for payloads in child_payloads_list):
+                if any(
+                    (payloads or [{}])[0].get("type") == "review"
+                    for payloads in child_payloads_list
+                ):
                     continue
 
                 # Orphan has no PR yet. Cap retries — if we've looked 3 times
@@ -2071,24 +2439,44 @@ async def _recover_orphaned_tasks():
                     continue
 
                 try:
-                    gh_token, owner, repo = await get_github_token_for_task(task.id, session)
+                    gh_token, owner, repo = await get_github_token_for_task(
+                        task.id, session
+                    )
                 except Exception:
-                    logger.warning(f"[RECOVERY] Skipping orphan {str(task.id)[:8]} — GitHub token fetch failed", exc_info=True)
+                    logger.warning(
+                        f"[RECOVERY] Skipping orphan {str(task.id)[:8]} — GitHub token fetch failed",
+                        exc_info=True,
+                    )
                     continue
 
-                short_id = str(task.id).replace('-', '')[:8]
-                type_prefix = {"docs": "docs", "deps": "deps", "migrate": "migrate", "refactor": "refactor"}.get(task_type, "task")
+                short_id = str(task.id).replace("-", "")[:8]
+                type_prefix = {
+                    "docs": "docs",
+                    "deps": "deps",
+                    "migrate": "migrate",
+                    "refactor": "refactor",
+                }.get(task_type, "task")
                 branch = f"blueprint/{type_prefix}-{short_id}"
 
                 try:
                     from app.github import _github_request
-                    headers = {"Authorization": f"Bearer {gh_token}", "Accept": "application/vnd.github.v3+json", "X-GitHub-Api-Version": "2022-11-28"}
-                    resp = await _github_request("GET",
+
+                    headers = {
+                        "Authorization": f"Bearer {gh_token}",
+                        "Accept": "application/vnd.github.v3+json",
+                        "X-GitHub-Api-Version": "2022-11-28",
+                    }
+                    resp = await _github_request(
+                        "GET",
                         f"https://api.github.com/repos/{owner}/{repo}/pulls?head={owner}:{branch}&state=open",
-                        headers)
+                        headers,
+                    )
                     prs = resp.json() if resp.status_code == 200 else []
                 except Exception:
-                    logger.warning(f"[RECOVERY] Skipping orphan {str(task.id)[:8]} — GitHub PR lookup failed", exc_info=True)
+                    logger.warning(
+                        f"[RECOVERY] Skipping orphan {str(task.id)[:8]} — GitHub PR lookup failed",
+                        exc_info=True,
+                    )
                     continue
 
                 if not prs:
@@ -2096,7 +2484,9 @@ async def _recover_orphaned_tasks():
                     task.context = {**ctx, "_recovery_attempts": attempts_so_far + 1}
                     session.add(task)
                     await session.commit()
-                    logger.info(f"[RECOVERY] Skipping orphan {str(task.id)[:8]} — no open PR found for branch {branch} (attempt {attempts_so_far + 1}/3)")
+                    logger.info(
+                        f"[RECOVERY] Skipping orphan {str(task.id)[:8]} — no open PR found for branch {branch} (attempt {attempts_so_far + 1}/3)"
+                    )
                     continue
 
                 pr = prs[0]
@@ -2105,14 +2495,26 @@ async def _recover_orphaned_tasks():
                 base_branch = task.first_payload.get("base_branch", "main")
 
                 # Create the missing artifact
-                artifact = Artifact(task_id=task.id, artifact_type=ArtifactType.PULL_REQUEST, pr_url=pr_url)
+                artifact = Artifact(
+                    task_id=task.id,
+                    artifact_type=ArtifactType.PULL_REQUEST,
+                    pr_url=pr_url,
+                )
                 session.add(artifact)
 
                 # Spawn review
-                original_prompt = task.first_payload.get("prompt", task.description or "")
+                original_prompt = task.first_payload.get(
+                    "prompt", task.description or ""
+                )
                 review_task, _ = await _spawn_pipeline_task(
-                    task, "review", session, pr_number, branch, base_branch,
-                    original_prompt=original_prompt, original_task_id=str(task.id)
+                    task,
+                    "review",
+                    session,
+                    pr_number,
+                    branch,
+                    base_branch,
+                    original_prompt=original_prompt,
+                    original_task_id=str(task.id),
                 )
 
                 # Create alert
@@ -2126,41 +2528,62 @@ async def _recover_orphaned_tasks():
                 session.add(alert)
                 await session.commit()
 
-                await broadcast_to_project(str(task.project_id), "alert_created",
-                    {"alert_id": str(alert.id), "severity": "WARNING", "title": alert.title})
-                logger.warning(f"[RECOVERY] Auto-recovered orphaned task {str(task.id)[:8]} → PR #{pr_number}, review={str(review_task.id)[:8] if review_task else 'NONE'}")
+                await broadcast_to_project(
+                    str(task.project_id),
+                    "alert_created",
+                    {
+                        "alert_id": str(alert.id),
+                        "severity": "WARNING",
+                        "title": alert.title,
+                    },
+                )
+                logger.warning(
+                    f"[RECOVERY] Auto-recovered orphaned task {str(task.id)[:8]} → PR #{pr_number}, review={str(review_task.id)[:8] if review_task else 'NONE'}"
+                )
 
             # Phase 2: Reaped-with-artifact recovery.
             # Tasks that were reaped (set back to QUEUED/PROVISIONING) after the PR was already
             # created.  The PR endpoint saves the artifact, so these tasks have an artifact but
             # never reached COMPLETED and thus never triggered pipeline routing.
-            reaped_candidates = (await session.execute(
-                select(Task).where(
-                    Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING]),
-                    Task.created_by == "ORCHESTRATOR",
-                    Task.attempt_count > 0,
-                    Task.created_at >= one_hour_ago,
+            reaped_candidates = (
+                (
+                    await session.execute(
+                        select(Task).where(
+                            Task.status.in_(
+                                [TaskStatus.QUEUED, TaskStatus.PROVISIONING]
+                            ),
+                            Task.created_by == "ORCHESTRATOR",
+                            Task.attempt_count > 0,
+                            Task.created_at >= one_hour_ago,
+                        )
+                    )
                 )
-            )).scalars().all()
+                .scalars()
+                .all()
+            )
 
             reaped_ids = [t.id for t in reaped_candidates]
             if reaped_ids:
-                pr_artifact_rows = (await session.execute(
-                    select(Artifact.task_id, Artifact.pr_url).where(
-                        Artifact.task_id.in_(reaped_ids),
-                        Artifact.artifact_type == ArtifactType.PULL_REQUEST,
+                pr_artifact_rows = (
+                    await session.execute(
+                        select(Artifact.task_id, Artifact.pr_url).where(
+                            Artifact.task_id.in_(reaped_ids),
+                            Artifact.artifact_type == ArtifactType.PULL_REQUEST,
+                        )
                     )
-                )).all()
+                ).all()
                 pr_url_by_task: dict = {}
                 for task_id, pr_url in pr_artifact_rows:
                     if pr_url and not pr_url_by_task.get(task_id):
                         pr_url_by_task[task_id] = pr_url
 
-                reaped_child_rows = (await session.execute(
-                    select(Task.parent_task_id, Task.payloads).where(
-                        Task.parent_task_id.in_(reaped_ids)
+                reaped_child_rows = (
+                    await session.execute(
+                        select(Task.parent_task_id, Task.payloads).where(
+                            Task.parent_task_id.in_(reaped_ids)
+                        )
                     )
-                )).all()
+                ).all()
                 reaped_children_by_parent: dict = {}
                 for parent_id, payloads in reaped_child_rows:
                     reaped_children_by_parent.setdefault(parent_id, []).append(payloads)
@@ -2170,7 +2593,14 @@ async def _recover_orphaned_tasks():
 
             for task in reaped_candidates:
                 task_type = task.first_payload.get("type", "")
-                if task_type not in ("create", "refactor", "fix", "docs", "deps", "migrate"):
+                if task_type not in (
+                    "create",
+                    "refactor",
+                    "fix",
+                    "docs",
+                    "deps",
+                    "migrate",
+                ):
                     continue
 
                 # Only recover tasks that already have a PR artifact
@@ -2180,7 +2610,10 @@ async def _recover_orphaned_tasks():
 
                 # Skip if review child already exists
                 child_payloads_list = reaped_children_by_parent.get(task.id, [])
-                if any((payloads or [{}])[0].get("type") == "review" for payloads in child_payloads_list):
+                if any(
+                    (payloads or [{}])[0].get("type") == "review"
+                    for payloads in child_payloads_list
+                ):
                     continue
 
                 # ── Site 3 lock-during-IO fix ──
@@ -2196,23 +2629,43 @@ async def _recover_orphaned_tasks():
                 # then call `_spawn_pipeline_task` (the advisory lock is
                 # per-PR and self-coordinating). The spawn-and-alert
                 # commit follows on a fresh transaction.
-                locked = (await session.execute(
-                    select(Task).where(Task.id == task.id).with_for_update(skip_locked=True)
-                )).scalars().first()
-                if not locked or locked.status not in (TaskStatus.QUEUED, TaskStatus.PROVISIONING):
+                locked = (
+                    (
+                        await session.execute(
+                            select(Task)
+                            .where(Task.id == task.id)
+                            .with_for_update(skip_locked=True)
+                        )
+                    )
+                    .scalars()
+                    .first()
+                )
+                if not locked or locked.status not in (
+                    TaskStatus.QUEUED,
+                    TaskStatus.PROVISIONING,
+                ):
                     continue
 
                 pr_number = int(pr_url.rstrip("/").split("/")[-1])
                 base_branch = locked.first_payload.get("base_branch", "main")
-                short_id = str(locked.id).replace('-', '')[:8]
-                type_prefix = {"docs": "docs", "deps": "deps", "migrate": "migrate", "refactor": "refactor"}.get(task_type, "task")
+                short_id = str(locked.id).replace("-", "")[:8]
+                type_prefix = {
+                    "docs": "docs",
+                    "deps": "deps",
+                    "migrate": "migrate",
+                    "refactor": "refactor",
+                }.get(task_type, "task")
                 branch = f"blueprint/{type_prefix}-{short_id}"
-                original_prompt = locked.first_payload.get("prompt", locked.description or "")
+                original_prompt = locked.first_payload.get(
+                    "prompt", locked.description or ""
+                )
                 project_id_local = locked.project_id
                 task_id_local = locked.id
 
                 locked.status = TaskStatus.COMPLETED
-                locked.latest_status_message = f"Auto-completed: PR #{pr_number} found after reap recovery"
+                locked.latest_status_message = (
+                    f"Auto-completed: PR #{pr_number} found after reap recovery"
+                )
                 session.add(locked)
                 # Commit-release the task FOR UPDATE before invoking the
                 # spawn (which acquires the per-PR advisory lock). The
@@ -2229,11 +2682,19 @@ async def _recover_orphaned_tasks():
                 # commit released the SQLA identity for some attributes.
                 refreshed = await session.get(Task, task_id_local)
                 if refreshed is None:
-                    logger.warning(f"[RECOVERY] Task {short_id} disappeared after release-commit — skipping spawn")
+                    logger.warning(
+                        f"[RECOVERY] Task {short_id} disappeared after release-commit — skipping spawn"
+                    )
                     continue
                 review_task, _ = await _spawn_pipeline_task(
-                    refreshed, "review", session, pr_number, branch, base_branch,
-                    original_prompt=original_prompt, original_task_id=str(task_id_local)
+                    refreshed,
+                    "review",
+                    session,
+                    pr_number,
+                    branch,
+                    base_branch,
+                    original_prompt=original_prompt,
+                    original_task_id=str(task_id_local),
                 )
 
                 alert = Alert(
@@ -2246,8 +2707,17 @@ async def _recover_orphaned_tasks():
                 session.add(alert)
                 await session.commit()
 
-                await broadcast_to_project(str(project_id_local), "alert_created",
-                    {"alert_id": str(alert.id), "severity": "WARNING", "title": alert.title})
-                logger.warning(f"[RECOVERY] Auto-completed reaped task {short_id} → PR #{pr_number}, review={str(review_task.id)[:8] if review_task else 'NONE'}")
+                await broadcast_to_project(
+                    str(project_id_local),
+                    "alert_created",
+                    {
+                        "alert_id": str(alert.id),
+                        "severity": "WARNING",
+                        "title": alert.title,
+                    },
+                )
+                logger.warning(
+                    f"[RECOVERY] Auto-completed reaped task {short_id} → PR #{pr_number}, review={str(review_task.id)[:8] if review_task else 'NONE'}"
+                )
     except Exception as e:
         logger.error(f"[RECOVERY] Orphaned task sweep failed: {e}", exc_info=True)

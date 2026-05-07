@@ -6,6 +6,7 @@ review-fix loop, iteration cap, and stuck-cycle detection logic.
 All imports are module-level — no circular dependency risk with app.main
 or app.task_lifecycle.
 """
+
 import logging
 import re
 import uuid
@@ -23,7 +24,10 @@ from app.payload_schemas import validate_internal_payload
 from app.shared_state import runtime_config as _runtime_config
 from app.broadcast import broadcast_to_project
 from app.time_utils import _utcnow
-from app.spawn_calibration import _compute_scope_budget_utilization, _compute_scope_overflow_warning  # noqa: F401
+from app.spawn_calibration import (
+    _compute_scope_budget_utilization,
+    _compute_scope_overflow_warning,
+)  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +93,7 @@ def _stuck_thresholds(scope: str, is_refactor: bool) -> tuple[float, float, floa
         STUCK_CYCLE_TEXT_THRESHOLD_DEFAULT,
     )
 
+
 _FEEDBACK_TOKEN_RE = re.compile(r"[a-z0-9_]+")
 
 # Issue-churn: fix agent keeps rotating CRITICAL+MAJOR issues without the total
@@ -98,7 +103,8 @@ ISSUE_CHURN_WINDOW = 2
 
 def _critical_major_count(entry: dict) -> int:
     return sum(
-        1 for i in (entry.get("issues") or [])
+        1
+        for i in (entry.get("issues") or [])
         if i.get("severity", "").upper() in ("CRITICAL", "MAJOR")
         and (i.get("description") or "").strip()
     )
@@ -128,7 +134,7 @@ def _repeating_issue_descriptions(
     per_entry: list[set[str]] = []
     for entry in recent:
         seen: set[str] = set()
-        for issue in (entry.get("issues") or []):
+        for issue in entry.get("issues") or []:
             if issue.get("severity", "").upper() not in ("CRITICAL", "MAJOR"):
                 continue
             desc = (issue.get("description") or "").strip()
@@ -160,7 +166,9 @@ def _format_repeating_issues_section(history: list) -> str:
 
 
 def compute_drift_signal(
-    review_history: list, planned_files: list, current_files: list,
+    review_history: list,
+    planned_files: list,
+    current_files: list,
 ) -> dict:
     """Compute drift_in / drift_out for the trajectory section in fix prompts.
 
@@ -198,7 +206,7 @@ def compute_drift_signal(
         # an issue's `file` field — distinguishes "merely changed" from
         # "actively rejected by a reviewer."
         if verdict == "REQUEST_CHANGES":
-            for issue in (entry.get("issues") or []):
+            for issue in entry.get("issues") or []:
                 if not isinstance(issue, dict):
                     continue
                 fname = issue.get("file")
@@ -281,13 +289,17 @@ _SCOPE_PRESSURE_HARD_CAP_PREFIX = (
 
 def _is_test_file(path: str) -> bool:
     p = path.lower()
-    if "/testing/" in p or p.startswith("testing/") or "/tests/" in p or p.startswith("tests/"):
+    if (
+        "/testing/" in p
+        or p.startswith("testing/")
+        or "/tests/" in p
+        or p.startswith("tests/")
+    ):
         return True
     name = p.rsplit("/", 1)[-1]
     if name.startswith("test_") or name.endswith("_test.py"):
         return True
     return ".test." in name or ".spec." in name
-
 
 
 # Minimum direction acceptance rate required to auto-approve a small diff.
@@ -345,7 +357,10 @@ def should_auto_approve_diff(
         max_lines = _runtime_config.get("auto_approve_medium_max_lines", 30)
         max_files = _runtime_config.get("auto_approve_medium_max_files", 2)
         if not max_lines or max_lines <= 0:
-            return (False, "medium auto-approve disabled (auto_approve_medium_max_lines=0)")
+            return (
+                False,
+                "medium auto-approve disabled (auto_approve_medium_max_lines=0)",
+            )
     else:
         return (False, f"scope {scope!r} not eligible (small/medium only)")
 
@@ -372,6 +387,7 @@ def should_auto_approve_diff(
 
     if direction_data is not None:
         from app.research_completion import _compute_acceptance_rate  # noqa: PLC0415
+
         acceptance_rate = _compute_acceptance_rate(direction_data)
         if (
             acceptance_rate is not None
@@ -439,17 +455,17 @@ def _max_review_iterations(task: Task, direction_data: dict | None = None) -> in
     on directions the operator consistently rejects.
     """
     ctx = task.context or {}
-    scope = ctx.get('scope', 'medium')
-    fix_reason = ctx.get('review_loop', {}).get('fix_reason', 'code_review')
+    scope = ctx.get("scope", "medium")
+    fix_reason = ctx.get("review_loop", {}).get("fix_reason", "code_review")
 
     # CI-only fixes should converge fast (lint/type/test errors)
-    if fix_reason == 'ci_failure':
+    if fix_reason == "ci_failure":
         limit = 8
     # Small scope tasks: less code, fewer things to fix
-    elif scope == 'small':
+    elif scope == "small":
         limit = 10
     # Medium scope: moderate iteration budget
-    elif scope == 'medium':
+    elif scope == "medium":
         limit = 12
     # Large scope or unknown: full budget
     else:
@@ -457,8 +473,9 @@ def _max_review_iterations(task: Task, direction_data: dict | None = None) -> in
 
     # Direction-aware reduction: cut cap by ~30% for consistently-rejected directions.
     # Only applies when direction_data is available and we're not already at the ci_failure cap.
-    if direction_data is not None and fix_reason != 'ci_failure':
+    if direction_data is not None and fix_reason != "ci_failure":
         from app.research_completion import _compute_acceptance_rate
+
         acceptance_rate = _compute_acceptance_rate(direction_data)
         # Check recent rejection ratio from last few history entries
         recent_history = (direction_data.get("research_history") or [])[-3:]
@@ -466,17 +483,17 @@ def _max_review_iterations(task: Task, direction_data: dict | None = None) -> in
         recent_rejected = sum(e.get("prs_rejected", 0) for e in recent_history)
         high_rejection_ratio = (
             recent_merged > 0 and (recent_rejected / recent_merged) > 2.0
-        ) or (
-            recent_merged == 0 and recent_rejected >= 3
-        )
-        if (acceptance_rate is not None and acceptance_rate < 0.3) or high_rejection_ratio:
+        ) or (recent_merged == 0 and recent_rejected >= 3)
+        if (
+            acceptance_rate is not None and acceptance_rate < 0.3
+        ) or high_rejection_ratio:
             limit = max(1, round(limit * 0.7))
 
     # Scope-budget hard cap: once a medium-scope PR crosses 90% of its
     # file budget, a prior spawn persists an absolute iteration ceiling via
     # _scope_budget_hard_cap. Honor it regardless of scope/direction-aware
     # logic so the reduction survives across subsequent review/fix spawns.
-    hard_cap = ctx.get('_scope_budget_hard_cap')
+    hard_cap = ctx.get("_scope_budget_hard_cap")
     if isinstance(hard_cap, int) and hard_cap > 0:
         limit = min(limit, hard_cap)
 
@@ -484,7 +501,7 @@ def _max_review_iterations(task: Task, direction_data: dict | None = None) -> in
     # cloned it) already burned review iterations, subtract half of that usage
     # from the fresh cap so retries don't each get a full budget. Floor at 3 so
     # a heavily-iterated prior attempt doesn't leave the retry dead on arrival.
-    prior_consumed = ctx.get('_prior_review_iterations_consumed')
+    prior_consumed = ctx.get("_prior_review_iterations_consumed")
     if isinstance(prior_consumed, int) and prior_consumed > 0:
         limit = max(limit - prior_consumed // 2, 3)
 
@@ -526,18 +543,20 @@ async def _handle_cap_exhaustion(
     from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
 
     cap_label = "global" if scope == "global" else "per-chain"
-    source_task.latest_status_message = (
-        f"Review-fix cap reached for PR #{pr_number} ({iterations} iterations, {cap_label})"
-    )
+    source_task.latest_status_message = f"Review-fix cap reached for PR #{pr_number} ({iterations} iterations, {cap_label})"
     session.add(source_task)
 
     try:
         orig = await session.get(Task, uuid.UUID(resolved_original_id))
     except Exception as e:
-        logger.warning(f"[PIPELINE] Cap-exhaustion: failed to load orig {resolved_original_id[:8]}: {e}")
+        logger.warning(
+            f"[PIPELINE] Cap-exhaustion: failed to load orig {resolved_original_id[:8]}: {e}"
+        )
         return
     if orig is None:
-        logger.warning(f"[PIPELINE] Cap-exhaustion: orig {resolved_original_id[:8]} not found")
+        logger.warning(
+            f"[PIPELINE] Cap-exhaustion: orig {resolved_original_id[:8]} not found"
+        )
         return
 
     already_handled = (
@@ -572,19 +591,26 @@ async def _handle_cap_exhaustion(
     try:
         await session.commit()
     except Exception as e:
-        logger.warning(f"[PIPELINE] Cap-exhaustion: failed to commit orig {resolved_original_id[:8]}: {e}", exc_info=True)
+        logger.warning(
+            f"[PIPELINE] Cap-exhaustion: failed to commit orig {resolved_original_id[:8]}: {e}",
+            exc_info=True,
+        )
         return
 
     # Surface cap-exhaustion to deploy_monitoring + direction health tracking.
     # Without this, cap failures bypass per-type failure gates and anomaly detection.
     record_task_result(
-        success=False, failure_class=CODE_ERROR,
-        task_id=str(orig.id), task_type=(orig.first_payload or {}).get("type", ""),
+        success=False,
+        failure_class=CODE_ERROR,
+        task_id=str(orig.id),
+        task_type=(orig.first_payload or {}).get("type", ""),
     )
     _direction_id = str((orig.context or {}).get("direction_id") or "")
     if _direction_id:
         record_direction_result(
-            _direction_id, success=False, failure_class=CODE_ERROR,
+            _direction_id,
+            success=False,
+            failure_class=CODE_ERROR,
             project_id=str(orig.project_id) if orig.project_id else "",
         )
 
@@ -592,59 +618,89 @@ async def _handle_cap_exhaustion(
     # _record_remediation_if_terminal directly to keep direction state consistent.
     try:
         from app.task_completion import _record_remediation_if_terminal  # noqa: PLC0415
+
         await _record_remediation_if_terminal(orig, TaskStatus.FAILED, session)
         await session.commit()
     except Exception as e:
-        logger.warning(f"[PIPELINE] Cap-exhaustion: failed to record remediation outcome for PR #{pr_number}: {e}")
+        logger.warning(
+            f"[PIPELINE] Cap-exhaustion: failed to record remediation outcome for PR #{pr_number}: {e}"
+        )
     investigation_id: str | None = None
     try:
         from app.autonomous_research import _spawn_review_convergence_investigation  # noqa: PLC0415
+
         _inv = await _spawn_review_convergence_investigation(
-            orig, session, pr_number=pr_number, iterations=iterations,
-            detail=cap_label, trigger="review_cap_exhausted",
+            orig,
+            session,
+            pr_number=pr_number,
+            iterations=iterations,
+            detail=cap_label,
+            trigger="review_cap_exhausted",
         )
         if _inv is not None:
             investigation_id = str(_inv)
             await session.commit()
     except Exception as e:
-        logger.warning(f"[PIPELINE] Cap-exhaustion: convergence investigation spawn failed for PR #{pr_number}: {e}", exc_info=True)
+        logger.warning(
+            f"[PIPELINE] Cap-exhaustion: convergence investigation spawn failed for PR #{pr_number}: {e}",
+            exc_info=True,
+        )
 
     try:
         gh_token, owner, repo = await get_github_token_for_task(orig.id, session)
         try:
-            fingerprint = ((orig.context or {}).get("failure_fingerprints") or [None])[0]
+            fingerprint = ((orig.context or {}).get("failure_fingerprints") or [None])[
+                0
+            ]
             investigation_note = (
                 f"A convergence investigation has been queued (task `{investigation_id[:8]}`) "
                 f"to diagnose why this PR could not converge. Reopen after the investigation completes."
-                if investigation_id else
-                "No investigation was spawned (no direction attached or a recent one already covers this). Manual review required."
+                if investigation_id
+                else "No investigation was spawned (no direction attached or a recent one already covers this). Manual review required."
             )
-            fingerprint_note = f"\n\nFailure fingerprint: `{fingerprint}`" if fingerprint else ""
+            fingerprint_note = (
+                f"\n\nFailure fingerprint: `{fingerprint}`" if fingerprint else ""
+            )
             await create_pr_comment(
-                gh_token, owner, repo, pr_number,
+                gh_token,
+                owner,
+                repo,
+                pr_number,
                 f"Auto-closed: review-fix cap reached ({iterations} iterations, {cap_label}). "
-                f"{investigation_note}{fingerprint_note}"
+                f"{investigation_note}{fingerprint_note}",
             )
         except Exception as e:
-            logger.warning(f"[PIPELINE] Cap-exhaustion: failed to comment on PR #{pr_number}: {e}")
+            logger.warning(
+                f"[PIPELINE] Cap-exhaustion: failed to comment on PR #{pr_number}: {e}"
+            )
         closed = await close_pull_request(
             gh_token, owner, repo, pr_number, project_id=str(orig.project_id)
         )
         if closed:
-            logger.info(f"[PIPELINE] Closed PR #{pr_number} after cap exhaustion ({iterations} iterations)")
+            logger.info(
+                f"[PIPELINE] Closed PR #{pr_number} after cap exhaustion ({iterations} iterations)"
+            )
         else:
-            logger.warning(f"[PIPELINE] close_pull_request returned False for PR #{pr_number}")
+            logger.warning(
+                f"[PIPELINE] close_pull_request returned False for PR #{pr_number}"
+            )
     except Exception as e:
-        logger.warning(f"[PIPELINE] Cap-exhaustion: failed to close PR #{pr_number}: {e}", exc_info=True)
+        logger.warning(
+            f"[PIPELINE] Cap-exhaustion: failed to close PR #{pr_number}: {e}",
+            exc_info=True,
+        )
 
     try:
         await _maybe_create_failure_alert(
-            orig, session,
+            orig,
+            session,
             f"PR #{pr_number} hit review-fix cap ({iterations} iterations, {cap_label}) — "
-            f"auto-closed, manual review required"
+            f"auto-closed, manual review required",
         )
     except Exception as e:
-        logger.warning(f"[PIPELINE] Cap-exhaustion: failed to create alert for PR #{pr_number}: {e}")
+        logger.warning(
+            f"[PIPELINE] Cap-exhaustion: failed to create alert for PR #{pr_number}: {e}"
+        )
 
 
 SPAWN_REASON_KEY = "_last_pipeline_spawn_reason"
@@ -684,19 +740,27 @@ def _pipeline_task_idempotency_key(
     is_rollup: bool,
 ) -> str:
     chain_id = f"rollup-pr-{pr_number}" if is_rollup else original_task_id
-    return f"review_pipeline:{project_id}:{chain_id}:{pr_number}:{task_type}:{iteration}"
+    return (
+        f"review_pipeline:{project_id}:{chain_id}:{pr_number}:{task_type}:{iteration}"
+    )
 
 
 async def _get_active_pipeline_task_by_key(
     session: AsyncSession,
     idempotency_key: str,
 ) -> Task | None:
-    return (await session.execute(
-        select(Task).where(
-            Task.idempotency_key == idempotency_key,
-            Task.status.in_(_PIPELINE_ACTIVE_STATUSES),
+    return (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.idempotency_key == idempotency_key,
+                    Task.status.in_(_PIPELINE_ACTIVE_STATUSES),
+                )
+            )
         )
-    )).scalars().first()
+        .scalars()
+        .first()
+    )
 
 
 def _set_spawn_reason(task: Task, reason: str) -> None:
@@ -709,11 +773,17 @@ _FINGERPRINT_NOISE_RE = (
     # Canonical UUID with dashes (8-4-4-4-12) — matched before the generic
     # hex regex so the whole UUID collapses into one token instead of leaving
     # the 4-char middle groups behind.
-    re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", re.IGNORECASE),
+    re.compile(
+        r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
+        re.IGNORECASE,
+    ),
     # SHAs / hex tokens of 8+ hex chars (no dashes)
     re.compile(r"\b[0-9a-f]{8,}\b", re.IGNORECASE),
     # Timestamps "2026-05-06T09:31" / "2026-05-06 09:31"
-    re.compile(r"\d{4}-\d{2}-\d{2}[t ]\d{2}:\d{2}(:\d{2})?(\.\d+)?(z|[+-]\d{2}:?\d{2})?", re.IGNORECASE),
+    re.compile(
+        r"\d{4}-\d{2}-\d{2}[t ]\d{2}:\d{2}(:\d{2})?(\.\d+)?(z|[+-]\d{2}:?\d{2})?",
+        re.IGNORECASE,
+    ),
     # /tmp/<noise> paths
     re.compile(r"/tmp/\S+"),
     # iter / iteration markers ("iter=3", "iteration 3", "iter:3")
@@ -740,6 +810,7 @@ def _failure_fingerprint_msg(msg: str | None) -> str:
     truncated) to match the ``errorFingerprint`` format used elsewhere.
     """
     from hashlib import sha256
+
     if not msg:
         return ""
     s = msg.strip().lower()
@@ -836,13 +907,19 @@ def _is_cross_cutting_pr(source_task: Task) -> tuple[bool, str]:
         return (True, "scope=large")
     if scope == "medium":
         changed = ctx.get("_pr_changed_files") or []
-        mods = len({f.split("/")[0] for f in changed if f.split("/")[0] in TOP_LEVEL_MODULES})
-        threshold = int(_runtime_config.get("cross_cutting_gate_medium_module_threshold", 3))
+        mods = len(
+            {f.split("/")[0] for f in changed if f.split("/")[0] in TOP_LEVEL_MODULES}
+        )
+        threshold = int(
+            _runtime_config.get("cross_cutting_gate_medium_module_threshold", 3)
+        )
         if mods >= threshold:
             return (True, f"scope=medium,{mods}_modules")
     if (ctx.get("review_loop") or {}).get("scope_overflow_warned"):
         lines = _diff_lines_changed(ctx.get("_pr_diff_summary"))
-        overflow_threshold = int(_runtime_config.get("cross_cutting_gate_overflow_line_threshold", 100))
+        overflow_threshold = int(
+            _runtime_config.get("cross_cutting_gate_overflow_line_threshold", 100)
+        )
         if lines and lines > overflow_threshold:
             return (True, f"overflow+{lines}_lines")
     return (False, "not cross-cutting")
@@ -859,6 +936,7 @@ async def maybe_spawn_cross_cutting_safeguard(
     Idempotent: no-ops if orig.context already has a safeguard_task_id.
     """
     from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
+
     ctx = orig.context or {}
     if ctx.get("safeguard_task_id"):
         return False
@@ -869,17 +947,20 @@ async def maybe_spawn_cross_cutting_safeguard(
     safeguard_id = uuid.uuid4()
     changed = ctx.get("_pr_changed_files") or []
     files_str = ", ".join(changed[:15]) or "all changed files"
-    payload_data = validate_internal_payload({
-        "type": "security_audit",
-        "prompt": (
-            f"Cross-cutting safeguard review for PR #{pr_number} ({reason}). "
-            "Assess: (1) security vulnerabilities introduced by cross-module changes, "
-            "(2) interface breakage across module boundaries, "
-            "(3) test coverage for cross-module interactions. "
-            f"Changed files: {files_str}. Return findings as a JSON array."
-        ),
-        "base_branch": base_branch,
-    }, "review_pipeline:cross_cutting_safeguard")
+    payload_data = validate_internal_payload(
+        {
+            "type": "security_audit",
+            "prompt": (
+                f"Cross-cutting safeguard review for PR #{pr_number} ({reason}). "
+                "Assess: (1) security vulnerabilities introduced by cross-module changes, "
+                "(2) interface breakage across module boundaries, "
+                "(3) test coverage for cross-module interactions. "
+                f"Changed files: {files_str}. Return findings as a JSON array."
+            ),
+            "base_branch": base_branch,
+        },
+        "review_pipeline:cross_cutting_safeguard",
+    )
     safeguard = Task(
         id=safeguard_id,
         project_id=orig.project_id,
@@ -898,36 +979,54 @@ async def maybe_spawn_cross_cutting_safeguard(
     )
     session.add(safeguard)
     orig.requires_approval = True
-    orig.context = {**ctx,
-                    "safeguard_task_id": str(safeguard_id),
-                    "safeguard_reason": reason,
-                    "safeguard_pr_number": pr_number}
+    orig.context = {
+        **ctx,
+        "safeguard_task_id": str(safeguard_id),
+        "safeguard_reason": reason,
+        "safeguard_pr_number": pr_number,
+    }
     flag_modified(orig, "context")
     orig.latest_status_message = (
         f"Merge gated — awaiting cross-cutting safeguard for PR #{pr_number} ({reason})"
     )
     session.add(orig)
-    session.add(TaskHistory(
-        task_id=safeguard_id, action="SPAWNED",
-        details={"spawned_by": "CROSS_CUTTING_GATE", "pr_number": pr_number, "reason": reason},
-    ))
+    session.add(
+        TaskHistory(
+            task_id=safeguard_id,
+            action="SPAWNED",
+            details={
+                "spawned_by": "CROSS_CUTTING_GATE",
+                "pr_number": pr_number,
+                "reason": reason,
+            },
+        )
+    )
     await session.commit()
     logger.info(
         f"[PIPELINE] Cross-cutting safeguard {safeguard_id} spawned "
         f"for PR #{pr_number} ({reason}) — merge gated on orig {orig.id}"
     )
     await broadcast_to_project(
-        str(orig.project_id), "task_updated",
+        str(orig.project_id),
+        "task_updated",
         {"task_id": str(safeguard_id), "status": TaskStatus.QUEUED},
     )
     return True
 
 
 async def _spawn_pipeline_task(
-    source_task: Task, task_type: str, session: AsyncSession,
-    pr_number: int, branch: str, base_branch: str,
-    original_prompt: str = "", fix_prompt: str = "", original_task_id: str = "",
-    current_feedback: str = "", fix_reason: str = "", current_issues: list | None = None,
+    source_task: Task,
+    task_type: str,
+    session: AsyncSession,
+    pr_number: int,
+    branch: str,
+    base_branch: str,
+    original_prompt: str = "",
+    fix_prompt: str = "",
+    original_task_id: str = "",
+    current_feedback: str = "",
+    fix_reason: str = "",
+    current_issues: list | None = None,
     ci_failure_logs: str = "",
     investigated_files: list[str] | None = None,
     suppress_warm_handoff: bool = False,
@@ -964,7 +1063,10 @@ async def _spawn_pipeline_task(
     # commits — each spawn has a distinct idempotency_key so the active-key
     # partial UNIQUE doesn't catch the race, and we end up with a double
     # review/fix on the same PR/chain. Lock is held until commit/rollback.
-    from app.task_locking import acquire_pr_spawn_lock  # local import to keep top of file lean
+    from app.task_locking import (
+        acquire_pr_spawn_lock,
+    )  # local import to keep top of file lean
+
     await acquire_pr_spawn_lock(session, pr_number)
 
     # Resolve the chain identifier once, so the "already merged" guard, the
@@ -975,7 +1077,9 @@ async def _spawn_pipeline_task(
     # the create task in that case).
     resolved_original_id = (
         original_task_id
-        or (source_task.context or {}).get("review_loop", {}).get("original_task_id", "")
+        or (source_task.context or {})
+        .get("review_loop", {})
+        .get("original_task_id", "")
         or (source_task.first_payload).get("original_task_id", "")
         or str(source_task.id)
     )
@@ -984,15 +1088,23 @@ async def _spawn_pipeline_task(
     try:
         orig_task = await session.get(Task, uuid.UUID(resolved_original_id))
         if orig_task and (orig_task.context or {}).get("pr_merged"):
-            logger.info(f"[PIPELINE] Skipping {task_type} spawn for PR #{pr_number} — PR already merged (original task {resolved_original_id[:8]})")
-            source_task.latest_status_message = f"PR #{pr_number} already merged — skipping {task_type}"
+            logger.info(
+                f"[PIPELINE] Skipping {task_type} spawn for PR #{pr_number} — PR already merged (original task {resolved_original_id[:8]})"
+            )
+            source_task.latest_status_message = (
+                f"PR #{pr_number} already merged — skipping {task_type}"
+            )
             _set_spawn_reason(source_task, SPAWN_REASON_ALREADY_MERGED)
             session.add(source_task)
             return (None, False)
     except Exception:
-        logger.debug(f"[PIPELINE] Could not verify pr_merged for original task {resolved_original_id[:8]}: skipping check")
+        logger.debug(
+            f"[PIPELINE] Could not verify pr_merged for original task {resolved_original_id[:8]}: skipping check"
+        )
     if (source_task.context or {}).get("pr_merged"):
-        logger.info(f"[PIPELINE] Skipping {task_type} spawn for PR #{pr_number} — PR already merged (source task)")
+        logger.info(
+            f"[PIPELINE] Skipping {task_type} spawn for PR #{pr_number} — PR already merged (source task)"
+        )
         _set_spawn_reason(source_task, SPAWN_REASON_ALREADY_MERGED)
         session.add(source_task)
         return (None, False)
@@ -1019,26 +1131,42 @@ async def _spawn_pipeline_task(
     # double-spawn review/fix for the shared PR.
     is_rollup_source = bool((source_task.context or {}).get("_is_rollup_review"))
     superseded_stale_task = False
-    active_pipeline = (await session.execute(
-        select(Task).where(
-            Task.project_id == source_task.project_id,
-            Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING]),
+    active_pipeline = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.project_id == source_task.project_id,
+                    Task.status.in_(
+                        [
+                            TaskStatus.QUEUED,
+                            TaskStatus.PROVISIONING,
+                            TaskStatus.IN_PROGRESS,
+                            TaskStatus.EVALUATING,
+                        ]
+                    ),
+                )
+            )
         )
-    )).scalars().all()
+        .scalars()
+        .all()
+    )
     for t in active_pipeline:
         if t.id == source_task.id:
             continue
         t_payload = t.first_payload
         t_type = t_payload.get("type")
         t_orig = t_payload.get("original_task_id") or ""
-        if (t_payload.get("pr_number") != pr_number
-                or t_type not in ("review", "fix")):
+        if t_payload.get("pr_number") != pr_number or t_type not in ("review", "fix"):
             continue
         if not is_rollup_source and t_orig != resolved_original_id:
             continue
 
         if _is_pipeline_task_stale(t):
-            from app.failure_classification import AGENT_TIMEOUT, persist_failure_category  # noqa: PLC0415
+            from app.failure_classification import (
+                AGENT_TIMEOUT,
+                persist_failure_category,
+            )  # noqa: PLC0415
+
             t.status = TaskStatus.CANCELLED
             t.latest_status_message = (
                 f"Superseded by new {task_type} for PR #{pr_number}: "
@@ -1068,7 +1196,11 @@ async def _spawn_pipeline_task(
             return (t, False)
 
         if task_type == "fix" and t_type == "review":
-            from app.failure_classification import AGENT_TIMEOUT, persist_failure_category  # noqa: PLC0415
+            from app.failure_classification import (
+                AGENT_TIMEOUT,
+                persist_failure_category,
+            )  # noqa: PLC0415
+
             t.status = TaskStatus.CANCELLED
             t.latest_status_message = (
                 f"Superseded by fix on PR #{pr_number}: review was scoped to "
@@ -1113,6 +1245,7 @@ async def _spawn_pipeline_task(
     # ``load_only`` keeps the row narrow — we only need status/context/payloads
     # for the post-filter; status_log and other JSONB columns stay deferred.
     from app.failure_classification import INFRA_CLASSES  # noqa: PLC0415
+
     # Dialect-conditional WHERE for the per-PR cap query (audit 2026-04-29
     # round 2 / finding C2). Postgres requires byte-exact expression match
     # for ``ix_task_payloads_pr_number`` (built on
@@ -1131,42 +1264,54 @@ async def _spawn_pipeline_task(
     # ``payloads`` for the SQLite branch), so seq-scan is acceptable for
     # tests. Postgres production path is the source of truth and gets the
     # index acceleration.
-    dialect_name = session.bind.dialect.name if session.bind else 'postgresql'
-    if dialect_name == 'sqlite':
-        pr_number_match = func.json_extract(Task.payloads, '$[0].pr_number') == pr_number
-        type_match = func.json_extract(Task.payloads, '$[0].type').in_(("review", "fix"))
+    dialect_name = session.bind.dialect.name if session.bind else "postgresql"
+    if dialect_name == "sqlite":
+        pr_number_match = (
+            func.json_extract(Task.payloads, "$[0].pr_number") == pr_number
+        )
+        type_match = func.json_extract(Task.payloads, "$[0].type").in_(
+            ("review", "fix")
+        )
     else:
         pr_number_match = Task.payloads[0]["pr_number"].as_string() == str(pr_number)
         type_match = Task.payloads[0]["type"].as_string().in_(("review", "fix"))
-    pr_pipeline_tasks = (await session.execute(
-        select(Task)
-        .options(load_only(
-            Task.id,
-            Task.status,
-            Task.context,
-            Task.payloads,
-            Task.archived,
-            Task.project_id,
-            Task.created_at,
-            Task.latest_status_message,
-            # status_log must be loaded eagerly: the event listener on
-            # latest_status_message setter (models.py:_on_status_message_set)
-            # reads target.status_log to append. Under async SQLAlchemy, a
-            # lazy-load of a deferred attribute during a setter event raises
-            # MissingGreenlet — see memory note "load_only Task event-listener
-            # gotcha". The repeat-fingerprint halt below mutates
-            # latest_status_message on the most-recent failed task; without
-            # this column the mutation crashes mid-cycle.
-            Task.status_log,
-        ))
-        .where(
-            Task.project_id == source_task.project_id,
-            Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
-            Task.archived.is_(False),
-            pr_number_match,
-            type_match,
+    pr_pipeline_tasks = (
+        (
+            await session.execute(
+                select(Task)
+                .options(
+                    load_only(
+                        Task.id,
+                        Task.status,
+                        Task.context,
+                        Task.payloads,
+                        Task.archived,
+                        Task.project_id,
+                        Task.created_at,
+                        Task.latest_status_message,
+                        # status_log must be loaded eagerly: the event listener on
+                        # latest_status_message setter (models.py:_on_status_message_set)
+                        # reads target.status_log to append. Under async SQLAlchemy, a
+                        # lazy-load of a deferred attribute during a setter event raises
+                        # MissingGreenlet — see memory note "load_only Task event-listener
+                        # gotcha". The repeat-fingerprint halt below mutates
+                        # latest_status_message on the most-recent failed task; without
+                        # this column the mutation crashes mid-cycle.
+                        Task.status_log,
+                    )
+                )
+                .where(
+                    Task.project_id == source_task.project_id,
+                    Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
+                    Task.archived.is_(False),
+                    pr_number_match,
+                    type_match,
+                )
+            )
         )
-    )).scalars().all()
+        .scalars()
+        .all()
+    )
 
     # ── Repeat-fingerprint halt ─────────────────────────────────────────
     # If the last two same-type FAILED tasks in this chain share an identical
@@ -1214,7 +1359,9 @@ async def _spawn_pipeline_task(
                     # halt the spawn and exit. Without this guard, repeated
                     # _spawn_pipeline_task calls for the same chain (e.g.
                     # rollup retries) would create duplicate ProjectMessages.
-                    already_halted = bool((b.context or {}).get("blocked_repeat_fingerprint"))
+                    already_halted = bool(
+                        (b.context or {}).get("blocked_repeat_fingerprint")
+                    )
                     logger.warning(
                         f"[PIPELINE] Repeat-fingerprint halt on PR #{pr_number} "
                         f"chain={resolved_original_id[:8]} type={src_payload_type}: "
@@ -1244,7 +1391,9 @@ async def _spawn_pipeline_task(
                         # Surface to operator/strategic via requires_approval
                         # on the chain's original task — mirrors stuck-cycle.
                         try:
-                            _orig = await session.get(Task, uuid.UUID(resolved_original_id))
+                            _orig = await session.get(
+                                Task, uuid.UUID(resolved_original_id)
+                            )
                             if _orig:
                                 _orig.requires_approval = True
                                 _orig.latest_status_message = (
@@ -1291,9 +1440,10 @@ async def _spawn_pipeline_task(
     direction_id = (source_task.context or {}).get("direction_id")
     if direction_id:
         from app.models import Project
+
         project = await session.get(Project, source_task.project_id)
         if project:
-            for d in (project.directions or []):
+            for d in project.directions or []:
                 if d.get("id") == direction_id:
                     direction_data = d
                     break
@@ -1302,16 +1452,21 @@ async def _spawn_pipeline_task(
     # Rollup reviews accumulate iterations across retry attempts — always use the max cap
     # so transient review failures don't permanently block rollup merges. Detection uses
     # context flags set authoritatively by rollup_management when spawning review/fix tasks.
-    is_rollup = (
-        (source_task.context or {}).get("_is_rollup_review") is True
-        or (source_task.context or {}).get("_rollup_retries") is not None
-    )
+    is_rollup = (source_task.context or {}).get("_is_rollup_review") is True or (
+        source_task.context or {}
+    ).get("_rollup_retries") is not None
     if is_rollup:
         global_cap = MAX_REVIEW_FIX_ITERATIONS
     if pr_iterations >= global_cap:
-        logger.warning(f"[PIPELINE] PR #{pr_number} hit global review-fix cap ({pr_iterations} iterations across all chains)")
+        logger.warning(
+            f"[PIPELINE] PR #{pr_number} hit global review-fix cap ({pr_iterations} iterations across all chains)"
+        )
         await _handle_cap_exhaustion(
-            source_task, resolved_original_id, pr_number, pr_iterations, session,
+            source_task,
+            resolved_original_id,
+            pr_number,
+            pr_iterations,
+            session,
             scope="global",
         )
         _set_spawn_reason(source_task, SPAWN_REASON_CAP)
@@ -1324,9 +1479,15 @@ async def _spawn_pipeline_task(
     per_chain_cap = _max_review_iterations(source_task, direction_data)
 
     if iteration > per_chain_cap:
-        logger.warning(f"[PIPELINE] Review-fix cycle limit reached for PR #{pr_number} after {iteration - 1} iterations")
+        logger.warning(
+            f"[PIPELINE] Review-fix cycle limit reached for PR #{pr_number} after {iteration - 1} iterations"
+        )
         await _handle_cap_exhaustion(
-            source_task, resolved_original_id, pr_number, per_chain_cap, session,
+            source_task,
+            resolved_original_id,
+            pr_number,
+            per_chain_cap,
+            session,
             scope="per-chain",
         )
         _set_spawn_reason(source_task, SPAWN_REASON_CAP)
@@ -1372,7 +1533,9 @@ async def _spawn_pipeline_task(
         if orig:
             inherited_priority = orig.priority
     except Exception:
-        logger.debug(f"[PIPELINE] Could not inherit properties from original task {resolved_original_id[:8] if resolved_original_id else '?'}")
+        logger.debug(
+            f"[PIPELINE] Could not inherit properties from original task {resolved_original_id[:8] if resolved_original_id else '?'}"
+        )
 
     # Cross-cutting safeguard gate: on the first review spawn for a PR that spans
     # multiple top-level modules, is large-scope, or has an overflow warning on a
@@ -1380,9 +1543,14 @@ async def _spawn_pipeline_task(
     # it completes. Skip for rollup reviews — those are already aggregated.
     if task_type == "review" and iteration == 1 and orig is not None and not is_rollup:
         try:
-            await maybe_spawn_cross_cutting_safeguard(orig, pr_number, branch, base_branch, session)
+            await maybe_spawn_cross_cutting_safeguard(
+                orig, pr_number, branch, base_branch, session
+            )
         except Exception as _sg_err:
-            logger.warning(f"[PIPELINE] Cross-cutting safeguard spawn failed for PR #{pr_number}: {_sg_err}", exc_info=True)
+            logger.warning(
+                f"[PIPELINE] Cross-cutting safeguard spawn failed for PR #{pr_number}: {_sg_err}",
+                exc_info=True,
+            )
 
     # Apply per-task-type model/effort defaults from settings
     type_model = _runtime_config.get("task_type_models", {}).get(task_type) or None
@@ -1390,23 +1558,33 @@ async def _spawn_pipeline_task(
 
     if task_type == "review":
         title = f"Review PR #{pr_number}"
-        payload_data = {"type": "review", "pr_number": pr_number, "branch": branch,
-                        "base_branch": base_branch, "original_prompt": original_prompt,
-                        "original_task_id": resolved_original_id,
-                        "original_task_type": source_task.first_payload.get("type", ""),
-                        **({"model": type_model} if type_model else {}),
-                        **({"effort": type_effort} if type_effort else {})}
+        payload_data = {
+            "type": "review",
+            "pr_number": pr_number,
+            "branch": branch,
+            "base_branch": base_branch,
+            "original_prompt": original_prompt,
+            "original_task_id": resolved_original_id,
+            "original_task_type": source_task.first_payload.get("type", ""),
+            **({"model": type_model} if type_model else {}),
+            **({"effort": type_effort} if type_effort else {}),
+        }
     else:
         title = f"Fix PR #{pr_number}"
         # Prior review feedback is carried via review_loop.review_history in the
         # task context, which the fix agent formats with severity tags and file/line
         # locations. Avoid duplicating it here as unstructured text.
-        payload_data = {"type": "fix", "pr_number": pr_number, "branch": branch,
-                        "base_branch": base_branch, "prompt": fix_prompt,
-                        "original_prompt": original_prompt,
-                        "original_task_id": resolved_original_id,
-                        **({"model": type_model} if type_model else {}),
-                        **({"effort": type_effort} if type_effort else {})}
+        payload_data = {
+            "type": "fix",
+            "pr_number": pr_number,
+            "branch": branch,
+            "base_branch": base_branch,
+            "prompt": fix_prompt,
+            "original_prompt": original_prompt,
+            "original_task_id": resolved_original_id,
+            **({"model": type_model} if type_model else {}),
+            **({"effort": type_effort} if type_effort else {}),
+        }
 
     # Build review_history: carry forward from source task, appending current feedback if spawning a fix
     prev_review_history = source_loop.get("review_history", [])
@@ -1470,8 +1648,7 @@ async def _spawn_pipeline_task(
 
         if curr_critical_major and prev_critical_major:
             matched_count = sum(
-                1 for desc in curr_critical_major
-                if desc in prev_critical_major
+                1 for desc in curr_critical_major if desc in prev_critical_major
             )
             total_count = len(curr_critical_major)
             if matched_count / total_count >= stuck_threshold:
@@ -1505,7 +1682,9 @@ async def _spawn_pipeline_task(
                 similarity = _feedback_jaccard(prev_feedback, curr_feedback)
                 if similarity >= text_threshold:
                     is_stuck = True
-                    stuck_detail = f"feedback similarity {similarity:.0%} ≥ {text_threshold:.0%}"
+                    stuck_detail = (
+                        f"feedback similarity {similarity:.0%} ≥ {text_threshold:.0%}"
+                    )
 
         # Standoff detection: distinct from generic stuck. When the prior fix
         # iteration submitted structured rationale for an issue AND the current
@@ -1571,26 +1750,40 @@ async def _spawn_pipeline_task(
                     await session.commit()
                     try:
                         import asyncio as _asyncio
-                        from app.notification_dispatch import dispatch_external_notification
-                        _asyncio.ensure_future(dispatch_external_notification(
-                            stuck_orig.project_id,
-                            "APPROVAL_NEEDED",
-                            {
-                                "task_id": str(stuck_orig.id),
-                                "task_title": stuck_orig.title or str(stuck_orig.id)[:8],
-                                "pr_number": pr_number,
-                                "iteration": iteration,
-                                "reason": "Review-fix cycle stuck — manual review required",
-                            },
-                        ))
+                        from app.notification_dispatch import (
+                            dispatch_external_notification,
+                        )
+
+                        _asyncio.ensure_future(
+                            dispatch_external_notification(
+                                stuck_orig.project_id,
+                                "APPROVAL_NEEDED",
+                                {
+                                    "task_id": str(stuck_orig.id),
+                                    "task_title": stuck_orig.title
+                                    or str(stuck_orig.id)[:8],
+                                    "pr_number": pr_number,
+                                    "iteration": iteration,
+                                    "reason": "Review-fix cycle stuck — manual review required",
+                                },
+                            )
+                        )
                     except Exception as _ne:
-                        logger.warning(f"[NOTIFY] APPROVAL_NEEDED dispatch setup failed: {_ne}")
+                        logger.warning(
+                            f"[NOTIFY] APPROVAL_NEEDED dispatch setup failed: {_ne}"
+                        )
                     try:
-                        from app.autonomous_research import _spawn_review_convergence_investigation  # noqa: PLC0415
+                        from app.autonomous_research import (
+                            _spawn_review_convergence_investigation,
+                        )  # noqa: PLC0415
+
                         if await _spawn_review_convergence_investigation(
-                            stuck_orig, session,
-                            pr_number=pr_number, iterations=iteration,
-                            detail=stuck_detail, trigger="review_stuck_cycle",
+                            stuck_orig,
+                            session,
+                            pr_number=pr_number,
+                            iterations=iteration,
+                            detail=stuck_detail,
+                            trigger="review_stuck_cycle",
                             review_history=new_review_history,
                         ):
                             await session.commit()
@@ -1640,8 +1833,10 @@ async def _spawn_pipeline_task(
             narrow_prefix += _format_repeating_issues_section(new_review_history)
             payload_data["prompt"] = narrow_prefix + (payload_data.get("prompt") or "")
             fix_prompt = narrow_prefix + (fix_prompt or "")
-        elif task_type == "fix" and per_chain_cap > 0 and (
-            iteration >= MID_BUDGET_NARROW_FOCUS_THRESHOLD * per_chain_cap
+        elif (
+            task_type == "fix"
+            and per_chain_cap > 0
+            and (iteration >= MID_BUDGET_NARROW_FOCUS_THRESHOLD * per_chain_cap)
         ):
             # Proactive mid-budget directive: softer wording, no cap reduction.
             mid_prefix = _MID_BUDGET_NARROW_FOCUS_PREFIX.format(
@@ -1660,7 +1855,9 @@ async def _spawn_pipeline_task(
             repeating_section = _format_repeating_issues_section(new_review_history)
             if repeating_section:
                 early_prefix = _EARLY_REPEATING_ISSUES_PREFIX + repeating_section
-                payload_data["prompt"] = early_prefix + (payload_data.get("prompt") or "")
+                payload_data["prompt"] = early_prefix + (
+                    payload_data.get("prompt") or ""
+                )
                 fix_prompt = early_prefix + (fix_prompt or "")
 
     # Graduated scope-budget pressure cap: a medium-scope fix cycle's
@@ -1672,7 +1869,7 @@ async def _spawn_pipeline_task(
     scope_budget_hard_cap: int | None = None
     if task_type == "fix":
         _scope_for_pressure = (source_task.context or {}).get(
-            'scope', source_loop.get('scope', 'medium')
+            "scope", source_loop.get("scope", "medium")
         )
         _changed_for_pressure = (
             (source_task.context or {}).get("_pr_changed_files")
@@ -1686,7 +1883,7 @@ async def _spawn_pipeline_task(
             _util_for_pressure
             and _scope_for_pressure == "medium"
             and _util_for_pressure.get("percentage", 0)
-                >= SCOPE_PRESSURE_WARN_THRESHOLD * 100
+            >= SCOPE_PRESSURE_WARN_THRESHOLD * 100
         ):
             util_pct = _util_for_pressure["percentage"]
             base_remaining = per_chain_cap - iteration
@@ -1710,37 +1907,42 @@ async def _spawn_pipeline_task(
                 scope_budget_hard_cap = hard_cap_target
             if util_pct >= SCOPE_PRESSURE_HARD_CAP_PERCENTAGE:
                 hard_prefix = _SCOPE_PRESSURE_HARD_CAP_PREFIX.format(
-                    count=_util_for_pressure['non_test_file_count'],
-                    budget=_util_for_pressure['budget'],
+                    count=_util_for_pressure["non_test_file_count"],
+                    budget=_util_for_pressure["budget"],
                     pct=util_pct,
                 )
-                payload_data["prompt"] = hard_prefix + (payload_data.get("prompt") or "")
+                payload_data["prompt"] = hard_prefix + (
+                    payload_data.get("prompt") or ""
+                )
                 fix_prompt = hard_prefix + (fix_prompt or "")
 
-    payload_data = validate_internal_payload(payload_data, f"review_pipeline:{task_type}:pr#{pr_number}")
+    payload_data = validate_internal_payload(
+        payload_data, f"review_pipeline:{task_type}:pr#{pr_number}"
+    )
     source_ctx = source_task.context or {}
-    propagated_scope = source_ctx.get('scope', source_loop.get('scope', 'medium'))
+    propagated_scope = source_ctx.get("scope", source_loop.get("scope", "medium"))
     # Carry strategic context (direction_id, related_files, parent_context, scope, …)
     # from source task so fix/review agents see the same direction/intent the create
     # task had. Skip underscore-prefixed internal flags and override review_loop below.
     propagated_ctx = {
-        k: v for k, v in source_ctx.items()
-        if not k.startswith('_') and k != 'review_loop'
+        k: v
+        for k, v in source_ctx.items()
+        if not k.startswith("_") and k != "review_loop"
     }
-    propagated_ctx['scope'] = propagated_scope
+    propagated_ctx["scope"] = propagated_scope
     # Propagate direction title (text snippet) so agent PR-body footers can
     # show a human-readable label alongside the direction ID.
-    if direction_data and not propagated_ctx.get('direction_title'):
+    if direction_data and not propagated_ctx.get("direction_title"):
         _dir_text = (direction_data.get("text") or "").strip()
         if _dir_text:
-            propagated_ctx['direction_title'] = _dir_text[:80]
+            propagated_ctx["direction_title"] = _dir_text[:80]
     # Carry forward the create task's self-review outcome so the review agent
     # can see which files were verified (truncated_files_read) and whether the
     # self-review was marked incomplete, and focus attention on blind spots
     # rather than re-reviewing files the self-review already checked.
-    prev_self_review_outcome = source_ctx.get('_self_review_outcome')
+    prev_self_review_outcome = source_ctx.get("_self_review_outcome")
     if prev_self_review_outcome:
-        propagated_ctx['_self_review_outcome'] = prev_self_review_outcome
+        propagated_ctx["_self_review_outcome"] = prev_self_review_outcome
     # Scope-pressure awareness: expose file-budget utilization to both fix and
     # review agents. Fix agents use it to prefer minimal edits; reviewers use it
     # to weigh whether requesting changes would push the PR over its budget.
@@ -1751,27 +1953,33 @@ async def _spawn_pipeline_task(
     )
     utilization = _compute_scope_budget_utilization(changed_files, propagated_scope)
     if utilization:
-        propagated_ctx['scope_budget_utilization'] = utilization
+        propagated_ctx["scope_budget_utilization"] = utilization
     overflow_warning = _compute_scope_overflow_warning(changed_files, propagated_scope)
     if overflow_warning:
-        propagated_ctx['scope_overflow_warned'] = True
-        propagated_ctx['scope_overflow_warning'] = overflow_warning
+        propagated_ctx["scope_overflow_warned"] = True
+        propagated_ctx["scope_overflow_warning"] = overflow_warning
         source_ctx_updated = dict(source_ctx)
-        source_ctx_updated['scope_overflow_warned'] = True
-        source_ctx_updated['scope_overflow_warning'] = overflow_warning
+        source_ctx_updated["scope_overflow_warned"] = True
+        source_ctx_updated["scope_overflow_warning"] = overflow_warning
         source_task.context = source_ctx_updated
         source_ctx = source_ctx_updated
         signal_already_emitted = bool(
             source_ctx.get(SCOPE_OVERFLOW_PR_SIGNAL_EMITTED_KEY)
-            or ((orig.context or {}).get(SCOPE_OVERFLOW_PR_SIGNAL_EMITTED_KEY) if orig else False)
+            or (
+                (orig.context or {}).get(SCOPE_OVERFLOW_PR_SIGNAL_EMITTED_KEY)
+                if orig
+                else False
+            )
         )
         if not signal_already_emitted:
             try:
                 from app.github import add_issue_label, create_pr_comment  # noqa: PLC0415
                 from app.routers.agent import get_github_token_for_task  # noqa: PLC0415
 
-                token_task_id = (orig.id if orig is not None else source_task.id)
-                gh_token, owner, repo = await get_github_token_for_task(token_task_id, session)
+                token_task_id = orig.id if orig is not None else source_task.id
+                gh_token, owner, repo = await get_github_token_for_task(
+                    token_task_id, session
+                )
                 changed_paths = overflow_warning.get("changed_files") or []
                 file_lines = "\n".join(f"- `{path}`" for path in changed_paths)
                 scope_label = overflow_warning.get("scope") or propagated_scope
@@ -1783,7 +1991,9 @@ async def _spawn_pipeline_task(
                     "Affected files (capped):\n"
                     f"{file_lines}"
                 )
-                await add_issue_label(gh_token, owner, repo, pr_number, "scope-overflow")
+                await add_issue_label(
+                    gh_token, owner, repo, pr_number, "scope-overflow"
+                )
                 await create_pr_comment(gh_token, owner, repo, pr_number, comment_body)
 
                 source_ctx_updated[SCOPE_OVERFLOW_PR_SIGNAL_EMITTED_KEY] = True
@@ -1808,12 +2018,14 @@ async def _spawn_pipeline_task(
                 "necessary unit or indicate scope sprawl that should be deferred."
             )
             payload_data["original_prompt"] = (
-                ((payload_data.get("original_prompt") or "").strip() + "\n\n" + overflow_instruction).strip()
-            )
+                (payload_data.get("original_prompt") or "").strip()
+                + "\n\n"
+                + overflow_instruction
+            ).strip()
     # Persist the scope-budget hard cap (either newly triggered this spawn or
     # carried forward from a prior spawn) so _max_review_iterations enforces
     # it on subsequent review/fix iterations for this chain.
-    prior_hard_cap = source_ctx.get('_scope_budget_hard_cap')
+    prior_hard_cap = source_ctx.get("_scope_budget_hard_cap")
     effective_hard_cap = scope_budget_hard_cap
     # Only propagate a prior hard cap while the PR is still under scope pressure.
     # If utilization has dropped below the warn threshold (or is unknown), the
@@ -1830,20 +2042,26 @@ async def _spawn_pipeline_task(
     ):
         effective_hard_cap = (
             min(effective_hard_cap, prior_hard_cap)
-            if effective_hard_cap is not None else prior_hard_cap
+            if effective_hard_cap is not None
+            else prior_hard_cap
         )
     if effective_hard_cap is not None:
-        propagated_ctx['_scope_budget_hard_cap'] = effective_hard_cap
+        propagated_ctx["_scope_budget_hard_cap"] = effective_hard_cap
     # Propagate diagnosis context from the original create task when the PR was
     # spawned by autonomous remediation. The reviewer uses these to verify the
     # fix targets the diagnosed root cause rather than doing a generic review.
     orig_ctx_src = (orig.context or {}) if orig else {}
     if orig_ctx_src.get("diagnosis_task_id"):
         for _dk in (
-            "diagnosis_task_id", "diagnosis_root_cause",
-            "diagnosis_recommended_fix", "severity", "diagnosis_confidence",
-            "diagnosis_fingerprint", "error_fingerprint",
-            "trigger_failure_class", "trigger_failure_taxonomy",
+            "diagnosis_task_id",
+            "diagnosis_root_cause",
+            "diagnosis_recommended_fix",
+            "severity",
+            "diagnosis_confidence",
+            "diagnosis_fingerprint",
+            "error_fingerprint",
+            "trigger_failure_class",
+            "trigger_failure_taxonomy",
         ):
             if orig_ctx_src.get(_dk) is not None:
                 propagated_ctx[_dk] = orig_ctx_src[_dk]
@@ -1869,7 +2087,7 @@ async def _spawn_pipeline_task(
     if not planned_files:
         planned_files = source_ctx.get("related_files")
     if planned_files:
-        propagated_ctx['_planned_files'] = list(planned_files)
+        propagated_ctx["_planned_files"] = list(planned_files)
     # Drift signal: surface files that drifted in (no plan/approval link) or
     # drifted out (lost from approved iteration). Computed at spawn time so the
     # fix-agent prompt builder can render the section without re-deriving from
@@ -1886,7 +2104,9 @@ async def _spawn_pipeline_task(
             or []
         )
         drift_signal = compute_drift_signal(
-            new_review_history or [], _planned_for_drift, _current_files,
+            new_review_history or [],
+            _planned_for_drift,
+            _current_files,
         )
 
     # Fix-agent responses carry-forward: if the prior fix iteration wrote
@@ -1899,8 +2119,9 @@ async def _spawn_pipeline_task(
     # cycles. Per-iteration cap of 5 is enforced at write time elsewhere.
     accumulated_responses = (prior_responses + new_responses)[-30:]
 
-    propagated_ctx['review_loop'] = {
-        "pr_number": pr_number, "branch": branch,
+    propagated_ctx["review_loop"] = {
+        "pr_number": pr_number,
+        "branch": branch,
         "base_branch": base_branch,
         "original_task_id": resolved_original_id,
         "iteration": iteration,
@@ -1910,7 +2131,11 @@ async def _spawn_pipeline_task(
         **({"churn_detections": churn_detections} if churn_detections else {}),
         **({"scope_overflow_warned": True} if overflow_warning else {}),
         **({"drift_signal": drift_signal} if drift_signal else {}),
-        **({"fix_agent_responses": accumulated_responses} if accumulated_responses else {}),
+        **(
+            {"fix_agent_responses": accumulated_responses}
+            if accumulated_responses
+            else {}
+        ),
     }
 
     # Phase 2c: warm-VM continuity pin. When the runtime flag is on AND the
@@ -1922,7 +2147,9 @@ async def _spawn_pipeline_task(
     # expires or the VM dies before pickup, the orchestrator clears the
     # warm fields and provisions normally.
     spawn_vm_instance_id: str | None = vm_name
-    warm_continuity_enabled = bool(_runtime_config.get("warm_continuity_enabled", False))
+    warm_continuity_enabled = bool(
+        _runtime_config.get("warm_continuity_enabled", False)
+    )
     if (
         warm_continuity_enabled
         and not suppress_warm_handoff
@@ -1946,7 +2173,9 @@ async def _spawn_pipeline_task(
             # ->> (text), so int → "<n>" conversion is automatic. SQLite test
             # backend behavior is not load-bearing here, but keeping the type
             # consistent makes the test fixtures reflect production.
-            propagated_ctx["warm_target_pr"] = int(pr_number) if pr_number is not None else None
+            propagated_ctx["warm_target_pr"] = (
+                int(pr_number) if pr_number is not None else None
+            )
             propagated_ctx["warm_handoff_deadline"] = (
                 _utcnow() + timedelta(seconds=WARM_HANDOFF_WINDOW_SECS)
             ).isoformat()
@@ -1994,13 +2223,23 @@ async def _spawn_pipeline_task(
         return (existing, False)
     await session.refresh(new_task)
 
-    history = TaskHistory(task_id=new_task.id, action="SPAWNED",
-                          details={"spawned_by": "REVIEW_PIPELINE", "type": task_type, "pr_number": pr_number})
+    history = TaskHistory(
+        task_id=new_task.id,
+        action="SPAWNED",
+        details={
+            "spawned_by": "REVIEW_PIPELINE",
+            "type": task_type,
+            "pr_number": pr_number,
+        },
+    )
     session.add(history)
     await session.commit()
 
-    await broadcast_to_project(str(source_task.project_id), "task_updated",
-                               {"task_id": str(new_task.id), "status": TaskStatus.QUEUED})
+    await broadcast_to_project(
+        str(source_task.project_id),
+        "task_updated",
+        {"task_id": str(new_task.id), "status": TaskStatus.QUEUED},
+    )
     _set_spawn_reason(source_task, SPAWN_REASON_SPAWNED)
     session.add(source_task)
     return (new_task, True)

@@ -22,6 +22,7 @@ Covers _verify_pr_merged:
   - Transient GitHub errors (500, 502, 503) → returns False without failing task
   - Closed-but-not-merged → marks task FAILED, creates alert, returns True
 """
+
 import pytest
 import pytest_asyncio
 from unittest.mock import AsyncMock, MagicMock
@@ -37,12 +38,16 @@ from app.models import Project, Task, TaskStatus, Artifact, ArtifactType
 
 # ── Fixture ───────────────────────────────────────────────────────────────────
 
+
 @pytest_asyncio.fixture()
 async def cleanup_db():
     """Isolated in-memory SQLite DB for _cleanup_branches tests."""
     from sqlalchemy.dialects.sqlite.base import SQLiteTypeCompiler
+
     if not hasattr(SQLiteTypeCompiler, "visit_JSONB"):
-        SQLiteTypeCompiler.visit_JSONB = lambda self, type_, **kw: self.visit_JSON(type_, **kw)
+        SQLiteTypeCompiler.visit_JSONB = lambda self, type_, **kw: self.visit_JSON(
+            type_, **kw
+        )
 
     _engine = create_async_engine(
         "sqlite+aiosqlite:///:memory:",
@@ -53,8 +58,11 @@ async def cleanup_db():
         await conn.run_sync(SQLModel.metadata.create_all)
 
     _Session = sessionmaker(
-        bind=_engine, class_=AsyncSession,
-        autocommit=False, autoflush=False, expire_on_commit=False,
+        bind=_engine,
+        class_=AsyncSession,
+        autocommit=False,
+        autoflush=False,
+        expire_on_commit=False,
     )
 
     async with _Session() as session:
@@ -66,6 +74,7 @@ async def cleanup_db():
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
 
 async def _make_project(session):
     project = Project(name="Test Project", user_id="user1")
@@ -103,13 +112,15 @@ async def _make_task(
 
 # ── Tests ─────────────────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_cleanup_non_parent_skips_staging_branch(cleanup_db, mocker):
     """A task that is NOT a parent (no plan_output, payload type not research/plan)
     should not trigger staging branch deletion even if context has plan_branch."""
     project = await _make_project(cleanup_db)
     task = await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         task_type="create",
         context={"plan_branch": "plan/some-branch"},
     )
@@ -131,13 +142,15 @@ async def test_cleanup_guard1_in_progress_child_skips_staging(cleanup_db, mocker
     """Guard 1: an IN_PROGRESS child blocks staging branch deletion."""
     project = await _make_project(cleanup_db)
     parent = await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         task_type="research",
         status=TaskStatus.EVALUATING,
         context={"research_branch": "research/my-branch"},
     )
     await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         task_type="create",
         status=TaskStatus.IN_PROGRESS,
         parent_task_id=parent.id,
@@ -160,13 +173,15 @@ async def test_cleanup_guard1_queued_child_skips_staging(cleanup_db, mocker):
     """Guard 1: a QUEUED child also blocks staging branch deletion."""
     project = await _make_project(cleanup_db)
     parent = await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         task_type="plan",
         status=TaskStatus.EVALUATING,
         context={"plan_branch": "plan/test-branch"},
     )
     await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         task_type="create",
         status=TaskStatus.QUEUED,
         parent_task_id=parent.id,
@@ -189,13 +204,15 @@ async def test_cleanup_guard1_provisioning_child_skips_staging(cleanup_db, mocke
     """Guard 1: a PROVISIONING child also blocks staging branch deletion."""
     project = await _make_project(cleanup_db)
     parent = await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         task_type="research",
         status=TaskStatus.EVALUATING,
         context={"research_branch": "research/prov-branch"},
     )
     await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         task_type="create",
         status=TaskStatus.PROVISIONING,
         parent_task_id=parent.id,
@@ -218,21 +235,24 @@ async def test_cleanup_guard2_parent_base_reference_skips(cleanup_db, mocker):
     """Guard 2: another EVALUATING task references same staging branch via parent_base → skip."""
     project = await _make_project(cleanup_db)
     parent = await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         task_type="research",
         status=TaskStatus.EVALUATING,
         context={"research_branch": "research/shared-branch"},
     )
     # All children completed — Guard 1 will pass
     await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         task_type="create",
         status=TaskStatus.COMPLETED,
         parent_task_id=parent.id,
     )
     # Another EVALUATING rollup references this branch as parent_base
     await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         task_type="research",
         status=TaskStatus.EVALUATING,
         context={"parent_base": "research/shared-branch"},
@@ -244,7 +264,9 @@ async def test_cleanup_guard2_parent_base_reference_skips(cleanup_db, mocker):
         new_callable=AsyncMock,
         return_value=("token", "owner", "repo"),
     )
-    mocker.patch("app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[])
+    mocker.patch(
+        "app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[]
+    )
 
     await _cleanup_branches(parent, cleanup_db)
 
@@ -256,20 +278,23 @@ async def test_cleanup_guard2_original_base_reference_skips(cleanup_db, mocker):
     """Guard 2: another EVALUATING task references same staging branch via original_base → skip."""
     project = await _make_project(cleanup_db)
     parent = await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         task_type="plan",
         status=TaskStatus.EVALUATING,
         context={"plan_branch": "plan/shared-base"},
     )
     await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         task_type="create",
         status=TaskStatus.COMPLETED,
         parent_task_id=parent.id,
     )
     # Another EVALUATING rollup references via original_base
     await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         task_type="plan",
         status=TaskStatus.EVALUATING,
         context={"original_base": "plan/shared-base"},
@@ -281,7 +306,9 @@ async def test_cleanup_guard2_original_base_reference_skips(cleanup_db, mocker):
         new_callable=AsyncMock,
         return_value=("token", "owner", "repo"),
     )
-    mocker.patch("app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[])
+    mocker.patch(
+        "app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[]
+    )
 
     await _cleanup_branches(parent, cleanup_db)
 
@@ -293,13 +320,15 @@ async def test_cleanup_guard3_open_prs_skips_staging(cleanup_db, mocker):
     """Guard 3: open PRs targeting the staging branch → skip deletion."""
     project = await _make_project(cleanup_db)
     parent = await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         task_type="research",
         status=TaskStatus.EVALUATING,
         context={"research_branch": "research/pr-branch"},
     )
     await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         task_type="create",
         status=TaskStatus.COMPLETED,
         parent_task_id=parent.id,
@@ -327,13 +356,15 @@ async def test_cleanup_guard3_github_error_skips(cleanup_db, mocker):
     """Guard 3: if get_open_pull_requests raises an exception, skip deletion (safe default)."""
     project = await _make_project(cleanup_db)
     parent = await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         task_type="research",
         status=TaskStatus.EVALUATING,
         context={"research_branch": "research/error-branch"},
     )
     await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         task_type="create",
         status=TaskStatus.COMPLETED,
         parent_task_id=parent.id,
@@ -362,29 +393,37 @@ async def test_cleanup_happy_path_research_branch_deleted(cleanup_db, mocker):
     no open PRs → research_branch is deleted."""
     project = await _make_project(cleanup_db)
     parent = await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         task_type="research",
         status=TaskStatus.EVALUATING,
         context={"research_branch": "research/clean-branch"},
     )
     await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         task_type="create",
         status=TaskStatus.COMPLETED,
         parent_task_id=parent.id,
     )
 
-    mock_delete = mocker.patch("app.github.delete_branch", new_callable=AsyncMock, return_value=True)
+    mock_delete = mocker.patch(
+        "app.github.delete_branch", new_callable=AsyncMock, return_value=True
+    )
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
         return_value=("gh-token", "owner", "repo"),
     )
-    mocker.patch("app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[])
+    mocker.patch(
+        "app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[]
+    )
 
     await _cleanup_branches(parent, cleanup_db)
 
-    mock_delete.assert_called_once_with("gh-token", "owner", "repo", "research/clean-branch")
+    mock_delete.assert_called_once_with(
+        "gh-token", "owner", "repo", "research/clean-branch"
+    )
 
 
 @pytest.mark.asyncio
@@ -392,24 +431,31 @@ async def test_cleanup_happy_path_plan_branch_deleted(cleanup_db, mocker):
     """Happy path: plan parent with plan_branch context → plan_branch is deleted."""
     project = await _make_project(cleanup_db)
     parent = await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         task_type="plan",
         status=TaskStatus.EVALUATING,
         context={"plan_branch": "plan/finished-branch"},
     )
     # No children
 
-    mock_delete = mocker.patch("app.github.delete_branch", new_callable=AsyncMock, return_value=True)
+    mock_delete = mocker.patch(
+        "app.github.delete_branch", new_callable=AsyncMock, return_value=True
+    )
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
         return_value=("gh-token", "owner", "repo"),
     )
-    mocker.patch("app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[])
+    mocker.patch(
+        "app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[]
+    )
 
     await _cleanup_branches(parent, cleanup_db)
 
-    mock_delete.assert_called_once_with("gh-token", "owner", "repo", "plan/finished-branch")
+    mock_delete.assert_called_once_with(
+        "gh-token", "owner", "repo", "plan/finished-branch"
+    )
 
 
 @pytest.mark.asyncio
@@ -420,20 +466,25 @@ async def test_cleanup_plan_output_alone_does_not_delete_staging(cleanup_db, moc
     role (task_type) determines what staging branch it owns."""
     project = await _make_project(cleanup_db)
     task = await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         task_type="create",
         status=TaskStatus.EVALUATING,
         context={"plan_branch": "plan/inherited-from-parent"},
         plan_output={"steps": ["implement feature"]},
     )
 
-    mock_delete = mocker.patch("app.github.delete_branch", new_callable=AsyncMock, return_value=True)
+    mock_delete = mocker.patch(
+        "app.github.delete_branch", new_callable=AsyncMock, return_value=True
+    )
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
         return_value=("gh-token", "owner", "repo"),
     )
-    mocker.patch("app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[])
+    mocker.patch(
+        "app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[]
+    )
 
     await _cleanup_branches(task, cleanup_db)
 
@@ -441,7 +492,9 @@ async def test_cleanup_plan_output_alone_does_not_delete_staging(cleanup_db, moc
 
 
 @pytest.mark.asyncio
-async def test_cleanup_plan_child_does_not_delete_inherited_research_branch(cleanup_db, mocker):
+async def test_cleanup_plan_child_does_not_delete_inherited_research_branch(
+    cleanup_db, mocker
+):
     """Regression for incident 2026-05-04: cancelling a plan child of a research
     task must not delete the parent's research_branch.
 
@@ -454,7 +507,8 @@ async def test_cleanup_plan_child_does_not_delete_inherited_research_branch(clea
     rolled up to main."""
     project = await _make_project(cleanup_db)
     plan_child = await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         task_type="plan",
         status=TaskStatus.CANCELLED,
         context={
@@ -464,13 +518,17 @@ async def test_cleanup_plan_child_does_not_delete_inherited_research_branch(clea
         },
     )
 
-    mock_delete = mocker.patch("app.github.delete_branch", new_callable=AsyncMock, return_value=True)
+    mock_delete = mocker.patch(
+        "app.github.delete_branch", new_callable=AsyncMock, return_value=True
+    )
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
         return_value=("gh-token", "owner", "repo"),
     )
-    mocker.patch("app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[])
+    mocker.patch(
+        "app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[]
+    )
 
     await _cleanup_branches(plan_child, cleanup_db)
 
@@ -479,13 +537,16 @@ async def test_cleanup_plan_child_does_not_delete_inherited_research_branch(clea
 
 
 @pytest.mark.asyncio
-async def test_cleanup_research_child_does_not_delete_inherited_plan_branch(cleanup_db, mocker):
+async def test_cleanup_research_child_does_not_delete_inherited_plan_branch(
+    cleanup_db, mocker
+):
     """Symmetric regression: a research task that somehow has plan_branch in
     its context (inherited / stale) must not delete that plan_branch — research
     tasks own research_branch, never plan_branch."""
     project = await _make_project(cleanup_db)
     research_task = await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         task_type="research",
         status=TaskStatus.CANCELLED,
         context={
@@ -494,13 +555,17 @@ async def test_cleanup_research_child_does_not_delete_inherited_plan_branch(clea
         },
     )
 
-    mock_delete = mocker.patch("app.github.delete_branch", new_callable=AsyncMock, return_value=True)
+    mock_delete = mocker.patch(
+        "app.github.delete_branch", new_callable=AsyncMock, return_value=True
+    )
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
         return_value=("gh-token", "owner", "repo"),
     )
-    mocker.patch("app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[])
+    mocker.patch(
+        "app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[]
+    )
 
     await _cleanup_branches(research_task, cleanup_db)
 
@@ -513,14 +578,23 @@ async def test_cleanup_feature_branch_deleted_for_merged_pr(cleanup_db, mocker):
     → the feature branch is deleted."""
     project = await _make_project(cleanup_db)
     child = await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         task_type="create",
         status=TaskStatus.COMPLETED,
         context={"pr_merged": True},
-        payloads=[{"type": "create", "prompt": "create task", "branch": "blueprint/my-feature"}],
+        payloads=[
+            {
+                "type": "create",
+                "prompt": "create task",
+                "branch": "blueprint/my-feature",
+            }
+        ],
     )
 
-    mock_delete = mocker.patch("app.github.delete_branch", new_callable=AsyncMock, return_value=True)
+    mock_delete = mocker.patch(
+        "app.github.delete_branch", new_callable=AsyncMock, return_value=True
+    )
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
@@ -529,7 +603,9 @@ async def test_cleanup_feature_branch_deleted_for_merged_pr(cleanup_db, mocker):
 
     await _cleanup_branches(child, cleanup_db)
 
-    mock_delete.assert_called_once_with("gh-token", "owner", "repo", "blueprint/my-feature")
+    mock_delete.assert_called_once_with(
+        "gh-token", "owner", "repo", "blueprint/my-feature"
+    )
 
 
 @pytest.mark.asyncio
@@ -538,11 +614,18 @@ async def test_cleanup_non_blueprint_branch_not_deleted(cleanup_db, mocker):
     even when pr_merged=True in context."""
     project = await _make_project(cleanup_db)
     child = await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         task_type="create",
         status=TaskStatus.COMPLETED,
         context={"pr_merged": True},
-        payloads=[{"type": "create", "prompt": "create task", "branch": "feature/other-branch"}],
+        payloads=[
+            {
+                "type": "create",
+                "prompt": "create task",
+                "branch": "feature/other-branch",
+            }
+        ],
     )
 
     mock_delete = mocker.patch("app.github.delete_branch", new_callable=AsyncMock)
@@ -562,7 +645,8 @@ async def test_cleanup_no_staging_branch_in_context(cleanup_db, mocker):
     """Parent task with neither plan_branch nor research_branch in context → no staging deletion."""
     project = await _make_project(cleanup_db)
     parent = await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         task_type="research",
         status=TaskStatus.EVALUATING,
         context={},  # No staging branch keys
@@ -585,39 +669,56 @@ async def test_cleanup_completed_children_do_not_block_staging(cleanup_db, mocke
     """Children in terminal states (COMPLETED/FAILED/CANCELLED) do NOT block staging deletion."""
     project = await _make_project(cleanup_db)
     parent = await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         task_type="research",
         status=TaskStatus.EVALUATING,
         context={"research_branch": "research/done-branch"},
     )
     # All children in terminal states
     await _make_task(
-        cleanup_db, project.id, task_type="create",
-        status=TaskStatus.COMPLETED, parent_task_id=parent.id,
+        cleanup_db,
+        project.id,
+        task_type="create",
+        status=TaskStatus.COMPLETED,
+        parent_task_id=parent.id,
     )
     await _make_task(
-        cleanup_db, project.id, task_type="create",
-        status=TaskStatus.FAILED, parent_task_id=parent.id,
+        cleanup_db,
+        project.id,
+        task_type="create",
+        status=TaskStatus.FAILED,
+        parent_task_id=parent.id,
     )
     await _make_task(
-        cleanup_db, project.id, task_type="create",
-        status=TaskStatus.CANCELLED, parent_task_id=parent.id,
+        cleanup_db,
+        project.id,
+        task_type="create",
+        status=TaskStatus.CANCELLED,
+        parent_task_id=parent.id,
     )
 
-    mock_delete = mocker.patch("app.github.delete_branch", new_callable=AsyncMock, return_value=True)
+    mock_delete = mocker.patch(
+        "app.github.delete_branch", new_callable=AsyncMock, return_value=True
+    )
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
         return_value=("gh-token", "owner", "repo"),
     )
-    mocker.patch("app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[])
+    mocker.patch(
+        "app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[]
+    )
 
     await _cleanup_branches(parent, cleanup_db)
 
-    mock_delete.assert_called_once_with("gh-token", "owner", "repo", "research/done-branch")
+    mock_delete.assert_called_once_with(
+        "gh-token", "owner", "repo", "research/done-branch"
+    )
 
 
 # ── _verify_pr_merged helpers ─────────────────────────────────────────────────
+
 
 def _make_write_session_mock(db_task=None):
     """Return a mock async context manager for AsyncSessionLocal()."""
@@ -644,12 +745,14 @@ async def _make_artifact(session, task_id, pr_url):
 
 # ── _verify_pr_merged tests ───────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_verify_pr_merged_context_cache_hit(cleanup_db, mocker):
     """If task.context already has pr_merged=True, returns True without any API call."""
     project = await _make_project(cleanup_db)
     task = await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         context={"pr_merged": True},
     )
 
@@ -738,7 +841,9 @@ async def test_verify_pr_merged_401_retries_with_fresh_token(cleanup_db, mocker)
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status_code", [500, 502, 503])
-async def test_verify_pr_merged_transient_errors_return_false(cleanup_db, mocker, status_code):
+async def test_verify_pr_merged_transient_errors_return_false(
+    cleanup_db, mocker, status_code
+):
     """Transient GitHub errors (500/502/503) → returns False without failing the task."""
     project = await _make_project(cleanup_db)
     task = await _make_task(cleanup_db, project.id, context={})
@@ -804,20 +909,25 @@ async def test_verify_pr_merged_closed_not_merged_fails_task(cleanup_db, mocker)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("bad_url", [
-    # Production incident 2026-05-06: haiku retry with wedged ./check viewport
-    # gate improvised this URL into the wrapper's PR-URL marker file.
-    "https://github.com/owner/repo/compare/main...blueprint/task-cb7bb07e",
-    # Bare branch name
-    "blueprint/task-cb7bb07e",
-    # Plain text Claude might write under "I made changes, here's a description"
-    "PR pending — see logs",
-    # /pull/ path but trailing seg isn't numeric (defensive — shouldn't happen
-    # for a real GitHub URL, but the guard is `/pull/ AND last_seg.isdigit()`)
-    "https://github.com/owner/repo/pull/foo",
-])
+@pytest.mark.parametrize(
+    "bad_url",
+    [
+        # Production incident 2026-05-06: haiku retry with wedged ./check viewport
+        # gate improvised this URL into the wrapper's PR-URL marker file.
+        "https://github.com/owner/repo/compare/main...blueprint/task-cb7bb07e",
+        # Bare branch name
+        "blueprint/task-cb7bb07e",
+        # Plain text Claude might write under "I made changes, here's a description"
+        "PR pending — see logs",
+        # /pull/ path but trailing seg isn't numeric (defensive — shouldn't happen
+        # for a real GitHub URL, but the guard is `/pull/ AND last_seg.isdigit()`)
+        "https://github.com/owner/repo/pull/foo",
+    ],
+)
 async def test_verify_pr_merged_malformed_pr_url_returns_false_without_calling_github(
-    cleanup_db, mocker, bad_url,
+    cleanup_db,
+    mocker,
+    bad_url,
 ):
     """Malformed PR URLs in the artifact must not crash int()-parsing — they
     fall through to the negative cache and the verifier returns False."""
@@ -848,6 +958,7 @@ async def test_verify_pr_merged_malformed_pr_url_returns_false_without_calling_g
 
 # ── Tests for persist_failure_category at rollup parent-failure paths ─────────
 
+
 @pytest.mark.asyncio
 async def test_all_children_failed_parent_persists_failure_category(cleanup_db, mocker):
     """When all children fail and the rollup parent marks itself FAILED,
@@ -871,7 +982,8 @@ async def test_all_children_failed_parent_persists_failure_category(cleanup_db, 
 
     # Parent task with research plan_output so it's treated as a rollup parent
     parent = await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         task_type="research",
         status=TaskStatus.EVALUATING,
         context={
@@ -884,13 +996,15 @@ async def test_all_children_failed_parent_persists_failure_category(cleanup_db, 
 
     # Two FAILED children — one CODE_ERROR, one AGENT_TIMEOUT
     child1 = await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         parent_task_id=parent.id,
         status=TaskStatus.FAILED,
         context={"failure_category": "AGENT_TIMEOUT"},
     )
     await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         parent_task_id=parent.id,
         status=TaskStatus.FAILED,
         context={"failure_category": "CODE_ERROR"},
@@ -920,7 +1034,8 @@ async def test_all_children_failed_with_only_infra_failures(cleanup_db, mocker):
     project = await _make_project(cleanup_db)
 
     parent = await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         task_type="research",
         status=TaskStatus.EVALUATING,
         context={
@@ -932,7 +1047,8 @@ async def test_all_children_failed_with_only_infra_failures(cleanup_db, mocker):
     )
 
     child = await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         parent_task_id=parent.id,
         status=TaskStatus.FAILED,
         context={"failure_category": "PROVISION_FAILURE"},
@@ -957,21 +1073,33 @@ async def test_zero_diff_rollup_pr_closed_without_spawning_review(cleanup_db, mo
         return_value=("token", "owner", "repo"),
     )
     # Target branch exists, staging branch exists, no open PRs targeting staging
-    mocker.patch("app.github.get_branch_sha", new_callable=AsyncMock, return_value="abc123")
-    mocker.patch("app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[])
+    mocker.patch(
+        "app.github.get_branch_sha", new_callable=AsyncMock, return_value="abc123"
+    )
+    mocker.patch(
+        "app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[]
+    )
     # Rollup PR is created (not empty_diff) but its diff fetch returns 0 lines changed
     mocker.patch(
         "app.github.create_pull_request",
         new_callable=AsyncMock,
-        return_value={"number": 4242, "html_url": "https://github.com/owner/repo/pull/4242", "empty_diff": False},
+        return_value={
+            "number": 4242,
+            "html_url": "https://github.com/owner/repo/pull/4242",
+            "empty_diff": False,
+        },
     )
     mocker.patch(
         "app.github.get_pull_request",
         new_callable=AsyncMock,
         return_value={"additions": 0, "deletions": 0, "merged": False, "state": "open"},
     )
-    mock_close = mocker.patch("app.github.close_pull_request", new_callable=AsyncMock, return_value=True)
-    mock_delete = mocker.patch("app.github.delete_branch", new_callable=AsyncMock, return_value=True)
+    mock_close = mocker.patch(
+        "app.github.close_pull_request", new_callable=AsyncMock, return_value=True
+    )
+    mock_delete = mocker.patch(
+        "app.github.delete_branch", new_callable=AsyncMock, return_value=True
+    )
     # Critical: verify review task is NOT spawned on zero-diff PR
     mock_spawn = mocker.patch(
         "app.rollup_management._spawn_pipeline_task",
@@ -984,7 +1112,8 @@ async def test_zero_diff_rollup_pr_closed_without_spawning_review(cleanup_db, mo
     project = await _make_project(cleanup_db)
 
     parent = await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         task_type="research",
         status=TaskStatus.EVALUATING,
         context={
@@ -995,7 +1124,8 @@ async def test_zero_diff_rollup_pr_closed_without_spawning_review(cleanup_db, mo
     )
     # One child that is COMPLETED with pr_merged=True so rollup proceeds
     child = await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         parent_task_id=parent.id,
         status=TaskStatus.COMPLETED,
         context={"pr_merged": True},
@@ -1010,7 +1140,9 @@ async def test_zero_diff_rollup_pr_closed_without_spawning_review(cleanup_db, mo
     close_args = mock_close.call_args
     assert close_args.args[3] == 4242 or close_args.kwargs.get("pr_number") == 4242
     # Staging branch deleted
-    assert any(call.args[-1] == "research/zero-diff" for call in mock_delete.call_args_list)
+    assert any(
+        call.args[-1] == "research/zero-diff" for call in mock_delete.call_args_list
+    )
     # No review/fix task spawned
     mock_spawn.assert_not_called()
     # Rollup PR marker cleared so reaper/retry logic doesn't resume with a closed PR
@@ -1028,36 +1160,53 @@ async def test_unverified_pr_size_defers_instead_of_spawning_review(cleanup_db, 
     mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
-        new_callable=AsyncMock, return_value=("token", "owner", "repo"),
+        new_callable=AsyncMock,
+        return_value=("token", "owner", "repo"),
     )
-    mocker.patch("app.github.get_branch_sha", new_callable=AsyncMock, return_value="abc123")
-    mocker.patch("app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[])
+    mocker.patch(
+        "app.github.get_branch_sha", new_callable=AsyncMock, return_value="abc123"
+    )
+    mocker.patch(
+        "app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[]
+    )
     mocker.patch(
         "app.github.create_pull_request",
         new_callable=AsyncMock,
-        return_value={"number": 7070, "html_url": "https://github.com/owner/repo/pull/7070", "empty_diff": False},
+        return_value={
+            "number": 7070,
+            "html_url": "https://github.com/owner/repo/pull/7070",
+            "empty_diff": False,
+        },
     )
     mocker.patch(
         "app.github.get_pull_request",
-        new_callable=AsyncMock, side_effect=Exception("GitHub 502"),
+        new_callable=AsyncMock,
+        side_effect=Exception("GitHub 502"),
     )
     mock_close = mocker.patch("app.github.close_pull_request", new_callable=AsyncMock)
     mock_spawn = mocker.patch(
         "app.rollup_management._spawn_pipeline_task",
-        new_callable=AsyncMock, return_value=(None, None),
+        new_callable=AsyncMock,
+        return_value=(None, None),
     )
 
     from app.rollup_management import _check_and_trigger_rollup
 
     project = await _make_project(cleanup_db)
     parent = await _make_task(
-        cleanup_db, project.id, task_type="research", status=TaskStatus.EVALUATING,
+        cleanup_db,
+        project.id,
+        task_type="research",
+        status=TaskStatus.EVALUATING,
         context={"research_branch": "research/unverified", "parent_base": "main"},
         plan_output="plan",
     )
     child = await _make_task(
-        cleanup_db, project.id, parent_task_id=parent.id,
-        status=TaskStatus.COMPLETED, context={"pr_merged": True},
+        cleanup_db,
+        project.id,
+        parent_task_id=parent.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
     )
 
     await _check_and_trigger_rollup(child, cleanup_db)
@@ -1083,8 +1232,12 @@ async def test_marker_commit_failure_rescues_pr_number(cleanup_db, mocker):
         new_callable=AsyncMock,
         return_value=("token", "owner", "repo"),
     )
-    mocker.patch("app.github.get_branch_sha", new_callable=AsyncMock, return_value="abc123")
-    mocker.patch("app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[])
+    mocker.patch(
+        "app.github.get_branch_sha", new_callable=AsyncMock, return_value="abc123"
+    )
+    mocker.patch(
+        "app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[]
+    )
     # PR creation itself succeeds — the bug is in the marker persistence that follows.
     mock_create = mocker.patch(
         "app.github.create_pull_request",
@@ -1113,14 +1266,16 @@ async def test_marker_commit_failure_rescues_pr_number(cleanup_db, mocker):
 
     project = await _make_project(cleanup_db)
     parent = await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         task_type="research",
         status=TaskStatus.EVALUATING,
         context={"research_branch": "research/marker-fail", "parent_base": "main"},
         plan_output="some plan",
     )
     child = await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         parent_task_id=parent.id,
         status=TaskStatus.COMPLETED,
         context={"pr_merged": True},
@@ -1161,11 +1316,16 @@ async def test_marker_commit_failure_rescues_pr_number(cleanup_db, mocker):
     # Context written to rescue session contains the PR number/url so that
     # the next retry cycle's crash-recovery branch can resume this PR.
     assert db_parent_mock.context.get("rollup_pr_number") == 9999
-    assert db_parent_mock.context.get("rollup_pr_url") == "https://github.com/owner/repo/pull/9999"
+    assert (
+        db_parent_mock.context.get("rollup_pr_url")
+        == "https://github.com/owner/repo/pull/9999"
+    )
 
 
 @pytest.mark.asyncio
-async def test_marker_commit_failure_skips_rescue_when_db_already_has_marker(cleanup_db, mocker):
+async def test_marker_commit_failure_skips_rescue_when_db_already_has_marker(
+    cleanup_db, mocker
+):
     """If the marker is already persisted in the DB (e.g. the commit partially
     succeeded or a prior cycle wrote it), the rescue path must NOT overwrite
     it — the existing value is authoritative."""
@@ -1176,8 +1336,12 @@ async def test_marker_commit_failure_skips_rescue_when_db_already_has_marker(cle
         new_callable=AsyncMock,
         return_value=("token", "owner", "repo"),
     )
-    mocker.patch("app.github.get_branch_sha", new_callable=AsyncMock, return_value="abc123")
-    mocker.patch("app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[])
+    mocker.patch(
+        "app.github.get_branch_sha", new_callable=AsyncMock, return_value="abc123"
+    )
+    mocker.patch(
+        "app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[]
+    )
     mocker.patch(
         "app.github.create_pull_request",
         new_callable=AsyncMock,
@@ -1190,7 +1354,10 @@ async def test_marker_commit_failure_skips_rescue_when_db_already_has_marker(cle
 
     db_parent_mock = MagicMock()
     # Simulate a stored marker from a prior cycle
-    db_parent_mock.context = {"rollup_pr_number": 8888, "rollup_pr_url": "https://x/8888"}
+    db_parent_mock.context = {
+        "rollup_pr_number": 8888,
+        "rollup_pr_url": "https://x/8888",
+    }
     rescue_session = AsyncMock()
     rescue_session.get = AsyncMock(return_value=db_parent_mock)
     rescue_session.add = MagicMock()
@@ -1204,14 +1371,16 @@ async def test_marker_commit_failure_skips_rescue_when_db_already_has_marker(cle
 
     project = await _make_project(cleanup_db)
     parent = await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         task_type="research",
         status=TaskStatus.EVALUATING,
         context={"research_branch": "research/marker-exists", "parent_base": "main"},
         plan_output="some plan",
     )
     child = await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         parent_task_id=parent.id,
         status=TaskStatus.COMPLETED,
         context={"pr_merged": True},
@@ -1243,7 +1412,9 @@ async def test_marker_commit_failure_skips_rescue_when_db_already_has_marker(cle
 
 
 @pytest.mark.asyncio
-async def test_parent_mutated_during_pr_creation_runs_rescue_and_returns(cleanup_db, mocker):
+async def test_parent_mutated_during_pr_creation_runs_rescue_and_returns(
+    cleanup_db, mocker
+):
     """Production 2026-05-05: when ``_relock_parent`` returns None after a peer
     mutated the parent during ``create_pull_request``, the handler must (a)
     persist the new PR marker via the orphan-PR rescue path so the next sweep
@@ -1259,8 +1430,12 @@ async def test_parent_mutated_during_pr_creation_runs_rescue_and_returns(cleanup
         new_callable=AsyncMock,
         return_value=("token", "owner", "repo"),
     )
-    mocker.patch("app.github.get_branch_sha", new_callable=AsyncMock, return_value="abc123")
-    mocker.patch("app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[])
+    mocker.patch(
+        "app.github.get_branch_sha", new_callable=AsyncMock, return_value="abc123"
+    )
+    mocker.patch(
+        "app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[]
+    )
     mocker.patch(
         "app.github.create_pull_request",
         new_callable=AsyncMock,
@@ -1284,14 +1459,16 @@ async def test_parent_mutated_during_pr_creation_runs_rescue_and_returns(cleanup
 
     project = await _make_project(cleanup_db)
     parent = await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         task_type="research",
         status=TaskStatus.EVALUATING,
         context={"research_branch": "research/relock-none", "parent_base": "main"},
         plan_output="some plan",
     )
     await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         parent_task_id=parent.id,
         status=TaskStatus.COMPLETED,
         context={"pr_merged": True},
@@ -1302,7 +1479,9 @@ async def test_parent_mutated_during_pr_creation_runs_rescue_and_returns(cleanup
     # pre-existing-PR-check, post-create). Returning None on the third
     # call simulates a peer mutating the parent during the PR creation
     # round-trip — the failure path the sentinel exception protects.
-    real_relock = __import__("app.rollup_management", fromlist=["_relock_parent"])._relock_parent
+    real_relock = __import__(
+        "app.rollup_management", fromlist=["_relock_parent"]
+    )._relock_parent
     relock_calls = {"n": 0}
 
     async def relock_returns_none_on_post_create(*args, **kwargs):
@@ -1320,9 +1499,17 @@ async def test_parent_mutated_during_pr_creation_runs_rescue_and_returns(cleanup
 
     # Must not raise — the AttributeError-on-NoneType bug surfaced as a
     # 500 from /api/github/webhook in production.
-    child = (await cleanup_db.execute(
-        __import__("sqlmodel", fromlist=["select"]).select(Task).where(Task.parent_task_id == parent.id)
-    )).scalars().first()
+    child = (
+        (
+            await cleanup_db.execute(
+                __import__("sqlmodel", fromlist=["select"])
+                .select(Task)
+                .where(Task.parent_task_id == parent.id)
+            )
+        )
+        .scalars()
+        .first()
+    )
     await _check_and_trigger_rollup(child, cleanup_db)
 
     # Rescue must have persisted the marker via the fresh session — this
@@ -1334,10 +1521,14 @@ async def test_parent_mutated_during_pr_creation_runs_rescue_and_returns(cleanup
     rescue_session.add.assert_called_once_with(db_parent_mock)
     rescue_session.commit.assert_awaited_once()
     assert db_parent_mock.context.get("rollup_pr_number") == 7777
-    assert db_parent_mock.context.get("rollup_pr_url") == "https://github.com/owner/repo/pull/7777"
+    assert (
+        db_parent_mock.context.get("rollup_pr_url")
+        == "https://github.com/owner/repo/pull/7777"
+    )
 
 
 # ── Error recovery: target/staging branch issues and all-cancelled ────────────
+
 
 @pytest.mark.asyncio
 async def test_target_branch_404_fails_parent(cleanup_db, mocker):
@@ -1351,7 +1542,9 @@ async def test_target_branch_404_fails_parent(cleanup_db, mocker):
         new_callable=AsyncMock,
         return_value=("token", "owner", "repo"),
     )
-    mocker.patch("app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[])
+    mocker.patch(
+        "app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[]
+    )
     mocker.patch(
         "app.github.get_branch_sha",
         new_callable=AsyncMock,
@@ -1362,7 +1555,8 @@ async def test_target_branch_404_fails_parent(cleanup_db, mocker):
 
     project = await _make_project(cleanup_db)
     parent = await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         task_type="research",
         status=TaskStatus.EVALUATING,
         context={
@@ -1373,7 +1567,8 @@ async def test_target_branch_404_fails_parent(cleanup_db, mocker):
         plan_output="some plan",
     )
     child = await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         parent_task_id=parent.id,
         status=TaskStatus.COMPLETED,
         context={"pr_merged": True},
@@ -1387,7 +1582,9 @@ async def test_target_branch_404_fails_parent(cleanup_db, mocker):
 
 
 @pytest.mark.asyncio
-async def test_staging_branch_missing_all_children_completed_marks_completed(cleanup_db, mocker):
+async def test_staging_branch_missing_all_children_completed_marks_completed(
+    cleanup_db, mocker
+):
     """Staging branch is gone (404) but every child completed successfully —
     the work already landed on the target branch. Parent transitions to
     COMPLETED with a 'no actionable changes' message."""
@@ -1398,7 +1595,9 @@ async def test_staging_branch_missing_all_children_completed_marks_completed(cle
         new_callable=AsyncMock,
         return_value=("token", "owner", "repo"),
     )
-    mocker.patch("app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[])
+    mocker.patch(
+        "app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[]
+    )
     # Target branch exists; staging branch 404
     mocker.patch(
         "app.github.get_branch_sha",
@@ -1414,7 +1613,8 @@ async def test_staging_branch_missing_all_children_completed_marks_completed(cle
 
     project = await _make_project(cleanup_db)
     parent = await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         task_type="research",
         status=TaskStatus.EVALUATING,
         context={
@@ -1424,7 +1624,8 @@ async def test_staging_branch_missing_all_children_completed_marks_completed(cle
         plan_output="some plan",
     )
     child = await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         parent_task_id=parent.id,
         status=TaskStatus.COMPLETED,
         context={"pr_merged": True},
@@ -1449,15 +1650,20 @@ async def test_all_children_cancelled_marks_parent_cancelled(cleanup_db, mocker)
         new_callable=AsyncMock,
         return_value=("token", "owner", "repo"),
     )
-    mocker.patch("app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[])
-    mock_create_pr = mocker.patch("app.github.create_pull_request", new_callable=AsyncMock)
+    mocker.patch(
+        "app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[]
+    )
+    mock_create_pr = mocker.patch(
+        "app.github.create_pull_request", new_callable=AsyncMock
+    )
     mocker.patch("app.github.delete_branch", new_callable=AsyncMock, return_value=True)
 
     from app.rollup_management import _check_and_trigger_rollup
 
     project = await _make_project(cleanup_db)
     parent = await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         task_type="research",
         status=TaskStatus.EVALUATING,
         context={
@@ -1467,12 +1673,14 @@ async def test_all_children_cancelled_marks_parent_cancelled(cleanup_db, mocker)
         plan_output="some plan",
     )
     child1 = await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         parent_task_id=parent.id,
         status=TaskStatus.CANCELLED,
     )
     await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         parent_task_id=parent.id,
         status=TaskStatus.CANCELLED,
     )
@@ -1508,7 +1716,8 @@ async def _make_rollup_parent_with_pr(session, project_id, *, extra_context=None
     if extra_context:
         ctx.update(extra_context)
     return await _make_task(
-        session, project_id,
+        session,
+        project_id,
         task_type="research",
         status=TaskStatus.EVALUATING,
         context=ctx,
@@ -1532,12 +1741,21 @@ def _mock_rollup_merge_conflict_deps(mocker, *, mergeable_state, head_sha="deadb
         new_callable=AsyncMock,
         return_value=("token", "owner", "repo"),
     )
-    mocker.patch("app.github.get_branch_sha", new_callable=AsyncMock, return_value="abc123")
-    mocker.patch("app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[])
+    mocker.patch(
+        "app.github.get_branch_sha", new_callable=AsyncMock, return_value="abc123"
+    )
+    mocker.patch(
+        "app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[]
+    )
     mocker.patch(
         "app.security.scan_pr_for_injection",
         new_callable=AsyncMock,
-        return_value={"blocked": False, "findings": [], "summary": "clean", "report": ""},
+        return_value={
+            "blocked": False,
+            "findings": [],
+            "summary": "clean",
+            "report": "",
+        },
     )
     mocker.patch(
         "app.github.merge_pull_request",
@@ -1572,7 +1790,8 @@ async def test_merge_conflict_dirty_spawns_fix_task(cleanup_db, mocker):
     project = await _make_project(cleanup_db)
     parent = await _make_rollup_parent_with_pr(cleanup_db, project.id)
     child = await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         parent_task_id=parent.id,
         status=TaskStatus.COMPLETED,
         context={"pr_merged": True},
@@ -1609,7 +1828,8 @@ async def test_merge_conflict_behind_calls_update_branch_and_defers(cleanup_db, 
     project = await _make_project(cleanup_db)
     parent = await _make_rollup_parent_with_pr(cleanup_db, project.id)
     child = await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         parent_task_id=parent.id,
         status=TaskStatus.COMPLETED,
         context={"pr_merged": True},
@@ -1625,7 +1845,9 @@ async def test_merge_conflict_behind_calls_update_branch_and_defers(cleanup_db, 
 
 
 @pytest.mark.asyncio
-async def test_merge_conflict_behind_update_fail_increments_retry_counter(cleanup_db, mocker):
+async def test_merge_conflict_behind_update_fail_increments_retry_counter(
+    cleanup_db, mocker
+):
     """mergeable_state='behind' + update_branch transient failure → defer with
     _behind_update_retries incremented, still within budget so no fix spawn."""
     _mock_rollup_merge_conflict_deps(mocker, mergeable_state="behind")
@@ -1645,7 +1867,8 @@ async def test_merge_conflict_behind_update_fail_increments_retry_counter(cleanu
     project = await _make_project(cleanup_db)
     parent = await _make_rollup_parent_with_pr(cleanup_db, project.id)
     child = await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         parent_task_id=parent.id,
         status=TaskStatus.COMPLETED,
         context={"pr_merged": True},
@@ -1660,7 +1883,9 @@ async def test_merge_conflict_behind_update_fail_increments_retry_counter(cleanu
 
 
 @pytest.mark.asyncio
-async def test_merge_conflict_behind_budget_exhausted_falls_through_to_fix(cleanup_db, mocker):
+async def test_merge_conflict_behind_budget_exhausted_falls_through_to_fix(
+    cleanup_db, mocker
+):
     """Once _behind_update_retries increment equals the budget (default 3),
     the behind-path falls through to fix-spawn and clears the counter so a
     future behind state starts fresh."""
@@ -1681,11 +1906,13 @@ async def test_merge_conflict_behind_budget_exhausted_falls_through_to_fix(clean
     project = await _make_project(cleanup_db)
     # Pre-seeded at 2 so the increment becomes 3, == budget → fall-through path.
     parent = await _make_rollup_parent_with_pr(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         extra_context={"_behind_update_retries": 2},
     )
     child = await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         parent_task_id=parent.id,
         status=TaskStatus.COMPLETED,
         context={"pr_merged": True},
@@ -1701,7 +1928,9 @@ async def test_merge_conflict_behind_budget_exhausted_falls_through_to_fix(clean
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("state", ["blocked", "unstable"])
-async def test_merge_conflict_blocked_or_unstable_defers_with_counter(cleanup_db, mocker, state):
+async def test_merge_conflict_blocked_or_unstable_defers_with_counter(
+    cleanup_db, mocker, state
+):
     """mergeable_state in {'blocked','unstable'} → defer without spawning fix,
     increment per-state + total deferral counters, and enable GitHub auto-merge
     so the PR lands once gates clear without a full orchestrator sweep."""
@@ -1722,7 +1951,8 @@ async def test_merge_conflict_blocked_or_unstable_defers_with_counter(cleanup_db
     project = await _make_project(cleanup_db)
     parent = await _make_rollup_parent_with_pr(cleanup_db, project.id)
     child = await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         parent_task_id=parent.id,
         status=TaskStatus.COMPLETED,
         context={"pr_merged": True},
@@ -1742,7 +1972,9 @@ async def test_merge_conflict_blocked_or_unstable_defers_with_counter(cleanup_db
 
 
 @pytest.mark.asyncio
-async def test_merge_conflict_deferral_counter_escalates_to_approval(cleanup_db, mocker):
+async def test_merge_conflict_deferral_counter_escalates_to_approval(
+    cleanup_db, mocker
+):
     """Once per-state deferral count reaches rollup_merge_deferred_approval
     (default 30), the parent is marked requires_approval and the approval
     dispatch fires exactly once (the approval gate is latched by
@@ -1770,7 +2002,8 @@ async def test_merge_conflict_deferral_counter_escalates_to_approval(cleanup_db,
     # latch suppresses the 10-count alert, total-deferral latch suppresses
     # the 20-count total alert so neither competes with the approval assertion.
     parent = await _make_rollup_parent_with_pr(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         extra_context={
             "_merge_deferred_state": "blocked",
             "_merge_deferred_count": 29,
@@ -1780,7 +2013,8 @@ async def test_merge_conflict_deferral_counter_escalates_to_approval(cleanup_db,
         },
     )
     child = await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         parent_task_id=parent.id,
         status=TaskStatus.COMPLETED,
         context={"pr_merged": True},
@@ -1797,6 +2031,7 @@ async def test_merge_conflict_deferral_counter_escalates_to_approval(cleanup_db,
 
 
 # ── Tests for requeue limit and partial-rollup paths ──────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_requeue_called_when_below_limit_with_mixed_children(cleanup_db, mocker):
@@ -1817,7 +2052,8 @@ async def test_requeue_called_when_below_limit_with_mixed_children(cleanup_db, m
 
     project = await _make_project(cleanup_db)
     parent = await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         task_type="research",
         status=TaskStatus.EVALUATING,
         context={
@@ -1828,13 +2064,15 @@ async def test_requeue_called_when_below_limit_with_mixed_children(cleanup_db, m
         plan_output="some plan",
     )
     await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         parent_task_id=parent.id,
         status=TaskStatus.COMPLETED,
         context={"pr_merged": True},
     )
     failed_child = await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         parent_task_id=parent.id,
         status=TaskStatus.FAILED,
         context={"failure_category": "CODE_ERROR"},
@@ -1860,8 +2098,12 @@ async def test_partial_rollup_proceeds_when_requeue_limit_exhausted(cleanup_db, 
         new_callable=AsyncMock,
         return_value=("token", "owner", "repo"),
     )
-    mocker.patch("app.github.get_branch_sha", new_callable=AsyncMock, return_value="abc123")
-    mocker.patch("app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[])
+    mocker.patch(
+        "app.github.get_branch_sha", new_callable=AsyncMock, return_value="abc123"
+    )
+    mocker.patch(
+        "app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[]
+    )
     # empty_diff short-circuits the rollup to COMPLETED — keeps the test scope
     # to verifying that the PR-creation path was entered (i.e. partial rollup).
     mock_create_pr = mocker.patch(
@@ -1878,7 +2120,8 @@ async def test_partial_rollup_proceeds_when_requeue_limit_exhausted(cleanup_db, 
 
     project = await _make_project(cleanup_db)
     parent = await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         task_type="research",
         status=TaskStatus.EVALUATING,
         context={
@@ -1889,13 +2132,15 @@ async def test_partial_rollup_proceeds_when_requeue_limit_exhausted(cleanup_db, 
         plan_output="some plan",
     )
     await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         parent_task_id=parent.id,
         status=TaskStatus.COMPLETED,
         context={"pr_merged": True},
     )
     failed_child = await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         parent_task_id=parent.id,
         status=TaskStatus.FAILED,
         context={"failure_category": "CODE_ERROR"},
@@ -1923,7 +2168,8 @@ async def test_parent_failure_stamps_deploy_monitoring(cleanup_db, mocker):
     mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
-        new_callable=AsyncMock, return_value=("token", "owner", "repo"),
+        new_callable=AsyncMock,
+        return_value=("token", "owner", "repo"),
     )
 
     from app.rollup_management import _check_and_trigger_rollup
@@ -1938,7 +2184,8 @@ async def test_parent_failure_stamps_deploy_monitoring(cleanup_db, mocker):
     project = await _make_project(cleanup_db)
     direction_id = "dir-deploy-monitor-test"
     parent = await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         task_type="research",
         status=TaskStatus.EVALUATING,
         context={
@@ -1950,7 +2197,8 @@ async def test_parent_failure_stamps_deploy_monitoring(cleanup_db, mocker):
         plan_output="some plan",
     )
     child = await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         parent_task_id=parent.id,
         status=TaskStatus.FAILED,
         context={"failure_category": "CODE_ERROR"},
@@ -1963,8 +2211,9 @@ async def test_parent_failure_stamps_deploy_monitoring(cleanup_db, mocker):
 
     # deploy_monitoring captured the parent failure
     results = list(_ss.deploy_monitoring["task_results"])
-    assert any(r[1] == "failure" and r[2] == "CODE_ERROR" for r in results), \
+    assert any(r[1] == "failure" and r[2] == "CODE_ERROR" for r in results), (
         f"Parent FAILED never reached deploy_monitoring: {results}"
+    )
 
     # Per-direction streak incremented (CODE_ERROR is not infra → counts)
     streak = _ss.direction_failure_streaks.get(direction_id)
@@ -1984,14 +2233,17 @@ async def test_parent_failure_after_pr_verification_stamps_deploy_monitoring(
     mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
-        new_callable=AsyncMock, return_value=("token", "owner", "repo"),
+        new_callable=AsyncMock,
+        return_value=("token", "owner", "repo"),
     )
+
     # _verify_pr_merged returns True (so all_done loop completes) but the
     # mocked side-effect flips the child to FAILED before the rollup branch runs.
     async def _flip_to_failed(task, _session):
         task.status = TaskStatus.FAILED
         task.context = {**(task.context or {}), "failure_category": "AGENT_TIMEOUT"}
         return True
+
     mocker.patch(
         "app.rollup_management._verify_pr_merged",
         side_effect=_flip_to_failed,
@@ -2006,7 +2258,8 @@ async def test_parent_failure_after_pr_verification_stamps_deploy_monitoring(
 
     project = await _make_project(cleanup_db)
     parent = await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         task_type="research",
         status=TaskStatus.EVALUATING,
         context={
@@ -2016,7 +2269,8 @@ async def test_parent_failure_after_pr_verification_stamps_deploy_monitoring(
         plan_output="some plan",
     )
     child = await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         parent_task_id=parent.id,
         status=TaskStatus.COMPLETED,
         context={},  # _verify_pr_merged flips this to FAILED before all_done branch
@@ -2027,8 +2281,9 @@ async def test_parent_failure_after_pr_verification_stamps_deploy_monitoring(
     await cleanup_db.refresh(parent)
     assert parent.status == TaskStatus.FAILED
     results = list(_ss.deploy_monitoring["task_results"])
-    assert any(r[1] == "failure" and r[2] == "AGENT_TIMEOUT" for r in results), \
+    assert any(r[1] == "failure" and r[2] == "AGENT_TIMEOUT" for r in results), (
         f"Post-verification parent FAILED never reached deploy_monitoring: {results}"
+    )
 
 
 # ── High-risk approval gate (require_approval_gates) ──────────────────────────
@@ -2052,10 +2307,15 @@ def _mock_high_risk_gate_deps(mocker, *, get_pull_request_responses):
     )
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
-        new_callable=AsyncMock, return_value=("token", "owner", "repo"),
+        new_callable=AsyncMock,
+        return_value=("token", "owner", "repo"),
     )
-    mocker.patch("app.github.get_branch_sha", new_callable=AsyncMock, return_value="abc123")
-    mocker.patch("app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[])
+    mocker.patch(
+        "app.github.get_branch_sha", new_callable=AsyncMock, return_value="abc123"
+    )
+    mocker.patch(
+        "app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[]
+    )
     mocker.patch(
         "app.github.get_pull_request",
         new_callable=AsyncMock,
@@ -2067,7 +2327,8 @@ async def _make_rollup_parent_to_main(session, project_id):
     """Rollup parent on the resume path with target_branch='main' (non-intermediate)
     so the high-risk gate at line 846 is reachable."""
     return await _make_task(
-        session, project_id,
+        session,
+        project_id,
         task_type="research",
         status=TaskStatus.EVALUATING,
         context={
@@ -2092,7 +2353,8 @@ async def test_high_risk_child_with_gate_enabled_requires_approval(cleanup_db, m
     )
     mock_spawn = mocker.patch(
         "app.rollup_management._spawn_pipeline_task",
-        new_callable=AsyncMock, return_value=(None, None),
+        new_callable=AsyncMock,
+        return_value=(None, None),
     )
 
     from app.rollup_management import _check_and_trigger_rollup
@@ -2100,7 +2362,8 @@ async def test_high_risk_child_with_gate_enabled_requires_approval(cleanup_db, m
     project = await _make_project(cleanup_db)
     parent = await _make_rollup_parent_to_main(cleanup_db, project.id)
     child = await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         task_type="create",
         parent_task_id=parent.id,
         status=TaskStatus.COMPLETED,
@@ -2118,19 +2381,27 @@ async def test_high_risk_child_with_gate_enabled_requires_approval(cleanup_db, m
 
 @pytest.mark.asyncio
 async def test_high_risk_child_with_gate_disabled_skips_approval(
-    cleanup_db, mocker, monkeypatch,
+    cleanup_db,
+    mocker,
+    monkeypatch,
 ):
     """require_approval_gates=False: a completed high-risk child does NOT
     flip requires_approval; control falls through to the rollup-to-main
     review spawn."""
     from app.shared_state import runtime_config
+
     monkeypatch.setitem(runtime_config, "require_approval_gates", False)
 
     _mock_high_risk_gate_deps(
         mocker,
         get_pull_request_responses=[
             {"merged": False, "state": "open"},  # resume validation
-            {"additions": 10, "deletions": 5, "merged": False, "state": "open"},  # diff size
+            {
+                "additions": 10,
+                "deletions": 5,
+                "merged": False,
+                "state": "open",
+            },  # diff size
         ],
     )
     mock_spawn = mocker.patch(
@@ -2144,7 +2415,8 @@ async def test_high_risk_child_with_gate_disabled_skips_approval(
     project = await _make_project(cleanup_db)
     parent = await _make_rollup_parent_to_main(cleanup_db, project.id)
     child = await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         task_type="create",
         parent_task_id=parent.id,
         status=TaskStatus.COMPLETED,
@@ -2184,7 +2456,8 @@ async def test_refactor_high_risk_child_excluded_from_approval_gate(cleanup_db, 
     parent = await _make_rollup_parent_to_main(cleanup_db, project.id)
     # Refactor type with risk=high — the type-filter must exclude it.
     child = await _make_task(
-        cleanup_db, project.id,
+        cleanup_db,
+        project.id,
         task_type="refactor",
         parent_task_id=parent.id,
         status=TaskStatus.COMPLETED,

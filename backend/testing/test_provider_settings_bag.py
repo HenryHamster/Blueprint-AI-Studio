@@ -1,5 +1,6 @@
 """Tests for the provider-settings bag system: schemas, validation, merge,
 CLI translation, and end-to-end resolution via resolve_task_provider_settings."""
+
 from __future__ import annotations
 
 import json
@@ -16,14 +17,17 @@ from app.providers.registry import get_provider
 # Schema validation
 # ---------------------------------------------------------------------------
 
+
 def test_anthropic_schema_accepts_known_knobs():
     provider = get_provider(LLMProviderName.ANTHROPIC)
-    validated = provider.validate_settings({
-        "model": "claude-sonnet-4-6",
-        "effort": "high",
-        "advisor": {"enabled": True, "model": "claude-opus-4-7"},
-        "betas": ["advisor-tool-2026-03-01"],
-    })
+    validated = provider.validate_settings(
+        {
+            "model": "claude-sonnet-4-6",
+            "effort": "high",
+            "advisor": {"enabled": True, "model": "claude-opus-4-7"},
+            "betas": ["advisor-tool-2026-03-01"],
+        }
+    )
     assert validated["model"] == "claude-sonnet-4-6"
     assert validated["effort"] == "high"
     assert validated["advisor"]["enabled"] is True
@@ -49,20 +53,24 @@ def test_anthropic_cli_skips_same_tier_fallback_model():
     # omits --fallback-model rather than emitting a useless flag.
     # Account/provider fallback already handle cross-model rerouting.
     provider = get_provider(LLMProviderName.ANTHROPIC)
-    cli = provider.settings_to_cli({
-        "model": "claude-sonnet-4-6",
-        "fallback_model": "claude-sonnet-4-6",
-    })
+    cli = provider.settings_to_cli(
+        {
+            "model": "claude-sonnet-4-6",
+            "fallback_model": "claude-sonnet-4-6",
+        }
+    )
     assert "--model" in cli.args
     assert "--fallback-model" not in cli.args
 
 
 def test_anthropic_cli_emits_fallback_model_when_different():
     provider = get_provider(LLMProviderName.ANTHROPIC)
-    cli = provider.settings_to_cli({
-        "model": "claude-opus-4-7",
-        "fallback_model": "claude-sonnet-4-6",
-    })
+    cli = provider.settings_to_cli(
+        {
+            "model": "claude-opus-4-7",
+            "fallback_model": "claude-sonnet-4-6",
+        }
+    )
     assert "--fallback-model" in cli.args
     idx = cli.args.index("--fallback-model")
     assert cli.args[idx + 1] == "claude-sonnet-4-6"
@@ -70,12 +78,14 @@ def test_anthropic_cli_emits_fallback_model_when_different():
 
 def test_openai_schema_accepts_known_knobs():
     provider = get_provider(LLMProviderName.OPENAI)
-    validated = provider.validate_settings({
-        "model": "gpt-5.4",
-        "reasoning_effort": "minimal",
-        "verbosity": "low",
-        "service_tier": "flex",
-    })
+    validated = provider.validate_settings(
+        {
+            "model": "gpt-5.4",
+            "reasoning_effort": "minimal",
+            "verbosity": "low",
+            "service_tier": "flex",
+        }
+    )
     assert validated["reasoning_effort"] == "minimal"
     assert validated["verbosity"] == "low"
 
@@ -99,12 +109,14 @@ def test_gemini_schema_accepts_core_knobs():
     # permissive flag (hardcoded in settings_to_cli) because anything else
     # stalls the ephemeral agent VM waiting on an operator.
     provider = get_provider(LLMProviderName.GEMINI)
-    validated = provider.validate_settings({
-        "model": "gemini-2.5-pro",
-        "thinking_budget": 4096,
-        "include_thoughts": False,
-        "max_output_tokens": 8192,
-    })
+    validated = provider.validate_settings(
+        {
+            "model": "gemini-2.5-pro",
+            "thinking_budget": 4096,
+            "include_thoughts": False,
+            "max_output_tokens": 8192,
+        }
+    )
     assert validated["thinking_budget"] == 4096
     assert validated["include_thoughts"] is False
 
@@ -144,10 +156,22 @@ def test_schema_validator_accepts_null_values_for_optional_scalars():
         },
     }
     assert _validate_against_schema(
-        {"effort": None, "max_budget_usd": None, "enabled": None, "count": None, "betas": None},
+        {
+            "effort": None,
+            "max_budget_usd": None,
+            "enabled": None,
+            "count": None,
+            "betas": None,
+        },
         schema,
         path="",
-    ) == {"effort": None, "max_budget_usd": None, "enabled": None, "count": None, "betas": None}
+    ) == {
+        "effort": None,
+        "max_budget_usd": None,
+        "enabled": None,
+        "count": None,
+        "betas": None,
+    }
 
 
 def test_schema_validator_rejects_wrong_type_on_scalars():
@@ -235,8 +259,10 @@ def test_manifest_includes_translation_even_when_bag_is_empty_dict():
     # Hardcoded permission flag is always present; the model flag now also
     # lands because compute injects the effective model into the bag.
     assert translation["args"] == [
-        "--model", "claude-opus-4-7",
-        "--permission-mode", "bypassPermissions",
+        "--model",
+        "claude-opus-4-7",
+        "--permission-mode",
+        "bypassPermissions",
     ]
 
 
@@ -250,10 +276,14 @@ def test_resolve_settings_handles_missing_provider_block_in_defaults():
     # Provider absent from defaults
     runtime_config = {
         "provider_settings_defaults": {"anthropic": {"effort": "medium"}},
-        "task_type_provider_overrides": {"review": {"openai": {"reasoning_effort": "high"}}},
+        "task_type_provider_overrides": {
+            "review": {"openai": {"reasoning_effort": "high"}}
+        },
     }
     task = SimpleNamespace(payloads=[{"type": "review"}], context={})
-    assert resolve_task_provider_settings(task, runtime_config, "openai") == {"reasoning_effort": "high"}
+    assert resolve_task_provider_settings(task, runtime_config, "openai") == {
+        "reasoning_effort": "high"
+    }
     # Gemini absent from both layers → empty bag
     assert resolve_task_provider_settings(task, runtime_config, "gemini") == {}
 
@@ -282,6 +312,7 @@ def test_schema_validator_enforces_required_keys():
 # ---------------------------------------------------------------------------
 # Deep merge semantics
 # ---------------------------------------------------------------------------
+
 
 def test_merge_settings_later_wins_for_scalars():
     result = merge_settings(
@@ -316,9 +347,12 @@ def test_merge_settings_skips_none_and_empty():
 # CLI translation
 # ---------------------------------------------------------------------------
 
+
 def test_anthropic_cli_translation_emits_model_and_effort():
     provider = get_provider(LLMProviderName.ANTHROPIC)
-    translation = provider.settings_to_cli({"model": "claude-opus-4-7", "effort": "high"})
+    translation = provider.settings_to_cli(
+        {"model": "claude-opus-4-7", "effort": "high"}
+    )
     assert "--model" in translation.args
     assert "claude-opus-4-7" in translation.args
     assert "--effort" in translation.args
@@ -346,10 +380,12 @@ def test_anthropic_cli_translation_keeps_xhigh_distinct_from_max():
 
 def test_anthropic_cli_translation_advisor_opus_executor_ignored():
     provider = get_provider(LLMProviderName.ANTHROPIC)
-    translation = provider.settings_to_cli({
-        "model": "claude-opus-4-7",
-        "advisor": {"enabled": True, "model": "claude-opus-4-7"},
-    })
+    translation = provider.settings_to_cli(
+        {
+            "model": "claude-opus-4-7",
+            "advisor": {"enabled": True, "model": "claude-opus-4-7"},
+        }
+    )
     # opus executor + opus advisor is a no-op; recorded as unsupported.
     assert any("advisor.enabled" in u for u in translation.unsupported)
     assert not translation.prompt_fragments
@@ -357,10 +393,12 @@ def test_anthropic_cli_translation_advisor_opus_executor_ignored():
 
 def test_anthropic_cli_translation_advisor_non_opus_emits_prompt_fragment():
     provider = get_provider(LLMProviderName.ANTHROPIC)
-    translation = provider.settings_to_cli({
-        "model": "claude-sonnet-4-6",
-        "advisor": {"enabled": True, "model": "claude-opus-4-7"},
-    })
+    translation = provider.settings_to_cli(
+        {
+            "model": "claude-sonnet-4-6",
+            "advisor": {"enabled": True, "model": "claude-opus-4-7"},
+        }
+    )
     # Sonnet executor is a valid advisor-pairing target; CLI can't pass the
     # tool, so fall back to a prompt fragment + log as unsupported.
     assert translation.prompt_fragments
@@ -369,12 +407,14 @@ def test_anthropic_cli_translation_advisor_non_opus_emits_prompt_fragment():
 
 def test_openai_cli_translation_emits_config_overrides():
     provider = get_provider(LLMProviderName.OPENAI)
-    translation = provider.settings_to_cli({
-        "model": "gpt-5.4",
-        "reasoning_effort": "high",
-        "verbosity": "low",
-        "service_tier": "flex",
-    })
+    translation = provider.settings_to_cli(
+        {
+            "model": "gpt-5.4",
+            "reasoning_effort": "high",
+            "verbosity": "low",
+            "service_tier": "flex",
+        }
+    )
     args = list(translation.args)
     assert args[:2] == ["-m", "gpt-5.4"]
     # Each -c flag is followed by key=value; the set of emitted pairs is what we assert.
@@ -386,11 +426,13 @@ def test_openai_cli_translation_emits_config_overrides():
 
 def test_gemini_cli_translation_writes_settings_alias_for_thinking():
     provider = get_provider(LLMProviderName.GEMINI)
-    translation = provider.settings_to_cli({
-        "model": "gemini-2.5-pro",
-        "thinking_budget": 8192,
-        "max_output_tokens": 4096,
-    })
+    translation = provider.settings_to_cli(
+        {
+            "model": "gemini-2.5-pro",
+            "thinking_budget": 8192,
+            "max_output_tokens": 4096,
+        }
+    )
     # Gemini CLI has no per-call thinking flags; must materialize a
     # settings.json custom alias and invoke `-m <alias>`.
     assert len(translation.settings_files) == 1
@@ -399,7 +441,12 @@ def test_gemini_cli_translation_writes_settings_alias_for_thinking():
     parsed = json.loads(settings_file.content)
     alias = next(iter(parsed["modelConfigs"]["customAliases"].values()))
     assert alias["modelConfig"]["model"] == "gemini-2.5-pro"
-    assert alias["modelConfig"]["generateContentConfig"]["thinkingConfig"]["thinkingBudget"] == 8192
+    assert (
+        alias["modelConfig"]["generateContentConfig"]["thinkingConfig"][
+            "thinkingBudget"
+        ]
+        == 8192
+    )
     assert alias["modelConfig"]["generateContentConfig"]["maxOutputTokens"] == 4096
     # Args should reference the alias, not the raw model.
     assert "-m" in translation.args
@@ -426,7 +473,12 @@ def test_gemini_cli_translation_model_only_uses_direct_flag():
 # End-to-end: resolve_task_provider_settings
 # ---------------------------------------------------------------------------
 
-def _make_task(task_type: str, payload_settings: dict | None = None, context_settings: dict | None = None):
+
+def _make_task(
+    task_type: str,
+    payload_settings: dict | None = None,
+    context_settings: dict | None = None,
+):
     payload = {"type": task_type}
     if payload_settings:
         payload["provider_settings"] = payload_settings
@@ -454,9 +506,9 @@ def test_resolve_task_provider_settings_three_layer_merge():
 
     resolved = resolve_task_provider_settings(task, runtime_config, "anthropic")
 
-    assert resolved["model"] == "claude-opus-4-7"      # from defaults
-    assert resolved["effort"] == "high"                # task-type override wins
-    assert resolved["max_budget_usd"] == 5.0           # payload wins
+    assert resolved["model"] == "claude-opus-4-7"  # from defaults
+    assert resolved["effort"] == "high"  # task-type override wins
+    assert resolved["max_budget_usd"] == 5.0  # payload wins
 
 
 def test_resolve_task_provider_settings_payload_beats_task_type():
@@ -528,7 +580,9 @@ def test_resolve_task_provider_settings_payload_effort_overrides_category():
 
     runtime_config = {
         "task_type_categories": {"strategic": ["strategic_review"]},
-        "category_routing": {"strategic": {"providers": ["anthropic"], "effort": "max"}},
+        "category_routing": {
+            "strategic": {"providers": ["anthropic"], "effort": "max"}
+        },
         "provider_settings_by_effort": {
             "anthropic": {
                 "low": {"model": "claude-haiku-4-5-20251001", "effort": "low"},
@@ -582,15 +636,18 @@ def test_resolve_task_routing_layers():
     }
     # No category, no override → _default
     assert resolve_task_routing(_make_task("qa"), runtime_config) == {
-        "providers": ["anthropic"], "effort": "medium",
+        "providers": ["anthropic"],
+        "effort": "medium",
     }
     # In "build" category → category routing wins
     assert resolve_task_routing(_make_task("create"), runtime_config) == {
-        "providers": ["anthropic", "openai"], "effort": "high",
+        "providers": ["anthropic", "openai"],
+        "effort": "high",
     }
     # task_type_routing override wins over category
     assert resolve_task_routing(_make_task("debug"), runtime_config) == {
-        "providers": ["openai"], "effort": "max",
+        "providers": ["openai"],
+        "effort": "max",
     }
     # payload.effort wins
     task = SimpleNamespace(
@@ -598,7 +655,8 @@ def test_resolve_task_routing_layers():
         context={},
     )
     assert resolve_task_routing(task, runtime_config) == {
-        "providers": ["anthropic", "openai"], "effort": "low",
+        "providers": ["anthropic", "openai"],
+        "effort": "low",
     }
 
 
@@ -609,7 +667,9 @@ def test_resolve_task_routing_partial_override_inherits_other_field():
 
     runtime_config = {
         "task_type_categories": {"ops": ["docs"]},
-        "category_routing": {"ops": {"providers": ["anthropic", "gemini"], "effort": "medium"}},
+        "category_routing": {
+            "ops": {"providers": ["anthropic", "gemini"], "effort": "medium"}
+        },
         "task_type_routing": {
             "docs": {"effort": "low"},  # only override effort
             "smoketest": {"providers": ["gemini"]},  # only override providers
@@ -617,7 +677,8 @@ def test_resolve_task_routing_partial_override_inherits_other_field():
     }
     # docs: providers inherited from ops category, effort overridden
     assert resolve_task_routing(_make_task("docs"), runtime_config) == {
-        "providers": ["anthropic", "gemini"], "effort": "low",
+        "providers": ["anthropic", "gemini"],
+        "effort": "low",
     }
     # smoketest: effort inherited from _default (ops doesn't contain smoketest), providers overridden
     # No _default in this config; falls through to ALL_PROVIDERS effort=medium
@@ -629,6 +690,7 @@ def test_resolve_task_routing_partial_override_inherits_other_field():
 # ---------------------------------------------------------------------------
 # build_agent_secret_manifest integration
 # ---------------------------------------------------------------------------
+
 
 def test_manifest_serializes_settings_bag_and_cli_translation():
     import uuid as _uuid
@@ -652,7 +714,10 @@ def test_manifest_serializes_settings_bag_and_cli_translation():
     translation = json.loads(env["LLM_CLI_TRANSLATION"])
     assert "--effort" in translation["args"]
     assert "high" in translation["args"]
-    assert manifest["metadata"]["provider_settings"] == {"model": "claude-opus-4-7", "effort": "high"}
+    assert manifest["metadata"]["provider_settings"] == {
+        "model": "claude-opus-4-7",
+        "effort": "high",
+    }
 
 
 def test_manifest_gemini_materializes_settings_file():

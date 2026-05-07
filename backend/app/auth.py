@@ -40,18 +40,20 @@ if not _ws_ticket_secret:
     raise ValueError("WS_TICKET_SECRET environment variable is required")
 WS_TICKET_SECRET: str = _ws_ticket_secret
 
+
 def create_ws_ticket(user_id: str, project_id: str) -> str:
     """
     Generate a short-lived ticket for WebSocket authentication.
     """
-    expire = datetime.now(timezone.utc) + timedelta(minutes=1) # Valid for 1 minute
+    expire = datetime.now(timezone.utc) + timedelta(minutes=1)  # Valid for 1 minute
     to_encode = {
         "sub": user_id,
         "project_id": project_id,
         "exp": expire,
-        "type": "ws_ticket"
+        "type": "ws_ticket",
     }
     return jwt.encode(to_encode, WS_TICKET_SECRET, algorithm=AGENT_JWT_ALGORITHM)
+
 
 def verify_ws_ticket(ticket: str) -> dict:
     """
@@ -67,7 +69,10 @@ def verify_ws_ticket(ticket: str) -> dict:
     except jwt.PyJWTError:
         raise HTTPException(status_code=401, detail="Invalid ticket")
 
-AGENT_TOKEN_TTL_HOURS = 8  # was 2; raised so long-running tasks don't 401 mid-execution.
+
+AGENT_TOKEN_TTL_HOURS = (
+    8  # was 2; raised so long-running tasks don't 401 mid-execution.
+)
 
 
 def create_agent_token(
@@ -97,6 +102,7 @@ def create_agent_token(
     encoded_jwt = jwt.encode(to_encode, AGENT_JWT_SECRET, algorithm=AGENT_JWT_ALGORITHM)
     return encoded_jwt
 
+
 def verify_agent_jwt(token: str) -> dict:
     """
     Verify an agent's JWT.
@@ -108,6 +114,7 @@ def verify_agent_jwt(token: str) -> dict:
         raise HTTPException(status_code=401, detail="Agent token expired")
     except jwt.PyJWTError:
         raise HTTPException(status_code=401, detail="Invalid agent token")
+
 
 async def get_current_user(
     credentials: HTTPAuthorizationCredentials = Security(security),
@@ -126,13 +133,17 @@ async def get_current_user(
         admin_uid = "admin-api-key"
         try:
             result = await session.execute(
-                select(AllowedUser).where(AllowedUser.role == "admin").order_by(AllowedUser.created_at.asc())
+                select(AllowedUser)
+                .where(AllowedUser.role == "admin")
+                .order_by(AllowedUser.created_at.asc())
             )
             admin_user = result.scalars().first()
             if admin_user and admin_user.firebase_uid:
                 admin_uid = admin_user.firebase_uid
         except Exception:
-            logger.exception("Failed to resolve admin UID from DB; falling back to literal")
+            logger.exception(
+                "Failed to resolve admin UID from DB; falling back to literal"
+            )
         return {"user_id": admin_uid, "email": "admin@system.local", "role": "admin"}
 
     try:
@@ -193,13 +204,13 @@ async def get_current_user(
         "role": allowed_user.role,
     }
 
+
 def require_admin(current_user: dict = Depends(get_current_user)):
     """
     Dependency to ensure the current user has admin privileges.
     """
     if current_user.get("role") != "admin":
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Admin privileges required"
+            status_code=status.HTTP_403_FORBIDDEN, detail="Admin privileges required"
         )
     return current_user

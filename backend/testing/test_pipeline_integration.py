@@ -8,6 +8,7 @@ downstream task and that the review_loop context is updated correctly.
 All external calls (VM provisioning/deletion, GitHub API, WebSocket
 broadcasts) are mocked so no real infrastructure is required.
 """
+
 import json
 import uuid
 import pytest
@@ -36,6 +37,7 @@ def _naive_utcnow() -> datetime:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _task_type(task: Task) -> str:
     return (task.payloads or [{}])[0].get("type", "")
@@ -69,6 +71,7 @@ async def _status(client: AsyncClient, task: Task, **fields) -> dict:
 # Full end-to-end pipeline test (covers the full scenario from the task spec)
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_full_review_fix_cycle(client: AsyncClient, db_session, mocker):
     """
@@ -88,7 +91,10 @@ async def test_full_review_fix_cycle(client: AsyncClient, db_session, mocker):
     mocker.patch("app.main.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
     mocker.patch("app.broadcast.broadcast_to_project")
-    mocker.patch("app.routers.agent.get_github_token_for_task", return_value=("fake-token", "owner", "repo"))
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        return_value=("fake-token", "owner", "repo"),
+    )
 
     # ------------------------------------------------------------------
     # Step 1: Create project + create-type task (QUEUED)
@@ -102,7 +108,9 @@ async def test_full_review_fix_cycle(client: AsyncClient, db_session, mocker):
     create_task = Task(
         project_id=project.id,
         title="Implement feature",
-        payloads=[{"type": "create", "prompt": "Build a new feature", "base_branch": "main"}],
+        payloads=[
+            {"type": "create", "prompt": "Build a new feature", "base_branch": "main"}
+        ],
         vm_instance_id=vm_id,
         status=TaskStatus.QUEUED,
     )
@@ -124,7 +132,8 @@ async def test_full_review_fix_cycle(client: AsyncClient, db_session, mocker):
     # ------------------------------------------------------------------
     pr_url = "https://github.com/owner/repo/pull/42"
     await _status(
-        client, create_task,
+        client,
+        create_task,
         status="COMPLETED",
         artifact_type="PULL_REQUEST",
         pr_url=pr_url,
@@ -174,7 +183,8 @@ async def test_full_review_fix_cycle(client: AsyncClient, db_session, mocker):
     feedback_text = "The authentication handler is missing a null check on user.id"
     verdict_json = json.dumps({"verdict": "REQUEST_CHANGES", "feedback": feedback_text})
     await _status(
-        client, review_task,
+        client,
+        review_task,
         status="COMPLETED",
         verdict_json=verdict_json,
         logs="Code review: null check missing in auth handler",
@@ -224,7 +234,8 @@ async def test_full_review_fix_cycle(client: AsyncClient, db_session, mocker):
     assert fix_task.status == TaskStatus.IN_PROGRESS
 
     await _status(
-        client, fix_task,
+        client,
+        fix_task,
         status="COMPLETED",
         logs="Added null check to authentication handler",
     )
@@ -264,6 +275,7 @@ async def test_full_review_fix_cycle(client: AsyncClient, db_session, mocker):
 # Focused tests for each pipeline transition
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_create_task_spawns_review_on_pr_completion(
     client: AsyncClient, db_session, mocker
@@ -272,7 +284,10 @@ async def test_create_task_spawns_review_on_pr_completion(
     mocker.patch("app.main.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
     mocker.patch("app.broadcast.broadcast_to_project")
-    mocker.patch("app.routers.agent.get_github_token_for_task", return_value=("fake-token", "owner", "repo"))
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        return_value=("fake-token", "owner", "repo"),
+    )
 
     project = Project(name="Spawn Review Test", user_id="test-user-123")
     db_session.add(project)
@@ -283,7 +298,9 @@ async def test_create_task_spawns_review_on_pr_completion(
     task = Task(
         project_id=project.id,
         title="Create feature Y",
-        payloads=[{"type": "create", "prompt": "Build feature Y", "base_branch": "main"}],
+        payloads=[
+            {"type": "create", "prompt": "Build feature Y", "base_branch": "main"}
+        ],
         vm_instance_id=vm_id,
         status=TaskStatus.QUEUED,
     )
@@ -297,7 +314,8 @@ async def test_create_task_spawns_review_on_pr_completion(
 
     pr_url = "https://github.com/owner/repo/pull/99"
     await _status(
-        client, task,
+        client,
+        task,
         status="COMPLETED",
         artifact_type="PULL_REQUEST",
         pr_url=pr_url,
@@ -334,7 +352,10 @@ async def test_review_request_changes_empty_pr_closes_rollup_instead_of_spawning
     mocker.patch("app.main.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
     mocker.patch("app.broadcast.broadcast_to_project")
-    mocker.patch("app.routers.agent.get_github_token_for_task", return_value=("fake-token", "owner", "repo"))
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        return_value=("fake-token", "owner", "repo"),
+    )
     # Empty diff — PR has no file changes.
     mocker.patch("app.github.get_pr_files", return_value=[])
     close_mock = mocker.patch("app.github.close_pull_request", return_value=True)
@@ -350,14 +371,16 @@ async def test_review_request_changes_empty_pr_closes_rollup_instead_of_spawning
         title="Rollup: empty branch",
         payloads=[{"type": "research"}],
         status=TaskStatus.EVALUATING,
-        context={"review_loop": {
-            "pr_number": 999,
-            "branch": "research/abc123",
-            "base_branch": "main",
-            "ci_waiting": True,
-            "ci_passed": True,
-            "iteration": 6,
-        }},
+        context={
+            "review_loop": {
+                "pr_number": 999,
+                "branch": "research/abc123",
+                "base_branch": "main",
+                "ci_waiting": True,
+                "ci_passed": True,
+                "iteration": 6,
+            }
+        },
     )
     db_session.add(parent_task)
     await db_session.commit()
@@ -367,20 +390,24 @@ async def test_review_request_changes_empty_pr_closes_rollup_instead_of_spawning
     review_task = Task(
         project_id=project.id,
         title="Review PR #999",
-        payloads=[{
-            "type": "review",
-            "pr_number": 999,
-            "branch": "research/abc123",
-            "base_branch": "main",
-            "original_task_id": str(parent_task.id),
-        }],
-        context={"review_loop": {
-            "pr_number": 999,
-            "branch": "research/abc123",
-            "base_branch": "main",
-            "iteration": 6,
-            "original_task_id": str(parent_task.id),
-        }},
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 999,
+                "branch": "research/abc123",
+                "base_branch": "main",
+                "original_task_id": str(parent_task.id),
+            }
+        ],
+        context={
+            "review_loop": {
+                "pr_number": 999,
+                "branch": "research/abc123",
+                "base_branch": "main",
+                "iteration": 6,
+                "original_task_id": str(parent_task.id),
+            }
+        },
         vm_instance_id=vm_id,
         status=TaskStatus.IN_PROGRESS,
     )
@@ -388,12 +415,15 @@ async def test_review_request_changes_empty_pr_closes_rollup_instead_of_spawning
     await db_session.commit()
     await db_session.refresh(review_task)
 
-    verdict_json = json.dumps({
-        "verdict": "REQUEST_CHANGES",
-        "feedback": "PR #999 is empty — branch tip equals main tip",
-    })
+    verdict_json = json.dumps(
+        {
+            "verdict": "REQUEST_CHANGES",
+            "feedback": "PR #999 is empty — branch tip equals main tip",
+        }
+    )
     await _status(
-        client, review_task,
+        client,
+        review_task,
         status="COMPLETED",
         verdict_json=verdict_json,
         logs="Review: empty PR",
@@ -437,10 +467,14 @@ async def test_review_request_changes_api_error_does_not_close_pr(
     false-positive empty-rollup closure caused by get_pr_files swallowing
     non-200 errors as []."""
     from fastapi import HTTPException
+
     mocker.patch("app.main.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
     mocker.patch("app.broadcast.broadcast_to_project")
-    mocker.patch("app.routers.agent.get_github_token_for_task", return_value=("fake-token", "owner", "repo"))
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        return_value=("fake-token", "owner", "repo"),
+    )
     # Simulate a transient GitHub API failure during the empty-PR check.
     mocker.patch(
         "app.github.get_pr_files",
@@ -458,14 +492,16 @@ async def test_review_request_changes_api_error_does_not_close_pr(
         title="Rollup: api-error branch",
         payloads=[{"type": "research"}],
         status=TaskStatus.EVALUATING,
-        context={"review_loop": {
-            "pr_number": 888,
-            "branch": "research/abc888",
-            "base_branch": "main",
-            "ci_waiting": True,
-            "ci_passed": True,
-            "iteration": 2,
-        }},
+        context={
+            "review_loop": {
+                "pr_number": 888,
+                "branch": "research/abc888",
+                "base_branch": "main",
+                "ci_waiting": True,
+                "ci_passed": True,
+                "iteration": 2,
+            }
+        },
     )
     db_session.add(parent_task)
     await db_session.commit()
@@ -475,20 +511,24 @@ async def test_review_request_changes_api_error_does_not_close_pr(
     review_task = Task(
         project_id=project.id,
         title="Review PR #888",
-        payloads=[{
-            "type": "review",
-            "pr_number": 888,
-            "branch": "research/abc888",
-            "base_branch": "main",
-            "original_task_id": str(parent_task.id),
-        }],
-        context={"review_loop": {
-            "pr_number": 888,
-            "branch": "research/abc888",
-            "base_branch": "main",
-            "iteration": 2,
-            "original_task_id": str(parent_task.id),
-        }},
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 888,
+                "branch": "research/abc888",
+                "base_branch": "main",
+                "original_task_id": str(parent_task.id),
+            }
+        ],
+        context={
+            "review_loop": {
+                "pr_number": 888,
+                "branch": "research/abc888",
+                "base_branch": "main",
+                "iteration": 2,
+                "original_task_id": str(parent_task.id),
+            }
+        },
         vm_instance_id=vm_id,
         status=TaskStatus.IN_PROGRESS,
     )
@@ -496,19 +536,24 @@ async def test_review_request_changes_api_error_does_not_close_pr(
     await db_session.commit()
     await db_session.refresh(review_task)
 
-    verdict_json = json.dumps({
-        "verdict": "REQUEST_CHANGES",
-        "feedback": "Real changes are needed; do not treat as empty",
-    })
+    verdict_json = json.dumps(
+        {
+            "verdict": "REQUEST_CHANGES",
+            "feedback": "Real changes are needed; do not treat as empty",
+        }
+    )
     await _status(
-        client, review_task,
+        client,
+        review_task,
         status="COMPLETED",
         verdict_json=verdict_json,
         logs="Review: needs changes",
     )
 
     # The PR must NOT have been closed — API error masked file presence.
-    assert not close_mock.called, "API error during empty-PR check must not close the PR"
+    assert not close_mock.called, (
+        "API error during empty-PR check must not close the PR"
+    )
 
     # A fix task should have been spawned (normal REQUEST_CHANGES flow).
     result = await db_session.execute(
@@ -545,18 +590,22 @@ async def test_review_request_changes_spawns_fix(
     review_task = Task(
         project_id=project.id,
         title="Review PR #77",
-        payloads=[{
-            "type": "review",
-            "pr_number": 77,
-            "branch": "blueprint/task-aabbccdd",
-            "base_branch": "main",
-        }],
-        context={"review_loop": {
-            "pr_number": 77,
-            "branch": "blueprint/task-aabbccdd",
-            "base_branch": "main",
-            "iteration": 1,
-        }},
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 77,
+                "branch": "blueprint/task-aabbccdd",
+                "base_branch": "main",
+            }
+        ],
+        context={
+            "review_loop": {
+                "pr_number": 77,
+                "branch": "blueprint/task-aabbccdd",
+                "base_branch": "main",
+                "iteration": 1,
+            }
+        },
         vm_instance_id=vm_id,
         status=TaskStatus.IN_PROGRESS,
     )
@@ -567,7 +616,8 @@ async def test_review_request_changes_spawns_fix(
     feedback = "Missing input validation on the /users endpoint"
     verdict_json = json.dumps({"verdict": "REQUEST_CHANGES", "feedback": feedback})
     await _status(
-        client, review_task,
+        client,
+        review_task,
         status="COMPLETED",
         verdict_json=verdict_json,
         logs="Review: missing input validation",
@@ -617,19 +667,23 @@ async def test_fix_task_spawns_review_on_completion(
     fix_task = Task(
         project_id=project.id,
         title="Fix PR #55",
-        payloads=[{
-            "type": "fix",
-            "pr_number": 55,
-            "branch": "blueprint/task-11223344",
-            "base_branch": "main",
-            "prompt": "Fix the validation error",
-        }],
-        context={"review_loop": {
-            "pr_number": 55,
-            "branch": "blueprint/task-11223344",
-            "base_branch": "main",
-            "iteration": 2,
-        }},
+        payloads=[
+            {
+                "type": "fix",
+                "pr_number": 55,
+                "branch": "blueprint/task-11223344",
+                "base_branch": "main",
+                "prompt": "Fix the validation error",
+            }
+        ],
+        context={
+            "review_loop": {
+                "pr_number": 55,
+                "branch": "blueprint/task-11223344",
+                "base_branch": "main",
+                "iteration": 2,
+            }
+        },
         vm_instance_id=vm_id,
         status=TaskStatus.IN_PROGRESS,
     )
@@ -638,7 +692,8 @@ async def test_fix_task_spawns_review_on_completion(
     await db_session.refresh(fix_task)
 
     await _status(
-        client, fix_task,
+        client,
+        fix_task,
         status="COMPLETED",
         logs="Validation added to /users endpoint",
     )
@@ -669,6 +724,7 @@ async def test_fix_task_spawns_review_on_completion(
 # Edge cases
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_review_approve_does_not_spawn_fix(
     client: AsyncClient, db_session, mocker
@@ -691,18 +747,22 @@ async def test_review_approve_does_not_spawn_fix(
     review_task = Task(
         project_id=project.id,
         title="Review PR #10",
-        payloads=[{
-            "type": "review",
-            "pr_number": 10,
-            "branch": "blueprint/task-deadbeef",
-            "base_branch": "main",
-        }],
-        context={"review_loop": {
-            "pr_number": 10,
-            "branch": "blueprint/task-deadbeef",
-            "base_branch": "main",
-            "iteration": 1,
-        }},
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 10,
+                "branch": "blueprint/task-deadbeef",
+                "base_branch": "main",
+            }
+        ],
+        context={
+            "review_loop": {
+                "pr_number": 10,
+                "branch": "blueprint/task-deadbeef",
+                "base_branch": "main",
+                "iteration": 1,
+            }
+        },
         vm_instance_id=vm_id,
         status=TaskStatus.IN_PROGRESS,
     )
@@ -712,7 +772,8 @@ async def test_review_approve_does_not_spawn_fix(
 
     verdict_json = json.dumps({"verdict": "APPROVE", "feedback": "Looks great!"})
     await _status(
-        client, review_task,
+        client,
+        review_task,
         status="COMPLETED",
         verdict_json=verdict_json,
         logs="Approved: code looks clean",
@@ -723,7 +784,9 @@ async def test_review_approve_does_not_spawn_fix(
     # parked in EVALUATING with ci_waiting so the CI monitor can retry.
     assert review_task.status in (TaskStatus.COMPLETED, TaskStatus.EVALUATING)
     if review_task.status == TaskStatus.EVALUATING:
-        ci_waiting = (review_task.context or {}).get("review_loop", {}).get("ci_waiting")
+        ci_waiting = (
+            (review_task.context or {}).get("review_loop", {}).get("ci_waiting")
+        )
         assert ci_waiting is True, "EVALUATING review should have ci_waiting=True"
 
     # No fix task should have been spawned
@@ -763,18 +826,22 @@ async def test_status_completed_idempotency_no_duplicate_fix(
     review_task = Task(
         project_id=project.id,
         title="Review PR #20",
-        payloads=[{
-            "type": "review",
-            "pr_number": 20,
-            "branch": "blueprint/task-cafebabe",
-            "base_branch": "main",
-        }],
-        context={"review_loop": {
-            "pr_number": 20,
-            "branch": "blueprint/task-cafebabe",
-            "base_branch": "main",
-            "iteration": 1,
-        }},
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 20,
+                "branch": "blueprint/task-cafebabe",
+                "base_branch": "main",
+            }
+        ],
+        context={
+            "review_loop": {
+                "pr_number": 20,
+                "branch": "blueprint/task-cafebabe",
+                "base_branch": "main",
+                "iteration": 1,
+            }
+        },
         vm_instance_id=vm_id,
         status=TaskStatus.IN_PROGRESS,
     )
@@ -782,11 +849,14 @@ async def test_status_completed_idempotency_no_duplicate_fix(
     await db_session.commit()
     await db_session.refresh(review_task)
 
-    verdict_json = json.dumps({"verdict": "REQUEST_CHANGES", "feedback": "Fix the typo"})
+    verdict_json = json.dumps(
+        {"verdict": "REQUEST_CHANGES", "feedback": "Fix the typo"}
+    )
 
     # First status call — should spawn a fix task
     result1 = await _status(
-        client, review_task,
+        client,
+        review_task,
         status="COMPLETED",
         verdict_json=verdict_json,
         logs="Typo found",
@@ -797,7 +867,8 @@ async def test_status_completed_idempotency_no_duplicate_fix(
     # The status endpoint is exempt from JWT revocation (agents may retry
     # their own completion POST), so it returns 200 with already_terminal.
     result2 = await _status(
-        client, review_task,
+        client,
+        review_task,
         status="COMPLETED",
         verdict_json=verdict_json,
         logs="Typo found",
@@ -842,18 +913,22 @@ async def test_verdict_parsed_from_logs_when_no_verdict_json(
     review_task = Task(
         project_id=project.id,
         title="Review PR #33",
-        payloads=[{
-            "type": "review",
-            "pr_number": 33,
-            "branch": "blueprint/task-feedface",
-            "base_branch": "main",
-        }],
-        context={"review_loop": {
-            "pr_number": 33,
-            "branch": "blueprint/task-feedface",
-            "base_branch": "main",
-            "iteration": 1,
-        }},
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 33,
+                "branch": "blueprint/task-feedface",
+                "base_branch": "main",
+            }
+        ],
+        context={
+            "review_loop": {
+                "pr_number": 33,
+                "branch": "blueprint/task-feedface",
+                "base_branch": "main",
+                "iteration": 1,
+            }
+        },
         vm_instance_id=vm_id,
         status=TaskStatus.IN_PROGRESS,
     )
@@ -863,12 +938,13 @@ async def test_verdict_parsed_from_logs_when_no_verdict_json(
 
     # Provide a JSON verdict embedded in the logs (no top-level verdict_json field)
     logs_with_verdict = (
-        'After reviewing the code I found several issues.\n\n'
+        "After reviewing the code I found several issues.\n\n"
         '{"verdict": "REQUEST_CHANGES", "feedback": "Add error handling"}\n\n'
-        'Please address the above points.'
+        "Please address the above points."
     )
     await _status(
-        client, review_task,
+        client,
+        review_task,
         status="COMPLETED",
         logs=logs_with_verdict,
         # no verdict_json field
@@ -886,9 +962,7 @@ async def test_verdict_parsed_from_logs_when_no_verdict_json(
     children = result.scalars().all()
     fix_tasks = [t for t in children if _task_type(t) == "fix"]
 
-    assert len(fix_tasks) == 1, (
-        "Verdict parsed from logs should spawn a fix task"
-    )
+    assert len(fix_tasks) == 1, "Verdict parsed from logs should spawn a fix task"
     ft = fix_tasks[0]
     assert _review_loop(ft).get("pr_number") == 33
 
@@ -916,11 +990,13 @@ async def test_pipeline_duplicate_guard_blocks_second_review(
     original_create = Task(
         project_id=project.id,
         title="Create PR #42",
-        payloads=[{
-            "type": "create",
-            "prompt": "Build feature X",
-            "base_branch": "main",
-        }],
+        payloads=[
+            {
+                "type": "create",
+                "prompt": "Build feature X",
+                "base_branch": "main",
+            }
+        ],
         vm_instance_id="agent-vm-dg-original",
         status=TaskStatus.COMPLETED,
     )
@@ -932,20 +1008,24 @@ async def test_pipeline_duplicate_guard_blocks_second_review(
     existing_review = Task(
         project_id=project.id,
         title="Review PR #42 (existing)",
-        payloads=[{
-            "type": "review",
-            "pr_number": 42,
-            "branch": "blueprint/task-existing",
-            "base_branch": "main",
-            "original_task_id": str(original_create.id),
-        }],
-        context={"review_loop": {
-            "pr_number": 42,
-            "branch": "blueprint/task-existing",
-            "base_branch": "main",
-            "original_task_id": str(original_create.id),
-            "iteration": 1,
-        }},
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 42,
+                "branch": "blueprint/task-existing",
+                "base_branch": "main",
+                "original_task_id": str(original_create.id),
+            }
+        ],
+        context={
+            "review_loop": {
+                "pr_number": 42,
+                "branch": "blueprint/task-existing",
+                "base_branch": "main",
+                "original_task_id": str(original_create.id),
+                "iteration": 1,
+            }
+        },
         vm_instance_id="agent-vm-existing-review",
         status=TaskStatus.QUEUED,
     )
@@ -958,21 +1038,25 @@ async def test_pipeline_duplicate_guard_blocks_second_review(
     fix_task = Task(
         project_id=project.id,
         title="Fix PR #42",
-        payloads=[{
-            "type": "fix",
-            "pr_number": 42,
-            "branch": "blueprint/task-existing",
-            "base_branch": "main",
-            "prompt": "Fix the issues",
-            "original_task_id": str(original_create.id),
-        }],
-        context={"review_loop": {
-            "pr_number": 42,
-            "branch": "blueprint/task-existing",
-            "base_branch": "main",
-            "original_task_id": str(original_create.id),
-            "iteration": 2,
-        }},
+        payloads=[
+            {
+                "type": "fix",
+                "pr_number": 42,
+                "branch": "blueprint/task-existing",
+                "base_branch": "main",
+                "prompt": "Fix the issues",
+                "original_task_id": str(original_create.id),
+            }
+        ],
+        context={
+            "review_loop": {
+                "pr_number": 42,
+                "branch": "blueprint/task-existing",
+                "base_branch": "main",
+                "original_task_id": str(original_create.id),
+                "iteration": 2,
+            }
+        },
         vm_instance_id=vm_id,
         status=TaskStatus.IN_PROGRESS,
     )
@@ -982,7 +1066,8 @@ async def test_pipeline_duplicate_guard_blocks_second_review(
 
     # Completing the fix should NOT spawn another review — one is already active
     await _status(
-        client, fix_task,
+        client,
+        fix_task,
         status="COMPLETED",
         logs="Fix applied",
     )
@@ -1008,6 +1093,7 @@ async def test_pipeline_duplicate_guard_blocks_second_review(
 # ---------------------------------------------------------------------------
 # Iteration cap enforcement tests
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.asyncio
 async def test_review_fix_cap_blocks_new_fix_on_iteration_limit(
@@ -1051,12 +1137,14 @@ async def test_review_fix_cap_blocks_new_fix_on_iteration_limit(
     review_task = Task(
         project_id=project.id,
         title="Review PR #88",
-        payloads=[{
-            "type": "review",
-            "pr_number": 88,
-            "branch": "blueprint/task-cap0001",
-            "base_branch": "main",
-        }],
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 88,
+                "branch": "blueprint/task-cap0001",
+                "base_branch": "main",
+            }
+        ],
         context={
             "scope": "small",
             "review_loop": {
@@ -1077,7 +1165,8 @@ async def test_review_fix_cap_blocks_new_fix_on_iteration_limit(
     feedback = "Still missing null checks"
     verdict_json = json.dumps({"verdict": "REQUEST_CHANGES", "feedback": feedback})
     await _status(
-        client, review_task,
+        client,
+        review_task,
         status="COMPLETED",
         verdict_json=verdict_json,
         logs="Review: null checks still missing",
@@ -1144,12 +1233,14 @@ async def test_review_fix_cap_ci_failure_lower_limit(
     review_task = Task(
         project_id=project.id,
         title="Review PR #55 (ci failure context)",
-        payloads=[{
-            "type": "review",
-            "pr_number": 55,
-            "branch": "blueprint/task-ci0001",
-            "base_branch": "main",
-        }],
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 55,
+                "branch": "blueprint/task-ci0001",
+                "base_branch": "main",
+            }
+        ],
         context={
             "review_loop": {
                 "pr_number": 55,
@@ -1167,9 +1258,12 @@ async def test_review_fix_cap_ci_failure_lower_limit(
     await db_session.commit()
     await db_session.refresh(review_task)
 
-    verdict_json = json.dumps({"verdict": "REQUEST_CHANGES", "feedback": "CI errors remain"})
+    verdict_json = json.dumps(
+        {"verdict": "REQUEST_CHANGES", "feedback": "CI errors remain"}
+    )
     await _status(
-        client, review_task,
+        client,
+        review_task,
         status="COMPLETED",
         verdict_json=verdict_json,
         logs="CI still failing",
@@ -1235,12 +1329,14 @@ async def test_review_fix_cap_sets_status_message(
     review_task = Task(
         project_id=project.id,
         title="Review PR #73",
-        payloads=[{
-            "type": "review",
-            "pr_number": 73,
-            "branch": "blueprint/task-msg0001",
-            "base_branch": "main",
-        }],
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 73,
+                "branch": "blueprint/task-msg0001",
+                "base_branch": "main",
+            }
+        ],
         context={
             "scope": "small",
             "review_loop": {
@@ -1258,9 +1354,12 @@ async def test_review_fix_cap_sets_status_message(
     await db_session.commit()
     await db_session.refresh(review_task)
 
-    verdict_json = json.dumps({"verdict": "REQUEST_CHANGES", "feedback": "More changes needed"})
+    verdict_json = json.dumps(
+        {"verdict": "REQUEST_CHANGES", "feedback": "More changes needed"}
+    )
     await _status(
-        client, review_task,
+        client,
+        review_task,
         status="COMPLETED",
         verdict_json=verdict_json,
         logs="Review: more changes needed",
@@ -1280,6 +1379,7 @@ async def test_review_fix_cap_sets_status_message(
 # ---------------------------------------------------------------------------
 # Stuck-cycle detection tests
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.asyncio
 async def test_stuck_cycle_detected_marks_original_and_returns_no_fix(
@@ -1335,13 +1435,15 @@ async def test_stuck_cycle_detected_marks_original_and_returns_no_fix(
     review_task = Task(
         project_id=project.id,
         title="Review PR #99",
-        payloads=[{
-            "type": "review",
-            "pr_number": 99,
-            "branch": "blueprint/task-stuck0001",
-            "base_branch": "main",
-            "original_task_id": str(original_task.id),
-        }],
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 99,
+                "branch": "blueprint/task-stuck0001",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
         context={
             "scope": "medium",
             "review_loop": {
@@ -1360,13 +1462,16 @@ async def test_stuck_cycle_detected_marks_original_and_returns_no_fix(
     await db_session.commit()
     await db_session.refresh(review_task)
 
-    verdict_json = json.dumps({
-        "verdict": "REQUEST_CHANGES",
-        "feedback": "Still missing validation",
-        "issues": [repeated_issue],
-    })
+    verdict_json = json.dumps(
+        {
+            "verdict": "REQUEST_CHANGES",
+            "feedback": "Still missing validation",
+            "issues": [repeated_issue],
+        }
+    )
     await _status(
-        client, review_task,
+        client,
+        review_task,
         status="COMPLETED",
         verdict_json=verdict_json,
         logs="Review: still missing validation",
@@ -1440,13 +1545,15 @@ async def test_stuck_cycle_detected_without_explicit_original_task_id(
     review_task = Task(
         project_id=project.id,
         title="Review PR #101",
-        payloads=[{
-            "type": "review",
-            "pr_number": 101,
-            "branch": "blueprint/task-stuck0002",
-            "base_branch": "main",
-            # deliberately omit original_task_id
-        }],
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 101,
+                "branch": "blueprint/task-stuck0002",
+                "base_branch": "main",
+                # deliberately omit original_task_id
+            }
+        ],
         context={
             "review_loop": {
                 "pr_number": 101,
@@ -1464,13 +1571,16 @@ async def test_stuck_cycle_detected_without_explicit_original_task_id(
     await db_session.commit()
     await db_session.refresh(review_task)
 
-    verdict_json = json.dumps({
-        "verdict": "REQUEST_CHANGES",
-        "feedback": "SQL injection still present",
-        "issues": [repeated_issue],
-    })
+    verdict_json = json.dumps(
+        {
+            "verdict": "REQUEST_CHANGES",
+            "feedback": "SQL injection still present",
+            "issues": [repeated_issue],
+        }
+    )
     await _status(
-        client, review_task,
+        client,
+        review_task,
         status="COMPLETED",
         verdict_json=verdict_json,
         logs="Review: SQL injection still present",
@@ -1506,10 +1616,9 @@ async def test_stuck_cycle_detected_without_explicit_original_task_id(
 # Rollup iteration cap bypass tests
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
-async def test_rollup_bypasses_global_cap_via_is_rollup_review_flag(
-    db_session, mocker
-):
+async def test_rollup_bypasses_global_cap_via_is_rollup_review_flag(db_session, mocker):
     """
     When source_task.context['_is_rollup_review'] is True, _spawn_pipeline_task
     must use MAX_REVIEW_FIX_ITERATIONS (16) as the global cap instead of the
@@ -1531,7 +1640,13 @@ async def test_rollup_bypasses_global_cap_via_is_rollup_review_flag(
     parent_task = Task(
         project_id=project.id,
         title="Research task (rollup parent)",
-        payloads=[{"type": "research", "prompt": "Research improvements", "base_branch": "main"}],
+        payloads=[
+            {
+                "type": "research",
+                "prompt": "Research improvements",
+                "base_branch": "main",
+            }
+        ],
         vm_instance_id="agent-vm-rollup-parent-001",
         status=TaskStatus.EVALUATING,
         context={"scope": "medium", "_is_rollup_review": True},
@@ -1547,12 +1662,14 @@ async def test_rollup_bypasses_global_cap_via_is_rollup_review_flag(
         t = Task(
             project_id=project.id,
             title=f"{'Review' if i % 2 == 0 else 'Fix'} PR #200 (prior attempt {i})",
-            payloads=[{
-                "type": "review" if i % 2 == 0 else "fix",
-                "pr_number": 200,
-                "branch": "blueprint/rollup-test",
-                "base_branch": "main",
-            }],
+            payloads=[
+                {
+                    "type": "review" if i % 2 == 0 else "fix",
+                    "pr_number": 200,
+                    "branch": "blueprint/rollup-test",
+                    "base_branch": "main",
+                }
+            ],
             vm_instance_id=f"agent-vm-rollup-prior-{i:03d}",
             status=TaskStatus.COMPLETED,
         )
@@ -1589,7 +1706,9 @@ async def test_rollup_bypasses_global_cap_via_rollup_retries_context(
     """
     mocker.patch("app.broadcast.broadcast_to_project")
 
-    project = Project(name="Rollup Cap Bypass via Context Test", user_id="test-user-123")
+    project = Project(
+        name="Rollup Cap Bypass via Context Test", user_id="test-user-123"
+    )
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
@@ -1598,7 +1717,13 @@ async def test_rollup_bypasses_global_cap_via_rollup_retries_context(
     parent_task = Task(
         project_id=project.id,
         title="Research task (rollup with retries)",
-        payloads=[{"type": "research", "prompt": "Research improvements", "base_branch": "main"}],
+        payloads=[
+            {
+                "type": "research",
+                "prompt": "Research improvements",
+                "base_branch": "main",
+            }
+        ],
         vm_instance_id="agent-vm-rollup-retry-001",
         status=TaskStatus.EVALUATING,
         context={"scope": "small", "_rollup_retries": 2},
@@ -1612,12 +1737,14 @@ async def test_rollup_bypasses_global_cap_via_rollup_retries_context(
         t = Task(
             project_id=project.id,
             title=f"{'Review' if i % 2 == 0 else 'Fix'} PR #201 (prior {i})",
-            payloads=[{
-                "type": "review" if i % 2 == 0 else "fix",
-                "pr_number": 201,
-                "branch": "blueprint/rollup-retry-test",
-                "base_branch": "main",
-            }],
+            payloads=[
+                {
+                    "type": "review" if i % 2 == 0 else "fix",
+                    "pr_number": 201,
+                    "branch": "blueprint/rollup-retry-test",
+                    "base_branch": "main",
+                }
+            ],
             vm_instance_id=f"agent-vm-rollup-retry-prior-{i:03d}",
             status=TaskStatus.COMPLETED,
         )
@@ -1641,9 +1768,7 @@ async def test_rollup_bypasses_global_cap_via_rollup_retries_context(
 
 
 @pytest.mark.asyncio
-async def test_non_rollup_task_respects_global_cap(
-    db_session, mocker
-):
+async def test_non_rollup_task_respects_global_cap(db_session, mocker):
     """
     Regression: a normal (non-rollup) task must still be blocked when the
     global cap is reached. Verifies the rollup bypass does not accidentally
@@ -1675,12 +1800,14 @@ async def test_non_rollup_task_respects_global_cap(
         t = Task(
             project_id=project.id,
             title=f"{'Review' if i % 2 == 0 else 'Fix'} PR #202 (prior {i})",
-            payloads=[{
-                "type": "review" if i % 2 == 0 else "fix",
-                "pr_number": 202,
-                "branch": "blueprint/normal-cap-test",
-                "base_branch": "main",
-            }],
+            payloads=[
+                {
+                    "type": "review" if i % 2 == 0 else "fix",
+                    "pr_number": 202,
+                    "branch": "blueprint/normal-cap-test",
+                    "base_branch": "main",
+                }
+            ],
             vm_instance_id=f"agent-vm-normal-prior-{i:03d}",
             status=TaskStatus.COMPLETED,
         )
@@ -1706,6 +1833,7 @@ async def test_non_rollup_task_respects_global_cap(
 # CI completion: non-transient merge block escalation
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_ci_merge_rule_block_escalates_immediately(db_session, mocker):
     """
@@ -1726,12 +1854,14 @@ async def test_ci_merge_rule_block_escalates_immediately(db_session, mocker):
     task = Task(
         project_id=project.id,
         title="CI rule block test",
-        payloads=[{
-            "type": "review",
-            "pr_number": 99,
-            "branch": "blueprint/rule-block-test",
-            "base_branch": "main",
-        }],
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 99,
+                "branch": "blueprint/rule-block-test",
+                "base_branch": "main",
+            }
+        ],
         context={
             "review_loop": {
                 "pr_number": 99,
@@ -1752,7 +1882,10 @@ async def test_ci_merge_rule_block_escalates_immediately(db_session, mocker):
     # Mock merge_pull_request to return a rule-violation failure
     mocker.patch(
         "app.github.merge_pull_request",
-        return_value={"merged": False, "message": "Repository rule violations: Required approving review not satisfied"},
+        return_value={
+            "merged": False,
+            "message": "Repository rule violations: Required approving review not satisfied",
+        },
     )
     # Mock get_pull_request to indicate PR is still open (not already merged/closed)
     mocker.patch(
@@ -1814,12 +1947,14 @@ async def test_ci_fail_fix_suppressed_uses_generic_message(db_session, mocker):
     task = Task(
         project_id=project.id,
         title="CI fix suppressed test",
-        payloads=[{
-            "type": "review",
-            "pr_number": 777,
-            "branch": "blueprint/fix-suppressed-test",
-            "base_branch": "main",
-        }],
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 777,
+                "branch": "blueprint/fix-suppressed-test",
+                "base_branch": "main",
+            }
+        ],
         context={
             "review_loop": {
                 "pr_number": 777,
@@ -1836,7 +1971,11 @@ async def test_ci_fail_fix_suppressed_uses_generic_message(db_session, mocker):
     await db_session.commit()
     await db_session.refresh(task)
 
-    ci_result = {"status": "completed", "conclusion": "failure", "failed_logs": "test failure"}
+    ci_result = {
+        "status": "completed",
+        "conclusion": "failure",
+        "failed_logs": "test failure",
+    }
     await handle_ci_completion(
         task=task,
         ci_result=ci_result,
@@ -1860,6 +1999,7 @@ async def test_ci_fail_fix_suppressed_uses_generic_message(db_session, mocker):
 # ---------------------------------------------------------------------------
 # Merge gate: ci_passed AND review_approved both required
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.asyncio
 async def test_ci_passed_without_review_approved_does_not_merge(db_session, mocker):
@@ -2092,7 +2232,9 @@ async def test_review_approved_only_does_not_merge(db_session, mocker):
 
 
 @pytest.mark.asyncio
-async def test_rollup_review_approval_writes_review_approved_on_parent(client, db_session, mocker):
+async def test_rollup_review_approval_writes_review_approved_on_parent(
+    client, db_session, mocker
+):
     """
     End-to-end rollup gate handoff: a rollup PR's review task completes with
     APPROVE verdict. The handler must write review_approved=True on the
@@ -2111,7 +2253,11 @@ async def test_rollup_review_approval_writes_review_approved_on_parent(client, d
     )
     mocker.patch(
         "app.github.get_pull_request",
-        return_value={"head": {"ref": "research/abc", "sha": "deadbeef"}, "merged": False, "state": "open"},
+        return_value={
+            "head": {"ref": "research/abc", "sha": "deadbeef"},
+            "merged": False,
+            "state": "open",
+        },
     )
     mocker.patch("app.github.create_pr_comment", return_value=None)
     mocker.patch("app.github.submit_pr_review", return_value={"id": 1})
@@ -2153,20 +2299,24 @@ async def test_rollup_review_approval_writes_review_approved_on_parent(client, d
     review_task = Task(
         project_id=project.id,
         title="Review rollup PR #1408",
-        payloads=[{
-            "type": "review",
-            "pr_number": 1408,
-            "branch": "research/abc",
-            "base_branch": "main",
-            "original_task_id": str(parent.id),
-        }],
-        context={"review_loop": {
-            "pr_number": 1408,
-            "branch": "research/abc",
-            "base_branch": "main",
-            "original_task_id": str(parent.id),
-            "iteration": 1,
-        }},
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 1408,
+                "branch": "research/abc",
+                "base_branch": "main",
+                "original_task_id": str(parent.id),
+            }
+        ],
+        context={
+            "review_loop": {
+                "pr_number": 1408,
+                "branch": "research/abc",
+                "base_branch": "main",
+                "original_task_id": str(parent.id),
+                "iteration": 1,
+            }
+        },
         vm_instance_id="agent-vm-rollup-review-001",
         status=TaskStatus.IN_PROGRESS,
     )
@@ -2176,7 +2326,8 @@ async def test_rollup_review_approval_writes_review_approved_on_parent(client, d
 
     verdict_json = json.dumps({"verdict": "APPROVE", "feedback": "Looks fine"})
     await _status(
-        client, review_task,
+        client,
+        review_task,
         status="COMPLETED",
         verdict_json=verdict_json,
         logs="APPROVE",
@@ -2200,6 +2351,7 @@ async def test_rollup_review_approval_writes_review_approved_on_parent(client, d
 # ---------------------------------------------------------------------------
 # Auto-playbook generation tests
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.asyncio
 async def test_auto_playbook_generation(db_session, mocker):
@@ -2269,9 +2421,7 @@ async def test_auto_playbook_generation(db_session, mocker):
     )
     entry = doc[playbook_full_key]
     assert entry.get("source") == "auto-generated"
-    assert "3" in entry.get("content", ""), (
-        "Content should mention 3 occurrences"
-    )
+    assert "3" in entry.get("content", ""), "Content should mention 3 occurrences"
     assert str(t3.id) in entry.get("content", ""), (
         "Content should reference the triggering task ID"
     )
@@ -2283,7 +2433,11 @@ async def test_auto_playbook_no_duplicate(db_session, mocker):
     already exists in the project's design_doc."""
     mocker.patch("app.broadcast.broadcast_to_project")
 
-    from app.playbook_learning import _extract_failure_signature, _signature_to_key, _maybe_auto_playbook
+    from app.playbook_learning import (
+        _extract_failure_signature,
+        _signature_to_key,
+        _maybe_auto_playbook,
+    )
 
     error_msg = "ModuleNotFoundError: No module named 'requests'"
     failure_class = "CODE_ERROR"
@@ -2339,7 +2493,9 @@ async def test_auto_playbook_timeout_signature(db_session, mocker):
 
     from app.playbook_learning import _maybe_auto_playbook, _extract_failure_signature
 
-    sig = _extract_failure_signature("AGENT_TIMEOUT", "execution timed out", "create", "large")
+    sig = _extract_failure_signature(
+        "AGENT_TIMEOUT", "execution timed out", "create", "large"
+    )
     assert sig == "timeout-create-large"
 
     project = Project(name="Timeout Signature Test", user_id="test-user-timeout")
@@ -2362,7 +2518,9 @@ async def test_auto_playbook_timeout_signature(db_session, mocker):
         await db_session.commit()
         await db_session.refresh(t)
 
-        key = await _maybe_auto_playbook(t, "AGENT_TIMEOUT", "execution timed out", db_session)
+        key = await _maybe_auto_playbook(
+            t, "AGENT_TIMEOUT", "execution timed out", db_session
+        )
         await db_session.commit()
 
     assert key is not None, "Expected playbook entry for repeated AGENT_TIMEOUT"
@@ -2413,14 +2571,18 @@ async def test_dedup_cross_type_fix_cancels_stale_review(
 
     alive_review = Task(
         project_id=project.id,
-        payloads=[{
-            "type": "review",
-            "pr_number": 4277,
-            "branch": "blueprint/task-xt",
-            "base_branch": "main",
-            "original_task_id": str(original.id),
-        }],
-        context={"review_loop": {"original_task_id": str(original.id), "pr_number": 4277}},
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 4277,
+                "branch": "blueprint/task-xt",
+                "base_branch": "main",
+                "original_task_id": str(original.id),
+            }
+        ],
+        context={
+            "review_loop": {"original_task_id": str(original.id), "pr_number": 4277}
+        },
         vm_instance_id="agent-review-xt",
         status=TaskStatus.IN_PROGRESS,
         last_heartbeat=_naive_utcnow(),
@@ -2431,14 +2593,18 @@ async def test_dedup_cross_type_fix_cancels_stale_review(
 
     ci_task = Task(
         project_id=project.id,
-        payloads=[{
-            "type": "create",
-            "pr_number": 4277,
-            "branch": "blueprint/task-xt",
-            "base_branch": "main",
-            "original_task_id": str(original.id),
-        }],
-        context={"review_loop": {"original_task_id": str(original.id), "pr_number": 4277}},
+        payloads=[
+            {
+                "type": "create",
+                "pr_number": 4277,
+                "branch": "blueprint/task-xt",
+                "base_branch": "main",
+                "original_task_id": str(original.id),
+            }
+        ],
+        context={
+            "review_loop": {"original_task_id": str(original.id), "pr_number": 4277}
+        },
         status=TaskStatus.EVALUATING,
     )
     db_session.add(ci_task)
@@ -2446,7 +2612,12 @@ async def test_dedup_cross_type_fix_cancels_stale_review(
     await db_session.refresh(ci_task)
 
     fix_task, was_created = await _spawn_pipeline_task(
-        ci_task, "fix", db_session, 4277, "blueprint/task-xt", "main",
+        ci_task,
+        "fix",
+        db_session,
+        4277,
+        "blueprint/task-xt",
+        "main",
         fix_prompt="rebase and resolve",
         original_task_id=str(original.id),
     )
@@ -2498,14 +2669,18 @@ async def test_dedup_same_type_stale_task_superseded(
     stale_hb = _naive_utcnow() - timedelta(minutes=PIPELINE_TASK_STALE_MINUTES + 10)
     dying_review = Task(
         project_id=project.id,
-        payloads=[{
-            "type": "review",
-            "pr_number": 4288,
-            "branch": "blueprint/task-stale",
-            "base_branch": "main",
-            "original_task_id": str(original.id),
-        }],
-        context={"review_loop": {"original_task_id": str(original.id), "pr_number": 4288}},
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 4288,
+                "branch": "blueprint/task-stale",
+                "base_branch": "main",
+                "original_task_id": str(original.id),
+            }
+        ],
+        context={
+            "review_loop": {"original_task_id": str(original.id), "pr_number": 4288}
+        },
         vm_instance_id="agent-dying",
         status=TaskStatus.IN_PROGRESS,
         last_heartbeat=stale_hb,
@@ -2517,14 +2692,18 @@ async def test_dedup_same_type_stale_task_superseded(
 
     ci_task = Task(
         project_id=project.id,
-        payloads=[{
-            "type": "create",
-            "pr_number": 4288,
-            "branch": "blueprint/task-stale",
-            "base_branch": "main",
-            "original_task_id": str(original.id),
-        }],
-        context={"review_loop": {"original_task_id": str(original.id), "pr_number": 4288}},
+        payloads=[
+            {
+                "type": "create",
+                "pr_number": 4288,
+                "branch": "blueprint/task-stale",
+                "base_branch": "main",
+                "original_task_id": str(original.id),
+            }
+        ],
+        context={
+            "review_loop": {"original_task_id": str(original.id), "pr_number": 4288}
+        },
         status=TaskStatus.EVALUATING,
     )
     db_session.add(ci_task)
@@ -2532,7 +2711,12 @@ async def test_dedup_same_type_stale_task_superseded(
     await db_session.refresh(ci_task)
 
     review_task, was_created = await _spawn_pipeline_task(
-        ci_task, "review", db_session, 4288, "blueprint/task-stale", "main",
+        ci_task,
+        "review",
+        db_session,
+        4288,
+        "blueprint/task-stale",
+        "main",
         original_prompt="review again",
         original_task_id=str(original.id),
     )
@@ -2576,14 +2760,18 @@ async def test_dedup_review_deferred_while_fix_active(
 
     alive_fix = Task(
         project_id=project.id,
-        payloads=[{
-            "type": "fix",
-            "pr_number": 4299,
-            "branch": "blueprint/task-def",
-            "base_branch": "main",
-            "original_task_id": str(original.id),
-        }],
-        context={"review_loop": {"original_task_id": str(original.id), "pr_number": 4299}},
+        payloads=[
+            {
+                "type": "fix",
+                "pr_number": 4299,
+                "branch": "blueprint/task-def",
+                "base_branch": "main",
+                "original_task_id": str(original.id),
+            }
+        ],
+        context={
+            "review_loop": {"original_task_id": str(original.id), "pr_number": 4299}
+        },
         vm_instance_id="agent-fix-def",
         status=TaskStatus.IN_PROGRESS,
         last_heartbeat=_naive_utcnow(),
@@ -2594,14 +2782,18 @@ async def test_dedup_review_deferred_while_fix_active(
 
     source = Task(
         project_id=project.id,
-        payloads=[{
-            "type": "create",
-            "pr_number": 4299,
-            "branch": "blueprint/task-def",
-            "base_branch": "main",
-            "original_task_id": str(original.id),
-        }],
-        context={"review_loop": {"original_task_id": str(original.id), "pr_number": 4299}},
+        payloads=[
+            {
+                "type": "create",
+                "pr_number": 4299,
+                "branch": "blueprint/task-def",
+                "base_branch": "main",
+                "original_task_id": str(original.id),
+            }
+        ],
+        context={
+            "review_loop": {"original_task_id": str(original.id), "pr_number": 4299}
+        },
         status=TaskStatus.EVALUATING,
     )
     db_session.add(source)
@@ -2609,7 +2801,12 @@ async def test_dedup_review_deferred_while_fix_active(
     await db_session.refresh(source)
 
     review_task, was_created = await _spawn_pipeline_task(
-        source, "review", db_session, 4299, "blueprint/task-def", "main",
+        source,
+        "review",
+        db_session,
+        4299,
+        "blueprint/task-def",
+        "main",
         original_prompt="review",
         original_task_id=str(original.id),
     )
@@ -2670,13 +2867,15 @@ async def test_rollup_sources_cross_chain_dedup_on_shared_pr(
     # The fix task parent_a spawned — chain keyed off parent_a.id.
     fix_from_a = Task(
         project_id=project.id,
-        payloads=[{
-            "type": "fix",
-            "pr_number": 7000,
-            "branch": "research/abc",
-            "base_branch": "main",
-            "original_task_id": str(parent_a.id),
-        }],
+        payloads=[
+            {
+                "type": "fix",
+                "pr_number": 7000,
+                "branch": "research/abc",
+                "base_branch": "main",
+                "original_task_id": str(parent_a.id),
+            }
+        ],
         vm_instance_id="agent-fix-a",
         status=TaskStatus.IN_PROGRESS,
         last_heartbeat=_naive_utcnow(),
@@ -2697,7 +2896,12 @@ async def test_rollup_sources_cross_chain_dedup_on_shared_pr(
     await db_session.refresh(parent_b)
 
     result, was_created = await _spawn_pipeline_task(
-        parent_b, "fix", db_session, 7000, "research/abc", "main",
+        parent_b,
+        "fix",
+        db_session,
+        7000,
+        "research/abc",
+        "main",
         fix_prompt="resolve conflicts",
         original_task_id=str(parent_b.id),  # different chain from fix_from_a
     )
@@ -2748,13 +2952,15 @@ async def test_non_rollup_sources_preserve_chain_based_dedup(
     # Fix on chain A for PR #8001
     fix_a = Task(
         project_id=project.id,
-        payloads=[{
-            "type": "fix",
-            "pr_number": 8001,
-            "branch": "blueprint/task-a",
-            "base_branch": "main",
-            "original_task_id": str(create_a.id),
-        }],
+        payloads=[
+            {
+                "type": "fix",
+                "pr_number": 8001,
+                "branch": "blueprint/task-a",
+                "base_branch": "main",
+                "original_task_id": str(create_a.id),
+            }
+        ],
         vm_instance_id="agent-fix-a",
         status=TaskStatus.IN_PROGRESS,
         last_heartbeat=_naive_utcnow(),
@@ -2767,13 +2973,15 @@ async def test_non_rollup_sources_preserve_chain_based_dedup(
     # (shouldn't happen in normal flow) but we verify isolation regardless.
     source_b = Task(
         project_id=project.id,
-        payloads=[{
-            "type": "create",
-            "pr_number": 8001,
-            "branch": "blueprint/task-b",
-            "base_branch": "main",
-            "original_task_id": str(create_b.id),
-        }],
+        payloads=[
+            {
+                "type": "create",
+                "pr_number": 8001,
+                "branch": "blueprint/task-b",
+                "base_branch": "main",
+                "original_task_id": str(create_b.id),
+            }
+        ],
         context={},  # no _is_rollup_review
         status=TaskStatus.EVALUATING,
     )
@@ -2782,7 +2990,12 @@ async def test_non_rollup_sources_preserve_chain_based_dedup(
     await db_session.refresh(source_b)
 
     result, was_created = await _spawn_pipeline_task(
-        source_b, "fix", db_session, 8001, "blueprint/task-b", "main",
+        source_b,
+        "fix",
+        db_session,
+        8001,
+        "blueprint/task-b",
+        "main",
         fix_prompt="fix b",
         original_task_id=str(create_b.id),
     )

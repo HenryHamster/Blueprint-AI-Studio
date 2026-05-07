@@ -36,11 +36,13 @@ _DEFAULT_TIER_MODELS = {
 # docs, 1M is model-gated to the current Opus 4.x and Sonnet 4.6 variants;
 # haiku and older models silently ignore the suffix or error. We drop the
 # suffix with an unsupported marker when the effective model can't use it.
-_1M_CONTEXT_MODELS: frozenset[str] = frozenset({
-    "claude-opus-4-7",
-    "claude-opus-4-6",
-    "claude-sonnet-4-6",
-})
+_1M_CONTEXT_MODELS: frozenset[str] = frozenset(
+    {
+        "claude-opus-4-7",
+        "claude-opus-4-6",
+        "claude-sonnet-4-6",
+    }
+)
 
 
 class AnthropicProvider(LLMProvider):
@@ -62,10 +64,14 @@ class AnthropicProvider(LLMProvider):
             raise ValueError("Anthropic secret should start with 'sk-ant-'")
         if not _TOKEN_RE.fullmatch(secret):
             raise ValueError("Anthropic secret contains invalid characters")
-        return ValidationResult(secret=secret, provider_metadata=dict(provider_metadata or {}))
+        return ValidationResult(
+            secret=secret, provider_metadata=dict(provider_metadata or {})
+        )
 
     def tier_to_model(self, tier: str, runtime_config: Mapping[str, Any]) -> str | None:
-        return tier_model_from_runtime_config(self.name, tier, runtime_config, _DEFAULT_TIER_MODELS)
+        return tier_model_from_runtime_config(
+            self.name, tier, runtime_config, _DEFAULT_TIER_MODELS
+        )
 
     def rate_limit_patterns(self, auth_mode: LLMAuthMode) -> tuple[str, ...]:
         self.ensure_supported_auth_mode(auth_mode)

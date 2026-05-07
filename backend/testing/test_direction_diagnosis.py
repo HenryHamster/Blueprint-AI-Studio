@@ -8,6 +8,7 @@ Also includes end-to-end tests that exercise the full diagnosis-remediation
 feedback loop: investigation completion → remediation spawn → outcome recording
 → auto-recovery → re-pause escalation.
 """
+
 import json
 from datetime import datetime, timedelta
 from types import SimpleNamespace
@@ -25,7 +26,16 @@ from app.direction_lifecycle import (
     _process_direction_lifecycle,
     _spawn_direction_diagnosis,
 )
-from app.models import Alert, AlertSeverity, ArtifactType, MessageType, Project, ProjectMessage, Task, TaskStatus
+from app.models import (
+    Alert,
+    AlertSeverity,
+    ArtifactType,
+    MessageType,
+    Project,
+    ProjectMessage,
+    Task,
+    TaskStatus,
+)
 from app.autonomous_research import _spawn_task_failure_investigation
 from app.failure_classification import (
     CODE_ERROR,
@@ -50,16 +60,36 @@ def _direction(did: str = "d-diag-1", pause_count: int = 1) -> dict:
         # only happens on code-failure pause reasons, so this mirrors real state.
         "code_failure_pause_count": pause_count,
         "research_history": [
-            {"tasks_created": 3, "tasks_failed": 3, "tasks_failed_infra": 0, "prs_merged": 0},
-            {"tasks_created": 2, "tasks_failed": 2, "tasks_failed_infra": 0, "prs_merged": 0},
-            {"tasks_created": 4, "tasks_failed": 3, "tasks_failed_infra": 0, "prs_merged": 0},
+            {
+                "tasks_created": 3,
+                "tasks_failed": 3,
+                "tasks_failed_infra": 0,
+                "prs_merged": 0,
+            },
+            {
+                "tasks_created": 2,
+                "tasks_failed": 2,
+                "tasks_failed_infra": 0,
+                "prs_merged": 0,
+            },
+            {
+                "tasks_created": 4,
+                "tasks_failed": 3,
+                "tasks_failed_infra": 0,
+                "prs_merged": 0,
+            },
         ],
     }
 
 
 async def _make_project(db_session) -> Project:
-    project = Project(name="Diag Test", user_id="u1", autonomous_enabled=True,
-                      directions=[], vision={"purpose": "t"})
+    project = Project(
+        name="Diag Test",
+        user_id="u1",
+        autonomous_enabled=True,
+        directions=[],
+        vision={"purpose": "t"},
+    )
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
@@ -77,9 +107,7 @@ async def test_spawns_investigate_task_on_code_failure_pause(db_session):
     assert direction["diagnosis_in_progress"] is True
     assert "diagnosis_started_at" in direction
     await db_session.commit()
-    result = await db_session.execute(
-        select(Task).where(Task.project_id == project.id)
-    )
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
     tasks = result.scalars().all()
     assert len(tasks) == 1
     t = tasks[0]
@@ -106,13 +134,17 @@ async def test_unproductive_diagnosis_spawns_investigate_for_non_code_pause(db_s
     project = await _make_project(db_session)
     direction = _direction(did="d-unprod-1")
     reason = "Unproductive: 0 PRs merged from 5 research cycles (12 tasks created)"
-    spawned = await _spawn_unproductive_diagnosis(project, direction, reason, db_session)
+    spawned = await _spawn_unproductive_diagnosis(
+        project, direction, reason, db_session
+    )
     assert spawned is True
     assert "unproductive_diagnosis_spawned_at" in direction
     await db_session.commit()
-    tasks = (await db_session.execute(
-        select(Task).where(Task.project_id == project.id)
-    )).scalars().all()
+    tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
     assert len(tasks) == 1
     t = tasks[0]
     assert t.first_payload["type"] == "investigate"
@@ -138,13 +170,21 @@ async def test_unproductive_diagnosis_dedups_within_window(db_session):
     project = await _make_project(db_session)
     direction = _direction(did="d-unprod-dedup")
     reason = "Saturated: last 5 research cycles produced no actionable findings"
-    assert await _spawn_unproductive_diagnosis(project, direction, reason, db_session) is True
+    assert (
+        await _spawn_unproductive_diagnosis(project, direction, reason, db_session)
+        is True
+    )
     await db_session.commit()
     direction.pop("unproductive_diagnosis_spawned_at", None)
-    assert await _spawn_unproductive_diagnosis(project, direction, reason, db_session) is False
-    tasks = (await db_session.execute(
-        select(Task).where(Task.project_id == project.id)
-    )).scalars().all()
+    assert (
+        await _spawn_unproductive_diagnosis(project, direction, reason, db_session)
+        is False
+    )
+    tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
     assert len(tasks) == 1
 
 
@@ -177,12 +217,17 @@ async def test_dedup_skips_when_recent_investigate_exists(db_session):
     project = await _make_project(db_session)
     direction = _direction(did="d-dedup-1")
     reason = "High code failure rate: ..."
-    assert await _spawn_direction_diagnosis(project, direction, reason, db_session) is True
+    assert (
+        await _spawn_direction_diagnosis(project, direction, reason, db_session) is True
+    )
     await db_session.commit()
     # Second call within 24h must not spawn again
     direction.pop("diagnosis_in_progress", None)
     direction.pop("diagnosis_started_at", None)
-    assert await _spawn_direction_diagnosis(project, direction, reason, db_session) is False
+    assert (
+        await _spawn_direction_diagnosis(project, direction, reason, db_session)
+        is False
+    )
 
 
 @pytest.mark.asyncio
@@ -196,9 +241,11 @@ async def test_cross_direction_dedup_by_shared_fingerprint(db_session):
     assert await _spawn_direction_diagnosis(project, d1, reason, db_session) is True
     await db_session.commit()
 
-    tasks = (await db_session.execute(
-        select(Task).where(Task.project_id == project.id)
-    )).scalars().all()
+    tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
     assert len(tasks) == 1
     existing_id = str(tasks[0].id)
     assert tasks[0].context.get("diagnosis_fingerprint") == "fp-shared-root"
@@ -215,9 +262,11 @@ async def test_cross_direction_dedup_by_shared_fingerprint(db_session):
     assert "fp-shared-root" in notes[-1]["text"]
 
     # Still only one investigate task in the project
-    tasks_after = (await db_session.execute(
-        select(Task).where(Task.project_id == project.id)
-    )).scalars().all()
+    tasks_after = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
     assert len(tasks_after) == 1
 
     # Distinct fingerprint on a third direction still spawns
@@ -225,9 +274,11 @@ async def test_cross_direction_dedup_by_shared_fingerprint(db_session):
     d3["error_fingerprint"] = "fp-other-root"
     assert await _spawn_direction_diagnosis(project, d3, reason, db_session) is True
     await db_session.commit()
-    tasks_final = (await db_session.execute(
-        select(Task).where(Task.project_id == project.id)
-    )).scalars().all()
+    tasks_final = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
     assert len(tasks_final) == 2
 
 
@@ -254,18 +305,25 @@ async def test_dedup_across_auto_pause_and_hold_paths(db_session):
             name="Cross Dedup A",
             user_id="u-cross-a",
             autonomous_enabled=True,
-            directions=[{
-                "id": direction_a_id,
-                "text": "Cross-path direction A",
-                "status": "active",
-                "priority": "medium",
-                "paths": [],
-                "added_at": "2026-01-01T00:00:00",
-                "auto_pause_count": 1,
-                "research_history": [
-                    {"tasks_created": 3, "tasks_failed": 3, "tasks_failed_infra": 0, "prs_merged": 0},
-                ],
-            }],
+            directions=[
+                {
+                    "id": direction_a_id,
+                    "text": "Cross-path direction A",
+                    "status": "active",
+                    "priority": "medium",
+                    "paths": [],
+                    "added_at": "2026-01-01T00:00:00",
+                    "auto_pause_count": 1,
+                    "research_history": [
+                        {
+                            "tasks_created": 3,
+                            "tasks_failed": 3,
+                            "tasks_failed_infra": 0,
+                            "prs_merged": 0,
+                        },
+                    ],
+                }
+            ],
             vision={"purpose": "t"},
         )
         db_session.add(project_a)
@@ -277,7 +335,10 @@ async def test_dedup_across_auto_pause_and_hold_paths(db_session):
             project_id=project_a.id,
             title="Hold-path investigation",
             payloads=[{"type": "investigate", "prompt": "hold"}],
-            context={"direction_id": direction_a_id, "spawned_by": "direction_hold_investigation"},
+            context={
+                "direction_id": direction_a_id,
+                "spawned_by": "direction_hold_investigation",
+            },
             status=TaskStatus.IN_PROGRESS,
             created_by="ORCHESTRATOR",
             vm_instance_id=f"agent-vm-{_uuid.uuid4().hex[:16]}",
@@ -287,14 +348,27 @@ async def test_dedup_across_auto_pause_and_hold_paths(db_session):
 
         reason = "High code failure rate: >70% of spawned tasks failed..."
         spawned = await _spawn_direction_diagnosis(
-            project_a, project_a.directions[0], reason, db_session,
+            project_a,
+            project_a.directions[0],
+            reason,
+            db_session,
         )
-        assert spawned is False, "auto-pause path must skip when a hold-path investigation is in-flight"
+        assert spawned is False, (
+            "auto-pause path must skip when a hold-path investigation is in-flight"
+        )
         assert "diagnosis_in_progress" not in project_a.directions[0]
-        count = (await db_session.execute(
-            select(Task).where(Task.project_id == project_a.id)
-        )).scalars().all()
-        investigates_a = [t for t in count if t.first_payload.get("type") == "investigate"]
+        count = (
+            (
+                await db_session.execute(
+                    select(Task).where(Task.project_id == project_a.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        investigates_a = [
+            t for t in count if t.first_payload.get("type") == "investigate"
+        ]
         assert len(investigates_a) == 1
 
         # ───────── direction B: auto-pause task already exists, hold-path must skip
@@ -303,14 +377,16 @@ async def test_dedup_across_auto_pause_and_hold_paths(db_session):
             name="Cross Dedup B",
             user_id="u-cross-b",
             autonomous_enabled=True,
-            directions=[{
-                "id": direction_b_id,
-                "text": "Cross-path direction B",
-                "status": "active",
-                "priority": "medium",
-                "paths": [],
-                "added_at": "2026-01-01T00:00:00",
-            }],
+            directions=[
+                {
+                    "id": direction_b_id,
+                    "text": "Cross-path direction B",
+                    "status": "active",
+                    "priority": "medium",
+                    "paths": [],
+                    "added_at": "2026-01-01T00:00:00",
+                }
+            ],
             vision={"purpose": "t"},
         )
         db_session.add(project_b)
@@ -335,16 +411,28 @@ async def test_dedup_across_auto_pause_and_hold_paths(db_session):
         # Place direction B on hold
         for _ in range(DIRECTION_HOLD_THRESHOLD):
             record_direction_result(
-                direction_b_id, success=False, failure_class="CODE_ERROR",
+                direction_b_id,
+                success=False,
+                failure_class="CODE_ERROR",
                 project_id=str(project_b.id),
             )
 
         spawned_b = await _spawn_direction_hold_investigation(project_b, db_session)
-        assert spawned_b == 0, "hold path must skip when auto-pause investigation exists for same direction"
-        tasks_b = (await db_session.execute(
-            select(Task).where(Task.project_id == project_b.id)
-        )).scalars().all()
-        investigates_b = [t for t in tasks_b if t.first_payload.get("type") == "investigate"]
+        assert spawned_b == 0, (
+            "hold path must skip when auto-pause investigation exists for same direction"
+        )
+        tasks_b = (
+            (
+                await db_session.execute(
+                    select(Task).where(Task.project_id == project_b.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        investigates_b = [
+            t for t in tasks_b if t.first_payload.get("type") == "investigate"
+        ]
         assert len(investigates_b) == 1
     finally:
         direction_failure_streaks.clear()
@@ -365,22 +453,26 @@ async def test_prompt_includes_last_remediation_failure_details(db_session):
     """When prior remediation failed, investigate prompt surfaces failure class + summary."""
     project = await _make_project(db_session)
     direction = _direction(did="d-with-failure-details")
-    direction.update({
-        "remediation_attempts": 2,
-        "last_remediation_result": "failed",
-        "last_remediation_at": "2026-04-17T12:00:00+00:00",
-        "last_remediation_task_id": "task-prev-remediation",
-        "last_remediation_fingerprint": "fp-recurring",
-        "last_remediation_failure_class": "SCOPE_OVERFLOW",
-        "last_remediation_error_summary": "expanded beyond 5 files during fix attempt",
-    })
+    direction.update(
+        {
+            "remediation_attempts": 2,
+            "last_remediation_result": "failed",
+            "last_remediation_at": "2026-04-17T12:00:00+00:00",
+            "last_remediation_task_id": "task-prev-remediation",
+            "last_remediation_fingerprint": "fp-recurring",
+            "last_remediation_failure_class": "SCOPE_OVERFLOW",
+            "last_remediation_error_summary": "expanded beyond 5 files during fix attempt",
+        }
+    )
     reason = "High code failure rate: >70% of spawned tasks failed..."
     spawned = await _spawn_direction_diagnosis(project, direction, reason, db_session)
     assert spawned is True
     await db_session.commit()
-    tasks = (await db_session.execute(
-        select(Task).where(Task.project_id == project.id)
-    )).scalars().all()
+    tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
     assert len(tasks) == 1
     prompt = tasks[0].first_payload["prompt"]
     assert "SCOPE_OVERFLOW" in prompt
@@ -404,21 +496,35 @@ async def test_prompt_enriches_with_prior_remediation_task(db_session):
     await db_session.commit()
     await db_session.refresh(rem_task)
     direction = _direction(did="d-enrich-rem")
-    direction.update({
-        "remediation_attempts": 1,
-        "last_remediation_result": "failed",
-        "last_remediation_task_id": str(rem_task.id),
-    })
-    assert await _spawn_direction_diagnosis(
-        project, direction, "High code failure rate: ...", db_session,
-    ) is True
-    await db_session.commit()
-    investigate = (await db_session.execute(
-        select(Task).where(
-            Task.project_id == project.id,
-            Task.context["direction_id"].as_string() == "d-enrich-rem",
+    direction.update(
+        {
+            "remediation_attempts": 1,
+            "last_remediation_result": "failed",
+            "last_remediation_task_id": str(rem_task.id),
+        }
+    )
+    assert (
+        await _spawn_direction_diagnosis(
+            project,
+            direction,
+            "High code failure rate: ...",
+            db_session,
         )
-    )).scalars().first()
+        is True
+    )
+    await db_session.commit()
+    investigate = (
+        (
+            await db_session.execute(
+                select(Task).where(
+                    Task.project_id == project.id,
+                    Task.context["direction_id"].as_string() == "d-enrich-rem",
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
     prompt = investigate.first_payload["prompt"]
     assert "feat: add retry loop to flaky call" in prompt
     assert "3-attempt retry to paper over transient errors" in prompt
@@ -431,21 +537,35 @@ async def test_prompt_falls_back_when_remediation_task_missing(db_session):
     """Invalid/unfindable last_remediation_task_id: prompt still includes metadata + guidance, no approach block."""
     project = await _make_project(db_session)
     direction = _direction(did="d-missing-rem")
-    direction.update({
-        "remediation_attempts": 1,
-        "last_remediation_result": "failed",
-        "last_remediation_task_id": "not-a-real-uuid",
-    })
-    assert await _spawn_direction_diagnosis(
-        project, direction, "High code failure rate: ...", db_session,
-    ) is True
-    await db_session.commit()
-    investigate = (await db_session.execute(
-        select(Task).where(
-            Task.project_id == project.id,
-            Task.context["direction_id"].as_string() == "d-missing-rem",
+    direction.update(
+        {
+            "remediation_attempts": 1,
+            "last_remediation_result": "failed",
+            "last_remediation_task_id": "not-a-real-uuid",
+        }
+    )
+    assert (
+        await _spawn_direction_diagnosis(
+            project,
+            direction,
+            "High code failure rate: ...",
+            db_session,
         )
-    )).scalars().first()
+        is True
+    )
+    await db_session.commit()
+    investigate = (
+        (
+            await db_session.execute(
+                select(Task).where(
+                    Task.project_id == project.id,
+                    Task.context["direction_id"].as_string() == "d-missing-rem",
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
     prompt = investigate.first_payload["prompt"]
     assert "Prior remediation attempts: 1" in prompt
     assert "previous remediation attempt failed" in prompt.lower()
@@ -457,21 +577,35 @@ async def test_prompt_omits_failure_guidance_when_last_remediation_merged(db_ses
     """A merged remediation must not trigger the 'previous remediation failed' guidance."""
     project = await _make_project(db_session)
     direction = _direction(did="d-guidance-merged")
-    direction.update({
-        "remediation_attempts": 1,
-        "last_remediation_result": "merged",
-        "last_remediation_task_id": "task-prev-merged",
-    })
-    assert await _spawn_direction_diagnosis(
-        project, direction, "High code failure rate: ...", db_session,
-    ) is True
-    await db_session.commit()
-    investigate = (await db_session.execute(
-        select(Task).where(
-            Task.project_id == project.id,
-            Task.context["direction_id"].as_string() == "d-guidance-merged",
+    direction.update(
+        {
+            "remediation_attempts": 1,
+            "last_remediation_result": "merged",
+            "last_remediation_task_id": "task-prev-merged",
+        }
+    )
+    assert (
+        await _spawn_direction_diagnosis(
+            project,
+            direction,
+            "High code failure rate: ...",
+            db_session,
         )
-    )).scalars().first()
+        is True
+    )
+    await db_session.commit()
+    investigate = (
+        (
+            await db_session.execute(
+                select(Task).where(
+                    Task.project_id == project.id,
+                    Task.context["direction_id"].as_string() == "d-guidance-merged",
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
     prompt = investigate.first_payload["prompt"]
     assert "previous remediation attempt failed" not in prompt.lower()
     assert "Prior remediation approach:" not in prompt
@@ -482,20 +616,24 @@ async def test_prompt_omits_failure_details_when_last_remediation_merged(db_sess
     """A merged prior remediation must not produce a failure-details line."""
     project = await _make_project(db_session)
     direction = _direction(did="d-prior-merged")
-    direction.update({
-        "remediation_attempts": 1,
-        "last_remediation_result": "merged",
-        "last_remediation_at": "2026-04-17T12:00:00+00:00",
-        "last_remediation_task_id": "task-merged",
-        "last_remediation_fingerprint": "fp-fixed",
-    })
+    direction.update(
+        {
+            "remediation_attempts": 1,
+            "last_remediation_result": "merged",
+            "last_remediation_at": "2026-04-17T12:00:00+00:00",
+            "last_remediation_task_id": "task-merged",
+            "last_remediation_fingerprint": "fp-fixed",
+        }
+    )
     reason = "High code failure rate: ..."
     spawned = await _spawn_direction_diagnosis(project, direction, reason, db_session)
     assert spawned is True
     await db_session.commit()
-    tasks = (await db_session.execute(
-        select(Task).where(Task.project_id == project.id)
-    )).scalars().all()
+    tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
     prompt = tasks[0].first_payload["prompt"]
     assert "Last remediation failed with" not in prompt
 
@@ -560,9 +698,24 @@ def _paused_direction_with_diagnosis(did: str, hours_paused: float = 2.0) -> dic
         "paths": [],
         "added_at": "2026-01-01T00:00:00",
         "research_history": [
-            {"tasks_created": 3, "tasks_failed": 3, "tasks_failed_infra": 0, "prs_merged": 0},
-            {"tasks_created": 3, "tasks_failed": 3, "tasks_failed_infra": 0, "prs_merged": 0},
-            {"tasks_created": 3, "tasks_failed": 3, "tasks_failed_infra": 0, "prs_merged": 0},
+            {
+                "tasks_created": 3,
+                "tasks_failed": 3,
+                "tasks_failed_infra": 0,
+                "prs_merged": 0,
+            },
+            {
+                "tasks_created": 3,
+                "tasks_failed": 3,
+                "tasks_failed_infra": 0,
+                "prs_merged": 0,
+            },
+            {
+                "tasks_created": 3,
+                "tasks_failed": 3,
+                "tasks_failed_infra": 0,
+                "prs_merged": 0,
+            },
         ],
     }
 
@@ -575,12 +728,16 @@ def _investigate_payload(report: dict):
     )
 
 
-async def _make_investigate_task(project: Project, direction_id: str, db_session) -> Task:
+async def _make_investigate_task(
+    project: Project, direction_id: str, db_session
+) -> Task:
     task = Task(
         project_id=project.id,
         title=f"Investigate direction {direction_id}",
         description="Auto-pause diagnosis",
-        payloads=[{"type": "investigate", "prompt": "investigate", "base_branch": "main"}],
+        payloads=[
+            {"type": "investigate", "prompt": "investigate", "base_branch": "main"}
+        ],
         context={
             "direction_id": direction_id,
             "pause_reason": "High code failure rate: ...",
@@ -615,15 +772,25 @@ async def test_full_cycle_pause_investigate_remediate_recover(db_session, mocker
     # Stage 1: investigation completes with a high-confidence, actionable report.
     investigate_task = await _make_investigate_task(project, "d-e2e-full-1", db_session)
     await _handle_investigation_completion(
-        investigate_task, _investigate_payload(_HIGH_CONFIDENCE_REPORT), db_session,
+        investigate_task,
+        _investigate_payload(_HIGH_CONFIDENCE_REPORT),
+        db_session,
     )
     await db_session.commit()
     await db_session.refresh(project)
 
-    remediation = (await db_session.execute(
-        select(Task).where(Task.parent_task_id == investigate_task.id)
-    )).scalars().first()
-    assert remediation is not None, "investigation should spawn a remediation child task"
+    remediation = (
+        (
+            await db_session.execute(
+                select(Task).where(Task.parent_task_id == investigate_task.id)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    assert remediation is not None, (
+        "investigation should spawn a remediation child task"
+    )
     assert remediation.first_payload["type"] == "create"
     assert remediation.first_payload["base_branch"] == "main"
     assert remediation.context["diagnosis_task_id"] == str(investigate_task.id)
@@ -635,7 +802,9 @@ async def test_full_cycle_pause_investigate_remediate_recover(db_session, mocker
     assert "diagnosis_in_progress" not in refreshed
 
     # Stage 2: remediation merges → outcome recorded on direction.
-    updated = await _record_remediation_outcome(remediation, merged=True, session=db_session)
+    updated = await _record_remediation_outcome(
+        remediation, merged=True, session=db_session
+    )
     await db_session.commit()
     await db_session.refresh(project)
     assert updated is True
@@ -656,13 +825,18 @@ async def test_full_cycle_pause_investigate_remediate_recover(db_session, mocker
     await db_session.commit()
 
     await _process_direction_lifecycle(
-        project, db_session, cooldown_minutes=240.0,
-        busy_direction_ids=set(), now=datetime.utcnow(),
+        project,
+        db_session,
+        cooldown_minutes=240.0,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
     )
     await db_session.refresh(project)
 
     recovered = project.directions[0]
-    assert recovered["status"] == "active", "direction should auto-recover after cooldown"
+    assert recovered["status"] == "active", (
+        "direction should auto-recover after cooldown"
+    )
     assert "auto_paused" not in recovered
     assert "paused_at" not in recovered
     assert recovered.get("remediation_monitor_started_at"), (
@@ -689,11 +863,28 @@ async def test_re_pause_after_merged_remediation_escalates(db_session, mocker):
         "paths": [],
         "added_at": "2026-01-01T00:00:00",
         "research_history": [
-            {"tasks_created": 4, "tasks_failed": 4, "tasks_failed_infra": 0, "prs_merged": 0},
-            {"tasks_created": 4, "tasks_failed": 4, "tasks_failed_infra": 0, "prs_merged": 0},
-            {"tasks_created": 4, "tasks_failed": 4, "tasks_failed_infra": 0, "prs_merged": 0},
+            {
+                "tasks_created": 4,
+                "tasks_failed": 4,
+                "tasks_failed_infra": 0,
+                "prs_merged": 0,
+            },
+            {
+                "tasks_created": 4,
+                "tasks_failed": 4,
+                "tasks_failed_infra": 0,
+                "prs_merged": 0,
+            },
+            {
+                "tasks_created": 4,
+                "tasks_failed": 4,
+                "tasks_failed_infra": 0,
+                "prs_merged": 0,
+            },
         ],
-        "remediation_monitor_started_at": (datetime.utcnow() - timedelta(hours=1)).isoformat(),
+        "remediation_monitor_started_at": (
+            datetime.utcnow() - timedelta(hours=1)
+        ).isoformat(),
         "remediation_attempts": 3,
         "last_remediation_result": "merged",
         "error_fingerprint": "fp-abc123",
@@ -711,8 +902,11 @@ async def test_re_pause_after_merged_remediation_escalates(db_session, mocker):
     _ss.circuit_breakers.pop(str(project.id), None)
 
     await _process_direction_lifecycle(
-        project, db_session, cooldown_minutes=240.0,
-        busy_direction_ids=set(), now=datetime.utcnow(),
+        project,
+        db_session,
+        cooldown_minutes=240.0,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
     )
     await db_session.refresh(project)
 
@@ -722,21 +916,35 @@ async def test_re_pause_after_merged_remediation_escalates(db_session, mocker):
 
     # Assert the BLOCKER escalation message was posted. `from_type='system'` plus
     # context.event_type='remediation_escalated' uniquely identify this path.
-    messages = (await db_session.execute(
-        select(ProjectMessage).where(
-            ProjectMessage.project_id == project.id,
-            ProjectMessage.message_type == MessageType.BLOCKER,
+    messages = (
+        (
+            await db_session.execute(
+                select(ProjectMessage).where(
+                    ProjectMessage.project_id == project.id,
+                    ProjectMessage.message_type == MessageType.BLOCKER,
+                )
+            )
         )
-    )).scalars().all()
-    escalations = [m for m in messages if (m.context or {}).get("event_type") == "remediation_escalated"]
-    assert len(escalations) == 1, "exactly one remediation_escalated BLOCKER should be posted"
+        .scalars()
+        .all()
+    )
+    escalations = [
+        m
+        for m in messages
+        if (m.context or {}).get("event_type") == "remediation_escalated"
+    ]
+    assert len(escalations) == 1, (
+        "exactly one remediation_escalated BLOCKER should be posted"
+    )
     ctx = escalations[0].context
     assert ctx["attempts"] == 3
     assert ctx["failure_pattern"] == "fp-abc123"
     assert "Remediation escalation" in escalations[0].content
 
 
-async def _run_escalation_scenario(db_session, mocker, *, current_fp, last_rem_fp, monitor_age_hours):
+async def _run_escalation_scenario(
+    db_session, mocker, *, current_fp, last_rem_fp, monitor_age_hours
+):
     mocker.patch(
         "app.direction_lifecycle._compute_direction_error_fingerprint",
         new_callable=AsyncMock,
@@ -750,11 +958,28 @@ async def _run_escalation_scenario(db_session, mocker, *, current_fp, last_rem_f
         "paths": [],
         "added_at": "2026-01-01T00:00:00",
         "research_history": [
-            {"tasks_created": 4, "tasks_failed": 4, "tasks_failed_infra": 0, "prs_merged": 0},
-            {"tasks_created": 4, "tasks_failed": 4, "tasks_failed_infra": 0, "prs_merged": 0},
-            {"tasks_created": 4, "tasks_failed": 4, "tasks_failed_infra": 0, "prs_merged": 0},
+            {
+                "tasks_created": 4,
+                "tasks_failed": 4,
+                "tasks_failed_infra": 0,
+                "prs_merged": 0,
+            },
+            {
+                "tasks_created": 4,
+                "tasks_failed": 4,
+                "tasks_failed_infra": 0,
+                "prs_merged": 0,
+            },
+            {
+                "tasks_created": 4,
+                "tasks_failed": 4,
+                "tasks_failed_infra": 0,
+                "prs_merged": 0,
+            },
         ],
-        "remediation_monitor_started_at": (datetime.utcnow() - timedelta(hours=monitor_age_hours)).isoformat(),
+        "remediation_monitor_started_at": (
+            datetime.utcnow() - timedelta(hours=monitor_age_hours)
+        ).isoformat(),
         "remediation_attempts": 3,
         "last_remediation_result": "merged",
         "last_remediation_fingerprint": last_rem_fp,
@@ -771,8 +996,11 @@ async def _run_escalation_scenario(db_session, mocker, *, current_fp, last_rem_f
     await db_session.refresh(project)
     _ss.circuit_breakers.pop(str(project.id), None)
     await _process_direction_lifecycle(
-        project, db_session, cooldown_minutes=240.0,
-        busy_direction_ids=set(), now=datetime.utcnow(),
+        project,
+        db_session,
+        cooldown_minutes=240.0,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
     )
     await db_session.refresh(project)
     return project.directions[0]
@@ -781,7 +1009,11 @@ async def _run_escalation_scenario(db_session, mocker, *, current_fp, last_rem_f
 @pytest.mark.asyncio
 async def test_escalation_fires_when_fingerprints_match(db_session, mocker):
     d = await _run_escalation_scenario(
-        db_session, mocker, current_fp="fp-same", last_rem_fp="fp-same", monitor_age_hours=1,
+        db_session,
+        mocker,
+        current_fp="fp-same",
+        last_rem_fp="fp-same",
+        monitor_age_hours=1,
     )
     assert d.get("needs_manual_intervention") is True
 
@@ -789,7 +1021,11 @@ async def test_escalation_fires_when_fingerprints_match(db_session, mocker):
 @pytest.mark.asyncio
 async def test_escalation_skipped_when_fingerprints_differ(db_session, mocker):
     d = await _run_escalation_scenario(
-        db_session, mocker, current_fp="fp-new", last_rem_fp="fp-old", monitor_age_hours=1,
+        db_session,
+        mocker,
+        current_fp="fp-new",
+        last_rem_fp="fp-old",
+        monitor_age_hours=1,
     )
     assert d.get("needs_manual_intervention") is not True
 
@@ -797,7 +1033,10 @@ async def test_escalation_skipped_when_fingerprints_differ(db_session, mocker):
 @pytest.mark.asyncio
 async def test_stale_monitor_cleared_without_escalation(db_session, mocker):
     d = await _run_escalation_scenario(
-        db_session, mocker, current_fp="fp-same", last_rem_fp="fp-same",
+        db_session,
+        mocker,
+        current_fp="fp-same",
+        last_rem_fp="fp-same",
         monitor_age_hours=24 * 30,
     )
     assert d.get("needs_manual_intervention") is not True
@@ -823,9 +1062,24 @@ async def test_auto_retire_at_threshold_creates_alert(db_session, mocker):
         "auto_pause_count": 2,
         "code_failure_pause_count": 2,
         "research_history": [
-            {"tasks_created": 4, "tasks_failed": 4, "tasks_failed_infra": 0, "prs_merged": 0},
-            {"tasks_created": 4, "tasks_failed": 4, "tasks_failed_infra": 0, "prs_merged": 0},
-            {"tasks_created": 4, "tasks_failed": 4, "tasks_failed_infra": 0, "prs_merged": 0},
+            {
+                "tasks_created": 4,
+                "tasks_failed": 4,
+                "tasks_failed_infra": 0,
+                "prs_merged": 0,
+            },
+            {
+                "tasks_created": 4,
+                "tasks_failed": 4,
+                "tasks_failed_infra": 0,
+                "prs_merged": 0,
+            },
+            {
+                "tasks_created": 4,
+                "tasks_failed": 4,
+                "tasks_failed_infra": 0,
+                "prs_merged": 0,
+            },
         ],
     }
     project = Project(
@@ -841,8 +1095,11 @@ async def test_auto_retire_at_threshold_creates_alert(db_session, mocker):
     _ss.circuit_breakers.pop(str(project.id), None)
 
     await _process_direction_lifecycle(
-        project, db_session, cooldown_minutes=240.0,
-        busy_direction_ids=set(), now=datetime.utcnow(),
+        project,
+        db_session,
+        cooldown_minutes=240.0,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
     )
     await db_session.refresh(project)
 
@@ -852,9 +1109,11 @@ async def test_auto_retire_at_threshold_creates_alert(db_session, mocker):
     assert d.get("auto_completed_reason")
     assert "auto-retired" in d["auto_completed_reason"].lower()
 
-    alerts = (await db_session.execute(
-        select(Alert).where(Alert.project_id == project.id)
-    )).scalars().all()
+    alerts = (
+        (await db_session.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
     assert len(alerts) == 1
     alert = alerts[0]
     assert alert.severity == AlertSeverity.INFO
@@ -883,7 +1142,12 @@ async def test_saturation_pauses_do_not_drive_auto_retire(db_session):
         "code_failure_pause_count": 0,
         "possibly_saturated": True,
         "research_history": [
-            {"tasks_created": 0, "tasks_failed": 0, "tasks_failed_infra": 0, "prs_merged": 0}
+            {
+                "tasks_created": 0,
+                "tasks_failed": 0,
+                "tasks_failed_infra": 0,
+                "prs_merged": 0,
+            }
             for _ in range(5)
         ],
     }
@@ -900,8 +1164,11 @@ async def test_saturation_pauses_do_not_drive_auto_retire(db_session):
     _ss.circuit_breakers.pop(str(project.id), None)
 
     await _process_direction_lifecycle(
-        project, db_session, cooldown_minutes=240.0,
-        busy_direction_ids=set(), now=datetime.utcnow(),
+        project,
+        db_session,
+        cooldown_minutes=240.0,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
     )
     await db_session.refresh(project)
 
@@ -933,7 +1200,12 @@ async def test_three_code_failure_pauses_trigger_auto_retire(db_session, mocker)
         "auto_pause_count": 2,
         "code_failure_pause_count": 2,
         "research_history": [
-            {"tasks_created": 4, "tasks_failed": 4, "tasks_failed_infra": 0, "prs_merged": 0}
+            {
+                "tasks_created": 4,
+                "tasks_failed": 4,
+                "tasks_failed_infra": 0,
+                "prs_merged": 0,
+            }
             for _ in range(3)
         ],
     }
@@ -950,8 +1222,11 @@ async def test_three_code_failure_pauses_trigger_auto_retire(db_session, mocker)
     _ss.circuit_breakers.pop(str(project.id), None)
 
     await _process_direction_lifecycle(
-        project, db_session, cooldown_minutes=240.0,
-        busy_direction_ids=set(), now=datetime.utcnow(),
+        project,
+        db_session,
+        cooldown_minutes=240.0,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
     )
     await db_session.refresh(project)
 
@@ -977,7 +1252,12 @@ async def test_mixed_pause_reasons_only_code_failures_count(db_session):
         "auto_pause_count": 2,  # already seen 2 infra-driven pauses
         "code_failure_pause_count": 1,  # only one of those was code-driven
         "research_history": [
-            {"tasks_created": 4, "tasks_failed": 4, "tasks_failed_infra": 0, "prs_merged": 0}
+            {
+                "tasks_created": 4,
+                "tasks_failed": 4,
+                "tasks_failed_infra": 0,
+                "prs_merged": 0,
+            }
             for _ in range(3)
         ],
     }
@@ -994,8 +1274,11 @@ async def test_mixed_pause_reasons_only_code_failures_count(db_session):
     _ss.circuit_breakers.pop(str(project.id), None)
 
     await _process_direction_lifecycle(
-        project, db_session, cooldown_minutes=240.0,
-        busy_direction_ids=set(), now=datetime.utcnow(),
+        project,
+        db_session,
+        cooldown_minutes=240.0,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
     )
     await db_session.refresh(project)
 
@@ -1023,16 +1306,26 @@ async def test_structural_diagnosis_appends_note_no_remediation(db_session, mock
     await db_session.commit()
     await db_session.refresh(project)
 
-    investigate_task = await _make_investigate_task(project, "d-e2e-struct-1", db_session)
+    investigate_task = await _make_investigate_task(
+        project, "d-e2e-struct-1", db_session
+    )
     await _handle_investigation_completion(
-        investigate_task, _investigate_payload(_STRUCTURAL_REPORT), db_session,
+        investigate_task,
+        _investigate_payload(_STRUCTURAL_REPORT),
+        db_session,
     )
     await db_session.commit()
     await db_session.refresh(project)
 
-    children = (await db_session.execute(
-        select(Task).where(Task.parent_task_id == investigate_task.id)
-    )).scalars().all()
+    children = (
+        (
+            await db_session.execute(
+                select(Task).where(Task.parent_task_id == investigate_task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
     assert children == [], "structural diagnosis must not spawn a remediation task"
 
     d = project.directions[0]
@@ -1075,8 +1368,11 @@ async def test_stale_diagnosis_clears_all_three_fields(db_session):
     _ss.circuit_breakers.pop(str(project.id), None)
 
     await _process_direction_lifecycle(
-        project, db_session, cooldown_minutes=240.0,
-        busy_direction_ids=set(), now=datetime.utcnow(),
+        project,
+        db_session,
+        cooldown_minutes=240.0,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
     )
     await db_session.refresh(project)
 
@@ -1093,7 +1389,10 @@ async def test_stale_diagnosis_clears_all_three_fields(db_session):
 
 
 async def _add_failed_task(
-    db_session, project_id, direction_id: str, msg: str | None,
+    db_session,
+    project_id,
+    direction_id: str,
+    msg: str | None,
     created_at: datetime | None = None,
 ) -> None:
     task = Task(
@@ -1115,7 +1414,10 @@ async def _add_failed_task(
 @pytest.mark.asyncio
 async def test_fingerprint_returns_none_when_no_failed_tasks(db_session):
     project = await _make_project(db_session)
-    assert await _compute_direction_error_fingerprint(project.id, "d-fp-empty", db_session) is None
+    assert (
+        await _compute_direction_error_fingerprint(project.id, "d-fp-empty", db_session)
+        is None
+    )
 
 
 @pytest.mark.asyncio
@@ -1123,16 +1425,24 @@ async def test_fingerprint_returns_none_below_recurrence_threshold(db_session):
     project = await _make_project(db_session)
     # Only one failure with this fingerprint — below _FINGERPRINT_MIN_RECURRENCE=2.
     await _add_failed_task(db_session, project.id, "d-fp-once", "TypeError: x is None")
-    assert await _compute_direction_error_fingerprint(project.id, "d-fp-once", db_session) is None
+    assert (
+        await _compute_direction_error_fingerprint(project.id, "d-fp-once", db_session)
+        is None
+    )
 
 
 @pytest.mark.asyncio
 async def test_fingerprint_returns_dominant_when_threshold_met(db_session):
     project = await _make_project(db_session)
     for _ in range(2):
-        await _add_failed_task(db_session, project.id, "d-fp-dom", "AssertionError: values differ")
+        await _add_failed_task(
+            db_session, project.id, "d-fp-dom", "AssertionError: values differ"
+        )
     expected = _error_fingerprint("AssertionError: values differ", "test")
-    assert await _compute_direction_error_fingerprint(project.id, "d-fp-dom", db_session) == expected
+    assert (
+        await _compute_direction_error_fingerprint(project.id, "d-fp-dom", db_session)
+        == expected
+    )
 
 
 @pytest.mark.asyncio
@@ -1141,7 +1451,12 @@ async def test_fingerprint_skips_empty_status_messages(db_session):
     # Two empty-message failures must NOT be coerced into a shared fingerprint.
     await _add_failed_task(db_session, project.id, "d-fp-empty-msg", "")
     await _add_failed_task(db_session, project.id, "d-fp-empty-msg", None)
-    assert await _compute_direction_error_fingerprint(project.id, "d-fp-empty-msg", db_session) is None
+    assert (
+        await _compute_direction_error_fingerprint(
+            project.id, "d-fp-empty-msg", db_session
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio
@@ -1149,10 +1464,17 @@ async def test_fingerprint_picks_best_among_multiple_distinct(db_session):
     project = await _make_project(db_session)
     # Dominant pattern: 3 matches. Other pattern: 1 match (below threshold on its own).
     for _ in range(3):
-        await _add_failed_task(db_session, project.id, "d-fp-best", "KeyError: 'direction_id'")
-    await _add_failed_task(db_session, project.id, "d-fp-best", "ConnectionRefusedError: db down")
+        await _add_failed_task(
+            db_session, project.id, "d-fp-best", "KeyError: 'direction_id'"
+        )
+    await _add_failed_task(
+        db_session, project.id, "d-fp-best", "ConnectionRefusedError: db down"
+    )
     expected = _error_fingerprint("KeyError: 'direction_id'")
-    assert await _compute_direction_error_fingerprint(project.id, "d-fp-best", db_session) == expected
+    assert (
+        await _compute_direction_error_fingerprint(project.id, "d-fp-best", db_session)
+        == expected
+    )
 
 
 @pytest.mark.asyncio
@@ -1162,9 +1484,14 @@ async def test_fingerprint_filters_by_direction_id(db_session):
     msg = "CODE_ERROR: shared error text"
     await _add_failed_task(db_session, project.id, "d-other", msg)
     await _add_failed_task(db_session, project.id, "d-other", msg)
-    assert await _compute_direction_error_fingerprint(
-        project.id, "d-target", db_session,
-    ) is None
+    assert (
+        await _compute_direction_error_fingerprint(
+            project.id,
+            "d-target",
+            db_session,
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio
@@ -1177,18 +1504,29 @@ async def test_fingerprint_uses_recent_failures_within_window(db_session):
     recent_msg = "TypeError: object has no attribute 'x'"
     for _ in range(3):
         await _add_failed_task(
-            db_session, project.id, "d-fp-recency", stale_msg,
+            db_session,
+            project.id,
+            "d-fp-recency",
+            stale_msg,
             created_at=now - timedelta(days=21),
         )
     for _ in range(2):
         await _add_failed_task(
-            db_session, project.id, "d-fp-recency", recent_msg,
+            db_session,
+            project.id,
+            "d-fp-recency",
+            recent_msg,
             created_at=now - timedelta(hours=1),
         )
     expected = _error_fingerprint(recent_msg, "integration")
-    assert await _compute_direction_error_fingerprint(
-        project.id, "d-fp-recency", db_session,
-    ) == expected
+    assert (
+        await _compute_direction_error_fingerprint(
+            project.id,
+            "d-fp-recency",
+            db_session,
+        )
+        == expected
+    )
 
 
 @pytest.mark.asyncio
@@ -1203,18 +1541,28 @@ async def test_fingerprint_excludes_stale_failures_outside_window(db_session):
     recent_msg = "TypeError: only recent"
     for _ in range(4):
         await _add_failed_task(
-            db_session, project.id, "d-fp-stale", stale_msg,
+            db_session,
+            project.id,
+            "d-fp-stale",
+            stale_msg,
             created_at=now - timedelta(days=30),
         )
     await _add_failed_task(
-        db_session, project.id, "d-fp-stale", recent_msg,
+        db_session,
+        project.id,
+        "d-fp-stale",
+        recent_msg,
         created_at=now - timedelta(hours=2),
     )
     # Recent window has 1 failure (below threshold), fallback scans all 5 where
     # the stale pattern is dominant.
     assert await _compute_direction_error_fingerprint(
-        project.id, "d-fp-stale", db_session,
-    ) == _error_fingerprint(stale_msg)  # "RateLimitError: slow down" has no stage keyword
+        project.id,
+        "d-fp-stale",
+        db_session,
+    ) == _error_fingerprint(
+        stale_msg
+    )  # "RateLimitError: slow down" has no stage keyword
 
 
 @pytest.mark.asyncio
@@ -1226,13 +1574,21 @@ async def test_fingerprint_falls_back_to_unfiltered_when_window_sparse(db_sessio
     msg = "AssertionError: legacy regression"
     for _ in range(2):
         await _add_failed_task(
-            db_session, project.id, "d-fp-sparse", msg,
+            db_session,
+            project.id,
+            "d-fp-sparse",
+            msg,
             created_at=now - timedelta(days=30),
         )
     expected = _error_fingerprint(msg, "test")
-    assert await _compute_direction_error_fingerprint(
-        project.id, "d-fp-sparse", db_session,
-    ) == expected
+    assert (
+        await _compute_direction_error_fingerprint(
+            project.id,
+            "d-fp-sparse",
+            db_session,
+        )
+        == expected
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1277,8 +1633,11 @@ async def test_auto_recovery_clears_intervention_when_fingerprint_differs(db_ses
     }
     project = await _make_intervention_project(db_session, direction)
     await _process_direction_lifecycle(
-        project, db_session, cooldown_minutes=240.0,
-        busy_direction_ids=set(), now=datetime.utcnow(),
+        project,
+        db_session,
+        cooldown_minutes=240.0,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
     )
     await db_session.refresh(project)
     d = project.directions[0]
@@ -1307,8 +1666,11 @@ async def test_auto_recovery_keeps_intervention_when_fingerprints_match(db_sessi
     }
     project = await _make_intervention_project(db_session, direction)
     await _process_direction_lifecycle(
-        project, db_session, cooldown_minutes=240.0,
-        busy_direction_ids=set(), now=datetime.utcnow(),
+        project,
+        db_session,
+        cooldown_minutes=240.0,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
     )
     await db_session.refresh(project)
     d = project.directions[0]
@@ -1328,14 +1690,19 @@ async def test_expired_monitor_on_active_direction_clears_intervention(db_sessio
         "added_at": "2026-01-01T00:00:00",
         "research_history": [],
         "needs_manual_intervention": True,
-        "remediation_monitor_started_at": (datetime.utcnow() - timedelta(days=8)).isoformat(),
+        "remediation_monitor_started_at": (
+            datetime.utcnow() - timedelta(days=8)
+        ).isoformat(),
         "last_remediation_result": "merged",
         "last_remediation_fingerprint": "fp-old",
     }
     project = await _make_intervention_project(db_session, direction)
     await _process_direction_lifecycle(
-        project, db_session, cooldown_minutes=240.0,
-        busy_direction_ids=set(), now=datetime.utcnow(),
+        project,
+        db_session,
+        cooldown_minutes=240.0,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
     )
     await db_session.refresh(project)
     d = project.directions[0]
@@ -1363,8 +1730,11 @@ async def test_unparseable_monitor_timestamp_clears_monitor(db_session):
     }
     project = await _make_intervention_project(db_session, direction)
     await _process_direction_lifecycle(
-        project, db_session, cooldown_minutes=240.0,
-        busy_direction_ids=set(), now=datetime.utcnow(),
+        project,
+        db_session,
+        cooldown_minutes=240.0,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
     )
     await db_session.refresh(project)
     d = project.directions[0]
@@ -1378,7 +1748,9 @@ async def test_unparseable_monitor_timestamp_clears_monitor(db_session):
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _other_paused(did: str, fp: str | None, *, status: str = "paused", auto_paused: bool = True) -> dict:
+def _other_paused(
+    did: str, fp: str | None, *, status: str = "paused", auto_paused: bool = True
+) -> dict:
     """Sibling direction record used to test cross-direction fingerprint annotation."""
     return {
         "id": did,
@@ -1403,13 +1775,18 @@ async def test_diagnosis_annotates_shared_fingerprint_directions(db_session):
     direction = _direction(did="d-target")
     direction["error_fingerprint"] = "fp-shared"
     spawned = await _spawn_direction_diagnosis(
-        project, direction, "High code failure rate: ...", db_session,
+        project,
+        direction,
+        "High code failure rate: ...",
+        db_session,
     )
     assert spawned is True
     await db_session.commit()
-    task = (await db_session.execute(
-        select(Task).where(Task.project_id == project.id)
-    )).scalars().first()
+    task = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .first()
+    )
     shared = task.context.get("shared_fingerprint_directions")
     assert shared is not None
     shared_ids = {entry["id"] for entry in shared}
@@ -1443,13 +1820,21 @@ async def test_diagnosis_omits_shared_directions_when_fingerprints_unique(db_ses
     await db_session.commit()
     direction = _direction(did="d-target-unique")
     direction["error_fingerprint"] = "fp-unique"
-    assert await _spawn_direction_diagnosis(
-        project, direction, "High code failure rate: ...", db_session,
-    ) is True
+    assert (
+        await _spawn_direction_diagnosis(
+            project,
+            direction,
+            "High code failure rate: ...",
+            db_session,
+        )
+        is True
+    )
     await db_session.commit()
-    task = (await db_session.execute(
-        select(Task).where(Task.project_id == project.id)
-    )).scalars().first()
+    task = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .first()
+    )
     assert "shared_fingerprint_directions" not in task.context
     assert "SYSTEMIC" not in task.first_payload["prompt"]
 
@@ -1472,13 +1857,21 @@ async def test_diagnosis_ignores_active_siblings_with_matching_fingerprint(db_se
     await db_session.commit()
     direction = _direction(did="d-target-active")
     direction["error_fingerprint"] = "fp-shared"
-    assert await _spawn_direction_diagnosis(
-        project, direction, "High code failure rate: ...", db_session,
-    ) is True
+    assert (
+        await _spawn_direction_diagnosis(
+            project,
+            direction,
+            "High code failure rate: ...",
+            db_session,
+        )
+        is True
+    )
     await db_session.commit()
-    task = (await db_session.execute(
-        select(Task).where(Task.project_id == project.id)
-    )).scalars().first()
+    task = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .first()
+    )
     assert "shared_fingerprint_directions" not in task.context
     assert "SYSTEMIC" not in task.first_payload["prompt"]
 
@@ -1495,13 +1888,18 @@ async def test_active_monitor_not_expired_keeps_intervention(db_session):
         "added_at": "2026-01-01T00:00:00",
         "research_history": [],
         "needs_manual_intervention": True,
-        "remediation_monitor_started_at": (datetime.utcnow() - timedelta(hours=6)).isoformat(),
+        "remediation_monitor_started_at": (
+            datetime.utcnow() - timedelta(hours=6)
+        ).isoformat(),
         "last_remediation_result": "merged",
     }
     project = await _make_intervention_project(db_session, direction)
     await _process_direction_lifecycle(
-        project, db_session, cooldown_minutes=240.0,
-        busy_direction_ids=set(), now=datetime.utcnow(),
+        project,
+        db_session,
+        cooldown_minutes=240.0,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
     )
     await db_session.refresh(project)
     d = project.directions[0]
@@ -1528,11 +1926,28 @@ def _re_pause_direction(did: str = "d-retry-1") -> dict:
         "paths": [],
         "added_at": "2026-01-01T00:00:00",
         "research_history": [
-            {"tasks_created": 4, "tasks_failed": 4, "tasks_failed_infra": 0, "prs_merged": 0},
-            {"tasks_created": 4, "tasks_failed": 4, "tasks_failed_infra": 0, "prs_merged": 0},
-            {"tasks_created": 4, "tasks_failed": 4, "tasks_failed_infra": 0, "prs_merged": 0},
+            {
+                "tasks_created": 4,
+                "tasks_failed": 4,
+                "tasks_failed_infra": 0,
+                "prs_merged": 0,
+            },
+            {
+                "tasks_created": 4,
+                "tasks_failed": 4,
+                "tasks_failed_infra": 0,
+                "prs_merged": 0,
+            },
+            {
+                "tasks_created": 4,
+                "tasks_failed": 4,
+                "tasks_failed_infra": 0,
+                "prs_merged": 0,
+            },
         ],
-        "remediation_monitor_started_at": (datetime.utcnow() - timedelta(hours=1)).isoformat(),
+        "remediation_monitor_started_at": (
+            datetime.utcnow() - timedelta(hours=1)
+        ).isoformat(),
         "remediation_attempts": 3,
         "last_remediation_result": "merged",
         "error_fingerprint": "fp-retry",
@@ -1566,8 +1981,11 @@ async def test_escalation_failure_sets_pending_flag(db_session, mocker):
     _ss.circuit_breakers.pop(str(project.id), None)
 
     await _process_direction_lifecycle(
-        project, db_session, cooldown_minutes=240.0,
-        busy_direction_ids=set(), now=datetime.utcnow(),
+        project,
+        db_session,
+        cooldown_minutes=240.0,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
     )
     await db_session.refresh(project)
     d = project.directions[0]
@@ -1604,8 +2022,11 @@ async def test_escalation_retry_succeeds_clears_flag(db_session, mocker):
     }
     project = await _make_intervention_project(db_session, direction)
     await _process_direction_lifecycle(
-        project, db_session, cooldown_minutes=240.0,
-        busy_direction_ids=set(), now=datetime.utcnow(),
+        project,
+        db_session,
+        cooldown_minutes=240.0,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
     )
     await db_session.refresh(project)
     d = project.directions[0]
@@ -1621,6 +2042,7 @@ async def test_escalation_retry_succeeds_clears_flag(db_session, mocker):
 async def test_escalation_retry_max_retries_stops(db_session, mocker, caplog):
     """After _MAX_ESCALATION_NOTIFICATION_RETRIES, the retry loop logs ERROR and stops."""
     import logging as _logging
+
     post_mock = mocker.patch(
         "app.notification_dispatch.post_remediation_escalation_message",
         new_callable=AsyncMock,
@@ -1643,15 +2065,19 @@ async def test_escalation_retry_max_retries_stops(db_session, mocker, caplog):
     project = await _make_intervention_project(db_session, direction)
     with caplog.at_level(_logging.ERROR, logger="app.direction_lifecycle"):
         await _process_direction_lifecycle(
-            project, db_session, cooldown_minutes=240.0,
-            busy_direction_ids=set(), now=datetime.utcnow(),
+            project,
+            db_session,
+            cooldown_minutes=240.0,
+            busy_direction_ids=set(),
+            now=datetime.utcnow(),
         )
     await db_session.refresh(project)
     d = project.directions[0]
     assert post_mock.await_count == 0, "must not retry after max retries"
     assert "escalation_notification_pending" not in d
     err_records = [
-        r for r in caplog.records
+        r
+        for r in caplog.records
         if r.levelno == _logging.ERROR and "retries exhausted" in r.message
     ]
     assert len(err_records) == 1
@@ -1685,14 +2111,21 @@ async def test_escalation_retry_exhaustion_creates_alert(db_session, mocker):
     }
     project = await _make_intervention_project(db_session, direction)
     await _process_direction_lifecycle(
-        project, db_session, cooldown_minutes=240.0,
-        busy_direction_ids=set(), now=datetime.utcnow(),
+        project,
+        db_session,
+        cooldown_minutes=240.0,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
     )
     await db_session.commit()
-    alerts = (await db_session.execute(
-        select(Alert).where(Alert.project_id == project.id)
-    )).scalars().all()
-    matching = [a for a in alerts if "Escalation notification delivery failed" in a.title]
+    alerts = (
+        (await db_session.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    matching = [
+        a for a in alerts if "Escalation notification delivery failed" in a.title
+    ]
     assert len(matching) == 1
     a = matching[0]
     assert a.severity == AlertSeverity.ERROR
@@ -1725,8 +2158,11 @@ async def test_escalation_retry_failure_increments_count(db_session, mocker):
     }
     project = await _make_intervention_project(db_session, direction)
     await _process_direction_lifecycle(
-        project, db_session, cooldown_minutes=240.0,
-        busy_direction_ids=set(), now=datetime.utcnow(),
+        project,
+        db_session,
+        cooldown_minutes=240.0,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
     )
     await db_session.refresh(project)
     d = project.directions[0]
@@ -1833,9 +2269,24 @@ async def test_partial_success_skips_escalation(db_session, mocker):
     # Rules 3/4 run against the last 3 cycles — pack recent history with code failures
     # so _check_direction_health returns a code-failure pause reason.
     recent = [
-        {"tasks_created": 4, "tasks_failed": 4, "tasks_failed_infra": 0, "prs_merged": 0},
-        {"tasks_created": 4, "tasks_failed": 4, "tasks_failed_infra": 0, "prs_merged": 0},
-        {"tasks_created": 4, "tasks_failed": 4, "tasks_failed_infra": 0, "prs_merged": 0},
+        {
+            "tasks_created": 4,
+            "tasks_failed": 4,
+            "tasks_failed_infra": 0,
+            "prs_merged": 0,
+        },
+        {
+            "tasks_created": 4,
+            "tasks_failed": 4,
+            "tasks_failed_infra": 0,
+            "prs_merged": 0,
+        },
+        {
+            "tasks_created": 4,
+            "tasks_failed": 4,
+            "tasks_failed_infra": 0,
+            "prs_merged": 0,
+        },
     ]
     direction["research_history"] = direction["research_history"] + recent
     project = Project(
@@ -1851,8 +2302,11 @@ async def test_partial_success_skips_escalation(db_session, mocker):
     _ss.circuit_breakers.pop(str(project.id), None)
 
     await _process_direction_lifecycle(
-        project, db_session, cooldown_minutes=240.0,
-        busy_direction_ids=set(), now=datetime.utcnow(),
+        project,
+        db_session,
+        cooldown_minutes=240.0,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
     )
     await db_session.refresh(project)
 
@@ -1860,7 +2314,9 @@ async def test_partial_success_skips_escalation(db_session, mocker):
     assert d["status"] == "paused"
     assert d.get("needs_manual_intervention") is not True
     assert d.get("last_remediation_result") == "partial_success"
-    assert post_mock.await_count == 0, "escalation notification must not fire on partial success"
+    assert post_mock.await_count == 0, (
+        "escalation notification must not fire on partial success"
+    )
 
 
 @pytest.mark.asyncio
@@ -1878,9 +2334,24 @@ async def test_insufficient_history_skips_escalation(db_session, mocker):
     direction = _partial_success_direction(pre_rate=0.8, post_rate=0.2)
     # Simulate newly-created direction: no pre-remediation history entries.
     recent = [
-        {"tasks_created": 4, "tasks_failed": 4, "tasks_failed_infra": 0, "prs_merged": 0},
-        {"tasks_created": 4, "tasks_failed": 4, "tasks_failed_infra": 0, "prs_merged": 0},
-        {"tasks_created": 4, "tasks_failed": 4, "tasks_failed_infra": 0, "prs_merged": 0},
+        {
+            "tasks_created": 4,
+            "tasks_failed": 4,
+            "tasks_failed_infra": 0,
+            "prs_merged": 0,
+        },
+        {
+            "tasks_created": 4,
+            "tasks_failed": 4,
+            "tasks_failed_infra": 0,
+            "prs_merged": 0,
+        },
+        {
+            "tasks_created": 4,
+            "tasks_failed": 4,
+            "tasks_failed_infra": 0,
+            "prs_merged": 0,
+        },
     ]
     direction["research_history"] = recent
     project = Project(
@@ -1896,14 +2367,19 @@ async def test_insufficient_history_skips_escalation(db_session, mocker):
     _ss.circuit_breakers.pop(str(project.id), None)
 
     await _process_direction_lifecycle(
-        project, db_session, cooldown_minutes=240.0,
-        busy_direction_ids=set(), now=datetime.utcnow(),
+        project,
+        db_session,
+        cooldown_minutes=240.0,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
     )
     await db_session.refresh(project)
 
     d = project.directions[0]
     assert d.get("needs_manual_intervention") is not True
-    assert post_mock.await_count == 0, "escalation must not fire when history is insufficient"
+    assert post_mock.await_count == 0, (
+        "escalation must not fire when history is insufficient"
+    )
 
 
 @pytest.mark.asyncio
@@ -1923,15 +2399,17 @@ async def test_full_task_failure_remediation_loop(db_session, mocker):
         name="E2E Task-Failure Loop",
         user_id="u-e2e-loop",
         autonomous_enabled=True,
-        directions=[{
-            "id": direction_id,
-            "text": "Direction under remediation",
-            "status": "active",
-            "priority": "medium",
-            "paths": [],
-            "added_at": "2026-01-01T00:00:00",
-            "research_history": [],
-        }],
+        directions=[
+            {
+                "id": direction_id,
+                "text": "Direction under remediation",
+                "status": "active",
+                "priority": "medium",
+                "paths": [],
+                "added_at": "2026-01-01T00:00:00",
+                "research_history": [],
+            }
+        ],
         vision={"purpose": "t"},
     )
     db_session.add(project)
@@ -1961,12 +2439,18 @@ async def test_full_task_failure_remediation_loop(db_session, mocker):
     assert spawned is True
     await db_session.commit()
 
-    investigate_task = (await db_session.execute(
-        select(Task).where(
-            Task.project_id == project.id,
-            Task.id != failed_task.id,
+    investigate_task = (
+        (
+            await db_session.execute(
+                select(Task).where(
+                    Task.project_id == project.id,
+                    Task.id != failed_task.id,
+                )
+            )
         )
-    )).scalars().one()
+        .scalars()
+        .one()
+    )
     assert investigate_task.first_payload["type"] == "investigate"
     assert investigate_task.context["direction_id"] == direction_id
     assert investigate_task.context["source_task_id"] == str(failed_task.id)
@@ -1975,14 +2459,22 @@ async def test_full_task_failure_remediation_loop(db_session, mocker):
 
     # Stage 3: investigation completes with a high-confidence actionable report.
     await _handle_investigation_completion(
-        investigate_task, _investigate_payload(_HIGH_CONFIDENCE_REPORT), db_session,
+        investigate_task,
+        _investigate_payload(_HIGH_CONFIDENCE_REPORT),
+        db_session,
     )
     await db_session.commit()
     await db_session.refresh(project)
 
-    remediation = (await db_session.execute(
-        select(Task).where(Task.parent_task_id == investigate_task.id)
-    )).scalars().one()
+    remediation = (
+        (
+            await db_session.execute(
+                select(Task).where(Task.parent_task_id == investigate_task.id)
+            )
+        )
+        .scalars()
+        .one()
+    )
     assert remediation.first_payload["type"] == "create"
     assert remediation.context["diagnosis_task_id"] == str(investigate_task.id)
     assert remediation.context["direction_id"] == direction_id
@@ -2064,15 +2556,17 @@ async def test_full_task_failure_remediation_loop_failed_outcome(db_session, moc
         name="E2E Task-Failure Loop (failed outcome)",
         user_id="u-e2e-loop-failed",
         autonomous_enabled=True,
-        directions=[{
-            "id": direction_id,
-            "text": "Direction under remediation (failed path)",
-            "status": "active",
-            "priority": "medium",
-            "paths": [],
-            "added_at": "2026-01-01T00:00:00",
-            "research_history": [],
-        }],
+        directions=[
+            {
+                "id": direction_id,
+                "text": "Direction under remediation (failed path)",
+                "status": "active",
+                "priority": "medium",
+                "paths": [],
+                "added_at": "2026-01-01T00:00:00",
+                "research_history": [],
+            }
+        ],
         vision={"purpose": "t"},
     )
     db_session.add(project)
@@ -2098,21 +2592,35 @@ async def test_full_task_failure_remediation_loop_failed_outcome(db_session, moc
     assert await _spawn_task_failure_investigation(failed_task, db_session) is True
     await db_session.commit()
 
-    investigate_task = (await db_session.execute(
-        select(Task).where(
-            Task.project_id == project.id,
-            Task.id != failed_task.id,
+    investigate_task = (
+        (
+            await db_session.execute(
+                select(Task).where(
+                    Task.project_id == project.id,
+                    Task.id != failed_task.id,
+                )
+            )
         )
-    )).scalars().one()
+        .scalars()
+        .one()
+    )
 
     await _handle_investigation_completion(
-        investigate_task, _investigate_payload(_HIGH_CONFIDENCE_REPORT), db_session,
+        investigate_task,
+        _investigate_payload(_HIGH_CONFIDENCE_REPORT),
+        db_session,
     )
     await db_session.commit()
 
-    remediation = (await db_session.execute(
-        select(Task).where(Task.parent_task_id == investigate_task.id)
-    )).scalars().one()
+    remediation = (
+        (
+            await db_session.execute(
+                select(Task).where(Task.parent_task_id == investigate_task.id)
+            )
+        )
+        .scalars()
+        .one()
+    )
     assert remediation.context["diagnosis_task_id"] == str(investigate_task.id)
 
     # Remediation task itself fails (fix didn't land) → direction records failure.

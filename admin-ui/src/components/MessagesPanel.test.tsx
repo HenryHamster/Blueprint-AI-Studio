@@ -1,9 +1,13 @@
-import { describe, test, expect, vi, afterEach } from 'vitest';
+import { describe, test, expect, vi, afterEach, beforeEach } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { render, waitFor } from '@testing-library/react';
 import { MessagesPanel } from './MessagesPanel';
-import { classifySignalLevel } from './MessagesPanel.utils';
+import { classifySignalLevel, effectiveSignal, loadEventPrefs, EVENT_PREFS_KEY } from './MessagesPanel.utils';
+
+vi.mock('../firebase', () => ({
+  auth: { currentUser: { email: 'test-user@example.com' } },
+}));
 
 vi.mock('../api', () => ({
   apiFetch: vi.fn(async () => new Response(JSON.stringify({ messages: [] }), { status: 200 })),
@@ -420,5 +424,200 @@ describe('MessagesPanel toast notifications', () => {
 
     // NOTE messages are not in highSignalTypes — no toast fires
     expect(mockAddToast).not.toHaveBeenCalled();
+  });
+});
+
+// ── effectiveSignal unit tests ────────────────────────────────────────────────
+
+describe('effectiveSignal', () => {
+  const base = { message_type: 'NOTE', from_type: 'system', context: {} };
+  const routineMsg = { ...base, context: { event_type: 'pr_merged' } };
+
+  test('mute pref hides message regardless of default classification', () => {
+    expect(effectiveSignal(routineMsg, { pr_merged: 'mute' })).toBe('mute');
+  });
+
+  test('surfaced pref promotes routine event to high-signal', () => {
+    expect(effectiveSignal(routineMsg, { pr_merged: 'surfaced' })).toBe('high');
+  });
+
+  test('explicit routine pref falls through to classifySignalLevel', () => {
+    expect(effectiveSignal(routineMsg, { pr_merged: 'routine' })).toBe('routine');
+  });
+
+  test('no pref falls through to classifySignalLevel (routine by default)', () => {
+    expect(effectiveSignal(routineMsg, {})).toBe('routine');
+  });
+
+  test('mute pref on a high-signal message type still returns mute', () => {
+    const blockerMsg = { message_type: 'BLOCKER', from_type: 'agent', context: { event_type: 'blocker_event' } };
+    expect(effectiveSignal(blockerMsg, { blocker_event: 'mute' })).toBe('mute');
+  });
+
+  test('pref key must match event_type in context — unmatched pref is ignored', () => {
+    expect(effectiveSignal(routineMsg, { some_other_event: 'mute' })).toBe('routine');
+  });
+
+  test('message with no event_type in context ignores prefs', () => {
+    const noEtMsg = { ...base, context: {} };
+    expect(effectiveSignal(noEtMsg, { pr_merged: 'mute' })).toBe('routine');
+  });
+});
+
+// ── loadEventPrefs / localStorage persistence tests ───────────────────────────
+
+describe('loadEventPrefs', () => {
+  afterEach(() => localStorage.removeItem(EVENT_PREFS_KEY));
+
+  test('returns empty object when nothing in localStorage', () => {
+    expect(loadEventPrefs()).toEqual({});
+  });
+
+  test('returns parsed prefs from localStorage', () => {
+    localStorage.setItem(EVENT_PREFS_KEY, JSON.stringify({ pr_merged: 'mute', cycle_summary: 'surfaced' }));
+    expect(loadEventPrefs()).toEqual({ pr_merged: 'mute', cycle_summary: 'surfaced' });
+  });
+
+  test('returns empty object on malformed JSON', () => {
+    localStorage.setItem(EVENT_PREFS_KEY, 'not-json{{{');
+    expect(loadEventPrefs()).toEqual({});
+  });
+
+  test('preferences survive a simulated page reload (re-read from localStorage)', () => {
+    localStorage.setItem(EVENT_PREFS_KEY, JSON.stringify({ auto_fix_spawned: 'mute' }));
+    // Simulates a new page load calling loadEventPrefs() fresh
+    const loaded = loadEventPrefs();
+    expect(loaded.auto_fix_spawned).toBe('mute');
+  });
+});
+
+// ── Per-event-type mute/surface component integration tests ───────────────────
+
+describe('MessagesPanel per-event-type prefs', () => {
+  let root: Root | null = null;
+  let host: HTMLDivElement | null = null;
+
+  beforeEach(() => localStorage.removeItem(EVENT_PREFS_KEY));
+
+  afterEach(() => {
+    const r = root;
+    if (r) act(() => r.unmount());
+    root = null;
+    host?.remove();
+    host = null;
+    localStorage.removeItem(EVENT_PREFS_KEY);
+    vi.clearAllMocks();
+  });
+
+  async function renderPanel(messages: ReturnType<typeof makeMsg>[]) {
+    (apiFetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      new Response(JSON.stringify({ messages }), { status: 200 }),
+    );
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <MessagesPanel
+          selectedProjectId="proj-1"
+          onClose={() => {}}
+          addToast={() => {}}
+          onMessageCountChange={() => {}}
+        />,
+      );
+    });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 50)); });
+    return host!;
+  }
+
+  test('muted event_type is hidden from the routine group', async () => {
+    localStorage.setItem(EVENT_PREFS_KEY, JSON.stringify({ pr_merged: 'mute' }));
+    const msgs = [makeMsg({ id: 'r1', from_type: 'system', context: { event_type: 'pr_merged' }, content: 'muted content' })];
+    const el = await renderPanel(msgs);
+    expect(el.textContent).not.toContain('muted content');
+    expect(el.textContent).not.toContain('routine ops');
+  });
+
+  test('muted event_type is hidden from the high-signal area too', async () => {
+    // Even a BLOCKER can be muted via explicit pref
+    localStorage.setItem(EVENT_PREFS_KEY, JSON.stringify({ blocker_ev: 'mute' }));
+    const msgs = [
+      makeMsg({ id: 'b1', message_type: 'BLOCKER', from_type: 'agent', context: { event_type: 'blocker_ev' }, content: 'muted blocker' }),
+    ];
+    const el = await renderPanel(msgs);
+    expect(el.textContent).not.toContain('muted blocker');
+  });
+
+  test('surfaced event_type appears in the high-signal area, not in routine group', async () => {
+    localStorage.setItem(EVENT_PREFS_KEY, JSON.stringify({ pr_merged: 'surfaced' }));
+    const msgs = [makeMsg({ id: 'r1', from_type: 'system', context: { event_type: 'pr_merged' }, content: 'promoted content' })];
+    const el = await renderPanel(msgs);
+    // content is visible
+    expect(el.textContent).toContain('promoted content');
+    // routine ops group is absent (no routine messages remain)
+    expect(el.textContent).not.toContain('routine ops');
+  });
+
+  test('clearing all preferences returns to default classification', async () => {
+    // Start with pr_merged surfaced so it appears as high-signal
+    localStorage.setItem(EVENT_PREFS_KEY, JSON.stringify({ pr_merged: 'surfaced' }));
+    const msgs = [makeMsg({ id: 'r1', from_type: 'system', context: { event_type: 'pr_merged' }, content: 'pref msg' })];
+    const el = await renderPanel(msgs);
+    // With surfaced pref, content is directly visible (high-signal)
+    expect(el.textContent).toContain('pref msg');
+    expect(el.textContent).not.toContain('routine ops');
+
+    // Simulate "Reset all" — clear localStorage
+    localStorage.removeItem(EVENT_PREFS_KEY);
+    // loadEventPrefs() now returns {}
+    expect(loadEventPrefs()).toEqual({});
+    // effectiveSignal falls back to classifySignalLevel — pr_merged is routine
+    const msg = { message_type: 'NOTE', from_type: 'system', context: { event_type: 'pr_merged' } };
+    const { effectiveSignal: es } = await import('./MessagesPanel.utils');
+    expect(es(msg, {})).toBe('routine');
+  });
+});
+
+describe('MessagesPanel persistence', () => {
+  let root: Root | null = null;
+  let host: HTMLDivElement | null = null;
+  const key = 'messages_panel_prefs:test-user@example.com';
+
+  beforeEach(() => {
+    localStorage.removeItem(key);
+  });
+
+  afterEach(() => {
+    const r = root;
+    if (r) act(() => r.unmount());
+    root = null;
+    host?.remove();
+    host = null;
+    localStorage.removeItem(key);
+    vi.clearAllMocks();
+  });
+
+  const routineMsg = makeMsg({ id: 'r1', from_type: 'system', context: { event_type: 'pr_merged' } });
+
+  async function renderPanel(messages = [routineMsg]) {
+    vi.mocked(apiFetch).mockResolvedValue(new Response(JSON.stringify({ messages }), { status: 200 }));
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    root = createRoot(host);
+    await act(async () => {
+      root!.render(
+        <MessagesPanel selectedProjectId="proj-1" onClose={() => {}} addToast={() => {}} onMessageCountChange={() => {}} />,
+      );
+    });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 50)); });
+  }
+
+  test('persists routineExpanded and falls back to defaults', async () => {
+    const clickRoutine = () => [...host!.querySelectorAll('button')].find(b => b.textContent?.includes('routine ops'))?.click();
+    await renderPanel(); await act(async () => clickRoutine()); expect(JSON.parse(localStorage.getItem(key) || '{}')).toMatchObject({ routineExpanded: true });
+    await act(async () => { root!.unmount(); }); root = null; await renderPanel(); expect(host!.textContent).toContain('test content');
+    localStorage.removeItem(key); await act(async () => { root!.unmount(); }); root = null; await renderPanel(); expect(JSON.parse(localStorage.getItem(key) || '{}')).toMatchObject({ routineExpanded: false, showResolved: false });
+    localStorage.setItem(key, '}{'); await act(async () => { root!.unmount(); }); root = null; await expect(renderPanel()).resolves.toBeUndefined(); expect(JSON.parse(localStorage.getItem(key) || '{}')).toMatchObject({ routineExpanded: false, showResolved: false });
   });
 });

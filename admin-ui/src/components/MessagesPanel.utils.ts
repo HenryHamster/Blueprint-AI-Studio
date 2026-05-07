@@ -19,6 +19,25 @@ export const ROUTINE_EVENT_LABELS: Record<string, string> = {
   feedback_acknowledgment: 'feedback acks',
 };
 
+export type EventPref = 'mute' | 'routine' | 'surfaced';
+
+export const EVENT_PREFS_KEY = 'messages_panel_event_prefs';
+
+export function loadEventPrefs(): Record<string, EventPref> {
+  try { return JSON.parse(localStorage.getItem(EVENT_PREFS_KEY) ?? '{}'); } catch { return {}; }
+}
+
+export function effectiveSignal(
+  msg: { message_type: string; from_type: string; context: Record<string, unknown> },
+  prefs: Record<string, EventPref>,
+): 'high' | 'routine' | 'mute' {
+  const et = msg.context.event_type as string | undefined;
+  const pref = et ? prefs[et] : undefined;
+  if (pref === 'mute') return 'mute';
+  if (pref === 'surfaced') return 'high';
+  return classifySignalLevel(msg);
+}
+
 export function classifySignalLevel(msg: {
   message_type: string;
   from_type: string;

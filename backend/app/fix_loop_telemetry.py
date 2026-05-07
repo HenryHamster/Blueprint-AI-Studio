@@ -14,6 +14,7 @@ Append-or-replace by ``(loop, iteration)``: agents emit ``in_progress``
 first, then a final terminal event for the same iteration. Per-loop
 lists are capped so a runaway agent can't blow the column up.
 """
+
 from __future__ import annotations
 
 from typing import Any, Dict, List, Literal, Optional
@@ -49,14 +50,16 @@ MAX_ATTEMPTS_PER_LOOP = 50
 # Exit reasons that indicate the agent concluded the fix path is not converging.
 # Importable by retry_budget.py and admin_digest.py so suppression logic and
 # dashboard consumers share a single authoritative set.
-DIVERGENCE_EXIT_REASONS: frozenset[str] = frozenset({
-    "divergence_detected",
-    "divergence_oscillation",
-    "divergence_similar_error",
-    "divergence_diff_revert",
-    "runaway_detected",
-    "same_wrong_fix",
-})
+DIVERGENCE_EXIT_REASONS: frozenset[str] = frozenset(
+    {
+        "divergence_detected",
+        "divergence_oscillation",
+        "divergence_similar_error",
+        "divergence_diff_revert",
+        "runaway_detected",
+        "same_wrong_fix",
+    }
+)
 
 
 def normalize_fix_loop_error_fingerprint(message: str | None) -> str:
@@ -77,6 +80,7 @@ class FixLoopEventIn(BaseModel):
     ``Task.fix_loop_history`` is the ``model_dump()`` of this object —
     keep field names stable across versions.
     """
+
     model_config = ConfigDict(extra="ignore")
 
     loop: FixLoopName
@@ -179,7 +183,9 @@ def has_terminal_divergence(
     return None
 
 
-def summarize_fix_loop_history(history: Dict[str, Any] | None) -> Dict[str, Dict[str, Any]]:
+def summarize_fix_loop_history(
+    history: Dict[str, Any] | None,
+) -> Dict[str, Dict[str, Any]]:
     """Build a per-loop summary suitable for the admin read endpoint.
 
     For each known loop returns ``{"attempts": int, "last_exit_reason": str | None}``.
@@ -192,7 +198,9 @@ def summarize_fix_loop_history(history: Dict[str, Any] | None) -> Dict[str, Dict
         bucket = history.get(loop) or []
         last_exit_reason: Optional[str] = None
         if bucket:
-            last_exit_reason = bucket[-1].get("exit_reason") if isinstance(bucket[-1], dict) else None
+            last_exit_reason = (
+                bucket[-1].get("exit_reason") if isinstance(bucket[-1], dict) else None
+            )
         summary[loop] = {
             "attempts": len(bucket),
             "last_exit_reason": last_exit_reason,

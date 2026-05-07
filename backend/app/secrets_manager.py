@@ -7,6 +7,7 @@ logger = logging.getLogger(__name__)
 
 GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID", "your-gcp-project-id")
 
+
 async def store_user_secret(user_id: str, secret_name: str, secret_value: str) -> str:
     """
     Stores a sensitive token (like a GitHub PAT) in Google Secret Manager.
@@ -21,7 +22,9 @@ async def store_user_secret(user_id: str, secret_name: str, secret_value: str) -
 
         # 1. Create the secret (if it doesn't exist)
         try:
-            secret = client.get_secret(request={"name": f"{parent}/secrets/{full_secret_id}"})
+            secret = client.get_secret(
+                request={"name": f"{parent}/secrets/{full_secret_id}"}
+            )
         except Exception:
             secret = client.create_secret(
                 request={
@@ -44,6 +47,7 @@ async def store_user_secret(user_id: str, secret_name: str, secret_value: str) -
     except Exception:
         logger.exception(f"Failed to store secret {full_secret_id}")
         raise
+
 
 async def delete_user_secret(secret_resource_name: str) -> None:
     """

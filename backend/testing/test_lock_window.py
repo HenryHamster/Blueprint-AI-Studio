@@ -39,6 +39,7 @@ These tests exercise:
        mutation via raw SQL caught by populate_existing), and
        _ensure_branch success-path re-lock.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -60,10 +61,9 @@ from app.rollup_management import (
 )
 
 
-USE_POSTGRES = (
-    os.getenv("USE_TEST_POSTGRES", "").lower() == "true"
-    and os.getenv("DATABASE_URL", "").startswith("postgresql")
-)
+USE_POSTGRES = os.getenv("USE_TEST_POSTGRES", "").lower() == "true" and os.getenv(
+    "DATABASE_URL", ""
+).startswith("postgresql")
 
 
 # ── Helper-level unit tests ─────────────────────────────────────────────────
@@ -433,9 +433,11 @@ async def test_relock_detects_peer_mutation_via_content_snapshot(db_session):
     # Have a separate session advance the row's status — the kind of
     # peer mutation the lock-window-break is meant to detect.
     async with Session() as peer_session:
-        peer = (await peer_session.execute(
-            select(Task).where(Task.id == parent_id)
-        )).scalars().first()
+        peer = (
+            (await peer_session.execute(select(Task).where(Task.id == parent_id)))
+            .scalars()
+            .first()
+        )
         assert peer is not None
         peer.status = TaskStatus.COMPLETED
         peer_session.add(peer)
@@ -490,9 +492,11 @@ async def test_relock_bypasses_identity_map_cache(db_session):
     parent_id = parent.id
 
     # Read once to seed the identity-map cache with a copy of the row.
-    cached = (await db_session.execute(
-        select(Task).where(Task.id == parent_id)
-    )).scalars().first()
+    cached = (
+        (await db_session.execute(select(Task).where(Task.id == parent_id)))
+        .scalars()
+        .first()
+    )
     assert cached is not None
     assert cached.status == TaskStatus.EVALUATING
 
@@ -617,6 +621,7 @@ async def test_ensure_branch_returns_none_on_failure(monkeypatch, db_session):
 
     async def _always_404(*args, **kwargs):
         from fastapi import HTTPException
+
         raise HTTPException(status_code=404, detail="branch not found")
 
     async def _fake_create_raises(*args, **kwargs):
@@ -635,6 +640,7 @@ async def test_ensure_branch_returns_none_on_failure(monkeypatch, db_session):
     monkeypatch.setattr(tc_mod.asyncio, "sleep", _no_sleep)
     # Patch the deferred import to avoid circular pulls.
     import app.main as _main
+
     monkeypatch.setattr(_main, "_maybe_create_failure_alert", _fake_alert)
 
     result = await tc_mod._ensure_branch(
@@ -685,7 +691,8 @@ async def test_lock_task_for_mutation_validates_expected_snapshot(db_session):
     # Stale snapshot — claims status=QUEUED but the row is EVALUATING.
     stale_snapshot = {"status": TaskStatus.QUEUED}
     locked = await _lock_task_for_mutation(
-        db_session, task.id,
+        db_session,
+        task.id,
         allowed_statuses=(TaskStatus.EVALUATING,),
         reason="snapshot mismatch test",
         expected_snapshot=stale_snapshot,
@@ -699,7 +706,8 @@ async def test_lock_task_for_mutation_validates_expected_snapshot(db_session):
     # Matching snapshot — should succeed.
     matching_snapshot = {"status": TaskStatus.EVALUATING}
     locked2 = await _lock_task_for_mutation(
-        db_session, task.id,
+        db_session,
+        task.id,
         allowed_statuses=(TaskStatus.EVALUATING,),
         reason="snapshot match test",
         expected_snapshot=matching_snapshot,
@@ -735,7 +743,8 @@ async def test_lock_task_for_mutation_no_snapshot_means_no_validation(db_session
     await db_session.refresh(task)
 
     locked = await _lock_task_for_mutation(
-        db_session, task.id,
+        db_session,
+        task.id,
         allowed_statuses=(TaskStatus.EVALUATING,),
         reason="B3 backcompat",
     )
@@ -777,7 +786,11 @@ async def test_capture_ci_polling_snapshot_includes_all_5_fields():
 
     snapshot = _capture_ci_polling_snapshot(task)
     assert set(snapshot.keys()) == {
-        "status", "pr_number", "ci_passed", "review_approved", "iteration",
+        "status",
+        "pr_number",
+        "ci_passed",
+        "review_approved",
+        "iteration",
     }, (
         f"Snapshot must include exactly the 5 protected fields; got {set(snapshot.keys())}. "
         "Adding/removing keys is a contract change — update the CI polling sites in lockstep."
@@ -845,7 +858,8 @@ async def test_lock_with_matching_ci_snapshot_succeeds(db_session):
     pre_snapshot = _capture_ci_polling_snapshot(task)
 
     locked = await _lock_task_for_mutation(
-        db_session, task.id,
+        db_session,
+        task.id,
         allowed_statuses=(TaskStatus.EVALUATING,),
         reason="ci snapshot match test",
         expected_snapshot=pre_snapshot,
@@ -901,7 +915,8 @@ async def test_lock_with_mutated_status_defers(db_session):
         "iteration": 1,
     }
     locked = await _lock_task_for_mutation(
-        db_session, task.id,
+        db_session,
+        task.id,
         allowed_statuses=(TaskStatus.EVALUATING,),
         reason="ci snapshot status mutate test",
         expected_snapshot=stale_snapshot,
@@ -924,7 +939,10 @@ async def test_lock_with_mutated_status_defers(db_session):
     ],
 )
 async def test_lock_with_mutated_review_loop_field_defers(
-    db_session, field, old_value, new_value,
+    db_session,
+    field,
+    old_value,
+    new_value,
 ):
     """When any review_loop field tracked by the snapshot moves during
     the unlocked window, the re-lock must defer (return None). Each of
@@ -973,7 +991,8 @@ async def test_lock_with_mutated_review_loop_field_defers(
         field: old_value,
     }
     locked = await _lock_task_for_mutation(
-        db_session, task.id,
+        db_session,
+        task.id,
         allowed_statuses=(TaskStatus.EVALUATING,),
         reason=f"ci snapshot {field} mutate test",
         expected_snapshot=stale_snapshot,
@@ -1041,7 +1060,8 @@ async def test_lock_with_only_heartbeat_change_succeeds(db_session):
         )
 
     locked = await _lock_task_for_mutation(
-        db_session, task.id,
+        db_session,
+        task.id,
         allowed_statuses=(TaskStatus.EVALUATING,),
         reason="ci snapshot heartbeat overlap test",
         expected_snapshot=pre_snapshot,
@@ -1098,11 +1118,13 @@ async def test_release_parent_lock_persists_context_when_dirty_flag_set(db_sessi
     assert snapshot is not None
 
     # Re-read with populate_existing to bypass the identity-map cache.
-    fresh = (await db_session.execute(
-        select(Task)
-        .where(Task.id == parent_id)
-        .execution_options(populate_existing=True)
-    )).scalar_one()
+    fresh = (
+        await db_session.execute(
+            select(Task)
+            .where(Task.id == parent_id)
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one()
     assert fresh.context.get("new_key") == "new_value", (
         "context_dirty=True did not persist the in-place mutation — "
         "flag_modified is no longer firing on context. R5-W3-B contract broken."
@@ -1119,7 +1141,9 @@ async def test_release_parent_lock_persists_context_when_dirty_flag_set(db_sessi
     ),
 )
 @pytest.mark.asyncio
-async def test_release_parent_lock_silently_drops_context_when_dirty_flag_omitted(db_session):
+async def test_release_parent_lock_silently_drops_context_when_dirty_flag_omitted(
+    db_session,
+):
     """R5-W3-B FOOTGUN documentation: if a caller forgets
     ``context_dirty=True`` after mutating ``parent.context`` in-place,
     SQLA's mutation tracking misses the change and the UPDATE is
@@ -1162,9 +1186,9 @@ async def test_release_parent_lock_silently_drops_context_when_dirty_flag_omitte
         expire_on_commit=False,
     )
     async with Session() as fresh_session:
-        fresh = (await fresh_session.execute(
-            select(Task).where(Task.id == parent_id)
-        )).scalar_one()
+        fresh = (
+            await fresh_session.execute(select(Task).where(Task.id == parent_id))
+        ).scalar_one()
         # Document the silent-loss contract. If this assertion ever
         # changes (i.e. the mutation persists without context_dirty), it
         # means a future commit fixed the footgun — update the test
@@ -1265,9 +1289,7 @@ async def test_reaper_tool_trace_fallback_when_missing(db_session):
     await db_session.refresh(task)
 
     tail = _extract_tool_trace_tail(task)
-    assert tail == "", (
-        f"Expected empty tail for missing _tool_trace; got: {tail}"
-    )
+    assert tail == "", f"Expected empty tail for missing _tool_trace; got: {tail}"
 
     # Task with empty tool trace list
     task2 = Task(
@@ -1282,9 +1304,7 @@ async def test_reaper_tool_trace_fallback_when_missing(db_session):
     await db_session.refresh(task2)
 
     tail2 = _extract_tool_trace_tail(task2)
-    assert tail2 == "", (
-        f"Expected empty tail for empty _tool_trace; got: {tail2}"
-    )
+    assert tail2 == "", f"Expected empty tail for empty _tool_trace; got: {tail2}"
 
 
 # ── Heartbeat-stale cutoff with PR artifact (reaper.py feature) ──────────────
@@ -1380,6 +1400,7 @@ async def test_orphan_pr_handoff_fires_within_90s_window(db_session):
 
     # Import the cutoff function to verify the task meets the 90s orphan threshold
     from app.reaper import _heartbeat_stale_cutoff
+
     now = datetime.utcnow()
 
     # Verify the task's heartbeat is stale according to the 90s PR-cutoff

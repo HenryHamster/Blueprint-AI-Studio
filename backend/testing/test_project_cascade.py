@@ -14,6 +14,7 @@ These tests are gated to PostgreSQL because:
 The Postgres path is the production reality, and the only path where
 the cascade vs. caller-side-cleanup distinction actually matters.
 """
+
 import os
 import uuid
 
@@ -34,10 +35,9 @@ from app.models import (
 )
 
 
-USE_POSTGRES = (
-    os.getenv("USE_TEST_POSTGRES", "").lower() == "true"
-    and os.getenv("DATABASE_URL", "").startswith("postgresql")
-)
+USE_POSTGRES = os.getenv("USE_TEST_POSTGRES", "").lower() == "true" and os.getenv(
+    "DATABASE_URL", ""
+).startswith("postgresql")
 
 
 pytestmark = pytest.mark.skipif(
@@ -57,7 +57,9 @@ async def test_project_delete_cascades_all_dependents(db_session):
     await db_session.refresh(project)
 
     # ProjectMember
-    member = ProjectMember(project_id=project.id, user_id="user-cascade-test", role="owner")
+    member = ProjectMember(
+        project_id=project.id, user_id="user-cascade-test", role="owner"
+    )
     db_session.add(member)
 
     # Task (parent of Alert.task_id)
@@ -128,9 +130,9 @@ async def test_project_delete_cascades_all_dependents(db_session):
     await db_session.commit()
 
     # Project gone.
-    assert (await db_session.execute(
-        select(Project).where(Project.id == project.id)
-    )).scalar_one_or_none() is None
+    assert (
+        await db_session.execute(select(Project).where(Project.id == project.id))
+    ).scalar_one_or_none() is None
 
     # Every Project-FK child row is gone (CASCADE).
     for model, row_id in [
@@ -184,13 +186,17 @@ async def test_task_delete_nulls_alert_task_id(db_session):
     # pg_constraint.confdeltype codes:
     #   'a' = NO ACTION, 'r' = RESTRICT, 'c' = CASCADE,
     #   'n' = SET NULL,  'd' = SET DEFAULT.
-    fk_check = (await db_session.execute(text(
-        "SELECT confdeltype FROM pg_constraint WHERE conname = 'alert_task_id_fkey'"
-    ))).scalar_one_or_none()
+    fk_check = (
+        await db_session.execute(
+            text(
+                "SELECT confdeltype FROM pg_constraint WHERE conname = 'alert_task_id_fkey'"
+            )
+        )
+    ).scalar_one_or_none()
     # asyncpg returns the single-char as bytes; normalize.
     if isinstance(fk_check, (bytes, bytearray)):
         fk_check = fk_check.decode("ascii")
-    assert fk_check == 'n', (
+    assert fk_check == "n", (
         f"alert_task_id_fkey ondelete is {fk_check!r}, expected 'n' (SET NULL). "
         f"Migration 0056 may not have applied."
     )
@@ -202,21 +208,23 @@ async def test_task_delete_nulls_alert_task_id(db_session):
     # Read the column directly via raw SQL — SQLAlchemy's identity-map can
     # serve a cached Alert entity here, so a typed select(Alert) would mask
     # whether the DB-level SET NULL actually fired.
-    raw_task_id = (await db_session.execute(text(
-        "SELECT task_id FROM alert WHERE id = :id"
-    ), {"id": alert_id})).scalar_one_or_none()
+    raw_task_id = (
+        await db_session.execute(
+            text("SELECT task_id FROM alert WHERE id = :id"), {"id": alert_id}
+        )
+    ).scalar_one_or_none()
     assert raw_task_id is None, (
         f"alert.task_id={raw_task_id!r} after parent task delete, expected NULL "
         f"(FK ondelete=SET NULL did not fire)"
     )
 
     # Sanity: the alert row still exists (SET NULL, not CASCADE).
-    raw_id = (await db_session.execute(text(
-        "SELECT id FROM alert WHERE id = :id"
-    ), {"id": alert_id})).scalar_one_or_none()
-    assert raw_id == alert_id, (
-        "alert row was cascaded away — should have been SET NULL"
-    )
+    raw_id = (
+        await db_session.execute(
+            text("SELECT id FROM alert WHERE id = :id"), {"id": alert_id}
+        )
+    ).scalar_one_or_none()
+    assert raw_id == alert_id, "alert row was cascaded away — should have been SET NULL"
 
 
 @pytest.mark.asyncio
@@ -233,6 +241,6 @@ async def test_delete_nonexistent_project_is_clean(db_session):
     await db_session.execute(sql_delete(Project).where(Project.id == fake_id))
     await db_session.commit()
 
-    assert (await db_session.execute(
-        select(Project).where(Project.id == fake_id)
-    )).scalar_one_or_none() is None
+    assert (
+        await db_session.execute(select(Project).where(Project.id == fake_id))
+    ).scalar_one_or_none() is None

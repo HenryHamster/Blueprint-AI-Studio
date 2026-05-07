@@ -22,7 +22,17 @@ from sqlmodel import select
 
 import app.shared_state as _shared_state
 from app.database import AsyncSessionLocal, init_db
-from app.models import AllowedUser, Alert, AlertSeverity, Project, Task, TaskHistory, TaskStatus
+from app.models import (
+    AllowedUser,
+    Alert,
+    AlertSeverity,
+    Project,
+    RegressionCaseStatus,
+    RegressionRemediationCase,
+    Task,
+    TaskHistory,
+    TaskStatus,
+)
 from app.payload_schemas import validate_internal_payload
 from app.time_utils import _utcnow
 
@@ -53,6 +63,7 @@ async def _spawn_crash_investigations(
     if service_name == "reaper":
         try:
             from app.reaper import get_reaper_stats  # noqa: PLC0415
+
             stats = get_reaper_stats()
             reaper_stats_str = (
                 f"\nReaper telemetry: cycles_completed={stats['cycles_completed_total']}, "
@@ -76,33 +87,66 @@ async def _spawn_crash_investigations(
         f"severity, confidence, affected_files."
     )
 
+    regression_class = f"background_service_crash:{service_name}"
     active_statuses = (
-        TaskStatus.QUEUED, TaskStatus.PROVISIONING,
-        TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING,
+        TaskStatus.QUEUED,
+        TaskStatus.PROVISIONING,
+        TaskStatus.IN_PROGRESS,
+        TaskStatus.EVALUATING,
     )
     spawned_count = 0
     async with AsyncSessionLocal() as session:
-        projects = (await session.execute(
-            select(Project).options(load_only(Project.id))
-        )).scalars().all()
+        projects = (
+            (await session.execute(select(Project).options(load_only(Project.id))))
+            .scalars()
+            .all()
+        )
 
         for project in projects:
             pid_str = str(project.id)
             if pid_str in inflight:
                 continue
             # DB dedup: skip if an active crash investigation already exists for this service+project
-            existing = (await session.execute(
-                select(Task.id).where(
-                    Task.project_id == project.id,
-                    Task.status.in_(active_statuses),
-                    Task.context.op("@>")(_cast(
-                        {"spawned_by": "crash_investigation", "service_name": service_name},
-                        _JSONB,
-                    )),
+            existing = (
+                await session.execute(
+                    select(Task.id).where(
+                        Task.project_id == project.id,
+                        Task.status.in_(active_statuses),
+                        Task.context.op("@>")(
+                            _cast(
+                                {
+                                    "spawned_by": "crash_investigation",
+                                    "service_name": service_name,
+                                },
+                                _JSONB,
+                            )
+                        ),
+                    )
                 )
-            )).first()
+            ).first()
             if existing:
                 inflight[pid_str] = str(existing[0])
+                continue
+
+            # Suppress re-spawn when the case is already awaiting manual intervention.
+            existing_case = (
+                (
+                    await session.execute(
+                        select(RegressionRemediationCase).where(
+                            RegressionRemediationCase.project_id == project.id,
+                            RegressionRemediationCase.regression_class
+                            == regression_class,
+                        )
+                    )
+                )
+                .scalars()
+                .first()
+            )
+            if (
+                existing_case is not None
+                and existing_case.status
+                == RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION
+            ):
                 continue
 
             payload = validate_internal_payload(
@@ -120,7 +164,7 @@ async def _spawn_crash_investigations(
                 context={
                     "spawned_by": "crash_investigation",
                     "service_name": service_name,
-                    "regression_class": f"background_service_crash:{service_name}",
+                    "regression_class": regression_class,
                     "exception_type": exc_type,
                     "exception_message": cause_str[:500],
                     "diagnosis_trigger": "background_service_crash",
@@ -131,22 +175,45 @@ async def _spawn_crash_investigations(
                 created_by="ORCHESTRATOR",
             )
             session.add(new_task)
-            session.add(TaskHistory(
-                task_id=new_task.id,
-                action="SPAWNED",
-                details={
-                    "spawned_by": "CRASH_INVESTIGATION",
-                    "service_name": service_name,
-                    "crash_count": crash_count,
-                },
-            ))
+            session.add(
+                TaskHistory(
+                    task_id=new_task.id,
+                    action="SPAWNED",
+                    details={
+                        "spawned_by": "CRASH_INVESTIGATION",
+                        "service_name": service_name,
+                        "crash_count": crash_count,
+                    },
+                )
+            )
             await session.flush()
+            signal_snapshot = {
+                "service_name": service_name,
+                "crash_count": crash_count,
+                "exception_type": exc_type,
+                "captured_at": _utcnow().isoformat(),
+            }
+            if existing_case is None:
+                session.add(
+                    RegressionRemediationCase.create_for_spawn(
+                        project_id=project.id,
+                        regression_class=regression_class,
+                        signal_snapshot=signal_snapshot,
+                        task_id=new_task.id,
+                    )
+                )
+            else:
+                existing_case.record_spawn(signal_snapshot, new_task.id)
+                session.add(existing_case)
             inflight[pid_str] = str(new_task.id)
             spawned_count += 1
             logger.info(
                 "[MONITOR] Spawned crash investigation for service '%s' "
                 "(project=%s, crashes=%d, task=%s)",
-                service_name, pid_str, crash_count, new_task.id,
+                service_name,
+                pid_str,
+                crash_count,
+                new_task.id,
             )
 
         if spawned_count:
@@ -156,7 +223,9 @@ async def _spawn_crash_investigations(
 async def _seed_initial_admin():
     """Seed the AllowedUser table with an initial admin if empty."""
     async with AsyncSessionLocal() as seed_session:
-        count = (await seed_session.execute(select(_func.count()).select_from(AllowedUser))).scalar_one()
+        count = (
+            await seed_session.execute(select(_func.count()).select_from(AllowedUser))
+        ).scalar_one()
         if count == 0:
             initial_email = os.getenv("INITIAL_ADMIN_EMAIL")
             if initial_email:
@@ -164,7 +233,9 @@ async def _seed_initial_admin():
                 await seed_session.commit()
                 logger.info(f"[STARTUP] Seeded initial admin: {initial_email}")
             else:
-                logger.warning("[STARTUP] AllowedUser table is empty and INITIAL_ADMIN_EMAIL not set. No users can sign in.")
+                logger.warning(
+                    "[STARTUP] AllowedUser table is empty and INITIAL_ADMIN_EMAIL not set. No users can sign in."
+                )
 
 
 @asynccontextmanager
@@ -177,8 +248,8 @@ async def lifespan(app):
     if not logging.root.handlers:
         logging.basicConfig(
             level=logging.INFO,
-            format='%(asctime)s [%(name)s] %(levelname)s %(message)s',
-            datefmt='%Y-%m-%dT%H:%M:%S',
+            format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
+            datefmt="%Y-%m-%dT%H:%M:%S",
             force=True,
         )
     # Route Python warnings (RuntimeWarning, DeprecationWarning, etc.) through the
@@ -190,8 +261,12 @@ async def lifespan(app):
     # to ERROR; everything else stays at WARNING.
     _warnings_logger = logging.getLogger("py.warnings")
 
-    def _show_warning_via_logger(message, category, filename, lineno, file=None, line=None):
-        formatted = warnings.formatwarning(message, category, filename, lineno, line).rstrip()
+    def _show_warning_via_logger(
+        message, category, filename, lineno, file=None, line=None
+    ):
+        formatted = warnings.formatwarning(
+            message, category, filename, lineno, line
+        ).rstrip()
         if issubclass(category, RuntimeWarning):
             _warnings_logger.error(formatted)
         else:
@@ -257,10 +332,13 @@ async def lifespan(app):
     _shared_state.is_leader = is_leader
 
     if not is_leader:
-        logger.info("[STARTUP] Not background-leader; skipping leader-only services (serving HTTP only)")
+        logger.info(
+            "[STARTUP] Not background-leader; skipping leader-only services (serving HTTP only)"
+        )
         # Per-instance services still run on non-leader instances.
         config_sync_task = asyncio.create_task(runtime_config_sync_service())
         from app.shared_state import background_tasks as _bg_tasks_nl
+
         _bg_tasks_nl["config_sync"] = config_sync_task
 
         # Minimal watchdog: restart per-instance services if they crash, AND
@@ -277,9 +355,17 @@ async def lifespan(app):
                 try:
                     await asyncio.sleep(30)
                     if config_sync_task.done():
-                        exc = config_sync_task.exception() if not config_sync_task.cancelled() else None
-                        logger.error(f"[MONITOR] config_sync DIED on non-leader (exc={exc}); restarting")
-                        _bg_tasks_nl["config_sync"] = asyncio.create_task(runtime_config_sync_service())
+                        exc = (
+                            config_sync_task.exception()
+                            if not config_sync_task.cancelled()
+                            else None
+                        )
+                        logger.error(
+                            f"[MONITOR] config_sync DIED on non-leader (exc={exc}); restarting"
+                        )
+                        _bg_tasks_nl["config_sync"] = asyncio.create_task(
+                            runtime_config_sync_service()
+                        )
 
                     # Leader-lock probe. Try to acquire on a fresh session;
                     # if we win, the previous leader's session has closed and
@@ -289,10 +375,14 @@ async def lifespan(app):
                     # selected cleanly.
                     try:
                         async with AsyncSessionLocal() as _probe_session:
-                            _probe_acquired = bool((await _probe_session.execute(
-                                _text("SELECT pg_try_advisory_lock(:lock_id)"),
-                                {"lock_id": _BACKGROUND_LOCK_ID},
-                            )).scalar())
+                            _probe_acquired = bool(
+                                (
+                                    await _probe_session.execute(
+                                        _text("SELECT pg_try_advisory_lock(:lock_id)"),
+                                        {"lock_id": _BACKGROUND_LOCK_ID},
+                                    )
+                                ).scalar()
+                            )
                             if _probe_acquired:
                                 # Release before exiting so the respawned
                                 # process (or a peer that probes during our
@@ -314,6 +404,7 @@ async def lifespan(app):
                             # leader-only state and the per-instance services
                             # we own (config_sync) are restartable.
                             import os as _os
+
                             _os._exit(0)
                     except Exception as _probe_exc:
                         logger.warning(
@@ -334,13 +425,16 @@ async def lifespan(app):
         config_sync_task.cancel()
         try:
             await asyncio.wait_for(
-                asyncio.gather(nl_monitor_task, config_sync_task, return_exceptions=True),
+                asyncio.gather(
+                    nl_monitor_task, config_sync_task, return_exceptions=True
+                ),
                 timeout=10.0,
             )
         except asyncio.TimeoutError:
             logger.warning("[SHUTDOWN] Non-leader tasks didn't finish within 10s")
         await close_github_client()
         from app.redis_client import close_redis
+
         await close_redis()
         return
 
@@ -368,26 +462,35 @@ async def lifespan(app):
     async def _regression_recovery_scan_service():
         """Periodic leader-only scan: re-evaluates MERGED regression cases."""
         from app.pipeline_regression_dispatcher import run_recovery_once  # noqa: PLC0415
+
         _SCAN_INTERVAL = 300  # 5 minutes
         while True:
             await asyncio.sleep(_SCAN_INTERVAL)
             try:
                 async with AsyncSessionLocal() as scan_session:
-                    projects = (await scan_session.execute(
-                        select(Project).options(load_only(Project.id))
-                    )).scalars().all()
+                    projects = (
+                        (
+                            await scan_session.execute(
+                                select(Project).options(load_only(Project.id))
+                            )
+                        )
+                        .scalars()
+                        .all()
+                    )
                     for project in projects:
                         try:
                             changed = await run_recovery_once(scan_session, project.id)
                             if changed:
                                 logger.info(
                                     "[RECOVERY_SCAN] project=%s changed=%d",
-                                    project.id, changed,
+                                    project.id,
+                                    changed,
                                 )
                         except Exception as proj_exc:
                             logger.warning(
                                 "[RECOVERY_SCAN] project=%s error=%s",
-                                project.id, proj_exc,
+                                project.id,
+                                proj_exc,
                             )
             except asyncio.CancelledError:
                 raise
@@ -404,31 +507,44 @@ async def lifespan(app):
         more than enough to catch staleness without burning DB cycles.
         """
         from app.pipeline_regression_dispatcher import run_watchdog_once  # noqa: PLC0415
+
         _SCAN_INTERVAL = 1800  # 30 minutes
         while True:
             await asyncio.sleep(_SCAN_INTERVAL)
             try:
                 async with AsyncSessionLocal() as scan_session:
-                    projects = (await scan_session.execute(
-                        select(Project).options(load_only(Project.id))
-                    )).scalars().all()
+                    projects = (
+                        (
+                            await scan_session.execute(
+                                select(Project).options(load_only(Project.id))
+                            )
+                        )
+                        .scalars()
+                        .all()
+                    )
                     for project in projects:
                         try:
-                            escalated = await run_watchdog_once(scan_session, project.id)
+                            escalated = await run_watchdog_once(
+                                scan_session, project.id
+                            )
                             if escalated:
                                 logger.info(
                                     "[REGRESSION_WATCHDOG] project=%s escalated=%d",
-                                    project.id, escalated,
+                                    project.id,
+                                    escalated,
                                 )
                         except Exception as proj_exc:
                             logger.warning(
                                 "[REGRESSION_WATCHDOG] project=%s error=%s",
-                                project.id, proj_exc,
+                                project.id,
+                                proj_exc,
                             )
             except asyncio.CancelledError:
                 raise
             except Exception as scan_exc:
-                logger.error("[REGRESSION_WATCHDOG] scan error: %s", scan_exc, exc_info=True)
+                logger.error(
+                    "[REGRESSION_WATCHDOG] scan error: %s", scan_exc, exc_info=True
+                )
 
     regression_watchdog_task = asyncio.create_task(_regression_watchdog_scan_service())
 
@@ -442,10 +558,13 @@ async def lifespan(app):
     # Refresh per-account model-availability caches every 30 min so a
     # provider-side preview-access change doesn't sit in dispatch rotation
     # for hours (audit E13).
-    availability_refresh_task = asyncio.create_task(account_availability_refresh_service())
+    availability_refresh_task = asyncio.create_task(
+        account_availability_refresh_service()
+    )
 
     # Store references for admin restart endpoint
     from app.shared_state import background_tasks as _bg_tasks
+
     _bg_tasks["orchestrator"] = orchestrator_task
     _bg_tasks["reaper"] = reaper_task
     _bg_tasks["gcp_cleanup"] = gcp_cleanup_task
@@ -469,7 +588,9 @@ async def lifespan(app):
         # Crash-episode tracking: timestamps of recent crashes per service, and
         # in-flight investigation task IDs per (service, project_id).
         crash_timestamps: Dict[str, list] = {}  # name -> [datetime, ...]
-        _inflight_crash_investigations: Dict[str, Dict[str, str]] = {}  # name -> {pid_str: task_id_str}
+        _inflight_crash_investigations: Dict[
+            str, Dict[str, str]
+        ] = {}  # name -> {pid_str: task_id_str}
         task_factories = {
             "orchestrator": orchestrator_worker,
             "reaper": reaper_service,
@@ -492,6 +613,7 @@ async def lifespan(app):
                 # is still running, cancel so the normal restart path below kicks in.
                 try:
                     from app import orchestrator as _orch  # noqa: PLC0415
+
                     orch_task = tasks.get("orchestrator")
                     if orch_task is not None and not orch_task.done():
                         last = _orch._orchestrator_last_cycle
@@ -515,7 +637,9 @@ async def lifespan(app):
                                 f"[MONITOR] Orchestrator appears hung — {reason}. "
                                 f"Cancelling task so restart path re-spawns it."
                             )
-                            cancel_reasons["orchestrator"] = f"watchdog cancelled: {reason}"
+                            cancel_reasons["orchestrator"] = (
+                                f"watchdog cancelled: {reason}"
+                            )
                             orch_task.cancel()
                 except Exception as wd_exc:
                     logger.warning(f"[MONITOR] Watchdog check failed: {wd_exc}")
@@ -532,22 +656,44 @@ async def lifespan(app):
                             cause_str = cancel_reason
                         else:
                             cause_str = "task cancelled (no exception)"
-                        logger.error(f"[MONITOR] Background task '{name}' DIED! Cause: {cause_str}")
-                        asyncio.create_task(_send_webhook_notification("SERVICE_CRASHED", f"Background service crashed: {name}", cause_str))
+                        logger.error(
+                            f"[MONITOR] Background task '{name}' DIED! Cause: {cause_str}"
+                        )
+                        asyncio.create_task(
+                            _send_webhook_notification(
+                                "SERVICE_CRASHED",
+                                f"Background service crashed: {name}",
+                                cause_str,
+                            )
+                        )
                         try:
                             async with AsyncSessionLocal() as alert_session:
-                                projects = (await alert_session.execute(
-                                    select(Project).options(load_only(Project.id))
-                                )).scalars().all()
+                                projects = (
+                                    (
+                                        await alert_session.execute(
+                                            select(Project).options(
+                                                load_only(Project.id)
+                                            )
+                                        )
+                                    )
+                                    .scalars()
+                                    .all()
+                                )
                                 alert_title = f"Background service crashed: {name}"
                                 for project in projects:
-                                    existing = (await alert_session.execute(
-                                        select(Alert).where(
-                                            Alert.project_id == project.id,
-                                            Alert.title == alert_title,
-                                            Alert.dismissed_at.is_(None),
+                                    existing = (
+                                        (
+                                            await alert_session.execute(
+                                                select(Alert).where(
+                                                    Alert.project_id == project.id,
+                                                    Alert.title == alert_title,
+                                                    Alert.dismissed_at.is_(None),
+                                                )
+                                            )
                                         )
-                                    )).scalars().first()
+                                        .scalars()
+                                        .first()
+                                    )
                                     if existing:
                                         continue
                                     alert = Alert(
@@ -559,7 +705,9 @@ async def lifespan(app):
                                     alert_session.add(alert)
                                 await alert_session.commit()
                         except Exception as alert_exc:
-                            logger.warning(f"[MONITOR] Failed to create crash alert: {alert_exc}")
+                            logger.warning(
+                                f"[MONITOR] Failed to create crash alert: {alert_exc}"
+                            )
 
                         # Track crash timestamp and check episode threshold.
                         now_ts = _utcnow()
@@ -571,7 +719,9 @@ async def lifespan(app):
                         # Spawn an investigate task when 3+ crashes occur in 10 min
                         _CRASH_EPISODE_THRESHOLD = 3
                         if len(crash_timestamps[name]) >= _CRASH_EPISODE_THRESHOLD:
-                            inflight = _inflight_crash_investigations.setdefault(name, {})
+                            inflight = _inflight_crash_investigations.setdefault(
+                                name, {}
+                            )
                             try:
                                 await _spawn_crash_investigations(
                                     service_name=name,
@@ -583,7 +733,8 @@ async def lifespan(app):
                             except Exception as ci_exc:
                                 logger.warning(
                                     "[MONITOR] Failed to spawn crash investigations for '%s': %s",
-                                    name, ci_exc,
+                                    name,
+                                    ci_exc,
                                 )
 
                         factory = task_factories.get(name)
@@ -596,16 +747,25 @@ async def lifespan(app):
                         # separately (the monitor loop itself is cancelled
                         # during shutdown, exiting before reaching here).
                         if factory:
-                            state = restart_state.setdefault(name, {"attempts": 0, "last_restart": None})
+                            state = restart_state.setdefault(
+                                name, {"attempts": 0, "last_restart": None}
+                            )
                             now = _utcnow()
                             # Reset attempts if last restart was >5 min ago (ran long enough to be stable)
-                            if state["last_restart"] and (now - state["last_restart"]).total_seconds() > 300:
+                            if (
+                                state["last_restart"]
+                                and (now - state["last_restart"]).total_seconds() > 300
+                            ):
                                 state["attempts"] = 0
                                 crash_timestamps.pop(name, None)
                                 _inflight_crash_investigations.pop(name, None)
-                            backoff = min(2 ** state["attempts"], 300)  # 1s, 2s, 4s, ... cap 5min
+                            backoff = min(
+                                2 ** state["attempts"], 300
+                            )  # 1s, 2s, 4s, ... cap 5min
                             if backoff > 1:
-                                logger.warning(f"[MONITOR] Backing off {backoff}s before restarting {name} (attempt #{state['attempts'] + 1})")
+                                logger.warning(
+                                    f"[MONITOR] Backing off {backoff}s before restarting {name} (attempt #{state['attempts'] + 1})"
+                                )
                                 await asyncio.sleep(backoff)
                             state["attempts"] += 1
                             state["last_restart"] = _utcnow()
@@ -613,9 +773,17 @@ async def lifespan(app):
                             tasks[name] = asyncio.create_task(factory())
                             try:
                                 async with AsyncSessionLocal() as alert_session:
-                                    projects = (await alert_session.execute(
-                                        select(Project).options(load_only(Project.id))
-                                    )).scalars().all()
+                                    projects = (
+                                        (
+                                            await alert_session.execute(
+                                                select(Project).options(
+                                                    load_only(Project.id)
+                                                )
+                                            )
+                                        )
+                                        .scalars()
+                                        .all()
+                                    )
                                     for project in projects:
                                         alert = Alert(
                                             project_id=project.id,
@@ -626,26 +794,45 @@ async def lifespan(app):
                                         alert_session.add(alert)
                                     await alert_session.commit()
                             except Exception as alert_exc:
-                                logger.warning(f"[MONITOR] Failed to create restart alert: {alert_exc}")
+                                logger.warning(
+                                    f"[MONITOR] Failed to create restart alert: {alert_exc}"
+                                )
             except Exception as mon_exc:
-                logger.error(f"[MONITOR] Monitor itself hit exception: {mon_exc}", exc_info=True)
+                logger.error(
+                    f"[MONITOR] Monitor itself hit exception: {mon_exc}", exc_info=True
+                )
                 await asyncio.sleep(10)  # Brief pause before retrying
+
     monitor_task = asyncio.create_task(_monitor_background_tasks())
 
     yield
     # Shutdown: graceful cleanup with timeout to let in-flight operations finish
-    tasks_to_cancel = [reaper_task, gcp_cleanup_task, gcp_image_cleanup_task, secret_recon_task, stale_branch_task, auto_archive_task, regression_recovery_task, regression_watchdog_task, orchestrator_task, config_sync_task, monitor_task]
+    tasks_to_cancel = [
+        reaper_task,
+        gcp_cleanup_task,
+        gcp_image_cleanup_task,
+        secret_recon_task,
+        stale_branch_task,
+        auto_archive_task,
+        regression_recovery_task,
+        regression_watchdog_task,
+        orchestrator_task,
+        config_sync_task,
+        monitor_task,
+    ]
     for t in tasks_to_cancel:
         t.cancel()
     try:
         await asyncio.wait_for(
-            asyncio.gather(*tasks_to_cancel, return_exceptions=True),
-            timeout=10.0
+            asyncio.gather(*tasks_to_cancel, return_exceptions=True), timeout=10.0
         )
     except asyncio.TimeoutError:
-        logger.warning("[SHUTDOWN] Background tasks didn't finish within 10s grace period")
+        logger.warning(
+            "[SHUTDOWN] Background tasks didn't finish within 10s grace period"
+        )
     await close_github_client()
     from app.redis_client import close_redis
+
     await close_redis()
     # Release the session-scoped advisory lock by closing the dedicated session.
     if leader_session is not None:

@@ -7,6 +7,7 @@ Anomaly detection, research completion, and strategic completion handlers have
 been further extracted into their own modules (anomaly_detection.py,
 research_completion.py, strategic_completion.py).
 """
+
 import asyncio
 import json
 import logging
@@ -21,8 +22,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
-from app.github import create_branch, create_pr_comment, get_branch_sha, get_open_pull_requests
-from app.github import BLUEPRINT_PR_MERGE_SUMMARY_MARKER, build_blueprint_pr_merge_summary_comment  # noqa: F401
+from app.github import (
+    BLUEPRINT_PR_MERGE_SUMMARY_MARKER,  # noqa: F401  (re-exported for tests / downstream)
+    build_blueprint_pr_merge_summary_comment,  # noqa: F401  (re-exported for tests / downstream)
+    create_branch,
+    create_pr_comment,
+    get_branch_sha,
+    get_open_pull_requests,
+)
 from app.models import (
     DIAGNOSIS_IN_PROGRESS_KEY,
     DIAGNOSIS_STARTED_AT_KEY,
@@ -124,11 +131,19 @@ def build_blueprint_pr_footer(
 
 
 async def patch_pr_body_with_blueprint_meta(
-    gh_token: str, owner: str, repo: str, pr_number: int, footer: str,
+    gh_token: str,
+    owner: str,
+    repo: str,
+    pr_number: int,
+    footer: str,
 ) -> None:
     """Best-effort: append or replace the blueprint:meta footer in a GitHub PR body."""
     import httpx  # noqa: PLC0415
-    headers = {"Authorization": f"Bearer {gh_token}", "Accept": "application/vnd.github+json"}
+
+    headers = {
+        "Authorization": f"Bearer {gh_token}",
+        "Accept": "application/vnd.github+json",
+    }
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.get(
             f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}",
@@ -152,7 +167,10 @@ def _compute_first_attempt_succeeded(attempt_count: int, status: "TaskStatus") -
 
 
 def _stamp_orphan_remediation_outcome(
-    task: Task, *, merged: bool, direction_id: str,
+    task: Task,
+    *,
+    merged: bool,
+    direction_id: str,
 ) -> None:
     """Record an orphan remediation outcome on the task itself when the linked
     direction no longer exists. Writes to ``task.context['orphan_remediation_outcome']``
@@ -168,6 +186,7 @@ def _stamp_orphan_remediation_outcome(
         outcome["fingerprint"] = str(fingerprint)
     if not merged:
         from app.failure_classification import classify_failure  # noqa: PLC0415
+
         outcome["failure_class"] = classify_failure(task)
         outcome["error_summary"] = (task.latest_status_message or "")[:200]
     ctx["orphan_remediation_outcome"] = outcome
@@ -175,7 +194,9 @@ def _stamp_orphan_remediation_outcome(
     flag_modified(task, "context")
 
 
-def _stamp_remediation_spawn_on_direction(direction: Dict[str, Any], task: Task) -> None:
+def _stamp_remediation_spawn_on_direction(
+    direction: Dict[str, Any], task: Task
+) -> None:
     """Record that a remediation task is in flight without declaring its outcome."""
     ctx = task.context or {}
     direction["last_remediation_at"] = _utcnow().isoformat()
@@ -190,7 +211,10 @@ def _stamp_remediation_spawn_on_direction(direction: Dict[str, Any], task: Task)
 
 
 async def _record_remediation_outcome(
-    task: Task, *, merged: bool, session: AsyncSession,
+    task: Task,
+    *,
+    merged: bool,
+    session: AsyncSession,
 ) -> bool:
     """Record remediation outcome on the direction the remediation targeted.
 
@@ -221,7 +245,9 @@ async def _record_remediation_outcome(
         # outcome is not silently discarded — operators and the diagnosis
         # pipeline can still find what happened via task.context.
         _stamp_orphan_remediation_outcome(
-            task, merged=merged, direction_id=str(direction_id),
+            task,
+            merged=merged,
+            direction_id=str(direction_id),
         )
         return False
     fingerprint = ctx.get("diagnosis_fingerprint") or ctx.get("error_fingerprint")
@@ -272,8 +298,11 @@ async def _record_remediation_outcome(
                 )
     else:
         from app.failure_classification import classify_failure  # noqa: PLC0415
+
         target["last_remediation_failure_class"] = classify_failure(task)
-        target["last_remediation_error_summary"] = (task.latest_status_message or "")[:200]
+        target["last_remediation_error_summary"] = (task.latest_status_message or "")[
+            :200
+        ]
         history_entry["failure_class"] = target["last_remediation_failure_class"]
         history_entry["error_summary"] = target["last_remediation_error_summary"]
         if fingerprint:
@@ -325,7 +354,9 @@ def _propagate_remediation_success_to_siblings(
     from app.anomaly_detection import find_directions_sharing_fingerprint  # noqa: PLC0415
 
     siblings = find_directions_sharing_fingerprint(
-        project, fingerprint, exclude_direction_id=successful_direction_id,
+        project,
+        fingerprint,
+        exclude_direction_id=successful_direction_id,
     )
     if not siblings:
         return
@@ -370,14 +401,18 @@ def _propagate_remediation_success_to_siblings(
         direction["last_remediation_result"] = "merged"
         direction["last_remediation_at"] = now_iso
         if successful_direction_id:
-            direction["cross_direction_remediation_source"] = str(successful_direction_id)
+            direction["cross_direction_remediation_source"] = str(
+                successful_direction_id
+            )
         notes = list(direction.get("notes") or [])
-        notes.append({
-            "text": note_text,
-            "added_at": now_iso,
-            "added_by_task": str(task.id),
-            "source": "sibling_remediation_success",
-        })
+        notes.append(
+            {
+                "text": note_text,
+                "added_at": now_iso,
+                "added_by_task": str(task.id),
+                "source": "sibling_remediation_success",
+            }
+        )
         direction["notes"] = notes[-STRATEGIC_NOTES_HISTORY_MAX:]
 
 
@@ -403,7 +438,9 @@ def _propagate_remediation_failure_to_siblings(
     from app.anomaly_detection import find_directions_sharing_fingerprint  # noqa: PLC0415
 
     siblings = find_directions_sharing_fingerprint(
-        project, fingerprint, exclude_direction_id=failed_direction_id,
+        project,
+        fingerprint,
+        exclude_direction_id=failed_direction_id,
     )
     if not siblings:
         return
@@ -432,12 +469,14 @@ def _propagate_remediation_failure_to_siblings(
         if direction.get("id") not in sibling_ids:
             continue
         notes = list(direction.get("notes") or [])
-        notes.append({
-            "text": note_text,
-            "added_at": now_iso,
-            "added_by_task": str(task.id),
-            "source": "sibling_remediation_failure",
-        })
+        notes.append(
+            {
+                "text": note_text,
+                "added_at": now_iso,
+                "added_by_task": str(task.id),
+                "source": "sibling_remediation_failure",
+            }
+        )
         direction["notes"] = notes[-STRATEGIC_NOTES_HISTORY_MAX:]
 
 
@@ -445,7 +484,10 @@ _PROJECT_REMEDIATION_HISTORY_MAX = 20
 
 
 async def _record_project_remediation_outcome(
-    task: Task, *, merged: bool, session: AsyncSession,
+    task: Task,
+    *,
+    merged: bool,
+    session: AsyncSession,
 ) -> bool:
     """Record a CI auto-remediation outcome at the project level when no
     direction_id is linked, so unlinked-fix effectiveness is still trackable
@@ -473,6 +515,7 @@ async def _record_project_remediation_outcome(
     error_summary: Optional[str] = None
     if not merged:
         from app.failure_classification import classify_failure  # noqa: PLC0415
+
         failure_class = classify_failure(task)
         error_summary = (task.latest_status_message or "")[:200]
         entry["failure_class"] = failure_class
@@ -526,7 +569,9 @@ async def _record_project_remediation_outcome(
 
 
 async def _record_remediation_if_terminal(
-    task: Task, status: "TaskStatus", session: AsyncSession,
+    task: Task,
+    status: "TaskStatus",
+    session: AsyncSession,
 ) -> None:
     """Stamp remediation outcome on the linked direction when a diagnosis-spawned task terminates.
 
@@ -537,7 +582,9 @@ async def _record_remediation_if_terminal(
     if status not in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
         return
     ctx = task.context or {}
-    has_direction_linkage = bool(ctx.get("diagnosis_task_id") and ctx.get("direction_id"))
+    has_direction_linkage = bool(
+        ctx.get("diagnosis_task_id") and ctx.get("direction_id")
+    )
     # Audit W1: auto_remediation is now a column.
     is_auto_remediation = bool(getattr(task, "auto_remediation", False))
     if not has_direction_linkage and not is_auto_remediation:
@@ -547,14 +594,25 @@ async def _record_remediation_if_terminal(
     # pipeline exhausts its iteration cap. Recording on the PR-creating task's
     # COMPLETED would prematurely stamp merged=True before review/CI has run.
     # FAILED/CANCELLED still record immediately since no viable PR exists.
-    _REVIEW_PIPELINE_TYPES = {"create", "refactor", "docs", "qa", "deps", "migrate", "fix", "review"}
+    _REVIEW_PIPELINE_TYPES = {
+        "create",
+        "refactor",
+        "docs",
+        "qa",
+        "deps",
+        "migrate",
+        "fix",
+        "review",
+    }
     if status == TaskStatus.COMPLETED:
         task_type = (task.first_payload or {}).get("type")
         if task_type in _REVIEW_PIPELINE_TYPES:
             return
     try:
         recorded = await _record_remediation_outcome(
-            task, merged=(status == TaskStatus.COMPLETED), session=session,
+            task,
+            merged=(status == TaskStatus.COMPLETED),
+            session=session,
         )
         if recorded and status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
             await _maybe_spawn_followup_investigation(task, session)
@@ -566,21 +624,35 @@ async def _record_remediation_if_terminal(
             had_direction_linkage = bool(ctx.get("direction_id"))
             if is_auto_remediation or had_direction_linkage:
                 await _record_project_remediation_outcome(
-                    task, merged=(status == TaskStatus.COMPLETED), session=session,
+                    task,
+                    merged=(status == TaskStatus.COMPLETED),
+                    session=session,
                 )
     except Exception as exc:
-        logger.warning(f"[DIAGNOSIS] Failed to record remediation outcome for task {task.id}: {exc!r}")
+        logger.warning(
+            f"[DIAGNOSIS] Failed to record remediation outcome for task {task.id}: {exc!r}"
+        )
 
 
 async def _record_regression_signal_if_matching(
-    task: Task, status: "TaskStatus", session: AsyncSession,
+    task: Task,
+    status: "TaskStatus",
+    session: AsyncSession,
 ) -> None:
     """Stamp remediation_regression_signal when a non-remediation failure during
     the monitoring window matches the last-remediated fingerprint."""
     from app.models import RegressionCaseStatus, RegressionRemediationCase  # noqa: PLC0415
+
     ctx = task.context or {}
     if status == TaskStatus.COMPLETED and (task.first_payload or {}).get("type") in {
-        "create", "refactor", "docs", "qa", "deps", "migrate", "fix", "review",
+        "create",
+        "refactor",
+        "docs",
+        "qa",
+        "deps",
+        "migrate",
+        "fix",
+        "review",
     }:
         return
     regression_class = ctx.get("regression_class")
@@ -626,8 +698,11 @@ async def _record_regression_signal_if_matching(
     if not monitor_started_at or not last_rem_fp:
         return
     from app.direction_lifecycle import _REMEDIATION_MONITOR_EXPIRY_DAYS  # noqa: PLC0415
+
     try:
-        age_days = (_utcnow() - datetime.fromisoformat(monitor_started_at)).total_seconds() / 86400
+        age_days = (
+            _utcnow() - datetime.fromisoformat(monitor_started_at)
+        ).total_seconds() / 86400
         if age_days > _REMEDIATION_MONITOR_EXPIRY_DAYS:
             return
     except (TypeError, ValueError):
@@ -638,6 +713,7 @@ async def _record_regression_signal_if_matching(
     # (auto_remediation, _record_remediation_outcome) — a stage-less probe
     # would never match.
     from app.anomaly_detection import _task_error_fingerprint  # noqa: PLC0415
+
     try:
         task_fp = _task_error_fingerprint(task)
     except Exception:
@@ -645,9 +721,9 @@ async def _record_regression_signal_if_matching(
     if not task_fp or str(task_fp) != str(last_rem_fp):
         return
     target["remediation_regression_signal"] = True
-    target["remediation_regression_count"] = int(
-        target.get("remediation_regression_count") or 0
-    ) + 1
+    target["remediation_regression_count"] = (
+        int(target.get("remediation_regression_count") or 0) + 1
+    )
     target["remediation_regression_last_task_id"] = str(task.id)
     target["remediation_regression_last_at"] = _utcnow().isoformat()
     project.directions = directions
@@ -677,7 +753,9 @@ _FOLLOWUP_INVESTIGATION_DECAY_DAYS = 14
 
 
 def _active_followup_timestamps(
-    entry: Any, *, now: Optional[datetime] = None,
+    entry: Any,
+    *,
+    now: Optional[datetime] = None,
 ) -> List[str]:
     """Return non-expired ISO timestamps from a fingerprint entry.
 
@@ -699,7 +777,10 @@ def _active_followup_timestamps(
 
 
 def _project_active_followup_count(
-    project: Project, fp_key: str, *, now: Optional[datetime] = None,
+    project: Project,
+    fp_key: str,
+    *,
+    now: Optional[datetime] = None,
 ) -> int:
     """Sum non-expired follow-up timestamps for ``fp_key`` across all directions.
 
@@ -711,14 +792,21 @@ def _project_active_followup_count(
     if not fp_key or fp_key == "no_fingerprint":
         return 0
     total = 0
-    for d in (project.directions or []):
-        attempts = (d.get("followup_investigation_attempts_by_fingerprint") or {}).get(fp_key)
+    for d in project.directions or []:
+        attempts = (d.get("followup_investigation_attempts_by_fingerprint") or {}).get(
+            fp_key
+        )
         total += len(_active_followup_timestamps(attempts, now=now))
     return total
 
 
 async def _recent_followup_investigation_exists(
-    project_id, direction_id, cutoff, fingerprint, session, exclude_task_id=None,
+    project_id,
+    direction_id,
+    cutoff,
+    fingerprint,
+    session,
+    exclude_task_id=None,
 ) -> bool:
     """Return True if a recent investigate task for this direction blocks a follow-up.
 
@@ -746,7 +834,11 @@ async def _recent_followup_investigation_exists(
 
 
 async def _find_sibling_fingerprint_investigation(
-    project_id, fingerprint, cutoff, session, exclude_task_id=None,
+    project_id,
+    fingerprint,
+    cutoff,
+    session,
+    exclude_task_id=None,
 ) -> Optional[str]:
     """Return ID of a recent investigate task sharing ``fingerprint`` (any direction).
 
@@ -768,23 +860,28 @@ async def _find_sibling_fingerprint_investigation(
     return str(row[0]) if row else None
 
 
-def _append_followup_dedup_note(direction: Dict[str, Any], fingerprint, existing_task_id: str) -> None:
+def _append_followup_dedup_note(
+    direction: Dict[str, Any], fingerprint, existing_task_id: str
+) -> None:
     note_text = (
         f"Skipped duplicate follow-up investigation: shares error fingerprint "
         f"{str(fingerprint)[:80]} with existing investigate task {existing_task_id}."
     )[:STRATEGIC_RATIONALE_MAX]
     notes = list(direction.get("notes") or [])
-    notes.append({
-        "text": note_text,
-        "added_at": _utcnow().isoformat(),
-        "source": "followup_dedup",
-        "shared_investigation_task_id": existing_task_id,
-    })
+    notes.append(
+        {
+            "text": note_text,
+            "added_at": _utcnow().isoformat(),
+            "source": "followup_dedup",
+            "shared_investigation_task_id": existing_task_id,
+        }
+    )
     direction["notes"] = notes[-STRATEGIC_NOTES_HISTORY_MAX:]
 
 
 async def _maybe_spawn_followup_investigation(
-    task: Task, session: AsyncSession,
+    task: Task,
+    session: AsyncSession,
 ) -> Optional[Task]:
     """Spawn a follow-up investigate task after a diagnosis-spawned remediation fails.
 
@@ -820,10 +917,17 @@ async def _maybe_spawn_followup_investigation(
         )
         return None
     cutoff = _utcnow() - timedelta(hours=24)
-    fingerprint = ctx.get("diagnosis_fingerprint") or ctx.get("error_fingerprint") \
+    fingerprint = (
+        ctx.get("diagnosis_fingerprint")
+        or ctx.get("error_fingerprint")
         or target.get("last_remediation_fingerprint")
+    )
     if await _recent_followup_investigation_exists(
-        project.id, direction_id, cutoff, fingerprint, session,
+        project.id,
+        direction_id,
+        cutoff,
+        fingerprint,
+        session,
     ):
         logger.debug(
             f"[DIAGNOSIS] Skip follow-up for direction {direction_id}: "
@@ -832,7 +936,10 @@ async def _maybe_spawn_followup_investigation(
         )
         return None
     shared_id = await _find_sibling_fingerprint_investigation(
-        project.id, fingerprint, cutoff, session,
+        project.id,
+        fingerprint,
+        cutoff,
+        session,
     )
     if shared_id is not None:
         _append_followup_dedup_note(target, fingerprint, shared_id)
@@ -845,7 +952,9 @@ async def _maybe_spawn_followup_investigation(
         )
         return None
     fp_key = str(fingerprint) if fingerprint else "no_fingerprint"
-    attempts_by_fp = dict(target.get("followup_investigation_attempts_by_fingerprint") or {})
+    attempts_by_fp = dict(
+        target.get("followup_investigation_attempts_by_fingerprint") or {}
+    )
     now = _utcnow()
     active_ts = _active_followup_timestamps(attempts_by_fp.get(fp_key), now=now)
     project_active = _project_active_followup_count(project, fp_key, now=now)
@@ -861,26 +970,28 @@ async def _maybe_spawn_followup_investigation(
             f"decay={_FOLLOWUP_INVESTIGATION_DECAY_DAYS}d)"
         )
         await _maybe_escalate_exhausted_followups(
-            project=project, direction=target, directions=directions,
-            fp_key=fp_key, session=session,
+            project=project,
+            direction=target,
+            directions=directions,
+            fp_key=fp_key,
+            session=session,
         )
         return None
 
     prior_summary = (target.get("diagnosis_summary") or "").strip()
     failure_class = target.get("last_remediation_failure_class") or "(unknown)"
     diagnosis_confidence = ctx.get("diagnosis_confidence")
-    error_summary = (target.get("last_remediation_error_summary") or "(no error message)")
+    error_summary = target.get("last_remediation_error_summary") or "(no error message)"
     failed_prompt = (task.first_payload or {}).get("prompt", "") or ""
     prior_history = list(target.get("remediation_history") or [])
     # Exclude the current failed attempt (just appended by _record_remediation_outcome)
     # since it is already surfaced separately as "approach that failed".
-    earlier_attempts = [
-        h for h in prior_history if h.get("task_id") != str(task.id)
-    ]
+    earlier_attempts = [h for h in prior_history if h.get("task_id") != str(task.id)]
     regression_case = None
     regression_class = ctx.get("regression_class")
     if regression_class:
         from app.models import RegressionRemediationCase  # noqa: PLC0415
+
         rr_result = await session.execute(
             select(RegressionRemediationCase).where(
                 RegressionRemediationCase.project_id == project.id,
@@ -906,14 +1017,16 @@ async def _maybe_spawn_followup_investigation(
     ]
     if target.get("remediation_regression_signal"):
         regression_count = int(target.get("remediation_regression_count") or 0)
-        prompt_parts.extend([
-            "",
-            f"REGRESSION SIGNAL: {regression_count} task failure(s) during the "
-            f"post-merge monitoring window have fingerprints matching the prior "
-            f"remediated error. The previous fix was merged but did not hold. "
-            f"Do not propose the same approach — treat the root cause as "
-            f"unresolved.",
-        ])
+        prompt_parts.extend(
+            [
+                "",
+                f"REGRESSION SIGNAL: {regression_count} task failure(s) during the "
+                f"post-merge monitoring window have fingerprints matching the prior "
+                f"remediated error. The previous fix was merged but did not hold. "
+                f"Do not propose the same approach — treat the root cause as "
+                f"unresolved.",
+            ]
+        )
     if diagnosis_confidence:
         guidance = {
             "low": (
@@ -932,10 +1045,12 @@ async def _maybe_spawn_followup_investigation(
                 "implementation approach for the same root cause."
             ),
         }.get(str(diagnosis_confidence).lower(), "")
-        prompt_parts.extend([
-            "",
-            f"Prior diagnosis confidence: {diagnosis_confidence}",
-        ])
+        prompt_parts.extend(
+            [
+                "",
+                f"Prior diagnosis confidence: {diagnosis_confidence}",
+            ]
+        )
         if guidance:
             prompt_parts.append(guidance)
     if earlier_attempts:
@@ -976,14 +1091,16 @@ async def _maybe_spawn_followup_investigation(
             "different contributing factor that the prior fix missed."
         )
         prompt_parts.extend(rc_lines)
-    prompt_parts.extend([
-        "",
-        "Produce a recommended_fix that is materially different from all prior "
-        "attempts above. Consider whether the direction scope is wrong, prior "
-        "fixes targeted a symptom rather than the cause, or a systemic/"
-        "cross-cutting issue (shared infrastructure, framework bug, test "
-        "harness) is at play.",
-    ])
+    prompt_parts.extend(
+        [
+            "",
+            "Produce a recommended_fix that is materially different from all prior "
+            "attempts above. Consider whether the direction scope is wrong, prior "
+            "fixes targeted a symptom rather than the cause, or a systemic/"
+            "cross-cutting issue (shared infrastructure, framework bug, test "
+            "harness) is at play.",
+        ]
+    )
     prompt = "\n".join(prompt_parts)[:20000]
     payload = validate_internal_payload(
         {"type": "investigate", "prompt": prompt, "base_branch": "main"},
@@ -994,8 +1111,8 @@ async def _maybe_spawn_followup_investigation(
         "diagnosis_trigger": "remediation_failure_followup",
         "failed_remediation_task_id": str(task.id),
     }
-    original_diagnosis_task_id = (
-        ctx.get("original_diagnosis_task_id") or ctx.get("diagnosis_task_id")
+    original_diagnosis_task_id = ctx.get("original_diagnosis_task_id") or ctx.get(
+        "diagnosis_task_id"
     )
     if original_diagnosis_task_id:
         task_context["original_diagnosis_task_id"] = str(original_diagnosis_task_id)
@@ -1014,8 +1131,7 @@ async def _maybe_spawn_followup_investigation(
         project_id=project.id,
         title=f"Investigate remediation failure: {(target.get('text') or '')[:60]}",
         description=(
-            f"Follow-up investigation after remediation task "
-            f"{str(task.id)[:8]} failed"
+            f"Follow-up investigation after remediation task {str(task.id)[:8]} failed"
         )[:500],
         payloads=[payload],
         context=task_context,
@@ -1044,7 +1160,8 @@ async def _maybe_spawn_followup_investigation(
 
 
 def _followup_history_all_failed(
-    direction: Dict[str, Any], fp_key: str,
+    direction: Dict[str, Any],
+    fp_key: str,
 ) -> bool:
     """True when remediation_history for this fingerprint exists and every entry failed.
 
@@ -1053,7 +1170,8 @@ def _followup_history_all_failed(
     """
     history = list(direction.get("remediation_history") or [])
     relevant = [
-        h for h in history
+        h
+        for h in history
         if (str(h.get("fingerprint") or "") or "no_fingerprint") == fp_key
     ]
     if not relevant:
@@ -1093,8 +1211,11 @@ async def _maybe_escalate_exhausted_followups(
     try:
         from app.notification_dispatch import post_remediation_escalation_message  # noqa: PLC0415
         from app.direction_lifecycle import _build_escalation_args  # noqa: PLC0415
+
         await post_remediation_escalation_message(
-            session, project.id, **_build_escalation_args(direction),
+            session,
+            project.id,
+            **_build_escalation_args(direction),
         )
         direction.pop("escalation_notification_pending", None)
         direction.pop("escalation_notification_retries", None)
@@ -1114,17 +1235,20 @@ async def _maybe_escalate_exhausted_followups(
         flag_modified(project, "directions")
         session.add(project)
         from app.models import Alert, AlertSeverity  # noqa: PLC0415
-        session.add(Alert(
-            project_id=project.id,
-            severity=AlertSeverity.ERROR,
-            title="Follow-up escalation notification failed",
-            message=(
-                f"Direction {direction.get('id')} ('{(direction.get('text') or '')[:80]}') "
-                f"hit the follow-up investigation cap with no merged remediation, but the "
-                f"BLOCKER notification failed: {exc!r}. Fingerprint={fp_key[:80]}, "
-                f"remediation_attempts={int(direction.get('remediation_attempts', 0))}."
-            ),
-        ))
+
+        session.add(
+            Alert(
+                project_id=project.id,
+                severity=AlertSeverity.ERROR,
+                title="Follow-up escalation notification failed",
+                message=(
+                    f"Direction {direction.get('id')} ('{(direction.get('text') or '')[:80]}') "
+                    f"hit the follow-up investigation cap with no merged remediation, but the "
+                    f"BLOCKER notification failed: {exc!r}. Fingerprint={fp_key[:80]}, "
+                    f"remediation_attempts={int(direction.get('remediation_attempts', 0))}."
+                ),
+            )
+        )
 
 
 async def _maybe_spawn_low_confidence_followup(
@@ -1147,17 +1271,23 @@ async def _maybe_spawn_low_confidence_followup(
     if not direction_id or direction.get(DIAGNOSIS_IN_PROGRESS_KEY):
         return None
     cutoff = _utcnow() - timedelta(hours=24)
-    fingerprint = (
-        (investigation_task.context or {}).get("diagnosis_fingerprint")
-        or direction.get("error_fingerprint")
-    )
+    fingerprint = (investigation_task.context or {}).get(
+        "diagnosis_fingerprint"
+    ) or direction.get("error_fingerprint")
     if await _recent_followup_investigation_exists(
-        project.id, direction_id, cutoff, fingerprint, session,
+        project.id,
+        direction_id,
+        cutoff,
+        fingerprint,
+        session,
         exclude_task_id=investigation_task.id,
     ):
         return None
     shared_id = await _find_sibling_fingerprint_investigation(
-        project.id, fingerprint, cutoff, session,
+        project.id,
+        fingerprint,
+        cutoff,
+        session,
         exclude_task_id=investigation_task.id,
     )
     if shared_id is not None:
@@ -1169,7 +1299,9 @@ async def _maybe_spawn_low_confidence_followup(
         )
         return None
     fp_key = str(fingerprint) if fingerprint else "no_fingerprint"
-    attempts_by_fp = dict(direction.get("followup_investigation_attempts_by_fingerprint") or {})
+    attempts_by_fp = dict(
+        direction.get("followup_investigation_attempts_by_fingerprint") or {}
+    )
     now = _utcnow()
     active_ts = _active_followup_timestamps(attempts_by_fp.get(fp_key), now=now)
     if (
@@ -1179,30 +1311,35 @@ async def _maybe_spawn_low_confidence_followup(
     ):
         directions = list(project.directions or [])
         await _maybe_escalate_exhausted_followups(
-            project=project, direction=direction, directions=directions,
-            fp_key=fp_key, session=session,
+            project=project,
+            direction=direction,
+            directions=directions,
+            fp_key=fp_key,
+            session=session,
         )
         return None
     prior_summary = (direction.get("diagnosis_summary") or "").strip()
-    prompt = "\n".join([
-        "A prior investigation on this direction produced a LOW-confidence "
-        "diagnosis. Re-investigate with a different approach: narrow the scope "
-        "to one concrete failing task, try to reproduce the failure, and examine "
-        "signals the prior pass may have missed (raw logs, stack traces, recent "
-        "diffs, CI output) rather than re-running the same root-cause analysis.",
-        "",
-        f"Direction: {(direction.get('text') or '')[:200]}",
-        f"Direction id: {direction_id}",
-        "",
-        f"Prior (low-confidence) summary:\n{prior_summary[:1500] or '(none recorded)'}",
-        "",
-        "Return a diagnosis with HIGH or MEDIUM confidence, or explicitly "
-        "declare that code signals alone are insufficient and manual "
-        "intervention is required.",
-    ])[:20000]
+    prompt = "\n".join(
+        [
+            "A prior investigation on this direction produced a LOW-confidence "
+            "diagnosis. Re-investigate with a different approach: narrow the scope "
+            "to one concrete failing task, try to reproduce the failure, and examine "
+            "signals the prior pass may have missed (raw logs, stack traces, recent "
+            "diffs, CI output) rather than re-running the same root-cause analysis.",
+            "",
+            f"Direction: {(direction.get('text') or '')[:200]}",
+            f"Direction id: {direction_id}",
+            "",
+            f"Prior (low-confidence) summary:\n{prior_summary[:1500] or '(none recorded)'}",
+            "",
+            "Return a diagnosis with HIGH or MEDIUM confidence, or explicitly "
+            "declare that code signals alone are insufficient and manual "
+            "intervention is required.",
+        ]
+    )[:20000]
     inv_ctx = investigation_task.context or {}
-    original_diagnosis_task_id = (
-        inv_ctx.get("original_diagnosis_task_id") or str(investigation_task.id)
+    original_diagnosis_task_id = inv_ctx.get("original_diagnosis_task_id") or str(
+        investigation_task.id
     )
     task_ctx: Dict[str, Any] = {
         "direction_id": str(direction_id),
@@ -1226,10 +1363,12 @@ async def _maybe_spawn_low_confidence_followup(
             f"Follow-up after low-confidence investigation "
             f"{str(investigation_task.id)[:8]}"
         )[:500],
-        payloads=[validate_internal_payload(
-            {"type": "investigate", "prompt": prompt, "base_branch": "main"},
-            "task_completion:low_confidence_followup",
-        )],
+        payloads=[
+            validate_internal_payload(
+                {"type": "investigate", "prompt": prompt, "base_branch": "main"},
+                "task_completion:low_confidence_followup",
+            )
+        ],
         context=task_ctx,
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
         status=TaskStatus.QUEUED,
@@ -1295,17 +1434,23 @@ async def _maybe_spawn_reinvestigation_after_failure(
     if not direction_id or direction.get(DIAGNOSIS_IN_PROGRESS_KEY):
         return None
     cutoff = _utcnow() - timedelta(hours=24)
-    fingerprint = (
-        (investigation_task.context or {}).get("diagnosis_fingerprint")
-        or direction.get("error_fingerprint")
-    )
+    fingerprint = (investigation_task.context or {}).get(
+        "diagnosis_fingerprint"
+    ) or direction.get("error_fingerprint")
     if await _recent_followup_investigation_exists(
-        project.id, direction_id, cutoff, fingerprint, session,
+        project.id,
+        direction_id,
+        cutoff,
+        fingerprint,
+        session,
         exclude_task_id=investigation_task.id,
     ):
         return None
     shared_id = await _find_sibling_fingerprint_investigation(
-        project.id, fingerprint, cutoff, session,
+        project.id,
+        fingerprint,
+        cutoff,
+        session,
         exclude_task_id=investigation_task.id,
     )
     if shared_id is not None:
@@ -1317,7 +1462,9 @@ async def _maybe_spawn_reinvestigation_after_failure(
         )
         return None
     fp_key = str(fingerprint) if fingerprint else "no_fingerprint"
-    attempts_by_fp = dict(direction.get("followup_investigation_attempts_by_fingerprint") or {})
+    attempts_by_fp = dict(
+        direction.get("followup_investigation_attempts_by_fingerprint") or {}
+    )
     now = _utcnow()
     active_ts = _active_followup_timestamps(attempts_by_fp.get(fp_key), now=now)
     if (
@@ -1333,48 +1480,56 @@ async def _maybe_spawn_reinvestigation_after_failure(
         )
         directions = list(project.directions or [])
         await _maybe_escalate_exhausted_followups(
-            project=project, direction=direction, directions=directions,
-            fp_key=fp_key, session=session,
+            project=project,
+            direction=direction,
+            directions=directions,
+            fp_key=fp_key,
+            session=session,
         )
         return None
     prior_summary = (direction.get("diagnosis_summary") or "").strip()
-    failure_summary = (investigation_task.latest_status_message or "(no error message)")
+    failure_summary = investigation_task.latest_status_message or "(no error message)"
     from app.failure_classification import classify_failure  # noqa: PLC0415
+
     failure_class = classify_failure(investigation_task)
     partial_summary = (direction.get("partial_diagnosis_summary") or "").strip()
     partial_root_cause = (direction.get("partial_diagnosis_root_cause") or "").strip()
     partial_files = direction.get("partial_diagnosis_files") or []
     partial_block = ""
     if partial_summary or partial_root_cause or partial_files:
-        partial_block = "\n".join([
+        partial_block = "\n".join(
+            [
+                "",
+                "Partial findings from the prior (incomplete) investigation:",
+                f"- summary: {partial_summary[:500] or '(none)'}",
+                f"- root_cause: {partial_root_cause[:1000] or '(none)'}",
+                f"- affected_files: {', '.join(partial_files[:20]) or '(none)'}",
+                "Build on these findings rather than re-investigating from scratch.",
+            ]
+        )
+    prompt = "\n".join(
+        [
+            "A prior investigation on this direction did not complete — the "
+            "investigate task terminated before producing a final diagnosis. "
+            "Re-run the investigation, leveraging any partial findings below.",
             "",
-            "Partial findings from the prior (incomplete) investigation:",
-            f"- summary: {partial_summary[:500] or '(none)'}",
-            f"- root_cause: {partial_root_cause[:1000] or '(none)'}",
-            f"- affected_files: {', '.join(partial_files[:20]) or '(none)'}",
-            "Build on these findings rather than re-investigating from scratch.",
-        ])
-    prompt = "\n".join([
-        "A prior investigation on this direction did not complete — the "
-        "investigate task terminated before producing a final diagnosis. "
-        "Re-run the investigation, leveraging any partial findings below.",
-        "",
-        f"Direction: {(direction.get('text') or '')[:200]}",
-        f"Direction id: {direction_id}",
-        "",
-        f"Prior diagnosis summary (if any):\n{prior_summary[:1500] or '(none recorded)'}",
-        partial_block,
-        "",
-        f"Previous investigation failure class: {failure_class}",
-        f"Previous investigation error summary: {str(failure_summary)[:400]}",
-        "",
-        "Produce a diagnosis (root cause, affected files, recommended fix) with "
-        "HIGH or MEDIUM confidence, or explicitly declare that code signals "
-        "alone are insufficient and manual intervention is required.",
-    ])[:20000]
+            f"Direction: {(direction.get('text') or '')[:200]}",
+            f"Direction id: {direction_id}",
+            "",
+            f"Prior diagnosis summary (if any):\n{prior_summary[:1500] or '(none recorded)'}",
+            partial_block,
+            "",
+            f"Previous investigation failure class: {failure_class}",
+            f"Previous investigation error summary: {str(failure_summary)[:400]}",
+            "",
+            "Produce a diagnosis (root cause, affected files, recommended fix) with "
+            "HIGH or MEDIUM confidence, or explicitly declare that code signals "
+            "alone are insufficient and manual intervention is required.",
+        ]
+    )[:20000]
     inv_ctx = investigation_task.context or {}
-    original_diagnosis_task_id = (
-        inv_ctx.get("original_diagnosis_task_id") or str(investigation_task.id)
+    original_diagnosis_task_id = inv_ctx.get("original_diagnosis_task_id") or str(
+        investigation_task.id
     )
     task_ctx: Dict[str, Any] = {
         "direction_id": str(direction_id),
@@ -1398,10 +1553,12 @@ async def _maybe_spawn_reinvestigation_after_failure(
             f"Follow-up after investigation task "
             f"{str(investigation_task.id)[:8]} failed ({failure_class})"
         )[:500],
-        payloads=[validate_internal_payload(
-            {"type": "investigate", "prompt": prompt, "base_branch": "main"},
-            "task_completion:investigation_failure_followup",
-        )],
+        payloads=[
+            validate_internal_payload(
+                {"type": "investigate", "prompt": prompt, "base_branch": "main"},
+                "task_completion:investigation_failure_followup",
+            )
+        ],
         context=task_ctx,
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
         status=TaskStatus.QUEUED,
@@ -1424,7 +1581,9 @@ async def _maybe_spawn_reinvestigation_after_failure(
 
 
 async def _handle_investigation_terminal_failure(
-    task: Task, status: "TaskStatus", session: AsyncSession,
+    task: Task,
+    status: "TaskStatus",
+    session: AsyncSession,
 ) -> None:
     """Clear diagnosis state + optionally re-spawn when an investigate task terminates FAILED/CANCELLED.
 
@@ -1488,6 +1647,7 @@ async def _handle_investigation_terminal_failure(
         if status != TaskStatus.FAILED:
             return
         from app.failure_classification import classify_failure, INFRA_CLASSES  # noqa: PLC0415
+
         failure_class = classify_failure(task)
         has_salvageable_root_cause = bool(partial and partial.get("root_cause"))
         if failure_class not in INFRA_CLASSES and not has_salvageable_root_cause:
@@ -1557,6 +1717,7 @@ async def _handle_investigation_terminal_failure(
 # Parser / Validator helpers
 # ---------------------------------------------------------------------------
 
+
 def _extract_json_array(text: str, *required_keys: str) -> Optional[str]:
     """Find the first JSON array in text containing objects with the required keys.
 
@@ -1593,12 +1754,13 @@ def _extract_json_array(text: str, *required_keys: str) -> Optional[str]:
             elif c == "]":
                 depth -= 1
                 if depth == 0:
-                    candidate = text[start:i + 1]
+                    candidate = text[start : i + 1]
                     if all(f'"{k}"' in candidate for k in required_keys):
                         return candidate
                     break  # This bracket pair didn't match, try next [
         start = text.find("[", start + 1)
     return None
+
 
 # Round 4 W1 (audit C3): content snapshot used by ``_ensure_branch`` for
 # lock-window-break validation. Heartbeat-driven ``updated_at`` advances
@@ -1634,8 +1796,7 @@ def _capture_branch_creation_snapshot(task: Task) -> dict:
 
 
 async def _ensure_branch(
-    task: Task, branch_name: str, source_branch: str,
-    label: str, session: AsyncSession
+    task: Task, branch_name: str, source_branch: str, label: str, session: AsyncSession
 ) -> Task | None:
     """Create a branch, or verify it already exists.
 
@@ -1693,7 +1854,7 @@ async def _ensure_branch(
     pre_branch_snapshot = _capture_branch_creation_snapshot(task)
     session.add(task)
     await session.commit()  # release task FOR UPDATE lock; SQLA returns
-                            # the connection to the pool (audit H6).
+    # the connection to the pool (audit H6).
 
     max_retries = 5
     gh_token = owner = repo = None
@@ -1702,7 +1863,8 @@ async def _ensure_branch(
     for _attempt in range(max_retries):
         try:
             gh_token, owner, repo = await get_github_token_for_task(
-                parent_id_local, session, force_refresh=(_attempt > 0))
+                parent_id_local, session, force_refresh=(_attempt > 0)
+            )
             sha = await get_branch_sha(gh_token, owner, repo, source_branch)
             await create_branch(gh_token, owner, repo, branch_name, sha)
             logger.info(f"[{label}] Created branch {branch_name} from {source_branch}")
@@ -1713,7 +1875,9 @@ async def _ensure_branch(
             if gh_token:
                 try:
                     await get_branch_sha(gh_token, owner, repo, branch_name)
-                    logger.info(f"[{label}] Branch {branch_name} already exists — reusing")
+                    logger.info(
+                        f"[{label}] Branch {branch_name} already exists — reusing"
+                    )
                     branch_created = True
                     break
                 except HTTPException as verify_exc:
@@ -1723,18 +1887,30 @@ async def _ensure_branch(
                     else:
                         # Transient server error during verification (e.g. 502) — don't
                         # conclude the branch is missing; continue retrying.
-                        logger.warning(f"[{label}] Transient error verifying branch {branch_name} ({verify_exc.status_code}), will retry")
+                        logger.warning(
+                            f"[{label}] Transient error verifying branch {branch_name} ({verify_exc.status_code}), will retry"
+                        )
                 except Exception:
-                    logger.exception(f"[{label}] Non-HTTP error verifying branch {branch_name}")
+                    logger.exception(
+                        f"[{label}] Non-HTTP error verifying branch {branch_name}"
+                    )
             if _attempt < max_retries - 1:
-                backoff = 10 * (2 ** _attempt) * (0.75 + 0.5 * random.random())  # jitter: 10-20s, 20-40s, …
-                logger.warning(f"[{label}] Branch creation attempt {_attempt + 1} failed, retrying in {backoff:.1f}s: {e!r}")
+                backoff = (
+                    10 * (2**_attempt) * (0.75 + 0.5 * random.random())
+                )  # jitter: 10-20s, 20-40s, …
+                logger.warning(
+                    f"[{label}] Branch creation attempt {_attempt + 1} failed, retrying in {backoff:.1f}s: {e!r}"
+                )
                 await asyncio.sleep(backoff)
             else:
                 if gh_token:
-                    logger.exception(f"[{label}] Branch {branch_name} creation failed after {max_retries} attempts")
+                    logger.exception(
+                        f"[{label}] Branch {branch_name} creation failed after {max_retries} attempts"
+                    )
                 else:
-                    logger.exception(f"[{label}] Cannot create branch — GitHub token unavailable")
+                    logger.exception(
+                        f"[{label}] Cannot create branch — GitHub token unavailable"
+                    )
 
     # Round 4 W1 (C1, C2, C3): re-acquire with snapshot validation on
     # BOTH the success path (C2 — caller will mutate task.context) AND
@@ -1811,20 +1987,34 @@ async def _ensure_branch(
     e = last_err
     task = fresh
     task.status = TaskStatus.FAILED
-    task.latest_status_message = f"Failed to create {label.lower()} branch: {type(e).__name__}: {e!r}"[:500]
+    task.latest_status_message = (
+        f"Failed to create {label.lower()} branch: {type(e).__name__}: {e!r}"[:500]
+    )
     from app.failure_classification import classify_failure, persist_failure_category  # noqa: PLC0415
     from app.routers.agent_status import record_task_result  # noqa: PLC0415
+
     _fc = classify_failure(task)
     persist_failure_category(task, _fc)
-    record_task_result(success=False, failure_class=_fc, task_id=str(task.id), task_type=parent_task_type, task_context=parent_context_snapshot, auto_remediation=parent_auto_remediation)
+    record_task_result(
+        success=False,
+        failure_class=_fc,
+        task_id=str(task.id),
+        task_type=parent_task_type,
+        task_context=parent_context_snapshot,
+        auto_remediation=parent_auto_remediation,
+    )
     session.add(task)
-    await _maybe_create_failure_alert(task, session, f"Failed to create branch: {type(e).__name__}: {e!r}"[:200])
+    await _maybe_create_failure_alert(
+        task, session, f"Failed to create branch: {type(e).__name__}: {e!r}"[:200]
+    )
     await session.commit()
     return None
+
 
 # ---------------------------------------------------------------------------
 # Completion handlers
 # ---------------------------------------------------------------------------
+
 
 async def _maybe_release_safeguard_gate(
     safeguard_task: Task, findings: list | None, session: AsyncSession
@@ -1837,6 +2027,7 @@ async def _maybe_release_safeguard_gate(
     sets review_loop.ci_waiting=True so the orchestrator's CI loop attempts the merge.
     """
     from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
+
     safeguard_for_id = (safeguard_task.context or {}).get("safeguard_for_task_id")
     if not safeguard_for_id:
         return
@@ -1848,27 +2039,38 @@ async def _maybe_release_safeguard_gate(
     except Exception:
         orig = None
     if orig is None:
-        logger.warning(f"[SAFEGUARD] orig {safeguard_for_id[:8]} not found — gate not updated")
+        logger.warning(
+            f"[SAFEGUARD] orig {safeguard_for_id[:8]} not found — gate not updated"
+        )
         return
     if has_blocker:
-        logger.info(f"[SAFEGUARD] Gate maintained on {safeguard_for_id[:8]} — critical/high findings")
+        logger.info(
+            f"[SAFEGUARD] Gate maintained on {safeguard_for_id[:8]} — critical/high findings"
+        )
         return
     orig.requires_approval = False
     pr_num = (safeguard_task.context or {}).get("safeguard_pr_number")
     orig_ctx = dict(orig.context or {})
     if orig.status == TaskStatus.EVALUATING and pr_num:
         # Review already approved while safeguard was pending; hand off to CI polling loop.
-        orig_ctx["review_loop"] = {**(orig_ctx.get("review_loop") or {}),
-                                   "ci_waiting": True, "pr_number": pr_num}
+        orig_ctx["review_loop"] = {
+            **(orig_ctx.get("review_loop") or {}),
+            "ci_waiting": True,
+            "pr_number": pr_num,
+        }
         orig.context = orig_ctx
         flag_modified(orig, "context")
-    orig.latest_status_message = f"Cross-cutting safeguard passed — merge gate released (PR #{pr_num})"
+    orig.latest_status_message = (
+        f"Cross-cutting safeguard passed — merge gate released (PR #{pr_num})"
+    )
     session.add(orig)
     await session.commit()
     logger.info(f"[SAFEGUARD] Gate released on {safeguard_for_id[:8]} for PR #{pr_num}")
 
 
-async def _handle_security_audit_completion(task: Task, logs: str, session: AsyncSession):
+async def _handle_security_audit_completion(
+    task: Task, logs: str, session: AsyncSession
+):
     """Parse security audit findings and spawn create tasks for critical/high severity issues."""
     # Parse the JSON findings array from logs
     findings = None
@@ -1882,7 +2084,9 @@ async def _handle_security_audit_completion(task: Task, logs: str, session: Asyn
         pass
 
     if not findings:
-        task.latest_status_message = "Security audit completed with no parseable findings"
+        task.latest_status_message = (
+            "Security audit completed with no parseable findings"
+        )
         task.plan_output = []
         session.add(task)
         await session.commit()
@@ -1913,7 +2117,7 @@ async def _handle_security_audit_completion(task: Task, logs: str, session: Asyn
         fix_prompt = finding.get("fix_prompt", finding.get("description", ""))
         if not fix_prompt:
             continue
-        title = finding.get("title", f"Security fix #{i+1}")
+        title = finding.get("title", f"Security fix #{i + 1}")
         severity = finding.get("severity", "high")
 
         new_task = Task(
@@ -1921,12 +2125,17 @@ async def _handle_security_audit_completion(task: Task, logs: str, session: Asyn
             title=f"[{severity.upper()}] {title}",
             description=finding.get("description", fix_prompt[:200]),
             parent_task_id=task.id,
-            payloads=[validate_internal_payload({
-                "type": "create",
-                "prompt": fix_prompt,
-                "base_branch": base_branch,
-                **({"prompt_suffix": create_suffix} if create_suffix else {}),
-            }, "task_completion:security_finding")],
+            payloads=[
+                validate_internal_payload(
+                    {
+                        "type": "create",
+                        "prompt": fix_prompt,
+                        "base_branch": base_branch,
+                        **({"prompt_suffix": create_suffix} if create_suffix else {}),
+                    },
+                    "task_completion:security_finding",
+                )
+            ],
             context={
                 "security_audit_task_id": str(task.id),
                 "finding_index": i,
@@ -1947,12 +2156,16 @@ async def _handle_security_audit_completion(task: Task, logs: str, session: Asyn
     for ct in child_tasks:
         await session.refresh(ct)
         history = TaskHistory(
-            task_id=ct.id, action="SPAWNED",
-            details={"spawned_by": "SECURITY_AUDIT", "parent_audit_id": str(task.id)}
+            task_id=ct.id,
+            action="SPAWNED",
+            details={"spawned_by": "SECURITY_AUDIT", "parent_audit_id": str(task.id)},
         )
         session.add(history)
-        await broadcast_to_project(str(task.project_id), "task_updated",
-                                   {"task_id": str(ct.id), "status": TaskStatus.QUEUED})
+        await broadcast_to_project(
+            str(task.project_id),
+            "task_updated",
+            {"task_id": str(ct.id), "status": TaskStatus.QUEUED},
+        )
 
     await session.commit()
 
@@ -1963,7 +2176,10 @@ async def _handle_security_audit_completion(task: Task, logs: str, session: Asyn
             "| {severity} | {title} | {loc} | {desc} |".format(
                 severity=f.get("severity", ""),
                 title=f.get("title", ""),
-                loc=(f.get("file_path", "") + (f":{f['line_number']}" if f.get("line_number") else "")),
+                loc=(
+                    f.get("file_path", "")
+                    + (f":{f['line_number']}" if f.get("line_number") else "")
+                ),
                 desc=f.get("description", ""),
             )
             for f in informational
@@ -1982,21 +2198,30 @@ async def _handle_security_audit_completion(task: Task, logs: str, session: Asyn
             if open_prs:
                 pr_number = open_prs[0]["number"]
                 await create_pr_comment(gh_token, owner, repo, pr_number, comment_body)
-                logger.info(f"[SECURITY AUDIT] Posted informational findings comment on PR #{pr_number}")
+                logger.info(
+                    f"[SECURITY AUDIT] Posted informational findings comment on PR #{pr_number}"
+                )
         except Exception as e:
-            logger.warning(f"[SECURITY AUDIT] Failed to post PR comment for informational findings: {e}", exc_info=True)
+            logger.warning(
+                f"[SECURITY AUDIT] Failed to post PR comment for informational findings: {e}",
+                exc_info=True,
+            )
 
     task.status = TaskStatus.EVALUATING
-    task.latest_status_message = (
-        f"{len(child_tasks)} critical/high fixed, {len(informational)} medium/low surfaced as PR comment"
-    )
+    task.latest_status_message = f"{len(child_tasks)} critical/high fixed, {len(informational)} medium/low surfaced as PR comment"
     session.add(task)
     await session.commit()
 
-    await broadcast_to_project(str(task.project_id), "autonomous_activity",
-                               {"security_audit_task_id": str(task.id), "tasks_created": len(child_tasks)})
-    logger.info(f"[SECURITY AUDIT] Created {len(child_tasks)} fix tasks from audit {task.id}")
+    await broadcast_to_project(
+        str(task.project_id),
+        "autonomous_activity",
+        {"security_audit_task_id": str(task.id), "tasks_created": len(child_tasks)},
+    )
+    logger.info(
+        f"[SECURITY AUDIT] Created {len(child_tasks)} fix tasks from audit {task.id}"
+    )
     await _maybe_release_safeguard_gate(task, findings, session)
+
 
 async def _handle_perf_completion(task: Task, logs: str, session: AsyncSession):
     """Parse perf findings and spawn create tasks for high-severity issues."""
@@ -2011,7 +2236,9 @@ async def _handle_perf_completion(task: Task, logs: str, session: AsyncSession):
         pass
 
     if not findings:
-        task.latest_status_message = "Perf analysis completed with no parseable findings"
+        task.latest_status_message = (
+            "Perf analysis completed with no parseable findings"
+        )
         task.plan_output = []
         session.add(task)
         return
@@ -2032,7 +2259,7 @@ async def _handle_perf_completion(task: Task, logs: str, session: AsyncSession):
         fix_prompt = finding.get("fix_prompt", finding.get("description", ""))
         if not fix_prompt:
             continue
-        title = finding.get("title", f"Perf fix #{i+1}")
+        title = finding.get("title", f"Perf fix #{i + 1}")
         area = finding.get("area", "")
 
         new_task = Task(
@@ -2040,11 +2267,16 @@ async def _handle_perf_completion(task: Task, logs: str, session: AsyncSession):
             title=f"[PERF] {title}",
             description=finding.get("description", fix_prompt[:200]),
             parent_task_id=task.id,
-            payloads=[validate_internal_payload({
-                "type": "create",
-                "prompt": fix_prompt,
-                "base_branch": base_branch,
-            }, "task_completion:perf_finding")],
+            payloads=[
+                validate_internal_payload(
+                    {
+                        "type": "create",
+                        "prompt": fix_prompt,
+                        "base_branch": base_branch,
+                    },
+                    "task_completion:perf_finding",
+                )
+            ],
             context={
                 "perf_task_id": str(task.id),
                 "finding_index": i,
@@ -2064,16 +2296,22 @@ async def _handle_perf_completion(task: Task, logs: str, session: AsyncSession):
     await session.flush()
     for ct in child_tasks:
         history = TaskHistory(
-            task_id=ct.id, action="SPAWNED",
-            details={"spawned_by": "PERF_AUDIT", "parent_perf_id": str(task.id)}
+            task_id=ct.id,
+            action="SPAWNED",
+            details={"spawned_by": "PERF_AUDIT", "parent_perf_id": str(task.id)},
         )
         session.add(history)
-        await broadcast_to_project(str(task.project_id), "task_updated",
-                                   {"task_id": str(ct.id), "status": TaskStatus.QUEUED})
+        await broadcast_to_project(
+            str(task.project_id),
+            "task_updated",
+            {"task_id": str(ct.id), "status": TaskStatus.QUEUED},
+        )
 
     # Post a summary comment on open PRs for medium/low findings
     informational = [f for f in findings if f.get("severity") in ("medium", "low")]
-    all_surfaced = informational + [f for f in findings if f.get("severity") == "high" and f not in actionable]
+    all_surfaced = informational + [
+        f for f in findings if f.get("severity") == "high" and f not in actionable
+    ]
     if all_surfaced or findings:
         rows = "\n".join(
             "| {area} | {severity} | {title} | {desc} |".format(
@@ -2098,7 +2336,9 @@ async def _handle_perf_completion(task: Task, logs: str, session: AsyncSession):
             if open_prs:
                 pr_number = open_prs[0]["number"]
                 await create_pr_comment(gh_token, owner, repo, pr_number, comment_body)
-                logger.info(f"[PERF] Posted findings summary comment on PR #{pr_number}")
+                logger.info(
+                    f"[PERF] Posted findings summary comment on PR #{pr_number}"
+                )
         except Exception as e:
             logger.warning(f"[PERF] Failed to post PR comment: {e}", exc_info=True)
 
@@ -2109,9 +2349,14 @@ async def _handle_perf_completion(task: Task, logs: str, session: AsyncSession):
     )
     session.add(task)
 
-    await broadcast_to_project(str(task.project_id), "autonomous_activity",
-                               {"perf_task_id": str(task.id), "tasks_created": len(child_tasks)})
-    logger.info(f"[PERF] Created {len(child_tasks)} fix tasks from perf analysis {task.id}")
+    await broadcast_to_project(
+        str(task.project_id),
+        "autonomous_activity",
+        {"perf_task_id": str(task.id), "tasks_created": len(child_tasks)},
+    )
+    logger.info(
+        f"[PERF] Created {len(child_tasks)} fix tasks from perf analysis {task.id}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2123,13 +2368,18 @@ async def _handle_perf_completion(task: Task, logs: str, session: AsyncSession):
 _VALID_SELF_AUDIT_MODES = {"audit", "fundamentals", "ship", "pause"}
 _SELF_AUDIT_PROPAGATED_MODES = {"audit", "fundamentals", "pause"}
 _MODE_STRICTNESS = {"ship": 0, "fundamentals": 1, "audit": 2, "pause": 3}
-_SHIP_RECOVERY_THRESHOLD = 2  # consecutive ship assessments before auto-clearing audit/fundamentals
+_SHIP_RECOVERY_THRESHOLD = (
+    2  # consecutive ship assessments before auto-clearing audit/fundamentals
+)
 _AUDIT_CLEARABLE_MODES = {"audit", "fundamentals"}
 
 # Per-component scores must be 0-100 integers; we don't enforce a DB check
 # constraint, so we clamp here to keep downstream consumers safe.
 _SELF_AUDIT_COMPONENT_KEYS = (
-    "test_coverage", "friction_density", "claim_consistency", "failure_mix",
+    "test_coverage",
+    "friction_density",
+    "claim_consistency",
+    "failure_mix",
 )
 
 
@@ -2211,7 +2461,9 @@ def _normalize_self_audit_finding(raw: Dict[str, Any]) -> Optional[Dict[str, Any
     evidence = raw.get("evidence") or []
     if not isinstance(evidence, list):
         evidence = []
-    evidence_norm: List[Dict[str, Any]] = [e for e in evidence[:20] if isinstance(e, dict)]
+    evidence_norm: List[Dict[str, Any]] = [
+        e for e in evidence[:20] if isinstance(e, dict)
+    ]
     return {
         "system_id": system_id.strip()[:200],
         "score": score,
@@ -2245,7 +2497,10 @@ def _maybe_auto_clear_direction_mode(
         if current_mode not in _AUDIT_CLEARABLE_MODES:
             continue
         meta = d.get(RECOMMENDED_MODE_META_KEY) or {}
-        if not isinstance(meta, dict) or meta.get("source") != RECOMMENDED_MODE_SOURCE_SELF_AUDIT:
+        if (
+            not isinstance(meta, dict)
+            or meta.get("source") != RECOMMENDED_MODE_SOURCE_SELF_AUDIT
+        ):
             continue
         d["recommended_mode"] = None
         d[RECOMMENDED_MODE_META_KEY] = {
@@ -2263,9 +2518,14 @@ def _maybe_auto_clear_direction_mode(
     return changed
 
 
-def _is_recent_strategic_mode_lock(direction: Dict[str, Any], incoming_mode: str, now: datetime) -> bool:
+def _is_recent_strategic_mode_lock(
+    direction: Dict[str, Any], incoming_mode: str, now: datetime
+) -> bool:
     meta = direction.get(RECOMMENDED_MODE_META_KEY) or {}
-    if not isinstance(meta, dict) or meta.get("source") != RECOMMENDED_MODE_SOURCE_STRATEGIC:
+    if (
+        not isinstance(meta, dict)
+        or meta.get("source") != RECOMMENDED_MODE_SOURCE_STRATEGIC
+    ):
         return False
     existing = str(direction.get("recommended_mode") or "").strip().lower()
     incoming_rank = _MODE_STRICTNESS.get(incoming_mode, -1)
@@ -2275,7 +2535,9 @@ def _is_recent_strategic_mode_lock(direction: Dict[str, Any], incoming_mode: str
     if now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)
     try:
-        set_at = datetime.fromisoformat(str(meta.get("set_at", "")).replace("Z", "+00:00"))
+        set_at = datetime.fromisoformat(
+            str(meta.get("set_at", "")).replace("Z", "+00:00")
+        )
     except ValueError:
         return False
     if set_at.tzinfo is None:
@@ -2328,17 +2590,25 @@ async def _handle_self_audit_completion(task: Task, logs: str, session: AsyncSes
     for finding in normalized:
         system_id = finding["system_id"]
         mode = finding["recommended_mode"]
-        existing = (await session.execute(
-            select(SystemMaturity).where(
-                SystemMaturity.project_id == task.project_id,
-                SystemMaturity.system_id == system_id,
+        existing = (
+            (
+                await session.execute(
+                    select(SystemMaturity).where(
+                        SystemMaturity.project_id == task.project_id,
+                        SystemMaturity.system_id == system_id,
+                    )
+                )
             )
-        )).scalars().first()
+            .scalars()
+            .first()
+        )
         now = _utcnow()
         # Track consecutive ship assessments so we can auto-clear recovered directions.
         if existing is not None:
             prev_mode = existing.recommended_mode
-            prev_ship_count = int((existing.components or {}).get("_consecutive_ship_count", 0))
+            prev_ship_count = int(
+                (existing.components or {}).get("_consecutive_ship_count", 0)
+            )
         else:
             prev_mode = None
             prev_ship_count = 0
@@ -2361,17 +2631,19 @@ async def _handle_self_audit_completion(task: Task, logs: str, session: AsyncSes
             flag_modified(existing, "evidence")
             session.add(existing)
         else:
-            session.add(SystemMaturity(
-                project_id=task.project_id,
-                system_id=system_id,
-                score=finding["score"],
-                components=new_components,
-                recommended_mode=finding["recommended_mode"],
-                top_issues=finding["top_issues"],
-                evidence=finding["evidence"],
-                last_audited_at=now,
-                source_task_id=task.id,
-            ))
+            session.add(
+                SystemMaturity(
+                    project_id=task.project_id,
+                    system_id=system_id,
+                    score=finding["score"],
+                    components=new_components,
+                    recommended_mode=finding["recommended_mode"],
+                    top_issues=finding["top_issues"],
+                    evidence=finding["evidence"],
+                    last_audited_at=now,
+                    source_task_id=task.id,
+                )
+            )
         upserted += 1
         now = _utcnow()
         if mode in _SELF_AUDIT_PROPAGATED_MODES:
@@ -2404,9 +2676,14 @@ async def _handle_self_audit_completion(task: Task, logs: str, session: AsyncSes
     session.add(task)
     await session.commit()
 
-    await broadcast_to_project(str(task.project_id), "autonomous_activity",
-                               {"self_audit_task_id": str(task.id), "systems_ingested": upserted})
-    logger.info(f"[SELF_AUDIT] Task {task.id}: upserted {upserted} maturity row(s), dropped {dropped}")
+    await broadcast_to_project(
+        str(task.project_id),
+        "autonomous_activity",
+        {"self_audit_task_id": str(task.id), "systems_ingested": upserted},
+    )
+    logger.info(
+        f"[SELF_AUDIT] Task {task.id}: upserted {upserted} maturity row(s), dropped {dropped}"
+    )
 
 
 # Phrases that unambiguously indicate a structural (direction-level) diagnosis
@@ -2450,14 +2727,51 @@ def _is_structural_diagnosis(root_cause: str, recommended_fix: str) -> bool:
 # Stopwords trimmed from root-cause divergence comparison so generic English
 # scaffolding ("the", "this", "test", etc.) doesn't inflate the apparent
 # overlap between diagnoses that actually disagree on substance.
-_DIVERGENCE_STOPWORDS: frozenset[str] = frozenset({
-    "the", "this", "that", "with", "from", "into", "have", "been", "will",
-    "their", "there", "these", "those", "what", "when", "which", "while",
-    "after", "because", "could", "should", "would", "shall", "might",
-    "test", "tests", "code", "fail", "fails", "failed", "failing",
-    "issue", "issues", "error", "errors", "task", "tasks", "task_id",
-    "regression", "investigation", "diagnosis",
-})
+_DIVERGENCE_STOPWORDS: frozenset[str] = frozenset(
+    {
+        "the",
+        "this",
+        "that",
+        "with",
+        "from",
+        "into",
+        "have",
+        "been",
+        "will",
+        "their",
+        "there",
+        "these",
+        "those",
+        "what",
+        "when",
+        "which",
+        "while",
+        "after",
+        "because",
+        "could",
+        "should",
+        "would",
+        "shall",
+        "might",
+        "test",
+        "tests",
+        "code",
+        "fail",
+        "fails",
+        "failed",
+        "failing",
+        "issue",
+        "issues",
+        "error",
+        "errors",
+        "task",
+        "tasks",
+        "task_id",
+        "regression",
+        "investigation",
+        "diagnosis",
+    }
+)
 
 
 def _normalize_path_for_divergence(path: str) -> str:
@@ -2530,8 +2844,10 @@ async def _maybe_escalate_diagnosis_divergence(
         return False
 
     from app.models import (  # noqa: PLC0415
-        Alert, AlertSeverity,
-        RegressionCaseStatus, RegressionRemediationCase,
+        Alert,
+        AlertSeverity,
+        RegressionCaseStatus,
+        RegressionRemediationCase,
     )
 
     case_result = await session.execute(
@@ -2587,27 +2903,37 @@ async def _maybe_escalate_diagnosis_divergence(
 
     case.escalate_for_divergence()
     session.add(case)
-    session.add(Alert(
-        project_id=task.project_id,
-        severity=AlertSeverity.WARNING,
-        title=f"Regression case escalated for diagnosis divergence: {regression_class}"[:200],
-        message=(
-            "investigations diverged: structural/environmental cause likely. "
-            f"{detail} Prior investigation {prior_task.id} and current investigation "
-            f"{task.id} produced incompatible diagnoses for {regression_class} "
-            f"after {case.attempts} attempts. Manual review required."
-        )[:1000],
-    ))
+    session.add(
+        Alert(
+            project_id=task.project_id,
+            severity=AlertSeverity.WARNING,
+            title=f"Regression case escalated for diagnosis divergence: {regression_class}"[
+                :200
+            ],
+            message=(
+                "investigations diverged: structural/environmental cause likely. "
+                f"{detail} Prior investigation {prior_task.id} and current investigation "
+                f"{task.id} produced incompatible diagnoses for {regression_class} "
+                f"after {case.attempts} attempts. Manual review required."
+            )[:1000],
+        )
+    )
     logger.warning(
         "[INVESTIGATION_DIVERGENCE] project=%s class=%s task=%s prior_task=%s "
         "attempts=%d — case escalated to NEEDS_MANUAL_INTERVENTION (%s)",
-        task.project_id, regression_class, task.id, prior_task.id,
-        case.attempts, detail,
+        task.project_id,
+        regression_class,
+        task.id,
+        prior_task.id,
+        case.attempts,
+        detail,
     )
     return True
 
 
-async def _handle_investigation_completion(task: Task, payload, session: AsyncSession) -> None:
+async def _handle_investigation_completion(
+    task: Task, payload, session: AsyncSession
+) -> None:
     """Process investigation report: update diagnosis state and spawn remediation.
 
     The investigate agent writes a JSON report with keys:
@@ -2632,7 +2958,9 @@ async def _handle_investigation_completion(task: Task, payload, session: AsyncSe
     if logs:
         candidates: List[str] = [logs]
         # Strip markdown code fences (```json ... ``` or ``` ... ```)
-        fence_stripped = re.sub(r"^\s*```(?:json)?\s*\n?|\n?```\s*$", "", logs.strip(), flags=re.IGNORECASE)
+        fence_stripped = re.sub(
+            r"^\s*```(?:json)?\s*\n?|\n?```\s*$", "", logs.strip(), flags=re.IGNORECASE
+        )
         if fence_stripped and fence_stripped != logs:
             candidates.append(fence_stripped)
         used_fallback = False
@@ -2679,8 +3007,9 @@ async def _handle_investigation_completion(task: Task, payload, session: AsyncSe
         flag_modified(task, "context")
         task.latest_status_message = (
             "Investigation report unparseable — no JSON diagnosis produced "
-            f"(raw_prefix={logs[:120]!r})" if logs else
-            "Investigation produced no output — no diagnosis report available"
+            f"(raw_prefix={logs[:120]!r})"
+            if logs
+            else "Investigation produced no output — no diagnosis report available"
         )[:500]
         session.add(task)
         # Still clear diagnosis_in_progress so a malformed report doesn't wedge
@@ -2688,7 +3017,10 @@ async def _handle_investigation_completion(task: Task, payload, session: AsyncSe
         # the retry budget and _maybe_spawn_reinvestigation_after_failure path
         # engage instead of silently swallowing the crash as a success.
         await _clear_direction_diagnosis_flag(
-            task, session, summary=None, outcome="report_unparseable",
+            task,
+            session,
+            summary=None,
+            outcome="report_unparseable",
         )
         return
 
@@ -2727,13 +3059,13 @@ async def _handle_investigation_completion(task: Task, payload, session: AsyncSe
     directions_list: List[Dict[str, Any]] = []
     if project is not None:
         directions_list = list(project.directions or [])
-        direction = next((d for d in directions_list if d.get("id") == direction_id), None)
+        direction = next(
+            (d for d in directions_list if d.get("id") == direction_id), None
+        )
 
     structural = _is_structural_diagnosis(root_cause, recommended_fix)
     spawn_remediation = (
-        not structural
-        and confidence in ("high", "medium")
-        and bool(recommended_fix)
+        not structural and confidence in ("high", "medium") and bool(recommended_fix)
     )
 
     # Diverged-diagnoses early escalation. Only fires for pipeline-regression
@@ -2779,7 +3111,10 @@ async def _handle_investigation_completion(task: Task, payload, session: AsyncSe
                 task.id,
                 spawned_child.id,
             )
-    elif spawn_remediation and (task.context or {}).get("spawned_by") == "crash_investigation":
+    elif (
+        spawn_remediation
+        and (task.context or {}).get("spawned_by") == "crash_investigation"
+    ):
         # Crash investigations have no linked direction — spawn remediation directly.
         spawned_child = await _spawn_investigation_remediation(
             task=task,
@@ -2803,9 +3138,7 @@ async def _handle_investigation_completion(task: Task, payload, session: AsyncSe
         # ship a fix; pass a synthetic direction_id keyed off the regression
         # class so _record_remediation_outcome can stamp something traceable
         # without requiring a real Direction row.
-        synthetic_direction = (
-            f"pipeline_regression:{(task.context or {}).get('regression_class') or 'unknown'}"
-        )
+        synthetic_direction = f"pipeline_regression:{(task.context or {}).get('regression_class') or 'unknown'}"
         spawned_child = await _spawn_investigation_remediation(
             task=task,
             direction_id=synthetic_direction,
@@ -2822,7 +3155,9 @@ async def _handle_investigation_completion(task: Task, payload, session: AsyncSe
             logger.info(
                 "[REGRESSION_DISPATCHER] Spawned remediation %s from pipeline "
                 "regression investigation %s (class=%s)",
-                spawned_child.id, task.id, synthetic_direction,
+                spawned_child.id,
+                task.id,
+                synthetic_direction,
             )
 
     # Update direction state
@@ -2852,23 +3187,22 @@ async def _handle_investigation_completion(task: Task, payload, session: AsyncSe
                 note_text += f" Recommendation: {recommended_fix[:400]}"
             note_text = note_text[:STRATEGIC_RATIONALE_MAX]
             notes = list(direction.get("notes") or [])
-            notes.append({
-                "text": note_text,
-                "added_at": now_iso,
-                "added_by_task": str(task.id),
-                "source": "investigation_diagnosis",
-            })
+            notes.append(
+                {
+                    "text": note_text,
+                    "added_at": now_iso,
+                    "added_by_task": str(task.id),
+                    "source": "investigation_diagnosis",
+                }
+            )
             direction["notes"] = notes[-STRATEGIC_NOTES_HISTORY_MAX:]
 
         # Append diagnosis insight to research_context via canonical builder
-        diag_line = (
-            f"Last diagnosis ({now_iso[:10]}): {(root_cause or summary)[:200]}"
-        )
+        diag_line = f"Last diagnosis ({now_iso[:10]}): {(root_cause or summary)[:200]}"
         insights = [diag_line]
         if affected_paths:
             insights.append(
-                "Diagnosed affected files: "
-                + ", ".join(affected_paths[:5])
+                "Diagnosed affected files: " + ", ".join(affected_paths[:5])
             )
         try:
             direction["research_context"] = _build_research_context(
@@ -2953,9 +3287,17 @@ async def _handle_investigation_completion(task: Task, payload, session: AsyncSe
         )
     else:
         reason = (
-            "structural" if structural else
-            ("no_actionable_fix" if not recommended_fix else
-             ("low_confidence" if confidence not in ("high", "medium") else "no_direction"))
+            "structural"
+            if structural
+            else (
+                "no_actionable_fix"
+                if not recommended_fix
+                else (
+                    "low_confidence"
+                    if confidence not in ("high", "medium")
+                    else "no_direction"
+                )
+            )
         )
         logger.info(
             f"[INVESTIGATION] Task {task.id} completed without spawning remediation "
@@ -3052,8 +3394,12 @@ async def _spawn_investigation_remediation(
     create_suffix = _runtime_config.get("agent_prompt_suffixes", {}).get("create")
     title_hint = (summary or recommended_fix or "diagnosed fix")[:80]
     title = f"fix (diagnosed): {title_hint}"
-    severity_tag = severity if severity in ("critical", "high", "medium", "low") else "medium"
-    scope = _calculate_remediation_scope(affected_paths, severity_tag, remediation_attempts)
+    severity_tag = (
+        severity if severity in ("critical", "high", "medium", "low") else "medium"
+    )
+    scope = _calculate_remediation_scope(
+        affected_paths, severity_tag, remediation_attempts
+    )
 
     payload_dict: Dict[str, Any] = {
         "type": "create",
@@ -3071,7 +3417,9 @@ async def _spawn_investigation_remediation(
             parent_ctx.get("original_diagnosis_task_id") or task.id
         ),
         "severity": severity_tag,
-        "diagnosis_confidence": confidence if confidence in ("high", "medium") else "high",
+        "diagnosis_confidence": confidence
+        if confidence in ("high", "medium")
+        else "high",
         "related_files": affected_paths[:25],
         "diagnosis_trigger": "investigation_completion",
         "diagnosis_root_cause": root_cause[:2000],
@@ -3086,9 +3434,7 @@ async def _spawn_investigation_remediation(
         fps = parent_ctx.get("failure_fingerprints") or []
         if isinstance(fps, list) and fps:
             error_fingerprint = fps[0]
-    diagnosis_fingerprint = (
-        parent_ctx.get("diagnosis_fingerprint") or error_fingerprint
-    )
+    diagnosis_fingerprint = parent_ctx.get("diagnosis_fingerprint") or error_fingerprint
     if diagnosis_fingerprint:
         remediation_context["diagnosis_fingerprint"] = diagnosis_fingerprint
     if error_fingerprint:
@@ -3105,6 +3451,7 @@ async def _spawn_investigation_remediation(
     if regression_class:
         remediation_context["regression_class"] = regression_class
         from app.models import RegressionRemediationCase  # noqa: PLC0415
+
         case_result = await session.execute(
             select(RegressionRemediationCase).where(
                 RegressionRemediationCase.project_id == task.project_id,
@@ -3122,16 +3469,18 @@ async def _spawn_investigation_remediation(
         title=title,
         description=(recommended_fix or summary or "")[:500],
         parent_task_id=task.id,
-        payloads=[validate_internal_payload(
-            payload_dict, "task_completion:investigation_fix"
-        )],
+        payloads=[
+            validate_internal_payload(payload_dict, "task_completion:investigation_fix")
+        ],
         context=remediation_context,
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
         status=TaskStatus.QUEUED,
         created_by="ORCHESTRATOR",
         requires_approval=False,
         depends_on=[],
-        priority=TASK_PRIORITY_MAP.get("high" if severity_tag in ("critical", "high") else "medium", 50),
+        priority=TASK_PRIORITY_MAP.get(
+            "high" if severity_tag in ("critical", "high") else "medium", 50
+        ),
     )
     session.add(new_task)
     await session.flush()
@@ -3146,6 +3495,7 @@ async def _spawn_investigation_remediation(
     )
     session.add(history)
     return new_task
+
 
 async def _handle_design_doc_completion(
     task: Task,
@@ -3187,20 +3537,30 @@ async def _handle_design_doc_completion(
         # returns None for both. We re-probe non-lockingly to choose the
         # right alert message; a missing project is a hard error, while
         # contention defers to the next cycle.
-        exists = (await session.execute(
-            select(Project.id).where(Project.id == task.project_id)
-        )).first()
+        exists = (
+            await session.execute(
+                select(Project.id).where(Project.id == task.project_id)
+            )
+        ).first()
         if exists is None:
-            logger.error(f"[DESIGN DOC] Task {task.id}: project {task.project_id} not found")
-            await _create_strategic_alert(task.project_id, session,
-                f"Design doc update failed: project not found (task {str(task.id)[:8]})")
+            logger.error(
+                f"[DESIGN DOC] Task {task.id}: project {task.project_id} not found"
+            )
+            await _create_strategic_alert(
+                task.project_id,
+                session,
+                f"Design doc update failed: project not found (task {str(task.id)[:8]})",
+            )
             return
         logger.warning(
             f"[DESIGN DOC] Task {task.id}: project {task.project_id} held under contention "
             f"after retries; deferring strategic chain"
         )
-        await _create_strategic_alert(task.project_id, session,
-            f"Design doc update: project row contended (task {str(task.id)[:8]}) — strategic chain deferred")
+        await _create_strategic_alert(
+            task.project_id,
+            session,
+            f"Design doc update: project row contended (task {str(task.id)[:8]}) — strategic chain deferred",
+        )
         return
 
     doc = project.design_doc or {}
@@ -3209,8 +3569,11 @@ async def _handle_design_doc_completion(
     logger.info(f"[DESIGN DOC] Task {task.id} completed: {page_count} pages, rev {rev}")
 
     if page_count == 0:
-        await _create_strategic_alert(task.project_id, session,
-            f"Design doc update produced 0 pages (task {str(task.id)[:8]})")
+        await _create_strategic_alert(
+            task.project_id,
+            session,
+            f"Design doc update produced 0 pages (task {str(task.id)[:8]})",
+        )
 
     # Chain: spawn Phase 2 (strategic review)
     # Do this BEFORE committing task status so a failed spawn doesn't leave
@@ -3226,39 +3589,62 @@ async def _handle_design_doc_completion(
         # strategic-completion handlers.
         spawned = await _spawn_strategic_review(project, session, cycle_id=cycle_id)
         if spawned:
-            task.latest_status_message = f"Design doc: {page_count} pages, rev {rev} — strategic review spawned"
+            task.latest_status_message = (
+                f"Design doc: {page_count} pages, rev {rev} — strategic review spawned"
+            )
         else:
             # Spawn silently skipped (active strategic task) — create retry marker
-            logger.warning(f"[DESIGN DOC] Phase 2 spawn skipped for task {task.id} (active strategic task exists)")
+            logger.warning(
+                f"[DESIGN DOC] Phase 2 spawn skipped for task {task.id} (active strategic task exists)"
+            )
             task.latest_status_message = f"Design doc: {page_count} pages, rev {rev} — strategic review deferred (active task exists)"
-            project.vision = {**(project.vision or {}), '_pending_strategic_review': {
-                'design_doc_task_id': str(task.id),
-                'failed_at': _utcnow().isoformat(),
-                'error': 'skipped: active strategic task exists',
-                'cycle_id': cycle_id,
-            }}
-            flag_modified(project, 'vision')
+            project.vision = {
+                **(project.vision or {}),
+                "_pending_strategic_review": {
+                    "design_doc_task_id": str(task.id),
+                    "failed_at": _utcnow().isoformat(),
+                    "error": "skipped: active strategic task exists",
+                    "cycle_id": cycle_id,
+                },
+            }
+            flag_modified(project, "vision")
             session.add(project)
     except Exception as chain_exc:
-        logger.error(f"[DESIGN DOC] Failed to chain Phase 2 for task {task.id}: {chain_exc}", exc_info=True)
-        task.latest_status_message = f"Design doc: {page_count} pages, rev {rev} — FAILED to spawn strategic review: {chain_exc!r}"[:500]
-        await _create_strategic_alert(task.project_id, session,
-            f"Strategic review failed to spawn after design doc update (task {str(task.id)[:8]}): {chain_exc!r}")
+        logger.error(
+            f"[DESIGN DOC] Failed to chain Phase 2 for task {task.id}: {chain_exc}",
+            exc_info=True,
+        )
+        task.latest_status_message = f"Design doc: {page_count} pages, rev {rev} — FAILED to spawn strategic review: {chain_exc!r}"[
+            :500
+        ]
+        await _create_strategic_alert(
+            task.project_id,
+            session,
+            f"Strategic review failed to spawn after design doc update (task {str(task.id)[:8]}): {chain_exc!r}",
+        )
         # Save a retry marker so the next research spawn can retry the strategic review
-        project.vision = {**(project.vision or {}), '_pending_strategic_review': {
-            'design_doc_task_id': str(task.id),
-            'failed_at': _utcnow().isoformat(),
-            'error': str(chain_exc)[:200],
-            'cycle_id': cycle_id,
-        }}
+        project.vision = {
+            **(project.vision or {}),
+            "_pending_strategic_review": {
+                "design_doc_task_id": str(task.id),
+                "failed_at": _utcnow().isoformat(),
+                "error": str(chain_exc)[:200],
+                "cycle_id": cycle_id,
+            },
+        }
         if cycle_id:
             from app.research_completion import _update_cycle_history  # noqa: PLC0415
-            _update_cycle_history(project, cycle_id, {
-                "phase1_completed_at": _utcnow().isoformat(),
-                "outcome": "failed_phase2_spawn",
-                "error": str(chain_exc)[:200],
-            })
-        flag_modified(project, 'vision')
+
+            _update_cycle_history(
+                project,
+                cycle_id,
+                {
+                    "phase1_completed_at": _utcnow().isoformat(),
+                    "outcome": "failed_phase2_spawn",
+                    "error": str(chain_exc)[:200],
+                },
+            )
+        flag_modified(project, "vision")
         session.add(project)
     # Previously emitted a "Architecture analysis completed, strategic review
     # starting" phase-transition message. Removed as part of the auto-status
@@ -3286,7 +3672,9 @@ async def confirm_applied_playbook_entries(task: Task, session: AsyncSession) ->
     confirmed = 0
     now_iso = _utcnow().isoformat()
     for entry_id in entry_ids:
-        full_key = entry_id if entry_id.startswith("playbook/") else f"playbook/{entry_id}"
+        full_key = (
+            entry_id if entry_id.startswith("playbook/") else f"playbook/{entry_id}"
+        )
         entry = doc.get(full_key)
         if not isinstance(entry, dict):
             continue

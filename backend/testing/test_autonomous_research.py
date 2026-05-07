@@ -9,6 +9,7 @@ Focuses on gaps not covered by test_directions.py:
 3. Direction management API endpoints: PUT (replace all), PATCH reorder,
    POST /research with/without bypass_cooldown
 """
+
 import hashlib
 import uuid
 from datetime import datetime, timedelta
@@ -19,7 +20,15 @@ from httpx import AsyncClient
 from sqlalchemy import select
 
 import app.shared_state as _shared_state
-from app.models import Alert, AlertSeverity, MessageType, Project, ProjectMessage, Task, TaskStatus
+from app.models import (
+    Alert,
+    AlertSeverity,
+    MessageType,
+    Project,
+    ProjectMessage,
+    Task,
+    TaskStatus,
+)
 from app.autonomous_research import _spawn_research_task
 from app.research_completion import _handle_research_completion
 from app.direction_outcomes import _update_direction_research_outcomes
@@ -32,13 +41,24 @@ def _ensure_test_account_pool():
     Also clears the task_results ring buffer so the _assess_spawn_health failure-rate
     gate doesn't trigger from results left by other test modules."""
     uid = "test-user-123"
-    entry = {"id": "test-acct", "user_id": uid, "name": "test", "enabled": True, "active_tasks": 0,
-             "oauth_token": "sk-ant-test", "total_tasks": 0, "token_created_at": None, "claude_config_json": None}
+    entry = {
+        "id": "test-acct",
+        "user_id": uid,
+        "name": "test",
+        "enabled": True,
+        "active_tasks": 0,
+        "oauth_token": "sk-ant-test",
+        "total_tasks": 0,
+        "token_created_at": None,
+        "claude_config_json": None,
+    }
     _max_plan_pools.setdefault(uid, []).append(entry)
     _account_by_id["test-acct"] = entry
     _shared_state.deploy_monitoring["task_results"].clear()
     yield
-    _max_plan_pools.get(uid, [])[:] = [a for a in _max_plan_pools.get(uid, []) if a["id"] != "test-acct"]
+    _max_plan_pools.get(uid, [])[:] = [
+        a for a in _max_plan_pools.get(uid, []) if a["id"] != "test-acct"
+    ]
     _account_by_id.pop("test-acct", None)
 
 
@@ -46,7 +66,10 @@ def _ensure_test_account_pool():
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def _deploy_project(client: AsyncClient, mocker, name: str = "Test Project") -> str:
+
+async def _deploy_project(
+    client: AsyncClient, mocker, name: str = "Test Project"
+) -> str:
     """Create a project via the deploy API and return its project_id string."""
     mocker.patch("app.main.provision_agent_vm", return_value=None)
     resp = await client.post(
@@ -76,13 +99,19 @@ async def _add_direction(
 
 def _patch_research_externals(mocker):
     """Patch all external calls needed by _handle_research_completion."""
+
     # R4-W1 (audit C2): _ensure_branch returns Task | None, not bool. Pass-through
     # the task argument so the caller's `task = relocked` swap binds to the same row.
     async def _passthrough_ensure_branch(task, *_a, **_kw):
         return task
-    mocker.patch("app.research_completion._ensure_branch", new=_passthrough_ensure_branch)
+
+    mocker.patch(
+        "app.research_completion._ensure_branch", new=_passthrough_ensure_branch
+    )
     mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
-    mocker.patch("app.research_completion._validate_plan_dependencies", return_value=True)
+    mocker.patch(
+        "app.research_completion._validate_plan_dependencies", return_value=True
+    )
     mocker.patch("app.research_completion._log_file_overlaps", return_value=[])
     # Simulate no pool configured so capacity-aware batch cap doesn't constrain unit tests
     mocker.patch("app.max_plan_pool._all_accounts", return_value=[])
@@ -132,7 +161,9 @@ async def _make_research_task(
     task = Task(
         project_id=project.id,
         title=f"Research: {direction['text']}",
-        payloads=[{"type": "research", "directions": [direction], "base_branch": "main"}],
+        payloads=[
+            {"type": "research", "directions": [direction], "base_branch": "main"}
+        ],
         context={"research_depth": depth},
         status=TaskStatus.IN_PROGRESS,
         created_by="ORCHESTRATOR",
@@ -147,6 +178,7 @@ async def _make_research_task(
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. _spawn_research_task — Circuit Breaker Guards
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_spawn_blocked_by_open_circuit_breaker(db_session):
@@ -174,8 +206,12 @@ async def test_spawn_blocked_by_open_circuit_breaker(db_session):
     try:
         await _spawn_research_task(project, db_session)
 
-        result = await db_session.execute(select(Task).where(Task.project_id == project.id))
-        assert len(result.scalars().all()) == 0, "No task spawned when circuit breaker OPEN"
+        result = await db_session.execute(
+            select(Task).where(Task.project_id == project.id)
+        )
+        assert len(result.scalars().all()) == 0, (
+            "No task spawned when circuit breaker OPEN"
+        )
     finally:
         _shared_state.circuit_breakers.pop(str(project.id), None)
 
@@ -188,7 +224,9 @@ async def test_spawn_allowed_when_circuit_breaker_cooldown_elapsed(db_session):
         user_id="test-user-123",
         autonomous_enabled=True,
         directions=[_active_direction("d-cbhalf01")],
-        vision={"purpose": "test"},  # Non-empty vision so force_strategic doesn't override
+        vision={
+            "purpose": "test"
+        },  # Non-empty vision so force_strategic doesn't override
     )
     db_session.add(project)
     await db_session.commit()
@@ -207,9 +245,13 @@ async def test_spawn_allowed_when_circuit_breaker_cooldown_elapsed(db_session):
     try:
         await _spawn_research_task(project, db_session)
 
-        result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+        result = await db_session.execute(
+            select(Task).where(Task.project_id == project.id)
+        )
         tasks = result.scalars().all()
-        research = [t for t in tasks if (t.payloads or [{}])[0].get("type") == "research"]
+        research = [
+            t for t in tasks if (t.payloads or [{}])[0].get("type") == "research"
+        ]
         assert len(research) == 1, "One test task should be spawned in HALF-OPEN state"
 
         # Breaker should have transitioned to HALF-OPEN
@@ -224,6 +266,7 @@ async def test_spawn_allowed_when_circuit_breaker_cooldown_elapsed(db_session):
 # 2. _spawn_research_task — No-Directions Guards
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_spawn_skipped_when_directions_empty(db_session):
     """_spawn_research_task does nothing when the directions list is empty."""
@@ -232,7 +275,10 @@ async def test_spawn_skipped_when_directions_empty(db_session):
         user_id="test-user-123",
         autonomous_enabled=True,
         directions=[],
-        vision={"purpose": "test", "_strategic_failures": 3},  # At failure cap so force_strategic doesn't fire
+        vision={
+            "purpose": "test",
+            "_strategic_failures": 3,
+        },  # At failure cap so force_strategic doesn't fire
     )
     db_session.add(project)
     await db_session.commit()
@@ -255,7 +301,10 @@ async def test_spawn_skipped_when_all_directions_non_active(db_session):
             {**_active_direction("d-paused01", "Paused A"), "status": "paused"},
             {**_active_direction("d-done0001", "Completed B"), "status": "completed"},
         ],
-        vision={"purpose": "test", "_strategic_failures": 3},  # At failure cap so force_strategic doesn't fire
+        vision={
+            "purpose": "test",
+            "_strategic_failures": 3,
+        },  # At failure cap so force_strategic doesn't fire
     )
     db_session.add(project)
     await db_session.commit()
@@ -271,10 +320,12 @@ async def test_spawn_skipped_when_all_directions_non_active(db_session):
 # 3. _spawn_research_task — Active Research Guard
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_spawn_skipped_when_research_task_already_queued(db_session):
     """_spawn_research_task does not spawn beyond the parallel limit when one is already QUEUED."""
     from app.shared_state import runtime_config as _runtime_config
+
     old_val = _runtime_config.get("max_parallel_research_per_project", 2)
     _runtime_config["max_parallel_research_per_project"] = 1
     try:
@@ -302,9 +353,13 @@ async def test_spawn_skipped_when_research_task_already_queued(db_session):
 
         await _spawn_research_task(project, db_session)
 
-        result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+        result = await db_session.execute(
+            select(Task).where(Task.project_id == project.id)
+        )
         all_tasks = result.scalars().all()
-        research = [t for t in all_tasks if (t.payloads or [{}])[0].get("type") == "research"]
+        research = [
+            t for t in all_tasks if (t.payloads or [{}])[0].get("type") == "research"
+        ]
         assert len(research) == 1, "Must not spawn a second research task"
     finally:
         _runtime_config["max_parallel_research_per_project"] = old_val
@@ -314,6 +369,7 @@ async def test_spawn_skipped_when_research_task_already_queued(db_session):
 async def test_spawn_skipped_when_research_task_in_progress(db_session):
     """_spawn_research_task does not spawn beyond the parallel limit when a research task is IN_PROGRESS."""
     from app.shared_state import runtime_config as _runtime_config
+
     old_val = _runtime_config.get("max_parallel_research_per_project", 2)
     _runtime_config["max_parallel_research_per_project"] = 1
     try:
@@ -340,9 +396,13 @@ async def test_spawn_skipped_when_research_task_in_progress(db_session):
 
         await _spawn_research_task(project, db_session)
 
-        result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+        result = await db_session.execute(
+            select(Task).where(Task.project_id == project.id)
+        )
         all_tasks = result.scalars().all()
-        research = [t for t in all_tasks if (t.payloads or [{}])[0].get("type") == "research"]
+        research = [
+            t for t in all_tasks if (t.payloads or [{}])[0].get("type") == "research"
+        ]
         assert len(research) == 1, "Must not spawn when research already IN_PROGRESS"
     finally:
         _runtime_config["max_parallel_research_per_project"] = old_val
@@ -352,6 +412,7 @@ async def test_spawn_skipped_when_research_task_in_progress(db_session):
 async def test_evaluating_blocks_direction_when_recent(db_session):
     """A recent EVALUATING research task blocks new research on the same direction."""
     from app.shared_state import runtime_config as _runtime_config
+
     _runtime_config["evaluating_pipeline_timeout_minutes"] = 30
     project = Project(
         name="Recent Evaluating Blocks",
@@ -366,8 +427,14 @@ async def test_evaluating_blocks_direction_when_recent(db_session):
     existing = Task(
         project_id=project.id,
         title="Research: evaluating recent",
-        payloads=[{"type": "research", "directions": [], "base_branch": "main",
-                   "current_direction_id": "d-evalblk1"}],
+        payloads=[
+            {
+                "type": "research",
+                "directions": [],
+                "base_branch": "main",
+                "current_direction_id": "d-evalblk1",
+            }
+        ],
         status=TaskStatus.EVALUATING,
         created_by="ORCHESTRATOR",
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
@@ -378,14 +445,21 @@ async def test_evaluating_blocks_direction_when_recent(db_session):
     await _spawn_research_task(project, db_session)
 
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
-    research = [t for t in result.scalars().all() if (t.payloads or [{}])[0].get("type") == "research"]
-    assert len(research) == 1, "Recent EVALUATING should block direction from new research"
+    research = [
+        t
+        for t in result.scalars().all()
+        if (t.payloads or [{}])[0].get("type") == "research"
+    ]
+    assert len(research) == 1, (
+        "Recent EVALUATING should block direction from new research"
+    )
 
 
 @pytest.mark.asyncio
 async def test_evaluating_releases_direction_after_timeout(db_session):
     """An old EVALUATING research task no longer blocks new research on the direction."""
     from app.shared_state import runtime_config as _runtime_config
+
     _runtime_config["evaluating_pipeline_timeout_minutes"] = 30
     project = Project(
         name="Old Evaluating Pipelines",
@@ -400,8 +474,14 @@ async def test_evaluating_releases_direction_after_timeout(db_session):
     existing = Task(
         project_id=project.id,
         title="Research: evaluating old",
-        payloads=[{"type": "research", "directions": [], "base_branch": "main",
-                   "current_direction_id": "d-evalold1"}],
+        payloads=[
+            {
+                "type": "research",
+                "directions": [],
+                "base_branch": "main",
+                "current_direction_id": "d-evalold1",
+            }
+        ],
         status=TaskStatus.EVALUATING,
         created_by="ORCHESTRATOR",
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
@@ -410,14 +490,21 @@ async def test_evaluating_releases_direction_after_timeout(db_session):
     await db_session.commit()
     # Backdate updated_at past the timeout via raw UPDATE so onupdate doesn't fire
     from sqlalchemy import update as _update
+
     stale = datetime.utcnow() - timedelta(minutes=90)
-    await db_session.execute(_update(Task).where(Task.id == existing.id).values(updated_at=stale))
+    await db_session.execute(
+        _update(Task).where(Task.id == existing.id).values(updated_at=stale)
+    )
     await db_session.commit()
 
     await _spawn_research_task(project, db_session)
 
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
-    research = [t for t in result.scalars().all() if (t.payloads or [{}])[0].get("type") == "research"]
+    research = [
+        t
+        for t in result.scalars().all()
+        if (t.payloads or [{}])[0].get("type") == "research"
+    ]
     assert len(research) == 2, "Stale EVALUATING should allow pipelined new research"
 
 
@@ -434,6 +521,7 @@ async def test_pipelining_capped_at_one_extra_per_window(db_session):
     pipelining window (default 240 min). Recent CANCELLED research counts
     against the cap so cancel-respawn loops can't bypass it."""
     from app.shared_state import runtime_config as _runtime_config
+
     _runtime_config["evaluating_pipeline_timeout_minutes"] = 30
     _runtime_config["research_pipelining_window_minutes"] = 240
     project = Project(
@@ -450,8 +538,14 @@ async def test_pipelining_capped_at_one_extra_per_window(db_session):
     parent = Task(
         project_id=project.id,
         title="Research: stuck parent",
-        payloads=[{"type": "research", "directions": [], "base_branch": "main",
-                   "current_direction_id": "d-pipecap"}],
+        payloads=[
+            {
+                "type": "research",
+                "directions": [],
+                "base_branch": "main",
+                "current_direction_id": "d-pipecap",
+            }
+        ],
         status=TaskStatus.EVALUATING,
         created_by="ORCHESTRATOR",
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
@@ -463,8 +557,14 @@ async def test_pipelining_capped_at_one_extra_per_window(db_session):
     pipelined = Task(
         project_id=project.id,
         title="Research: pipelined recently, then cancelled",
-        payloads=[{"type": "research", "directions": [], "base_branch": "main",
-                   "current_direction_id": "d-pipecap"}],
+        payloads=[
+            {
+                "type": "research",
+                "directions": [],
+                "base_branch": "main",
+                "current_direction_id": "d-pipecap",
+            }
+        ],
         status=TaskStatus.CANCELLED,
         created_by="ORCHESTRATOR",
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
@@ -474,14 +574,21 @@ async def test_pipelining_capped_at_one_extra_per_window(db_session):
 
     # Backdate parent's updated_at to make EVALUATING look stale.
     from sqlalchemy import update as _update
+
     stale = datetime.utcnow() - timedelta(minutes=90)
-    await db_session.execute(_update(Task).where(Task.id == parent.id).values(updated_at=stale))
+    await db_session.execute(
+        _update(Task).where(Task.id == parent.id).values(updated_at=stale)
+    )
     await db_session.commit()
 
     await _spawn_research_task(project, db_session)
 
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
-    research = [t for t in result.scalars().all() if (t.payloads or [{}])[0].get("type") == "research"]
+    research = [
+        t
+        for t in result.scalars().all()
+        if (t.payloads or [{}])[0].get("type") == "research"
+    ]
     assert len(research) == 2, (
         f"Pipelining must be capped at 1 extra per direction per window "
         f"(parent + 1 prior pipelined = 2 total; expected no new spawn). "
@@ -495,6 +602,7 @@ async def test_pipelining_allows_first_extra_when_no_prior(db_session):
     and NO other recent research exists on this direction, the FIRST pipelined
     spawn is allowed (cap is at 1 extra, not 0)."""
     from app.shared_state import runtime_config as _runtime_config
+
     _runtime_config["evaluating_pipeline_timeout_minutes"] = 30
     _runtime_config["research_pipelining_window_minutes"] = 240
     project = Project(
@@ -510,8 +618,14 @@ async def test_pipelining_allows_first_extra_when_no_prior(db_session):
     parent = Task(
         project_id=project.id,
         title="Research: stuck, no prior pipelined",
-        payloads=[{"type": "research", "directions": [], "base_branch": "main",
-                   "current_direction_id": "d-pipefirst"}],
+        payloads=[
+            {
+                "type": "research",
+                "directions": [],
+                "base_branch": "main",
+                "current_direction_id": "d-pipefirst",
+            }
+        ],
         status=TaskStatus.EVALUATING,
         created_by="ORCHESTRATOR",
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
@@ -520,14 +634,21 @@ async def test_pipelining_allows_first_extra_when_no_prior(db_session):
     await db_session.commit()
 
     from sqlalchemy import update as _update
+
     stale = datetime.utcnow() - timedelta(minutes=90)
-    await db_session.execute(_update(Task).where(Task.id == parent.id).values(updated_at=stale))
+    await db_session.execute(
+        _update(Task).where(Task.id == parent.id).values(updated_at=stale)
+    )
     await db_session.commit()
 
     await _spawn_research_task(project, db_session)
 
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
-    research = [t for t in result.scalars().all() if (t.payloads or [{}])[0].get("type") == "research"]
+    research = [
+        t
+        for t in result.scalars().all()
+        if (t.payloads or [{}])[0].get("type") == "research"
+    ]
     assert len(research) == 2, (
         "First pipelined spawn must be allowed when no prior pipelined research exists"
     )
@@ -562,8 +683,14 @@ async def test_failed_resurrection_eligible_blocks_direction(db_session):
     failed = Task(
         project_id=project.id,
         title="Research: failed but eligible",
-        payloads=[{"type": "research", "directions": [], "base_branch": "main",
-                   "current_direction_id": "d-resur001"}],
+        payloads=[
+            {
+                "type": "research",
+                "directions": [],
+                "base_branch": "main",
+                "current_direction_id": "d-resur001",
+            }
+        ],
         context={"failure_category": "AGENT_TIMEOUT"},
         status=TaskStatus.FAILED,
         created_by="ORCHESTRATOR",
@@ -575,7 +702,11 @@ async def test_failed_resurrection_eligible_blocks_direction(db_session):
     await _spawn_research_task(project, db_session)
 
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
-    research = [t for t in result.scalars().all() if (t.payloads or [{}])[0].get("type") == "research"]
+    research = [
+        t
+        for t in result.scalars().all()
+        if (t.payloads or [{}])[0].get("type") == "research"
+    ]
     assert len(research) == 1, (
         "FAILED + resurrection-eligible must keep the direction busy until "
         "reaper resolves it (resurrect or age-out at 2h)"
@@ -602,8 +733,14 @@ async def test_failed_already_resurrected_does_not_block_direction(db_session):
     failed = Task(
         project_id=project.id,
         title="Research: already resurrected once",
-        payloads=[{"type": "research", "directions": [], "base_branch": "main",
-                   "current_direction_id": "d-resur002"}],
+        payloads=[
+            {
+                "type": "research",
+                "directions": [],
+                "base_branch": "main",
+                "current_direction_id": "d-resur002",
+            }
+        ],
         # Already resurrected once; reaper.py:1818 skips on _resurrection_count>=1
         context={"failure_category": "AGENT_TIMEOUT", "_resurrection_count": 1},
         status=TaskStatus.FAILED,
@@ -616,7 +753,11 @@ async def test_failed_already_resurrected_does_not_block_direction(db_session):
     await _spawn_research_task(project, db_session)
 
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
-    research = [t for t in result.scalars().all() if (t.payloads or [{}])[0].get("type") == "research"]
+    research = [
+        t
+        for t in result.scalars().all()
+        if (t.payloads or [{}])[0].get("type") == "research"
+    ]
     assert len(research) == 2, (
         "Already-resurrected FAILED task should NOT block — reaper won't "
         "resurrect it again, so direction is free for new research"
@@ -643,8 +784,14 @@ async def test_failed_non_infra_does_not_block_direction(db_session):
     failed = Task(
         project_id=project.id,
         title="Research: failed with code error",
-        payloads=[{"type": "research", "directions": [], "base_branch": "main",
-                   "current_direction_id": "d-resur003"}],
+        payloads=[
+            {
+                "type": "research",
+                "directions": [],
+                "base_branch": "main",
+                "current_direction_id": "d-resur003",
+            }
+        ],
         context={"failure_category": "CODE_ERROR"},
         status=TaskStatus.FAILED,
         created_by="ORCHESTRATOR",
@@ -656,7 +803,11 @@ async def test_failed_non_infra_does_not_block_direction(db_session):
     await _spawn_research_task(project, db_session)
 
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
-    research = [t for t in result.scalars().all() if (t.payloads or [{}])[0].get("type") == "research"]
+    research = [
+        t
+        for t in result.scalars().all()
+        if (t.payloads or [{}])[0].get("type") == "research"
+    ]
     assert len(research) == 2, (
         "Non-infra FAILED task should NOT block — reaper won't resurrect "
         "CODE_ERROR / OOM / pr_closed_unmerged failures"
@@ -666,6 +817,7 @@ async def test_failed_non_infra_does_not_block_direction(db_session):
 # ─────────────────────────────────────────────────────────────────────────────
 # 4. _spawn_research_task — Rate Limits
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_spawn_skipped_at_per_project_rate_limit(db_session):
@@ -705,7 +857,9 @@ async def test_spawn_skipped_at_per_project_rate_limit(db_session):
                 Task.status == TaskStatus.QUEUED,
             )
         )
-        assert len(result.scalars().all()) == 0, "No QUEUED task should be spawned at rate limit"
+        assert len(result.scalars().all()) == 0, (
+            "No QUEUED task should be spawned at rate limit"
+        )
     finally:
         _shared_state.runtime_config["max_autonomous_tasks_per_hour"] = original
 
@@ -729,8 +883,12 @@ async def test_spawn_skipped_at_global_rate_limit(db_session):
     try:
         await _spawn_research_task(project, db_session)
 
-        result = await db_session.execute(select(Task).where(Task.project_id == project.id))
-        assert len(result.scalars().all()) == 0, "No task should be spawned when global limit is 0"
+        result = await db_session.execute(
+            select(Task).where(Task.project_id == project.id)
+        )
+        assert len(result.scalars().all()) == 0, (
+            "No task should be spawned when global limit is 0"
+        )
     finally:
         _shared_state.runtime_config["max_global_autonomous_tasks_per_hour"] = original
 
@@ -739,12 +897,16 @@ async def test_spawn_skipped_at_global_rate_limit(db_session):
 # 5. _handle_research_completion — Depth Guard
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_depth_limit_prevents_child_tasks(db_session, mocker):
     """Research at MAX_RESEARCH_DEPTH=3 skips child task creation and sets a status message."""
     direction = _active_direction("d-depth001", "Deep research")
     project = Project(
-        name="Depth Limit", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+        name="Depth Limit",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
     )
     db_session.add(project)
     await db_session.commit()
@@ -761,9 +923,7 @@ async def test_depth_limit_prevents_child_tasks(db_session, mocker):
     await _handle_research_completion(task, "", db_session)
 
     result = await db_session.execute(
-        select(Task).where(
-            Task.project_id == project.id, Task.id != task.id
-        )
+        select(Task).where(Task.project_id == project.id, Task.id != task.id)
     )
     assert len(result.scalars().all()) == 0, "No children at max depth"
     assert "depth limit" in (task.latest_status_message or "").lower()
@@ -773,12 +933,16 @@ async def test_depth_limit_prevents_child_tasks(db_session, mocker):
 # 6. _handle_research_completion — Deduplication
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_hash_deduplication_skips_finding_with_matching_hash(db_session, mocker):
     """A finding whose hash matches a recent task's finding_hash context key is skipped."""
     direction = _active_direction("d-hashdup1", "Hash dedup direction")
     project = Project(
-        name="Hash Dedup Test", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+        name="Hash Dedup Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
     )
     db_session.add(project)
     await db_session.commit()
@@ -806,16 +970,18 @@ async def test_hash_deduplication_skips_finding_with_matching_hash(db_session, m
     _patch_research_externals(mocker)
     mocker.patch(
         "app.research_completion._parse_research_findings",
-        return_value=[{
-            "title": dup_title,
-            "description": dup_desc,
-            "prompt": "Fix auth token expiry",
-            "priority": "high",
-            "scope": "small",
-            "risk": "high",
-            "type": "improvement",
-            "direction_id": direction["id"],
-        }],
+        return_value=[
+            {
+                "title": dup_title,
+                "description": dup_desc,
+                "prompt": "Fix auth token expiry",
+                "priority": "high",
+                "scope": "small",
+                "risk": "high",
+                "type": "improvement",
+                "direction_id": direction["id"],
+            }
+        ],
     )
 
     await _handle_research_completion(task, "", db_session)
@@ -825,9 +991,13 @@ async def test_hash_deduplication_skips_finding_with_matching_hash(db_session, m
             Task.project_id == project.id, Task.parent_task_id == task.id
         )
     )
-    assert len(result.scalars().all()) == 0, "Hash-duplicate finding must not create a task"
+    assert len(result.scalars().all()) == 0, (
+        "Hash-duplicate finding must not create a task"
+    )
     await db_session.refresh(task)
-    assert task.status == TaskStatus.COMPLETED, "Research task must be auto-completed when all findings are duplicates"
+    assert task.status == TaskStatus.COMPLETED, (
+        "Research task must be auto-completed when all findings are duplicates"
+    )
 
 
 @pytest.mark.asyncio
@@ -835,7 +1005,10 @@ async def test_word_overlap_deduplication_skips_similar_title(db_session, mocker
     """A finding with 4+ meaningful words overlapping an active task title is skipped."""
     direction = _active_direction("d-worddup1", "Word overlap direction")
     project = Project(
-        name="Word Overlap Dedup", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+        name="Word Overlap Dedup",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
     )
     db_session.add(project)
     await db_session.commit()
@@ -859,17 +1032,19 @@ async def test_word_overlap_deduplication_skips_similar_title(db_session, mocker
     _patch_research_externals(mocker)
     mocker.patch(
         "app.research_completion._parse_research_findings",
-        return_value=[{
-            # "database", "connection", "pooling", "configuration" overlap existing → ≥4 words
-            "title": "tune database connection pooling configuration settings",
-            "description": "Improve pooling",
-            "prompt": "Tune the connection pool",
-            "priority": "medium",
-            "scope": "small",
-            "risk": "low",
-            "type": "improvement",
-            "direction_id": direction["id"],
-        }],
+        return_value=[
+            {
+                # "database", "connection", "pooling", "configuration" overlap existing → ≥4 words
+                "title": "tune database connection pooling configuration settings",
+                "description": "Improve pooling",
+                "prompt": "Tune the connection pool",
+                "priority": "medium",
+                "scope": "small",
+                "risk": "low",
+                "type": "improvement",
+                "direction_id": direction["id"],
+            }
+        ],
     )
 
     await _handle_research_completion(task, "", db_session)
@@ -879,17 +1054,26 @@ async def test_word_overlap_deduplication_skips_similar_title(db_session, mocker
             Task.project_id == project.id, Task.parent_task_id == task.id
         )
     )
-    assert len(result.scalars().all()) == 0, "Word-overlap duplicate must not create a task"
+    assert len(result.scalars().all()) == 0, (
+        "Word-overlap duplicate must not create a task"
+    )
     await db_session.refresh(task)
-    assert task.status == TaskStatus.COMPLETED, "Research task must be auto-completed when all findings are duplicates"
+    assert task.status == TaskStatus.COMPLETED, (
+        "Research task must be auto-completed when all findings are duplicates"
+    )
 
 
 @pytest.mark.asyncio
-async def test_word_overlap_deduplication_allows_common_word_findings(db_session, mocker):
+async def test_word_overlap_deduplication_allows_common_word_findings(
+    db_session, mocker
+):
     """Findings sharing only common stopwords/prepositions are NOT falsely deduplicated."""
     direction = _active_direction("d-worddup2", "Stopword false-positive direction")
     project = Project(
-        name="Stopword False Positive Test", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+        name="Stopword False Positive Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
     )
     db_session.add(project)
     await db_session.commit()
@@ -913,17 +1097,19 @@ async def test_word_overlap_deduplication_allows_common_word_findings(db_session
     _patch_research_externals(mocker)
     mocker.patch(
         "app.research_completion._parse_research_findings",
-        return_value=[{
-            # Shares only stopwords ("inject", "into", "for") with existing — should NOT be deduplicated
-            "title": "inject rate limiting into api gateway for security",
-            "description": "Add rate limiting to protect the API",
-            "prompt": "Add rate limiting middleware",
-            "priority": "medium",
-            "scope": "small",
-            "risk": "low",
-            "type": "improvement",
-            "direction_id": direction["id"],
-        }],
+        return_value=[
+            {
+                # Shares only stopwords ("inject", "into", "for") with existing — should NOT be deduplicated
+                "title": "inject rate limiting into api gateway for security",
+                "description": "Add rate limiting to protect the API",
+                "prompt": "Add rate limiting middleware",
+                "priority": "medium",
+                "scope": "small",
+                "risk": "low",
+                "type": "improvement",
+                "direction_id": direction["id"],
+            }
+        ],
     )
 
     await _handle_research_completion(task, "", db_session)
@@ -934,7 +1120,9 @@ async def test_word_overlap_deduplication_allows_common_word_findings(db_session
         )
     )
     child_tasks = result.scalars().all()
-    assert len(child_tasks) == 1, "Finding with only stopword overlap must NOT be deduplicated"
+    assert len(child_tasks) == 1, (
+        "Finding with only stopword overlap must NOT be deduplicated"
+    )
 
 
 @pytest.mark.asyncio
@@ -971,18 +1159,20 @@ async def test_cross_direction_word_overlap_not_deduplicated(db_session, mocker)
     _patch_research_externals(mocker)
     mocker.patch(
         "app.research_completion._parse_research_findings",
-        return_value=[{
-            # "optimize", "database", "query", "execution", "performance" overlap existing (5 words)
-            # Same-direction threshold (4) would falsely dedup this; cross-direction threshold (6) must not
-            "title": "optimize database query execution performance strategy",
-            "description": "Improve query performance for direction B",
-            "prompt": "Optimize query execution",
-            "priority": "medium",
-            "scope": "small",
-            "risk": "low",
-            "type": "improvement",
-            "direction_id": "d-cross-b01",
-        }],
+        return_value=[
+            {
+                # "optimize", "database", "query", "execution", "performance" overlap existing (5 words)
+                # Same-direction threshold (4) would falsely dedup this; cross-direction threshold (6) must not
+                "title": "optimize database query execution performance strategy",
+                "description": "Improve query performance for direction B",
+                "prompt": "Optimize query execution",
+                "priority": "medium",
+                "scope": "small",
+                "risk": "low",
+                "type": "improvement",
+                "direction_id": "d-cross-b01",
+            }
+        ],
     )
 
     await _handle_research_completion(task, "", db_session)
@@ -1004,7 +1194,10 @@ async def test_all_findings_deduplicated_auto_completes_task(db_session, mocker)
     """When every finding is deduplicated (zero children), the research task is auto-completed."""
     direction = _active_direction("d-autocomp1", "Auto-complete direction")
     project = Project(
-        name="Auto Complete Test", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+        name="Auto Complete Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
     )
     db_session.add(project)
     await db_session.commit()
@@ -1032,16 +1225,18 @@ async def test_all_findings_deduplicated_auto_completes_task(db_session, mocker)
     _patch_research_externals(mocker)
     mocker.patch(
         "app.research_completion._parse_research_findings",
-        return_value=[{
-            "title": dup_title,
-            "description": dup_desc,
-            "prompt": "Refactor auth middleware",
-            "priority": "medium",
-            "scope": "small",
-            "risk": "low",
-            "type": "improvement",
-            "direction_id": direction["id"],
-        }],
+        return_value=[
+            {
+                "title": dup_title,
+                "description": dup_desc,
+                "prompt": "Refactor auth middleware",
+                "priority": "medium",
+                "scope": "small",
+                "risk": "low",
+                "type": "improvement",
+                "direction_id": direction["id"],
+            }
+        ],
     )
 
     await _handle_research_completion(task, "", db_session)
@@ -1056,7 +1251,9 @@ async def test_all_findings_deduplicated_auto_completes_task(db_session, mocker)
             Task.project_id == project.id, Task.parent_task_id == task.id
         )
     )
-    assert len(result.scalars().all()) == 0, "No child tasks should be created when all findings are duplicates"
+    assert len(result.scalars().all()) == 0, (
+        "No child tasks should be created when all findings are duplicates"
+    )
 
 
 @pytest.mark.asyncio
@@ -1064,7 +1261,10 @@ async def test_ghost_completion_does_not_block_rededup(db_session, mocker):
     """A COMPLETED task without pr_merged=True (ghost completion) must NOT block re-proposal."""
     direction = _active_direction("d-ghost01", "Ghost completion direction")
     project = Project(
-        name="Ghost Dedup Test", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+        name="Ghost Dedup Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
     )
     db_session.add(project)
     await db_session.commit()
@@ -1092,16 +1292,18 @@ async def test_ghost_completion_does_not_block_rededup(db_session, mocker):
     _patch_research_externals(mocker)
     mocker.patch(
         "app.research_completion._parse_research_findings",
-        return_value=[{
-            "title": dup_title,
-            "description": dup_desc,
-            "prompt": "Fix auth token expiry",
-            "priority": "high",
-            "scope": "small",
-            "risk": "high",
-            "type": "improvement",
-            "direction_id": direction["id"],
-        }],
+        return_value=[
+            {
+                "title": dup_title,
+                "description": dup_desc,
+                "prompt": "Fix auth token expiry",
+                "priority": "high",
+                "scope": "small",
+                "risk": "high",
+                "type": "improvement",
+                "direction_id": direction["id"],
+            }
+        ],
     )
 
     await _handle_research_completion(task, "", db_session)
@@ -1112,7 +1314,9 @@ async def test_ghost_completion_does_not_block_rededup(db_session, mocker):
         )
     )
     child_tasks = result.scalars().all()
-    assert len(child_tasks) == 1, "Ghost completion must NOT block re-proposal — child task should be created"
+    assert len(child_tasks) == 1, (
+        "Ghost completion must NOT block re-proposal — child task should be created"
+    )
 
 
 @pytest.mark.asyncio
@@ -1120,7 +1324,10 @@ async def test_confirmed_merge_still_blocks_rededup(db_session, mocker):
     """A COMPLETED task WITH pr_merged=True must still block re-proposal."""
     direction = _active_direction("d-merged01", "Merged completion direction")
     project = Project(
-        name="Merged Dedup Test", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+        name="Merged Dedup Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
     )
     db_session.add(project)
     await db_session.commit()
@@ -1148,16 +1355,18 @@ async def test_confirmed_merge_still_blocks_rededup(db_session, mocker):
     _patch_research_externals(mocker)
     mocker.patch(
         "app.research_completion._parse_research_findings",
-        return_value=[{
-            "title": dup_title,
-            "description": dup_desc,
-            "prompt": "Fix auth token expiry",
-            "priority": "high",
-            "scope": "small",
-            "risk": "high",
-            "type": "improvement",
-            "direction_id": direction["id"],
-        }],
+        return_value=[
+            {
+                "title": dup_title,
+                "description": dup_desc,
+                "prompt": "Fix auth token expiry",
+                "priority": "high",
+                "scope": "small",
+                "risk": "high",
+                "type": "improvement",
+                "direction_id": direction["id"],
+            }
+        ],
     )
 
     await _handle_research_completion(task, "", db_session)
@@ -1168,7 +1377,9 @@ async def test_confirmed_merge_still_blocks_rededup(db_session, mocker):
         )
     )
     child_tasks = result.scalars().all()
-    assert len(child_tasks) == 0, "Confirmed merge (pr_merged=True) must still block re-proposal"
+    assert len(child_tasks) == 0, (
+        "Confirmed merge (pr_merged=True) must still block re-proposal"
+    )
 
 
 @pytest.mark.asyncio
@@ -1176,7 +1387,10 @@ async def test_ghost_merge_does_not_block_rededup(db_session, mocker):
     """A COMPLETED+pr_merged task whose parent rollup failed must NOT block re-proposal."""
     direction = _active_direction("d-ghostmrg", "Ghost merge direction")
     project = Project(
-        name="Ghost Merge Dedup Test", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+        name="Ghost Merge Dedup Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
     )
     db_session.add(project)
     await db_session.commit()
@@ -1218,16 +1432,18 @@ async def test_ghost_merge_does_not_block_rededup(db_session, mocker):
     _patch_research_externals(mocker)
     mocker.patch(
         "app.research_completion._parse_research_findings",
-        return_value=[{
-            "title": dup_title,
-            "description": dup_desc,
-            "prompt": "Fix auth token expiry",
-            "priority": "high",
-            "scope": "small",
-            "risk": "high",
-            "type": "improvement",
-            "direction_id": direction["id"],
-        }],
+        return_value=[
+            {
+                "title": dup_title,
+                "description": dup_desc,
+                "prompt": "Fix auth token expiry",
+                "priority": "high",
+                "scope": "small",
+                "risk": "high",
+                "type": "improvement",
+                "direction_id": direction["id"],
+            }
+        ],
     )
 
     await _handle_research_completion(task, "", db_session)
@@ -1238,7 +1454,9 @@ async def test_ghost_merge_does_not_block_rededup(db_session, mocker):
         )
     )
     child_tasks = result.scalars().all()
-    assert len(child_tasks) == 1, "Ghost merge (failed rollup parent) must NOT block re-proposal"
+    assert len(child_tasks) == 1, (
+        "Ghost merge (failed rollup parent) must NOT block re-proposal"
+    )
 
 
 @pytest.mark.asyncio
@@ -1246,7 +1464,10 @@ async def test_infra_failure_does_not_block_rededup(db_session, mocker):
     """A FAILED task due to infrastructure issues must NOT block re-proposal."""
     direction = _active_direction("d-infrafail", "Infra failure direction")
     project = Project(
-        name="Infra Failure Dedup Test", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+        name="Infra Failure Dedup Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
     )
     db_session.add(project)
     await db_session.commit()
@@ -1260,7 +1481,9 @@ async def test_infra_failure_does_not_block_rededup(db_session, mocker):
     infra_failed = Task(
         project_id=project.id,
         title=infra_title,
-        payloads=[{"type": "create", "prompt": "add rate limiting", "base_branch": "main"}],
+        payloads=[
+            {"type": "create", "prompt": "add rate limiting", "base_branch": "main"}
+        ],
         context={"finding_hash": infra_hash},
         status=TaskStatus.FAILED,
         latest_status_message="Reaped (attempt 1/3): No heartbeat for 314s",
@@ -1275,16 +1498,18 @@ async def test_infra_failure_does_not_block_rededup(db_session, mocker):
     _patch_research_externals(mocker)
     mocker.patch(
         "app.research_completion._parse_research_findings",
-        return_value=[{
-            "title": infra_title,
-            "description": infra_desc,
-            "prompt": "Add rate limiting",
-            "priority": "high",
-            "scope": "small",
-            "risk": "medium",
-            "type": "improvement",
-            "direction_id": direction["id"],
-        }],
+        return_value=[
+            {
+                "title": infra_title,
+                "description": infra_desc,
+                "prompt": "Add rate limiting",
+                "priority": "high",
+                "scope": "small",
+                "risk": "medium",
+                "type": "improvement",
+                "direction_id": direction["id"],
+            }
+        ],
     )
 
     await _handle_research_completion(task, "", db_session)
@@ -1303,7 +1528,10 @@ async def test_code_error_failure_still_blocks_rededup(db_session, mocker):
     """A FAILED task due to a code error must still block re-proposal."""
     direction = _active_direction("d-codefail", "Code failure direction")
     project = Project(
-        name="Code Failure Dedup Test", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+        name="Code Failure Dedup Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
     )
     db_session.add(project)
     await db_session.commit()
@@ -1332,16 +1560,18 @@ async def test_code_error_failure_still_blocks_rededup(db_session, mocker):
     _patch_research_externals(mocker)
     mocker.patch(
         "app.research_completion._parse_research_findings",
-        return_value=[{
-            "title": code_title,
-            "description": code_desc,
-            "prompt": "Refactor connection pool",
-            "priority": "medium",
-            "scope": "small",
-            "risk": "medium",
-            "type": "improvement",
-            "direction_id": direction["id"],
-        }],
+        return_value=[
+            {
+                "title": code_title,
+                "description": code_desc,
+                "prompt": "Refactor connection pool",
+                "priority": "medium",
+                "scope": "small",
+                "risk": "medium",
+                "type": "improvement",
+                "direction_id": direction["id"],
+            }
+        ],
     )
 
     await _handle_research_completion(task, "", db_session)
@@ -1360,7 +1590,10 @@ async def test_unique_findings_are_not_deduplicated(db_session, mocker):
     """Distinct findings that share fewer than 3 meaningful words each get a child task."""
     direction = _active_direction("d-unique01", "Unique findings direction")
     project = Project(
-        name="Unique Findings", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+        name="Unique Findings",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
     )
     db_session.add(project)
     await db_session.commit()
@@ -1499,13 +1732,17 @@ async def test_filtered_findings_recorded_in_direction_history(db_session, mocke
 # 7. _handle_research_completion — Child Task Properties
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_child_task_direction_id_set_in_context(db_session, mocker):
     """Child tasks created from findings carry direction_id in their context."""
     direction_id = "d-dirctx01"
     direction = _active_direction(direction_id, "Direction context test")
     project = Project(
-        name="Child Context Test", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+        name="Child Context Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
     )
     db_session.add(project)
     await db_session.commit()
@@ -1536,7 +1773,10 @@ async def test_child_task_has_research_task_as_parent(db_session, mocker):
     """Child tasks have parent_task_id pointing to the originating research task."""
     direction = _active_direction("d-parent01", "Parent tracking direction")
     project = Project(
-        name="Parent Task ID Test", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+        name="Parent Task ID Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
     )
     db_session.add(project)
     await db_session.commit()
@@ -1567,7 +1807,10 @@ async def test_research_task_status_becomes_evaluating(db_session, mocker):
     """After _handle_research_completion, the research task's status is EVALUATING."""
     direction = _active_direction("d-evalsts1", "Evaluating status direction")
     project = Project(
-        name="EVALUATING Status Test", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+        name="EVALUATING Status Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
     )
     db_session.add(project)
     await db_session.commit()
@@ -1592,7 +1835,10 @@ async def test_multiple_findings_each_create_a_child_task(db_session, mocker):
     """Three distinct findings produce three child tasks."""
     direction = _active_direction("d-multi001", "Multi-finding direction")
     project = Project(
-        name="Multiple Findings", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+        name="Multiple Findings",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
     )
     db_session.add(project)
     await db_session.commit()
@@ -1604,9 +1850,15 @@ async def test_multiple_findings_each_create_a_child_task(db_session, mocker):
     mocker.patch(
         "app.research_completion._parse_research_findings",
         return_value=[
-            _make_finding("Add request tracing middleware to all routes", direction["id"]),
-            _make_finding("Implement exponential backoff on external API calls", direction["id"]),
-            _make_finding("Replace print statements with structured logging", direction["id"]),
+            _make_finding(
+                "Add request tracing middleware to all routes", direction["id"]
+            ),
+            _make_finding(
+                "Implement exponential backoff on external API calls", direction["id"]
+            ),
+            _make_finding(
+                "Replace print statements with structured logging", direction["id"]
+            ),
         ],
     )
 
@@ -1625,7 +1877,10 @@ async def test_child_task_carries_research_depth_plus_one(db_session, mocker):
     """Child tasks have research_depth = parent research_depth + 1."""
     direction = _active_direction("d-depth2x1", "Depth tracking direction")
     project = Project(
-        name="Depth Increment Test", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+        name="Depth Increment Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
     )
     db_session.add(project)
     await db_session.commit()
@@ -1656,12 +1911,16 @@ async def test_child_task_carries_research_depth_plus_one(db_session, mocker):
 # 8. _handle_research_completion — Task Type Selection
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_finding_type_research_spawns_research_subtask(db_session, mocker):
     """A finding with type='research' spawns a child research task."""
     direction = _active_direction("d-typeres1", "Type research")
     project = Project(
-        name="Sub-Research Test", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+        name="Sub-Research Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
     )
     db_session.add(project)
     await db_session.commit()
@@ -1672,11 +1931,13 @@ async def test_finding_type_research_spawns_research_subtask(db_session, mocker)
     _patch_research_externals(mocker)
     mocker.patch(
         "app.research_completion._parse_research_findings",
-        return_value=[_make_finding(
-            "Investigate query performance bottlenecks in depth",
-            direction["id"],
-            finding_type="research",
-        )],
+        return_value=[
+            _make_finding(
+                "Investigate query performance bottlenecks in depth",
+                direction["id"],
+                finding_type="research",
+            )
+        ],
     )
 
     await _handle_research_completion(task, "", db_session)
@@ -1696,7 +1957,10 @@ async def test_finding_scope_large_spawns_plan_task(db_session, mocker):
     """A finding with scope='large' spawns a 'plan' task for decomposition."""
     direction = _active_direction("d-planscop1", "Large scope direction")
     project = Project(
-        name="Large Scope Plan Test", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+        name="Large Scope Plan Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
     )
     db_session.add(project)
     await db_session.commit()
@@ -1707,11 +1971,13 @@ async def test_finding_scope_large_spawns_plan_task(db_session, mocker):
     _patch_research_externals(mocker)
     mocker.patch(
         "app.research_completion._parse_research_findings",
-        return_value=[_make_finding(
-            "Migrate entire payment processing system to new provider",
-            direction["id"],
-            scope="large",
-        )],
+        return_value=[
+            _make_finding(
+                "Migrate entire payment processing system to new provider",
+                direction["id"],
+                scope="large",
+            )
+        ],
     )
 
     await _handle_research_completion(task, "", db_session)
@@ -1731,7 +1997,10 @@ async def test_finding_scope_small_spawns_create_task(db_session, mocker):
     """A finding with scope='small' spawns a 'create' task for single-PR work."""
     direction = _active_direction("d-createsc1", "Small scope direction")
     project = Project(
-        name="Small Scope Create Test", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+        name="Small Scope Create Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
     )
     db_session.add(project)
     await db_session.commit()
@@ -1742,11 +2011,13 @@ async def test_finding_scope_small_spawns_create_task(db_session, mocker):
     _patch_research_externals(mocker)
     mocker.patch(
         "app.research_completion._parse_research_findings",
-        return_value=[_make_finding(
-            "Add null check to user profile endpoint handler",
-            direction["id"],
-            scope="small",
-        )],
+        return_value=[
+            _make_finding(
+                "Add null check to user profile endpoint handler",
+                direction["id"],
+                scope="small",
+            )
+        ],
     )
 
     await _handle_research_completion(task, "", db_session)
@@ -1766,7 +2037,10 @@ async def test_small_scope_finding_gets_low_effort(db_session, mocker):
     """Small-scope findings spawn with effort='low' (cheaper/faster)."""
     direction = _active_direction("d-efflow01", "Small scope low effort direction")
     project = Project(
-        name="Scope Low Effort Test", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+        name="Scope Low Effort Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
     )
     db_session.add(project)
     await db_session.commit()
@@ -1777,11 +2051,13 @@ async def test_small_scope_finding_gets_low_effort(db_session, mocker):
     _patch_research_externals(mocker)
     mocker.patch(
         "app.research_completion._parse_research_findings",
-        return_value=[_make_finding(
-            "Add null check to specific handler",
-            direction["id"],
-            scope="small",
-        )],
+        return_value=[
+            _make_finding(
+                "Add null check to specific handler",
+                direction["id"],
+                scope="small",
+            )
+        ],
     )
 
     await _handle_research_completion(task, "", db_session)
@@ -1801,7 +2077,10 @@ async def test_large_scope_finding_gets_high_effort(db_session, mocker):
     """Large-scope findings spawn with effort='high' (deeper decomposition)."""
     direction = _active_direction("d-effhigh1", "Large scope high effort direction")
     project = Project(
-        name="Scope High Effort Test", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+        name="Scope High Effort Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
     )
     db_session.add(project)
     await db_session.commit()
@@ -1812,11 +2091,13 @@ async def test_large_scope_finding_gets_high_effort(db_session, mocker):
     _patch_research_externals(mocker)
     mocker.patch(
         "app.research_completion._parse_research_findings",
-        return_value=[_make_finding(
-            "Migrate auth subsystem to new provider",
-            direction["id"],
-            scope="large",
-        )],
+        return_value=[
+            _make_finding(
+                "Migrate auth subsystem to new provider",
+                direction["id"],
+                scope="large",
+            )
+        ],
     )
 
     await _handle_research_completion(task, "", db_session)
@@ -1836,7 +2117,10 @@ async def test_explicit_finding_effort_max_beats_scope_floor(db_session, mocker)
     """Finding-specified effort wins when it ranks higher than the scope-derived floor."""
     direction = _active_direction("d-effmax01", "Explicit max effort direction")
     project = Project(
-        name="Explicit Max Effort Test", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+        name="Explicit Max Effort Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
     )
     db_session.add(project)
     await db_session.commit()
@@ -1870,11 +2154,16 @@ async def test_explicit_finding_effort_max_beats_scope_floor(db_session, mocker)
 
 
 @pytest.mark.asyncio
-async def test_finding_type_security_audit_spawns_security_audit_task(db_session, mocker):
+async def test_finding_type_security_audit_spawns_security_audit_task(
+    db_session, mocker
+):
     """A finding with type='security_audit' spawns a specialized security_audit task."""
     direction = _active_direction("d-secaud01", "Security audit direction")
     project = Project(
-        name="Security Audit Test", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+        name="Security Audit Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
     )
     db_session.add(project)
     await db_session.commit()
@@ -1885,11 +2174,13 @@ async def test_finding_type_security_audit_spawns_security_audit_task(db_session
     _patch_research_externals(mocker)
     mocker.patch(
         "app.research_completion._parse_research_findings",
-        return_value=[_make_finding(
-            "Audit authentication module for injection vulnerabilities",
-            direction["id"],
-            finding_type="security_audit",
-        )],
+        return_value=[
+            _make_finding(
+                "Audit authentication module for injection vulnerabilities",
+                direction["id"],
+                finding_type="security_audit",
+            )
+        ],
     )
 
     await _handle_research_completion(task, "", db_session)
@@ -1905,11 +2196,16 @@ async def test_finding_type_security_audit_spawns_security_audit_task(db_session
 
 
 @pytest.mark.asyncio
-async def test_medium_scope_with_many_related_files_upgrades_to_large(db_session, mocker):
+async def test_medium_scope_with_many_related_files_upgrades_to_large(
+    db_session, mocker
+):
     """Medium-scope finding with >=5 related_files is upgraded to large via pre-spawn heuristic."""
     direction = _active_direction("d-fchint01", "File-count heuristic direction")
     project = Project(
-        name="File Count Heuristic Test", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+        name="File Count Heuristic Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
     )
     db_session.add(project)
     await db_session.commit()
@@ -1948,12 +2244,19 @@ async def test_medium_scope_with_many_related_files_upgrades_to_large(db_session
 
 
 @pytest.mark.asyncio
-async def test_small_scope_with_many_related_files_upgrades_to_medium(db_session, mocker, monkeypatch):
+async def test_small_scope_with_many_related_files_upgrades_to_medium(
+    db_session, mocker, monkeypatch
+):
     """Small-scope finding with >=4 related_files is upgraded to medium via pre-spawn heuristic."""
-    monkeypatch.setitem(_shared_state.runtime_config, "pipeline_scope_baseline_rates", {})
+    monkeypatch.setitem(
+        _shared_state.runtime_config, "pipeline_scope_baseline_rates", {}
+    )
     direction = _active_direction("d-fchint03", "Small file-count heuristic direction")
     project = Project(
-        name="Small File Count Heuristic Test", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+        name="Small File Count Heuristic Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
     )
     db_session.add(project)
     await db_session.commit()
@@ -1989,13 +2292,17 @@ async def test_small_scope_with_many_related_files_upgrades_to_medium(db_session
 
 
 @pytest.mark.asyncio
-async def test_history_downgrade_suppresses_heuristic_upgrade(db_session, mocker, monkeypatch):
+async def test_history_downgrade_suppresses_heuristic_upgrade(
+    db_session, mocker, monkeypatch
+):
     """Medium finding downgraded to small by _calibrate_scope (historical merge
     rates) stays at small even when related_files >= 3. Historical data is a
     stronger signal than the file-count heuristic, so the heuristic must not
     revert the downgrade and route the task back into the failing medium pool.
     """
-    monkeypatch.setitem(_shared_state.runtime_config, "pipeline_scope_baseline_rates", {})
+    monkeypatch.setitem(
+        _shared_state.runtime_config, "pipeline_scope_baseline_rates", {}
+    )
     direction = _active_direction("d-histdown01", "History downgrade direction")
     # Medium has 6 terminal tasks at 17% merge rate (< 40% threshold) and no
     # small data, so _calibrate_scope downgrades medium→small.
@@ -2003,7 +2310,10 @@ async def test_history_downgrade_suppresses_heuristic_upgrade(db_session, mocker
         {"scope_breakdown": {"medium": {"created": 6, "merged": 1, "failed": 5}}},
     ]
     project = Project(
-        name="History Downgrade Test", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+        name="History Downgrade Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
     )
     db_session.add(project)
     await db_session.commit()
@@ -2015,12 +2325,16 @@ async def test_history_downgrade_suppresses_heuristic_upgrade(db_session, mocker
     finding["related_files"] = [f"backend/app/mod_{i}.py" for i in range(3)]
 
     _patch_research_externals(mocker)
-    mocker.patch("app.research_completion._parse_research_findings", return_value=[finding])
+    mocker.patch(
+        "app.research_completion._parse_research_findings", return_value=[finding]
+    )
 
     await _handle_research_completion(task, "", db_session)
 
     result = await db_session.execute(
-        select(Task).where(Task.project_id == project.id, Task.parent_task_id == task.id)
+        select(Task).where(
+            Task.project_id == project.id, Task.parent_task_id == task.id
+        )
     )
     child_tasks = result.scalars().all()
     assert len(child_tasks) == 1
@@ -2030,12 +2344,19 @@ async def test_history_downgrade_suppresses_heuristic_upgrade(db_session, mocker
 
 
 @pytest.mark.asyncio
-async def test_small_scope_with_few_related_files_stays_small(db_session, mocker, monkeypatch):
+async def test_small_scope_with_few_related_files_stays_small(
+    db_session, mocker, monkeypatch
+):
     """Small-scope finding with <3 related_files is not upgraded by the file-count heuristic."""
-    monkeypatch.setitem(_shared_state.runtime_config, "pipeline_scope_baseline_rates", {})
+    monkeypatch.setitem(
+        _shared_state.runtime_config, "pipeline_scope_baseline_rates", {}
+    )
     direction = _active_direction("d-fchint04", "Small file-count under threshold")
     project = Project(
-        name="Small File Count Under Threshold Test", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+        name="Small File Count Under Threshold Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
     )
     db_session.add(project)
     await db_session.commit()
@@ -2071,13 +2392,20 @@ async def test_small_scope_with_few_related_files_stays_small(db_session, mocker
 
 
 @pytest.mark.asyncio
-async def test_medium_scope_with_few_related_files_stays_medium(db_session, mocker, monkeypatch):
+async def test_medium_scope_with_few_related_files_stays_medium(
+    db_session, mocker, monkeypatch
+):
     """Medium-scope finding with <8 related_files is not upgraded by the file-count heuristic."""
     # Disable cold-start baseline upgrade so this test isolates the file-count heuristic.
-    monkeypatch.setitem(_shared_state.runtime_config, "pipeline_scope_baseline_rates", {})
+    monkeypatch.setitem(
+        _shared_state.runtime_config, "pipeline_scope_baseline_rates", {}
+    )
     direction = _active_direction("d-fchint02", "File-count heuristic under threshold")
     project = Project(
-        name="File Count Under Threshold Test", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+        name="File Count Under Threshold Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
     )
     db_session.add(project)
     await db_session.commit()
@@ -2113,12 +2441,19 @@ async def test_medium_scope_with_few_related_files_stays_medium(db_session, mock
 
 
 @pytest.mark.asyncio
-async def test_medium_scope_cross_module_related_files_auto_decomposes(db_session, mocker, monkeypatch):
+async def test_medium_scope_cross_module_related_files_auto_decomposes(
+    db_session, mocker, monkeypatch
+):
     """3-module cross-module medium finding auto-decomposes into per-file small sub-findings."""
-    monkeypatch.setitem(_shared_state.runtime_config, "pipeline_scope_baseline_rates", {})
+    monkeypatch.setitem(
+        _shared_state.runtime_config, "pipeline_scope_baseline_rates", {}
+    )
     direction = _active_direction("d-xmod01", "Cross-module heuristic direction")
     project = Project(
-        name="Cross-Module Heuristic Test", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+        name="Cross-Module Heuristic Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
     )
     db_session.add(project)
     await db_session.commit()
@@ -2126,7 +2461,9 @@ async def test_medium_scope_cross_module_related_files_auto_decomposes(db_sessio
 
     task = await _make_research_task(project, direction, db_session)
 
-    finding = _make_finding("Change spanning backend, agent, and admin-ui", direction["id"], scope="medium")
+    finding = _make_finding(
+        "Change spanning backend, agent, and admin-ui", direction["id"], scope="medium"
+    )
     finding["related_files"] = [
         "backend/app/foo.py",
         "agent/src/bar.ts",
@@ -2142,7 +2479,9 @@ async def test_medium_scope_cross_module_related_files_auto_decomposes(db_sessio
     await _handle_research_completion(task, "", db_session)
 
     result = await db_session.execute(
-        select(Task).where(Task.project_id == project.id, Task.parent_task_id == task.id)
+        select(Task).where(
+            Task.project_id == project.id, Task.parent_task_id == task.id
+        )
     )
     child_tasks = result.scalars().all()
     assert len(child_tasks) == 3
@@ -2160,7 +2499,9 @@ async def test_medium_scope_cross_module_related_files_auto_decomposes(db_sessio
 
 
 @pytest.mark.asyncio
-async def test_auto_decomposed_siblings_are_chained_via_depends_on(db_session, mocker, monkeypatch):
+async def test_auto_decomposed_siblings_are_chained_via_depends_on(
+    db_session, mocker, monkeypatch
+):
     """Decomposed sibling tasks of one finding chain via depends_on so they run
     serially, not in parallel.
 
@@ -2169,11 +2510,15 @@ async def test_auto_decomposed_siblings_are_chained_via_depends_on(db_session, m
     sibling-merged scaffolding in their base branch instead of the actual
     implementation. Sequential execution lets each agent work against the
     actually-merged state of prior siblings."""
-    monkeypatch.setitem(_shared_state.runtime_config, "pipeline_scope_baseline_rates", {})
+    monkeypatch.setitem(
+        _shared_state.runtime_config, "pipeline_scope_baseline_rates", {}
+    )
     direction = _active_direction("d-chain01", "Sibling-chain direction")
     project = Project(
-        name="Sibling Chain Test", user_id="test-user-123",
-        autonomous_enabled=True, directions=[direction],
+        name="Sibling Chain Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
     )
     db_session.add(project)
     await db_session.commit()
@@ -2182,7 +2527,9 @@ async def test_auto_decomposed_siblings_are_chained_via_depends_on(db_session, m
     task = await _make_research_task(project, direction, db_session)
 
     # 3-module finding triggers top-level-dir auto-decomposition (3 siblings).
-    finding = _make_finding("Coupled cross-module change", direction["id"], scope="medium")
+    finding = _make_finding(
+        "Coupled cross-module change", direction["id"], scope="medium"
+    )
     finding["related_files"] = [
         "backend/app/foo.py",
         "agent/src/bar.ts",
@@ -2198,7 +2545,8 @@ async def test_auto_decomposed_siblings_are_chained_via_depends_on(db_session, m
     await _handle_research_completion(task, "", db_session)
 
     result = await db_session.execute(
-        select(Task).where(Task.project_id == project.id, Task.parent_task_id == task.id)
+        select(Task)
+        .where(Task.project_id == project.id, Task.parent_task_id == task.id)
         .order_by(Task.created_at)
     )
     child_tasks = result.scalars().all()
@@ -2218,11 +2566,15 @@ async def test_non_decomposed_siblings_do_not_chain(db_session, mocker, monkeypa
     """Two unrelated findings produce two unrelated tasks — no chain dependency.
     Only auto-decomposed sibling groups should chain; independent findings
     stay parallel."""
-    monkeypatch.setitem(_shared_state.runtime_config, "pipeline_scope_baseline_rates", {})
+    monkeypatch.setitem(
+        _shared_state.runtime_config, "pipeline_scope_baseline_rates", {}
+    )
     direction = _active_direction("d-nochn01", "Independent findings direction")
     project = Project(
-        name="No-Chain Test", user_id="test-user-123",
-        autonomous_enabled=True, directions=[direction],
+        name="No-Chain Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
     )
     db_session.add(project)
     await db_session.commit()
@@ -2244,7 +2596,8 @@ async def test_non_decomposed_siblings_do_not_chain(db_session, mocker, monkeypa
     await _handle_research_completion(task, "", db_session)
 
     result = await db_session.execute(
-        select(Task).where(Task.project_id == project.id, Task.parent_task_id == task.id)
+        select(Task)
+        .where(Task.project_id == project.id, Task.parent_task_id == task.id)
         .order_by(Task.created_at)
     )
     child_tasks = result.scalars().all()
@@ -2254,15 +2607,26 @@ async def test_non_decomposed_siblings_do_not_chain(db_session, mocker, monkeypa
 
 
 @pytest.mark.asyncio
-async def test_medium_scope_expansion_ratio_prediction_upgrades_to_large(db_session, mocker, monkeypatch):
+async def test_medium_scope_expansion_ratio_prediction_upgrades_to_large(
+    db_session, mocker, monkeypatch
+):
     """Medium finding with 4 related_files x 3.0 avg_expansion_ratio predicts >10 → upgrade."""
-    monkeypatch.setitem(_shared_state.runtime_config, "pipeline_scope_baseline_rates", {})
+    monkeypatch.setitem(
+        _shared_state.runtime_config, "pipeline_scope_baseline_rates", {}
+    )
     direction = _active_direction("d-exprat01", "Expansion ratio prediction direction")
     direction["research_history"] = [
-        {"scope_breakdown": {"medium": {"created": 3, "merged": 2, "avg_expansion_ratio": 3.0}}},
+        {
+            "scope_breakdown": {
+                "medium": {"created": 3, "merged": 2, "avg_expansion_ratio": 3.0}
+            }
+        },
     ]
     project = Project(
-        name="Expansion Ratio Test", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+        name="Expansion Ratio Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
     )
     db_session.add(project)
     await db_session.commit()
@@ -2270,16 +2634,22 @@ async def test_medium_scope_expansion_ratio_prediction_upgrades_to_large(db_sess
 
     task = await _make_research_task(project, direction, db_session)
 
-    finding = _make_finding("Refactor four related modules", direction["id"], scope="medium")
+    finding = _make_finding(
+        "Refactor four related modules", direction["id"], scope="medium"
+    )
     finding["related_files"] = [f"backend/app/mod_{i}.py" for i in range(4)]
 
     _patch_research_externals(mocker)
-    mocker.patch("app.research_completion._parse_research_findings", return_value=[finding])
+    mocker.patch(
+        "app.research_completion._parse_research_findings", return_value=[finding]
+    )
 
     await _handle_research_completion(task, "", db_session)
 
     result = await db_session.execute(
-        select(Task).where(Task.project_id == project.id, Task.parent_task_id == task.id)
+        select(Task).where(
+            Task.project_id == project.id, Task.parent_task_id == task.id
+        )
     )
     child_tasks = result.scalars().all()
     assert len(child_tasks) == 1
@@ -2289,12 +2659,19 @@ async def test_medium_scope_expansion_ratio_prediction_upgrades_to_large(db_sess
 
 
 @pytest.mark.asyncio
-async def test_medium_scope_without_expansion_ratio_history_stays_medium(db_session, mocker, monkeypatch):
+async def test_medium_scope_without_expansion_ratio_history_stays_medium(
+    db_session, mocker, monkeypatch
+):
     """No historical avg_expansion_ratio → predictive check skipped, finding stays medium."""
-    monkeypatch.setitem(_shared_state.runtime_config, "pipeline_scope_baseline_rates", {})
+    monkeypatch.setitem(
+        _shared_state.runtime_config, "pipeline_scope_baseline_rates", {}
+    )
     direction = _active_direction("d-exprat02", "No expansion ratio history")
     project = Project(
-        name="No Expansion Ratio Test", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+        name="No Expansion Ratio Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
     )
     db_session.add(project)
     await db_session.commit()
@@ -2302,16 +2679,22 @@ async def test_medium_scope_without_expansion_ratio_history_stays_medium(db_sess
 
     task = await _make_research_task(project, direction, db_session)
 
-    finding = _make_finding("Refactor four related modules", direction["id"], scope="medium")
+    finding = _make_finding(
+        "Refactor four related modules", direction["id"], scope="medium"
+    )
     finding["related_files"] = [f"backend/app/mod_{i}.py" for i in range(4)]
 
     _patch_research_externals(mocker)
-    mocker.patch("app.research_completion._parse_research_findings", return_value=[finding])
+    mocker.patch(
+        "app.research_completion._parse_research_findings", return_value=[finding]
+    )
 
     await _handle_research_completion(task, "", db_session)
 
     result = await db_session.execute(
-        select(Task).where(Task.project_id == project.id, Task.parent_task_id == task.id)
+        select(Task).where(
+            Task.project_id == project.id, Task.parent_task_id == task.id
+        )
     )
     child_tasks = result.scalars().all()
     assert len(child_tasks) == 1
@@ -2324,12 +2707,15 @@ async def test_medium_scope_without_expansion_ratio_history_stays_medium(db_sess
 # 8b. _handle_research_completion — Auto-decomposition via co-change clustering
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_medium_with_independent_clusters_decomposes_to_smalls(
     db_session, mocker, monkeypatch
 ):
     """Medium finding whose related_files form 2 independent clusters splits into 2 small tasks."""
-    monkeypatch.setitem(_shared_state.runtime_config, "pipeline_scope_baseline_rates", {})
+    monkeypatch.setitem(
+        _shared_state.runtime_config, "pipeline_scope_baseline_rates", {}
+    )
     direction = _active_direction("d-decomp01", "Decomposition direction")
     cochange_index = {
         "a.py": {"b.py": 2.0},
@@ -2349,7 +2735,9 @@ async def test_medium_with_independent_clusters_decomposes_to_smalls(
     await db_session.refresh(project)
 
     task = await _make_research_task(project, direction, db_session)
-    finding = _make_finding("Touch two unrelated clusters", direction["id"], scope="medium")
+    finding = _make_finding(
+        "Touch two unrelated clusters", direction["id"], scope="medium"
+    )
     finding["related_files"] = ["a.py", "b.py", "c.py", "d.py"]
 
     _patch_research_externals(mocker)
@@ -2361,7 +2749,9 @@ async def test_medium_with_independent_clusters_decomposes_to_smalls(
     await _handle_research_completion(task, "", db_session)
 
     result = await db_session.execute(
-        select(Task).where(Task.project_id == project.id, Task.parent_task_id == task.id)
+        select(Task).where(
+            Task.project_id == project.id, Task.parent_task_id == task.id
+        )
     )
     child_tasks = result.scalars().all()
     assert len(child_tasks) == 2
@@ -2376,7 +2766,9 @@ async def test_medium_with_independent_clusters_decomposes_to_smalls(
 @pytest.mark.asyncio
 async def test_medium_with_single_cluster_stays_medium(db_session, mocker, monkeypatch):
     """When all related_files co-change together, decomposition is skipped."""
-    monkeypatch.setitem(_shared_state.runtime_config, "pipeline_scope_baseline_rates", {})
+    monkeypatch.setitem(
+        _shared_state.runtime_config, "pipeline_scope_baseline_rates", {}
+    )
     direction = _active_direction("d-decomp02", "Single cluster direction")
     cochange_index = {
         "a.py": {"b.py": 2.0, "c.py": 2.0},
@@ -2395,7 +2787,9 @@ async def test_medium_with_single_cluster_stays_medium(db_session, mocker, monke
     await db_session.refresh(project)
 
     task = await _make_research_task(project, direction, db_session)
-    finding = _make_finding("Touch one cohesive module", direction["id"], scope="medium")
+    finding = _make_finding(
+        "Touch one cohesive module", direction["id"], scope="medium"
+    )
     finding["related_files"] = ["a.py", "b.py", "c.py"]
 
     _patch_research_externals(mocker)
@@ -2407,7 +2801,9 @@ async def test_medium_with_single_cluster_stays_medium(db_session, mocker, monke
     await _handle_research_completion(task, "", db_session)
 
     result = await db_session.execute(
-        select(Task).where(Task.project_id == project.id, Task.parent_task_id == task.id)
+        select(Task).where(
+            Task.project_id == project.id, Task.parent_task_id == task.id
+        )
     )
     child_tasks = result.scalars().all()
     assert len(child_tasks) == 1
@@ -2420,7 +2816,9 @@ async def test_medium_skips_decomposition_when_cochange_is_sparse(
     db_session, mocker, monkeypatch
 ):
     """Without cochange data for the finding's files, decomposition is skipped."""
-    monkeypatch.setitem(_shared_state.runtime_config, "pipeline_scope_baseline_rates", {})
+    monkeypatch.setitem(
+        _shared_state.runtime_config, "pipeline_scope_baseline_rates", {}
+    )
     direction = _active_direction("d-decomp03", "Sparse direction")
     project = Project(
         name="Sparse Cochange Test",
@@ -2446,7 +2844,9 @@ async def test_medium_skips_decomposition_when_cochange_is_sparse(
     await _handle_research_completion(task, "", db_session)
 
     result = await db_session.execute(
-        select(Task).where(Task.project_id == project.id, Task.parent_task_id == task.id)
+        select(Task).where(
+            Task.project_id == project.id, Task.parent_task_id == task.id
+        )
     )
     child_tasks = result.scalars().all()
     assert len(child_tasks) == 1
@@ -2456,6 +2856,7 @@ async def test_medium_skips_decomposition_when_cochange_is_sparse(
 def test_cluster_files_by_cochange_returns_none_when_empty():
     """_cluster_files_by_cochange returns None for sparse / empty input."""
     from app.research_completion import _cluster_files_by_cochange
+
     assert _cluster_files_by_cochange([], {"a.py": {"b.py": 2.0}}) is None
     assert _cluster_files_by_cochange(["a.py"], {"a.py": {"b.py": 2.0}}) is None
     assert _cluster_files_by_cochange(["x.py", "y.py"], {}) is None
@@ -2465,6 +2866,7 @@ def test_cluster_files_by_cochange_returns_none_when_empty():
 def test_cluster_files_by_cochange_splits_independent_groups():
     """_cluster_files_by_cochange groups co-changing files and separates independent ones."""
     from app.research_completion import _cluster_files_by_cochange
+
     idx = {
         "a.py": {"b.py": 2.0},
         "b.py": {"a.py": 2.0},
@@ -2480,6 +2882,7 @@ def test_cluster_files_by_cochange_splits_independent_groups():
 def test_cluster_files_by_cochange_merges_transitive_affinity():
     """Transitive co-change (a-b, b-c) unifies all three files into one cluster."""
     from app.research_completion import _cluster_files_by_cochange
+
     idx = {
         "a.py": {"b.py": 2.0},
         "b.py": {"a.py": 2.0, "c.py": 2.0},
@@ -2494,6 +2897,7 @@ def test_cluster_files_by_cochange_merges_transitive_affinity():
 def test_cluster_files_by_cochange_ignores_below_threshold_scores():
     """Affinity scores below 1.0 threshold don't merge files."""
     from app.research_completion import _cluster_files_by_cochange
+
     idx = {
         "a.py": {"b.py": 0.5},
         "b.py": {"a.py": 0.5},
@@ -2510,14 +2914,17 @@ def test_cluster_files_by_toplevel_dir_requires_min_files_and_dirs():
     matching the scope-escalation threshold.
     """
     from app.cochange_decomposition import cluster_files_by_toplevel_dir
+
     assert cluster_files_by_toplevel_dir(["backend/a.py", "agent/b.ts"]) is None
-    assert cluster_files_by_toplevel_dir(
-        ["backend/a.py", "backend/b.py", "backend/c.py"]
-    ) is None
+    assert (
+        cluster_files_by_toplevel_dir(["backend/a.py", "backend/b.py", "backend/c.py"])
+        is None
+    )
     # 2-module findings (backend + agent) don't decompose.
-    assert cluster_files_by_toplevel_dir(
-        ["backend/a.py", "backend/b.py", "agent/c.ts"]
-    ) is None
+    assert (
+        cluster_files_by_toplevel_dir(["backend/a.py", "backend/b.py", "agent/c.ts"])
+        is None
+    )
     # Root-level files don't establish a directory span.
     assert cluster_files_by_toplevel_dir(["a.py", "b.py", "c.py"]) is None
     clusters = cluster_files_by_toplevel_dir(
@@ -2550,7 +2957,10 @@ def test_auto_decompose_falls_back_to_path_when_cochange_empty():
         ],
     }
     result = auto_decompose_findings_by_cochange(
-        [(0, finding, "h0")], {}, None, _hash,
+        [(0, finding, "h0")],
+        {},
+        None,
+        _hash,
     )
     assert len(result) == 3
     assert all(sub["scope"] == "small" for _, sub, _ in result)
@@ -2583,7 +2993,10 @@ def test_auto_decompose_keeps_two_module_medium_finding_intact():
         ],
     }
     result = auto_decompose_findings_by_cochange(
-        [(0, finding, "h0")], {}, None, _hash,
+        [(0, finding, "h0")],
+        {},
+        None,
+        _hash,
     )
     assert len(result) == 1
     assert result[0][1] is finding
@@ -2599,7 +3012,10 @@ def test_auto_decompose_keeps_two_module_medium_finding_intact():
         ],
     }
     result = auto_decompose_findings_by_cochange(
-        [(0, finding_three, "h0")], {}, None, _hash,
+        [(0, finding_three, "h0")],
+        {},
+        None,
+        _hash,
     )
     assert len(result) == 1
     assert result[0][1] is finding_three
@@ -2622,7 +3038,10 @@ def test_auto_decompose_path_fallback_skipped_for_single_directory():
         ],
     }
     result = auto_decompose_findings_by_cochange(
-        [(0, finding, "h0")], None, None, _hash,
+        [(0, finding, "h0")],
+        None,
+        None,
+        _hash,
     )
     assert len(result) == 1
     assert result[0][1] is finding
@@ -2647,7 +3066,10 @@ def test_auto_decompose_prepends_scope_boundary_preamble_to_prompt():
         ],
     }
     result = auto_decompose_findings_by_cochange(
-        [(0, finding, "h0")], {}, None, _hash,
+        [(0, finding, "h0")],
+        {},
+        None,
+        _hash,
     )
     assert len(result) == 3
     for _, sub, _ in result:
@@ -2660,7 +3082,9 @@ def test_auto_decompose_prepends_scope_boundary_preamble_to_prompt():
             assert f in prompt
         # other clusters' files should not be listed
         other_files = {
-            f for _, other, _ in result if other is not sub
+            f
+            for _, other, _ in result
+            if other is not sub
             for f in other["related_files"]
         }
         for f in other_files:
@@ -2696,6 +3120,7 @@ def _decomp_cochange_index(clusters: list[list[str]]) -> dict:
 def test_auto_decompose_normal_split_when_clusters_fit_small_budget():
     """[5 files, 3 files] decomposes normally — both clusters fit small budget (6)."""
     from app.cochange_decomposition import auto_decompose_findings_by_cochange
+
     cluster_a = [f"a{i}.py" for i in range(5)]
     cluster_b = [f"b{i}.py" for i in range(3)]
     files = cluster_a + cluster_b
@@ -2714,6 +3139,7 @@ def test_auto_decompose_normal_split_when_clusters_fit_small_budget():
 def test_auto_decompose_oversized_cluster_keeps_medium_scope():
     """[7 files, 3 files] — 7-file cluster stays medium, 3-file cluster goes small."""
     from app.cochange_decomposition import auto_decompose_findings_by_cochange
+
     cluster_a = [f"a{i}.py" for i in range(7)]
     cluster_b = [f"b{i}.py" for i in range(3)]
     files = cluster_a + cluster_b
@@ -2733,6 +3159,7 @@ def test_auto_decompose_oversized_cluster_keeps_medium_scope():
 def test_auto_decompose_skipped_when_all_clusters_exceed_small_budget():
     """When every cluster exceeds the small budget, leave the original medium finding intact."""
     from app.cochange_decomposition import auto_decompose_findings_by_cochange
+
     cluster_a = [f"a{i}.py" for i in range(7)]
     cluster_b = [f"b{i}.py" for i in range(8)]
     files = cluster_a + cluster_b
@@ -2752,6 +3179,7 @@ def test_auto_decompose_skipped_when_all_clusters_exceed_small_budget():
 def test_split_oversized_clusters_by_subdir_splits_on_real_subdirs():
     """Oversized cluster spanning two sub-dirs splits into per-sub-dir groups."""
     from app.cochange_decomposition import split_oversized_clusters_by_subdir
+
     cluster = [
         "backend/app/a.py",
         "backend/app/b.py",
@@ -2764,7 +3192,12 @@ def test_split_oversized_clusters_by_subdir_splits_on_real_subdirs():
     out = split_oversized_clusters_by_subdir([cluster], small_budget=6)
     assert out is not None
     assert {tuple(sorted(g)) for g in out} == {
-        ("backend/app/a.py", "backend/app/b.py", "backend/app/c.py", "backend/app/d.py"),
+        (
+            "backend/app/a.py",
+            "backend/app/b.py",
+            "backend/app/c.py",
+            "backend/app/d.py",
+        ),
         ("backend/testing/e.py", "backend/testing/f.py", "backend/testing/g.py"),
     }
 
@@ -2772,6 +3205,7 @@ def test_split_oversized_clusters_by_subdir_splits_on_real_subdirs():
 def test_split_oversized_clusters_by_subdir_refuses_root_level_files():
     """Root-level (bare-filename) files have no sub-dir prefix, so don't fragment."""
     from app.cochange_decomposition import split_oversized_clusters_by_subdir
+
     cluster = [f"a{i}.py" for i in range(7)]
     out = split_oversized_clusters_by_subdir([cluster], small_budget=6)
     assert out is None
@@ -2781,6 +3215,7 @@ def test_split_oversized_clusters_by_subdir_refuses_mixed_root_and_subdir():
     """Mixed root-level + sub-dir files: refuse split so root-level files aren't
     fragmented into singletons while sub-dir files get grouped."""
     from app.cochange_decomposition import split_oversized_clusters_by_subdir
+
     cluster = [
         "root_a.py",
         "backend/app/a.py",
@@ -2797,6 +3232,7 @@ def test_split_oversized_clusters_by_subdir_refuses_mixed_root_and_subdir():
 def test_split_oversized_clusters_by_subdir_refuses_all_singleton_subgroups():
     """Sub-grouping produces only singletons — refuse to flood the orchestrator."""
     from app.cochange_decomposition import split_oversized_clusters_by_subdir
+
     cluster = [
         "backend/app/a.py",
         "backend/lib/b.py",
@@ -2814,6 +3250,7 @@ def test_split_oversized_clusters_by_subdir_leaves_fitting_clusters_alone():
     """Clusters already within small_budget pass through unchanged; None when
     no split progress is made."""
     from app.cochange_decomposition import split_oversized_clusters_by_subdir
+
     fitting = ["a.py", "b.py", "c.py"]
     out = split_oversized_clusters_by_subdir([fitting], small_budget=6)
     assert out is None
@@ -2822,11 +3259,14 @@ def test_split_oversized_clusters_by_subdir_leaves_fitting_clusters_alone():
 def test_cluster_files_by_subdir_splits_on_second_level_dirs():
     """Files in one top-level dir spanning 2+ second-level dirs split by subdir."""
     from app.cochange_decomposition import cluster_files_by_subdir
-    clusters = cluster_files_by_subdir([
-        "backend/app/x.py",
-        "backend/app/y.py",
-        "backend/testing/test_x.py",
-    ])
+
+    clusters = cluster_files_by_subdir(
+        [
+            "backend/app/x.py",
+            "backend/app/y.py",
+            "backend/testing/test_x.py",
+        ]
+    )
     assert clusters is not None
     cluster_sets = {frozenset(c) for c in clusters}
     assert cluster_sets == {
@@ -2838,40 +3278,64 @@ def test_cluster_files_by_subdir_splits_on_second_level_dirs():
 def test_cluster_files_by_subdir_returns_none_when_single_subdir():
     """Files all sharing the same second-level dir → None."""
     from app.cochange_decomposition import cluster_files_by_subdir
-    assert cluster_files_by_subdir([
-        "backend/app/a.py",
-        "backend/app/b.py",
-        "backend/app/c.py",
-    ]) is None
+
+    assert (
+        cluster_files_by_subdir(
+            [
+                "backend/app/a.py",
+                "backend/app/b.py",
+                "backend/app/c.py",
+            ]
+        )
+        is None
+    )
 
 
 def test_cluster_files_by_subdir_requires_min_files():
     """Fewer than 3 files → None."""
     from app.cochange_decomposition import cluster_files_by_subdir
-    assert cluster_files_by_subdir([
-        "backend/app/a.py",
-        "backend/testing/b.py",
-    ]) is None
+
+    assert (
+        cluster_files_by_subdir(
+            [
+                "backend/app/a.py",
+                "backend/testing/b.py",
+            ]
+        )
+        is None
+    )
 
 
 def test_cluster_files_by_subdir_returns_none_for_multi_toplevel():
     """Multiple top-level dirs → None (toplevel clustering handles that case)."""
     from app.cochange_decomposition import cluster_files_by_subdir
-    assert cluster_files_by_subdir([
-        "backend/app/a.py",
-        "backend/testing/b.py",
-        "agent/src/c.ts",
-    ]) is None
+
+    assert (
+        cluster_files_by_subdir(
+            [
+                "backend/app/a.py",
+                "backend/testing/b.py",
+                "agent/src/c.ts",
+            ]
+        )
+        is None
+    )
 
 
 def test_cluster_files_by_subdir_returns_none_when_missing_subdir():
     """Files without a real second-level dir (only 2 segments) → None."""
     from app.cochange_decomposition import cluster_files_by_subdir
-    assert cluster_files_by_subdir([
-        "backend/a.py",
-        "backend/b.py",
-        "backend/c.py",
-    ]) is None
+
+    assert (
+        cluster_files_by_subdir(
+            [
+                "backend/a.py",
+                "backend/b.py",
+                "backend/c.py",
+            ]
+        )
+        is None
+    )
 
 
 def test_auto_decompose_falls_back_to_subdir_within_single_toplevel():
@@ -2889,7 +3353,10 @@ def test_auto_decompose_falls_back_to_subdir_within_single_toplevel():
         ],
     }
     result = auto_decompose_findings_by_cochange(
-        [(0, finding, "h0")], {}, None, _decomp_hash_fn,
+        [(0, finding, "h0")],
+        {},
+        None,
+        _decomp_hash_fn,
     )
     assert len(result) == 2
     assert all(sub["scope"] == "small" for _, sub, _ in result)
@@ -2903,10 +3370,21 @@ def test_auto_decompose_falls_back_to_subdir_within_single_toplevel():
 def test_cochange_decomposition_suppressed_triggers_on_poor_merge_rate():
     """Suppress when cumulative sub_findings_total >= 3 and merge_rate < 40%."""
     from app.research_completion import _cochange_decomposition_suppressed
+
     direction = {
         "research_history": [
-            {"cochange_decomposition": {"sub_findings_total": 2, "sub_findings_merged": 0}},
-            {"cochange_decomposition": {"sub_findings_total": 3, "sub_findings_merged": 1}},
+            {
+                "cochange_decomposition": {
+                    "sub_findings_total": 2,
+                    "sub_findings_merged": 0,
+                }
+            },
+            {
+                "cochange_decomposition": {
+                    "sub_findings_total": 3,
+                    "sub_findings_merged": 1,
+                }
+            },
         ],
     }
     assert _cochange_decomposition_suppressed(direction) is True
@@ -2915,9 +3393,15 @@ def test_cochange_decomposition_suppressed_triggers_on_poor_merge_rate():
 def test_cochange_decomposition_not_suppressed_on_healthy_merge_rate():
     """Do not suppress when merge rate >= 40%."""
     from app.research_completion import _cochange_decomposition_suppressed
+
     direction = {
         "research_history": [
-            {"cochange_decomposition": {"sub_findings_total": 4, "sub_findings_merged": 2}},
+            {
+                "cochange_decomposition": {
+                    "sub_findings_total": 4,
+                    "sub_findings_merged": 2,
+                }
+            },
         ],
     }
     assert _cochange_decomposition_suppressed(direction) is False
@@ -2926,9 +3410,15 @@ def test_cochange_decomposition_not_suppressed_on_healthy_merge_rate():
 def test_cochange_decomposition_not_suppressed_below_sample_threshold():
     """Do not suppress when cumulative sub_findings_total < 3."""
     from app.research_completion import _cochange_decomposition_suppressed
+
     direction = {
         "research_history": [
-            {"cochange_decomposition": {"sub_findings_total": 2, "sub_findings_merged": 0}},
+            {
+                "cochange_decomposition": {
+                    "sub_findings_total": 2,
+                    "sub_findings_merged": 0,
+                }
+            },
         ],
     }
     assert _cochange_decomposition_suppressed(direction) is False
@@ -2940,6 +3430,7 @@ def test_cochange_decomposition_not_suppressed_below_sample_threshold():
 # 9. _handle_research_completion — JSONB research_history Updates
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_research_history_entry_has_correct_fields(db_session, mocker):
     """research_history gets a new entry with timestamp, task_id, tasks_created, summary."""
@@ -2949,7 +3440,10 @@ async def test_research_history_entry_has_correct_fields(db_session, mocker):
         "research_history": [],
     }
     project = Project(
-        name="History Fields Test", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+        name="History Fields Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
     )
     db_session.add(project)
     await db_session.commit()
@@ -3000,7 +3494,10 @@ async def test_research_history_capped_at_10_entries(db_session, mocker):
         "research_history": existing_history,
     }
     project = Project(
-        name="History Cap Test", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+        name="History Cap Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
     )
     db_session.add(project)
     await db_session.commit()
@@ -3025,20 +3522,33 @@ async def test_research_history_capped_at_10_entries(db_session, mocker):
     assert history[-1]["task_id"] == str(task.id)
     # Oldest entry (index 0 from seed) should have been dropped
     oldest_id = existing_history[0]["task_id"]
-    assert oldest_id not in [e["task_id"] for e in history], "Oldest entry should be evicted"
+    assert oldest_id not in [e["task_id"] for e in history], (
+        "Oldest entry should be evicted"
+    )
 
 
 @pytest.mark.asyncio
-async def test_research_history_only_updated_for_directions_with_findings(db_session, mocker):
+async def test_research_history_only_updated_for_directions_with_findings(
+    db_session, mocker
+):
     """Only directions that produced at least one child task get a research_history entry."""
     dir_a_id = "d-histdra1"
     dir_b_id = "d-histdrb1"
     directions = [
-        {**_active_direction(dir_a_id, "Direction A with findings"), "research_history": []},
-        {**_active_direction(dir_b_id, "Direction B no findings"), "research_history": []},
+        {
+            **_active_direction(dir_a_id, "Direction A with findings"),
+            "research_history": [],
+        },
+        {
+            **_active_direction(dir_b_id, "Direction B no findings"),
+            "research_history": [],
+        },
     ]
     project = Project(
-        name="Selective History Test", user_id="test-user-123", autonomous_enabled=True, directions=directions
+        name="Selective History Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=directions,
     )
     db_session.add(project)
     await db_session.commit()
@@ -3067,6 +3577,7 @@ async def test_research_history_only_updated_for_directions_with_findings(db_ses
 # 10. _handle_research_completion — Direction Proposal Handling
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def _make_direction_proposal(
     prompt: str = "Explore new caching strategy",
     description: str = "Rationale for this proposal",
@@ -3090,7 +3601,10 @@ async def test_research_completion_creates_direction_proposals(db_session, mocke
     direction_id = "d-prop0001"
     direction = _active_direction(direction_id, "Active direction")
     project = Project(
-        name="Proposal Happy Path", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+        name="Proposal Happy Path",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
     )
     db_session.add(project)
     await db_session.commit()
@@ -3103,7 +3617,9 @@ async def test_research_completion_creates_direction_proposals(db_session, mocke
     _patch_research_externals(mocker)
     mocker.patch(
         "app.research_completion._parse_research_findings",
-        return_value=[_make_direction_proposal(proposal_prompt, proposal_rationale, "high")],
+        return_value=[
+            _make_direction_proposal(proposal_prompt, proposal_rationale, "high")
+        ],
     )
 
     await _handle_research_completion(task, "", db_session)
@@ -3128,7 +3644,10 @@ async def test_direction_proposals_not_converted_to_tasks(db_session, mocker):
     direction_id = "d-prop0002"
     direction = _active_direction(direction_id, "Active direction")
     project = Project(
-        name="Proposal No Task", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+        name="Proposal No Task",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
     )
     db_session.add(project)
     await db_session.commit()
@@ -3145,13 +3664,9 @@ async def test_direction_proposals_not_converted_to_tasks(db_session, mocker):
         ],
     )
 
-    before_ids = set(
-        (await db_session.execute(select(Task.id))).scalars().all()
-    )
+    before_ids = set((await db_session.execute(select(Task.id))).scalars().all())
     await _handle_research_completion(task, "", db_session)
-    after_ids = set(
-        (await db_session.execute(select(Task.id))).scalars().all()
-    )
+    after_ids = set((await db_session.execute(select(Task.id))).scalars().all())
 
     new_task_ids = after_ids - before_ids
     # Only the real improvement finding should produce a child task, not the proposal
@@ -3169,7 +3684,10 @@ async def test_direction_proposals_capped_at_5_per_call(db_session, mocker):
     direction_id = "d-prop0003"
     direction = _active_direction(direction_id, "Active direction")
     project = Project(
-        name="Proposal Per-Call Cap", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+        name="Proposal Per-Call Cap",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
     )
     db_session.add(project)
     await db_session.commit()
@@ -3179,7 +3697,9 @@ async def test_direction_proposals_capped_at_5_per_call(db_session, mocker):
 
     proposals = [_make_direction_proposal(f"Proposal {i}") for i in range(8)]
     _patch_research_externals(mocker)
-    mocker.patch("app.research_completion._parse_research_findings", return_value=proposals)
+    mocker.patch(
+        "app.research_completion._parse_research_findings", return_value=proposals
+    )
 
     await _handle_research_completion(task, "", db_session)
 
@@ -3236,6 +3756,7 @@ async def test_direction_proposals_capped_at_10_pending_total(db_session, mocker
 # 11. Direction API — PUT (replace all directions)
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_put_directions_replaces_entire_list(client: AsyncClient, mocker):
     """PUT /directions discards existing directions and installs the provided list."""
@@ -3281,7 +3802,14 @@ async def test_put_directions_preserves_provided_id(client: AsyncClient, mocker)
 
     resp = await client.put(
         f"/api/admin/projects/{project_id}/directions",
-        json=[{"id": existing_id, "text": "Keep my ID", "priority": "medium", "status": "active"}],
+        json=[
+            {
+                "id": existing_id,
+                "text": "Keep my ID",
+                "priority": "medium",
+                "status": "active",
+            }
+        ],
     )
     assert resp.status_code == 200
     directions = resp.json()["directions"]
@@ -3325,6 +3853,7 @@ async def test_put_directions_project_not_found_returns_404(client: AsyncClient)
 # ─────────────────────────────────────────────────────────────────────────────
 # 12. Direction API — PATCH /reorder
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_reorder_directions_changes_order(client: AsyncClient, mocker):
@@ -3415,23 +3944,28 @@ async def test_reorder_non_list_payload_returns_400(client: AsyncClient, mocker)
 # 13. Direction API — POST /{direction_id}/research (cooldown behavior)
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_research_endpoint_returns_429_when_direction_in_cooldown(
     client: AsyncClient, mocker
 ):
     """POST /research without bypass returns 429 when direction was recently researched."""
     project_id = await _deploy_project(client, mocker)
-    direction = await _add_direction(client, project_id, text="Recently researched direction")
+    direction = await _add_direction(
+        client, project_id, text="Recently researched direction"
+    )
     direction_id = direction["id"]
 
     # Inject a last_researched_at 1 hour ago via PUT (within the 4-hour default cooldown)
     recent_ts = (datetime.utcnow() - timedelta(hours=1)).isoformat()
     put_resp = await client.put(
         f"/api/admin/projects/{project_id}/directions",
-        json=[{
-            **direction,
-            "last_researched_at": recent_ts,
-        }],
+        json=[
+            {
+                **direction,
+                "last_researched_at": recent_ts,
+            }
+        ],
     )
     assert put_resp.status_code == 200
 
@@ -3443,10 +3977,14 @@ async def test_research_endpoint_returns_429_when_direction_in_cooldown(
 
 
 @pytest.mark.asyncio
-async def test_research_endpoint_bypass_cooldown_creates_task(client: AsyncClient, mocker):
+async def test_research_endpoint_bypass_cooldown_creates_task(
+    client: AsyncClient, mocker
+):
     """POST /research?bypass_cooldown=true creates a QUEUED task even if in cooldown."""
     project_id = await _deploy_project(client, mocker)
-    direction = await _add_direction(client, project_id, text="Cooldown bypass direction")
+    direction = await _add_direction(
+        client, project_id, text="Cooldown bypass direction"
+    )
     direction_id = direction["id"]
 
     # Put it in cooldown
@@ -3587,19 +4125,24 @@ async def test_research_context_truncated_under_8000_chars(db_session, mocker):
         cycle_findings = []
         for i in range(5):
             title = f"unique-{cycle}-{i}"
-            cycle_findings.append({
-                "title": title,
-                "description": f"Long description for {title}: " + "x" * 150,
-                "prompt": f"Implement: {title}",
-                "priority": "medium",
-                "scope": "small",
-                "risk": "low",
-                "type": "improvement",
-                "direction_id": direction_id,
-            })
+            cycle_findings.append(
+                {
+                    "title": title,
+                    "description": f"Long description for {title}: " + "x" * 150,
+                    "prompt": f"Implement: {title}",
+                    "priority": "medium",
+                    "scope": "small",
+                    "risk": "low",
+                    "type": "improvement",
+                    "direction_id": direction_id,
+                }
+            )
         findings_per_cycle.append(cycle_findings)
 
-    mocker.patch("app.research_completion._parse_research_findings", side_effect=findings_per_cycle)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        side_effect=findings_per_cycle,
+    )
 
     for i in range(6):
         await db_session.refresh(project)
@@ -3676,7 +4219,9 @@ async def test_research_context_updates_on_task_failure(db_session, mocker):
     research_task = Task(
         project_id=project.id,
         title="Research: Outcome update test",
-        payloads=[{"type": "research", "directions": [direction], "base_branch": "main"}],
+        payloads=[
+            {"type": "research", "directions": [direction], "base_branch": "main"}
+        ],
         context={"research_depth": 0},
         status=TaskStatus.COMPLETED,
         created_by="ORCHESTRATOR",
@@ -3695,15 +4240,21 @@ async def test_research_context_updates_on_task_failure(db_session, mocker):
     dirs = list(project.directions or [])
     for d in dirs:
         if d.get("id") == direction_id:
-            d["research_history"] = [{
-                "timestamp": "2026-04-07T00:00:00",
-                "task_id": str(research_task.id),
-                "tasks_created": 2,
-                "finding_titles": ["Add retry logic to API client", "Improve caching layer"],
-            }]
+            d["research_history"] = [
+                {
+                    "timestamp": "2026-04-07T00:00:00",
+                    "task_id": str(research_task.id),
+                    "tasks_created": 2,
+                    "finding_titles": [
+                        "Add retry logic to API client",
+                        "Improve caching layer",
+                    ],
+                }
+            ]
             break
     project.directions = dirs
     from sqlalchemy.orm.attributes import flag_modified
+
     flag_modified(project, "directions")
     db_session.add(project)
     await db_session.commit()
@@ -3726,7 +4277,9 @@ async def test_research_context_updates_on_task_failure(db_session, mocker):
     # Failed task's finding should be moved to Failed Approaches
     assert "## Failed Approaches" in ctx
     assert "Add retry logic to API client" in ctx
-    assert "Timed out after 30 minutes" in ctx, "Failure reason should appear in Failed Approaches"
+    assert "Timed out after 30 minutes" in ctx, (
+        "Failure reason should appear in Failed Approaches"
+    )
     # Should no longer be in Established as (proposed)
     assert "Add retry logic to API client (proposed)" not in ctx
 
@@ -3739,8 +4292,11 @@ async def test_research_context_updates_on_task_failure(db_session, mocker):
 # recent_findings_evidence — structured evidence for strategic agent
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
-async def test_recent_findings_evidence_populated_with_claims_and_sources(db_session, mocker):
+async def test_recent_findings_evidence_populated_with_claims_and_sources(
+    db_session, mocker
+):
     """recent_findings_evidence is stored on the direction when findings have claims and sources."""
     direction_id = "d-rfe0001"
     direction = _active_direction(direction_id, "Evidence test")
@@ -3758,18 +4314,25 @@ async def test_recent_findings_evidence_populated_with_claims_and_sources(db_ses
     mocker.patch("app.research_completion._parse_research_insights", return_value=[])
     mocker.patch(
         "app.research_completion._parse_research_findings",
-        return_value=[{
-            "title": "Improve caching layer",
-            "description": "Cache miss rate is 40%.",
-            "prompt": "Add LRU cache",
-            "priority": "high",
-            "scope": "small",
-            "risk": "low",
-            "type": "improvement",
-            "direction_id": direction_id,
-            "claims": ["Cache miss rate is 40%", "LRU cache reduces latency by 30%"],
-            "sources": [{"ref": "backend/app/cache.py:42", "excerpt": "def get_cache():"}],
-        }],
+        return_value=[
+            {
+                "title": "Improve caching layer",
+                "description": "Cache miss rate is 40%.",
+                "prompt": "Add LRU cache",
+                "priority": "high",
+                "scope": "small",
+                "risk": "low",
+                "type": "improvement",
+                "direction_id": direction_id,
+                "claims": [
+                    "Cache miss rate is 40%",
+                    "LRU cache reduces latency by 30%",
+                ],
+                "sources": [
+                    {"ref": "backend/app/cache.py:42", "excerpt": "def get_cache():"}
+                ],
+            }
+        ],
     )
 
     task = await _make_research_task(project, direction, db_session)
@@ -3780,7 +4343,9 @@ async def test_recent_findings_evidence_populated_with_claims_and_sources(db_ses
     d = next((x for x in dirs if x.get("id") == direction_id), None)
     assert d is not None
     rfe = d.get("recent_findings_evidence")
-    assert rfe, "recent_findings_evidence should be set when findings have claims/sources"
+    assert rfe, (
+        "recent_findings_evidence should be set when findings have claims/sources"
+    )
     assert len(rfe) >= 1
     entry = rfe[0]
     assert entry["title"] == "Improve caching layer"
@@ -3815,15 +4380,24 @@ async def test_recent_findings_evidence_absent_when_no_findings(db_session, mock
     d = next((x for x in dirs if x.get("id") == direction_id), None)
     assert d is not None
     rfe = d.get("recent_findings_evidence")
-    assert not rfe, "recent_findings_evidence should be empty when no findings with claims/sources"
+    assert not rfe, (
+        "recent_findings_evidence should be empty when no findings with claims/sources"
+    )
 
 
 @pytest.mark.asyncio
-async def test_recent_findings_evidence_in_direction_summary_payload(db_session, mocker):
+async def test_recent_findings_evidence_in_direction_summary_payload(
+    db_session, mocker
+):
     """recent_findings_evidence on a direction is included in the spawned research task payload."""
     direction_id = "d-rfe0003"
-    evidence = [{"title": "Fix N+1 query", "claims": ["query runs 100x"], "source_refs": []}]
-    direction = {**_active_direction(direction_id, "Payload evidence test"), "recent_findings_evidence": evidence}
+    evidence = [
+        {"title": "Fix N+1 query", "claims": ["query runs 100x"], "source_refs": []}
+    ]
+    direction = {
+        **_active_direction(direction_id, "Payload evidence test"),
+        "recent_findings_evidence": evidence,
+    }
     project = Project(
         name="Payload Evidence",
         user_id="test-user-123",
@@ -3905,7 +4479,9 @@ async def test_type_distribution_and_product_ratio(db_session):
     research_task = Task(
         project_id=project.id,
         title="Research: Type distribution test",
-        payloads=[{"type": "research", "directions": [direction], "base_branch": "main"}],
+        payloads=[
+            {"type": "research", "directions": [direction], "base_branch": "main"}
+        ],
         context={"research_depth": 0},
         status=TaskStatus.COMPLETED,
         created_by="ORCHESTRATOR",
@@ -3924,15 +4500,18 @@ async def test_type_distribution_and_product_ratio(db_session):
     dirs = list(project.directions or [])
     for d in dirs:
         if d.get("id") == direction_id:
-            d["research_history"] = [{
-                "timestamp": "2026-04-07T00:00:00",
-                "task_id": str(research_task.id),
-                "tasks_created": 4,
-                "finding_titles": [],
-            }]
+            d["research_history"] = [
+                {
+                    "timestamp": "2026-04-07T00:00:00",
+                    "task_id": str(research_task.id),
+                    "tasks_created": 4,
+                    "finding_titles": [],
+                }
+            ]
             break
     project.directions = dirs
     from sqlalchemy.orm.attributes import flag_modified
+
     flag_modified(project, "directions")
     db_session.add(project)
     await db_session.commit()
@@ -4021,7 +4600,9 @@ async def test_stage_dropout_breakdown(db_session):
     research_task = Task(
         project_id=project.id,
         title="Research: Stage dropout test",
-        payloads=[{"type": "research", "directions": [direction], "base_branch": "main"}],
+        payloads=[
+            {"type": "research", "directions": [direction], "base_branch": "main"}
+        ],
         context={"research_depth": 0},
         status=TaskStatus.COMPLETED,
         created_by="ORCHESTRATOR",
@@ -4038,15 +4619,18 @@ async def test_stage_dropout_breakdown(db_session):
     dirs = list(project.directions or [])
     for d in dirs:
         if d.get("id") == direction_id:
-            d["research_history"] = [{
-                "timestamp": "2026-04-07T00:00:00",
-                "task_id": str(research_task.id),
-                "tasks_created": 3,
-                "finding_titles": [],
-            }]
+            d["research_history"] = [
+                {
+                    "timestamp": "2026-04-07T00:00:00",
+                    "task_id": str(research_task.id),
+                    "tasks_created": 3,
+                    "finding_titles": [],
+                }
+            ]
             break
     project.directions = dirs
     from sqlalchemy.orm.attributes import flag_modified
+
     flag_modified(project, "directions")
     db_session.add(project)
     await db_session.commit()
@@ -4064,15 +4648,22 @@ async def test_stage_dropout_breakdown(db_session):
     entry = d["research_history"][0]
     dropout = entry.get("stage_dropout", {})
 
-    assert dropout.get("tasks_failed_code_error") == 1, f"Expected 1 code error, got {dropout}"
-    assert dropout.get("tasks_required_approval") == 1, f"Expected 1 required approval, got {dropout}"
+    assert dropout.get("tasks_failed_code_error") == 1, (
+        f"Expected 1 code error, got {dropout}"
+    )
+    assert dropout.get("tasks_required_approval") == 1, (
+        f"Expected 1 required approval, got {dropout}"
+    )
     # rollup succeeded (research task COMPLETED) — no staging-only merges
-    assert dropout.get("tasks_merged_staging_only") == 0, f"Expected 0 staging-only, got {dropout}"
+    assert dropout.get("tasks_merged_staging_only") == 0, (
+        f"Expected 0 staging-only, got {dropout}"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # _strategic_failures auto-decay
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_strategic_failures_auto_decay_triggers_force_strategic(db_session):
@@ -4127,7 +4718,9 @@ async def test_strategic_failures_no_decay_when_recent(db_session):
 
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
     tasks = result.scalars().all()
-    assert len(tasks) == 0, "Expected no task: decay should not apply for recent failure"
+    assert len(tasks) == 0, (
+        "Expected no task: decay should not apply for recent failure"
+    )
 
 
 @pytest.mark.asyncio
@@ -4138,9 +4731,24 @@ async def test_all_saturated_directions_triggers_force_strategic(db_session):
         user_id="test-user-123",
         autonomous_enabled=True,
         directions=[
-            {"id": "d-111", "status": "active", "possibly_saturated": True, "title": "Dir 1"},
-            {"id": "d-222", "status": "active", "possibly_saturated": True, "title": "Dir 2"},
-            {"id": "d-333", "status": "active", "possibly_saturated": True, "title": "Dir 3"},
+            {
+                "id": "d-111",
+                "status": "active",
+                "possibly_saturated": True,
+                "title": "Dir 1",
+            },
+            {
+                "id": "d-222",
+                "status": "active",
+                "possibly_saturated": True,
+                "title": "Dir 2",
+            },
+            {
+                "id": "d-333",
+                "status": "active",
+                "possibly_saturated": True,
+                "title": "Dir 3",
+            },
         ],
         vision={"purpose": "test purpose"},
     )
@@ -4154,8 +4762,12 @@ async def test_all_saturated_directions_triggers_force_strategic(db_session):
     tasks = result.scalars().all()
     task_types = [t.payloads[0].get("type") for t in tasks]
     strategic_types = {"design_doc_update", "strategic_review"}
-    assert any(t in strategic_types for t in task_types), "Expected a strategic task when all directions are saturated"
-    assert "research" not in task_types, "Expected no research tasks when all directions are saturated"
+    assert any(t in strategic_types for t in task_types), (
+        "Expected a strategic task when all directions are saturated"
+    )
+    assert "research" not in task_types, (
+        "Expected no research tasks when all directions are saturated"
+    )
 
 
 @pytest.mark.asyncio
@@ -4166,8 +4778,18 @@ async def test_partially_saturated_directions_no_force_strategic(db_session):
         user_id="test-user-123",
         autonomous_enabled=True,
         directions=[
-            {"id": "d-111", "status": "active", "possibly_saturated": True, "title": "Dir 1"},
-            {"id": "d-222", "status": "active", "possibly_saturated": False, "title": "Dir 2"},
+            {
+                "id": "d-111",
+                "status": "active",
+                "possibly_saturated": True,
+                "title": "Dir 1",
+            },
+            {
+                "id": "d-222",
+                "status": "active",
+                "possibly_saturated": False,
+                "title": "Dir 2",
+            },
         ],
         vision={"purpose": "test purpose"},
     )
@@ -4180,20 +4802,28 @@ async def test_partially_saturated_directions_no_force_strategic(db_session):
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
     tasks = result.scalars().all()
     # A research task for the non-saturated direction should spawn, not a strategic task
-    strategic_tasks = [t for t in tasks if t.payloads[0].get("type") == "design_doc_update"]
-    assert len(strategic_tasks) == 0, "Expected no strategic task when only some directions are saturated"
+    strategic_tasks = [
+        t for t in tasks if t.payloads[0].get("type") == "design_doc_update"
+    ]
+    assert len(strategic_tasks) == 0, (
+        "Expected no strategic task when only some directions are saturated"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Dedup hole tests — failed parent and infra failures
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_failed_parent_child_not_blocking_dedup(db_session, mocker):
     """A COMPLETED child with pr_merged=True whose parent rollup FAILED must NOT block re-proposal."""
     direction = _active_direction("d-fpdedup01", "Failed parent dedup test")
     project = Project(
-        name="Failed Parent Dedup Test", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+        name="Failed Parent Dedup Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
     )
     db_session.add(project)
     await db_session.commit()
@@ -4237,16 +4867,18 @@ async def test_failed_parent_child_not_blocking_dedup(db_session, mocker):
     _patch_research_externals(mocker)
     mocker.patch(
         "app.research_completion._parse_research_findings",
-        return_value=[{
-            "title": dup_title,
-            "description": dup_desc,
-            "prompt": "Fix session token caching",
-            "priority": "high",
-            "scope": "small",
-            "risk": "low",
-            "type": "improvement",
-            "direction_id": direction["id"],
-        }],
+        return_value=[
+            {
+                "title": dup_title,
+                "description": dup_desc,
+                "prompt": "Fix session token caching",
+                "priority": "high",
+                "scope": "small",
+                "risk": "low",
+                "type": "improvement",
+                "direction_id": direction["id"],
+            }
+        ],
     )
 
     await _handle_research_completion(task, "", db_session)
@@ -4257,7 +4889,9 @@ async def test_failed_parent_child_not_blocking_dedup(db_session, mocker):
         )
     )
     child_tasks = result.scalars().all()
-    assert len(child_tasks) == 1, "Ghost child (failed parent) must NOT block re-proposal"
+    assert len(child_tasks) == 1, (
+        "Ghost child (failed parent) must NOT block re-proposal"
+    )
 
 
 @pytest.mark.asyncio
@@ -4265,7 +4899,10 @@ async def test_infra_failure_not_blocking_dedup(db_session, mocker):
     """A FAILED task with AGENT_TIMEOUT classification must NOT block re-proposal."""
     direction = _active_direction("d-infraded01", "Infra failure dedup test")
     project = Project(
-        name="Infra Failure Dedup Test", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+        name="Infra Failure Dedup Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
     )
     db_session.add(project)
     await db_session.commit()
@@ -4294,16 +4931,18 @@ async def test_infra_failure_not_blocking_dedup(db_session, mocker):
     _patch_research_externals(mocker)
     mocker.patch(
         "app.research_completion._parse_research_findings",
-        return_value=[{
-            "title": dup_title,
-            "description": dup_desc,
-            "prompt": "Add retry logic",
-            "priority": "high",
-            "scope": "small",
-            "risk": "low",
-            "type": "improvement",
-            "direction_id": direction["id"],
-        }],
+        return_value=[
+            {
+                "title": dup_title,
+                "description": dup_desc,
+                "prompt": "Add retry logic",
+                "priority": "high",
+                "scope": "small",
+                "risk": "low",
+                "type": "improvement",
+                "direction_id": direction["id"],
+            }
+        ],
     )
 
     await _handle_research_completion(task, "", db_session)
@@ -4322,7 +4961,10 @@ async def test_code_error_still_blocks_dedup(db_session, mocker):
     """A FAILED task with CODE_ERROR classification must still block re-proposal."""
     direction = _active_direction("d-codedeup01", "Code error dedup test")
     project = Project(
-        name="Code Error Dedup Test", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+        name="Code Error Dedup Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
     )
     db_session.add(project)
     await db_session.commit()
@@ -4351,16 +4993,18 @@ async def test_code_error_still_blocks_dedup(db_session, mocker):
     _patch_research_externals(mocker)
     mocker.patch(
         "app.research_completion._parse_research_findings",
-        return_value=[{
-            "title": dup_title,
-            "description": dup_desc,
-            "prompt": "Refactor middleware",
-            "priority": "high",
-            "scope": "small",
-            "risk": "low",
-            "type": "improvement",
-            "direction_id": direction["id"],
-        }],
+        return_value=[
+            {
+                "title": dup_title,
+                "description": dup_desc,
+                "prompt": "Refactor middleware",
+                "priority": "high",
+                "scope": "small",
+                "risk": "low",
+                "type": "improvement",
+                "direction_id": direction["id"],
+            }
+        ],
     )
 
     await _handle_research_completion(task, "", db_session)
@@ -4379,7 +5023,10 @@ async def test_code_error_after_cooldown_allows_reproposal(db_session, mocker):
     """A CODE_ERROR failure older than 48 hours must NOT block re-proposal."""
     direction = _active_direction("d-ceold01", "Code error cooldown test")
     project = Project(
-        name="Code Error Cooldown Allow", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+        name="Code Error Cooldown Allow",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
     )
     db_session.add(project)
     await db_session.commit()
@@ -4393,7 +5040,9 @@ async def test_code_error_after_cooldown_allows_reproposal(db_session, mocker):
     old_code_failed = Task(
         project_id=project.id,
         title=old_title,
-        payloads=[{"type": "create", "prompt": "add validation", "base_branch": "main"}],
+        payloads=[
+            {"type": "create", "prompt": "add validation", "base_branch": "main"}
+        ],
         context={"finding_hash": fhash},
         status=TaskStatus.FAILED,
         latest_status_message="Tests failed: AssertionError in test_registration.py line 15",
@@ -4409,16 +5058,18 @@ async def test_code_error_after_cooldown_allows_reproposal(db_session, mocker):
     _patch_research_externals(mocker)
     mocker.patch(
         "app.research_completion._parse_research_findings",
-        return_value=[{
-            "title": old_title,
-            "description": old_desc,
-            "prompt": "Add input validation",
-            "priority": "medium",
-            "scope": "small",
-            "risk": "low",
-            "type": "improvement",
-            "direction_id": direction["id"],
-        }],
+        return_value=[
+            {
+                "title": old_title,
+                "description": old_desc,
+                "prompt": "Add input validation",
+                "priority": "medium",
+                "scope": "small",
+                "risk": "low",
+                "type": "improvement",
+                "direction_id": direction["id"],
+            }
+        ],
     )
 
     await _handle_research_completion(task, "", db_session)
@@ -4429,7 +5080,9 @@ async def test_code_error_after_cooldown_allows_reproposal(db_session, mocker):
         )
     )
     child_tasks = result.scalars().all()
-    assert len(child_tasks) == 1, "CODE_ERROR failure older than 48h must NOT block re-proposal"
+    assert len(child_tasks) == 1, (
+        "CODE_ERROR failure older than 48h must NOT block re-proposal"
+    )
 
 
 @pytest.mark.asyncio
@@ -4437,7 +5090,10 @@ async def test_code_error_within_cooldown_blocks_reproposal(db_session, mocker):
     """A CODE_ERROR failure within the 48-hour cooldown must still block re-proposal."""
     direction = _active_direction("d-cewarm01", "Code error within cooldown test")
     project = Project(
-        name="Code Error Cooldown Block", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+        name="Code Error Cooldown Block",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
     )
     db_session.add(project)
     await db_session.commit()
@@ -4451,7 +5107,9 @@ async def test_code_error_within_cooldown_blocks_reproposal(db_session, mocker):
     recent_code_failed = Task(
         project_id=project.id,
         title=recent_title,
-        payloads=[{"type": "create", "prompt": "fix null pointer", "base_branch": "main"}],
+        payloads=[
+            {"type": "create", "prompt": "fix null pointer", "base_branch": "main"}
+        ],
         context={"finding_hash": fhash},
         status=TaskStatus.FAILED,
         latest_status_message="Build failed: NullPointerException in OrderProcessor.java:88",
@@ -4467,16 +5125,18 @@ async def test_code_error_within_cooldown_blocks_reproposal(db_session, mocker):
     _patch_research_externals(mocker)
     mocker.patch(
         "app.research_completion._parse_research_findings",
-        return_value=[{
-            "title": recent_title,
-            "description": recent_desc,
-            "prompt": "Fix null pointer error",
-            "priority": "high",
-            "scope": "small",
-            "risk": "low",
-            "type": "improvement",
-            "direction_id": direction["id"],
-        }],
+        return_value=[
+            {
+                "title": recent_title,
+                "description": recent_desc,
+                "prompt": "Fix null pointer error",
+                "priority": "high",
+                "scope": "small",
+                "risk": "low",
+                "type": "improvement",
+                "direction_id": direction["id"],
+            }
+        ],
     )
 
     await _handle_research_completion(task, "", db_session)
@@ -4487,7 +5147,9 @@ async def test_code_error_within_cooldown_blocks_reproposal(db_session, mocker):
         )
     )
     child_tasks = result.scalars().all()
-    assert len(child_tasks) == 0, "CODE_ERROR failure within 48h cooldown must still block re-proposal"
+    assert len(child_tasks) == 0, (
+        "CODE_ERROR failure within 48h cooldown must still block re-proposal"
+    )
 
 
 @pytest.mark.asyncio
@@ -4495,7 +5157,10 @@ async def test_merged_pr_blocks_reproposal_permanently(db_session, mocker):
     """A successfully merged PR must block re-proposal even after the cooldown period."""
     direction = _active_direction("d-mergedold01", "Merged PR permanent block test")
     project = Project(
-        name="Merged PR Permanent Block", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+        name="Merged PR Permanent Block",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
     )
     db_session.add(project)
     await db_session.commit()
@@ -4524,16 +5189,18 @@ async def test_merged_pr_blocks_reproposal_permanently(db_session, mocker):
     _patch_research_externals(mocker)
     mocker.patch(
         "app.research_completion._parse_research_findings",
-        return_value=[{
-            "title": merged_title,
-            "description": merged_desc,
-            "prompt": "Migrate auth to OAuth2",
-            "priority": "high",
-            "scope": "medium",
-            "risk": "low",
-            "type": "improvement",
-            "direction_id": direction["id"],
-        }],
+        return_value=[
+            {
+                "title": merged_title,
+                "description": merged_desc,
+                "prompt": "Migrate auth to OAuth2",
+                "priority": "high",
+                "scope": "medium",
+                "risk": "low",
+                "type": "improvement",
+                "direction_id": direction["id"],
+            }
+        ],
     )
 
     await _handle_research_completion(task, "", db_session)
@@ -4544,15 +5211,20 @@ async def test_merged_pr_blocks_reproposal_permanently(db_session, mocker):
         )
     )
     child_tasks = result.scalars().all()
-    assert len(child_tasks) == 0, "Successfully merged PR must block re-proposal permanently"
+    assert len(child_tasks) == 0, (
+        "Successfully merged PR must block re-proposal permanently"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Deadlock Detection
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
-async def test_dedup_deadlock_triggers_alert_after_3_consecutive_empty_cycles(db_session, mocker):
+async def test_dedup_deadlock_triggers_alert_after_3_consecutive_empty_cycles(
+    db_session, mocker
+):
     """3 consecutive 0-task cycles driven by hash dedup creates a WARNING Alert and BUG_REPORT message."""
     direction_id = "d-deadlk01"
     direction = {
@@ -4620,7 +5292,9 @@ async def test_dedup_deadlock_triggers_alert_after_3_consecutive_empty_cycles(db
     task = Task(
         project_id=project.id,
         title="Research: Fix performance bottlenecks",
-        payloads=[{"type": "research", "directions": [direction], "base_branch": "main"}],
+        payloads=[
+            {"type": "research", "directions": [direction], "base_branch": "main"}
+        ],
         context={"research_depth": 0, "direction_id": direction_id},
         status=TaskStatus.IN_PROGRESS,
         created_by="ORCHESTRATOR",
@@ -4633,37 +5307,50 @@ async def test_dedup_deadlock_triggers_alert_after_3_consecutive_empty_cycles(db
     _patch_research_externals(mocker)
     mocker.patch(
         "app.research_completion._parse_research_findings",
-        return_value=[{
-            "title": dup_title,
-            "description": dup_desc,
-            "prompt": "Fix the connection leak",
-            "priority": "high",
-            "scope": "small",
-            "risk": "low",
-            "type": "improvement",
-            "direction_id": direction_id,
-        }],
+        return_value=[
+            {
+                "title": dup_title,
+                "description": dup_desc,
+                "prompt": "Fix the connection leak",
+                "priority": "high",
+                "scope": "small",
+                "risk": "low",
+                "type": "improvement",
+                "direction_id": direction_id,
+            }
+        ],
     )
 
     await _handle_research_completion(task, "", db_session)
 
     # A WARNING-severity Alert should have been created for the deadlock
-    alerts = (await db_session.execute(
-        select(Alert).where(Alert.project_id == project.id)
-    )).scalars().all()
+    alerts = (
+        (await db_session.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
     deadlock_alerts = [
-        a for a in alerts
+        a
+        for a in alerts
         if a.severity == AlertSeverity.WARNING and "deadlock" in a.title.lower()
     ]
     assert len(deadlock_alerts) >= 1, "Expected a WARNING Alert for dedup deadlock"
     assert direction_id in deadlock_alerts[0].message
 
     # A BUG_REPORT ProjectMessage should also have been created
-    messages = (await db_session.execute(
-        select(ProjectMessage).where(ProjectMessage.project_id == project.id)
-    )).scalars().all()
+    messages = (
+        (
+            await db_session.execute(
+                select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
     bug_reports = [m for m in messages if m.message_type == MessageType.BUG_REPORT]
-    assert len(bug_reports) >= 1, "Expected a BUG_REPORT ProjectMessage for dedup deadlock"
+    assert len(bug_reports) >= 1, (
+        "Expected a BUG_REPORT ProjectMessage for dedup deadlock"
+    )
     assert bug_reports[0].context.get("source") == "dedup_deadlock"
     assert bug_reports[0].context.get("consecutive_empty_cycles") == 3
 
@@ -4672,13 +5359,16 @@ async def test_dedup_deadlock_triggers_alert_after_3_consecutive_empty_cycles(db
 # 15. _handle_research_completion — Spawn-Time Health Gate
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_health_gate_normal_no_cap(db_session, mocker):
     """When pipeline is healthy, all findings create tasks without any cap."""
     direction_id = "d-hgate001"
     direction = _active_direction(direction_id, "Health gate normal")
     project = Project(
-        name="Health Gate Normal", user_id="test-user-123", autonomous_enabled=True,
+        name="Health Gate Normal",
+        user_id="test-user-123",
+        autonomous_enabled=True,
         directions=[direction],
     )
     db_session.add(project)
@@ -4690,9 +5380,14 @@ async def test_health_gate_normal_no_cap(db_session, mocker):
     _patch_research_externals(mocker)
     # 5 findings — all should spawn tasks when healthy
     findings = [_make_finding(f"Improvement {i}", direction_id) for i in range(5)]
-    mocker.patch("app.research_completion._parse_research_findings", return_value=findings)
+    mocker.patch(
+        "app.research_completion._parse_research_findings", return_value=findings
+    )
     # Healthy pipeline: zone available, no degradation
-    mocker.patch("app.research_completion._assess_project_spawn_health", return_value=(False, None))
+    mocker.patch(
+        "app.research_completion._assess_project_spawn_health",
+        return_value=(False, None),
+    )
 
     await _handle_research_completion(task, "", db_session)
 
@@ -4714,7 +5409,9 @@ async def test_health_gate_zone_exhaustion_caps_spawn(db_session, mocker):
     direction_id = "d-hgate002"
     direction = _active_direction(direction_id, "Zone exhaustion cap")
     project = Project(
-        name="Zone Exhaustion", user_id="test-user-123", autonomous_enabled=True,
+        name="Zone Exhaustion",
+        user_id="test-user-123",
+        autonomous_enabled=True,
         directions=[direction],
     )
     db_session.add(project)
@@ -4726,7 +5423,9 @@ async def test_health_gate_zone_exhaustion_caps_spawn(db_session, mocker):
     _patch_research_externals(mocker)
     # 6 findings — only _DEGRADED_SPAWN_CAP should be created
     findings = [_make_finding(f"Zone cap finding {i}", direction_id) for i in range(6)]
-    mocker.patch("app.research_completion._parse_research_findings", return_value=findings)
+    mocker.patch(
+        "app.research_completion._parse_research_findings", return_value=findings
+    )
     mocker.patch(
         "app.research_completion._assess_project_spawn_health",
         return_value=(True, "all zones in cooldown"),
@@ -4757,7 +5456,9 @@ async def test_health_gate_account_unavailable_caps_spawn(db_session, mocker):
     direction_id = "d-hgate003"
     direction = _active_direction(direction_id, "Account unavailable cap")
     project = Project(
-        name="Account Unavailable", user_id="test-user-123", autonomous_enabled=True,
+        name="Account Unavailable",
+        user_id="test-user-123",
+        autonomous_enabled=True,
         directions=[direction],
     )
     db_session.add(project)
@@ -4767,8 +5468,12 @@ async def test_health_gate_account_unavailable_caps_spawn(db_session, mocker):
     task = await _make_research_task(project, direction, db_session)
 
     _patch_research_externals(mocker)
-    findings = [_make_finding(f"Account cap finding {i}", direction_id) for i in range(5)]
-    mocker.patch("app.research_completion._parse_research_findings", return_value=findings)
+    findings = [
+        _make_finding(f"Account cap finding {i}", direction_id) for i in range(5)
+    ]
+    mocker.patch(
+        "app.research_completion._parse_research_findings", return_value=findings
+    )
     mocker.patch(
         "app.research_completion._assess_project_spawn_health",
         return_value=(True, "no accounts available"),
@@ -4795,7 +5500,9 @@ async def test_health_gate_deferred_findings_stored_in_context(db_session, mocke
     direction_id = "d-hgate004"
     direction = _active_direction(direction_id, "Deferred findings storage")
     project = Project(
-        name="Deferred Storage Test", user_id="test-user-123", autonomous_enabled=True,
+        name="Deferred Storage Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
         directions=[direction],
     )
     db_session.add(project)
@@ -4805,10 +5512,10 @@ async def test_health_gate_deferred_findings_stored_in_context(db_session, mocke
     task = await _make_research_task(project, direction, db_session)
 
     _patch_research_externals(mocker)
-    findings = [
-        _make_finding(f"Finding {i}", direction_id) for i in range(4)
-    ]
-    mocker.patch("app.research_completion._parse_research_findings", return_value=findings)
+    findings = [_make_finding(f"Finding {i}", direction_id) for i in range(4)]
+    mocker.patch(
+        "app.research_completion._parse_research_findings", return_value=findings
+    )
     mocker.patch(
         "app.research_completion._assess_project_spawn_health",
         return_value=(True, "high failure rate (8/10 recent tasks failed)"),
@@ -4833,7 +5540,9 @@ async def test_deferred_stats_persisted_on_research_history_entry(db_session, mo
     direction_id = "d-defstats01"
     direction = _active_direction(direction_id, "Deferred stats persistence")
     project = Project(
-        name="Deferred Stats", user_id="test-user-123", autonomous_enabled=True,
+        name="Deferred Stats",
+        user_id="test-user-123",
+        autonomous_enabled=True,
         directions=[direction],
     )
     db_session.add(project)
@@ -4844,7 +5553,9 @@ async def test_deferred_stats_persisted_on_research_history_entry(db_session, mo
 
     _patch_research_externals(mocker)
     findings = [_make_finding(f"Finding {i}", direction_id) for i in range(5)]
-    mocker.patch("app.research_completion._parse_research_findings", return_value=findings)
+    mocker.patch(
+        "app.research_completion._parse_research_findings", return_value=findings
+    )
     mocker.patch(
         "app.research_completion._assess_project_spawn_health",
         return_value=(True, "high failure rate"),
@@ -4871,7 +5582,9 @@ async def test_health_gate_metadata_findings_bypass_cap(db_session, mocker):
     direction_id = "d-hgate005"
     direction = _active_direction(direction_id, "Metadata bypass test")
     project = Project(
-        name="Metadata Bypass", user_id="test-user-123", autonomous_enabled=True,
+        name="Metadata Bypass",
+        user_id="test-user-123",
+        autonomous_enabled=True,
         directions=[direction],
     )
     db_session.add(project)
@@ -4907,7 +5620,9 @@ async def test_health_gate_metadata_findings_bypass_cap(db_session, mocker):
             "direction_id": direction_id,
         },
     ]
-    mocker.patch("app.research_completion._parse_research_findings", return_value=findings)
+    mocker.patch(
+        "app.research_completion._parse_research_findings", return_value=findings
+    )
     # Pipeline is degraded — but metadata findings must still be processed
     mocker.patch(
         "app.research_completion._assess_project_spawn_health",
@@ -4935,13 +5650,16 @@ async def test_health_gate_metadata_findings_bypass_cap(db_session, mocker):
 # 16. _handle_research_completion — Prior Deferred Findings Recovery
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_prior_deferred_findings_processed_in_next_cycle(db_session, mocker):
     """Deferred findings from a previous cycle are prepended and spawned in the next cycle."""
     direction_id = "d-deferred-recovery01"
     direction = _active_direction(direction_id, "Deferred recovery test")
     project = Project(
-        name="Deferred Recovery", user_id="test-user-123", autonomous_enabled=True,
+        name="Deferred Recovery",
+        user_id="test-user-123",
+        autonomous_enabled=True,
         directions=[direction],
     )
     db_session.add(project)
@@ -4956,8 +5674,13 @@ async def test_prior_deferred_findings_processed_in_next_cycle(db_session, mocke
     task = Task(
         project_id=project.id,
         title=f"Research: {direction['text']}",
-        payloads=[{"type": "research", "directions": [direction], "base_branch": "main"}],
-        context={"research_depth": 0, "prior_deferred_findings": deferred_from_prev_cycle},
+        payloads=[
+            {"type": "research", "directions": [direction], "base_branch": "main"}
+        ],
+        context={
+            "research_depth": 0,
+            "prior_deferred_findings": deferred_from_prev_cycle,
+        },
         status=TaskStatus.IN_PROGRESS,
         created_by="ORCHESTRATOR",
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
@@ -4969,9 +5692,14 @@ async def test_prior_deferred_findings_processed_in_next_cycle(db_session, mocke
     _patch_research_externals(mocker)
     # New cycle produces 1 fresh finding — plus 2 deferred = 3 total
     new_findings = [_make_finding("Fresh finding C", direction_id)]
-    mocker.patch("app.research_completion._parse_research_findings", return_value=new_findings)
+    mocker.patch(
+        "app.research_completion._parse_research_findings", return_value=new_findings
+    )
     # Healthy pipeline: no cap
-    mocker.patch("app.research_completion._assess_project_spawn_health", return_value=(False, None))
+    mocker.patch(
+        "app.research_completion._assess_project_spawn_health",
+        return_value=(False, None),
+    )
 
     await _handle_research_completion(task, "", db_session)
 
@@ -4989,14 +5717,18 @@ async def test_prior_deferred_findings_processed_in_next_cycle(db_session, mocke
 
 
 @pytest.mark.asyncio
-async def test_prior_deferred_findings_still_capped_if_pipeline_degraded(db_session, mocker):
+async def test_prior_deferred_findings_still_capped_if_pipeline_degraded(
+    db_session, mocker
+):
     """Deferred findings from previous cycle are still subject to the health gate cap."""
     from app.research_completion import _DEGRADED_SPAWN_CAP
 
     direction_id = "d-deferred-recovery02"
     direction = _active_direction(direction_id, "Deferred still capped")
     project = Project(
-        name="Deferred Still Capped", user_id="test-user-123", autonomous_enabled=True,
+        name="Deferred Still Capped",
+        user_id="test-user-123",
+        autonomous_enabled=True,
         directions=[direction],
     )
     db_session.add(project)
@@ -5010,8 +5742,13 @@ async def test_prior_deferred_findings_still_capped_if_pipeline_degraded(db_sess
     task = Task(
         project_id=project.id,
         title=f"Research: {direction['text']}",
-        payloads=[{"type": "research", "directions": [direction], "base_branch": "main"}],
-        context={"research_depth": 0, "prior_deferred_findings": deferred_from_prev_cycle},
+        payloads=[
+            {"type": "research", "directions": [direction], "base_branch": "main"}
+        ],
+        context={
+            "research_depth": 0,
+            "prior_deferred_findings": deferred_from_prev_cycle,
+        },
         status=TaskStatus.IN_PROGRESS,
         created_by="ORCHESTRATOR",
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
@@ -5023,7 +5760,9 @@ async def test_prior_deferred_findings_still_capped_if_pipeline_degraded(db_sess
     _patch_research_externals(mocker)
     # 2 new findings + 3 deferred = 5 total — but pipeline still degraded
     new_findings = [_make_finding(f"New finding {i}", direction_id) for i in range(2)]
-    mocker.patch("app.research_completion._parse_research_findings", return_value=new_findings)
+    mocker.patch(
+        "app.research_completion._parse_research_findings", return_value=new_findings
+    )
     mocker.patch(
         "app.research_completion._assess_project_spawn_health",
         return_value=(True, "all zones in cooldown"),
@@ -5048,12 +5787,16 @@ async def test_prior_deferred_findings_still_capped_if_pipeline_degraded(db_sess
 
 
 @pytest.mark.asyncio
-async def test_repeatedly_deferred_low_confidence_findings_are_decayed(db_session, mocker):
+async def test_repeatedly_deferred_low_confidence_findings_are_decayed(
+    db_session, mocker
+):
     """Findings deferred >=4 times for ultra_low_confidence are discarded, not retried."""
     direction_id = "d-decay0001"
     direction = _active_direction(direction_id, "Decay test")
     project = Project(
-        name="Decay test", user_id="test-user-123", autonomous_enabled=True,
+        name="Decay test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
         directions=[direction],
     )
     db_session.add(project)
@@ -5070,7 +5813,9 @@ async def test_repeatedly_deferred_low_confidence_findings_are_decayed(db_sessio
     task = Task(
         project_id=project.id,
         title=f"Research: {direction['text']}",
-        payloads=[{"type": "research", "directions": [direction], "base_branch": "main"}],
+        payloads=[
+            {"type": "research", "directions": [direction], "base_branch": "main"}
+        ],
         context={
             "research_depth": 0,
             "prior_deferred_findings": [stale_finding, fresh_deferred],
@@ -5088,7 +5833,10 @@ async def test_repeatedly_deferred_low_confidence_findings_are_decayed(db_sessio
         "app.research_completion._parse_research_findings",
         return_value=[_make_finding("Fresh sentinel", direction_id)],
     )
-    mocker.patch("app.research_completion._assess_project_spawn_health", return_value=(False, None))
+    mocker.patch(
+        "app.research_completion._assess_project_spawn_health",
+        return_value=(False, None),
+    )
 
     await _handle_research_completion(task, "", db_session)
 
@@ -5117,7 +5865,11 @@ async def test_undirected_cycle_recovers_unscoped_deferred_findings(db_session, 
         autonomous_enabled=True,
         directions=[direction],
         # Force is_undirected=True (12 % 12 == 0) without is_strategic (12 % 5 != 0)
-        vision={"purpose": "test", "_research_spawn_count": 12, "_strategic_frequency_override": 5},
+        vision={
+            "purpose": "test",
+            "_research_spawn_count": 12,
+            "_strategic_frequency_override": 5,
+        },
     )
     db_session.add(project)
     await db_session.commit()
@@ -5125,12 +5877,20 @@ async def test_undirected_cycle_recovers_unscoped_deferred_findings(db_session, 
 
     unscoped_finding = _make_finding("Unscoped deferred finding", direction_id=None)
     unscoped_finding.pop("direction_id")  # truly unscoped — no direction_id key
-    directed_finding = _make_finding("Directed deferred finding", direction_id=direction["id"])
+    directed_finding = _make_finding(
+        "Directed deferred finding", direction_id=direction["id"]
+    )
     prev_completed = Task(
         project_id=project.id,
         title="Research: prior undirected cycle",
-        payloads=[{"type": "research", "directions": [direction], "base_branch": "main",
-                   "current_direction_id": None}],
+        payloads=[
+            {
+                "type": "research",
+                "directions": [direction],
+                "base_branch": "main",
+                "current_direction_id": None,
+            }
+        ],
         context={"deferred_findings": [unscoped_finding, directed_finding]},
         status=TaskStatus.COMPLETED,
         created_by="ORCHESTRATOR",
@@ -5148,10 +5908,14 @@ async def test_undirected_cycle_recovers_unscoped_deferred_findings(db_session, 
             Task.created_by == "ORCHESTRATOR",
         )
     )
-    new_tasks = [t for t in result.scalars().all() if t.first_payload.get("type") == "research"]
+    new_tasks = [
+        t for t in result.scalars().all() if t.first_payload.get("type") == "research"
+    ]
     assert len(new_tasks) == 1, f"Expected one new research task, got {len(new_tasks)}"
     new_task = new_tasks[0]
-    assert new_task.first_payload.get("current_direction_id") is None, "Expected undirected cycle"
+    assert new_task.first_payload.get("current_direction_id") is None, (
+        "Expected undirected cycle"
+    )
     prior = (new_task.context or {}).get("prior_deferred_findings", [])
     titles = [f.get("title") for f in prior]
     assert "Unscoped deferred finding" in titles, (
@@ -5173,7 +5937,9 @@ async def test_batch_cap_excess_findings_are_deferred_not_discarded(db_session, 
     direction_id = "d-batchcap01"
     direction = _active_direction(direction_id, "Batch cap deferral")
     project = Project(
-        name="Batch Cap Deferral", user_id="test-user-123", autonomous_enabled=True,
+        name="Batch Cap Deferral",
+        user_id="test-user-123",
+        autonomous_enabled=True,
         directions=[direction],
     )
     db_session.add(project)
@@ -5185,10 +5951,15 @@ async def test_batch_cap_excess_findings_are_deferred_not_discarded(db_session, 
     _patch_research_externals(mocker)
     # Force batch cap to 3 by saturating queue (cap_by_queue = max(3, 15-12) = 3)
     mocker.patch.object(_shared_state, "tasks_queued_gauge", 12)
-    mocker.patch("app.research_completion._assess_project_spawn_health", return_value=(False, None))
+    mocker.patch(
+        "app.research_completion._assess_project_spawn_health",
+        return_value=(False, None),
+    )
 
     findings = [_make_finding(f"Finding {i}", direction_id) for i in range(5)]
-    mocker.patch("app.research_completion._parse_research_findings", return_value=findings)
+    mocker.patch(
+        "app.research_completion._parse_research_findings", return_value=findings
+    )
 
     await _handle_research_completion(task, "", db_session)
 
@@ -5200,7 +5971,9 @@ async def test_batch_cap_excess_findings_are_deferred_not_discarded(db_session, 
 
     await db_session.refresh(task)
     deferred = (task.context or {}).get("deferred_findings", [])
-    assert len(deferred) == 2, f"Excess 2 findings should be deferred, got {len(deferred)}"
+    assert len(deferred) == 2, (
+        f"Excess 2 findings should be deferred, got {len(deferred)}"
+    )
     deferred_titles = {f["title"] for f in deferred}
     assert all(t.startswith("Finding") for t in deferred_titles)
 
@@ -5211,7 +5984,9 @@ async def test_priority_sort_before_batch_cap_keeps_high_priority(db_session, mo
     direction_id = "d-batchcap02"
     direction = _active_direction(direction_id, "Priority sort before cap")
     project = Project(
-        name="Priority Sort Before Cap", user_id="test-user-123", autonomous_enabled=True,
+        name="Priority Sort Before Cap",
+        user_id="test-user-123",
+        autonomous_enabled=True,
         directions=[direction],
     )
     db_session.add(project)
@@ -5223,7 +5998,10 @@ async def test_priority_sort_before_batch_cap_keeps_high_priority(db_session, mo
     _patch_research_externals(mocker)
     # Force batch cap to 3
     mocker.patch.object(_shared_state, "tasks_queued_gauge", 12)
-    mocker.patch("app.research_completion._assess_project_spawn_health", return_value=(False, None))
+    mocker.patch(
+        "app.research_completion._assess_project_spawn_health",
+        return_value=(False, None),
+    )
 
     # Agent returns 5 findings in low-first order — without priority sort,
     # the batch cap would discard the trailing high-priority findings.
@@ -5234,7 +6012,9 @@ async def test_priority_sort_before_batch_cap_keeps_high_priority(db_session, mo
         _make_finding("High D", direction_id, priority="high"),
         _make_finding("High E", direction_id, priority="high"),
     ]
-    mocker.patch("app.research_completion._parse_research_findings", return_value=findings)
+    mocker.patch(
+        "app.research_completion._parse_research_findings", return_value=findings
+    )
 
     await _handle_research_completion(task, "", db_session)
 
@@ -5247,14 +6027,18 @@ async def test_priority_sort_before_batch_cap_keeps_high_priority(db_session, mo
     )
 
     await db_session.refresh(task)
-    deferred_titles = {f["title"] for f in (task.context or {}).get("deferred_findings", [])}
+    deferred_titles = {
+        f["title"] for f in (task.context or {}).get("deferred_findings", [])
+    }
     assert {"Low A", "Low B"} == deferred_titles, (
         f"Low-priority findings should be deferred, got {deferred_titles}"
     )
 
 
 @pytest.mark.asyncio
-async def test_batch_cap_preserves_depends_on_indices_across_priority_selection(db_session, mocker):
+async def test_batch_cap_preserves_depends_on_indices_across_priority_selection(
+    db_session, mocker
+):
     """A high-priority dependent keeps its link to a low-priority prerequisite that also survives the cap.
 
     Regression: earlier priority-sort+cap code mutated findings in place so
@@ -5264,7 +6048,9 @@ async def test_batch_cap_preserves_depends_on_indices_across_priority_selection(
     direction_id = "d-batchcap04"
     direction = _active_direction(direction_id, "Deps across priority cap")
     project = Project(
-        name="Deps Across Priority Cap", user_id="test-user-123", autonomous_enabled=True,
+        name="Deps Across Priority Cap",
+        user_id="test-user-123",
+        autonomous_enabled=True,
         directions=[direction],
     )
     db_session.add(project)
@@ -5276,7 +6062,10 @@ async def test_batch_cap_preserves_depends_on_indices_across_priority_selection(
     _patch_research_externals(mocker)
     # Force batch cap to 3
     mocker.patch.object(_shared_state, "tasks_queued_gauge", 12)
-    mocker.patch("app.research_completion._assess_project_spawn_health", return_value=(False, None))
+    mocker.patch(
+        "app.research_completion._assess_project_spawn_health",
+        return_value=(False, None),
+    )
 
     # Agent output: a low-priority prerequisite at index 0, a pure-low filler
     # at index 1, a high-priority dependent at index 2 (points to 0), and a
@@ -5289,7 +6078,9 @@ async def test_batch_cap_preserves_depends_on_indices_across_priority_selection(
     dependent["depends_on_indices"] = [0]
     high_d = _make_finding("High D", direction_id, priority="high")
     findings = [prereq, filler, dependent, high_d]
-    mocker.patch("app.research_completion._parse_research_findings", return_value=findings)
+    mocker.patch(
+        "app.research_completion._parse_research_findings", return_value=findings
+    )
 
     await _handle_research_completion(task, "", db_session)
 
@@ -5315,7 +6106,9 @@ async def test_batch_cap_and_health_gate_deferrals_combine(db_session, mocker):
     direction_id = "d-batchcap03"
     direction = _active_direction(direction_id, "Combined deferral")
     project = Project(
-        name="Combined Deferral", user_id="test-user-123", autonomous_enabled=True,
+        name="Combined Deferral",
+        user_id="test-user-123",
+        autonomous_enabled=True,
         directions=[direction],
     )
     db_session.add(project)
@@ -5336,7 +6129,9 @@ async def test_batch_cap_and_health_gate_deferrals_combine(db_session, mocker):
     # 6 findings: batch cap leaves 4, health gate spawns _DEGRADED_SPAWN_CAP,
     # remaining (4 - _DEGRADED_SPAWN_CAP) deferred by health gate, plus 2 deferred by batch cap.
     findings = [_make_finding(f"Finding {i}", direction_id) for i in range(6)]
-    mocker.patch("app.research_completion._parse_research_findings", return_value=findings)
+    mocker.patch(
+        "app.research_completion._parse_research_findings", return_value=findings
+    )
 
     await _handle_research_completion(task, "", db_session)
 
@@ -5376,17 +6171,21 @@ async def test_anomaly_adjustment_creates_warning_alert(db_session, mocker):
 
     mocker.patch(
         "app.anomaly_detection.check_anomaly_actions",
-        new=AsyncMock(return_value={
-            "action": "adjusted",
-            "is_new": True,
-            "max_concurrent_vms": 4,
-            "failure_gate_threshold": 0.6,
-            "trigger_anomalies": ["PROVISION_FAILURE"],
-            "pre_adjustment_max_vms": 8,
-        }),
+        new=AsyncMock(
+            return_value={
+                "action": "adjusted",
+                "is_new": True,
+                "max_concurrent_vms": 4,
+                "failure_gate_threshold": 0.6,
+                "trigger_anomalies": ["PROVISION_FAILURE"],
+                "pre_adjustment_max_vms": 8,
+            }
+        ),
     )
     mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock())
-    mocker.patch("app.notification_dispatch.dispatch_external_notification", new=AsyncMock())
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification", new=AsyncMock()
+    )
 
     await _spawn_research_task(project, db_session)
 
@@ -5420,17 +6219,21 @@ async def test_anomaly_already_active_does_not_duplicate_alert(db_session, mocke
 
     mocker.patch(
         "app.anomaly_detection.check_anomaly_actions",
-        new=AsyncMock(return_value={
-            "action": "adjusted",
-            "is_new": False,  # Already active — no new alert
-            "max_concurrent_vms": 4,
-            "failure_gate_threshold": 0.6,
-            "trigger_anomalies": ["PROVISION_FAILURE"],
-            "pre_adjustment_max_vms": 8,
-        }),
+        new=AsyncMock(
+            return_value={
+                "action": "adjusted",
+                "is_new": False,  # Already active — no new alert
+                "max_concurrent_vms": 4,
+                "failure_gate_threshold": 0.6,
+                "trigger_anomalies": ["PROVISION_FAILURE"],
+                "pre_adjustment_max_vms": 8,
+            }
+        ),
     )
     mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock())
-    mocker.patch("app.notification_dispatch.dispatch_external_notification", new=AsyncMock())
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification", new=AsyncMock()
+    )
 
     await _spawn_research_task(project, db_session)
 
@@ -5459,14 +6262,18 @@ async def test_anomaly_restoration_creates_info_alert(db_session, mocker):
 
     mocker.patch(
         "app.anomaly_detection.check_anomaly_actions",
-        new=AsyncMock(return_value={
-            "action": "restored",
-            "max_concurrent_vms": 8,
-            "failure_gate_threshold": 0.8,
-        }),
+        new=AsyncMock(
+            return_value={
+                "action": "restored",
+                "max_concurrent_vms": 8,
+                "failure_gate_threshold": 0.8,
+            }
+        ),
     )
     mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock())
-    mocker.patch("app.notification_dispatch.dispatch_external_notification", new=AsyncMock())
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification", new=AsyncMock()
+    )
 
     await _spawn_research_task(project, db_session)
 
@@ -5509,11 +6316,18 @@ async def test_respawn_after_cooldown_injects_prior_failure_context(db_session, 
             "finding_hash": fhash,
             "_analysis_plan": "Planned to wrap dispatcher in tenacity retry decorator",
             "_pr_changed_files": ["app/webhooks.py", "testing/test_webhooks.py"],
-            "_pr_diff_summary": [{"file": "app/webhooks.py", "added": 12, "removed": 2}],
+            "_pr_diff_summary": [
+                {"file": "app/webhooks.py", "added": 12, "removed": 2}
+            ],
             "_pr_url": "https://github.com/example/repo/pull/999",
             "_test_failure_summary": "1 failed: test_webhooks.py::test_retry_on_5xx",
-            "_self_review_outcome": {"status": "failed", "notes": "missing retry count assertion"},
-            "_file_change_details": [{"file": "app/webhooks.py", "summary": "added retry decorator"}],
+            "_self_review_outcome": {
+                "status": "failed",
+                "notes": "missing retry count assertion",
+            },
+            "_file_change_details": [
+                {"file": "app/webhooks.py", "summary": "added retry decorator"}
+            ],
         },
         status=TaskStatus.FAILED,
         latest_status_message="Tests failed: AssertionError in test_webhooks.py line 42",
@@ -5529,16 +6343,18 @@ async def test_respawn_after_cooldown_injects_prior_failure_context(db_session, 
     _patch_research_externals(mocker)
     mocker.patch(
         "app.research_completion._parse_research_findings",
-        return_value=[{
-            "title": title,
-            "description": desc,
-            "prompt": "Add retry logic",
-            "priority": "medium",
-            "scope": "small",
-            "risk": "low",
-            "type": "improvement",
-            "direction_id": direction["id"],
-        }],
+        return_value=[
+            {
+                "title": title,
+                "description": desc,
+                "prompt": "Add retry logic",
+                "priority": "medium",
+                "scope": "small",
+                "risk": "low",
+                "type": "improvement",
+                "direction_id": direction["id"],
+            }
+        ],
     )
 
     await _handle_research_completion(task, "", db_session)
@@ -5554,18 +6370,40 @@ async def test_respawn_after_cooldown_injects_prior_failure_context(db_session, 
     assert ctx.get("_attempt_number") == 2
     assert "AssertionError" in (ctx.get("_previous_error") or "")
     assert ctx.get("_previous_failure_class") == "CODE_ERROR"
-    assert ctx.get("_previous_analysis_plan") == "Planned to wrap dispatcher in tenacity retry decorator"
-    assert ctx.get("_previous_changed_files") == ["app/webhooks.py", "testing/test_webhooks.py"]
-    assert ctx.get("_previous_diff_summary") == [{"file": "app/webhooks.py", "added": 12, "removed": 2}]
+    assert (
+        ctx.get("_previous_analysis_plan")
+        == "Planned to wrap dispatcher in tenacity retry decorator"
+    )
+    assert ctx.get("_previous_changed_files") == [
+        "app/webhooks.py",
+        "testing/test_webhooks.py",
+    ]
+    assert ctx.get("_previous_diff_summary") == [
+        {"file": "app/webhooks.py", "added": 12, "removed": 2}
+    ]
     assert ctx.get("_previous_pr_url") == "https://github.com/example/repo/pull/999"
-    assert ctx.get("_previous_test_failure_summary") == "1 failed: test_webhooks.py::test_retry_on_5xx"
-    assert ctx.get("_previous_self_review_outcome") == {"status": "failed", "notes": "missing retry count assertion"}
-    assert ctx.get("_previous_file_change_details") == [{"file": "app/webhooks.py", "summary": "added retry decorator"}]
+    assert (
+        ctx.get("_previous_test_failure_summary")
+        == "1 failed: test_webhooks.py::test_retry_on_5xx"
+    )
+    assert ctx.get("_previous_self_review_outcome") == {
+        "status": "failed",
+        "notes": "missing retry count assertion",
+    }
+    assert ctx.get("_previous_file_change_details") == [
+        {"file": "app/webhooks.py", "summary": "added retry decorator"}
+    ]
     # Enriched failure diagnosis fields (mirror task_lifecycle._requeue_parent_task)
-    assert ctx.get("_previous_error_summary") == "Tests failed: AssertionError in test_webhooks.py line 42"
+    assert (
+        ctx.get("_previous_error_summary")
+        == "Tests failed: AssertionError in test_webhooks.py line 42"
+    )
     assert ctx.get("_previous_failure_stage") == "test"
     # Audit W1: previous_error_fingerprint is a column.
-    assert isinstance(children[0].previous_error_fingerprint, str) and children[0].previous_error_fingerprint
+    assert (
+        isinstance(children[0].previous_error_fingerprint, str)
+        and children[0].previous_error_fingerprint
+    )
 
 
 @pytest.mark.asyncio
@@ -5614,11 +6452,18 @@ async def test_respawn_after_cooldown_marks_recurring_failure(db_session, mocker
     _patch_research_externals(mocker)
     mocker.patch(
         "app.research_completion._parse_research_findings",
-        return_value=[{
-            "title": title, "description": desc, "prompt": "Refactor",
-            "priority": "medium", "scope": "small", "risk": "low",
-            "type": "improvement", "direction_id": direction["id"],
-        }],
+        return_value=[
+            {
+                "title": title,
+                "description": desc,
+                "prompt": "Refactor",
+                "priority": "medium",
+                "scope": "small",
+                "risk": "low",
+                "type": "improvement",
+                "direction_id": direction["id"],
+            }
+        ],
     )
 
     try:
@@ -5638,10 +6483,14 @@ async def test_respawn_after_cooldown_marks_recurring_failure(db_session, mocker
 
 
 @pytest.mark.asyncio
-async def test_respawn_after_cooldown_injects_failure_class_prompt_suffix(db_session, mocker):
+async def test_respawn_after_cooldown_injects_failure_class_prompt_suffix(
+    db_session, mocker
+):
     """Re-spawned findings receive failure-class-specific retry guidance in prompt_suffix,
     matching task_lifecycle._requeue_parent_task's behavior for directly requeued tasks."""
-    direction = _active_direction("d-promptsfx", "Prompt-suffix retry guidance direction")
+    direction = _active_direction(
+        "d-promptsfx", "Prompt-suffix retry guidance direction"
+    )
     project = Project(
         name="Respawn Prompt Suffix Test",
         user_id="test-user-123",
@@ -5659,7 +6508,9 @@ async def test_respawn_after_cooldown_injects_failure_class_prompt_suffix(db_ses
     prior_failed = Task(
         project_id=project.id,
         title=title,
-        payloads=[{"type": "create", "prompt": "tighten parsing", "base_branch": "main"}],
+        payloads=[
+            {"type": "create", "prompt": "tighten parsing", "base_branch": "main"}
+        ],
         context={"finding_hash": fhash},
         status=TaskStatus.FAILED,
         latest_status_message="pytest failures: AssertionError in test_ingest.py::test_parse",
@@ -5674,11 +6525,18 @@ async def test_respawn_after_cooldown_injects_failure_class_prompt_suffix(db_ses
     _patch_research_externals(mocker)
     mocker.patch(
         "app.research_completion._parse_research_findings",
-        return_value=[{
-            "title": title, "description": desc, "prompt": "Tighten parsing",
-            "priority": "medium", "scope": "small", "risk": "low",
-            "type": "improvement", "direction_id": direction["id"],
-        }],
+        return_value=[
+            {
+                "title": title,
+                "description": desc,
+                "prompt": "Tighten parsing",
+                "priority": "medium",
+                "scope": "small",
+                "risk": "low",
+                "type": "improvement",
+                "direction_id": direction["id"],
+            }
+        ],
     )
 
     await _handle_research_completion(task, "", db_session)
@@ -5737,8 +6595,16 @@ def test_fold_evicted_preserves_scope_and_decomposition():
                 "medium": {"created": 1, "merged": 0, "failed": 0, "failed_infra": 1},
             },
             "decomposition_quality": [
-                {"subtask_count": 4, "subtask_merge_rate": 0.5, "cross_module_count": 1},
-                {"subtask_count": 2, "subtask_merge_rate": None, "cross_module_count": 0},
+                {
+                    "subtask_count": 4,
+                    "subtask_merge_rate": 0.5,
+                    "cross_module_count": 1,
+                },
+                {
+                    "subtask_count": 2,
+                    "subtask_merge_rate": None,
+                    "cross_module_count": 0,
+                },
             ],
         },
         {
@@ -5749,7 +6615,11 @@ def test_fold_evicted_preserves_scope_and_decomposition():
                 "small": {"created": 3, "merged": 2, "failed": 0, "failed_infra": 0},
             },
             "decomposition_quality": [
-                {"subtask_count": 5, "subtask_merge_rate": 0.8, "cross_module_count": 2},
+                {
+                    "subtask_count": 5,
+                    "subtask_merge_rate": 0.8,
+                    "cross_module_count": 2,
+                },
             ],
         },
     ]
@@ -5761,8 +6631,20 @@ def test_fold_evicted_preserves_scope_and_decomposition():
     assert agg["first_cycle_at"] == "2025-01-01T00:00:00"
 
     sb = agg["scope_breakdown"]
-    assert sb["small"] == {"created": 5, "merged": 3, "failed": 1, "failed_infra": 0, "failed_scope_overflow": 0}
-    assert sb["medium"] == {"created": 1, "merged": 0, "failed": 0, "failed_infra": 1, "failed_scope_overflow": 0}
+    assert sb["small"] == {
+        "created": 5,
+        "merged": 3,
+        "failed": 1,
+        "failed_infra": 0,
+        "failed_scope_overflow": 0,
+    }
+    assert sb["medium"] == {
+        "created": 1,
+        "merged": 0,
+        "failed": 0,
+        "failed_infra": 1,
+        "failed_scope_overflow": 0,
+    }
 
     dq = agg["decomposition_quality"]
     assert dq["total_decompositions"] == 3
@@ -5784,7 +6666,9 @@ def test_fold_evicted_accumulates_into_existing_aggregate():
         "total_tasks_failed": 1,
         "total_tasks_cancelled": 0,
         "first_cycle_at": "2024-12-01T00:00:00",
-        "scope_breakdown": {"small": {"created": 4, "merged": 2, "failed": 1, "failed_infra": 0}},
+        "scope_breakdown": {
+            "small": {"created": 4, "merged": 2, "failed": 1, "failed_infra": 0}
+        },
         "decomposition_quality": {
             "total_decompositions": 1,
             "subtask_merge_rate_weighted_sum": 3.0,
@@ -5802,7 +6686,11 @@ def test_fold_evicted_accumulates_into_existing_aggregate():
                 "large": {"created": 1, "merged": 0, "failed": 1, "failed_infra": 0},
             },
             "decomposition_quality": [
-                {"subtask_count": 3, "subtask_merge_rate": 1.0, "cross_module_count": 0},
+                {
+                    "subtask_count": 3,
+                    "subtask_merge_rate": 1.0,
+                    "cross_module_count": 0,
+                },
             ],
         }
     ]
@@ -5816,7 +6704,13 @@ def test_fold_evicted_accumulates_into_existing_aggregate():
     sb = agg["scope_breakdown"]
     assert sb["small"]["created"] == 6
     assert sb["small"]["merged"] == 3
-    assert sb["large"] == {"created": 1, "merged": 0, "failed": 1, "failed_infra": 0, "failed_scope_overflow": 0}
+    assert sb["large"] == {
+        "created": 1,
+        "merged": 0,
+        "failed": 1,
+        "failed_infra": 0,
+        "failed_scope_overflow": 0,
+    }
 
     dq = agg["decomposition_quality"]
     assert dq["total_decompositions"] == 2
@@ -5829,9 +6723,11 @@ def test_fold_evicted_accumulates_into_existing_aggregate():
 # _assess_spawn_health — direct validation of the decision logic
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def test_assess_spawn_health_all_healthy(mocker, monkeypatch):
     """Zone available, account available, empty ring buffer → (False, None)."""
     from app.research_completion import _assess_spawn_health
+
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     mocker.patch("app.compute.any_zone_available", return_value=True)
     mocker.patch("app.max_plan_pool._account_available_for_model", return_value=True)
@@ -5845,6 +6741,7 @@ def test_assess_spawn_health_all_healthy(mocker, monkeypatch):
 def test_assess_spawn_health_zone_cooldown(mocker, monkeypatch):
     """All zones in cooldown → degraded with zone-related reason."""
     from app.research_completion import _assess_spawn_health
+
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     mocker.patch("app.compute.any_zone_available", return_value=False)
 
@@ -5857,6 +6754,7 @@ def test_assess_spawn_health_zone_cooldown(mocker, monkeypatch):
 def test_assess_spawn_health_no_accounts_available(mocker, monkeypatch):
     """No accounts usable for the create model → degraded with account reason."""
     from app.research_completion import _assess_spawn_health
+
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     mocker.patch("app.compute.any_zone_available", return_value=True)
     mocker.patch("app.max_plan_pool._account_available_for_model", return_value=False)
@@ -5873,6 +6771,7 @@ def test_assess_spawn_health_high_failure_rate(mocker, monkeypatch):
     """Ring buffer with >50% recent failures → degraded with failure-rate reason."""
     from app.research_completion import _assess_spawn_health
     from app.time_utils import _utcnow
+
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     mocker.patch("app.compute.any_zone_available", return_value=True)
     mocker.patch("app.max_plan_pool._account_available_for_model", return_value=True)
@@ -5894,6 +6793,7 @@ def test_assess_spawn_health_high_failure_rate(mocker, monkeypatch):
 def test_assess_spawn_health_empty_ring_buffer_cold_start(mocker, monkeypatch):
     """Empty ring buffer (cold start) must not block spawning."""
     from app.research_completion import _assess_spawn_health
+
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     mocker.patch("app.compute.any_zone_available", return_value=True)
     mocker.patch("app.max_plan_pool._account_available_for_model", return_value=True)
@@ -6043,6 +6943,7 @@ def test_detect_dedup_deadlock_productive_cycle_breaks_window():
 # _spawn_direction_hold_investigation
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @pytest.fixture
 def _clear_direction_streaks():
     _shared_state.direction_failure_streaks.clear()
@@ -6050,15 +6951,26 @@ def _clear_direction_streaks():
     _shared_state.direction_failure_streaks.clear()
 
 
-async def _hold_direction(direction_id: str, project_id: str, *, failure_class: str = "CODE_ERROR"):
+async def _hold_direction(
+    direction_id: str, project_id: str, *, failure_class: str = "CODE_ERROR"
+):
     from app.shared_state import record_direction_result, DIRECTION_HOLD_THRESHOLD
+
     for _ in range(DIRECTION_HOLD_THRESHOLD):
-        record_direction_result(direction_id, success=False, failure_class=failure_class, project_id=project_id)
+        record_direction_result(
+            direction_id,
+            success=False,
+            failure_class=failure_class,
+            project_id=project_id,
+        )
 
 
 @pytest.mark.asyncio
-async def test_investigation_spawns_on_direction_hold(db_session, _clear_direction_streaks):
+async def test_investigation_spawns_on_direction_hold(
+    db_session, _clear_direction_streaks
+):
     from app.autonomous_research import _spawn_direction_hold_investigation
+
     direction_id = "d-held0001"
     project = Project(
         name="Hold Spawn",
@@ -6090,7 +7002,8 @@ async def test_investigation_spawns_on_direction_hold(db_session, _clear_directi
 
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
     investigations = [
-        t for t in result.scalars().all()
+        t
+        for t in result.scalars().all()
         if (t.payloads or [{}])[0].get("type") == "investigate"
     ]
     assert len(investigations) == 1
@@ -6105,8 +7018,11 @@ async def test_investigation_spawns_on_direction_hold(db_session, _clear_directi
 
 
 @pytest.mark.asyncio
-async def test_investigation_not_duplicated_when_in_flight(db_session, _clear_direction_streaks):
+async def test_investigation_not_duplicated_when_in_flight(
+    db_session, _clear_direction_streaks
+):
     from app.autonomous_research import _spawn_direction_hold_investigation
+
     direction_id = "d-held0002"
     project = Project(
         name="Hold Dedup",
@@ -6124,7 +7040,10 @@ async def test_investigation_not_duplicated_when_in_flight(db_session, _clear_di
         project_id=project.id,
         title="Already investigating",
         payloads=[{"type": "investigate", "prompt": "in-flight"}],
-        context={"direction_id": direction_id, "spawned_by": "direction_hold_investigation"},
+        context={
+            "direction_id": direction_id,
+            "spawned_by": "direction_hold_investigation",
+        },
         status=TaskStatus.IN_PROGRESS,
         created_by="ORCHESTRATOR",
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
@@ -6136,7 +7055,8 @@ async def test_investigation_not_duplicated_when_in_flight(db_session, _clear_di
     assert spawned == 0
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
     investigations = [
-        t for t in result.scalars().all()
+        t
+        for t in result.scalars().all()
         if (t.payloads or [{}])[0].get("type") == "investigate"
     ]
     assert len(investigations) == 1  # still just the pre-existing one
@@ -6144,9 +7064,11 @@ async def test_investigation_not_duplicated_when_in_flight(db_session, _clear_di
 
 @pytest.mark.asyncio
 async def test_investigation_spawns_when_existing_covers_different_fingerprint(
-    db_session, _clear_direction_streaks,
+    db_session,
+    _clear_direction_streaks,
 ):
     from app.autonomous_research import _spawn_direction_hold_investigation
+
     direction_id = "d-heldfp01"
     project = Project(
         name="Hold FP Dedup",
@@ -6194,7 +7116,8 @@ async def test_investigation_spawns_when_existing_covers_different_fingerprint(
 
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
     investigations = [
-        t for t in result.scalars().all()
+        t
+        for t in result.scalars().all()
         if (t.payloads or [{}])[0].get("type") == "investigate"
     ]
     assert len(investigations) == 2
@@ -6203,6 +7126,7 @@ async def test_investigation_spawns_when_existing_covers_different_fingerprint(
 @pytest.mark.asyncio
 async def test_investigation_skipped_when_no_hold(db_session, _clear_direction_streaks):
     from app.autonomous_research import _spawn_direction_hold_investigation
+
     project = Project(
         name="No Hold",
         user_id="test-user-123",
@@ -6221,9 +7145,11 @@ async def test_investigation_skipped_when_no_hold(db_session, _clear_direction_s
 # _spawn_task_failure_investigation
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_task_failure_investigation_spawns_for_code_defect(db_session):
     from app.autonomous_research import _spawn_task_failure_investigation
+
     direction_id = "d-tfail001"
     project = Project(
         name="Task Fail Inv",
@@ -6261,7 +7187,8 @@ async def test_task_failure_investigation_spawns_for_code_defect(db_session):
 
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
     investigations = [
-        t for t in result.scalars().all()
+        t
+        for t in result.scalars().all()
         if (t.payloads or [{}])[0].get("type") == "investigate"
     ]
     assert len(investigations) == 1
@@ -6283,6 +7210,7 @@ async def test_task_failure_investigation_spawns_for_code_defect(db_session):
 @pytest.mark.asyncio
 async def test_task_failure_investigation_skips_investigate_type(db_session):
     from app.autonomous_research import _spawn_task_failure_investigation
+
     project = Project(
         name="Skip Inv Type",
         user_id="test-user-123",
@@ -6312,6 +7240,7 @@ async def test_task_failure_investigation_skips_investigate_type(db_session):
 @pytest.mark.asyncio
 async def test_task_failure_investigation_skips_without_direction(db_session):
     from app.autonomous_research import _spawn_task_failure_investigation
+
     project = Project(
         name="No Dir",
         user_id="test-user-123",
@@ -6341,6 +7270,7 @@ async def test_task_failure_investigation_skips_without_direction(db_session):
 async def test_task_failure_investigation_skips_review_quality(db_session):
     """Single review-quality failure doesn't meet the streak threshold, skip."""
     from app.autonomous_research import _spawn_task_failure_investigation
+
     project = Project(
         name="Review Quality",
         user_id="test-user-123",
@@ -6371,6 +7301,7 @@ async def test_task_failure_investigation_skips_review_quality(db_session):
 async def test_task_failure_investigation_spawns_for_review_quality_streak(db_session):
     """3 consecutive review-quality failures on a direction trigger investigation."""
     from app.autonomous_research import _spawn_task_failure_investigation
+
     direction_id = "d-revq0002"
     project = Project(
         name="Review Quality Streak",
@@ -6415,7 +7346,8 @@ async def test_task_failure_investigation_spawns_for_review_quality_streak(db_se
 
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
     investigations = [
-        t for t in result.scalars().all()
+        t
+        for t in result.scalars().all()
         if (t.payloads or [{}])[0].get("type") == "investigate"
     ]
     assert len(investigations) == 1
@@ -6425,10 +7357,13 @@ async def test_task_failure_investigation_spawns_for_review_quality_streak(db_se
 
 
 @pytest.mark.asyncio
-async def test_task_failure_investigation_lowered_streak_with_convergence_investigation(db_session):
+async def test_task_failure_investigation_lowered_streak_with_convergence_investigation(
+    db_session,
+):
     """A recent convergence investigation on the direction lowers the
     review-quality streak threshold by 1 (requires 1 prior fail, not 2)."""
     from app.autonomous_research import _spawn_task_failure_investigation
+
     direction_id = "d-revq0099"
     project = Project(
         name="Lowered Streak",
@@ -6443,6 +7378,7 @@ async def test_task_failure_investigation_lowered_streak_with_convergence_invest
     # Backdate past the 24h _recent_investigation_exists dedup but within
     # the 7-day convergence lookback window.
     from datetime import datetime, timedelta, timezone
+
     backdated = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=3)
     convergence_inv = Task(
         project_id=project.id,
@@ -6491,7 +7427,8 @@ async def test_task_failure_investigation_lowered_streak_with_convergence_invest
 
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
     investigations = [
-        t for t in result.scalars().all()
+        t
+        for t in result.scalars().all()
         if (t.payloads or [{}])[0].get("type") == "investigate"
         and t.context.get("spawned_by") != "review_convergence_investigation"
     ]
@@ -6500,11 +7437,14 @@ async def test_task_failure_investigation_lowered_streak_with_convergence_invest
 
 
 @pytest.mark.asyncio
-async def test_task_failure_investigation_spawns_with_interspersed_non_review_quality(db_session):
+async def test_task_failure_investigation_spawns_with_interspersed_non_review_quality(
+    db_session,
+):
     """Sliding-window trigger: enough review-quality failures in the recent
     window fire even when a non-review-quality failure is interspersed."""
     from app.autonomous_research import _spawn_task_failure_investigation
     from datetime import datetime, timedelta, timezone
+
     direction_id = "d-revq0050"
     project = Project(
         name="Review Quality Window",
@@ -6520,23 +7460,28 @@ async def test_task_failure_investigation_spawns_with_interspersed_non_review_qu
     # Prior failures ordered oldest -> newest: rq, rq, code_defect, rq.
     # Sliding window over last 4 priors has 3 review_quality (>= 2 required).
     prior_specs = [
-        (now - timedelta(hours=5), "ruff: lint in a.py"),          # rq
-        (now - timedelta(hours=4), "eslint: style in b.ts"),        # rq
-        (now - timedelta(hours=3), "AttributeError: 'NoneType'"),   # code_defect (interspersed)
-        (now - timedelta(hours=2), "ruff: lint in c.py"),           # rq
+        (now - timedelta(hours=5), "ruff: lint in a.py"),  # rq
+        (now - timedelta(hours=4), "eslint: style in b.ts"),  # rq
+        (
+            now - timedelta(hours=3),
+            "AttributeError: 'NoneType'",
+        ),  # code_defect (interspersed)
+        (now - timedelta(hours=2), "ruff: lint in c.py"),  # rq
     ]
     for ts, msg in prior_specs:
-        db_session.add(Task(
-            project_id=project.id,
-            title=f"Prior fail {ts.isoformat()}",
-            payloads=[{"type": "create", "prompt": "do"}],
-            context={"direction_id": direction_id},
-            status=TaskStatus.FAILED,
-            created_by="ORCHESTRATOR",
-            latest_status_message=msg,
-            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
-            created_at=ts,
-        ))
+        db_session.add(
+            Task(
+                project_id=project.id,
+                title=f"Prior fail {ts.isoformat()}",
+                payloads=[{"type": "create", "prompt": "do"}],
+                context={"direction_id": direction_id},
+                status=TaskStatus.FAILED,
+                created_by="ORCHESTRATOR",
+                latest_status_message=msg,
+                vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+                created_at=ts,
+            )
+        )
     await db_session.commit()
 
     failed = Task(
@@ -6558,7 +7503,8 @@ async def test_task_failure_investigation_spawns_with_interspersed_non_review_qu
 
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
     investigations = [
-        t for t in result.scalars().all()
+        t
+        for t in result.scalars().all()
         if (t.payloads or [{}])[0].get("type") == "investigate"
     ]
     assert len(investigations) == 1
@@ -6566,10 +7512,13 @@ async def test_task_failure_investigation_spawns_with_interspersed_non_review_qu
 
 
 @pytest.mark.asyncio
-async def test_task_failure_investigation_skipped_by_cross_direction_fingerprint(db_session):
+async def test_task_failure_investigation_skipped_by_cross_direction_fingerprint(
+    db_session,
+):
     """Existing investigate task on a sibling direction sharing the same
     fingerprint blocks a new initial investigation spawn."""
     from app.autonomous_research import _spawn_task_failure_investigation
+
     project = Project(
         name="Cross Dir Dedup",
         user_id="test-user-123",
@@ -6588,7 +7537,10 @@ async def test_task_failure_investigation_skipped_by_cross_direction_fingerprint
         project_id=project.id,
         title="Sibling investigation",
         payloads=[{"type": "investigate", "prompt": "sibling", "base_branch": "main"}],
-        context={"direction_id": "d-xdir0002", "diagnosis_fingerprint": "fp-shared-xdir"},
+        context={
+            "direction_id": "d-xdir0002",
+            "diagnosis_fingerprint": "fp-shared-xdir",
+        },
         status=TaskStatus.QUEUED,
         created_by="ORCHESTRATOR",
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
@@ -6624,7 +7576,8 @@ async def test_task_failure_investigation_skipped_by_cross_direction_fingerprint
     # Verify no new investigate task was created for d-xdir0001.
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
     investigations = [
-        t for t in result.scalars().all()
+        t
+        for t in result.scalars().all()
         if (t.payloads or [{}])[0].get("type") == "investigate"
     ]
     assert len(investigations) == 1
@@ -6635,6 +7588,7 @@ async def test_task_failure_investigation_skipped_by_cross_direction_fingerprint
 async def test_recent_investigation_distinct_fingerprints_can_coexist(db_session):
     """Different fingerprints on the same direction each get an investigation."""
     from app.autonomous_research import _recent_investigation_exists
+
     project = Project(
         name="Distinct FP",
         user_id="test-user-123",
@@ -6658,23 +7612,41 @@ async def test_recent_investigation_distinct_fingerprints_can_coexist(db_session
     await db_session.commit()
 
     # Same fingerprint → deduped.
-    assert await _recent_investigation_exists(
-        project.id, "d-fp00001", db_session, error_fingerprint="fp-A",
-    ) is True
+    assert (
+        await _recent_investigation_exists(
+            project.id,
+            "d-fp00001",
+            db_session,
+            error_fingerprint="fp-A",
+        )
+        is True
+    )
     # Different fingerprint → allowed.
-    assert await _recent_investigation_exists(
-        project.id, "d-fp00001", db_session, error_fingerprint="fp-B",
-    ) is False
+    assert (
+        await _recent_investigation_exists(
+            project.id,
+            "d-fp00001",
+            db_session,
+            error_fingerprint="fp-B",
+        )
+        is False
+    )
     # Without fingerprint → preserves direction-level dedup.
-    assert await _recent_investigation_exists(
-        project.id, "d-fp00001", db_session,
-    ) is True
+    assert (
+        await _recent_investigation_exists(
+            project.id,
+            "d-fp00001",
+            db_session,
+        )
+        is True
+    )
 
 
 @pytest.mark.asyncio
 async def test_recent_investigation_concurrent_cap(db_session):
     """3+ active investigations on a direction blocks further spawns even with new fingerprints."""
     from app.autonomous_research import _recent_investigation_exists
+
     project = Project(
         name="Cap Test",
         user_id="test-user-123",
@@ -6686,21 +7658,34 @@ async def test_recent_investigation_concurrent_cap(db_session):
     await db_session.refresh(project)
 
     for i in range(3):
-        db_session.add(Task(
-            project_id=project.id,
-            title=f"Active inv {i}",
-            payloads=[{"type": "investigate", "prompt": "p", "base_branch": "main"}],
-            context={"direction_id": "d-cap0001", "failure_fingerprints": [f"fp-{i}"]},
-            status=TaskStatus.IN_PROGRESS,
-            created_by="ORCHESTRATOR",
-            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
-        ))
+        db_session.add(
+            Task(
+                project_id=project.id,
+                title=f"Active inv {i}",
+                payloads=[
+                    {"type": "investigate", "prompt": "p", "base_branch": "main"}
+                ],
+                context={
+                    "direction_id": "d-cap0001",
+                    "failure_fingerprints": [f"fp-{i}"],
+                },
+                status=TaskStatus.IN_PROGRESS,
+                created_by="ORCHESTRATOR",
+                vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+            )
+        )
     await db_session.commit()
 
     # New fingerprint still blocked when cap is reached.
-    assert await _recent_investigation_exists(
-        project.id, "d-cap0001", db_session, error_fingerprint="fp-novel",
-    ) is True
+    assert (
+        await _recent_investigation_exists(
+            project.id,
+            "d-cap0001",
+            db_session,
+            error_fingerprint="fp-novel",
+        )
+        is True
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -6711,6 +7696,7 @@ async def test_recent_investigation_concurrent_cap(db_session):
 @pytest.mark.asyncio
 async def test_review_convergence_investigation_spawns_on_cap_exhausted(db_session):
     from app.autonomous_research import _spawn_review_convergence_investigation
+
     direction_id = "d-conv0001"
     project = Project(
         name="Conv Cap",
@@ -6728,14 +7714,28 @@ async def test_review_convergence_investigation_spawns_on_cap_exhausted(db_sessi
         payloads=[{"type": "create", "prompt": "do thing"}],
         context={
             "direction_id": direction_id,
-            "review_loop": {"review_history": [
-                {"iteration": 0, "issues": [
-                    {"severity": "CRITICAL", "description": "Missing null check in handler"},
-                ]},
-                {"iteration": 1, "issues": [
-                    {"severity": "CRITICAL", "description": "Missing null check in handler"},
-                ]},
-            ]},
+            "review_loop": {
+                "review_history": [
+                    {
+                        "iteration": 0,
+                        "issues": [
+                            {
+                                "severity": "CRITICAL",
+                                "description": "Missing null check in handler",
+                            },
+                        ],
+                    },
+                    {
+                        "iteration": 1,
+                        "issues": [
+                            {
+                                "severity": "CRITICAL",
+                                "description": "Missing null check in handler",
+                            },
+                        ],
+                    },
+                ]
+            },
         },
         status=TaskStatus.FAILED,
         created_by="ORCHESTRATOR",
@@ -6747,16 +7747,20 @@ async def test_review_convergence_investigation_spawns_on_cap_exhausted(db_sessi
     await db_session.refresh(orig)
 
     spawned = await _spawn_review_convergence_investigation(
-        orig, db_session,
-        pr_number=4321, iterations=10,
-        detail="global", trigger="review_cap_exhausted",
+        orig,
+        db_session,
+        pr_number=4321,
+        iterations=10,
+        detail="global",
+        trigger="review_cap_exhausted",
     )
     assert spawned is not None
     await db_session.commit()
 
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
     investigations = [
-        t for t in result.scalars().all()
+        t
+        for t in result.scalars().all()
         if (t.payloads or [{}])[0].get("type") == "investigate"
     ]
     assert len(investigations) == 1
@@ -6770,16 +7774,23 @@ async def test_review_convergence_investigation_spawns_on_cap_exhausted(db_sessi
     assert "Missing null check" in prompt
 
     # Dedup: second call should not spawn another
-    assert await _spawn_review_convergence_investigation(
-        orig, db_session,
-        pr_number=4321, iterations=10,
-        detail="global", trigger="review_cap_exhausted",
-    ) is None
+    assert (
+        await _spawn_review_convergence_investigation(
+            orig,
+            db_session,
+            pr_number=4321,
+            iterations=10,
+            detail="global",
+            trigger="review_cap_exhausted",
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio
 async def test_review_convergence_investigation_skips_without_direction(db_session):
     from app.autonomous_research import _spawn_review_convergence_investigation
+
     project = Project(
         name="Conv No Dir",
         user_id="test-user-123",
@@ -6801,15 +7812,23 @@ async def test_review_convergence_investigation_skips_without_direction(db_sessi
     db_session.add(orig)
     await db_session.commit()
 
-    assert await _spawn_review_convergence_investigation(
-        orig, db_session,
-        pr_number=1, iterations=5, detail="x", trigger="review_stuck_cycle",
-    ) is None
+    assert (
+        await _spawn_review_convergence_investigation(
+            orig,
+            db_session,
+            pr_number=1,
+            iterations=5,
+            detail="x",
+            trigger="review_stuck_cycle",
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio
 async def test_review_convergence_investigation_skips_investigate_type(db_session):
     from app.autonomous_research import _spawn_review_convergence_investigation
+
     project = Project(
         name="Conv Inv Type",
         user_id="test-user-123",
@@ -6832,16 +7851,26 @@ async def test_review_convergence_investigation_skips_investigate_type(db_sessio
     db_session.add(orig)
     await db_session.commit()
 
-    assert await _spawn_review_convergence_investigation(
-        orig, db_session,
-        pr_number=1, iterations=5, detail="x", trigger="review_cap_exhausted",
-    ) is None
+    assert (
+        await _spawn_review_convergence_investigation(
+            orig,
+            db_session,
+            pr_number=1,
+            iterations=5,
+            detail="x",
+            trigger="review_cap_exhausted",
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio
-async def test_review_convergence_investigation_sets_fingerprint_and_failure_class(db_session):
+async def test_review_convergence_investigation_sets_fingerprint_and_failure_class(
+    db_session,
+):
     from app.autonomous_research import _spawn_review_convergence_investigation
     from app.anomaly_detection import _error_fingerprint
+
     direction_id = "d-convfp01"
     project = Project(
         name="Conv FP",
@@ -6869,16 +7898,20 @@ async def test_review_convergence_investigation_sets_fingerprint_and_failure_cla
     await db_session.refresh(orig)
 
     spawned = await _spawn_review_convergence_investigation(
-        orig, db_session,
-        pr_number=9001, iterations=10,
-        detail="global", trigger="review_cap_exhausted",
+        orig,
+        db_session,
+        pr_number=9001,
+        iterations=10,
+        detail="global",
+        trigger="review_cap_exhausted",
     )
     assert spawned is not None
     await db_session.commit()
 
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
     inv = next(
-        t for t in result.scalars().all()
+        t
+        for t in result.scalars().all()
         if (t.payloads or [{}])[0].get("type") == "investigate"
     )
     expected_fp = _error_fingerprint(status_msg)
@@ -6889,9 +7922,12 @@ async def test_review_convergence_investigation_sets_fingerprint_and_failure_cla
 
 
 @pytest.mark.asyncio
-async def test_review_convergence_investigation_skipped_by_cross_direction_fingerprint(db_session):
+async def test_review_convergence_investigation_skipped_by_cross_direction_fingerprint(
+    db_session,
+):
     from app.autonomous_research import _spawn_review_convergence_investigation
     from app.anomaly_detection import _error_fingerprint
+
     project = Project(
         name="Conv Cross Dir",
         user_id="test-user-123",
@@ -6935,16 +7971,20 @@ async def test_review_convergence_investigation_skipped_by_cross_direction_finge
     await db_session.refresh(orig)
 
     spawned = await _spawn_review_convergence_investigation(
-        orig, db_session,
-        pr_number=9100, iterations=10,
-        detail="global", trigger="review_cap_exhausted",
+        orig,
+        db_session,
+        pr_number=9100,
+        iterations=10,
+        detail="global",
+        trigger="review_cap_exhausted",
     )
     assert spawned is None
     await db_session.commit()
 
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
     investigations = [
-        t for t in result.scalars().all()
+        t
+        for t in result.scalars().all()
         if (t.payloads or [{}])[0].get("type") == "investigate"
     ]
     assert len(investigations) == 1
@@ -6958,10 +7998,13 @@ async def test_review_convergence_investigation_skipped_by_cross_direction_finge
 
 
 @pytest.mark.asyncio
-async def test_anomaly_sweep_spawns_for_held_direction(db_session, _clear_direction_streaks):
+async def test_anomaly_sweep_spawns_for_held_direction(
+    db_session, _clear_direction_streaks
+):
     """Sweep-level helper iterates held directions and spawns investigations,
     even for projects that are not autonomous-enabled."""
     from app.anomaly_detection import _spawn_held_direction_investigations
+
     direction_id = "d-sweep001"
     project = Project(
         name="Sweep Hold",
@@ -6979,7 +8022,8 @@ async def test_anomaly_sweep_spawns_for_held_direction(db_session, _clear_direct
 
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
     investigations = [
-        t for t in result.scalars().all()
+        t
+        for t in result.scalars().all()
         if (t.payloads or [{}])[0].get("type") == "investigate"
     ]
     assert len(investigations) == 1
@@ -6988,9 +8032,12 @@ async def test_anomaly_sweep_spawns_for_held_direction(db_session, _clear_direct
 
 
 @pytest.mark.asyncio
-async def test_anomaly_sweep_dedups_across_projects(db_session, _clear_direction_streaks):
+async def test_anomaly_sweep_dedups_across_projects(
+    db_session, _clear_direction_streaks
+):
     """Sweep respects the per-direction in-flight dedup guard."""
     from app.anomaly_detection import _spawn_held_direction_investigations
+
     direction_id = "d-sweep002"
     project = Project(
         name="Sweep Dedup",
@@ -7007,7 +8054,10 @@ async def test_anomaly_sweep_dedups_across_projects(db_session, _clear_direction
         project_id=project.id,
         title="Already investigating",
         payloads=[{"type": "investigate", "prompt": "in-flight"}],
-        context={"direction_id": direction_id, "spawned_by": "direction_hold_investigation"},
+        context={
+            "direction_id": direction_id,
+            "spawned_by": "direction_hold_investigation",
+        },
         status=TaskStatus.IN_PROGRESS,
         created_by="ORCHESTRATOR",
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
@@ -7022,6 +8072,7 @@ async def test_anomaly_sweep_dedups_across_projects(db_session, _clear_direction
 @pytest.mark.asyncio
 async def test_anomaly_sweep_noop_without_holds(db_session, _clear_direction_streaks):
     from app.anomaly_detection import _spawn_held_direction_investigations
+
     spawned = await _spawn_held_direction_investigations(db_session)
     assert spawned == 0
 
@@ -7029,6 +8080,7 @@ async def test_anomaly_sweep_noop_without_holds(db_session, _clear_direction_str
 # ─────────────────────────────────────────────────────────────────────────────
 # _compute_direction_quality_score — taxonomy-based direction health signal
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def _history_entry(
     *,
@@ -7056,8 +8108,11 @@ def _load_quality_score():
     Skip until it lands so this cluster can merge independently."""
     pytest.importorskip("app.direction_metrics")
     import app.direction_metrics as dm
+
     if not hasattr(dm, "_compute_direction_quality_score"):
-        pytest.skip("_compute_direction_quality_score not yet available (sibling cluster pending)")
+        pytest.skip(
+            "_compute_direction_quality_score not yet available (sibling cluster pending)"
+        )
     return dm._compute_direction_quality_score
 
 
@@ -7074,7 +8129,9 @@ def test_quality_score_high_for_actionable_taxonomy():
     d = {
         "research_history": [
             _history_entry(tasks_created=3, prs_merged=2, code_defect=3),
-            _history_entry(tasks_created=3, prs_merged=2, code_defect=2, scope_related=1),
+            _history_entry(
+                tasks_created=3, prs_merged=2, code_defect=2, scope_related=1
+            ),
             _history_entry(tasks_created=3, prs_merged=3, code_defect=1),
         ],
     }
@@ -7089,7 +8146,9 @@ def test_quality_score_low_for_structural_taxonomy():
     d = {
         "research_history": [
             _history_entry(tasks_created=3, prs_merged=0, infra_related=3),
-            _history_entry(tasks_created=3, prs_merged=0, infra_related=2, review_quality=2),
+            _history_entry(
+                tasks_created=3, prs_merged=0, infra_related=2, review_quality=2
+            ),
             _history_entry(tasks_created=3, prs_merged=0, review_quality=3),
         ],
     }
@@ -7115,7 +8174,9 @@ def test_quality_score_penalizes_wasted_cycles():
             _history_entry(tasks_created=2, prs_merged=0, code_defect=2),
         ],
     }
-    assert _compute_direction_quality_score(healthy) > _compute_direction_quality_score(wasted)
+    assert _compute_direction_quality_score(healthy) > _compute_direction_quality_score(
+        wasted
+    )
 
 
 def test_quality_score_penalizes_scope_dominated_failures():
@@ -7123,15 +8184,21 @@ def test_quality_score_penalizes_scope_dominated_failures():
     _compute_direction_quality_score = _load_quality_score()
     balanced = {
         "research_history": [
-            _history_entry(tasks_created=3, prs_merged=2, code_defect=2, scope_related=1),
+            _history_entry(
+                tasks_created=3, prs_merged=2, code_defect=2, scope_related=1
+            ),
         ],
     }
     scope_heavy = {
         "research_history": [
-            _history_entry(tasks_created=3, prs_merged=2, code_defect=1, scope_related=4),
+            _history_entry(
+                tasks_created=3, prs_merged=2, code_defect=1, scope_related=4
+            ),
         ],
     }
-    assert _compute_direction_quality_score(balanced) > _compute_direction_quality_score(scope_heavy)
+    assert _compute_direction_quality_score(
+        balanced
+    ) > _compute_direction_quality_score(scope_heavy)
 
 
 @pytest.mark.asyncio
@@ -7139,6 +8206,7 @@ async def test_direction_score_ranks_higher_quality_first(db_session, mocker):
     """With equivalent productivity, the direction with healthier taxonomy wins selection."""
     _load_quality_score()  # skip unless sibling integration has landed
     from app.shared_state import runtime_config as _runtime_config
+
     old_val = _runtime_config.get("max_parallel_research_per_project", 2)
     _runtime_config["max_parallel_research_per_project"] = 1
 
@@ -7148,14 +8216,26 @@ async def test_direction_score_ranks_higher_quality_first(db_session, mocker):
         _history_entry(tasks_created=2, prs_merged=1, code_defect=2),
     ]
     poor_history = [
-        _history_entry(tasks_created=2, prs_merged=1, infra_related=2, review_quality=1),
-        _history_entry(tasks_created=2, prs_merged=1, infra_related=2, review_quality=1),
-        _history_entry(tasks_created=2, prs_merged=1, infra_related=2, review_quality=1),
+        _history_entry(
+            tasks_created=2, prs_merged=1, infra_related=2, review_quality=1
+        ),
+        _history_entry(
+            tasks_created=2, prs_merged=1, infra_related=2, review_quality=1
+        ),
+        _history_entry(
+            tasks_created=2, prs_merged=1, infra_related=2, review_quality=1
+        ),
     ]
-    d_good = {**_active_direction("d-quality1", "Healthy"), "research_history": healthy_history,
-              "last_researched_at": "2026-01-01T00:00:00"}
-    d_bad = {**_active_direction("d-quality2", "Structural"), "research_history": poor_history,
-             "last_researched_at": "2026-01-01T00:00:00"}
+    d_good = {
+        **_active_direction("d-quality1", "Healthy"),
+        "research_history": healthy_history,
+        "last_researched_at": "2026-01-01T00:00:00",
+    }
+    d_bad = {
+        **_active_direction("d-quality2", "Structural"),
+        "research_history": poor_history,
+        "last_researched_at": "2026-01-01T00:00:00",
+    }
 
     project = Project(
         name="Quality Sort",
@@ -7171,13 +8251,18 @@ async def test_direction_score_ranks_higher_quality_first(db_session, mocker):
     try:
         await _spawn_research_task(project, db_session)
 
-        result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+        result = await db_session.execute(
+            select(Task).where(Task.project_id == project.id)
+        )
         research = [
-            t for t in result.scalars().all()
+            t
+            for t in result.scalars().all()
             if (t.payloads or [{}])[0].get("type") == "research"
         ]
-        assert len(research) == 1, "Expected exactly one research task at max_parallel=1"
-        chosen = (research[0].payloads[0].get("directions") or [])
+        assert len(research) == 1, (
+            "Expected exactly one research task at max_parallel=1"
+        )
+        chosen = research[0].payloads[0].get("directions") or []
         assert chosen, "Research payload should carry the chosen direction"
         # Either direction may win when productivity and difficulty tie — the
         # remaining tiebreakers (vision rank, acceptance, staleness) are equal.
@@ -7192,6 +8277,7 @@ async def test_direction_score_ranks_higher_quality_first(db_session, mocker):
 async def test_direction_score_prefers_higher_acceptance_rate(db_session, mocker):
     """Higher operator acceptance rate should sort earlier (be selected first)."""
     from app.shared_state import runtime_config as _runtime_config
+
     old_val = _runtime_config.get("max_parallel_research_per_project", 2)
     _runtime_config["max_parallel_research_per_project"] = 1
 
@@ -7207,12 +8293,16 @@ async def test_direction_score_prefers_higher_acceptance_rate(db_session, mocker
         {"tasks_created": 2, "prs_merged": 2, "prs_rejected": 6},
         {"tasks_created": 2, "prs_merged": 2, "prs_rejected": 6},
     ]
-    d_high = {**_active_direction("d-accept-hi", "High acceptance"),
-              "research_history": high_acceptance_history,
-              "last_researched_at": "2026-01-01T00:00:00"}
-    d_low = {**_active_direction("d-accept-lo", "Low acceptance"),
-             "research_history": low_acceptance_history,
-             "last_researched_at": "2026-01-01T00:00:00"}
+    d_high = {
+        **_active_direction("d-accept-hi", "High acceptance"),
+        "research_history": high_acceptance_history,
+        "last_researched_at": "2026-01-01T00:00:00",
+    }
+    d_low = {
+        **_active_direction("d-accept-lo", "Low acceptance"),
+        "research_history": low_acceptance_history,
+        "last_researched_at": "2026-01-01T00:00:00",
+    }
 
     project = Project(
         name="Acceptance Sort",
@@ -7228,12 +8318,17 @@ async def test_direction_score_prefers_higher_acceptance_rate(db_session, mocker
     try:
         await _spawn_research_task(project, db_session)
 
-        result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+        result = await db_session.execute(
+            select(Task).where(Task.project_id == project.id)
+        )
         research = [
-            t for t in result.scalars().all()
+            t
+            for t in result.scalars().all()
             if (t.payloads or [{}])[0].get("type") == "research"
         ]
-        assert len(research) == 1, "Expected exactly one research task at max_parallel=1"
+        assert len(research) == 1, (
+            "Expected exactly one research task at max_parallel=1"
+        )
         current_did = research[0].payloads[0].get("current_direction_id")
         assert current_did == "d-accept-hi", (
             f"Higher operator acceptance rate should be preferred; got {current_did}"
@@ -7246,21 +8341,26 @@ async def test_direction_score_prefers_higher_acceptance_rate(db_session, mocker
 # _spawn_residual_fingerprint_remediation
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @pytest.fixture()
 def _clear_residual_state():
     """Clear residual fingerprint store between tests. Cooldowns now live
     on ResidualRemediationCase rows, which the db_session fixture truncates
     after each test."""
     from app.failure_classification import _residual_store
+
     _residual_store.clear()
     yield
     _residual_store.clear()
 
 
-def _make_residual_case(project_id, fingerprint, hit_count=5, sample_message="some error"):
+def _make_residual_case(
+    project_id, fingerprint, hit_count=5, sample_message="some error"
+):
     """Helper: create an ACTIVE ResidualRemediationCase for tests."""
     from app.models import ResidualRemediationCase, ResidualCaseStatus
     from datetime import datetime, timezone
+
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     return ResidualRemediationCase(
         project_id=project_id,
@@ -7276,7 +8376,9 @@ def _make_residual_case(project_id, fingerprint, hit_count=5, sample_message="so
 
 
 @pytest.mark.asyncio
-async def test_residual_fingerprint_remediation_spawns_task(db_session, _clear_residual_state):
+async def test_residual_fingerprint_remediation_spawns_task(
+    db_session, _clear_residual_state
+):
     """Top residual fingerprint spawns a create task with auto_remediation context."""
     import time
     from app.failure_classification import _residual_store
@@ -7307,7 +8409,9 @@ async def test_residual_fingerprint_remediation_spawns_task(db_session, _clear_r
     assert spawned == 1
 
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
-    create_tasks = [t for t in result.scalars().all() if t.first_payload.get("type") == "create"]
+    create_tasks = [
+        t for t in result.scalars().all() if t.first_payload.get("type") == "create"
+    ]
     assert len(create_tasks) == 1
     t = create_tasks[0]
     assert t.context["auto_remediation"] is True
@@ -7317,7 +8421,9 @@ async def test_residual_fingerprint_remediation_spawns_task(db_session, _clear_r
 
 
 @pytest.mark.asyncio
-async def test_residual_fingerprint_remediation_cooldown_blocks_respawn(db_session, _clear_residual_state):
+async def test_residual_fingerprint_remediation_cooldown_blocks_respawn(
+    db_session, _clear_residual_state
+):
     """Active cooldown prevents re-spawning for the same fingerprint.
     Cooldown now reads ResidualRemediationCase.last_spawned_at."""
     import time
@@ -7346,7 +8452,8 @@ async def test_residual_fingerprint_remediation_cooldown_blocks_respawn(db_sessi
     }
     # Seed cooldown via case row: last_spawned_at = now (within 24h cooldown)
     case = ResidualRemediationCase(
-        project_id=project.id, fingerprint=fp,
+        project_id=project.id,
+        fingerprint=fp,
         status=ResidualCaseStatus.MERGED,  # any non-blocked status
         last_spawned_at=_utcnow() - _td(minutes=10),
     )
@@ -7361,7 +8468,9 @@ async def test_residual_fingerprint_remediation_cooldown_blocks_respawn(db_sessi
 
 
 @pytest.mark.asyncio
-async def test_residual_fingerprint_remediation_cooldown_expired_allows_respawn(db_session, _clear_residual_state):
+async def test_residual_fingerprint_remediation_cooldown_expired_allows_respawn(
+    db_session, _clear_residual_state
+):
     """Expired cooldown (>24 h ago) allows a new remediation task to be spawned.
     Cooldown reads ResidualRemediationCase.last_spawned_at."""
     import time
@@ -7391,7 +8500,8 @@ async def test_residual_fingerprint_remediation_cooldown_expired_allows_respawn(
     # Seed expired cooldown via case row: last_spawned_at = 25h ago,
     # past the 24h default window.
     case = ResidualRemediationCase(
-        project_id=project.id, fingerprint=fp,
+        project_id=project.id,
+        fingerprint=fp,
         status=ResidualCaseStatus.MERGED,
         last_spawned_at=_utcnow() - _td(hours=25),
     )
@@ -7402,12 +8512,16 @@ async def test_residual_fingerprint_remediation_cooldown_expired_allows_respawn(
     assert spawned == 1
 
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
-    create_tasks = [t for t in result.scalars().all() if t.first_payload.get("type") == "create"]
+    create_tasks = [
+        t for t in result.scalars().all() if t.first_payload.get("type") == "create"
+    ]
     assert len(create_tasks) == 1
 
 
 @pytest.mark.asyncio
-async def test_residual_fingerprint_remediation_skips_agent_timeout_sample(db_session, _clear_residual_state):
+async def test_residual_fingerprint_remediation_skips_agent_timeout_sample(
+    db_session, _clear_residual_state
+):
     """Fingerprints whose primary sample now classifies as non-CODE_ERROR are skipped.
 
     Tasks that die (OOM/SIGKILL) while the agent is creating a PR leave the
@@ -7433,6 +8547,7 @@ async def test_residual_fingerprint_remediation_skips_agent_timeout_sample(db_se
     # AGENT_TIMEOUT but fell through to CODE_ERROR in the old code.
     import time
     from app.failure_classification import _residual_store
+
     fp = "creating pull request for blueprint/task-<hash>..."
     pr_heartbeat = "[15.5MB] Creating pull request for blueprint/task-2a30fc5a..."
     _residual_store[fp] = {
@@ -7446,15 +8561,23 @@ async def test_residual_fingerprint_remediation_skips_agent_timeout_sample(db_se
     }
 
     spawned = await _spawn_residual_fingerprint_remediation(project, db_session)
-    assert spawned == 0, "PR-creation heartbeat fingerprint should be skipped by re-classification guard"
+    assert spawned == 0, (
+        "PR-creation heartbeat fingerprint should be skipped by re-classification guard"
+    )
 
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
-    create_tasks = [t for t in result.scalars().all() if t.first_payload.get("type") == "create"]
-    assert len(create_tasks) == 0, "No remediation task should have been spawned for a non-CODE_ERROR fingerprint"
+    create_tasks = [
+        t for t in result.scalars().all() if t.first_payload.get("type") == "create"
+    ]
+    assert len(create_tasks) == 0, (
+        "No remediation task should have been spawned for a non-CODE_ERROR fingerprint"
+    )
 
 
 @pytest.mark.asyncio
-async def test_residual_fingerprint_remediation_skipped_when_no_fingerprints(db_session, _clear_residual_state):
+async def test_residual_fingerprint_remediation_skipped_when_no_fingerprints(
+    db_session, _clear_residual_state
+):
     """Empty residual store → no task spawned."""
     from app.autonomous_research import _spawn_residual_fingerprint_remediation
 
@@ -7476,7 +8599,9 @@ async def test_residual_fingerprint_remediation_skipped_when_no_fingerprints(db_
 
 
 @pytest.mark.asyncio
-async def test_residual_in_memory_selection_ranks_by_hit_count(db_session, _clear_residual_state):
+async def test_residual_in_memory_selection_ranks_by_hit_count(
+    db_session, _clear_residual_state
+):
     """In-memory _residual_store selection picks the highest hit_count fingerprint first."""
     import time
     from app.failure_classification import _residual_store
@@ -7496,19 +8621,27 @@ async def test_residual_in_memory_selection_ranks_by_hit_count(db_session, _clea
     fp_high = "fp_high_count_xyz"
     # Seed in-memory store; get_top_residual_fingerprints() sorts by count desc.
     _residual_store[fp_low] = {
-        "count": 2, "first_seen": time.time() - 3600, "last_seen": time.time(),
-        "sample_message": "low error", "task_ids": [],
+        "count": 2,
+        "first_seen": time.time() - 3600,
+        "last_seen": time.time(),
+        "sample_message": "low error",
+        "task_ids": [],
     }
     _residual_store[fp_high] = {
-        "count": 20, "first_seen": time.time() - 3600, "last_seen": time.time(),
-        "sample_message": "high error", "task_ids": [],
+        "count": 20,
+        "first_seen": time.time() - 3600,
+        "last_seen": time.time(),
+        "sample_message": "high error",
+        "task_ids": [],
     }
 
     spawned = await _spawn_residual_fingerprint_remediation(project, db_session)
     assert spawned == 1
 
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
-    create_tasks = [t for t in result.scalars().all() if t.first_payload.get("type") == "create"]
+    create_tasks = [
+        t for t in result.scalars().all() if t.first_payload.get("type") == "create"
+    ]
     assert len(create_tasks) == 1
     assert create_tasks[0].context["error_fingerprint"] == fp_high
 
@@ -7535,8 +8668,11 @@ async def test_residual_ignored_case_not_selected(db_session, _clear_residual_st
     fp = "fp_ignored_fingerprint_xyz"
     # Fingerprint is in the store (would otherwise be eligible).
     _residual_store[fp] = {
-        "count": 15, "first_seen": time.time() - 3600, "last_seen": time.time(),
-        "sample_message": "ignored error", "task_ids": [],
+        "count": 15,
+        "first_seen": time.time() - 3600,
+        "last_seen": time.time(),
+        "sample_message": "ignored error",
+        "task_ids": [],
     }
     # DB case row carries IGNORED status → lands in blocked_fingerprints.
     now = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -7562,6 +8698,7 @@ async def test_residual_ignored_case_not_selected(db_session, _clear_residual_st
 # 11. Direction recommended_mode dispatch
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_spawn_skips_pause_mode_direction_solo(db_session):
     """Solo-direction variant: when the only direction is pause-mode, no task spawns this tick."""
@@ -7569,7 +8706,12 @@ async def test_spawn_skips_pause_mode_direction_solo(db_session):
         name="Pause Mode Project",
         user_id="test-user-123",
         autonomous_enabled=True,
-        directions=[{**_active_direction("d-pause-mode", "Pause me"), "recommended_mode": "pause"}],
+        directions=[
+            {
+                **_active_direction("d-pause-mode", "Pause me"),
+                "recommended_mode": "pause",
+            }
+        ],
         vision={"purpose": "test", "_research_spawn_count": 1},
     )
     db_session.add(project)
@@ -7578,22 +8720,31 @@ async def test_spawn_skips_pause_mode_direction_solo(db_session):
 
     await _spawn_research_task(project, db_session)
 
-    tasks = (await db_session.execute(select(Task).where(Task.project_id == project.id))).scalars().all()
+    tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
     assert len(tasks) == 0, "pause mode directions must be skipped this tick"
 
 
 @pytest.mark.asyncio
 async def test_audit_mode_direction_dispatches_self_audit(db_session, mocker):
-    mocker.patch("app.autonomous_research._should_dispatch_self_audit", new=AsyncMock(return_value=None))
+    mocker.patch(
+        "app.autonomous_research._should_dispatch_self_audit",
+        new=AsyncMock(return_value=None),
+    )
     project = Project(
         name="Audit Mode Project",
         user_id="test-user-123",
         autonomous_enabled=True,
-        directions=[{
-            **_active_direction("d-audit-mode", "Audit me"),
-            "recommended_mode": "audit",
-            "system_id": "sys-audit-mode",
-        }],
+        directions=[
+            {
+                **_active_direction("d-audit-mode", "Audit me"),
+                "recommended_mode": "audit",
+                "system_id": "sys-audit-mode",
+            }
+        ],
         vision={"purpose": "test", "_research_spawn_count": 1},
     )
     db_session.add(project)
@@ -7602,7 +8753,11 @@ async def test_audit_mode_direction_dispatches_self_audit(db_session, mocker):
 
     await _spawn_research_task(project, db_session)
 
-    tasks = (await db_session.execute(select(Task).where(Task.project_id == project.id))).scalars().all()
+    tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
     task_types = [(t.first_payload or {}).get("type") for t in tasks]
     assert "self_audit" in task_types
     assert "research" not in task_types
@@ -7611,12 +8766,20 @@ async def test_audit_mode_direction_dispatches_self_audit(db_session, mocker):
 @pytest.mark.asyncio
 async def test_fundamentals_mode_direction_injects_mode_hint_legacy(db_session, mocker):
     """Legacy assertion variant: requires the literal string "fundamentals mode" in suffix."""
-    mocker.patch("app.autonomous_research._should_dispatch_self_audit", new=AsyncMock(return_value=None))
+    mocker.patch(
+        "app.autonomous_research._should_dispatch_self_audit",
+        new=AsyncMock(return_value=None),
+    )
     project = Project(
         name="Fundamentals Mode Project",
         user_id="test-user-123",
         autonomous_enabled=True,
-        directions=[{**_active_direction("d-fund-mode", "Harden internals"), "recommended_mode": "fundamentals"}],
+        directions=[
+            {
+                **_active_direction("d-fund-mode", "Harden internals"),
+                "recommended_mode": "fundamentals",
+            }
+        ],
         vision={"purpose": "test", "_research_spawn_count": 1},
     )
     db_session.add(project)
@@ -7625,7 +8788,11 @@ async def test_fundamentals_mode_direction_injects_mode_hint_legacy(db_session, 
 
     await _spawn_research_task(project, db_session)
 
-    tasks = (await db_session.execute(select(Task).where(Task.project_id == project.id))).scalars().all()
+    tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
     research = [t for t in tasks if (t.first_payload or {}).get("type") == "research"]
     assert len(research) == 1
     suffix = (research[0].first_payload or {}).get("prompt_suffix", "")
@@ -7634,12 +8801,20 @@ async def test_fundamentals_mode_direction_injects_mode_hint_legacy(db_session, 
 
 @pytest.mark.asyncio
 async def test_ship_mode_direction_keeps_default_prompt_behavior(db_session, mocker):
-    mocker.patch("app.autonomous_research._should_dispatch_self_audit", new=AsyncMock(return_value=None))
+    mocker.patch(
+        "app.autonomous_research._should_dispatch_self_audit",
+        new=AsyncMock(return_value=None),
+    )
     project = Project(
         name="Ship Mode Project",
         user_id="test-user-123",
         autonomous_enabled=True,
-        directions=[{**_active_direction("d-ship-mode", "Ship feature"), "recommended_mode": "ship"}],
+        directions=[
+            {
+                **_active_direction("d-ship-mode", "Ship feature"),
+                "recommended_mode": "ship",
+            }
+        ],
         vision={"purpose": "test", "_research_spawn_count": 1},
     )
     db_session.add(project)
@@ -7648,7 +8823,11 @@ async def test_ship_mode_direction_keeps_default_prompt_behavior(db_session, moc
 
     await _spawn_research_task(project, db_session)
 
-    tasks = (await db_session.execute(select(Task).where(Task.project_id == project.id))).scalars().all()
+    tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
     research = [t for t in tasks if (t.first_payload or {}).get("type") == "research"]
     assert len(research) == 1
     suffix = (research[0].first_payload or {}).get("prompt_suffix", "").lower()
@@ -7659,6 +8838,7 @@ async def test_ship_mode_direction_keeps_default_prompt_behavior(db_session, moc
 # ─────────────────────────────────────────────────────────────────────────────
 # 12. Mode-aware self_audit dispatch
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_self_audit_no_directions_with_system_ids_falls_through(db_session):
@@ -7692,15 +8872,23 @@ async def test_self_audit_one_dispatch_then_cooldown(db_session):
     """First dispatch fires once when a system has no maturity row; subsequent
     ticks fall through under cool-down so the pipeline never deadlocks on a
     pending or failed audit."""
-    from app.autonomous_research import _should_dispatch_self_audit, _spawn_self_audit_task
+    from app.autonomous_research import (
+        _should_dispatch_self_audit,
+        _spawn_self_audit_task,
+    )
 
     project = Project(
         name="Cold Start With Systems",
         user_id="test-user-123",
         autonomous_enabled=True,
         directions=[
-            {"id": "d-cold", "text": "x", "status": "active",
-             "priority": "medium", "system_id": "sys-cold"},
+            {
+                "id": "d-cold",
+                "text": "x",
+                "status": "active",
+                "priority": "medium",
+                "system_id": "sys-cold",
+            },
         ],
         vision={"purpose": "test"},
     )
@@ -7735,8 +8923,13 @@ async def test_self_audit_skipped_when_all_systems_fresh_and_healthy(db_session)
         user_id="test-user-123",
         autonomous_enabled=True,
         directions=[
-            {"id": "d-h1", "text": "h1", "status": "active",
-             "priority": "medium", "system_id": "sys-fresh"},
+            {
+                "id": "d-h1",
+                "text": "h1",
+                "status": "active",
+                "priority": "medium",
+                "system_id": "sys-fresh",
+            },
         ],
         vision={"purpose": "test"},
     )
@@ -7744,14 +8937,16 @@ async def test_self_audit_skipped_when_all_systems_fresh_and_healthy(db_session)
     await db_session.commit()
     await db_session.refresh(project)
 
-    db_session.add(SystemMaturity(
-        project_id=project.id,
-        system_id="sys-fresh",
-        score=85,
-        components={},
-        recommended_mode="ship",
-        last_audited_at=_utcnow() - timedelta(hours=2),  # very recent
-    ))
+    db_session.add(
+        SystemMaturity(
+            project_id=project.id,
+            system_id="sys-fresh",
+            score=85,
+            components={},
+            recommended_mode="ship",
+            last_audited_at=_utcnow() - timedelta(hours=2),  # very recent
+        )
+    )
     await db_session.commit()
 
     decision = await _should_dispatch_self_audit(project, db_session)
@@ -7771,8 +8966,13 @@ async def test_self_audit_dispatched_when_one_system_stale(db_session):
         user_id="test-user-123",
         autonomous_enabled=True,
         directions=[
-            {"id": "d-stale", "text": "s", "status": "active",
-             "priority": "medium", "system_id": "sys-old"},
+            {
+                "id": "d-stale",
+                "text": "s",
+                "status": "active",
+                "priority": "medium",
+                "system_id": "sys-old",
+            },
         ],
         vision={"purpose": "test"},
     )
@@ -7780,14 +8980,16 @@ async def test_self_audit_dispatched_when_one_system_stale(db_session):
     await db_session.commit()
     await db_session.refresh(project)
 
-    db_session.add(SystemMaturity(
-        project_id=project.id,
-        system_id="sys-old",
-        score=60,
-        components={},
-        recommended_mode="ship",
-        last_audited_at=_utcnow() - timedelta(days=30),  # very stale
-    ))
+    db_session.add(
+        SystemMaturity(
+            project_id=project.id,
+            system_id="sys-old",
+            score=60,
+            components={},
+            recommended_mode="ship",
+            last_audited_at=_utcnow() - timedelta(days=30),  # very stale
+        )
+    )
     await db_session.commit()
 
     decision = await _should_dispatch_self_audit(project, db_session)
@@ -7808,8 +9010,13 @@ async def test_self_audit_dispatched_for_high_drift_direction(db_session):
         user_id="test-user-123",
         autonomous_enabled=True,
         directions=[
-            {"id": "d-drift", "text": "drift", "status": "active",
-             "priority": "medium", "system_id": "sys-drift"},
+            {
+                "id": "d-drift",
+                "text": "drift",
+                "status": "active",
+                "priority": "medium",
+                "system_id": "sys-drift",
+            },
         ],
         vision={"purpose": "test"},
     )
@@ -7818,14 +9025,16 @@ async def test_self_audit_dispatched_for_high_drift_direction(db_session):
     await db_session.refresh(project)
 
     # Fresh SystemMaturity row — would otherwise be healthy.
-    db_session.add(SystemMaturity(
-        project_id=project.id,
-        system_id="sys-drift",
-        score=80,
-        components={},
-        recommended_mode="ship",
-        last_audited_at=_utcnow(),
-    ))
+    db_session.add(
+        SystemMaturity(
+            project_id=project.id,
+            system_id="sys-drift",
+            score=80,
+            components={},
+            recommended_mode="ship",
+            last_audited_at=_utcnow(),
+        )
+    )
     # Synthesize over-claim drift: 5 claims, 0 merges → over_claim_flag.
     for i in range(5):
         t = Task(
@@ -7834,7 +9043,9 @@ async def test_self_audit_dispatched_for_high_drift_direction(db_session):
             description="",
             status=TaskStatus.COMPLETED,
             created_by="ORCHESTRATOR",
-            payloads=[{"type": "create", "prompt": "x", "current_direction_id": "d-drift"}],
+            payloads=[
+                {"type": "create", "prompt": "x", "current_direction_id": "d-drift"}
+            ],
             context={"direction_id": "d-drift"},
             plan_output={"summary": "shipped"},
             vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
@@ -7880,7 +9091,9 @@ async def test_self_audit_skipped_when_force_strategic_with_no_maturity(db_sessi
 
 
 @pytest.mark.asyncio
-async def test_residual_fingerprint_remediation_threshold_for_no_error_cluster(db_session, _clear_residual_state):
+async def test_residual_fingerprint_remediation_threshold_for_no_error_cluster(
+    db_session, _clear_residual_state
+):
     """Non-error-shaped clusters (is_error_shaped=False) require hit_count >= no_error_min_count (default 20).
     Below the threshold the fingerprint is skipped; at/above the threshold it spawns.
     """
@@ -7901,11 +9114,17 @@ async def test_residual_fingerprint_remediation_threshold_for_no_error_cluster(d
     # Below threshold: is_error_shaped=False, count=5 < 20 → must be skipped
     fp_below = "fp_heartbeat_below_threshold_abc"
     _residual_store[fp_below] = {
-        "count": 5, "first_seen": time.time() - 3600, "last_seen": time.time(),
-        "sample_message": "", "task_ids": [], "is_error_shaped": False,
+        "count": 5,
+        "first_seen": time.time() - 3600,
+        "last_seen": time.time(),
+        "sample_message": "",
+        "task_ids": [],
+        "is_error_shaped": False,
     }
     spawned = await _spawn_residual_fingerprint_remediation(project, db_session)
-    assert spawned == 0, "Heartbeat-only cluster below threshold (5 < 20) must NOT spawn"
+    assert spawned == 0, (
+        "Heartbeat-only cluster below threshold (5 < 20) must NOT spawn"
+    )
     del _residual_store[fp_below]
 
     # Above threshold: is_error_shaped=False, count=25 >= 20 → must spawn.
@@ -7913,15 +9132,24 @@ async def test_residual_fingerprint_remediation_threshold_for_no_error_cluster(d
     # synthesize a [""] list that triggers (and fails) the re-classification guard.
     fp_above = "fp_heartbeat_above_threshold_xyz"
     _residual_store[fp_above] = {
-        "count": 25, "first_seen": time.time() - 3600, "last_seen": time.time(),
-        "sample_message": "", "sample_messages": [], "task_ids": [], "is_error_shaped": False,
+        "count": 25,
+        "first_seen": time.time() - 3600,
+        "last_seen": time.time(),
+        "sample_message": "",
+        "sample_messages": [],
+        "task_ids": [],
+        "is_error_shaped": False,
     }
     spawned = await _spawn_residual_fingerprint_remediation(project, db_session)
-    assert spawned == 1, "Heartbeat-only cluster above threshold (25 >= 20) SHOULD spawn"
+    assert spawned == 1, (
+        "Heartbeat-only cluster above threshold (25 >= 20) SHOULD spawn"
+    )
 
 
 @pytest.mark.asyncio
-async def test_residual_fingerprint_remediation_error_shaped_uses_normal_threshold(db_session, _clear_residual_state):
+async def test_residual_fingerprint_remediation_error_shaped_uses_normal_threshold(
+    db_session, _clear_residual_state
+):
     """CODE_ERROR sample spawns at hit_count=1 — no extra threshold."""
     import time
     from app.failure_classification import _residual_store
@@ -7940,8 +9168,11 @@ async def test_residual_fingerprint_remediation_error_shaped_uses_normal_thresho
     fp = "fp_typeerror_real_<n>"
     sample = "TypeError: 'NoneType' object is not callable"
     _residual_store[fp] = {
-        "count": 1, "first_seen": time.time() - 3600, "last_seen": time.time(),
-        "sample_message": sample, "task_ids": [],
+        "count": 1,
+        "first_seen": time.time() - 3600,
+        "last_seen": time.time(),
+        "sample_message": sample,
+        "task_ids": [],
     }
 
     spawned = await _spawn_residual_fingerprint_remediation(project, db_session)
@@ -7949,7 +9180,9 @@ async def test_residual_fingerprint_remediation_error_shaped_uses_normal_thresho
 
 
 @pytest.mark.asyncio
-async def test_residual_defers_when_system_in_audit_mode(db_session, _clear_residual_state):
+async def test_residual_defers_when_system_in_audit_mode(
+    db_session, _clear_residual_state
+):
     """Fingerprint whose tasks all map to a single system in audit mode is deferred (no spawn)."""
     import time
     from app.failure_classification import _residual_store
@@ -7980,18 +9213,23 @@ async def test_residual_defers_when_system_in_audit_mode(db_session, _clear_resi
     await db_session.commit()
     await db_session.refresh(source_task)
 
-    db_session.add(SystemMaturity(
-        project_id=project.id,
-        system_id=system_id,
-        score=40,
-        recommended_mode="audit",
-    ))
+    db_session.add(
+        SystemMaturity(
+            project_id=project.id,
+            system_id=system_id,
+            score=40,
+            recommended_mode="audit",
+        )
+    )
     await db_session.commit()
 
     fp = "fp_audit_gate_defers_xyz"
     _residual_store[fp] = {
-        "count": 3, "first_seen": time.time() - 3600, "last_seen": time.time(),
-        "sample_message": "TypeError: audit mode test", "task_ids": [str(source_task.id)],
+        "count": 3,
+        "first_seen": time.time() - 3600,
+        "last_seen": time.time(),
+        "sample_message": "TypeError: audit mode test",
+        "task_ids": [str(source_task.id)],
         "is_error_shaped": True,
     }
 
@@ -8000,7 +9238,9 @@ async def test_residual_defers_when_system_in_audit_mode(db_session, _clear_resi
 
 
 @pytest.mark.asyncio
-async def test_residual_defers_when_system_in_fundamentals_mode(db_session, _clear_residual_state):
+async def test_residual_defers_when_system_in_fundamentals_mode(
+    db_session, _clear_residual_state
+):
     """Fingerprint whose tasks map to a system in fundamentals mode is also deferred."""
     import time
     from app.failure_classification import _residual_store
@@ -8031,27 +9271,36 @@ async def test_residual_defers_when_system_in_fundamentals_mode(db_session, _cle
     await db_session.commit()
     await db_session.refresh(source_task)
 
-    db_session.add(SystemMaturity(
-        project_id=project.id,
-        system_id=system_id,
-        score=30,
-        recommended_mode="fundamentals",
-    ))
+    db_session.add(
+        SystemMaturity(
+            project_id=project.id,
+            system_id=system_id,
+            score=30,
+            recommended_mode="fundamentals",
+        )
+    )
     await db_session.commit()
 
     fp = "fp_fundamentals_gate_defers_xyz"
     _residual_store[fp] = {
-        "count": 3, "first_seen": time.time() - 3600, "last_seen": time.time(),
-        "sample_message": "TypeError: fundamentals mode test", "task_ids": [str(source_task.id)],
+        "count": 3,
+        "first_seen": time.time() - 3600,
+        "last_seen": time.time(),
+        "sample_message": "TypeError: fundamentals mode test",
+        "task_ids": [str(source_task.id)],
         "is_error_shaped": True,
     }
 
     spawned = await _spawn_residual_fingerprint_remediation(project, db_session)
-    assert spawned == 0, "Fingerprint mapped to fundamentals-mode system must be deferred"
+    assert spawned == 0, (
+        "Fingerprint mapped to fundamentals-mode system must be deferred"
+    )
 
 
 @pytest.mark.asyncio
-async def test_record_residual_audit_deferral_stamps_updated_at(db_session, _clear_residual_state):
+async def test_record_residual_audit_deferral_stamps_updated_at(
+    db_session, _clear_residual_state
+):
     """_record_residual_audit_deferral increments audit_defer_count, records system_id, and bumps updated_at."""
     import time
     from datetime import datetime as _dt
@@ -8083,12 +9332,14 @@ async def test_record_residual_audit_deferral_stamps_updated_at(db_session, _cle
     await db_session.commit()
     await db_session.refresh(source_task)
 
-    db_session.add(SystemMaturity(
-        project_id=project.id,
-        system_id=system_id,
-        score=40,
-        recommended_mode="audit",
-    ))
+    db_session.add(
+        SystemMaturity(
+            project_id=project.id,
+            system_id=system_id,
+            score=40,
+            recommended_mode="audit",
+        )
+    )
 
     fp = "fp_deferral_stamp_test_xyz"
     # Use a hardcoded old timestamp so the comparison is unambiguous.
@@ -8108,7 +9359,9 @@ async def test_record_residual_audit_deferral_stamps_updated_at(db_session, _cle
     await db_session.commit()
 
     _residual_store[fp] = {
-        "count": 5, "first_seen": time.time() - 3600, "last_seen": time.time(),
+        "count": 5,
+        "first_seen": time.time() - 3600,
+        "last_seen": time.time(),
         "sample_message": "TypeError: deferral stamp test",
         "task_ids": [str(source_task.id)],
         "is_error_shaped": True,
@@ -8120,13 +9373,19 @@ async def test_record_residual_audit_deferral_stamps_updated_at(db_session, _cle
     # returns 0 without committing; the real outer caller commits after return).
     await db_session.commit()
     await db_session.refresh(case)
-    assert case.updated_at > old_updated_at, "updated_at must be bumped by deferral recording"
+    assert case.updated_at > old_updated_at, (
+        "updated_at must be bumped by deferral recording"
+    )
     assert case.audit_defer_count == 1, "audit_defer_count must be incremented"
-    assert case.audit_deferred_system_id == system_id, "audit_deferred_system_id must be recorded"
+    assert case.audit_deferred_system_id == system_id, (
+        "audit_deferred_system_id must be recorded"
+    )
 
 
 @pytest.mark.asyncio
-async def test_residual_spawns_when_system_in_ship_mode(db_session, _clear_residual_state):
+async def test_residual_spawns_when_system_in_ship_mode(
+    db_session, _clear_residual_state
+):
     """Fingerprint tasks mapping to a ship-mode system are not gated — spawn proceeds normally."""
     import time
     from app.failure_classification import _residual_store
@@ -8157,18 +9416,23 @@ async def test_residual_spawns_when_system_in_ship_mode(db_session, _clear_resid
     await db_session.commit()
     await db_session.refresh(source_task)
 
-    db_session.add(SystemMaturity(
-        project_id=project.id,
-        system_id=system_id,
-        score=80,
-        recommended_mode="ship",
-    ))
+    db_session.add(
+        SystemMaturity(
+            project_id=project.id,
+            system_id=system_id,
+            score=80,
+            recommended_mode="ship",
+        )
+    )
     await db_session.commit()
 
     fp = "fp_ship_gate_spawns_xyz"
     _residual_store[fp] = {
-        "count": 3, "first_seen": time.time() - 3600, "last_seen": time.time(),
-        "sample_message": "TypeError: ship mode spawns", "task_ids": [str(source_task.id)],
+        "count": 3,
+        "first_seen": time.time() - 3600,
+        "last_seen": time.time(),
+        "sample_message": "TypeError: ship mode spawns",
+        "task_ids": [str(source_task.id)],
         "is_error_shaped": True,
     }
 
@@ -8177,7 +9441,9 @@ async def test_residual_spawns_when_system_in_ship_mode(db_session, _clear_resid
 
 
 @pytest.mark.asyncio
-async def test_residual_spawns_when_tasks_span_multiple_systems(db_session, _clear_residual_state):
+async def test_residual_spawns_when_tasks_span_multiple_systems(
+    db_session, _clear_residual_state
+):
     """Fingerprint tasks spanning two systems produce an ambiguous mapping — spawn proceeds.
 
     _infer_fingerprint_audit_system returns None when len(system_ids) != 1, so
@@ -8225,13 +9491,23 @@ async def test_residual_spawns_when_tasks_span_multiple_systems(db_session, _cle
     await db_session.refresh(task_a)
     await db_session.refresh(task_b)
 
-    db_session.add(SystemMaturity(project_id=project.id, system_id=sys_a, score=30, recommended_mode="audit"))
-    db_session.add(SystemMaturity(project_id=project.id, system_id=sys_b, score=35, recommended_mode="audit"))
+    db_session.add(
+        SystemMaturity(
+            project_id=project.id, system_id=sys_a, score=30, recommended_mode="audit"
+        )
+    )
+    db_session.add(
+        SystemMaturity(
+            project_id=project.id, system_id=sys_b, score=35, recommended_mode="audit"
+        )
+    )
     await db_session.commit()
 
     fp = "fp_mixed_systems_ambiguous_xyz"
     _residual_store[fp] = {
-        "count": 4, "first_seen": time.time() - 3600, "last_seen": time.time(),
+        "count": 4,
+        "first_seen": time.time() - 3600,
+        "last_seen": time.time(),
         "sample_message": "TypeError: mixed systems test",
         "task_ids": [str(task_a.id), str(task_b.id)],
         "is_error_shaped": True,
@@ -8244,7 +9520,9 @@ async def test_residual_spawns_when_tasks_span_multiple_systems(db_session, _cle
 
 
 @pytest.mark.asyncio
-async def test_residual_resumes_spawn_when_system_exits_audit_mode(db_session, _clear_residual_state):
+async def test_residual_resumes_spawn_when_system_exits_audit_mode(
+    db_session, _clear_residual_state
+):
     """Spawn resumes after a system's recommended_mode changes from audit back to ship."""
     import time
     from app.failure_classification import _residual_store
@@ -8275,19 +9553,26 @@ async def test_residual_resumes_spawn_when_system_exits_audit_mode(db_session, _
     await db_session.commit()
     await db_session.refresh(source_task)
 
-    mat = SystemMaturity(project_id=project.id, system_id=system_id, score=35, recommended_mode="audit")
+    mat = SystemMaturity(
+        project_id=project.id, system_id=system_id, score=35, recommended_mode="audit"
+    )
     db_session.add(mat)
     case = ResidualRemediationCase(
-        project_id=project.id, fingerprint="fp_resume_audit_xyz",
-        status=ResidualCaseStatus.ACTIVE, hit_count=4,
+        project_id=project.id,
+        fingerprint="fp_resume_audit_xyz",
+        status=ResidualCaseStatus.ACTIVE,
+        hit_count=4,
     )
     db_session.add(case)
     await db_session.commit()
 
     fp = "fp_resume_audit_xyz"
     _residual_store[fp] = {
-        "count": 4, "first_seen": time.time() - 7200, "last_seen": time.time(),
-        "sample_message": "TypeError: resume test", "task_ids": [str(source_task.id)],
+        "count": 4,
+        "first_seen": time.time() - 7200,
+        "last_seen": time.time(),
+        "sample_message": "TypeError: resume test",
+        "task_ids": [str(source_task.id)],
         "is_error_shaped": True,
     }
 
@@ -8305,6 +9590,7 @@ async def test_residual_resumes_spawn_when_system_exits_audit_mode(db_session, _
 # ─────────────────────────────────────────────────────────────────────────────
 # Failure Feedback Consumption — Coaching Suffix & Scope Override
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_coaching_suffix_injected_for_dominant_failure_category(db_session):
@@ -8360,7 +9646,7 @@ async def test_coaching_suffix_absent_below_rejection_threshold(db_session):
         design_doc={
             "direction_first_attempt_feedback": {
                 dir_id: {
-                    "test_coverage": 2,   # Total=2 < 3 → no coaching
+                    "test_coverage": 2,  # Total=2 < 3 → no coaching
                     "total": 2,
                     "last_updated": "2026-01-01",
                 }
@@ -8398,7 +9684,7 @@ def test_calibrate_scope_downscopes_via_failure_feedback():
         design_doc={
             "direction_first_attempt_feedback": {
                 dir_id: {
-                    "scope_related": 3,   # 3 failures → triggers downscope
+                    "scope_related": 3,  # 3 failures → triggers downscope
                     "total": 3,
                     "last_updated": "2026-01-01",
                 }
@@ -8406,11 +9692,15 @@ def test_calibrate_scope_downscopes_via_failure_feedback():
         },
     )
 
-    final_scope, calibrated_from = _calibrate_scope("medium", direction, project=project, task_type="create")
+    final_scope, calibrated_from = _calibrate_scope(
+        "medium", direction, project=project, task_type="create"
+    )
     assert final_scope == "small", (
         f"Expected medium→small downscope via failure feedback, got {final_scope!r}"
     )
-    assert calibrated_from == "medium", "calibrated_from should record the original scope"
+    assert calibrated_from == "medium", (
+        "calibrated_from should record the original scope"
+    )
 
 
 def test_success_pattern_retains_scope_against_cold_start_upgrade():
@@ -8428,7 +9718,7 @@ def test_success_pattern_retains_scope_against_cold_start_upgrade():
         directions=[direction],
         design_doc={
             "playbook/success-create-medium": {
-                "success_count": 6,   # 6 >= 5 → strong success evidence, retain scope
+                "success_count": 6,  # 6 >= 5 → strong success evidence, retain scope
                 "content": "Medium scope works well for create tasks",
             }
         },
@@ -8439,11 +9729,15 @@ def test_success_pattern_retains_scope_against_cold_start_upgrade():
     original_rates = _runtime_config.get("pipeline_scope_baseline_rates")
     _runtime_config["pipeline_scope_baseline_rates"] = {"medium": 0.2, "small": 0.8}
     try:
-        final_scope, calibrated_from = _calibrate_scope("medium", direction, project=project, task_type="create")
+        final_scope, calibrated_from = _calibrate_scope(
+            "medium", direction, project=project, task_type="create"
+        )
         assert final_scope == "medium", (
             f"Success pattern should prevent cold-start upgrade to large, got {final_scope!r}"
         )
-        assert calibrated_from is None, "No calibration adjustment when scope is retained by success pattern"
+        assert calibrated_from is None, (
+            "No calibration adjustment when scope is retained by success pattern"
+        )
     finally:
         if original_rates is None:
             _runtime_config.pop("pipeline_scope_baseline_rates", None)
@@ -8455,6 +9749,7 @@ def test_success_pattern_retains_scope_against_cold_start_upgrade():
 # recommended_mode — direction-level dispatch behavior
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_spawn_skips_pause_mode_direction(db_session):
     """A direction with recommended_mode='pause' is excluded from spawn selection.
@@ -8464,7 +9759,10 @@ async def test_spawn_skips_pause_mode_direction(db_session):
         user_id="test-user-123",
         autonomous_enabled=True,
         directions=[
-            {**_active_direction("d-pausemode", "Paused system"), "recommended_mode": "pause"},
+            {
+                **_active_direction("d-pausemode", "Paused system"),
+                "recommended_mode": "pause",
+            },
             _active_direction("d-normaldir", "Normal direction"),
         ],
         vision={"purpose": "test"},
@@ -8476,10 +9774,14 @@ async def test_spawn_skips_pause_mode_direction(db_session):
     await _spawn_research_task(project, db_session)
 
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
-    research = [t for t in result.scalars().all() if t.first_payload.get("type") == "research"]
+    research = [
+        t for t in result.scalars().all() if t.first_payload.get("type") == "research"
+    ]
     assert len(research) == 1
     spawned_dir = research[0].first_payload.get("current_direction_id")
-    assert spawned_dir == "d-normaldir", f"pause-mode direction must be skipped; got {spawned_dir!r}"
+    assert spawned_dir == "d-normaldir", (
+        f"pause-mode direction must be skipped; got {spawned_dir!r}"
+    )
 
 
 @pytest.mark.asyncio
@@ -8490,7 +9792,12 @@ async def test_audit_mode_direction_injects_mode_hint(db_session):
         name="Audit Mode Direction",
         user_id="test-user-123",
         autonomous_enabled=True,
-        directions=[{**_active_direction("d-auditdir", "Audit direction"), "recommended_mode": "audit"}],
+        directions=[
+            {
+                **_active_direction("d-auditdir", "Audit direction"),
+                "recommended_mode": "audit",
+            }
+        ],
         vision={"purpose": "test"},
     )
     db_session.add(project)
@@ -8500,16 +9807,20 @@ async def test_audit_mode_direction_injects_mode_hint(db_session):
     await _spawn_research_task(project, db_session)
 
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
-    research = [t for t in result.scalars().all() if t.first_payload.get("type") == "research"]
+    research = [
+        t for t in result.scalars().all() if t.first_payload.get("type") == "research"
+    ]
     assert len(research) == 1
     suffix = research[0].first_payload.get("prompt_suffix", "")
     # Accept any audit-mode hint that biases away from "new features".
     # mode_prompt_hint helper produces validation/audit/drift framing,
     # earlier wording used "fix/test/refactor".
     suffix_l = suffix.lower()
-    assert "audit" in suffix_l and ("fix/test/refactor" in suffix or "validation" in suffix_l or "auditing" in suffix_l), (
-        f"audit-mode direction must inject mode hint in prompt_suffix; got: {suffix!r}"
-    )
+    assert "audit" in suffix_l and (
+        "fix/test/refactor" in suffix
+        or "validation" in suffix_l
+        or "auditing" in suffix_l
+    ), f"audit-mode direction must inject mode hint in prompt_suffix; got: {suffix!r}"
 
 
 @pytest.mark.asyncio
@@ -8520,7 +9831,12 @@ async def test_fundamentals_mode_direction_injects_mode_hint(db_session):
         name="Fundamentals Mode Direction",
         user_id="test-user-123",
         autonomous_enabled=True,
-        directions=[{**_active_direction("d-funddir0", "Fundamentals direction"), "recommended_mode": "fundamentals"}],
+        directions=[
+            {
+                **_active_direction("d-funddir0", "Fundamentals direction"),
+                "recommended_mode": "fundamentals",
+            }
+        ],
         vision={"purpose": "test"},
     )
     db_session.add(project)
@@ -8530,11 +9846,17 @@ async def test_fundamentals_mode_direction_injects_mode_hint(db_session):
     await _spawn_research_task(project, db_session)
 
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
-    research = [t for t in result.scalars().all() if t.first_payload.get("type") == "research"]
+    research = [
+        t for t in result.scalars().all() if t.first_payload.get("type") == "research"
+    ]
     assert len(research) == 1
     suffix = research[0].first_payload.get("prompt_suffix", "")
     suffix_l = suffix.lower()
-    assert "fundamentals" in suffix_l and ("fix/test/refactor" in suffix or "tests" in suffix_l or "maintainability" in suffix_l), (
+    assert "fundamentals" in suffix_l and (
+        "fix/test/refactor" in suffix
+        or "tests" in suffix_l
+        or "maintainability" in suffix_l
+    ), (
         f"fundamentals-mode direction must inject mode hint in prompt_suffix; got: {suffix!r}"
     )
 
@@ -8543,9 +9865,15 @@ async def test_fundamentals_mode_direction_injects_mode_hint(db_session):
 # DB-driven residual selection (sibling cluster 1/2 pending)
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
-@pytest.mark.xfail(strict=False, reason="DB-driven selection not yet implemented; sibling cluster 1/2 will replace in-memory get_top_residual_fingerprints with a project-scoped DB query")
-async def test_residual_db_selection_spawns_top_active_case_by_hit_count(db_session, _clear_residual_state):
+@pytest.mark.xfail(
+    strict=False,
+    reason="DB-driven selection not yet implemented; sibling cluster 1/2 will replace in-memory get_top_residual_fingerprints with a project-scoped DB query",
+)
+async def test_residual_db_selection_spawns_top_active_case_by_hit_count(
+    db_session, _clear_residual_state
+):
     """Without seeding _residual_store, DB ACTIVE rows should drive selection.
     The highest hit_count ACTIVE case should be picked and spawn one task.
     This validates the DB-first path that sibling cluster 1/2 will add to
@@ -8564,22 +9892,40 @@ async def test_residual_db_selection_spawns_top_active_case_by_hit_count(db_sess
 
     fp_low = "fp_db_low_hits_abc"
     fp_high = "fp_db_high_hits_xyz"
-    db_session.add(_make_residual_case(project.id, fp_low, hit_count=3, sample_message="low count error"))
-    db_session.add(_make_residual_case(project.id, fp_high, hit_count=20, sample_message="TypeError: high count error"))
+    db_session.add(
+        _make_residual_case(
+            project.id, fp_low, hit_count=3, sample_message="low count error"
+        )
+    )
+    db_session.add(
+        _make_residual_case(
+            project.id,
+            fp_high,
+            hit_count=20,
+            sample_message="TypeError: high count error",
+        )
+    )
     await db_session.commit()
 
     spawned = await _spawn_residual_fingerprint_remediation(project, db_session)
 
     assert spawned == 1
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
-    create_tasks = [t for t in result.scalars().all() if t.first_payload.get("type") == "create"]
+    create_tasks = [
+        t for t in result.scalars().all() if t.first_payload.get("type") == "create"
+    ]
     assert len(create_tasks) == 1
     assert create_tasks[0].context["error_fingerprint"] == fp_high
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(strict=False, reason="DB-driven selection not yet implemented; sibling cluster 1/2 pending")
-async def test_residual_db_selection_skips_non_active_statuses(db_session, _clear_residual_state):
+@pytest.mark.xfail(
+    strict=False,
+    reason="DB-driven selection not yet implemented; sibling cluster 1/2 pending",
+)
+async def test_residual_db_selection_skips_non_active_statuses(
+    db_session, _clear_residual_state
+):
     """MERGED, FAILED, and SUSPENDED case rows must not be selected even when
     _residual_store is empty. Only ACTIVE rows qualify for spawn in the DB path."""
     from app.autonomous_research import _spawn_residual_fingerprint_remediation
@@ -8600,21 +9946,28 @@ async def test_residual_db_selection_skips_non_active_statuses(db_session, _clea
         (ResidualCaseStatus.FAILED, "fp_failed_skip"),
         (ResidualCaseStatus.SUSPENDED, "fp_suspended_skip"),
     ]:
-        case = _make_residual_case(project.id, fp, hit_count=50, sample_message="TypeError: stale error")
+        case = _make_residual_case(
+            project.id, fp, hit_count=50, sample_message="TypeError: stale error"
+        )
         case.status = status
         db_session.add(case)
     await db_session.commit()
 
     spawned = await _spawn_residual_fingerprint_remediation(project, db_session)
-    assert spawned == 0, "Non-ACTIVE DB cases must not trigger spawn in DB-driven selection"
+    assert spawned == 0, (
+        "Non-ACTIVE DB cases must not trigger spawn in DB-driven selection"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Playbook followed_count — research_completion credits shown entries
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
-async def test_followed_count_incremented_when_research_spawns_impl_task(db_session, mocker):
+async def test_followed_count_incremented_when_research_spawns_impl_task(
+    db_session, mocker
+):
     """When a research task spawns >= 1 impl task and _shown_playbook_keys is set,
     followed_count is incremented on each shown playbook entry in design_doc.
     Entries not listed in _shown_playbook_keys are not modified."""
@@ -8652,7 +10005,9 @@ async def test_followed_count_incremented_when_research_spawns_impl_task(db_sess
     task = Task(
         project_id=project.id,
         title="Research: Playbook follow test direction",
-        payloads=[{"type": "research", "directions": [direction], "base_branch": "main"}],
+        payloads=[
+            {"type": "research", "directions": [direction], "base_branch": "main"}
+        ],
         context={"research_depth": 0, "_shown_playbook_keys": ["shown-entry"]},
         status=TaskStatus.IN_PROGRESS,
         created_by="ORCHESTRATOR",
@@ -8709,11 +10064,14 @@ async def test_followed_count_not_incremented_when_no_impl_spawned(db_session, m
     dup_title = "Avoid globals in config module"
     dup_desc = "Global state causes test isolation failures"
     import hashlib as _hashlib
+
     fhash = _hashlib.sha256((dup_title + dup_desc).encode()).hexdigest()[:16]
     existing = Task(
         project_id=project.id,
         title=dup_title,
-        payloads=[{"type": "create", "prompt": "remove globals", "base_branch": "main"}],
+        payloads=[
+            {"type": "create", "prompt": "remove globals", "base_branch": "main"}
+        ],
         context={"finding_hash": fhash},
         status=TaskStatus.QUEUED,
         created_by="ORCHESTRATOR",
@@ -8724,7 +10082,9 @@ async def test_followed_count_not_incremented_when_no_impl_spawned(db_session, m
     task = Task(
         project_id=project.id,
         title="Research: zero spawn",
-        payloads=[{"type": "research", "directions": [direction], "base_branch": "main"}],
+        payloads=[
+            {"type": "research", "directions": [direction], "base_branch": "main"}
+        ],
         context={"research_depth": 0, "_shown_playbook_keys": ["shown-entry"]},
         status=TaskStatus.IN_PROGRESS,
         created_by="ORCHESTRATOR",
@@ -8737,16 +10097,18 @@ async def test_followed_count_not_incremented_when_no_impl_spawned(db_session, m
     _patch_research_externals(mocker)
     mocker.patch(
         "app.research_completion._parse_research_findings",
-        return_value=[{
-            "title": dup_title,
-            "description": dup_desc,
-            "prompt": "remove globals",
-            "priority": "medium",
-            "scope": "small",
-            "risk": "low",
-            "type": "improvement",
-            "direction_id": direction["id"],
-        }],
+        return_value=[
+            {
+                "title": dup_title,
+                "description": dup_desc,
+                "prompt": "remove globals",
+                "priority": "medium",
+                "scope": "small",
+                "risk": "low",
+                "type": "improvement",
+                "direction_id": direction["id"],
+            }
+        ],
     )
 
     await _handle_research_completion(task, "", db_session)

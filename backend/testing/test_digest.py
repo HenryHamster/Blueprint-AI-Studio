@@ -11144,6 +11144,95 @@ async def test_sr_alert_drilldown_invalid_alert_type(client: AsyncClient, db_ses
 
 
 # ---------------------------------------------------------------------------
+# /api/admin/regression-dispatcher/health
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_regression_dispatcher_health_empty(client: AsyncClient, db_session):
+    """Empty state: no cycle records and no cases returns zeroed aggregates."""
+    import app.shared_state as _ss
+
+    saved = list(_ss.dispatcher_cycle_log)
+    _ss.dispatcher_cycle_log.clear()
+    try:
+        response = await client.get(
+            "/api/admin/regression-dispatcher/health",
+            params={"window_hours": 24},
+        )
+    finally:
+        for rec in saved:
+            _ss.dispatcher_cycle_log.append(rec)
+
+    assert response.status_code == 200
+    data = response.json()
+    agg = data["aggregate"]
+    assert agg["cycles"] == 0
+    assert agg["spawns"] == 0
+    assert agg["signals_tripped"] == 0
+    assert data["per_class"] == []
+    assert len(data["spawns_sparkline"]) == 24
+
+
+@pytest.mark.asyncio
+async def test_regression_dispatcher_health_with_cycle_and_case(
+    client: AsyncClient, db_session
+):
+    """Cycle records aggregate correctly; open case appears in per_class."""
+    import app.shared_state as _ss
+    from app.shared_state import record_dispatcher_cycle
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate:correctness",
+        status=RegressionCaseStatus.ACTIVE,
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    saved = list(_ss.dispatcher_cycle_log)
+    _ss.dispatcher_cycle_log.clear()
+    now = _utcnow()
+    record_dispatcher_cycle(
+        project_id=str(project.id),
+        cycle_started_at=now - timedelta(minutes=5),
+        cycle_finished_at=now - timedelta(minutes=4),
+        signals_evaluated=3,
+        signals_tripped=1,
+        spawns_emitted=1,
+        rejections_by_reason={"cooldown": 0, "dedup": 1},
+        mttd_p50_sec=120.0,
+    )
+    try:
+        response = await client.get(
+            "/api/admin/regression-dispatcher/health",
+            params={"project_id": str(project.id), "window_hours": 24},
+        )
+    finally:
+        _ss.dispatcher_cycle_log.clear()
+        for rec in saved:
+            _ss.dispatcher_cycle_log.append(rec)
+
+    assert response.status_code == 200
+    data = response.json()
+    agg = data["aggregate"]
+    assert agg["cycles"] == 1
+    assert agg["signals_tripped"] == 1
+    assert agg["spawns"] == 1
+    assert agg["rejections"]["dedup"] == 1
+
+    assert len(data["per_class"]) == 1
+    cls = data["per_class"][0]
+    assert cls["regression_class"] == "sr_catch_rate:correctness"
+    assert cls["status"] == RegressionCaseStatus.ACTIVE
+
+
+# ---------------------------------------------------------------------------
 # self_review_effectiveness sr_fixed_count / sr_clean_count counts
 # ---------------------------------------------------------------------------
 

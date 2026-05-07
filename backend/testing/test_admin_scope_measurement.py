@@ -1,4 +1,5 @@
 """Regression tests for admin_scope_measurement._compute_scope_baselines."""
+
 from datetime import datetime, timezone
 from unittest.mock import MagicMock
 
@@ -23,7 +24,7 @@ def test_null_scope_coerced_to_unknown_and_does_not_typeerror_on_sort():
     returned 500 every time such a task existed in the lookback."""
     tasks = [
         _fake_task("medium"),
-        _fake_task(None),         # explicit-null scope — the bug case
+        _fake_task(None),  # explicit-null scope — the bug case
         _fake_task("small"),
         _fake_task("medium"),
     ]

@@ -1,4 +1,5 @@
 """Project CRUD, deploy, WebSocket, and status endpoints."""
+
 import asyncio
 import json
 import logging
@@ -6,11 +7,25 @@ import time
 import uuid
 from typing import Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    HTTPException,
+    Query,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
-from app.auth import get_current_user, verify_agent_jwt, create_ws_ticket, verify_ws_ticket
+from app.auth import (
+    get_current_user,
+    verify_agent_jwt,
+    create_ws_ticket,
+    verify_ws_ticket,
+)
 from app.database import get_session, AsyncSessionLocal
 from app.models import (
     Artifact,
@@ -65,7 +80,7 @@ async def deploy_blueprint(
     payload: DeployPayload,
     background_tasks: BackgroundTasks,
     session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
 ):
     # 1. Create a new Project
     project = Project(
@@ -73,13 +88,17 @@ async def deploy_blueprint(
         user_id=current_user["user_id"],
         status=ProjectStatus.DEPLOYING,
         github_owner=payload.github_owner,
-        github_repo=payload.github_repo
+        github_repo=payload.github_repo,
     )
     session.add(project)
     await session.flush()  # Assign project.id without committing
 
     # Auto-add owner membership
-    session.add(ProjectMember(project_id=project.id, user_id=current_user["user_id"], role="owner"))
+    session.add(
+        ProjectMember(
+            project_id=project.id, user_id=current_user["user_id"], role="owner"
+        )
+    )
 
     # 2. Create Tasks based on the flexible payloads
     created_tasks = []
@@ -126,10 +145,12 @@ async def deploy_blueprint(
     return {
         "status": "accepted",
         "project_id": project.id,
-        "message": f"Project created. {len(created_tasks)} tasks queued for provisioning."
+        "message": f"Project created. {len(created_tasks)} tasks queued for provisioning.",
     }
 
+
 # --- Frontend Read APIs ---
+
 
 @router.get("/api/projects")
 @limiter.limit("30/minute")
@@ -139,14 +160,18 @@ async def list_projects(
     offset: int = Query(0, ge=0),
     status: Optional[ProjectStatus] = None,
     session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
 ):
     """
     List all projects for the authenticated user.
     """
-    stmt = select(Project).where(Project.id.in_(
-        select(ProjectMember.project_id).where(ProjectMember.user_id == current_user["user_id"])
-    ))
+    stmt = select(Project).where(
+        Project.id.in_(
+            select(ProjectMember.project_id).where(
+                ProjectMember.user_id == current_user["user_id"]
+            )
+        )
+    )
     if status:
         stmt = stmt.where(Project.status == status)
 
@@ -154,12 +179,9 @@ async def list_projects(
     projects = (await session.execute(stmt)).scalars().all()
     return {
         "projects": projects,
-        "pagination": {
-            "limit": limit,
-            "offset": offset,
-            "count": len(projects)
-        }
+        "pagination": {"limit": limit, "offset": offset, "count": len(projects)},
     }
+
 
 @router.get("/api/projects/{project_id}")
 @limiter.limit("60/minute")
@@ -167,15 +189,20 @@ async def get_project(
     request: Request,
     project_id: uuid.UUID,
     session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
 ):
     """
     Get a specific project's details.
     """
     # Check membership
-    member = (await session.execute(
-        select(ProjectMember).where(ProjectMember.project_id == project_id, ProjectMember.user_id == current_user["user_id"])
-    )).scalar_one_or_none()
+    member = (
+        await session.execute(
+            select(ProjectMember).where(
+                ProjectMember.project_id == project_id,
+                ProjectMember.user_id == current_user["user_id"],
+            )
+        )
+    ).scalar_one_or_none()
     if not member:
         raise HTTPException(status_code=404, detail="Project not found or unauthorized")
 
@@ -184,6 +211,7 @@ async def get_project(
         raise HTTPException(status_code=404, detail="Project not found or unauthorized")
 
     return project
+
 
 @router.get("/api/projects/{project_id}/tasks")
 @limiter.limit("60/minute")
@@ -196,15 +224,20 @@ async def get_project_tasks(
     direction_id: Optional[str] = None,
     task_type: Optional[str] = None,
     session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
 ):
     """
     Get all tasks and their artifacts for a specific project.
     """
     # Verify project membership
-    member = (await session.execute(
-        select(ProjectMember).where(ProjectMember.project_id == project_id, ProjectMember.user_id == current_user["user_id"])
-    )).scalar_one_or_none()
+    member = (
+        await session.execute(
+            select(ProjectMember).where(
+                ProjectMember.project_id == project_id,
+                ProjectMember.user_id == current_user["user_id"],
+            )
+        )
+    ).scalar_one_or_none()
     if not member:
         raise HTTPException(status_code=404, detail="Project not found or unauthorized")
     project = await session.get(Project, project_id)
@@ -216,7 +249,9 @@ async def get_project_tasks(
     if status:
         tasks_stmt = tasks_stmt.where(Task.status == status)
     if direction_id:
-        tasks_stmt = tasks_stmt.where(Task.context["direction_id"].as_string() == direction_id)
+        tasks_stmt = tasks_stmt.where(
+            Task.context["direction_id"].as_string() == direction_id
+        )
     if task_type:
         tasks_stmt = tasks_stmt.where(Task.payloads[0]["type"].as_string() == task_type)
 
@@ -240,7 +275,9 @@ async def get_project_tasks(
         if a.artifact_type == ArtifactType.RESEARCH_FINDINGS and a.logs:
             try:
                 parsed = json.loads(a.logs[:100000])
-                research_map[a.task_id] = parsed if isinstance(parsed, list) else parsed.get('logs', [])
+                research_map[a.task_id] = (
+                    parsed if isinstance(parsed, list) else parsed.get("logs", [])
+                )
             except (json.JSONDecodeError, AttributeError):
                 pass
 
@@ -263,7 +300,11 @@ async def get_project_tasks(
             "payloads": t.payloads,
             "created_at": t.created_at,
             "parent_task_id": str(t.parent_task_id) if t.parent_task_id else None,
-            "context": {k: v for k, v in (t.context or {}).items() if not k.startswith("max_plan_")},
+            "context": {
+                k: v
+                for k, v in (t.context or {}).items()
+                if not k.startswith("max_plan_")
+            },
             "artifacts": artifacts_by_task.get(t.id, []),
             "research_findings": research_map.get(t.id),
             "duration_seconds": duration_seconds,
@@ -273,12 +314,9 @@ async def get_project_tasks(
 
     return {
         "tasks": result,
-        "pagination": {
-            "limit": limit,
-            "offset": offset,
-            "count": len(result)
-        }
+        "pagination": {"limit": limit, "offset": offset, "count": len(result)},
     }
+
 
 @router.post("/api/projects/{project_id}/ws-ticket")
 @limiter.limit("30/minute")
@@ -286,19 +324,25 @@ async def generate_ws_ticket(
     request: Request,
     project_id: uuid.UUID,
     session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
 ):
     """
     Generates a short-lived ticket for authenticating WebSocket connections.
     """
-    member = (await session.execute(
-        select(ProjectMember).where(ProjectMember.project_id == project_id, ProjectMember.user_id == current_user["user_id"])
-    )).scalar_one_or_none()
+    member = (
+        await session.execute(
+            select(ProjectMember).where(
+                ProjectMember.project_id == project_id,
+                ProjectMember.user_id == current_user["user_id"],
+            )
+        )
+    ).scalar_one_or_none()
     if not member:
         raise HTTPException(status_code=404, detail="Project not found or unauthorized")
 
     ticket = create_ws_ticket(current_user["user_id"], str(project_id))
     return {"ticket": ticket}
+
 
 @router.websocket("/api/projects/{project_id}/ws")
 async def websocket_endpoint(websocket: WebSocket, project_id: str):
@@ -329,10 +373,13 @@ async def websocket_endpoint(websocket: WebSocket, project_id: str):
     if not await manager.connect(websocket, project_id):
         return
     try:
-        await websocket.send_json({"event": "connected", "data": {"project_id": project_id}})
+        await websocket.send_json(
+            {"event": "connected", "data": {"project_id": project_id}}
+        )
         # Send current deploy state immediately so the client hydrates without waiting for polling
         try:
             from app.admin import build_deploy_state_payload
+
             async with AsyncSessionLocal() as ds_session:
                 deploy_payload = await build_deploy_state_payload(ds_session)
             await websocket.send_json({"event": "deploy_state", "data": deploy_payload})
@@ -351,7 +398,7 @@ async def websocket_endpoint(websocket: WebSocket, project_id: str):
 
             manager.update_activity(websocket)
 
-            if len(data) > 10000: # 10KB limit
+            if len(data) > 10000:  # 10KB limit
                 await _safe_ws_close(websocket, code=1009, reason="Message too big")
                 return
 
@@ -368,7 +415,9 @@ async def websocket_endpoint(websocket: WebSocket, project_id: str):
                     try:
                         await websocket.send_json({"event": "pong", "data": {}})
                     except Exception as _ws_exc:
-                        logger.debug(f"[WS] pong send failed, client disconnected: {_ws_exc}")
+                        logger.debug(
+                            f"[WS] pong send failed, client disconnected: {_ws_exc}"
+                        )
                         return
                     continue
             except (json.JSONDecodeError, AttributeError):
@@ -379,7 +428,9 @@ async def websocket_endpoint(websocket: WebSocket, project_id: str):
             if current_time - last_message_time < 1.0:
                 message_count += 1
                 if message_count > 10:
-                    await _safe_ws_close(websocket, code=1008, reason="Rate limit exceeded")
+                    await _safe_ws_close(
+                        websocket, code=1008, reason="Rate limit exceeded"
+                    )
                     return
             else:
                 last_message_time = current_time
@@ -390,7 +441,9 @@ async def websocket_endpoint(websocket: WebSocket, project_id: str):
     finally:
         await manager.disconnect(websocket, project_id)
 
+
 # --- Agent APIs ---
+
 
 @router.websocket("/api/agent/ws/{task_id}")
 async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
@@ -435,7 +488,7 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
         message_count = 0
         while True:
             text_data = await websocket.receive_text()
-            if len(text_data) > 100000: # 100KB limit for agent logs
+            if len(text_data) > 100000:  # 100KB limit for agent logs
                 await _safe_ws_close(websocket, code=1009, reason="Message too big")
                 return
 
@@ -444,7 +497,9 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
             if current_time - last_message_time < 1.0:
                 message_count += 1
                 if message_count > 20:
-                    await _safe_ws_close(websocket, code=1008, reason="Rate limit exceeded")
+                    await _safe_ws_close(
+                        websocket, code=1008, reason="Rate limit exceeded"
+                    )
                     return
             else:
                 last_message_time = current_time
@@ -456,10 +511,14 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
                 continue
 
             if data.get("type") == "log":
-                await broadcast_to_project(project_id, "agent_log", {
-                    "task_id": str(task_id),
-                    "log": _sanitize_log(data.get("content", ""))
-                })
+                await broadcast_to_project(
+                    project_id,
+                    "agent_log",
+                    {
+                        "task_id": str(task_id),
+                        "log": _sanitize_log(data.get("content", "")),
+                    },
+                )
             elif data.get("type") == "status":
                 # Optionally handle status updates via WS too
                 pass
@@ -476,31 +535,50 @@ async def cancel_project(
     project_id: uuid.UUID,
     background_tasks: BackgroundTasks,
     session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
 ):
     """
     Halts the project, marks pending tasks as cancelled, and immediately terminates all associated running VMs.
     """
     from app.main import _ensure_vm_deleted  # noqa: PLC0415
 
-    member = (await session.execute(
-        select(ProjectMember).where(ProjectMember.project_id == project_id, ProjectMember.user_id == current_user["user_id"])
-    )).scalar_one_or_none()
+    member = (
+        await session.execute(
+            select(ProjectMember).where(
+                ProjectMember.project_id == project_id,
+                ProjectMember.user_id == current_user["user_id"],
+            )
+        )
+    ).scalar_one_or_none()
     if not member:
         raise HTTPException(status_code=404, detail="Project not found or unauthorized")
     project = await session.get(Project, project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found or unauthorized")
 
-    if project.status in [ProjectStatus.COMPLETED, ProjectStatus.FAILED, ProjectStatus.CANCELLED]:
-        return {"status": "ignored", "message": f"Project is already in terminal state: {project.status}"}
+    if project.status in [
+        ProjectStatus.COMPLETED,
+        ProjectStatus.FAILED,
+        ProjectStatus.CANCELLED,
+    ]:
+        return {
+            "status": "ignored",
+            "message": f"Project is already in terminal state: {project.status}",
+        }
 
     project.status = ProjectStatus.CANCELLED
     session.add(project)
 
     tasks_stmt = select(Task).where(
         Task.project_id == project_id,
-        Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING])
+        Task.status.in_(
+            [
+                TaskStatus.QUEUED,
+                TaskStatus.PROVISIONING,
+                TaskStatus.IN_PROGRESS,
+                TaskStatus.EVALUATING,
+            ]
+        ),
     )
     active_tasks = (await session.execute(tasks_stmt)).scalars().all()
 
@@ -514,17 +592,23 @@ async def cancel_project(
         await broadcast_to_project(
             str(project_id),
             "task_updated",
-            {"task_id": str(task.id), "status": TaskStatus.CANCELLED}
+            {"task_id": str(task.id), "status": TaskStatus.CANCELLED},
         )
 
     await session.commit()
-    await broadcast_to_project(str(project_id), "project_updated", {"status": ProjectStatus.CANCELLED})
+    await broadcast_to_project(
+        str(project_id), "project_updated", {"status": ProjectStatus.CANCELLED}
+    )
 
     # Delete VMs after commit
     for vm_id in vm_ids_to_delete:
         await _ensure_vm_deleted(vm_id, reason="project_cancel")
 
-    return {"status": "cancelled", "message": f"Project {project_id} and {len(active_tasks)} tasks cancelled."}
+    return {
+        "status": "cancelled",
+        "message": f"Project {project_id} and {len(active_tasks)} tasks cancelled.",
+    }
+
 
 @router.get("/api/projects/{project_id}/status")
 @limiter.limit("60/minute")
@@ -534,15 +618,20 @@ async def get_project_status(
     limit: int = Query(200, ge=1, le=500),
     offset: int = Query(0, ge=0),
     session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
 ):
     """
     Endpoint for the frontend to poll or stream the current status of the deployment
     and agent activities.
     """
-    member = (await session.execute(
-        select(ProjectMember).where(ProjectMember.project_id == project_id, ProjectMember.user_id == current_user["user_id"])
-    )).scalar_one_or_none()
+    member = (
+        await session.execute(
+            select(ProjectMember).where(
+                ProjectMember.project_id == project_id,
+                ProjectMember.user_id == current_user["user_id"],
+            )
+        )
+    ).scalar_one_or_none()
     if not member:
         raise HTTPException(status_code=404, detail="Project not found or unauthorized")
     project = await session.get(Project, project_id)
@@ -578,7 +667,8 @@ async def get_project_status(
                 "task_id": t.id,
                 "status": t.status,
                 "vm_instance_id": t.vm_instance_id,
-                "attempt_count": t.attempt_count
-            } for t in tasks
-        ]
+                "attempt_count": t.attempt_count,
+            }
+            for t in tasks
+        ],
     }

@@ -11,6 +11,7 @@ correctness-adjacent invariant: without it, repeated multi-thousand-row
 JSONB scans run in parallel and have caused OOM/instance kill before
 (see digest_cache.py docstring).
 """
+
 import asyncio
 from typing import Any, Dict
 from unittest.mock import AsyncMock
@@ -70,7 +71,9 @@ async def test_health_overview_recomputes_after_ttl(
     short_cache = DigestCache(default_ttl=0.05)
     app.dependency_overrides[get_digest_cache] = lambda: short_cache
 
-    spy = AsyncMock(side_effect=[{"overall_status": "first"}, {"overall_status": "second"}])
+    spy = AsyncMock(
+        side_effect=[{"overall_status": "first"}, {"overall_status": "second"}]
+    )
     mocker.patch.object(_admin_health, "_compute_health_overview", spy)
 
     try:
@@ -99,7 +102,9 @@ async def test_health_overview_cache_key_includes_query_params(
     try:
         r1 = await client.get("/api/admin/health-overview?lookback_hours=24")
         r2 = await client.get("/api/admin/health-overview?lookback_hours=48")
-        r3 = await client.get("/api/admin/health-overview?lookback_hours=24")  # same key as r1
+        r3 = await client.get(
+            "/api/admin/health-overview?lookback_hours=24"
+        )  # same key as r1
     finally:
         app.dependency_overrides.pop(get_digest_cache, None)
 
@@ -156,7 +161,9 @@ async def test_pool_accounts_health_dedups_concurrent_polls(
         await release.wait()
         return {"accounts": []}
 
-    mocker.patch.object(_admin_pool_accounts, "_compute_account_health_summary", slow_compute)
+    mocker.patch.object(
+        _admin_pool_accounts, "_compute_account_health_summary", slow_compute
+    )
 
     try:
         # Fire N concurrent requests; they should all share the same in-flight

@@ -8,6 +8,7 @@ Covers:
 5. Failure categorization (infra vs non-infra, failed_task_details cap, reason truncation)
 6. Scope breakdown per-scope created/merged/failed counters
 """
+
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -30,11 +31,14 @@ from app.shared_state import runtime_config
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
-async def _create_project(session: AsyncSession, directions: list | None = None) -> Project:
+async def _create_project(
+    session: AsyncSession, directions: list | None = None
+) -> Project:
     """Create a minimal project with optional directions list."""
     project = Project(
         name="Test Project",
@@ -47,7 +51,9 @@ async def _create_project(session: AsyncSession, directions: list | None = None)
     return project
 
 
-def _make_direction(direction_id: str, research_task_id: str, tasks_created: int = 3) -> dict:
+def _make_direction(
+    direction_id: str, research_task_id: str, tasks_created: int = 3
+) -> dict:
     """Build a minimal direction with one research_history entry."""
     return {
         "id": direction_id,
@@ -117,6 +123,7 @@ async def _make_research_task(session: AsyncSession, project_id: uuid.UUID) -> T
 # 1. Guard conditions — early return / break without committing
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_guard_missing_project(db_session: AsyncSession):
     """Returns early when project_id does not exist."""
@@ -134,9 +141,9 @@ async def test_guard_direction_not_found(db_session: AsyncSession):
     """Returns early when no direction matches direction_id."""
     direction_id = "d-exists"
     research_task_id = str(uuid.uuid4())
-    project = await _create_project(db_session, directions=[
-        _make_direction(direction_id, research_task_id)
-    ])
+    project = await _create_project(
+        db_session, directions=[_make_direction(direction_id, research_task_id)]
+    )
 
     # Call with a non-existent direction_id
     await _update_direction_research_outcomes(
@@ -155,9 +162,9 @@ async def test_guard_research_task_id_not_in_history(db_session: AsyncSession):
     """Breaks without updating when task_id not in research_history."""
     direction_id = "d-history"
     history_task_id = str(uuid.uuid4())
-    project = await _create_project(db_session, directions=[
-        _make_direction(direction_id, history_task_id)
-    ])
+    project = await _create_project(
+        db_session, directions=[_make_direction(direction_id, history_task_id)]
+    )
 
     await _update_direction_research_outcomes(
         project_id=project.id,
@@ -175,14 +182,19 @@ async def test_guard_invalid_uuid_in_history(db_session: AsyncSession):
     """Breaks when task_id in history entry is not a valid UUID."""
     direction_id = "d-baduuid"
     bad_task_id = "not-a-uuid"
-    project = await _create_project(db_session, directions=[{
-        "id": direction_id,
-        "text": "Test",
-        "status": "active",
-        "priority": "medium",
-        "paths": [],
-        "research_history": [{"task_id": bad_task_id, "tasks_created": 1}],
-    }])
+    project = await _create_project(
+        db_session,
+        directions=[
+            {
+                "id": direction_id,
+                "text": "Test",
+                "status": "active",
+                "priority": "medium",
+                "paths": [],
+                "research_history": [{"task_id": bad_task_id, "tasks_created": 1}],
+            }
+        ],
+    )
 
     await _update_direction_research_outcomes(
         project_id=project.id,
@@ -198,9 +210,9 @@ async def test_guard_invalid_uuid_in_history(db_session: AsyncSession):
 async def test_guard_no_child_tasks(db_session: AsyncSession):
     """Breaks without updating when research task has no child tasks."""
     direction_id = "d-nochildren"
-    project = await _create_project(db_session, directions=[
-        _make_direction(direction_id, str(uuid.uuid4()))
-    ])
+    project = await _create_project(
+        db_session, directions=[_make_direction(direction_id, str(uuid.uuid4()))]
+    )
     # Use a valid UUID that has no child tasks
     fresh_task_id = str(uuid.uuid4())
     project.directions[0]["research_history"][0]["task_id"] = fresh_task_id
@@ -222,6 +234,7 @@ async def test_guard_no_child_tasks(db_session: AsyncSession):
 # 2. Status aggregation
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_status_aggregation_mixed(db_session: AsyncSession):
     """tasks_completed/failed/cancelled are counted from mixed-status children."""
@@ -230,14 +243,42 @@ async def test_status_aggregation_mixed(db_session: AsyncSession):
     research_task = await _make_research_task(db_session, project.id)
     research_task_id = str(research_task.id)
 
-    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=5)]
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=5)
+    ]
     await db_session.flush()
 
-    await _create_child_task(db_session, research_task.id, project.id, status=TaskStatus.COMPLETED, title="c1")
-    await _create_child_task(db_session, research_task.id, project.id, status=TaskStatus.COMPLETED, title="c2")
-    await _create_child_task(db_session, research_task.id, project.id, status=TaskStatus.FAILED, title="c3")
-    await _create_child_task(db_session, research_task.id, project.id, status=TaskStatus.CANCELLED, title="c4")
-    await _create_child_task(db_session, research_task.id, project.id, status=TaskStatus.IN_PROGRESS, title="c5")
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        title="c1",
+    )
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        title="c2",
+    )
+    await _create_child_task(
+        db_session, research_task.id, project.id, status=TaskStatus.FAILED, title="c3"
+    )
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.CANCELLED,
+        title="c4",
+    )
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.IN_PROGRESS,
+        title="c5",
+    )
     await db_session.flush()
 
     await _update_direction_research_outcomes(
@@ -258,6 +299,7 @@ async def test_status_aggregation_mixed(db_session: AsyncSession):
 # 3. PR metrics
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_pr_metrics_basic(db_session: AsyncSession):
     """prs_merged and prs_rejected counted from context flags."""
@@ -266,21 +308,43 @@ async def test_pr_metrics_basic(db_session: AsyncSession):
     research_task = await _make_research_task(db_session, project.id)
     research_task_id = str(research_task.id)
 
-    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=4)]
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=4)
+    ]
     await db_session.flush()
 
-    await _create_child_task(db_session, research_task.id, project.id,
-                              status=TaskStatus.COMPLETED,
-                              context={"pr_merged": True}, title="merged1")
-    await _create_child_task(db_session, research_task.id, project.id,
-                              status=TaskStatus.COMPLETED,
-                              context={"pr_merged": True}, title="merged2")
-    await _create_child_task(db_session, research_task.id, project.id,
-                              status=TaskStatus.COMPLETED,
-                              context={"pr_rejected": True}, title="rejected1")
-    await _create_child_task(db_session, research_task.id, project.id,
-                              status=TaskStatus.COMPLETED,
-                              context={}, title="no-pr")
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        title="merged1",
+    )
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        title="merged2",
+    )
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_rejected": True},
+        title="rejected1",
+    )
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={},
+        title="no-pr",
+    )
     await db_session.flush()
 
     await _update_direction_research_outcomes(
@@ -311,9 +375,14 @@ async def test_conversion_rate_division_by_zero(db_session: AsyncSession):
     project.directions = [direction]
     await db_session.flush()
 
-    await _create_child_task(db_session, research_task.id, project.id,
-                              status=TaskStatus.COMPLETED,
-                              context={"pr_merged": True}, title="merged")
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        title="merged",
+    )
     await db_session.flush()
 
     await _update_direction_research_outcomes(
@@ -329,31 +398,59 @@ async def test_conversion_rate_division_by_zero(db_session: AsyncSession):
 
 
 @pytest.mark.asyncio
-async def test_rejected_and_review_counts_require_completed_status(db_session: AsyncSession):
+async def test_rejected_and_review_counts_require_completed_status(
+    db_session: AsyncSession,
+):
     """prs_rejected, reviews_dismissed, reviews_overridden exclude non-COMPLETED tasks."""
     direction_id = "d-status-filter"
     project = await _create_project(db_session, directions=[])
     research_task = await _make_research_task(db_session, project.id)
     research_task_id = str(research_task.id)
 
-    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=6)]
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=6)
+    ]
     await db_session.flush()
 
     # COMPLETED — should count
-    await _create_child_task(db_session, research_task.id, project.id,
-                              status=TaskStatus.COMPLETED,
-                              context={"pr_rejected": True, "review_dismissed": True,
-                                       "user_overrode_review": True}, title="ok")
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_rejected": True,
+            "review_dismissed": True,
+            "user_overrode_review": True,
+        },
+        title="ok",
+    )
     # FAILED with the same flags — should NOT count
-    await _create_child_task(db_session, research_task.id, project.id,
-                              status=TaskStatus.FAILED,
-                              context={"pr_rejected": True, "review_dismissed": True,
-                                       "user_overrode_review": True}, title="failed")
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.FAILED,
+        context={
+            "pr_rejected": True,
+            "review_dismissed": True,
+            "user_overrode_review": True,
+        },
+        title="failed",
+    )
     # CANCELLED with flags — should NOT count
-    await _create_child_task(db_session, research_task.id, project.id,
-                              status=TaskStatus.CANCELLED,
-                              context={"pr_rejected": True, "review_dismissed": True,
-                                       "user_overrode_review": True}, title="cancelled")
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.CANCELLED,
+        context={
+            "pr_rejected": True,
+            "review_dismissed": True,
+            "user_overrode_review": True,
+        },
+        title="cancelled",
+    )
     await db_session.flush()
 
     await _update_direction_research_outcomes(
@@ -374,6 +471,7 @@ async def test_rejected_and_review_counts_require_completed_status(db_session: A
 # 4. Time-to-merge calculation
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_avg_time_to_merge_hours(db_session: AsyncSession):
     """avg_time_to_merge_hours is mean of (vm_stopped_at - created_at) for merged tasks."""
@@ -382,24 +480,34 @@ async def test_avg_time_to_merge_hours(db_session: AsyncSession):
     research_task = await _make_research_task(db_session, project.id)
     research_task_id = str(research_task.id)
 
-    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=2)]
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=2)
+    ]
     await db_session.flush()
 
     base = _utcnow()
     # Task 1: 2 hours
-    await _create_child_task(db_session, research_task.id, project.id,
-                              status=TaskStatus.COMPLETED,
-                              context={"pr_merged": True},
-                              created_at=base,
-                              vm_stopped_at=base + timedelta(hours=2),
-                              title="t1")
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        created_at=base,
+        vm_stopped_at=base + timedelta(hours=2),
+        title="t1",
+    )
     # Task 2: 4 hours
-    await _create_child_task(db_session, research_task.id, project.id,
-                              status=TaskStatus.COMPLETED,
-                              context={"pr_merged": True},
-                              created_at=base,
-                              vm_stopped_at=base + timedelta(hours=4),
-                              title="t2")
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        created_at=base,
+        vm_stopped_at=base + timedelta(hours=4),
+        title="t2",
+    )
     await db_session.flush()
 
     await _update_direction_research_outcomes(
@@ -422,22 +530,32 @@ async def test_avg_time_to_merge_excludes_null_timestamps(db_session: AsyncSessi
     research_task = await _make_research_task(db_session, project.id)
     research_task_id = str(research_task.id)
 
-    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=2)]
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=2)
+    ]
     await db_session.flush()
 
     base = _utcnow()
     # One valid merged task: 3 hours
-    await _create_child_task(db_session, research_task.id, project.id,
-                              status=TaskStatus.COMPLETED,
-                              context={"pr_merged": True},
-                              created_at=base,
-                              vm_stopped_at=base + timedelta(hours=3),
-                              title="valid")
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        created_at=base,
+        vm_stopped_at=base + timedelta(hours=3),
+        title="valid",
+    )
     # One merged task with no vm_stopped_at
-    await _create_child_task(db_session, research_task.id, project.id,
-                              status=TaskStatus.COMPLETED,
-                              context={"pr_merged": True},
-                              title="no-stop-time")
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        title="no-stop-time",
+    )
     await db_session.flush()
 
     await _update_direction_research_outcomes(
@@ -460,12 +578,19 @@ async def test_avg_time_to_merge_none_when_no_merged(db_session: AsyncSession):
     research_task = await _make_research_task(db_session, project.id)
     research_task_id = str(research_task.id)
 
-    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=1)]
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=1)
+    ]
     await db_session.flush()
 
-    await _create_child_task(db_session, research_task.id, project.id,
-                              status=TaskStatus.FAILED,
-                              context={}, title="failed")
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.FAILED,
+        context={},
+        title="failed",
+    )
     await db_session.flush()
 
     await _update_direction_research_outcomes(
@@ -488,13 +613,17 @@ async def test_implementation_and_review_timing_split(db_session: AsyncSession):
     research_task = await _make_research_task(db_session, project.id)
     research_task_id = str(research_task.id)
 
-    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=2)]
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=2)
+    ]
     await db_session.flush()
 
     base = _utcnow()
     # Merged create task: 2h implementation
     merged = await _create_child_task(
-        db_session, research_task.id, project.id,
+        db_session,
+        research_task.id,
+        project.id,
         status=TaskStatus.COMPLETED,
         context={"pr_merged": True, "pr_number": 42},
         created_at=base,
@@ -503,7 +632,9 @@ async def test_implementation_and_review_timing_split(db_session: AsyncSession):
     )
     # Completed-but-unmerged create task: 4h implementation, contributes only to impl avg
     await _create_child_task(
-        db_session, research_task.id, project.id,
+        db_session,
+        research_task.id,
+        project.id,
         status=TaskStatus.COMPLETED,
         context={},
         created_at=base,
@@ -512,7 +643,9 @@ async def test_implementation_and_review_timing_split(db_session: AsyncSession):
     )
     # Review child for PR 42: vm_stopped 1h after merged.vm_stopped_at
     await _create_child_task(
-        db_session, research_task.id, project.id,
+        db_session,
+        research_task.id,
+        project.id,
         status=TaskStatus.COMPLETED,
         payloads=[{"type": "review", "pr_number": 42}],
         context={"pr_number": 42},
@@ -547,12 +680,16 @@ async def test_avg_review_hours_falls_back_to_updated_at(db_session: AsyncSessio
     research_task = await _make_research_task(db_session, project.id)
     research_task_id = str(research_task.id)
 
-    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=1)]
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=1)
+    ]
     await db_session.flush()
 
     base = _utcnow()
     merged = await _create_child_task(
-        db_session, research_task.id, project.id,
+        db_session,
+        research_task.id,
+        project.id,
         status=TaskStatus.COMPLETED,
         context={"pr_merged": True, "pr_number": 99},
         created_at=base,
@@ -584,13 +721,18 @@ async def test_timing_fields_none_when_no_data(db_session: AsyncSession):
     research_task = await _make_research_task(db_session, project.id)
     research_task_id = str(research_task.id)
 
-    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=1)]
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=1)
+    ]
     await db_session.flush()
 
     await _create_child_task(
-        db_session, research_task.id, project.id,
+        db_session,
+        research_task.id,
+        project.id,
         status=TaskStatus.FAILED,
-        context={}, title="failed",
+        context={},
+        title="failed",
     )
     await db_session.flush()
 
@@ -611,6 +753,7 @@ async def test_timing_fields_none_when_no_data(db_session: AsyncSession):
 # 5. Failure categorization
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_infra_vs_non_infra_failure_counting(db_session: AsyncSession):
     """tasks_failed_infra counts only INFRA_CATEGORIES; failed_task_details includes all failed/cancelled."""
@@ -619,25 +762,47 @@ async def test_infra_vs_non_infra_failure_counting(db_session: AsyncSession):
     research_task = await _make_research_task(db_session, project.id)
     research_task_id = str(research_task.id)
 
-    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=4)]
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=4)
+    ]
     await db_session.flush()
 
-    await _create_child_task(db_session, research_task.id, project.id,
-                              status=TaskStatus.FAILED,
-                              context={"failure_category": "PROVISION_FAILURE"},
-                              title="infra1", latest_status_message="VM failed")
-    await _create_child_task(db_session, research_task.id, project.id,
-                              status=TaskStatus.FAILED,
-                              context={"failure_category": "RATE_LIMIT"},
-                              title="infra2", latest_status_message="Rate limited")
-    await _create_child_task(db_session, research_task.id, project.id,
-                              status=TaskStatus.FAILED,
-                              context={"failure_category": "CODE_ERROR"},
-                              title="noinfra1", latest_status_message="Code error")
-    await _create_child_task(db_session, research_task.id, project.id,
-                              status=TaskStatus.CANCELLED,
-                              context={"failure_category": "AGENT_TIMEOUT"},
-                              title="infra3", latest_status_message="Timed out")
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.FAILED,
+        context={"failure_category": "PROVISION_FAILURE"},
+        title="infra1",
+        latest_status_message="VM failed",
+    )
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.FAILED,
+        context={"failure_category": "RATE_LIMIT"},
+        title="infra2",
+        latest_status_message="Rate limited",
+    )
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.FAILED,
+        context={"failure_category": "CODE_ERROR"},
+        title="noinfra1",
+        latest_status_message="Code error",
+    )
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.CANCELLED,
+        context={"failure_category": "AGENT_TIMEOUT"},
+        title="infra3",
+        latest_status_message="Timed out",
+    )
     await db_session.flush()
 
     await _update_direction_research_outcomes(
@@ -662,14 +827,21 @@ async def test_failed_task_details_capped_at_5(db_session: AsyncSession):
     research_task = await _make_research_task(db_session, project.id)
     research_task_id = str(research_task.id)
 
-    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=8)]
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=8)
+    ]
     await db_session.flush()
 
     for i in range(8):
-        await _create_child_task(db_session, research_task.id, project.id,
-                                  status=TaskStatus.FAILED,
-                                  context={},
-                                  title=f"failed-{i}", latest_status_message=f"Error {i}")
+        await _create_child_task(
+            db_session,
+            research_task.id,
+            project.id,
+            status=TaskStatus.FAILED,
+            context={},
+            title=f"failed-{i}",
+            latest_status_message=f"Error {i}",
+        )
     await db_session.flush()
 
     await _update_direction_research_outcomes(
@@ -692,14 +864,21 @@ async def test_failed_task_reason_truncated_to_120(db_session: AsyncSession):
     research_task = await _make_research_task(db_session, project.id)
     research_task_id = str(research_task.id)
 
-    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=1)]
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=1)
+    ]
     await db_session.flush()
 
     long_message = "X" * 200
-    await _create_child_task(db_session, research_task.id, project.id,
-                              status=TaskStatus.FAILED,
-                              context={},
-                              title="long-fail", latest_status_message=long_message)
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.FAILED,
+        context={},
+        title="long-fail",
+        latest_status_message=long_message,
+    )
     await db_session.flush()
 
     await _update_direction_research_outcomes(
@@ -723,41 +902,76 @@ async def test_taxonomy_fields_in_outcome_entries(db_session: AsyncSession):
     research_task = await _make_research_task(db_session, project.id)
     research_task_id = str(research_task.id)
 
-    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=8)]
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=8)
+    ]
     await db_session.flush()
 
     # infra_related: PROVISION_FAILURE
-    await _create_child_task(db_session, research_task.id, project.id,
-                              status=TaskStatus.FAILED,
-                              context={"failure_category": "PROVISION_FAILURE"},
-                              title="infra1", latest_status_message="VM failed")
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.FAILED,
+        context={"failure_category": "PROVISION_FAILURE"},
+        title="infra1",
+        latest_status_message="VM failed",
+    )
     # infra_related: AGENT_TIMEOUT
-    await _create_child_task(db_session, research_task.id, project.id,
-                              status=TaskStatus.CANCELLED,
-                              context={"failure_category": "AGENT_TIMEOUT"},
-                              title="infra2", latest_status_message="Timed out")
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.CANCELLED,
+        context={"failure_category": "AGENT_TIMEOUT"},
+        title="infra2",
+        latest_status_message="Timed out",
+    )
     # review_quality: CODE_ERROR with pytest signal
-    await _create_child_task(db_session, research_task.id, project.id,
-                              status=TaskStatus.FAILED,
-                              context={"failure_category": "CODE_ERROR", "scope": "small"},
-                              title="rq1", latest_status_message="pytest failed in tests")
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.FAILED,
+        context={"failure_category": "CODE_ERROR", "scope": "small"},
+        title="rq1",
+        latest_status_message="pytest failed in tests",
+    )
     # scope_related: CODE_ERROR with positive scope evidence (status-msg keyword)
-    await _create_child_task(db_session, research_task.id, project.id,
-                              status=TaskStatus.FAILED,
-                              context={"failure_category": "CODE_ERROR", "scope": "medium",
-                                       "scope_calibrated_from": "small"},
-                              title="sc1", latest_status_message="task exceeds scope budget")
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.FAILED,
+        context={
+            "failure_category": "CODE_ERROR",
+            "scope": "medium",
+            "scope_calibrated_from": "small",
+        },
+        title="sc1",
+        latest_status_message="task exceeds scope budget",
+    )
     # code_defect: CODE_ERROR small with no classifying signal
-    await _create_child_task(db_session, research_task.id, project.id,
-                              status=TaskStatus.FAILED,
-                              context={"failure_category": "CODE_ERROR", "scope": "small"},
-                              title="cd1", latest_status_message="unknown failure")
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.FAILED,
+        context={"failure_category": "CODE_ERROR", "scope": "small"},
+        title="cd1",
+        latest_status_message="unknown failure",
+    )
     # Extra failures to push total above the cap of 5
     for i in range(3):
-        await _create_child_task(db_session, research_task.id, project.id,
-                                  status=TaskStatus.FAILED,
-                                  context={"failure_category": "PROVISION_FAILURE"},
-                                  title=f"extra-{i}", latest_status_message="vm crashed")
+        await _create_child_task(
+            db_session,
+            research_task.id,
+            project.id,
+            status=TaskStatus.FAILED,
+            context={"failure_category": "PROVISION_FAILURE"},
+            title=f"extra-{i}",
+            latest_status_message="vm crashed",
+        )
     await db_session.flush()
 
     await _update_direction_research_outcomes(
@@ -773,7 +987,12 @@ async def test_taxonomy_fields_in_outcome_entries(db_session: AsyncSession):
     assert len(entry["failed_task_details"]) == 5
     for d in entry["failed_task_details"]:
         assert "taxonomy" in d
-        assert d["taxonomy"] in {"scope_related", "review_quality", "infra_related", "code_defect"}
+        assert d["taxonomy"] in {
+            "scope_related",
+            "review_quality",
+            "infra_related",
+            "code_defect",
+        }
     # taxonomy_summary counts ALL 8 failed tasks, not just capped 5
     ts = entry["taxonomy_summary"]
     assert ts["infra_related"] == 5  # 1 provision + 1 agent_timeout + 3 extra provision
@@ -786,6 +1005,7 @@ async def test_taxonomy_fields_in_outcome_entries(db_session: AsyncSession):
 # 6. Scope breakdown
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_scope_breakdown_per_scope_counters(db_session: AsyncSession):
     """scope_breakdown tracks created/merged/failed per scope."""
@@ -794,32 +1014,50 @@ async def test_scope_breakdown_per_scope_counters(db_session: AsyncSession):
     research_task = await _make_research_task(db_session, project.id)
     research_task_id = str(research_task.id)
 
-    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=4)]
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=4)
+    ]
     await db_session.flush()
 
     # small: 2 created, 1 merged, 0 failed
-    await _create_child_task(db_session, research_task.id, project.id,
-                              status=TaskStatus.COMPLETED,
-                              context={"pr_merged": True, "scope": "small"},
-                              payloads=[{"type": "create"}],
-                              title="s1")
-    await _create_child_task(db_session, research_task.id, project.id,
-                              status=TaskStatus.COMPLETED,
-                              context={"scope": "small"},
-                              payloads=[{"type": "create"}],
-                              title="s2")
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True, "scope": "small"},
+        payloads=[{"type": "create"}],
+        title="s1",
+    )
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={"scope": "small"},
+        payloads=[{"type": "create"}],
+        title="s2",
+    )
     # medium: 1 created, 0 merged, 1 failed
-    await _create_child_task(db_session, research_task.id, project.id,
-                              status=TaskStatus.FAILED,
-                              context={"scope": "medium"},
-                              payloads=[{"type": "create"}],
-                              title="m1")
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.FAILED,
+        context={"scope": "medium"},
+        payloads=[{"type": "create"}],
+        title="m1",
+    )
     # no scope → unknown
-    await _create_child_task(db_session, research_task.id, project.id,
-                              status=TaskStatus.COMPLETED,
-                              context={},  # no scope key
-                              payloads=[{"type": "create"}],
-                              title="u1")
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={},  # no scope key
+        payloads=[{"type": "create"}],
+        title="u1",
+    )
     await db_session.flush()
 
     await _update_direction_research_outcomes(
@@ -853,20 +1091,30 @@ async def test_scope_breakdown_tracks_calibration(db_session: AsyncSession):
     research_task = await _make_research_task(db_session, project.id)
     research_task_id = str(research_task.id)
 
-    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=2)]
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=2)
+    ]
     await db_session.flush()
 
     # Calibrated task: proposed medium, ran as small, merged
     await _create_child_task(
-        db_session, research_task.id, project.id,
+        db_session,
+        research_task.id,
+        project.id,
         status=TaskStatus.COMPLETED,
-        context={"pr_merged": True, "scope": "small", "scope_calibrated_from": "medium"},
+        context={
+            "pr_merged": True,
+            "scope": "small",
+            "scope_calibrated_from": "medium",
+        },
         payloads=[{"type": "create"}],
         title="calibrated",
     )
     # Non-calibrated small task
     await _create_child_task(
-        db_session, research_task.id, project.id,
+        db_session,
+        research_task.id,
+        project.id,
         status=TaskStatus.COMPLETED,
         context={"scope": "small"},
         payloads=[{"type": "create"}],
@@ -903,20 +1151,30 @@ async def test_escalation_outcomes_tracks_attempt_merge_fail(db_session: AsyncSe
     research_task = await _make_research_task(db_session, project.id)
     research_task_id = str(research_task.id)
 
-    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=4)]
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=4)
+    ]
     await db_session.flush()
 
     # Escalation small → medium, merged
     await _create_child_task(
-        db_session, research_task.id, project.id,
+        db_session,
+        research_task.id,
+        project.id,
         status=TaskStatus.COMPLETED,
-        context={"pr_merged": True, "scope": "medium", "scope_calibrated_from": "small"},
+        context={
+            "pr_merged": True,
+            "scope": "medium",
+            "scope_calibrated_from": "small",
+        },
         payloads=[{"type": "create"}],
         title="esc-sm-md-merged",
     )
     # Escalation small → medium, failed
     await _create_child_task(
-        db_session, research_task.id, project.id,
+        db_session,
+        research_task.id,
+        project.id,
         status=TaskStatus.FAILED,
         context={"scope": "medium", "scope_calibrated_from": "small"},
         payloads=[{"type": "create"}],
@@ -924,7 +1182,9 @@ async def test_escalation_outcomes_tracks_attempt_merge_fail(db_session: AsyncSe
     )
     # Escalation medium → large, attempted only (still running)
     await _create_child_task(
-        db_session, research_task.id, project.id,
+        db_session,
+        research_task.id,
+        project.id,
         status=TaskStatus.IN_PROGRESS,
         context={"scope": "large", "scope_calibrated_from": "medium"},
         payloads=[{"type": "create"}],
@@ -932,9 +1192,15 @@ async def test_escalation_outcomes_tracks_attempt_merge_fail(db_session: AsyncSe
     )
     # Downsize medium → small — must NOT appear in escalation_outcomes
     await _create_child_task(
-        db_session, research_task.id, project.id,
+        db_session,
+        research_task.id,
+        project.id,
         status=TaskStatus.COMPLETED,
-        context={"pr_merged": True, "scope": "small", "scope_calibrated_from": "medium"},
+        context={
+            "pr_merged": True,
+            "scope": "small",
+            "scope_calibrated_from": "medium",
+        },
         payloads=[{"type": "create"}],
         title="downsize-md-sm",
     )
@@ -964,11 +1230,15 @@ async def test_escalation_outcomes_empty_when_no_escalations(db_session: AsyncSe
     research_task = await _make_research_task(db_session, project.id)
     research_task_id = str(research_task.id)
 
-    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=1)]
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=1)
+    ]
     await db_session.flush()
 
     await _create_child_task(
-        db_session, research_task.id, project.id,
+        db_session,
+        research_task.id,
+        project.id,
         status=TaskStatus.COMPLETED,
         context={"pr_merged": True, "scope": "small"},
         payloads=[{"type": "create"}],
@@ -997,56 +1267,82 @@ async def test_scope_breakdown_avg_expansion_ratio(db_session: AsyncSession):
     research_task = await _make_research_task(db_session, project.id)
     research_task_id = str(research_task.id)
 
-    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=5)]
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=5)
+    ]
     await db_session.flush()
 
     # small #1: 2 expected, 4 changed → ratio 2.0
     await _create_child_task(
-        db_session, research_task.id, project.id,
+        db_session,
+        research_task.id,
+        project.id,
         status=TaskStatus.COMPLETED,
-        context={"pr_merged": True, "scope": "small",
-                 "related_files": ["a.py", "b.py"],
-                 "_pr_changed_files": ["a.py", "b.py", "c.py", "d.py"]},
+        context={
+            "pr_merged": True,
+            "scope": "small",
+            "related_files": ["a.py", "b.py"],
+            "_pr_changed_files": ["a.py", "b.py", "c.py", "d.py"],
+        },
         payloads=[{"type": "create"}],
         title="s1",
     )
     # small #2: 1 expected, 1 changed → ratio 1.0  → avg small = 1.5
     await _create_child_task(
-        db_session, research_task.id, project.id,
+        db_session,
+        research_task.id,
+        project.id,
         status=TaskStatus.COMPLETED,
-        context={"pr_merged": True, "scope": "small",
-                 "related_files": ["x.py"],
-                 "_pr_changed_files": ["x.py"]},
+        context={
+            "pr_merged": True,
+            "scope": "small",
+            "related_files": ["x.py"],
+            "_pr_changed_files": ["x.py"],
+        },
         payloads=[{"type": "create"}],
         title="s2",
     )
     # medium: 2 expected, 6 changed → ratio 3.0
     await _create_child_task(
-        db_session, research_task.id, project.id,
+        db_session,
+        research_task.id,
+        project.id,
         status=TaskStatus.COMPLETED,
-        context={"pr_merged": True, "scope": "medium",
-                 "related_files": ["m1.py", "m2.py"],
-                 "_pr_changed_files": ["m1.py", "m2.py", "m3.py", "m4.py", "m5.py", "m6.py"]},
+        context={
+            "pr_merged": True,
+            "scope": "medium",
+            "related_files": ["m1.py", "m2.py"],
+            "_pr_changed_files": ["m1.py", "m2.py", "m3.py", "m4.py", "m5.py", "m6.py"],
+        },
         payloads=[{"type": "create"}],
         title="m1",
     )
     # small with empty related_files: should be excluded (division by zero guard)
     await _create_child_task(
-        db_session, research_task.id, project.id,
+        db_session,
+        research_task.id,
+        project.id,
         status=TaskStatus.COMPLETED,
-        context={"pr_merged": True, "scope": "small",
-                 "related_files": [],
-                 "_pr_changed_files": ["y.py"]},
+        context={
+            "pr_merged": True,
+            "scope": "small",
+            "related_files": [],
+            "_pr_changed_files": ["y.py"],
+        },
         payloads=[{"type": "create"}],
         title="s-no-related",
     )
     # failed task: contributes to avg_expansion_ratio_failed (separate from merged bucket)
     await _create_child_task(
-        db_session, research_task.id, project.id,
+        db_session,
+        research_task.id,
+        project.id,
         status=TaskStatus.FAILED,
-        context={"scope": "medium",
-                 "related_files": ["z.py"],
-                 "_pr_changed_files": ["z.py", "q.py", "r.py"]},
+        context={
+            "scope": "medium",
+            "related_files": ["z.py"],
+            "_pr_changed_files": ["z.py", "q.py", "r.py"],
+        },
         payloads=[{"type": "create"}],
         title="failed-m",
     )
@@ -1083,22 +1379,29 @@ async def test_expansion_ratio_excludes_test_files(db_session: AsyncSession):
     research_task = await _make_research_task(db_session, project.id)
     research_task_id = str(research_task.id)
 
-    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=2)]
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=2)
+    ]
     await db_session.flush()
 
     # 2 production related_files, PR touches the same 2 plus 2 test files →
     # production-only ratio 1.0 (not inflated to 2.0).
     await _create_child_task(
-        db_session, research_task.id, project.id,
+        db_session,
+        research_task.id,
+        project.id,
         status=TaskStatus.COMPLETED,
-        context={"pr_merged": True, "scope": "small",
-                 "related_files": ["backend/app/foo.py", "backend/app/bar.py"],
-                 "_pr_changed_files": [
-                     "backend/app/foo.py",
-                     "backend/app/bar.py",
-                     "backend/testing/test_foo.py",
-                     "backend/testing/test_bar.py",
-                 ]},
+        context={
+            "pr_merged": True,
+            "scope": "small",
+            "related_files": ["backend/app/foo.py", "backend/app/bar.py"],
+            "_pr_changed_files": [
+                "backend/app/foo.py",
+                "backend/app/bar.py",
+                "backend/testing/test_foo.py",
+                "backend/testing/test_bar.py",
+            ],
+        },
         payloads=[{"type": "create"}],
         title="s-with-tests",
     )
@@ -1130,32 +1433,43 @@ async def test_scope_breakdown_failed_scope_overflow_counter(db_session: AsyncSe
     research_task = await _make_research_task(db_session, project.id)
     research_task_id = str(research_task.id)
 
-    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=3)]
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=3)
+    ]
     await db_session.flush()
 
     # medium task that hit scope overflow
     await _create_child_task(
-        db_session, research_task.id, project.id,
+        db_session,
+        research_task.id,
+        project.id,
         status=TaskStatus.FAILED,
         context={"scope": "medium", "failure_category": "SCOPE_OVERFLOW"},
         payloads=[{"type": "create"}],
-        title="m-overflow", latest_status_message="scope overflow",
+        title="m-overflow",
+        latest_status_message="scope overflow",
     )
     # medium task with a pure infra failure (no scope overflow)
     await _create_child_task(
-        db_session, research_task.id, project.id,
+        db_session,
+        research_task.id,
+        project.id,
         status=TaskStatus.FAILED,
         context={"scope": "medium", "failure_category": "RATE_LIMIT"},
         payloads=[{"type": "create"}],
-        title="m-rate", latest_status_message="rate limited",
+        title="m-rate",
+        latest_status_message="rate limited",
     )
     # small task with CODE_ERROR — should not touch either infra counter
     await _create_child_task(
-        db_session, research_task.id, project.id,
+        db_session,
+        research_task.id,
+        project.id,
         status=TaskStatus.FAILED,
         context={"scope": "small", "failure_category": "CODE_ERROR"},
         payloads=[{"type": "create"}],
-        title="s-code", latest_status_message="test failed",
+        title="s-code",
+        latest_status_message="test failed",
     )
     await db_session.flush()
 
@@ -1179,7 +1493,9 @@ async def test_scope_breakdown_failed_scope_overflow_counter(db_session: AsyncSe
 
 
 @pytest.mark.asyncio
-async def test_scope_breakdown_failed_analysis_overflow_counter(db_session: AsyncSession):
+async def test_scope_breakdown_failed_analysis_overflow_counter(
+    db_session: AsyncSession,
+):
     """scope_gate_triggered='analysis_overflow' increments failed_analysis_overflow.
 
     Other scope_gate values (post_review_overflow) and non-analysis failures
@@ -1192,34 +1508,51 @@ async def test_scope_breakdown_failed_analysis_overflow_counter(db_session: Asyn
     research_task = await _make_research_task(db_session, project.id)
     research_task_id = str(research_task.id)
 
-    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=3)]
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=3)
+    ]
     await db_session.flush()
 
     # medium + analysis_overflow
     await _create_child_task(
-        db_session, research_task.id, project.id,
+        db_session,
+        research_task.id,
+        project.id,
         status=TaskStatus.FAILED,
-        context={"scope": "medium", "failure_category": "SCOPE_OVERFLOW",
-                 "scope_gate_triggered": "analysis_overflow"},
+        context={
+            "scope": "medium",
+            "failure_category": "SCOPE_OVERFLOW",
+            "scope_gate_triggered": "analysis_overflow",
+        },
         payloads=[{"type": "create"}],
-        title="m-ao", latest_status_message="analysis overflow",
+        title="m-ao",
+        latest_status_message="analysis overflow",
     )
     # medium + post_review_overflow — must NOT increment
     await _create_child_task(
-        db_session, research_task.id, project.id,
+        db_session,
+        research_task.id,
+        project.id,
         status=TaskStatus.FAILED,
-        context={"scope": "medium", "failure_category": "SCOPE_OVERFLOW",
-                 "scope_gate_triggered": "post_review_overflow"},
+        context={
+            "scope": "medium",
+            "failure_category": "SCOPE_OVERFLOW",
+            "scope_gate_triggered": "post_review_overflow",
+        },
         payloads=[{"type": "create"}],
-        title="m-pro", latest_status_message="post review overflow",
+        title="m-pro",
+        latest_status_message="post review overflow",
     )
     # small + no scope_gate
     await _create_child_task(
-        db_session, research_task.id, project.id,
+        db_session,
+        research_task.id,
+        project.id,
         status=TaskStatus.FAILED,
         context={"scope": "small", "failure_category": "CODE_ERROR"},
         payloads=[{"type": "create"}],
-        title="s-code", latest_status_message="test failed",
+        title="s-code",
+        latest_status_message="test failed",
     )
     await db_session.flush()
 
@@ -1244,41 +1577,58 @@ async def test_scope_breakdown_failure_stages_per_scope(db_session: AsyncSession
     research_task = await _make_research_task(db_session, project.id)
     research_task_id = str(research_task.id)
 
-    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=4)]
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=4)
+    ]
     await db_session.flush()
 
     # small — test failure
     await _create_child_task(
-        db_session, research_task.id, project.id,
+        db_session,
+        research_task.id,
+        project.id,
         status=TaskStatus.FAILED,
         context={"scope": "small", "failure_category": "CODE_ERROR"},
         payloads=[{"type": "create"}],
-        title="s-test", latest_status_message="pytest assert failed",
+        title="s-test",
+        latest_status_message="pytest assert failed",
     )
     # small — lint failure
     await _create_child_task(
-        db_session, research_task.id, project.id,
+        db_session,
+        research_task.id,
+        project.id,
         status=TaskStatus.FAILED,
         context={"scope": "small", "failure_category": "CODE_ERROR"},
         payloads=[{"type": "create"}],
-        title="s-lint", latest_status_message="ruff E501",
+        title="s-lint",
+        latest_status_message="ruff E501",
     )
     # medium — merge failure via _previous_failure_stage
     await _create_child_task(
-        db_session, research_task.id, project.id,
+        db_session,
+        research_task.id,
+        project.id,
         status=TaskStatus.FAILED,
-        context={"scope": "medium", "failure_category": "CODE_ERROR",
-                 "_previous_failure_stage": "merge"},
+        context={
+            "scope": "medium",
+            "failure_category": "CODE_ERROR",
+            "_previous_failure_stage": "merge",
+        },
         payloads=[{"type": "create"}],
-        title="m-merge", latest_status_message="something else",
+        title="m-merge",
+        latest_status_message="something else",
     )
     # medium — unknown stage (AGENT_TIMEOUT, generic message)
     await _create_child_task(
-        db_session, research_task.id, project.id,
+        db_session,
+        research_task.id,
+        project.id,
         status=TaskStatus.FAILED,
         context={"scope": "medium", "failure_category": "AGENT_TIMEOUT"},
         payloads=[{"type": "create"}],
-        title="m-unknown", latest_status_message="No heartbeat for 300s",
+        title="m-unknown",
+        latest_status_message="No heartbeat for 300s",
     )
     await db_session.flush()
 
@@ -1302,30 +1652,44 @@ async def test_scope_breakdown_merged_cross_module(db_session: AsyncSession):
     project = await _create_project(db_session, directions=[])
     research_task = await _make_research_task(db_session, project.id)
     research_task_id = str(research_task.id)
-    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=3)]
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=3)
+    ]
     await db_session.flush()
 
     # merged, cross-module (backend + admin-ui)
     await _create_child_task(
-        db_session, research_task.id, project.id,
+        db_session,
+        research_task.id,
+        project.id,
         status=TaskStatus.COMPLETED,
-        context={"scope": "medium", "pr_merged": True,
-                 "_pr_changed_files": ["backend/app/a.py", "admin-ui/src/b.ts"]},
+        context={
+            "scope": "medium",
+            "pr_merged": True,
+            "_pr_changed_files": ["backend/app/a.py", "admin-ui/src/b.ts"],
+        },
         payloads=[{"type": "create"}],
         title="x1",
     )
     # merged, single-module
     await _create_child_task(
-        db_session, research_task.id, project.id,
+        db_session,
+        research_task.id,
+        project.id,
         status=TaskStatus.COMPLETED,
-        context={"scope": "medium", "pr_merged": True,
-                 "_pr_changed_files": ["backend/app/x.py", "backend/app/y.py"]},
+        context={
+            "scope": "medium",
+            "pr_merged": True,
+            "_pr_changed_files": ["backend/app/x.py", "backend/app/y.py"],
+        },
         payloads=[{"type": "create"}],
         title="x2",
     )
     # merged, no changed files recorded
     await _create_child_task(
-        db_session, research_task.id, project.id,
+        db_session,
+        research_task.id,
+        project.id,
         status=TaskStatus.COMPLETED,
         context={"scope": "small", "pr_merged": True},
         payloads=[{"type": "create"}],
@@ -1352,19 +1716,38 @@ def test_aggregate_scope_breakdown_sums_failure_stages():
     from app.spawn_calibration import _aggregate_scope_breakdown
 
     entries = [
-        {"scope_breakdown": {
-            "small": {"created": 2, "merged": 1, "failed": 1,
-                      "failed_infra": 0, "failed_scope_overflow": 0,
-                      "failure_stages": {"test": 1}},
-        }},
-        {"scope_breakdown": {
-            "small": {"created": 3, "merged": 1, "failed": 2,
-                      "failed_infra": 0, "failed_scope_overflow": 0,
-                      "failure_stages": {"test": 1, "lint": 1}},
-            "medium": {"created": 1, "merged": 0, "failed": 1,
-                       "failed_infra": 0, "failed_scope_overflow": 0,
-                       "failure_stages": {"merge": 1}},
-        }},
+        {
+            "scope_breakdown": {
+                "small": {
+                    "created": 2,
+                    "merged": 1,
+                    "failed": 1,
+                    "failed_infra": 0,
+                    "failed_scope_overflow": 0,
+                    "failure_stages": {"test": 1},
+                },
+            }
+        },
+        {
+            "scope_breakdown": {
+                "small": {
+                    "created": 3,
+                    "merged": 1,
+                    "failed": 2,
+                    "failed_infra": 0,
+                    "failed_scope_overflow": 0,
+                    "failure_stages": {"test": 1, "lint": 1},
+                },
+                "medium": {
+                    "created": 1,
+                    "merged": 0,
+                    "failed": 1,
+                    "failed_infra": 0,
+                    "failed_scope_overflow": 0,
+                    "failure_stages": {"merge": 1},
+                },
+            }
+        },
     ]
     agg = _aggregate_scope_breakdown(entries)
     assert agg["small"]["failure_stages"] == {"test": 2, "lint": 1}
@@ -1372,19 +1755,25 @@ def test_aggregate_scope_breakdown_sums_failure_stages():
 
 
 @pytest.mark.asyncio
-async def test_scope_breakdown_no_expansion_ratio_when_no_data(db_session: AsyncSession):
+async def test_scope_breakdown_no_expansion_ratio_when_no_data(
+    db_session: AsyncSession,
+):
     """avg_expansion_ratio is omitted when no qualifying tasks exist for a scope."""
     direction_id = "d-no-expand"
     project = await _create_project(db_session, directions=[])
     research_task = await _make_research_task(db_session, project.id)
     research_task_id = str(research_task.id)
 
-    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=1)]
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=1)
+    ]
     await db_session.flush()
 
     # Task missing _pr_changed_files entirely
     await _create_child_task(
-        db_session, research_task.id, project.id,
+        db_session,
+        research_task.id,
+        project.id,
         status=TaskStatus.COMPLETED,
         context={"pr_merged": True, "scope": "small", "related_files": ["a.py"]},
         payloads=[{"type": "create"}],
@@ -1407,6 +1796,7 @@ async def test_scope_breakdown_no_expansion_ratio_when_no_data(db_session: Async
 # ─────────────────────────────────────────────────────────────────────────────
 # 7. Co-change affinity index
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def _make_project_with_design_doc(design_doc: dict | None = None) -> Project:
     """Create an in-memory Project with the given design_doc (no DB flush needed)."""
@@ -1482,7 +1872,7 @@ def test_cochange_index_caps_total_files():
     """Index is capped at MAX_FILES (200) tracked files."""
     # Build a large index with 210 files
     large_index: dict = {
-        f"file{i}.py": {f"file{i+1}.py": float(i)} for i in range(210)
+        f"file{i}.py": {f"file{i + 1}.py": float(i)} for i in range(210)
     }
     project = _make_project_with_design_doc({"cochange_index": large_index})
     # Trigger an update with a small new PR
@@ -1499,13 +1889,24 @@ async def test_cochange_index_updated_on_merged_pr(db_session: AsyncSession):
     research_task = await _make_research_task(db_session, project.id)
     research_task_id = str(research_task.id)
 
-    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=1)]
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=1)
+    ]
     await db_session.flush()
 
     await _create_child_task(
-        db_session, research_task.id, project.id,
+        db_session,
+        research_task.id,
+        project.id,
         status=TaskStatus.COMPLETED,
-        context={"pr_merged": True, "_pr_changed_files": ["app/models.py", "app/schemas.py", "tests/test_models.py"]},
+        context={
+            "pr_merged": True,
+            "_pr_changed_files": [
+                "app/models.py",
+                "app/schemas.py",
+                "tests/test_models.py",
+            ],
+        },
         title="merged-with-files",
     )
     await db_session.flush()
@@ -1525,18 +1926,24 @@ async def test_cochange_index_updated_on_merged_pr(db_session: AsyncSession):
 
 
 @pytest.mark.asyncio
-async def test_cochange_index_not_updated_when_no_changed_files(db_session: AsyncSession):
+async def test_cochange_index_not_updated_when_no_changed_files(
+    db_session: AsyncSession,
+):
     """No cochange_index entry when merged PR has no _pr_changed_files."""
     direction_id = "d-nofiles"
     project = await _create_project(db_session, directions=[])
     research_task = await _make_research_task(db_session, project.id)
     research_task_id = str(research_task.id)
 
-    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=1)]
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=1)
+    ]
     await db_session.flush()
 
     await _create_child_task(
-        db_session, research_task.id, project.id,
+        db_session,
+        research_task.id,
+        project.id,
         status=TaskStatus.COMPLETED,
         context={"pr_merged": True},  # no _pr_changed_files
         title="merged-no-files",
@@ -1564,21 +1971,31 @@ async def test_scope_breakdown_unknown_default(db_session: AsyncSession):
     research_task = await _make_research_task(db_session, project.id)
     research_task_id = str(research_task.id)
 
-    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=2)]
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=2)
+    ]
     await db_session.flush()
 
     # Task with scope in context — should be categorized as "small"
-    await _create_child_task(db_session, research_task.id, project.id,
-                              status=TaskStatus.COMPLETED,
-                              context={"scope": "small"},
-                              payloads=[{"type": "fix"}],
-                              title="with-scope")
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={"scope": "small"},
+        payloads=[{"type": "fix"}],
+        title="with-scope",
+    )
     # Task with no scope in context — should default to "unknown"
-    await _create_child_task(db_session, research_task.id, project.id,
-                              status=TaskStatus.COMPLETED,
-                              context={},
-                              payloads=[{"type": "fix"}],
-                              title="no-scope")
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={},
+        payloads=[{"type": "fix"}],
+        title="no-scope",
+    )
     await db_session.flush()
 
     await _update_direction_research_outcomes(
@@ -1600,6 +2017,7 @@ async def test_scope_breakdown_unknown_default(db_session: AsyncSession):
 # 8. Decomposition quality (plan parent metrics)
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def test_longest_chain_length_empty_and_linear():
     assert _longest_chain_length({}) == 0
     # A -> B -> C (depth 3)
@@ -1619,11 +2037,15 @@ async def test_decomposition_quality_basic(db_session: AsyncSession):
     project = await _create_project(db_session, directions=[])
     research_task = await _make_research_task(db_session, project.id)
     research_task_id = str(research_task.id)
-    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=3)]
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=3)
+    ]
     await db_session.flush()
 
     plan = await _create_child_task(
-        db_session, research_task.id, project.id,
+        db_session,
+        research_task.id,
+        project.id,
         status=TaskStatus.COMPLETED,
         context={},
         payloads=[{"type": "plan"}],
@@ -1631,21 +2053,30 @@ async def test_decomposition_quality_basic(db_session: AsyncSession):
     )
     # Subtask 1: merged, 2 files, cross-module (backend + tests)
     s1 = await _create_child_task(
-        db_session, plan.id, project.id,
+        db_session,
+        plan.id,
+        project.id,
         status=TaskStatus.COMPLETED,
-        context={"pr_merged": True, "_pr_changed_files": ["backend/app/x.py", "tests/test_x.py"]},
+        context={
+            "pr_merged": True,
+            "_pr_changed_files": ["backend/app/x.py", "tests/test_x.py"],
+        },
         title="s1",
     )
     # Subtask 2: merged, 1 file (single module)
     s2 = await _create_child_task(
-        db_session, plan.id, project.id,
+        db_session,
+        plan.id,
+        project.id,
         status=TaskStatus.COMPLETED,
         context={"pr_merged": True, "_pr_changed_files": ["backend/app/y.py"]},
         title="s2",
     )
     # Subtask 3: failed with non-infra error; depends on s1 and s2
     s3 = await _create_child_task(
-        db_session, plan.id, project.id,
+        db_session,
+        plan.id,
+        project.id,
         status=TaskStatus.FAILED,
         context={"failure_category": "CODE_ERROR"},
         title="s3",
@@ -1680,29 +2111,39 @@ async def test_decomposition_quality_basic(db_session: AsyncSession):
 
 
 @pytest.mark.asyncio
-async def test_decomposition_quality_ignores_infra_failures_in_merge_rate(db_session: AsyncSession):
+async def test_decomposition_quality_ignores_infra_failures_in_merge_rate(
+    db_session: AsyncSession,
+):
     """Infra-class failures are excluded from the merge rate denominator."""
     direction_id = "d-decomp-infra"
     project = await _create_project(db_session, directions=[])
     research_task = await _make_research_task(db_session, project.id)
     research_task_id = str(research_task.id)
-    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=2)]
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=2)
+    ]
     await db_session.flush()
 
     plan = await _create_child_task(
-        db_session, research_task.id, project.id,
+        db_session,
+        research_task.id,
+        project.id,
         status=TaskStatus.COMPLETED,
         payloads=[{"type": "plan"}],
         title="plan-b",
     )
     await _create_child_task(
-        db_session, plan.id, project.id,
+        db_session,
+        plan.id,
+        project.id,
         status=TaskStatus.COMPLETED,
         context={"pr_merged": True, "_pr_changed_files": ["a.py"]},
         title="m",
     )
     await _create_child_task(
-        db_session, plan.id, project.id,
+        db_session,
+        plan.id,
+        project.id,
         status=TaskStatus.FAILED,
         context={"failure_category": "RATE_LIMIT"},
         title="infra",
@@ -1722,18 +2163,24 @@ async def test_decomposition_quality_ignores_infra_failures_in_merge_rate(db_ses
 
 
 @pytest.mark.asyncio
-async def test_decomposition_quality_records_failed_plan_with_zero_subtasks(db_session: AsyncSession):
+async def test_decomposition_quality_records_failed_plan_with_zero_subtasks(
+    db_session: AsyncSession,
+):
     """A terminal plan that produced no subtasks gets a sentinel entry with
     subtask_merge_rate=0.0 so _poor_decomp_history can count the failure."""
     direction_id = "d-decomp-zero"
     project = await _create_project(db_session, directions=[])
     research_task = await _make_research_task(db_session, project.id)
     research_task_id = str(research_task.id)
-    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=1)]
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=1)
+    ]
     await db_session.flush()
 
     plan = await _create_child_task(
-        db_session, research_task.id, project.id,
+        db_session,
+        research_task.id,
+        project.id,
         status=TaskStatus.FAILED,
         context={"failure_category": "CODE_ERROR"},
         payloads=[{"type": "plan"}],
@@ -1764,17 +2211,23 @@ async def test_decomposition_quality_skips_non_terminal_plans(db_session: AsyncS
     project = await _create_project(db_session, directions=[])
     research_task = await _make_research_task(db_session, project.id)
     research_task_id = str(research_task.id)
-    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=1)]
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=1)
+    ]
     await db_session.flush()
 
     plan = await _create_child_task(
-        db_session, research_task.id, project.id,
+        db_session,
+        research_task.id,
+        project.id,
         status=TaskStatus.EVALUATING,
         payloads=[{"type": "plan"}],
         title="plan-open",
     )
     await _create_child_task(
-        db_session, plan.id, project.id,
+        db_session,
+        plan.id,
+        project.id,
         status=TaskStatus.COMPLETED,
         context={"pr_merged": True, "_pr_changed_files": ["a.py"]},
         title="s",
@@ -1796,6 +2249,7 @@ async def test_decomposition_quality_skips_non_terminal_plans(db_session: AsyncS
 # 9. Pipeline scope merge rate auto-population
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @pytest.fixture
 def _reset_pipeline_scope_rates():
     """Snapshot/restore runtime_config['pipeline_scope_merge_rates'] per test."""
@@ -1813,23 +2267,44 @@ def _direction_with_scope_breakdown(direction_id: str, scope_breakdown: dict) ->
         "status": "active",
         "priority": "medium",
         "paths": [],
-        "research_history": [{"task_id": str(uuid.uuid4()), "scope_breakdown": scope_breakdown}],
+        "research_history": [
+            {"task_id": str(uuid.uuid4()), "scope_breakdown": scope_breakdown}
+        ],
     }
 
 
-def test_refresh_pipeline_scope_merge_rates_aggregates_and_publishes(_reset_pipeline_scope_rates):
+def test_refresh_pipeline_scope_merge_rates_aggregates_and_publishes(
+    _reset_pipeline_scope_rates,
+):
     """Rates are aggregated across all directions and written to runtime_config."""
     project = Project(
-        name="p", user_id="u",
+        name="p",
+        user_id="u",
         directions=[
-            _direction_with_scope_breakdown("d1", {
-                "small": {"created": 4, "merged": 3, "failed": 1,
-                          "failed_infra": 0, "failed_scope_overflow": 0},
-            }),
-            _direction_with_scope_breakdown("d2", {
-                "small": {"created": 3, "merged": 2, "failed": 1,
-                          "failed_infra": 0, "failed_scope_overflow": 0},
-            }),
+            _direction_with_scope_breakdown(
+                "d1",
+                {
+                    "small": {
+                        "created": 4,
+                        "merged": 3,
+                        "failed": 1,
+                        "failed_infra": 0,
+                        "failed_scope_overflow": 0,
+                    },
+                },
+            ),
+            _direction_with_scope_breakdown(
+                "d2",
+                {
+                    "small": {
+                        "created": 3,
+                        "merged": 2,
+                        "failed": 1,
+                        "failed_infra": 0,
+                        "failed_scope_overflow": 0,
+                    },
+                },
+            ),
         ],
     )
     _refresh_pipeline_scope_merge_rates(project)
@@ -1838,17 +2313,33 @@ def test_refresh_pipeline_scope_merge_rates_aggregates_and_publishes(_reset_pipe
     assert runtime_config["pipeline_scope_merge_rates"] == {"small": round(5 / 7, 3)}
 
 
-def test_refresh_pipeline_scope_merge_rates_omits_sparse_scopes(_reset_pipeline_scope_rates):
+def test_refresh_pipeline_scope_merge_rates_omits_sparse_scopes(
+    _reset_pipeline_scope_rates,
+):
     """Scopes with < 5 effective data points are excluded from the published dict."""
     project = Project(
-        name="p", user_id="u",
+        name="p",
+        user_id="u",
         directions=[
-            _direction_with_scope_breakdown("d1", {
-                "small": {"created": 6, "merged": 4, "failed": 2,
-                          "failed_infra": 0, "failed_scope_overflow": 0},
-                "medium": {"created": 3, "merged": 1, "failed": 2,
-                           "failed_infra": 0, "failed_scope_overflow": 0},
-            }),
+            _direction_with_scope_breakdown(
+                "d1",
+                {
+                    "small": {
+                        "created": 6,
+                        "merged": 4,
+                        "failed": 2,
+                        "failed_infra": 0,
+                        "failed_scope_overflow": 0,
+                    },
+                    "medium": {
+                        "created": 3,
+                        "merged": 1,
+                        "failed": 2,
+                        "failed_infra": 0,
+                        "failed_scope_overflow": 0,
+                    },
+                },
+            ),
         ],
     )
     _refresh_pipeline_scope_merge_rates(project)
@@ -1857,15 +2348,26 @@ def test_refresh_pipeline_scope_merge_rates_omits_sparse_scopes(_reset_pipeline_
     assert "medium" not in rates  # effective = 3, excluded
 
 
-def test_refresh_pipeline_scope_merge_rates_excludes_infra_from_denominator(_reset_pipeline_scope_rates):
+def test_refresh_pipeline_scope_merge_rates_excludes_infra_from_denominator(
+    _reset_pipeline_scope_rates,
+):
     """Non-overflow infra failures are excluded from the effective denominator."""
     project = Project(
-        name="p", user_id="u",
+        name="p",
+        user_id="u",
         directions=[
-            _direction_with_scope_breakdown("d1", {
-                "medium": {"created": 10, "merged": 3, "failed": 7,
-                           "failed_infra": 5, "failed_scope_overflow": 1},
-            }),
+            _direction_with_scope_breakdown(
+                "d1",
+                {
+                    "medium": {
+                        "created": 10,
+                        "merged": 3,
+                        "failed": 7,
+                        "failed_infra": 5,
+                        "failed_scope_overflow": 1,
+                    },
+                },
+            ),
         ],
     )
     _refresh_pipeline_scope_merge_rates(project)
@@ -1889,19 +2391,40 @@ def test_pipeline_scope_expansion_ratios_fallback(_reset_pipeline_scope_rates):
 
     # Pipeline signal: 5 medium history entries with avg_expansion_ratio.
     entries = [
-        {"task_id": str(uuid.uuid4()), "scope_breakdown": {
-            "medium": {"created": 1, "merged": 1, "failed": 0,
-                       "failed_infra": 0, "failed_scope_overflow": 0,
-                       "avg_expansion_ratio": 3.0,
-                       "avg_expansion_ratio_merged": 3.0},
-        }} for _ in range(5)
+        {
+            "task_id": str(uuid.uuid4()),
+            "scope_breakdown": {
+                "medium": {
+                    "created": 1,
+                    "merged": 1,
+                    "failed": 0,
+                    "failed_infra": 0,
+                    "failed_scope_overflow": 0,
+                    "avg_expansion_ratio": 3.0,
+                    "avg_expansion_ratio_merged": 3.0,
+                },
+            },
+        }
+        for _ in range(5)
     ]
-    seeded = {"id": "d-seed", "text": "t", "status": "active",
-              "priority": "medium", "paths": [], "research_history": entries}
+    seeded = {
+        "id": "d-seed",
+        "text": "t",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "research_history": entries,
+    }
     # A brand-new direction with no research_history — only benefits from the
     # pipeline-wide fallback.
-    fresh = {"id": "d-new", "text": "t", "status": "active",
-             "priority": "medium", "paths": [], "research_history": []}
+    fresh = {
+        "id": "d-new",
+        "text": "t",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "research_history": [],
+    }
     project = Project(name="p", user_id="u", directions=[seeded, fresh])
 
     _refresh_pipeline_scope_merge_rates(project)
@@ -1912,14 +2435,26 @@ def test_pipeline_scope_expansion_ratios_fallback(_reset_pipeline_scope_rates):
     assert _avg_medium_expansion_ratio([fresh]) is None
 
     # Sparse signal (< 5 samples) → no publication, fallback falls through to 2.0.
-    project_sparse = Project(name="p", user_id="u", directions=[
-        _direction_with_scope_breakdown("d1", {
-            "medium": {"created": 1, "merged": 1, "failed": 0,
-                       "failed_infra": 0, "failed_scope_overflow": 0,
-                       "avg_expansion_ratio": 3.0,
-                       "avg_expansion_ratio_merged": 3.0},
-        }),
-    ])
+    project_sparse = Project(
+        name="p",
+        user_id="u",
+        directions=[
+            _direction_with_scope_breakdown(
+                "d1",
+                {
+                    "medium": {
+                        "created": 1,
+                        "merged": 1,
+                        "failed": 0,
+                        "failed_infra": 0,
+                        "failed_scope_overflow": 0,
+                        "avg_expansion_ratio": 3.0,
+                        "avg_expansion_ratio_merged": 3.0,
+                    },
+                },
+            ),
+        ],
+    )
     _refresh_pipeline_scope_merge_rates(project_sparse)
     assert runtime_config["pipeline_scope_expansion_ratios"] == {}
 
@@ -1936,26 +2471,42 @@ async def test_update_outcomes_publishes_pipeline_scope_rates(
 
     # Seed another direction with history so the cross-direction aggregation reaches
     # the 5-effective threshold after this cycle's 2 small tasks land.
-    seeded_direction = _direction_with_scope_breakdown("d-seed", {
-        "small": {"created": 3, "merged": 3, "failed": 0,
-                  "failed_infra": 0, "failed_scope_overflow": 0},
-    })
+    seeded_direction = _direction_with_scope_breakdown(
+        "d-seed",
+        {
+            "small": {
+                "created": 3,
+                "merged": 3,
+                "failed": 0,
+                "failed_infra": 0,
+                "failed_scope_overflow": 0,
+            },
+        },
+    )
     project.directions = [
         _make_direction(direction_id, research_task_id, tasks_created=2),
         seeded_direction,
     ]
     await db_session.flush()
 
-    await _create_child_task(db_session, research_task.id, project.id,
-                             status=TaskStatus.COMPLETED,
-                             context={"pr_merged": True, "scope": "small"},
-                             payloads=[{"type": "create"}],
-                             title="s1")
-    await _create_child_task(db_session, research_task.id, project.id,
-                             status=TaskStatus.FAILED,
-                             context={"scope": "small", "failure_category": "CODE_ERROR"},
-                             payloads=[{"type": "create"}],
-                             title="s2")
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True, "scope": "small"},
+        payloads=[{"type": "create"}],
+        title="s1",
+    )
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.FAILED,
+        context={"scope": "small", "failure_category": "CODE_ERROR"},
+        payloads=[{"type": "create"}],
+        title="s2",
+    )
     await db_session.flush()
 
     await _update_direction_research_outcomes(
@@ -1980,7 +2531,9 @@ async def test_update_outcomes_writes_cost_by_provider_model(db_session: AsyncSe
     project = await _create_project(db_session, directions=[])
     research_task = await _make_research_task(db_session, project.id)
     research_task_id = str(research_task.id)
-    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=3)]
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=3)
+    ]
     await db_session.flush()
 
     now = _utcnow()
@@ -2054,12 +2607,18 @@ async def test_update_outcomes_writes_cost_by_provider_model(db_session: AsyncSe
 # 10. Cascade-cancellation exclusion from failure metrics
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def test_is_cascade_cancelled_detects_signals():
     """All four cascade signals are detected; genuine CANCELLED is not."""
     # Requeue replacement via _replaced_by_task_id in context
-    t = Task(project_id=uuid.uuid4(), title="t", payloads=[{"type": "create"}],
-             status=TaskStatus.CANCELLED, context={"_replaced_by_task_id": "x"},
-             created_by="ORCHESTRATOR")
+    t = Task(
+        project_id=uuid.uuid4(),
+        title="t",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.CANCELLED,
+        context={"_replaced_by_task_id": "x"},
+        created_by="ORCHESTRATOR",
+    )
     assert _is_cascade_cancelled(t)
     # Requeue message
     t.context = {}
@@ -2081,9 +2640,14 @@ def test_is_cascade_cancelled_detects_signals():
 
 
 def test_counts_as_failure_excludes_cascade_cancelled():
-    t = Task(project_id=uuid.uuid4(), title="t", payloads=[{"type": "create"}],
-             status=TaskStatus.CANCELLED, context={"_replaced_by_task_id": "x"},
-             created_by="ORCHESTRATOR")
+    t = Task(
+        project_id=uuid.uuid4(),
+        title="t",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.CANCELLED,
+        context={"_replaced_by_task_id": "x"},
+        created_by="ORCHESTRATOR",
+    )
     assert not _counts_as_failure(t)
     t.context = {}
     t.latest_status_message = "Cancelled by admin"
@@ -2093,7 +2657,9 @@ def test_counts_as_failure_excludes_cascade_cancelled():
 
 
 @pytest.mark.asyncio
-async def test_cascade_cancelled_excluded_from_failure_buckets(db_session: AsyncSession):
+async def test_cascade_cancelled_excluded_from_failure_buckets(
+    db_session: AsyncSession,
+):
     """A cascade-cancelled task stays in tasks_cancelled but is excluded from
     taxonomy_summary, scope_breakdown.failed, type_breakdown.failed,
     stage_dropout, and failed_task_details."""
@@ -2102,32 +2668,43 @@ async def test_cascade_cancelled_excluded_from_failure_buckets(db_session: Async
     research_task = await _make_research_task(db_session, project.id)
     research_task_id = str(research_task.id)
 
-    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=3)]
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=3)
+    ]
     await db_session.flush()
 
     # Genuine FAILED — should count everywhere
     await _create_child_task(
-        db_session, research_task.id, project.id,
+        db_session,
+        research_task.id,
+        project.id,
         status=TaskStatus.FAILED,
         context={"scope": "small", "failure_category": "CODE_ERROR"},
         payloads=[{"type": "create"}],
-        title="real-failure", latest_status_message="pytest failed",
+        title="real-failure",
+        latest_status_message="pytest failed",
     )
     # Cascade-cancelled via requeue clone — should NOT count as failure
     await _create_child_task(
-        db_session, research_task.id, project.id,
+        db_session,
+        research_task.id,
+        project.id,
         status=TaskStatus.CANCELLED,
         context={"scope": "small", "_replaced_by_task_id": str(uuid.uuid4())},
         payloads=[{"type": "create"}],
-        title="requeued", latest_status_message="Parent requeued — replaced by retry",
+        title="requeued",
+        latest_status_message="Parent requeued — replaced by retry",
     )
     # Cascade-cancelled via parent dependency failure — should NOT count
     await _create_child_task(
-        db_session, research_task.id, project.id,
+        db_session,
+        research_task.id,
+        project.id,
         status=TaskStatus.CANCELLED,
         context={"scope": "small"},
         payloads=[{"type": "create"}],
-        title="dep-cascade", latest_status_message="Cancelled: parent dependency failed",
+        title="dep-cascade",
+        latest_status_message="Cancelled: parent dependency failed",
     )
     await db_session.flush()
 
@@ -2171,15 +2748,20 @@ async def test_genuine_cancelled_still_counts_as_failure(db_session: AsyncSessio
     research_task = await _make_research_task(db_session, project.id)
     research_task_id = str(research_task.id)
 
-    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=1)]
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=1)
+    ]
     await db_session.flush()
 
     await _create_child_task(
-        db_session, research_task.id, project.id,
+        db_session,
+        research_task.id,
+        project.id,
         status=TaskStatus.CANCELLED,
         context={"scope": "small", "failure_category": "AGENT_TIMEOUT"},
         payloads=[{"type": "create"}],
-        title="genuine-cancel", latest_status_message="Task timed out on VM",
+        title="genuine-cancel",
+        latest_status_message="Task timed out on VM",
     )
     await db_session.flush()
 
@@ -2200,6 +2782,7 @@ async def test_genuine_cancelled_still_counts_as_failure(db_session: AsyncSessio
 # Preventive context tracking
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_preventive_context_counts(db_session: AsyncSession):
     """preventive_context_tasks_{created,merged,failed} counted from child context."""
@@ -2208,31 +2791,41 @@ async def test_preventive_context_counts(db_session: AsyncSession):
     research_task = await _make_research_task(db_session, project.id)
     research_task_id = str(research_task.id)
 
-    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=5)]
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=5)
+    ]
     await db_session.flush()
 
     # 3 preventive-context: 1 merged, 1 failed, 1 in-progress/other
     await _create_child_task(
-        db_session, research_task.id, project.id,
+        db_session,
+        research_task.id,
+        project.id,
         status=TaskStatus.COMPLETED,
         context={"has_preventive_context": True, "pr_merged": True},
         title="prev-merged",
     )
     await _create_child_task(
-        db_session, research_task.id, project.id,
+        db_session,
+        research_task.id,
+        project.id,
         status=TaskStatus.FAILED,
         context={"has_preventive_context": True},
         title="prev-failed",
     )
     await _create_child_task(
-        db_session, research_task.id, project.id,
+        db_session,
+        research_task.id,
+        project.id,
         status=TaskStatus.COMPLETED,
         context={"has_preventive_context": True},  # completed, not merged
         title="prev-completed-no-pr",
     )
     # Non-preventive: shouldn't count
     await _create_child_task(
-        db_session, research_task.id, project.id,
+        db_session,
+        research_task.id,
+        project.id,
         status=TaskStatus.COMPLETED,
         context={"pr_merged": True},
         title="no-prev-merged",
@@ -2261,30 +2854,40 @@ async def test_remediation_task_counts(db_session: AsyncSession):
     research_task = await _make_research_task(db_session, project.id)
     research_task_id = str(research_task.id)
 
-    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=5)]
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=5)
+    ]
     await db_session.flush()
 
     await _create_child_task(
-        db_session, research_task.id, project.id,
+        db_session,
+        research_task.id,
+        project.id,
         status=TaskStatus.COMPLETED,
         context={"diagnosis_task_id": "diag-1", "pr_merged": True},
         title="rem-diag-merged",
     )
     await _create_child_task(
-        db_session, research_task.id, project.id,
+        db_session,
+        research_task.id,
+        project.id,
         status=TaskStatus.FAILED,
         context={"auto_remediation": True},
         title="rem-auto-failed",
     )
     await _create_child_task(
-        db_session, research_task.id, project.id,
+        db_session,
+        research_task.id,
+        project.id,
         status=TaskStatus.COMPLETED,
         context={"auto_remediation": True},  # completed, not merged
         title="rem-auto-no-pr",
     )
     # Non-remediation: shouldn't count
     await _create_child_task(
-        db_session, research_task.id, project.id,
+        db_session,
+        research_task.id,
+        project.id,
         status=TaskStatus.COMPLETED,
         context={"pr_merged": True},
         title="regular-merged",
@@ -2307,19 +2910,44 @@ async def test_remediation_task_counts(db_session: AsyncSession):
 
 def test_synthesize_prompt_quality_patterns_emits_when_signal_meaningful():
     from app.direction_outcomes import synthesize_prompt_quality_patterns
+
     history = [
-        {"prompt_telemetry": {
-            "merged": {"count": 3, "avg_char_count": 1200, "avg_related_file_count": 4.0,
-                       "frac_mentions_tests": 0.8, "frac_mentions_symbols": 0.7},
-            "failed": {"count": 2, "avg_char_count": 800, "avg_related_file_count": 2.0,
-                       "frac_mentions_tests": 0.3, "frac_mentions_symbols": 0.2},
-        }},
-        {"prompt_telemetry": {
-            "merged": {"count": 2, "avg_char_count": 1300, "avg_related_file_count": 5.0,
-                       "frac_mentions_tests": 0.9, "frac_mentions_symbols": 0.8},
-            "failed": {"count": 2, "avg_char_count": 700, "avg_related_file_count": 1.5,
-                       "frac_mentions_tests": 0.2, "frac_mentions_symbols": 0.1},
-        }},
+        {
+            "prompt_telemetry": {
+                "merged": {
+                    "count": 3,
+                    "avg_char_count": 1200,
+                    "avg_related_file_count": 4.0,
+                    "frac_mentions_tests": 0.8,
+                    "frac_mentions_symbols": 0.7,
+                },
+                "failed": {
+                    "count": 2,
+                    "avg_char_count": 800,
+                    "avg_related_file_count": 2.0,
+                    "frac_mentions_tests": 0.3,
+                    "frac_mentions_symbols": 0.2,
+                },
+            }
+        },
+        {
+            "prompt_telemetry": {
+                "merged": {
+                    "count": 2,
+                    "avg_char_count": 1300,
+                    "avg_related_file_count": 5.0,
+                    "frac_mentions_tests": 0.9,
+                    "frac_mentions_symbols": 0.8,
+                },
+                "failed": {
+                    "count": 2,
+                    "avg_char_count": 700,
+                    "avg_related_file_count": 1.5,
+                    "frac_mentions_tests": 0.2,
+                    "frac_mentions_symbols": 0.1,
+                },
+            }
+        },
     ]
     notes = synthesize_prompt_quality_patterns(history)
     assert len(notes) >= 3
@@ -2330,53 +2958,114 @@ def test_synthesize_prompt_quality_patterns_emits_when_signal_meaningful():
 
 def test_synthesize_prompt_quality_patterns_skips_when_too_few_cycles():
     from app.direction_outcomes import synthesize_prompt_quality_patterns
+
     history = [
-        {"prompt_telemetry": {
-            "merged": {"count": 2, "avg_char_count": 1200, "frac_mentions_tests": 0.8},
-            "failed": {"count": 2, "avg_char_count": 600, "frac_mentions_tests": 0.2},
-        }},
+        {
+            "prompt_telemetry": {
+                "merged": {
+                    "count": 2,
+                    "avg_char_count": 1200,
+                    "frac_mentions_tests": 0.8,
+                },
+                "failed": {
+                    "count": 2,
+                    "avg_char_count": 600,
+                    "frac_mentions_tests": 0.2,
+                },
+            }
+        },
     ]
     assert synthesize_prompt_quality_patterns(history) == []
 
 
 def test_synthesize_prompt_quality_patterns_skips_when_differences_are_noise():
     from app.direction_outcomes import synthesize_prompt_quality_patterns
+
     history = [
-        {"prompt_telemetry": {
-            "merged": {"count": 2, "avg_char_count": 1000, "avg_related_file_count": 3.0,
-                       "frac_mentions_tests": 0.5, "frac_mentions_symbols": 0.5},
-            "failed": {"count": 2, "avg_char_count": 1010, "avg_related_file_count": 3.1,
-                       "frac_mentions_tests": 0.55, "frac_mentions_symbols": 0.5},
-        }},
-        {"prompt_telemetry": {
-            "merged": {"count": 2, "avg_char_count": 990, "avg_related_file_count": 2.9,
-                       "frac_mentions_tests": 0.5, "frac_mentions_symbols": 0.5},
-            "failed": {"count": 2, "avg_char_count": 1000, "avg_related_file_count": 3.0,
-                       "frac_mentions_tests": 0.55, "frac_mentions_symbols": 0.5},
-        }},
+        {
+            "prompt_telemetry": {
+                "merged": {
+                    "count": 2,
+                    "avg_char_count": 1000,
+                    "avg_related_file_count": 3.0,
+                    "frac_mentions_tests": 0.5,
+                    "frac_mentions_symbols": 0.5,
+                },
+                "failed": {
+                    "count": 2,
+                    "avg_char_count": 1010,
+                    "avg_related_file_count": 3.1,
+                    "frac_mentions_tests": 0.55,
+                    "frac_mentions_symbols": 0.5,
+                },
+            }
+        },
+        {
+            "prompt_telemetry": {
+                "merged": {
+                    "count": 2,
+                    "avg_char_count": 990,
+                    "avg_related_file_count": 2.9,
+                    "frac_mentions_tests": 0.5,
+                    "frac_mentions_symbols": 0.5,
+                },
+                "failed": {
+                    "count": 2,
+                    "avg_char_count": 1000,
+                    "avg_related_file_count": 3.0,
+                    "frac_mentions_tests": 0.55,
+                    "frac_mentions_symbols": 0.5,
+                },
+            }
+        },
     ]
     assert synthesize_prompt_quality_patterns(history) == []
 
 
 def test_synthesize_prompt_quality_patterns_emits_scope_segmented_note():
     from app.direction_outcomes import synthesize_prompt_quality_patterns
+
     history = [
-        {"prompt_telemetry": {
-            "merged": {"count": 3, "avg_char_count": 600, "avg_related_file_count": 2.0,
-                       "frac_mentions_tests": 0.5, "frac_mentions_symbols": 0.5},
-            "failed": {"count": 2, "avg_char_count": 600, "avg_related_file_count": 2.0,
-                       "frac_mentions_tests": 0.5, "frac_mentions_symbols": 0.5},
-            "merged_small": {"count": 2, "avg_char_count": 300},
-            "failed_small": {"count": 2, "avg_char_count": 900},
-        }},
-        {"prompt_telemetry": {
-            "merged": {"count": 3, "avg_char_count": 600, "avg_related_file_count": 2.0,
-                       "frac_mentions_tests": 0.5, "frac_mentions_symbols": 0.5},
-            "failed": {"count": 2, "avg_char_count": 600, "avg_related_file_count": 2.0,
-                       "frac_mentions_tests": 0.5, "frac_mentions_symbols": 0.5},
-            "merged_small": {"count": 2, "avg_char_count": 320},
-            "failed_small": {"count": 2, "avg_char_count": 880},
-        }},
+        {
+            "prompt_telemetry": {
+                "merged": {
+                    "count": 3,
+                    "avg_char_count": 600,
+                    "avg_related_file_count": 2.0,
+                    "frac_mentions_tests": 0.5,
+                    "frac_mentions_symbols": 0.5,
+                },
+                "failed": {
+                    "count": 2,
+                    "avg_char_count": 600,
+                    "avg_related_file_count": 2.0,
+                    "frac_mentions_tests": 0.5,
+                    "frac_mentions_symbols": 0.5,
+                },
+                "merged_small": {"count": 2, "avg_char_count": 300},
+                "failed_small": {"count": 2, "avg_char_count": 900},
+            }
+        },
+        {
+            "prompt_telemetry": {
+                "merged": {
+                    "count": 3,
+                    "avg_char_count": 600,
+                    "avg_related_file_count": 2.0,
+                    "frac_mentions_tests": 0.5,
+                    "frac_mentions_symbols": 0.5,
+                },
+                "failed": {
+                    "count": 2,
+                    "avg_char_count": 600,
+                    "avg_related_file_count": 2.0,
+                    "frac_mentions_tests": 0.5,
+                    "frac_mentions_symbols": 0.5,
+                },
+                "merged_small": {"count": 2, "avg_char_count": 320},
+                "failed_small": {"count": 2, "avg_char_count": 880},
+            }
+        },
     ]
     notes = synthesize_prompt_quality_patterns(history)
     assert any("Small-scope" in n for n in notes)
@@ -2384,6 +3073,7 @@ def test_synthesize_prompt_quality_patterns_emits_scope_segmented_note():
 
 def test_summarize_review_quality_feedback_includes_top_categories():
     from app.direction_outcomes import summarize_review_quality_feedback
+
     history = [{"reviews_dismissed": 1, "tasks_completed": 1}]
     dfa = {
         "missing_tests": 4,
@@ -2400,6 +3090,7 @@ def test_summarize_review_quality_feedback_includes_top_categories():
 
 def test_summarize_review_quality_feedback_skips_top_categories_when_sparse():
     from app.direction_outcomes import summarize_review_quality_feedback
+
     history = [{"reviews_dismissed": 1, "tasks_completed": 1}]
     dfa = {"missing_tests": 1, "style": 1, "total": 2}
     result = summarize_review_quality_feedback(history, dfa)
@@ -2409,6 +3100,7 @@ def test_summarize_review_quality_feedback_skips_top_categories_when_sparse():
 
 def test_summarize_review_quality_feedback_no_dfa_unchanged():
     from app.direction_outcomes import summarize_review_quality_feedback
+
     history = [{"reviews_dismissed": 2, "tasks_completed": 1}]
     result = summarize_review_quality_feedback(history)
     assert result is not None
@@ -2418,6 +3110,7 @@ def test_summarize_review_quality_feedback_no_dfa_unchanged():
 # ─────────────────────────────────────────────────────────────────────────────
 # Autonomous / operator-assisted classification
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 class TestIsAutonomousMerge:
     """Unit tests for is_autonomous_merge — pure function, no DB required."""
@@ -2435,31 +3128,37 @@ class TestIsAutonomousMerge:
 
     def test_orchestrator_created_no_override_is_autonomous(self):
         from app.direction_outcomes import is_autonomous_merge
+
         task = self._make_task(created_by="ORCHESTRATOR")
         assert is_autonomous_merge(task) is True
 
     def test_user_created_is_operator_assisted(self):
         from app.direction_outcomes import is_autonomous_merge
+
         task = self._make_task(created_by="USER")
         assert is_autonomous_merge(task) is False
 
     def test_review_dismissed_is_operator_assisted(self):
         from app.direction_outcomes import is_autonomous_merge
+
         task = self._make_task(context={"review_dismissed": True})
         assert is_autonomous_merge(task) is False
 
     def test_user_overrode_review_is_operator_assisted(self):
         from app.direction_outcomes import is_autonomous_merge
+
         task = self._make_task(context={"user_overrode_review": True})
         assert is_autonomous_merge(task) is False
 
     def test_orchestrator_with_pr_merged_and_no_override_is_autonomous(self):
         from app.direction_outcomes import is_autonomous_merge
+
         task = self._make_task(context={"pr_merged": True})
         assert is_autonomous_merge(task) is True
 
     def test_user_created_even_with_pr_merged_is_operator_assisted(self):
         from app.direction_outcomes import is_autonomous_merge
+
         task = self._make_task(created_by="USER", context={"pr_merged": True})
         assert is_autonomous_merge(task) is False
 
@@ -2467,6 +3166,7 @@ class TestIsAutonomousMerge:
 # ─────────────────────────────────────────────────────────────────────────────
 # Aggregation: autonomous_prs_merged + assisted_prs_merged sum invariant
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_autonomous_assisted_sum_equals_prs_merged(db_session: AsyncSession):
@@ -2476,18 +3176,36 @@ async def test_autonomous_assisted_sum_equals_prs_merged(db_session: AsyncSessio
     research_task = await _make_research_task(db_session, project.id)
     research_task_id = str(research_task.id)
 
-    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=4)]
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=4)
+    ]
     await db_session.flush()
 
     # 2 autonomous merges, 1 operator-assisted merge, 1 rejected
-    await _create_child_task(db_session, research_task.id, project.id,
-                              context={"pr_merged": True}, created_by="ORCHESTRATOR")
-    await _create_child_task(db_session, research_task.id, project.id,
-                              context={"pr_merged": True}, created_by="ORCHESTRATOR")
-    await _create_child_task(db_session, research_task.id, project.id,
-                              context={"pr_merged": True}, created_by="USER")
-    await _create_child_task(db_session, research_task.id, project.id,
-                              context={"pr_rejected": True})
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        context={"pr_merged": True},
+        created_by="ORCHESTRATOR",
+    )
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        context={"pr_merged": True},
+        created_by="ORCHESTRATOR",
+    )
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        context={"pr_merged": True},
+        created_by="USER",
+    )
+    await _create_child_task(
+        db_session, research_task.id, project.id, context={"pr_rejected": True}
+    )
     await db_session.flush()
 
     await _update_direction_research_outcomes(
@@ -2502,7 +3220,10 @@ async def test_autonomous_assisted_sum_equals_prs_merged(db_session: AsyncSessio
     assert entry["prs_merged"] == 3
     assert entry["autonomous_prs_merged"] == 2
     assert entry["assisted_prs_merged"] == 1
-    assert entry["autonomous_prs_merged"] + entry["assisted_prs_merged"] == entry["prs_merged"]
+    assert (
+        entry["autonomous_prs_merged"] + entry["assisted_prs_merged"]
+        == entry["prs_merged"]
+    )
 
 
 @pytest.mark.asyncio
@@ -2513,12 +3234,19 @@ async def test_all_autonomous_direction_counts(db_session: AsyncSession):
     research_task = await _make_research_task(db_session, project.id)
     research_task_id = str(research_task.id)
 
-    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=2)]
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=2)
+    ]
     await db_session.flush()
 
     for _ in range(2):
-        await _create_child_task(db_session, research_task.id, project.id,
-                                  context={"pr_merged": True}, created_by="ORCHESTRATOR")
+        await _create_child_task(
+            db_session,
+            research_task.id,
+            project.id,
+            context={"pr_merged": True},
+            created_by="ORCHESTRATOR",
+        )
     await db_session.flush()
 
     await _update_direction_research_outcomes(
@@ -2543,12 +3271,18 @@ async def test_zero_autonomous_all_assisted(db_session: AsyncSession):
     research_task = await _make_research_task(db_session, project.id)
     research_task_id = str(research_task.id)
 
-    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=2)]
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=2)
+    ]
     await db_session.flush()
 
     for _ in range(2):
-        await _create_child_task(db_session, research_task.id, project.id,
-                                  context={"pr_merged": True, "review_dismissed": True})
+        await _create_child_task(
+            db_session,
+            research_task.id,
+            project.id,
+            context={"pr_merged": True, "review_dismissed": True},
+        )
     await db_session.flush()
 
     await _update_direction_research_outcomes(
@@ -2568,6 +3302,7 @@ async def test_zero_autonomous_all_assisted(db_session: AsyncSession):
 # ─────────────────────────────────────────────────────────────────────────────
 # _fold_evicted_into_aggregate: attribution rollup
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def test_fold_evicted_attribution_fields():
     """total_autonomous/assisted/operator aggregate correctly; legacy entries fall back to prs_merged."""
@@ -2605,27 +3340,31 @@ def test_fold_evicted_attribution_accumulates_on_prior_agg():
         "total_assisted_prs_merged": 1,
         "total_operator_actions": 1,
     }
-    evicted = [{
-        "timestamp": "2025-03-01T00:00:00",
-        "tasks_created": 2,
-        "prs_merged": 2,
-        "autonomous_prs_merged": 1,
-        "assisted_prs_merged": 1,
-        "operator_action_count": 1,
-    }]
+    evicted = [
+        {
+            "timestamp": "2025-03-01T00:00:00",
+            "tasks_created": 2,
+            "prs_merged": 2,
+            "autonomous_prs_merged": 1,
+            "assisted_prs_merged": 1,
+            "operator_action_count": 1,
+        }
+    ]
     agg = _fold_evicted_into_aggregate(prior, evicted)
 
     assert agg["total_autonomous_prs_merged"] == 5  # 4 + 1
-    assert agg["total_assisted_prs_merged"] == 2    # 1 + 1
-    assert agg["total_operator_actions"] == 2        # 1 + 1
+    assert agg["total_assisted_prs_merged"] == 2  # 1 + 1
+    assert agg["total_operator_actions"] == 2  # 1 + 1
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # compute_direction_autonomy_state
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def test_autonomy_state_below_threshold():
     from app.direction_outcomes import compute_direction_autonomy_state
+
     d = {
         "research_history": [
             {"autonomous_prs_merged": 3, "operator_action_count": 0},
@@ -2640,7 +3379,10 @@ def test_autonomy_state_below_threshold():
 
 def test_autonomy_state_at_threshold():
     from app.direction_outcomes import compute_direction_autonomy_state
-    d = {"research_history": [{"autonomous_prs_merged": 10, "operator_action_count": 0}]}
+
+    d = {
+        "research_history": [{"autonomous_prs_merged": 10, "operator_action_count": 0}]
+    }
     result = compute_direction_autonomy_state(d)
     assert result["lifetime_autonomous_prs_merged"] == 10
     assert result["lifetime_operator_actions"] == 0
@@ -2649,9 +3391,13 @@ def test_autonomy_state_at_threshold():
 
 def test_autonomy_state_above_threshold_from_aggregate():
     from app.direction_outcomes import compute_direction_autonomy_state
+
     d = {
         "research_history": [],
-        "history_aggregate": {"total_autonomous_prs_merged": 12, "total_operator_actions": 0},
+        "history_aggregate": {
+            "total_autonomous_prs_merged": 12,
+            "total_operator_actions": 0,
+        },
     }
     result = compute_direction_autonomy_state(d)
     assert result["lifetime_autonomous_prs_merged"] == 12
@@ -2661,7 +3407,10 @@ def test_autonomy_state_above_threshold_from_aggregate():
 def test_autonomy_state_operator_action_blocks_eligibility():
     """12 autonomous merges but 1 operator action — must NOT be retirement-eligible."""
     from app.direction_outcomes import compute_direction_autonomy_state
-    d = {"research_history": [{"autonomous_prs_merged": 12, "operator_action_count": 1}]}
+
+    d = {
+        "research_history": [{"autonomous_prs_merged": 12, "operator_action_count": 1}]
+    }
     result = compute_direction_autonomy_state(d)
     assert result["lifetime_autonomous_prs_merged"] == 12
     assert result["lifetime_operator_actions"] == 1
@@ -2671,6 +3420,7 @@ def test_autonomy_state_operator_action_blocks_eligibility():
 def test_autonomy_state_legacy_fallback_treats_prs_merged_as_autonomous():
     """Pre-attribution entries without autonomous_prs_merged fall back to prs_merged."""
     from app.direction_outcomes import compute_direction_autonomy_state
+
     d = {"research_history": [{"prs_merged": 5}]}  # no autonomous_prs_merged key
     result = compute_direction_autonomy_state(d)
     assert result["lifetime_autonomous_prs_merged"] == 5
@@ -2678,9 +3428,13 @@ def test_autonomy_state_legacy_fallback_treats_prs_merged_as_autonomous():
 
 def test_autonomy_state_combines_history_and_aggregate():
     from app.direction_outcomes import compute_direction_autonomy_state
+
     d = {
         "research_history": [{"autonomous_prs_merged": 3, "operator_action_count": 0}],
-        "history_aggregate": {"total_autonomous_prs_merged": 7, "total_operator_actions": 0},
+        "history_aggregate": {
+            "total_autonomous_prs_merged": 7,
+            "total_operator_actions": 0,
+        },
     }
     result = compute_direction_autonomy_state(d)
     assert result["lifetime_autonomous_prs_merged"] == 10

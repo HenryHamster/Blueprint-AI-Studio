@@ -4,6 +4,7 @@ Handles Phase 1 (design_doc_update) and Phase 2 (strategic_review) of the
 strategic review cycle. Extracted from autonomous_research.py to free up
 function slots in that module.
 """
+
 import logging
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -17,7 +18,14 @@ from sqlmodel import select
 from app import strategic_cycle
 from app.direction_metrics import _compute_direction_quality_score
 from app.direction_mode import mode_prompt_hint, normalized_recommended_mode
-from app.models import Task, Project, TaskHistory, TaskStatus, ProjectMessage, SystemMaturity
+from app.models import (
+    Task,
+    Project,
+    TaskHistory,
+    TaskStatus,
+    ProjectMessage,
+    SystemMaturity,
+)
 from app.payload_schemas import pack_under_budget, validate_internal_payload
 import app.shared_state as _shared_state
 from app.shared_state import runtime_config as _runtime_config
@@ -113,7 +121,8 @@ _SYSTEM_MATURITY_TOP_ISSUES_CAP = 5
 
 
 async def _build_system_maturity_payload(
-    project: Project, session: AsyncSession,
+    project: Project,
+    session: AsyncSession,
 ) -> list[dict]:
     """Fetch SystemMaturity rows for *project* and shape them for the agent.
 
@@ -134,17 +143,18 @@ async def _build_system_maturity_payload(
     out: list[dict] = []
     for row in rows:
         top_issues = (row.top_issues or [])[:_SYSTEM_MATURITY_TOP_ISSUES_CAP]
-        out.append({
-            "system_id": row.system_id,
-            "score": row.score,
-            "components": dict(row.components or {}),
-            "recommended_mode": row.recommended_mode,
-            "last_audited_at": (
-                row.last_audited_at.isoformat()
-                if row.last_audited_at else None
-            ),
-            "top_issues": top_issues,
-        })
+        out.append(
+            {
+                "system_id": row.system_id,
+                "score": row.score,
+                "components": dict(row.components or {}),
+                "recommended_mode": row.recommended_mode,
+                "last_audited_at": (
+                    row.last_audited_at.isoformat() if row.last_audited_at else None
+                ),
+                "top_issues": top_issues,
+            }
+        )
     return out
 
 
@@ -165,7 +175,10 @@ def _summarize_drift_signals(drift: dict) -> dict:
     for did, sig in by_direction.items():
         if sig.get("over_claim_flag") or sig.get("stalled_despite_churn_flag"):
             interesting_directions[did] = sig
-        elif sig.get("claim_shipped_consistency", 1.0) < 0.8 and sig.get("claimed_changes_count", 0) > 0:
+        elif (
+            sig.get("claim_shipped_consistency", 1.0) < 0.8
+            and sig.get("claimed_changes_count", 0) > 0
+        ):
             interesting_directions[did] = sig
     return {
         "by_direction": interesting_directions,
@@ -196,6 +209,7 @@ async def _enrich_drift_with_trend(
     flagged-direction count (typically 0–3 per project).
     """
     from app.drift_detection import last_n_drift_snapshots
+
     by_direction = (drift_summary or {}).get("by_direction") or {}
     if not by_direction:
         return drift_summary
@@ -268,7 +282,10 @@ def _summarize_outcome_evaluation(oe: dict) -> dict:
         return oe
     trimmed = dict(oe)
     direction_outcomes = trimmed.get("direction_outcomes")
-    if isinstance(direction_outcomes, list) and len(direction_outcomes) > _OUTCOME_DIRECTION_OUTCOMES_KEEP:
+    if (
+        isinstance(direction_outcomes, list)
+        and len(direction_outcomes) > _OUTCOME_DIRECTION_OUTCOMES_KEEP
+    ):
         sorted_outcomes = sorted(
             direction_outcomes,
             key=lambda d: (
@@ -278,13 +295,18 @@ def _summarize_outcome_evaluation(oe: dict) -> dict:
             ),
             reverse=True,
         )
-        trimmed["direction_outcomes"] = sorted_outcomes[:_OUTCOME_DIRECTION_OUTCOMES_KEEP]
+        trimmed["direction_outcomes"] = sorted_outcomes[
+            :_OUTCOME_DIRECTION_OUTCOMES_KEEP
+        ]
     return trimmed
 
 
 def _summarize_conversation_thread(thread: list) -> list:
     """Keep the most recent N conversation messages."""
-    if not isinstance(thread, list) or len(thread) <= _CONVERSATION_THREAD_KEEP_WHEN_TRIMMED:
+    if (
+        not isinstance(thread, list)
+        or len(thread) <= _CONVERSATION_THREAD_KEEP_WHEN_TRIMMED
+    ):
         return thread
     return thread[-_CONVERSATION_THREAD_KEEP_WHEN_TRIMMED:]
 
@@ -299,58 +321,64 @@ def _summarize_conversation_thread(thread: list) -> list:
 # summarize_fn is dropped wholesale rather than trimmed when over budget.
 _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     # Identity / routing — must always reach the agent
-    "type":                            {"priority": "critical"},
-    "research_mode":                   {"priority": "critical"},
-    "project_name":                    {"priority": "critical"},
-    "base_branch":                     {"priority": "critical"},
-    "is_self_repo":                    {"priority": "critical"},
-    "model":                           {"priority": "critical"},
-    "effort":                          {"priority": "critical"},
-    "prompt_suffix":                   {"priority": "high"},
+    "type": {"priority": "critical"},
+    "research_mode": {"priority": "critical"},
+    "project_name": {"priority": "critical"},
+    "base_branch": {"priority": "critical"},
+    "is_self_repo": {"priority": "critical"},
+    "model": {"priority": "critical"},
+    "effort": {"priority": "critical"},
+    "prompt_suffix": {"priority": "high"},
     # Vision + intent — small but load-bearing for every decision
-    "vision":                          {"priority": "critical"},
+    "vision": {"priority": "critical"},
     # User-facing state the agent must respond to
-    "open_messages":                   {"priority": "high"},
-    "running_update":                  {"priority": "high"},
-    "running_update_acknowledged_at":  {"priority": "high"},
-    "user_last_active_at":             {"priority": "high"},
+    "open_messages": {"priority": "high"},
+    "running_update": {"priority": "high"},
+    "running_update_acknowledged_at": {"priority": "high"},
+    "user_last_active_at": {"priority": "high"},
     # Core working set (the big stuff) — summarize when over budget
-    "directions_summary":              {"priority": "high",   "summarize": _summarize_directions},
-    "problem_model":                   {"priority": "high",   "summarize": _agent_view_problem_model},
-    "design_doc":                      {"priority": "medium", "summarize": _agent_view_design_doc},
-    "outcome_evaluation":              {"priority": "medium", "summarize": _summarize_outcome_evaluation},
-    "recent_interventions":            {"priority": "medium"},
-    "conversation_thread":             {"priority": "medium", "summarize": _summarize_conversation_thread},
+    "directions_summary": {"priority": "high", "summarize": _summarize_directions},
+    "problem_model": {"priority": "high", "summarize": _agent_view_problem_model},
+    "design_doc": {"priority": "medium", "summarize": _agent_view_design_doc},
+    "outcome_evaluation": {
+        "priority": "medium",
+        "summarize": _summarize_outcome_evaluation,
+    },
+    "recent_interventions": {"priority": "medium"},
+    "conversation_thread": {
+        "priority": "medium",
+        "summarize": _summarize_conversation_thread,
+    },
     # Long-tail context — first to be dropped when budget is tight
-    "self_reflection_log":             {"priority": "low"},
-    "previous_decision_outcomes":      {"priority": "low"},
-    "anomaly_summary":                 {"priority": "low"},
-    "playbook_summary":                {"priority": "low"},
-    "rejected_proposals":              {"priority": "low"},
-    "prediction_calibration_factor":   {"priority": "low"},
-    "prediction_calibration_note":     {"priority": "low"},
+    "self_reflection_log": {"priority": "low"},
+    "previous_decision_outcomes": {"priority": "low"},
+    "anomaly_summary": {"priority": "low"},
+    "playbook_summary": {"priority": "low"},
+    "rejected_proposals": {"priority": "low"},
+    "prediction_calibration_factor": {"priority": "low"},
+    "prediction_calibration_note": {"priority": "low"},
     # Mode-aware additions: only present when non-empty
-    "system_maturity":                 {"priority": "low"},
+    "system_maturity": {"priority": "low"},
     # drift_signals is actionable mode-switch input (audit/pause triggers), so it
     # must survive budget pressure — promoted to medium alongside conversation_thread.
-    "drift_signals":                   {"priority": "medium"},
+    "drift_signals": {"priority": "medium"},
     # Lessons from retired directions — helps the agent avoid repeating patterns.
-    "past_retirement_critiques":       {"priority": "low"},
+    "past_retirement_critiques": {"priority": "low"},
 }
 
 
 _DESIGN_DOC_UPDATE_SCHEMA: dict[str, dict] = {
-    "type":                            {"priority": "critical"},
-    "project_name":                    {"priority": "critical"},
-    "base_branch":                     {"priority": "critical"},
-    "model":                           {"priority": "critical"},
-    "effort":                          {"priority": "critical"},
-    "vision":                          {"priority": "critical"},
-    "open_messages":                   {"priority": "high"},
-    "design_doc":                      {"priority": "high",   "summarize": _agent_view_design_doc},
-    "problem_model":                   {"priority": "high",   "summarize": _agent_view_problem_model},
-    "proposed_changes":                {"priority": "high"},
-    "shipped_changes_manifest":        {"priority": "medium"},
+    "type": {"priority": "critical"},
+    "project_name": {"priority": "critical"},
+    "base_branch": {"priority": "critical"},
+    "model": {"priority": "critical"},
+    "effort": {"priority": "critical"},
+    "vision": {"priority": "critical"},
+    "open_messages": {"priority": "high"},
+    "design_doc": {"priority": "high", "summarize": _agent_view_design_doc},
+    "problem_model": {"priority": "high", "summarize": _agent_view_problem_model},
+    "proposed_changes": {"priority": "high"},
+    "shipped_changes_manifest": {"priority": "medium"},
 }
 
 
@@ -363,6 +391,7 @@ async def _build_shipped_changes_manifest(
     most recent phase1_completed_at from vision._strategic_cycle_history.
     Returns a list of direction-grouped dicts, capped at 50 merged tasks.
     """
+
     # Determine cutoff timestamp.
     # Task.updated_at is TIMESTAMP WITHOUT TIME ZONE — the cutoff must be naive
     # UTC or asyncpg raises "can't subtract offset-naive and offset-aware
@@ -384,7 +413,9 @@ async def _build_shipped_changes_manifest(
     if cutoff is None:
         # Audit W2: cycle history is the StrategicCycle table now. Walk
         # newest-first; the helper returns rows in that order.
-        recent_cycles = await strategic_cycle.all_for_project(session, project.id, limit=20)
+        recent_cycles = await strategic_cycle.all_for_project(
+            session, project.id, limit=20
+        )
         for c in recent_cycles:
             if c.phase1_completed_at:
                 cutoff = c.phase1_completed_at
@@ -435,11 +466,13 @@ async def _build_shipped_changes_manifest(
                 "tasks": [],
                 "all_changed_files": [],
             }
-        by_direction[dir_id]["tasks"].append({
-            "title": entry["title"],
-            "scope": entry["scope"],
-            "changed_files": entry["changed_files"],
-        })
+        by_direction[dir_id]["tasks"].append(
+            {
+                "title": entry["title"],
+                "scope": entry["scope"],
+                "changed_files": entry["changed_files"],
+            }
+        )
         for f in entry["changed_files"]:
             if f not in by_direction[dir_id]["all_changed_files"]:
                 by_direction[dir_id]["all_changed_files"].append(f)
@@ -457,12 +490,15 @@ def _rollup_body_is_trivial(body: str | None) -> bool:
     if not body:
         return True
     import re
+
     return bool(re.match(r"^\s*Rollup of \d+ subtasks?\b", body))
 
 
 async def _build_recent_interventions(
-    project: Project, session: AsyncSession,
-    limit: int = 15, lookback_days: int = 21,
+    project: Project,
+    session: AsyncSession,
+    limit: int = 15,
+    lookback_days: int = 21,
     last_strategic_at: datetime | None = None,
 ) -> dict[str, Any]:
     """Build a rolling-window view of recent merged work.
@@ -500,17 +536,26 @@ async def _build_recent_interventions(
             Task.project_id == project.id,
             Task.created_at >= cutoff,
         )
-        .options(load_only(
-            Task.id, Task.status, Task.created_at, Task.updated_at,
-            Task.context, Task.payloads, Task.parent_task_id, Task.status_log,
-            # title + description are read by _build_recent_interventions
-            # (lines ~613, 629, 638) when constructing the merge summary the
-            # strategic agent consumes. Excluding them caused MissingGreenlet
-            # at lazy-load time when this function ran from
-            # task_completion._handle_design_doc_completion → spawn fails
-            # silently and the strategic cycle stalls.
-            Task.title, Task.description,
-        ))
+        .options(
+            load_only(
+                Task.id,
+                Task.status,
+                Task.created_at,
+                Task.updated_at,
+                Task.context,
+                Task.payloads,
+                Task.parent_task_id,
+                Task.status_log,
+                # title + description are read by _build_recent_interventions
+                # (lines ~613, 629, 638) when constructing the merge summary the
+                # strategic agent consumes. Excluding them caused MissingGreenlet
+                # at lazy-load time when this function ran from
+                # task_completion._handle_design_doc_completion → spawn fails
+                # silently and the strategic cycle stalls.
+                Task.title,
+                Task.description,
+            )
+        )
         .order_by(Task.created_at.desc())
         .limit(500)
     )
@@ -520,7 +565,8 @@ async def _build_recent_interventions(
             "[STRATEGIC] creation_velocity truncated to 500 rows for project=%s "
             "(lookback=%dd) — extend lookback OR add LIMIT-aware logic if the "
             "rolling rates need to span a busier window",
-            project.id, lookback_days,
+            project.id,
+            lookback_days,
         )
 
     # Build direction lookup for text enrichment
@@ -554,6 +600,7 @@ async def _build_recent_interventions(
         succeeded?" — the number they actually want to read.
         """
         from app.time_utils import _to_naive_utc
+
         since_naive = _to_naive_utc(since)
         merged = 0
         finished = 0
@@ -595,11 +642,14 @@ async def _build_recent_interventions(
 
     # Extract the latest N merged tasks, newest first
     merged_tasks = [
-        t for t in tasks_in_window
+        t
+        for t in tasks_in_window
         if t.status == TaskStatus.COMPLETED and (t.context or {}).get("pr_merged")
     ]
     merged_tasks.sort(
-        key=lambda t: t.updated_at or t.created_at or datetime.min.replace(tzinfo=timezone.utc),
+        key=lambda t: (
+            t.updated_at or t.created_at or datetime.min.replace(tzinfo=timezone.utc)
+        ),
         reverse=True,
     )
 
@@ -644,26 +694,31 @@ async def _build_recent_interventions(
             else:
                 body = ""
 
-        merges_out.append({
-            "pr_title": (t.title or "")[:200],
-            "pr_number": ctx.get("rollup_pr_number") or ctx.get("pr_number"),
-            "direction_id": direction_id,
-            "direction_text": directions_by_id.get(direction_id, "") if direction_id else "",
-            "merged_at": merged_at.isoformat() if merged_at else None,
-            "hours_ago": hours_ago,
-            "body": body,
-        })
+        merges_out.append(
+            {
+                "pr_title": (t.title or "")[:200],
+                "pr_number": ctx.get("rollup_pr_number") or ctx.get("pr_number"),
+                "direction_id": direction_id,
+                "direction_text": directions_by_id.get(direction_id, "")
+                if direction_id
+                else "",
+                "merged_at": merged_at.isoformat() if merged_at else None,
+                "hours_ago": hours_ago,
+                "body": body,
+            }
+        )
 
     # Per-direction delta: for each active direction, counts + titles per
     # window. Lets the agent see "direction X shipped N things since my
     # last cycle" without having to cross-correlate merges[] by direction_id.
     per_direction_delta: list[dict[str, Any]] = []
-    for d in (project.directions or []):
+    for d in project.directions or []:
         d_id = d.get("id")
         if not d_id or d.get("status") != "active":
             continue
-        d_tasks = [t for t in tasks_in_window
-                   if (t.context or {}).get("direction_id") == d_id]
+        d_tasks = [
+            t for t in tasks_in_window if (t.context or {}).get("direction_id") == d_id
+        ]
         entry: dict[str, Any] = {
             "direction_id": d_id,
             "direction_text": (d.get("text") or "")[:200],
@@ -671,16 +726,20 @@ async def _build_recent_interventions(
             "last_3d": _window_counts(d_tasks, _3d_ago),
         }
         if _strategic_cutoff:
-            entry["since_last_strategic"] = _window_counts(
-                d_tasks, _strategic_cutoff
-            )
+            entry["since_last_strategic"] = _window_counts(d_tasks, _strategic_cutoff)
         # Titles of things that shipped since last strategic (or last 24h as fallback)
         recent_cutoff = _strategic_cutoff or _24h_ago
         recent_merges = [
-            (t.title or "")[:160] for t in d_tasks
+            (t.title or "")[:160]
+            for t in d_tasks
             if t.status == TaskStatus.COMPLETED
             and (t.context or {}).get("pr_merged")
-            and (t.updated_at or t.created_at or datetime.min.replace(tzinfo=timezone.utc)) >= recent_cutoff
+            and (
+                t.updated_at
+                or t.created_at
+                or datetime.min.replace(tzinfo=timezone.utc)
+            )
+            >= recent_cutoff
         ]
         if recent_merges:
             entry["recent_merged_titles"] = recent_merges[:10]
@@ -693,10 +752,17 @@ async def _build_recent_interventions(
     # tasks entirely — the agent would see "no large merges in 24h" with
     # no signal that 3 large tasks are actively running.
     active_statuses = (
-        TaskStatus.QUEUED, TaskStatus.PROVISIONING,
-        TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING,
+        TaskStatus.QUEUED,
+        TaskStatus.PROVISIONING,
+        TaskStatus.IN_PROGRESS,
+        TaskStatus.EVALUATING,
     )
-    active_by_scope: dict[str, int] = {"small": 0, "medium": 0, "large": 0, "unknown": 0}
+    active_by_scope: dict[str, int] = {
+        "small": 0,
+        "medium": 0,
+        "large": 0,
+        "unknown": 0,
+    }
     for t in tasks_in_window:
         if t.status not in active_statuses:
             continue
@@ -724,7 +790,9 @@ async def _build_recent_interventions(
     return result
 
 
-def _build_previous_decision_outcomes(project: Project, cycle_history: list) -> dict[str, Any] | None:
+def _build_previous_decision_outcomes(
+    project: Project, cycle_history: list
+) -> dict[str, Any] | None:
     """Summarize outcomes of the most recent completed strategic cycle's
     direction create/retire decisions so the agent can learn from them.
 
@@ -760,10 +828,16 @@ def _build_previous_decision_outcomes(project: Project, cycle_history: list) -> 
     created_predictions = prev_entry.get("created_predictions") or {}
     retired_final_metrics = prev_entry.get("retired_final_metrics") or {}
 
-    def _summarize(direction_id: str, role: str, rationale: str | None) -> dict[str, Any]:
+    def _summarize(
+        direction_id: str, role: str, rationale: str | None
+    ) -> dict[str, Any]:
         d = directions_by_id.get(direction_id)
         if d is None:
-            entry: dict[str, Any] = {"direction_id": direction_id, "role": role, "status": "missing"}
+            entry: dict[str, Any] = {
+                "direction_id": direction_id,
+                "role": role,
+                "status": "missing",
+            }
             if rationale:
                 entry["rationale"] = rationale
             if role == "retired" and direction_id in retired_final_metrics:
@@ -772,7 +846,9 @@ def _build_previous_decision_outcomes(project: Project, cycle_history: list) -> 
         history = d.get("research_history") or []
         agg = d.get("history_aggregate") or {}
         cycles_active = len(history) + (agg.get("total_cycles") or 0)
-        prs_merged = sum(h.get("prs_merged", 0) for h in history) + (agg.get("total_prs_merged") or 0)
+        prs_merged = sum(h.get("prs_merged", 0) for h in history) + (
+            agg.get("total_prs_merged") or 0
+        )
         is_paused = d.get("status") == "paused"
         auto_paused = bool(d.get("auto_paused"))
         entry = {
@@ -893,13 +969,18 @@ def _build_anomaly_summary(project: Project) -> dict[str, Any] | None:
 
 
 _STRATEGIC_PLAYBOOK_SOURCES = {
-    "auto-generated",      # recurring failure patterns
-    "review-extracted",    # review feedback patterns
+    "auto-generated",  # recurring failure patterns
+    "review-extracted",  # review feedback patterns
     "first-attempt-pattern",  # direction-level rejection patterns
 }
 _STRATEGIC_PLAYBOOK_KEYWORDS = (
-    "direction", "auto-pause", "auto_pause", "auto paused",
-    "recurring", "repeated failure", "architecture",
+    "direction",
+    "auto-pause",
+    "auto_pause",
+    "auto paused",
+    "recurring",
+    "repeated failure",
+    "architecture",
 )
 
 
@@ -930,13 +1011,18 @@ def _build_playbook_summary(project: Project) -> dict[str, Any] | None:
         if not relevant:
             continue
         item: dict[str, Any] = {
-            "key": key[len("playbook/"):],
+            "key": key[len("playbook/") :],
             "content": content[:400],
             "source": source or None,
             "updated_at": entry.get("updated_at"),
         }
-        for opt in ("hit_count", "confirmed_count", "scope",
-                    "learned_from_direction", "rejection_count"):
+        for opt in (
+            "hit_count",
+            "confirmed_count",
+            "scope",
+            "learned_from_direction",
+            "rejection_count",
+        ):
             if entry.get(opt) is not None:
                 item[opt] = entry[opt]
         candidates.append(item)
@@ -961,14 +1047,17 @@ async def _find_last_strategic_cycle_time(
     pipeline_regression_dispatcher, which treats both types as cycle activity.
     """
     result = await session.execute(
-        select(Task).where(
+        select(Task)
+        .where(
             Task.project_id == project.id,
             Task.status == TaskStatus.COMPLETED,
             or_(
                 Task.payloads[0]["type"].as_string() == "strategic_review",
                 Task.payloads[0]["type"].as_string() == "design_doc_update",
             ),
-        ).order_by(Task.updated_at.desc()).limit(1)
+        )
+        .order_by(Task.updated_at.desc())
+        .limit(1)
     )
     task = result.scalars().first()
     if not task:
@@ -984,47 +1073,69 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
     Returns True if a task was created, False if skipped.
     """
     from app.task_lifecycle import _has_active_strategic_task
+
     # Guard: no design_doc_update or strategic_review already running
     if await _has_active_strategic_task(project.id, session):
-        logger.warning(f"[STRATEGIC] Skipping design doc update — strategic task already active for {project.id}")
+        logger.warning(
+            f"[STRATEGIC] Skipping design doc update — strategic task already active for {project.id}"
+        )
         return False
 
-    doc_model = _runtime_config.get("task_type_models", {}).get("design_doc_update") or \
-                _runtime_config.get("task_type_models", {}).get("research") or None
-    doc_effort = _runtime_config.get("task_type_efforts", {}).get("design_doc_update") or \
-                 _runtime_config.get("task_type_efforts", {}).get("research") or None
+    doc_model = (
+        _runtime_config.get("task_type_models", {}).get("design_doc_update")
+        or _runtime_config.get("task_type_models", {}).get("research")
+        or None
+    )
+    doc_effort = (
+        _runtime_config.get("task_type_efforts", {}).get("design_doc_update")
+        or _runtime_config.get("task_type_efforts", {}).get("research")
+        or None
+    )
 
     # Fetch open messages for the design doc agent
     open_msgs_result = await session.execute(
-        select(ProjectMessage).where(
+        select(ProjectMessage)
+        .where(
             ProjectMessage.project_id == project.id,
             ProjectMessage.status == "open",
-        ).order_by(ProjectMessage.created_at.asc()).limit(50)
+        )
+        .order_by(ProjectMessage.created_at.asc())
+        .limit(50)
     )
     open_msgs = [
-        {"id": str(m.id), "type": m.message_type, "content": m.content,
-         "context": m.context, "from": m.from_type,
-         "created_at": m.created_at.isoformat() if m.created_at else None}
+        {
+            "id": str(m.id),
+            "type": m.message_type,
+            "content": m.content,
+            "context": m.context,
+            "from": m.from_type,
+            "created_at": m.created_at.isoformat() if m.created_at else None,
+        }
         for m in open_msgs_result.scalars().all()
     ]
 
     # Build shipped_changes_manifest: tasks merged since the last arch review
     shipped_changes_manifest = await _build_shipped_changes_manifest(project, session)
 
-    payload: dict = pack_under_budget({
-        "type": "design_doc_update",
-        "design_doc": _agent_view_design_doc(project.design_doc),
-        "proposed_changes": (project.design_doc or {}).get("proposed_changes", []),
-        "project_name": project.name,
-        "vision": project.vision or {},
-        "problem_model": _agent_view_problem_model(project.problem_model),
-        "open_messages": open_msgs,
-        "shipped_changes_manifest": shipped_changes_manifest,
-        "base_branch": "main",
-        **({"model": doc_model} if doc_model else {}),
-        **({"effort": doc_effort} if doc_effort else {}),
-    }, _DESIGN_DOC_UPDATE_SCHEMA)
-    payload = validate_internal_payload(payload, "autonomous_research:design_doc_update")
+    payload: dict = pack_under_budget(
+        {
+            "type": "design_doc_update",
+            "design_doc": _agent_view_design_doc(project.design_doc),
+            "proposed_changes": (project.design_doc or {}).get("proposed_changes", []),
+            "project_name": project.name,
+            "vision": project.vision or {},
+            "problem_model": _agent_view_problem_model(project.problem_model),
+            "open_messages": open_msgs,
+            "shipped_changes_manifest": shipped_changes_manifest,
+            "base_branch": "main",
+            **({"model": doc_model} if doc_model else {}),
+            **({"effort": doc_effort} if doc_effort else {}),
+        },
+        _DESIGN_DOC_UPDATE_SCHEMA,
+    )
+    payload = validate_internal_payload(
+        payload, "autonomous_research:design_doc_update"
+    )
     # Audit W2: cycle history is a real table now (StrategicCycle); the
     # 10-entry sliding-window cap in vision JSONB is gone. Snapshot the
     # vision at cycle start so the 3-way merge in strategic_completion can
@@ -1044,7 +1155,8 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
     session.add(new_task)
     await session.flush()  # assign new_task.id for the FK below
     history = TaskHistory(
-        task_id=new_task.id, action="SPAWNED",
+        task_id=new_task.id,
+        action="SPAWNED",
         details={"spawned_by": "STRATEGIC_CYCLE", "phase": "design_doc_update"},
     )
     session.add(history)
@@ -1056,11 +1168,15 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
         baseline_vision=project.vision or {},
     )
     await session.commit()
-    logger.info(f"[STRATEGIC] Spawned design_doc_update task {new_task.id} for project {project.id} (cycle {cycle_id})")
+    logger.info(
+        f"[STRATEGIC] Spawned design_doc_update task {new_task.id} for project {project.id} (cycle {cycle_id})"
+    )
     return True
 
 
-async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle_id: str | None = None) -> bool:
+async def _spawn_strategic_review(
+    project: Project, session: AsyncSession, cycle_id: str | None = None
+) -> bool:
     """Spawn Phase 2 of the strategic cycle: vision + direction review.
 
     Called by _handle_design_doc_completion after the design doc is updated.
@@ -1068,9 +1184,12 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
     Returns True if a task was created, False if skipped.
     """
     from app.task_lifecycle import _has_active_strategic_task
+
     # Guard: no design_doc_update or strategic_review already running
     if await _has_active_strategic_task(project.id, session):
-        logger.warning(f"[STRATEGIC] Skipping strategic review — strategic task already active for {project.id}")
+        logger.warning(
+            f"[STRATEGIC] Skipping strategic review — strategic task already active for {project.id}"
+        )
         return False
 
     # Build direction stats with rich data. Include `active` + `paused` +
@@ -1078,7 +1197,8 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
     # should respect rather than re-propose; proposed entries exist so the
     # strategic agent can approve/reject them in the same cycle.
     included_directions = [
-        d for d in (project.directions or [])
+        d
+        for d in (project.directions or [])
         if d.get("status") in ("active", "paused", "proposed")
     ]
     direction_stats = []
@@ -1086,20 +1206,26 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
         history = d.get("research_history", [])
         agg = d.get("history_aggregate", {})
         total_cycles = len(history) + (agg.get("total_cycles") or 0)
-        total_merged = sum(h.get("prs_merged", 0) for h in history) + (agg.get("total_prs_merged") or 0)
-        total_rejected = sum(h.get("prs_rejected", 0) for h in history) + (agg.get("total_prs_rejected") or 0)
-        total_failed = sum(h.get("tasks_failed", 0) for h in history) + (agg.get("total_tasks_failed") or 0)
-        total_failed_infra = sum(h.get("tasks_failed_infra", 0) for h in history) + (agg.get("total_tasks_failed_infra") or 0)
+        total_merged = sum(h.get("prs_merged", 0) for h in history) + (
+            agg.get("total_prs_merged") or 0
+        )
+        total_rejected = sum(h.get("prs_rejected", 0) for h in history) + (
+            agg.get("total_prs_rejected") or 0
+        )
+        total_failed = sum(h.get("tasks_failed", 0) for h in history) + (
+            agg.get("total_tasks_failed") or 0
+        )
+        total_failed_infra = sum(h.get("tasks_failed_infra", 0) for h in history) + (
+            agg.get("total_tasks_failed_infra") or 0
+        )
         # Autonomy lifetime totals — legacy fallback treats prs_merged as autonomous
         # (same interpretation as admin_digest.py and direction_metrics.py).
-        lifetime_autonomous = (
-            sum(h.get("autonomous_prs_merged", h.get("prs_merged", 0)) for h in history)
-            + (agg.get("total_autonomous_prs_merged") or 0)
-        )
-        lifetime_op_actions = (
-            sum(h.get("operator_action_count", 0) for h in history)
-            + (agg.get("total_operator_actions") or 0)
-        )
+        lifetime_autonomous = sum(
+            h.get("autonomous_prs_merged", h.get("prs_merged", 0)) for h in history
+        ) + (agg.get("total_autonomous_prs_merged") or 0)
+        lifetime_op_actions = sum(
+            h.get("operator_action_count", 0) for h in history
+        ) + (agg.get("total_operator_actions") or 0)
         retirement_eligible = lifetime_autonomous >= 10 and lifetime_op_actions == 0
         taxonomy_totals: dict[str, int] = {}
         for h in history:
@@ -1111,19 +1237,27 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
         recent_failures = []
         _agg_grade: dict = {"HIGH": 0, "MEDIUM": 0, "LOW": 0}
         for h in recent_history:
-            for desc in (h.get("key_finding_descriptions") or []):
+            for desc in h.get("key_finding_descriptions") or []:
                 if desc and desc not in recent_findings:
                     recent_findings.append(desc)
-            recent_failures.extend(fd for fd in (h.get("failed_task_details") or []) if fd)
+            recent_failures.extend(
+                fd for fd in (h.get("failed_task_details") or []) if fd
+            )
             for _gk, _gv in (h.get("grade_distribution") or {}).items():
                 if _gk in _agg_grade:
                     _agg_grade[_gk] = _agg_grade.get(_gk, 0) + int(_gv or 0)
         total_prs = total_merged + total_rejected
-        operator_rejection_rate = round(total_rejected / total_prs, 2) if total_prs > 0 else None
+        operator_rejection_rate = (
+            round(total_rejected / total_prs, 2) if total_prs > 0 else None
+        )
         stat_entry: dict = {
-            "id": d.get("id"), "text": d.get("text"), "priority": d.get("priority"),
-            "status": d.get("status"), "total_cycles": total_cycles,
-            "prs_merged": total_merged, "tasks_failed": total_failed,
+            "id": d.get("id"),
+            "text": d.get("text"),
+            "priority": d.get("priority"),
+            "status": d.get("status"),
+            "total_cycles": total_cycles,
+            "prs_merged": total_merged,
+            "tasks_failed": total_failed,
             "possibly_saturated": d.get("possibly_saturated", False),
         }
         if total_failed_infra > 0:
@@ -1139,6 +1273,7 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
         if operator_rejection_rate is not None and total_rejected > 0:
             stat_entry["operator_rejection_rate"] = operator_rejection_rate
         from app.routers.admin_analytics import ON_DEMAND_RATE
+
         cost_seconds = 0.0
         for h in history:
             tcount = h.get("tasks_created", 0) or 0
@@ -1149,13 +1284,16 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
         if estimated_cost_usd > 0:
             stat_entry["estimated_cost_usd"] = estimated_cost_usd
             if total_merged > 0:
-                stat_entry["cost_per_merged_pr"] = round(estimated_cost_usd / total_merged, 2)
+                stat_entry["cost_per_merged_pr"] = round(
+                    estimated_cost_usd / total_merged, 2
+                )
         ctx = d.get("research_context")
         if ctx:
             stat_entry["research_context"] = ctx[:3000]
         _rfe = d.get("recent_findings_evidence") or []
         if _rfe:
             from app.research_context import filter_direction_evidence  # noqa: PLC0415
+
             _filtered_ev = filter_direction_evidence(ctx, _rfe)
             if _filtered_ev:
                 stat_entry["recent_findings_evidence"] = _filtered_ev
@@ -1200,7 +1338,11 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
                 "work for this direction in this cycle; defer new findings against it."
             )
         mode_hint_lines.append(f"- {direction_label} — {hint}")
-    prompt_suffix = "\n".join(["Mode hints for this cycle:"] + mode_hint_lines) if mode_hint_lines else None
+    prompt_suffix = (
+        "\n".join(["Mode hints for this cycle:"] + mode_hint_lines)
+        if mode_hint_lines
+        else None
+    )
 
     # Recently rejected proposals (last 30 days) — surfaced so the strategic
     # agent avoids re-proposing similar work the user already declined.
@@ -1209,11 +1351,12 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
         {
             "text": (d.get("text") or "")[:300],
             "rejected_at": d.get("rejected_at"),
-            "rationale": (d.get("rationale") or "")[:300] if d.get("rationale") else None,
+            "rationale": (d.get("rationale") or "")[:300]
+            if d.get("rationale")
+            else None,
         }
         for d in (project.directions or [])
-        if d.get("status") == "rejected"
-        and (d.get("rejected_at") or "") >= cutoff_iso
+        if d.get("status") == "rejected" and (d.get("rejected_at") or "") >= cutoff_iso
     ]
     rejected_proposals.sort(key=lambda r: r.get("rejected_at") or "", reverse=True)
     rejected_proposals = rejected_proposals[:10]
@@ -1225,17 +1368,26 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
     # (design_doc + problem_model alone are ~160 KB), and conversation_thread
     # is the most aggressively trimmable component without losing critical state.
     thread_result = await session.execute(
-        select(ProjectMessage).where(
+        select(ProjectMessage)
+        .where(
             ProjectMessage.project_id == project.id,
-        ).order_by(ProjectMessage.created_at.desc()).limit(15)
+        )
+        .order_by(ProjectMessage.created_at.desc())
+        .limit(15)
     )
     all_thread_msgs = list(reversed(thread_result.scalars().all()))  # chronological
     conversation_thread = [
-        {"id": str(m.id), "type": m.message_type, "content": m.content,
-         "context": m.context, "from": m.from_type, "status": m.status,
-         "resolution": m.resolution,
-         "created_at": m.created_at.isoformat() if m.created_at else None,
-         "resolved_at": m.resolved_at.isoformat() if m.resolved_at else None}
+        {
+            "id": str(m.id),
+            "type": m.message_type,
+            "content": m.content,
+            "context": m.context,
+            "from": m.from_type,
+            "status": m.status,
+            "resolution": m.resolution,
+            "created_at": m.created_at.isoformat() if m.created_at else None,
+            "resolved_at": m.resolved_at.isoformat() if m.resolved_at else None,
+        }
         for m in all_thread_msgs
     ]
     # Executor still needs a flat list of open messages for resolve operations
@@ -1254,16 +1406,28 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
         else None
     )
 
-    review_model = _runtime_config.get("task_type_models", {}).get("strategic_review") or \
-                   _runtime_config.get("task_type_models", {}).get("research") or None
-    review_effort = _runtime_config.get("task_type_efforts", {}).get("strategic_review") or \
-                    _runtime_config.get("task_type_efforts", {}).get("research") or None
+    review_model = (
+        _runtime_config.get("task_type_models", {}).get("strategic_review")
+        or _runtime_config.get("task_type_models", {}).get("research")
+        or None
+    )
+    review_effort = (
+        _runtime_config.get("task_type_efforts", {}).get("strategic_review")
+        or _runtime_config.get("task_type_efforts", {}).get("research")
+        or None
+    )
 
-    from app.strategic_analysis import _build_outcome_evaluation, _compute_prediction_calibration
+    from app.strategic_analysis import (
+        _build_outcome_evaluation,
+        _compute_prediction_calibration,
+    )
+
     # Audit W2: cycle history is in the StrategicCycle table; pre-fetch once
     # and pass into all the sync analysis helpers so they don't need the session.
     cycle_history = await strategic_cycle.recent_for_agent_context(
-        session, project.id, limit=20,
+        session,
+        project.id,
+        limit=20,
     )
     last_strategic_at = await _find_last_strategic_cycle_time(project, session)
     _cal = _compute_prediction_calibration(project, cycle_history)
@@ -1278,54 +1442,83 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
     system_maturity_payload = await _build_system_maturity_payload(project, session)
     try:
         from app.drift_detection import compute_direction_drift, persist_drift_snapshot
+
         drift_raw = await compute_direction_drift(session, project)
         await persist_drift_snapshot(session, project, drift_raw)
         drift_summary = _summarize_drift_signals(drift_raw)
         if drift_summary.get("by_direction"):
-            drift_summary = await _enrich_drift_with_trend(session, project.id, drift_summary)
+            drift_summary = await _enrich_drift_with_trend(
+                session, project.id, drift_summary
+            )
     except Exception:  # noqa: BLE001 — drift signals are best-effort
         logger.exception("[STRATEGIC] drift signal computation failed; continuing")
         drift_summary = {}
-    payload: dict = pack_under_budget({
-        "type": "strategic_review",
-        "research_mode": "strategic",
-        "design_doc": _agent_view_design_doc(project.design_doc),
-        "vision": project.vision or {},
-        "problem_model": _agent_view_problem_model(project.problem_model),
-        "running_update": project.running_update or "",
-        "running_update_acknowledged_at": (
-            project.running_update_acknowledged_at.isoformat()
-            if project.running_update_acknowledged_at else None
-        ),
-        "user_last_active_at": user_last_active_at,
-        "self_reflection_log": (project.self_reflection_log or [])[-5:],
-        "is_self_repo": bool(project.is_self_repo),
-        "directions_summary": direction_stats,
-        "outcome_evaluation": _build_outcome_evaluation(project, cycle_history),
-        "recent_interventions": recent_interventions,
-        "prediction_calibration_factor": calibration_factor,
-        "prediction_calibration_note": calibration_note,
-        **({"previous_decision_outcomes": _prev_outcomes}
-           if (_prev_outcomes := _build_previous_decision_outcomes(project, cycle_history)) else {}),
-        **({"anomaly_summary": _anomaly_summary}
-           if (_anomaly_summary := _build_anomaly_summary(project)) else {}),
-        **({"playbook_summary": _playbook_summary}
-           if (_playbook_summary := _build_playbook_summary(project)) else {}),
-        "project_name": project.name,
-        "open_messages": open_msgs,
-        "conversation_thread": conversation_thread,
-        **({"rejected_proposals": rejected_proposals} if rejected_proposals else {}),
-        **({"prompt_suffix": prompt_suffix} if prompt_suffix else {}),
-        # Mode-aware: include only when non-empty so cold-start projects
-        # don't carry empty fields through the strategic payload size cap.
-        **({"system_maturity": system_maturity_payload} if system_maturity_payload else {}),
-        **({"drift_signals": drift_summary} if drift_summary else {}),
-        **({"past_retirement_critiques": _past_critiques}
-           if (_past_critiques := _build_past_retirement_critiques(cycle_history)) else {}),
-        "base_branch": "main",
-        **({"model": review_model} if review_model else {}),
-        **({"effort": review_effort} if review_effort else {}),
-    }, _STRATEGIC_REVIEW_SCHEMA)
+    payload: dict = pack_under_budget(
+        {
+            "type": "strategic_review",
+            "research_mode": "strategic",
+            "design_doc": _agent_view_design_doc(project.design_doc),
+            "vision": project.vision or {},
+            "problem_model": _agent_view_problem_model(project.problem_model),
+            "running_update": project.running_update or "",
+            "running_update_acknowledged_at": (
+                project.running_update_acknowledged_at.isoformat()
+                if project.running_update_acknowledged_at
+                else None
+            ),
+            "user_last_active_at": user_last_active_at,
+            "self_reflection_log": (project.self_reflection_log or [])[-5:],
+            "is_self_repo": bool(project.is_self_repo),
+            "directions_summary": direction_stats,
+            "outcome_evaluation": _build_outcome_evaluation(project, cycle_history),
+            "recent_interventions": recent_interventions,
+            "prediction_calibration_factor": calibration_factor,
+            "prediction_calibration_note": calibration_note,
+            **(
+                {"previous_decision_outcomes": _prev_outcomes}
+                if (
+                    _prev_outcomes := _build_previous_decision_outcomes(
+                        project, cycle_history
+                    )
+                )
+                else {}
+            ),
+            **(
+                {"anomaly_summary": _anomaly_summary}
+                if (_anomaly_summary := _build_anomaly_summary(project))
+                else {}
+            ),
+            **(
+                {"playbook_summary": _playbook_summary}
+                if (_playbook_summary := _build_playbook_summary(project))
+                else {}
+            ),
+            "project_name": project.name,
+            "open_messages": open_msgs,
+            "conversation_thread": conversation_thread,
+            **(
+                {"rejected_proposals": rejected_proposals} if rejected_proposals else {}
+            ),
+            **({"prompt_suffix": prompt_suffix} if prompt_suffix else {}),
+            # Mode-aware: include only when non-empty so cold-start projects
+            # don't carry empty fields through the strategic payload size cap.
+            **(
+                {"system_maturity": system_maturity_payload}
+                if system_maturity_payload
+                else {}
+            ),
+            **({"drift_signals": drift_summary} if drift_summary else {}),
+            **(
+                {"past_retirement_critiques": _past_critiques}
+                if (_past_critiques := _build_past_retirement_critiques(cycle_history))
+                else {}
+            ),
+            "base_branch": "main",
+            **({"model": review_model} if review_model else {}),
+            **({"effort": review_effort} if review_effort else {}),
+        },
+        _STRATEGIC_REVIEW_SCHEMA,
+    )
     payload = validate_internal_payload(payload, "autonomous_research:strategic_review")
     new_task = Task(
         project_id=project.id,
@@ -1341,7 +1534,8 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
     session.add(new_task)
     await session.flush()  # assign new_task.id for the cycle update below
     history = TaskHistory(
-        task_id=new_task.id, action="SPAWNED",
+        task_id=new_task.id,
+        action="SPAWNED",
         details={"spawned_by": "STRATEGIC_CYCLE", "phase": "strategic_review"},
     )
     session.add(history)
@@ -1349,10 +1543,14 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
         # Audit W2: record phase1 completion + phase2 task_id on the cycle
         # row instead of patching vision._strategic_cycle_history JSONB.
         await strategic_cycle.mark_phase1_completed(
-            session, cycle_id, phase2_task_id=new_task.id,
+            session,
+            cycle_id,
+            phase2_task_id=new_task.id,
         )
     await session.commit()
-    logger.info(f"[STRATEGIC] Spawned strategic_review task {new_task.id} for project {project.id}")
+    logger.info(
+        f"[STRATEGIC] Spawned strategic_review task {new_task.id} for project {project.id}"
+    )
     return True
 
 
@@ -1397,21 +1595,31 @@ def _build_failure_feedback_mitigation(
     dfa = doc.get("direction_first_attempt_feedback") or {}
     fa_entry = dfa.get(direction_id) or {}
     cat_counts = {
-        k: v for k, v in fa_entry.items()
+        k: v
+        for k, v in fa_entry.items()
         if k not in ("total", "last_updated") and isinstance(v, int) and v > 0
     }
     if cat_counts:
         top_cat = max(cat_counts, key=lambda k: cat_counts[k])
         top_count = cat_counts[top_cat]
-        if top_count >= _FAILURE_DOWNSCOPE_THRESHOLD and final_scope in _SCOPE_DOWNGRADE:
+        if (
+            top_count >= _FAILURE_DOWNSCOPE_THRESHOLD
+            and final_scope in _SCOPE_DOWNGRADE
+        ):
             downscoped = _SCOPE_DOWNGRADE[final_scope]
             evidence["failure_downscope"] = {
-                "category": top_cat, "count": top_count,
-                "from": final_scope, "to": downscoped,
+                "category": top_cat,
+                "count": top_count,
+                "from": final_scope,
+                "to": downscoped,
             }
             logger.info(
                 "[SPAWN] Downscoping %s→%s for direction '%s' (first-attempt %s=%d)",
-                final_scope, downscoped, direction_id, top_cat, top_count,
+                final_scope,
+                downscoped,
+                direction_id,
+                top_cat,
+                top_count,
             )
             final_scope = downscoped
             coaching_note = (
@@ -1421,20 +1629,35 @@ def _build_failure_feedback_mitigation(
             )
 
     # --- Success-pattern scope bias ---
-    proposed_idx = _SCOPE_ORDER_LIST.index(proposed_scope) if proposed_scope in _SCOPE_ORDER_LIST else -1
+    proposed_idx = (
+        _SCOPE_ORDER_LIST.index(proposed_scope)
+        if proposed_scope in _SCOPE_ORDER_LIST
+        else -1
+    )
     if proposed_idx > 0:
         for candidate in _SCOPE_ORDER_LIST[:proposed_idx]:
             key = f"playbook/success-{task_type}-{candidate}"
             entry = doc.get(key)
-            success_count = entry.get("success_count") if isinstance(entry, dict) else None
-            if isinstance(success_count, int) and success_count >= _SUCCESS_BIAS_THRESHOLD:
+            success_count = (
+                entry.get("success_count") if isinstance(entry, dict) else None
+            )
+            if (
+                isinstance(success_count, int)
+                and success_count >= _SUCCESS_BIAS_THRESHOLD
+            ):
                 evidence["success_bias"] = {
-                    "key": key, "success_count": success_count,
-                    "from": final_scope, "to": candidate,
+                    "key": key,
+                    "success_count": success_count,
+                    "from": final_scope,
+                    "to": candidate,
                 }
                 logger.info(
                     "[SPAWN] Success bias %s→%s for task_type='%s' ('%s': %d successes)",
-                    final_scope, candidate, task_type, key, success_count,
+                    final_scope,
+                    candidate,
+                    task_type,
+                    key,
+                    success_count,
                 )
                 final_scope = candidate
                 break  # use smallest qualifying scope

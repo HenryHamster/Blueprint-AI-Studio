@@ -18,7 +18,7 @@ from app.task_locking import lock_project_or_429
 router = APIRouter(
     prefix="/api/admin",
     tags=["admin-projects"],
-    dependencies=[Depends(get_current_user)]
+    dependencies=[Depends(get_current_user)],
 )
 
 
@@ -27,7 +27,7 @@ router = APIRouter(
 async def get_all_projects(
     request: Request,
     session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
 ):
     # Join projects with membership to get user's role on each project
     query = (
@@ -47,7 +47,9 @@ async def get_all_projects(
             "status": project.status,
             "github_owner": project.github_owner,
             "github_repo": project.github_repo,
-            "created_at": project.created_at.isoformat() if project.created_at else None,
+            "created_at": project.created_at.isoformat()
+            if project.created_at
+            else None,
             "directions": project.directions,
             "vision": project.vision or {},
             "design_doc": project.design_doc or {},
@@ -55,7 +57,8 @@ async def get_all_projects(
             "running_update": project.running_update or [],
             "running_update_acknowledged_at": (
                 project.running_update_acknowledged_at.isoformat()
-                if project.running_update_acknowledged_at else None
+                if project.running_update_acknowledged_at
+                else None
             ),
             "self_reflection_log": project.self_reflection_log or [],
             "build_config": project.build_config or {},
@@ -86,9 +89,11 @@ async def update_project(
     project_id: uuid.UUID,
     payload: ProjectUpdate,
     session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
 ):
-    project = await _get_user_project_with_role(project_id, current_user["user_id"], session, "member")
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
 
     if payload.name is not None:
         project.name = payload.name
@@ -102,9 +107,13 @@ async def update_project(
             if not entry.get("id"):
                 entry["id"] = f"d-{uuid.uuid4().hex[:8]}"
             if entry.get("priority") not in ("high", "medium", "low"):
-                raise HTTPException(status_code=400, detail=f"Invalid priority: {entry.get('priority')}")
+                raise HTTPException(
+                    status_code=400, detail=f"Invalid priority: {entry.get('priority')}"
+                )
             if not isinstance(entry.get("text"), str) or not entry["text"].strip():
-                raise HTTPException(status_code=400, detail="Each direction must have non-empty text")
+                raise HTTPException(
+                    status_code=400, detail="Each direction must have non-empty text"
+                )
             normalized.append(entry)
         project.directions = normalized
         flag_modified(project, "directions")
@@ -127,12 +136,15 @@ async def update_project(
         from pydantic import ValidationError
 
         from app.schemas import BuildConfig as BuildConfigSchema
+
         try:
             merged = {**(project.build_config or {}), **payload.build_config}
             validated = BuildConfigSchema(**merged) if merged else BuildConfigSchema()
             project.build_config = validated.model_dump(exclude_none=True)
         except ValidationError as e:
-            raise HTTPException(status_code=400, detail="Invalid build_config structure") from e
+            raise HTTPException(
+                status_code=400, detail="Invalid build_config structure"
+            ) from e
         flag_modified(project, "build_config")
 
     if payload.problem_model_patch is not None:
@@ -151,7 +163,7 @@ async def update_project(
             raise HTTPException(
                 status_code=400,
                 detail=f"Cannot edit agent-owned problem_model fields: {sorted(invalid)}. "
-                       f"Editable fields: {sorted(ALLOWED_USER_FIELDS)}",
+                f"Editable fields: {sorted(ALLOWED_USER_FIELDS)}",
             )
         current = parse_problem_model(project.problem_model)
         merged_raw: Dict[str, Any] = current.model_dump()
@@ -159,7 +171,9 @@ async def update_project(
         try:
             validated = ProblemModel.model_validate(merged_raw)
         except _PmValidationError as ve:
-            raise HTTPException(status_code=400, detail=f"Invalid problem_model patch: {ve}") from None
+            raise HTTPException(
+                status_code=400, detail=f"Invalid problem_model patch: {ve}"
+            ) from None
         validated.revision = current.revision + 1
         validated.last_updated = _utcnow().isoformat()
         validated.last_updated_by = "user"
@@ -180,9 +194,13 @@ async def detect_project_build_config(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
-    project = await _get_user_project_with_role(project_id, current_user["user_id"], session, "member")
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
     if not project.github_owner or not project.github_repo:
-        raise HTTPException(status_code=400, detail="Project has no GitHub repository configured")
+        raise HTTPException(
+            status_code=400, detail="Project has no GitHub repository configured"
+        )
 
     from pydantic import ValidationError
 
@@ -192,9 +210,14 @@ async def detect_project_build_config(
 
     token = await get_repo_installation_token(project.github_owner, project.github_repo)
     if not token:
-        raise HTTPException(status_code=502, detail="No GitHub installation token available for this repo")
+        raise HTTPException(
+            status_code=502,
+            detail="No GitHub installation token available for this repo",
+        )
 
-    detected = await _detect_build_config(token, project.github_owner, project.github_repo)
+    detected = await _detect_build_config(
+        token, project.github_owner, project.github_repo
+    )
 
     existing = project.build_config or {}
     if existing.get("git_user_email"):
@@ -246,7 +269,7 @@ async def delete_project_admin(
     project_id: uuid.UUID,
     force: bool = Query(False),
     session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
 ):
     """Delete a project and cascade to tasks/artifacts/history.
     Refuses if active tasks exist unless force=true."""
@@ -254,23 +277,39 @@ async def delete_project_admin(
     # as 429), then acquire a Project row lock with skip_locked. Closes the
     # heartbeat-arrives-mid-delete race where a concurrent agent status POST
     # could mutate task rows between our cancel and FK-cascade delete.
-    await _get_user_project_with_role(project_id, current_user["user_id"], session, "owner")
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
     project = await lock_project_or_429(session, project_id)
 
-    ACTIVE_STATUSES = [TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING]
-    active_tasks = (await session.execute(
-        select(Task).where(Task.project_id == project_id, Task.status.in_(ACTIVE_STATUSES))
-    )).scalars().all()
+    ACTIVE_STATUSES = [
+        TaskStatus.QUEUED,
+        TaskStatus.PROVISIONING,
+        TaskStatus.IN_PROGRESS,
+        TaskStatus.EVALUATING,
+    ]
+    active_tasks = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.project_id == project_id, Task.status.in_(ACTIVE_STATUSES)
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
 
     if active_tasks and not force:
         raise HTTPException(
             status_code=409,
-            detail=f"Project has {len(active_tasks)} active task(s). Cancel them first, or pass ?force=true."
+            detail=f"Project has {len(active_tasks)} active task(s). Cancel them first, or pass ?force=true.",
         )
 
     if active_tasks and force:
         # Force: cancel active tasks and delete their VMs
         from app.main import _ensure_vm_deleted
+
         for task in active_tasks:
             task.status = TaskStatus.CANCELLED
             task.latest_status_message = "Project force-deleted"
@@ -280,17 +319,20 @@ async def delete_project_admin(
 
     # Delete dependent records that lack ON DELETE CASCADE
     from app.models import Alert
-    await session.execute(
-        delete(Alert).where(Alert.project_id == project_id)
-    )
+
+    await session.execute(delete(Alert).where(Alert.project_id == project_id))
     await session.delete(project)
     await session.commit()
 
     # Evict from GitHub token cache
     from app.routers.agent import _github_token_cache
+
     _github_token_cache.pop(str(project_id), None)
 
-    return {"message": f"Project {project_id} deleted", "active_tasks_cancelled": len(active_tasks) if active_tasks else 0}
+    return {
+        "message": f"Project {project_id} deleted",
+        "active_tasks_cancelled": len(active_tasks) if active_tasks else 0,
+    }
 
 
 @router.post("/autonomous/pause-all")
@@ -298,12 +340,20 @@ async def delete_project_admin(
 async def pause_all_autonomous(
     request: Request,
     session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
 ):
     """Disable autonomous mode on all projects at once."""
-    projects = (await session.execute(
-        select(Project).where(Project.id.in_(_user_project_ids(current_user["user_id"])))
-    )).scalars().all()
+    projects = (
+        (
+            await session.execute(
+                select(Project).where(
+                    Project.id.in_(_user_project_ids(current_user["user_id"]))
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
     for p in projects:
         p.autonomous_enabled = False
     await session.commit()
@@ -316,15 +366,17 @@ async def get_direction_task_counts(
     request: Request,
     project_id: uuid.UUID,
     session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
 ):
     await _get_user_project(project_id, current_user["user_id"], session)
 
     result = await session.execute(
-        select(Task).where(
+        select(Task)
+        .where(
             Task.project_id == project_id,
             Task.status.not_in([TaskStatus.CANCELLED, TaskStatus.FAILED]),
-        ).limit(5000)
+        )
+        .limit(5000)
     )
     tasks = result.scalars().all()
 
@@ -356,14 +408,22 @@ async def get_direction_task_counts(
             counts[d_id] = counts.get(d_id, 0) + 1
             counts_by_type.setdefault(d_id, {})
             counts_by_type[d_id][task_type] = counts_by_type[d_id].get(task_type, 0) + 1
-            active_tasks.setdefault(d_id, []).append({
-                "id": str(task.id),
-                "status": task.status.value if hasattr(task.status, "value") else str(task.status),
-                "title": task.title or "",
-                "latest_status_message": (task.latest_status_message or "")[:200],
-            })
+            active_tasks.setdefault(d_id, []).append(
+                {
+                    "id": str(task.id),
+                    "status": task.status.value
+                    if hasattr(task.status, "value")
+                    else str(task.status),
+                    "title": task.title or "",
+                    "latest_status_message": (task.latest_status_message or "")[:200],
+                }
+            )
 
-    return {"counts": counts, "counts_by_type": counts_by_type, "active_tasks": active_tasks}
+    return {
+        "counts": counts,
+        "counts_by_type": counts_by_type,
+        "active_tasks": active_tasks,
+    }
 
 
 @router.patch("/projects/{project_id}/autonomous")
@@ -373,9 +433,11 @@ async def toggle_autonomous(
     project_id: uuid.UUID,
     payload: Dict[str, Any],
     session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
 ):
-    project = await _get_user_project_with_role(project_id, current_user["user_id"], session, "owner")
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
 
     if "enabled" not in payload:
         raise HTTPException(status_code=400, detail="'enabled' field required")
@@ -384,6 +446,7 @@ async def toggle_autonomous(
     # Reset failure counter when re-enabling
     if project.autonomous_enabled:
         from app.shared_state import autonomous_failure_counts
+
         autonomous_failure_counts.pop(str(project_id), None)
     session.add(project)
     await session.commit()
@@ -395,25 +458,39 @@ async def toggle_autonomous(
 async def get_autonomous_status(
     request: Request,
     session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
 ):
     from app.shared_state import autonomous_failure_counts, runtime_config
 
-    projects = (await session.execute(
-        select(Project).where(Project.id.in_(_user_project_ids(current_user["user_id"]))).order_by(Project.created_at.desc())
-    )).scalars().all()
+    projects = (
+        (
+            await session.execute(
+                select(Project)
+                .where(Project.id.in_(_user_project_ids(current_user["user_id"])))
+                .order_by(Project.created_at.desc())
+            )
+        )
+        .scalars()
+        .all()
+    )
 
     one_hour_ago = _utcnow() - timedelta(hours=1)
 
     # Count autonomous RESEARCH tasks per project in the last hour (matches rate limit guard)
     user_pids = _user_project_ids(current_user["user_id"])
-    auto_tasks = (await session.execute(
-        select(Task).where(
-            Task.project_id.in_(user_pids),
-            Task.created_by == "ORCHESTRATOR",
-            Task.created_at >= one_hour_ago,
+    auto_tasks = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.project_id.in_(user_pids),
+                    Task.created_by == "ORCHESTRATOR",
+                    Task.created_at >= one_hour_ago,
+                )
+            )
         )
-    )).scalars().all()
+        .scalars()
+        .all()
+    )
     tasks_per_project: dict = {}
     for t in auto_tasks:
         if (t.first_payload).get("type") == "research":
@@ -424,26 +501,37 @@ async def get_autonomous_status(
         select(
             Task.project_id,
             func.max(Task.created_at).label("max_created_at"),
-        ).where(Task.created_by == "ORCHESTRATOR")
+        )
+        .where(Task.created_by == "ORCHESTRATOR")
         .group_by(Task.project_id)
         .subquery()
     )
-    last_research_rows = (await session.execute(
-        select(last_research_subq.c.project_id, last_research_subq.c.max_created_at)
-    )).all()
-    last_research_map = {row.project_id: row.max_created_at for row in last_research_rows}
+    last_research_rows = (
+        await session.execute(
+            select(last_research_subq.c.project_id, last_research_subq.c.max_created_at)
+        )
+    ).all()
+    last_research_map = {
+        row.project_id: row.max_created_at for row in last_research_rows
+    }
 
     result = []
     for project in projects:
         project_id_str = str(project.id)
-        result.append({
-            "project_id": project_id_str,
-            "project_name": project.name,
-            "autonomous_enabled": project.autonomous_enabled,
-            "consecutive_failures": autonomous_failure_counts.get(project_id_str, 0),
-            "last_research_at": last_research_map[project.id].isoformat() if last_research_map.get(project.id) else None,
-            "tasks_spawned_last_hour": tasks_per_project.get(project.id, 0),
-            "rate_limit": runtime_config["max_autonomous_tasks_per_hour"],
-        })
+        result.append(
+            {
+                "project_id": project_id_str,
+                "project_name": project.name,
+                "autonomous_enabled": project.autonomous_enabled,
+                "consecutive_failures": autonomous_failure_counts.get(
+                    project_id_str, 0
+                ),
+                "last_research_at": last_research_map[project.id].isoformat()
+                if last_research_map.get(project.id)
+                else None,
+                "tasks_spawned_last_hour": tasks_per_project.get(project.id, 0),
+                "rate_limit": runtime_config["max_autonomous_tasks_per_hour"],
+            }
+        )
 
     return {"projects": result}

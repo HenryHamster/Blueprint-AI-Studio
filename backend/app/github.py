@@ -71,6 +71,7 @@ def _record_call(method: str, url: str) -> None:
     """Bump the per-endpoint counter so we can see which endpoints drain
     the 5000/hr quota when the window runs low."""
     import app.shared_state as _ss  # noqa: PLC0415
+
     template = _normalize_endpoint_template(method, url)
     _ss.github_call_counts[template] = _ss.github_call_counts.get(template, 0) + 1
 
@@ -86,6 +87,7 @@ async def probe_rate_limit() -> bool:
     # on a refresh.  If nothing's cached, skip the probe; real activity
     # will populate the pill soon enough.
     from app.routers.agent import _github_token_cache  # noqa: PLC0415
+
     cached_token: str | None = None
     for entry in _github_token_cache.values():
         token = entry.get("token")
@@ -101,7 +103,9 @@ async def probe_rate_limit() -> bool:
     }
     try:
         resp = await _github_request(
-            "GET", "https://api.github.com/rate_limit", headers,
+            "GET",
+            "https://api.github.com/rate_limit",
+            headers,
             max_retries=1,
         )
         return resp is not None
@@ -127,6 +131,7 @@ def _relevant_bucket(url: str, headers: dict | None) -> dict:
     spurious short-circuits.
     """
     import app.shared_state as _ss  # noqa: PLC0415
+
     auth = (headers or {}).get("Authorization", "")
     if "/app/" in url or auth.startswith("Bearer eyJ"):
         return _ss.github_jwt_quota
@@ -134,8 +139,11 @@ def _relevant_bucket(url: str, headers: dict | None) -> dict:
 
 
 def _update_quota_state(
-    remaining: int, limit: int | None, reset_ts: int | None,
-    *, bucket_name: str = "install",
+    remaining: int,
+    limit: int | None,
+    reset_ts: int | None,
+    *,
+    bucket_name: str = "install",
 ) -> None:
     """Mirror X-RateLimit-* headers into the correct shared_state quota bucket.
 
@@ -152,6 +160,7 @@ def _update_quota_state(
     """
     from datetime import datetime, timezone
     import app.shared_state as _ss  # noqa: PLC0415
+
     q = _ss.github_jwt_quota if bucket_name == "jwt" else _ss.github_quota
     now_iso = datetime.now(timezone.utc).isoformat()
     prev_reset = q.get("reset_at")
@@ -238,8 +247,11 @@ async def _github_request(
         and (b_reset - int(time.time())) > RATE_LIMIT_FAST_FAIL_THRESHOLD_S
     ):
         import app.shared_state as _ss  # noqa: PLC0415
+
         label = "JWT" if bucket is _ss.github_jwt_quota else "install-token"
-        _ss.github_cache_hits["bucket_short_circuit"] = _ss.github_cache_hits.get("bucket_short_circuit", 0) + 1
+        _ss.github_cache_hits["bucket_short_circuit"] = (
+            _ss.github_cache_hits.get("bucket_short_circuit", 0) + 1
+        )
         logger.warning(
             f"[GITHUB] {method} {url} short-circuited — {label} bucket empty, "
             f"resets in {b_reset - int(time.time())}s"
@@ -260,8 +272,10 @@ async def _github_request(
             # X-RateLimit-Remaining: 0, so also treat 403 + Retry-After as retriable.
             is_rate_limited = response.status_code == 429 or (
                 response.status_code == 403
-                and (response.headers.get("X-RateLimit-Remaining") == "0"
-                     or response.headers.get("Retry-After") is not None)
+                and (
+                    response.headers.get("X-RateLimit-Remaining") == "0"
+                    or response.headers.get("Retry-After") is not None
+                )
             )
             if is_rate_limited and attempt < max_retries - 1:
                 retry_after = response.headers.get("Retry-After")
@@ -271,7 +285,7 @@ async def _github_request(
                 elif reset_ts:
                     delay = min(max(0, int(reset_ts) - int(time.time())) + 1, 120)
                 else:
-                    delay = min(2 ** attempt * 10, 120)
+                    delay = min(2**attempt * 10, 120)
                 # Fail fast on "hard" rate limits: if the reset window is more
                 # than a few seconds out, retrying is guaranteed to burn extra
                 # 403s against the counter without changing the outcome. Return
@@ -298,7 +312,9 @@ async def _github_request(
                         reset_ts = response.headers.get("X-RateLimit-Reset")
                         if reset_ts:
                             wait = max(0, int(reset_ts) - int(time.time())) + 1
-                            logger.warning(f"[GITHUB] Rate limit critical: {remaining} calls left, waiting {wait}s until reset")
+                            logger.warning(
+                                f"[GITHUB] Rate limit critical: {remaining} calls left, waiting {wait}s until reset"
+                            )
                             await asyncio.sleep(min(wait, 120))  # cap at 2min
                 except (ValueError, TypeError):
                     pass  # Malformed header, skip rate limit check
@@ -324,8 +340,10 @@ async def _github_request(
                     try:
                         _update_quota_state(
                             remaining=int(remaining),
-                            limit=int(response.headers.get("X-RateLimit-Limit", 0)) or None,
-                            reset_ts=int(response.headers.get("X-RateLimit-Reset", 0)) or None,
+                            limit=int(response.headers.get("X-RateLimit-Limit", 0))
+                            or None,
+                            reset_ts=int(response.headers.get("X-RateLimit-Reset", 0))
+                            or None,
                             bucket_name=_bucket_name,
                         )
                     except (ValueError, TypeError):
@@ -337,8 +355,11 @@ async def _github_request(
                 )
                 if project_id:
                     from app.routers.agent import invalidate_github_token_cache  # noqa: PLC0415
+
                     invalidate_github_token_cache(project_id)
-                    logger.info(f"[GITHUB] Invalidated token cache for project {project_id} after 401")
+                    logger.info(
+                        f"[GITHUB] Invalidated token cache for project {project_id} after 401"
+                    )
             if response.status_code < 500 or attempt == max_retries - 1:
                 if attempt > 0 and response.status_code >= 500:
                     logger.error(
@@ -346,7 +367,7 @@ async def _github_request(
                         f"after {max_retries} attempts"
                     )
                 return response
-            delay = 2 ** attempt * (0.5 + random.random() * 0.5)  # jittered: 0.5x–1x base
+            delay = 2**attempt * (0.5 + random.random() * 0.5)  # jittered: 0.5x–1x base
             logger.warning(
                 f"[GITHUB] {method} {url} returned {response.status_code}, "
                 f"retrying in {delay:.2f}s (attempt {attempt + 1}/{max_retries})"
@@ -360,11 +381,20 @@ async def _github_request(
             # next attempt rebuilds TCP+TLS instead of reusing the broken
             # connection. Non-transport HTTPErrors (timeouts on a fresh conn,
             # invalid URL, etc.) don't benefit from a pool reset.
-            if isinstance(exc, (httpx.ConnectError, httpx.ReadError,
-                                httpx.WriteError, httpx.PoolTimeout)):
+            if isinstance(
+                exc,
+                (
+                    httpx.ConnectError,
+                    httpx.ReadError,
+                    httpx.WriteError,
+                    httpx.PoolTimeout,
+                ),
+            ):
                 await close_github_client()
-                logger.warning(f"[GITHUB] Reset HTTP client after transport error: {type(exc).__name__}")
-            delay = 2 ** attempt * (0.5 + random.random() * 0.5)  # jittered: 0.5x–1x base
+                logger.warning(
+                    f"[GITHUB] Reset HTTP client after transport error: {type(exc).__name__}"
+                )
+            delay = 2**attempt * (0.5 + random.random() * 0.5)  # jittered: 0.5x–1x base
             logger.warning(
                 f"[GITHUB] {method} {url} network error: {exc}, "
                 f"retrying in {delay:.2f}s (attempt {attempt + 1}/{max_retries})"
@@ -379,20 +409,24 @@ def generate_github_app_jwt() -> str:
     Generates a JWT to authenticate as the GitHub App.
     """
     if not GITHUB_APP_ID or not GITHUB_PRIVATE_KEY:
-        raise ValueError("GITHUB_APP_ID and GITHUB_PRIVATE_KEY must be set in environment variables.")
+        raise ValueError(
+            "GITHUB_APP_ID and GITHUB_PRIVATE_KEY must be set in environment variables."
+        )
 
     now = int(time.time())
     payload = {
-        "iat": now - 60, # Issued at time, 60 seconds in the past to allow for clock drift
-        "exp": now + (10 * 60), # JWT expiration time (10 minute maximum)
-        "iss": GITHUB_APP_ID # GitHub App's identifier
+        "iat": now
+        - 60,  # Issued at time, 60 seconds in the past to allow for clock drift
+        "exp": now + (10 * 60),  # JWT expiration time (10 minute maximum)
+        "iss": GITHUB_APP_ID,  # GitHub App's identifier
     }
 
     # Ensure the private key is properly formatted
-    private_key = GITHUB_PRIVATE_KEY.replace('\\n', '\n')
+    private_key = GITHUB_PRIVATE_KEY.replace("\\n", "\n")
 
     encoded_jwt = jwt.encode(payload, private_key, algorithm="RS256")
     return encoded_jwt
+
 
 # Cache of (owner, repo) → installation_id.  Installations don't change
 # often (only when a repo is added/removed from the App), so a long TTL
@@ -427,19 +461,23 @@ async def get_repo_installation_token(owner: str, repo: str) -> str | None:
         headers = {
             "Authorization": f"Bearer {app_jwt}",
             "Accept": "application/vnd.github.v3+json",
-            "X-GitHub-Api-Version": "2022-11-28"
+            "X-GitHub-Api-Version": "2022-11-28",
         }
         resp = await _github_request(
             "GET", f"https://api.github.com/repos/{owner}/{repo}/installation", headers
         )
         if resp.status_code != 200:
-            logger.warning(f"No GitHub App installation found for {owner}/{repo}: {resp.status_code}")
+            logger.warning(
+                f"No GitHub App installation found for {owner}/{repo}: {resp.status_code}"
+            )
             _installation_id_cache.pop(cache_key, None)
             return None
         installation_id = str(resp.json()["id"])
         _installation_id_cache[cache_key] = (installation_id, time.time())
 
-    return await generate_installation_access_token(installation_id, repositories=[repo])
+    return await generate_installation_access_token(
+        installation_id, repositories=[repo]
+    )
 
 
 async def exchange_oauth_code(code: str, redirect_uri: str | None = None) -> dict:
@@ -464,7 +502,8 @@ async def exchange_oauth_code(code: str, redirect_uri: str | None = None) -> dic
     if resp.status_code != 200:
         logger.error(
             "[GITHUB OAUTH] Token exchange returned %s: %s",
-            resp.status_code, resp.text,
+            resp.status_code,
+            resp.text,
         )
         raise HTTPException(status_code=502, detail="GitHub OAuth exchange failed")
 
@@ -510,7 +549,9 @@ async def get_user_installations(user_token: str) -> list[dict]:
         resp = await _github_request("GET", url, headers)
         if resp.status_code != 200:
             logger.error(f"Failed to fetch user installations: {resp.text}")
-            raise HTTPException(status_code=resp.status_code, detail=f"GitHub API error: {resp.text}")
+            raise HTTPException(
+                status_code=resp.status_code, detail=f"GitHub API error: {resp.text}"
+            )
         data = resp.json()
         installations.extend(data.get("installations", []))
         # Follow pagination
@@ -521,15 +562,23 @@ async def get_user_installations(user_token: str) -> list[dict]:
 async def get_github_user(user_token: str) -> dict:
     """Get the authenticated GitHub user's profile."""
     resp = await _github_request(
-        "GET", "https://api.github.com/user",
-        {"Authorization": f"Bearer {user_token}", "Accept": "application/vnd.github.v3+json"},
+        "GET",
+        "https://api.github.com/user",
+        {
+            "Authorization": f"Bearer {user_token}",
+            "Accept": "application/vnd.github.v3+json",
+        },
     )
     if resp.status_code != 200:
-        raise HTTPException(status_code=502, detail="Failed to fetch GitHub user profile")
+        raise HTTPException(
+            status_code=502, detail="Failed to fetch GitHub user profile"
+        )
     return resp.json()
 
 
-async def generate_installation_access_token(installation_id: str, repositories: list[str] | None = None) -> str:
+async def generate_installation_access_token(
+    installation_id: str, repositories: list[str] | None = None
+) -> str:
     """
     Exchanges the GitHub App JWT for a short-lived Installation Access Token.
     """
@@ -538,7 +587,7 @@ async def generate_installation_access_token(installation_id: str, repositories:
     headers = {
         "Authorization": f"Bearer {app_jwt}",
         "Accept": "application/vnd.github.v3+json",
-        "X-GitHub-Api-Version": "2022-11-28"
+        "X-GitHub-Api-Version": "2022-11-28",
     }
 
     payload = {}
@@ -549,23 +598,25 @@ async def generate_installation_access_token(installation_id: str, repositories:
         response = await _github_request(
             "POST",
             f"https://api.github.com/app/installations/{installation_id}/access_tokens",
-            headers, json=payload
+            headers,
+            json=payload,
         )
     except httpx.HTTPError as e:
         logger.exception("Network error generating installation token")
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Failed to reach GitHub API: {e}"
+            detail=f"Failed to reach GitHub API: {e}",
         )
 
     if response.status_code != 201:
         logger.error(f"Failed to generate installation access token: {response.text}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to authenticate with GitHub App ({response.status_code}): {response.text[:200]}"
+            detail=f"Failed to authenticate with GitHub App ({response.status_code}): {response.text[:200]}",
         )
 
     return response.json().get("token")
+
 
 async def validate_fine_grained_pat(token: str, target_repo: str | None = None) -> dict:
     """
@@ -577,13 +628,13 @@ async def validate_fine_grained_pat(token: str, target_repo: str | None = None) 
     if not token.startswith("github_pat_"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid token format. Please provide a Fine-Grained Personal Access Token (starts with 'github_pat_'). Classic tokens ('ghp_') are not allowed for security reasons."
+            detail="Invalid token format. Please provide a Fine-Grained Personal Access Token (starts with 'github_pat_'). Classic tokens ('ghp_') are not allowed for security reasons.",
         )
 
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github.v3+json",
-        "X-GitHub-Api-Version": "2022-11-28"
+        "X-GitHub-Api-Version": "2022-11-28",
     }
 
     # 1. Check if the token is valid by hitting the authenticated user endpoint
@@ -592,28 +643,30 @@ async def validate_fine_grained_pat(token: str, target_repo: str | None = None) 
     if user_response.status_code == 401:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="The provided GitHub token is invalid or expired."
+            detail="The provided GitHub token is invalid or expired.",
         )
     elif user_response.status_code != 200:
         logger.error(f"GitHub API error: {user_response.text}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to validate token with GitHub."
+            detail="Failed to validate token with GitHub.",
         )
 
     # 2. If a target repo is provided, verify the token can access it
     if target_repo:
-        repo_response = await _github_request("GET", f"https://api.github.com/repos/{target_repo}", headers)
+        repo_response = await _github_request(
+            "GET", f"https://api.github.com/repos/{target_repo}", headers
+        )
         if repo_response.status_code == 404:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"The token does not have access to the repository '{target_repo}'. Ensure the Fine-Grained PAT is scoped to this repository."
+                detail=f"The token does not have access to the repository '{target_repo}'. Ensure the Fine-Grained PAT is scoped to this repository.",
             )
         elif repo_response.status_code != 200:
             logger.error(f"GitHub API error on repo check: {repo_response.text}")
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to verify repository access with GitHub."
+                detail="Failed to verify repository access with GitHub.",
             )
 
         # Optionally check if the token has push access
@@ -622,14 +675,15 @@ async def validate_fine_grained_pat(token: str, target_repo: str | None = None) 
         if not permissions.get("push", False):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"The token has read access to '{target_repo}', but lacks 'push' (write) permissions. Please update the token scopes."
+                detail=f"The token has read access to '{target_repo}', but lacks 'push' (write) permissions. Please update the token scopes.",
             )
 
     return {
         "status": "valid",
         "message": "Fine-Grained PAT is valid and properly scoped.",
-        "user": user_response.json().get("login")
+        "user": user_response.json().get("login"),
     }
+
 
 async def update_commit_status(
     token: str,
@@ -639,7 +693,7 @@ async def update_commit_status(
     state: str,
     description: str = "",
     context: str = "blueprint-agent",
-    target_url: str = ""
+    target_url: str = "",
 ) -> dict:
     """
     Reports agent task progress (Queued, In Progress, Success, Failed) directly to the GitHub Commit Status API.
@@ -648,30 +702,29 @@ async def update_commit_status(
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github.v3+json",
-        "X-GitHub-Api-Version": "2022-11-28"
+        "X-GitHub-Api-Version": "2022-11-28",
     }
 
-    payload = {
-        "state": state,
-        "description": description,
-        "context": context
-    }
+    payload = {"state": state, "description": description, "context": context}
     if target_url:
         payload["target_url"] = target_url
 
     response = await _github_request(
-        "POST", f"https://api.github.com/repos/{owner}/{repo}/statuses/{sha}",
-        headers, json=payload
+        "POST",
+        f"https://api.github.com/repos/{owner}/{repo}/statuses/{sha}",
+        headers,
+        json=payload,
     )
 
     if response.status_code != 201:
         logger.error(f"Failed to update commit status: {response.text}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to update commit status on GitHub."
+            detail="Failed to update commit status on GitHub.",
         )
 
     return response.json()
+
 
 async def create_check_run(
     token: str,
@@ -694,6 +747,7 @@ async def create_check_run(
     }
     # Audit W1/F8: use _utcnow() for consistency with the rest of the app.
     from app.time_utils import _utcnow as _ut  # noqa: PLC0415
+
     payload: dict = {
         "name": name,
         "head_sha": head_sha,
@@ -704,8 +758,10 @@ async def create_check_run(
         payload["details_url"] = details_url
 
     response = await _github_request(
-        "POST", f"https://api.github.com/repos/{owner}/{repo}/check-runs",
-        headers, json=payload
+        "POST",
+        f"https://api.github.com/repos/{owner}/{repo}/check-runs",
+        headers,
+        json=payload,
     )
 
     if response.status_code == 201:
@@ -750,6 +806,7 @@ async def update_check_run(
 
     # Audit W1/F8: use _utcnow() for consistency with the rest of the app.
     from app.time_utils import _utcnow as _ut  # noqa: PLC0415
+
     payload: dict = {
         "status": "completed",
         "conclusion": conclusion,
@@ -758,8 +815,10 @@ async def update_check_run(
     }
 
     response = await _github_request(
-        "PATCH", f"https://api.github.com/repos/{owner}/{repo}/check-runs/{check_run_id}",
-        headers, json=payload
+        "PATCH",
+        f"https://api.github.com/repos/{owner}/{repo}/check-runs/{check_run_id}",
+        headers,
+        json=payload,
     )
 
     if response.status_code == 200:
@@ -772,11 +831,7 @@ async def update_check_run(
 
 
 async def create_pr_comment(
-    token: str,
-    owner: str,
-    repo: str,
-    pr_number: int,
-    body: str
+    token: str, owner: str, repo: str, pr_number: int, body: str
 ) -> dict:
     """
     Posts a general PR summary or error log back to a GitHub PR.
@@ -785,23 +840,23 @@ async def create_pr_comment(
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github.v3+json",
-        "X-GitHub-Api-Version": "2022-11-28"
+        "X-GitHub-Api-Version": "2022-11-28",
     }
 
-    payload = {
-        "body": body
-    }
+    payload = {"body": body}
 
     response = await _github_request(
-        "POST", f"https://api.github.com/repos/{owner}/{repo}/issues/{pr_number}/comments",
-        headers, json=payload
+        "POST",
+        f"https://api.github.com/repos/{owner}/{repo}/issues/{pr_number}/comments",
+        headers,
+        json=payload,
     )
 
     if response.status_code != 201:
         logger.error(f"Failed to create PR comment: {response.text}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to create PR comment on GitHub."
+            detail="Failed to create PR comment on GitHub.",
         )
 
     return response.json()
@@ -848,7 +903,7 @@ async def create_pr_review_comment(
     commit_id: str,
     path: str,
     line: int,
-    body: str
+    body: str,
 ) -> dict:
     """
     Posts an inline code review comment on a specific line of a file in a PR.
@@ -856,7 +911,7 @@ async def create_pr_review_comment(
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github.v3+json",
-        "X-GitHub-Api-Version": "2022-11-28"
+        "X-GitHub-Api-Version": "2022-11-28",
     }
 
     payload = {
@@ -864,19 +919,21 @@ async def create_pr_review_comment(
         "commit_id": commit_id,
         "path": path,
         "line": line,
-        "side": "RIGHT"
+        "side": "RIGHT",
     }
 
     response = await _github_request(
-        "POST", f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/comments",
-        headers, json=payload
+        "POST",
+        f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/comments",
+        headers,
+        json=payload,
     )
 
     if response.status_code != 201:
         logger.error(f"Failed to create PR review comment: {response.text}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to create PR review comment on GitHub."
+            detail="Failed to create PR review comment on GitHub.",
         )
 
     return response.json()
@@ -889,7 +946,7 @@ async def submit_pr_review(
     pr_number: int,
     event: str,
     body: str,
-    comments: list[dict]
+    comments: list[dict],
 ) -> dict | None:
     """
     Submits a PR review via the GitHub Pull Request Reviews API.
@@ -904,7 +961,7 @@ async def submit_pr_review(
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github.v3+json",
-        "X-GitHub-Api-Version": "2022-11-28"
+        "X-GitHub-Api-Version": "2022-11-28",
     }
 
     payload: dict = {
@@ -915,8 +972,10 @@ async def submit_pr_review(
     }
 
     response = await _github_request(
-        "POST", f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/reviews",
-        headers, json=payload
+        "POST",
+        f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/reviews",
+        headers,
+        json=payload,
     )
 
     if response.status_code == 422:
@@ -925,22 +984,29 @@ async def submit_pr_review(
         )
         payload["comments"] = []
         response = await _github_request(
-            "POST", f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/reviews",
-            headers, json=payload
+            "POST",
+            f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/reviews",
+            headers,
+            json=payload,
         )
 
     if response.status_code == 404:
-        logger.warning(f"[GITHUB] submit_pr_review 404 for PR #{pr_number} in {owner}/{repo}")
+        logger.warning(
+            f"[GITHUB] submit_pr_review 404 for PR #{pr_number} in {owner}/{repo}"
+        )
         return None
 
     if response.status_code not in (200, 201):
-        logger.error(f"[GITHUB] Failed to submit PR review #{pr_number}: {response.status_code} {response.text[:300]}")
+        logger.error(
+            f"[GITHUB] Failed to submit PR review #{pr_number}: {response.status_code} {response.text[:300]}"
+        )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to submit PR review on GitHub: {response.text[:200]}"
+            detail=f"Failed to submit PR review on GitHub: {response.text[:200]}",
         )
 
     return response.json()
+
 
 async def create_issue(
     token: str,
@@ -948,7 +1014,7 @@ async def create_issue(
     repo: str,
     title: str,
     body: str = "",
-    assignees: list | None = None
+    assignees: list | None = None,
 ) -> dict:
     """
     Creates a new issue in the specified repository.
@@ -956,58 +1022,55 @@ async def create_issue(
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github.v3+json",
-        "X-GitHub-Api-Version": "2022-11-28"
+        "X-GitHub-Api-Version": "2022-11-28",
     }
 
-    payload: Dict[str, Any] = {
-        "title": title,
-        "body": body
-    }
+    payload: Dict[str, Any] = {"title": title, "body": body}
     if assignees:
         payload["assignees"] = assignees
 
     response = await _github_request(
-        "POST", f"https://api.github.com/repos/{owner}/{repo}/issues",
-        headers, json=payload
+        "POST",
+        f"https://api.github.com/repos/{owner}/{repo}/issues",
+        headers,
+        json=payload,
     )
 
     if response.status_code != 201:
         logger.error(f"Failed to create issue: {response.text}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to create issue on GitHub."
+            detail="Failed to create issue on GitHub.",
         )
 
     return response.json()
 
-async def get_issues(
-    token: str,
-    owner: str,
-    repo: str,
-    state: str = "open"
-) -> list:
+
+async def get_issues(token: str, owner: str, repo: str, state: str = "open") -> list:
     """
     Retrieves a list of issues for the specified repository.
     """
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github.v3+json",
-        "X-GitHub-Api-Version": "2022-11-28"
+        "X-GitHub-Api-Version": "2022-11-28",
     }
 
     response = await _github_request(
-        "GET", f"https://api.github.com/repos/{owner}/{repo}/issues?state={state}",
-        headers
+        "GET",
+        f"https://api.github.com/repos/{owner}/{repo}/issues?state={state}",
+        headers,
     )
 
     if response.status_code != 200:
         logger.error(f"Failed to get issues: {response.text}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to retrieve issues from GitHub."
+            detail="Failed to retrieve issues from GitHub.",
         )
 
     return response.json()
+
 
 async def get_single_issue(
     token: str,
@@ -1023,7 +1086,8 @@ async def get_single_issue(
     }
 
     response = await _github_request(
-        "GET", f"https://api.github.com/repos/{owner}/{repo}/issues/{issue_number}",
+        "GET",
+        f"https://api.github.com/repos/{owner}/{repo}/issues/{issue_number}",
         headers,
     )
 
@@ -1058,7 +1122,9 @@ async def get_issue_comments(
             headers,
         )
         if response.status_code != 200:
-            logger.warning(f"Failed to get comments for issue #{issue_number}: {response.status_code}")
+            logger.warning(
+                f"Failed to get comments for issue #{issue_number}: {response.status_code}"
+            )
             return []
         return response.json()
     except Exception as exc:
@@ -1088,7 +1154,9 @@ async def create_issue_comment(
     )
 
     if response.status_code != 201:
-        logger.error(f"Failed to create comment on issue #{issue_number}: {response.text}")
+        logger.error(
+            f"Failed to create comment on issue #{issue_number}: {response.text}"
+        )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to create comment on issue #{issue_number}.",
@@ -1098,11 +1166,7 @@ async def create_issue_comment(
 
 
 async def create_branch(
-    token: str,
-    owner: str,
-    repo: str,
-    branch_name: str,
-    sha: str
+    token: str, owner: str, repo: str, branch_name: str, sha: str
 ) -> dict:
     """
     Creates a new branch (git reference) in the specified repository.
@@ -1110,62 +1174,66 @@ async def create_branch(
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github.v3+json",
-        "X-GitHub-Api-Version": "2022-11-28"
+        "X-GitHub-Api-Version": "2022-11-28",
     }
 
-    payload = {
-        "ref": f"refs/heads/{branch_name}",
-        "sha": sha
-    }
+    payload = {"ref": f"refs/heads/{branch_name}", "sha": sha}
 
     response = await _github_request(
-        "POST", f"https://api.github.com/repos/{owner}/{repo}/git/refs",
-        headers, json=payload
+        "POST",
+        f"https://api.github.com/repos/{owner}/{repo}/git/refs",
+        headers,
+        json=payload,
     )
 
     if response.status_code == 422:
         # Branch may already exist (e.g., retry after 502 that actually succeeded)
         try:
             existing_sha = await get_branch_sha(token, owner, repo, branch_name)
-            logger.info(f"Branch '{branch_name}' already exists (sha: {existing_sha[:8]}), reusing")
+            logger.info(
+                f"Branch '{branch_name}' already exists (sha: {existing_sha[:8]}), reusing"
+            )
             return {"ref": f"refs/heads/{branch_name}", "object": {"sha": existing_sha}}
         except Exception:
-            logger.exception(f"Branch '{branch_name}' 422 but get_branch_sha also failed; falling through")
+            logger.exception(
+                f"Branch '{branch_name}' 422 but get_branch_sha also failed; falling through"
+            )
 
     if response.status_code != 201:
         logger.error(f"Failed to create branch: {response.status_code} {response.text}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to create branch '{branch_name}' on GitHub (GitHub {response.status_code})."
+            detail=f"Failed to create branch '{branch_name}' on GitHub (GitHub {response.status_code}).",
         )
 
     return response.json()
 
 
-async def get_branch_sha(
-    token: str, owner: str, repo: str, branch: str
-) -> str:
+async def get_branch_sha(token: str, owner: str, repo: str, branch: str) -> str:
     """Gets the latest commit SHA of a branch."""
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github.v3+json",
-        "X-GitHub-Api-Version": "2022-11-28"
+        "X-GitHub-Api-Version": "2022-11-28",
     }
     response = await _github_request(
-        "GET", f"https://api.github.com/repos/{owner}/{repo}/git/ref/heads/{branch}",
-        headers
+        "GET",
+        f"https://api.github.com/repos/{owner}/{repo}/git/ref/heads/{branch}",
+        headers,
     )
     if response.status_code == 404:
         logger.warning(f"Branch '{branch}' not found (404)")
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Branch '{branch}' not found (GitHub 404)."
+            detail=f"Branch '{branch}' not found (GitHub 404).",
         )
     if response.status_code != 200:
-        logger.error(f"Failed to get SHA for branch {branch}: {response.status_code} {response.text}")
+        logger.error(
+            f"Failed to get SHA for branch {branch}: {response.status_code} {response.text}"
+        )
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"GitHub API error getting branch '{branch}' SHA (HTTP {response.status_code})."
+            detail=f"GitHub API error getting branch '{branch}' SHA (HTTP {response.status_code}).",
         )
     return response.json()["object"]["sha"]
 
@@ -1175,7 +1243,7 @@ async def get_repo_default_branch(token: str, owner: str, repo: str) -> str:
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github.v3+json",
-        "X-GitHub-Api-Version": "2022-11-28"
+        "X-GitHub-Api-Version": "2022-11-28",
     }
     response = await _github_request(
         "GET", f"https://api.github.com/repos/{owner}/{repo}", headers
@@ -1185,18 +1253,17 @@ async def get_repo_default_branch(token: str, owner: str, repo: str) -> str:
     return response.json().get("default_branch", "main")
 
 
-async def delete_branch(
-    token: str, owner: str, repo: str, branch: str
-) -> bool:
+async def delete_branch(token: str, owner: str, repo: str, branch: str) -> bool:
     """Deletes a branch (git reference). Returns True if deleted."""
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github.v3+json",
-        "X-GitHub-Api-Version": "2022-11-28"
+        "X-GitHub-Api-Version": "2022-11-28",
     }
     response = await _github_request(
-        "DELETE", f"https://api.github.com/repos/{owner}/{repo}/git/refs/heads/{branch}",
-        headers
+        "DELETE",
+        f"https://api.github.com/repos/{owner}/{repo}/git/refs/heads/{branch}",
+        headers,
     )
     if response.status_code == 204:
         return True
@@ -1205,7 +1272,9 @@ async def delete_branch(
 
 
 async def list_branches(
-    token: str, owner: str, repo: str,
+    token: str,
+    owner: str,
+    repo: str,
     prefixes: list | None = None,
     max_branches: int = 500,
 ) -> list:
@@ -1225,9 +1294,14 @@ async def list_branches(
     while url and len(branches) < max_branches:
         response = await _github_request("GET", url, headers)
         if response.status_code == 401:
-            raise HTTPException(status_code=401, detail="GitHub authentication failed (401 Unauthorized)")
+            raise HTTPException(
+                status_code=401,
+                detail="GitHub authentication failed (401 Unauthorized)",
+            )
         if response.status_code != 200:
-            logger.error(f"[GITHUB] Failed to list branches for {owner}/{repo}: {response.status_code}")
+            logger.error(
+                f"[GITHUB] Failed to list branches for {owner}/{repo}: {response.status_code}"
+            )
             return []
         data = response.json()
         for b in data:
@@ -1244,6 +1318,7 @@ async def get_commit_date(
 ) -> "datetime | None":
     """Get the committer date for a commit SHA. Returns None on error."""
     from datetime import datetime as _dt
+
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github.v3+json",
@@ -1279,19 +1354,17 @@ async def create_pull_request(
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github.v3+json",
-        "X-GitHub-Api-Version": "2022-11-28"
+        "X-GitHub-Api-Version": "2022-11-28",
     }
 
-    payload = {
-        "title": title[:256],
-        "head": head,
-        "base": base,
-        "body": body[:65536]
-    }
+    payload = {"title": title[:256], "head": head, "base": base, "body": body[:65536]}
 
     response = await _github_request(
-        "POST", f"https://api.github.com/repos/{owner}/{repo}/pulls",
-        headers, json=payload, project_id=project_id,
+        "POST",
+        f"https://api.github.com/repos/{owner}/{repo}/pulls",
+        headers,
+        json=payload,
+        project_id=project_id,
     )
 
     if response.status_code == 201:
@@ -1305,11 +1378,14 @@ async def create_pull_request(
             msg = str(err.get("message", "")).lower()
             if "pull request already exists" in msg:
                 # Return the existing PR instead of failing
-                logger.info(f"PR already exists for {head} -> {base}, fetching existing PR")
+                logger.info(
+                    f"PR already exists for {head} -> {base}, fetching existing PR"
+                )
                 list_resp = await _github_request(
                     "GET",
                     f"https://api.github.com/repos/{owner}/{repo}/pulls?head={owner}:{head}&base={base}&state=open",
-                    headers, project_id=project_id,
+                    headers,
+                    project_id=project_id,
                 )
                 if list_resp.status_code == 200 and list_resp.json():
                     return list_resp.json()[0]
@@ -1324,47 +1400,71 @@ async def create_pull_request(
         # "Failed to create pull request" so the EXTERNAL_API classifier still
         # routes it correctly.
         gh_msg = data.get("message", "Validation failed")
-        err_msgs = "; ".join(str(e.get("message", "")) for e in errors if e.get("message"))
+        err_msgs = "; ".join(
+            str(e.get("message", "")) for e in errors if e.get("message")
+        )
         detail = f"Failed to create pull request (GitHub 422): {gh_msg}"
         if err_msgs:
             detail += f" — {err_msgs}"
-        logger.warning(f"Failed to create pull request (422 unmatched): {response.text[:500]}")
+        logger.warning(
+            f"Failed to create pull request (422 unmatched): {response.text[:500]}"
+        )
         raise HTTPException(status_code=422, detail=detail[:500])
 
     if response.status_code == 401:
-        logger.error(f"Failed to create pull request (401 Unauthorized): {response.text}")
+        logger.error(
+            f"Failed to create pull request (401 Unauthorized): {response.text}"
+        )
         raise HTTPException(
             status_code=401,
-            detail="GitHub authentication failed (401 Unauthorized) — token may be expired or revoked"
+            detail="GitHub authentication failed (401 Unauthorized) — token may be expired or revoked",
         )
-    logger.error(f"Failed to create pull request ({response.status_code}): {response.text}")
+    logger.error(
+        f"Failed to create pull request ({response.status_code}): {response.text}"
+    )
     raise HTTPException(
-        status_code=status.HTTP_502_BAD_GATEWAY if response.status_code >= 500 else status.HTTP_500_INTERNAL_SERVER_ERROR,
-        detail=f"Failed to create pull request (GitHub {response.status_code}): {response.text[:500]}"
+        status_code=status.HTTP_502_BAD_GATEWAY
+        if response.status_code >= 500
+        else status.HTTP_500_INTERNAL_SERVER_ERROR,
+        detail=f"Failed to create pull request (GitHub {response.status_code}): {response.text[:500]}",
     )
 
 
 async def get_pull_request(
-    token: str, owner: str, repo: str, pr_number: int,
+    token: str,
+    owner: str,
+    repo: str,
+    pr_number: int,
     project_id: str | None = None,
 ) -> dict:
     """Fetches PR details."""
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github.v3+json",
-        "X-GitHub-Api-Version": "2022-11-28"
+        "X-GitHub-Api-Version": "2022-11-28",
     }
     response = await _github_request(
-        "GET", f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}",
-        headers, project_id=project_id,
+        "GET",
+        f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}",
+        headers,
+        project_id=project_id,
     )
     if response.status_code == 401:
-        raise HTTPException(status_code=401, detail="GitHub authentication failed (401 Unauthorized) — token may be expired or revoked")
+        raise HTTPException(
+            status_code=401,
+            detail="GitHub authentication failed (401 Unauthorized) — token may be expired or revoked",
+        )
     if response.status_code in (404, 410):
-        raise HTTPException(status_code=response.status_code, detail=f"PR #{pr_number} not found or repo gone")
+        raise HTTPException(
+            status_code=response.status_code,
+            detail=f"PR #{pr_number} not found or repo gone",
+        )
     if response.status_code != 200:
         logger.error(f"Failed to get PR #{pr_number}: {response.text}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to get PR #{pr_number}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to get PR #{pr_number}",
+        )
     return response.json()
 
 
@@ -1375,17 +1475,21 @@ async def get_open_pull_requests(
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github.v3+json",
-        "X-GitHub-Api-Version": "2022-11-28"
+        "X-GitHub-Api-Version": "2022-11-28",
     }
     params: dict[str, str | int] = {"state": "open", "per_page": 100}
     if base is not None:
         params["base"] = base
     response = await _github_request(
-        "GET", f"https://api.github.com/repos/{owner}/{repo}/pulls",
-        headers, params=params
+        "GET",
+        f"https://api.github.com/repos/{owner}/{repo}/pulls",
+        headers,
+        params=params,
     )
     if response.status_code == 401:
-        raise HTTPException(status_code=401, detail="GitHub authentication failed (401 Unauthorized)")
+        raise HTTPException(
+            status_code=401, detail="GitHub authentication failed (401 Unauthorized)"
+        )
     if response.status_code != 200:
         logger.error(f"Failed to list PRs (base={base}): {response.text}")
         return []
@@ -1399,11 +1503,13 @@ async def get_pull_request_diff(
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github.v3.diff",
-        "X-GitHub-Api-Version": "2022-11-28"
+        "X-GitHub-Api-Version": "2022-11-28",
     }
     response = await _github_request(
-        "GET", f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}",
-        headers, timeout=30.0
+        "GET",
+        f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}",
+        headers,
+        timeout=30.0,
     )
     if response.status_code != 200:
         logger.error(f"Failed to get PR diff #{pr_number}: {response.text}")
@@ -1418,14 +1524,17 @@ async def get_pull_request_commits(
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github.v3+json",
-        "X-GitHub-Api-Version": "2022-11-28"
+        "X-GitHub-Api-Version": "2022-11-28",
     }
     response = await _github_request(
-        "GET", f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/commits?per_page=100",
-        headers
+        "GET",
+        f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/commits?per_page=100",
+        headers,
     )
     if response.status_code == 401:
-        raise HTTPException(status_code=401, detail="GitHub authentication failed (401 Unauthorized)")
+        raise HTTPException(
+            status_code=401, detail="GitHub authentication failed (401 Unauthorized)"
+        )
     if response.status_code != 200:
         logger.error(f"Failed to get PR commits #{pr_number}: {response.text}")
         return []
@@ -1433,18 +1542,25 @@ async def get_pull_request_commits(
 
 
 async def merge_pull_request(
-    token: str, owner: str, repo: str, pr_number: int, merge_method: str = "squash",
+    token: str,
+    owner: str,
+    repo: str,
+    pr_number: int,
+    merge_method: str = "squash",
     project_id: str | None = None,
 ) -> dict:
     """Merges a PR. Returns dict with 'merged' bool and 'message'. Does not raise on conflict."""
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github.v3+json",
-        "X-GitHub-Api-Version": "2022-11-28"
+        "X-GitHub-Api-Version": "2022-11-28",
     }
     response = await _github_request(
-        "PUT", f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/merge",
-        headers, json={"merge_method": merge_method}, project_id=project_id,
+        "PUT",
+        f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/merge",
+        headers,
+        json={"merge_method": merge_method},
+        project_id=project_id,
     )
     data = response.json()
     if response.status_code == 200:
@@ -1453,7 +1569,11 @@ async def merge_pull_request(
         # 405 = not mergeable (checks/reviews), 409 = merge conflict
         msg = data.get("message", "Merge failed")
         logger.warning(f"PR #{pr_number} merge blocked ({response.status_code}): {msg}")
-        return {"merged": False, "conflict": response.status_code == 409, "message": msg}
+        return {
+            "merged": False,
+            "conflict": response.status_code == 409,
+            "message": msg,
+        }
     body_snippet = (response.text or "")[:500]
     logger.error(
         f"Failed to merge PR #{pr_number} (status={response.status_code}): {body_snippet}"
@@ -1465,7 +1585,11 @@ async def merge_pull_request(
 
 
 async def enable_auto_merge(
-    token: str, owner: str, repo: str, pr_number: int, merge_method: str = "SQUASH",
+    token: str,
+    owner: str,
+    repo: str,
+    pr_number: int,
+    merge_method: str = "SQUASH",
     project_id: str | None = None,
 ) -> dict:
     """Enable GitHub auto-merge on a PR via the GraphQL enablePullRequestAutoMerge mutation.
@@ -1489,12 +1613,20 @@ async def enable_auto_merge(
 
     # Fetch node_id via the REST PR endpoint — GraphQL needs the global ID.
     try:
-        pr_data = await get_pull_request(token, owner, repo, pr_number, project_id=project_id)
+        pr_data = await get_pull_request(
+            token, owner, repo, pr_number, project_id=project_id
+        )
     except HTTPException as exc:
-        return {"enabled": False, "message": f"Failed to fetch PR #{pr_number}: {exc.detail}"}
+        return {
+            "enabled": False,
+            "message": f"Failed to fetch PR #{pr_number}: {exc.detail}",
+        }
     pr_node_id = pr_data.get("node_id")
     if not pr_node_id:
-        return {"enabled": False, "message": f"PR #{pr_number} has no node_id in REST response"}
+        return {
+            "enabled": False,
+            "message": f"PR #{pr_number} has no node_id in REST response",
+        }
 
     headers = {
         "Authorization": f"Bearer {token}",
@@ -1508,14 +1640,22 @@ async def enable_auto_merge(
         "  }"
         "}"
     )
-    body = {"query": mutation, "variables": {"prId": pr_node_id, "method": merge_method}}
+    body = {
+        "query": mutation,
+        "variables": {"prId": pr_node_id, "method": merge_method},
+    }
 
     response = await _github_request(
-        "POST", "https://api.github.com/graphql",
-        headers, json=body, project_id=project_id,
+        "POST",
+        "https://api.github.com/graphql",
+        headers,
+        json=body,
+        project_id=project_id,
     )
     if response.status_code != 200:
-        logger.warning(f"[AUTO-MERGE] PR #{pr_number} GraphQL {response.status_code}: {response.text[:200]}")
+        logger.warning(
+            f"[AUTO-MERGE] PR #{pr_number} GraphQL {response.status_code}: {response.text[:200]}"
+        )
         return {"enabled": False, "message": f"GraphQL HTTP {response.status_code}"}
     data = response.json() or {}
     # GraphQL returns 200 even on application-level errors — check the errors array.
@@ -1524,17 +1664,28 @@ async def enable_auto_merge(
         logger.info(f"[AUTO-MERGE] PR #{pr_number} rejected by GitHub: {err_msgs}")
         return {"enabled": False, "message": err_msgs or "GraphQL error"}
     enabled_at = (
-        data.get("data", {}).get("enablePullRequestAutoMerge", {})
-        .get("pullRequest", {}).get("autoMergeRequest", {}) or {}
+        data.get("data", {})
+        .get("enablePullRequestAutoMerge", {})
+        .get("pullRequest", {})
+        .get("autoMergeRequest", {})
+        or {}
     ).get("enabledAt")
     if enabled_at:
-        logger.info(f"[AUTO-MERGE] PR #{pr_number} queued for auto-merge ({merge_method}) at {enabled_at}")
+        logger.info(
+            f"[AUTO-MERGE] PR #{pr_number} queued for auto-merge ({merge_method}) at {enabled_at}"
+        )
         return {"enabled": True, "message": f"Auto-merge enabled at {enabled_at}"}
-    return {"enabled": False, "message": "GraphQL returned no enabledAt — auto-merge not confirmed"}
+    return {
+        "enabled": False,
+        "message": "GraphQL returned no enabledAt — auto-merge not confirmed",
+    }
 
 
 async def update_branch(
-    token: str, owner: str, repo: str, pr_number: int,
+    token: str,
+    owner: str,
+    repo: str,
+    pr_number: int,
     expected_head_sha: str | None = None,
     project_id: str | None = None,
 ) -> dict:
@@ -1560,7 +1711,9 @@ async def update_branch(
     response = await _github_request(
         "PUT",
         f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/update-branch",
-        headers, json=body, project_id=project_id,
+        headers,
+        json=body,
+        project_id=project_id,
     )
     if response.status_code == 202:
         try:
@@ -1576,7 +1729,9 @@ async def update_branch(
         except Exception:
             data = {}
         msg = data.get("message", f"HTTP {response.status_code}")
-        logger.info(f"[UPDATE-BRANCH] PR #{pr_number} cannot update ({response.status_code}): {msg}")
+        logger.info(
+            f"[UPDATE-BRANCH] PR #{pr_number} cannot update ({response.status_code}): {msg}"
+        )
         return {"updated": False, "message": msg}
     body_snippet = (response.text or "")[:500]
     logger.error(
@@ -1589,7 +1744,10 @@ async def update_branch(
 
 
 async def update_branch_with_sha_retry(
-    token: str, owner: str, repo: str, pr_number: int,
+    token: str,
+    owner: str,
+    repo: str,
+    pr_number: int,
     expected_head_sha: str | None = None,
     project_id: str | None = None,
 ) -> dict:
@@ -1605,8 +1763,12 @@ async def update_branch_with_sha_retry(
     """
     try:
         result = await update_branch(
-            token, owner, repo, pr_number,
-            expected_head_sha=expected_head_sha, project_id=project_id,
+            token,
+            owner,
+            repo,
+            pr_number,
+            expected_head_sha=expected_head_sha,
+            project_id=project_id,
         )
     except HTTPException as exc:
         return {"updated": False, "message": f"HTTP error: {exc.detail}"}
@@ -1615,7 +1777,9 @@ async def update_branch_with_sha_retry(
     if result.get("updated"):
         return result
     try:
-        fresh = await get_pull_request(token, owner, repo, pr_number, project_id=project_id)
+        fresh = await get_pull_request(
+            token, owner, repo, pr_number, project_id=project_id
+        )
     except Exception as exc:
         logger.debug(f"[UPDATE-BRANCH] PR #{pr_number} refetch failed: {exc}")
         return result
@@ -1628,8 +1792,12 @@ async def update_branch_with_sha_retry(
     )
     try:
         return await update_branch(
-            token, owner, repo, pr_number,
-            expected_head_sha=fresh_sha, project_id=project_id,
+            token,
+            owner,
+            repo,
+            pr_number,
+            expected_head_sha=fresh_sha,
+            project_id=project_id,
         )
     except HTTPException as exc:
         return {"updated": False, "message": f"HTTP error on retry: {exc.detail}"}
@@ -1638,49 +1806,68 @@ async def update_branch_with_sha_retry(
 
 
 async def close_pull_request(
-    token: str, owner: str, repo: str, pr_number: int,
+    token: str,
+    owner: str,
+    repo: str,
+    pr_number: int,
     project_id: str | None = None,
 ) -> bool:
     """Close a PR without merging. Returns True if closed successfully."""
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github.v3+json",
-        "X-GitHub-Api-Version": "2022-11-28"
+        "X-GitHub-Api-Version": "2022-11-28",
     }
     response = await _github_request(
-        "PATCH", f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}",
-        headers, json={"state": "closed"}, project_id=project_id,
+        "PATCH",
+        f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}",
+        headers,
+        json={"state": "closed"},
+        project_id=project_id,
     )
     if response.status_code == 200:
         logger.info(f"Closed PR #{pr_number} on {owner}/{repo}")
         return True
-    logger.warning(f"Failed to close PR #{pr_number}: {response.status_code} {response.text[:200]}")
+    logger.warning(
+        f"Failed to close PR #{pr_number}: {response.status_code} {response.text[:200]}"
+    )
     return False
 
 
 async def reopen_pull_request(
-    token: str, owner: str, repo: str, pr_number: int,
+    token: str,
+    owner: str,
+    repo: str,
+    pr_number: int,
     project_id: str | None = None,
 ) -> bool:
     """Reopen a previously closed PR. Returns True on success."""
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github.v3+json",
-        "X-GitHub-Api-Version": "2022-11-28"
+        "X-GitHub-Api-Version": "2022-11-28",
     }
     response = await _github_request(
-        "PATCH", f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}",
-        headers, json={"state": "open"}, project_id=project_id,
+        "PATCH",
+        f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}",
+        headers,
+        json={"state": "open"},
+        project_id=project_id,
     )
     if response.status_code == 200:
         logger.info(f"Reopened PR #{pr_number} on {owner}/{repo}")
         return True
-    logger.warning(f"Failed to reopen PR #{pr_number}: {response.status_code} {response.text[:200]}")
+    logger.warning(
+        f"Failed to reopen PR #{pr_number}: {response.status_code} {response.text[:200]}"
+    )
     return False
 
 
 async def get_pr_files(
-    token: str, owner: str, repo: str, pr_number: int,
+    token: str,
+    owner: str,
+    repo: str,
+    pr_number: int,
     project_id: str | None = None,
 ) -> list[dict]:
     """Fetches the list of files changed in a PR with their status.
@@ -1693,16 +1880,22 @@ async def get_pr_files(
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github.v3+json",
-        "X-GitHub-Api-Version": "2022-11-28"
+        "X-GitHub-Api-Version": "2022-11-28",
     }
     response = await _github_request(
-        "GET", f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/files?per_page=100",
-        headers, project_id=project_id,
+        "GET",
+        f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/files?per_page=100",
+        headers,
+        project_id=project_id,
     )
     if response.status_code == 401:
-        raise HTTPException(status_code=401, detail="GitHub authentication failed (401 Unauthorized)")
+        raise HTTPException(
+            status_code=401, detail="GitHub authentication failed (401 Unauthorized)"
+        )
     if response.status_code != 200:
-        logger.error(f"Failed to get PR files #{pr_number}: {response.status_code} {response.text[:300]}")
+        logger.error(
+            f"Failed to get PR files #{pr_number}: {response.status_code} {response.text[:300]}"
+        )
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"GitHub API error fetching PR #{pr_number} files (HTTP {response.status_code})",
@@ -1722,7 +1915,10 @@ def _unique(*values: int | None) -> list[int]:
 
 
 async def get_check_runs(
-    token: str, owner: str, repo: str, ref: str,
+    token: str,
+    owner: str,
+    repo: str,
+    ref: str,
     project_id: str | None = None,
 ) -> dict:
     """Get CI check run results for a commit SHA.
@@ -1736,15 +1932,22 @@ async def get_check_runs(
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github.v3+json",
-        "X-GitHub-Api-Version": "2022-11-28"
+        "X-GitHub-Api-Version": "2022-11-28",
     }
     response = await _github_request(
-        "GET", f"https://api.github.com/repos/{owner}/{repo}/commits/{ref}/check-runs",
-        headers, project_id=project_id,
+        "GET",
+        f"https://api.github.com/repos/{owner}/{repo}/commits/{ref}/check-runs",
+        headers,
+        project_id=project_id,
     )
     if response.status_code != 200:
         logger.error(f"Failed to get check runs for {ref}: {response.text}")
-        return {"status": "pending", "conclusion": None, "details": [], "failed_logs": ""}
+        return {
+            "status": "pending",
+            "conclusion": None,
+            "details": [],
+            "failed_logs": "",
+        }
 
     data = response.json()
     check_runs = data.get("check_runs", [])
@@ -1752,25 +1955,38 @@ async def get_check_runs(
     if not check_runs:
         # No CI configured on this repo — treat as passed so the
         # orchestrator doesn't wait 30 min for checks that will never arrive.
-        return {"status": "completed", "conclusion": "success", "details": [], "failed_logs": ""}
+        return {
+            "status": "completed",
+            "conclusion": "success",
+            "details": [],
+            "failed_logs": "",
+        }
 
     details = []
     failed_names = []
     for cr in check_runs:
-        details.append({
-            "name": cr.get("name", ""),
-            "status": cr.get("status", ""),
-            "conclusion": cr.get("conclusion"),
-        })
+        details.append(
+            {
+                "name": cr.get("name", ""),
+                "status": cr.get("status", ""),
+                "conclusion": cr.get("conclusion"),
+            }
+        )
         if cr.get("conclusion") == "failure":
             failed_names.append(cr.get("name", "unknown"))
 
     # Aggregate status
     statuses = [cr.get("status", "") for cr in check_runs]
-    agg_status = "in_progress" if any(s in ("queued", "in_progress") for s in statuses) else "completed"
+    agg_status = (
+        "in_progress"
+        if any(s in ("queued", "in_progress") for s in statuses)
+        else "completed"
+    )
 
     # Aggregate conclusion — "skipped" and "neutral" are non-failures
-    conclusions = [cr.get("conclusion") for cr in check_runs if cr.get("status") == "completed"]
+    conclusions = [
+        cr.get("conclusion") for cr in check_runs if cr.get("status") == "completed"
+    ]
     if not conclusions:
         agg_conclusion = None
     elif all(c in ("success", "skipped", "neutral") for c in conclusions):
@@ -1789,7 +2005,8 @@ async def get_check_runs(
             runs_resp = await _github_request(
                 "GET",
                 f"https://api.github.com/repos/{owner}/{repo}/actions/runs?head_sha={ref}&per_page=5",
-                headers, timeout=5.0,
+                headers,
+                timeout=5.0,
             )
             if runs_resp.status_code == 200:
                 wf_runs = runs_resp.json().get("workflow_runs", [])
@@ -1797,7 +2014,8 @@ async def get_check_runs(
                     _github_request(
                         "GET",
                         f"https://api.github.com/repos/{owner}/{repo}/actions/runs/{wf_run['id']}/jobs?filter=latest&per_page=30",
-                        headers, timeout=5.0,
+                        headers,
+                        timeout=5.0,
                     )
                     for wf_run in wf_runs
                 ]
@@ -1824,20 +2042,39 @@ async def get_check_runs(
                     log_response = await _github_request(
                         "GET",
                         f"https://api.github.com/repos/{owner}/{repo}/actions/jobs/{job_id}/logs",
-                        headers, follow_redirects=True, timeout=10.0,
+                        headers,
+                        follow_redirects=True,
+                        timeout=10.0,
                     )
                     if log_response.status_code == 200:
                         raw_log = log_response.text
                         lines = raw_log.strip().split("\n")
-                        error_lines = [ln for ln in lines if any(kw in ln.lower() for kw in ["error", "failed", "err!", "✗", "\u00d7"])]
+                        error_lines = [
+                            ln
+                            for ln in lines
+                            if any(
+                                kw in ln.lower()
+                                for kw in ["error", "failed", "err!", "✗", "\u00d7"]
+                            )
+                        ]
                         if error_lines:
-                            log_lines.append(f"  [{name}] Errors:\n" + "\n".join(f"    {ln.strip()}" for ln in error_lines[-30:]))
+                            log_lines.append(
+                                f"  [{name}] Errors:\n"
+                                + "\n".join(
+                                    f"    {ln.strip()}" for ln in error_lines[-30:]
+                                )
+                            )
                         else:
-                            log_lines.append(f"  [{name}] (last 30 lines):\n" + "\n".join(f"    {ln.strip()}" for ln in lines[-30:]))
+                            log_lines.append(
+                                f"  [{name}] (last 30 lines):\n"
+                                + "\n".join(f"    {ln.strip()}" for ln in lines[-30:])
+                            )
                         got_logs = True
                         break
                 except Exception:
-                    logger.exception(f"[CI LOGS] Failed to fetch logs for check-run {name}")
+                    logger.exception(
+                        f"[CI LOGS] Failed to fetch logs for check-run {name}"
+                    )
             if got_logs:
                 continue
 
@@ -1846,7 +2083,7 @@ async def get_check_runs(
                 ann_response = await _github_request(
                     "GET",
                     f"https://api.github.com/repos/{owner}/{repo}/check-runs/{cr_id}/annotations",
-                    headers
+                    headers,
                 )
                 if ann_response.status_code == 200:
                     for ann in ann_response.json():
@@ -1857,7 +2094,9 @@ async def get_check_runs(
                         line = ann.get("start_line", "")
                         log_lines.append(f"  [{name}] {path}:{line} — {msg}")
             except Exception:
-                logger.exception(f"[CI LOGS] Failed to fetch annotations for check-run {name}")
+                logger.exception(
+                    f"[CI LOGS] Failed to fetch annotations for check-run {name}"
+                )
 
             # Also include output summary if available
             output = cr.get("output", {})
@@ -1865,7 +2104,11 @@ async def get_check_runs(
             if summary:
                 log_lines.append(f"  [{name}] {summary[:500]}")
 
-        failed_logs = "\n".join(log_lines) if log_lines else "CI checks failed: " + ", ".join(failed_names)
+        failed_logs = (
+            "\n".join(log_lines)
+            if log_lines
+            else "CI checks failed: " + ", ".join(failed_names)
+        )
 
     return {
         "status": agg_status,
@@ -1895,8 +2138,12 @@ def invalidate_check_runs_cache(owner: str, repo: str, head_sha: str) -> None:
 
 
 async def get_check_runs_cached(
-    token: str, owner: str, repo: str, head_sha: str,
-    *, project_id: str | None = None,
+    token: str,
+    owner: str,
+    repo: str,
+    head_sha: str,
+    *,
+    project_id: str | None = None,
     ttl: float = _CHECK_RUNS_CACHE_TTL_S,
 ) -> dict:
     """Cached wrapper around ``get_check_runs``.
@@ -1907,11 +2154,14 @@ async def get_check_runs_cached(
     status changes over time.
     """
     import app.shared_state as _ss  # noqa: PLC0415
+
     key = (owner, repo, head_sha)
     now = time.time()
     cached = _check_runs_cache.get(key)
     if cached is not None and (now - cached[1]) < ttl:
-        _ss.github_cache_hits["check_runs"] = _ss.github_cache_hits.get("check_runs", 0) + 1
+        _ss.github_cache_hits["check_runs"] = (
+            _ss.github_cache_hits.get("check_runs", 0) + 1
+        )
         return cached[0]
     result = await get_check_runs(token, owner, repo, head_sha, project_id=project_id)
     _check_runs_cache[key] = (result, now)
@@ -1952,7 +2202,9 @@ def build_merge_summary_body(
         detail_lines.append(f"**Model:** {' / '.join(filter(None, [provider, model]))}")
     if direction_title or direction_id:
         if direction_title and direction_id:
-            detail_lines.append(f"**Direction:** {direction_title[:80]} `{direction_id[:8]}`")
+            detail_lines.append(
+                f"**Direction:** {direction_title[:80]} `{direction_id[:8]}`"
+            )
         else:
             detail_lines.append(f"**Direction:** {direction_title or direction_id}")
 
@@ -1987,15 +2239,22 @@ async def post_merge_summary_comment(
     Only call this for Blueprint-authored PRs — skip manual PRs at the call site.
     """
     body = build_merge_summary_body(
-        task_type=task_type, scope=scope, iteration_count=iteration_count,
-        provider=provider, model=model, cost_usd=cost_usd,
-        direction_title=direction_title, direction_id=direction_id,
+        task_type=task_type,
+        scope=scope,
+        iteration_count=iteration_count,
+        provider=provider,
+        model=model,
+        cost_usd=cost_usd,
+        direction_title=direction_title,
+        direction_id=direction_id,
     )
     try:
         await create_pr_comment(token, owner, repo, pr_number, body)
         return True
     except Exception as exc:
-        logger.warning(f"[GITHUB] post_merge_summary_comment failed for PR #{pr_number}: {exc}")
+        logger.warning(
+            f"[GITHUB] post_merge_summary_comment failed for PR #{pr_number}: {exc}"
+        )
         return False
 
 
@@ -2003,48 +2262,96 @@ BLUEPRINT_PR_MERGE_SUMMARY_MARKER = "<!-- blueprint:merge-summary -->"
 
 
 def build_blueprint_pr_merge_summary_comment(
-    task: Any, *, iteration_count: int | None = None, direction_title: str | None = None,
+    task: Any,
+    *,
+    iteration_count: int | None = None,
+    direction_title: str | None = None,
 ) -> str:
     """Build a markdown merge-summary comment for Blueprint-authored PRs."""
     from app.max_plan_pool import get_task_llm_provider  # noqa: PLC0415
     from app.task_completion import _estimated_task_cost_usd  # noqa: PLC0415
+
     ctx, pld = task.context or {}, task.first_payload or {}
-    if iteration_count is None and isinstance((ctx.get("review_loop") or {}).get("iteration"), int):
+    if iteration_count is None and isinstance(
+        (ctx.get("review_loop") or {}).get("iteration"), int
+    ):
         iteration_count = int((ctx.get("review_loop") or {})["iteration"])
     if not direction_title and isinstance(ctx.get("direction_title"), str):
         direction_title = ctx.get("direction_title")
-    task_type, scope = str(pld.get("type") or "create"), str(ctx.get("scope") or pld.get("scope") or "unknown")
+    task_type, scope = (
+        str(pld.get("type") or "create"),
+        str(ctx.get("scope") or pld.get("scope") or "unknown"),
+    )
     provider = get_task_llm_provider(task)
     model = ctx.get("llm_model") if isinstance(ctx.get("llm_model"), str) else None
-    exec_label, cost = " / ".join(p for p in [provider, model] if p) or "unknown", _estimated_task_cost_usd(task)
-    iters, dlabel = iteration_count if isinstance(iteration_count, int) else "n/a", (direction_title or "n/a").strip() or "n/a"
-    top = f"Review-fix iterations: **{iters}**" + (f" · Cost: **~${cost:.2f}**" if cost is not None else "")
-    return (f"{BLUEPRINT_PR_MERGE_SUMMARY_MARKER}\n### Blueprint Merge Summary\n{top}\n\n"
-            f"<details><summary>Execution details</summary>\n\n- Task: `{task_type}` (`{scope}`)\n"
-            f"- Agent: `{ctx.get('agent_handler') or task_type}`\n- Provider/Model: `{exec_label}`\n- Direction: {dlabel[:120]}\n</details>")
+    exec_label, cost = (
+        " / ".join(p for p in [provider, model] if p) or "unknown",
+        _estimated_task_cost_usd(task),
+    )
+    iters, dlabel = (
+        iteration_count if isinstance(iteration_count, int) else "n/a",
+        (direction_title or "n/a").strip() or "n/a",
+    )
+    top = f"Review-fix iterations: **{iters}**" + (
+        f" · Cost: **~${cost:.2f}**" if cost is not None else ""
+    )
+    return (
+        f"{BLUEPRINT_PR_MERGE_SUMMARY_MARKER}\n### Blueprint Merge Summary\n{top}\n\n"
+        f"<details><summary>Execution details</summary>\n\n- Task: `{task_type}` (`{scope}`)\n"
+        f"- Agent: `{ctx.get('agent_handler') or task_type}`\n- Provider/Model: `{exec_label}`\n- Direction: {dlabel[:120]}\n</details>"
+    )
 
 
 async def post_pipeline_merge_summary_comment(
-    orig_task: Any, ci_task: Any, gh_token: str, owner: str, repo: str, pr_number: int,
+    orig_task: Any,
+    ci_task: Any,
+    gh_token: str,
+    owner: str,
+    repo: str,
+    pr_number: int,
 ) -> None:
     """Post a one-time merge summary comment on a Blueprint-merged PR (errors swallowed)."""
     from app.task_completion import _estimated_task_cost_usd  # noqa: PLC0415
+
     if (orig_task.created_by or "").upper() == "USER":
         return
     ctx, pld = orig_task.context or {}, orig_task.first_payload or {}
-    iterations = int(((ci_task.context or {}).get("review_loop") or {}).get("iteration") or 0)
+    iterations = int(
+        ((ci_task.context or {}).get("review_loop") or {}).get("iteration") or 0
+    )
     cost = _estimated_task_cost_usd(orig_task)
     provider, model = ctx.get("llm_provider") or "", ctx.get("llm_model") or ""
-    task_type, scope = pld.get("type", "create"), ctx.get("scope") or pld.get("scope") or ""
-    direction_id, direction_title = ctx.get("direction_id"), ctx.get("direction_title") or ""
-    sparts = ([f"`{task_type}`"] + ([f"`{scope}` scope"] if scope else [])
-              + (["1 review cycle" if iterations == 1 else f"{iterations} review cycles"] if iterations > 0 else [])
-              + ([f"~${cost:.2f}"] if cost is not None else []))
-    dparts = ([f"`{'/'.join(filter(None, [provider, model]))}`"] if provider or model else [])
+    task_type, scope = (
+        pld.get("type", "create"),
+        ctx.get("scope") or pld.get("scope") or "",
+    )
+    direction_id, direction_title = (
+        ctx.get("direction_id"),
+        ctx.get("direction_title") or "",
+    )
+    sparts = (
+        [f"`{task_type}`"]
+        + ([f"`{scope}` scope"] if scope else [])
+        + (
+            ["1 review cycle" if iterations == 1 else f"{iterations} review cycles"]
+            if iterations > 0
+            else []
+        )
+        + ([f"~${cost:.2f}"] if cost is not None else [])
+    )
+    dparts = (
+        [f"`{'/'.join(filter(None, [provider, model]))}`"] if provider or model else []
+    )
     if direction_id:
-        dparts.append(f"direction: {direction_title[:60] if direction_title else str(direction_id)[:8]}")
-    body = f"**Blueprint** · {' · '.join(sparts)}" + ("\n" + " · ".join(dparts) if dparts else "")
+        dparts.append(
+            f"direction: {direction_title[:60] if direction_title else str(direction_id)[:8]}"
+        )
+    body = f"**Blueprint** · {' · '.join(sparts)}" + (
+        "\n" + " · ".join(dparts) if dparts else ""
+    )
     try:
         await create_pr_comment(gh_token, owner, repo, pr_number, body)
     except Exception as e:
-        logger.warning(f"[PIPELINE] merge-summary comment failed for PR #{pr_number}: {e}")
+        logger.warning(
+            f"[PIPELINE] merge-summary comment failed for PR #{pr_number}: {e}"
+        )

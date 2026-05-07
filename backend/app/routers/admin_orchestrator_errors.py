@@ -1,4 +1,5 @@
 """Orchestrator error aggregation and acknowledgement endpoints."""
+
 import os
 import re
 import time
@@ -26,7 +27,9 @@ router = APIRouter(
 
 
 ORCHESTRATOR_ERRORS_CACHE_TTL_SECONDS = 60
-ORCHESTRATOR_SERVICE_NAME = os.getenv("ORCHESTRATOR_SERVICE_NAME", "blueprint-orchestrator")
+ORCHESTRATOR_SERVICE_NAME = os.getenv(
+    "ORCHESTRATOR_SERVICE_NAME", "blueprint-orchestrator"
+)
 _orchestrator_errors_cache: Dict[Tuple[int, int], Tuple[float, Dict[str, Any]]] = {}
 
 # Acknowledged error buckets are persisted in the OrchestratorErrorAck table.
@@ -95,7 +98,11 @@ def _parse_exception_class(message: str) -> str:
         return matches[-1].rstrip(":")
     for line in reversed(message.strip().splitlines()):
         stripped = line.strip()
-        if stripped and stripped[0].isupper() and ("Error" in stripped or "Exception" in stripped):
+        if (
+            stripped
+            and stripped[0].isupper()
+            and ("Error" in stripped or "Exception" in stripped)
+        ):
             head = stripped.split(":", 1)[0].strip()
             if head:
                 return head
@@ -122,7 +129,7 @@ def _parse_source_location(message: str) -> Tuple[str, int | None]:
     marker = "/app/app/"
     idx = path.find(marker)
     if idx != -1:
-        return (path[idx + len("/app/"):], line_no)
+        return (path[idx + len("/app/") :], line_no)
     return (path, line_no)
 
 
@@ -155,7 +162,9 @@ def _bucket_log_entries(entries: List[Any], limit: int) -> List[Dict[str, Any]]:
                 sample = sample[:3000] + "..."
             buckets[key] = {
                 "exception_class": exception_class,
-                "source": f"{source_file}:{source_line}" if source_line else source_file,
+                "source": f"{source_file}:{source_line}"
+                if source_line
+                else source_file,
                 "count": 1,
                 "first_seen_iso": ts.isoformat(),
                 "last_seen_iso": ts.isoformat(),
@@ -188,7 +197,7 @@ def _fetch_orchestrator_error_entries(hours: int) -> List[Any]:
     filter_str = (
         'resource.type="cloud_run_revision" '
         f'resource.labels.service_name="{ORCHESTRATOR_SERVICE_NAME}" '
-        'severity>=ERROR '
+        "severity>=ERROR "
         f'timestamp>="{cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")}"'
     )
     entries_iter = client.list_entries(
@@ -209,7 +218,11 @@ def _parse_bucket_last_seen(last_seen_iso: str) -> Optional[datetime]:
         dt = datetime.fromisoformat(last_seen_iso)
     except (TypeError, ValueError):
         return None
-    return dt.astimezone(timezone.utc).replace(tzinfo=None) if dt.tzinfo is not None else dt
+    return (
+        dt.astimezone(timezone.utc).replace(tzinfo=None)
+        if dt.tzinfo is not None
+        else dt
+    )
 
 
 def _filter_acknowledged_buckets(
@@ -245,7 +258,9 @@ async def _load_acknowledgements(session: AsyncSession) -> Dict[str, datetime]:
 async def _upsert_ack(session: AsyncSession, key: str, when: datetime, by: str) -> None:
     existing = await session.get(OrchestratorErrorAck, key)
     if existing is None:
-        session.add(OrchestratorErrorAck(key=key, acknowledged_at=when, acknowledged_by=by))
+        session.add(
+            OrchestratorErrorAck(key=key, acknowledged_at=when, acknowledged_by=by)
+        )
     else:
         existing.acknowledged_at = when
         existing.acknowledged_by = by
@@ -267,7 +282,11 @@ async def get_recent_orchestrator_errors(
         cached_payload = cached[1]
         cached_buckets = cached_payload.get("buckets", [])
         visible = _filter_acknowledged_buckets(cached_buckets, acks)
-        return {**cached_payload, "buckets": visible, "acknowledged_count": len(cached_buckets) - len(visible)}
+        return {
+            **cached_payload,
+            "buckets": visible,
+            "acknowledged_count": len(cached_buckets) - len(visible),
+        }
 
     try:
         entries = _fetch_orchestrator_error_entries(hours)
@@ -283,12 +302,15 @@ async def get_recent_orchestrator_errors(
         return payload
 
     all_buckets = _bucket_log_entries(entries, limit)
-    _orchestrator_errors_cache[cache_key] = (now, {
-        "buckets": all_buckets,
-        "hours": hours,
-        "total_entries_scanned": len(entries),
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-    })
+    _orchestrator_errors_cache[cache_key] = (
+        now,
+        {
+            "buckets": all_buckets,
+            "hours": hours,
+            "total_entries_scanned": len(entries),
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
     visible = _filter_acknowledged_buckets(all_buckets, acks)
     return {
         "buckets": visible,
@@ -337,7 +359,9 @@ async def acknowledge_all_orchestrator_errors(
     if not acknowledged_keys:
         await _upsert_ack(session, "*", now_dt, user_email)
     await session.commit()
-    logger.info(f"[ADMIN] All orchestrator errors acknowledged ({len(acknowledged_keys)} buckets) by {user_email}")
+    logger.info(
+        f"[ADMIN] All orchestrator errors acknowledged ({len(acknowledged_keys)} buckets) by {user_email}"
+    )
     return {"status": "acknowledged", "count": len(acknowledged_keys)}
 
 
@@ -348,6 +372,7 @@ async def clear_acknowledged_orchestrator_errors(
 ):
     """Clear all acknowledgments so previously hidden errors reappear."""
     from sqlalchemy import delete as sa_delete
+
     result = await session.execute(sa_delete(OrchestratorErrorAck))
     await session.commit()
     count = result.rowcount or 0

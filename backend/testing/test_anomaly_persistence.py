@@ -6,10 +6,11 @@ the restart hadn't happened.
 
 Run with: bash scripts/test-backend.sh testing/test_anomaly_persistence.py --standalone
 """
+
 import uuid
 
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import app.shared_state as _ss
 from app.shared_state import (
@@ -43,6 +44,7 @@ def _make_execute_session(projects):
 # persist_anomaly_snapshot
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_persist_writes_to_design_doc():
     project = make_project()
@@ -72,7 +74,9 @@ async def test_persist_preserves_existing_design_doc_keys():
     project.design_doc = {"architecture": "existing content"}
     session = _make_get_session(project)
 
-    await persist_anomaly_snapshot(str(project.id), {"CODE_ERROR": {"occurrence_count": 1}}, session)
+    await persist_anomaly_snapshot(
+        str(project.id), {"CODE_ERROR": {"occurrence_count": 1}}, session
+    )
 
     assert project.design_doc["architecture"] == "existing content"
     assert _ANOMALY_FINGERPRINTS_KEY in project.design_doc
@@ -89,6 +93,7 @@ async def test_persist_bad_project_id_is_noop():
 # ─────────────────────────────────────────────────────────────────────────────
 # hydrate_persistent_anomalies
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_hydrate_loads_stored_entries():
@@ -110,7 +115,9 @@ async def test_hydrate_loads_stored_entries():
     loaded = await hydrate_persistent_anomalies(session)
 
     assert loaded == 1
-    assert _ss.persistent_anomalies[str(project.id)]["CODE_ERROR"]["occurrence_count"] == 5
+    assert (
+        _ss.persistent_anomalies[str(project.id)]["CODE_ERROR"]["occurrence_count"] == 5
+    )
 
 
 @pytest.mark.asyncio
@@ -126,7 +133,9 @@ async def test_hydrate_does_not_clobber_in_memory_entries():
     _ss.persistent_anomalies[str(project.id)] = {"CODE_ERROR": {"occurrence_count": 7}}
     await hydrate_persistent_anomalies(session)
 
-    assert _ss.persistent_anomalies[str(project.id)]["CODE_ERROR"]["occurrence_count"] == 7
+    assert (
+        _ss.persistent_anomalies[str(project.id)]["CODE_ERROR"]["occurrence_count"] == 7
+    )
 
 
 @pytest.mark.asyncio
@@ -146,6 +155,7 @@ async def test_hydrate_skips_projects_without_stored_anomalies():
 # ─────────────────────────────────────────────────────────────────────────────
 # Round-trip: persist → restart → hydrate → same decision
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_roundtrip_same_anomaly_state_after_restart():

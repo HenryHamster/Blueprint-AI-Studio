@@ -14,6 +14,7 @@ via `npm start`, which requires agent/node_modules on the host filesystem):
 
 Prerequisites: cd agent && npm ci
 """
+
 import asyncio
 import os
 import pathlib
@@ -34,7 +35,10 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
 _AGENT_DIR = _REPO_ROOT / "agent"
 
 if not (_AGENT_DIR / "node_modules").is_dir():
-    pytest.skip("agent/node_modules not installed — run `cd agent && npm ci`", allow_module_level=True)
+    pytest.skip(
+        "agent/node_modules not installed — run `cd agent && npm ci`",
+        allow_module_level=True,
+    )
 
 # ---------------------------------------------------------------------------
 # Environment bootstrap (must happen before any app imports)
@@ -62,7 +66,11 @@ from unittest.mock import AsyncMock, patch  # noqa: E402
 from app.auth import create_agent_token  # noqa: E402
 from app.database import get_session  # noqa: E402
 from app.models import (  # noqa: E402
-    Project, Task, TaskStatus, Artifact, ArtifactType,
+    Project,
+    Task,
+    TaskStatus,
+    Artifact,
+    ArtifactType,
 )
 
 pytestmark = pytest.mark.integration
@@ -71,6 +79,7 @@ pytestmark = pytest.mark.integration
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture(scope="session")
 def mock_claude_dir():
@@ -101,24 +110,50 @@ def bare_git_repo():
     clone_path = os.path.join(tmpdir, "work")
 
     # Create bare repo
-    subprocess.run(["git", "init", "--bare", bare_path], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "init", "--bare", bare_path], check=True, capture_output=True
+    )
 
     # Create working clone, add initial commit, push
-    subprocess.run(["git", "clone", bare_path, clone_path], check=True, capture_output=True)
-    subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=clone_path, check=True, capture_output=True)
-    subprocess.run(["git", "config", "user.name", "Test"], cwd=clone_path, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "clone", bare_path, clone_path], check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "test@test.com"],
+        cwd=clone_path,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test"],
+        cwd=clone_path,
+        check=True,
+        capture_output=True,
+    )
     # Create an initial file so the repo has a commit
     with open(os.path.join(clone_path, "README.md"), "w") as f:
         f.write("# Test Repo\n")
     subprocess.run(["git", "add", "."], cwd=clone_path, check=True, capture_output=True)
-    subprocess.run(["git", "commit", "-m", "Initial commit"], cwd=clone_path, check=True, capture_output=True)
-    subprocess.run(["git", "push", "origin", "HEAD:main"], cwd=clone_path, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "Initial commit"],
+        cwd=clone_path,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "push", "origin", "HEAD:main"],
+        cwd=clone_path,
+        check=True,
+        capture_output=True,
+    )
 
     # Write URL rewriting to a dedicated temp gitconfig instead of mutating the
     # real global gitconfig.  The agent subprocess receives GIT_CONFIG_GLOBAL
     # pointing at this file so git picks it up without affecting the host user.
     # The agent constructs exactly: https://x-access-token:test-token@github.com/test-owner/test-repo.git
-    full_clone_url = "https://x-access-token:test-token@github.com/test-owner/test-repo.git"
+    full_clone_url = (
+        "https://x-access-token:test-token@github.com/test-owner/test-repo.git"
+    )
     gitconfig_path = os.path.join(tmpdir, "gitconfig")
     with open(gitconfig_path, "w") as f:
         f.write(f'[url "{bare_path}"]\n')
@@ -150,6 +185,7 @@ def integration_server(bare_git_repo):
 
     # Create engine and tables synchronously
     from sqlalchemy import create_engine
+
     sync_url = f"sqlite:///{db_path}"
     sync_engine = create_engine(sync_url, connect_args={"check_same_thread": False})
     SQLModel.metadata.create_all(sync_engine)
@@ -175,10 +211,12 @@ def integration_server(bare_git_repo):
     # Mock GitHub token resolution — return test values
     _gh_token_mock = AsyncMock(return_value=("test-token", "test-owner", "test-repo"))
     _broadcast_mock = AsyncMock()
-    _create_pr_mock = AsyncMock(return_value={
-        "html_url": "https://github.com/test-owner/test-repo/pull/1",
-        "number": 1,
-    })
+    _create_pr_mock = AsyncMock(
+        return_value={
+            "html_url": "https://github.com/test-owner/test-repo/pull/1",
+            "number": 1,
+        }
+    )
 
     patches = [
         patch("app.routers.agent.get_github_token_for_task", _gh_token_mock),
@@ -190,9 +228,10 @@ def integration_server(bare_git_repo):
 
     # Reset rate limiter
     from app.main import limiter
-    underlying = getattr(limiter, '_limiter', None)
-    storage = getattr(underlying, 'storage', None) if underlying else None
-    if storage and hasattr(storage, 'reset'):
+
+    underlying = getattr(limiter, "_limiter", None)
+    storage = getattr(underlying, "storage", None) if underlying else None
+    if storage and hasattr(storage, "reset"):
         storage.reset()
 
     port = _find_free_port()
@@ -231,6 +270,7 @@ def integration_server(bare_git_repo):
 # ---------------------------------------------------------------------------
 # Helper functions
 # ---------------------------------------------------------------------------
+
 
 async def create_test_task(
     db_url: str,
@@ -298,7 +338,11 @@ async def wait_for_terminal_status(
                 task = result.scalars().first()
                 if task:
                     last_status = task.status
-                    if task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
+                    if task.status in (
+                        TaskStatus.COMPLETED,
+                        TaskStatus.FAILED,
+                        TaskStatus.CANCELLED,
+                    ):
                         # Also load artifacts eagerly
                         art_result = await session.execute(
                             select(Artifact).where(Artifact.task_id == task_id)
@@ -377,7 +421,9 @@ def start_agent(
     return proc, agent_workspace, mode_file
 
 
-def cleanup_agent(proc: subprocess.Popen, timeout: int = 10, mode_file: str | None = None):
+def cleanup_agent(
+    proc: subprocess.Popen, timeout: int = 10, mode_file: str | None = None
+):
     """Gracefully stop the agent subprocess and clean up the per-task mode file."""
     if proc.poll() is None:
         try:
@@ -417,6 +463,7 @@ def get_bare_repo_branches(bare_path: str) -> list[str]:
 # Tests
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_write_task_lifecycle(integration_server, bare_git_repo, mock_claude_dir):
     """
@@ -429,17 +476,25 @@ async def test_write_task_lifecycle(integration_server, bare_git_repo, mock_clau
 
     task, project = await create_test_task(
         db_url,
-        payloads=[{"type": "create", "prompt": "Create a test file", "base_branch": "main"}],
+        payloads=[
+            {"type": "create", "prompt": "Create a test file", "base_branch": "main"}
+        ],
         status=TaskStatus.QUEUED,
         vm_instance_id=vm_id,
     )
 
     proc, agent_workspace, mode_file = start_agent(
-        task.id, vm_id, server_url, mock_claude_dir, mock_mode="write",
+        task.id,
+        vm_id,
+        server_url,
+        mock_claude_dir,
+        mock_mode="write",
         gitconfig_path=gitconfig_path,
     )
     try:
-        completed_task = await wait_for_terminal_status(db_url, task.id, timeout_seconds=90)
+        completed_task = await wait_for_terminal_status(
+            db_url, task.id, timeout_seconds=90
+        )
         assert completed_task.status == TaskStatus.COMPLETED, (
             f"Expected COMPLETED but got {completed_task.status}. "
             f"Latest message: {completed_task.latest_status_message}"
@@ -447,7 +502,9 @@ async def test_write_task_lifecycle(integration_server, bare_git_repo, mock_clau
 
         # Check for PR artifact
         artifacts = getattr(completed_task, "_loaded_artifacts", [])
-        pr_artifacts = [a for a in artifacts if a.artifact_type == ArtifactType.PULL_REQUEST]
+        pr_artifacts = [
+            a for a in artifacts if a.artifact_type == ArtifactType.PULL_REQUEST
+        ]
         assert len(pr_artifacts) > 0, (
             f"Expected a PULL_REQUEST artifact, got: {[a.artifact_type for a in artifacts]}"
         )
@@ -465,7 +522,9 @@ async def test_write_task_lifecycle(integration_server, bare_git_repo, mock_clau
 
 
 @pytest.mark.asyncio
-async def test_readonly_task_lifecycle(integration_server, bare_git_repo, mock_claude_dir):
+async def test_readonly_task_lifecycle(
+    integration_server, bare_git_repo, mock_claude_dir
+):
     """
     Research task lifecycle: agent claims -> mock claude writes findings file ->
     agent reports COMPLETED with RESEARCH_FINDINGS artifact, no git push.
@@ -476,17 +535,29 @@ async def test_readonly_task_lifecycle(integration_server, bare_git_repo, mock_c
 
     task, project = await create_test_task(
         db_url,
-        payloads=[{"type": "research", "prompt": "Research the codebase", "base_branch": "main"}],
+        payloads=[
+            {
+                "type": "research",
+                "prompt": "Research the codebase",
+                "base_branch": "main",
+            }
+        ],
         status=TaskStatus.QUEUED,
         vm_instance_id=vm_id,
     )
 
     proc, agent_workspace, mode_file = start_agent(
-        task.id, vm_id, server_url, mock_claude_dir, mock_mode="readonly",
+        task.id,
+        vm_id,
+        server_url,
+        mock_claude_dir,
+        mock_mode="readonly",
         gitconfig_path=gitconfig_path,
     )
     try:
-        completed_task = await wait_for_terminal_status(db_url, task.id, timeout_seconds=90)
+        completed_task = await wait_for_terminal_status(
+            db_url, task.id, timeout_seconds=90
+        )
         assert completed_task.status == TaskStatus.COMPLETED, (
             f"Expected COMPLETED but got {completed_task.status}. "
             f"Latest message: {completed_task.latest_status_message}"
@@ -494,7 +565,9 @@ async def test_readonly_task_lifecycle(integration_server, bare_git_repo, mock_c
 
         # Research tasks produce RESEARCH_FINDINGS artifacts
         artifacts = getattr(completed_task, "_loaded_artifacts", [])
-        research_artifacts = [a for a in artifacts if a.artifact_type == ArtifactType.RESEARCH_FINDINGS]
+        research_artifacts = [
+            a for a in artifacts if a.artifact_type == ArtifactType.RESEARCH_FINDINGS
+        ]
         assert len(research_artifacts) > 0, (
             f"Expected RESEARCH_FINDINGS artifact, got: {[a.artifact_type for a in artifacts]}"
         )
@@ -523,17 +596,25 @@ async def test_failure_lifecycle(integration_server, bare_git_repo, mock_claude_
 
     task, project = await create_test_task(
         db_url,
-        payloads=[{"type": "create", "prompt": "This will fail", "base_branch": "main"}],
+        payloads=[
+            {"type": "create", "prompt": "This will fail", "base_branch": "main"}
+        ],
         status=TaskStatus.QUEUED,
         vm_instance_id=vm_id,
     )
 
     proc, agent_workspace, mode_file = start_agent(
-        task.id, vm_id, server_url, mock_claude_dir, mock_mode="fail",
+        task.id,
+        vm_id,
+        server_url,
+        mock_claude_dir,
+        mock_mode="fail",
         gitconfig_path=gitconfig_path,
     )
     try:
-        completed_task = await wait_for_terminal_status(db_url, task.id, timeout_seconds=90)
+        completed_task = await wait_for_terminal_status(
+            db_url, task.id, timeout_seconds=90
+        )
         assert completed_task.status == TaskStatus.FAILED, (
             f"Expected FAILED but got {completed_task.status}. "
             f"Latest message: {completed_task.latest_status_message}"
@@ -541,7 +622,9 @@ async def test_failure_lifecycle(integration_server, bare_git_repo, mock_claude_
 
         # Error information should be preserved
         artifacts = getattr(completed_task, "_loaded_artifacts", [])
-        error_artifacts = [a for a in artifacts if a.artifact_type == ArtifactType.ERROR_LOG]
+        error_artifacts = [
+            a for a in artifacts if a.artifact_type == ArtifactType.ERROR_LOG
+        ]
         assert len(error_artifacts) > 0, (
             f"Expected ERROR_LOG artifact, got: {[a.artifact_type for a in artifacts]}"
         )

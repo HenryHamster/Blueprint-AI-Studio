@@ -5,6 +5,7 @@ snapshots of pipeline state used by the admin UI to debug why autonomy is
 (or isn't) spawning, inspect strategic cycle state, surface stuck tasks,
 and reset circuit breakers.
 """
+
 import os
 import uuid
 import logging
@@ -19,7 +20,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from app.database import get_session
-from app.models import Task, TaskStatus, Project, DeploymentState, DeploymentStatus, SystemMaturity, _utcnow
+from app.models import (
+    Task,
+    TaskStatus,
+    Project,
+    DeploymentState,
+    DeploymentStatus,
+    SystemMaturity,
+    _utcnow,
+)
 from app.auth import get_current_user, require_admin
 from app.broadcast import broadcast_to_project
 from app.admin import _get_user_project, _get_user_project_with_role
@@ -28,15 +37,14 @@ from app.reaper import _heartbeat_stale_cutoff
 logger = logging.getLogger(__name__)
 
 router = APIRouter(
-    prefix="/api/admin",
-    tags=["admin-debug"],
-    dependencies=[Depends(get_current_user)]
+    prefix="/api/admin", tags=["admin-debug"], dependencies=[Depends(get_current_user)]
 )
 
 
 # ---------------------------------------------------------------------------
 # Diagnostics TypedDicts and helpers
 # ---------------------------------------------------------------------------
+
 
 class StuckTaskInfo(TypedDict):
     task_id: str
@@ -88,7 +96,9 @@ class DirectionRemediationInfo(TypedDict):
     needs_manual_intervention: bool
 
 
-def _build_direction_remediation_state(project: Project) -> List[DirectionRemediationInfo]:
+def _build_direction_remediation_state(
+    project: Project,
+) -> List[DirectionRemediationInfo]:
     """Surface per-direction diagnosis/remediation state for operators.
 
     Returns entries for directions that have notable state: active remediation
@@ -97,31 +107,37 @@ def _build_direction_remediation_state(project: Project) -> List[DirectionRemedi
     operator view stays focused on what actually needs attention.
     """
     entries: List[DirectionRemediationInfo] = []
-    for d in (project.directions or []):
+    for d in project.directions or []:
         attempts = int(d.get("remediation_attempts", 0) or 0)
         monitor_started = d.get("remediation_monitor_started_at")
         needs_intervention = bool(d.get("needs_manual_intervention"))
         auto_paused = bool(d.get("auto_paused"))
         if not (attempts or monitor_started or needs_intervention or auto_paused):
             continue
-        entries.append({
-            "direction_id": d.get("id", ""),
-            "direction_text": d.get("text", ""),
-            "status": d.get("status", "active"),
-            "auto_paused": auto_paused,
-            "paused_reason": d.get("paused_reason"),
-            "paused_at": d.get("paused_at"),
-            "auto_pause_count": int(d.get("auto_pause_count", 0) or 0),
-            "remediation_attempts": attempts,
-            "last_remediation_result": d.get("last_remediation_result"),
-            "last_remediation_at": d.get("last_remediation_at"),
-            "error_fingerprint": d.get("error_fingerprint"),
-            "remediation_monitor_active": bool(monitor_started),
-            "remediation_monitor_started_at": monitor_started,
-            "remediation_regression_signal": bool(d.get("remediation_regression_signal")),
-            "remediation_regression_count": int(d.get("remediation_regression_count", 0) or 0),
-            "needs_manual_intervention": needs_intervention,
-        })
+        entries.append(
+            {
+                "direction_id": d.get("id", ""),
+                "direction_text": d.get("text", ""),
+                "status": d.get("status", "active"),
+                "auto_paused": auto_paused,
+                "paused_reason": d.get("paused_reason"),
+                "paused_at": d.get("paused_at"),
+                "auto_pause_count": int(d.get("auto_pause_count", 0) or 0),
+                "remediation_attempts": attempts,
+                "last_remediation_result": d.get("last_remediation_result"),
+                "last_remediation_at": d.get("last_remediation_at"),
+                "error_fingerprint": d.get("error_fingerprint"),
+                "remediation_monitor_active": bool(monitor_started),
+                "remediation_monitor_started_at": monitor_started,
+                "remediation_regression_signal": bool(
+                    d.get("remediation_regression_signal")
+                ),
+                "remediation_regression_count": int(
+                    d.get("remediation_regression_count", 0) or 0
+                ),
+                "needs_manual_intervention": needs_intervention,
+            }
+        )
     return entries
 
 
@@ -136,6 +152,7 @@ def _classify_stuck_failure(task: Task) -> Optional[str]:
     'unclassified' instead.
     """
     from app.failure_classification import classify_failure  # noqa: PLC0415
+
     if not (task.latest_status_message or "").strip():
         return None
     result = classify_failure(task)
@@ -161,6 +178,7 @@ async def _build_stuck_tasks(
 ) -> List[StuckTaskInfo]:
     """Detect stuck tasks and build the diagnostics list."""
     from app.compute import get_zone_health  # noqa: PLC0415
+
     stuck: List[StuckTaskInfo] = []
     # Align with reaper's pre-claim threshold (6 min) so diagnostics don't flag a
     # PROVISIONING task before the reaper would act on it. IN_PROGRESS heartbeat
@@ -174,6 +192,7 @@ async def _build_stuck_tasks(
 
     # Pre-fetch all dependency statuses and titles in a single batch query to avoid N+1
     from app.time_utils import _to_naive_utc
+
     all_dep_uuids: set[uuid.UUID] = set()
     for task in tasks:
         if task.status == TaskStatus.QUEUED:
@@ -212,7 +231,11 @@ async def _build_stuck_tasks(
         unresolvable_deps: List[str] = []
         remediation_hint = ""
 
-        if task.status == TaskStatus.PROVISIONING and task.last_heartbeat is None and task.vm_provisioned_at is not None:
+        if (
+            task.status == TaskStatus.PROVISIONING
+            and task.last_heartbeat is None
+            and task.vm_provisioned_at is not None
+        ):
             # vm_provisioned_at is the orchestrator-side VM lifecycle clock (set
             # at dispatch and refreshed when GCE confirms running). last_heartbeat
             # is the agent-side clock and is None until claim. Using
@@ -230,7 +253,9 @@ async def _build_stuck_tasks(
                     else:
                         remediation_hint = f"VM timed out in {zone} — zone available, reaper will retry"
                 else:
-                    remediation_hint = "VM provision timed out — reaper will detect and retry"
+                    remediation_hint = (
+                        "VM provision timed out — reaper will detect and retry"
+                    )
 
         elif task.status == TaskStatus.IN_PROGRESS and task.last_heartbeat is not None:
             hb_cutoff = _heartbeat_stale_cutoff(task, now)
@@ -269,14 +294,22 @@ async def _build_stuck_tasks(
                         stuck_reason = "stuck_deps"
                         stuck_for_seconds = int(created_age - stuck_deps_secs)
                         unresolvable_deps = failed_dep_ids
-                        dep_titles = [dep_title_map.get(d, d[:8]) for d in failed_dep_ids[:2]]
-                        suffix = f" +{len(failed_dep_ids) - 2} more" if len(failed_dep_ids) > 2 else ""
+                        dep_titles = [
+                            dep_title_map.get(d, d[:8]) for d in failed_dep_ids[:2]
+                        ]
+                        suffix = (
+                            f" +{len(failed_dep_ids) - 2} more"
+                            if len(failed_dep_ids) > 2
+                            else ""
+                        )
                         remediation_hint = f"Blocked by {len(failed_dep_ids)} failed task(s): {', '.join(dep_titles)}{suffix}"
 
             elif not dep_ids and created_age > long_queued_secs:
                 stuck_reason = "long_queued"
                 stuck_for_seconds = int(created_age - long_queued_secs)
-                exhausted = [z for z, d in zone_health.items() if d.get("cooldown_active")]
+                exhausted = [
+                    z for z, d in zone_health.items() if d.get("cooldown_active")
+                ]
                 if exhausted:
                     remediation_hint = f"All zones exhausted — {running_count} running, {queued_count}Q waiting"
                 else:
@@ -285,7 +318,9 @@ async def _build_stuck_tasks(
         elif task.status == TaskStatus.EVALUATING:
             # Skip CI-waiting tasks — they have their own timeout
             ctx = task.context or {}
-            if not ctx.get("ci_waiting") and not ctx.get("review_loop", {}).get("ci_waiting"):
+            if not ctx.get("ci_waiting") and not ctx.get("review_loop", {}).get(
+                "ci_waiting"
+            ):
                 # Find when the task entered EVALUATING from status_log
                 evaluating_since = None
                 for entry in reversed(task.status_log or []):
@@ -305,17 +340,19 @@ async def _build_stuck_tasks(
                     remediation_hint = f"Evaluating for {_fmt_duration(eval_age)} — may need manual review"
 
         if stuck_reason:
-            stuck.append({
-                "task_id": str(task.id),
-                "title": task.title,
-                "status": task.status,
-                "stuck_reason": stuck_reason,
-                "stuck_for_seconds": stuck_for_seconds,
-                "attempt_count": task.attempt_count,
-                "failure_class": _classify_stuck_failure(task),
-                "unresolvable_deps": unresolvable_deps,
-                "remediation_hint": remediation_hint,
-            })
+            stuck.append(
+                {
+                    "task_id": str(task.id),
+                    "title": task.title,
+                    "status": task.status,
+                    "stuck_reason": stuck_reason,
+                    "stuck_for_seconds": stuck_for_seconds,
+                    "attempt_count": task.attempt_count,
+                    "failure_class": _classify_stuck_failure(task),
+                    "unresolvable_deps": unresolvable_deps,
+                    "remediation_hint": remediation_hint,
+                }
+            )
 
     return stuck
 
@@ -341,6 +378,7 @@ def _format_circuit_breaker(cb: dict) -> CircuitBreakerInfo:
 # GET /api/admin/projects/{project_id}/autonomy-debug
 # ---------------------------------------------------------------------------
 
+
 @router.get("/projects/{project_id}/autonomy-debug")
 async def get_autonomy_debug(
     project_id: uuid.UUID,
@@ -360,42 +398,54 @@ async def get_autonomy_debug(
     # Guard 0: no available Max Plan accounts
     user_pool = _max_plan_pools.get(project.user_id, [])
     research_model = _runtime_config.get("task_type_models", {}).get("research")
-    has_available = any(_account_available_for_model(a, research_model) for a in user_pool) or bool(os.getenv("ANTHROPIC_API_KEY"))
+    has_available = any(
+        _account_available_for_model(a, research_model) for a in user_pool
+    ) or bool(os.getenv("ANTHROPIC_API_KEY"))
     if not has_available:
-        blocking_guards.append({
-            "guard": "no_available_accounts",
-            "reason": f"No Max Plan accounts available for research model ({research_model})",
-            "pool_size": len(user_pool),
-        })
+        blocking_guards.append(
+            {
+                "guard": "no_available_accounts",
+                "reason": f"No Max Plan accounts available for research model ({research_model})",
+                "pool_size": len(user_pool),
+            }
+        )
 
     # Guard 1: autonomous_disabled
     if not project.autonomous_enabled:
-        blocking_guards.append({
-            "guard": "autonomous_disabled",
-            "reason": "project.autonomous_enabled is False",
-        })
+        blocking_guards.append(
+            {
+                "guard": "autonomous_disabled",
+                "reason": "project.autonomous_enabled is False",
+            }
+        )
 
     # Guard 2: circuit_breaker_open
     raw_breaker = get_circuit_breaker(str(project_id))
     breaker_state = raw_breaker["state"]
     cooldown_ends_at = None
     if raw_breaker.get("opened_at"):
-        cooldown_end = raw_breaker["opened_at"] + timedelta(seconds=raw_breaker["cooldown_seconds"])
+        cooldown_end = raw_breaker["opened_at"] + timedelta(
+            seconds=raw_breaker["cooldown_seconds"]
+        )
         cooldown_ends_at = cooldown_end.isoformat()
         if breaker_state == "OPEN" and now < cooldown_end:
-            blocking_guards.append({
-                "guard": "circuit_breaker_open",
-                "reason": "Circuit breaker is OPEN and cooldown has not elapsed",
-                "opened_at": raw_breaker["opened_at"].isoformat(),
-                "cooldown_ends_at": cooldown_ends_at,
-                "failure_count": raw_breaker["failure_count"],
-            })
+            blocking_guards.append(
+                {
+                    "guard": "circuit_breaker_open",
+                    "reason": "Circuit breaker is OPEN and cooldown has not elapsed",
+                    "opened_at": raw_breaker["opened_at"].isoformat(),
+                    "cooldown_ends_at": cooldown_ends_at,
+                    "failure_count": raw_breaker["failure_count"],
+                }
+            )
 
     circuit_breaker_info = {
         "state": breaker_state,
         "failure_count": raw_breaker["failure_count"],
         "success_count": raw_breaker["success_count"],
-        "opened_at": raw_breaker["opened_at"].isoformat() if raw_breaker.get("opened_at") else None,
+        "opened_at": raw_breaker["opened_at"].isoformat()
+        if raw_breaker.get("opened_at")
+        else None,
         "cooldown_seconds": raw_breaker["cooldown_seconds"],
         "cooldown_ends_at": cooldown_ends_at,
     }
@@ -415,10 +465,14 @@ async def get_autonomy_debug(
     busy_tasks_result = await session.execute(
         select(Task).where(
             Task.project_id == project_id,
-            Task.status.in_([
-                TaskStatus.QUEUED, TaskStatus.PROVISIONING,
-                TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING,
-            ]),
+            Task.status.in_(
+                [
+                    TaskStatus.QUEUED,
+                    TaskStatus.PROVISIONING,
+                    TaskStatus.IN_PROGRESS,
+                    TaskStatus.EVALUATING,
+                ]
+            ),
         )
     )
     busy_direction_ids: list[str] = []
@@ -431,7 +485,11 @@ async def get_autonomy_debug(
         if did:
             busy_direction_ids.append(did)
         # Only the VM-consuming statuses count against the parallel cap
-        if t.status in (TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS):
+        if t.status in (
+            TaskStatus.QUEUED,
+            TaskStatus.PROVISIONING,
+            TaskStatus.IN_PROGRESS,
+        ):
             active_research_count += 1
 
     # Guard 3: no_eligible_directions — a direction is eligible only if it's
@@ -439,7 +497,7 @@ async def get_autonomy_debug(
     cooldown_minutes = _runtime_config.get("autonomous_direction_cooldown_minutes", 240)
     cooldown_seconds_dir = cooldown_minutes * 60
     directions_info = []
-    for d in (project.directions or []):
+    for d in project.directions or []:
         if d.get("status") != "active":
             continue
         last_researched_at = d.get("last_researched_at")
@@ -464,13 +522,19 @@ async def get_autonomy_debug(
             "seconds_until_eligible": seconds_until_eligible,
         }
         if is_busy:
-            entry["busy_reason"] = "direction has active research task (QUEUED/PROVISIONING/IN_PROGRESS/EVALUATING)"
+            entry["busy_reason"] = (
+                "direction has active research task (QUEUED/PROVISIONING/IN_PROGRESS/EVALUATING)"
+            )
         directions_info.append(entry)
 
     eligible_directions = [d for d in directions_info if d["is_eligible"]]
     if not eligible_directions:
         min_wait = min(
-            (d["seconds_until_eligible"] for d in directions_info if d["seconds_until_eligible"] is not None),
+            (
+                d["seconds_until_eligible"]
+                for d in directions_info
+                if d["seconds_until_eligible"] is not None
+            ),
             default=None,
         )
         busy_count = sum(1 for d in directions_info if d.get("busy_reason"))
@@ -482,23 +546,27 @@ async def get_autonomy_debug(
             reason = f"All remaining directions in cooldown; {busy_count} held by running research"
         else:
             reason = "All active directions are still in cooldown"
-        blocking_guards.append({
-            "guard": "no_eligible_directions",
-            "reason": reason,
-            "time_until_eligible_seconds": min_wait,
-            "busy_direction_count": busy_count,
-            "total_active_directions": len(directions_info),
-        })
+        blocking_guards.append(
+            {
+                "guard": "no_eligible_directions",
+                "reason": reason,
+                "time_until_eligible_seconds": min_wait,
+                "busy_direction_count": busy_count,
+                "total_active_directions": len(directions_info),
+            }
+        )
 
     # Guard 4: research_task_active — parallel-research cap (now matches spawn logic)
     max_parallel = _runtime_config.get("max_parallel_research_per_project", 3)
     if active_research_count >= max_parallel:
-        blocking_guards.append({
-            "guard": "research_task_active",
-            "reason": f"Active research ({active_research_count}) >= max_parallel ({max_parallel})",
-            "active_research_count": active_research_count,
-            "max_parallel": max_parallel,
-        })
+        blocking_guards.append(
+            {
+                "guard": "research_task_active",
+                "reason": f"Active research ({active_research_count}) >= max_parallel ({max_parallel})",
+                "active_research_count": active_research_count,
+                "max_parallel": max_parallel,
+            }
+        )
 
     # Guard 5: rate_limit_exceeded
     one_hour_ago = now - timedelta(hours=1)
@@ -510,61 +578,88 @@ async def get_autonomy_debug(
         )
     )
     recent_tasks = recent_tasks_result.scalars().all()
-    tasks_this_hour = sum(1 for t in recent_tasks if (t.first_payload).get("type") == "research")
+    tasks_this_hour = sum(
+        1 for t in recent_tasks if (t.first_payload).get("type") == "research"
+    )
     max_per_hour = _runtime_config.get("max_autonomous_tasks_per_hour", 5)
     if tasks_this_hour >= max_per_hour:
-        blocking_guards.append({
-            "guard": "rate_limit_exceeded",
-            "reason": f"tasks_this_hour ({tasks_this_hour}) >= max_per_hour ({max_per_hour})",
-            "tasks_this_hour": tasks_this_hour,
-            "max_per_hour": max_per_hour,
-        })
+        blocking_guards.append(
+            {
+                "guard": "rate_limit_exceeded",
+                "reason": f"tasks_this_hour ({tasks_this_hour}) >= max_per_hour ({max_per_hour})",
+                "tasks_this_hour": tasks_this_hour,
+                "max_per_hour": max_per_hour,
+            }
+        )
 
     # Guard 6a: pipeline_paused — admin-paused or auto-paused deployments halt dispatch,
     # which means _check_idle_research silently skips spawning.
     deploy_state = await session.get(DeploymentState, 1)
     if deploy_state and deploy_state.status == DeploymentStatus.PAUSED:
-        blocking_guards.append({
-            "guard": "pipeline_paused",
-            "reason": f"Pipeline is PAUSED ({deploy_state.pause_reason or 'no reason recorded'})",
-            "pause_reason": deploy_state.pause_reason,
-            "paused_at": deploy_state.paused_at.isoformat() if deploy_state.paused_at else None,
-        })
+        blocking_guards.append(
+            {
+                "guard": "pipeline_paused",
+                "reason": f"Pipeline is PAUSED ({deploy_state.pause_reason or 'no reason recorded'})",
+                "pause_reason": deploy_state.pause_reason,
+                "paused_at": deploy_state.paused_at.isoformat()
+                if deploy_state.paused_at
+                else None,
+            }
+        )
 
     # Guard 6b: vm_slots_full — _check_idle_research only spawns when VMs are available.
     # This is the most common silent-return path when max_concurrent_vms is small.
-    vm_consuming = (await session.execute(
-        select(func.count()).select_from(Task).where(
-            Task.status.in_([TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]),
+    vm_consuming = (
+        await session.execute(
+            select(func.count())
+            .select_from(Task)
+            .where(
+                Task.status.in_([TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]),
+            )
         )
-    )).scalar() or 0
+    ).scalar() or 0
     max_concurrent_vms = _runtime_config.get("max_concurrent_vms", 5)
     if vm_consuming >= max_concurrent_vms:
-        blocking_guards.append({
-            "guard": "vm_slots_full",
-            "reason": f"VM slots full ({vm_consuming}/{max_concurrent_vms}) — waiting for a task to finish",
-            "vm_consuming": vm_consuming,
-            "max_concurrent_vms": max_concurrent_vms,
-        })
+        blocking_guards.append(
+            {
+                "guard": "vm_slots_full",
+                "reason": f"VM slots full ({vm_consuming}/{max_concurrent_vms}) — waiting for a task to finish",
+                "vm_consuming": vm_consuming,
+                "max_concurrent_vms": max_concurrent_vms,
+            }
+        )
 
     # Guard 6: waiting_for_interval — interval gate hasn't elapsed since last_idle_check
     interval_minutes = _runtime_config.get("autonomous_research_interval_minutes", 30)
     last_idle_check = _shared_state_mod.last_idle_check
     if last_idle_check:
-        interval_elapsed = (now - last_idle_check).total_seconds() >= interval_minutes * 60
-        next_check_at = (last_idle_check + timedelta(minutes=interval_minutes)).isoformat()
+        interval_elapsed = (
+            now - last_idle_check
+        ).total_seconds() >= interval_minutes * 60
+        next_check_at = (
+            last_idle_check + timedelta(minutes=interval_minutes)
+        ).isoformat()
     else:
         interval_elapsed = True
         next_check_at = now.isoformat()
 
     if not interval_elapsed:
-        secs_until_check = max(0, int((last_idle_check + timedelta(minutes=interval_minutes) - now).total_seconds()))
-        blocking_guards.append({
-            "guard": "waiting_for_interval",
-            "reason": f"Research interval ({interval_minutes}m) has not elapsed since last check",
-            "next_check_at": next_check_at,
-            "seconds_until_check": secs_until_check,
-        })
+        secs_until_check = max(
+            0,
+            int(
+                (
+                    last_idle_check + timedelta(minutes=interval_minutes) - now
+                ).total_seconds()
+            ),
+        )
+        blocking_guards.append(
+            {
+                "guard": "waiting_for_interval",
+                "reason": f"Research interval ({interval_minutes}m) has not elapsed since last check",
+                "next_check_at": next_check_at,
+                "seconds_until_check": secs_until_check,
+            }
+        )
 
     return {
         "spawn_blocked": len(blocking_guards) > 0,
@@ -576,7 +671,9 @@ async def get_autonomy_debug(
         },
         "directions": directions_info,
         "next_check_at": next_check_at,
-        "strategic_cycle_history": (project.vision or {}).get("_strategic_cycle_history", []),
+        "strategic_cycle_history": (project.vision or {}).get(
+            "_strategic_cycle_history", []
+        ),
     }
 
 
@@ -605,7 +702,9 @@ async def get_strategic_debug(
     # _has_active_strategic_task but without the FOR UPDATE lock (read-only view).
     active_stmt = select(Task).where(
         Task.project_id == project_id,
-        Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]),
+        Task.status.in_(
+            [TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]
+        ),
     )
     active_strategic_task: Optional[Task] = None
     active_phase: Optional[str] = None
@@ -617,8 +716,9 @@ async def get_strategic_debug(
             break
 
     # Trigger countdowns
-    strategic_frequency = vision.get("_strategic_frequency_override") or \
-        _runtime_config.get("strategic_research_frequency", 6)
+    strategic_frequency = vision.get(
+        "_strategic_frequency_override"
+    ) or _runtime_config.get("strategic_research_frequency", 6)
     arch_frequency = _runtime_config.get("architecture_review_frequency", 3)
     research_spawn_count = vision.get("_research_spawn_count", 0) or 0
     strategic_cycle_count = vision.get("_strategic_cycle_count", 0) or 0
@@ -638,7 +738,9 @@ async def get_strategic_debug(
 
     # Will the *next* strategic cycle also do architecture?
     next_cycle_number = strategic_cycle_count + 1
-    next_is_architecture = arch_frequency > 0 and next_cycle_number % arch_frequency == 0
+    next_is_architecture = (
+        arch_frequency > 0 and next_cycle_number % arch_frequency == 0
+    )
 
     # Strategic failure state (auto-decays after 48h)
     strategic_failures = vision.get("_strategic_failures", 0) or 0
@@ -646,19 +748,25 @@ async def get_strategic_debug(
     failures_decay_at_iso: Optional[str] = None
     if failures_at_iso:
         try:
-            last_failure = datetime.fromisoformat(failures_at_iso.replace("Z", "+00:00"))
+            last_failure = datetime.fromisoformat(
+                failures_at_iso.replace("Z", "+00:00")
+            )
             if last_failure.tzinfo is not None:
-                last_failure = last_failure.astimezone(timezone.utc).replace(tzinfo=None)
+                last_failure = last_failure.astimezone(timezone.utc).replace(
+                    tzinfo=None
+                )
             decay_deadline = last_failure + timedelta(hours=48)
             failures_decay_at_iso = decay_deadline.isoformat()
             if strategic_failures >= 3 and now < decay_deadline:
-                blocking_guards.append({
-                    "guard": "strategic_failures_high",
-                    "reason": f"{strategic_failures} consecutive strategic failures — auto-recovery in "
-                              f"{int((decay_deadline - now).total_seconds() / 3600)}h",
-                    "failures": strategic_failures,
-                    "decay_at": failures_decay_at_iso,
-                })
+                blocking_guards.append(
+                    {
+                        "guard": "strategic_failures_high",
+                        "reason": f"{strategic_failures} consecutive strategic failures — auto-recovery in "
+                        f"{int((decay_deadline - now).total_seconds() / 3600)}h",
+                        "failures": strategic_failures,
+                        "decay_at": failures_decay_at_iso,
+                    }
+                )
         except (ValueError, TypeError):
             pass
 
@@ -689,8 +797,14 @@ async def get_strategic_debug(
     # and how many strategic cycles until the next architecture review fires.
     design_doc = project.design_doc or {}
     dd_meta = design_doc.get("_meta") or {}
-    system_keys = [k for k in design_doc.keys() if isinstance(k, str) and k.startswith("systems/")]
-    capability_keys = [k for k in design_doc.keys() if isinstance(k, str) and k.startswith("capabilities/")]
+    system_keys = [
+        k for k in design_doc.keys() if isinstance(k, str) and k.startswith("systems/")
+    ]
+    capability_keys = [
+        k
+        for k in design_doc.keys()
+        if isinstance(k, str) and k.startswith("capabilities/")
+    ]
     if arch_frequency > 0:
         arch_remainder = strategic_cycle_count % arch_frequency
         if strategic_cycle_count == 0:
@@ -726,8 +840,12 @@ async def get_strategic_debug(
             "id": str(active_strategic_task.id),
             "phase": active_phase,
             "status": active_strategic_task.status,
-            "started_at": active_strategic_task.started_at.isoformat() if active_strategic_task.started_at else None,
-        } if active_strategic_task else None,
+            "started_at": active_strategic_task.started_at.isoformat()
+            if active_strategic_task.started_at
+            else None,
+        }
+        if active_strategic_task
+        else None,
         "last_cycle": last_cycle,
         "recent_cycles": recent_cycles,
     }
@@ -740,14 +858,18 @@ async def reset_circuit_breaker(
     current_user: dict = Depends(get_current_user),
 ):
     """Manually reset a project's circuit breaker to CLOSED state."""
-    await _get_user_project_with_role(project_id, current_user["user_id"], session, "member")
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
     import app.shared_state as _shared_state
     from app.orchestrator import _persist_circuit_breakers
 
     key = str(project_id)
     breaker = _shared_state.circuit_breakers.get(key)
     if not breaker:
-        raise HTTPException(status_code=404, detail="No circuit breaker state found for this project")
+        raise HTTPException(
+            status_code=404, detail="No circuit breaker state found for this project"
+        )
 
     base_cooldown = breaker.get("base_cooldown", 1800)
     breaker["state"] = "CLOSED"
@@ -769,12 +891,18 @@ async def reset_circuit_breaker(
             flag_modified(project, "vision")
             session.add(project)
             await session.commit()
-            logger.info(f"[ADMIN] Cleared strategic cycle state (_strategic_failures, _pending_strategic_review) for project {project_id}")
+            logger.info(
+                f"[ADMIN] Cleared strategic cycle state (_strategic_failures, _pending_strategic_review) for project {project_id}"
+            )
 
     user_email = current_user.get("email", current_user.get("sub", "unknown"))
-    logger.info(f"[ADMIN] Circuit breaker manually reset for project {project_id} by {user_email}")
+    logger.info(
+        f"[ADMIN] Circuit breaker manually reset for project {project_id} by {user_email}"
+    )
 
-    await broadcast_to_project(key, "autonomy_updated", {"project_id": key, "circuit_breaker_reset": True})
+    await broadcast_to_project(
+        key, "autonomy_updated", {"project_id": key, "circuit_breaker_reset": True}
+    )
 
     return {
         "project_id": key,
@@ -790,6 +918,7 @@ async def reset_circuit_breaker(
 # GET /api/admin/projects/{project_id}/diagnostics
 # ---------------------------------------------------------------------------
 
+
 @router.get("/projects/{project_id}/diagnostics")
 async def get_project_diagnostics(
     project_id: uuid.UUID,
@@ -804,7 +933,12 @@ async def get_project_diagnostics(
 
     now = _utcnow()
 
-    active_statuses = [TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING]
+    active_statuses = [
+        TaskStatus.QUEUED,
+        TaskStatus.PROVISIONING,
+        TaskStatus.IN_PROGRESS,
+        TaskStatus.EVALUATING,
+    ]
     active_result = await session.execute(
         select(Task).where(
             Task.project_id == project_id,
@@ -817,7 +951,9 @@ async def get_project_diagnostics(
     stuck_tasks = await _build_stuck_tasks(active_tasks, now, session)
 
     queued_count = sum(1 for t in active_tasks if t.status == TaskStatus.QUEUED)
-    in_progress_count = sum(1 for t in active_tasks if t.status == TaskStatus.IN_PROGRESS)
+    in_progress_count = sum(
+        1 for t in active_tasks if t.status == TaskStatus.IN_PROGRESS
+    )
 
     cb_raw = get_circuit_breaker(str(project_id))
     circuit_breaker = _format_circuit_breaker(cb_raw)
@@ -861,19 +997,36 @@ async def get_global_diagnostics(
 
     now = _utcnow()
 
-    active_statuses = [TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING]
+    active_statuses = [
+        TaskStatus.QUEUED,
+        TaskStatus.PROVISIONING,
+        TaskStatus.IN_PROGRESS,
+        TaskStatus.EVALUATING,
+    ]
     active_result = await session.execute(
         select(Task)
-        .options(load_only(
-            Task.id, Task.project_id, Task.status, Task.title,
-            Task.created_at, Task.updated_at, Task.vm_instance_id,
-            Task.last_heartbeat, Task.vm_provisioned_at, Task.started_at,
-            Task.attempt_count, Task.latest_status_message,
-            Task.context, Task.status_log, Task.depends_on,
-            # payloads is read by classify_failure → _classify_stuck_failure;
-            # omitting it here triggers MissingGreenlet on lazy-load.
-            Task.payloads,
-        ))
+        .options(
+            load_only(
+                Task.id,
+                Task.project_id,
+                Task.status,
+                Task.title,
+                Task.created_at,
+                Task.updated_at,
+                Task.vm_instance_id,
+                Task.last_heartbeat,
+                Task.vm_provisioned_at,
+                Task.started_at,
+                Task.attempt_count,
+                Task.latest_status_message,
+                Task.context,
+                Task.status_log,
+                Task.depends_on,
+                # payloads is read by classify_failure → _classify_stuck_failure;
+                # omitting it here triggers MissingGreenlet on lazy-load.
+                Task.payloads,
+            )
+        )
         .where(
             Task.status.in_(active_statuses),
             Task.archived.is_(False),
@@ -925,19 +1078,20 @@ async def get_global_diagnostics(
         manual_count = sum(1 for e in remediation if e["needs_manual_intervention"])
 
         cb_raw = get_circuit_breaker(pid)
-        project_summaries.append({
-            "project_id": pid,
-            "stuck_count": len(stuck),
-            "queued_count": queued,
-            "in_progress_count": in_prog,
-            "circuit_breaker_state": cb_raw.get("state", "CLOSED"),
-            "needs_manual_intervention_count": manual_count,
-        })
+        project_summaries.append(
+            {
+                "project_id": pid,
+                "stuck_count": len(stuck),
+                "queued_count": queued,
+                "in_progress_count": in_prog,
+                "circuit_breaker_state": cb_raw.get("state", "CLOSED"),
+                "needs_manual_intervention_count": manual_count,
+            }
+        )
 
     # All known circuit breakers (includes projects with no active tasks)
     all_circuit_breakers = {
-        pid: _format_circuit_breaker(cb)
-        for pid, cb in circuit_breakers.items()
+        pid: _format_circuit_breaker(cb) for pid, cb in circuit_breakers.items()
     }
 
     try:
@@ -964,6 +1118,7 @@ async def get_global_diagnostics(
 # ---------------------------------------------------------------------------
 # GET /api/admin/projects/{project_id}/system-maturity
 # ---------------------------------------------------------------------------
+
 
 @router.get("/projects/{project_id}/system-maturity")
 async def get_project_system_maturity(
@@ -994,6 +1149,7 @@ async def get_project_system_maturity(
 # GET /api/admin/tasks/{task_id}/fix-loop-history
 # ---------------------------------------------------------------------------
 
+
 @router.get("/tasks/{task_id}/fix-loop-history")
 async def get_task_fix_loop_history(
     task_id: uuid.UUID,
@@ -1009,9 +1165,11 @@ async def get_task_fix_loop_history(
     """
     from app.fix_loop_telemetry import summarize_fix_loop_history  # noqa: PLC0415
 
-    task = (await session.execute(
-        select(Task).where(Task.id == task_id)
-    )).scalars().first()
+    task = (
+        (await session.execute(select(Task).where(Task.id == task_id)))
+        .scalars()
+        .first()
+    )
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
 
@@ -1028,6 +1186,7 @@ async def get_task_fix_loop_history(
 # ---------------------------------------------------------------------------
 # GET /api/admin/projects/{project_id}/recent-findings
 # ---------------------------------------------------------------------------
+
 
 @router.get("/projects/{project_id}/recent-findings")
 async def get_recent_findings(
@@ -1066,16 +1225,18 @@ async def get_recent_findings(
             if grade not in grade_counts:
                 grade = "MEDIUM"
             grade_counts[grade] = grade_counts.get(grade, 0) + 1
-            findings_out.append({
-                "task_id": str(t.id),
-                "title": f.get("title", ""),
-                "type": f.get("type", ""),
-                "scope": f.get("scope", ""),
-                "priority": f.get("priority", "medium"),
-                "actionability_grade": grade,
-                "direction_id": f.get("direction_id"),
-                "researched_at": t.created_at.isoformat() if t.created_at else None,
-            })
+            findings_out.append(
+                {
+                    "task_id": str(t.id),
+                    "title": f.get("title", ""),
+                    "type": f.get("type", ""),
+                    "scope": f.get("scope", ""),
+                    "priority": f.get("priority", "medium"),
+                    "actionability_grade": grade,
+                    "direction_id": f.get("direction_id"),
+                    "researched_at": t.created_at.isoformat() if t.created_at else None,
+                }
+            )
             if len(findings_out) >= limit:
                 break
         if len(findings_out) >= limit:

@@ -5,6 +5,7 @@ size budget. The function is still re-exported from ``autonomous_research``
 so existing callers (``direction_lifecycle`` and tests that import it from
 there) continue to work unchanged.
 """
+
 import logging
 import subprocess
 import uuid
@@ -36,13 +37,17 @@ async def _get_recent_changes_context(session: AsyncSession) -> dict:
     Serializes the data at spawn time so the investigation VM (which has no
     repo access) can reference what shipped recently.
     """
-    deploy_row = (await session.execute(
-        select(DeploymentState).where(DeploymentState.id == 1)
-    )).scalars().first()
+    deploy_row = (
+        (await session.execute(select(DeploymentState).where(DeploymentState.id == 1)))
+        .scalars()
+        .first()
+    )
 
     deployed_at_iso = deploy_row.deployed_at.isoformat() if deploy_row else None
     current_sha = (deploy_row.current_sha or "") if deploy_row else ""
-    prior_sha = (getattr(deploy_row, "prior_deploy_sha", None) or "") if deploy_row else ""
+    prior_sha = (
+        (getattr(deploy_row, "prior_deploy_sha", None) or "") if deploy_row else ""
+    )
 
     commits: list[str] = []
     if deployed_at_iso:
@@ -52,18 +57,26 @@ async def _get_recent_changes_context(session: AsyncSession) -> dict:
         # prior sha hasn't been captured yet (first deploy after the migration).
         if prior_sha and current_sha and prior_sha != current_sha:
             log_args = [
-                "git", "log", "--oneline", f"-{_RECENT_CHANGES_COMMIT_CAP}",
+                "git",
+                "log",
+                "--oneline",
+                f"-{_RECENT_CHANGES_COMMIT_CAP}",
                 f"{prior_sha}..{current_sha}",
             ]
         else:
             log_args = [
-                "git", "log", "--oneline", f"-{_RECENT_CHANGES_COMMIT_CAP}",
+                "git",
+                "log",
+                "--oneline",
+                f"-{_RECENT_CHANGES_COMMIT_CAP}",
                 f"--since={deployed_at_iso}",
             ]
         try:
             result = subprocess.run(
                 log_args,
-                capture_output=True, text=True, timeout=10,
+                capture_output=True,
+                text=True,
+                timeout=10,
             )
             raw = result.stdout.strip()
             if raw:
@@ -75,11 +88,13 @@ async def _get_recent_changes_context(session: AsyncSession) -> dict:
                 logger.warning(
                     "[DIAGNOSIS] git log returned non-zero (rc=%s) — "
                     "recent_changes block will be empty: %s",
-                    result.returncode, (result.stderr or "").strip()[:200],
+                    result.returncode,
+                    (result.stderr or "").strip()[:200],
                 )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "[DIAGNOSIS] git log failed; omitting commit list: %s", exc,
+                "[DIAGNOSIS] git log failed; omitting commit list: %s",
+                exc,
             )
 
     return {
@@ -112,16 +127,26 @@ async def _spawn_direction_diagnosis(
 
     # Skip if a diagnosis research is already active for this direction —
     # one diagnosis per pause event is plenty.
-    existing = (await session.execute(
-        select(Task).where(
-            Task.project_id == project.id,
-            Task.status.in_([
-                TaskStatus.QUEUED, TaskStatus.PROVISIONING,
-                TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING,
-            ]),
-            Task.context["diagnosis_for_direction"].as_string() == did,
+    existing = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.project_id == project.id,
+                    Task.status.in_(
+                        [
+                            TaskStatus.QUEUED,
+                            TaskStatus.PROVISIONING,
+                            TaskStatus.IN_PROGRESS,
+                            TaskStatus.EVALUATING,
+                        ]
+                    ),
+                    Task.context["diagnosis_for_direction"].as_string() == did,
+                )
+            )
         )
-    )).scalars().first()
+        .scalars()
+        .first()
+    )
     if existing is not None:
         logger.info(
             f"[DIAGNOSIS] Skipping diagnosis spawn for direction {did}: "
@@ -130,13 +155,22 @@ async def _spawn_direction_diagnosis(
         return False
 
     # Gather recent failed-task signatures for this direction to inform the agent.
-    recent_failed_rows = (await session.execute(
-        select(Task).where(
-            Task.project_id == project.id,
-            Task.status == TaskStatus.FAILED,
-            Task.context["direction_id"].as_string() == did,
-        ).order_by(Task.created_at.desc()).limit(10)
-    )).scalars().all()
+    recent_failed_rows = (
+        (
+            await session.execute(
+                select(Task)
+                .where(
+                    Task.project_id == project.id,
+                    Task.status == TaskStatus.FAILED,
+                    Task.context["direction_id"].as_string() == did,
+                )
+                .order_by(Task.created_at.desc())
+                .limit(10)
+            )
+        )
+        .scalars()
+        .all()
+    )
     failed_signatures: list[dict] = []
     taxonomy_counts: dict[str, int] = {}
     for t in recent_failed_rows:
@@ -179,8 +213,11 @@ async def _spawn_direction_diagnosis(
     # Compact direction summary — just this direction, with recent history attached.
     raw_history = direction.get("research_history") or []
     _HISTORY_NUMERIC_FIELDS = {
-        "tasks_created", "prs_merged", "tasks_failed",
-        "tasks_failed_infra", "scope_breakdown",
+        "tasks_created",
+        "prs_merged",
+        "tasks_failed",
+        "tasks_failed_infra",
+        "scope_breakdown",
     }
     compact_history = [
         {k: entry[k] for k in _HISTORY_NUMERIC_FIELDS if k in entry}
@@ -201,12 +238,16 @@ async def _spawn_direction_diagnosis(
 
     # Design doc summary — keys + playbook entries (same shape as standard research).
     design_doc_summary: dict = {
-        "_keys": [k for k in doc if not k.startswith("_") and not k.startswith("playbook/")],
+        "_keys": [
+            k for k in doc if not k.startswith("_") and not k.startswith("playbook/")
+        ],
     }
     design_doc_summary.update(playbook_entries)
 
     research_model = _runtime_config.get("task_type_models", {}).get("research") or None
-    research_effort = _runtime_config.get("task_type_efforts", {}).get("research") or None
+    research_effort = (
+        _runtime_config.get("task_type_efforts", {}).get("research") or None
+    )
     research_suffix = _runtime_config.get("agent_prompt_suffixes", {}).get("research")
 
     remediation_history = {
@@ -215,8 +256,12 @@ async def _spawn_direction_diagnosis(
         "last_remediation_at": direction.get("last_remediation_at"),
         "last_remediation_task_id": direction.get("last_remediation_task_id"),
         "last_remediation_fingerprint": direction.get("last_remediation_fingerprint"),
-        "last_remediation_failure_class": direction.get("last_remediation_failure_class"),
-        "last_remediation_error_summary": direction.get("last_remediation_error_summary"),
+        "last_remediation_failure_class": direction.get(
+            "last_remediation_failure_class"
+        ),
+        "last_remediation_error_summary": direction.get(
+            "last_remediation_error_summary"
+        ),
     }
 
     research_payload: dict = {
@@ -236,7 +281,9 @@ async def _spawn_direction_diagnosis(
     }
     if project.build_config:
         research_payload["build_config"] = project.build_config
-    research_payload = validate_internal_payload(research_payload, "autonomous_research:diagnosis")
+    research_payload = validate_internal_payload(
+        research_payload, "autonomous_research:diagnosis"
+    )
 
     direction_text = (direction.get("text") or "direction")[:160]
     new_task = Task(
@@ -255,7 +302,8 @@ async def _spawn_direction_diagnosis(
     )
     session.add(new_task)
     history = TaskHistory(
-        task_id=new_task.id, action="SPAWNED",
+        task_id=new_task.id,
+        action="SPAWNED",
         details={
             "spawned_by": "AUTONOMOUS_LOOP",
             "trigger": "direction_auto_pause_diagnosis",
@@ -297,13 +345,18 @@ async def _spawn_unproductive_diagnosis(
         return False
 
     cutoff = _utcnow() - timedelta(hours=_UNPRODUCTIVE_DIAGNOSIS_DEDUP_HOURS)
-    existing = (await session.execute(
-        select(Task.id).where(
-            Task.project_id == project.id,
-            Task.context["unproductive_diagnosis_direction_id"].as_string() == str(did),
-            Task.created_at >= cutoff,
-        ).limit(1)
-    )).first()
+    existing = (
+        await session.execute(
+            select(Task.id)
+            .where(
+                Task.project_id == project.id,
+                Task.context["unproductive_diagnosis_direction_id"].as_string()
+                == str(did),
+                Task.created_at >= cutoff,
+            )
+            .limit(1)
+        )
+    ).first()
     if existing is not None:
         logger.info(
             f"[DIAGNOSIS] Skipping unproductive diagnosis for direction {did}: "
@@ -312,12 +365,15 @@ async def _spawn_unproductive_diagnosis(
         return False
 
     history = direction.get("research_history") or []
-    recent_lines = "\n".join(
-        f"- created={e.get('tasks_created', 0)} completed={e.get('tasks_completed', 0)} "
-        f"failed={e.get('tasks_failed', 0)} merged={e.get('prs_merged', 0)} "
-        f"scope={e.get('scope_breakdown') or {}}"
-        for e in history[-5:]
-    ) or "- (no research history)"
+    recent_lines = (
+        "\n".join(
+            f"- created={e.get('tasks_created', 0)} completed={e.get('tasks_completed', 0)} "
+            f"failed={e.get('tasks_failed', 0)} merged={e.get('prs_merged', 0)} "
+            f"scope={e.get('scope_breakdown') or {}}"
+            for e in history[-5:]
+        )
+        or "- (no research history)"
+    )
     direction_text = (direction.get("text") or "")[:200]
 
     recent_changes = await _get_recent_changes_context(session)
@@ -325,8 +381,12 @@ async def _spawn_unproductive_diagnosis(
     if recent_changes.get("deployed_at"):
         changes_lines = (
             f"\n\nRecent changes (since deploy at {recent_changes['deployed_at']}"
-            + (f", sha {recent_changes['current_sha']}" if recent_changes.get("current_sha") else "")
-            + f"):\n"
+            + (
+                f", sha {recent_changes['current_sha']}"
+                if recent_changes.get("current_sha")
+                else ""
+            )
+            + "):\n"
             + (
                 "\n".join(f"  {c}" for c in recent_changes["commits"])
                 if recent_changes["commits"]
@@ -351,7 +411,10 @@ async def _spawn_unproductive_diagnosis(
     )
     payload = validate_internal_payload(
         {
-            "type": "investigate", "prompt": prompt, "base_branch": "main", "effort": "low",
+            "type": "investigate",
+            "prompt": prompt,
+            "base_branch": "main",
+            "effort": "low",
             "recent_changes": recent_changes,
         },
         "autonomous_research_diagnosis:unproductive",
@@ -373,14 +436,17 @@ async def _spawn_unproductive_diagnosis(
         priority=60,
     )
     session.add(new_task)
-    session.add(TaskHistory(
-        task_id=new_task.id, action="SPAWNED",
-        details={
-            "spawned_by": "AUTONOMOUS_LOOP",
-            "trigger": "direction_unproductive_pause",
-            "pause_reason": pause_reason,
-        },
-    ))
+    session.add(
+        TaskHistory(
+            task_id=new_task.id,
+            action="SPAWNED",
+            details={
+                "spawned_by": "AUTONOMOUS_LOOP",
+                "trigger": "direction_unproductive_pause",
+                "pause_reason": pause_reason,
+            },
+        )
+    )
     direction["unproductive_diagnosis_spawned_at"] = _utcnow().isoformat()
     logger.info(
         f"[DIAGNOSIS] Spawned unproductive investigate {new_task.id} for direction {did}: "

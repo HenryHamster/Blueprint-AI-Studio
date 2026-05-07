@@ -8,6 +8,7 @@ Covers the critical functions:
   4. _merge_with_retry — PR merge with exponential backoff
   5. _process_post_commit — task not found guard and rollup triggering
 """
+
 import uuid
 
 import pytest
@@ -38,11 +39,15 @@ from app.task_lifecycle import (
 
 # SQLite JSONB compatibility — defensive, conftest.py also sets this
 from sqlalchemy.dialects.sqlite.base import SQLiteTypeCompiler as _SQLiteTypeCompiler
+
 if not hasattr(_SQLiteTypeCompiler, "visit_JSONB"):
-    _SQLiteTypeCompiler.visit_JSONB = lambda self, type_, **kw: self.visit_JSON(type_, **kw)
+    _SQLiteTypeCompiler.visit_JSONB = lambda self, type_, **kw: self.visit_JSON(
+        type_, **kw
+    )
 
 
 # ── Fixture ───────────────────────────────────────────────────────────────────
+
 
 @pytest_asyncio.fixture()
 async def tl_db(mocker):
@@ -60,8 +65,11 @@ async def tl_db(mocker):
         await conn.run_sync(SQLModel.metadata.create_all)
 
     _Session = sessionmaker(
-        bind=_engine, class_=AsyncSession,
-        autocommit=False, autoflush=False, expire_on_commit=False,
+        bind=_engine,
+        class_=AsyncSession,
+        autocommit=False,
+        autoflush=False,
+        expire_on_commit=False,
     )
 
     # Patch AsyncSessionLocal used by the inner dep-unblocking session
@@ -80,6 +88,7 @@ async def tl_db(mocker):
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
 
 async def _make_project(session) -> Project:
     project = Project(name="Test Project", user_id="user-1")
@@ -130,12 +139,15 @@ async def _make_task(
 # _has_active_strategic_task
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 @pytest.mark.asyncio
 async def test_has_active_strategic_task_true_for_design_doc_update(tl_db):
     """Returns True when a QUEUED design_doc_update task exists."""
     session, _ = tl_db
     project = await _make_project(session)
-    await _make_task(session, project.id, task_type="design_doc_update", status=TaskStatus.QUEUED)
+    await _make_task(
+        session, project.id, task_type="design_doc_update", status=TaskStatus.QUEUED
+    )
     assert await _has_active_strategic_task(project.id, session) is True
 
 
@@ -144,7 +156,9 @@ async def test_has_active_strategic_task_true_for_strategic_review_in_progress(t
     """Returns True when a strategic_review task is IN_PROGRESS."""
     session, _ = tl_db
     project = await _make_project(session)
-    await _make_task(session, project.id, task_type="strategic_review", status=TaskStatus.IN_PROGRESS)
+    await _make_task(
+        session, project.id, task_type="strategic_review", status=TaskStatus.IN_PROGRESS
+    )
     assert await _has_active_strategic_task(project.id, session) is True
 
 
@@ -153,7 +167,12 @@ async def test_has_active_strategic_task_true_for_provisioning(tl_db):
     """Returns True for a PROVISIONING strategic task."""
     session, _ = tl_db
     project = await _make_project(session)
-    await _make_task(session, project.id, task_type="design_doc_update", status=TaskStatus.PROVISIONING)
+    await _make_task(
+        session,
+        project.id,
+        task_type="design_doc_update",
+        status=TaskStatus.PROVISIONING,
+    )
     assert await _has_active_strategic_task(project.id, session) is True
 
 
@@ -163,7 +182,9 @@ async def test_has_active_strategic_task_false_for_non_strategic(tl_db):
     session, _ = tl_db
     project = await _make_project(session)
     await _make_task(session, project.id, task_type="create", status=TaskStatus.QUEUED)
-    await _make_task(session, project.id, task_type="research", status=TaskStatus.IN_PROGRESS)
+    await _make_task(
+        session, project.id, task_type="research", status=TaskStatus.IN_PROGRESS
+    )
     assert await _has_active_strategic_task(project.id, session) is False
 
 
@@ -172,7 +193,9 @@ async def test_has_active_strategic_task_false_for_completed_strategic(tl_db):
     """Returns False when the strategic task is already COMPLETED (terminal)."""
     session, _ = tl_db
     project = await _make_project(session)
-    await _make_task(session, project.id, task_type="design_doc_update", status=TaskStatus.COMPLETED)
+    await _make_task(
+        session, project.id, task_type="design_doc_update", status=TaskStatus.COMPLETED
+    )
     assert await _has_active_strategic_task(project.id, session) is False
 
 
@@ -187,6 +210,7 @@ async def test_has_active_strategic_task_false_with_no_tasks(tl_db):
 # ══════════════════════════════════════════════════════════════════════════════
 # _increment_research_spawn_count
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 @pytest.mark.asyncio
 async def test_increment_research_spawn_count_starts_at_one(tl_db):
@@ -203,7 +227,9 @@ async def test_increment_research_spawn_count_starts_at_one(tl_db):
 
 
 @pytest.mark.asyncio
-async def test_increment_research_spawn_count_accumulates_and_preserves_other_keys(tl_db):
+async def test_increment_research_spawn_count_accumulates_and_preserves_other_keys(
+    tl_db,
+):
     """Successive increments accumulate and other vision keys are preserved."""
     session, _ = tl_db
     project = await _make_project(session)
@@ -221,6 +247,7 @@ async def test_increment_research_spawn_count_accumulates_and_preserves_other_ke
 # ══════════════════════════════════════════════════════════════════════════════
 # _requeue_parent_task
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 @pytest.mark.asyncio
 async def test_requeue_skips_cancelled_parent(tl_db):
@@ -242,7 +269,9 @@ async def test_requeue_fails_parent_permanently_at_limit(tl_db):
     session, _ = tl_db
     project = await _make_project(session)
     parent = await _make_task(
-        session, project.id, status=TaskStatus.EVALUATING,
+        session,
+        project.id,
+        status=TaskStatus.EVALUATING,
         context={"_requeue_count": 3},
     )
 
@@ -260,12 +289,16 @@ async def test_requeue_limit_persists_failure_category(tl_db):
     session, _ = tl_db
     project = await _make_project(session)
     parent = await _make_task(
-        session, project.id, status=TaskStatus.EVALUATING,
+        session,
+        project.id,
+        status=TaskStatus.EVALUATING,
         context={"_requeue_count": 3},
     )
     # Child with CODE_ERROR persisted
     await _make_task(
-        session, project.id, status=TaskStatus.FAILED,
+        session,
+        project.id,
+        status=TaskStatus.FAILED,
         parent_task_id=parent.id,
         context={"failure_category": "CODE_ERROR"},
         latest_status_message="tests failed",
@@ -295,11 +328,15 @@ async def test_requeue_limit_records_deploy_monitoring_result(tl_db):
     session, _ = tl_db
     project = await _make_project(session)
     parent = await _make_task(
-        session, project.id, status=TaskStatus.EVALUATING,
+        session,
+        project.id,
+        status=TaskStatus.EVALUATING,
         context={"_requeue_count": 3},
     )
     await _make_task(
-        session, project.id, status=TaskStatus.FAILED,
+        session,
+        project.id,
+        status=TaskStatus.FAILED,
         parent_task_id=parent.id,
         context={"failure_category": "CODE_ERROR"},
         latest_status_message="tests failed",
@@ -324,11 +361,15 @@ async def test_requeue_limit_records_direction_result_on_non_infra_failure(tl_db
     session, _ = tl_db
     project = await _make_project(session)
     parent = await _make_task(
-        session, project.id, status=TaskStatus.EVALUATING,
+        session,
+        project.id,
+        status=TaskStatus.EVALUATING,
         context={"_requeue_count": 3, "direction_id": "d-test-42"},
     )
     await _make_task(
-        session, project.id, status=TaskStatus.FAILED,
+        session,
+        project.id,
+        status=TaskStatus.FAILED,
         parent_task_id=parent.id,
         context={"failure_category": "CODE_ERROR"},
         latest_status_message="tests failed",
@@ -349,11 +390,15 @@ async def test_requeue_same_class_consecutive_failures_reduces_budget(tl_db):
     project = await _make_project(session)
     # requeue_count=2 is below base max (3) but at the reduced max — should fail.
     parent = await _make_task(
-        session, project.id, status=TaskStatus.EVALUATING,
+        session,
+        project.id,
+        status=TaskStatus.EVALUATING,
         context={"_requeue_count": 2},
     )
     await _make_task(
-        session, project.id, status=TaskStatus.FAILED,
+        session,
+        project.id,
+        status=TaskStatus.FAILED,
         parent_task_id=parent.id,
         context={
             "failure_category": "CODE_ERROR",
@@ -376,12 +421,16 @@ async def test_requeue_different_class_failures_preserve_full_budget(tl_db, mock
     session, _ = tl_db
     project = await _make_project(session)
     parent = await _make_task(
-        session, project.id, status=TaskStatus.EVALUATING,
+        session,
+        project.id,
+        status=TaskStatus.EVALUATING,
         context={"_requeue_count": 2},
     )
     # Current failure is CODE_ERROR, previous was SCOPE_OVERFLOW → different class.
     await _make_task(
-        session, project.id, status=TaskStatus.FAILED,
+        session,
+        project.id,
+        status=TaskStatus.FAILED,
         parent_task_id=parent.id,
         context={
             "failure_category": "CODE_ERROR",
@@ -413,14 +462,18 @@ async def test_requeue_alternating_pattern_in_history_reduces_budget(tl_db, mock
     session, _ = tl_db
     project = await _make_project(session)
     parent = await _make_task(
-        session, project.id, status=TaskStatus.EVALUATING,
+        session,
+        project.id,
+        status=TaskStatus.EVALUATING,
         context={"_requeue_count": 2},
     )
     # Current failure: CODE_ERROR. Immediately previous: AGENT_TIMEOUT (different
     # class — would normally preserve budget). But _failure_class_history shows
     # CODE_ERROR has already occurred twice in recent attempts → trim by 1.
     await _make_task(
-        session, project.id, status=TaskStatus.FAILED,
+        session,
+        project.id,
+        status=TaskStatus.FAILED,
         parent_task_id=parent.id,
         context={
             "failure_category": "CODE_ERROR",
@@ -449,12 +502,16 @@ async def test_requeue_recurring_failing_tests_reduces_budget(tl_db, mocker):
     session, _ = tl_db
     project = await _make_project(session)
     parent = await _make_task(
-        session, project.id, status=TaskStatus.EVALUATING,
+        session,
+        project.id,
+        status=TaskStatus.EVALUATING,
         context={"_requeue_count": 2},
     )
     # Same test ID shows up in prior-attempt ctx and in the current status message.
     await _make_task(
-        session, project.id, status=TaskStatus.FAILED,
+        session,
+        project.id,
+        status=TaskStatus.FAILED,
         parent_task_id=parent.id,
         context={
             "failure_category": "CODE_ERROR",
@@ -480,11 +537,15 @@ async def test_requeue_same_class_infra_exempt_from_budget_reduction(tl_db, mock
     session, _ = tl_db
     project = await _make_project(session)
     parent = await _make_task(
-        session, project.id, status=TaskStatus.EVALUATING,
+        session,
+        project.id,
+        status=TaskStatus.EVALUATING,
         context={"_requeue_count": 2},
     )
     await _make_task(
-        session, project.id, status=TaskStatus.FAILED,
+        session,
+        project.id,
+        status=TaskStatus.FAILED,
         parent_task_id=parent.id,
         context={
             "failure_category": "PROVISION_FAILURE",
@@ -513,11 +574,15 @@ async def test_requeue_history_count_three_reduces_budget_by_two(tl_db, mocker):
     project = await _make_project(session)
     # _requeue_count=1 → with MAX=3 reduced by 2, effective=1, hit cap → FAILED.
     parent = await _make_task(
-        session, project.id, status=TaskStatus.EVALUATING,
+        session,
+        project.id,
+        status=TaskStatus.EVALUATING,
         context={"_requeue_count": 1},
     )
     await _make_task(
-        session, project.id, status=TaskStatus.FAILED,
+        session,
+        project.id,
+        status=TaskStatus.FAILED,
         parent_task_id=parent.id,
         context={
             "failure_category": "CODE_ERROR",
@@ -545,16 +610,24 @@ async def test_requeue_repeated_scope_overflow_reduces_budget(tl_db, mocker):
     project = await _make_project(session)
     # _requeue_count=2 → with MAX=3 reduced by 1, effective=2, hit cap → FAILED.
     parent = await _make_task(
-        session, project.id, status=TaskStatus.EVALUATING,
+        session,
+        project.id,
+        status=TaskStatus.EVALUATING,
         context={"_requeue_count": 2},
     )
     await _make_task(
-        session, project.id, status=TaskStatus.FAILED,
+        session,
+        project.id,
+        status=TaskStatus.FAILED,
         parent_task_id=parent.id,
         context={
             "failure_category": "SCOPE_OVERFLOW",
             "_previous_failure_class": "SCOPE_OVERFLOW",
-            "_failure_class_history": ["SCOPE_OVERFLOW", "CODE_ERROR", "SCOPE_OVERFLOW"],
+            "_failure_class_history": [
+                "SCOPE_OVERFLOW",
+                "CODE_ERROR",
+                "SCOPE_OVERFLOW",
+            ],
             "_attempt_number": 3,
         },
         latest_status_message="scope overflow again",
@@ -576,11 +649,15 @@ async def test_requeue_repeated_agent_timeout_reduces_budget(tl_db, mocker):
     session, _ = tl_db
     project = await _make_project(session)
     parent = await _make_task(
-        session, project.id, status=TaskStatus.EVALUATING,
+        session,
+        project.id,
+        status=TaskStatus.EVALUATING,
         context={"_requeue_count": 2},
     )
     await _make_task(
-        session, project.id, status=TaskStatus.FAILED,
+        session,
+        project.id,
+        status=TaskStatus.FAILED,
         parent_task_id=parent.id,
         context={
             "failure_category": "AGENT_TIMEOUT",
@@ -616,7 +693,9 @@ async def test_requeue_no_children_to_retry_records_deploy_monitoring_result(tl_
     parent = await _make_task(session, project.id, status=TaskStatus.EVALUATING)
     # Only a CANCELLED child → retried_count=0, no completed, no active.
     await _make_task(
-        session, project.id, status=TaskStatus.CANCELLED,
+        session,
+        project.id,
+        status=TaskStatus.CANCELLED,
         parent_task_id=parent.id,
     )
 
@@ -637,7 +716,9 @@ async def test_requeue_cancels_failed_children_and_creates_clones(tl_db, mocker)
     project = await _make_project(session)
     parent = await _make_task(session, project.id, status=TaskStatus.EVALUATING)
     child = await _make_task(
-        session, project.id, task_type="create",
+        session,
+        project.id,
+        task_type="create",
         status=TaskStatus.FAILED,
         parent_task_id=parent.id,
         context={"_attempt_number": 1},
@@ -652,9 +733,17 @@ async def test_requeue_cancels_failed_children_and_creates_clones(tl_db, mocker)
     assert child.status == TaskStatus.CANCELLED
     assert child.latest_status_message == "Parent requeued — replaced by retry"
 
-    clones = (await session.execute(
-        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
-    )).scalars().all()
+    clones = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
     assert len(clones) == 1
     clone = clones[0]
     assert clone.context["_attempt_number"] == 2
@@ -664,16 +753,22 @@ async def test_requeue_cancels_failed_children_and_creates_clones(tl_db, mocker)
 
 
 @pytest.mark.asyncio
-async def test_requeue_sets_parent_to_evaluating_and_increments_requeue_count(tl_db, mocker):
+async def test_requeue_sets_parent_to_evaluating_and_increments_requeue_count(
+    tl_db, mocker
+):
     """Parent status becomes EVALUATING and _requeue_count is incremented."""
     mocker.patch("app.playbook_learning._maybe_auto_playbook", new_callable=AsyncMock)
     session, _ = tl_db
     project = await _make_project(session)
     parent = await _make_task(
-        session, project.id, status=TaskStatus.EVALUATING,
+        session,
+        project.id,
+        status=TaskStatus.EVALUATING,
         context={"_requeue_count": 1},
     )
-    await _make_task(session, project.id, status=TaskStatus.FAILED, parent_task_id=parent.id)
+    await _make_task(
+        session, project.id, status=TaskStatus.FAILED, parent_task_id=parent.id
+    )
 
     await _requeue_parent_task(parent, session)
 
@@ -694,11 +789,15 @@ async def test_requeue_noop_with_completed_child_does_not_burn_budget(tl_db):
     session, _ = tl_db
     project = await _make_project(session)
     parent = await _make_task(
-        session, project.id, status=TaskStatus.EVALUATING,
+        session,
+        project.id,
+        status=TaskStatus.EVALUATING,
         context={"_requeue_count": 1},
     )
     await _make_task(
-        session, project.id, status=TaskStatus.COMPLETED,
+        session,
+        project.id,
+        status=TaskStatus.COMPLETED,
         parent_task_id=parent.id,
         context={"pr_merged": True},
     )
@@ -720,11 +819,15 @@ async def test_requeue_noop_with_active_child_does_not_burn_budget(tl_db):
     session, _ = tl_db
     project = await _make_project(session)
     parent = await _make_task(
-        session, project.id, status=TaskStatus.EVALUATING,
+        session,
+        project.id,
+        status=TaskStatus.EVALUATING,
         context={"_requeue_count": 2},
     )
     await _make_task(
-        session, project.id, status=TaskStatus.IN_PROGRESS,
+        session,
+        project.id,
+        status=TaskStatus.IN_PROGRESS,
         parent_task_id=parent.id,
     )
 
@@ -748,11 +851,15 @@ async def test_requeue_all_cancelled_children_marks_parent_failed(tl_db):
     project = await _make_project(session)
     parent = await _make_task(session, project.id, status=TaskStatus.EVALUATING)
     await _make_task(
-        session, project.id, status=TaskStatus.CANCELLED,
+        session,
+        project.id,
+        status=TaskStatus.CANCELLED,
         parent_task_id=parent.id,
     )
     await _make_task(
-        session, project.id, status=TaskStatus.CANCELLED,
+        session,
+        project.id,
+        status=TaskStatus.CANCELLED,
         parent_task_id=parent.id,
     )
 
@@ -775,16 +882,26 @@ async def test_requeue_strips_max_plan_account_id_from_clone(tl_db, mocker):
     project = await _make_project(session)
     parent = await _make_task(session, project.id, status=TaskStatus.EVALUATING)
     await _make_task(
-        session, project.id, status=TaskStatus.FAILED,
+        session,
+        project.id,
+        status=TaskStatus.FAILED,
         parent_task_id=parent.id,
         context={"max_plan_account_id": "acct-blacklisted", "_attempt_number": 1},
     )
 
     await _requeue_parent_task(parent, session)
 
-    clone = (await session.execute(
-        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
-    )).scalars().first()
+    clone = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
     assert clone is not None
     assert "max_plan_account_id" not in clone.context
 
@@ -802,7 +919,9 @@ async def test_requeue_rate_limit_propagates_blacklist_to_clone(tl_db, mocker):
     project = await _make_project(session)
     parent = await _make_task(session, project.id, status=TaskStatus.EVALUATING)
     await _make_task(
-        session, project.id, task_type="create",
+        session,
+        project.id,
+        task_type="create",
         status=TaskStatus.FAILED,
         parent_task_id=parent.id,
         context={
@@ -815,9 +934,17 @@ async def test_requeue_rate_limit_propagates_blacklist_to_clone(tl_db, mocker):
 
     await _requeue_parent_task(parent, session)
 
-    clone = (await session.execute(
-        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
-    )).scalars().first()
+    clone = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
     assert clone is not None
     bl = clone.context.get("blacklisted_accounts") or []
     assert "acct-rl-1234" in bl, f"failed account missing from clone blacklist: {bl}"
@@ -834,7 +961,9 @@ async def test_requeue_rate_limit_adds_account_to_existing_blacklist(tl_db, mock
     project = await _make_project(session)
     parent = await _make_task(session, project.id, status=TaskStatus.EVALUATING)
     await _make_task(
-        session, project.id, task_type="create",
+        session,
+        project.id,
+        task_type="create",
         status=TaskStatus.FAILED,
         parent_task_id=parent.id,
         context={
@@ -848,9 +977,17 @@ async def test_requeue_rate_limit_adds_account_to_existing_blacklist(tl_db, mock
 
     await _requeue_parent_task(parent, session)
 
-    clone = (await session.execute(
-        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
-    )).scalars().first()
+    clone = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
     assert clone is not None
     bl = clone.context.get("blacklisted_accounts") or []
     assert "acct-old-fail" in bl
@@ -866,7 +1003,9 @@ async def test_requeue_non_rate_limit_does_not_preserve_blacklist(tl_db, mocker)
     project = await _make_project(session)
     parent = await _make_task(session, project.id, status=TaskStatus.EVALUATING)
     await _make_task(
-        session, project.id, task_type="create",
+        session,
+        project.id,
+        task_type="create",
         status=TaskStatus.FAILED,
         parent_task_id=parent.id,
         context={
@@ -879,9 +1018,17 @@ async def test_requeue_non_rate_limit_does_not_preserve_blacklist(tl_db, mocker)
 
     await _requeue_parent_task(parent, session)
 
-    clone = (await session.execute(
-        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
-    )).scalars().first()
+    clone = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
     assert clone is not None
     assert not clone.context.get("blacklisted_accounts"), (
         "blacklisted_accounts should be absent for CODE_ERROR (account was not at fault)"
@@ -897,7 +1044,9 @@ async def test_requeue_agent_timeout_injects_scope_guidance(tl_db, mocker):
     project = await _make_project(session)
     parent = await _make_task(session, project.id, status=TaskStatus.EVALUATING)
     await _make_task(
-        session, project.id, task_type="create",
+        session,
+        project.id,
+        task_type="create",
         status=TaskStatus.FAILED,
         parent_task_id=parent.id,
         context={"_attempt_number": 1},
@@ -906,9 +1055,17 @@ async def test_requeue_agent_timeout_injects_scope_guidance(tl_db, mocker):
 
     await _requeue_parent_task(parent, session)
 
-    clone = (await session.execute(
-        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
-    )).scalars().first()
+    clone = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
     assert clone is not None
     prompt_suffix = clone.payloads[0].get("prompt_suffix", "") or ""
     assert "TIMED OUT" in prompt_suffix
@@ -923,22 +1080,38 @@ async def test_requeue_scope_overflow_medium_escalates_to_large(tl_db, mocker):
     project = await _make_project(session)
     parent = await _make_task(session, project.id, status=TaskStatus.EVALUATING)
     await _make_task(
-        session, project.id, task_type="create",
+        session,
+        project.id,
+        task_type="create",
         status=TaskStatus.FAILED,
         parent_task_id=parent.id,
-        context={"_attempt_number": 1, "scope": "medium", "failure_category": "SCOPE_OVERFLOW"},
+        context={
+            "_attempt_number": 1,
+            "scope": "medium",
+            "failure_category": "SCOPE_OVERFLOW",
+        },
         latest_status_message="Scope overflow: 11 files changed",
     )
 
     await _requeue_parent_task(parent, session)
 
-    clone = (await session.execute(
-        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
-    )).scalars().first()
+    clone = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
     assert clone is not None
     assert clone.context.get("scope") == "large"
     assert clone.context.get("_scope_reduced") is True
-    assert clone.context.get("scope_calibrated_from") == "medium:scope_overflow_escalation"
+    assert (
+        clone.context.get("scope_calibrated_from") == "medium:scope_overflow_escalation"
+    )
     prompt_suffix = clone.payloads[0].get("prompt_suffix", "") or ""
     assert "scope" in prompt_suffix.lower()
     assert "file-count budget" in prompt_suffix.lower()
@@ -953,18 +1126,32 @@ async def test_requeue_scope_overflow_small_escalates_to_medium(tl_db, mocker):
     project = await _make_project(session)
     parent = await _make_task(session, project.id, status=TaskStatus.EVALUATING)
     await _make_task(
-        session, project.id, task_type="create",
+        session,
+        project.id,
+        task_type="create",
         status=TaskStatus.FAILED,
         parent_task_id=parent.id,
-        context={"_attempt_number": 1, "scope": "small", "failure_category": "SCOPE_OVERFLOW"},
+        context={
+            "_attempt_number": 1,
+            "scope": "small",
+            "failure_category": "SCOPE_OVERFLOW",
+        },
         latest_status_message="Scope overflow: 7 files changed for a small-scope task",
     )
 
     await _requeue_parent_task(parent, session)
 
-    clone = (await session.execute(
-        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
-    )).scalars().first()
+    clone = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
     assert clone is not None
     # Scope escalates small→medium; guidance is still added
     assert clone.context.get("scope") == "medium"
@@ -983,18 +1170,32 @@ async def test_requeue_scope_overflow_raw_lowercase_label_escalates(tl_db, mocke
     project = await _make_project(session)
     parent = await _make_task(session, project.id, status=TaskStatus.EVALUATING)
     await _make_task(
-        session, project.id, task_type="create",
+        session,
+        project.id,
+        task_type="create",
         status=TaskStatus.FAILED,
         parent_task_id=parent.id,
-        context={"_attempt_number": 1, "scope": "medium", "failure_category": "scope_overflow"},
+        context={
+            "_attempt_number": 1,
+            "scope": "medium",
+            "failure_category": "scope_overflow",
+        },
         latest_status_message="Scope overflow: too many files",
     )
 
     await _requeue_parent_task(parent, session)
 
-    clone = (await session.execute(
-        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
-    )).scalars().first()
+    clone = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
     assert clone is not None
     assert clone.context.get("scope") == "large"
 
@@ -1008,7 +1209,9 @@ async def test_requeue_scope_overflow_injects_module_distribution(tl_db, mocker)
     project = await _make_project(session)
     parent = await _make_task(session, project.id, status=TaskStatus.EVALUATING)
     await _make_task(
-        session, project.id, task_type="create",
+        session,
+        project.id,
+        task_type="create",
         status=TaskStatus.FAILED,
         parent_task_id=parent.id,
         context={
@@ -1029,9 +1232,17 @@ async def test_requeue_scope_overflow_injects_module_distribution(tl_db, mocker)
 
     await _requeue_parent_task(parent, session)
 
-    clone = (await session.execute(
-        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
-    )).scalars().first()
+    clone = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
     assert clone is not None
     prompt_suffix = clone.payloads[0].get("prompt_suffix", "") or ""
     assert "OVERFLOW DETAILS FROM PREVIOUS ATTEMPT" in prompt_suffix
@@ -1044,7 +1255,9 @@ async def test_requeue_scope_overflow_injects_module_distribution(tl_db, mocker)
 def test_build_scope_overflow_details_returns_empty_without_changed_files():
     """No _previous_changed_files → no overflow block (caller keeps the generic guidance)."""
     assert _build_scope_overflow_details({}, "medium") == ""
-    assert _build_scope_overflow_details({"_previous_changed_files": []}, "medium") == ""
+    assert (
+        _build_scope_overflow_details({"_previous_changed_files": []}, "medium") == ""
+    )
 
 
 def test_build_scope_overflow_details_reports_expansion_ratio():
@@ -1064,7 +1277,9 @@ def test_build_scope_overflow_details_single_module_omits_split_hint():
     """When all files live in one module, the split-along-boundaries hint is skipped."""
     ctx = {
         "_previous_changed_files": [
-            "backend/app/a.py", "backend/app/b.py", "backend/app/c.py",
+            "backend/app/a.py",
+            "backend/app/b.py",
+            "backend/app/c.py",
         ],
     }
     block = _build_scope_overflow_details(ctx, "small")
@@ -1081,7 +1296,9 @@ async def test_requeue_external_api_injects_api_guidance(tl_db, mocker):
     project = await _make_project(session)
     parent = await _make_task(session, project.id, status=TaskStatus.EVALUATING)
     await _make_task(
-        session, project.id, task_type="create",
+        session,
+        project.id,
+        task_type="create",
         status=TaskStatus.FAILED,
         parent_task_id=parent.id,
         context={"_attempt_number": 1},
@@ -1090,9 +1307,17 @@ async def test_requeue_external_api_injects_api_guidance(tl_db, mocker):
 
     await _requeue_parent_task(parent, session)
 
-    clone = (await session.execute(
-        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
-    )).scalars().first()
+    clone = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
     assert clone is not None
     prompt_suffix = clone.payloads[0].get("prompt_suffix", "") or ""
     assert "GitHub API" in prompt_suffix
@@ -1109,7 +1334,9 @@ async def test_requeue_rate_limit_injects_rate_limit_guidance(tl_db, mocker):
     project = await _make_project(session)
     parent = await _make_task(session, project.id, status=TaskStatus.EVALUATING)
     await _make_task(
-        session, project.id, task_type="create",
+        session,
+        project.id,
+        task_type="create",
         status=TaskStatus.FAILED,
         parent_task_id=parent.id,
         context={"_attempt_number": 1},
@@ -1118,9 +1345,17 @@ async def test_requeue_rate_limit_injects_rate_limit_guidance(tl_db, mocker):
 
     await _requeue_parent_task(parent, session)
 
-    clone = (await session.execute(
-        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
-    )).scalars().first()
+    clone = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
     assert clone is not None
     prompt_suffix = clone.payloads[0].get("prompt_suffix", "") or ""
     assert "rate limit" in prompt_suffix.lower()
@@ -1160,9 +1395,17 @@ async def test_requeue_remaps_depends_on_to_new_clone_ids(tl_db, mocker):
 
     await _requeue_parent_task(parent, session)
 
-    clones = (await session.execute(
-        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
-    )).scalars().all()
+    clones = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
     assert len(clones) == 2
 
     # The clone of child_b should depend on the clone of child_a, not on child_a itself
@@ -1201,6 +1444,7 @@ async def test_requeue_skips_non_failed_children(tl_db, mocker):
 # _requeue_parent_task — enriched failure diagnosis
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 @pytest.mark.asyncio
 async def test_requeue_enriches_clone_context_with_fingerprint_and_stage(tl_db, mocker):
     """Clone context includes error fingerprint and failure stage for CODE_ERROR at test stage."""
@@ -1209,7 +1453,9 @@ async def test_requeue_enriches_clone_context_with_fingerprint_and_stage(tl_db, 
     project = await _make_project(session)
     parent = await _make_task(session, project.id, status=TaskStatus.EVALUATING)
     await _make_task(
-        session, project.id, task_type="create",
+        session,
+        project.id,
+        task_type="create",
         status=TaskStatus.FAILED,
         parent_task_id=parent.id,
         context={"_attempt_number": 1},
@@ -1218,9 +1464,17 @@ async def test_requeue_enriches_clone_context_with_fingerprint_and_stage(tl_db, 
 
     await _requeue_parent_task(parent, session)
 
-    clones = (await session.execute(
-        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
-    )).scalars().all()
+    clones = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
     assert len(clones) == 1
     clone = clones[0]
 
@@ -1252,12 +1506,17 @@ async def test_requeue_skips_child_when_error_fingerprint_matches_prior(tl_db, m
     parent = await _make_task(session, project.id, status=TaskStatus.EVALUATING)
     # COMPLETED sibling keeps the no-failed-to-retry branch from marking parent FAILED
     await _make_task(
-        session, project.id, status=TaskStatus.COMPLETED, parent_task_id=parent.id,
+        session,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        parent_task_id=parent.id,
     )
     error_msg = "pytest failed: assertion error on line 42"
     prior_fp = _error_fingerprint(error_msg)
     failed_child = await _make_task(
-        session, project.id, task_type="create",
+        session,
+        project.id,
+        task_type="create",
         status=TaskStatus.FAILED,
         parent_task_id=parent.id,
         context={"_attempt_number": 2, "_previous_error_fingerprint": prior_fp},
@@ -1268,9 +1527,17 @@ async def test_requeue_skips_child_when_error_fingerprint_matches_prior(tl_db, m
 
     assert result == 0
     # No new QUEUED clone was created for the fingerprint-matching child
-    clones = (await session.execute(
-        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
-    )).scalars().all()
+    clones = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
     assert clones == []
 
     # Original failed child is untouched (not cancelled)
@@ -1286,12 +1553,16 @@ async def test_requeue_skips_child_when_error_fingerprint_matches_prior(tl_db, m
 async def test_requeue_enriches_clone_context_provision_stage(tl_db, mocker):
     """Clone context has _previous_failure_stage=provision for PROVISION_FAILURE."""
     mocker.patch("app.playbook_learning._maybe_auto_playbook", new_callable=AsyncMock)
-    mocker.patch("app.task_lifecycle.classify_failure", return_value="PROVISION_FAILURE")
+    mocker.patch(
+        "app.task_lifecycle.classify_failure", return_value="PROVISION_FAILURE"
+    )
     session, _ = tl_db
     project = await _make_project(session)
     parent = await _make_task(session, project.id, status=TaskStatus.EVALUATING)
     await _make_task(
-        session, project.id, task_type="create",
+        session,
+        project.id,
+        task_type="create",
         status=TaskStatus.FAILED,
         parent_task_id=parent.id,
         context={"_attempt_number": 1},
@@ -1300,22 +1571,34 @@ async def test_requeue_enriches_clone_context_provision_stage(tl_db, mocker):
 
     await _requeue_parent_task(parent, session)
 
-    clone = (await session.execute(
-        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
-    )).scalars().first()
+    clone = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
     assert clone is not None
     assert clone.context.get("_previous_failure_stage") == "provision"
 
 
 @pytest.mark.asyncio
-async def test_requeue_sets_recurring_flag_when_anomaly_exceeds_threshold(tl_db, mocker):
+async def test_requeue_sets_recurring_flag_when_anomaly_exceeds_threshold(
+    tl_db, mocker
+):
     """_previous_is_recurring=True when persistent_anomalies has CODE_ERROR with count >= 3."""
     mocker.patch("app.playbook_learning._maybe_auto_playbook", new_callable=AsyncMock)
     session, _ = tl_db
     project = await _make_project(session)
     parent = await _make_task(session, project.id, status=TaskStatus.EVALUATING)
     await _make_task(
-        session, project.id, task_type="create",
+        session,
+        project.id,
+        task_type="create",
         status=TaskStatus.FAILED,
         parent_task_id=parent.id,
         context={"_attempt_number": 1},
@@ -1324,17 +1607,30 @@ async def test_requeue_sets_recurring_flag_when_anomaly_exceeds_threshold(tl_db,
 
     # Inject a persistent anomaly for CODE_ERROR with high occurrence count
     import app.shared_state as _shared_state
+
     _shared_state.persistent_anomalies[str(project.id)] = {
-        "CODE_ERROR": {"occurrence_count": 5, "severity": "high", "latest_details": "test"}
+        "CODE_ERROR": {
+            "occurrence_count": 5,
+            "severity": "high",
+            "latest_details": "test",
+        }
     }
     try:
         await _requeue_parent_task(parent, session)
     finally:
         _shared_state.persistent_anomalies.pop(str(project.id), None)
 
-    clone = (await session.execute(
-        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
-    )).scalars().first()
+    clone = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
     assert clone is not None
     assert clone.context.get("_previous_is_recurring") is True
 
@@ -1347,7 +1643,9 @@ async def test_requeue_does_not_set_recurring_flag_below_threshold(tl_db, mocker
     project = await _make_project(session)
     parent = await _make_task(session, project.id, status=TaskStatus.EVALUATING)
     await _make_task(
-        session, project.id, task_type="create",
+        session,
+        project.id,
+        task_type="create",
         status=TaskStatus.FAILED,
         parent_task_id=parent.id,
         context={"_attempt_number": 1},
@@ -1355,17 +1653,30 @@ async def test_requeue_does_not_set_recurring_flag_below_threshold(tl_db, mocker
     )
 
     import app.shared_state as _shared_state
+
     _shared_state.persistent_anomalies[str(project.id)] = {
-        "CODE_ERROR": {"occurrence_count": 2, "severity": "medium", "latest_details": "test"}
+        "CODE_ERROR": {
+            "occurrence_count": 2,
+            "severity": "medium",
+            "latest_details": "test",
+        }
     }
     try:
         await _requeue_parent_task(parent, session)
     finally:
         _shared_state.persistent_anomalies.pop(str(project.id), None)
 
-    clone = (await session.execute(
-        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
-    )).scalars().first()
+    clone = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
     assert clone is not None
     assert "_previous_is_recurring" not in clone.context
 
@@ -1379,7 +1690,9 @@ async def test_requeue_no_error_summary_for_non_code_error(tl_db, mocker):
     project = await _make_project(session)
     parent = await _make_task(session, project.id, status=TaskStatus.EVALUATING)
     await _make_task(
-        session, project.id, task_type="create",
+        session,
+        project.id,
+        task_type="create",
         status=TaskStatus.FAILED,
         parent_task_id=parent.id,
         context={"_attempt_number": 1},
@@ -1388,9 +1701,17 @@ async def test_requeue_no_error_summary_for_non_code_error(tl_db, mocker):
 
     await _requeue_parent_task(parent, session)
 
-    clone = (await session.execute(
-        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
-    )).scalars().first()
+    clone = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
     assert clone is not None
     assert "_previous_error_summary" not in clone.context
 
@@ -1399,38 +1720,57 @@ async def test_requeue_no_error_summary_for_non_code_error(tl_db, mocker):
 # _derive_failure_stage
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 def test_derive_failure_stage_provision():
     from app.task_lifecycle import _derive_failure_stage
-    assert _derive_failure_stage("PROVISION_FAILURE", "vm failed to start") == "provision"
+
+    assert (
+        _derive_failure_stage("PROVISION_FAILURE", "vm failed to start") == "provision"
+    )
 
 
 def test_derive_failure_stage_test_keyword():
     from app.task_lifecycle import _derive_failure_stage
+
     assert _derive_failure_stage("CODE_ERROR", "pytest: FAILED assert x == y") == "test"
 
 
 def test_derive_failure_stage_lint_keyword():
     from app.task_lifecycle import _derive_failure_stage
+
     assert _derive_failure_stage("CODE_ERROR", "ruff: E501 line too long") == "lint"
 
 
 def test_derive_failure_stage_build_keyword():
     from app.task_lifecycle import _derive_failure_stage
-    assert _derive_failure_stage("CODE_ERROR", "build failed: cannot compile module") == "build"
+
+    assert (
+        _derive_failure_stage("CODE_ERROR", "build failed: cannot compile module")
+        == "build"
+    )
 
 
 def test_derive_failure_stage_clone_keyword():
     from app.task_lifecycle import _derive_failure_stage
-    assert _derive_failure_stage("CODE_ERROR", "git clone failed: repository not found") == "clone"
+
+    assert (
+        _derive_failure_stage("CODE_ERROR", "git clone failed: repository not found")
+        == "clone"
+    )
 
 
 def test_derive_failure_stage_pr_creation():
     from app.task_lifecycle import _derive_failure_stage
-    assert _derive_failure_stage("CODE_ERROR", "failed to create pr: branch not found") == "pr_creation"
+
+    assert (
+        _derive_failure_stage("CODE_ERROR", "failed to create pr: branch not found")
+        == "pr_creation"
+    )
 
 
 def test_derive_failure_stage_merge_keyword():
     from app.task_lifecycle import _derive_failure_stage
+
     assert _derive_failure_stage("CODE_ERROR", "merge conflict in app.py") == "merge"
     assert _derive_failure_stage("CODE_ERROR", "PR not mergeable") == "merge"
     assert _derive_failure_stage("CODE_ERROR", "branch is behind main") == "merge"
@@ -1438,6 +1778,7 @@ def test_derive_failure_stage_merge_keyword():
 
 def test_derive_failure_stage_review_keyword():
     from app.task_lifecycle import _derive_failure_stage
+
     assert _derive_failure_stage("CODE_ERROR", "reviewer rejected changes") == "review"
     assert _derive_failure_stage("CODE_ERROR", "changes requested on PR") == "review"
     assert _derive_failure_stage("CODE_ERROR", "review dismissed by author") == "review"
@@ -1445,63 +1786,99 @@ def test_derive_failure_stage_review_keyword():
 
 def test_derive_failure_stage_unknown():
     from app.task_lifecycle import _derive_failure_stage
+
     assert _derive_failure_stage("AGENT_TIMEOUT", "No heartbeat for 300s") is None
 
 
 def test_derive_failure_stage_specific_before_test_keyword():
     """Specific stage keywords must be checked before the generic 'test' keyword."""
     from app.task_lifecycle import _derive_failure_stage
+
     # Lint errors reported against test file paths → lint, not test
-    assert _derive_failure_stage(
-        "CODE_ERROR", "ruff check failed: backend/testing/test_api.py"
-    ) == "lint"
-    assert _derive_failure_stage(
-        "CODE_ERROR", "eslint error in src/components/Foo.test.tsx"
-    ) == "lint"
+    assert (
+        _derive_failure_stage(
+            "CODE_ERROR", "ruff check failed: backend/testing/test_api.py"
+        )
+        == "lint"
+    )
+    assert (
+        _derive_failure_stage(
+            "CODE_ERROR", "eslint error in src/components/Foo.test.tsx"
+        )
+        == "lint"
+    )
     # Merge conflict in a test file → merge, not test
-    assert _derive_failure_stage(
-        "CODE_ERROR", "merge conflict in backend/testing/test_api.py"
-    ) == "merge"
+    assert (
+        _derive_failure_stage(
+            "CODE_ERROR", "merge conflict in backend/testing/test_api.py"
+        )
+        == "merge"
+    )
     # Review rejection mentioning test coverage → review, not test
-    assert _derive_failure_stage(
-        "CODE_ERROR", "review rejected: test coverage insufficient"
-    ) == "review"
+    assert (
+        _derive_failure_stage(
+            "CODE_ERROR", "review rejected: test coverage insufficient"
+        )
+        == "review"
+    )
     # Build error importing test utilities → build, not test
-    assert _derive_failure_stage(
-        "CODE_ERROR", "build failed: cannot compile testing/helpers.ts"
-    ) == "build"
+    assert (
+        _derive_failure_stage(
+            "CODE_ERROR", "build failed: cannot compile testing/helpers.ts"
+        )
+        == "build"
+    )
 
 
 def test_derive_failure_stage_integration():
     """Cross-file coordination failures map to 'integration', ahead of test/build."""
     from app.task_lifecycle import _derive_failure_stage
-    assert _derive_failure_stage(
-        "CODE_ERROR", "ImportError: cannot import name 'foo' from 'app.bar'"
-    ) == "integration"
-    assert _derive_failure_stage(
-        "CODE_ERROR", "AttributeError: module 'app.x' has no attribute 'y'"
-    ) == "integration"
-    assert _derive_failure_stage(
-        "CODE_ERROR", "TS2305: Module './x' has no exported member 'Foo'"
-    ) == "integration"
-    assert _derive_failure_stage(
-        "CODE_ERROR", "Type 'string' is not assignable to type 'number'"
-    ) == "integration"
+
+    assert (
+        _derive_failure_stage(
+            "CODE_ERROR", "ImportError: cannot import name 'foo' from 'app.bar'"
+        )
+        == "integration"
+    )
+    assert (
+        _derive_failure_stage(
+            "CODE_ERROR", "AttributeError: module 'app.x' has no attribute 'y'"
+        )
+        == "integration"
+    )
+    assert (
+        _derive_failure_stage(
+            "CODE_ERROR", "TS2305: Module './x' has no exported member 'Foo'"
+        )
+        == "integration"
+    )
+    assert (
+        _derive_failure_stage(
+            "CODE_ERROR", "Type 'string' is not assignable to type 'number'"
+        )
+        == "integration"
+    )
     # Should win over generic test/build even when those keywords also appear
-    assert _derive_failure_stage(
-        "CODE_ERROR", "pytest failed: ImportError: no module named 'app.newmod'"
-    ) == "integration"
+    assert (
+        _derive_failure_stage(
+            "CODE_ERROR", "pytest failed: ImportError: no module named 'app.newmod'"
+        )
+        == "integration"
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # _merge_with_retry
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 @pytest.mark.asyncio
 async def test_merge_with_retry_succeeds_on_first_attempt():
     """Returns the merge result immediately when the first call succeeds."""
     mock_merge = AsyncMock(return_value={"merged": True, "sha": "abc123"})
-    result = await _merge_with_retry(mock_merge, "gh_token", "owner", "repo", 42, "proj-id")
+    result = await _merge_with_retry(
+        mock_merge, "gh_token", "owner", "repo", 42, "proj-id"
+    )
     assert result == {"merged": True, "sha": "abc123"}
     assert mock_merge.await_count == 1
 
@@ -1548,7 +1925,9 @@ async def test_merge_with_retry_returns_non_merged_without_retry():
         call_count += 1
         return {"merged": False, "message": "Merge conflict detected"}
 
-    result = await _merge_with_retry(_conflict_merge, "token", "owner", "repo", 5, "proj")
+    result = await _merge_with_retry(
+        _conflict_merge, "token", "owner", "repo", 5, "proj"
+    )
     assert result == {"merged": False, "message": "Merge conflict detected"}
     assert call_count == 1
 
@@ -1574,6 +1953,7 @@ async def test_merge_with_retry_respects_max_attempts_parameter(mocker):
 # ══════════════════════════════════════════════════════════════════════════════
 # _comment_with_retry
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 @pytest.mark.asyncio
 async def test_comment_with_retry_succeeds_on_first_attempt():
@@ -1647,6 +2027,7 @@ async def test_comment_with_retry_respects_max_attempts_parameter(mocker):
 # _process_post_commit
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 @pytest.mark.asyncio
 async def test_process_post_commit_task_not_found_returns_accepted(tl_db):
     """Returns {"status": "accepted"} when the task_id does not exist in the DB."""
@@ -1654,7 +2035,9 @@ async def test_process_post_commit_task_not_found_returns_accepted(tl_db):
     nonexistent_id = uuid.uuid4()
     payload = AgentStatusPayload(task_id=nonexistent_id, status=TaskStatus.COMPLETED)
 
-    result = await _process_post_commit(nonexistent_id, payload, _session_factory=factory)
+    result = await _process_post_commit(
+        nonexistent_id, payload, _session_factory=factory
+    )
 
     assert result == {"status": "accepted"}
 
@@ -1667,7 +2050,9 @@ async def test_process_post_commit_persists_timing_fields(tl_db, mocker):
     session, factory = tl_db
     project = await _make_project(session)
     task = await _make_task(
-        session, project.id, task_type="fix",
+        session,
+        project.id,
+        task_type="fix",
         status=TaskStatus.COMPLETED,
         context={"existing": "value"},
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
@@ -1700,7 +2085,9 @@ async def test_process_post_commit_omits_unsent_timing_fields(tl_db, mocker):
     session, factory = tl_db
     project = await _make_project(session)
     task = await _make_task(
-        session, project.id, task_type="fix",
+        session,
+        project.id,
+        task_type="fix",
         status=TaskStatus.COMPLETED,
         context={},
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
@@ -1782,13 +2169,15 @@ async def test_approve_branch_does_not_propagate_warm_target(tl_db, mocker):
 
     review_task = Task(
         project_id=project.id,
-        payloads=[{
-            "type": "review",
-            "pr_number": 5050,
-            "branch": "feat/x",
-            "base_branch": "main",
-            "original_task_id": str(original.id),
-        }],
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 5050,
+                "branch": "feat/x",
+                "base_branch": "main",
+                "original_task_id": str(original.id),
+            }
+        ],
         status=TaskStatus.COMPLETED,
         created_by="ORCHESTRATOR",
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
@@ -1823,8 +2212,7 @@ async def test_approve_branch_does_not_propagate_warm_target(tl_db, mocker):
         pass
 
     ci_failure_calls = [
-        kw for kw in captured_kwargs
-        if kw.get("fix_reason") == "ci_failure"
+        kw for kw in captured_kwargs if kw.get("fix_reason") == "ci_failure"
     ]
     assert ci_failure_calls, "Expected at least one ci_failure spawn from APPROVE path"
     for kw in ci_failure_calls:
@@ -1843,7 +2231,9 @@ async def test_process_post_commit_completed_child_triggers_rollup_check(tl_db, 
     project = await _make_project(session)
     parent = await _make_task(session, project.id, status=TaskStatus.EVALUATING)
     child = await _make_task(
-        session, project.id, task_type="create",
+        session,
+        project.id,
+        task_type="create",
         status=TaskStatus.COMPLETED,
         parent_task_id=parent.id,
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
@@ -1868,6 +2258,7 @@ async def test_process_post_commit_completed_child_triggers_rollup_check(tl_db, 
 # Task-level CODE_ERROR investigation trigger
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 @pytest.mark.asyncio
 async def test_code_defect_failure_spawns_investigation(tl_db, mocker):
     """A FAILED task with CODE_ERROR/code_defect and a direction_id spawns investigate."""
@@ -1876,7 +2267,9 @@ async def test_code_defect_failure_spawns_investigation(tl_db, mocker):
     project = await _make_project(session)
     direction_id = "d-abc123"
     task = await _make_task(
-        session, project.id, task_type="create",
+        session,
+        project.id,
+        task_type="create",
         status=TaskStatus.FAILED,
         context={"direction_id": direction_id, "failure_category": "CODE_ERROR"},
         latest_status_message="Build failed: ReferenceError in src/foo.ts",
@@ -1908,7 +2301,9 @@ async def test_failure_without_direction_id_skips_investigation(tl_db, mocker):
     session, factory = tl_db
     project = await _make_project(session)
     task = await _make_task(
-        session, project.id, task_type="create",
+        session,
+        project.id,
+        task_type="create",
         status=TaskStatus.FAILED,
         context={"failure_category": "CODE_ERROR"},
         latest_status_message="Build failed: syntax error",
@@ -1931,7 +2326,9 @@ async def test_investigate_task_failure_does_not_self_loop(tl_db, mocker):
     session, factory = tl_db
     project = await _make_project(session)
     task = await _make_task(
-        session, project.id, task_type="investigate",
+        session,
+        project.id,
+        task_type="investigate",
         status=TaskStatus.FAILED,
         context={"direction_id": "d-xyz", "failure_category": "CODE_ERROR"},
         latest_status_message="Build failed",
@@ -1950,6 +2347,7 @@ async def test_investigate_task_failure_does_not_self_loop(tl_db, mocker):
 # ══════════════════════════════════════════════════════════════════════════════
 # _is_transient_scan_error
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 def test_is_transient_scan_error_timeout():
     assert _is_transient_scan_error(TimeoutError("connection timed out")) is True
@@ -1975,6 +2373,7 @@ def test_is_transient_scan_error_permission():
 # Security scan retry logic (via _process_post_commit)
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 async def _make_task_with_pr(session, project_id, *, scope="small"):
     """Helper: create a task that will trigger the small-scope security scan path."""
     task = Task(
@@ -1998,12 +2397,16 @@ async def test_scan_transient_retry_success(tl_db, mocker):
     project = await _make_project(session)
     # Scope must be "small" in context; base_branch must start with "research/" for is_intermediate path
     task = await _make_task(
-        session, project.id, task_type="create",
+        session,
+        project.id,
+        task_type="create",
         status=TaskStatus.IN_PROGRESS,
         context={"scope": "small"},
     )
     # Patch the payloads to include base_branch so branch routing picks intermediate path
-    task.payloads = [{"type": "create", "prompt": "do create", "base_branch": "research/cycle-1"}]
+    task.payloads = [
+        {"type": "create", "prompt": "do create", "base_branch": "research/cycle-1"}
+    ]
     session.add(task)
     await session.commit()
     await session.refresh(task)
@@ -2011,6 +2414,7 @@ async def test_scan_transient_retry_success(tl_db, mocker):
     clean_result = {"blocked": False, "findings": [], "summary": "clean", "report": ""}
 
     call_count = 0
+
     async def _scan_side_effect(*_args):
         nonlocal call_count
         call_count += 1
@@ -2019,12 +2423,18 @@ async def test_scan_transient_retry_success(tl_db, mocker):
         return clean_result
 
     mocker.patch("app.task_lifecycle.asyncio.sleep", new_callable=AsyncMock)
-    mocker.patch("app.routers.agent.get_github_token_for_task", new_callable=AsyncMock,
-                 return_value=("gh-token", "owner", "repo"))
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("gh-token", "owner", "repo"),
+    )
     mocker.patch("app.security.scan_pr_for_injection", side_effect=_scan_side_effect)
     # Merge succeeds
-    mocker.patch("app.task_lifecycle._merge_with_retry", new_callable=AsyncMock,
-                 return_value={"merged": True})
+    mocker.patch(
+        "app.task_lifecycle._merge_with_retry",
+        new_callable=AsyncMock,
+        return_value={"merged": True},
+    )
     mocker.patch("app.task_lifecycle._cleanup_branches", new_callable=AsyncMock)
     mocker.patch("app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock)
 
@@ -2052,20 +2462,29 @@ async def test_scan_transient_retry_exhausted(tl_db, mocker):
     session, factory = tl_db
     project = await _make_project(session)
     task = await _make_task(
-        session, project.id, task_type="create",
+        session,
+        project.id,
+        task_type="create",
         status=TaskStatus.IN_PROGRESS,
         context={"scope": "small"},
     )
-    task.payloads = [{"type": "create", "prompt": "do create", "base_branch": "research/cycle-1"}]
+    task.payloads = [
+        {"type": "create", "prompt": "do create", "base_branch": "research/cycle-1"}
+    ]
     session.add(task)
     await session.commit()
     await session.refresh(task)
 
     mocker.patch("app.task_lifecycle.asyncio.sleep", new_callable=AsyncMock)
-    mocker.patch("app.routers.agent.get_github_token_for_task", new_callable=AsyncMock,
-                 return_value=("gh-token", "owner", "repo"))
-    mocker.patch("app.security.scan_pr_for_injection",
-                 side_effect=TimeoutError("connection timed out"))
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("gh-token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.security.scan_pr_for_injection",
+        side_effect=TimeoutError("connection timed out"),
+    )
 
     payload = AgentStatusPayload(
         task_id=task.id,
@@ -2088,6 +2507,7 @@ async def test_scan_transient_retry_exhausted(tl_db, mocker):
 # ══════════════════════════════════════════════════════════════════════════════
 # Residual remediation MERGED transition on merge
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 @pytest.mark.asyncio
 async def test_residual_remediation_case_merged_on_merge(tl_db, mocker):
@@ -2115,7 +2535,9 @@ async def test_residual_remediation_case_merged_on_merge(tl_db, mocker):
 
     # The original create task spawned by residual fingerprint remediation.
     orig_task = await _make_task(
-        session, project.id, task_type="create",
+        session,
+        project.id,
+        task_type="create",
         status=TaskStatus.IN_PROGRESS,
         context={
             "auto_remediation": True,
@@ -2127,7 +2549,9 @@ async def test_residual_remediation_case_merged_on_merge(tl_db, mocker):
     # A review task linked to the original via review_loop (this is the task
     # whose completion triggers the merge path in _process_post_commit).
     review_task = await _make_task(
-        session, project.id, task_type="review",
+        session,
+        project.id,
+        task_type="review",
         status=TaskStatus.IN_PROGRESS,
         context={
             "review_loop": {
@@ -2139,15 +2563,30 @@ async def test_residual_remediation_case_merged_on_merge(tl_db, mocker):
         },
     )
 
-    mocker.patch("app.routers.agent.get_github_token_for_task", new_callable=AsyncMock,
-                 return_value=("gh-token", "owner", "repo"))
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("gh-token", "owner", "repo"),
+    )
     # get_pull_request: used for PR state check (early-exit guard) and head-branch validation.
     # Return empty head.sha so CI gate is skipped; ref matches branch so no branch-mismatch abort.
-    mocker.patch("app.github.get_pull_request", new_callable=AsyncMock,
-                 return_value={"head": {"ref": "blueprint/task-remfp", "sha": ""}, "state": "open", "merged": False})
-    mocker.patch("app.github.submit_pr_review", new_callable=AsyncMock, return_value={"id": 1})
-    mocker.patch("app.task_lifecycle._merge_with_retry", new_callable=AsyncMock,
-                 return_value={"merged": True})
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "head": {"ref": "blueprint/task-remfp", "sha": ""},
+            "state": "open",
+            "merged": False,
+        },
+    )
+    mocker.patch(
+        "app.github.submit_pr_review", new_callable=AsyncMock, return_value={"id": 1}
+    )
+    mocker.patch(
+        "app.task_lifecycle._merge_with_retry",
+        new_callable=AsyncMock,
+        return_value={"merged": True},
+    )
     mocker.patch("app.task_lifecycle._comment_with_retry", new_callable=AsyncMock)
     mocker.patch("app.task_lifecycle._cleanup_branches", new_callable=AsyncMock)
     mocker.patch("app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock)
@@ -2175,6 +2614,7 @@ async def test_residual_remediation_case_merged_on_merge(tl_db, mocker):
 # ══════════════════════════════════════════════════════════════════════════════
 # _record_parent_failure
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 def test_record_parent_failure_with_direction_id_calls_both(mocker):
     """direction_id in context → both record_task_result and record_direction_result."""
@@ -2270,6 +2710,7 @@ def test_record_parent_failure_defaults_task_type_when_payload_missing(mocker):
 
 # ── _extract_failing_tests / _extract_error_files ──────────────────────────────
 
+
 class TestExtractFailingTests:
     def test_pytest_failed_line(self):
         assert _extract_failing_tests("FAILED tests/test_foo.py::test_bar") == [
@@ -2300,11 +2741,7 @@ class TestExtractFailingTests:
         assert _extract_failing_tests("") == []
 
     def test_mixed_formats(self):
-        text = (
-            "FAILED tests/test_a.py::test_x\n"
-            "FAIL src/b.test.ts\n"
-            "Error: boom\n"
-        )
+        text = "FAILED tests/test_a.py::test_x\nFAIL src/b.test.ts\nError: boom\n"
         result = _extract_failing_tests(text)
         assert "tests/test_a.py::test_x" in result
         assert "src/b.test.ts" in result
@@ -2335,16 +2772,14 @@ class TestExtractErrorFiles:
         assert len(_extract_error_files(text)) == 5
 
     def test_mixed_patterns(self):
-        text = (
-            'File "backend/app/main.py", line 42\n'
-            "src/index.ts:15:3 error\n"
-        )
+        text = 'File "backend/app/main.py", line 42\nsrc/index.ts:15:3 error\n'
         result = _extract_error_files(text)
         assert "backend/app/main.py" in result
         assert "src/index.ts" in result
 
 
 # ── _build_retry_prompt_suffix ────────────────────────────────────────────────
+
 
 class TestBuildRetryPromptSuffix:
     """Pure-function tests for the retry prompt-suffix builder.
@@ -2377,15 +2812,21 @@ class TestBuildRetryPromptSuffix:
 
     def test_agent_timeout_iteration_limit_no_downgrade(self):
         _, override = _build_retry_prompt_suffix(
-            "AGENT_TIMEOUT", "Review-fix cycle limit reached",
-            attempt=3, task_scope="medium", ctx={},
+            "AGENT_TIMEOUT",
+            "Review-fix cycle limit reached",
+            attempt=3,
+            task_scope="medium",
+            ctx={},
         )
         assert override is None
 
     def test_agent_timeout_iteration_limit_large_no_downgrade(self):
         _, override = _build_retry_prompt_suffix(
-            "AGENT_TIMEOUT", "review-fix cap reached",
-            attempt=2, task_scope="large", ctx={},
+            "AGENT_TIMEOUT",
+            "review-fix cap reached",
+            attempt=2,
+            task_scope="large",
+            ctx={},
         )
         assert override is None
 
@@ -2412,7 +2853,9 @@ class TestBuildRetryPromptSuffix:
     def test_scope_overflow_includes_overflow_details_when_changed_files_present(self):
         ctx = {
             "_previous_changed_files": [
-                "backend/app/a.py", "backend/app/b.py", "agent/src/c.ts",
+                "backend/app/a.py",
+                "backend/app/b.py",
+                "agent/src/c.ts",
             ],
         }
         guidance, _ = _build_retry_prompt_suffix(
@@ -2424,7 +2867,10 @@ class TestBuildRetryPromptSuffix:
 
     def test_scope_overflow_analysis_gate_uses_analysis_guidance(self):
         guidance, override = _build_retry_prompt_suffix(
-            "SCOPE_OVERFLOW", None, attempt=1, task_scope="medium",
+            "SCOPE_OVERFLOW",
+            None,
+            attempt=1,
+            task_scope="medium",
             ctx={"scope_gate_triggered": "analysis_overflow"},
         )
         assert "analysis plan" in guidance.lower()
@@ -2434,31 +2880,43 @@ class TestBuildRetryPromptSuffix:
     def test_scope_overflow_raw_lowercase_label_via_failure_category(self):
         """Path matches when failure_class is missing but ctx has lowercase label."""
         _, override = _build_retry_prompt_suffix(
-            None, None, attempt=1, task_scope="medium",
+            None,
+            None,
+            attempt=1,
+            task_scope="medium",
             ctx={"failure_category": "scope_overflow"},
         )
         assert override == "large"
 
     def test_code_error_test_keyword_hint(self):
         guidance, override = _build_retry_prompt_suffix(
-            "CODE_ERROR", "pytest assertion failed in test_foo",
-            attempt=1, task_scope="small", ctx={},
+            "CODE_ERROR",
+            "pytest assertion failed in test_foo",
+            attempt=1,
+            task_scope="small",
+            ctx={},
         )
         assert "failing tests" in guidance.lower()
         assert override is None
 
     def test_code_error_lint_keyword_hint(self):
         guidance, _ = _build_retry_prompt_suffix(
-            "CODE_ERROR", "ruff E501 line too long; eslint warning",
-            attempt=1, task_scope="small", ctx={},
+            "CODE_ERROR",
+            "ruff E501 line too long; eslint warning",
+            attempt=1,
+            task_scope="small",
+            ctx={},
         )
         assert "lint/type errors" in guidance
 
     def test_code_error_no_keywords_uses_default_fallback(self):
         """No test/lint keywords → default fallback guidance is emitted."""
         guidance, _ = _build_retry_prompt_suffix(
-            "CODE_ERROR", "something unexpected happened",
-            attempt=1, task_scope="small", ctx={},
+            "CODE_ERROR",
+            "something unexpected happened",
+            attempt=1,
+            task_scope="small",
+            ctx={},
         )
         assert "RETRY GUIDANCE" in guidance
         assert "unclassified" in guidance.lower()
@@ -2473,7 +2931,8 @@ class TestBuildRetryPromptSuffix:
         guidance, _ = _build_retry_prompt_suffix(
             "CODE_ERROR",
             "interface ProjectBuildConfigSectionProps {\n  githubOwner: string;",
-            attempt=2, task_scope="small",
+            attempt=2,
+            task_scope="small",
             ctx={
                 "agent_failure_category_raw": "incomplete",
                 "_previous_failure_stage": "build",  # mis-derived; should be ignored
@@ -2489,8 +2948,10 @@ class TestBuildRetryPromptSuffix:
         hints — the agent didn't actually run tests/lint, so those hints would
         be misleading."""
         guidance, _ = _build_retry_prompt_suffix(
-            "CODE_ERROR", "diff text that mentions test_foo and eslint",
-            attempt=1, task_scope="small",
+            "CODE_ERROR",
+            "diff text that mentions test_foo and eslint",
+            attempt=1,
+            task_scope="small",
             ctx={"agent_failure_category_raw": "incomplete"},
         )
         assert "printed a diff to stdout" in guidance
@@ -2500,77 +2961,118 @@ class TestBuildRetryPromptSuffix:
 
     def test_code_error_attempt_one_no_scope_override(self):
         _, override = _build_retry_prompt_suffix(
-            "CODE_ERROR", "boom", attempt=1, task_scope="large", ctx={},
+            "CODE_ERROR",
+            "boom",
+            attempt=1,
+            task_scope="large",
+            ctx={},
         )
         assert override is None
 
     def test_code_error_large_downgrades_to_medium_on_attempt_two(self):
         _, override = _build_retry_prompt_suffix(
-            "CODE_ERROR", "boom", attempt=2, task_scope="large", ctx={},
+            "CODE_ERROR",
+            "boom",
+            attempt=2,
+            task_scope="large",
+            ctx={},
         )
         assert override == "medium"
 
     def test_code_error_medium_downgrades_to_small_on_attempt_two(self):
         _, override = _build_retry_prompt_suffix(
-            "CODE_ERROR", "boom", attempt=2, task_scope="medium", ctx={},
+            "CODE_ERROR",
+            "boom",
+            attempt=2,
+            task_scope="medium",
+            ctx={},
         )
         assert override == "small"
 
     def test_code_error_test_stage_preserves_scope(self):
         _, override = _build_retry_prompt_suffix(
-            "CODE_ERROR", "boom", attempt=2, task_scope="medium",
+            "CODE_ERROR",
+            "boom",
+            attempt=2,
+            task_scope="medium",
             ctx={"_previous_failure_stage": "test"},
         )
         assert override is None
 
     def test_code_error_lint_stage_preserves_scope(self):
         _, override = _build_retry_prompt_suffix(
-            "CODE_ERROR", "boom", attempt=3, task_scope="large",
+            "CODE_ERROR",
+            "boom",
+            attempt=3,
+            task_scope="large",
             ctx={"_previous_failure_stage": "lint"},
         )
         assert override is None
 
     def test_code_error_build_stage_preserves_scope(self):
         _, override = _build_retry_prompt_suffix(
-            "CODE_ERROR", "boom", attempt=2, task_scope="medium",
+            "CODE_ERROR",
+            "boom",
+            attempt=2,
+            task_scope="medium",
             ctx={"_previous_failure_stage": "build"},
         )
         assert override is None
 
     def test_code_error_review_stage_preserves_scope(self):
         _, override = _build_retry_prompt_suffix(
-            "CODE_ERROR", "boom", attempt=2, task_scope="medium",
+            "CODE_ERROR",
+            "boom",
+            attempt=2,
+            task_scope="medium",
             ctx={"_previous_failure_stage": "review"},
         )
         assert override is None
 
     def test_code_error_downgrades_when_expansion_ratio_indicates_scope_overflow(self):
         _, override = _build_retry_prompt_suffix(
-            "CODE_ERROR", "boom", attempt=2, task_scope="medium",
+            "CODE_ERROR",
+            "boom",
+            attempt=2,
+            task_scope="medium",
             ctx={"_previous_failure_stage": "test", "expansion_ratio": 2.0},
         )
         assert override == "small"
 
     def test_code_error_expansion_ratio_at_threshold_does_not_force_downgrade(self):
         _, override = _build_retry_prompt_suffix(
-            "CODE_ERROR", "boom", attempt=2, task_scope="medium",
+            "CODE_ERROR",
+            "boom",
+            attempt=2,
+            task_scope="medium",
             ctx={"_previous_failure_stage": "test", "expansion_ratio": 1.5},
         )
         assert override is None
 
     def test_code_error_small_no_downgrade(self):
         _, override = _build_retry_prompt_suffix(
-            "CODE_ERROR", "boom", attempt=3, task_scope="small", ctx={},
+            "CODE_ERROR",
+            "boom",
+            attempt=3,
+            task_scope="small",
+            ctx={},
         )
         assert override is None
 
     def test_code_error_extracts_previous_failing_tests_and_error_files(self):
         ctx = {
-            "_previous_failing_tests": ["tests/test_a.py::test_x", "tests/test_b.py::test_y"],
+            "_previous_failing_tests": [
+                "tests/test_a.py::test_x",
+                "tests/test_b.py::test_y",
+            ],
             "_previous_error_files": ["backend/app/main.py", "agent/src/index.ts"],
         }
         guidance, _ = _build_retry_prompt_suffix(
-            "CODE_ERROR", "test failure: assert", attempt=1, task_scope="small", ctx=ctx,
+            "CODE_ERROR",
+            "test failure: assert",
+            attempt=1,
+            task_scope="small",
+            ctx=ctx,
         )
         assert "Previously failing tests:" in guidance
         assert "tests/test_a.py::test_x" in guidance
@@ -2587,7 +3089,11 @@ class TestBuildRetryPromptSuffix:
             ],
         }
         guidance, _ = _build_retry_prompt_suffix(
-            "CODE_ERROR", "test failure", attempt=1, task_scope="small", ctx=ctx,
+            "CODE_ERROR",
+            "test failure",
+            attempt=1,
+            task_scope="small",
+            ctx=ctx,
         )
         assert "Unresolved review issues" in guidance
         assert "Missing null check in foo()" in guidance
@@ -2595,7 +3101,11 @@ class TestBuildRetryPromptSuffix:
 
     def test_code_error_generic_message_falls_back_to_default_guidance(self):
         guidance, _ = _build_retry_prompt_suffix(
-            "CODE_ERROR", "something went wrong", attempt=1, task_scope="small", ctx={},
+            "CODE_ERROR",
+            "something went wrong",
+            attempt=1,
+            task_scope="small",
+            ctx={},
         )
         assert guidance
         assert "RETRY GUIDANCE" in guidance
@@ -2603,7 +3113,10 @@ class TestBuildRetryPromptSuffix:
 
     def test_code_error_stage_test_guidance(self):
         guidance, _ = _build_retry_prompt_suffix(
-            "CODE_ERROR", "something unexpected", attempt=1, task_scope="small",
+            "CODE_ERROR",
+            "something unexpected",
+            attempt=1,
+            task_scope="small",
             ctx={"_previous_failure_stage": "test"},
         )
         assert "test stage" in guidance
@@ -2611,7 +3124,10 @@ class TestBuildRetryPromptSuffix:
 
     def test_code_error_stage_lint_guidance(self):
         guidance, _ = _build_retry_prompt_suffix(
-            "CODE_ERROR", "something unexpected", attempt=1, task_scope="small",
+            "CODE_ERROR",
+            "something unexpected",
+            attempt=1,
+            task_scope="small",
             ctx={"_previous_failure_stage": "lint"},
         )
         assert "lint stage" in guidance
@@ -2619,7 +3135,10 @@ class TestBuildRetryPromptSuffix:
 
     def test_code_error_stage_build_guidance(self):
         guidance, _ = _build_retry_prompt_suffix(
-            "CODE_ERROR", "something unexpected", attempt=1, task_scope="small",
+            "CODE_ERROR",
+            "something unexpected",
+            attempt=1,
+            task_scope="small",
             ctx={"_previous_failure_stage": "build"},
         )
         assert "build stage" in guidance
@@ -2627,7 +3146,10 @@ class TestBuildRetryPromptSuffix:
 
     def test_code_error_stage_merge_guidance(self):
         guidance, _ = _build_retry_prompt_suffix(
-            "CODE_ERROR", "something unexpected", attempt=1, task_scope="small",
+            "CODE_ERROR",
+            "something unexpected",
+            attempt=1,
+            task_scope="small",
             ctx={"_previous_failure_stage": "merge"},
         )
         assert "merge stage" in guidance
@@ -2636,7 +3158,10 @@ class TestBuildRetryPromptSuffix:
     def test_code_error_stage_takes_precedence_over_keyword(self):
         """When stage is set, use stage guidance instead of keyword-matched hints."""
         guidance, _ = _build_retry_prompt_suffix(
-            "CODE_ERROR", "pytest assertion failed", attempt=1, task_scope="small",
+            "CODE_ERROR",
+            "pytest assertion failed",
+            attempt=1,
+            task_scope="small",
             ctx={"_previous_failure_stage": "lint"},
         )
         assert "lint stage" in guidance
@@ -2644,39 +3169,54 @@ class TestBuildRetryPromptSuffix:
 
     def test_code_error_unknown_stage_falls_back_to_keyword(self):
         guidance, _ = _build_retry_prompt_suffix(
-            "CODE_ERROR", "pytest assertion failed", attempt=1, task_scope="small",
+            "CODE_ERROR",
+            "pytest assertion failed",
+            attempt=1,
+            task_scope="small",
             ctx={"_previous_failure_stage": "provision"},
         )
         assert "failing tests" in guidance.lower()
 
     def test_agent_timeout_oom_subtype_guidance(self):
         guidance, _ = _build_retry_prompt_suffix(
-            "AGENT_TIMEOUT", "exit code 137 out of memory",
-            attempt=1, task_scope="medium", ctx={},
+            "AGENT_TIMEOUT",
+            "exit code 137 out of memory",
+            attempt=1,
+            task_scope="medium",
+            ctx={},
         )
         assert "out-of-memory" in guidance
         assert "memory" in guidance.lower()
 
     def test_agent_timeout_heartbeat_subtype_guidance(self):
         guidance, _ = _build_retry_prompt_suffix(
-            "AGENT_TIMEOUT", "No heartbeat received after 300s",
-            attempt=1, task_scope="medium", ctx={},
+            "AGENT_TIMEOUT",
+            "No heartbeat received after 300s",
+            attempt=1,
+            task_scope="medium",
+            ctx={},
         )
         assert "heartbeat" in guidance.lower()
         assert "smaller" in guidance.lower()
 
     def test_agent_timeout_iteration_limit_subtype_guidance(self):
         guidance, _ = _build_retry_prompt_suffix(
-            "AGENT_TIMEOUT", "review-fix cycle limit reached",
-            attempt=1, task_scope="medium", ctx={},
+            "AGENT_TIMEOUT",
+            "review-fix cycle limit reached",
+            attempt=1,
+            task_scope="medium",
+            ctx={},
         )
         assert "iteration" in guidance.lower()
         assert "narrow scope" in guidance.lower()
 
     def test_agent_timeout_cascade_no_scope_downgrade(self):
         _, override = _build_retry_prompt_suffix(
-            "AGENT_TIMEOUT", "Cancelled: parent evaluation timeout",
-            attempt=3, task_scope="medium", ctx={},
+            "AGENT_TIMEOUT",
+            "Cancelled: parent evaluation timeout",
+            attempt=3,
+            task_scope="medium",
+            ctx={},
         )
         assert override is None
 
@@ -2684,7 +3224,11 @@ class TestBuildRetryPromptSuffix:
         ctx = {"_previous_failing_tests": ["tests/test_a.py::test_x"]}
         status = "pytest FAILED tests/test_a.py::test_x\nassert 1 == 2"
         guidance, _ = _build_retry_prompt_suffix(
-            "CODE_ERROR", status, attempt=2, task_scope="small", ctx=ctx,
+            "CODE_ERROR",
+            status,
+            attempt=2,
+            task_scope="small",
+            ctx=ctx,
         )
         assert "same tests are failing" in guidance.lower()
         assert "tests/test_a.py::test_x" in guidance
@@ -2692,7 +3236,10 @@ class TestBuildRetryPromptSuffix:
 
     def test_previous_is_recurring_surfaces_in_guidance(self):
         guidance, _ = _build_retry_prompt_suffix(
-            "CODE_ERROR", "pytest failed", attempt=2, task_scope="small",
+            "CODE_ERROR",
+            "pytest failed",
+            attempt=2,
+            task_scope="small",
             ctx={"_previous_is_recurring": True},
         )
         assert "CROSS-ATTEMPT CONTEXT" in guidance
@@ -2700,7 +3247,10 @@ class TestBuildRetryPromptSuffix:
 
     def test_previous_self_review_outcome_surfaces(self):
         guidance, _ = _build_retry_prompt_suffix(
-            "CODE_ERROR", "err", attempt=2, task_scope="small",
+            "CODE_ERROR",
+            "err",
+            attempt=2,
+            task_scope="small",
             ctx={"_previous_self_review_outcome": "missed edge case in parser"},
         )
         assert "self-review" in guidance.lower()
@@ -2708,8 +3258,11 @@ class TestBuildRetryPromptSuffix:
 
     def test_external_api_github_with_status_code(self):
         guidance, override = _build_retry_prompt_suffix(
-            "EXTERNAL_API", "GitHub API returned 503 Service Unavailable",
-            attempt=1, task_scope="small", ctx={},
+            "EXTERNAL_API",
+            "GitHub API returned 503 Service Unavailable",
+            attempt=1,
+            task_scope="small",
+            ctx={},
         )
         assert "GitHub API error" in guidance
         assert "(status 503)" in guidance
@@ -2718,21 +3271,33 @@ class TestBuildRetryPromptSuffix:
 
     def test_external_api_anthropic_detected_from_claude_keyword(self):
         guidance, _ = _build_retry_prompt_suffix(
-            "EXTERNAL_API", "Claude returned 429", attempt=1, task_scope="small", ctx={},
+            "EXTERNAL_API",
+            "Claude returned 429",
+            attempt=1,
+            task_scope="small",
+            ctx={},
         )
         assert "Claude API error" in guidance
         assert "(status 429)" in guidance
 
     def test_external_api_generic_without_status_code(self):
         guidance, _ = _build_retry_prompt_suffix(
-            "EXTERNAL_API", "network unreachable", attempt=1, task_scope="small", ctx={},
+            "EXTERNAL_API",
+            "network unreachable",
+            attempt=1,
+            task_scope="small",
+            ctx={},
         )
         assert "external API error" in guidance
         assert "(status" not in guidance
 
     def test_rate_limit_static_guidance(self):
         guidance, override = _build_retry_prompt_suffix(
-            "RATE_LIMIT", None, attempt=1, task_scope="small", ctx={},
+            "RATE_LIMIT",
+            None,
+            attempt=1,
+            task_scope="small",
+            ctx={},
         )
         assert "rate limit" in guidance.lower()
         assert "Retry-After" in guidance
@@ -2740,14 +3305,22 @@ class TestBuildRetryPromptSuffix:
 
     def test_unknown_failure_class_returns_empty_guidance(self):
         guidance, override = _build_retry_prompt_suffix(
-            "MYSTERY_FAILURE", "anything", attempt=1, task_scope="small", ctx={},
+            "MYSTERY_FAILURE",
+            "anything",
+            attempt=1,
+            task_scope="small",
+            ctx={},
         )
         assert guidance == ""
         assert override is None
 
     def test_none_failure_class_returns_empty_guidance(self):
         guidance, override = _build_retry_prompt_suffix(
-            None, None, attempt=1, task_scope="small", ctx={},
+            None,
+            None,
+            attempt=1,
+            task_scope="small",
+            ctx={},
         )
         assert guidance == ""
         assert override is None
@@ -2756,6 +3329,7 @@ class TestBuildRetryPromptSuffix:
 # ══════════════════════════════════════════════════════════════════════════════
 # Double-spawn dedup: _requeue_parent_task skips cloning when debug-fix is active
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 @pytest.mark.asyncio
 async def test_requeue_skips_clone_when_debug_fix_active(tl_db):
@@ -2771,14 +3345,16 @@ async def test_requeue_skips_clone_when_debug_fix_active(tl_db):
 
     # The active Fix: task spawned by the debug path
     active_fix = await _make_task(
-        session, project.id,
+        session,
+        project.id,
         status=TaskStatus.QUEUED,
         parent_task_id=parent.id,
     )
 
     # Failed child that references the active fix task
     child = await _make_task(
-        session, project.id,
+        session,
+        project.id,
         status=TaskStatus.FAILED,
         parent_task_id=parent.id,
         context={"_debug_fix_spawned_task_id": str(active_fix.id)},
@@ -2836,7 +3412,8 @@ async def test_requeue_proceeds_when_debug_fix_failed(tl_db):
 
     # Failed child (direct child of parent) references the now-failed fix task
     child = await _make_task(
-        session, project.id,
+        session,
+        project.id,
         status=TaskStatus.FAILED,
         parent_task_id=parent.id,
         context={"_debug_fix_spawned_task_id": str(failed_fix.id)},
@@ -2854,6 +3431,7 @@ async def test_requeue_proceeds_when_debug_fix_failed(tl_db):
 
 # ── Fix-task SR feedback loop: fix_iteration stamp ───────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_fix_completion_stamps_fix_iteration_on_sr_outcome(tl_db, mocker):
     """When a fix task completes with _self_review_outcome lacking fix_iteration,
@@ -2863,7 +3441,9 @@ async def test_fix_completion_stamps_fix_iteration_on_sr_outcome(tl_db, mocker):
     project = await _make_project(session)
     # review_loop.iteration=4 → second fix iteration (review1→fix1→review2→fix2)
     task = await _make_task(
-        session, project.id, task_type="fix",
+        session,
+        project.id,
+        task_type="fix",
         status=TaskStatus.COMPLETED,
         context={
             "_self_review_outcome": {
@@ -2889,7 +3469,9 @@ async def test_fix_completion_preserves_agent_stamped_fix_iteration(tl_db, mocke
     session, factory = tl_db
     project = await _make_project(session)
     task = await _make_task(
-        session, project.id, task_type="fix",
+        session,
+        project.id,
+        task_type="fix",
         status=TaskStatus.COMPLETED,
         context={
             "_self_review_outcome": {

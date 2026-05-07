@@ -1,27 +1,111 @@
 import { afterEach, describe, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
-import { ManualInterventionPanel } from './PipelineRegressionsPanel';
+import { DispatcherHealthPanel, ManualInterventionPanel } from './PipelineRegressionsPanel';
 import { expectNoOverflowAt } from '../test/viewport';
 
 vi.mock('../api', () => ({
-  apiFetch: vi.fn(async (url: string) =>
-    url.includes('/manual-intervention')
-      ? new Response(JSON.stringify({ cases: Array.from({ length: 6 }, (_, i) => ({
-          id: `case-${i + 1}`, regression_class: `very_long_regression_class_name_${i + 1}_with_nested_failure_signals`,
-          signal_name: `signal-${i + 1}`, status: 'NEEDS_ATTENTION', attempts: i + 2, last_remediation_pr_number: 1200 + i,
-          last_failure_class: `LONG_FAILURE_CLASS_NAME_${i + 1}_WITH_MULTIPLE_SEGMENTS`,
-          signal_snapshot_at_spawn: { task_type: 'create', severity: 'critical', queue_depth: 18 + i, note: 'initial snapshot has enough detail to pressure the card layout' },
-          signal_snapshot_at_merge: { task_type: 'create', severity: 'critical', queue_depth: 24 + i, note: 'merge snapshot stays dense enough to exercise wrapping' },
-          fingerprint_to_fix_log: [{ fix_pr_number: 700 + i, merged_at: '2026-05-06T00:00:00Z', recovered_at: i % 2 === 0 ? '2026-05-06T01:00:00Z' : undefined }],
-          last_seen_at: '2026-05-06T02:00:00Z', needs_manual_intervention_at: '2026-05-06T03:00:00Z',
-          first_seen_at: '2026-05-06T01:05:00Z', signal_first_crossed_at: '2026-05-06T01:00:00Z',
-        })) }), { status: 200 })
-      : new Response('{}', { status: 200 })
-  ),
+  apiFetch: vi.fn(async (url: string) => {
+    if (url.includes('regression-dispatcher/health')) {
+      return new Response(JSON.stringify({
+        cycles_last_24h: 47,
+        signals_tripped_last_24h: 12,
+        spawns_last_24h: 4,
+        cooldown_blocks_last_24h: 8,
+        cap_blocks_last_24h: 0,
+        classes: [
+          {
+            regression_class: 'sr_regression_pipeline_success_rate',
+            last_spawn_at: new Date(Date.now() - 3600_000).toISOString(),
+            last_rejection_reason: null,
+            in_cooldown_until: new Date(Date.now() + 3600_000).toISOString(),
+          },
+          {
+            regression_class: 'sr_regression_first_attempt_success',
+            last_spawn_at: new Date(Date.now() - 7200_000).toISOString(),
+            last_rejection_reason: 'cooldown',
+            in_cooldown_until: null,
+          },
+        ],
+      }), { status: 200 });
+    }
+    if (url.includes('/manual-intervention')) {
+      return new Response(JSON.stringify({ cases: Array.from({ length: 6 }, (_, i) => ({
+        id: `case-${i + 1}`, regression_class: `very_long_regression_class_name_${i + 1}_with_nested_failure_signals`,
+        signal_name: `signal-${i + 1}`, status: 'NEEDS_ATTENTION', attempts: i + 2, last_remediation_pr_number: 1200 + i,
+        last_failure_class: `LONG_FAILURE_CLASS_NAME_${i + 1}_WITH_MULTIPLE_SEGMENTS`,
+        signal_snapshot_at_spawn: { task_type: 'create', severity: 'critical', queue_depth: 18 + i, note: 'initial snapshot has enough detail to pressure the card layout' },
+        signal_snapshot_at_merge: { task_type: 'create', severity: 'critical', queue_depth: 24 + i, note: 'merge snapshot stays dense enough to exercise wrapping' },
+        fingerprint_to_fix_log: [{ fix_pr_number: 700 + i, merged_at: '2026-05-06T00:00:00Z', recovered_at: i % 2 === 0 ? '2026-05-06T01:00:00Z' : undefined }],
+        last_seen_at: '2026-05-06T02:00:00Z', needs_manual_intervention_at: '2026-05-06T03:00:00Z',
+        first_seen_at: '2026-05-06T01:05:00Z', signal_first_crossed_at: '2026-05-06T01:00:00Z',
+      })) }), { status: 200 });
+    }
+    return new Response('{}', { status: 404 });
+  }),
 }));
 
-describe('PipelineRegressionsPanel — viewport regression', () => {
+describe('DispatcherHealthPanel — viewport regression', () => {
+  let root: Root | null = null;
+  let host: HTMLDivElement | null = null;
+
+  afterEach(() => {
+    const r = root;
+    if (r) {
+      act(() => { r.unmount(); });
+      root = null;
+    }
+    if (host) {
+      host.remove();
+      host = null;
+    }
+  });
+
+  test('renders populated state without overflow at 375px', async () => {
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(<DispatcherHealthPanel projectId="project-test" />);
+      });
+      await act(async () => {
+        await new Promise<void>((resolve) => setTimeout(resolve, 50));
+      });
+    });
+  });
+
+  test('renders empty state without overflow at 375px', async () => {
+    const { apiFetch } = await import('../api');
+    vi.mocked(apiFetch).mockResolvedValueOnce(
+      new Response(JSON.stringify({
+        cycles_last_24h: 0,
+        signals_tripped_last_24h: 0,
+        spawns_last_24h: 0,
+        cooldown_blocks_last_24h: 0,
+        cap_blocks_last_24h: 0,
+        classes: [],
+      }), { status: 200 })
+    );
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(<DispatcherHealthPanel projectId="project-test" />);
+      });
+      await act(async () => {
+        await new Promise<void>((resolve) => setTimeout(resolve, 50));
+      });
+    });
+  });
+});
+
+describe('ManualInterventionPanel — viewport regression', () => {
   let root: Root | null = null;
   let host: HTMLDivElement | null = null;
   afterEach(() => { if (root) act(() => root?.unmount()); root = null; host?.remove(); host = null; });

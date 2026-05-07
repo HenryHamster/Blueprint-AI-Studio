@@ -268,6 +268,52 @@ export async function fetchDirectionSrBreakdown(
   return res.json();
 }
 
+export interface DispatcherRejectionReasons {
+  dedup: number;
+  cooldown: number;
+  system_cap: number;
+  manual_intervention_suppressed: number;
+}
+
+export interface DispatcherCycleRecord {
+  cycle_started_at: string;
+  cycle_finished_at: string | null;
+  project_id: string;
+  signals_evaluated: number;
+  signals_tripped: number;
+  spawns_emitted: number;
+  rejections_by_reason: DispatcherRejectionReasons;
+  mttd_p50_sec: number | null;
+}
+
+export interface DispatcherClassStatus {
+  regression_class: string;
+  project_id: string;
+  last_spawn_at: string | null;
+  last_rejection_reason: string | null;
+  in_cooldown_until: string | null;
+}
+
+export interface DispatcherHealthSummary {
+  cycles_24h: number;
+  signals_tripped_24h: number;
+  spawns_24h: number;
+  cooldown_rejections_24h: number;
+  cap_rejections_24h: number;
+}
+
+export interface DispatcherHealthResponse {
+  summary: DispatcherHealthSummary;
+  recent_cycles: DispatcherCycleRecord[];
+  class_statuses: DispatcherClassStatus[];
+}
+
+export async function fetchDispatcherHealth(): Promise<DispatcherHealthResponse> {
+  const res = await apiFetch('/api/admin/regression-dispatcher/health');
+  if (!res.ok) throw new Error(`Failed to fetch dispatcher health: ${res.status}`);
+  return res.json();
+}
+
 export interface SrAlertDrilldownRow {
   task_id: string;
   title: string;

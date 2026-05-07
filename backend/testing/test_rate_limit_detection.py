@@ -11,6 +11,7 @@ the error text. That caused accounts to get disabled for GCP disk quota,
 GitHub 429s, Anthropic 529 overloads, credit-card setup errors, and any
 message mentioning "billing". See RATE_LIMIT_PATTERNS in max_plan_pool.py.
 """
+
 from unittest.mock import MagicMock
 
 import pytest
@@ -63,8 +64,16 @@ def test_pattern_list_is_all_lowercase():
 
 def test_pattern_list_has_no_bare_keywords():
     """Guard against regressing to broad keywords that caused false positives."""
-    forbidden_bare = {"credit", "billing", "429", "quota exceeded", "overloaded",
-                      "too many requests", "rate limit", "usage limit"}
+    forbidden_bare = {
+        "credit",
+        "billing",
+        "429",
+        "quota exceeded",
+        "overloaded",
+        "too many requests",
+        "rate limit",
+        "usage limit",
+    }
     # A bare forbidden term as a whole pattern (not a substring of a larger phrase)
     # would bring back the false-positive classification.
     for p in RATE_LIMIT_PATTERNS:
@@ -128,7 +137,10 @@ def test_superseded_message_classifies_as_agent_timeout():
 def test_real_code_error_still_classifies_as_code_error():
     """Regression: typical code-defect messages still classify as CODE_ERROR."""
     assert classify_failure(_task("AssertionError: expected 3, got 4")) == "CODE_ERROR"
-    assert classify_failure(_task("TypeError: unsupported operand type(s)")) == "CODE_ERROR"
+    assert (
+        classify_failure(_task("TypeError: unsupported operand type(s)"))
+        == "CODE_ERROR"
+    )
 
 
 def test_agent_reported_rate_limited_category_bypasses_text_match():
@@ -149,10 +161,14 @@ def test_case_insensitive_matching():
 def test_logs_field_is_searched():
     """classify_failure also scans the logs parameter, not just status message."""
     t = _task("")
-    assert classify_failure(t, logs="trace: API Error: Rate limit reached\n") == "RATE_LIMIT"
+    assert (
+        classify_failure(t, logs="trace: API Error: Rate limit reached\n")
+        == "RATE_LIMIT"
+    )
 
 
 # ── normalize_agent_failure_category ───────────────────────────────────────
+
 
 def test_normalize_agent_category_maps_lowercase_rate_limited_to_uppercase():
     """Agent posts lowercase 'rate_limited' — must persist as canonical RATE_LIMIT."""
@@ -173,7 +189,13 @@ def test_normalize_agent_category_maps_clone_failed_to_provision_failure():
 def test_normalize_agent_category_accepts_already_canonical_names():
     """If the caller already hands us an uppercase class name, pass it through."""
     t = _task("")
-    for canonical in ["PROVISION_FAILURE", "RATE_LIMIT", "AGENT_TIMEOUT", "EXTERNAL_API", "CODE_ERROR"]:
+    for canonical in [
+        "PROVISION_FAILURE",
+        "RATE_LIMIT",
+        "AGENT_TIMEOUT",
+        "EXTERNAL_API",
+        "CODE_ERROR",
+    ]:
         assert normalize_agent_failure_category(canonical, t) == canonical
 
 
@@ -190,6 +212,7 @@ def test_normalize_agent_category_none_falls_back_to_classify():
 
 # ── Provision phrase match (not bare substring) ────────────────────────────
 
+
 def test_since_provisioning_is_not_provision_failure():
     """Reaper status like 'No heartbeat received after 300s since provisioning'
     must classify as AGENT_TIMEOUT (via 'no heartbeat'), not PROVISION_FAILURE."""
@@ -200,7 +223,10 @@ def test_since_provisioning_is_not_provision_failure():
 def test_failed_to_provision_still_matches():
     """Existing 'failed to provision VM' path must keep classifying as PROVISION_FAILURE."""
     assert classify_failure(_task("failed to provision VM")) == "PROVISION_FAILURE"
-    assert classify_failure(_task("Provisioning failed for zone us-central1")) == "PROVISION_FAILURE"
+    assert (
+        classify_failure(_task("Provisioning failed for zone us-central1"))
+        == "PROVISION_FAILURE"
+    )
 
 
 def test_infra_classes_includes_external_api():
@@ -239,28 +265,41 @@ def test_classify_failure_respects_scope_overflow_agent_category():
 
 # ── Cascade cancellation classifier ───────────────────────────────────────────
 
+
 def test_cascade_dependency_task_failed_is_agent_timeout():
     """'Cancelled: dependency task failed' (set on directly-cancelled parent task)
     must classify as AGENT_TIMEOUT — it's an orchestrator decision, not a code defect."""
-    assert classify_failure(_task("Cancelled: dependency task failed")) == "AGENT_TIMEOUT"
+    assert (
+        classify_failure(_task("Cancelled: dependency task failed")) == "AGENT_TIMEOUT"
+    )
 
 
 def test_cascade_parent_dependency_failed_is_agent_timeout():
     """'Cancelled: parent dependency failed' (set on children) must classify as AGENT_TIMEOUT."""
-    assert classify_failure(_task("Cancelled: parent dependency failed")) == "AGENT_TIMEOUT"
+    assert (
+        classify_failure(_task("Cancelled: parent dependency failed"))
+        == "AGENT_TIMEOUT"
+    )
 
 
 def test_cascade_parent_evaluation_timeout_is_agent_timeout():
     """Existing 'cancelled: parent evaluation timeout' pattern still matches after broadening."""
-    assert classify_failure(_task("Cancelled: parent evaluation timeout")) == "AGENT_TIMEOUT"
+    assert (
+        classify_failure(_task("Cancelled: parent evaluation timeout"))
+        == "AGENT_TIMEOUT"
+    )
 
 
 def test_cancelled_prefix_broad_match():
     """Any message starting with 'cancelled:' is treated as AGENT_TIMEOUT."""
-    assert classify_failure(_task("Cancelled: some new orchestrator reason")) == "AGENT_TIMEOUT"
+    assert (
+        classify_failure(_task("Cancelled: some new orchestrator reason"))
+        == "AGENT_TIMEOUT"
+    )
 
 
 # ── worst_child_failure_category ───────────────────────────────────────────────
+
 
 def _child(failure_category=None):
     """Make a minimal Task-like mock with optional failure_category in context."""
@@ -283,7 +322,10 @@ def test_worst_child_failure_category_single_agent_timeout():
 
 
 def test_worst_child_failure_category_single_provision_failure():
-    assert worst_child_failure_category([_child("PROVISION_FAILURE")]) == "PROVISION_FAILURE"
+    assert (
+        worst_child_failure_category([_child("PROVISION_FAILURE")])
+        == "PROVISION_FAILURE"
+    )
 
 
 def test_worst_child_failure_category_code_error_wins_over_agent_timeout():
@@ -372,15 +414,17 @@ def test_taxonomy_medium_scope_without_evidence_is_code_defect():
 
 def test_taxonomy_scope_related_from_expansion_ratio():
     """expansion_ratio > 1.5 is positive evidence that the scope was exceeded."""
-    t = _task_with_ctx("NameError: foo not defined",
-                       {"scope": "small", "expansion_ratio": 2.0})
+    t = _task_with_ctx(
+        "NameError: foo not defined", {"scope": "small", "expansion_ratio": 2.0}
+    )
     assert classify_failure_taxonomy(t) == TAXONOMY_SCOPE_RELATED
 
 
 def test_taxonomy_expansion_ratio_at_or_below_threshold_is_code_defect():
     """expansion_ratio <= 1.5 is not enough evidence — falls through to code_defect."""
-    t = _task_with_ctx("NameError: foo not defined",
-                       {"scope": "small", "expansion_ratio": 1.5})
+    t = _task_with_ctx(
+        "NameError: foo not defined", {"scope": "small", "expansion_ratio": 1.5}
+    )
     assert classify_failure_taxonomy(t) == TAXONOMY_CODE_DEFECT
 
 
@@ -388,19 +432,24 @@ def test_taxonomy_calibrated_from_without_scope_evidence_is_code_defect():
     """scope_calibrated_from alone is NOT evidence of a scope-related failure —
     a calibrated task can fail for unrelated code defects (e.g. NameError).
     Without scope keywords or an expansion_ratio signal, fall through to code_defect."""
-    t = _task_with_ctx("NameError: foo not defined",
-                       {"scope": "small", "scope_calibrated_from": "medium"})
+    t = _task_with_ctx(
+        "NameError: foo not defined",
+        {"scope": "small", "scope_calibrated_from": "medium"},
+    )
     assert classify_failure_taxonomy(t) == TAXONOMY_CODE_DEFECT
 
     # With corroborating expansion_ratio > 1.5, classifies as scope_related.
-    t2 = _task_with_ctx("NameError: foo not defined",
-                        {"scope": "small", "scope_calibrated_from": "medium",
-                         "expansion_ratio": 2.0})
+    t2 = _task_with_ctx(
+        "NameError: foo not defined",
+        {"scope": "small", "scope_calibrated_from": "medium", "expansion_ratio": 2.0},
+    )
     assert classify_failure_taxonomy(t2) == TAXONOMY_SCOPE_RELATED
 
     # With corroborating scope-keyword in status message, classifies as scope_related.
-    t3 = _task_with_ctx("aborted: too many files changed",
-                        {"scope": "small", "scope_calibrated_from": "medium"})
+    t3 = _task_with_ctx(
+        "aborted: too many files changed",
+        {"scope": "small", "scope_calibrated_from": "medium"},
+    )
     assert classify_failure_taxonomy(t3) == TAXONOMY_SCOPE_RELATED
 
 
@@ -436,6 +485,7 @@ def test_taxonomy_review_quality_beats_scope():
 
 
 # ── Cross-function: normalize_agent_failure_category + classify_failure_taxonomy ──
+
 
 def test_taxonomy_calibrated_from_with_generic_message_is_code_defect():
     """scope_calibrated_from in ctx alone (no scope keywords, no expansion_ratio)

@@ -69,7 +69,9 @@ async def filter_file_conflicts(
         if t.status == TaskStatus.IN_PROGRESS:
             files = _prod_files((t.context or {}).get("related_files", []))
             if files:
-                in_progress_files_by_project.setdefault(t.project_id, set()).update(files)
+                in_progress_files_by_project.setdefault(t.project_id, set()).update(
+                    files
+                )
 
     if not in_progress_files_by_project:
         return eligible_ids
@@ -85,7 +87,9 @@ async def filter_file_conflicts(
         if not project_files:
             non_conflicting.append(eid)
             continue
-        candidate_files = _prod_files((candidate.context or {}).get("related_files", []))
+        candidate_files = _prod_files(
+            (candidate.context or {}).get("related_files", [])
+        )
         if not candidate_files:
             non_conflicting.append(eid)
             continue
@@ -97,24 +101,42 @@ async def filter_file_conflicts(
         # (refactors are expected to touch decomposition targets — overlap is intentional)
         scope = (candidate.context or {}).get("scope", DEFAULT_TASK_SCOPE)
         task_type = (candidate.first_payload).get("type", "")
-        is_large = scope == "large" or task_type == "plan"  # refactors use standard threshold
+        is_large = (
+            scope == "large" or task_type == "plan"
+        )  # refactors use standard threshold
         # Otherwise: defer if at least 2 files overlap AND >= 50% of candidate's files
-        should_defer = is_large or (len(overlap) >= 2 and len(overlap) >= len(candidate_files) * 0.5)
+        should_defer = is_large or (
+            len(overlap) >= 2 and len(overlap) >= len(candidate_files) * 0.5
+        )
         if should_defer:
-            overlapping_files = ', '.join(sorted(overlap))[:120]
-            blocking_task = next((t for t in active_tasks if t.status == TaskStatus.IN_PROGRESS
-                                  and t.project_id == candidate.project_id
-                                  and set((t.context or {}).get("related_files", [])) & overlap), None)
-            blocking_title = f" (blocked by: {blocking_task.title[:60]})" if blocking_task else ""
+            overlapping_files = ", ".join(sorted(overlap))[:120]
+            blocking_task = next(
+                (
+                    t
+                    for t in active_tasks
+                    if t.status == TaskStatus.IN_PROGRESS
+                    and t.project_id == candidate.project_id
+                    and set((t.context or {}).get("related_files", [])) & overlap
+                ),
+                None,
+            )
+            blocking_title = (
+                f" (blocked by: {blocking_task.title[:60]})" if blocking_task else ""
+            )
             defer_msg = f"Waiting: file conflict on {overlapping_files}{blocking_title}"
             if candidate.latest_status_message != defer_msg:
                 candidate.latest_status_message = defer_msg
                 session.add(candidate)
                 try:
-                    await broadcast_fn(str(candidate.project_id), "task_updated",
-                        {"task_id": str(eid), "status": "QUEUED", "message": defer_msg})
+                    await broadcast_fn(
+                        str(candidate.project_id),
+                        "task_updated",
+                        {"task_id": str(eid), "status": "QUEUED", "message": defer_msg},
+                    )
                 except Exception:
-                    logger.debug(f"Failed to broadcast deferral for {eid}", exc_info=True)
+                    logger.debug(
+                        f"Failed to broadcast deferral for {eid}", exc_info=True
+                    )
             logger.info(
                 f"[DISPATCH] Deferring task {eid} — file conflict "
                 f"({len(overlap)}/{len(candidate_files)} files, scope={scope}): {overlapping_files}"
@@ -142,19 +164,31 @@ async def filter_rollup_conflicts(
     if not eligible_ids:
         return eligible_ids
 
-    eval_parent_ids = (await session.execute(
-        select(Task.id).where(Task.status == TaskStatus.EVALUATING)
-    )).scalars().all()
+    eval_parent_ids = (
+        (
+            await session.execute(
+                select(Task.id).where(Task.status == TaskStatus.EVALUATING)
+            )
+        )
+        .scalars()
+        .all()
+    )
     if not eval_parent_ids:
         return eligible_ids
     eval_parent_id_set = set(eval_parent_ids)
 
-    pending_children = (await session.execute(
-        select(Task).where(
-            Task.parent_task_id.in_(eval_parent_ids),
-            Task.status == TaskStatus.COMPLETED,
+    pending_children = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.parent_task_id.in_(eval_parent_ids),
+                    Task.status == TaskStatus.COMPLETED,
+                )
+            )
         )
-    )).scalars().all()
+        .scalars()
+        .all()
+    )
 
     # Build per-project rollup file sets (different repos can't conflict)
     pending_rollup_by_project: dict[uuid.UUID, dict[str, str]] = {}
@@ -195,7 +229,9 @@ async def filter_rollup_conflicts(
             continue
         stale_overlap = cfiles & project_rollup_files.keys()
         # Only defer on significant overlap: 2+ files AND >= 50% of candidate's files
-        should_defer = len(stale_overlap) >= 2 and len(stale_overlap) >= len(cfiles) * 0.5
+        should_defer = (
+            len(stale_overlap) >= 2 and len(stale_overlap) >= len(cfiles) * 0.5
+        )
         if should_defer:
             blocking_title = project_rollup_files[next(iter(stale_overlap))]
             logger.warning(
@@ -208,10 +244,15 @@ async def filter_rollup_conflicts(
                 candidate.latest_status_message = defer_msg
                 session.add(candidate)
                 try:
-                    await broadcast_fn(str(candidate.project_id), "task_updated",
-                        {"task_id": str(eid), "status": "QUEUED", "message": defer_msg})
+                    await broadcast_fn(
+                        str(candidate.project_id),
+                        "task_updated",
+                        {"task_id": str(eid), "status": "QUEUED", "message": defer_msg},
+                    )
                 except Exception:
-                    logger.debug(f"Failed to broadcast rollup deferral for {eid}", exc_info=True)
+                    logger.debug(
+                        f"Failed to broadcast rollup deferral for {eid}", exc_info=True
+                    )
         else:
             if stale_overlap:
                 blocking_title = project_rollup_files[next(iter(stale_overlap))]
@@ -269,7 +310,10 @@ async def filter_held_directions(
                     {"task_id": str(eid), "status": "QUEUED", "message": reason},
                 )
             except Exception:
-                logger.debug(f"Failed to broadcast direction-hold deferral for {eid}", exc_info=True)
+                logger.debug(
+                    f"Failed to broadcast direction-hold deferral for {eid}",
+                    exc_info=True,
+                )
         logger.info(
             f"[DISPATCH] Deferring task {eid} — direction {direction_id} is held: {reason}"
         )
@@ -296,7 +340,9 @@ def _is_migration_task(task: Task) -> bool:
         normalized = f.replace("\\", "/")
         if "backend/alembic/versions/" in normalized:
             return True
-        if normalized == "backend/app/models.py" or normalized.endswith("/backend/app/models.py"):
+        if normalized == "backend/app/models.py" or normalized.endswith(
+            "/backend/app/models.py"
+        ):
             return True
     return False
 
@@ -348,11 +394,14 @@ async def filter_migration_serialization(
             session.add(candidate)
             try:
                 await broadcast_fn(
-                    str(candidate.project_id), "task_updated",
+                    str(candidate.project_id),
+                    "task_updated",
                     {"task_id": str(eid), "status": "QUEUED", "message": defer_msg},
                 )
             except Exception:
-                logger.debug(f"Failed to broadcast migration deferral for {eid}", exc_info=True)
+                logger.debug(
+                    f"Failed to broadcast migration deferral for {eid}", exc_info=True
+                )
         logger.info(
             f"[DISPATCH] Deferring migration task {eid} — blocked by {blocker.id} in project {candidate.project_id}"
         )
@@ -390,7 +439,8 @@ async def filter_pipeline_duplicates(
     # Limit the DB fetch to review/fix candidates — non-pipeline tasks pass
     # through, so we don't need to check them.
     pipeline_candidates = [
-        t for t in candidate_tasks
+        t
+        for t in candidate_tasks
         if t.id in eligible_ids
         and (t.first_payload).get("type") in ("review", "fix")
         and (t.first_payload).get("pr_number") is not None
@@ -401,15 +451,25 @@ async def filter_pipeline_duplicates(
     project_ids = {t.project_id for t in pipeline_candidates}
     # Fetch ALL active (non-terminal, non-cancelled) review/fix tasks in these
     # projects, fully loaded. We need payloads for pr_number/task_type lookup.
-    active_pipeline = (await session.execute(
-        select(Task).where(
-            Task.project_id.in_(project_ids),
-            Task.status.in_([
-                TaskStatus.QUEUED, TaskStatus.PROVISIONING,
-                TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING,
-            ]),
+    active_pipeline = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.project_id.in_(project_ids),
+                    Task.status.in_(
+                        [
+                            TaskStatus.QUEUED,
+                            TaskStatus.PROVISIONING,
+                            TaskStatus.IN_PROGRESS,
+                            TaskStatus.EVALUATING,
+                        ]
+                    ),
+                )
+            )
         )
-    )).scalars().all()
+        .scalars()
+        .all()
+    )
 
     # Group by (project_id, pr_number, task_type). Using project_id in the
     # key guards against the unlikely case of two projects reusing PR numbers.
@@ -443,7 +503,11 @@ async def filter_pipeline_duplicates(
         # (a) Any other task is already claimed → cancel this one.
         running_other = next((t for t in others if t.status in RUNNING), None)
         if running_other:
-            from app.failure_classification import AGENT_TIMEOUT, persist_failure_category  # noqa: PLC0415
+            from app.failure_classification import (
+                AGENT_TIMEOUT,
+                persist_failure_category,
+            )  # noqa: PLC0415
+
             candidate.status = TaskStatus.CANCELLED
             candidate.latest_status_message = (
                 f"Deduplicated: {fp.get('type')} task {str(running_other.id)[:8]} "
@@ -453,10 +517,19 @@ async def filter_pipeline_duplicates(
             persist_failure_category(candidate, AGENT_TIMEOUT)
             session.add(candidate)
             try:
-                await broadcast_fn(str(candidate.project_id), "task_updated",
-                    {"task_id": str(eid), "status": "CANCELLED", "message": candidate.latest_status_message})
+                await broadcast_fn(
+                    str(candidate.project_id),
+                    "task_updated",
+                    {
+                        "task_id": str(eid),
+                        "status": "CANCELLED",
+                        "message": candidate.latest_status_message,
+                    },
+                )
             except Exception:
-                logger.debug(f"Failed to broadcast dedup cancel for {eid}", exc_info=True)
+                logger.debug(
+                    f"Failed to broadcast dedup cancel for {eid}", exc_info=True
+                )
             logger.warning(
                 f"[DISPATCH] Cancelling duplicate {fp.get('type')} {eid} — "
                 f"{running_other.status} sibling {running_other.id} on PR #{fp.get('pr_number')}"
@@ -469,8 +542,15 @@ async def filter_pipeline_duplicates(
         queued_others = [t for t in others if t.status == TaskStatus.QUEUED]
         if queued_others:
             oldest_queued = min(queued_others, key=lambda t: (t.created_at, t.id))
-            if (candidate.created_at, candidate.id) > (oldest_queued.created_at, oldest_queued.id):
-                from app.failure_classification import AGENT_TIMEOUT, persist_failure_category  # noqa: PLC0415
+            if (candidate.created_at, candidate.id) > (
+                oldest_queued.created_at,
+                oldest_queued.id,
+            ):
+                from app.failure_classification import (
+                    AGENT_TIMEOUT,
+                    persist_failure_category,
+                )  # noqa: PLC0415
+
                 candidate.status = TaskStatus.CANCELLED
                 candidate.latest_status_message = (
                     f"Deduplicated: older QUEUED {fp.get('type')} task "
@@ -479,10 +559,19 @@ async def filter_pipeline_duplicates(
                 persist_failure_category(candidate, AGENT_TIMEOUT)
                 session.add(candidate)
                 try:
-                    await broadcast_fn(str(candidate.project_id), "task_updated",
-                        {"task_id": str(eid), "status": "CANCELLED", "message": candidate.latest_status_message})
+                    await broadcast_fn(
+                        str(candidate.project_id),
+                        "task_updated",
+                        {
+                            "task_id": str(eid),
+                            "status": "CANCELLED",
+                            "message": candidate.latest_status_message,
+                        },
+                    )
                 except Exception:
-                    logger.debug(f"Failed to broadcast dedup cancel for {eid}", exc_info=True)
+                    logger.debug(
+                        f"Failed to broadcast dedup cancel for {eid}", exc_info=True
+                    )
                 logger.warning(
                     f"[DISPATCH] Cancelling duplicate {fp.get('type')} {eid} — "
                     f"older QUEUED sibling {oldest_queued.id} on PR #{fp.get('pr_number')}"

@@ -38,10 +38,11 @@ from app.models import (
     StrategicCycle,
     Alert,
     AlertSeverity,
+    CLOSE_REASON_RECOVERED_UNATTENDED,
 )
 from app.auth import get_current_user, require_admin
 from app.admin import _get_user_project_with_role
-from app.shared_state import runtime_config as _runtime_config
+from app.shared_state import runtime_config as _runtime_config, get_dispatcher_cycles
 from app.routers.admin_analytics import _derive_completed_at, ON_DEMAND_RATE, SPOT_RATE
 from app.direction_metrics import _compute_direction_quality_score
 from app.direction_outcomes import synthesize_prompt_quality_patterns
@@ -2136,6 +2137,17 @@ async def clear_regression_manual_intervention(
     case.updated_at = _utcnow()
     session.add(case)
     await session.commit()
+    # Drop process-local markers so a re-escalated case does not pick up a
+    # stale healthy_since (which would let it auto-close on the first tick,
+    # bypassing the stable window) or a stale first-tripped (which would
+    # mis-report time_to_detect_sec on the next escalation).
+    from app.pipeline_regression_dispatcher import (  # noqa: PLC0415
+        _signal_first_tripped,
+        _signal_healthy_since,
+    )
+
+    _signal_healthy_since.pop((str(project_id), regression_class), None)
+    _signal_first_tripped.pop((str(project_id), regression_class), None)
     return {
         "id": str(case.id),
         "regression_class": regression_class,
@@ -2203,6 +2215,77 @@ async def list_regression_manual_intervention_cases(
             for c in rows
         ],
     }
+
+
+@router.get("/regression-cases/auto-recovered")
+async def list_regression_auto_recovered_cases(
+    project_id: uuid.UUID = Query(..., description="Project to query (required)"),
+    limit: int = Query(50, ge=1, le=500),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),  # noqa: ARG001
+):
+    """List regression cases auto-closed by the watchdog after unattended recovery.
+
+    Mirrors the response shape of /regression-cases/manual-intervention so the
+    admin UI can render auto-recovered cases alongside outstanding escalations.
+    Adds a ``recovered_at`` field pulled from the latest ``recovered_unattended``
+    log entry and an ``updated_at`` field so operators can sort by close time.
+    """
+    rows = (
+        (
+            await session.execute(
+                select(RegressionRemediationCase)
+                .where(
+                    RegressionRemediationCase.project_id == project_id,
+                    RegressionRemediationCase.status == RegressionCaseStatus.CLOSED,
+                    RegressionRemediationCase.last_remediation_result
+                    == CLOSE_REASON_RECOVERED_UNATTENDED,
+                )
+                .order_by(RegressionRemediationCase.updated_at.desc())
+                .limit(limit)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    cases = []
+    for c in rows:
+        recovered_at = None
+        for entry in reversed(c.fingerprint_to_fix_log or []):
+            if (
+                isinstance(entry, dict)
+                and entry.get("reason") == CLOSE_REASON_RECOVERED_UNATTENDED
+            ):
+                recovered_at = entry.get("recovered_at")
+                break
+        cases.append(
+            {
+                "id": str(c.id),
+                "project_id": str(c.project_id),
+                "regression_class": c.regression_class,
+                "signal_name": c.regression_class.replace("_", " "),
+                "status": c.status,
+                "attempts": c.attempts,
+                "last_remediation_pr_number": c.last_remediation_pr_number,
+                "last_failure_class": c.last_failure_class,
+                "signal_snapshot_at_spawn": c.signal_snapshot_at_spawn,
+                "signal_snapshot_at_merge": c.signal_snapshot_at_merge,
+                "fingerprint_to_fix_log": c.fingerprint_to_fix_log,
+                "last_seen_at": c.last_seen_at.isoformat() if c.last_seen_at else None,
+                "needs_manual_intervention_at": c.needs_manual_intervention_at.isoformat()
+                if c.needs_manual_intervention_at
+                else None,
+                "signal_first_seen_at": c.signal_first_seen_at.isoformat()
+                if c.signal_first_seen_at
+                else None,
+                "time_to_detect_sec": c.time_to_detect_sec,
+                "escalation_reason": c.escalation_reason,
+                "recovered_at": recovered_at,
+                "updated_at": c.updated_at.isoformat() if c.updated_at else None,
+            }
+        )
+    return {"count": len(cases), "cases": cases}
 
 
 @router.get("/regression-cases/stalled")
@@ -7030,4 +7113,118 @@ async def get_evicted_findings(
         "offset": offset,
         "limit": limit,
         "evicted_findings": page,
+    }
+
+
+@router.get("/regression-dispatcher/health")
+async def get_regression_dispatcher_health(
+    project_id: Optional[uuid.UUID] = Query(default=None),
+    window_hours: int = Query(default=24, ge=1, le=168),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),  # noqa: ARG001
+) -> Dict[str, Any]:
+    """Dispatcher health and throughput summary for the last N hours.
+
+    Returns aggregate cycle counts, per-hour spawn sparkline, and per-class
+    last-spawn/cooldown info derived from the in-memory cycle ring buffer and
+    the RegressionRemediationCase table. Works at all viewport widths.
+    """
+    pid_str = str(project_id) if project_id else None
+    cycles = get_dispatcher_cycles(project_id=pid_str, window_hours=window_hours)
+
+    # Aggregate totals
+    total_cycles = len(cycles)
+    total_signals_evaluated = sum(r.get("signals_evaluated", 0) for r in cycles)
+    total_signals_tripped = sum(r.get("signals_tripped", 0) for r in cycles)
+    total_spawns = sum(r.get("spawns_emitted", 0) for r in cycles)
+    total_cooldown = sum(
+        r.get("rejections_by_reason", {}).get("cooldown", 0) for r in cycles
+    )
+    total_dedup = sum(r.get("rejections_by_reason", {}).get("dedup", 0) for r in cycles)
+    total_cap = sum(
+        r.get("rejections_by_reason", {}).get("system_cap", 0) for r in cycles
+    )
+    total_mi_suppressed = sum(
+        r.get("rejections_by_reason", {}).get("manual_intervention_suppressed", 0)
+        for r in cycles
+    )
+
+    # Per-hour sparkline: count spawns_emitted in each 1-hour bucket
+    now = datetime.utcnow()
+    sparkline: List[Dict[str, Any]] = []
+    for h in range(window_hours - 1, -1, -1):
+        bucket_start = (now - timedelta(hours=h + 1)).isoformat()
+        bucket_end = (now - timedelta(hours=h)).isoformat()
+        bucket_spawns = sum(
+            r.get("spawns_emitted", 0)
+            for r in cycles
+            if bucket_start <= r.get("cycle_started_at", "") < bucket_end
+        )
+        bucket_cycles = sum(
+            1
+            for r in cycles
+            if bucket_start <= r.get("cycle_started_at", "") < bucket_end
+        )
+        sparkline.append(
+            {
+                "hour_start": bucket_start,
+                "spawns": bucket_spawns,
+                "cycles": bucket_cycles,
+            }
+        )
+
+    # Per-class info from DB: last seen_at, status, cooldown
+    where_clause = [RegressionRemediationCase.status != RegressionCaseStatus.CLOSED]
+    if project_id is not None:
+        where_clause.append(RegressionRemediationCase.project_id == project_id)
+    cases = (
+        (
+            await session.execute(
+                select(RegressionRemediationCase)
+                .where(*where_clause)
+                .order_by(RegressionRemediationCase.last_seen_at.desc())
+                .limit(200)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    from app.pipeline_regression_dispatcher import _REGRESSION_COOLDOWN  # noqa: PLC0415
+
+    per_class: List[Dict[str, Any]] = []
+    for case in cases:
+        last_seen = case.last_seen_at
+        cooldown_until: Optional[str] = None
+        if last_seen:
+            cooldown_end = last_seen + _REGRESSION_COOLDOWN
+            if cooldown_end > now:
+                cooldown_until = cooldown_end.isoformat()
+        per_class.append(
+            {
+                "project_id": str(case.project_id),
+                "regression_class": case.regression_class,
+                "status": case.status,
+                "last_seen_at": last_seen.isoformat() if last_seen else None,
+                "attempts": case.attempts,
+                "in_cooldown_until": cooldown_until,
+            }
+        )
+
+    return {
+        "window_hours": window_hours,
+        "aggregate": {
+            "cycles": total_cycles,
+            "signals_evaluated": total_signals_evaluated,
+            "signals_tripped": total_signals_tripped,
+            "spawns": total_spawns,
+            "rejections": {
+                "cooldown": total_cooldown,
+                "dedup": total_dedup,
+                "system_cap": total_cap,
+                "manual_intervention_suppressed": total_mi_suppressed,
+            },
+        },
+        "spawns_sparkline": sparkline,
+        "per_class": per_class,
     }

@@ -4,6 +4,7 @@ Tests for three admin routers:
 2. admin_projects.py — project CRUD + autonomous mode
 3. admin_notifications.py — alerts, messages, playbook
 """
+
 import uuid
 import pytest
 from httpx import AsyncClient, ASGITransport
@@ -11,8 +12,15 @@ from sqlmodel import select
 
 from app.main import app
 from app.models import (
-    AllowedUser, Project, ProjectMember, Task, TaskStatus,
-    Alert, ProjectMessage, MessageType, SystemMaturity,
+    AllowedUser,
+    Project,
+    ProjectMember,
+    Task,
+    TaskStatus,
+    Alert,
+    ProjectMessage,
+    MessageType,
+    SystemMaturity,
 )
 from app.auth import get_current_user, require_admin
 
@@ -24,6 +32,7 @@ TEST_USER_EMAIL = "test@example.com"
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
+
 
 async def _make_project(session, owner_id=TEST_USER_ID, name="Test Project"):
     """Create a project with the given user as owner, plus the owner membership."""
@@ -40,6 +49,7 @@ async def _make_project(session, owner_id=TEST_USER_ID, name="Test Project"):
 # ═══════════════════════════════════════════════════════════════════════════════
 # admin_users.py — User Management & Project Members
 # ═══════════════════════════════════════════════════════════════════════════════
+
 
 class TestListUsers:
     @pytest.mark.asyncio
@@ -92,7 +102,9 @@ class TestAddUser:
         assert "id" in data
 
     @pytest.mark.asyncio
-    async def test_add_user_duplicate_email_returns_409(self, client: AsyncClient, db_session):
+    async def test_add_user_duplicate_email_returns_409(
+        self, client: AsyncClient, db_session
+    ):
         """Duplicate email returns 409."""
         db_session.add(AllowedUser(email="dup@example.com", role="user"))
         await db_session.commit()
@@ -129,9 +141,7 @@ class TestUpdateUser:
         await db_session.commit()
         await db_session.refresh(user)
 
-        resp = await client.patch(
-            f"/api/admin/users/{user.id}", json={"role": "admin"}
-        )
+        resp = await client.patch(f"/api/admin/users/{user.id}", json={"role": "admin"})
         assert resp.status_code == 200
         assert resp.json()["role"] == "admin"
 
@@ -144,7 +154,9 @@ class TestUpdateUser:
         assert resp.status_code == 404
 
     @pytest.mark.asyncio
-    async def test_update_user_invalid_role_returns_422(self, client: AsyncClient, db_session):
+    async def test_update_user_invalid_role_returns_422(
+        self, client: AsyncClient, db_session
+    ):
         """Invalid role in update payload is rejected."""
         user = AllowedUser(email="role2@example.com", role="user")
         db_session.add(user)
@@ -205,7 +217,9 @@ class TestProjectMembers:
         assert members[0]["role"] == "owner"
 
     @pytest.mark.asyncio
-    async def test_list_members_non_member_returns_404(self, client: AsyncClient, db_session):
+    async def test_list_members_non_member_returns_404(
+        self, client: AsyncClient, db_session
+    ):
         """User without membership gets 404."""
         # Create a project owned by someone else with no membership for test user
         project = Project(name="Private", user_id="other-owner")
@@ -292,7 +306,9 @@ class TestProjectMembers:
     async def test_update_project_member_role(self, client: AsyncClient, db_session):
         """Owner can change a member's role."""
         project = await _make_project(db_session)
-        db_session.add(AllowedUser(email="m@example.com", firebase_uid="m-uid", role="user"))
+        db_session.add(
+            AllowedUser(email="m@example.com", firebase_uid="m-uid", role="user")
+        )
         m = ProjectMember(project_id=project.id, user_id="m-uid", role="member")
         db_session.add(m)
         await db_session.commit()
@@ -327,20 +343,22 @@ class TestProjectMembers:
     async def test_remove_project_member_success(self, client: AsyncClient, db_session):
         """Owner can remove a non-owner member."""
         project = await _make_project(db_session)
-        db_session.add(AllowedUser(email="rem@example.com", firebase_uid="rem-uid", role="user"))
+        db_session.add(
+            AllowedUser(email="rem@example.com", firebase_uid="rem-uid", role="user")
+        )
         m = ProjectMember(project_id=project.id, user_id="rem-uid", role="member")
         db_session.add(m)
         await db_session.commit()
         await db_session.refresh(m)
 
-        resp = await client.delete(
-            f"/api/admin/projects/{project.id}/members/{m.id}"
-        )
+        resp = await client.delete(f"/api/admin/projects/{project.id}/members/{m.id}")
         assert resp.status_code == 200
         assert resp.json()["message"] == "Member removed"
 
     @pytest.mark.asyncio
-    async def test_remove_project_owner_returns_400(self, client: AsyncClient, db_session):
+    async def test_remove_project_owner_returns_400(
+        self, client: AsyncClient, db_session
+    ):
         """Cannot remove the project owner via the member endpoint."""
         project = await _make_project(db_session)
         result = await db_session.execute(
@@ -361,6 +379,7 @@ class TestProjectMembers:
 # admin_projects.py — Project CRUD + Autonomous Mode
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
 class TestGetAllProjects:
     @pytest.mark.asyncio
     async def test_returns_user_projects(self, client: AsyncClient, db_session):
@@ -379,7 +398,9 @@ class TestGetAllProjects:
         db_session.add(other)
         await db_session.commit()
         await db_session.refresh(other)
-        db_session.add(ProjectMember(project_id=other.id, user_id="other-owner", role="owner"))
+        db_session.add(
+            ProjectMember(project_id=other.id, user_id="other-owner", role="owner")
+        )
         await db_session.commit()
 
         resp = await client.get("/api/admin/projects")
@@ -453,7 +474,9 @@ class TestUpdateProject:
 
 class TestDeleteProject:
     @pytest.mark.asyncio
-    async def test_delete_project_no_active_tasks(self, client: AsyncClient, db_session):
+    async def test_delete_project_no_active_tasks(
+        self, client: AsyncClient, db_session
+    ):
         """Owner can delete a project that has no active tasks."""
         project = await _make_project(db_session)
 
@@ -607,6 +630,7 @@ class TestAutonomousMode:
 # admin_notifications.py — Alerts, Messages, Playbook
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
 class TestAlerts:
     @pytest.mark.asyncio
     async def test_get_alerts_empty(self, client: AsyncClient, db_session):
@@ -709,6 +733,7 @@ class TestAlerts:
     ):
         """include_dismissed=true returns already-dismissed alerts."""
         from app.models import _utcnow
+
         project = await _make_project(db_session)
         db_session.add(
             Alert(
@@ -1025,7 +1050,9 @@ class TestPlaybook:
         assert resp.status_code == 400
 
     @pytest.mark.asyncio
-    async def test_playbook_update_existing_entry(self, client: AsyncClient, db_session):
+    async def test_playbook_update_existing_entry(
+        self, client: AsyncClient, db_session
+    ):
         """PUT on an existing key updates the content."""
         project = await _make_project(db_session)
         await client.put(
@@ -1127,6 +1154,7 @@ class TestPlaybook:
 # notification_config settings — validation and webhook_url masking
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
 class TestNotificationConfigSettings:
     """Tests for PATCH /api/admin/settings notification_config validation and
     GET /api/admin/settings webhook_url masking for non-admin callers."""
@@ -1141,87 +1169,120 @@ class TestNotificationConfigSettings:
 
         bad = await client.patch("/api/admin/settings", json={"max_pipeline_slots": -1})
         assert bad.status_code == 400
-        bad2 = await client.patch("/api/admin/settings", json={"max_pipeline_slots": "x"})
+        bad2 = await client.patch(
+            "/api/admin/settings", json={"max_pipeline_slots": "x"}
+        )
         assert bad2.status_code == 400
 
     @pytest.mark.asyncio
     async def test_patch_warm_continuity_enabled(self, client: AsyncClient):
         """warm_continuity_enabled accepts booleans and rejects non-booleans; round-trips on GET."""
-        resp = await client.patch("/api/admin/settings", json={"warm_continuity_enabled": True})
+        resp = await client.patch(
+            "/api/admin/settings", json={"warm_continuity_enabled": True}
+        )
         assert resp.status_code == 200
         get_resp = await client.get("/api/admin/settings")
         assert get_resp.json()["warm_continuity_enabled"] is True
 
-        resp = await client.patch("/api/admin/settings", json={"warm_continuity_enabled": False})
+        resp = await client.patch(
+            "/api/admin/settings", json={"warm_continuity_enabled": False}
+        )
         assert resp.status_code == 200
         get_resp = await client.get("/api/admin/settings")
         assert get_resp.json()["warm_continuity_enabled"] is False
 
         # Reject non-booleans (truthy strings/ints must NOT silently flip the flag).
-        bad = await client.patch("/api/admin/settings", json={"warm_continuity_enabled": "true"})
+        bad = await client.patch(
+            "/api/admin/settings", json={"warm_continuity_enabled": "true"}
+        )
         assert bad.status_code == 400
-        bad2 = await client.patch("/api/admin/settings", json={"warm_continuity_enabled": 1})
+        bad2 = await client.patch(
+            "/api/admin/settings", json={"warm_continuity_enabled": 1}
+        )
         assert bad2.status_code == 400
 
     @pytest.mark.asyncio
     async def test_patch_next_role_poll_timeout_secs(self, client: AsyncClient):
         """next_role_poll_timeout_secs accepts ints in [30,600] and rejects out-of-range / non-numeric."""
-        resp = await client.patch("/api/admin/settings", json={"next_role_poll_timeout_secs": 240})
+        resp = await client.patch(
+            "/api/admin/settings", json={"next_role_poll_timeout_secs": 240}
+        )
         assert resp.status_code == 200
         get_resp = await client.get("/api/admin/settings")
         assert get_resp.json()["next_role_poll_timeout_secs"] == 240
 
-        bad_low = await client.patch("/api/admin/settings", json={"next_role_poll_timeout_secs": 29})
+        bad_low = await client.patch(
+            "/api/admin/settings", json={"next_role_poll_timeout_secs": 29}
+        )
         assert bad_low.status_code == 400
-        bad_high = await client.patch("/api/admin/settings", json={"next_role_poll_timeout_secs": 601})
+        bad_high = await client.patch(
+            "/api/admin/settings", json={"next_role_poll_timeout_secs": 601}
+        )
         assert bad_high.status_code == 400
-        bad_str = await client.patch("/api/admin/settings", json={"next_role_poll_timeout_secs": "x"})
+        bad_str = await client.patch(
+            "/api/admin/settings", json={"next_role_poll_timeout_secs": "x"}
+        )
         assert bad_str.status_code == 400
 
     @pytest.mark.asyncio
     async def test_patch_valid_notification_config(self, client: AsyncClient):
         """PATCH with a valid notification_config is accepted."""
-        resp = await client.patch("/api/admin/settings", json={
-            "notification_config": {
-                "webhook_url": "https://hooks.example.com/token",
-                "enabled_events": ["TASK_FAILED", "APPROVAL_NEEDED"],
-                "throttle_seconds": 60,
-            }
-        })
+        resp = await client.patch(
+            "/api/admin/settings",
+            json={
+                "notification_config": {
+                    "webhook_url": "https://hooks.example.com/token",
+                    "enabled_events": ["TASK_FAILED", "APPROVAL_NEEDED"],
+                    "throttle_seconds": 60,
+                }
+            },
+        )
         assert resp.status_code == 200
 
     @pytest.mark.asyncio
-    async def test_patch_notification_config_invalid_webhook_url(self, client: AsyncClient):
+    async def test_patch_notification_config_invalid_webhook_url(
+        self, client: AsyncClient
+    ):
         """webhook_url must start with http:// or https://."""
-        resp = await client.patch("/api/admin/settings", json={
-            "notification_config": {"webhook_url": "ftp://bad.example.com"}
-        })
+        resp = await client.patch(
+            "/api/admin/settings",
+            json={"notification_config": {"webhook_url": "ftp://bad.example.com"}},
+        )
         assert resp.status_code == 400
 
     @pytest.mark.asyncio
-    async def test_patch_notification_config_invalid_throttle_below_zero(self, client: AsyncClient):
+    async def test_patch_notification_config_invalid_throttle_below_zero(
+        self, client: AsyncClient
+    ):
         """throttle_seconds must be >= 0."""
-        resp = await client.patch("/api/admin/settings", json={
-            "notification_config": {"throttle_seconds": -1}
-        })
+        resp = await client.patch(
+            "/api/admin/settings",
+            json={"notification_config": {"throttle_seconds": -1}},
+        )
         assert resp.status_code == 400
 
     @pytest.mark.asyncio
-    async def test_patch_notification_config_invalid_throttle_above_max(self, client: AsyncClient):
+    async def test_patch_notification_config_invalid_throttle_above_max(
+        self, client: AsyncClient
+    ):
         """throttle_seconds must be <= 3600."""
-        resp = await client.patch("/api/admin/settings", json={
-            "notification_config": {"throttle_seconds": 3601}
-        })
+        resp = await client.patch(
+            "/api/admin/settings",
+            json={"notification_config": {"throttle_seconds": 3601}},
+        )
         assert resp.status_code == 400
 
     @pytest.mark.asyncio
     async def test_patch_notification_config_unknown_event(self, client: AsyncClient):
         """enabled_events rejects strings not in the known event set."""
-        resp = await client.patch("/api/admin/settings", json={
-            "notification_config": {
-                "enabled_events": ["TASK_FAILED", "UNKNOWN_EVENT_XYZ"],
-            }
-        })
+        resp = await client.patch(
+            "/api/admin/settings",
+            json={
+                "notification_config": {
+                    "enabled_events": ["TASK_FAILED", "UNKNOWN_EVENT_XYZ"],
+                }
+            },
+        )
         assert resp.status_code == 400
         assert "unknown" in resp.json()["error"]["message"].lower()
 
@@ -1229,59 +1290,89 @@ class TestNotificationConfigSettings:
     async def test_get_settings_admin_sees_webhook_url(self, client: AsyncClient):
         """Admin caller receives the actual webhook_url in notification_config."""
         # First configure a webhook URL as admin
-        await client.patch("/api/admin/settings", json={
-            "notification_config": {
-                "webhook_url": "https://hooks.example.com/secret-token",
-                "enabled_events": ["TASK_FAILED"],
-                "throttle_seconds": 30,
-            }
-        })
+        await client.patch(
+            "/api/admin/settings",
+            json={
+                "notification_config": {
+                    "webhook_url": "https://hooks.example.com/secret-token",
+                    "enabled_events": ["TASK_FAILED"],
+                    "throttle_seconds": 30,
+                }
+            },
+        )
         resp = await client.get("/api/admin/settings")
         assert resp.status_code == 200
         nc = resp.json()["notification_config"]
         assert nc["webhook_url"] == "https://hooks.example.com/secret-token"
 
     @pytest.mark.asyncio
-    async def test_patch_residual_audit_defer_escalation_threshold(self, client: AsyncClient):
+    async def test_patch_residual_audit_defer_escalation_threshold(
+        self, client: AsyncClient
+    ):
         """residual_audit_defer_escalation_threshold accepts ints in [1,50] and rejects bad values."""
-        resp = await client.patch("/api/admin/settings", json={"residual_audit_defer_escalation_threshold": 10})
+        resp = await client.patch(
+            "/api/admin/settings",
+            json={"residual_audit_defer_escalation_threshold": 10},
+        )
         assert resp.status_code == 200
         get_resp = await client.get("/api/admin/settings")
         assert get_resp.json()["residual_audit_defer_escalation_threshold"] == 10
 
-        bad_low = await client.patch("/api/admin/settings", json={"residual_audit_defer_escalation_threshold": 0})
+        bad_low = await client.patch(
+            "/api/admin/settings", json={"residual_audit_defer_escalation_threshold": 0}
+        )
         assert bad_low.status_code == 400
-        bad_high = await client.patch("/api/admin/settings", json={"residual_audit_defer_escalation_threshold": 51})
+        bad_high = await client.patch(
+            "/api/admin/settings",
+            json={"residual_audit_defer_escalation_threshold": 51},
+        )
         assert bad_high.status_code == 400
-        bad_str = await client.patch("/api/admin/settings", json={"residual_audit_defer_escalation_threshold": "x"})
+        bad_str = await client.patch(
+            "/api/admin/settings",
+            json={"residual_audit_defer_escalation_threshold": "x"},
+        )
         assert bad_str.status_code == 400
 
     @pytest.mark.asyncio
-    async def test_patch_notification_config_residual_fix_audit_deferred_is_valid(self, client: AsyncClient):
+    async def test_patch_notification_config_residual_fix_audit_deferred_is_valid(
+        self, client: AsyncClient
+    ):
         """RESIDUAL_FIX_AUDIT_DEFERRED is accepted as a valid notification event."""
-        resp = await client.patch("/api/admin/settings", json={
-            "notification_config": {
-                "webhook_url": "https://hooks.example.com/x",
-                "enabled_events": ["TASK_FAILED", "RESIDUAL_FIX_AUDIT_DEFERRED"],
-                "throttle_seconds": 30,
-            }
-        })
+        resp = await client.patch(
+            "/api/admin/settings",
+            json={
+                "notification_config": {
+                    "webhook_url": "https://hooks.example.com/x",
+                    "enabled_events": ["TASK_FAILED", "RESIDUAL_FIX_AUDIT_DEFERRED"],
+                    "throttle_seconds": 30,
+                }
+            },
+        )
         assert resp.status_code == 200
 
     @pytest.mark.asyncio
-    async def test_get_settings_non_admin_webhook_url_masked(self, override_get_session):
+    async def test_get_settings_non_admin_webhook_url_masked(
+        self, override_get_session
+    ):
         """Non-admin caller gets empty webhook_url and a boolean configured flag instead."""
         from app.main import app as _app
         from app.auth import get_current_user as _gcu, require_admin as _ra
 
         async def _non_admin():
-            return {"user_id": "non-admin-user", "email": "user@example.com", "role": "user"}
+            return {
+                "user_id": "non-admin-user",
+                "email": "user@example.com",
+                "role": "user",
+            }
 
         async def _reject_admin():
-            raise __import__('fastapi').HTTPException(status_code=403, detail="Forbidden")
+            raise __import__("fastapi").HTTPException(
+                status_code=403, detail="Forbidden"
+            )
 
         # Set a webhook URL in runtime config first
         from app.shared_state import runtime_config
+
         runtime_config["notification_config"] = {
             "webhook_url": "https://hooks.example.com/secret-token",
             "enabled_events": ["TASK_FAILED"],
@@ -1298,7 +1389,9 @@ class TestNotificationConfigSettings:
             assert resp.status_code == 200
             nc = resp.json()["notification_config"]
             assert nc["webhook_url"] == "", "webhook_url must be masked for non-admin"
-            assert nc["webhook_url_configured"] is True, "configured flag must be True when URL is set"
+            assert nc["webhook_url_configured"] is True, (
+                "configured flag must be True when URL is set"
+            )
         finally:
             _app.dependency_overrides.pop(_gcu, None)
             _app.dependency_overrides.pop(_ra, None)
@@ -1310,6 +1403,7 @@ class TestNotificationConfigSettings:
 # dispatch_external_notification — webhook dispatch logic
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
 class TestDispatchExternalNotification:
     """Tests for dispatch_external_notification in notification_dispatch.py."""
 
@@ -1317,7 +1411,10 @@ class TestDispatchExternalNotification:
     async def test_dispatches_when_event_enabled(self, mocker):
         """POSTs to webhook_url when event_type is in enabled_events."""
         from app import shared_state
-        from app.notification_dispatch import dispatch_external_notification, _last_dispatch_time
+        from app.notification_dispatch import (
+            dispatch_external_notification,
+            _last_dispatch_time,
+        )
 
         # Clear throttle state
         _last_dispatch_time.clear()
@@ -1336,7 +1433,9 @@ class TestDispatchExternalNotification:
         mock_client.__aexit__ = mocker.AsyncMock(return_value=False)
         mock_client.post = mocker.AsyncMock(return_value=mock_response)
 
-        mocker.patch("app.notification_dispatch.httpx.AsyncClient", return_value=mock_client)
+        mocker.patch(
+            "app.notification_dispatch.httpx.AsyncClient", return_value=mock_client
+        )
 
         project_id = uuid.uuid4()
         await dispatch_external_notification(
@@ -1345,7 +1444,11 @@ class TestDispatchExternalNotification:
 
         mock_client.post.assert_awaited_once()
         call_args = mock_client.post.call_args
-        body = call_args.kwargs.get("json") or call_args.args[1] if len(call_args.args) > 1 else call_args.kwargs["json"]
+        body = (
+            call_args.kwargs.get("json") or call_args.args[1]
+            if len(call_args.args) > 1
+            else call_args.kwargs["json"]
+        )
         assert body["event_type"] == "TASK_FAILED"
         assert body["project_id"] == str(project_id)
         assert "timestamp" in body
@@ -1355,7 +1458,10 @@ class TestDispatchExternalNotification:
     async def test_skips_when_event_not_enabled(self, mocker):
         """Does NOT POST when event_type is not in enabled_events."""
         from app import shared_state
-        from app.notification_dispatch import dispatch_external_notification, _last_dispatch_time
+        from app.notification_dispatch import (
+            dispatch_external_notification,
+            _last_dispatch_time,
+        )
 
         _last_dispatch_time.clear()
 
@@ -1369,7 +1475,9 @@ class TestDispatchExternalNotification:
         mock_client.__aenter__ = mocker.AsyncMock(return_value=mock_client)
         mock_client.__aexit__ = mocker.AsyncMock(return_value=False)
         mock_client.post = mocker.AsyncMock()
-        mocker.patch("app.notification_dispatch.httpx.AsyncClient", return_value=mock_client)
+        mocker.patch(
+            "app.notification_dispatch.httpx.AsyncClient", return_value=mock_client
+        )
 
         await dispatch_external_notification(uuid.uuid4(), "TASK_FAILED", {})
 
@@ -1379,7 +1487,10 @@ class TestDispatchExternalNotification:
     async def test_skips_when_no_webhook_url(self, mocker):
         """Does NOT POST when webhook_url is empty."""
         from app import shared_state
-        from app.notification_dispatch import dispatch_external_notification, _last_dispatch_time
+        from app.notification_dispatch import (
+            dispatch_external_notification,
+            _last_dispatch_time,
+        )
 
         _last_dispatch_time.clear()
 
@@ -1393,7 +1504,9 @@ class TestDispatchExternalNotification:
         mock_client.__aenter__ = mocker.AsyncMock(return_value=mock_client)
         mock_client.__aexit__ = mocker.AsyncMock(return_value=False)
         mock_client.post = mocker.AsyncMock()
-        mocker.patch("app.notification_dispatch.httpx.AsyncClient", return_value=mock_client)
+        mocker.patch(
+            "app.notification_dispatch.httpx.AsyncClient", return_value=mock_client
+        )
 
         await dispatch_external_notification(uuid.uuid4(), "TASK_FAILED", {})
 
@@ -1403,7 +1516,10 @@ class TestDispatchExternalNotification:
     async def test_respects_throttle_seconds(self, mocker):
         """Second call within throttle window is silently dropped."""
         from app import shared_state
-        from app.notification_dispatch import dispatch_external_notification, _last_dispatch_time
+        from app.notification_dispatch import (
+            dispatch_external_notification,
+            _last_dispatch_time,
+        )
 
         _last_dispatch_time.clear()
 
@@ -1420,7 +1536,9 @@ class TestDispatchExternalNotification:
         mock_client.__aenter__ = mocker.AsyncMock(return_value=mock_client)
         mock_client.__aexit__ = mocker.AsyncMock(return_value=False)
         mock_client.post = mocker.AsyncMock(return_value=mock_response)
-        mocker.patch("app.notification_dispatch.httpx.AsyncClient", return_value=mock_client)
+        mocker.patch(
+            "app.notification_dispatch.httpx.AsyncClient", return_value=mock_client
+        )
 
         project_id = uuid.uuid4()
         await dispatch_external_notification(project_id, "TASK_FAILED", {"n": 1})
@@ -1433,7 +1551,10 @@ class TestDispatchExternalNotification:
     async def test_never_raises_on_http_error(self, mocker):
         """dispatch_external_notification swallows all exceptions without propagating."""
         from app import shared_state
-        from app.notification_dispatch import dispatch_external_notification, _last_dispatch_time
+        from app.notification_dispatch import (
+            dispatch_external_notification,
+            _last_dispatch_time,
+        )
 
         _last_dispatch_time.clear()
 
@@ -1444,6 +1565,7 @@ class TestDispatchExternalNotification:
         }
 
         import httpx as _httpx
+
         mocker.patch(
             "app.notification_dispatch.httpx.AsyncClient",
             side_effect=_httpx.RequestError("network down"),
@@ -1456,6 +1578,7 @@ class TestDispatchExternalNotification:
 # ═══════════════════════════════════════════════════════════════════════════════
 # notification_config startup restore — survives Cloud Run restart
 # ═══════════════════════════════════════════════════════════════════════════════
+
 
 class TestNotificationConfigStartupRestore:
     """Verify that notification_config in runtime_config_json is restored on startup."""
@@ -1483,8 +1606,11 @@ class TestNotificationConfigStartupRestore:
             await conn.run_sync(SQLModel.metadata.create_all)
 
         _Session = sessionmaker(
-            bind=_engine, class_=AsyncSession,
-            autocommit=False, autoflush=False, expire_on_commit=False,
+            bind=_engine,
+            class_=AsyncSession,
+            autocommit=False,
+            autoflush=False,
+            expire_on_commit=False,
         )
         mocker.patch("app.main.AsyncSessionLocal", _Session)
 
@@ -1510,7 +1636,9 @@ class TestNotificationConfigStartupRestore:
         try:
             await _init_deployment_state()
             restored = shared_state.runtime_config.get("notification_config")
-            assert restored is not None, "notification_config must be restored from runtime_config_json"
+            assert restored is not None, (
+                "notification_config must be restored from runtime_config_json"
+            )
             assert restored["webhook_url"] == "https://hooks.example.com/token123"
             assert restored["enabled_events"] == ["TASK_FAILED", "APPROVAL_NEEDED"]
             assert restored["throttle_seconds"] == 120
@@ -1529,6 +1657,7 @@ class TestNotificationConfigStartupRestore:
 # admin_settings.py — repair-state stuck task persists failure_category
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
 class TestRepairStateFailureCategory:
     """Ensure that the /repair-state stuck-task path sets failure_category=AGENT_TIMEOUT
     on repaired tasks so downstream analytics can bucket them correctly."""
@@ -1541,6 +1670,7 @@ class TestRepairStateFailureCategory:
         FAILED with failure_category=AGENT_TIMEOUT in its context."""
         from datetime import datetime, timedelta
         from unittest.mock import AsyncMock
+
         mocker.patch("app.main._ensure_vm_deleted", new_callable=AsyncMock)
 
         project = Project(name="Repair Test", user_id="test-user-123")
@@ -1573,6 +1703,7 @@ class TestRepairStateFailureCategory:
 # admin_analytics.py — direction auto-pause stats
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
 class TestDirectionAutoPauseStats:
     """Aggregation of direction auto-pause/recovery events for the dashboard widget."""
 
@@ -1581,13 +1712,17 @@ class TestDirectionAutoPauseStats:
         self, client: AsyncClient, db_session
     ):
         from datetime import datetime, timedelta, timezone
+
         project = await _make_project(db_session)
 
         # Live directions: one currently auto-paused, one not
         project.directions = [
             {
-                "id": "d1", "text": "dir one", "status": "paused",
-                "auto_paused": True, "auto_pause_count": 1,
+                "id": "d1",
+                "text": "dir one",
+                "status": "paused",
+                "auto_paused": True,
+                "auto_pause_count": 1,
                 "paused_reason": "high failure rate",
                 "paused_at": datetime.now(timezone.utc).isoformat(),
             },
@@ -1597,6 +1732,7 @@ class TestDirectionAutoPauseStats:
         await db_session.commit()
 
         now = datetime.now(timezone.utc).replace(tzinfo=None)
+
         # Current window (last 24h): 3 auto-paused, 1 auto-retired
         def _msg(hours_ago: float, milestone: str, reason: str):
             m = ProjectMessage(
@@ -1614,14 +1750,16 @@ class TestDirectionAutoPauseStats:
             m.created_at = now - timedelta(hours=hours_ago)
             return m
 
-        db_session.add_all([
-            _msg(1, "auto-paused", "high failure rate"),
-            _msg(5, "auto-paused", "high failure rate"),
-            _msg(10, "auto-paused", "no merges"),
-            _msg(11, "auto-retired", "3 consecutive auto-pause cycles"),
-            # Previous window (24–48h ago): only 1 auto-paused — drives "up" trend
-            _msg(30, "auto-paused", "stale activity"),
-        ])
+        db_session.add_all(
+            [
+                _msg(1, "auto-paused", "high failure rate"),
+                _msg(5, "auto-paused", "high failure rate"),
+                _msg(10, "auto-paused", "no merges"),
+                _msg(11, "auto-retired", "3 consecutive auto-pause cycles"),
+                # Previous window (24–48h ago): only 1 auto-paused — drives "up" trend
+                _msg(30, "auto-paused", "stale activity"),
+            ]
+        )
         await db_session.commit()
 
         resp = await client.get(
@@ -1693,15 +1831,16 @@ class TestPatchProblemModel:
     user-editable subset (intent, context, constraints)."""
 
     @pytest.mark.asyncio
-    async def test_patch_intent_and_constraints(
-        self, client: AsyncClient, db_session
-    ):
+    async def test_patch_intent_and_constraints(self, client: AsyncClient, db_session):
         project = await _make_project(db_session)
         resp = await client.patch(
             f"/api/admin/projects/{project.id}",
             json={
                 "problem_model_patch": {
-                    "intent": {"purpose": "Autonomous dev.", "current_focus": "Review loop."},
+                    "intent": {
+                        "purpose": "Autonomous dev.",
+                        "current_focus": "Review loop.",
+                    },
                     "constraints": ["Solo dev, 4h/day.", "Don't touch CI workflows."],
                     "context": {"project_type": "personal", "team": "solo"},
                 }
@@ -1735,9 +1874,7 @@ class TestPatchProblemModel:
         assert "agent-owned" in msg or "Cannot edit" in msg
 
     @pytest.mark.asyncio
-    async def test_patch_preserves_agent_fields(
-        self, client: AsyncClient, db_session
-    ):
+    async def test_patch_preserves_agent_fields(self, client: AsyncClient, db_session):
         """Patching intent does not disturb agent-owned fields."""
         project = await _make_project(db_session)
         project.problem_model = {
@@ -1839,15 +1976,17 @@ class TestBuildDeployStatePayload:
         snap = _shared_state.external_health.get("last_check")
         try:
             _shared_state.external_health["last_check"] = _dt(2026, 4, 27, 8, 0, 0)
-            db_session.add(DeploymentState(
-                id=1,
-                status=DeploymentStatus.STABLE,
-                current_revision="rev-1",
-                current_sha="sha-1",
-                last_known_good_revision="rev-1",
-                last_known_good_sha="sha-1",
-                runtime_max_concurrent_vms=5,
-            ))
+            db_session.add(
+                DeploymentState(
+                    id=1,
+                    status=DeploymentStatus.STABLE,
+                    current_revision="rev-1",
+                    current_sha="sha-1",
+                    last_known_good_revision="rev-1",
+                    last_known_good_sha="sha-1",
+                    runtime_max_concurrent_vms=5,
+                )
+            )
             await db_session.commit()
 
             payload = await build_deploy_state_payload(db_session)
@@ -1862,9 +2001,12 @@ class TestBuildDeployStatePayload:
 # admin_debug.py — System Maturity endpoint
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
 class TestProjectSystemMaturity:
     @pytest.mark.asyncio
-    async def test_returns_empty_list_when_no_rows(self, client: AsyncClient, db_session):
+    async def test_returns_empty_list_when_no_rows(
+        self, client: AsyncClient, db_session
+    ):
         """Returns empty list when the project has no SystemMaturity rows."""
         project = await _make_project(db_session)
         resp = await client.get(f"/api/admin/projects/{project.id}/system-maturity")
@@ -1872,7 +2014,9 @@ class TestProjectSystemMaturity:
         assert resp.json() == []
 
     @pytest.mark.asyncio
-    async def test_returns_rows_ordered_by_score_ascending(self, client: AsyncClient, db_session):
+    async def test_returns_rows_ordered_by_score_ascending(
+        self, client: AsyncClient, db_session
+    ):
         """Returns rows ordered by score ascending with correct fields."""
         project = await _make_project(db_session)
         row_high = SystemMaturity(
@@ -1907,7 +2051,9 @@ class TestProjectSystemMaturity:
         assert data[1]["recommended_mode"] == "ship"
 
     @pytest.mark.asyncio
-    async def test_returns_404_for_non_member_project(self, client: AsyncClient, db_session):
+    async def test_returns_404_for_non_member_project(
+        self, client: AsyncClient, db_session
+    ):
         """Non-member project returns 404."""
         project = Project(name="Other Project", user_id="other-owner")
         db_session.add(project)

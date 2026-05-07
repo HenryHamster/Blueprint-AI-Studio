@@ -20,6 +20,7 @@ from app.models import Project, Task, TaskStatus
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
+
 def _utc_now() -> datetime:
     """Naive UTC timestamp — matches DB convention (TIMESTAMP WITHOUT TIME ZONE)."""
     return datetime.now(timezone.utc).replace(tzinfo=None)
@@ -65,6 +66,7 @@ def _make_task(
 # Section 1 — _classify_stuck_failure()
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 class TestClassifyStuckFailure:
     """Pure unit tests — no DB needed."""
 
@@ -77,12 +79,27 @@ class TestClassifyStuckFailure:
         # NB: "quota exceeded" alone used to match the provision bank, but
         # bare "quota" was removed because it mis-caught LLM-provider quota
         # errors. Use a specific GCP-quota phrase that still routes here.
-        for kw in ["provision error", "CPUS_ALL_REGIONS quota exceeded", "vm failed to start", "connection refused", "sshd failed", "startup script failed"]:
-            assert _classify_stuck_failure(self._task_with_message(kw)) == "PROVISION_FAILURE", kw
+        for kw in [
+            "provision error",
+            "CPUS_ALL_REGIONS quota exceeded",
+            "vm failed to start",
+            "connection refused",
+            "sshd failed",
+            "startup script failed",
+        ]:
+            assert (
+                _classify_stuck_failure(self._task_with_message(kw))
+                == "PROVISION_FAILURE"
+            ), kw
 
     def test_provision_keywords_previously_missing(self):
         # cpus_all_regions was missing from old lightweight classifier
-        assert _classify_stuck_failure(self._task_with_message("cpus_all_regions quota exceeded")) == "PROVISION_FAILURE"
+        assert (
+            _classify_stuck_failure(
+                self._task_with_message("cpus_all_regions quota exceeded")
+            )
+            == "PROVISION_FAILURE"
+        )
 
     def test_rate_limit_keywords(self):
         # Exact verbatim Claude Code CLI / Anthropic API rate-limit strings — see RATE_LIMIT_PATTERNS.
@@ -95,47 +112,91 @@ class TestClassifyStuckFailure:
             "API Error: Rate limit reached",
             "This request would exceed your account's rate limit. Please try again later.",
         ]:
-            assert _classify_stuck_failure(self._task_with_message(kw)) == "RATE_LIMIT", kw
+            assert (
+                _classify_stuck_failure(self._task_with_message(kw)) == "RATE_LIMIT"
+            ), kw
 
     def test_external_api_keywords(self):
-        for kw in ["api.github.com error", "api.anthropic.com down", "502 bad gateway", "503 service unavailable", "ssl handshake", "certificate expired"]:
-            assert _classify_stuck_failure(self._task_with_message(kw)) == "EXTERNAL_API", kw
+        for kw in [
+            "api.github.com error",
+            "api.anthropic.com down",
+            "502 bad gateway",
+            "503 service unavailable",
+            "ssl handshake",
+            "certificate expired",
+        ]:
+            assert (
+                _classify_stuck_failure(self._task_with_message(kw)) == "EXTERNAL_API"
+            ), kw
 
     def test_overloaded_is_external_api(self):
         # Anthropic 529 is server-side capacity — not a Claude rate limit, must not disable accounts.
-        assert _classify_stuck_failure(self._task_with_message("overloaded server")) == "EXTERNAL_API"
-        assert _classify_stuck_failure(self._task_with_message("Error: Overloaded")) == "EXTERNAL_API"
+        assert (
+            _classify_stuck_failure(self._task_with_message("overloaded server"))
+            == "EXTERNAL_API"
+        )
+        assert (
+            _classify_stuck_failure(self._task_with_message("Error: Overloaded"))
+            == "EXTERNAL_API"
+        )
 
     def test_non_claude_rate_limit_words_are_not_rate_limit(self):
         # Broad keywords that previously caused false-positive account disables.
         # None of these are real Claude rate-limit messages; classifier must not flag them.
         from app.failure_classification import classify_failure
+
         for msg, expected in [
-            ("credit card declined", "CODE_ERROR"),                       # generic "credit"
-            ("billing address required", "CODE_ERROR"),                   # generic "billing"
-            ("GitHub API rate limit exceeded", "EXTERNAL_API"),            # GitHub 429
-            ("too many requests to downstream service", "CODE_ERROR"),    # generic 429 phrase
-            ("HTTP 429 from upstream", "CODE_ERROR"),                     # bare 429
-            ("disk quota exceeded on /var", "PROVISION_FAILURE"),         # GCP/disk quota
+            ("credit card declined", "CODE_ERROR"),  # generic "credit"
+            ("billing address required", "CODE_ERROR"),  # generic "billing"
+            ("GitHub API rate limit exceeded", "EXTERNAL_API"),  # GitHub 429
+            (
+                "too many requests to downstream service",
+                "CODE_ERROR",
+            ),  # generic 429 phrase
+            ("HTTP 429 from upstream", "CODE_ERROR"),  # bare 429
+            ("disk quota exceeded on /var", "PROVISION_FAILURE"),  # GCP/disk quota
         ]:
             t = self._task_with_message(msg)
             assert classify_failure(t) == expected, f"{msg!r} → expected {expected}"
 
     def test_agent_timeout_keywords(self):
-        for kw in ["no heartbeat received", "reaped by watchdog", "execution timed out", "node process killed", "oom-kill", "killed by oom", "sigterm received", "exit code 137", "exit code 143"]:
-            assert _classify_stuck_failure(self._task_with_message(kw)) == "AGENT_TIMEOUT", kw
+        for kw in [
+            "no heartbeat received",
+            "reaped by watchdog",
+            "execution timed out",
+            "node process killed",
+            "oom-kill",
+            "killed by oom",
+            "sigterm received",
+            "exit code 137",
+            "exit code 143",
+        ]:
+            assert (
+                _classify_stuck_failure(self._task_with_message(kw)) == "AGENT_TIMEOUT"
+            ), kw
 
     def test_agent_timeout_keywords_previously_missing(self):
         # exit code 124 (timeout) and exit code 139 (segfault) were missing from old classifier
-        assert _classify_stuck_failure(self._task_with_message("exit code 124")) == "AGENT_TIMEOUT"
-        assert _classify_stuck_failure(self._task_with_message("exit code 139")) == "AGENT_TIMEOUT"
+        assert (
+            _classify_stuck_failure(self._task_with_message("exit code 124"))
+            == "AGENT_TIMEOUT"
+        )
+        assert (
+            _classify_stuck_failure(self._task_with_message("exit code 139"))
+            == "AGENT_TIMEOUT"
+        )
 
     def test_empty_message_returns_none(self):
         assert _classify_stuck_failure(self._task_with_message("")) is None
 
     def test_unrelated_message_returns_none(self):
         # CODE_ERROR is suppressed → returns None for stuck tasks
-        assert _classify_stuck_failure(self._task_with_message("task completed successfully")) is None
+        assert (
+            _classify_stuck_failure(
+                self._task_with_message("task completed successfully")
+            )
+            is None
+        )
 
     def test_none_message_returns_none(self):
         t = MagicMock(spec=Task)
@@ -143,15 +204,27 @@ class TestClassifyStuckFailure:
         assert _classify_stuck_failure(t) is None
 
     def test_case_insensitive(self):
-        assert _classify_stuck_failure(self._task_with_message("API ERROR: RATE LIMIT REACHED")) == "RATE_LIMIT"
-        assert _classify_stuck_failure(self._task_with_message("VM FAILED TO START")) == "PROVISION_FAILURE"
+        assert (
+            _classify_stuck_failure(
+                self._task_with_message("API ERROR: RATE LIMIT REACHED")
+            )
+            == "RATE_LIMIT"
+        )
+        assert (
+            _classify_stuck_failure(self._task_with_message("VM FAILED TO START"))
+            == "PROVISION_FAILURE"
+        )
 
     def test_cascade_cancellation_messages(self):
         """Cascade-cancelled children should be AGENT_TIMEOUT, not CODE_ERROR."""
         from app.failure_classification import classify_failure
+
         cases = [
             ("Cancelled: parent evaluation timeout after 2.0h", "AGENT_TIMEOUT"),
-            ("Cancelled: parent CI wait backstop timeout after 1.9h (reason)", "AGENT_TIMEOUT"),
+            (
+                "Cancelled: parent CI wait backstop timeout after 1.9h (reason)",
+                "AGENT_TIMEOUT",
+            ),
             ("Cancelled: parent dependency failed", "AGENT_TIMEOUT"),
         ]
         for msg, expected in cases:
@@ -162,6 +235,7 @@ class TestClassifyStuckFailure:
 # ══════════════════════════════════════════════════════════════════════════════
 # Section 2 — _build_stuck_tasks()
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 class TestBuildStuckTasks:
     """Integration tests using a real DB session."""
@@ -176,8 +250,12 @@ class TestBuildStuckTasks:
         await db_session.commit()
         await db_session.refresh(project)
 
-        task = _make_task(project.id, TaskStatus.PROVISIONING,
-                          provisioned_ago_secs=8 * 60, no_heartbeat=True)
+        task = _make_task(
+            project.id,
+            TaskStatus.PROVISIONING,
+            provisioned_ago_secs=8 * 60,
+            no_heartbeat=True,
+        )
         db_session.add(task)
         await db_session.commit()
         await db_session.refresh(task)
@@ -197,8 +275,12 @@ class TestBuildStuckTasks:
         await db_session.commit()
         await db_session.refresh(project)
 
-        task = _make_task(project.id, TaskStatus.PROVISIONING,
-                          provisioned_ago_secs=3 * 60, no_heartbeat=True)
+        task = _make_task(
+            project.id,
+            TaskStatus.PROVISIONING,
+            provisioned_ago_secs=3 * 60,
+            no_heartbeat=True,
+        )
         db_session.add(task)
         await db_session.commit()
         await db_session.refresh(task)
@@ -207,15 +289,21 @@ class TestBuildStuckTasks:
         assert result == []
 
     @pytest.mark.asyncio
-    async def test_provision_timeout_not_triggered_when_heartbeat_present(self, db_session):
+    async def test_provision_timeout_not_triggered_when_heartbeat_present(
+        self, db_session
+    ):
         """PROVISIONING task that already has a heartbeat must NOT be flagged."""
         project = Project(name="diag-test3", user_id="test-user-123")
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
 
-        task = _make_task(project.id, TaskStatus.PROVISIONING,
-                          provisioned_ago_secs=8 * 60, heartbeat_ago_secs=60)
+        task = _make_task(
+            project.id,
+            TaskStatus.PROVISIONING,
+            provisioned_ago_secs=8 * 60,
+            heartbeat_ago_secs=60,
+        )
         db_session.add(task)
         await db_session.commit()
         await db_session.refresh(task)
@@ -233,8 +321,7 @@ class TestBuildStuckTasks:
         await db_session.commit()
         await db_session.refresh(project)
 
-        task = _make_task(project.id, TaskStatus.IN_PROGRESS,
-                          heartbeat_ago_secs=8 * 60)
+        task = _make_task(project.id, TaskStatus.IN_PROGRESS, heartbeat_ago_secs=8 * 60)
         db_session.add(task)
         await db_session.commit()
         await db_session.refresh(task)
@@ -349,7 +436,8 @@ class TestBuildStuckTasks:
         await db_session.refresh(dep_task)
 
         waiting_task = _make_task(
-            project.id, TaskStatus.QUEUED,
+            project.id,
+            TaskStatus.QUEUED,
             created_ago_secs=15 * 60,
             depends_on=[str(dep_task.id)],
         )
@@ -379,7 +467,8 @@ class TestBuildStuckTasks:
         await db_session.refresh(dep_task)
 
         waiting_task = _make_task(
-            project.id, TaskStatus.QUEUED,
+            project.id,
+            TaskStatus.QUEUED,
             created_ago_secs=15 * 60,
             depends_on=[str(dep_task.id)],
         )
@@ -401,14 +490,18 @@ class TestBuildStuckTasks:
         await db_session.refresh(project)
 
         dep_task = Task(
-            project_id=project.id, title="dep", payloads=[], status=TaskStatus.IN_PROGRESS
+            project_id=project.id,
+            title="dep",
+            payloads=[],
+            status=TaskStatus.IN_PROGRESS,
         )
         db_session.add(dep_task)
         await db_session.commit()
         await db_session.refresh(dep_task)
 
         waiting_task = _make_task(
-            project.id, TaskStatus.QUEUED,
+            project.id,
+            TaskStatus.QUEUED,
             created_ago_secs=15 * 60,
             depends_on=[str(dep_task.id)],
         )
@@ -435,7 +528,8 @@ class TestBuildStuckTasks:
         await db_session.refresh(dep_task)
 
         waiting_task = _make_task(
-            project.id, TaskStatus.QUEUED,
+            project.id,
+            TaskStatus.QUEUED,
             created_ago_secs=5 * 60,  # under the 10-min threshold
             depends_on=[str(dep_task.id)],
         )
@@ -447,7 +541,9 @@ class TestBuildStuckTasks:
         assert result == []
 
     @pytest.mark.asyncio
-    async def test_stuck_deps_not_triggered_when_only_some_deps_failed(self, db_session):
+    async def test_stuck_deps_not_triggered_when_only_some_deps_failed(
+        self, db_session
+    ):
         """Task with one FAILED dep and one QUEUED dep must NOT be flagged."""
         project = Project(name="diag-sd4", user_id="test-user-123")
         db_session.add(project)
@@ -455,10 +551,16 @@ class TestBuildStuckTasks:
         await db_session.refresh(project)
 
         dep_failed = Task(
-            project_id=project.id, title="failed dep", payloads=[], status=TaskStatus.FAILED
+            project_id=project.id,
+            title="failed dep",
+            payloads=[],
+            status=TaskStatus.FAILED,
         )
         dep_active = Task(
-            project_id=project.id, title="active dep", payloads=[], status=TaskStatus.QUEUED
+            project_id=project.id,
+            title="active dep",
+            payloads=[],
+            status=TaskStatus.QUEUED,
         )
         db_session.add_all([dep_failed, dep_active])
         await db_session.commit()
@@ -466,7 +568,8 @@ class TestBuildStuckTasks:
         await db_session.refresh(dep_active)
 
         waiting_task = _make_task(
-            project.id, TaskStatus.QUEUED,
+            project.id,
+            TaskStatus.QUEUED,
             created_ago_secs=15 * 60,
             depends_on=[str(dep_failed.id), str(dep_active.id)],
         )
@@ -480,7 +583,9 @@ class TestBuildStuckTasks:
     # ── batch query — multiple QUEUED tasks with deps ─────────────────────────
 
     @pytest.mark.asyncio
-    async def test_multiple_queued_tasks_with_deps_use_single_db_query(self, db_session, mocker):
+    async def test_multiple_queued_tasks_with_deps_use_single_db_query(
+        self, db_session, mocker
+    ):
         """
         When multiple QUEUED tasks have dependencies, all dep statuses should be
         fetched in a single query rather than one per task (N+1 prevention).
@@ -491,17 +596,29 @@ class TestBuildStuckTasks:
         await db_session.refresh(project)
 
         # Create two separate dependency chains, both fully failed
-        dep_a = Task(project_id=project.id, title="dep_a", payloads=[], status=TaskStatus.FAILED)
-        dep_b = Task(project_id=project.id, title="dep_b", payloads=[], status=TaskStatus.FAILED)
+        dep_a = Task(
+            project_id=project.id, title="dep_a", payloads=[], status=TaskStatus.FAILED
+        )
+        dep_b = Task(
+            project_id=project.id, title="dep_b", payloads=[], status=TaskStatus.FAILED
+        )
         db_session.add_all([dep_a, dep_b])
         await db_session.commit()
         await db_session.refresh(dep_a)
         await db_session.refresh(dep_b)
 
-        task_a = _make_task(project.id, TaskStatus.QUEUED, created_ago_secs=15 * 60,
-                            depends_on=[str(dep_a.id)])
-        task_b = _make_task(project.id, TaskStatus.QUEUED, created_ago_secs=15 * 60,
-                            depends_on=[str(dep_b.id)])
+        task_a = _make_task(
+            project.id,
+            TaskStatus.QUEUED,
+            created_ago_secs=15 * 60,
+            depends_on=[str(dep_a.id)],
+        )
+        task_b = _make_task(
+            project.id,
+            TaskStatus.QUEUED,
+            created_ago_secs=15 * 60,
+            depends_on=[str(dep_b.id)],
+        )
         db_session.add_all([task_a, task_b])
         await db_session.commit()
         await db_session.refresh(task_a)
@@ -535,8 +652,12 @@ class TestBuildStuckTasks:
         await db_session.commit()
         await db_session.refresh(project)
 
-        task = _make_task(project.id, TaskStatus.QUEUED, created_ago_secs=35 * 60,
-                          status_message="API Error: Rate limit reached")
+        task = _make_task(
+            project.id,
+            TaskStatus.QUEUED,
+            created_ago_secs=35 * 60,
+            status_message="API Error: Rate limit reached",
+        )
         db_session.add(task)
         await db_session.commit()
         await db_session.refresh(task)
@@ -546,8 +667,14 @@ class TestBuildStuckTasks:
         assert len(result) == 1
         entry = result[0]
         assert set(entry.keys()) == {
-            "task_id", "title", "status", "stuck_reason",
-            "stuck_for_seconds", "attempt_count", "failure_class", "unresolvable_deps",
+            "task_id",
+            "title",
+            "status",
+            "stuck_reason",
+            "stuck_for_seconds",
+            "attempt_count",
+            "failure_class",
+            "unresolvable_deps",
             "remediation_hint",
         }
         assert entry["failure_class"] == "RATE_LIMIT"
@@ -561,8 +688,12 @@ class TestBuildStuckTasks:
         await db_session.commit()
         await db_session.refresh(project)
 
-        healthy_queued = _make_task(project.id, TaskStatus.QUEUED, created_ago_secs=5 * 60)
-        healthy_in_progress = _make_task(project.id, TaskStatus.IN_PROGRESS, heartbeat_ago_secs=60)
+        healthy_queued = _make_task(
+            project.id, TaskStatus.QUEUED, created_ago_secs=5 * 60
+        )
+        healthy_in_progress = _make_task(
+            project.id, TaskStatus.IN_PROGRESS, heartbeat_ago_secs=60
+        )
         db_session.add_all([healthy_queued, healthy_in_progress])
         await db_session.commit()
 
@@ -576,6 +707,7 @@ class TestBuildStuckTasks:
 # Section 3 — _build_direction_remediation_state()
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 class TestBuildDirectionRemediationState:
     """Pure unit tests — operates on Project.directions (JSON)."""
 
@@ -585,18 +717,28 @@ class TestBuildDirectionRemediationState:
         return p
 
     def test_omits_directions_with_no_notable_state(self):
-        project = self._project([
-            {"id": "d1", "text": "clean direction", "status": "active"},
-            {"id": "d2", "text": "also clean", "status": "proposed"},
-        ])
+        project = self._project(
+            [
+                {"id": "d1", "text": "clean direction", "status": "active"},
+                {"id": "d2", "text": "also clean", "status": "proposed"},
+            ]
+        )
         assert _build_direction_remediation_state(project) == []
 
     def test_surfaces_auto_paused_direction(self):
-        project = self._project([{
-            "id": "d1", "text": "paused dir", "status": "paused",
-            "auto_paused": True, "paused_reason": "High code failure rate: 0.75",
-            "paused_at": "2026-04-10T00:00:00", "auto_pause_count": 2,
-        }])
+        project = self._project(
+            [
+                {
+                    "id": "d1",
+                    "text": "paused dir",
+                    "status": "paused",
+                    "auto_paused": True,
+                    "paused_reason": "High code failure rate: 0.75",
+                    "paused_at": "2026-04-10T00:00:00",
+                    "auto_pause_count": 2,
+                }
+            ]
+        )
         entries = _build_direction_remediation_state(project)
         assert len(entries) == 1
         e = entries[0]
@@ -607,13 +749,19 @@ class TestBuildDirectionRemediationState:
         assert e["needs_manual_intervention"] is False
 
     def test_surfaces_active_remediation_monitor(self):
-        project = self._project([{
-            "id": "d1", "text": "monitoring", "status": "active",
-            "remediation_monitor_started_at": "2026-04-15T00:00:00",
-            "remediation_attempts": 1,
-            "last_remediation_result": "merged",
-            "error_fingerprint": "abc123",
-        }])
+        project = self._project(
+            [
+                {
+                    "id": "d1",
+                    "text": "monitoring",
+                    "status": "active",
+                    "remediation_monitor_started_at": "2026-04-15T00:00:00",
+                    "remediation_attempts": 1,
+                    "last_remediation_result": "merged",
+                    "error_fingerprint": "abc123",
+                }
+            ]
+        )
         entries = _build_direction_remediation_state(project)
         assert len(entries) == 1
         e = entries[0]
@@ -623,24 +771,42 @@ class TestBuildDirectionRemediationState:
         assert e["error_fingerprint"] == "abc123"
 
     def test_surfaces_needs_manual_intervention(self):
-        project = self._project([{
-            "id": "d1", "text": "stuck", "status": "paused",
-            "needs_manual_intervention": True,
-            "remediation_attempts": 3,
-            "last_remediation_result": "failed",
-        }])
+        project = self._project(
+            [
+                {
+                    "id": "d1",
+                    "text": "stuck",
+                    "status": "paused",
+                    "needs_manual_intervention": True,
+                    "remediation_attempts": 3,
+                    "last_remediation_result": "failed",
+                }
+            ]
+        )
         entries = _build_direction_remediation_state(project)
         assert len(entries) == 1
         assert entries[0]["needs_manual_intervention"] is True
         assert entries[0]["remediation_attempts"] == 3
 
     def test_mixed_directions_only_notable_returned(self):
-        project = self._project([
-            {"id": "clean", "text": "ok", "status": "active"},
-            {"id": "paused", "text": "paused", "status": "paused", "auto_paused": True},
-            {"id": "escalated", "text": "stuck", "status": "paused",
-             "needs_manual_intervention": True, "remediation_attempts": 3},
-        ])
+        project = self._project(
+            [
+                {"id": "clean", "text": "ok", "status": "active"},
+                {
+                    "id": "paused",
+                    "text": "paused",
+                    "status": "paused",
+                    "auto_paused": True,
+                },
+                {
+                    "id": "escalated",
+                    "text": "stuck",
+                    "status": "paused",
+                    "needs_manual_intervention": True,
+                    "remediation_attempts": 3,
+                },
+            ]
+        )
         entries = _build_direction_remediation_state(project)
         ids = {e["direction_id"] for e in entries}
         assert ids == {"paused", "escalated"}

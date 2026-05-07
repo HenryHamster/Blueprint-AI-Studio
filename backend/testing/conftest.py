@@ -22,8 +22,10 @@ os.environ.setdefault("WS_TICKET_SECRET", "test-ws-ticket-secret")
 # in-memory SQLite engine creates tables for testing.
 from sqlalchemy.dialects.sqlite.base import SQLiteTypeCompiler as _SQLiteTypeCompiler
 
+
 def _sqlite_visit_JSONB(self, type_, **kw):
     return self.visit_JSON(type_, **kw)
+
 
 _SQLiteTypeCompiler.visit_JSONB = _sqlite_visit_JSONB
 
@@ -35,12 +37,15 @@ from app.auth import get_current_user, require_admin  # noqa: E402
 # CI explicitly sets USE_TEST_POSTGRES=true to use real PostgreSQL.
 # Local dev (including docker-compose) defaults to in-memory SQLite for speed.
 _db_url = os.getenv("DATABASE_URL", "")
-USE_POSTGRES = os.getenv("USE_TEST_POSTGRES", "").lower() == "true" and _db_url.startswith("postgresql")
+USE_POSTGRES = os.getenv(
+    "USE_TEST_POSTGRES", ""
+).lower() == "true" and _db_url.startswith("postgresql")
 
 if USE_POSTGRES:
     # CI mode: real PostgreSQL (tables created by alembic migration before tests)
     # Use NullPool to avoid connection state leaking between tests
     from sqlalchemy.pool import NullPool
+
     engine = create_async_engine(_db_url, echo=False, future=True, poolclass=NullPool)
     TestingSessionLocal = sessionmaker(
         engine, class_=AsyncSession, expire_on_commit=False
@@ -61,7 +66,10 @@ else:
         poolclass=StaticPool,
     )
     TestingSessionLocal = sessionmaker(
-        autocommit=False, autoflush=False, bind=engine, class_=AsyncSession,
+        autocommit=False,
+        autoflush=False,
+        bind=engine,
+        class_=AsyncSession,
         expire_on_commit=False,
     )
 
@@ -84,19 +92,27 @@ async def db_session():
         async with engine.begin() as conn:
             for table in (
                 # Tables with FK to task must come before task
-                "strategiccycle", "projectmessage",
+                "strategiccycle",
+                "projectmessage",
                 # Tables with FK to task only
-                "artifact", "taskhistory",
+                "artifact",
+                "taskhistory",
                 # Other dependents before task/project
-                "alert", "orchestratorerrorack",
+                "alert",
+                "orchestratorerrorack",
                 # task has FK to project
                 "task",
                 # Remaining dependents of project
-                "projectmember", "residualremediationcase", "systemmaturity",
+                "projectmember",
+                "residualremediationcase",
+                "systemmaturity",
                 # Drift time-series (project_id not a FK constraint, safe to delete standalone)
                 "directiondriftsnapshot",
                 # Base tables
-                "project", "maxplanaccount", "userintegration", "alloweduser",
+                "project",
+                "maxplanaccount",
+                "userintegration",
+                "alloweduser",
             ):
                 await conn.execute(sqlalchemy.text(f"DELETE FROM {table}"))
             # Reset deploymentstate to empty (singleton, don't delete)
@@ -125,6 +141,7 @@ def override_get_session(db_session):
         async def _override():
             async with TestingSessionLocal() as session:
                 yield session
+
     app.dependency_overrides[get_session] = _override
     yield
     app.dependency_overrides.pop(get_session, None)
@@ -136,20 +153,32 @@ def override_get_current_user():
     Overrides the authentication dependency so we don't need real tokens.
     Returns an admin user so the /api/admin/* endpoints are accessible.
     """
+
     async def _override_get_current_user():
-        return {"user_id": "test-user-123", "email": "test@example.com", "role": "admin"}
+        return {
+            "user_id": "test-user-123",
+            "email": "test@example.com",
+            "role": "admin",
+        }
+
     app.dependency_overrides[get_current_user] = _override_get_current_user
     # Also bypass the require_admin router-level dependency directly
-    app.dependency_overrides[require_admin] = lambda: {"user_id": "test-user-123", "email": "test@example.com", "role": "admin"}
+    app.dependency_overrides[require_admin] = lambda: {
+        "user_id": "test-user-123",
+        "email": "test@example.com",
+        "role": "admin",
+    }
     yield
     app.dependency_overrides.pop(get_current_user, None)
     app.dependency_overrides.pop(require_admin, None)
+
 
 @pytest.fixture(autouse=True)
 def reset_digest_cache():
     """Clear the in-memory digest TTL cache between tests so a stale response
     from one test's DB state isn't served to the next."""
     from app.digest_cache import _default_cache
+
     _default_cache.clear()
     yield
     _default_cache.clear()
@@ -166,6 +195,7 @@ def reset_runtime_config():
     """
     import copy
     from app import shared_state
+
     snapshot = copy.deepcopy(shared_state.runtime_config)
     yield
     shared_state.runtime_config.clear()
@@ -182,15 +212,16 @@ def reset_rate_limiter():
     (a limits.MemoryStorage instance), not at limiter._storage directly.
     """
     from app.main import limiter
+
     # slowapi wraps a limits strategy object; the storage is one level deeper
-    underlying = getattr(limiter, '_limiter', None)
-    storage = getattr(underlying, 'storage', None) if underlying is not None else None
+    underlying = getattr(limiter, "_limiter", None)
+    storage = getattr(underlying, "storage", None) if underlying is not None else None
     if storage is not None:
-        if hasattr(storage, 'reset'):
+        if hasattr(storage, "reset"):
             storage.reset()
         else:
             # Fallback: clear whichever internal dict the storage uses
-            for attr in ('_storage', 'storage', '_data', 'data'):
+            for attr in ("_storage", "storage", "_data", "data"):
                 bucket = getattr(storage, attr, None)
                 if isinstance(bucket, dict):
                     bucket.clear()
@@ -203,24 +234,27 @@ async def client(override_get_session, override_get_current_user):
     """
     Provides an async HTTP client for testing the FastAPI endpoints.
     """
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as ac:
         yield ac
 
 
 @pytest.fixture
 def mock_provision_vm(mocker):
-    return mocker.patch('app.main.provision_agent_vm', return_value=None)
+    return mocker.patch("app.main.provision_agent_vm", return_value=None)
 
 
 @pytest.fixture
 def mock_delete_vm(mocker):
-    return mocker.patch('app.main.delete_agent_vm', return_value=None)
+    return mocker.patch("app.main.delete_agent_vm", return_value=None)
 
 
 @pytest.fixture
 def mock_broadcast(mocker):
     from unittest.mock import AsyncMock
-    return mocker.patch('app.broadcast.broadcast_to_project', new_callable=AsyncMock)
+
+    return mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
 
 
 async def assert_alert_exists(
@@ -231,6 +265,7 @@ async def assert_alert_exists(
 ):
     """Assert at least one undismissed alert exists for task_id+severity, return it."""
     from app.models import Alert
+
     result = await session.execute(
         select(Alert).where(
             Alert.task_id == task_id,
@@ -239,7 +274,9 @@ async def assert_alert_exists(
         )
     )
     alerts = result.scalars().all()
-    assert alerts, f"Expected an alert with severity={severity!r} for task {task_id}, but none found"
+    assert alerts, (
+        f"Expected an alert with severity={severity!r} for task {task_id}, but none found"
+    )
     if contains_text is not None:
         assert any(contains_text in a.message for a in alerts), (
             f"No alert message contains {contains_text!r}; messages: {[a.message for a in alerts]}"
@@ -254,6 +291,7 @@ async def assert_no_alert(
 ) -> None:
     """Assert no undismissed alert exists for task_id+severity."""
     from app.models import Alert
+
     result = await session.execute(
         select(Alert).where(
             Alert.task_id == task_id,

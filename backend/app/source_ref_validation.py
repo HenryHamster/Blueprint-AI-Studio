@@ -5,6 +5,7 @@ numbers are within bounds. Refs that fail validation are marked with
 valid: false or dropped, with warnings logged. The system degrades gracefully
 on validation failures — does not crash.
 """
+
 import logging
 import re
 import subprocess
@@ -54,7 +55,12 @@ def _file_exists_at_head(path: str) -> bool:
     Returns False if git command fails, file doesn't exist, or path is invalid.
     Does not raise exceptions — logs and returns False on errors.
     """
-    if not path or not isinstance(path, str) or "/" not in path and not path.endswith((".py", ".ts", ".tsx", ".js", ".go", ".rs")):
+    if (
+        not path
+        or not isinstance(path, str)
+        or "/" not in path
+        and not path.endswith((".py", ".ts", ".tsx", ".js", ".go", ".rs"))
+    ):
         # Reject obvious non-file paths to avoid wasting git calls
         return False
 
@@ -72,7 +78,9 @@ def _file_exists_at_head(path: str) -> bool:
         logger.warning(f"[SOURCE_REF_VALIDATION] git ls-files timeout for path {path}")
         return False
     except Exception as e:
-        logger.warning(f"[SOURCE_REF_VALIDATION] Failed to check if file exists: {path}: {e}")
+        logger.warning(
+            f"[SOURCE_REF_VALIDATION] Failed to check if file exists: {path}: {e}"
+        )
         return False
 
 
@@ -115,10 +123,14 @@ def _file_has_line_count(path: str, min_line: int) -> bool:
         line_count = int(stdout.strip().split()[0])
         return line_count >= min_line
     except (subprocess.TimeoutExpired, ValueError):
-        logger.warning(f"[SOURCE_REF_VALIDATION] Failed to validate line count for {path}")
+        logger.warning(
+            f"[SOURCE_REF_VALIDATION] Failed to validate line count for {path}"
+        )
         return False
     except Exception as e:
-        logger.warning(f"[SOURCE_REF_VALIDATION] Error validating line count for {path}: {e}")
+        logger.warning(
+            f"[SOURCE_REF_VALIDATION] Error validating line count for {path}: {e}"
+        )
         return False
 
 
@@ -188,9 +200,7 @@ def validate_source_refs(sources: Optional[list]) -> list:
 
     for source in sources:
         if not isinstance(source, dict):
-            logger.warning(
-                "[SOURCE_REF_VALIDATION] Dropping non-dict source entry"
-            )
+            logger.warning("[SOURCE_REF_VALIDATION] Dropping non-dict source entry")
             continue
 
         source_type = source.get("type", "").lower()

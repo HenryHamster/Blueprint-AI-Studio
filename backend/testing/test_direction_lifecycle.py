@@ -7,7 +7,10 @@ import pytest
 from sqlmodel import select
 
 import app.shared_state as _ss
-from app.direction_lifecycle import _detect_partial_remediation_success, _process_direction_lifecycle
+from app.direction_lifecycle import (
+    _detect_partial_remediation_success,
+    _process_direction_lifecycle,
+)
 from app.models import ArtifactType, Project, Task, TaskStatus
 from app.task_completion import _handle_investigation_completion
 
@@ -24,7 +27,9 @@ def _history_entry(ts: datetime, failure_rate: float) -> dict:
 
 
 @pytest.mark.asyncio
-async def test_remediation_spawn_sets_last_remediation_at_for_partial_detector(db_session, mocker):
+async def test_remediation_spawn_sets_last_remediation_at_for_partial_detector(
+    db_session, mocker
+):
     """D13: in-flight remediation has a boundary timestamp before merge outcome."""
     mocker.patch("app.task_completion.broadcast_to_project", new_callable=AsyncMock)
     direction_id = "d13-direction"
@@ -57,7 +62,9 @@ async def test_remediation_spawn_sets_last_remediation_at_for_partial_detector(d
     investigation = Task(
         project_id=project.id,
         title="Investigate direction",
-        payloads=[{"type": "investigate", "prompt": "investigate", "base_branch": "main"}],
+        payloads=[
+            {"type": "investigate", "prompt": "investigate", "base_branch": "main"}
+        ],
         context={
             "direction_id": direction_id,
             "diagnosis_fingerprint": "fp-d13",
@@ -73,22 +80,32 @@ async def test_remediation_spawn_sets_last_remediation_at_for_partial_detector(d
     report = {
         "summary": "Missing lock causes recurring failed tasks",
         "root_cause": "A shared direction counter is updated without synchronization.",
-        "affected_files": [{"path": "backend/app/shared_state.py", "issue": "missing lock"}],
+        "affected_files": [
+            {"path": "backend/app/shared_state.py", "issue": "missing lock"}
+        ],
         "recommended_fix": "Guard the shared counter update with the existing lock.",
         "severity": "high",
         "confidence": "high",
     }
     await _handle_investigation_completion(
         investigation,
-        SimpleNamespace(logs=json.dumps(report), artifact_type=ArtifactType.INVESTIGATION_REPORT),
+        SimpleNamespace(
+            logs=json.dumps(report), artifact_type=ArtifactType.INVESTIGATION_REPORT
+        ),
         db_session,
     )
     await db_session.commit()
     await db_session.refresh(project)
 
-    remediation = (await db_session.execute(
-        select(Task).where(Task.parent_task_id == investigation.id)
-    )).scalars().one()
+    remediation = (
+        (
+            await db_session.execute(
+                select(Task).where(Task.parent_task_id == investigation.id)
+            )
+        )
+        .scalars()
+        .one()
+    )
     refreshed = next(d for d in project.directions if d["id"] == direction_id)
     assert refreshed["last_remediation_task_id"] == str(remediation.id)
     assert refreshed["last_remediation_at"]
@@ -105,14 +122,18 @@ def _cost_history(*costs: float) -> list[dict]:
     """Build a minimal research_history with estimated_cost_usd entries and healthy metrics."""
     entries = []
     for i, cost in enumerate(costs):
-        entries.append({
-            "timestamp": (datetime.utcnow() - timedelta(days=len(costs) - i)).isoformat(),
-            "tasks_created": 2,
-            "tasks_failed": 0,
-            "tasks_failed_infra": 0,
-            "prs_merged": 2,
-            "estimated_cost_usd": cost,
-        })
+        entries.append(
+            {
+                "timestamp": (
+                    datetime.utcnow() - timedelta(days=len(costs) - i)
+                ).isoformat(),
+                "tasks_created": 2,
+                "tasks_failed": 0,
+                "tasks_failed_infra": 0,
+                "prs_merged": 2,
+                "estimated_cost_usd": cost,
+            }
+        )
     return entries
 
 
@@ -156,13 +177,18 @@ async def test_process_lifecycle_pauses_on_cost_budget_exceeded(db_session, mock
     project = await _make_cost_project(db_session, direction)
 
     await _process_direction_lifecycle(
-        project, db_session, cooldown_minutes=0.0,
-        busy_direction_ids=set(), now=datetime.utcnow(),
+        project,
+        db_session,
+        cooldown_minutes=0.0,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
     )
     await db_session.refresh(project)
 
     d = project.directions[0]
-    assert d["status"] == "paused", "direction should be auto-paused when cost budget exceeded"
+    assert d["status"] == "paused", (
+        "direction should be auto-paused when cost budget exceeded"
+    )
     assert d.get("auto_paused") is True
     reason = d.get("paused_reason", "")
     assert "budget" in reason.lower() or "cost" in reason.lower(), (
@@ -189,17 +215,24 @@ async def test_process_lifecycle_no_pause_when_cost_within_budget(db_session, mo
     project = await _make_cost_project(db_session, direction)
 
     await _process_direction_lifecycle(
-        project, db_session, cooldown_minutes=0.0,
-        busy_direction_ids=set(), now=datetime.utcnow(),
+        project,
+        db_session,
+        cooldown_minutes=0.0,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
     )
     await db_session.refresh(project)
 
     d = project.directions[0]
-    assert d["status"] == "active", "direction should stay active when spend is within budget"
+    assert d["status"] == "active", (
+        "direction should stay active when spend is within budget"
+    )
 
 
 @pytest.mark.asyncio
-async def test_process_lifecycle_no_cost_pause_without_budget_configured(db_session, mocker):
+async def test_process_lifecycle_no_cost_pause_without_budget_configured(
+    db_session, mocker
+):
     """Direction without cost_budget_usd is not paused regardless of estimated spend."""
     direction = {
         "id": "d-no-budget",
@@ -209,22 +242,31 @@ async def test_process_lifecycle_no_cost_pause_without_budget_configured(db_sess
         "paths": [],
         "added_at": "2026-01-01T00:00:00",
         # no cost_budget_usd set
-        "research_history": _cost_history(500.0, 500.0),  # high spend, no budget ceiling
+        "research_history": _cost_history(
+            500.0, 500.0
+        ),  # high spend, no budget ceiling
     }
     project = await _make_cost_project(db_session, direction)
 
     await _process_direction_lifecycle(
-        project, db_session, cooldown_minutes=0.0,
-        busy_direction_ids=set(), now=datetime.utcnow(),
+        project,
+        db_session,
+        cooldown_minutes=0.0,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
     )
     await db_session.refresh(project)
 
     d = project.directions[0]
-    assert d["status"] == "active", "direction without cost_budget_usd should not be paused on cost"
+    assert d["status"] == "active", (
+        "direction without cost_budget_usd should not be paused on cost"
+    )
 
 
 @pytest.mark.asyncio
-async def test_process_lifecycle_flags_retirement_consideration_for_high_cost_per_merge(db_session, mocker):
+async def test_process_lifecycle_flags_retirement_consideration_for_high_cost_per_merge(
+    db_session, mocker
+):
     """Expensive directions are flagged when cost/merge exceeds project median * multiplier."""
     now = datetime.utcnow()
     expensive_direction = {
@@ -234,14 +276,16 @@ async def test_process_lifecycle_flags_retirement_consideration_for_high_cost_pe
         "priority": "medium",
         "paths": [],
         "added_at": "2026-01-01T00:00:00",
-        "research_history": [{
-            "timestamp": now.isoformat(),
-            "tasks_created": 2,
-            "tasks_failed": 0,
-            "tasks_failed_infra": 0,
-            "prs_merged": 1,
-            "estimated_cost_usd": 10.0,
-        }],
+        "research_history": [
+            {
+                "timestamp": now.isoformat(),
+                "tasks_created": 2,
+                "tasks_failed": 0,
+                "tasks_failed_infra": 0,
+                "prs_merged": 1,
+                "estimated_cost_usd": 10.0,
+            }
+        ],
     }
     project = Project(
         name="Retirement Flag Test",
@@ -255,14 +299,16 @@ async def test_process_lifecycle_flags_retirement_consideration_for_high_cost_pe
                 "priority": "medium",
                 "paths": [],
                 "added_at": "2026-01-01T00:00:00",
-                "research_history": [{
-                    "timestamp": now.isoformat(),
-                    "tasks_created": 2,
-                    "tasks_failed": 0,
-                    "tasks_failed_infra": 0,
-                    "prs_merged": 1,
-                    "estimated_cost_usd": 1.0,
-                }],
+                "research_history": [
+                    {
+                        "timestamp": now.isoformat(),
+                        "tasks_created": 2,
+                        "tasks_failed": 0,
+                        "tasks_failed_infra": 0,
+                        "prs_merged": 1,
+                        "estimated_cost_usd": 1.0,
+                    }
+                ],
             },
             {
                 "id": "d-cheap-2",
@@ -271,14 +317,16 @@ async def test_process_lifecycle_flags_retirement_consideration_for_high_cost_pe
                 "priority": "medium",
                 "paths": [],
                 "added_at": "2026-01-01T00:00:00",
-                "research_history": [{
-                    "timestamp": now.isoformat(),
-                    "tasks_created": 2,
-                    "tasks_failed": 0,
-                    "tasks_failed_infra": 0,
-                    "prs_merged": 1,
-                    "estimated_cost_usd": 2.0,
-                }],
+                "research_history": [
+                    {
+                        "timestamp": now.isoformat(),
+                        "tasks_created": 2,
+                        "tasks_failed": 0,
+                        "tasks_failed_infra": 0,
+                        "prs_merged": 1,
+                        "estimated_cost_usd": 2.0,
+                    }
+                ],
             },
             expensive_direction,
         ],
@@ -290,19 +338,30 @@ async def test_process_lifecycle_flags_retirement_consideration_for_high_cost_pe
 
     mocker.patch.dict(
         "app.direction_lifecycle._runtime_config",
-        {"direction_cost_per_merge_window": 6, "direction_cost_per_merge_multiplier": 2.0},
+        {
+            "direction_cost_per_merge_window": 6,
+            "direction_cost_per_merge_multiplier": 2.0,
+        },
         clear=False,
     )
 
     await _process_direction_lifecycle(
-        project, db_session, cooldown_minutes=0.0,
-        busy_direction_ids=set(), now=now,
+        project,
+        db_session,
+        cooldown_minutes=0.0,
+        busy_direction_ids=set(),
+        now=now,
     )
     await db_session.refresh(project)
 
     by_id = {d["id"]: d for d in project.directions}
     assert by_id["d-expensive"].get("retirement_consideration_needed") is True
-    assert by_id["d-expensive"].get("retirement_consideration_evidence", {}).get("threshold_usd") == 4.0
+    assert (
+        by_id["d-expensive"]
+        .get("retirement_consideration_evidence", {})
+        .get("threshold_usd")
+        == 4.0
+    )
     assert "retirement_consideration_needed" not in by_id["d-cheap-1"]
     assert "retirement_consideration_needed" not in by_id["d-cheap-2"]
 
@@ -320,18 +379,20 @@ async def test_retirement_evidence_includes_provider_model_split(db_session, moc
         "priority": "medium",
         "paths": [],
         "added_at": "2026-01-01T00:00:00",
-        "research_history": [{
-            "timestamp": now.isoformat(),
-            "tasks_created": 2,
-            "tasks_failed": 0,
-            "tasks_failed_infra": 0,
-            "prs_merged": 1,
-            "estimated_cost_usd": 10.0,
-            "cost_by_provider_model": {
-                "anthropic|claude-opus-4-7": 8.0,
-                "openai|gpt-5.4": 2.0,
-            },
-        }],
+        "research_history": [
+            {
+                "timestamp": now.isoformat(),
+                "tasks_created": 2,
+                "tasks_failed": 0,
+                "tasks_failed_infra": 0,
+                "prs_merged": 1,
+                "estimated_cost_usd": 10.0,
+                "cost_by_provider_model": {
+                    "anthropic|claude-opus-4-7": 8.0,
+                    "openai|gpt-5.4": 2.0,
+                },
+            }
+        ],
     }
     project = Project(
         name="Split evidence test",
@@ -345,14 +406,16 @@ async def test_retirement_evidence_includes_provider_model_split(db_session, moc
                 "priority": "medium",
                 "paths": [],
                 "added_at": "2026-01-01T00:00:00",
-                "research_history": [{
-                    "timestamp": now.isoformat(),
-                    "tasks_created": 2,
-                    "tasks_failed": 0,
-                    "tasks_failed_infra": 0,
-                    "prs_merged": 1,
-                    "estimated_cost_usd": 1.0,
-                }],
+                "research_history": [
+                    {
+                        "timestamp": now.isoformat(),
+                        "tasks_created": 2,
+                        "tasks_failed": 0,
+                        "tasks_failed_infra": 0,
+                        "prs_merged": 1,
+                        "estimated_cost_usd": 1.0,
+                    }
+                ],
             },
             {
                 "id": "d-split-cheap-2",
@@ -361,14 +424,16 @@ async def test_retirement_evidence_includes_provider_model_split(db_session, moc
                 "priority": "medium",
                 "paths": [],
                 "added_at": "2026-01-01T00:00:00",
-                "research_history": [{
-                    "timestamp": now.isoformat(),
-                    "tasks_created": 2,
-                    "tasks_failed": 0,
-                    "tasks_failed_infra": 0,
-                    "prs_merged": 1,
-                    "estimated_cost_usd": 2.0,
-                }],
+                "research_history": [
+                    {
+                        "timestamp": now.isoformat(),
+                        "tasks_created": 2,
+                        "tasks_failed": 0,
+                        "tasks_failed_infra": 0,
+                        "prs_merged": 1,
+                        "estimated_cost_usd": 2.0,
+                    }
+                ],
             },
             expensive_direction,
         ],
@@ -380,13 +445,19 @@ async def test_retirement_evidence_includes_provider_model_split(db_session, moc
 
     mocker.patch.dict(
         "app.direction_lifecycle._runtime_config",
-        {"direction_cost_per_merge_window": 6, "direction_cost_per_merge_multiplier": 2.0},
+        {
+            "direction_cost_per_merge_window": 6,
+            "direction_cost_per_merge_multiplier": 2.0,
+        },
         clear=False,
     )
 
     await _process_direction_lifecycle(
-        project, db_session, cooldown_minutes=0.0,
-        busy_direction_ids=set(), now=now,
+        project,
+        db_session,
+        cooldown_minutes=0.0,
+        busy_direction_ids=set(),
+        now=now,
     )
     await db_session.refresh(project)
 
@@ -405,7 +476,9 @@ async def test_retirement_evidence_includes_provider_model_split(db_session, moc
 
 
 @pytest.mark.asyncio
-async def test_retirement_consideration_still_flagged_without_provider_model_split(db_session, mocker):
+async def test_retirement_consideration_still_flagged_without_provider_model_split(
+    db_session, mocker
+):
     """Legacy directions without cost_by_provider_model on history entries
     must still be flagged for retirement; the split is omitted (empty dict)
     rather than crashing or being skipped."""
@@ -417,15 +490,17 @@ async def test_retirement_consideration_still_flagged_without_provider_model_spl
         "priority": "medium",
         "paths": [],
         "added_at": "2026-01-01T00:00:00",
-        "research_history": [{
-            "timestamp": now.isoformat(),
-            "tasks_created": 2,
-            "tasks_failed": 0,
-            "tasks_failed_infra": 0,
-            "prs_merged": 1,
-            "estimated_cost_usd": 10.0,
-            # No cost_by_provider_model — legacy entry.
-        }],
+        "research_history": [
+            {
+                "timestamp": now.isoformat(),
+                "tasks_created": 2,
+                "tasks_failed": 0,
+                "tasks_failed_infra": 0,
+                "prs_merged": 1,
+                "estimated_cost_usd": 10.0,
+                # No cost_by_provider_model — legacy entry.
+            }
+        ],
     }
     project = Project(
         name="Legacy retirement test",
@@ -439,14 +514,16 @@ async def test_retirement_consideration_still_flagged_without_provider_model_spl
                 "priority": "medium",
                 "paths": [],
                 "added_at": "2026-01-01T00:00:00",
-                "research_history": [{
-                    "timestamp": now.isoformat(),
-                    "tasks_created": 2,
-                    "tasks_failed": 0,
-                    "tasks_failed_infra": 0,
-                    "prs_merged": 1,
-                    "estimated_cost_usd": 1.0,
-                }],
+                "research_history": [
+                    {
+                        "timestamp": now.isoformat(),
+                        "tasks_created": 2,
+                        "tasks_failed": 0,
+                        "tasks_failed_infra": 0,
+                        "prs_merged": 1,
+                        "estimated_cost_usd": 1.0,
+                    }
+                ],
             },
             {
                 "id": "d-legacy-cheap-2",
@@ -455,14 +532,16 @@ async def test_retirement_consideration_still_flagged_without_provider_model_spl
                 "priority": "medium",
                 "paths": [],
                 "added_at": "2026-01-01T00:00:00",
-                "research_history": [{
-                    "timestamp": now.isoformat(),
-                    "tasks_created": 2,
-                    "tasks_failed": 0,
-                    "tasks_failed_infra": 0,
-                    "prs_merged": 1,
-                    "estimated_cost_usd": 2.0,
-                }],
+                "research_history": [
+                    {
+                        "timestamp": now.isoformat(),
+                        "tasks_created": 2,
+                        "tasks_failed": 0,
+                        "tasks_failed_infra": 0,
+                        "prs_merged": 1,
+                        "estimated_cost_usd": 2.0,
+                    }
+                ],
             },
             expensive_legacy,
         ],
@@ -474,13 +553,19 @@ async def test_retirement_consideration_still_flagged_without_provider_model_spl
 
     mocker.patch.dict(
         "app.direction_lifecycle._runtime_config",
-        {"direction_cost_per_merge_window": 6, "direction_cost_per_merge_multiplier": 2.0},
+        {
+            "direction_cost_per_merge_window": 6,
+            "direction_cost_per_merge_multiplier": 2.0,
+        },
         clear=False,
     )
 
     await _process_direction_lifecycle(
-        project, db_session, cooldown_minutes=0.0,
-        busy_direction_ids=set(), now=now,
+        project,
+        db_session,
+        cooldown_minutes=0.0,
+        busy_direction_ids=set(),
+        now=now,
     )
     await db_session.refresh(project)
 
@@ -496,7 +581,9 @@ async def test_retirement_consideration_still_flagged_without_provider_model_spl
 
 
 @pytest.mark.asyncio
-async def test_process_lifecycle_uses_default_cpm_config_when_runtime_values_invalid(db_session, mocker):
+async def test_process_lifecycle_uses_default_cpm_config_when_runtime_values_invalid(
+    db_session, mocker
+):
     """Invalid runtime config values should not crash lifecycle processing."""
     direction = {
         "id": "d-invalid-cpm-config",
@@ -518,8 +605,11 @@ async def test_process_lifecycle_uses_default_cpm_config_when_runtime_values_inv
     )
 
     await _process_direction_lifecycle(
-        project, db_session, cooldown_minutes=0.0,
-        busy_direction_ids=set(), now=datetime.utcnow(),
+        project,
+        db_session,
+        cooldown_minutes=0.0,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
     )
     await db_session.refresh(project)
 
@@ -539,6 +629,7 @@ _XFAIL_SIBLING = pytest.mark.xfail(
 def test_classify_task_autonomy_orchestrator_created():
     """ORCHESTRATOR-created task with no operator signals is classified as autonomous."""
     from app.direction_outcomes import classify_task_autonomy  # ImportError → xfail
+
     task = Task(created_by="ORCHESTRATOR", latest_status_message=None)
     assert classify_task_autonomy(task) is True
 
@@ -547,6 +638,7 @@ def test_classify_task_autonomy_orchestrator_created():
 def test_classify_task_autonomy_user_created():
     """USER-created task is always operator-assisted regardless of other signals."""
     from app.direction_outcomes import classify_task_autonomy
+
     task = Task(created_by="USER")
     assert classify_task_autonomy(task) is False
 
@@ -555,6 +647,7 @@ def test_classify_task_autonomy_user_created():
 def test_classify_task_autonomy_admin_spawned():
     """ORCHESTRATOR task with ADMIN_* spawned_by context is operator-assisted."""
     from app.direction_outcomes import classify_task_autonomy
+
     task = Task(created_by="ORCHESTRATOR", context={"spawned_by": "ADMIN_MANUAL"})
     assert classify_task_autonomy(task) is False
 
@@ -563,6 +656,7 @@ def test_classify_task_autonomy_admin_spawned():
 def test_classify_task_autonomy_human_approved_merge():
     """Task whose merge was approved by an operator (status message prefix) is operator-assisted."""
     from app.direction_outcomes import classify_task_autonomy
+
     task = Task(
         created_by="ORCHESTRATOR",
         latest_status_message="Human-approved: merged by operator",
@@ -574,14 +668,17 @@ def test_classify_task_autonomy_human_approved_merge():
 def test_classify_task_autonomy_request_changes_spawned():
     """Fix task spawned via request-changes (human feedback in fix_prompt) is operator-assisted."""
     from app.direction_outcomes import classify_task_autonomy
+
     task = Task(
         created_by="ORCHESTRATOR",
-        payloads=[{
-            "type": "fix",
-            "prompt": "fix issues",
-            "fix_prompt": "Human reviewer requested changes:\n\nMissing tests",
-            "base_branch": "main",
-        }],
+        payloads=[
+            {
+                "type": "fix",
+                "prompt": "fix issues",
+                "fix_prompt": "Human reviewer requested changes:\n\nMissing tests",
+                "base_branch": "main",
+            }
+        ],
     )
     assert classify_task_autonomy(task) is False
 
@@ -591,7 +688,9 @@ def test_classify_task_autonomy_request_changes_spawned():
     strict=False,
     reason="pending sibling cluster 1/2: _cost_per_merge not yet using autonomous_prs_merged",
 )
-async def test_process_lifecycle_cpm_zero_autonomous_no_retirement_flag(db_session, mocker):
+async def test_process_lifecycle_cpm_zero_autonomous_no_retirement_flag(
+    db_session, mocker
+):
     """CPM is None when autonomous_prs_merged=0 — no retirement flag even if prs_merged>0."""
     now = datetime.utcnow()
 
@@ -650,13 +749,19 @@ async def test_process_lifecycle_cpm_zero_autonomous_no_retirement_flag(db_sessi
 
     mocker.patch.dict(
         "app.direction_lifecycle._runtime_config",
-        {"direction_cost_per_merge_window": 6, "direction_cost_per_merge_multiplier": 2.0},
+        {
+            "direction_cost_per_merge_window": 6,
+            "direction_cost_per_merge_multiplier": 2.0,
+        },
         clear=False,
     )
 
     await _process_direction_lifecycle(
-        project, db_session, cooldown_minutes=0.0,
-        busy_direction_ids=set(), now=now,
+        project,
+        db_session,
+        cooldown_minutes=0.0,
+        busy_direction_ids=set(),
+        now=now,
     )
     await db_session.refresh(project)
 
@@ -665,7 +770,9 @@ async def test_process_lifecycle_cpm_zero_autonomous_no_retirement_flag(db_sessi
 
 
 @pytest.mark.asyncio
-async def test_process_lifecycle_cpm_unchanged_for_fully_autonomous_direction(db_session, mocker):
+async def test_process_lifecycle_cpm_unchanged_for_fully_autonomous_direction(
+    db_session, mocker
+):
     """Retirement threshold is unchanged when autonomous_prs_merged == prs_merged (migration no-op)."""
     now = datetime.utcnow()
 
@@ -723,13 +830,19 @@ async def test_process_lifecycle_cpm_unchanged_for_fully_autonomous_direction(db
 
     mocker.patch.dict(
         "app.direction_lifecycle._runtime_config",
-        {"direction_cost_per_merge_window": 6, "direction_cost_per_merge_multiplier": 2.0},
+        {
+            "direction_cost_per_merge_window": 6,
+            "direction_cost_per_merge_multiplier": 2.0,
+        },
         clear=False,
     )
 
     await _process_direction_lifecycle(
-        project, db_session, cooldown_minutes=0.0,
-        busy_direction_ids=set(), now=now,
+        project,
+        db_session,
+        cooldown_minutes=0.0,
+        busy_direction_ids=set(),
+        now=now,
     )
     await db_session.refresh(project)
 

@@ -20,7 +20,16 @@ from sqlmodel import select
 from app.auth import get_current_user
 from app.database import get_session
 from app.digest_cache import DigestCache, get_digest_cache
-from app.models import Alert, AlertSeverity, LLMAuthMode, LLMProviderName, MaxPlanAccount, Task, TaskStatus, _utcnow
+from app.models import (
+    Alert,
+    AlertSeverity,
+    LLMAuthMode,
+    LLMProviderName,
+    MaxPlanAccount,
+    Task,
+    TaskStatus,
+    _utcnow,
+)
 from app.providers.registry import get_provider
 from app.shared_state import limiter
 
@@ -65,7 +74,9 @@ def _validate_claude_config_json(raw: Any) -> str | None:
     return raw
 
 
-def _provider_metadata_from_payload(payload: Dict[str, Any], current: Dict[str, Any] | None = None) -> Dict[str, Any]:
+def _provider_metadata_from_payload(
+    payload: Dict[str, Any], current: Dict[str, Any] | None = None
+) -> Dict[str, Any]:
     if "provider_metadata" not in payload:
         return dict(current or {})
     metadata = payload["provider_metadata"]
@@ -94,36 +105,60 @@ def _legacy_anthropic_secret_from_payload(payload: Dict[str, Any]) -> str | None
     return raw.strip()
 
 
-def _create_request_shape(payload: Dict[str, Any]) -> tuple[LLMProviderName, LLMAuthMode, str]:
+def _create_request_shape(
+    payload: Dict[str, Any],
+) -> tuple[LLMProviderName, LLMAuthMode, str]:
     canonical_secret = _canonical_secret_from_payload(payload)
     if canonical_secret is not None:
         if "provider" not in payload or "auth_mode" not in payload:
-            raise _bad_request("'provider', 'auth_mode', and 'secret' are required for provider-aware account creation")
-        return _parse_provider(payload["provider"]), _parse_auth_mode(payload["auth_mode"]), canonical_secret
+            raise _bad_request(
+                "'provider', 'auth_mode', and 'secret' are required for provider-aware account creation"
+            )
+        return (
+            _parse_provider(payload["provider"]),
+            _parse_auth_mode(payload["auth_mode"]),
+            canonical_secret,
+        )
 
     legacy_secret = _legacy_anthropic_secret_from_payload(payload)
     if legacy_secret is not None:
         return LLMProviderName.ANTHROPIC, LLMAuthMode.OAUTH, legacy_secret
 
-    raise _bad_request("'name' and either canonical 'secret' or legacy 'oauth_token' are required")
+    raise _bad_request(
+        "'name' and either canonical 'secret' or legacy 'oauth_token' are required"
+    )
 
 
 def _update_target_identity(
     payload: Dict[str, Any],
     db_account: MaxPlanAccount,
 ) -> tuple[LLMProviderName, LLMAuthMode, str | None]:
-    provider = _parse_provider(payload["provider"]) if "provider" in payload else db_account.provider
-    auth_mode = _parse_auth_mode(payload["auth_mode"]) if "auth_mode" in payload else db_account.auth_mode
+    provider = (
+        _parse_provider(payload["provider"])
+        if "provider" in payload
+        else db_account.provider
+    )
+    auth_mode = (
+        _parse_auth_mode(payload["auth_mode"])
+        if "auth_mode" in payload
+        else db_account.auth_mode
+    )
 
     canonical_secret = _canonical_secret_from_payload(payload)
     legacy_secret = _legacy_anthropic_secret_from_payload(payload)
     new_secret = canonical_secret if canonical_secret is not None else legacy_secret
 
-    if (provider != db_account.provider or auth_mode != db_account.auth_mode) and new_secret is None:
+    if (
+        provider != db_account.provider or auth_mode != db_account.auth_mode
+    ) and new_secret is None:
         raise _bad_request("Changing provider or auth_mode requires a new secret")
 
-    if legacy_secret is not None and (provider != LLMProviderName.ANTHROPIC or auth_mode != LLMAuthMode.OAUTH):
-        raise _bad_request("legacy oauth_token updates are only valid for anthropic/oauth accounts")
+    if legacy_secret is not None and (
+        provider != LLMProviderName.ANTHROPIC or auth_mode != LLMAuthMode.OAUTH
+    ):
+        raise _bad_request(
+            "legacy oauth_token updates are only valid for anthropic/oauth accounts"
+        )
 
     return provider, auth_mode, new_secret
 
@@ -142,13 +177,17 @@ def _validate_provider_inputs(
     return result.secret, result.provider_metadata
 
 
-def _runtime_pool_secret(provider: LLMProviderName, auth_mode: LLMAuthMode, raw_secret: str | None) -> str | None:
+def _runtime_pool_secret(
+    provider: LLMProviderName, auth_mode: LLMAuthMode, raw_secret: str | None
+) -> str | None:
     if provider == LLMProviderName.ANTHROPIC and auth_mode == LLMAuthMode.OAUTH:
         return raw_secret
     return None
 
 
-def _stored_oauth_token_ref(provider: LLMProviderName, auth_mode: LLMAuthMode, stored_secret_ref: str | None) -> str | None:
+def _stored_oauth_token_ref(
+    provider: LLMProviderName, auth_mode: LLMAuthMode, stored_secret_ref: str | None
+) -> str | None:
     if provider == LLMProviderName.ANTHROPIC and auth_mode == LLMAuthMode.OAUTH:
         return stored_secret_ref
     return None
@@ -158,7 +197,11 @@ def _account_secret_ref(db_account: MaxPlanAccount) -> str | None:
     return db_account.secret_blob_ref or db_account.oauth_token
 
 
-_CAP_FIELDS = ("daily_task_cap", "max_concurrent_tasks", "auto_disable_after_rate_limits")
+_CAP_FIELDS = (
+    "daily_task_cap",
+    "max_concurrent_tasks",
+    "auto_disable_after_rate_limits",
+)
 
 
 def _parse_cap(payload: Dict[str, Any], field: str) -> int | None | object:
@@ -181,8 +224,13 @@ def _parse_cap(payload: Dict[str, Any], field: str) -> int | None | object:
 _UNSET = object()
 
 _HEALTH_FAILURE_CLASSES = (
-    "CODE_ERROR", "RATE_LIMIT", "EXTERNAL_API",
-    "PROVISION_FAILURE", "MIGRATION_ERROR", "AGENT_TIMEOUT", "SCOPE_OVERFLOW",
+    "CODE_ERROR",
+    "RATE_LIMIT",
+    "EXTERNAL_API",
+    "PROVISION_FAILURE",
+    "MIGRATION_ERROR",
+    "AGENT_TIMEOUT",
+    "SCOPE_OVERFLOW",
 )
 
 _FAILURE_CLASS_BUCKET_GROUPS: dict[str, list[str]] = {
@@ -212,7 +260,8 @@ async def get_account_health_summary(
     return await cache.get_or_compute(
         cache_key,
         lambda: _compute_account_health_summary(
-            user_id=user_id, session=session,
+            user_id=user_id,
+            session=session,
         ),
     )
 
@@ -253,26 +302,36 @@ async def _compute_account_health_summary(
             for aid in _account_id_list
         ]
         failed_tasks = (
-            await session.execute(
-                select(Task)
-                .options(load_only(
-                    Task.id, Task.status, Task.account_id, Task.context,
-                    Task.latest_status_message, Task.updated_at,
-                    Task.project_id,  # classify_failure → record_residual_fingerprint
-                    Task.payloads,  # classify_failure reads first_payload (L-P2)
-                ))
-                .where(
-                    Task.status.in_([TaskStatus.FAILED, TaskStatus.CANCELLED]),
-                    Task.updated_at >= cutoff,
-                    Task.latest_status_message.isnot(None),
-                    or_(
-                        Task.account_id.in_(_account_id_list),
-                        *_llm_predicates,
-                        *_mp_predicates,
-                    ),
+            (
+                await session.execute(
+                    select(Task)
+                    .options(
+                        load_only(
+                            Task.id,
+                            Task.status,
+                            Task.account_id,
+                            Task.context,
+                            Task.latest_status_message,
+                            Task.updated_at,
+                            Task.project_id,  # classify_failure → record_residual_fingerprint
+                            Task.payloads,  # classify_failure reads first_payload (L-P2)
+                        )
+                    )
+                    .where(
+                        Task.status.in_([TaskStatus.FAILED, TaskStatus.CANCELLED]),
+                        Task.updated_at >= cutoff,
+                        Task.latest_status_message.isnot(None),
+                        or_(
+                            Task.account_id.in_(_account_id_list),
+                            *_llm_predicates,
+                            *_mp_predicates,
+                        ),
+                    )
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         for t in failed_tasks:
             acct_id = t.account_id
             if not acct_id:
@@ -281,7 +340,9 @@ async def _compute_account_health_summary(
             if acct_id not in account_ids:
                 continue
             fc = classify_failure(t)
-            bucket = failure_counts.setdefault(acct_id, {c: 0 for c in _HEALTH_FAILURE_CLASSES})
+            bucket = failure_counts.setdefault(
+                acct_id, {c: 0 for c in _HEALTH_FAILURE_CLASSES}
+            )
             if fc in bucket:
                 bucket[fc] += 1
 
@@ -299,27 +360,30 @@ async def _compute_account_health_summary(
             if m.get("regression_stats"):
                 entry["regression_stats"] = m["regression_stats"]
             rate_limited_models.append(entry)
-        accounts.append({
-            "account_id": acct_id,
-            "label": s.get("name", acct_id),
-            "provider": s.get("provider"),
-            "state": state,
-            "disabled_reason": s.get("disabled_reason"),
-            "health_score": s["health_score"],
-            "success_rate_7d": s.get("success_rate_7d"),
-            "avg_duration_seconds": s.get("avg_duration_seconds"),
-            "completions_24h": s["completions_24h"],
-            "rl_events_24h": s["rl_events_24h"],
-            "rate_limited_models": rate_limited_models,
-            "failure_class_counts": failure_counts.get(acct_id, {c: 0 for c in _HEALTH_FAILURE_CLASSES}),
-            "failure_class_buckets": {
-                bucket: sum(
-                    failure_counts.get(acct_id, {}).get(cls, 0)
-                    for cls in classes
-                )
-                for bucket, classes in _FAILURE_CLASS_BUCKET_GROUPS.items()
-            },
-        })
+        accounts.append(
+            {
+                "account_id": acct_id,
+                "label": s.get("name", acct_id),
+                "provider": s.get("provider"),
+                "state": state,
+                "disabled_reason": s.get("disabled_reason"),
+                "health_score": s["health_score"],
+                "success_rate_7d": s.get("success_rate_7d"),
+                "avg_duration_seconds": s.get("avg_duration_seconds"),
+                "completions_24h": s["completions_24h"],
+                "rl_events_24h": s["rl_events_24h"],
+                "rate_limited_models": rate_limited_models,
+                "failure_class_counts": failure_counts.get(
+                    acct_id, {c: 0 for c in _HEALTH_FAILURE_CLASSES}
+                ),
+                "failure_class_buckets": {
+                    bucket: sum(
+                        failure_counts.get(acct_id, {}).get(cls, 0) for cls in classes
+                    )
+                    for bucket, classes in _FAILURE_CLASS_BUCKET_GROUPS.items()
+                },
+            }
+        )
 
     return {"accounts": accounts}
 
@@ -334,10 +398,16 @@ async def get_provider_model_breakdown(
     from app.account_model_regression import compute_provider_model_breakdown
 
     user_acct_ids = (
-        await session.execute(
-            select(MaxPlanAccount.id).where(MaxPlanAccount.user_id == current_user["user_id"])
+        (
+            await session.execute(
+                select(MaxPlanAccount.id).where(
+                    MaxPlanAccount.user_id == current_user["user_id"]
+                )
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     user_acct_id_strs = [str(aid) for aid in user_acct_ids]
     if not user_acct_id_strs:
         return {"rows": []}
@@ -377,11 +447,17 @@ async def add_max_plan_account(
 
     provider, auth_mode, raw_secret = _create_request_shape(payload)
     provider_metadata = _provider_metadata_from_payload(payload)
-    normalized_secret, normalized_metadata = _validate_provider_inputs(provider, auth_mode, raw_secret, provider_metadata)
+    normalized_secret, normalized_metadata = _validate_provider_inputs(
+        provider, auth_mode, raw_secret, provider_metadata
+    )
 
     claude_config_json = _validate_claude_config_json(payload.get("claude_config_json"))
-    if claude_config_json is not None and (provider != LLMProviderName.ANTHROPIC or auth_mode != LLMAuthMode.OAUTH):
-        raise _bad_request("claude_config_json is only valid for anthropic/oauth accounts")
+    if claude_config_json is not None and (
+        provider != LLMProviderName.ANTHROPIC or auth_mode != LLMAuthMode.OAUTH
+    ):
+        raise _bad_request(
+            "claude_config_json is only valid for anthropic/oauth accounts"
+        )
 
     now = _utcnow()
     cap_values: Dict[str, int | None] = {}
@@ -411,15 +487,23 @@ async def add_max_plan_account(
         from app.secrets_manager import store_user_secret
 
         secret_name = f"llm-account-{db_account.id}"
-        stored_secret_ref = await store_user_secret("system", secret_name, normalized_secret)
+        stored_secret_ref = await store_user_secret(
+            "system", secret_name, normalized_secret
+        )
         db_account.secret_blob_ref = stored_secret_ref
-        db_account.oauth_token = _stored_oauth_token_ref(provider, auth_mode, stored_secret_ref)
+        db_account.oauth_token = _stored_oauth_token_ref(
+            provider, auth_mode, stored_secret_ref
+        )
         session.add(db_account)
         await session.commit()
     except Exception as exc:
-        logger.warning(f"[POOL] Secret Manager unavailable, secret stored inline for account {db_account.id}: {exc}")
+        logger.warning(
+            f"[POOL] Secret Manager unavailable, secret stored inline for account {db_account.id}: {exc}"
+        )
         db_account.secret_blob_ref = normalized_secret
-        db_account.oauth_token = _stored_oauth_token_ref(provider, auth_mode, normalized_secret)
+        db_account.oauth_token = _stored_oauth_token_ref(
+            provider, auth_mode, normalized_secret
+        )
         session.add(db_account)
         await session.commit()
 
@@ -462,7 +546,9 @@ async def add_max_plan_account(
         "name": db_account.name,
         "provider": db_account.provider.value,
         "auth_mode": db_account.auth_mode.value,
-        "available_models": (entry.get("provider_metadata") or {}).get("available_models"),
+        "available_models": (entry.get("provider_metadata") or {}).get(
+            "available_models"
+        ),
         "message": "Account added to pool",
     }
 
@@ -502,7 +588,8 @@ async def _best_effort_refresh_availability(
     except Exception:
         logger.exception(
             "[POOL] persisting availability metadata failed for account %s; "
-            "keeping in-memory copy only", account_uuid,
+            "keeping in-memory copy only",
+            account_uuid,
         )
 
 
@@ -560,15 +647,17 @@ async def remove_max_plan_account(
         for project_id, task_ids in affected_by_project.items():
             short_list = ", ".join(str(t)[:8] for t in task_ids[:10])
             suffix = f" (+{len(task_ids) - 10} more)" if len(task_ids) > 10 else ""
-            session.add(Alert(
-                project_id=project_id,
-                severity=AlertSeverity.WARNING,
-                title=f"Pool account force-deleted with {len(task_ids)} active task(s)",
-                message=(
-                    f"Account {db_account.name} ({account_id[:8]}) was force-removed; "
-                    f"these tasks may fail on next token refresh: {short_list}{suffix}"
-                ),
-            ))
+            session.add(
+                Alert(
+                    project_id=project_id,
+                    severity=AlertSeverity.WARNING,
+                    title=f"Pool account force-deleted with {len(task_ids)} active task(s)",
+                    message=(
+                        f"Account {db_account.name} ({account_id[:8]}) was force-removed; "
+                        f"these tasks may fail on next token refresh: {short_list}{suffix}"
+                    ),
+                )
+            )
 
     secret_ref = _account_secret_ref(db_account)
     if secret_ref and secret_ref.startswith("projects/"):
@@ -577,7 +666,9 @@ async def remove_max_plan_account(
 
             await delete_user_secret(secret_ref)
         except Exception as exc:
-            logger.warning(f"[POOL] Failed to delete Secret Manager secret for account {account_id}: {exc}")
+            logger.warning(
+                f"[POOL] Failed to delete Secret Manager secret for account {account_id}: {exc}"
+            )
 
     await session.delete(db_account)
     await session.commit()
@@ -587,7 +678,9 @@ async def remove_max_plan_account(
     async with _max_plan_pool_lock:
         user_id = current_user["user_id"]
         if user_id in _max_plan_pools:
-            _max_plan_pools[user_id] = [a for a in _max_plan_pools[user_id] if a["id"] != account_id]
+            _max_plan_pools[user_id] = [
+                a for a in _max_plan_pools[user_id] if a["id"] != account_id
+            ]
         _account_by_id.pop(account_id, None)
     return {"message": "Account removed"}
 
@@ -625,8 +718,12 @@ async def update_max_plan_account(
         if parsed is not _UNSET:
             setattr(db_account, field, parsed)
 
-    target_provider, target_auth_mode, new_secret = _update_target_identity(payload, db_account)
-    target_metadata = _provider_metadata_from_payload(payload, current=db_account.provider_metadata)
+    target_provider, target_auth_mode, new_secret = _update_target_identity(
+        payload, db_account
+    )
+    target_metadata = _provider_metadata_from_payload(
+        payload, current=db_account.provider_metadata
+    )
 
     if new_secret is not None:
         normalized_secret, normalized_metadata = _validate_provider_inputs(
@@ -637,12 +734,22 @@ async def update_max_plan_account(
         normalized_metadata = target_metadata
         try:
             get_provider(target_provider)
-            required_fields = get_provider(target_provider).required_metadata_fields(target_auth_mode)
+            required_fields = get_provider(target_provider).required_metadata_fields(
+                target_auth_mode
+            )
         except ValueError as exc:
             raise _bad_request(str(exc)) from exc
-        missing_fields = [field for field in required_fields if not normalized_metadata.get(field)]
-        if ("provider_metadata" in payload or "provider" in payload or "auth_mode" in payload) and missing_fields:
-            raise _bad_request(f"Missing provider metadata fields: {', '.join(missing_fields)}")
+        missing_fields = [
+            field for field in required_fields if not normalized_metadata.get(field)
+        ]
+        if (
+            "provider_metadata" in payload
+            or "provider" in payload
+            or "auth_mode" in payload
+        ) and missing_fields:
+            raise _bad_request(
+                f"Missing provider metadata fields: {', '.join(missing_fields)}"
+            )
 
     if "provider" in payload:
         db_account.provider = target_provider
@@ -652,16 +759,21 @@ async def update_max_plan_account(
         db_account.provider_metadata = normalized_metadata or None
 
     if "claude_config_json" in payload:
-        db_account.claude_config_json = _validate_claude_config_json(payload.get("claude_config_json"))
+        db_account.claude_config_json = _validate_claude_config_json(
+            payload.get("claude_config_json")
+        )
     if (
         target_provider != LLMProviderName.ANTHROPIC
         or target_auth_mode != LLMAuthMode.OAUTH
     ) and "claude_config_json" not in payload:
         db_account.claude_config_json = None
     if db_account.claude_config_json is not None and (
-        db_account.provider != LLMProviderName.ANTHROPIC or db_account.auth_mode != LLMAuthMode.OAUTH
+        db_account.provider != LLMProviderName.ANTHROPIC
+        or db_account.auth_mode != LLMAuthMode.OAUTH
     ):
-        raise _bad_request("claude_config_json is only valid for anthropic/oauth accounts")
+        raise _bad_request(
+            "claude_config_json is only valid for anthropic/oauth accounts"
+        )
 
     if (
         target_provider != LLMProviderName.ANTHROPIC
@@ -674,12 +786,18 @@ async def update_max_plan_account(
             from app.secrets_manager import store_user_secret
 
             secret_name = f"llm-account-{account_id}"
-            stored_secret_ref = await store_user_secret("system", secret_name, normalized_secret)
+            stored_secret_ref = await store_user_secret(
+                "system", secret_name, normalized_secret
+            )
         except Exception as exc:
-            logger.warning(f"[POOL] Secret Manager unavailable, secret stored inline for account {account_id}: {exc}")
+            logger.warning(
+                f"[POOL] Secret Manager unavailable, secret stored inline for account {account_id}: {exc}"
+            )
             stored_secret_ref = normalized_secret
         db_account.secret_blob_ref = stored_secret_ref
-        db_account.oauth_token = _stored_oauth_token_ref(target_provider, target_auth_mode, stored_secret_ref)
+        db_account.oauth_token = _stored_oauth_token_ref(
+            target_provider, target_auth_mode, stored_secret_ref
+        )
         db_account.token_created_at = _utcnow()
 
     if "provider" in payload or "auth_mode" in payload:
@@ -705,9 +823,15 @@ async def update_max_plan_account(
             mem_account["claude_config_json"] = db_account.claude_config_json
             mem_account["daily_task_cap"] = db_account.daily_task_cap
             mem_account["max_concurrent_tasks"] = db_account.max_concurrent_tasks
-            mem_account["auto_disable_after_rate_limits"] = db_account.auto_disable_after_rate_limits
+            mem_account["auto_disable_after_rate_limits"] = (
+                db_account.auto_disable_after_rate_limits
+            )
             mem_account["disabled_reason"] = db_account.disabled_reason
-            if normalized_secret is not None or "provider" in payload or "auth_mode" in payload:
+            if (
+                normalized_secret is not None
+                or "provider" in payload
+                or "auth_mode" in payload
+            ):
                 mem_account["runtime_secret"] = normalized_secret
                 mem_account["runtime_ready"] = bool(normalized_secret)
                 mem_account["oauth_token"] = _runtime_pool_secret(
@@ -716,15 +840,15 @@ async def update_max_plan_account(
                     normalized_secret,
                 )
                 mem_account["token_created_at"] = (
-                    db_account.token_created_at.isoformat() if db_account.token_created_at else None
+                    db_account.token_created_at.isoformat()
+                    if db_account.token_created_at
+                    else None
                 )
 
     # When the secret/provider/auth-mode change, the prior availability snapshot
     # is no longer valid — re-probe so the dispatcher's filter stays accurate.
     secret_or_identity_changed = (
-        normalized_secret is not None
-        or "provider" in payload
-        or "auth_mode" in payload
+        normalized_secret is not None or "provider" in payload or "auth_mode" in payload
     )
     if secret_or_identity_changed and mem_account is not None:
         await _best_effort_refresh_availability(
@@ -742,7 +866,11 @@ async def update_max_plan_account(
         "daily_task_cap": db_account.daily_task_cap,
         "max_concurrent_tasks": db_account.max_concurrent_tasks,
         "auto_disable_after_rate_limits": db_account.auto_disable_after_rate_limits,
-        "available_models": ((mem_account or {}).get("provider_metadata") or {}).get("available_models") if mem_account else None,
+        "available_models": ((mem_account or {}).get("provider_metadata") or {}).get(
+            "available_models"
+        )
+        if mem_account
+        else None,
     }
 
 
@@ -753,7 +881,11 @@ async def reset_account_rate_limits(
     current_user: dict = Depends(get_current_user),
 ):
     """Clear all rate-limit state (disabled_models) for a Max plan account."""
-    from app.max_plan_pool import _account_by_id, _max_plan_pool_lock, _pending_rl_persists
+    from app.max_plan_pool import (
+        _account_by_id,
+        _max_plan_pool_lock,
+        _pending_rl_persists,
+    )
 
     try:
         acct_uuid = uuid.UUID(account_id)
@@ -783,7 +915,9 @@ async def reset_account_rate_limits(
     if account_id in _pending_rl_persists:
         _pending_rl_persists.remove(account_id)
 
-    logger.info(f"[POOL] Rate-limit state reset for account {db_account.name} ({account_id}) by user {current_user['user_id']}")
+    logger.info(
+        f"[POOL] Rate-limit state reset for account {db_account.name} ({account_id}) by user {current_user['user_id']}"
+    )
     return {"message": f"Rate-limit state cleared for account {db_account.name}"}
 
 
@@ -819,7 +953,9 @@ async def clear_account_model_regression_quarantine(
     if not provider.strip() or not model.strip():
         raise _bad_request("provider and model are required")
 
-    cleared = await clear_account_model_regression(account_id, model.strip(), provider.strip())
+    cleared = await clear_account_model_regression(
+        account_id, model.strip(), provider.strip()
+    )
     if not cleared:
         # No-op when (a) the entry doesn't exist or (b) it exists but isn't
         # regression-kind — surface a 404 so callers know the override was
@@ -876,7 +1012,9 @@ async def refresh_account_model_availability(
 
     mem_account = _account_by_id.get(account_id)
     if not mem_account:
-        raise HTTPException(status_code=409, detail="Account not loaded in pool; restart or re-add")
+        raise HTTPException(
+            status_code=409, detail="Account not loaded in pool; restart or re-add"
+        )
 
     # The in-memory account carries `runtime_secret` — the raw secret or a
     # Secret-Manager-resolved string, populated at pool load. When that's None
@@ -897,14 +1035,18 @@ async def refresh_account_model_availability(
         session.add(db_account)
         await session.commit()
 
-    known_preview = sorted(
-        m for m in (models or []) if m in _GEMINI_PREVIEW_MODELS
-    ) if db_account.provider == LLMProviderName.GEMINI else []
+    known_preview = (
+        sorted(m for m in (models or []) if m in _GEMINI_PREVIEW_MODELS)
+        if db_account.provider == LLMProviderName.GEMINI
+        else []
+    )
 
     logger.info(
         "[POOL] refresh-models for account %s: %s",
         account_id,
-        f"{len(models)} models" if models is not None else f"failed ({updated_metadata.get('available_models_error')})",
+        f"{len(models)} models"
+        if models is not None
+        else f"failed ({updated_metadata.get('available_models_error')})",
     )
 
     return {

@@ -14,10 +14,11 @@ _PROVIDERS: dict[LLMProviderName, LLMProvider] = {
 
 
 def get_provider(provider: LLMProviderName | str) -> LLMProvider:
-    provider_name = provider if isinstance(provider, LLMProviderName) else LLMProviderName(provider)
+    provider_name = (
+        provider if isinstance(provider, LLMProviderName) else LLMProviderName(provider)
+    )
     return _PROVIDERS[provider_name]
 
 
 def list_providers() -> tuple[LLMProvider, ...]:
     return tuple(_PROVIDERS.values())
-

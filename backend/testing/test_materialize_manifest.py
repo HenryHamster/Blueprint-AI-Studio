@@ -10,6 +10,7 @@ assertion failures point at concrete lines. The file-writing half that
 touches /etc and chowns to the agent user is exercised in a second
 test with a temp working dir and monkeypatched uid/gid lookup.
 """
+
 from __future__ import annotations
 
 import json
@@ -60,7 +61,7 @@ class TestEnvFileMaterialization:
         manifest = _write_manifest(
             tmp_path,
             env={
-                "CONFIG": 'line1\nline2',
+                "CONFIG": "line1\nline2",
                 "QUOTED": 'has "inner" quotes',
                 "BACKSLASH": r"path\with\backslashes",
             },
@@ -122,7 +123,9 @@ class TestFileMaterialization:
         monkeypatch.setattr(
             materialize_manifest,
             "_lookup_uid_gid",
-            lambda _user: (os.getuid(), os.getgid()) if hasattr(os, "getuid") else (0, 0),
+            lambda _user: (
+                (os.getuid(), os.getgid()) if hasattr(os, "getuid") else (0, 0)
+            ),
         )
         target = tmp_path / "empty"
         manifest = _write_manifest(
@@ -151,7 +154,9 @@ class TestFileMaterialization:
         monkeypatch.setattr(
             materialize_manifest,
             "_lookup_uid_gid",
-            lambda _user: (os.getuid(), os.getgid()) if hasattr(os, "getuid") else (0, 0),
+            lambda _user: (
+                (os.getuid(), os.getgid()) if hasattr(os, "getuid") else (0, 0)
+            ),
         )
 
         # Two levels of missing parents — simulates /home/agent/.gemini/sub/x
@@ -191,7 +196,9 @@ class TestFileMaterialization:
         monkeypatch.setattr(
             materialize_manifest,
             "_lookup_uid_gid",
-            lambda _user: (os.getuid(), os.getgid()) if hasattr(os, "getuid") else (0, 0),
+            lambda _user: (
+                (os.getuid(), os.getgid()) if hasattr(os, "getuid") else (0, 0)
+            ),
         )
 
         # Parent already exists — simulates /home/agent/.claude.json
@@ -237,6 +244,7 @@ class TestNssBypass:
         # — but here we just call _lookup_uid_gid against the real files.
         # On any system that has a current user in passwd, this will succeed.
         import pwd
+
         me = pwd.getpwuid(os.getuid()).pw_name if hasattr(os, "getuid") else "root"
         # Roll back the boom patch just for getpwuid, which we used above
         # to find the test user name. Then re-apply for the real call.
@@ -247,9 +255,7 @@ class TestNssBypass:
 
     def test_lookup_raises_on_missing_user(self, tmp_path: Path):
         with pytest.raises(RuntimeError, match="missing from /etc/passwd"):
-            materialize_manifest._lookup_uid_gid(
-                "definitely-not-a-real-user-2x4f6z8q"
-            )
+            materialize_manifest._lookup_uid_gid("definitely-not-a-real-user-2x4f6z8q")
 
 
 class TestCLIContract:
@@ -285,6 +291,7 @@ class TestBase64EmbeddingIsStable:
 
     def test_base64_roundtrip(self):
         import base64
+
         path = Path(materialize_manifest.__file__)
         raw = path.read_bytes()
         encoded = base64.b64encode(raw).decode("ascii")

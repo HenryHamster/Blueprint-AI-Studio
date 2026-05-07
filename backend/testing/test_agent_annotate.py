@@ -7,6 +7,7 @@ strategic decision. Server returns the policy-driven new_limit so the
 agent can apply it to module_size_limits.json without any judgment of
 its own.
 """
+
 import pytest
 from httpx import AsyncClient
 from sqlalchemy import select
@@ -14,13 +15,18 @@ from sqlalchemy import select
 from app.auth import create_agent_token
 from app.main import _bump_size_limit
 from app.models import (
-    MessageType, Project, ProjectMessage, Task, TaskStatus,
+    MessageType,
+    Project,
+    ProjectMessage,
+    Task,
+    TaskStatus,
 )
 
 
 @pytest.mark.asyncio
 async def test_size_breach_creates_structured_message_and_returns_new_limit(
-    client: AsyncClient, db_session,
+    client: AsyncClient,
+    db_session,
 ):
     """size_breach annotation persists structured fields in ProjectMessage.context
     and returns new_limit so the agent can apply it to the JSON."""
@@ -30,8 +36,10 @@ async def test_size_breach_creates_structured_message_and_returns_new_limit(
     await db_session.refresh(project)
 
     task = Task(
-        project_id=project.id, payloads=[{"cmd": "ls"}],
-        vm_instance_id="agent-vm-sb1", status=TaskStatus.IN_PROGRESS,
+        project_id=project.id,
+        payloads=[{"cmd": "ls"}],
+        vm_instance_id="agent-vm-sb1",
+        status=TaskStatus.IN_PROGRESS,
     )
     db_session.add(task)
     await db_session.commit()
@@ -55,9 +63,15 @@ async def test_size_breach_creates_structured_message_and_returns_new_limit(
     assert body["new_limit"] == _bump_size_limit(1720)
 
     # Persisted as a FEEDBACK ProjectMessage with structured context.
-    msgs = (await db_session.execute(
-        select(ProjectMessage).where(ProjectMessage.from_task_id == task.id)
-    )).scalars().all()
+    msgs = (
+        (
+            await db_session.execute(
+                select(ProjectMessage).where(ProjectMessage.from_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
     assert len(msgs) == 1
     msg = msgs[0]
     assert msg.message_type == MessageType.FEEDBACK
@@ -71,15 +85,18 @@ async def test_size_breach_creates_structured_message_and_returns_new_limit(
 
 @pytest.mark.asyncio
 async def test_size_breach_rejects_missing_required_fields(
-    client: AsyncClient, db_session,
+    client: AsyncClient,
+    db_session,
 ):
     project = Project(name="Size Breach Missing", user_id="test-user-123")
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
     task = Task(
-        project_id=project.id, payloads=[{"cmd": "ls"}],
-        vm_instance_id="agent-vm-sb2", status=TaskStatus.IN_PROGRESS,
+        project_id=project.id,
+        payloads=[{"cmd": "ls"}],
+        vm_instance_id="agent-vm-sb2",
+        status=TaskStatus.IN_PROGRESS,
     )
     db_session.add(task)
     await db_session.commit()
@@ -88,7 +105,7 @@ async def test_size_breach_rejects_missing_required_fields(
 
     def _err_message(resp) -> str:
         body = resp.json()
-        return (body.get("detail") or body.get("error", {}).get("message") or "")
+        return body.get("detail") or body.get("error", {}).get("message") or ""
 
     # Missing file_path.
     resp = await client.post(
@@ -135,7 +152,8 @@ async def test_size_breach_rejects_missing_required_fields(
 
 @pytest.mark.asyncio
 async def test_existing_annotation_types_still_work(
-    client: AsyncClient, db_session,
+    client: AsyncClient,
+    db_session,
 ):
     """Regression: size_breach addition must not break comment/issue/vision."""
     project = Project(name="Annotation Backcompat", user_id="test-user-123")
@@ -143,8 +161,10 @@ async def test_existing_annotation_types_still_work(
     await db_session.commit()
     await db_session.refresh(project)
     task = Task(
-        project_id=project.id, payloads=[{"cmd": "ls"}],
-        vm_instance_id="agent-vm-sb3", status=TaskStatus.IN_PROGRESS,
+        project_id=project.id,
+        payloads=[{"cmd": "ls"}],
+        vm_instance_id="agent-vm-sb3",
+        status=TaskStatus.IN_PROGRESS,
     )
     db_session.add(task)
     await db_session.commit()
@@ -167,9 +187,15 @@ async def test_existing_annotation_types_still_work(
         )
         assert resp.status_code == 200, f"{ann_type}: {resp.text}"
 
-    msgs = (await db_session.execute(
-        select(ProjectMessage).where(ProjectMessage.from_task_id == task.id)
-    )).scalars().all()
+    msgs = (
+        (
+            await db_session.execute(
+                select(ProjectMessage).where(ProjectMessage.from_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
     assert len(msgs) == 3
     by_type = {m.context["annotation_type"]: m for m in msgs}
     assert by_type["comment"].message_type == MessageType.NOTE
@@ -196,6 +222,7 @@ def test_size_limits_json_loaded_into_test_invariants():
     """test_invariants reads limits from module_size_limits.json — neither dict
     can be empty if the JSON loaded correctly."""
     from testing.test_invariants import MODULE_SIZE_LIMITS, FRONTEND_SIZE_LIMITS
+
     assert "main.py" in MODULE_SIZE_LIMITS
     assert "components/DashboardHome.tsx" in FRONTEND_SIZE_LIMITS
     assert isinstance(MODULE_SIZE_LIMITS["main.py"], int)

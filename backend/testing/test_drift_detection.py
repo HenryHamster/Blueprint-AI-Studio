@@ -11,6 +11,7 @@ Synthetic claims-vs-shipped fixtures verify:
  - persist_drift_snapshot writes rows, emits drift alerts, and prunes excess history
  - last_n_drift_snapshots returns newest-first ordered rows
 """
+
 import uuid
 from datetime import timedelta
 from unittest.mock import patch
@@ -26,7 +27,15 @@ from app.drift_detection import (
     last_n_drift_snapshots,
     persist_drift_snapshot,
 )
-from app.models import Alert, AlertSeverity, Artifact, ArtifactType, Project, Task, TaskStatus
+from app.models import (
+    Alert,
+    AlertSeverity,
+    Artifact,
+    ArtifactType,
+    Project,
+    Task,
+    TaskStatus,
+)
 from app.time_utils import _utcnow
 
 
@@ -60,7 +69,9 @@ async def _make_completed_task(
         description="",
         status=TaskStatus.COMPLETED,
         created_by="ORCHESTRATOR",
-        payloads=[{"type": "create", "prompt": "test", "current_direction_id": direction_id}],
+        payloads=[
+            {"type": "create", "prompt": "test", "current_direction_id": direction_id}
+        ],
         context=ctx,
         plan_output=plan_output or {"summary": "Shipped a thing"},
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
@@ -102,17 +113,21 @@ async def project_with_directions(db_session):
 
 # ── Test 1: Healthy direction — high consistency, no flags ─────────────────
 
+
 @pytest.mark.asyncio
 async def test_healthy_direction_returns_high_consistency_no_flags(
-    db_session, project_with_directions,
+    db_session,
+    project_with_directions,
 ):
     """4 claims + 4 merged PRs → consistency=1.0, no flags."""
     project = project_with_directions
     for _ in range(4):
         await _make_completed_task(
-            db_session, project,
+            db_session,
+            project,
             direction_id="d-healthy",
-            pr_merged=True, has_pr_artifact=True,
+            pr_merged=True,
+            has_pr_artifact=True,
         )
 
     drift = await compute_direction_drift(db_session, project)
@@ -126,21 +141,29 @@ async def test_healthy_direction_returns_high_consistency_no_flags(
 
 # ── Test 2: Over-claimer — many claims, few merges → over_claim_flag ───────
 
+
 @pytest.mark.asyncio
 async def test_over_claimer_sets_over_claim_flag(
-    db_session, project_with_directions,
+    db_session,
+    project_with_directions,
 ):
     """5 claims + 1 merged → consistency=0.2, over_claim_flag set."""
     project = project_with_directions
     # 5 tasks claim shipped, only 1 has merged PR
     await _make_completed_task(
-        db_session, project, direction_id="d-overclaim",
-        pr_merged=True, has_pr_artifact=True,
+        db_session,
+        project,
+        direction_id="d-overclaim",
+        pr_merged=True,
+        has_pr_artifact=True,
     )
     for _ in range(4):
         await _make_completed_task(
-            db_session, project, direction_id="d-overclaim",
-            pr_merged=False, has_pr_artifact=False,
+            db_session,
+            project,
+            direction_id="d-overclaim",
+            pr_merged=False,
+            has_pr_artifact=False,
         )
 
     drift = await compute_direction_drift(db_session, project)
@@ -154,16 +177,21 @@ async def test_over_claimer_sets_over_claim_flag(
 
 # ── Test 3: Stalled-despite-churn — claims but zero merges ────────────────
 
+
 @pytest.mark.asyncio
 async def test_stalled_direction_sets_stalled_flag(
-    db_session, project_with_directions,
+    db_session,
+    project_with_directions,
 ):
     """5 claims + 0 merged → stalled_despite_churn_flag set."""
     project = project_with_directions
     for _ in range(5):
         await _make_completed_task(
-            db_session, project, direction_id="d-stalled",
-            pr_merged=False, has_pr_artifact=False,
+            db_session,
+            project,
+            direction_id="d-stalled",
+            pr_merged=False,
+            has_pr_artifact=False,
         )
 
     drift = await compute_direction_drift(db_session, project)
@@ -178,9 +206,11 @@ async def test_stalled_direction_sets_stalled_flag(
 
 # ── Test 4: No-data direction — returns neutral signal ─────────────────────
 
+
 @pytest.mark.asyncio
 async def test_no_data_direction_returns_neutral_signal(
-    db_session, project_with_directions,
+    db_session,
+    project_with_directions,
 ):
     """Direction with no in-window tasks gets a neutral signal."""
     project = project_with_directions
@@ -197,27 +227,38 @@ async def test_no_data_direction_returns_neutral_signal(
 
 # ── Test 5: Per-system rollup correctness ──────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_per_system_rollup_aggregates_directions(
-    db_session, project_with_directions,
+    db_session,
+    project_with_directions,
 ):
     """sys-alpha = d-healthy (4/4) + d-overclaim (5/1) → 9 claims, 5 merged."""
     project = project_with_directions
     # d-healthy: 4 claims, 4 merged
     for _ in range(4):
         await _make_completed_task(
-            db_session, project, direction_id="d-healthy",
-            pr_merged=True, has_pr_artifact=True,
+            db_session,
+            project,
+            direction_id="d-healthy",
+            pr_merged=True,
+            has_pr_artifact=True,
         )
     # d-overclaim: 5 claims, 1 merged
     await _make_completed_task(
-        db_session, project, direction_id="d-overclaim",
-        pr_merged=True, has_pr_artifact=True,
+        db_session,
+        project,
+        direction_id="d-overclaim",
+        pr_merged=True,
+        has_pr_artifact=True,
     )
     for _ in range(4):
         await _make_completed_task(
-            db_session, project, direction_id="d-overclaim",
-            pr_merged=False, has_pr_artifact=False,
+            db_session,
+            project,
+            direction_id="d-overclaim",
+            pr_merged=False,
+            has_pr_artifact=False,
         )
 
     drift = await compute_direction_drift(db_session, project)
@@ -236,23 +277,33 @@ async def test_per_system_rollup_aggregates_directions(
 
 # ── Test 6: Old PRs outside window are excluded ────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_window_excludes_older_tasks(
-    db_session, project_with_directions,
+    db_session,
+    project_with_directions,
 ):
     """Tasks older than window_days are excluded entirely."""
     project = project_with_directions
     # 3 in-window tasks (1h ago)
     for _ in range(3):
         await _make_completed_task(
-            db_session, project, direction_id="d-healthy",
-            pr_merged=True, has_pr_artifact=True, age_hours=1,
+            db_session,
+            project,
+            direction_id="d-healthy",
+            pr_merged=True,
+            has_pr_artifact=True,
+            age_hours=1,
         )
     # 5 out-of-window tasks (10 days ago)
     for _ in range(5):
         await _make_completed_task(
-            db_session, project, direction_id="d-healthy",
-            pr_merged=False, has_pr_artifact=False, age_hours=240,
+            db_session,
+            project,
+            direction_id="d-healthy",
+            pr_merged=False,
+            has_pr_artifact=False,
+            age_hours=240,
         )
 
     drift = await compute_direction_drift(db_session, project, window_days=7)
@@ -262,6 +313,7 @@ async def test_window_excludes_older_tasks(
 
 
 # ── Test 7: Empty project → empty signal dicts ─────────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_empty_project_returns_empty_dicts(db_session):
@@ -284,6 +336,7 @@ async def test_empty_project_returns_empty_dicts(db_session):
 
 # ── Test 8: Direction without system_id only contributes to by_direction ───
 
+
 @pytest.mark.asyncio
 async def test_direction_without_system_id_skips_system_rollup(db_session):
     """Directions without system_id appear in by_direction but not by_system."""
@@ -297,8 +350,11 @@ async def test_direction_without_system_id_skips_system_rollup(db_session):
     await db_session.commit()
     await db_session.refresh(project)
     await _make_completed_task(
-        db_session, project, direction_id="d-orphan",
-        pr_merged=True, has_pr_artifact=True,
+        db_session,
+        project,
+        direction_id="d-orphan",
+        pr_merged=True,
+        has_pr_artifact=True,
     )
 
     drift = await compute_direction_drift(db_session, project)
@@ -307,6 +363,7 @@ async def test_direction_without_system_id_skips_system_rollup(db_session):
 
 
 # ── Test 9: persist_drift_snapshot writes one row per direction ────────────
+
 
 @pytest.mark.asyncio
 async def test_persist_drift_snapshot_writes_rows(db_session):
@@ -326,12 +383,16 @@ async def test_persist_drift_snapshot_writes_rows(db_session):
     await db_session.commit()
 
     rows = (
-        await db_session.execute(
-            select(DirectionDriftSnapshot).where(
-                DirectionDriftSnapshot.project_id == project.id
+        (
+            await db_session.execute(
+                select(DirectionDriftSnapshot).where(
+                    DirectionDriftSnapshot.project_id == project.id
+                )
             )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     assert len(rows) == 2
     direction_ids = {r.direction_id for r in rows}
     assert direction_ids == {"d-a", "d-b"}
@@ -342,6 +403,7 @@ async def test_persist_drift_snapshot_writes_rows(db_session):
 
 
 # ── Test 10: persist_drift_snapshot prunes to retention limit ─────────────
+
 
 @pytest.mark.asyncio
 async def test_persist_drift_snapshot_prunes_excess(db_session):
@@ -387,6 +449,7 @@ async def test_persist_drift_snapshot_prunes_excess(db_session):
 
 # ── Test 11: persist_drift_snapshot is a no-op for empty drift ────────────
 
+
 @pytest.mark.asyncio
 async def test_persist_drift_snapshot_noop_on_empty(db_session):
     """persist_drift_snapshot does nothing when by_direction is empty."""
@@ -404,16 +467,21 @@ async def test_persist_drift_snapshot_noop_on_empty(db_session):
     await db_session.commit()
 
     rows = (
-        await db_session.execute(
-            select(DirectionDriftSnapshot).where(
-                DirectionDriftSnapshot.project_id == project.id
+        (
+            await db_session.execute(
+                select(DirectionDriftSnapshot).where(
+                    DirectionDriftSnapshot.project_id == project.id
+                )
             )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     assert rows == []
 
 
 # ── Test 12: last_n_drift_snapshots returns newest-first ─────────────────
+
 
 @pytest.mark.asyncio
 async def test_last_n_drift_snapshots_returns_newest_first(db_session):
@@ -469,6 +537,7 @@ async def test_last_n_drift_snapshots_returns_newest_first(db_session):
 
 # ── Test 13: Non-default thresholds from runtime_config are respected ───────
 
+
 @pytest.mark.asyncio
 async def test_custom_thresholds_from_runtime_config_are_respected(db_session):
     """Lowered over_claim_min_claims=2 should flag a direction with 2 claims, 0 merges."""
@@ -485,8 +554,11 @@ async def test_custom_thresholds_from_runtime_config_are_respected(db_session):
     # 2 tasks claim shipped, none merged — won't flag with default min=3, will with min=2
     for _ in range(2):
         await _make_completed_task(
-            db_session, project, direction_id="d-threshold",
-            pr_merged=False, has_pr_artifact=False,
+            db_session,
+            project,
+            direction_id="d-threshold",
+            pr_merged=False,
+            has_pr_artifact=False,
         )
 
     patched_config = {
@@ -499,11 +571,16 @@ async def test_custom_thresholds_from_runtime_config_are_respected(db_session):
 
     sig = drift["by_direction"]["d-threshold"]
     assert sig["claimed_changes_count"] == 2
-    assert sig["over_claim_flag"] is True, "lowered threshold should trigger over_claim_flag"
-    assert sig["stalled_despite_churn_flag"] is True, "lowered stall_min should trigger stalled flag"
+    assert sig["over_claim_flag"] is True, (
+        "lowered threshold should trigger over_claim_flag"
+    )
+    assert sig["stalled_despite_churn_flag"] is True, (
+        "lowered stall_min should trigger stalled flag"
+    )
 
 
 # ── Test 14: drift_history_series returns serialised sparkline data ─────────
+
 
 @pytest.mark.asyncio
 async def test_drift_history_series_returns_serialised_sparkline_data(db_session):
@@ -567,6 +644,7 @@ async def test_drift_history_series_returns_serialised_sparkline_data(db_session
 
 # ── Tests for Alert creation on drift flags ────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_no_drift_creates_no_alert(db_session):
     """persist_drift_snapshot with no flags creates no Alert rows."""
@@ -580,17 +658,25 @@ async def test_no_drift_creates_no_alert(db_session):
     await db_session.commit()
     await db_session.refresh(project)
 
-    neutral = {"by_direction": {"d-clean": {
-        "claimed_changes_count": 0, "actually_merged_prs": 0,
-        "claim_shipped_consistency": 1.0, "over_claim_flag": False,
-        "stalled_despite_churn_flag": False,
-    }}}
+    neutral = {
+        "by_direction": {
+            "d-clean": {
+                "claimed_changes_count": 0,
+                "actually_merged_prs": 0,
+                "claim_shipped_consistency": 1.0,
+                "over_claim_flag": False,
+                "stalled_despite_churn_flag": False,
+            }
+        }
+    }
     await persist_drift_snapshot(db_session, project, neutral)
     await db_session.commit()
 
     alerts = (
-        await db_session.execute(select(Alert).where(Alert.project_id == project.id))
-    ).scalars().all()
+        (await db_session.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
     assert alerts == []
 
 
@@ -607,17 +693,25 @@ async def test_over_claim_flag_creates_warning_alert(db_session):
     await db_session.commit()
     await db_session.refresh(project)
 
-    flagged = {"by_direction": {"d-oc": {
-        "claimed_changes_count": 5, "actually_merged_prs": 1,
-        "claim_shipped_consistency": 0.2, "over_claim_flag": True,
-        "stalled_despite_churn_flag": False,
-    }}}
+    flagged = {
+        "by_direction": {
+            "d-oc": {
+                "claimed_changes_count": 5,
+                "actually_merged_prs": 1,
+                "claim_shipped_consistency": 0.2,
+                "over_claim_flag": True,
+                "stalled_despite_churn_flag": False,
+            }
+        }
+    }
     await persist_drift_snapshot(db_session, project, flagged)
     await db_session.commit()
 
     alerts = (
-        await db_session.execute(select(Alert).where(Alert.project_id == project.id))
-    ).scalars().all()
+        (await db_session.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
     assert len(alerts) == 1
     assert alerts[0].severity == AlertSeverity.WARNING
     assert "over-claim drift" in alerts[0].title
@@ -639,19 +733,27 @@ async def test_repeated_drift_flag_no_duplicate_alert(db_session):
     await db_session.commit()
     await db_session.refresh(project)
 
-    flagged = {"by_direction": {"d-dup": {
-        "claimed_changes_count": 4, "actually_merged_prs": 0,
-        "claim_shipped_consistency": 0.0, "over_claim_flag": True,
-        "stalled_despite_churn_flag": False,
-    }}}
+    flagged = {
+        "by_direction": {
+            "d-dup": {
+                "claimed_changes_count": 4,
+                "actually_merged_prs": 0,
+                "claim_shipped_consistency": 0.0,
+                "over_claim_flag": True,
+                "stalled_despite_churn_flag": False,
+            }
+        }
+    }
     await persist_drift_snapshot(db_session, project, flagged)
     await db_session.commit()
     await persist_drift_snapshot(db_session, project, flagged)
     await db_session.commit()
 
     alerts = (
-        await db_session.execute(select(Alert).where(Alert.project_id == project.id))
-    ).scalars().all()
+        (await db_session.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
     assert len(alerts) == 1, "second persist should not create a duplicate alert"
 
 
@@ -668,24 +770,38 @@ async def test_flag_cleared_no_new_alert(db_session):
     await db_session.commit()
     await db_session.refresh(project)
 
-    flagged = {"by_direction": {"d-clear": {
-        "claimed_changes_count": 3, "actually_merged_prs": 0,
-        "claim_shipped_consistency": 0.0, "over_claim_flag": True,
-        "stalled_despite_churn_flag": False,
-    }}}
-    neutral = {"by_direction": {"d-clear": {
-        "claimed_changes_count": 0, "actually_merged_prs": 0,
-        "claim_shipped_consistency": 1.0, "over_claim_flag": False,
-        "stalled_despite_churn_flag": False,
-    }}}
+    flagged = {
+        "by_direction": {
+            "d-clear": {
+                "claimed_changes_count": 3,
+                "actually_merged_prs": 0,
+                "claim_shipped_consistency": 0.0,
+                "over_claim_flag": True,
+                "stalled_despite_churn_flag": False,
+            }
+        }
+    }
+    neutral = {
+        "by_direction": {
+            "d-clear": {
+                "claimed_changes_count": 0,
+                "actually_merged_prs": 0,
+                "claim_shipped_consistency": 1.0,
+                "over_claim_flag": False,
+                "stalled_despite_churn_flag": False,
+            }
+        }
+    }
     await persist_drift_snapshot(db_session, project, flagged)
     await db_session.commit()
     await persist_drift_snapshot(db_session, project, neutral)
     await db_session.commit()
 
     alerts = (
-        await db_session.execute(select(Alert).where(Alert.project_id == project.id))
-    ).scalars().all()
+        (await db_session.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
     assert len(alerts) == 1, "neutral snapshot should not create additional alerts"
 
 
@@ -703,17 +819,25 @@ async def test_stalled_flag_creates_warning_alert(db_session):
     await db_session.refresh(project)
 
     # Use patched thresholds so only stalled fires (over_claim_min raised above claimed)
-    flagged = {"by_direction": {"d-stall-alert": {
-        "claimed_changes_count": 5, "actually_merged_prs": 0,
-        "claim_shipped_consistency": 0.0, "over_claim_flag": False,
-        "stalled_despite_churn_flag": True,
-    }}}
+    flagged = {
+        "by_direction": {
+            "d-stall-alert": {
+                "claimed_changes_count": 5,
+                "actually_merged_prs": 0,
+                "claim_shipped_consistency": 0.0,
+                "over_claim_flag": False,
+                "stalled_despite_churn_flag": True,
+            }
+        }
+    }
     await persist_drift_snapshot(db_session, project, flagged)
     await db_session.commit()
 
     alerts = (
-        await db_session.execute(select(Alert).where(Alert.project_id == project.id))
-    ).scalars().all()
+        (await db_session.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
     assert len(alerts) == 1
     assert alerts[0].severity == AlertSeverity.WARNING
     assert "stalled-despite-churn drift" in alerts[0].title
@@ -733,17 +857,25 @@ async def test_both_flags_create_two_alerts(db_session):
     await db_session.commit()
     await db_session.refresh(project)
 
-    flagged = {"by_direction": {"d-both": {
-        "claimed_changes_count": 5, "actually_merged_prs": 0,
-        "claim_shipped_consistency": 0.0, "over_claim_flag": True,
-        "stalled_despite_churn_flag": True,
-    }}}
+    flagged = {
+        "by_direction": {
+            "d-both": {
+                "claimed_changes_count": 5,
+                "actually_merged_prs": 0,
+                "claim_shipped_consistency": 0.0,
+                "over_claim_flag": True,
+                "stalled_despite_churn_flag": True,
+            }
+        }
+    }
     await persist_drift_snapshot(db_session, project, flagged)
     await db_session.commit()
 
     alerts = (
-        await db_session.execute(select(Alert).where(Alert.project_id == project.id))
-    ).scalars().all()
+        (await db_session.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
     assert len(alerts) == 2
     titles = {a.title for a in alerts}
     assert any("over-claim drift" in t for t in titles)

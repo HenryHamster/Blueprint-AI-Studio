@@ -11,6 +11,7 @@ factor in [0.5, 1.0], and the product gives the composite probability.
 Extreme values in any single dimension can still drive the composite below
 the escalation threshold.
 """
+
 from app.cochange_decomposition import (
     cluster_files_by_cochange as _cluster_files_by_cochange,
 )
@@ -24,7 +25,9 @@ def _is_auto_generated(path: str) -> bool:
 
 
 def _composite_complexity_score(
-    related_files: list[str], direction: dict | None, cochange_index: dict | None,
+    related_files: list[str],
+    direction: dict | None,
+    cochange_index: dict | None,
 ) -> tuple[float, dict]:
     """Estimate P(merge) in [0,1] as a product of per-dimension factors.
 
@@ -40,8 +43,12 @@ def _composite_complexity_score(
     ratio = 0.0
     f_ratio = 1.0
     if direction and n > 0:
-        rs = [(e.get("scope_breakdown") or {}).get("medium", {}).get("avg_expansion_ratio")
-              for e in (direction.get("research_history") or [])[-3:]]
+        rs = [
+            (e.get("scope_breakdown") or {})
+            .get("medium", {})
+            .get("avg_expansion_ratio")
+            for e in (direction.get("research_history") or [])[-3:]
+        ]
         rs = [float(r) for r in rs if isinstance(r, (int, float))]
         if rs:
             ratio = sum(rs) / len(rs)
@@ -54,7 +61,9 @@ def _composite_complexity_score(
             f_clusters = 0.9
         elif len(clusters) > 1:
             f_clusters = max(0.5, 1.0 - 0.08 * (len(clusters) - 1))
-    modules = {"/".join(f.split("/", 2)[:2]) if "/" in f else f for f in (related_files or [])}
+    modules = {
+        "/".join(f.split("/", 2)[:2]) if "/" in f else f for f in (related_files or [])
+    }
     # modules=1 → 1.0; modules=5+ → floor 0.5.
     f_modules = max(0.5, 1.0 - 0.125 * max(0, len(modules) - 1))
     neighbor_ratio = 0.0

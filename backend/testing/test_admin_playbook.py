@@ -23,7 +23,9 @@ async def project_with_member(db_session):
 
 @pytest.mark.smoketest
 @pytest.mark.asyncio
-async def test_admin_playbook_list(client: AsyncClient, db_session, project_with_member):
+async def test_admin_playbook_list(
+    client: AsyncClient, db_session, project_with_member
+):
     """GET /playbook returns entries with metadata."""
     project = project_with_member
 
@@ -62,7 +64,9 @@ async def test_admin_playbook_list(client: AsyncClient, db_session, project_with
 
 @pytest.mark.smoketest
 @pytest.mark.asyncio
-async def test_admin_playbook_list_empty(client: AsyncClient, db_session, project_with_member):
+async def test_admin_playbook_list_empty(
+    client: AsyncClient, db_session, project_with_member
+):
     """GET /playbook returns empty entries when no playbook keys exist."""
     resp = await client.get(f"/api/admin/projects/{project_with_member.id}/playbook")
     assert resp.status_code == 200
@@ -97,7 +101,9 @@ async def test_admin_playbook_set(client: AsyncClient, db_session, project_with_
 
 @pytest.mark.smoketest
 @pytest.mark.asyncio
-async def test_admin_playbook_set_update(client: AsyncClient, db_session, project_with_member):
+async def test_admin_playbook_set_update(
+    client: AsyncClient, db_session, project_with_member
+):
     """PUT /playbook updates an existing entry, preserving confirmed_count."""
     project = project_with_member
     project.design_doc = {
@@ -127,7 +133,9 @@ async def test_admin_playbook_set_update(client: AsyncClient, db_session, projec
 
 @pytest.mark.smoketest
 @pytest.mark.asyncio
-async def test_admin_playbook_delete(client: AsyncClient, db_session, project_with_member):
+async def test_admin_playbook_delete(
+    client: AsyncClient, db_session, project_with_member
+):
     """DELETE /playbook/{key} removes the entry."""
     project = project_with_member
     project.design_doc = {
@@ -154,7 +162,9 @@ async def test_admin_playbook_delete(client: AsyncClient, db_session, project_wi
 
 @pytest.mark.smoketest
 @pytest.mark.asyncio
-async def test_admin_playbook_delete_404(client: AsyncClient, db_session, project_with_member):
+async def test_admin_playbook_delete_404(
+    client: AsyncClient, db_session, project_with_member
+):
     """DELETE /playbook/{key} returns 404 for missing key."""
     resp = await client.delete(
         f"/api/admin/projects/{project_with_member.id}/playbook/does-not-exist"
@@ -164,7 +174,9 @@ async def test_admin_playbook_delete_404(client: AsyncClient, db_session, projec
 
 @pytest.mark.smoketest
 @pytest.mark.asyncio
-async def test_admin_playbook_seed(client: AsyncClient, db_session, project_with_member):
+async def test_admin_playbook_seed(
+    client: AsyncClient, db_session, project_with_member
+):
     """POST /seed populates all default entries on an empty playbook."""
     project = project_with_member
 
@@ -192,7 +204,9 @@ async def test_admin_playbook_seed(client: AsyncClient, db_session, project_with
 
 @pytest.mark.smoketest
 @pytest.mark.asyncio
-async def test_admin_playbook_seed_skips_existing(client: AsyncClient, db_session, project_with_member):
+async def test_admin_playbook_seed_skips_existing(
+    client: AsyncClient, db_session, project_with_member
+):
     """POST /seed skips entries that already exist."""
     project = project_with_member
     project.design_doc = {
@@ -221,7 +235,9 @@ async def test_admin_playbook_seed_skips_existing(client: AsyncClient, db_sessio
 
 @pytest.mark.smoketest
 @pytest.mark.asyncio
-async def test_admin_playbook_size_limits(client: AsyncClient, db_session, project_with_member):
+async def test_admin_playbook_size_limits(
+    client: AsyncClient, db_session, project_with_member
+):
     """PUT /playbook rejects values over 2048 bytes and invalid key formats."""
     project = project_with_member
 
@@ -251,7 +267,9 @@ async def test_admin_playbook_size_limits(client: AsyncClient, db_session, proje
 
 @pytest.mark.smoketest
 @pytest.mark.asyncio
-async def test_admin_playbook_list_computed_fields(client: AsyncClient, db_session, project_with_member):
+async def test_admin_playbook_list_computed_fields(
+    client: AsyncClient, db_session, project_with_member
+):
     """GET /playbook returns computed effectiveness_score, stale, and age_days."""
     project = project_with_member
     project.design_doc = {
@@ -295,7 +313,9 @@ async def test_admin_playbook_list_computed_fields(client: AsyncClient, db_sessi
 
 @pytest.mark.smoketest
 @pytest.mark.asyncio
-async def test_admin_playbook_patch_promote(client: AsyncClient, db_session, project_with_member):
+async def test_admin_playbook_patch_promote(
+    client: AsyncClient, db_session, project_with_member
+):
     """PATCH /playbook/{key} with action=promote increments confirmed_count."""
     project = project_with_member
     project.design_doc = {
@@ -327,7 +347,9 @@ async def test_admin_playbook_patch_promote(client: AsyncClient, db_session, pro
 
 @pytest.mark.smoketest
 @pytest.mark.asyncio
-async def test_admin_playbook_patch_demote(client: AsyncClient, db_session, project_with_member):
+async def test_admin_playbook_patch_demote(
+    client: AsyncClient, db_session, project_with_member
+):
     """PATCH /playbook/{key} with action=demote marks entry stale."""
     project = project_with_member
     project.design_doc = {
@@ -357,7 +379,9 @@ async def test_admin_playbook_patch_demote(client: AsyncClient, db_session, proj
 
 @pytest.mark.smoketest
 @pytest.mark.asyncio
-async def test_admin_playbook_patch_archive(client: AsyncClient, db_session, project_with_member):
+async def test_admin_playbook_patch_archive(
+    client: AsyncClient, db_session, project_with_member
+):
     """PATCH /playbook/{key} with action=archive removes entry and appends to archive."""
     project = project_with_member
     project.design_doc = {
@@ -388,7 +412,9 @@ async def test_admin_playbook_patch_archive(client: AsyncClient, db_session, pro
 
 @pytest.mark.smoketest
 @pytest.mark.asyncio
-async def test_admin_playbook_patch_404(client: AsyncClient, db_session, project_with_member):
+async def test_admin_playbook_patch_404(
+    client: AsyncClient, db_session, project_with_member
+):
     """PATCH /playbook/{key} returns 404 for unknown key."""
     resp = await client.patch(
         f"/api/admin/projects/{project_with_member.id}/playbook/no-such-key",
@@ -399,7 +425,9 @@ async def test_admin_playbook_patch_404(client: AsyncClient, db_session, project
 
 @pytest.mark.smoketest
 @pytest.mark.asyncio
-async def test_admin_playbook_patch_invalid_action(client: AsyncClient, db_session, project_with_member):
+async def test_admin_playbook_patch_invalid_action(
+    client: AsyncClient, db_session, project_with_member
+):
     """PATCH /playbook/{key} returns 422 for invalid action."""
     project = project_with_member
     project.design_doc = {

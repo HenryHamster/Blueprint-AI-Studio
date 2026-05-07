@@ -12,6 +12,7 @@ rolls it up per system_id. The strategic agent and autonomous_research
 consume this signal to switch the pipeline into audit/fundamentals mode
 when drift is high — independent of lifetime merge calibration.
 """
+
 from __future__ import annotations
 
 import logging
@@ -41,9 +42,15 @@ def _drift_thresholds() -> tuple[int, float, int]:
     from runtime_config, falling back to defaults when absent.
     """
     from app.shared_state import runtime_config as _rc  # lazy import avoids circular
+
     return (
         int(_rc.get("drift_over_claim_min_claims", _OVER_CLAIM_MIN_CLAIMS_DEFAULT)),
-        float(_rc.get("drift_over_claim_consistency_threshold", _OVER_CLAIM_CONSISTENCY_THRESHOLD_DEFAULT)),
+        float(
+            _rc.get(
+                "drift_over_claim_consistency_threshold",
+                _OVER_CLAIM_CONSISTENCY_THRESHOLD_DEFAULT,
+            )
+        ),
         int(_rc.get("drift_stall_min_claims", _STALL_MIN_CLAIMS_DEFAULT)),
     )
 
@@ -67,7 +74,9 @@ class DirectionDriftSnapshot(SQLModel, table=True):
     stalled_despite_churn_flag: bool = Field(default=False)
 
     __table_args__ = (
-        Index("ix_dds_project_direction_at", "project_id", "direction_id", "snapshot_at"),
+        Index(
+            "ix_dds_project_direction_at", "project_id", "direction_id", "snapshot_at"
+        ),
     )
 
 
@@ -106,7 +115,11 @@ def _direction_claimed_changes(task: Task) -> int:
         return 1
     plan_out = task.plan_output or {}
     if isinstance(plan_out, dict):
-        if plan_out.get("results") or plan_out.get("findings") or plan_out.get("changes"):
+        if (
+            plan_out.get("results")
+            or plan_out.get("findings")
+            or plan_out.get("changes")
+        ):
             return 1
         if plan_out.get("summary"):
             return 1
@@ -134,13 +147,12 @@ def _build_direction_signal(
     if over_claim_min is None or consistency_threshold is None or stall_min is None:
         _oc_min, _ct, _st_min = _drift_thresholds()
         over_claim_min = over_claim_min if over_claim_min is not None else _oc_min
-        consistency_threshold = consistency_threshold if consistency_threshold is not None else _ct
+        consistency_threshold = (
+            consistency_threshold if consistency_threshold is not None else _ct
+        )
         stall_min = stall_min if stall_min is not None else _st_min
     consistency = _consistency(merged, claimed)
-    over_claim = (
-        claimed >= over_claim_min
-        and consistency < consistency_threshold
-    )
+    over_claim = claimed >= over_claim_min and consistency < consistency_threshold
     stalled = claimed >= stall_min and merged == 0
     return {
         "claimed_changes_count": claimed,
@@ -164,32 +176,42 @@ async def _maybe_create_drift_alerts(
     merged = signal.get("actually_merged_prs", 0)
     candidates: list[tuple[str, str]] = []
     if signal.get("over_claim_flag"):
-        candidates.append((
-            f"over-claim drift: direction {direction_id}",
-            f"Direction {direction_id} claims {claimed} changes but only {merged} PRs merged in 7d",
-        ))
+        candidates.append(
+            (
+                f"over-claim drift: direction {direction_id}",
+                f"Direction {direction_id} claims {claimed} changes but only {merged} PRs merged in 7d",
+            )
+        )
     if signal.get("stalled_despite_churn_flag"):
-        candidates.append((
-            f"stalled-despite-churn drift: direction {direction_id}",
-            f"Direction {direction_id} has {claimed} claimed changes but 0 PRs merged in 7d",
-        ))
+        candidates.append(
+            (
+                f"stalled-despite-churn drift: direction {direction_id}",
+                f"Direction {direction_id} has {claimed} claimed changes but 0 PRs merged in 7d",
+            )
+        )
     for title, message in candidates:
         existing = (
-            await session.execute(
-                select(Alert).where(
-                    Alert.project_id == project_id,
-                    Alert.title == title,
-                    Alert.dismissed_at.is_(None),
+            (
+                await session.execute(
+                    select(Alert).where(
+                        Alert.project_id == project_id,
+                        Alert.title == title,
+                        Alert.dismissed_at.is_(None),
+                    )
                 )
             )
-        ).scalars().first()
+            .scalars()
+            .first()
+        )
         if not existing:
-            session.add(Alert(
-                project_id=project_id,
-                severity=AlertSeverity.WARNING,
-                title=title,
-                message=message,
-            ))
+            session.add(
+                Alert(
+                    project_id=project_id,
+                    severity=AlertSeverity.WARNING,
+                    title=title,
+                    message=message,
+                )
+            )
 
 
 async def compute_direction_drift(
@@ -237,13 +259,17 @@ async def compute_direction_drift(
     # tracked on Task.context.pr_merged (the rollup_management writer
     # stamps that on rollup).
     tasks_in_window = (
-        await session.execute(
-            select(Task).where(
-                Task.project_id == project.id,
-                Task.created_at >= cutoff,
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.project_id == project.id,
+                    Task.created_at >= cutoff,
+                )
             )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
 
     # Pre-fetch PR artifacts grouped by task_id for the in-window tasks.
     in_window_task_ids = [t.id for t in tasks_in_window]
@@ -273,7 +299,9 @@ async def compute_direction_drift(
             dir_id = payload.get("current_direction_id")
         if not dir_id:
             continue
-        per_direction_claims[dir_id] = per_direction_claims.get(dir_id, 0) + _direction_claimed_changes(t)
+        per_direction_claims[dir_id] = per_direction_claims.get(
+            dir_id, 0
+        ) + _direction_claimed_changes(t)
         # Merged PR: must have a PULL_REQUEST artifact AND context.pr_merged
         # truthy. The latter is set by the rollup verification step, so it's
         # the authoritative "shipped" signal — pure artifact existence
@@ -288,7 +316,8 @@ async def compute_direction_drift(
         claimed = per_direction_claims.get(did, 0)
         merged = per_direction_merged.get(did, 0)
         signal = _build_direction_signal(
-            claimed, merged,
+            claimed,
+            merged,
             over_claim_min=over_claim_min,
             consistency_threshold=consistency_threshold,
             stall_min=stall_min,
@@ -306,7 +335,8 @@ async def compute_direction_drift(
     by_system: dict[str, dict[str, Any]] = {}
     for sid, acc in by_system_accum.items():
         by_system[sid] = _build_direction_signal(
-            acc["claimed"], acc["merged"],
+            acc["claimed"],
+            acc["merged"],
             over_claim_min=over_claim_min,
             consistency_threshold=consistency_threshold,
             stall_min=stall_min,
@@ -357,7 +387,9 @@ async def persist_drift_snapshot(
                 actually_merged_prs=signal.get("actually_merged_prs", 0),
                 claim_shipped_consistency=signal.get("claim_shipped_consistency", 1.0),
                 over_claim_flag=bool(signal.get("over_claim_flag", False)),
-                stalled_despite_churn_flag=bool(signal.get("stalled_despite_churn_flag", False)),
+                stalled_despite_churn_flag=bool(
+                    signal.get("stalled_despite_churn_flag", False)
+                ),
             )
         )
 
@@ -404,7 +436,9 @@ async def last_n_drift_snapshots(
                 .order_by(DirectionDriftSnapshot.snapshot_at.desc())
                 .limit(n)
             )
-        ).scalars().all()
+        )
+        .scalars()
+        .all()
     )
 
 

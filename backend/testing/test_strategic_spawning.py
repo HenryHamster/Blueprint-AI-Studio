@@ -10,6 +10,7 @@ Covers:
   - Autonomy fields (lifetime_autonomous_prs_merged, lifetime_operator_actions, retirement_eligible)
     in directions_summary for the strategic agent
 """
+
 import uuid
 from datetime import datetime, timezone, timedelta
 
@@ -21,29 +22,43 @@ import app.drift_detection  # noqa: F401 — registers DirectionDriftSnapshot in
 import app.shared_state as _shared_state
 from app.models import Project, Task, TaskStatus, RECOMMENDED_MODE_META_KEY
 from app.autonomous_research import _spawn_research_task
-from app.strategic_spawning import _spawn_design_doc_update, _spawn_strategic_review, _build_shipped_changes_manifest
+from app.strategic_spawning import (
+    _spawn_design_doc_update,
+    _spawn_strategic_review,
+    _build_shipped_changes_manifest,
+)
 from app.max_plan_pool import _max_plan_pools, _account_by_id
 
 
 # ── Account pool fixture (required by _spawn_research_task) ───────────────────
+
 
 @pytest.fixture(autouse=True)
 def _ensure_test_account_pool():
     """Ensure _spawn_research_task finds an available account for the test user."""
     uid = "test-user-123"
     entry = {
-        "id": "test-acct-ss", "user_id": uid, "name": "test", "enabled": True,
-        "active_tasks": 0, "oauth_token": "sk-ant-test", "total_tasks": 0,
-        "token_created_at": None, "claude_config_json": None,
+        "id": "test-acct-ss",
+        "user_id": uid,
+        "name": "test",
+        "enabled": True,
+        "active_tasks": 0,
+        "oauth_token": "sk-ant-test",
+        "total_tasks": 0,
+        "token_created_at": None,
+        "claude_config_json": None,
     }
     _max_plan_pools.setdefault(uid, []).append(entry)
     _account_by_id["test-acct-ss"] = entry
     yield
-    _max_plan_pools.get(uid, [])[:] = [a for a in _max_plan_pools.get(uid, []) if a["id"] != "test-acct-ss"]
+    _max_plan_pools.get(uid, [])[:] = [
+        a for a in _max_plan_pools.get(uid, []) if a["id"] != "test-acct-ss"
+    ]
     _account_by_id.pop("test-acct-ss", None)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
 
 def _make_project(**kwargs) -> Project:
     """Build a Project with sensible test defaults."""
@@ -69,9 +84,11 @@ async def _seed_legacy_cycles(session, project: Project) -> None:
     from app.models import StrategicCycle as _SC
     from app.time_utils import _utcnow as _ut
     from datetime import datetime as _dt
+
     raw = (project.vision or {}).get("_strategic_cycle_history") or []
     if not raw:
         return
+
     def _parse_ts(v):
         if not v:
             return None
@@ -80,6 +97,7 @@ async def _seed_legacy_cycles(session, project: Project) -> None:
             return d.replace(tzinfo=None) if d.tzinfo else d
         except Exception:
             return None
+
     for entry in raw:
         if not isinstance(entry, dict) or not entry.get("cycle_id"):
             continue
@@ -87,30 +105,48 @@ async def _seed_legacy_cycles(session, project: Project) -> None:
         existing = await session.get(_SC, entry["cycle_id"])
         if existing is not None:
             continue
-        meta = {k: v for k, v in entry.items() if k not in {
-            "cycle_id", "outcome", "phase1_task_id", "phase1_completed_at",
-            "phase2_task_id", "phase2_completed_at", "phase1_started_at",
-            "directions_created", "directions_retired", "tasks_spawned",
-            "vision_updated", "cycle_reasoning", "summary_text", "started_at",
-        }}
-        session.add(_SC(
-            id=entry["cycle_id"],
-            project_id=project.id,
-            outcome=entry.get("outcome") or "in_progress",
-            phase1_task_id=None,  # legacy entries store str not UUID; skip FK
-            phase1_started_at=_parse_ts(entry.get("started_at"))
-                or _parse_ts(entry.get("phase1_started_at")) or _ut(),
-            phase1_completed_at=_parse_ts(entry.get("phase1_completed_at")),
-            phase2_started_at=_parse_ts(entry.get("phase2_started_at")),
-            phase2_completed_at=_parse_ts(entry.get("phase2_completed_at")),
-            directions_created=int(entry.get("directions_created") or 0),
-            directions_retired=int(entry.get("directions_retired") or 0),
-            tasks_spawned=int(entry.get("tasks_spawned") or 0),
-            vision_updated=bool(entry.get("vision_updated", False)),
-            cycle_reasoning=entry.get("cycle_reasoning"),
-            summary_text=entry.get("summary_text"),
-            cycle_metadata=meta,
-        ))
+        meta = {
+            k: v
+            for k, v in entry.items()
+            if k
+            not in {
+                "cycle_id",
+                "outcome",
+                "phase1_task_id",
+                "phase1_completed_at",
+                "phase2_task_id",
+                "phase2_completed_at",
+                "phase1_started_at",
+                "directions_created",
+                "directions_retired",
+                "tasks_spawned",
+                "vision_updated",
+                "cycle_reasoning",
+                "summary_text",
+                "started_at",
+            }
+        }
+        session.add(
+            _SC(
+                id=entry["cycle_id"],
+                project_id=project.id,
+                outcome=entry.get("outcome") or "in_progress",
+                phase1_task_id=None,  # legacy entries store str not UUID; skip FK
+                phase1_started_at=_parse_ts(entry.get("started_at"))
+                or _parse_ts(entry.get("phase1_started_at"))
+                or _ut(),
+                phase1_completed_at=_parse_ts(entry.get("phase1_completed_at")),
+                phase2_started_at=_parse_ts(entry.get("phase2_started_at")),
+                phase2_completed_at=_parse_ts(entry.get("phase2_completed_at")),
+                directions_created=int(entry.get("directions_created") or 0),
+                directions_retired=int(entry.get("directions_retired") or 0),
+                tasks_spawned=int(entry.get("tasks_spawned") or 0),
+                vision_updated=bool(entry.get("vision_updated", False)),
+                cycle_reasoning=entry.get("cycle_reasoning"),
+                summary_text=entry.get("summary_text"),
+                cycle_metadata=meta,
+            )
+        )
     await session.commit()
 
 
@@ -127,6 +163,7 @@ def _patch_spawning_deps(mocker):
 
 
 # ── Type selection: arch_frequency / strategic_cycle_count ────────────────────
+
 
 @pytest.mark.asyncio
 async def test_architecture_cycle_spawns_design_doc_update(db_session):
@@ -240,12 +277,18 @@ async def test_strategic_cycle_count_increments_in_vision(db_session):
 
 # ── force_strategic: no vision purpose ────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_no_vision_purpose_triggers_force_strategic(db_session):
     """Missing vision purpose triggers force_strategic even when spawn count is low."""
     project = _make_project(
         directions=[
-            {"id": "d-001", "status": "active", "title": "Test direction", "possibly_saturated": False},
+            {
+                "id": "d-001",
+                "status": "active",
+                "title": "Test direction",
+                "possibly_saturated": False,
+            },
         ],
         vision={
             # No "purpose" key → force_strategic fires
@@ -293,6 +336,7 @@ async def test_no_active_directions_triggers_force_strategic(db_session):
 
 
 # ── force_strategic: strategic_failures >= 3 blocks ──────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_strategic_failures_exactly_three_blocks_force_strategic(db_session):
@@ -344,6 +388,7 @@ async def test_strategic_failures_below_three_allows_force_strategic(db_session)
 
 # ── operator_rejection_rate in _spawn_strategic_review ────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_operator_rejection_rate_computed_correctly(db_session):
     """operator_rejection_rate = rejected / (merged + rejected) when total_rejected > 0."""
@@ -377,7 +422,9 @@ async def test_operator_rejection_rate_computed_correctly(db_session):
     d_stat = next(s for s in payload["directions_summary"] if s["id"] == "d-rej01")
 
     # 4 merged + 2 rejected = 6 total PRs, rate = 2/6 ≈ 0.33
-    assert "operator_rejection_rate" in d_stat, "Expected operator_rejection_rate in direction stat"
+    assert "operator_rejection_rate" in d_stat, (
+        "Expected operator_rejection_rate in direction stat"
+    )
     assert d_stat["operator_rejection_rate"] == round(2 / 6, 2)
     assert d_stat.get("prs_rejected") == 2
 
@@ -473,7 +520,11 @@ async def test_operator_rejection_rate_zero_rejected_in_history_aggregate(db_ses
                 "text": "Clean direction",
                 "priority": "low",
                 "research_history": [{"prs_merged": 2, "prs_rejected": 0}],
-                "history_aggregate": {"total_prs_merged": 3, "total_prs_rejected": 0, "total_cycles": 3},
+                "history_aggregate": {
+                    "total_prs_merged": 3,
+                    "total_prs_rejected": 0,
+                    "total_cycles": 3,
+                },
             }
         ],
         vision={"purpose": "test purpose"},
@@ -507,10 +558,19 @@ async def test_retirement_eligibility_fields_in_direction_stats(db_session):
                 "priority": "high",
                 # 2 explicit autonomous + 2 legacy fallback = 4 from history; 7 from aggregate → total 11
                 "research_history": [
-                    {"autonomous_prs_merged": 2, "prs_merged": 2, "operator_action_count": 0},
-                    {"prs_merged": 2},  # legacy: no autonomous_prs_merged, falls back to prs_merged
+                    {
+                        "autonomous_prs_merged": 2,
+                        "prs_merged": 2,
+                        "operator_action_count": 0,
+                    },
+                    {
+                        "prs_merged": 2
+                    },  # legacy: no autonomous_prs_merged, falls back to prs_merged
                 ],
-                "history_aggregate": {"total_autonomous_prs_merged": 7, "total_operator_actions": 0},
+                "history_aggregate": {
+                    "total_autonomous_prs_merged": 7,
+                    "total_operator_actions": 0,
+                },
             },
             {
                 "id": "d-ret-ineligible-ops",
@@ -518,9 +578,16 @@ async def test_retirement_eligibility_fields_in_direction_stats(db_session):
                 "text": "Ineligible: has operator actions",
                 "priority": "medium",
                 "research_history": [
-                    {"autonomous_prs_merged": 15, "prs_merged": 15, "operator_action_count": 1},
+                    {
+                        "autonomous_prs_merged": 15,
+                        "prs_merged": 15,
+                        "operator_action_count": 1,
+                    },
                 ],
-                "history_aggregate": {"total_autonomous_prs_merged": 0, "total_operator_actions": 0},
+                "history_aggregate": {
+                    "total_autonomous_prs_merged": 0,
+                    "total_operator_actions": 0,
+                },
             },
             {
                 "id": "d-ret-ineligible-count",
@@ -528,9 +595,16 @@ async def test_retirement_eligibility_fields_in_direction_stats(db_session):
                 "text": "Ineligible: not enough autonomous merges",
                 "priority": "low",
                 "research_history": [
-                    {"autonomous_prs_merged": 5, "prs_merged": 5, "operator_action_count": 0},
+                    {
+                        "autonomous_prs_merged": 5,
+                        "prs_merged": 5,
+                        "operator_action_count": 0,
+                    },
                 ],
-                "history_aggregate": {"total_autonomous_prs_merged": 4, "total_operator_actions": 0},
+                "history_aggregate": {
+                    "total_autonomous_prs_merged": 4,
+                    "total_operator_actions": 0,
+                },
             },
         ],
         vision={"purpose": "test purpose"},
@@ -566,6 +640,7 @@ async def test_retirement_eligibility_fields_in_direction_stats(db_session):
 async def test_cost_fields_present_when_history_has_merge_data(db_session):
     """cost_per_merged_pr and estimated_cost_usd appear when history has tasks_created + avg_time_to_merge_hours + merges."""
     from app.routers.admin_analytics import ON_DEMAND_RATE
+
     project = _make_project(
         directions=[
             {
@@ -574,8 +649,16 @@ async def test_cost_fields_present_when_history_has_merge_data(db_session):
                 "text": "Direction with cost data",
                 "priority": "medium",
                 "research_history": [
-                    {"prs_merged": 2, "tasks_created": 4, "avg_time_to_merge_hours": 1.5},
-                    {"prs_merged": 1, "tasks_created": 2, "avg_time_to_merge_hours": 2.0},
+                    {
+                        "prs_merged": 2,
+                        "tasks_created": 4,
+                        "avg_time_to_merge_hours": 1.5,
+                    },
+                    {
+                        "prs_merged": 1,
+                        "tasks_created": 2,
+                        "avg_time_to_merge_hours": 2.0,
+                    },
                 ],
             }
         ],
@@ -675,8 +758,11 @@ async def test_tasks_failed_infra_includes_history_aggregate(db_session):
 
 # ── Active-task guard in _spawn_design_doc_update / _spawn_strategic_review ───
 
+
 @pytest.mark.asyncio
-async def test_spawn_design_doc_update_skips_when_strategic_task_active(db_session, mocker):
+async def test_spawn_design_doc_update_skips_when_strategic_task_active(
+    db_session, mocker
+):
     """_spawn_design_doc_update returns False when a strategic task is already active."""
     mocker.patch(
         "app.task_lifecycle._has_active_strategic_task",
@@ -692,7 +778,9 @@ async def test_spawn_design_doc_update_skips_when_strategic_task_active(db_sessi
 
 
 @pytest.mark.asyncio
-async def test_spawn_strategic_review_skips_when_strategic_task_active(db_session, mocker):
+async def test_spawn_strategic_review_skips_when_strategic_task_active(
+    db_session, mocker
+):
     """_spawn_strategic_review returns False when a strategic task is already active."""
     mocker.patch(
         "app.task_lifecycle._has_active_strategic_task",
@@ -731,7 +819,12 @@ async def test_spawn_strategic_review_proceeds_when_no_active_strategic(db_sessi
     """_spawn_strategic_review returns True and creates a task when no strategic task is active."""
     project = _make_project(
         directions=[
-            {"id": "d-sr01", "status": "active", "text": "Some direction", "priority": "medium"},
+            {
+                "id": "d-sr01",
+                "status": "active",
+                "text": "Some direction",
+                "priority": "medium",
+            },
         ],
         vision={"purpose": "test purpose"},
     )
@@ -752,6 +845,7 @@ async def test_spawn_strategic_review_proceeds_when_no_active_strategic(db_sessi
 
 # ── Additional _spawn_design_doc_update tests ─────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_spawn_design_doc_update_adds_cycle_history_entry(db_session, mocker):
     """_spawn_design_doc_update writes a new StrategicCycle row.
@@ -761,6 +855,7 @@ async def test_spawn_design_doc_update_adds_cycle_history_entry(db_session, mock
     from app import strategic_cycle
     from app.models import StrategicCycle as _SC
     from sqlmodel import select as _select
+
     _patch_spawning_deps(mocker)
     mocker.patch(
         "app.task_lifecycle._has_active_strategic_task",
@@ -773,9 +868,11 @@ async def test_spawn_design_doc_update_adds_cycle_history_entry(db_session, mock
 
     await _spawn_design_doc_update(project, db_session)
 
-    cycles = (await db_session.execute(
-        _select(_SC).where(_SC.project_id == project.id)
-    )).scalars().all()
+    cycles = (
+        (await db_session.execute(_select(_SC).where(_SC.project_id == project.id)))
+        .scalars()
+        .all()
+    )
     assert len(cycles) == 1
     cycle = cycles[0]
     assert cycle.outcome == strategic_cycle.OUTCOME_PHASE1_RUNNING
@@ -784,7 +881,9 @@ async def test_spawn_design_doc_update_adds_cycle_history_entry(db_session, mock
 
 
 @pytest.mark.asyncio
-async def test_spawn_design_doc_update_cycle_history_unbounded_in_table(db_session, mocker):
+async def test_spawn_design_doc_update_cycle_history_unbounded_in_table(
+    db_session, mocker
+):
     """Audit W2: the 10-entry cap on cycle history was a JSONB-bloat guard.
     With cycles in a real table the cap is gone; ``recent_for_agent_context``
     applies a per-call limit at read time instead."""
@@ -792,6 +891,7 @@ async def test_spawn_design_doc_update_cycle_history_unbounded_in_table(db_sessi
     from app.models import StrategicCycle as _SC
     from sqlmodel import select as _select
     from app.time_utils import _utcnow
+
     _patch_spawning_deps(mocker)
     mocker.patch(
         "app.task_lifecycle._has_active_strategic_task",
@@ -803,18 +903,25 @@ async def test_spawn_design_doc_update_cycle_history_unbounded_in_table(db_sessi
     await db_session.refresh(project)
     # Pre-populate with 10 historical cycles
     from datetime import timedelta
+
     for i in range(10):
-        db_session.add(_SC(
-            id=f"sc-{i:08x}", project_id=project.id,
-            outcome="completed", phase1_started_at=_utcnow() - timedelta(days=i + 1),
-        ))
+        db_session.add(
+            _SC(
+                id=f"sc-{i:08x}",
+                project_id=project.id,
+                outcome="completed",
+                phase1_started_at=_utcnow() - timedelta(days=i + 1),
+            )
+        )
     await db_session.commit()
 
     await _spawn_design_doc_update(project, db_session)
 
-    all_cycles = (await db_session.execute(
-        _select(_SC).where(_SC.project_id == project.id)
-    )).scalars().all()
+    all_cycles = (
+        (await db_session.execute(_select(_SC).where(_SC.project_id == project.id)))
+        .scalars()
+        .all()
+    )
     assert len(all_cycles) == 11
     # The agent-context view caps at the helper's default (10).
     recent = await strategic_cycle.recent_for_agent_context(db_session, project.id)
@@ -825,6 +932,7 @@ async def test_spawn_design_doc_update_cycle_history_unbounded_in_table(db_sessi
 
 # ── Additional _spawn_strategic_review tests ──────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_spawn_strategic_review_records_phase2_task_id(db_session, mocker):
     """When called with cycle_id, _spawn_strategic_review records phase2_task_id on the cycle row.
@@ -834,6 +942,7 @@ async def test_spawn_strategic_review_records_phase2_task_id(db_session, mocker)
     from app import strategic_cycle
     from app.models import StrategicCycle as _SC
     from app.time_utils import _utcnow
+
     _patch_spawning_deps(mocker)
     mocker.patch(
         "app.task_lifecycle._has_active_strategic_task",
@@ -844,11 +953,14 @@ async def test_spawn_strategic_review_records_phase2_task_id(db_session, mocker)
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
-    db_session.add(_SC(
-        id=cycle_id, project_id=project.id,
-        outcome=strategic_cycle.OUTCOME_PHASE1_RUNNING,
-        phase1_started_at=_utcnow(),
-    ))
+    db_session.add(
+        _SC(
+            id=cycle_id,
+            project_id=project.id,
+            outcome=strategic_cycle.OUTCOME_PHASE1_RUNNING,
+            phase1_started_at=_utcnow(),
+        )
+    )
     await db_session.commit()
 
     await _spawn_strategic_review(project, db_session, cycle_id=cycle_id)
@@ -861,6 +973,7 @@ async def test_spawn_strategic_review_records_phase2_task_id(db_session, mocker)
 
 
 # ── recommended_mode in direction stats ──────────────────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_recommended_mode_audit_present_in_direction_stats(db_session):
@@ -960,8 +1073,12 @@ async def test_recommended_mode_ship_absent_from_direction_stats(db_session):
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
     tasks = result.scalars().all()
     payload = tasks[0].payloads[0]
-    d_stat_ship = next(s for s in payload["directions_summary"] if s["id"] == "d-mode03")
-    d_stat_unset = next(s for s in payload["directions_summary"] if s["id"] == "d-mode04")
+    d_stat_ship = next(
+        s for s in payload["directions_summary"] if s["id"] == "d-mode03"
+    )
+    d_stat_unset = next(
+        s for s in payload["directions_summary"] if s["id"] == "d-mode04"
+    )
 
     assert "recommended_mode" not in d_stat_ship, (
         "recommended_mode='ship' should be omitted (default behavior)"
@@ -1029,7 +1146,10 @@ async def test_strategic_review_prompt_suffix_includes_mode_hints(db_session):
                 "text": "Operator-pinned fundamentals direction",
                 "priority": "medium",
                 "recommended_mode": "fundamentals",
-                RECOMMENDED_MODE_META_KEY: {"source": "operator", "set_at": "2026-04-01T00:00:00"},
+                RECOMMENDED_MODE_META_KEY: {
+                    "source": "operator",
+                    "set_at": "2026-04-01T00:00:00",
+                },
             },
         ],
         vision={"purpose": "test purpose"},
@@ -1054,17 +1174,21 @@ async def test_strategic_review_prompt_suffix_includes_mode_hints(db_session):
 
 
 @pytest.mark.asyncio
-async def test_spawn_strategic_review_no_cycle_id_does_not_modify_history(db_session, mocker):
+async def test_spawn_strategic_review_no_cycle_id_does_not_modify_history(
+    db_session, mocker
+):
     """When called without cycle_id, _spawn_strategic_review leaves cycle history unchanged."""
     _patch_spawning_deps(mocker)
     mocker.patch(
         "app.task_lifecycle._has_active_strategic_task",
         new=AsyncMock(return_value=False),
     )
-    project = _make_project(vision={
-        "purpose": "test purpose",
-        "_strategic_cycle_history": [{"cycle_id": "existing", "outcome": "ok"}],
-    })
+    project = _make_project(
+        vision={
+            "purpose": "test purpose",
+            "_strategic_cycle_history": [{"cycle_id": "existing", "outcome": "ok"}],
+        }
+    )
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
@@ -1077,7 +1201,9 @@ async def test_spawn_strategic_review_no_cycle_id_does_not_modify_history(db_ses
 
 
 @pytest.mark.asyncio
-async def test_spawn_strategic_review_task_context_includes_cycle_id(db_session, mocker):
+async def test_spawn_strategic_review_task_context_includes_cycle_id(
+    db_session, mocker
+):
     """Task created by _spawn_strategic_review has strategic_cycle_id in context."""
     _patch_spawning_deps(mocker)
     mocker.patch(
@@ -1085,10 +1211,12 @@ async def test_spawn_strategic_review_task_context_includes_cycle_id(db_session,
         new=AsyncMock(return_value=False),
     )
     cycle_id = "sc-testcycle"
-    project = _make_project(vision={
-        "purpose": "test purpose",
-        "_strategic_cycle_history": [{"cycle_id": cycle_id}],
-    })
+    project = _make_project(
+        vision={
+            "purpose": "test purpose",
+            "_strategic_cycle_history": [{"cycle_id": cycle_id}],
+        }
+    )
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
@@ -1102,19 +1230,24 @@ async def test_spawn_strategic_review_task_context_includes_cycle_id(db_session,
 
 # ── previous_decision_outcomes in _spawn_strategic_review payload ────────────
 
+
 @pytest.mark.asyncio
 async def test_previous_decision_outcomes_populated_from_prior_cycle(db_session):
     """Payload surfaces current performance of directions created/retired by the prior cycle."""
     project = _make_project(
         directions=[
             {
-                "id": "d-new01", "status": "active", "text": "Newly created direction",
+                "id": "d-new01",
+                "status": "active",
+                "text": "Newly created direction",
                 "priority": "medium",
                 "research_history": [{"prs_merged": 2, "prs_rejected": 0}],
             },
             {
-                "id": "d-retired01", "status": "retired",
-                "text": "Direction retired last cycle", "priority": "low",
+                "id": "d-retired01",
+                "status": "retired",
+                "text": "Direction retired last cycle",
+                "priority": "low",
                 "research_history": [],
             },
         ],
@@ -1165,11 +1298,16 @@ async def test_previous_decision_outcomes_populated_from_prior_cycle(db_session)
 async def test_previous_decision_outcomes_absent_when_no_prior_decisions(db_session):
     """No created/retired ids in prior cycles → previous_decision_outcomes omitted."""
     project = _make_project(
-        directions=[{"id": "d-a", "status": "active", "text": "d", "priority": "medium"}],
+        directions=[
+            {"id": "d-a", "status": "active", "text": "d", "priority": "medium"}
+        ],
         vision={
             "purpose": "test",
             "_strategic_cycle_history": [
-                {"cycle_id": "sc-old", "outcome": "completed"},  # no created/retired ids
+                {
+                    "cycle_id": "sc-old",
+                    "outcome": "completed",
+                },  # no created/retired ids
             ],
         },
     )
@@ -1190,7 +1328,9 @@ async def test_previous_decision_outcomes_surfaces_created_rationales(db_session
     project = _make_project(
         directions=[
             {
-                "id": "d-new01", "status": "active", "text": "new direction",
+                "id": "d-new01",
+                "status": "active",
+                "text": "new direction",
                 "priority": "medium",
                 "research_history": [{"prs_merged": 2}],
             },
@@ -1261,7 +1401,9 @@ async def test_previous_decision_outcomes_surfaces_retired_rationales(db_session
     assert prev is not None
     retired_stat = prev["retired"][0]
     assert retired_stat["direction_id"] == "d-retired01"
-    assert retired_stat.get("rationale") == "Saturated; low PR merge volume for 3 cycles."
+    assert (
+        retired_stat.get("rationale") == "Saturated; low PR merge volume for 3 cycles."
+    )
 
 
 @pytest.mark.asyncio
@@ -1303,12 +1445,19 @@ async def test_previous_decision_outcomes_surfaces_cycle_reasoning(db_session):
 
 
 @pytest.mark.asyncio
-async def test_previous_decision_outcomes_rationale_absent_when_not_recorded(db_session):
+async def test_previous_decision_outcomes_rationale_absent_when_not_recorded(
+    db_session,
+):
     """When rationale fields are not present in the cycle entry, direction stats have no rationale key."""
     project = _make_project(
         directions=[
-            {"id": "d-r", "status": "active", "text": "d", "priority": "medium",
-             "research_history": []},
+            {
+                "id": "d-r",
+                "status": "active",
+                "text": "d",
+                "priority": "medium",
+                "research_history": [],
+            },
         ],
         vision={
             "purpose": "test",
@@ -1364,12 +1513,17 @@ async def test_previous_decision_outcomes_missing_retired_direction(db_session):
     payload = result.scalars().first().payloads[0]
     prev = payload.get("previous_decision_outcomes")
     assert prev is not None
-    assert prev["retired"] == [{"direction_id": "d-deleted", "role": "retired", "status": "missing"}]
+    assert prev["retired"] == [
+        {"direction_id": "d-deleted", "role": "retired", "status": "missing"}
+    ]
 
 
 # ── _build_shipped_changes_manifest ──────────────────────────────────────────
 
-def _make_merged_task(project_id, title="Fix bug", direction_id="d-001", changed_files=None, scope="small"):
+
+def _make_merged_task(
+    project_id, title="Fix bug", direction_id="d-001", changed_files=None, scope="small"
+):
     """Create a COMPLETED task with pr_merged=True context."""
     return Task(
         project_id=project_id,
@@ -1422,9 +1576,21 @@ async def test_build_shipped_manifest_groups_by_direction(db_session):
     await db_session.commit()
     await db_session.refresh(project)
 
-    db_session.add(_make_merged_task(project.id, "Task A", direction_id="d-001", changed_files=["a.py"]))
-    db_session.add(_make_merged_task(project.id, "Task B", direction_id="d-001", changed_files=["a.py", "b.py"]))
-    db_session.add(_make_merged_task(project.id, "Task C", direction_id="d-002", changed_files=["c.py"]))
+    db_session.add(
+        _make_merged_task(
+            project.id, "Task A", direction_id="d-001", changed_files=["a.py"]
+        )
+    )
+    db_session.add(
+        _make_merged_task(
+            project.id, "Task B", direction_id="d-001", changed_files=["a.py", "b.py"]
+        )
+    )
+    db_session.add(
+        _make_merged_task(
+            project.id, "Task C", direction_id="d-002", changed_files=["c.py"]
+        )
+    )
     await db_session.commit()
 
     manifest = await _build_shipped_changes_manifest(project, db_session)
@@ -1505,7 +1671,9 @@ async def test_build_shipped_manifest_cutoff_from_design_doc(db_session):
         design_doc={
             "_meta": {
                 # Future cutoff — excludes all current tasks
-                "last_updated": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+                "last_updated": (
+                    datetime.now(timezone.utc) + timedelta(hours=1)
+                ).isoformat()
             }
         },
     )
@@ -1513,7 +1681,9 @@ async def test_build_shipped_manifest_cutoff_from_design_doc(db_session):
     await db_session.commit()
     await db_session.refresh(project)
 
-    db_session.add(_make_merged_task(project.id, "Old merged task", direction_id="d-001"))
+    db_session.add(
+        _make_merged_task(project.id, "Old merged task", direction_id="d-001")
+    )
     await db_session.commit()
 
     manifest = await _build_shipped_changes_manifest(project, db_session)
@@ -1531,7 +1701,9 @@ async def test_build_shipped_manifest_cutoff_from_cycle_history(db_session):
                 {
                     "cycle_id": "sc-old",
                     # Future cutoff in cycle history
-                    "phase1_completed_at": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+                    "phase1_completed_at": (
+                        datetime.now(timezone.utc) + timedelta(hours=1)
+                    ).isoformat(),
                 }
             ],
         },
@@ -1558,6 +1730,7 @@ class TestPredictSpawnSuccessQualityAndMomentum:
     @pytest.fixture(autouse=True)
     def _clear_pipeline_rates(self):
         from app.shared_state import runtime_config
+
         prev = runtime_config.get("pipeline_scope_merge_rates")
         runtime_config["pipeline_scope_merge_rates"] = {}
         yield
@@ -1568,24 +1741,37 @@ class TestPredictSpawnSuccessQualityAndMomentum:
 
     def test_quality_score_signal_present_with_history(self):
         from app.spawn_calibration import predict_spawn_success
+
         healthy = {
             "research_history": [
-                {"taxonomy_summary": {"code_defect": 3}, "tasks_created": 2, "prs_merged": 2},
+                {
+                    "taxonomy_summary": {"code_defect": 3},
+                    "tasks_created": 2,
+                    "prs_merged": 2,
+                },
             ],
         }
         poor = {
             "research_history": [
-                {"taxonomy_summary": {"infra_related": 3, "review_quality": 2}, "tasks_created": 2, "prs_merged": 0},
+                {
+                    "taxonomy_summary": {"infra_related": 3, "review_quality": 2},
+                    "tasks_created": 2,
+                    "prs_merged": 0,
+                },
             ],
         }
-        assert predict_spawn_success("small", healthy) > predict_spawn_success("small", poor)
+        assert predict_spawn_success("small", healthy) > predict_spawn_success(
+            "small", poor
+        )
 
     def test_no_history_skips_quality_signal(self):
         from app.spawn_calibration import predict_spawn_success
+
         assert predict_spawn_success("small", {}) == 0.5
 
     def test_momentum_hot_streak_boosts_prediction(self):
         from app.spawn_calibration import predict_spawn_success
+
         hot = {
             "research_history": [
                 {"tasks_created": 2, "prs_merged": 1},
@@ -1597,10 +1783,13 @@ class TestPredictSpawnSuccessQualityAndMomentum:
                 {"tasks_created": 2, "prs_merged": 1},
             ],
         }
-        assert predict_spawn_success("small", hot) > predict_spawn_success("small", neutral)
+        assert predict_spawn_success("small", hot) > predict_spawn_success(
+            "small", neutral
+        )
 
     def test_momentum_stall_penalizes_prediction(self):
         from app.spawn_calibration import predict_spawn_success
+
         stalled = {
             "research_history": [
                 {"tasks_created": 0, "taxonomy_summary": {"code_defect": 1}},
@@ -1613,10 +1802,13 @@ class TestPredictSpawnSuccessQualityAndMomentum:
                 {"tasks_created": 0, "taxonomy_summary": {"code_defect": 1}},
             ],
         }
-        assert predict_spawn_success("small", stalled) < predict_spawn_success("small", neutral)
+        assert predict_spawn_success("small", stalled) < predict_spawn_success(
+            "small", neutral
+        )
 
     def test_result_within_bounds(self):
         from app.spawn_calibration import predict_spawn_success
+
         direction = {
             "research_history": [
                 {"tasks_created": 2, "prs_merged": 1},
@@ -1627,6 +1819,7 @@ class TestPredictSpawnSuccessQualityAndMomentum:
 
     def test_remediation_regression_penalizes_prediction(self):
         from app.spawn_calibration import predict_spawn_success
+
         base_history = [{"tasks_created": 2, "prs_merged": 1}]
         clean = {
             "research_history": base_history,
@@ -1644,7 +1837,9 @@ class TestPredictSpawnSuccessQualityAndMomentum:
                 {"result": "failed", "fingerprint": "fp-b"},
             ],
         }
-        assert predict_spawn_success("small", regressed) < predict_spawn_success("small", clean)
+        assert predict_spawn_success("small", regressed) < predict_spawn_success(
+            "small", clean
+        )
 
 
 # ── predict_spawn_success: first-attempt rejection concentration ──────────────
@@ -1656,6 +1851,7 @@ class TestPredictSpawnSuccessFirstAttemptConcentration:
     @pytest.fixture(autouse=True)
     def _clear_pipeline_rates(self):
         from app.shared_state import runtime_config
+
         prev = runtime_config.get("pipeline_scope_merge_rates")
         runtime_config["pipeline_scope_merge_rates"] = {}
         yield
@@ -1672,71 +1868,94 @@ class TestPredictSpawnSuccessFirstAttemptConcentration:
 
     def test_strong_concentration_penalty(self):
         from app.spawn_calibration import predict_spawn_success
+
         direction = self._direction()
-        project_bad = _make_project(design_doc={
-            "direction_first_attempt_feedback": {
-                "dir-abc": {"correctness": 8, "style": 2, "total": 10},
-            },
-        })
+        project_bad = _make_project(
+            design_doc={
+                "direction_first_attempt_feedback": {
+                    "dir-abc": {"correctness": 8, "style": 2, "total": 10},
+                },
+            }
+        )
         project_clean = _make_project(design_doc={})
-        assert predict_spawn_success("small", direction, project=project_bad) < \
-               predict_spawn_success("small", direction, project=project_clean)
+        assert predict_spawn_success(
+            "small", direction, project=project_bad
+        ) < predict_spawn_success("small", direction, project=project_clean)
 
     def test_moderate_concentration_penalty(self):
         from app.spawn_calibration import predict_spawn_success
+
         direction = self._direction()
-        project_mod = _make_project(design_doc={
-            "direction_first_attempt_feedback": {
-                "dir-abc": {"correctness": 3, "style": 2, "scope": 2, "total": 7},
-            },
-        })
-        project_strong = _make_project(design_doc={
-            "direction_first_attempt_feedback": {
-                "dir-abc": {"correctness": 8, "style": 2, "total": 10},
-            },
-        })
+        project_mod = _make_project(
+            design_doc={
+                "direction_first_attempt_feedback": {
+                    "dir-abc": {"correctness": 3, "style": 2, "scope": 2, "total": 7},
+                },
+            }
+        )
+        project_strong = _make_project(
+            design_doc={
+                "direction_first_attempt_feedback": {
+                    "dir-abc": {"correctness": 8, "style": 2, "total": 10},
+                },
+            }
+        )
         # Strong signal (0.3) penalizes more than moderate (0.5)
-        assert predict_spawn_success("small", direction, project=project_strong) < \
-               predict_spawn_success("small", direction, project=project_mod)
+        assert predict_spawn_success(
+            "small", direction, project=project_strong
+        ) < predict_spawn_success("small", direction, project=project_mod)
 
     def test_below_threshold_omitted(self):
         from app.spawn_calibration import predict_spawn_success
+
         direction = self._direction()
-        project_low = _make_project(design_doc={
-            "direction_first_attempt_feedback": {
-                "dir-abc": {"correctness": 2, "style": 1, "total": 3},
-            },
-        })
+        project_low = _make_project(
+            design_doc={
+                "direction_first_attempt_feedback": {
+                    "dir-abc": {"correctness": 2, "style": 1, "total": 3},
+                },
+            }
+        )
         project_none = _make_project(design_doc={})
-        assert predict_spawn_success("small", direction, project=project_low) == \
-               predict_spawn_success("small", direction, project=project_none)
+        assert predict_spawn_success(
+            "small", direction, project=project_low
+        ) == predict_spawn_success("small", direction, project=project_none)
 
     def test_spread_not_concentrated_omitted(self):
         from app.spawn_calibration import predict_spawn_success
+
         direction = self._direction()
-        project_spread = _make_project(design_doc={
-            "direction_first_attempt_feedback": {
-                "dir-abc": {"a": 2, "b": 2, "c": 2, "d": 2, "total": 8},
-            },
-        })
+        project_spread = _make_project(
+            design_doc={
+                "direction_first_attempt_feedback": {
+                    "dir-abc": {"a": 2, "b": 2, "c": 2, "d": 2, "total": 8},
+                },
+            }
+        )
         project_none = _make_project(design_doc={})
-        assert predict_spawn_success("small", direction, project=project_spread) == \
-               predict_spawn_success("small", direction, project=project_none)
+        assert predict_spawn_success(
+            "small", direction, project=project_spread
+        ) == predict_spawn_success("small", direction, project=project_none)
 
     def test_missing_direction_id_omitted(self):
         from app.spawn_calibration import predict_spawn_success
+
         direction = {"research_history": [{"tasks_created": 2, "prs_merged": 1}]}
-        project_bad = _make_project(design_doc={
-            "direction_first_attempt_feedback": {
-                "dir-abc": {"correctness": 8, "total": 8},
-            },
-        })
+        project_bad = _make_project(
+            design_doc={
+                "direction_first_attempt_feedback": {
+                    "dir-abc": {"correctness": 8, "total": 8},
+                },
+            }
+        )
         project_none = _make_project(design_doc={})
-        assert predict_spawn_success("small", direction, project=project_bad) == \
-               predict_spawn_success("small", direction, project=project_none)
+        assert predict_spawn_success(
+            "small", direction, project=project_bad
+        ) == predict_spawn_success("small", direction, project=project_none)
 
 
 # ── anomaly_summary in _spawn_strategic_review payload ───────────────────────
+
 
 @pytest.mark.asyncio
 async def test_anomaly_summary_surfaces_high_occurrence_entries(db_session):
@@ -1749,25 +1968,33 @@ async def test_anomaly_summary_surfaces_high_occurrence_entries(db_session):
     proj_key = str(project.id)
     _shared_state.persistent_anomalies[proj_key] = {
         "CODE_ERROR": {
-            "occurrence_count": 5, "severity": "high",
-            "first_seen": "2026-04-01T00:00:00", "last_seen": "2026-04-10T00:00:00",
+            "occurrence_count": 5,
+            "severity": "high",
+            "first_seen": "2026-04-01T00:00:00",
+            "last_seen": "2026-04-10T00:00:00",
         },
         "LOW_SIGNAL": {
-            "occurrence_count": 2, "severity": "low",
-            "first_seen": "2026-04-01T00:00:00", "last_seen": "2026-04-05T00:00:00",
+            "occurrence_count": 2,
+            "severity": "low",
+            "first_seen": "2026-04-01T00:00:00",
+            "last_seen": "2026-04-05T00:00:00",
         },
         "CrossDirectionFingerprint_abc123": {
-            "occurrence_count": 4, "severity": "high",
+            "occurrence_count": 4,
+            "severity": "high",
             "fingerprint": "abc123",
             "affected_directions": ["d-1", "d-2", "d-3"],
             "failure_count": 12,
-            "first_seen": "2026-04-01T00:00:00", "last_seen": "2026-04-10T00:00:00",
+            "first_seen": "2026-04-01T00:00:00",
+            "last_seen": "2026-04-10T00:00:00",
         },
     }
     try:
         spawned = await _spawn_strategic_review(project, db_session)
         assert spawned is True
-        result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+        result = await db_session.execute(
+            select(Task).where(Task.project_id == project.id)
+        )
         payload = result.scalars().all()[0].payloads[0]
 
         assert "anomaly_summary" in payload
@@ -1797,13 +2024,17 @@ async def test_anomaly_summary_absent_when_no_qualifying_entries(db_session):
     proj_key = str(project.id)
     _shared_state.persistent_anomalies[proj_key] = {
         "ONE_OFF": {
-            "occurrence_count": 1, "severity": "medium",
-            "first_seen": "2026-04-01T00:00:00", "last_seen": "2026-04-01T00:00:00",
+            "occurrence_count": 1,
+            "severity": "medium",
+            "first_seen": "2026-04-01T00:00:00",
+            "last_seen": "2026-04-01T00:00:00",
         },
     }
     try:
         await _spawn_strategic_review(project, db_session)
-        result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+        result = await db_session.execute(
+            select(Task).where(Task.project_id == project.id)
+        )
         payload = result.scalars().all()[0].payloads[0]
         assert "anomaly_summary" not in payload
     finally:
@@ -1811,6 +2042,7 @@ async def test_anomaly_summary_absent_when_no_qualifying_entries(db_session):
 
 
 # ── playbook_summary in _spawn_strategic_review payload ──────────────────────
+
 
 @pytest.mark.asyncio
 async def test_playbook_summary_includes_relevant_entries(db_session, mocker):
@@ -1899,7 +2131,7 @@ async def test_playbook_summary_caps_at_ten_entries(db_session, mocker):
         f"playbook/auto-pattern-{i:02d}": {
             "content": f"Repeated failure pattern {i}.",
             "source": "auto-generated",
-            "updated_at": f"2026-04-{i+1:02d}T00:00:00",
+            "updated_at": f"2026-04-{i + 1:02d}T00:00:00",
         }
         for i in range(15)
     }
@@ -1922,11 +2154,13 @@ async def test_playbook_summary_caps_at_ten_entries(db_session, mocker):
 # _agent_view_design_doc — strips agent-unused + internal keys
 # ---------------------------------------------------------------------------
 
+
 def test_agent_view_design_doc_strips_playbook_archive():
     """playbook_archive is operator-only state — it must never ship in agent
     payloads. Unbounded growth of this field was the trigger for the silent
     pre-claim death investigation (task 595c235d, 351KB archive bloat)."""
     from app.strategic_spawning import _agent_view_design_doc
+
     doc = {
         "summary": "keep",
         "systems/sys-a": {"id": "sys-a"},
@@ -1943,6 +2177,7 @@ def test_agent_view_design_doc_strips_internal_keys():
     design-doc handler already filters them client-side, so stripping them
     server-side is both safe and saves bytes on the wire."""
     from app.strategic_spawning import _agent_view_design_doc
+
     doc = {
         "summary": "keep",
         "_meta": {"last_updated": "x"},
@@ -1956,6 +2191,7 @@ def test_agent_view_design_doc_strips_internal_keys():
 
 def test_agent_view_design_doc_handles_empty_input():
     from app.strategic_spawning import _agent_view_design_doc
+
     assert _agent_view_design_doc(None) == {}
     assert _agent_view_design_doc({}) == {}
 
@@ -1966,12 +2202,15 @@ async def test_design_doc_update_payload_omits_playbook_archive(db_session):
     project = _make_project(
         id=uuid.uuid4(),
         name="archive-strip-test",
-        github_owner="test", github_repo="repo",
+        github_owner="test",
+        github_repo="repo",
         autonomous_enabled=True,
         vision={"purpose": "test"},
         design_doc={
             "summary": "ok",
-            "playbook_archive": [{"_archived_key": f"playbook/e{i}"} for i in range(100)],
+            "playbook_archive": [
+                {"_archived_key": f"playbook/e{i}"} for i in range(100)
+            ],
         },
     )
     db_session.add(project)
@@ -2015,8 +2254,13 @@ async def test_strategic_review_payload_includes_calibration_factor(db_session):
 async def test_strategic_review_calibration_factor_reflects_history(db_session):
     """Factor < 1.0 when recent cycles consistently over-predicted merges."""
     directions = [
-        {"id": f"d{i}", "status": "active", "text": f"direction {i}", "priority": "medium",
-         "research_history": [{"prs_merged": 1}]}
+        {
+            "id": f"d{i}",
+            "status": "active",
+            "text": f"direction {i}",
+            "priority": "medium",
+            "research_history": [{"prs_merged": 1}],
+        }
         for i in range(3)
     ]
     cycles = [
@@ -2044,11 +2288,14 @@ async def test_strategic_review_calibration_factor_reflects_history(db_session):
     tasks = result.scalars().all()
     payload = tasks[0].payloads[0]
     factor = payload["prediction_calibration_factor"]
-    assert factor < 1.0, f"Expected factor < 1.0 for over-prediction history, got {factor}"
+    assert factor < 1.0, (
+        f"Expected factor < 1.0 for over-prediction history, got {factor}"
+    )
     assert "optimistic" in payload["prediction_calibration_note"]
 
 
 # ── Mode-aware additions: system_maturity + drift_signals ─────────────────────
+
 
 @pytest.mark.asyncio
 async def test_strategic_review_includes_system_maturity_when_rows_exist(db_session):
@@ -2059,8 +2306,13 @@ async def test_strategic_review_includes_system_maturity_when_rows_exist(db_sess
 
     project = _make_project(
         directions=[
-            {"id": "d-sm01", "status": "active", "text": "x", "priority": "medium",
-             "system_id": "sys-A"},
+            {
+                "id": "d-sm01",
+                "status": "active",
+                "text": "x",
+                "priority": "medium",
+                "system_id": "sys-A",
+            },
         ],
         vision={"purpose": "test"},
     )
@@ -2068,15 +2320,17 @@ async def test_strategic_review_includes_system_maturity_when_rows_exist(db_sess
     await db_session.commit()
     await db_session.refresh(project)
 
-    db_session.add(SystemMaturity(
-        project_id=project.id,
-        system_id="sys-A",
-        score=72,
-        components={"test_coverage": 0.5},
-        recommended_mode="ship",
-        top_issues=[{"description": "thin tests"}],
-        last_audited_at=_utcnow(),
-    ))
+    db_session.add(
+        SystemMaturity(
+            project_id=project.id,
+            system_id="sys-A",
+            score=72,
+            components={"test_coverage": 0.5},
+            recommended_mode="ship",
+            top_issues=[{"description": "thin tests"}],
+            last_audited_at=_utcnow(),
+        )
+    )
     await db_session.commit()
 
     spawned = await _spawn_strategic_review(project, db_session)
@@ -2098,8 +2352,13 @@ async def test_strategic_review_omits_system_maturity_when_no_rows(db_session):
     """Without SystemMaturity rows, the system_maturity field is omitted from the payload."""
     project = _make_project(
         directions=[
-            {"id": "d-sm02", "status": "active", "text": "x", "priority": "medium",
-             "system_id": "sys-B"},
+            {
+                "id": "d-sm02",
+                "status": "active",
+                "text": "x",
+                "priority": "medium",
+                "system_id": "sys-B",
+            },
         ],
         vision={"purpose": "test"},
     )
@@ -2126,8 +2385,13 @@ async def test_strategic_review_includes_drift_signals_when_drift_present(db_ses
 
     project = _make_project(
         directions=[
-            {"id": "d-drift01", "status": "active", "text": "x", "priority": "medium",
-             "system_id": "sys-C"},
+            {
+                "id": "d-drift01",
+                "status": "active",
+                "text": "x",
+                "priority": "medium",
+                "system_id": "sys-C",
+            },
         ],
         vision={"purpose": "test"},
     )
@@ -2137,24 +2401,36 @@ async def test_strategic_review_includes_drift_signals_when_drift_present(db_ses
 
     # Create 5 completed claim-tasks with no PR artifacts → stalled_despite_churn
     for i in range(5):
-        db_session.add(_Task(
-            project_id=project.id,
-            title=f"claim {i}",
-            description="",
-            status=_TaskStatus.COMPLETED,
-            created_by="ORCHESTRATOR",
-            payloads=[{"type": "create", "prompt": "x", "current_direction_id": "d-drift01"}],
-            context={"direction_id": "d-drift01"},
-            plan_output={"summary": "shipped"},
-            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
-        ))
+        db_session.add(
+            _Task(
+                project_id=project.id,
+                title=f"claim {i}",
+                description="",
+                status=_TaskStatus.COMPLETED,
+                created_by="ORCHESTRATOR",
+                payloads=[
+                    {
+                        "type": "create",
+                        "prompt": "x",
+                        "current_direction_id": "d-drift01",
+                    }
+                ],
+                context={"direction_id": "d-drift01"},
+                plan_output={"summary": "shipped"},
+                vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+            )
+        )
     await db_session.commit()
 
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
 
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
-    tasks = [t for t in result.scalars().all() if t.first_payload.get("type") == "strategic_review"]
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
     assert tasks
     payload = tasks[0].payloads[0]
     assert "drift_signals" in payload
@@ -2164,7 +2440,9 @@ async def test_strategic_review_includes_drift_signals_when_drift_present(db_ses
 
 
 @pytest.mark.asyncio
-async def test_drift_signals_persist_snapshot_and_include_consecutive_cycles(db_session):
+async def test_drift_signals_persist_snapshot_and_include_consecutive_cycles(
+    db_session,
+):
     """_spawn_strategic_review persists a drift snapshot and enriches the payload
     with consecutive_flagged_cycles when prior flagged snapshots exist."""
     from datetime import timedelta
@@ -2173,8 +2451,13 @@ async def test_drift_signals_persist_snapshot_and_include_consecutive_cycles(db_
 
     project = _make_project(
         directions=[
-            {"id": "d-trend01", "status": "active", "text": "x", "priority": "medium",
-             "system_id": "sys-T"},
+            {
+                "id": "d-trend01",
+                "status": "active",
+                "text": "x",
+                "priority": "medium",
+                "system_id": "sys-T",
+            },
         ],
         vision={"purpose": "test"},
     )
@@ -2185,52 +2468,71 @@ async def test_drift_signals_persist_snapshot_and_include_consecutive_cycles(db_
     # Seed two prior flagged snapshots to simulate previous cycles.
     now = _utcnow()
     for i in range(2, 0, -1):
-        db_session.add(DirectionDriftSnapshot(
-            project_id=project.id,
-            direction_id="d-trend01",
-            snapshot_at=now - timedelta(hours=i * 6),
-            claimed_changes_count=5,
-            actually_merged_prs=0,
-            claim_shipped_consistency=0.0,
-            over_claim_flag=False,
-            stalled_despite_churn_flag=True,
-        ))
+        db_session.add(
+            DirectionDriftSnapshot(
+                project_id=project.id,
+                direction_id="d-trend01",
+                snapshot_at=now - timedelta(hours=i * 6),
+                claimed_changes_count=5,
+                actually_merged_prs=0,
+                claim_shipped_consistency=0.0,
+                over_claim_flag=False,
+                stalled_despite_churn_flag=True,
+            )
+        )
     await db_session.commit()
 
     # Create 5 completed claim-tasks with no PR artifacts → stalled_despite_churn
     for i in range(5):
-        db_session.add(Task(
-            project_id=project.id,
-            title=f"trend claim {i}",
-            description="",
-            status=TaskStatus.COMPLETED,
-            created_by="ORCHESTRATOR",
-            payloads=[{"type": "create", "prompt": "x", "current_direction_id": "d-trend01"}],
-            context={"direction_id": "d-trend01"},
-            plan_output={"summary": "shipped"},
-            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
-        ))
+        db_session.add(
+            Task(
+                project_id=project.id,
+                title=f"trend claim {i}",
+                description="",
+                status=TaskStatus.COMPLETED,
+                created_by="ORCHESTRATOR",
+                payloads=[
+                    {
+                        "type": "create",
+                        "prompt": "x",
+                        "current_direction_id": "d-trend01",
+                    }
+                ],
+                context={"direction_id": "d-trend01"},
+                plan_output={"summary": "shipped"},
+                vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+            )
+        )
     await db_session.commit()
 
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
 
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
-    sr_tasks = [t for t in result.scalars().all() if t.first_payload.get("type") == "strategic_review"]
+    sr_tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
     assert sr_tasks, "No strategic_review task spawned"
     payload = sr_tasks[0].payloads[0]
-    assert "drift_signals" in payload, f"drift_signals missing; keys: {sorted(payload.keys())}"
+    assert "drift_signals" in payload, (
+        f"drift_signals missing; keys: {sorted(payload.keys())}"
+    )
     drift = payload["drift_signals"]
     assert "d-trend01" in drift.get("by_direction", {}), (
         f"d-trend01 not in by_direction: {list(drift.get('by_direction', {}).keys())}"
     )
     sig = drift["by_direction"]["d-trend01"]
     # 2 prior flagged + 1 current (written by persist_drift_snapshot) = 3 consecutive
-    assert "consecutive_flagged_cycles" in sig, f"consecutive_flagged_cycles missing from sig: {sig}"
+    assert "consecutive_flagged_cycles" in sig, (
+        f"consecutive_flagged_cycles missing from sig: {sig}"
+    )
     assert sig["consecutive_flagged_cycles"] == 3
 
     # Verify snapshot was persisted to DB (one new row for the current cycle).
     from sqlmodel import select as _select
+
     snap_result = await db_session.execute(
         _select(DirectionDriftSnapshot).where(
             DirectionDriftSnapshot.project_id == project.id,
@@ -2238,7 +2540,9 @@ async def test_drift_signals_persist_snapshot_and_include_consecutive_cycles(db_
         )
     )
     snaps = snap_result.scalars().all()
-    assert len(snaps) == 3, f"Expected 3 snapshots (2 seeded + 1 persisted), got {len(snaps)}"
+    assert len(snaps) == 3, (
+        f"Expected 3 snapshots (2 seeded + 1 persisted), got {len(snaps)}"
+    )
 
 
 @pytest.mark.asyncio
@@ -2270,16 +2574,24 @@ async def test_strategic_review_payload_documents_recommended_mode(db_session):
 # _build_failure_feedback_mitigation unit tests
 # ---------------------------------------------------------------------------
 
+
 def test_failure_feedback_downscopes_large_to_medium():
     """3 first-attempt failures in a category downscopes large→medium."""
     from app.strategic_spawning import _build_failure_feedback_mitigation
+
     direction = {"id": "d-abc123"}
     design_doc = {
         "direction_first_attempt_feedback": {
-            "d-abc123": {"code_defect": 3, "total": 3, "last_updated": "2026-04-20T00:00:00"},
+            "d-abc123": {
+                "code_defect": 3,
+                "total": 3,
+                "last_updated": "2026-04-20T00:00:00",
+            },
         }
     }
-    scope, note, evidence = _build_failure_feedback_mitigation(direction, "large", "create", design_doc)
+    scope, note, evidence = _build_failure_feedback_mitigation(
+        direction, "large", "create", design_doc
+    )
     assert scope == "medium"
     assert note is not None and "code defect" in note
     assert evidence["failure_downscope"]["count"] == 3
@@ -2290,13 +2602,21 @@ def test_failure_feedback_downscopes_large_to_medium():
 def test_failure_feedback_downscopes_medium_to_small():
     """3+ first-attempt failures downscopes medium→small and names the category."""
     from app.strategic_spawning import _build_failure_feedback_mitigation
+
     direction = {"id": "d-def456"}
     design_doc = {
         "direction_first_attempt_feedback": {
-            "d-def456": {"testing": 5, "scope_related": 1, "total": 6, "last_updated": "2026-04-20T00:00:00"},
+            "d-def456": {
+                "testing": 5,
+                "scope_related": 1,
+                "total": 6,
+                "last_updated": "2026-04-20T00:00:00",
+            },
         }
     }
-    scope, note, evidence = _build_failure_feedback_mitigation(direction, "medium", "create", design_doc)
+    scope, note, evidence = _build_failure_feedback_mitigation(
+        direction, "medium", "create", design_doc
+    )
     assert scope == "small"
     assert note is not None and "testing" in note
     assert evidence["failure_downscope"]["category"] == "testing"
@@ -2305,13 +2625,20 @@ def test_failure_feedback_downscopes_medium_to_small():
 def test_failure_feedback_no_downscope_below_threshold():
     """2 failures (< threshold) leaves scope and note unchanged."""
     from app.strategic_spawning import _build_failure_feedback_mitigation
+
     direction = {"id": "d-ghi789"}
     design_doc = {
         "direction_first_attempt_feedback": {
-            "d-ghi789": {"code_defect": 2, "total": 2, "last_updated": "2026-04-20T00:00:00"},
+            "d-ghi789": {
+                "code_defect": 2,
+                "total": 2,
+                "last_updated": "2026-04-20T00:00:00",
+            },
         }
     }
-    scope, note, evidence = _build_failure_feedback_mitigation(direction, "medium", "create", design_doc)
+    scope, note, evidence = _build_failure_feedback_mitigation(
+        direction, "medium", "create", design_doc
+    )
     assert scope == "medium"
     assert note is None
     assert "failure_downscope" not in evidence
@@ -2320,11 +2647,17 @@ def test_failure_feedback_no_downscope_below_threshold():
 def test_success_pattern_biases_medium_to_small():
     """playbook/success-create-small with 3+ successes biases medium→small."""
     from app.strategic_spawning import _build_failure_feedback_mitigation
+
     direction = {"id": "d-jkl012"}
     design_doc = {
-        "playbook/success-create-small": {"source": "success-pattern", "success_count": 4},
+        "playbook/success-create-small": {
+            "source": "success-pattern",
+            "success_count": 4,
+        },
     }
-    scope, note, evidence = _build_failure_feedback_mitigation(direction, "medium", "create", design_doc)
+    scope, note, evidence = _build_failure_feedback_mitigation(
+        direction, "medium", "create", design_doc
+    )
     assert scope == "small"
     assert evidence["success_bias"]["success_count"] == 4
     assert evidence["success_bias"]["to"] == "small"
@@ -2333,11 +2666,17 @@ def test_success_pattern_biases_medium_to_small():
 def test_success_pattern_insufficient_count_no_bias():
     """2 successes (< threshold) leaves scope unchanged."""
     from app.strategic_spawning import _build_failure_feedback_mitigation
+
     direction = {"id": "d-mno345"}
     design_doc = {
-        "playbook/success-create-small": {"source": "success-pattern", "success_count": 2},
+        "playbook/success-create-small": {
+            "source": "success-pattern",
+            "success_count": 2,
+        },
     }
-    scope, note, evidence = _build_failure_feedback_mitigation(direction, "medium", "create", design_doc)
+    scope, note, evidence = _build_failure_feedback_mitigation(
+        direction, "medium", "create", design_doc
+    )
     assert scope == "medium"
     assert "success_bias" not in evidence
 
@@ -2345,7 +2684,10 @@ def test_success_pattern_insufficient_count_no_bias():
 def test_no_data_returns_proposed_scope_unchanged():
     """Empty design_doc leaves scope and note unchanged."""
     from app.strategic_spawning import _build_failure_feedback_mitigation
-    scope, note, evidence = _build_failure_feedback_mitigation({"id": "d-xyz"}, "medium", "create", {})
+
+    scope, note, evidence = _build_failure_feedback_mitigation(
+        {"id": "d-xyz"}, "medium", "create", {}
+    )
     assert scope == "medium"
     assert note is None
     assert evidence["proposed_scope"] == "medium"
@@ -2354,13 +2696,19 @@ def test_no_data_returns_proposed_scope_unchanged():
 
 # ── pack_under_budget integration ─────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_strategic_review_packer_meta_present_on_small_project(db_session):
     """Small project: packer ships everything cleanly, meta lists no trims."""
     project = _make_project(
         directions=[
-            {"id": "d-small1", "status": "active", "text": "Small direction",
-             "priority": "medium", "research_history": [{"prs_merged": 1}]}
+            {
+                "id": "d-small1",
+                "status": "active",
+                "text": "Small direction",
+                "priority": "medium",
+                "research_history": [{"prs_merged": 1}],
+            }
         ],
         vision={"purpose": "test"},
     )
@@ -2376,14 +2724,20 @@ async def test_strategic_review_packer_meta_present_on_small_project(db_session)
 
     assert "_packer_meta" in payload, "Packer must always attach _packer_meta"
     meta = payload["_packer_meta"]
-    assert meta["trimmed"] == [], f"Small project should have no trims: {meta['trimmed']}"
-    assert meta["dropped"] == [], f"Small project should have no drops: {meta['dropped']}"
+    assert meta["trimmed"] == [], (
+        f"Small project should have no trims: {meta['trimmed']}"
+    )
+    assert meta["dropped"] == [], (
+        f"Small project should have no drops: {meta['dropped']}"
+    )
     assert meta["budget_used"] > 0
     assert meta["budget_used"] < meta["budget_total"]
 
 
 @pytest.mark.asyncio
-async def test_strategic_review_packer_keeps_payload_under_cap_on_bloated_project(db_session):
+async def test_strategic_review_packer_keeps_payload_under_cap_on_bloated_project(
+    db_session,
+):
     """Bloated project (50 directions, heavy history): packer must keep payload
     under the 256 KB validate_internal_payload hard cap and surface trims/drops
     so the agent can fetch full state via the ./fetch tool."""
@@ -2403,7 +2757,9 @@ async def test_strategic_review_packer_keeps_payload_under_cap_on_bloated_projec
                     "prs_rejected": 0,
                     "tasks_failed": 0,
                     "tasks_created": 1,
-                    "key_finding_descriptions": [f"finding {j} " * 20 for j in range(5)],
+                    "key_finding_descriptions": [
+                        f"finding {j} " * 20 for j in range(5)
+                    ],
                     "failed_task_details": [],
                     "timestamp": "2026-04-01T00:00:00Z",
                 }
@@ -2419,15 +2775,17 @@ async def test_strategic_review_packer_keeps_payload_under_cap_on_bloated_projec
         problem_model={
             "intent": {"purpose": "test", "current_focus": "x"},
             "gaps": [
-                {"id": f"g{i}", "name": f"gap {i}", "description": "x" * 500,
-                 "history": [f"h{j}" * 10 for j in range(20)],
-                 "past_moves": [f"m{j}" * 10 for j in range(20)],
-                 "evidence": [f"e{j}" * 10 for j in range(20)]}
+                {
+                    "id": f"g{i}",
+                    "name": f"gap {i}",
+                    "description": "x" * 500,
+                    "history": [f"h{j}" * 10 for j in range(20)],
+                    "past_moves": [f"m{j}" * 10 for j in range(20)],
+                    "evidence": [f"e{j}" * 10 for j in range(20)],
+                }
                 for i in range(20)
             ],
-            "archived_gaps": [
-                {"id": f"ag{i}", "name": "archived"} for i in range(40)
-            ],
+            "archived_gaps": [{"id": f"ag{i}", "name": "archived"} for i in range(40)],
             "friction": [],
             "capabilities": [],
         },
@@ -2488,7 +2846,9 @@ async def test_drift_signals_survives_budget_pressure(db_session):
                     "prs_rejected": 0,
                     "tasks_failed": 0,
                     "tasks_created": 1,
-                    "key_finding_descriptions": [f"finding {j} " * 20 for j in range(5)],
+                    "key_finding_descriptions": [
+                        f"finding {j} " * 20 for j in range(5)
+                    ],
                     "failed_task_details": [],
                     "timestamp": "2026-04-01T00:00:00Z",
                 }
@@ -2504,10 +2864,14 @@ async def test_drift_signals_survives_budget_pressure(db_session):
         problem_model={
             "intent": {"purpose": "test", "current_focus": "x"},
             "gaps": [
-                {"id": f"g{i}", "name": f"gap {i}", "description": "x" * 500,
-                 "history": [f"h{j}" * 10 for j in range(20)],
-                 "past_moves": [f"m{j}" * 10 for j in range(20)],
-                 "evidence": [f"e{j}" * 10 for j in range(20)]}
+                {
+                    "id": f"g{i}",
+                    "name": f"gap {i}",
+                    "description": "x" * 500,
+                    "history": [f"h{j}" * 10 for j in range(20)],
+                    "past_moves": [f"m{j}" * 10 for j in range(20)],
+                    "evidence": [f"e{j}" * 10 for j in range(20)],
+                }
                 for i in range(20)
             ],
             "archived_gaps": [{"id": f"ag{i}", "name": "archived"} for i in range(40)],
@@ -2522,24 +2886,32 @@ async def test_drift_signals_survives_budget_pressure(db_session):
 
     # Add stalled tasks so drift_signals is non-empty and included in the payload
     for i in range(5):
-        db_session.add(Task(
-            project_id=project.id,
-            title=f"drift claim {i}",
-            description="",
-            status=TaskStatus.COMPLETED,
-            created_by="ORCHESTRATOR",
-            payloads=[{"type": "create", "prompt": "x", "current_direction_id": "d-dp00"}],
-            context={"direction_id": "d-dp00"},
-            plan_output={"summary": "shipped"},
-            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
-        ))
+        db_session.add(
+            Task(
+                project_id=project.id,
+                title=f"drift claim {i}",
+                description="",
+                status=TaskStatus.COMPLETED,
+                created_by="ORCHESTRATOR",
+                payloads=[
+                    {"type": "create", "prompt": "x", "current_direction_id": "d-dp00"}
+                ],
+                context={"direction_id": "d-dp00"},
+                plan_output={"summary": "shipped"},
+                vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+            )
+        )
     await db_session.commit()
 
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
 
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
-    tasks = [t for t in result.scalars().all() if t.first_payload.get("type") == "strategic_review"]
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
     assert tasks
     payload = tasks[0].payloads[0]
 

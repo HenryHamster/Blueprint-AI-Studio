@@ -4,6 +4,7 @@ These tests are pure schema validation — they don't touch the DB or
 the orchestrator. Integration with claim_task / strategic cycles lives
 in later tests.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -32,6 +33,7 @@ from app.problem_model import (
 # ---------------------------------------------------------------------------
 # Round-trip
 # ---------------------------------------------------------------------------
+
 
 def test_empty_problem_model_parses():
     model = parse_problem_model(None)
@@ -147,6 +149,7 @@ def test_is_empty_detects_meaningful_content():
 # Gap archiving
 # ---------------------------------------------------------------------------
 
+
 def test_archive_closed_gaps_moves_closed_and_abandoned():
     model = ProblemModel(
         gaps=[
@@ -179,6 +182,7 @@ def test_archive_is_idempotent_and_preserves_prior_archive():
 # Revision log
 # ---------------------------------------------------------------------------
 
+
 def test_append_revision_log_caps_to_max():
     model = ProblemModel(revision=1, last_updated="2026-04-21T00:00:00")
     for i in range(REVISION_LOG_MAX + 5):
@@ -210,6 +214,7 @@ def test_append_revision_log_records_changes():
 # Friction promotion
 # ---------------------------------------------------------------------------
 
+
 def test_friction_tracks_promotion_to_gap():
     """When the agent decides friction is worth building a solution for,
     it promotes by opening a gap and pointing friction.promoted_to_gap_id
@@ -235,6 +240,7 @@ def test_friction_tracks_promotion_to_gap():
 # ---------------------------------------------------------------------------
 # Optional context fields
 # ---------------------------------------------------------------------------
+
 
 def test_context_fields_all_optional():
     ctx = ProjectContext()
@@ -304,7 +310,12 @@ def test_apply_agent_update_preserves_prior_archive_and_log():
             {"id": "g-ancient", "name": "old", "status": "closed"},
         ],
         "revision_log": [
-            {"revision": 1, "ts": "2026-04-01T00:00:00", "summary": "prior", "changes": {}},
+            {
+                "revision": 1,
+                "ts": "2026-04-01T00:00:00",
+                "summary": "prior",
+                "changes": {},
+            },
         ],
     }
     proposed: dict = {"gaps": []}
@@ -409,23 +420,28 @@ def test_apply_agent_update_no_changes_still_logs():
 # Strategic-payload integration — smoke tests
 # ---------------------------------------------------------------------------
 
+
 def test_strategic_review_payload_accepts_problem_model():
     """Schema allows problem_model on the strategic_review payload."""
     from app.payload_schemas import StrategicReviewPayload
 
-    payload = StrategicReviewPayload.model_validate({
-        "vision": {"purpose": "x"},
-        "problem_model": {"intent": {"purpose": "x"}},
-    })
+    payload = StrategicReviewPayload.model_validate(
+        {
+            "vision": {"purpose": "x"},
+            "problem_model": {"intent": {"purpose": "x"}},
+        }
+    )
     assert payload.problem_model == {"intent": {"purpose": "x"}}
 
 
 def test_design_doc_update_payload_accepts_problem_model():
     from app.payload_schemas import DesignDocUpdatePayload
 
-    payload = DesignDocUpdatePayload.model_validate({
-        "problem_model": {"intent": {"purpose": "x"}},
-    })
+    payload = DesignDocUpdatePayload.model_validate(
+        {
+            "problem_model": {"intent": {"purpose": "x"}},
+        }
+    )
     assert payload.problem_model == {"intent": {"purpose": "x"}}
 
 
@@ -434,12 +450,16 @@ def test_strategic_payload_accepts_running_update_fields():
     + last-user timestamps from spawn to the agent."""
     from app.payload_schemas import StrategicReviewPayload
 
-    payload = StrategicReviewPayload.model_validate({
-        "running_update": "## What's going on\nShipping problem_model v1.",
-        "running_update_acknowledged_at": "2026-04-20T00:00:00",
-        "user_last_active_at": "2026-04-20T12:00:00",
-        "self_reflection_log": [{"ts": "2026-04-19T00:00:00", "what_was_hard": "y"}],
-    })
+    payload = StrategicReviewPayload.model_validate(
+        {
+            "running_update": "## What's going on\nShipping problem_model v1.",
+            "running_update_acknowledged_at": "2026-04-20T00:00:00",
+            "user_last_active_at": "2026-04-20T12:00:00",
+            "self_reflection_log": [
+                {"ts": "2026-04-19T00:00:00", "what_was_hard": "y"}
+            ],
+        }
+    )
     assert payload.running_update.startswith("## What's going on")
     assert payload.running_update_acknowledged_at == "2026-04-20T00:00:00"
     assert payload.user_last_active_at == "2026-04-20T12:00:00"
@@ -449,6 +469,7 @@ def test_strategic_payload_accepts_running_update_fields():
 # ---------------------------------------------------------------------------
 # Gap source binding — cross-cycle continuity for user asks
 # ---------------------------------------------------------------------------
+
 
 def test_gap_accepts_user_message_source():
     """When a user message drives a gap, the binding persists so subsequent

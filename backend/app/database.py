@@ -2,7 +2,12 @@ import logging
 import os
 from typing import cast
 from sqlalchemy import event
-from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncEngine, AsyncSession
+from sqlalchemy.ext.asyncio import (
+    create_async_engine,
+    async_sessionmaker,
+    AsyncEngine,
+    AsyncSession,
+)
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 logger = logging.getLogger(__name__)
@@ -84,9 +89,9 @@ def _install_disconnect_invalidation(engine: AsyncEngine) -> None:
         except Exception as inv_exc:
             _invalidate_failure_count += 1
             logger.warning(
-                "[DB] Connection invalidation failed "
-                "(consecutive_failures=%d): %s",
-                _invalidate_failure_count, inv_exc,
+                "[DB] Connection invalidation failed (consecutive_failures=%d): %s",
+                _invalidate_failure_count,
+                inv_exc,
             )
             if _invalidate_failure_count >= _INVALIDATE_FAILURE_ESCALATION_THRESHOLD:
                 # Repeated invalidation failures imply driver-level corruption.
@@ -102,7 +107,9 @@ def _install_disconnect_invalidation(engine: AsyncEngine) -> None:
                 try:
                     engine.sync_engine.pool.dispose()
                 except Exception as disp_exc:
-                    logger.error("[DB] pool.dispose() raised: %s", disp_exc, exc_info=True)
+                    logger.error(
+                        "[DB] pool.dispose() raised: %s", disp_exc, exc_info=True
+                    )
                 _invalidate_failure_count = 0
 
 
@@ -131,6 +138,7 @@ def _make_engine():
     _install_disconnect_invalidation(eng)
     return eng
 
+
 # Lazy engine: created on first access so test environments can import without asyncpg
 class _LazyEngine:
     _engine = None
@@ -144,6 +152,7 @@ class _LazyEngine:
         if self._engine is None:
             self.__class__._engine = _make_engine()
         return self._engine(*args, **kwargs)
+
 
 engine = _LazyEngine()
 
@@ -182,11 +191,13 @@ AsyncSessionLocal = async_sessionmaker(
     cast(AsyncEngine, engine), class_=AsyncSession, expire_on_commit=False
 )
 
+
 async def init_db():
     """Schema management is handled by Alembic migrations."""
     pass
 
-async def get_session() -> AsyncSession: # type: ignore
+
+async def get_session() -> AsyncSession:  # type: ignore
     """Dependency to provide a database session to FastAPI routes.
 
     The close path is wrapped to swallow ``InterfaceError("connection is closed")``
@@ -200,6 +211,7 @@ async def get_session() -> AsyncSession: # type: ignore
     response intact; the bad connection is gone from the pool either way.
     """
     from sqlalchemy.exc import InterfaceError as SAInterfaceError
+
     session = AsyncSessionLocal()
     try:
         yield session
@@ -209,6 +221,8 @@ async def get_session() -> AsyncSession: # type: ignore
         except SAInterfaceError as e:
             msg = str(e).lower()
             if "connection is closed" in msg or "connection does not exist" in msg:
-                logger.debug("[DB] Tolerating closed-connection during session close: %s", e)
+                logger.debug(
+                    "[DB] Tolerating closed-connection during session close: %s", e
+                )
             else:
                 raise

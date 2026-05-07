@@ -1,4 +1,5 @@
 """Test factories for creating model instances with sensible defaults."""
+
 import uuid
 from datetime import datetime, timezone
 
@@ -82,7 +83,9 @@ def make_task(project_id=None, **kwargs) -> Task:
     return Task(**defaults)
 
 
-def make_alert(project_id: uuid.UUID, task_id: uuid.UUID | None = None, **kwargs) -> Alert:
+def make_alert(
+    project_id: uuid.UUID, task_id: uuid.UUID | None = None, **kwargs
+) -> Alert:
     defaults: dict = dict(
         project_id=project_id,
         task_id=task_id,

@@ -4,6 +4,7 @@ Pure metric/aggregation functions extracted from app.research_completion.
 These operate on direction/project data structures and have no coupling to the
 research pipeline orchestration.
 """
+
 from typing import Any, Dict
 
 from sqlalchemy.orm.attributes import flag_modified
@@ -15,7 +16,9 @@ from app.failure_classification import (
     TAXONOMY_SCOPE_RELATED,
 )
 
-_AUTONOMY_RETIREMENT_THRESHOLD = 10  # autonomous merges required for retirement eligibility
+_AUTONOMY_RETIREMENT_THRESHOLD = (
+    10  # autonomous merges required for retirement eligibility
+)
 
 _HISTORY_AGG_DEFAULTS = {
     "total_cycles": 0,
@@ -59,22 +62,32 @@ def _fold_evicted_into_aggregate(prev_agg: dict | None, evicted: list[dict]) -> 
         agg["total_tasks_cancelled"] += ev.get("tasks_cancelled", 0)
         # Legacy fallback: pre-attribution entries have no autonomous_prs_merged;
         # treat all merges as autonomous so CPM is conservative for old data.
-        agg["total_autonomous_prs_merged"] += ev.get("autonomous_prs_merged", ev.get("prs_merged", 0))
+        agg["total_autonomous_prs_merged"] += ev.get(
+            "autonomous_prs_merged", ev.get("prs_merged", 0)
+        )
         agg["total_assisted_prs_merged"] += ev.get("assisted_prs_merged", 0)
         agg["total_operator_actions"] += ev.get("operator_action_count", 0)
         if not agg["first_cycle_at"] and ev.get("timestamp"):
             agg["first_cycle_at"] = ev["timestamp"]
         for scope, stats in (ev.get("scope_breakdown") or {}).items():
-            bucket = sb.setdefault(scope, {
-                "created": 0, "merged": 0, "failed": 0, "failed_infra": 0,
-                "failed_scope_overflow": 0,
-            })
+            bucket = sb.setdefault(
+                scope,
+                {
+                    "created": 0,
+                    "merged": 0,
+                    "failed": 0,
+                    "failed_infra": 0,
+                    "failed_scope_overflow": 0,
+                },
+            )
             bucket["created"] += stats.get("created", 0)
             bucket["merged"] += stats.get("merged", 0)
             bucket["failed"] += stats.get("failed", 0)
             bucket["failed_infra"] += stats.get("failed_infra", 0)
-            bucket["failed_scope_overflow"] = bucket.get("failed_scope_overflow", 0) + stats.get("failed_scope_overflow", 0)
-        for qd in (ev.get("decomposition_quality") or []):
+            bucket["failed_scope_overflow"] = bucket.get(
+                "failed_scope_overflow", 0
+            ) + stats.get("failed_scope_overflow", 0)
+        for qd in ev.get("decomposition_quality") or []:
             dq["total_decompositions"] += 1
             count = qd.get("subtask_count") or 0
             dq["subtask_count_sum"] += count
@@ -104,8 +117,12 @@ def _compute_acceptance_rate(d: dict) -> float | None:
     """
     history = d.get("research_history", [])
     agg = d.get("history_aggregate", {})
-    total_merged = sum(e.get("prs_merged", 0) for e in history) + (agg.get("total_prs_merged") or 0)
-    total_rejected = sum(e.get("prs_rejected", 0) for e in history) + (agg.get("total_prs_rejected") or 0)
+    total_merged = sum(e.get("prs_merged", 0) for e in history) + (
+        agg.get("total_prs_merged") or 0
+    )
+    total_rejected = sum(e.get("prs_rejected", 0) for e in history) + (
+        agg.get("total_prs_rejected") or 0
+    )
     total_prs = total_merged + total_rejected
     if total_prs == 0:
         return None  # no data yet
@@ -133,8 +150,12 @@ def _compute_difficulty_index(d: dict) -> float:
     """
     history = d.get("research_history", [])
     agg = d.get("history_aggregate", {})
-    total_tasks = sum(e.get("tasks_created", 0) for e in history) + (agg.get("total_tasks_created") or 0)
-    total_merged = sum(e.get("prs_merged", 0) for e in history) + (agg.get("total_prs_merged") or 0)
+    total_tasks = sum(e.get("tasks_created", 0) for e in history) + (
+        agg.get("total_tasks_created") or 0
+    )
+    total_merged = sum(e.get("prs_merged", 0) for e in history) + (
+        agg.get("total_prs_merged") or 0
+    )
     if total_merged <= 0:
         return 1.0
     return min(30.0, total_tasks / total_merged)
@@ -151,8 +172,12 @@ def _compute_productivity_score(d: dict) -> float:
     history = d.get("research_history", [])
     agg = d.get("history_aggregate", {})
     total_cycles = len(history) + (agg.get("total_cycles") or 0)
-    total_merged = sum(e.get("prs_merged", 0) for e in history) + (agg.get("total_prs_merged") or 0)
-    total_rejected = sum(e.get("prs_rejected", 0) for e in history) + (agg.get("total_prs_rejected") or 0)
+    total_merged = sum(e.get("prs_merged", 0) for e in history) + (
+        agg.get("total_prs_merged") or 0
+    )
+    total_rejected = sum(e.get("prs_rejected", 0) for e in history) + (
+        agg.get("total_prs_rejected") or 0
+    )
     if total_cycles == 0:
         return 0.5  # unknown, neutral
     # Net productivity: merge contributes +1, rejection contributes -0.5
@@ -201,7 +226,9 @@ def _compute_direction_quality_score(d: dict) -> float:
         actionable_w += w * (code_defect + scope_related)
         structural_w += w * (infra_related + review_quality)
         scope_w += w * scope_related
-        total_taxon_w += w * (code_defect + scope_related + infra_related + review_quality)
+        total_taxon_w += w * (
+            code_defect + scope_related + infra_related + review_quality
+        )
 
         tasks_created = entry.get("tasks_created", 0) or 0
         prs_merged = entry.get("prs_merged", 0) or 0
@@ -268,18 +295,17 @@ def _compute_autonomy_threshold_state(d: dict) -> dict:
     """
     history = d.get("research_history") or []
     agg = d.get("history_aggregate") or {}
-    lifetime_autonomous = (
-        sum(h.get("autonomous_prs_merged", h.get("prs_merged", 0)) for h in history)
-        + (agg.get("total_autonomous_prs_merged") or 0)
-    )
-    lifetime_operator_actions = (
-        sum(h.get("operator_action_count", 0) for h in history)
-        + (agg.get("total_operator_actions") or 0)
-    )
+    lifetime_autonomous = sum(
+        h.get("autonomous_prs_merged", h.get("prs_merged", 0)) for h in history
+    ) + (agg.get("total_autonomous_prs_merged") or 0)
+    lifetime_operator_actions = sum(
+        h.get("operator_action_count", 0) for h in history
+    ) + (agg.get("total_operator_actions") or 0)
     return {
         "lifetime_autonomous_prs_merged": lifetime_autonomous,
         "lifetime_operator_actions": lifetime_operator_actions,
-        "retirement_eligible": lifetime_autonomous >= _AUTONOMY_RETIREMENT_THRESHOLD and lifetime_operator_actions == 0,
+        "retirement_eligible": lifetime_autonomous >= _AUTONOMY_RETIREMENT_THRESHOLD
+        and lifetime_operator_actions == 0,
     }
 
 

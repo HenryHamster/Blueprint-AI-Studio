@@ -22,6 +22,7 @@ Related bug history (see comments on each check for details):
   - task 0bcfd031: inverted `if ! python3 ...` branches; unguarded
     `grep | cut` pipeline crashed on pipefail + no match
 """
+
 from __future__ import annotations
 
 import re
@@ -40,6 +41,7 @@ from app.compute_startup_script import build_agent_startup_script
 # ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
+
 
 @dataclass(frozen=True)
 class ShellGenerator:
@@ -81,6 +83,7 @@ GENERATORS: list[ShellGenerator] = [
 # Shared fixtures / helpers
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture(scope="module")
 def bash_executable() -> str | None:
     for candidate in (
@@ -101,6 +104,7 @@ _PARAMS = [pytest.param(g, id=g.name) for g in GENERATORS]
 # Checks
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.parametrize("gen", _PARAMS)
 class TestGeneratedShellContract:
     """Contract each generated shell script must satisfy.
@@ -119,7 +123,9 @@ class TestGeneratedShellContract:
             f"{gen.name} missing shebang {gen.expected_shebang!r}"
         )
 
-    def test_bash_syntax(self, gen: ShellGenerator, bash_executable: str | None, tmp_path: Path):
+    def test_bash_syntax(
+        self, gen: ShellGenerator, bash_executable: str | None, tmp_path: Path
+    ):
         """Structural test: bash -n rejects syntactic nonsense (missing
         `fi`, unbalanced heredoc, bad quoting) without running any code.
         Fast (~10 ms) and catches any regression that breaks parsing.
@@ -134,9 +140,7 @@ class TestGeneratedShellContract:
             text=True,
             timeout=10,
         )
-        assert result.returncode == 0, (
-            f"bash -n rejected {gen.name}:\n{result.stderr}"
-        )
+        assert result.returncode == 0, f"bash -n rejected {gen.name}:\n{result.stderr}"
 
     def test_heredoc_terminators_balance(self, gen: ShellGenerator):
         """Every `<<'MARKER'` must be closed by a line consisting solely of
@@ -149,9 +153,7 @@ class TestGeneratedShellContract:
         lines = script.splitlines()
         for name in opener_names:
             closed = any(line.strip() == name for line in lines)
-            assert closed, (
-                f"{gen.name}: heredoc <<'{name}' has no matching terminator"
-            )
+            assert closed, f"{gen.name}: heredoc <<'{name}' has no matching terminator"
 
     def test_pipefail_pipelines_guarded(self, gen: ShellGenerator):
         """Under `set -euo pipefail`, a pipeline like `grep X | cut -f2-`
@@ -213,7 +215,9 @@ class TestGeneratedShellContract:
         """
         script = gen.render()
         lines = script.splitlines()
-        poweroff_lines = [i for i, line in enumerate(lines) if line.strip() == "poweroff"]
+        poweroff_lines = [
+            i for i, line in enumerate(lines) if line.strip() == "poweroff"
+        ]
         if not poweroff_lines:
             return
         non_terminal = poweroff_lines[:-1]
@@ -285,7 +289,7 @@ class TestGeneratedShellContract:
         for m in pattern.finditer(script):
             snippet = m.group(0)
             # Acceptable quote-strip steps inside the substitution.
-            if "tr -d '\"'" in snippet or "tr -d \"\\\"\"" in snippet:
+            if "tr -d '\"'" in snippet or 'tr -d "\\""' in snippet:
                 continue
             if re.search(r"sed[^|]*['\"]\^?\\?[\"]", snippet):
                 continue
@@ -295,8 +299,8 @@ class TestGeneratedShellContract:
             f"{gen.name}: extracting values from /etc/agent.env via "
             f"`grep | cut` MUST strip the surrounding quotes "
             f"(`| tr -d '\"'`). systemd env file values are written as "
-            f"KEY=\"value\"; without stripping the cut output is "
-            f"`\"value\"` (literal quotes) and consumers like the JWT "
+            f'KEY="value"; without stripping the cut output is '
+            f'`"value"` (literal quotes) and consumers like the JWT '
             f"verifier reject it. Bash's `var=$(curl -f ...)` simple-"
             f"command rule then exits the script with curl's status "
             f"under set -e, with NO ERR trap fire. Offenders:\n"
@@ -399,13 +403,15 @@ class TestGeneratedShellContract:
             is_python = any(
                 token in body
                 for token in (
-                    "\nimport ", "\nfrom ",
-                    "def ", "print(", "sys.argv", "__name__",
+                    "\nimport ",
+                    "\nfrom ",
+                    "def ",
+                    "print(",
+                    "sys.argv",
+                    "__name__",
                 )
             )
-            is_node = any(
-                token in body for token in ("require(", "console.log", "=>")
-            )
+            is_node = any(token in body for token in ("require(", "console.log", "=>"))
             lang = "python" if is_python else "node" if is_node else None
             if lang:
                 offenders.append((marker, lang, body[:80]))
@@ -417,7 +423,9 @@ class TestGeneratedShellContract:
             f"Fix: move the embedded code to a real .py/.js file under a "
             f"scripts dir and load it via base64 (see "
             f"backend/app/_agent_scripts/materialize_manifest.py). Offenders:\n"
-            + "\n".join(f"  <<'{m}' ({lang}): {preview!r}..." for m, lang, preview in offenders)
+            + "\n".join(
+                f"  <<'{m}' ({lang}): {preview!r}..." for m, lang, preview in offenders
+            )
         )
 
 
@@ -428,6 +436,7 @@ class TestGeneratedShellContract:
 # here (vs. in the generic contract) because they are semantic, not
 # structural — a generator added later shouldn't be required to implement
 # these exact beacons.
+
 
 class TestComputeStartupScriptBeacons:
     """The provisioning beacons close the boot→claim observability gap.
@@ -487,7 +496,7 @@ class TestComputeStartupScriptBeacons:
         marker = "# 6b. Notify orchestrator that startup completed"
         idx = script.find(marker)
         assert idx != -1, f"could not find step-6b marker {marker!r}"
-        tail = script[idx:idx + 2000]
+        tail = script[idx : idx + 2000]
         assert ". /etc/agent.env" in tail, (
             "step 6b health check must source /etc/agent.env rather than "
             "grep it (pipefail + unmatched pattern crashes the script — "
@@ -554,7 +563,8 @@ def test_shellcheck_no_errors(
     path.write_text(gen.render(), encoding="utf-8")
     cmd = [
         "shellcheck",
-        "-S", "error",
+        "-S",
+        "error",
         f"--exclude={','.join(_SHELLCHECK_EXCLUDES)}",
         str(path),
     ]
@@ -569,6 +579,7 @@ def test_shellcheck_no_errors(
 # Same bash -n + shellcheck treatment as the generated ones, but the
 # source is the file itself — no render step.
 # ---------------------------------------------------------------------------
+
 
 def _discover_static_scripts() -> list[Path]:
     """Find committed .sh files we ship. The test runs from /app inside
@@ -597,9 +608,9 @@ def _discover_static_scripts() -> list[Path]:
 
 
 _STATIC_SCRIPTS = _discover_static_scripts()
-_STATIC_PARAMS = [
-    pytest.param(p, id=str(p.name)) for p in _STATIC_SCRIPTS
-] or [pytest.param(None, id="no-static-scripts-found", marks=pytest.mark.skip)]
+_STATIC_PARAMS = [pytest.param(p, id=str(p.name)) for p in _STATIC_SCRIPTS] or [
+    pytest.param(None, id="no-static-scripts-found", marks=pytest.mark.skip)
+]
 
 
 @pytest.mark.parametrize("path", _STATIC_PARAMS)
@@ -620,7 +631,8 @@ def test_static_script_shellcheck(path: Path, shellcheck_available: bool):
     assert path is not None
     cmd = [
         "shellcheck",
-        "-S", "error",
+        "-S",
+        "error",
         f"--exclude={','.join(_SHELLCHECK_EXCLUDES)}",
         str(path),
     ]

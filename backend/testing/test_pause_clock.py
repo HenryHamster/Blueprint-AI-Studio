@@ -4,6 +4,7 @@ The pure-function helpers (total_paused_seconds, active_elapsed,
 mark_paused, accumulate_pause_window) operate on a DeploymentState
 object directly and can be tested without a live DB.
 """
+
 from datetime import datetime, timedelta
 
 import pytest
@@ -26,6 +27,7 @@ def _state(**overrides):
 
 
 # ── total_paused_seconds + breakdown ──────────────────────────────────────────
+
 
 def test_total_zero_on_fresh_state():
     s = _state()
@@ -55,6 +57,7 @@ def test_total_includes_in_flight_window():
 
 
 # ── active_elapsed ────────────────────────────────────────────────────────────
+
 
 def test_active_elapsed_no_baseline_returns_raw():
     """Legacy timers with no stashed baseline get raw wall-clock elapsed."""
@@ -116,6 +119,7 @@ def test_active_elapsed_during_in_flight_pause():
 
 # ── mark_paused ───────────────────────────────────────────────────────────────
 
+
 def test_mark_paused_sets_fields():
     s = _state()
     pause_clock.mark_paused(s, pause_clock.PAUSED_KIND_MANUAL)
@@ -140,6 +144,7 @@ def test_mark_paused_rejects_unknown_kind():
 
 
 # ── accumulate_pause_window ───────────────────────────────────────────────────
+
 
 def test_accumulate_noop_when_not_paused():
     s = _state(total_manual_paused_seconds=10.0, total_auto_paused_seconds=20.0)
@@ -183,6 +188,7 @@ def test_accumulate_preserves_prior_totals():
 
 
 # ── End-to-end: pause → measure → resume → measure ────────────────────────────
+
 
 def test_full_cycle_active_elapsed_excludes_completed_pause():
     """Simulate: start timer, pause for ~5s, resume, check active_elapsed

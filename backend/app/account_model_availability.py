@@ -92,7 +92,9 @@ def account_has_model(account: Mapping[str, Any], model: str) -> bool | None:
     return model in models
 
 
-def account_availability_is_stale(account: Mapping[str, Any], now: datetime | None = None) -> bool:
+def account_availability_is_stale(
+    account: Mapping[str, Any], now: datetime | None = None
+) -> bool:
     metadata = account.get("provider_metadata") or {}
     if not isinstance(metadata, Mapping):
         return True
@@ -125,7 +127,8 @@ def account_success_rate_7d(
     _now = (now if now is not None else datetime.now(timezone.utc)).replace(tzinfo=None)
     cutoff = _now - SUCCESS_RATE_WINDOW
     events = [
-        e for e in account.get("outcome_events", [])
+        e
+        for e in account.get("outcome_events", [])
         if e.get("at") is not None and e["at"] > cutoff
     ]
     if len(events) < SUCCESS_RATE_MIN_SAMPLES:
@@ -147,7 +150,8 @@ def account_success_rate_7d_for_type(
     _now = (now if now is not None else datetime.now(timezone.utc)).replace(tzinfo=None)
     cutoff = _now - SUCCESS_RATE_WINDOW
     events = [
-        e for e in account.get("outcome_events", [])
+        e
+        for e in account.get("outcome_events", [])
         if e.get("at") is not None
         and e["at"] > cutoff
         and e.get("task_type") == task_type
@@ -181,7 +185,9 @@ async def refresh_account_available_models(
     except ValueError:
         logger.info(
             "[AVAILABILITY] unrecognized provider=%r / auth_mode=%r on account %s",
-            provider_name, auth_mode_raw, account.get("id"),
+            provider_name,
+            auth_mode_raw,
+            account.get("id"),
         )
         return None
 

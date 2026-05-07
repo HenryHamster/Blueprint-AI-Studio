@@ -58,6 +58,7 @@ Coverage:
   (MaxPlanAccount.disabled_at) so a misconfigured ``sa_column`` on
   either column fails the suite.
 """
+
 import os
 from datetime import datetime, timedelta, timezone
 
@@ -68,10 +69,9 @@ from sqlmodel import select
 from app.models import MaxPlanAccount, Project, SystemMaturity, Task, TaskStatus
 
 
-USE_POSTGRES = (
-    os.getenv("USE_TEST_POSTGRES", "").lower() == "true"
-    and os.getenv("DATABASE_URL", "").startswith("postgresql")
-)
+USE_POSTGRES = os.getenv("USE_TEST_POSTGRES", "").lower() == "true" and os.getenv(
+    "DATABASE_URL", ""
+).startswith("postgresql")
 
 
 # ── NaiveUTCDateTime process_bind_param ────────────────────────────────────
@@ -210,6 +210,7 @@ async def test_bulk_archive_bumps_updated_at(db_session):
     # Sleep long enough that the resolution-coarsened SQLite/Postgres
     # timestamp comparison can still resolve a strictly-greater value.
     import asyncio
+
     await asyncio.sleep(0.01)
 
     await db_session.execute(
@@ -221,9 +222,9 @@ async def test_bulk_archive_bumps_updated_at(db_session):
 
     # Re-fetch to get the DB-side state — the in-memory ``task`` object
     # was bypassed by the Core UPDATE.
-    refreshed = (await db_session.execute(
-        select(Task).where(Task.id == task.id)
-    )).scalar_one()
+    refreshed = (
+        await db_session.execute(select(Task).where(Task.id == task.id))
+    ).scalar_one()
     await db_session.refresh(refreshed)
 
     assert refreshed.archived is True
@@ -267,9 +268,9 @@ async def test_bulk_archive_updated_at_naive_after_bump(db_session):
     )
     await db_session.commit()
 
-    refreshed = (await db_session.execute(
-        select(Task).where(Task.id == task_id)
-    )).scalar_one()
+    refreshed = (
+        await db_session.execute(select(Task).where(Task.id == task_id))
+    ).scalar_one()
     await db_session.refresh(refreshed)
 
     assert refreshed.updated_at.tzinfo is None
@@ -313,8 +314,9 @@ async def test_migration_0068_backfill_normal_numeric_value(db_session):
 
     # Re-execute the exact UPDATE from migration 0068 (with the R5-W4
     # MEDIUM-B guard included — the migration's current SQL).
-    await db_session.execute(text(
-        """
+    await db_session.execute(
+        text(
+            """
         UPDATE task
         SET heartbeat_count = COALESCE((context->>'_heartbeat_count')::int, 0)
         WHERE jsonb_typeof(context) = 'object'
@@ -323,17 +325,21 @@ async def test_migration_0068_backfill_normal_numeric_value(db_session):
           AND heartbeat_count = 0
           AND id = :tid
         """
-    ), {"tid": str(task_id)})
+        ),
+        {"tid": str(task_id)},
+    )
     await db_session.commit()
 
     # populate_existing bypasses the identity-map cache (the task added
     # by db_session.add lives in the cache with heartbeat_count=0; the
     # raw-SQL UPDATE bypassed the ORM so the cache is stale).
-    refreshed = (await db_session.execute(
-        select(Task)
-        .where(Task.id == task_id)
-        .execution_options(populate_existing=True)
-    )).scalar_one()
+    refreshed = (
+        await db_session.execute(
+            select(Task)
+            .where(Task.id == task_id)
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one()
 
     assert refreshed.heartbeat_count == 42, (
         f"expected backfill to copy 42 from context, got {refreshed.heartbeat_count}"
@@ -363,31 +369,38 @@ async def test_migration_0068_backfill_skips_non_numeric_garbage(db_session):
     await db_session.commit()
 
     valid = Task(
-        project_id=project.id, title="valid",
+        project_id=project.id,
+        title="valid",
         context={"_heartbeat_count": 7},
     )
     bad_str = Task(
-        project_id=project.id, title="bad-str",
+        project_id=project.id,
+        title="bad-str",
         context={"_heartbeat_count": "abc"},
     )
     bad_array = Task(
-        project_id=project.id, title="bad-array",
+        project_id=project.id,
+        title="bad-array",
         context={"_heartbeat_count": [1, 2, 3]},
     )
     bad_null = Task(
-        project_id=project.id, title="bad-null",
+        project_id=project.id,
+        title="bad-null",
         context={"_heartbeat_count": None},
     )
     db_session.add_all([valid, bad_str, bad_array, bad_null])
     await db_session.commit()
     ids = {
-        "valid": valid.id, "bad_str": bad_str.id,
-        "bad_array": bad_array.id, "bad_null": bad_null.id,
+        "valid": valid.id,
+        "bad_str": bad_str.id,
+        "bad_array": bad_array.id,
+        "bad_null": bad_null.id,
     }
 
     # Run the guarded backfill SQL — must not raise.
-    await db_session.execute(text(
-        """
+    await db_session.execute(
+        text(
+            """
         UPDATE task
         SET heartbeat_count = COALESCE((context->>'_heartbeat_count')::int, 0)
         WHERE jsonb_typeof(context) = 'object'
@@ -396,17 +409,25 @@ async def test_migration_0068_backfill_skips_non_numeric_garbage(db_session):
           AND heartbeat_count = 0
           AND project_id = :pid
         """
-    ), {"pid": str(project.id)})
+        ),
+        {"pid": str(project.id)},
+    )
     await db_session.commit()
 
     # Force-refresh: identity map under expire_on_commit=False would
     # return cached pre-UPDATE state; populate_existing on the SELECT
     # bypasses the cache (mirrors task_completion.py:1671 / reaper.py:382).
-    rows = (await db_session.execute(
-        select(Task)
-        .where(Task.project_id == project.id)
-        .execution_options(populate_existing=True)
-    )).scalars().all()
+    rows = (
+        (
+            await db_session.execute(
+                select(Task)
+                .where(Task.project_id == project.id)
+                .execution_options(populate_existing=True)
+            )
+        )
+        .scalars()
+        .all()
+    )
     by_id = {r.id: r for r in rows}
 
     assert by_id[ids["valid"]].heartbeat_count == 7, (
@@ -423,7 +444,9 @@ async def test_migration_0068_backfill_skips_non_numeric_garbage(db_session):
 # ── ix_task_payloads_type_active index shape (R5-W5 MED-6) ─────────────────
 
 
-@pytest.mark.skipif(not USE_POSTGRES, reason="expression-on-JSONB index is Postgres-only")
+@pytest.mark.skipif(
+    not USE_POSTGRES, reason="expression-on-JSONB index is Postgres-only"
+)
 @pytest.mark.asyncio
 async def test_ix_task_payloads_type_active_exists_and_is_partial(db_session):
     """The orchestrator pipeline-budget index must be a partial expression index.
@@ -450,17 +473,19 @@ async def test_ix_task_payloads_type_active_exists_and_is_partial(db_session):
          partial predicate; without it the index spans every task ever
          created and pages out hot rows under cache pressure).
     """
-    rows = (await db_session.execute(
-        text(
-            """
+    rows = (
+        await db_session.execute(
+            text(
+                """
             SELECT indexdef
               FROM pg_indexes
              WHERE schemaname = current_schema()
                AND tablename = 'task'
                AND indexname = 'ix_task_payloads_type_active'
             """
+            )
         )
-    )).all()
+    ).all()
 
     assert rows, (
         "ix_task_payloads_type_active not found in pg_indexes — "
@@ -526,12 +551,14 @@ async def test_pipeline_budget_query_uses_payloads_type_index(db_session):
     for i in range(20):
         status = TaskStatus.IN_PROGRESS if i % 2 == 0 else TaskStatus.QUEUED
         ttype = "review" if i % 3 == 0 else ("fix" if i % 3 == 1 else "research")
-        tasks.append(Task(
-            project_id=project.id,
-            title=f"pb-{i}",
-            payloads=[{"type": ttype, "prompt": "x"}],
-            status=status,
-        ))
+        tasks.append(
+            Task(
+                project_id=project.id,
+                title=f"pb-{i}",
+                payloads=[{"type": ttype, "prompt": "x"}],
+                status=status,
+            )
+        )
     db_session.add_all(tasks)
     await db_session.commit()
 
@@ -547,16 +574,18 @@ async def test_pipeline_budget_query_uses_payloads_type_index(db_session):
 
     # EXPLAIN the exact filter shape the orchestrator issues.
     try:
-        explain_rows = (await db_session.execute(
-            text(
-                """
+        explain_rows = (
+            await db_session.execute(
+                text(
+                    """
                 EXPLAIN (FORMAT TEXT)
                 SELECT count(*) FROM task
                  WHERE status IN ('PROVISIONING', 'IN_PROGRESS')
                    AND (payloads -> 0 ->> 'type') IN ('review', 'fix')
                 """
+                )
             )
-        )).all()
+        ).all()
         plan = "\n".join(row[0] for row in explain_rows)
     finally:
         # Reset planner flags so subsequent queries in the same session
@@ -577,7 +606,9 @@ async def test_pipeline_budget_query_uses_payloads_type_index(db_session):
 # ── ix_task_retry_after_active index shape (R6 audit / R5-W2-C) ────────────
 
 
-@pytest.mark.skipif(not USE_POSTGRES, reason="partial expression index is Postgres-only")
+@pytest.mark.skipif(
+    not USE_POSTGRES, reason="partial expression index is Postgres-only"
+)
 @pytest.mark.asyncio
 async def test_ix_task_retry_after_active_exists_and_is_partial(db_session):
     """The reaper's retry_after sweep index must be a partial index on
@@ -592,17 +623,19 @@ async def test_ix_task_retry_after_active_exists_and_is_partial(db_session):
     Mirror of test_ix_task_payloads_type_active_exists_and_is_partial —
     same three checks (exists / partial / WHERE clause).
     """
-    rows = (await db_session.execute(
-        text(
-            """
+    rows = (
+        await db_session.execute(
+            text(
+                """
             SELECT indexdef
               FROM pg_indexes
              WHERE schemaname = current_schema()
                AND tablename = 'task'
                AND indexname = 'ix_task_retry_after_active'
             """
+            )
         )
-    )).all()
+    ).all()
 
     assert rows, (
         "ix_task_retry_after_active not found in pg_indexes — "
@@ -647,13 +680,15 @@ async def test_reaper_retry_after_query_uses_retry_index(db_session):
     for i in range(20):
         status = TaskStatus.QUEUED if i % 2 == 0 else TaskStatus.IN_PROGRESS
         retry_after = now + timedelta(seconds=30) if (i % 4 == 0) else None
-        tasks.append(Task(
-            project_id=project.id,
-            title=f"retry-{i}",
-            payloads=[{"type": "research"}],
-            status=status,
-            retry_after_until=retry_after,
-        ))
+        tasks.append(
+            Task(
+                project_id=project.id,
+                title=f"retry-{i}",
+                payloads=[{"type": "research"}],
+                status=status,
+                retry_after_until=retry_after,
+            )
+        )
     db_session.add_all(tasks)
     await db_session.commit()
 
@@ -662,17 +697,19 @@ async def test_reaper_retry_after_query_uses_retry_index(db_session):
     await db_session.execute(text("SET LOCAL enable_bitmapscan = off"))
 
     try:
-        explain_rows = (await db_session.execute(
-            text(
-                """
+        explain_rows = (
+            await db_session.execute(
+                text(
+                    """
                 EXPLAIN (FORMAT TEXT)
                 SELECT id FROM task
                  WHERE status = 'QUEUED'
                    AND retry_after_until IS NOT NULL
                  LIMIT 5000
                 """
+                )
             )
-        )).all()
+        ).all()
         plan = "\n".join(row[0] for row in explain_rows)
     finally:
         await db_session.execute(text("RESET enable_seqscan"))

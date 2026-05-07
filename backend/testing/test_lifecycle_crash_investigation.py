@@ -1,5 +1,5 @@
 """Tests for crash-episode investigation spawning in lifecycle.py."""
-import asyncio
+
 import uuid
 from datetime import timedelta
 from typing import Dict
@@ -8,12 +8,18 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from app.lifecycle import _spawn_crash_investigations
-from app.models import Task, TaskHistory, TaskStatus
+from app.models import (
+    RegressionCaseStatus,
+    RegressionRemediationCase,
+    Task,
+    TaskStatus,
+)
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _make_project(pid=None):
     p = MagicMock()
@@ -21,19 +27,21 @@ def _make_project(pid=None):
     return p
 
 
-def _make_session(projects, existing_task=None):
-    """Return a fake AsyncSession that returns `projects` for Project queries
-    and `existing_task` for Task dedup queries."""
+def _make_session(projects, existing_task=None, existing_case=None):
+    """Return a fake AsyncSession that returns `projects` for Project queries,
+    `existing_task` for Task dedup queries, and `existing_case` for
+    RegressionRemediationCase queries."""
     session = AsyncMock()
     session.__aenter__ = AsyncMock(return_value=session)
     session.__aexit__ = AsyncMock(return_value=False)
 
     async def execute(stmt):
         result = MagicMock()
-        # Distinguish Project selects from Task selects by inspecting whereclause text
-        stmt_str = str(stmt)
-        if "task" in stmt_str.lower() or "spawned_by" in stmt_str.lower():
-            # Task dedup query
+        stmt_str = str(stmt).lower()
+        if "regressionremediationcase" in stmt_str:
+            result.scalars.return_value.first.return_value = existing_case
+        elif "task" in stmt_str or "spawned_by" in stmt_str:
+            # Task dedup query returns a row-tuple or None
             if existing_task:
                 result.first.return_value = (existing_task.id,)
             else:
@@ -54,28 +62,37 @@ def _make_session(projects, existing_task=None):
 # Tests for _spawn_crash_investigations
 # ---------------------------------------------------------------------------
 
+
 class TestSpawnCrashInvestigations:
     @pytest.mark.asyncio
-    async def test_spawns_task_per_project(self):
-        """One investigation task should be created for each project."""
+    async def test_spawns_task_and_case_per_project(self):
+        """One investigation task and one RegressionRemediationCase per project."""
         pid1 = uuid.uuid4()
         pid2 = uuid.uuid4()
         projects = [_make_project(pid1), _make_project(pid2)]
         inflight: Dict[str, str] = {}
 
-        session = _make_session(projects, existing_task=None)
+        session = _make_session(projects, existing_task=None, existing_case=None)
         added_objects = []
         session.add = MagicMock(side_effect=lambda obj: added_objects.append(obj))
 
         with patch("app.lifecycle.AsyncSessionLocal", return_value=session):
-            with patch("app.lifecycle.validate_internal_payload", side_effect=lambda p, _: p):
-                await _spawn_crash_investigations(
-                    service_name="reaper",
-                    cause_str="MissingGreenlet at reaper.py:724",
-                    exc=ValueError("test"),
-                    crash_count=3,
-                    inflight=inflight,
-                )
+            with patch(
+                "app.lifecycle.validate_internal_payload", side_effect=lambda p, _: p
+            ):
+                with patch.object(
+                    RegressionRemediationCase,
+                    "create_for_spawn",
+                    side_effect=lambda **kw: MagicMock(spec=RegressionRemediationCase),
+                ) as mock_create:
+                    await _spawn_crash_investigations(
+                        service_name="reaper",
+                        cause_str="MissingGreenlet at reaper.py:724",
+                        exc=ValueError("test"),
+                        crash_count=3,
+                        inflight=inflight,
+                    )
+                assert mock_create.call_count == 2
 
         task_objects = [o for o in added_objects if isinstance(o, Task)]
         assert len(task_objects) == 2
@@ -85,8 +102,70 @@ class TestSpawnCrashInvestigations:
             assert t.context["spawned_by"] == "crash_investigation"
             assert t.context["service_name"] == "reaper"
             assert t.context["crash_count"] == 3
+            assert t.context["regression_class"] == "background_service_crash:reaper"
         assert len(inflight) == 2
         session.commit.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_suppressed_when_needs_manual_intervention(self):
+        """No task is spawned when the existing case is at NEEDS_MANUAL_INTERVENTION."""
+        pid = uuid.uuid4()
+        projects = [_make_project(pid)]
+        inflight: Dict[str, str] = {}
+
+        mock_case = MagicMock(spec=RegressionRemediationCase)
+        mock_case.status = RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION
+
+        session = _make_session(projects, existing_task=None, existing_case=mock_case)
+        added_objects = []
+        session.add = MagicMock(side_effect=lambda obj: added_objects.append(obj))
+
+        with patch("app.lifecycle.AsyncSessionLocal", return_value=session):
+            with patch(
+                "app.lifecycle.validate_internal_payload", side_effect=lambda p, _: p
+            ):
+                await _spawn_crash_investigations(
+                    service_name="orchestrator",
+                    cause_str="hung",
+                    exc=None,
+                    crash_count=5,
+                    inflight=inflight,
+                )
+
+        task_objects = [o for o in added_objects if isinstance(o, Task)]
+        assert len(task_objects) == 0
+        session.commit.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_existing_active_case_recorded_not_duplicated(self):
+        """When an ACTIVE case exists, record_spawn is called instead of create_for_spawn."""
+        pid = uuid.uuid4()
+        projects = [_make_project(pid)]
+        inflight: Dict[str, str] = {}
+
+        mock_case = MagicMock(spec=RegressionRemediationCase)
+        mock_case.status = RegressionCaseStatus.ACTIVE
+
+        session = _make_session(projects, existing_task=None, existing_case=mock_case)
+        added_objects = []
+        session.add = MagicMock(side_effect=lambda obj: added_objects.append(obj))
+
+        with patch("app.lifecycle.AsyncSessionLocal", return_value=session):
+            with patch(
+                "app.lifecycle.validate_internal_payload", side_effect=lambda p, _: p
+            ):
+                with patch.object(
+                    RegressionRemediationCase, "create_for_spawn"
+                ) as mock_create:
+                    await _spawn_crash_investigations(
+                        service_name="gcp_cleanup",
+                        cause_str="timeout",
+                        exc=None,
+                        crash_count=3,
+                        inflight=inflight,
+                    )
+                mock_create.assert_not_called()
+        mock_case.record_spawn.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_dedup_skips_project_already_inflight(self):
@@ -101,7 +180,9 @@ class TestSpawnCrashInvestigations:
         session.add = MagicMock(side_effect=lambda obj: added_objects.append(obj))
 
         with patch("app.lifecycle.AsyncSessionLocal", return_value=session):
-            with patch("app.lifecycle.validate_internal_payload", side_effect=lambda p, _: p):
+            with patch(
+                "app.lifecycle.validate_internal_payload", side_effect=lambda p, _: p
+            ):
                 await _spawn_crash_investigations(
                     service_name="reaper",
                     cause_str="error",
@@ -128,7 +209,9 @@ class TestSpawnCrashInvestigations:
         session.add = MagicMock(side_effect=lambda obj: added_objects.append(obj))
 
         with patch("app.lifecycle.AsyncSessionLocal", return_value=session):
-            with patch("app.lifecycle.validate_internal_payload", side_effect=lambda p, _: p):
+            with patch(
+                "app.lifecycle.validate_internal_payload", side_effect=lambda p, _: p
+            ):
                 await _spawn_crash_investigations(
                     service_name="reaper",
                     cause_str="error",
@@ -159,7 +242,9 @@ class TestSpawnCrashInvestigations:
         mock_stats = {"cycles_completed_total": 42, "last_cycle_age_seconds": 90.5}
 
         with patch("app.lifecycle.AsyncSessionLocal", return_value=session):
-            with patch("app.lifecycle.validate_internal_payload", side_effect=capture_payload):
+            with patch(
+                "app.lifecycle.validate_internal_payload", side_effect=capture_payload
+            ):
                 with patch("app.reaper.get_reaper_stats", return_value=mock_stats):
                     await _spawn_crash_investigations(
                         service_name="reaper",
@@ -181,7 +266,9 @@ class TestSpawnCrashInvestigations:
         session = _make_session(projects=[], existing_task=None)
 
         with patch("app.lifecycle.AsyncSessionLocal", return_value=session):
-            with patch("app.lifecycle.validate_internal_payload", side_effect=lambda p, _: p):
+            with patch(
+                "app.lifecycle.validate_internal_payload", side_effect=lambda p, _: p
+            ):
                 await _spawn_crash_investigations(
                     service_name="orchestrator",
                     cause_str="timeout",
@@ -196,6 +283,7 @@ class TestSpawnCrashInvestigations:
 # ---------------------------------------------------------------------------
 # Tests for crash tracking logic in _monitor_background_tasks
 # ---------------------------------------------------------------------------
+
 
 class TestMonitorCrashTracking:
     """Unit tests for the crash-episode threshold logic extracted from the monitor."""
@@ -238,7 +326,9 @@ class TestMonitorCrashTracking:
     def test_stability_reset_clears_tracking(self):
         """Simulates the stability reset: crash_timestamps and inflight are cleared."""
         crash_timestamps: Dict[str, list] = {"reaper": [MagicMock(), MagicMock()]}
-        inflight_investigations: Dict[str, Dict[str, str]] = {"reaper": {"proj-1": "task-abc"}}
+        inflight_investigations: Dict[str, Dict[str, str]] = {
+            "reaper": {"proj-1": "task-abc"}
+        }
 
         # Stability reset triggered
         crash_timestamps.pop("reaper", None)

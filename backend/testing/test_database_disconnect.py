@@ -9,16 +9,24 @@ The tests construct a minimal AsyncEngine, register the listener, simulate
 disconnect-class errors via the dispatch hook, and verify the
 connection.invalidate() call + counter behavior.
 """
+
 from unittest.mock import MagicMock
 
 import pytest
 
 import app.database as db_module
-from app.database import _install_disconnect_invalidation, get_db_pool_invalidation_stats
+from app.database import (
+    _install_disconnect_invalidation,
+    get_db_pool_invalidation_stats,
+)
 
 
-def _make_ctx(*, is_disconnect: bool, original_exc: Exception | None = None,
-              connection: object | None = None) -> MagicMock:
+def _make_ctx(
+    *,
+    is_disconnect: bool,
+    original_exc: Exception | None = None,
+    connection: object | None = None,
+) -> MagicMock:
     """Construct a minimal SQLAlchemy ExceptionContext stand-in."""
     ctx = MagicMock()
     ctx.is_disconnect = is_disconnect
@@ -48,11 +56,13 @@ def _attach_listener_get_dispatcher() -> tuple[MagicMock, callable]:
         def decorator(fn):
             captured["fn"] = fn
             return fn
+
         return decorator
 
     # Patch event.listens_for with our capturing decorator so we can call the
     # listener directly rather than driving it via real SQL.
     import sqlalchemy
+
     original = sqlalchemy.event.listens_for
     sqlalchemy.event.listens_for = fake_listens_for
     try:

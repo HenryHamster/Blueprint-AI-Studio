@@ -8,6 +8,7 @@ All deferred imports from ``app.main`` are intentional — they avoid circular
 imports (task_lifecycle is imported BY main) and preserve test-patchability
 (tests mock via ``app.main.<name>``).
 """
+
 import asyncio
 import copy
 import json
@@ -24,8 +25,14 @@ from sqlmodel import select
 
 from app.database import AsyncSessionLocal
 from app.models import (
-    Task, TaskHistory, Project,
-    TaskStatus, ArtifactType, Alert, AlertSeverity, ProjectStatus,
+    Task,
+    TaskHistory,
+    Project,
+    TaskStatus,
+    ArtifactType,
+    Alert,
+    AlertSeverity,
+    ProjectStatus,
     RegressionRemediationCase,
 )
 from app.schemas import AgentStatusPayload
@@ -66,7 +73,7 @@ class PostCommitLocked(Exception):
     """
 
 
-from app.failure_stage import (  # noqa: F401 — re-exported for legacy callers/tests
+from app.failure_stage import (  # noqa: E402, F401 — re-exported for legacy callers/tests
     _TRANSIENT_SCAN_ERROR_PATTERNS,
     _derive_failure_stage,
     _is_transient_scan_error,
@@ -94,7 +101,10 @@ _BUILD_GATE_PATTERN = re.compile(
 
 
 def _detect_ci_review_disagreement(
-    issues: list, feedback: str, ci_check: dict | None, pr_number: int | None,
+    issues: list,
+    feedback: str,
+    ci_check: dict | None,
+    pr_number: int | None,
 ) -> str:
     """Return a fix-prompt preamble when reviewer claims a build/lint gate is
     red but CI shows the matching job green.
@@ -124,19 +134,24 @@ def _detect_ci_review_disagreement(
     # Map reviewer-complaint domains to CI job-name fragments. A green CI job
     # that matches a complained-about domain is the disagreement signal.
     flagged: list[str] = []
-    if (
-        any(kw in haystack for kw in ("admin-ui", "vite", "tailwind", "vite/client", "frontend", "npm run build"))
-        and any("frontend" in n for n in green_jobs)
-    ):
+    if any(
+        kw in haystack
+        for kw in (
+            "admin-ui",
+            "vite",
+            "tailwind",
+            "vite/client",
+            "frontend",
+            "npm run build",
+        )
+    ) and any("frontend" in n for n in green_jobs):
         flagged.append("CI / Frontend")
-    if (
-        any(kw in haystack for kw in ("agent", "tsc", "noemit", "type def"))
-        and any("agent" in n for n in green_jobs)
+    if any(kw in haystack for kw in ("agent", "tsc", "noemit", "type def")) and any(
+        "agent" in n for n in green_jobs
     ):
         flagged.append("CI / Agent")
-    if (
-        any(kw in haystack for kw in ("ruff", "backend", "py_compile", "lint"))
-        and any("backend" in n for n in green_jobs)
+    if any(kw in haystack for kw in ("ruff", "backend", "py_compile", "lint")) and any(
+        "backend" in n for n in green_jobs
     ):
         flagged.append("CI / Backend")
     if not flagged:
@@ -181,8 +196,10 @@ def _build_scope_overflow_details(ctx: dict, task_scope: str) -> str:
         key = "/".join(parts[:2]) if len(parts) >= 2 else parts[0]
         module_counts[key] = module_counts.get(key, 0) + 1
 
-    lines = ["OVERFLOW DETAILS FROM PREVIOUS ATTEMPT:",
-             f"- Files touched: {len(changed_files)}"]
+    lines = [
+        "OVERFLOW DETAILS FROM PREVIOUS ATTEMPT:",
+        f"- Files touched: {len(changed_files)}",
+    ]
     threshold = _SCOPE_OVERFLOW_THRESHOLDS.get(task_scope)
     if threshold:
         lines.append(
@@ -205,7 +222,8 @@ def _build_scope_overflow_details(ctx: dict, task_scope: str) -> str:
 
 
 def _append_approve_to_review_history(
-    review_loop: dict, changed_files: "list[str] | None" = None,
+    review_loop: dict,
+    changed_files: "list[str] | None" = None,
 ) -> list:
     """Append an APPROVE entry to ``review_history`` so the trajectory section
     shown to fix agents includes approved iterations alongside REQUEST_CHANGES
@@ -226,18 +244,21 @@ def _append_approve_to_review_history(
         and history[-1].get("verdict") == "APPROVE"
     ):
         return history
-    history.append({
-        "iteration": iteration,
-        "feedback": "",
-        "verdict": "APPROVE",
-        "changed_files": list(changed_files or [])[:30],
-    })
+    history.append(
+        {
+            "iteration": iteration,
+            "feedback": "",
+            "verdict": "APPROVE",
+            "changed_files": list(changed_files or [])[:30],
+        }
+    )
     return history
 
 
 def _record_parent_failure(parent: Task, failure_class: str) -> None:
     """Record a parent-task FAILED transition in deploy_monitoring and direction health."""
     from app.routers.agent_status import record_task_result
+
     record_task_result(
         success=False,
         failure_class=failure_class,
@@ -299,7 +320,9 @@ def _build_retry_prompt_suffix(
             lines.append(f"- Originally recommended fix: {recommended_fix[:800]}")
         affected = ctx.get("related_files") or []
         if affected:
-            lines.append("- Affected files: " + ", ".join(str(f) for f in affected[:10]))
+            lines.append(
+                "- Affected files: " + ", ".join(str(f) for f in affected[:10])
+            )
         diagnosis_prefix = "\n".join(lines) + "\n"
 
     if failure_class == "AGENT_TIMEOUT":
@@ -359,7 +382,10 @@ def _build_retry_prompt_suffix(
     # into multiple small subtasks — turning a repeated same-scope failure into a
     # productive decomposition pass. Matches both the canonical SCOPE_OVERFLOW class
     # and the raw lowercase 'scope_overflow' label in case normalization didn't run.
-    elif failure_class == "SCOPE_OVERFLOW" or (ctx.get("failure_category") or "").lower() == "scope_overflow":
+    elif (
+        failure_class == "SCOPE_OVERFLOW"
+        or (ctx.get("failure_category") or "").lower() == "scope_overflow"
+    ):
         if ctx.get("scope_gate_triggered") == "analysis_overflow":
             extra_guidance = (
                 "RETRY GUIDANCE: The previous attempt could not produce a valid analysis plan within the scope budget.\n"
@@ -399,20 +425,29 @@ def _build_retry_prompt_suffix(
                 "    apply changes to the working tree — do not just print a patch\n"
                 "  - Run the build/tests if the task requires verification\n"
                 "  - Open a PR via ./pr and call ./done to ship — OR call\n"
-                "    ./fail \"<reason>\" if the task fundamentally cannot be completed\n"
+                '    ./fail "<reason>" if the task fundamentally cannot be completed\n'
                 "Do NOT print a unified diff to stdout and exit.\n"
             )
         else:
-            stage_guidance = CODE_ERROR_STAGE_GUIDANCE.get(ctx.get("_previous_failure_stage") or "")
+            stage_guidance = CODE_ERROR_STAGE_GUIDANCE.get(
+                ctx.get("_previous_failure_stage") or ""
+            )
             if stage_guidance:
                 extra_guidance = "RETRY GUIDANCE: " + stage_guidance + "\n"
             else:
                 error_text = (original_status_message or "").lower()
                 hints = []
-                if any(kw in error_text for kw in ["test", "assert", "pytest", "jest", "vitest"]):
-                    hints.append("Fix the specific failing tests shown in the error log before making other changes.")
+                if any(
+                    kw in error_text
+                    for kw in ["test", "assert", "pytest", "jest", "vitest"]
+                ):
+                    hints.append(
+                        "Fix the specific failing tests shown in the error log before making other changes."
+                    )
                 if any(kw in error_text for kw in ["lint", "ruff", "eslint", "tsc"]):
-                    hints.append("Fix lint/type errors first — run the linter before committing.")
+                    hints.append(
+                        "Fix lint/type errors first — run the linter before committing."
+                    )
                 if hints:
                     extra_guidance = "RETRY GUIDANCE: " + " ".join(hints) + "\n"
                 else:
@@ -433,9 +468,13 @@ def _build_retry_prompt_suffix(
                 "- Overlapping failures: " + ", ".join(overlap[:5]) + "\n"
             ) + extra_guidance
         if failing_tests:
-            extra_guidance += "Previously failing tests:\n" + "".join(f"  {t}\n" for t in failing_tests)
+            extra_guidance += "Previously failing tests:\n" + "".join(
+                f"  {t}\n" for t in failing_tests
+            )
         if error_files:
-            extra_guidance += "Error file locations:\n" + "".join(f"  {f}\n" for f in error_files)
+            extra_guidance += "Error file locations:\n" + "".join(
+                f"  {f}\n" for f in error_files
+            )
         prev_review_issues = ctx.get("_previous_review_issues") or []
         if prev_review_issues:
             extra_guidance += (
@@ -457,7 +496,7 @@ def _build_retry_prompt_suffix(
                 scope_override = "medium" if task_scope == "large" else "small"
 
     elif failure_class == "EXTERNAL_API":
-        error_text = (original_status_message or "")
+        error_text = original_status_message or ""
         lower = error_text.lower()
         if "github" in lower:
             service = "GitHub API"
@@ -490,7 +529,9 @@ def _build_retry_prompt_suffix(
         )
     prev_stage = ctx.get("_previous_failure_stage")
     if prev_stage:
-        cross_attempt_lines.append(f"- Previous attempt failed at pipeline stage: {prev_stage}")
+        cross_attempt_lines.append(
+            f"- Previous attempt failed at pipeline stage: {prev_stage}"
+        )
     prev_self_review = ctx.get("_previous_self_review_outcome")
     if prev_self_review:
         summary = str(prev_self_review)[:300]
@@ -498,13 +539,14 @@ def _build_retry_prompt_suffix(
             f"- Previous attempt's self-review flagged: {summary}"
         )
     if cross_attempt_lines:
-        extra_guidance += "CROSS-ATTEMPT CONTEXT:\n" + "\n".join(cross_attempt_lines) + "\n"
+        extra_guidance += (
+            "CROSS-ATTEMPT CONTEXT:\n" + "\n".join(cross_attempt_lines) + "\n"
+        )
 
     if diagnosis_prefix:
         extra_guidance = diagnosis_prefix + extra_guidance
 
     return extra_guidance, scope_override
-
 
 
 async def _has_active_strategic_task(project_id, session: AsyncSession) -> bool:
@@ -535,7 +577,9 @@ async def _has_active_strategic_task(project_id, session: AsyncSession) -> bool:
     ``docs/concurrency.md`` for the full canonical-order argument.
     """
     result = await session.execute(
-        select(Project.id).where(Project.id == project_id).with_for_update(skip_locked=True)
+        select(Project.id)
+        .where(Project.id == project_id)
+        .with_for_update(skip_locked=True)
     )
     if result.first() is None:
         # Row missing or held — fail safe. The other holder will spawn (or
@@ -545,26 +589,44 @@ async def _has_active_strategic_task(project_id, session: AsyncSession) -> bool:
     # drop status_log/plan_output JSONB. Loading payloads keeps first_payload
     # cheap (L-P2 — without payloads loaded, accessing first_payload would
     # trigger a per-row reload).
-    active = (await session.execute(
-        select(Task)
-        .options(load_only(Task.id, Task.status, Task.payloads, Task.project_id))
-        .where(
-            Task.project_id == project_id,
-            Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]),
+    active = (
+        (
+            await session.execute(
+                select(Task)
+                .options(
+                    load_only(Task.id, Task.status, Task.payloads, Task.project_id)
+                )
+                .where(
+                    Task.project_id == project_id,
+                    Task.status.in_(
+                        [
+                            TaskStatus.QUEUED,
+                            TaskStatus.PROVISIONING,
+                            TaskStatus.IN_PROGRESS,
+                        ]
+                    ),
+                )
+            )
         )
-    )).scalars().all()
+        .scalars()
+        .all()
+    )
     return any(
         (t.first_payload).get("type") in ("design_doc_update", "strategic_review")
         for t in active
     )
 
-async def _increment_research_spawn_count(project: Project, session: AsyncSession) -> int:
+
+async def _increment_research_spawn_count(
+    project: Project, session: AsyncSession
+) -> int:
     """Increment _research_spawn_count in project.vision and persist. Returns new count."""
     new_count = (project.vision or {}).get("_research_spawn_count", 0) + 1
     project.vision = {**(project.vision or {}), "_research_spawn_count": new_count}
     flag_modified(project, "vision")
     session.add(project)
     return new_count
+
 
 def _extract_failing_tests(text: str) -> list[str]:
     """Extract up to 10 failing test identifiers from error output.
@@ -581,15 +643,15 @@ def _extract_failing_tests(text: str) -> list[str]:
             results.append(ident)
 
     # pytest: FAILED path/to/test_file.py::test_name[param]
-    for m in re.finditer(r'FAILED\s+(\S+::\S+)', text):
+    for m in re.finditer(r"FAILED\s+(\S+::\S+)", text):
         _add(m.group(1))
 
     # Jest/Vitest: FAIL TestSuite/TestName or FAIL path/to/test.ts
-    for m in re.finditer(r'\bFAIL\b\s+(\S+/\S+)', text):
+    for m in re.finditer(r"\bFAIL\b\s+(\S+/\S+)", text):
         _add(m.group(1))
 
     # Generic "Error: message" lines (capped at 120 chars each)
-    for m in re.finditer(r'^Error:\s+.+$', text, re.MULTILINE):
+    for m in re.finditer(r"^Error:\s+.+$", text, re.MULTILINE):
         _add(m.group(0).strip()[:120])
 
     return results
@@ -614,9 +676,11 @@ def _extract_error_files(text: str) -> list[str]:
         _add(m.group(1))
 
     # TypeScript/ESLint: path/to/file.ts:line:col (require path separator)
-    for m in re.finditer(r'([a-zA-Z0-9_.][a-zA-Z0-9_./\-]*\.[a-z]{2,4}):(\d+):(\d+)', text):
+    for m in re.finditer(
+        r"([a-zA-Z0-9_.][a-zA-Z0-9_./\-]*\.[a-z]{2,4}):(\d+):(\d+)", text
+    ):
         path = m.group(1)
-        if '/' in path:
+        if "/" in path:
             _add(path)
 
     return results
@@ -650,9 +714,18 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
             f"({requeue_count}/{effective_max} attempts) — failing permanently"
         )
         parent.status = TaskStatus.FAILED
-        failed_children = (await session.execute(
-            select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.FAILED)
-        )).scalars().all()
+        failed_children = (
+            (
+                await session.execute(
+                    select(Task).where(
+                        Task.parent_task_id == parent.id,
+                        Task.status == TaskStatus.FAILED,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
 
         # Surface divergence cause in the status message when available so
         # operators on the kanban immediately see why the task was abandoned.
@@ -671,7 +744,11 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
             if _divergence_msg
             else f"Re-evaluation limit reached ({requeue_count} attempts) — children consistently failing"
         )
-        from app.failure_classification import worst_child_failure_category, persist_failure_category
+        from app.failure_classification import (
+            worst_child_failure_category,
+            persist_failure_category,
+        )
+
         worst_cat = worst_child_failure_category(failed_children)
         persist_failure_category(parent, worst_cat)
         _record_parent_failure(parent, worst_cat)
@@ -681,9 +758,11 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
         await _maybe_create_failure_alert(parent, session, parent.latest_status_message)
         return 0
 
-    children = (await session.execute(
-        select(Task).where(Task.parent_task_id == parent.id)
-    )).scalars().all()
+    children = (
+        (await session.execute(select(Task).where(Task.parent_task_id == parent.id)))
+        .scalars()
+        .all()
+    )
 
     # Refresh base_branch from parent's staging branch — the original child's
     # base_branch may reference a deleted branch (e.g., plan/* after rollup merge)
@@ -733,19 +812,26 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
         if _debug_fix_id:
             try:
                 _debug_fix_uuid = uuid.UUID(_debug_fix_id)
-                _debug_fix_task = (await session.execute(
-                    select(Task).where(
-                        Task.id == _debug_fix_uuid,
-                        Task.status.in_([
-                            TaskStatus.QUEUED, TaskStatus.PROVISIONING,
-                            TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING,
-                        ]),
+                _debug_fix_task = (
+                    await session.execute(
+                        select(Task).where(
+                            Task.id == _debug_fix_uuid,
+                            Task.status.in_(
+                                [
+                                    TaskStatus.QUEUED,
+                                    TaskStatus.PROVISIONING,
+                                    TaskStatus.IN_PROGRESS,
+                                    TaskStatus.EVALUATING,
+                                ]
+                            ),
+                        )
                     )
-                )).scalar_one_or_none()
+                ).scalar_one_or_none()
                 if _debug_fix_task is not None:
                     logger.info(
                         "[REQUEUE] Skipping clone of child %s — debug-fix task %s already active",
-                        str(child.id)[:8], _debug_fix_id[:8],
+                        str(child.id)[:8],
+                        _debug_fix_id[:8],
                     )
                     continue
             except Exception:
@@ -780,6 +866,7 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
         # project-wide, which is too late for individual task abort.
         try:
             from app.anomaly_detection import _error_fingerprint as _fp_fn
+
             # Audit W1: previous_error_fingerprint is now a column.
             prior_fp = child.previous_error_fingerprint
             current_fp = _fp_fn(original_status_message or "")
@@ -790,14 +877,21 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
                 )
                 continue
         except Exception:
-            logger.exception("[REQUEUE] Fingerprint comparison failed for task %s", child.id)
+            logger.exception(
+                "[REQUEUE] Fingerprint comparison failed for task %s", child.id
+            )
 
         # Auto-generate playbook entry if this failure pattern is recurring
         try:
             from app.playbook_learning import _maybe_auto_playbook
-            await _maybe_auto_playbook(child, failure_class, original_status_message, session)
+
+            await _maybe_auto_playbook(
+                child, failure_class, original_status_message, session
+            )
         except Exception:
-            logger.exception("[AUTO_PLAYBOOK] Failed to process playbook for task %s", child.id)
+            logger.exception(
+                "[AUTO_PLAYBOOK] Failed to process playbook for task %s", child.id
+            )
 
         # Cancel the failed child so rollup skips it
         child.status = TaskStatus.CANCELLED
@@ -836,7 +930,9 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
         # it here closes the gap where _ctx_keys_to_strip would otherwise clear
         # the list and the clone starts with a blank slate.
         if failure_class == "RATE_LIMIT":
-            rl_acct_id = child_ctx.get("llm_account_id") or child_ctx.get("max_plan_account_id")
+            rl_acct_id = child_ctx.get("llm_account_id") or child_ctx.get(
+                "max_plan_account_id"
+            )
             if rl_acct_id:
                 prior_bl = list(child_ctx.get("blacklisted_accounts") or [])
                 if rl_acct_id not in prior_bl:
@@ -856,13 +952,22 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
         # total compute burned on retries that eventually succeeded.
         try:
             from app.routers.admin_analytics import ON_DEMAND_RATE, SPOT_RATE
+
             if child.vm_provisioned_at and child.vm_stopped_at:
                 _rate = SPOT_RATE if child.vm_spot else ON_DEMAND_RATE
-                _attempt_cost = _rate * (child.vm_stopped_at - child.vm_provisioned_at).total_seconds()
+                _attempt_cost = (
+                    _rate
+                    * (child.vm_stopped_at - child.vm_provisioned_at).total_seconds()
+                )
                 _prior_cost = float(clone_ctx.get("_prior_attempts_cost") or 0.0)
-                clone_ctx["_prior_attempts_cost"] = round(_prior_cost + max(_attempt_cost, 0.0), 6)
+                clone_ctx["_prior_attempts_cost"] = round(
+                    _prior_cost + max(_attempt_cost, 0.0), 6
+                )
         except Exception:
-            logger.exception("[REQUEUE] Failed to accumulate prior attempt cost for task %s", child.id)
+            logger.exception(
+                "[REQUEUE] Failed to accumulate prior attempt cost for task %s",
+                child.id,
+            )
         clone_ctx["_previous_error"] = (original_status_message or "")[:5000]
         clone_ctx["_previous_failure_class"] = failure_class
         clone_ctx["_failure_class_history"] = append_failure_class_history(
@@ -872,7 +977,11 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
 
         # Enriched failure diagnosis: fingerprint, stage, error summary, and recurring flag
         try:
-            from app.anomaly_detection import _error_fingerprint, _is_recurring_failure_class
+            from app.anomaly_detection import (
+                _error_fingerprint,
+                _is_recurring_failure_class,
+            )
+
             error_msg = original_status_message or ""
             clone_ctx["_previous_error_fingerprint"] = _error_fingerprint(error_msg)
             failure_stage = _derive_failure_stage(failure_class, error_msg)
@@ -880,11 +989,15 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
                 clone_ctx["_previous_failure_stage"] = failure_stage
             if failure_class == "CODE_ERROR":
                 clone_ctx["_previous_error_summary"] = error_msg[:500]
-            proj_anomalies = _shared_state.persistent_anomalies.get(str(child.project_id), {})
+            proj_anomalies = _shared_state.persistent_anomalies.get(
+                str(child.project_id), {}
+            )
             if _is_recurring_failure_class(proj_anomalies, failure_class):
                 clone_ctx["_previous_is_recurring"] = True
         except Exception:
-            logger.exception("[REQUEUE] Failed to enrich retry context for task %s", child.id)
+            logger.exception(
+                "[REQUEUE] Failed to enrich retry context for task %s", child.id
+            )
 
         # Propagate PR artifacts from the failed attempt to the retry context
         prev_pr_url = child_ctx.get("_pr_url", "")
@@ -915,9 +1028,9 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
         # retry can address structured reviewer feedback that truncated status
         # messages often miss.
         try:
-            review_history = (
-                (child_ctx.get("review_loop") or {}).get("review_history") or []
-            )
+            review_history = (child_ctx.get("review_loop") or {}).get(
+                "review_history"
+            ) or []
             if review_history:
                 last_issues = (review_history[-1] or {}).get("issues") or []
                 filtered = [
@@ -930,15 +1043,15 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
                 if filtered:
                     clone_ctx["_previous_review_issues"] = filtered[:5]
         except Exception:
-            logger.exception("[REQUEUE] Failed to extract review issues for task %s", child.id)
+            logger.exception(
+                "[REQUEUE] Failed to extract review issues for task %s", child.id
+            )
 
         # Carry forward the review-iteration count consumed by the prior attempt.
         # _max_review_iterations subtracts half of this from the new cap (floor 3)
         # so retries don't each receive a fresh full iteration budget.
         try:
-            prior_iter = int(
-                (child_ctx.get("review_loop") or {}).get("iteration") or 0
-            )
+            prior_iter = int((child_ctx.get("review_loop") or {}).get("iteration") or 0)
             if prior_iter > 0:
                 clone_ctx["_prior_review_iterations_consumed"] = prior_iter
         except (TypeError, ValueError):
@@ -947,7 +1060,11 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
         if new_payloads and isinstance(new_payloads[0], dict):
             existing_suffix = new_payloads[0].get("prompt_suffix", "") or ""
             extra_guidance, scope_override = _build_retry_prompt_suffix(
-                failure_class, original_status_message, attempt, task_scope, clone_ctx,
+                failure_class,
+                original_status_message,
+                attempt,
+                task_scope,
+                clone_ctx,
             )
             if scope_override:
                 _override_reason = classify_override_reason(failure_class, clone_ctx)
@@ -955,9 +1072,14 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
                 clone_ctx["_scope_reduced"] = True
                 clone_ctx["scope_calibrated_from"] = f"{task_scope}:{_override_reason}"
             if extra_guidance:
-                new_payloads[0]["prompt_suffix"] = extra_guidance + ("\n" + existing_suffix if existing_suffix else "")
+                new_payloads[0]["prompt_suffix"] = extra_guidance + (
+                    "\n" + existing_suffix if existing_suffix else ""
+                )
 
-        new_payloads = [validate_internal_payload(p, "task_lifecycle:requeue_child") for p in new_payloads]
+        new_payloads = [
+            validate_internal_payload(p, "task_lifecycle:requeue_child")
+            for p in new_payloads
+        ]
         new_child = Task(
             project_id=child.project_id,
             title=child.title,
@@ -978,18 +1100,24 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
         # Record the clone's ID in the cancelled child's context so the
         # orchestrator can resolve requeue-cancelled dependencies without
         # cascade-cancelling external tasks that depend on this child.
-        child.context = {**(child.context or {}), "_replaced_by_task_id": str(new_child.id)}
+        child.context = {
+            **(child.context or {}),
+            "_replaced_by_task_id": str(new_child.id),
+        }
         flag_modified(child, "context")
         retried_count += 1
 
-        history = TaskHistory(task_id=new_child.id, action="SPAWNED",
-                              details={"spawned_by": "REQUEUE", "retrying": str(child.id)})
+        history = TaskHistory(
+            task_id=new_child.id,
+            action="SPAWNED",
+            details={"spawned_by": "REQUEUE", "retrying": str(child.id)},
+        )
         session.add(history)
 
     # Pass 2: Remap depends_on from old (cancelled) IDs to new (cloned) IDs
     for original, clone in cloned_pairs:
         remapped = []
-        for dep_id in (original.depends_on or []):
+        for dep_id in original.depends_on or []:
             if dep_id in old_to_new:
                 remapped.append(old_to_new[dep_id])  # Point to the clone
             else:
@@ -1000,7 +1128,9 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
     if cloned_pairs:
         graph = {str(c.id): c.depends_on or [] for _, c in cloned_pairs}
         if _has_local_cycle(graph):
-            logger.warning(f"[REQUEUE] Circular deps detected in cloned children of {parent.id} — clearing all depends_on")
+            logger.warning(
+                f"[REQUEUE] Circular deps detected in cloned children of {parent.id} — clearing all depends_on"
+            )
             for _, clone in cloned_pairs:
                 clone.depends_on = []
 
@@ -1012,8 +1142,13 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
     if retried_count == 0:
         has_completed = any(c.status == TaskStatus.COMPLETED for c in children)
         has_active = any(
-            c.status in (TaskStatus.QUEUED, TaskStatus.PROVISIONING,
-                         TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING)
+            c.status
+            in (
+                TaskStatus.QUEUED,
+                TaskStatus.PROVISIONING,
+                TaskStatus.IN_PROGRESS,
+                TaskStatus.EVALUATING,
+            )
             for c in children
         )
         if not has_completed and not has_active:
@@ -1024,8 +1159,11 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
             # the BLOCKED_PRECONDITION case so operators see "held on upstream"
             # rather than the generic "nothing to roll up" message.
             from app.failure_classification import (
-                AGENT_TIMEOUT, BLOCKED_PRECONDITION, persist_failure_category,
+                AGENT_TIMEOUT,
+                BLOCKED_PRECONDITION,
+                persist_failure_category,
             )
+
             parent.status = TaskStatus.FAILED
             if blocked_count > 0 and blocked_count == sum(
                 1 for c in children if c.status == TaskStatus.FAILED
@@ -1044,9 +1182,14 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
             _record_parent_failure(parent, parent_class)
             session.add(parent)
             await session.commit()
-            await _maybe_create_failure_alert(parent, session, parent.latest_status_message)
-            await broadcast_to_project(str(parent.project_id), "task_updated",
-                                       {"task_id": str(parent.id), "status": TaskStatus.FAILED})
+            await _maybe_create_failure_alert(
+                parent, session, parent.latest_status_message
+            )
+            await broadcast_to_project(
+                str(parent.project_id),
+                "task_updated",
+                {"task_id": str(parent.id), "status": TaskStatus.FAILED},
+            )
             logger.warning(
                 f"[REQUEUE] Parent {parent.id} has no failed children to retry and "
                 f"no successful ones to roll up — marking FAILED ({parent_class})"
@@ -1062,8 +1205,11 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
         )
         session.add(parent)
         await session.commit()
-        await broadcast_to_project(str(parent.project_id), "task_updated",
-                                   {"task_id": str(parent.id), "status": TaskStatus.EVALUATING})
+        await broadcast_to_project(
+            str(parent.project_id),
+            "task_updated",
+            {"task_id": str(parent.id), "status": TaskStatus.EVALUATING},
+        )
         logger.info(
             f"[REQUEUE] Parent {parent.id} — no failed children to retry "
             f"(has_completed={has_completed}, has_active={has_active}); "
@@ -1073,22 +1219,34 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
 
     parent.context = {**(parent.context or {}), "_requeue_count": requeue_count + 1}
     parent.status = TaskStatus.EVALUATING
-    parent.latest_status_message = f"Requeued — retrying {retried_count} failed subtask(s)"
+    parent.latest_status_message = (
+        f"Requeued — retrying {retried_count} failed subtask(s)"
+    )
     parent.attempt_count += 1
     session.add(parent)
     await session.commit()
 
     for child in children:
         await session.refresh(child)
-    await broadcast_to_project(str(parent.project_id), "task_updated",
-                               {"task_id": str(parent.id), "status": TaskStatus.EVALUATING})
-    logger.info(f"[REQUEUE] Parent {parent.id} re-evaluating — {retried_count} failed children retried")
+    await broadcast_to_project(
+        str(parent.project_id),
+        "task_updated",
+        {"task_id": str(parent.id), "status": TaskStatus.EVALUATING},
+    )
+    logger.info(
+        f"[REQUEUE] Parent {parent.id} re-evaluating — {retried_count} failed children retried"
+    )
     return retried_count
 
 
 async def _merge_with_retry(
-    merge_pull_request_fn, gh_token: str, owner: str, repo: str,
-    pr_number: int, project_id: str, max_attempts: int = 3
+    merge_pull_request_fn,
+    gh_token: str,
+    owner: str,
+    repo: str,
+    pr_number: int,
+    project_id: str,
+    max_attempts: int = 3,
 ) -> dict:
     """Call merge_pull_request with exponential backoff for transient 5xx errors.
 
@@ -1099,11 +1257,13 @@ async def _merge_with_retry(
     last_exc = None
     for attempt in range(max_attempts):
         try:
-            return await merge_pull_request_fn(gh_token, owner, repo, pr_number, project_id=project_id)
+            return await merge_pull_request_fn(
+                gh_token, owner, repo, pr_number, project_id=project_id
+            )
         except Exception as exc:  # noqa: PERF203 — per-attempt try is required for the retry loop
             last_exc = exc
             if attempt < max_attempts - 1:
-                backoff = (2 ** attempt) * (1 + _random.random())  # ~1-2s, ~2-4s
+                backoff = (2**attempt) * (1 + _random.random())  # ~1-2s, ~2-4s
                 logger.warning(
                     f"[PIPELINE] Merge attempt {attempt + 1} for PR #{pr_number} raised {type(exc).__name__}, "
                     f"retrying in {backoff:.1f}s: {exc!r}"
@@ -1113,8 +1273,13 @@ async def _merge_with_retry(
 
 
 async def _comment_with_retry(
-    create_pr_comment_fn, gh_token: str, owner: str, repo: str,
-    pr_number: int, body: str, max_attempts: int = 3,
+    create_pr_comment_fn,
+    gh_token: str,
+    owner: str,
+    repo: str,
+    pr_number: int,
+    body: str,
+    max_attempts: int = 3,
 ) -> None:
     """Call create_pr_comment with exponential backoff for transient GitHub failures.
 
@@ -1131,7 +1296,7 @@ async def _comment_with_retry(
         except Exception as exc:  # noqa: PERF203 — per-attempt try is required for the retry loop
             last_exc = exc
             if attempt < max_attempts - 1:
-                backoff = (2 ** attempt) * (1 + _random.random())  # ~1-2s, ~2-4s
+                backoff = (2**attempt) * (1 + _random.random())  # ~1-2s, ~2-4s
                 logger.warning(
                     f"[PIPELINE] PR #{pr_number} comment attempt {attempt + 1} raised "
                     f"{type(exc).__name__}, retrying in {backoff:.1f}s: {exc!r}"
@@ -1141,8 +1306,10 @@ async def _comment_with_retry(
         f"[PIPELINE] PR #{pr_number} comment failed after {max_attempts} attempts: {last_exc!r}"
     )
 
+
 async def _spawn_ci_auto_remediation_followup(
-    task: Task, session: AsyncSession,
+    task: Task,
+    session: AsyncSession,
 ) -> bool:
     """Spawn an investigate task after a CI auto-remediation task fails.
 
@@ -1197,10 +1364,12 @@ async def _spawn_ci_auto_remediation_followup(
     if fingerprint:
         prompt_lines.append(f"Error fingerprint: {fingerprint}")
     if failed_prompt:
-        prompt_lines.extend([
-            "",
-            f"Approach the auto-fix attempted (truncated):\n{failed_prompt[:1500]}",
-        ])
+        prompt_lines.extend(
+            [
+                "",
+                f"Approach the auto-fix attempted (truncated):\n{failed_prompt[:1500]}",
+            ]
+        )
     prompt_lines.append(
         "\nProduce the structured diagnosis JSON report so a targeted "
         "remediation can be spawned. Consider whether the failure is "
@@ -1208,7 +1377,11 @@ async def _spawn_ci_auto_remediation_followup(
         "that the original auto-fix prompt mis-scoped."
     )
     inv_payload = validate_internal_payload(
-        {"type": "investigate", "prompt": "\n".join(prompt_lines)[:20000], "base_branch": "main"},
+        {
+            "type": "investigate",
+            "prompt": "\n".join(prompt_lines)[:20000],
+            "base_branch": "main",
+        },
         "task_lifecycle:ci_auto_remediation_followup",
     )
     inv_ctx = {
@@ -1233,14 +1406,17 @@ async def _spawn_ci_auto_remediation_followup(
         created_by="ORCHESTRATOR",
     )
     session.add(new_task)
-    session.add(TaskHistory(
-        task_id=new_task.id, action="SPAWNED",
-        details={
-            "spawned_by": "CI_AUTO_REMEDIATION_FAILURE",
-            "source_task_id": str(task.id),
-            "ci_failure_branch": str(branch),
-        },
-    ))
+    session.add(
+        TaskHistory(
+            task_id=new_task.id,
+            action="SPAWNED",
+            details={
+                "spawned_by": "CI_AUTO_REMEDIATION_FAILURE",
+                "source_task_id": str(task.id),
+                "ci_failure_branch": str(branch),
+            },
+        )
+    )
     logger.info(
         f"[AUTO-REMEDIATION] Spawned follow-up investigation {new_task.id} "
         f"for failed auto-fix {task.id} (branch={branch}, "
@@ -1317,7 +1493,8 @@ async def _close_loop_regression_case_on_failure(
     except Exception as exc:
         logger.warning(
             "classify_failure raised while capturing last_failure_class for case %s: %s",
-            case.id, exc,
+            case.id,
+            exc,
         )
     case.re_arm()
     session.add(case)
@@ -1339,18 +1516,30 @@ async def _process_post_commit(
     from app.routers.agent import get_github_token_for_task
     from app.security import scan_pr_for_injection
     from app.github import (
-        create_pr_comment, merge_pull_request, get_pull_request,
-        get_pr_files, get_check_runs_cached, submit_pr_review, update_check_run,
+        create_pr_comment,
+        merge_pull_request,
+        get_pull_request,
+        get_pr_files,
+        get_check_runs_cached,
+        submit_pr_review,
+        update_check_run,
         close_pull_request,
     )
     from app.task_completion import (
-        _handle_plan_completion, _handle_design_doc_completion,
-        _handle_security_audit_completion, _handle_perf_completion,
+        _handle_plan_completion,
+        _handle_design_doc_completion,
+        _handle_security_audit_completion,
+        _handle_perf_completion,
         _handle_self_audit_completion,
-        _handle_investigation_completion, _record_remediation_if_terminal,
-        _handle_investigation_terminal_failure, _record_regression_signal_if_matching,
+        _handle_investigation_completion,
+        _record_remediation_if_terminal,
+        _handle_investigation_terminal_failure,
+        _record_regression_signal_if_matching,
     )
-    from app.strategic_completion import _handle_strategic_completion, _record_strategic_task_failure
+    from app.strategic_completion import (
+        _handle_strategic_completion,
+        _record_strategic_task_failure,
+    )
     from app.research_completion import _handle_research_completion
 
     factory = _session_factory or AsyncSessionLocal
@@ -1363,9 +1552,11 @@ async def _process_post_commit(
         # closed, so we peek at the task type via a non-locking read and use
         # the canonical pair-locker for strategic types. Non-strategic types
         # use the existing task-only lock pattern.
-        _peek_row = (await session.execute(
-            select(Task.payloads, Task.project_id).where(Task.id == task_id)
-        )).first()
+        _peek_row = (
+            await session.execute(
+                select(Task.payloads, Task.project_id).where(Task.id == task_id)
+            )
+        ).first()
         if _peek_row is None:
             return {"status": "accepted"}
         _peek_payload_list = _peek_row[0] or []
@@ -1392,8 +1583,12 @@ async def _process_post_commit(
                 # yields ``(project, None)`` and we retry. If the project is
                 # held it yields ``(None, None)`` and we retry as well.
                 from app.task_locking import lock_project_then_task
+
                 async with lock_project_then_task(
-                    session, _peek_project_id, task_id, skip_locked=True,
+                    session,
+                    _peek_project_id,
+                    task_id,
+                    skip_locked=True,
                 ) as (_p, _t):
                     if _t is not None:
                         # Both locks acquired. Capture references and break.
@@ -1412,23 +1607,29 @@ async def _process_post_commit(
                     if _p is not None:
                         await session.rollback()
             else:
-                task = (await session.execute(
-                    select(Task).where(Task.id == task_id).with_for_update(skip_locked=True)
-                )).scalars().first()
+                task = (
+                    (
+                        await session.execute(
+                            select(Task)
+                            .where(Task.id == task_id)
+                            .with_for_update(skip_locked=True)
+                        )
+                    )
+                    .scalars()
+                    .first()
+                )
                 if task is not None:
                     break
             # Confirm the row still exists before retrying — if it's gone the
             # peer holder is irrelevant.
-            exists = (await session.execute(
-                select(Task.id).where(Task.id == task_id)
-            )).first()
+            exists = (
+                await session.execute(select(Task.id).where(Task.id == task_id))
+            ).first()
             if exists is None:
                 return {"status": "accepted"}
             await asyncio.sleep(2)
         if task is None:
-            raise PostCommitLocked(
-                f"task {task_id} row held by peer after 3 retries"
-            )
+            raise PostCommitLocked(f"task {task_id} row held by peer after 3 retries")
 
         # Phase 0 telemetry: persist warm-VM continuity timing fields into
         # task.context["_timing"] so cold-vs-warm setup cost is observable.
@@ -1446,7 +1647,9 @@ async def _process_post_commit(
             # Wave 5 follow-up: wall-time of the role's handler (post-claim,
             # post-setup). Combined with setup_secs this decomposes total
             # role time so cold-vs-warm gains can be attributed correctly.
-            _timing_payload["handler_duration_secs"] = float(payload.handler_duration_secs)
+            _timing_payload["handler_duration_secs"] = float(
+                payload.handler_duration_secs
+            )
         if _timing_payload:
             ctx = dict(task.context or {})
             existing = dict(ctx.get("_timing") or {})
@@ -1471,19 +1674,29 @@ async def _process_post_commit(
                 waiting_tasks = dep_result.scalars().all()
                 count = 0
                 for wt in waiting_tasks:
-                    wt.depends_on = [d for d in (wt.depends_on or []) if d != str(task.id)]
+                    wt.depends_on = [
+                        d for d in (wt.depends_on or []) if d != str(task.id)
+                    ]
                     session.add(wt)
                     count += 1
                 if count:
                     # Don't commit here — let the session's final commit handle it.
                     # An intermediate commit would release the FOR UPDATE lock while
                     # failure-handling code below still needs the task.
-                    logger.info(f"[PIPELINE] Cleared terminal dependency {task.id} from {count} waiting tasks")
+                    logger.info(
+                        f"[PIPELINE] Cleared terminal dependency {task.id} from {count} waiting tasks"
+                    )
             except Exception as e:
-                logger.error(f"[PIPELINE] Failed to unblock dependents of {task.id}: {e}", exc_info=True)
+                logger.error(
+                    f"[PIPELINE] Failed to unblock dependents of {task.id}: {e}",
+                    exc_info=True,
+                )
 
             # Record strategic task failures for the circuit breaker and cycle history
-            if task.first_payload.get("type") in ("design_doc_update", "strategic_review"):
+            if task.first_payload.get("type") in (
+                "design_doc_update",
+                "strategic_review",
+            ):
                 try:
                     # Round 3 C3 + C4: the canonical pair-lock acquired at the
                     # top of _process_post_commit (Project before Task, see
@@ -1494,9 +1707,14 @@ async def _process_post_commit(
                     # types (the helper does an unlocked session.get(Project)
                     # in that case — the failure-record path doesn't strictly
                     # require the project lock).
-                    await _record_strategic_task_failure(task, session, project=locked_project)
+                    await _record_strategic_task_failure(
+                        task, session, project=locked_project
+                    )
                 except Exception as _strat_exc:
-                    logger.error(f"[STRATEGIC] Failed to record strategic failure for {task.id}: {_strat_exc!r}", exc_info=True)
+                    logger.error(
+                        f"[STRATEGIC] Failed to record strategic failure for {task.id}: {_strat_exc!r}",
+                        exc_info=True,
+                    )
 
             # Record research task failures so _check_direction_health can see
             # cycles that never reached _handle_research_completion (VM crash,
@@ -1504,9 +1722,13 @@ async def _process_post_commit(
             if task.first_payload.get("type") == "research":
                 try:
                     from app.research_completion import _record_research_task_failure
+
                     await _record_research_task_failure(task, session)
                 except Exception as _res_exc:
-                    logger.error(f"[RESEARCH] Failed to record research failure for {task.id}: {_res_exc!r}", exc_info=True)
+                    logger.error(
+                        f"[RESEARCH] Failed to record research failure for {task.id}: {_res_exc!r}",
+                        exc_info=True,
+                    )
 
             # Post result message for permanently failed auto-remediation tasks.
             # Routes to residual lifecycle for residual-fingerprint tasks,
@@ -1514,11 +1736,16 @@ async def _process_post_commit(
             if task.auto_remediation:
                 try:
                     await post_remediation_result_message(
-                        session, task, result="failed",
+                        session,
+                        task,
+                        result="failed",
                     )
                     await session.commit()
                 except Exception as _ar_exc:
-                    logger.warning("[AUTO-REMEDIATION] Failed to post failure result message: %s", _ar_exc)
+                    logger.warning(
+                        "[AUTO-REMEDIATION] Failed to post failure result message: %s",
+                        _ar_exc,
+                    )
 
                 # Spawn a follow-up investigation for the failed CI auto-fix.
                 # The standard _spawn_task_failure_investigation path requires a
@@ -1540,6 +1767,7 @@ async def _process_post_commit(
             # per-task so one-off recurring defects still get diagnosed.
             try:
                 from app.autonomous_research import _spawn_task_failure_investigation
+
                 await _spawn_task_failure_investigation(task, session)
             except Exception as _inv_exc:
                 logger.error(
@@ -1551,7 +1779,9 @@ async def _process_post_commit(
             try:
                 await _close_loop_regression_case_on_failure(task, session)
             except Exception as _rc_fail_exc:
-                logger.warning(f"[REGRESSION-CASE] Failed to re-arm case on task failure {task.id}: {_rc_fail_exc!r}")
+                logger.warning(
+                    f"[REGRESSION-CASE] Failed to re-arm case on task failure {task.id}: {_rc_fail_exc!r}"
+                )
 
         # Anti-poisoning: resolve playbook entries the task wrote while
         # IN_PROGRESS. On COMPLETED, clear pending_source so peers can see
@@ -1559,14 +1789,23 @@ async def _process_post_commit(
         # never landed its code can't leave a "X exists" lie in the
         # playbook. Must run before commit so the design_doc mutation
         # is persisted alongside the rest of the post-commit work.
-        if payload.status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
+        if payload.status in (
+            TaskStatus.COMPLETED,
+            TaskStatus.FAILED,
+            TaskStatus.CANCELLED,
+        ):
             try:
                 from app.playbook_learning import finalize_pending_playbook_entries
+
                 await finalize_pending_playbook_entries(
-                    task, session, succeeded=(payload.status == TaskStatus.COMPLETED),
+                    task,
+                    session,
+                    succeeded=(payload.status == TaskStatus.COMPLETED),
                 )
             except Exception:
-                logger.exception("[PLAYBOOK] Failed to finalise pending entries for task %s", task.id)
+                logger.exception(
+                    "[PLAYBOOK] Failed to finalise pending entries for task %s", task.id
+                )
 
         # Audit 2026-04-25 A7/A12: release the FOR UPDATE row lock before the
         # review pipeline runs its slow GitHub calls (PR fetch, check-runs,
@@ -1589,13 +1828,29 @@ async def _process_post_commit(
             review_loop = (task.context or {}).get("review_loop", {})
 
             # Create task completed with PR → route based on target branch
-            if task_type in ("create", "refactor", "docs", "qa", "deps", "migrate", "") and payload.pr_url and payload.artifact_type == ArtifactType.PULL_REQUEST:
+            if (
+                task_type in ("create", "refactor", "docs", "qa", "deps", "migrate", "")
+                and payload.pr_url
+                and payload.artifact_type == ArtifactType.PULL_REQUEST
+            ):
                 pr_number = int(payload.pr_url.rstrip("/").split("/")[-1])
-                short_id = str(task.id).replace('-', '')[:8]
-                branch = f"blueprint/docs-{short_id}" if task_type == "docs" else f"blueprint/deps-{short_id}" if task_type == "deps" else f"blueprint/migrate-{short_id}" if task_type == "migrate" else f"blueprint/refactor-{short_id}" if task_type == "refactor" else f"blueprint/task-{short_id}"
+                short_id = str(task.id).replace("-", "")[:8]
+                branch = (
+                    f"blueprint/docs-{short_id}"
+                    if task_type == "docs"
+                    else f"blueprint/deps-{short_id}"
+                    if task_type == "deps"
+                    else f"blueprint/migrate-{short_id}"
+                    if task_type == "migrate"
+                    else f"blueprint/refactor-{short_id}"
+                    if task_type == "refactor"
+                    else f"blueprint/task-{short_id}"
+                )
                 base_branch = task_payload.get("base_branch", "main")
                 original_prompt = task_payload.get("prompt", task.description or "")
-                is_intermediate = base_branch.startswith("research/") or base_branch.startswith("plan/")
+                is_intermediate = base_branch.startswith(
+                    "research/"
+                ) or base_branch.startswith("plan/")
                 scope = (task.context or {}).get("scope", "unknown")
 
                 # Auto-approve trivially small main-branch diffs: skip review and route
@@ -1609,19 +1864,55 @@ async def _process_post_commit(
                     and _runtime_config.get("auto_approve_small_diff_enabled", True)
                 ):
                     try:
-                        max_lines = int(_runtime_config.get("auto_approve_max_lines", 50))
-                        max_files = int(_runtime_config.get("auto_approve_max_files", 4))
-                        _aa_tok, _aa_owner, _aa_repo = await get_github_token_for_task(task.id, session)
-                        _aa_pr = await get_pull_request(_aa_tok, _aa_owner, _aa_repo, pr_number, project_id=str(task.project_id))
-                        lines_changed = int(_aa_pr.get("additions", 0) or 0) + int(_aa_pr.get("deletions", 0) or 0)
+                        max_lines = int(
+                            _runtime_config.get("auto_approve_max_lines", 50)
+                        )
+                        max_files = int(
+                            _runtime_config.get("auto_approve_max_files", 4)
+                        )
+                        _aa_tok, _aa_owner, _aa_repo = await get_github_token_for_task(
+                            task.id, session
+                        )
+                        _aa_pr = await get_pull_request(
+                            _aa_tok,
+                            _aa_owner,
+                            _aa_repo,
+                            pr_number,
+                            project_id=str(task.project_id),
+                        )
+                        lines_changed = int(_aa_pr.get("additions", 0) or 0) + int(
+                            _aa_pr.get("deletions", 0) or 0
+                        )
                         files_changed = int(_aa_pr.get("changed_files", 0) or 0)
                         direction_id = (task.context or {}).get("direction_id")
                         acceptance = None
                         if direction_id:
-                            _aa_proj = (await session.execute(select(Project).where(Project.id == task.project_id))).scalars().first()
-                            _aa_dir = next((d for d in (getattr(_aa_proj, "directions", None) or []) if d.get("id") == direction_id), None)
+                            _aa_proj = (
+                                (
+                                    await session.execute(
+                                        select(Project).where(
+                                            Project.id == task.project_id
+                                        )
+                                    )
+                                )
+                                .scalars()
+                                .first()
+                            )
+                            _aa_dir = next(
+                                (
+                                    d
+                                    for d in (
+                                        getattr(_aa_proj, "directions", None) or []
+                                    )
+                                    if d.get("id") == direction_id
+                                ),
+                                None,
+                            )
                             if _aa_dir:
-                                from app.direction_metrics import _compute_acceptance_rate
+                                from app.direction_metrics import (
+                                    _compute_acceptance_rate,
+                                )
+
                                 acceptance = _compute_acceptance_rate(_aa_dir)
                         if (
                             0 < lines_changed <= max_lines
@@ -1635,42 +1926,78 @@ async def _process_post_commit(
                                 f"({lines_changed} lines, {files_changed} files, acceptance={acceptance:.2f}) — skipping review"
                             )
                     except Exception as _aa_exc:
-                        logger.info(f"[PIPELINE] Auto-approve eligibility check failed for PR #{pr_number}: {_aa_exc!r} — defaulting to review")
+                        logger.info(
+                            f"[PIPELINE] Auto-approve eligibility check failed for PR #{pr_number}: {_aa_exc!r} — defaulting to review"
+                        )
 
-                if (is_intermediate and scope in ("small", "medium")) or auto_approve_small:
+                if (
+                    is_intermediate and scope in ("small", "medium")
+                ) or auto_approve_small:
                     # Small/medium scope on intermediate branch → security scan then auto-merge, skip review
                     # The rollup PR to main gets the full review — intermediate merges don't need it
                     try:
-                        gh_token, owner, repo = await get_github_token_for_task(task.id, session)
+                        gh_token, owner, repo = await get_github_token_for_task(
+                            task.id, session
+                        )
 
                         # Always run security scan before any merge
                         try:
-                            scan_result = await scan_pr_for_injection(gh_token, owner, repo, pr_number)
-                            logger.info(f"[SECURITY] Small-scope scan: {scan_result['summary']}")
+                            scan_result = await scan_pr_for_injection(
+                                gh_token, owner, repo, pr_number
+                            )
+                            logger.info(
+                                f"[SECURITY] Small-scope scan: {scan_result['summary']}"
+                            )
                             if scan_result["blocked"]:
                                 task.requires_approval = True
-                                task.latest_status_message = f"Security scan blocked: {scan_result['summary']}"
+                                task.latest_status_message = (
+                                    f"Security scan blocked: {scan_result['summary']}"
+                                )
                                 session.add(task)
                                 if task.auto_remediation:
                                     try:
                                         await post_remediation_result_message(
-                                            session, task, result="review_needed", pr_number=pr_number,
+                                            session,
+                                            task,
+                                            result="review_needed",
+                                            pr_number=pr_number,
                                         )
                                     except Exception as _ar_exc:
-                                        logger.warning("[AUTO-REMEDIATION] Failed to post review_needed message: %s", _ar_exc)
+                                        logger.warning(
+                                            "[AUTO-REMEDIATION] Failed to post review_needed message: %s",
+                                            _ar_exc,
+                                        )
                                 await session.commit()
                                 if scan_result["findings"]:
-                                    await create_pr_comment(gh_token, owner, repo, pr_number, scan_result["report"])
+                                    await create_pr_comment(
+                                        gh_token,
+                                        owner,
+                                        repo,
+                                        pr_number,
+                                        scan_result["report"],
+                                    )
                                 return {"status": "accepted"}
                             if scan_result["findings"]:
-                                await create_pr_comment(gh_token, owner, repo, pr_number, scan_result["report"])
+                                await create_pr_comment(
+                                    gh_token,
+                                    owner,
+                                    repo,
+                                    pr_number,
+                                    scan_result["report"],
+                                )
                         except Exception as e:
                             if _is_transient_scan_error(e):
-                                logger.warning(f"[SECURITY] Small-scope scan transient error for PR #{pr_number}, retrying: {e}")
+                                logger.warning(
+                                    f"[SECURITY] Small-scope scan transient error for PR #{pr_number}, retrying: {e}"
+                                )
                                 await asyncio.sleep(5)
                                 try:
-                                    scan_result = await scan_pr_for_injection(gh_token, owner, repo, pr_number)
-                                    logger.info(f"[SECURITY] Small-scope scan retry succeeded: {scan_result['summary']}")
+                                    scan_result = await scan_pr_for_injection(
+                                        gh_token, owner, repo, pr_number
+                                    )
+                                    logger.info(
+                                        f"[SECURITY] Small-scope scan retry succeeded: {scan_result['summary']}"
+                                    )
                                     if scan_result["blocked"]:
                                         task.requires_approval = True
                                         task.latest_status_message = f"Security scan blocked: {scan_result['summary']}"
@@ -1678,47 +2005,97 @@ async def _process_post_commit(
                                         if task.auto_remediation:
                                             try:
                                                 await post_remediation_result_message(
-                                                    session, task, result="review_needed", pr_number=pr_number,
+                                                    session,
+                                                    task,
+                                                    result="review_needed",
+                                                    pr_number=pr_number,
                                                 )
                                             except Exception as _ar_exc:
-                                                logger.warning("[AUTO-REMEDIATION] Failed to post review_needed message: %s", _ar_exc)
+                                                logger.warning(
+                                                    "[AUTO-REMEDIATION] Failed to post review_needed message: %s",
+                                                    _ar_exc,
+                                                )
                                         await session.commit()
                                         if scan_result["findings"]:
-                                            await create_pr_comment(gh_token, owner, repo, pr_number, scan_result["report"])
+                                            await create_pr_comment(
+                                                gh_token,
+                                                owner,
+                                                repo,
+                                                pr_number,
+                                                scan_result["report"],
+                                            )
                                         return {"status": "accepted"}
                                     if scan_result["findings"]:
-                                        await create_pr_comment(gh_token, owner, repo, pr_number, scan_result["report"])
+                                        await create_pr_comment(
+                                            gh_token,
+                                            owner,
+                                            repo,
+                                            pr_number,
+                                            scan_result["report"],
+                                        )
                                 except Exception as retry_exc:
-                                    logger.error(f"[SECURITY] Small-scope scan retry also failed for PR #{pr_number}: {retry_exc}", exc_info=True)
+                                    logger.error(
+                                        f"[SECURITY] Small-scope scan retry also failed for PR #{pr_number}: {retry_exc}",
+                                        exc_info=True,
+                                    )
                                     task.requires_approval = True
-                                    task.context = {**(task.context or {}), "scan_transient_failure": True}
-                                    task.latest_status_message = f"Security scan unavailable (infrastructure error) — requires manual approval: {type(retry_exc).__name__}: {retry_exc!r}"[:500]
+                                    task.context = {
+                                        **(task.context or {}),
+                                        "scan_transient_failure": True,
+                                    }
+                                    task.latest_status_message = f"Security scan unavailable (infrastructure error) — requires manual approval: {type(retry_exc).__name__}: {retry_exc!r}"[
+                                        :500
+                                    ]
                                     session.add(task)
                                     if task.auto_remediation:
                                         try:
                                             await post_remediation_result_message(
-                                                session, task, result="review_needed", pr_number=pr_number,
+                                                session,
+                                                task,
+                                                result="review_needed",
+                                                pr_number=pr_number,
                                             )
                                         except Exception as _ar_exc:
-                                            logger.warning("[AUTO-REMEDIATION] Failed to post review_needed message: %s", _ar_exc)
+                                            logger.warning(
+                                                "[AUTO-REMEDIATION] Failed to post review_needed message: %s",
+                                                _ar_exc,
+                                            )
                                     await session.commit()
                                     return {"status": "accepted"}
                             else:
-                                logger.error(f"[SECURITY] Small-scope scan failed for PR #{pr_number}, blocking: {e}", exc_info=True)
+                                logger.error(
+                                    f"[SECURITY] Small-scope scan failed for PR #{pr_number}, blocking: {e}",
+                                    exc_info=True,
+                                )
                                 task.requires_approval = True
-                                task.latest_status_message = f"Security scan failed — requires manual approval: {type(e).__name__}: {e!r}"[:500]
+                                task.latest_status_message = f"Security scan failed — requires manual approval: {type(e).__name__}: {e!r}"[
+                                    :500
+                                ]
                                 session.add(task)
                                 if task.auto_remediation:
                                     try:
                                         await post_remediation_result_message(
-                                            session, task, result="review_needed", pr_number=pr_number,
+                                            session,
+                                            task,
+                                            result="review_needed",
+                                            pr_number=pr_number,
                                         )
                                     except Exception as _ar_exc:
-                                        logger.warning("[AUTO-REMEDIATION] Failed to post review_needed message: %s", _ar_exc)
+                                        logger.warning(
+                                            "[AUTO-REMEDIATION] Failed to post review_needed message: %s",
+                                            _ar_exc,
+                                        )
                                 await session.commit()
                                 return {"status": "accepted"}
 
-                        merge_result = await _merge_with_retry(merge_pull_request, gh_token, owner, repo, pr_number, project_id=str(task.project_id))
+                        merge_result = await _merge_with_retry(
+                            merge_pull_request,
+                            gh_token,
+                            owner,
+                            repo,
+                            pr_number,
+                            project_id=str(task.project_id),
+                        )
                         if merge_result.get("merged"):
                             task.context = {**(task.context or {}), "pr_merged": True}
                             session.add(task)
@@ -1728,19 +2105,34 @@ async def _process_post_commit(
                                 task.auto_remediation and _t_ctx.get("direction_id")
                             ):
                                 try:
-                                    from app.task_completion import _record_remediation_outcome
-                                    await _record_remediation_outcome(task, merged=True, session=session)
+                                    from app.task_completion import (
+                                        _record_remediation_outcome,
+                                    )
+
+                                    await _record_remediation_outcome(
+                                        task, merged=True, session=session
+                                    )
                                 except Exception as _rr_exc:
-                                    logger.warning(f"[DIAGNOSIS] Failed to record remediation outcome on merge for task {task.id}: {_rr_exc!r}")
+                                    logger.warning(
+                                        f"[DIAGNOSIS] Failed to record remediation outcome on merge for task {task.id}: {_rr_exc!r}"
+                                    )
                             try:
-                                await _close_loop_regression_case_on_merge(task, pr_number, session)
+                                await _close_loop_regression_case_on_merge(
+                                    task, pr_number, session
+                                )
                             except Exception as _rc_merge_exc:
-                                logger.warning(f"[REGRESSION-CASE] Failed to advance case on auto-merge for task {task.id}: {_rc_merge_exc!r}")
+                                logger.warning(
+                                    f"[REGRESSION-CASE] Failed to advance case on auto-merge for task {task.id}: {_rc_merge_exc!r}"
+                                )
                             await session.commit()
                             await _cleanup_branches(task, session)
-                            logger.info(f"[PIPELINE] Auto-merged PR #{pr_number} into {base_branch} (small scope, intermediate)")
+                            logger.info(
+                                f"[PIPELINE] Auto-merged PR #{pr_number} into {base_branch} (small scope, intermediate)"
+                            )
                         else:
-                            logger.error(f"[PIPELINE] Auto-merge failed for PR #{pr_number}: {merge_result.get('message')}")
+                            logger.error(
+                                f"[PIPELINE] Auto-merge failed for PR #{pr_number}: {merge_result.get('message')}"
+                            )
                             # Probe GitHub for the PR's mergeable_state so we can
                             # route the recovery correctly:
                             #   blocked / unstable → CI gating; queue GitHub auto-merge
@@ -1766,18 +2158,37 @@ async def _process_post_commit(
                             recovery_type = "review"
                             try:
                                 from app.github import enable_auto_merge
-                                pr_detail = await get_pull_request(gh_token, owner, repo, pr_number, project_id=str(task.project_id))
+
+                                pr_detail = await get_pull_request(
+                                    gh_token,
+                                    owner,
+                                    repo,
+                                    pr_number,
+                                    project_id=str(task.project_id),
+                                )
                                 ms = (pr_detail.get("mergeable_state") or "").lower()
                                 if ms in ("blocked", "unstable"):
-                                    am_result = await enable_auto_merge(gh_token, owner, repo, pr_number, project_id=str(task.project_id))
+                                    am_result = await enable_auto_merge(
+                                        gh_token,
+                                        owner,
+                                        repo,
+                                        pr_number,
+                                        project_id=str(task.project_id),
+                                    )
                                     if am_result.get("enabled"):
-                                        logger.info(f"[PIPELINE] Enabled GitHub auto-merge on PR #{pr_number} (mergeable_state={ms})")
+                                        logger.info(
+                                            f"[PIPELINE] Enabled GitHub auto-merge on PR #{pr_number} (mergeable_state={ms})"
+                                        )
                                     else:
-                                        logger.info(f"[PIPELINE] Auto-merge enablement declined for PR #{pr_number}: {am_result.get('message')}")
+                                        logger.info(
+                                            f"[PIPELINE] Auto-merge enablement declined for PR #{pr_number}: {am_result.get('message')}"
+                                        )
                                 elif ms == "dirty":
                                     recovery_type = "fix"
                             except Exception as _am_exc:
-                                logger.warning(f"[PIPELINE] Mergeable-state probe failed for PR #{pr_number}: {_am_exc}")
+                                logger.warning(
+                                    f"[PIPELINE] Mergeable-state probe failed for PR #{pr_number}: {_am_exc}"
+                                )
                             # Spawn the recovery task. For DIRTY conflicts on cluster
                             # sub-PRs we use `fix` (rebase + resolve); otherwise
                             # `review` (the existing default).
@@ -1790,67 +2201,124 @@ async def _process_post_commit(
                             # there's no review-worthy logic change to re-assess —
                             # rebase output is mechanical. This keeps the cost model
                             # symmetric with the no-conflict happy path.
-                            spawn_kwargs = {"original_prompt": original_prompt, "original_task_id": str(task.id)}
+                            spawn_kwargs = {
+                                "original_prompt": original_prompt,
+                                "original_task_id": str(task.id),
+                            }
                             if recovery_type == "fix":
                                 spawn_kwargs["fix_reason"] = "merge_conflict"
                             recovery_task, was_created = await _spawn_pipeline_task(
-                                task, recovery_type, session, pr_number, branch, base_branch,
+                                task,
+                                recovery_type,
+                                session,
+                                pr_number,
+                                branch,
+                                base_branch,
                                 **spawn_kwargs,
                             )
                             if was_created:
-                                logger.info(f"[PIPELINE] Spawned {recovery_type} task {recovery_task.id} for PR #{pr_number} after auto-merge failure")
+                                logger.info(
+                                    f"[PIPELINE] Spawned {recovery_type} task {recovery_task.id} for PR #{pr_number} after auto-merge failure"
+                                )
                             elif recovery_task is not None:
-                                logger.info(f"[PIPELINE] Auto-merge failed for PR #{pr_number} — same-chain {recovery_task.first_payload.get('type')} task {recovery_task.id} ({recovery_task.status}) already handling it")
+                                logger.info(
+                                    f"[PIPELINE] Auto-merge failed for PR #{pr_number} — same-chain {recovery_task.first_payload.get('type')} task {recovery_task.id} ({recovery_task.status}) already handling it"
+                                )
                             else:
-                                logger.warning(f"[PIPELINE] Auto-merge failed and no {recovery_type} spawned for PR #{pr_number} (cap hit or guard) — parking in CI-wait")
+                                logger.warning(
+                                    f"[PIPELINE] Auto-merge failed and no {recovery_type} spawned for PR #{pr_number} (cap hit or guard) — parking in CI-wait"
+                                )
                                 task.status = TaskStatus.EVALUATING
                                 task.latest_status_message = f"Auto-merge failed for PR #{pr_number} — parked for CI-wait retry"
-                                task.context = {**(task.context or {}), "review_loop": {
-                                    "ci_waiting": True, "pr_number": pr_number,
-                                    "branch": branch, "base_branch": base_branch,
-                                    "original_task_id": str(task.id),
-                                    "ci_wait_started": _utcnow().isoformat()}}
+                                task.context = {
+                                    **(task.context or {}),
+                                    "review_loop": {
+                                        "ci_waiting": True,
+                                        "pr_number": pr_number,
+                                        "branch": branch,
+                                        "base_branch": base_branch,
+                                        "original_task_id": str(task.id),
+                                        "ci_wait_started": _utcnow().isoformat(),
+                                    },
+                                }
                                 session.add(task)
                                 await session.commit()
                     except Exception as e:
-                        logger.error(f"[PIPELINE] Auto-merge error for PR #{pr_number}: {e}", exc_info=True)
+                        logger.error(
+                            f"[PIPELINE] Auto-merge error for PR #{pr_number}: {e}",
+                            exc_info=True,
+                        )
                         # Fallback: spawn review so the pipeline doesn't die
                         try:
-                            fallback_review, fb_was_created = await _spawn_pipeline_task(
-                                task, "review", session, pr_number, branch, base_branch,
-                                original_prompt=original_prompt, original_task_id=str(task.id)
+                            (
+                                fallback_review,
+                                fb_was_created,
+                            ) = await _spawn_pipeline_task(
+                                task,
+                                "review",
+                                session,
+                                pr_number,
+                                branch,
+                                base_branch,
+                                original_prompt=original_prompt,
+                                original_task_id=str(task.id),
                             )
                             if fb_was_created:
-                                logger.info(f"[PIPELINE] Spawned fallback review {fallback_review.id} for PR #{pr_number} after merge error")
+                                logger.info(
+                                    f"[PIPELINE] Spawned fallback review {fallback_review.id} for PR #{pr_number} after merge error"
+                                )
                             elif fallback_review is not None:
-                                logger.info(f"[PIPELINE] Merge errored for PR #{pr_number} — same-chain task {fallback_review.id} already handling it")
+                                logger.info(
+                                    f"[PIPELINE] Merge errored for PR #{pr_number} — same-chain task {fallback_review.id} already handling it"
+                                )
                             else:
-                                logger.warning(f"[PIPELINE] Merge error and no fallback review spawned for PR #{pr_number} — parking in CI-wait")
+                                logger.warning(
+                                    f"[PIPELINE] Merge error and no fallback review spawned for PR #{pr_number} — parking in CI-wait"
+                                )
                                 task.status = TaskStatus.EVALUATING
                                 task.latest_status_message = f"Auto-merge error for PR #{pr_number} — parked for CI-wait retry"
-                                task.context = {**(task.context or {}), "review_loop": {
-                                    "ci_waiting": True, "pr_number": pr_number,
-                                    "branch": branch, "base_branch": base_branch,
-                                    "original_task_id": str(task.id),
-                                    "ci_wait_started": _utcnow().isoformat()}}
+                                task.context = {
+                                    **(task.context or {}),
+                                    "review_loop": {
+                                        "ci_waiting": True,
+                                        "pr_number": pr_number,
+                                        "branch": branch,
+                                        "base_branch": base_branch,
+                                        "original_task_id": str(task.id),
+                                        "ci_wait_started": _utcnow().isoformat(),
+                                    },
+                                }
                                 session.add(task)
                                 await session.commit()
                         except Exception as inner_e:
-                            logger.error(f"[PIPELINE] Fallback review spawn failed for PR #{pr_number}: {inner_e}", exc_info=True)
+                            logger.error(
+                                f"[PIPELINE] Fallback review spawn failed for PR #{pr_number}: {inner_e}",
+                                exc_info=True,
+                            )
                             task.status = TaskStatus.EVALUATING
                             task.latest_status_message = f"Pipeline recovery: merge and review spawn failed for PR #{pr_number} — CI monitor will retry"
-                            task.context = {**(task.context or {}), "review_loop": {
-                                "ci_waiting": True, "pr_number": pr_number,
-                                "branch": branch, "base_branch": base_branch,
-                                "original_task_id": str(task.id),
-                                "ci_wait_started": _utcnow().isoformat()}}
+                            task.context = {
+                                **(task.context or {}),
+                                "review_loop": {
+                                    "ci_waiting": True,
+                                    "pr_number": pr_number,
+                                    "branch": branch,
+                                    "base_branch": base_branch,
+                                    "original_task_id": str(task.id),
+                                    "ci_wait_started": _utcnow().isoformat(),
+                                },
+                            }
                             session.add(task)
                             await session.commit()
                 else:
                     # Full pipeline: security scan → review (for main targets or medium+ scope)
                     try:
-                        gh_token, owner, repo = await get_github_token_for_task(task.id, session)
-                        scan_result = await scan_pr_for_injection(gh_token, owner, repo, pr_number)
+                        gh_token, owner, repo = await get_github_token_for_task(
+                            task.id, session
+                        )
+                        scan_result = await scan_pr_for_injection(
+                            gh_token, owner, repo, pr_number
+                        )
                         logger.info(f"[SECURITY] {scan_result['summary']}")
                         if scan_result["blocked"]:
                             task.requires_approval = True
@@ -1858,32 +2326,59 @@ async def _process_post_commit(
                             session.add(task)
                             await session.commit()
                         if scan_result["findings"]:
-                            await create_pr_comment(gh_token, owner, repo, pr_number, scan_result["report"])
+                            await create_pr_comment(
+                                gh_token, owner, repo, pr_number, scan_result["report"]
+                            )
                     except Exception as e:
                         if _is_transient_scan_error(e):
-                            logger.warning(f"[SECURITY] Scan transient error for PR #{pr_number}, retrying: {e}")
+                            logger.warning(
+                                f"[SECURITY] Scan transient error for PR #{pr_number}, retrying: {e}"
+                            )
                             await asyncio.sleep(5)
                             try:
-                                scan_result = await scan_pr_for_injection(gh_token, owner, repo, pr_number)
-                                logger.info(f"[SECURITY] Scan retry succeeded: {scan_result['summary']}")
+                                scan_result = await scan_pr_for_injection(
+                                    gh_token, owner, repo, pr_number
+                                )
+                                logger.info(
+                                    f"[SECURITY] Scan retry succeeded: {scan_result['summary']}"
+                                )
                                 if scan_result["blocked"]:
                                     task.requires_approval = True
                                     task.latest_status_message = scan_result["summary"]
                                     session.add(task)
                                     await session.commit()
                                 if scan_result["findings"]:
-                                    await create_pr_comment(gh_token, owner, repo, pr_number, scan_result["report"])
+                                    await create_pr_comment(
+                                        gh_token,
+                                        owner,
+                                        repo,
+                                        pr_number,
+                                        scan_result["report"],
+                                    )
                             except Exception as retry_exc:
-                                logger.error(f"[SECURITY] Scan retry also failed for PR #{pr_number}: {retry_exc}", exc_info=True)
+                                logger.error(
+                                    f"[SECURITY] Scan retry also failed for PR #{pr_number}: {retry_exc}",
+                                    exc_info=True,
+                                )
                                 task.requires_approval = True
-                                task.context = {**(task.context or {}), "scan_transient_failure": True}
-                                task.latest_status_message = f"Security scan unavailable (infrastructure error) — review will proceed but merge requires manual approval: {type(retry_exc).__name__}: {retry_exc!r}"[:500]
+                                task.context = {
+                                    **(task.context or {}),
+                                    "scan_transient_failure": True,
+                                }
+                                task.latest_status_message = f"Security scan unavailable (infrastructure error) — review will proceed but merge requires manual approval: {type(retry_exc).__name__}: {retry_exc!r}"[
+                                    :500
+                                ]
                                 session.add(task)
                                 await session.commit()
                         else:
-                            logger.error(f"[SECURITY] Scan failed for PR #{pr_number}, flagging for approval: {e}", exc_info=True)
+                            logger.error(
+                                f"[SECURITY] Scan failed for PR #{pr_number}, flagging for approval: {e}",
+                                exc_info=True,
+                            )
                             task.requires_approval = True
-                            task.latest_status_message = f"Security scan failed — review will proceed but merge requires manual approval: {type(e).__name__}: {e!r}"[:500]
+                            task.latest_status_message = f"Security scan failed — review will proceed but merge requires manual approval: {type(e).__name__}: {e!r}"[
+                                :500
+                            ]
                             session.add(task)
                             await session.commit()
 
@@ -1893,73 +2388,137 @@ async def _process_post_commit(
                     # Blueprint repo and irrelevant for other projects.
                     if _runtime_config.get("require_approval_gates", True):
                         try:
-                            pr_files = await get_pr_files(gh_token, owner, repo, pr_number)
-                            INFRA_FILES = {"backend/app/main.py", "backend/app/compute.py", "backend/app/models.py",
-                                           "backend/app/database.py", "backend/app/security.py", "backend/app/auth.py",
-                                           "agent/src/index.ts", "CLAUDE.md"}
-                            CRITICAL_FILES = {"backend/app/security.py", "backend/app/auth.py", "CLAUDE.md"}
-                            touched_infra = [f["filename"] for f in pr_files if f["filename"] in INFRA_FILES]
-                            touched_critical = [f for f in touched_infra if f in CRITICAL_FILES]
+                            pr_files = await get_pr_files(
+                                gh_token, owner, repo, pr_number
+                            )
+                            INFRA_FILES = {
+                                "backend/app/main.py",
+                                "backend/app/compute.py",
+                                "backend/app/models.py",
+                                "backend/app/database.py",
+                                "backend/app/security.py",
+                                "backend/app/auth.py",
+                                "agent/src/index.ts",
+                                "CLAUDE.md",
+                            }
+                            CRITICAL_FILES = {
+                                "backend/app/security.py",
+                                "backend/app/auth.py",
+                                "CLAUDE.md",
+                            }
+                            touched_infra = [
+                                f["filename"]
+                                for f in pr_files
+                                if f["filename"] in INFRA_FILES
+                            ]
+                            touched_critical = [
+                                f for f in touched_infra if f in CRITICAL_FILES
+                            ]
                             if touched_infra:
-                                task.context = {**(task.context or {}), "extended_monitoring": True, "risk_tier": "large",
-                                                "touched_infra": touched_infra, "touched_critical": touched_critical}
+                                task.context = {
+                                    **(task.context or {}),
+                                    "extended_monitoring": True,
+                                    "risk_tier": "large",
+                                    "touched_infra": touched_infra,
+                                    "touched_critical": touched_critical,
+                                }
                                 task.latest_status_message = f"Infrastructure change flagged: {', '.join(touched_infra)}"
-                                logger.info(f"[PIPELINE] PR #{pr_number} touches infra files: {touched_infra} (critical: {touched_critical})")
+                                logger.info(
+                                    f"[PIPELINE] PR #{pr_number} touches infra files: {touched_infra} (critical: {touched_critical})"
+                                )
                                 session.add(task)
                                 await session.commit()
                                 _shared_state.deploy_monitoring["is_extended"] = True
                         except Exception as e:
-                            logger.info(f"[PIPELINE] Could not check PR files for infra flagging: {e}")
+                            logger.info(
+                                f"[PIPELINE] Could not check PR files for infra flagging: {e}"
+                            )
 
                     # Always spawn the review — requires_approval gates MERGING
                     # (checked at merge time in the review-complete path), not
                     # reviewing. A security scan failure or blocking finding
                     # should not orphan the PR by preventing review entirely.
                     review_task, _ = await _spawn_pipeline_task(
-                        task, "review", session, pr_number, branch, base_branch,
-                        original_prompt=original_prompt, original_task_id=str(task.id)
+                        task,
+                        "review",
+                        session,
+                        pr_number,
+                        branch,
+                        base_branch,
+                        original_prompt=original_prompt,
+                        original_task_id=str(task.id),
                     )
                     if review_task:
                         if task.requires_approval:
-                            logger.info(f"[REVIEW PIPELINE] Spawned review for flagged PR #{pr_number} → task {review_task.id} (merge will require manual approval)")
+                            logger.info(
+                                f"[REVIEW PIPELINE] Spawned review for flagged PR #{pr_number} → task {review_task.id} (merge will require manual approval)"
+                            )
                         else:
-                            logger.info(f"[REVIEW PIPELINE] Spawned review for PR #{pr_number} → task {review_task.id}")
+                            logger.info(
+                                f"[REVIEW PIPELINE] Spawned review for PR #{pr_number} → task {review_task.id}"
+                            )
                     else:
                         task.latest_status_message = f"Review not spawned for PR #{pr_number} — iteration cap reached"
                         task.requires_approval = True
                         session.add(task)
                         await session.commit()
-                        logger.warning(f"[REVIEW PIPELINE] WARNING: Review spawn returned None for PR #{pr_number}")
+                        logger.warning(
+                            f"[REVIEW PIPELINE] WARNING: Review spawn returned None for PR #{pr_number}"
+                        )
 
             # Review task completed → parse verdict
             elif task_type == "review":
-                pr_number = review_loop.get("pr_number") or task_payload.get("pr_number")
+                pr_number = review_loop.get("pr_number") or task_payload.get(
+                    "pr_number"
+                )
                 branch = review_loop.get("branch") or task_payload.get("branch")
-                base_branch = review_loop.get("base_branch") or task_payload.get("base_branch", "main")
-                original_task_id = review_loop.get("original_task_id", "") or task_payload.get("original_task_id", "")
+                base_branch = review_loop.get("base_branch") or task_payload.get(
+                    "base_branch", "main"
+                )
+                original_task_id = review_loop.get(
+                    "original_task_id", ""
+                ) or task_payload.get("original_task_id", "")
                 original_prompt = task_payload.get("original_prompt", "")
 
                 if not pr_number or not branch:
-                    logger.info(f"[REVIEW PIPELINE] Review task {task.id} missing pr_number ({pr_number}) or branch ({branch}) — cannot continue pipeline")
-                    task.latest_status_message = "Review pipeline error: missing pr_number or branch"
+                    logger.info(
+                        f"[REVIEW PIPELINE] Review task {task.id} missing pr_number ({pr_number}) or branch ({branch}) — cannot continue pipeline"
+                    )
+                    task.latest_status_message = (
+                        "Review pipeline error: missing pr_number or branch"
+                    )
                     session.add(task)
                     await session.commit()
                     return {"status": "accepted"}
 
                 # Early exit: skip review pipeline if PR is already merged or closed
                 try:
-                    gh_token_check, owner_check, repo_check = await get_github_token_for_task(task.id, session)
-                    pr_data_check = await get_pull_request(gh_token_check, owner_check, repo_check, pr_number)
+                    (
+                        gh_token_check,
+                        owner_check,
+                        repo_check,
+                    ) = await get_github_token_for_task(task.id, session)
+                    pr_data_check = await get_pull_request(
+                        gh_token_check, owner_check, repo_check, pr_number
+                    )
                     pr_state = pr_data_check.get("state", "open")
                     if pr_state == "closed" or pr_data_check.get("merged"):
-                        merged_label = "merged" if pr_data_check.get("merged") else "closed"
-                        logger.info(f"[REVIEW PIPELINE] PR #{pr_number} already {merged_label} — skipping review pipeline for task {task.id}")
-                        task.latest_status_message = f"PR #{pr_number} already {merged_label} — review skipped"
+                        merged_label = (
+                            "merged" if pr_data_check.get("merged") else "closed"
+                        )
+                        logger.info(
+                            f"[REVIEW PIPELINE] PR #{pr_number} already {merged_label} — skipping review pipeline for task {task.id}"
+                        )
+                        task.latest_status_message = (
+                            f"PR #{pr_number} already {merged_label} — review skipped"
+                        )
                         session.add(task)
                         await session.commit()
                         return {"status": "accepted"}
                 except Exception as e:
-                    logger.info(f"[REVIEW PIPELINE] Could not check PR #{pr_number} state: {e} — proceeding with review")
+                    logger.info(
+                        f"[REVIEW PIPELINE] Could not check PR #{pr_number} state: {e} — proceeding with review"
+                    )
 
                 verdict_text = payload.logs or task.latest_status_message or ""
                 verdict = "REQUEST_CHANGES"
@@ -1969,6 +2528,7 @@ async def _process_post_commit(
 
                 # Parse verdict: prefer structured verdict_json field, fall back to log parsing
                 import re
+
                 verdict_parsed = False
                 verdict_unparseable = False
 
@@ -1979,17 +2539,26 @@ async def _process_post_commit(
                         if vj.get("verdict"):
                             verdict = vj["verdict"]
                             feedback = vj.get("feedback", verdict_text)
-                            issues = vj.get("issues", []) if isinstance(vj.get("issues"), list) else []
+                            issues = (
+                                vj.get("issues", [])
+                                if isinstance(vj.get("issues"), list)
+                                else []
+                            )
                             raw_investigated = vj.get("investigated_files")
                             if isinstance(raw_investigated, list):
                                 investigated_files = [
-                                    str(p) for p in raw_investigated
+                                    str(p)
+                                    for p in raw_investigated
                                     if isinstance(p, str) and p
                                 ][:25]
                             verdict_parsed = True
-                            logger.info(f"[REVIEW PIPELINE] Verdict from verdict_json field: {verdict}")
+                            logger.info(
+                                f"[REVIEW PIPELINE] Verdict from verdict_json field: {verdict}"
+                            )
                     except (json.JSONDecodeError, TypeError):
-                        logger.exception(f"[REVIEW PIPELINE] verdict_json field present but invalid for task {task.id}")
+                        logger.exception(
+                            f"[REVIEW PIPELINE] verdict_json field present but invalid for task {task.id}"
+                        )
 
                 # Method 2: Parse JSON from log output (string-aware bracket counting)
                 if not verdict_parsed:
@@ -2004,7 +2573,7 @@ async def _process_post_commit(
                                 if escape_next:
                                     escape_next = False
                                     continue
-                                if c == '\\' and in_string:
+                                if c == "\\" and in_string:
                                     escape_next = True
                                     continue
                                 if c == '"' and not escape_next:
@@ -2012,23 +2581,36 @@ async def _process_post_commit(
                                     continue
                                 if in_string:
                                     continue
-                                if c == '{':
+                                if c == "{":
                                     depth += 1
-                                elif c == '}':
+                                elif c == "}":
                                     depth -= 1
                                     if depth == 0:
                                         try:
-                                            candidate = json.loads(verdict_text[start:i+1])
+                                            candidate = json.loads(
+                                                verdict_text[start : i + 1]
+                                            )
                                             if "verdict" in candidate:
                                                 verdict = candidate["verdict"]
-                                                feedback = candidate.get("feedback", verdict_text)
-                                                issues = candidate.get("issues", []) if isinstance(candidate.get("issues"), list) else []
+                                                feedback = candidate.get(
+                                                    "feedback", verdict_text
+                                                )
+                                                issues = (
+                                                    candidate.get("issues", [])
+                                                    if isinstance(
+                                                        candidate.get("issues"), list
+                                                    )
+                                                    else []
+                                                )
                                                 verdict_parsed = True
                                         except json.JSONDecodeError:
                                             pass
                                         break
                     except Exception as e:
-                        logger.error(f"[REVIEW PIPELINE] Verdict parsing error for task {task.id}: {e}", exc_info=True)
+                        logger.error(
+                            f"[REVIEW PIPELINE] Verdict parsing error for task {task.id}: {e}",
+                            exc_info=True,
+                        )
 
                 if not verdict_parsed:
                     # Fallback: look for APPROVE / REQUEST_CHANGES as standalone words
@@ -2049,7 +2631,9 @@ async def _process_post_commit(
                     if approve_idx == -1 and rc_idx == -1:
                         verdict = "REQUEST_CHANGES"
                         feedback = "Review agent did not produce a verdict — manual review required"
-                        logger.warning(f"[REVIEW PIPELINE] No verdict found for task {task.id} (len={len(verdict_text)}) — defaulting to REQUEST_CHANGES, marking for manual review")
+                        logger.warning(
+                            f"[REVIEW PIPELINE] No verdict found for task {task.id} (len={len(verdict_text)}) — defaulting to REQUEST_CHANGES, marking for manual review"
+                        )
                         verdict_unparseable = True
                     elif approve_idx > rc_idx:
                         verdict = "APPROVE"
@@ -2079,25 +2663,34 @@ async def _process_post_commit(
                                 session.add(orig)
                                 await session.commit()
                         except Exception as e:
-                            logger.warning(f"[REVIEW PIPELINE] Failed to mark requires_approval on {original_task_id}: {e}", exc_info=True)
+                            logger.warning(
+                                f"[REVIEW PIPELINE] Failed to mark requires_approval on {original_task_id}: {e}",
+                                exc_info=True,
+                            )
 
                 # Post the review to the PR via GitHub Reviews API (falls back to plain comment)
                 try:
-                    gh_token, owner, repo = await get_github_token_for_task(task.id, session)
+                    gh_token, owner, repo = await get_github_token_for_task(
+                        task.id, session
+                    )
                     event = "APPROVE" if verdict == "APPROVE" else "REQUEST_CHANGES"
                     inline_comments = []
                     body_issues = []
                     for issue in issues:
                         if issue.get("file") and issue.get("line"):
                             sev = issue.get("severity", "minor").upper()
-                            inline_comments.append({
-                                "path": issue["file"],
-                                "line": issue["line"],
-                                "body": f"[{sev}] {issue.get('description', '')}",
-                            })
+                            inline_comments.append(
+                                {
+                                    "path": issue["file"],
+                                    "line": issue["line"],
+                                    "body": f"[{sev}] {issue.get('description', '')}",
+                                }
+                            )
                         else:
                             body_issues.append(issue)
-                    review_body = f"**Blueprint Code Review** ({verdict})\n\n{feedback[:3000]}"
+                    review_body = (
+                        f"**Blueprint Code Review** ({verdict})\n\n{feedback[:3000]}"
+                    )
                     if body_issues:
                         issues_text = "\n".join(
                             f"- [{i.get('severity', '?').upper()}] {i.get('description', '')}"
@@ -2105,63 +2698,107 @@ async def _process_post_commit(
                         )
                         review_body += f"\n\n**Issues:**\n{issues_text}"
                     result = await submit_pr_review(
-                        gh_token, owner, repo, pr_number, event, review_body, inline_comments
+                        gh_token,
+                        owner,
+                        repo,
+                        pr_number,
+                        event,
+                        review_body,
+                        inline_comments,
                     )
                     if result is None:
                         raise ValueError("PR not found")
                 except Exception as e:
-                    logger.warning(f"[REVIEW PIPELINE] submit_pr_review failed, falling back: {e}")
+                    logger.warning(
+                        f"[REVIEW PIPELINE] submit_pr_review failed, falling back: {e}"
+                    )
                     try:
-                        gh_token, owner, repo = await get_github_token_for_task(task.id, session)
+                        gh_token, owner, repo = await get_github_token_for_task(
+                            task.id, session
+                        )
                         review_comment = f"**Blueprint Code Review** ({verdict})\n\n{feedback[:3000]}"
-                        await create_pr_comment(gh_token, owner, repo, pr_number, review_comment)
+                        await create_pr_comment(
+                            gh_token, owner, repo, pr_number, review_comment
+                        )
                     except Exception as e2:
-                        logger.warning(f"[REVIEW PIPELINE] Fallback comment also failed: {e2}", exc_info=True)
+                        logger.warning(
+                            f"[REVIEW PIPELINE] Fallback comment also failed: {e2}",
+                            exc_info=True,
+                        )
 
                 # Update Check Run with verdict conclusion (best-effort — errors are swallowed)
                 check_run_id = (task.context or {}).get("check_run_id")
                 if check_run_id:
                     try:
-                        _cr_token, _cr_owner, _cr_repo = await get_github_token_for_task(task.id, session)
-                        _severity_map = {"critical": "failure", "major": "warning", "minor": "notice"}
-                        _conclusion = "success" if verdict == "APPROVE" else "action_required"
+                        (
+                            _cr_token,
+                            _cr_owner,
+                            _cr_repo,
+                        ) = await get_github_token_for_task(task.id, session)
+                        _severity_map = {
+                            "critical": "failure",
+                            "major": "warning",
+                            "minor": "notice",
+                        }
+                        _conclusion = (
+                            "success" if verdict == "APPROVE" else "action_required"
+                        )
                         _annotations = []
                         for _issue in issues:
                             if _issue.get("file") and _issue.get("line"):
-                                _lvl = _severity_map.get(_issue.get("severity", "minor"), "notice")
+                                _lvl = _severity_map.get(
+                                    _issue.get("severity", "minor"), "notice"
+                                )
                                 _ln = int(_issue["line"])
-                                _annotations.append({
-                                    "path": _issue["file"],
-                                    "start_line": _ln,
-                                    "end_line": _ln,
-                                    "annotation_level": _lvl,
-                                    "message": _issue.get("description", ""),
-                                })
+                                _annotations.append(
+                                    {
+                                        "path": _issue["file"],
+                                        "start_line": _ln,
+                                        "end_line": _ln,
+                                        "annotation_level": _lvl,
+                                        "message": _issue.get("description", ""),
+                                    }
+                                )
                         _issue_counts = {}
                         for _issue in issues:
                             _sev = _issue.get("severity", "minor")
                             _issue_counts[_sev] = _issue_counts.get(_sev, 0) + 1
-                        _counts_line = ", ".join(
-                            f"{v} {k}" for k, v in sorted(_issue_counts.items())
-                        ) if _issue_counts else "no issues"
-                        _cr_summary = f"**Blueprint Code Review**: {verdict}\n\n{feedback[:3000]}"
+                        _counts_line = (
+                            ", ".join(
+                                f"{v} {k}" for k, v in sorted(_issue_counts.items())
+                            )
+                            if _issue_counts
+                            else "no issues"
+                        )
+                        _cr_summary = (
+                            f"**Blueprint Code Review**: {verdict}\n\n{feedback[:3000]}"
+                        )
                         if _issue_counts:
                             _cr_summary += f"\n\n**Issue summary**: {_counts_line}"
                         await update_check_run(
-                            _cr_token, _cr_owner, _cr_repo,
+                            _cr_token,
+                            _cr_owner,
+                            _cr_repo,
                             check_run_id,
                             conclusion=_conclusion,
                             title=f"Blueprint Code Review: {verdict}",
                             summary=_cr_summary,
                             annotations=_annotations or None,
                         )
-                        logger.info(f"[CHECK RUN] Updated check run {check_run_id} → {_conclusion} for task {task.id}")
+                        logger.info(
+                            f"[CHECK RUN] Updated check run {check_run_id} → {_conclusion} for task {task.id}"
+                        )
                     except Exception as _cr_exc:
-                        logger.warning(f"[CHECK RUN] Failed to update check run {check_run_id} for task {task.id}: {_cr_exc}")
+                        logger.warning(
+                            f"[CHECK RUN] Failed to update check run {check_run_id} for task {task.id}: {_cr_exc}"
+                        )
 
                 # Store Blueprint's verdict on the review task context so the
                 # pull_request_review webhook handler can correlate quality signals.
-                task.context = {**(task.context or {}), "blueprint_review_verdict": verdict}
+                task.context = {
+                    **(task.context or {}),
+                    "blueprint_review_verdict": verdict,
+                }
                 session.add(task)
 
                 action_taken = False
@@ -2180,6 +2817,7 @@ async def _process_post_commit(
                                 _attempt_merge_with_retry_and_escalation,
                             )
                             from app.routers.agent import get_github_token_for_task
+
                             # ── Site 2 lock-during-IO fix ──
                             # Previously we acquired FOR UPDATE on `_orig`
                             # unconditionally, then only the
@@ -2194,12 +2832,22 @@ async def _process_post_commit(
                             # to peek at ci_waiting first, and only acquire
                             # FOR UPDATE when we're committing to the rollup-
                             # handoff branch.
-                            _orig_peek = (await session.execute(
-                                select(Task.context).where(
-                                    Task.id == uuid.UUID(original_task_id)
+                            _orig_peek = (
+                                (
+                                    await session.execute(
+                                        select(Task.context).where(
+                                            Task.id == uuid.UUID(original_task_id)
+                                        )
+                                    )
                                 )
-                            )).scalars().first()
-                            _orig_peek_loop = (_orig_peek or {}).get("review_loop", {}) if _orig_peek else {}
+                                .scalars()
+                                .first()
+                            )
+                            _orig_peek_loop = (
+                                (_orig_peek or {}).get("review_loop", {})
+                                if _orig_peek
+                                else {}
+                            )
                             if _orig_peek_loop.get("ci_waiting"):
                                 # Phase A1: skip_locked + bounded retry. If the parent
                                 # task row is held by a peer, defer the handoff —
@@ -2207,38 +2855,64 @@ async def _process_post_commit(
                                 # on the next iteration once the lock clears.
                                 _orig = None
                                 for _attempt in range(3):
-                                    _orig_q = select(Task).where(
-                                        Task.id == uuid.UUID(original_task_id)
-                                    ).with_for_update(skip_locked=True)
-                                    _orig = (await session.execute(_orig_q)).scalars().first()
+                                    _orig_q = (
+                                        select(Task)
+                                        .where(Task.id == uuid.UUID(original_task_id))
+                                        .with_for_update(skip_locked=True)
+                                    )
+                                    _orig = (
+                                        (await session.execute(_orig_q))
+                                        .scalars()
+                                        .first()
+                                    )
                                     if _orig is not None:
                                         break
-                                    _orig_exists = (await session.execute(
-                                        select(Task.id).where(Task.id == uuid.UUID(original_task_id))
-                                    )).first()
+                                    _orig_exists = (
+                                        await session.execute(
+                                            select(Task.id).where(
+                                                Task.id == uuid.UUID(original_task_id)
+                                            )
+                                        )
+                                    ).first()
                                     if _orig_exists is None:
                                         break  # Genuinely missing
                                     await asyncio.sleep(0.5 * (_attempt + 1))
                                 # Re-read the loop from the locked row — peer may
                                 # have flipped ci_waiting in the gap between the
                                 # peek and the lock acquisition.
-                                _orig_loop = (_orig.context or {}).get("review_loop", {}) if _orig else {}
+                                _orig_loop = (
+                                    (_orig.context or {}).get("review_loop", {})
+                                    if _orig
+                                    else {}
+                                )
                                 if _orig and _orig_loop.get("ci_waiting"):
                                     _orig_loop["review_approved"] = True
-                                    _orig.context = {**(_orig.context or {}), "review_loop": _orig_loop}
+                                    _orig.context = {
+                                        **(_orig.context or {}),
+                                        "review_loop": _orig_loop,
+                                    }
                                     flag_modified(_orig, "context")
                                     session.add(_orig)
                                     task.status = TaskStatus.COMPLETED
-                                    task.latest_status_message = (
-                                        f"Review approved for rollup PR #{pr_number} — handed off to CI gate"
-                                    )
+                                    task.latest_status_message = f"Review approved for rollup PR #{pr_number} — handed off to CI gate"
                                     session.add(task)
 
                                     if _orig_loop.get("ci_passed"):
                                         try:
-                                            _gh, _own, _rep = await get_github_token_for_task(_orig.id, session)
+                                            (
+                                                _gh,
+                                                _own,
+                                                _rep,
+                                            ) = await get_github_token_for_task(
+                                                _orig.id, session
+                                            )
                                             await _attempt_merge_with_retry_and_escalation(
-                                                _orig, _gh, _own, _rep, session, source="review_approval",
+                                                _orig,
+                                                _gh,
+                                                _own,
+                                                _rep,
+                                                session,
+                                                source="review_approval",
                                             )
                                         except Exception as _gate_e:
                                             logger.error(
@@ -2248,8 +2922,12 @@ async def _process_post_commit(
 
                                     await session.commit()
                                     await broadcast_to_project(
-                                        str(_orig.project_id), "task_updated",
-                                        {"task_id": str(_orig.id), "status": _orig.status},
+                                        str(_orig.project_id),
+                                        "task_updated",
+                                        {
+                                            "task_id": str(_orig.id),
+                                            "status": _orig.status,
+                                        },
                                     )
                                     logger.info(
                                         f"[REVIEW PIPELINE] Rollup PR #{pr_number}: review approved, handed to CI gate (parent {_orig.id})"
@@ -2263,14 +2941,29 @@ async def _process_post_commit(
 
                     head_sha = ""
                     try:
-                        gh_token, owner, repo = await get_github_token_for_task(task.id, session)
+                        gh_token, owner, repo = await get_github_token_for_task(
+                            task.id, session
+                        )
                         # Validate PR head branch matches before merging
-                        pr_data = await get_pull_request(gh_token, owner, repo, pr_number, project_id=str(task.project_id))
+                        pr_data = await get_pull_request(
+                            gh_token,
+                            owner,
+                            repo,
+                            pr_number,
+                            project_id=str(task.project_id),
+                        )
                         pr_head = pr_data.get("head", {}).get("ref", "")
                         if pr_head and pr_head != branch:
-                            logger.info(f"[REVIEW PIPELINE] Branch mismatch: reviewed '{branch}' but PR #{pr_number} head is '{pr_head}' — skipping merge")
-                            await create_pr_comment(gh_token, owner, repo, pr_number,
-                                f"**Blueprint Review Pipeline**: Merge aborted — reviewed branch `{branch}` does not match PR head `{pr_head}`.")
+                            logger.info(
+                                f"[REVIEW PIPELINE] Branch mismatch: reviewed '{branch}' but PR #{pr_number} head is '{pr_head}' — skipping merge"
+                            )
+                            await create_pr_comment(
+                                gh_token,
+                                owner,
+                                repo,
+                                pr_number,
+                                f"**Blueprint Review Pipeline**: Merge aborted — reviewed branch `{branch}` does not match PR head `{pr_head}`.",
+                            )
                             task.latest_status_message = f"Branch mismatch: reviewed {branch}, PR head is {pr_head}"
                             session.add(task)
                             await session.commit()
@@ -2279,42 +2972,78 @@ async def _process_post_commit(
                         # Check CI status before merging (only for PRs targeting main)
                         head_sha = pr_data.get("head", {}).get("sha", "")
                         is_main_merge = base_branch == "main"
-                        ci_status = await get_check_runs_cached(gh_token, owner, repo, head_sha, project_id=str(task.project_id)) if (head_sha and is_main_merge) else None
+                        ci_status = (
+                            await get_check_runs_cached(
+                                gh_token,
+                                owner,
+                                repo,
+                                head_sha,
+                                project_id=str(task.project_id),
+                            )
+                            if (head_sha and is_main_merge)
+                            else None
+                        )
 
                         if ci_status and ci_status["status"] != "completed":
                             # CI still running — park task in EVALUATING (no VM consumed)
                             try:
                                 _approve_files = [
-                                    f.get("filename", "") for f in (
-                                        await get_pr_files(gh_token, owner, repo, pr_number)
-                                    ) if isinstance(f, dict) and f.get("filename")
+                                    f.get("filename", "")
+                                    for f in (
+                                        await get_pr_files(
+                                            gh_token, owner, repo, pr_number
+                                        )
+                                    )
+                                    if isinstance(f, dict) and f.get("filename")
                                 ]
                             except Exception as _af_e:
                                 logger.warning(
                                     f"[REVIEW PIPELINE] APPROVE entry: failed to fetch PR files for #{pr_number}: {_af_e}"
                                 )
                                 _approve_files = []
-                            _approved_history = _append_approve_to_review_history(review_loop, _approve_files)
+                            _approved_history = _append_approve_to_review_history(
+                                review_loop, _approve_files
+                            )
                             task.status = TaskStatus.EVALUATING
-                            task.latest_status_message = f"Review approved, waiting for CI on PR #{pr_number}..."
-                            task.context = {**(task.context or {}), "review_loop": {
-                                **review_loop, "ci_waiting": True, "review_approved": True,
-                                "review_history": _approved_history,
-                                "head_sha": head_sha, "pr_number": pr_number,
-                                "branch": branch, "base_branch": base_branch,
-                                "original_task_id": original_task_id,
-                                "ci_wait_started": _utcnow().isoformat()}}
+                            task.latest_status_message = (
+                                f"Review approved, waiting for CI on PR #{pr_number}..."
+                            )
+                            task.context = {
+                                **(task.context or {}),
+                                "review_loop": {
+                                    **review_loop,
+                                    "ci_waiting": True,
+                                    "review_approved": True,
+                                    "review_history": _approved_history,
+                                    "head_sha": head_sha,
+                                    "pr_number": pr_number,
+                                    "branch": branch,
+                                    "base_branch": base_branch,
+                                    "original_task_id": original_task_id,
+                                    "ci_wait_started": _utcnow().isoformat(),
+                                },
+                            }
                             session.add(task)
                             await session.commit()
-                            logger.info(f"[CI] PR #{pr_number} approved, CI pending — waiting")
+                            logger.info(
+                                f"[CI] PR #{pr_number} approved, CI pending — waiting"
+                            )
                             action_taken = True
                             return {"status": "accepted"}
 
                         if ci_status and ci_status["conclusion"] == "failure":
                             # CI failed — spawn fix with CI errors
-                            ci_errors = ci_status["failed_logs"] or "CI checks failed (no details available)"
-                            await create_pr_comment(gh_token, owner, repo, pr_number,
-                                f"**Blueprint CI**: Checks failed — spawning fix task.\n\n```\n{ci_errors[:2000]}\n```")
+                            ci_errors = (
+                                ci_status["failed_logs"]
+                                or "CI checks failed (no details available)"
+                            )
+                            await create_pr_comment(
+                                gh_token,
+                                owner,
+                                repo,
+                                pr_number,
+                                f"**Blueprint CI**: Checks failed — spawning fix task.\n\n```\n{ci_errors[:2000]}\n```",
+                            )
                             ci_fix_prompt = (
                                 f"CI checks failed on PR #{pr_number} (code review already approved).\n\n"
                                 f"CI errors:\n{ci_errors}\n\n"
@@ -2326,7 +3055,12 @@ async def _process_post_commit(
                             # is releasing on this APPROVE, so the new fix must
                             # cold-provision rather than wait for a dying poll.
                             fix_task, _ = await _spawn_pipeline_task(
-                                task, "fix", session, pr_number, branch, base_branch,
+                                task,
+                                "fix",
+                                session,
+                                pr_number,
+                                branch,
+                                base_branch,
                                 fix_prompt=ci_fix_prompt,
                                 original_task_id=original_task_id,
                                 fix_reason="ci_failure",
@@ -2334,7 +3068,9 @@ async def _process_post_commit(
                                 suppress_warm_handoff=True,
                             )
                             if fix_task:
-                                logger.error(f"[CI] PR #{pr_number} CI failed, spawned fix → {fix_task.id}")
+                                logger.error(
+                                    f"[CI] PR #{pr_number} CI failed, spawned fix → {fix_task.id}"
+                                )
                             action_taken = True
                             return {"status": "accepted"}
 
@@ -2343,107 +3079,224 @@ async def _process_post_commit(
                             logger.info(f"[CI] PR #{pr_number} CI passed")
 
                         # Critical files gate: block merge if security-critical files were touched
-                        if original_task_id and _runtime_config.get("require_approval_gates", True):
+                        if original_task_id and _runtime_config.get(
+                            "require_approval_gates", True
+                        ):
                             try:
-                                orig_task = await session.get(Task, uuid.UUID(original_task_id))
-                                critical_touched = (orig_task.context or {}).get("touched_critical", []) if orig_task else []
+                                orig_task = await session.get(
+                                    Task, uuid.UUID(original_task_id)
+                                )
+                                critical_touched = (
+                                    (orig_task.context or {}).get(
+                                        "touched_critical", []
+                                    )
+                                    if orig_task
+                                    else []
+                                )
                                 if critical_touched:
                                     orig_task.requires_approval = True
                                     orig_task.status = TaskStatus.EVALUATING
                                     orig_task.latest_status_message = f"Review approved — awaiting human approval to merge (critical files: {', '.join(critical_touched)})"
                                     session.add(orig_task)
                                     await session.commit()
-                                    await broadcast_to_project(str(orig_task.project_id), "task_updated",
-                                                               {"task_id": str(orig_task.id), "status": TaskStatus.EVALUATING})
-                                    await create_pr_comment(gh_token, owner, repo, pr_number,
-                                        f"**Blueprint Review Pipeline**: Review approved, but PR touches security-critical files ({', '.join(critical_touched)}). Merge requires human approval.")
-                                    logger.error(f"[PIPELINE] PR #{pr_number} review approved but merge blocked — critical files: {critical_touched}")
+                                    await broadcast_to_project(
+                                        str(orig_task.project_id),
+                                        "task_updated",
+                                        {
+                                            "task_id": str(orig_task.id),
+                                            "status": TaskStatus.EVALUATING,
+                                        },
+                                    )
+                                    await create_pr_comment(
+                                        gh_token,
+                                        owner,
+                                        repo,
+                                        pr_number,
+                                        f"**Blueprint Review Pipeline**: Review approved, but PR touches security-critical files ({', '.join(critical_touched)}). Merge requires human approval.",
+                                    )
+                                    logger.error(
+                                        f"[PIPELINE] PR #{pr_number} review approved but merge blocked — critical files: {critical_touched}"
+                                    )
                                     action_taken = True
                                     return {"status": "accepted"}
                             except Exception as e:
-                                logger.error(f"[PIPELINE] Error checking critical files for merge gate: {e}", exc_info=True)
+                                logger.error(
+                                    f"[PIPELINE] Error checking critical files for merge gate: {e}",
+                                    exc_info=True,
+                                )
 
                         # Security / approval gate: if the original create task was
                         # flagged (security scan blocking, scan failure, etc.), park
                         # for manual merge. The review still ran and posted feedback,
                         # but auto-merge is not safe without human sign-off.
-                        if original_task_id and _runtime_config.get("require_approval_gates", True):
+                        if original_task_id and _runtime_config.get(
+                            "require_approval_gates", True
+                        ):
                             try:
-                                _approval_orig = await session.get(Task, uuid.UUID(original_task_id))
+                                _approval_orig = await session.get(
+                                    Task, uuid.UUID(original_task_id)
+                                )
                                 if _approval_orig and _approval_orig.requires_approval:
                                     _approval_orig.status = TaskStatus.EVALUATING
-                                    reason = _approval_orig.latest_status_message or "requires manual approval"
+                                    reason = (
+                                        _approval_orig.latest_status_message
+                                        or "requires manual approval"
+                                    )
                                     _approval_orig.latest_status_message = f"Review approved — awaiting human approval to merge ({reason})"
                                     session.add(_approval_orig)
                                     await session.commit()
-                                    await broadcast_to_project(str(_approval_orig.project_id), "task_updated",
-                                                               {"task_id": str(_approval_orig.id), "status": TaskStatus.EVALUATING})
-                                    await _comment_with_retry(create_pr_comment, gh_token, owner, repo, pr_number,
-                                        f"**Blueprint Review Pipeline**: Review approved, but merge requires human approval — {reason}")
-                                    logger.info(f"[PIPELINE] PR #{pr_number} review approved but merge blocked — requires_approval set on {original_task_id[:8]}")
+                                    await broadcast_to_project(
+                                        str(_approval_orig.project_id),
+                                        "task_updated",
+                                        {
+                                            "task_id": str(_approval_orig.id),
+                                            "status": TaskStatus.EVALUATING,
+                                        },
+                                    )
+                                    await _comment_with_retry(
+                                        create_pr_comment,
+                                        gh_token,
+                                        owner,
+                                        repo,
+                                        pr_number,
+                                        f"**Blueprint Review Pipeline**: Review approved, but merge requires human approval — {reason}",
+                                    )
+                                    logger.info(
+                                        f"[PIPELINE] PR #{pr_number} review approved but merge blocked — requires_approval set on {original_task_id[:8]}"
+                                    )
                                     action_taken = True
                                     return {"status": "accepted"}
                             except Exception as e:
-                                logger.error(f"[PIPELINE] Error checking requires_approval for merge gate: {e}", exc_info=True)
+                                logger.error(
+                                    f"[PIPELINE] Error checking requires_approval for merge gate: {e}",
+                                    exc_info=True,
+                                )
 
-                        merge_result = await _merge_with_retry(merge_pull_request, gh_token, owner, repo, pr_number, project_id=str(task.project_id))
+                        merge_result = await _merge_with_retry(
+                            merge_pull_request,
+                            gh_token,
+                            owner,
+                            repo,
+                            pr_number,
+                            project_id=str(task.project_id),
+                        )
 
                         if merge_result.get("merged"):
-                            await _comment_with_retry(create_pr_comment, gh_token, owner, repo, pr_number,
-                                "**Blueprint Review Pipeline**: PR auto-merged.")
+                            await _comment_with_retry(
+                                create_pr_comment,
+                                gh_token,
+                                owner,
+                                repo,
+                                pr_number,
+                                "**Blueprint Review Pipeline**: PR auto-merged.",
+                            )
                             # Mark original create task so dependents can proceed
                             if original_task_id:
                                 try:
-                                    orig = await session.get(Task, uuid.UUID(original_task_id))
+                                    orig = await session.get(
+                                        Task, uuid.UUID(original_task_id)
+                                    )
                                     if orig:
-                                        orig.context = {**(orig.context or {}), "pr_merged": True}
+                                        orig.context = {
+                                            **(orig.context or {}),
+                                            "pr_merged": True,
+                                        }
                                         # If this was a rollup PR review, mark the parent as COMPLETED
-                                        is_rollup_merge = orig.status == TaskStatus.EVALUATING
+                                        is_rollup_merge = (
+                                            orig.status == TaskStatus.EVALUATING
+                                        )
                                         if is_rollup_merge:
                                             orig.status = TaskStatus.COMPLETED
-                                            orig.latest_status_message = "Rollup PR merged"
+                                            orig.latest_status_message = (
+                                                "Rollup PR merged"
+                                            )
                                         session.add(orig)
                                         _o_ctx = orig.context or {}
                                         # Audit W1: auto_remediation is now a column.
                                         if _o_ctx.get("diagnosis_task_id") or (
-                                            orig.auto_remediation and _o_ctx.get("direction_id")
+                                            orig.auto_remediation
+                                            and _o_ctx.get("direction_id")
                                         ):
                                             try:
-                                                from app.task_completion import _record_remediation_outcome
-                                                await _record_remediation_outcome(orig, merged=True, session=session)
+                                                from app.task_completion import (
+                                                    _record_remediation_outcome,
+                                                )
+
+                                                await _record_remediation_outcome(
+                                                    orig, merged=True, session=session
+                                                )
                                             except Exception as _rr_exc:
-                                                logger.warning(f"[DIAGNOSIS] Failed to record remediation outcome on merge for task {orig.id}: {_rr_exc!r}")
+                                                logger.warning(
+                                                    f"[DIAGNOSIS] Failed to record remediation outcome on merge for task {orig.id}: {_rr_exc!r}"
+                                                )
                                         # Post result message for auto-remediation tasks
                                         # (routes between CI auto-fix and residual lifecycles).
                                         if orig.auto_remediation:
                                             try:
                                                 await post_remediation_result_message(
-                                                    session, orig, result="merged", pr_number=pr_number,
+                                                    session,
+                                                    orig,
+                                                    result="merged",
+                                                    pr_number=pr_number,
                                                 )
                                                 try:
-                                                    from app.notification_dispatch import dispatch_external_notification
-                                                    if is_residual_remediation_task(orig):
-                                                        _wh_event = "RESIDUAL_FIX_MERGED"
+                                                    from app.notification_dispatch import (
+                                                        dispatch_external_notification,
+                                                    )
+
+                                                    if is_residual_remediation_task(
+                                                        orig
+                                                    ):
+                                                        _wh_event = (
+                                                            "RESIDUAL_FIX_MERGED"
+                                                        )
                                                         _wh_payload = {
-                                                            "fingerprint": (orig.context or {}).get("error_fingerprint", ""),
+                                                            "fingerprint": (
+                                                                orig.context or {}
+                                                            ).get(
+                                                                "error_fingerprint", ""
+                                                            ),
                                                             "pr_number": pr_number,
                                                         }
                                                     else:
-                                                        _ar_branch = (orig.context or {}).get("ci_failure_branch", base_branch)
+                                                        _ar_branch = (
+                                                            orig.context or {}
+                                                        ).get(
+                                                            "ci_failure_branch",
+                                                            base_branch,
+                                                        )
                                                         _wh_event = "AUTO_FIX_MERGED"
-                                                        _wh_payload = {"branch": _ar_branch, "pr_number": pr_number}
-                                                    asyncio.ensure_future(dispatch_external_notification(  # noqa: RUF006 — fire-and-forget webhook dispatch from background flow
-                                                        orig.project_id, _wh_event, _wh_payload,
-                                                    ))
+                                                        _wh_payload = {
+                                                            "branch": _ar_branch,
+                                                            "pr_number": pr_number,
+                                                        }
+                                                    asyncio.ensure_future(
+                                                        dispatch_external_notification(  # noqa: RUF006 — fire-and-forget webhook dispatch from background flow
+                                                            orig.project_id,
+                                                            _wh_event,
+                                                            _wh_payload,
+                                                        )
+                                                    )
                                                 except Exception as _wh_exc:
-                                                    logger.warning("[AUTO-REMEDIATION] Failed to dispatch merged webhook: %s", _wh_exc)
+                                                    logger.warning(
+                                                        "[AUTO-REMEDIATION] Failed to dispatch merged webhook: %s",
+                                                        _wh_exc,
+                                                    )
                                             except Exception as _ar_exc:
-                                                logger.warning("[AUTO-REMEDIATION] Failed to post result message: %s", _ar_exc)
+                                                logger.warning(
+                                                    "[AUTO-REMEDIATION] Failed to post result message: %s",
+                                                    _ar_exc,
+                                                )
                                         # Extract review feedback as persistent playbook entries
                                         # on every merge (captures first-attempt data at any iteration)
                                         try:
-                                            from app.playbook_learning import extract_review_feedback_to_playbook
-                                            _orig_task_type = orig.first_payload.get("type", "create")
+                                            from app.playbook_learning import (
+                                                extract_review_feedback_to_playbook,
+                                            )
+
+                                            _orig_task_type = orig.first_payload.get(
+                                                "type", "create"
+                                            )
                                             await extract_review_feedback_to_playbook(
                                                 task=task,
                                                 review_loop=review_loop,
@@ -2452,30 +3305,73 @@ async def _process_post_commit(
                                                 session=session,
                                             )
                                         except Exception as _rp_exc:
-                                            logger.warning("[REVIEW_PLAYBOOK] Failed to extract review feedback: %s", _rp_exc)
+                                            logger.warning(
+                                                "[REVIEW_PLAYBOOK] Failed to extract review feedback: %s",
+                                                _rp_exc,
+                                            )
                                         # Close-loop: advance the RegressionRemediationCase to MERGED.
                                         try:
-                                            await _close_loop_regression_case_on_merge(orig, pr_number, session)
+                                            await _close_loop_regression_case_on_merge(
+                                                orig, pr_number, session
+                                            )
                                         except Exception as _rc_merge_exc:
-                                            logger.warning(f"[REGRESSION-CASE] Failed to advance case on review-merge for task {orig.id}: {_rc_merge_exc!r}")
+                                            logger.warning(
+                                                f"[REGRESSION-CASE] Failed to advance case on review-merge for task {orig.id}: {_rc_merge_exc!r}"
+                                            )
                                         await session.commit()
                                         # Clean up branches (staging + feature)
                                         await _cleanup_branches(orig, session)
                                         # Spawn a smoketest after rollup merges to main
                                         # Supported runtime_config keys for smoketest:
                                         #   health_check_urls: list[str] — live URLs to probe with HTTP GET after local tests
-                                        if is_rollup_merge and base_branch == "main" and _runtime_config.get("smoketest_enabled"):
+                                        if (
+                                            is_rollup_merge
+                                            and base_branch == "main"
+                                            and _runtime_config.get("smoketest_enabled")
+                                        ):
                                             try:
-                                                type_model = _runtime_config.get("task_type_models", {}).get("smoketest") or None
-                                                type_effort = _runtime_config.get("task_type_efforts", {}).get("smoketest") or None
-                                                health_check_urls = _runtime_config.get("health_check_urls") or []
-                                                _smoketest_payload = validate_internal_payload({
-                                                    "type": "smoketest",
-                                                    "base_branch": base_branch,
-                                                    **({"model": type_model} if type_model else {}),
-                                                    **({"effort": type_effort} if type_effort else {}),
-                                                    **({"health_check_urls": health_check_urls} if health_check_urls else {}),
-                                                }, "task_lifecycle:smoketest")
+                                                type_model = (
+                                                    _runtime_config.get(
+                                                        "task_type_models", {}
+                                                    ).get("smoketest")
+                                                    or None
+                                                )
+                                                type_effort = (
+                                                    _runtime_config.get(
+                                                        "task_type_efforts", {}
+                                                    ).get("smoketest")
+                                                    or None
+                                                )
+                                                health_check_urls = (
+                                                    _runtime_config.get(
+                                                        "health_check_urls"
+                                                    )
+                                                    or []
+                                                )
+                                                _smoketest_payload = validate_internal_payload(
+                                                    {
+                                                        "type": "smoketest",
+                                                        "base_branch": base_branch,
+                                                        **(
+                                                            {"model": type_model}
+                                                            if type_model
+                                                            else {}
+                                                        ),
+                                                        **(
+                                                            {"effort": type_effort}
+                                                            if type_effort
+                                                            else {}
+                                                        ),
+                                                        **(
+                                                            {
+                                                                "health_check_urls": health_check_urls
+                                                            }
+                                                            if health_check_urls
+                                                            else {}
+                                                        ),
+                                                    },
+                                                    "task_lifecycle:smoketest",
+                                                )
                                                 smoketest_task = Task(
                                                     project_id=task.project_id,
                                                     title=f"Smoketest after rollup merge to {base_branch}",
@@ -2489,51 +3385,118 @@ async def _process_post_commit(
                                                 await session.commit()
                                                 await session.refresh(smoketest_task)
                                                 history = TaskHistory(
-                                                    task_id=smoketest_task.id, action="SPAWNED",
-                                                    details={"spawned_by": "POST_ROLLUP_MERGE", "base_branch": base_branch}
+                                                    task_id=smoketest_task.id,
+                                                    action="SPAWNED",
+                                                    details={
+                                                        "spawned_by": "POST_ROLLUP_MERGE",
+                                                        "base_branch": base_branch,
+                                                    },
                                                 )
                                                 session.add(history)
                                                 await session.commit()
                                                 await broadcast_to_project(
-                                                    str(task.project_id), "task_updated",
-                                                    {"task_id": str(smoketest_task.id), "status": TaskStatus.QUEUED}
+                                                    str(task.project_id),
+                                                    "task_updated",
+                                                    {
+                                                        "task_id": str(
+                                                            smoketest_task.id
+                                                        ),
+                                                        "status": TaskStatus.QUEUED,
+                                                    },
                                                 )
-                                                logger.info(f"[SMOKETEST] Spawned smoketest task {smoketest_task.id} after rollup merge to {base_branch}")
+                                                logger.info(
+                                                    f"[SMOKETEST] Spawned smoketest task {smoketest_task.id} after rollup merge to {base_branch}"
+                                                )
                                             except Exception as e:
-                                                logger.warning(f"[SMOKETEST] Failed to spawn smoketest after rollup merge: {e}", exc_info=True)
+                                                logger.warning(
+                                                    f"[SMOKETEST] Failed to spawn smoketest after rollup merge: {e}",
+                                                    exc_info=True,
+                                                )
                                         # Spawn security rescan if merged task's parent was a security_audit
                                         if orig.parent_task_id:
                                             try:
-                                                audit_parent = await session.get(Task, orig.parent_task_id)
-                                                if (audit_parent and
-                                                        audit_parent.first_payload.get("type") == "security_audit" and
-                                                        audit_parent.status == TaskStatus.COMPLETED):
+                                                audit_parent = await session.get(
+                                                    Task, orig.parent_task_id
+                                                )
+                                                if (
+                                                    audit_parent
+                                                    and audit_parent.first_payload.get(
+                                                        "type"
+                                                    )
+                                                    == "security_audit"
+                                                    and audit_parent.status
+                                                    == TaskStatus.COMPLETED
+                                                ):
                                                     # Only rescan once per original audit
-                                                    existing_rescan = (await session.execute(
-                                                        select(Task).where(
-                                                            Task.parent_task_id == audit_parent.id,
-                                                            Task.title.ilike("%rescan%")
+                                                    existing_rescan = (
+                                                        (
+                                                            await session.execute(
+                                                                select(Task).where(
+                                                                    Task.parent_task_id
+                                                                    == audit_parent.id,
+                                                                    Task.title.ilike(
+                                                                        "%rescan%"
+                                                                    ),
+                                                                )
+                                                            )
                                                         )
-                                                    )).scalars().first()
+                                                        .scalars()
+                                                        .first()
+                                                    )
                                                     if not existing_rescan:
                                                         try:
-                                                            pr_files = await get_pr_files(gh_token, owner, repo, pr_number)
-                                                            changed_files = ", ".join(f["filename"] for f in pr_files)
+                                                            pr_files = (
+                                                                await get_pr_files(
+                                                                    gh_token,
+                                                                    owner,
+                                                                    repo,
+                                                                    pr_number,
+                                                                )
+                                                            )
+                                                            changed_files = ", ".join(
+                                                                f["filename"]
+                                                                for f in pr_files
+                                                            )
                                                         except Exception:
                                                             changed_files = "(could not fetch file list)"
                                                         audit_title = audit_parent.title
-                                                        type_model = _runtime_config.get("task_type_models", {}).get("security_audit") or None
-                                                        type_effort = _runtime_config.get("task_type_efforts", {}).get("security_audit") or None
-                                                        _rescan_payload = validate_internal_payload({
-                                                            "type": "security_audit",
-                                                            "prompt": (
-                                                                f"Verify that the security fixes merged in PR #{pr_number} actually addressed "
-                                                                f"the reported vulnerabilities. Focus audit on these files: {changed_files}. "
-                                                                f"Output only PASS or remaining FAIL findings."
-                                                            ),
-                                                            **({"model": type_model} if type_model else {}),
-                                                            **({"effort": type_effort} if type_effort else {}),
-                                                        }, "task_lifecycle:security_audit")
+                                                        type_model = (
+                                                            _runtime_config.get(
+                                                                "task_type_models", {}
+                                                            ).get("security_audit")
+                                                            or None
+                                                        )
+                                                        type_effort = (
+                                                            _runtime_config.get(
+                                                                "task_type_efforts", {}
+                                                            ).get("security_audit")
+                                                            or None
+                                                        )
+                                                        _rescan_payload = validate_internal_payload(
+                                                            {
+                                                                "type": "security_audit",
+                                                                "prompt": (
+                                                                    f"Verify that the security fixes merged in PR #{pr_number} actually addressed "
+                                                                    f"the reported vulnerabilities. Focus audit on these files: {changed_files}. "
+                                                                    f"Output only PASS or remaining FAIL findings."
+                                                                ),
+                                                                **(
+                                                                    {
+                                                                        "model": type_model
+                                                                    }
+                                                                    if type_model
+                                                                    else {}
+                                                                ),
+                                                                **(
+                                                                    {
+                                                                        "effort": type_effort
+                                                                    }
+                                                                    if type_effort
+                                                                    else {}
+                                                                ),
+                                                            },
+                                                            "task_lifecycle:security_audit",
+                                                        )
                                                         rescan_task = Task(
                                                             project_id=orig.project_id,
                                                             title=f"Security rescan: verify {audit_title} fixes",
@@ -2547,27 +3510,47 @@ async def _process_post_commit(
                                                         )
                                                         session.add(rescan_task)
                                                         await session.commit()
-                                                        await session.refresh(rescan_task)
+                                                        await session.refresh(
+                                                            rescan_task
+                                                        )
                                                         history = TaskHistory(
-                                                            task_id=rescan_task.id, action="SPAWNED",
+                                                            task_id=rescan_task.id,
+                                                            action="SPAWNED",
                                                             details={
                                                                 "spawned_by": "POST_SECURITY_FIX_MERGE",
                                                                 "pr_number": pr_number,
-                                                                "audit_parent_id": str(audit_parent.id),
-                                                            }
+                                                                "audit_parent_id": str(
+                                                                    audit_parent.id
+                                                                ),
+                                                            },
                                                         )
                                                         session.add(history)
                                                         await session.commit()
                                                         await broadcast_to_project(
-                                                            str(orig.project_id), "task_updated",
-                                                            {"task_id": str(rescan_task.id), "status": TaskStatus.QUEUED}
+                                                            str(orig.project_id),
+                                                            "task_updated",
+                                                            {
+                                                                "task_id": str(
+                                                                    rescan_task.id
+                                                                ),
+                                                                "status": TaskStatus.QUEUED,
+                                                            },
                                                         )
-                                                        logger.info(f"[SECURITY RESCAN] Spawned rescan task {rescan_task.id} after security fix merge PR #{pr_number}")
+                                                        logger.info(
+                                                            f"[SECURITY RESCAN] Spawned rescan task {rescan_task.id} after security fix merge PR #{pr_number}"
+                                                        )
                                             except Exception as e:
-                                                logger.info(f"[SECURITY RESCAN] Failed to spawn security rescan: {e}")
+                                                logger.info(
+                                                    f"[SECURITY RESCAN] Failed to spawn security rescan: {e}"
+                                                )
                                 except Exception as e:
-                                    logger.warning(f"[REVIEW PIPELINE] Failed to set pr_merged on {original_task_id}: {e}", exc_info=True)
-                            logger.info(f"[REVIEW PIPELINE] PR #{pr_number} approved and merged")
+                                    logger.warning(
+                                        f"[REVIEW PIPELINE] Failed to set pr_merged on {original_task_id}: {e}",
+                                        exc_info=True,
+                                    )
+                            logger.info(
+                                f"[REVIEW PIPELINE] PR #{pr_number} approved and merged"
+                            )
                             action_taken = True
                         else:
                             # Merge blocked — park in EVALUATING with ci_waiting so the
@@ -2581,14 +3564,24 @@ async def _process_post_commit(
                             # case (sibling rollups advancing the base branch between
                             # fetches).  Fully autonomous; no requires_approval.
                             merge_msg = merge_result.get("message", "unknown")
-                            await create_pr_comment(gh_token, owner, repo, pr_number,
-                                f"**Blueprint Review Pipeline**: Merge blocked — {merge_msg}. Retrying with backoff.")
+                            await create_pr_comment(
+                                gh_token,
+                                owner,
+                                repo,
+                                pr_number,
+                                f"**Blueprint Review Pipeline**: Merge blocked — {merge_msg}. Retrying with backoff.",
+                            )
                             from app import pause_clock
+
                             try:
                                 _approve_files = [
-                                    f.get("filename", "") for f in (
-                                        await get_pr_files(gh_token, owner, repo, pr_number)
-                                    ) if isinstance(f, dict) and f.get("filename")
+                                    f.get("filename", "")
+                                    for f in (
+                                        await get_pr_files(
+                                            gh_token, owner, repo, pr_number
+                                        )
+                                    )
+                                    if isinstance(f, dict) and f.get("filename")
                                 ]
                             except Exception as _af_e:
                                 logger.warning(
@@ -2596,12 +3589,20 @@ async def _process_post_commit(
                                 )
                                 _approve_files = []
                             merge_wait_loop = dict(review_loop)
-                            merge_wait_loop["review_history"] = _append_approve_to_review_history(review_loop, _approve_files)
+                            merge_wait_loop["review_history"] = (
+                                _append_approve_to_review_history(
+                                    review_loop, _approve_files
+                                )
+                            )
                             merge_wait_loop["ci_waiting"] = True
                             merge_wait_loop["review_approved"] = True
-                            merge_wait_loop["ci_passed"] = True  # CI was already verified green above
+                            merge_wait_loop["ci_passed"] = (
+                                True  # CI was already verified green above
+                            )
                             merge_wait_loop["ci_wait_started"] = _utcnow().isoformat()
-                            merge_wait_loop["ci_wait_pause_baseline"] = await pause_clock.current_baseline(session)
+                            merge_wait_loop[
+                                "ci_wait_pause_baseline"
+                            ] = await pause_clock.current_baseline(session)
                             merge_wait_loop["ci_poll_interval"] = 30
                             merge_wait_loop["pr_number"] = pr_number
                             merge_wait_loop["branch"] = branch
@@ -2610,38 +3611,58 @@ async def _process_post_commit(
                             merge_wait_loop["head_sha"] = head_sha
                             merge_wait_loop["merge_blocked_msg"] = merge_msg[:300]
                             task.status = TaskStatus.EVALUATING
-                            task.context = {**(task.context or {}), "review_loop": merge_wait_loop}
+                            task.context = {
+                                **(task.context or {}),
+                                "review_loop": merge_wait_loop,
+                            }
                             task.latest_status_message = f"Review approved, merge blocked on PR #{pr_number} ({merge_msg[:120]}) — retrying with backoff"
                             session.add(task)
                             await session.commit()
-                            logger.info(f"[REVIEW PIPELINE] PR #{pr_number} merge blocked, parked for ci_completion retry: {merge_msg[:200]}")
+                            logger.info(
+                                f"[REVIEW PIPELINE] PR #{pr_number} merge blocked, parked for ci_completion retry: {merge_msg[:200]}"
+                            )
                             action_taken = True
                     except Exception as e:
                         # Merge/CI-check failed — park in EVALUATING with ci_waiting so
                         # the orchestrator's CI monitoring loop retries the merge instead
                         # of silently orphaning the PR.
-                        logger.error(f"[REVIEW PIPELINE] Failed to merge PR #{pr_number}, parking in CI-wait: {e}", exc_info=True)
+                        logger.error(
+                            f"[REVIEW PIPELINE] Failed to merge PR #{pr_number}, parking in CI-wait: {e}",
+                            exc_info=True,
+                        )
                         # Best-effort: gh_token may not be in scope if the failure
                         # happened before the auth call.  An empty file list here
                         # still records that the iteration was approved.
                         try:
                             _approve_files = [
-                                f.get("filename", "") for f in (
+                                f.get("filename", "")
+                                for f in (
                                     await get_pr_files(gh_token, owner, repo, pr_number)
-                                ) if isinstance(f, dict) and f.get("filename")
+                                )
+                                if isinstance(f, dict) and f.get("filename")
                             ]
                         except Exception:
                             _approve_files = []
-                        _approved_history = _append_approve_to_review_history(review_loop, _approve_files)
+                        _approved_history = _append_approve_to_review_history(
+                            review_loop, _approve_files
+                        )
                         task.status = TaskStatus.EVALUATING
                         task.latest_status_message = f"Review approved, merge attempt failed ({type(e).__name__}) — CI monitor will retry"
-                        task.context = {**(task.context or {}), "review_loop": {
-                            **review_loop, "ci_waiting": True, "review_approved": True,
-                            "review_history": _approved_history,
-                            "head_sha": head_sha, "pr_number": pr_number,
-                            "branch": branch, "base_branch": base_branch,
-                            "original_task_id": original_task_id,
-                            "ci_wait_started": _utcnow().isoformat()}}
+                        task.context = {
+                            **(task.context or {}),
+                            "review_loop": {
+                                **review_loop,
+                                "ci_waiting": True,
+                                "review_approved": True,
+                                "review_history": _approved_history,
+                                "head_sha": head_sha,
+                                "pr_number": pr_number,
+                                "branch": branch,
+                                "base_branch": base_branch,
+                                "original_task_id": original_task_id,
+                                "ci_wait_started": _utcnow().isoformat(),
+                            },
+                        }
                         session.add(task)
                         await session.commit()
                         action_taken = True
@@ -2660,9 +3681,7 @@ async def _process_post_commit(
                             f"[REVIEW PIPELINE] PR #{pr_number}: verdict unparseable — skipping fix spawn, original task flagged requires_approval"
                         )
                         task.status = TaskStatus.COMPLETED
-                        task.latest_status_message = (
-                            f"Review verdict unparseable for PR #{pr_number} — fix skipped, manual review required"
-                        )
+                        task.latest_status_message = f"Review verdict unparseable for PR #{pr_number} — fix skipped, manual review required"
                         session.add(task)
                         await session.commit()
                         return {"status": "accepted"}
@@ -2673,17 +3692,39 @@ async def _process_post_commit(
                     # fix. Close the PR and mark the rollup parent COMPLETED so it
                     # stops blocking the pipeline.
                     try:
-                        _empty_gh, _empty_owner, _empty_repo = await get_github_token_for_task(task.id, session)
-                        _pr_files = await get_pr_files(_empty_gh, _empty_owner, _empty_repo, pr_number, project_id=str(task.project_id))
+                        (
+                            _empty_gh,
+                            _empty_owner,
+                            _empty_repo,
+                        ) = await get_github_token_for_task(task.id, session)
+                        _pr_files = await get_pr_files(
+                            _empty_gh,
+                            _empty_owner,
+                            _empty_repo,
+                            pr_number,
+                            project_id=str(task.project_id),
+                        )
                     except Exception as _empty_err:
-                        logger.warning(f"[REVIEW PIPELINE] Empty-PR check failed for #{pr_number}: {_empty_err} — proceeding with fix spawn")
+                        logger.warning(
+                            f"[REVIEW PIPELINE] Empty-PR check failed for #{pr_number}: {_empty_err} — proceeding with fix spawn"
+                        )
                         _pr_files = None
                     if _pr_files == []:
-                        logger.info(f"[REVIEW PIPELINE] PR #{pr_number} has no file changes — closing as empty rollup")
+                        logger.info(
+                            f"[REVIEW PIPELINE] PR #{pr_number} has no file changes — closing as empty rollup"
+                        )
                         try:
-                            await close_pull_request(_empty_gh, _empty_owner, _empty_repo, pr_number, project_id=str(task.project_id))
+                            await close_pull_request(
+                                _empty_gh,
+                                _empty_owner,
+                                _empty_repo,
+                                pr_number,
+                                project_id=str(task.project_id),
+                            )
                         except Exception as _close_err:
-                            logger.warning(f"[REVIEW PIPELINE] Failed to close empty PR #{pr_number}: {_close_err}")
+                            logger.warning(
+                                f"[REVIEW PIPELINE] Failed to close empty PR #{pr_number}: {_close_err}"
+                            )
                         if original_task_id:
                             try:
                                 # Phase A1: skip_locked + bounded retry. If the
@@ -2692,34 +3733,50 @@ async def _process_post_commit(
                                 # 500'ing the review handler.
                                 _orig = None
                                 for _attempt in range(3):
-                                    _orig_q = select(Task).where(
-                                        Task.id == uuid.UUID(original_task_id)
-                                    ).with_for_update(skip_locked=True)
-                                    _orig = (await session.execute(_orig_q)).scalars().first()
+                                    _orig_q = (
+                                        select(Task)
+                                        .where(Task.id == uuid.UUID(original_task_id))
+                                        .with_for_update(skip_locked=True)
+                                    )
+                                    _orig = (
+                                        (await session.execute(_orig_q))
+                                        .scalars()
+                                        .first()
+                                    )
                                     if _orig is not None:
                                         break
-                                    _orig_exists = (await session.execute(
-                                        select(Task.id).where(Task.id == uuid.UUID(original_task_id))
-                                    )).first()
+                                    _orig_exists = (
+                                        await session.execute(
+                                            select(Task.id).where(
+                                                Task.id == uuid.UUID(original_task_id)
+                                            )
+                                        )
+                                    ).first()
                                     if _orig_exists is None:
                                         break
                                     await asyncio.sleep(0.5 * (_attempt + 1))
                                 if _orig:
-                                    _orig_loop = (_orig.context or {}).get("review_loop", {}) or {}
+                                    _orig_loop = (_orig.context or {}).get(
+                                        "review_loop", {}
+                                    ) or {}
                                     _orig_loop.pop("ci_waiting", None)
-                                    _orig.context = {**(_orig.context or {}), "review_loop": _orig_loop, "pr_closed_empty": True}
+                                    _orig.context = {
+                                        **(_orig.context or {}),
+                                        "review_loop": _orig_loop,
+                                        "pr_closed_empty": True,
+                                    }
                                     flag_modified(_orig, "context")
                                     _orig.status = TaskStatus.COMPLETED
-                                    _orig.latest_status_message = (
-                                        f"✓ Rollup PR #{pr_number} closed — branch equivalent to {base_branch}, no new changes to merge"
-                                    )
+                                    _orig.latest_status_message = f"✓ Rollup PR #{pr_number} closed — branch equivalent to {base_branch}, no new changes to merge"
                                     session.add(_orig)
                                 else:
                                     logger.warning(
                                         f"[REVIEW PIPELINE] Empty-PR cleanup deferred — parent {original_task_id[:8]} contended"
                                     )
                             except Exception as _orig_err:
-                                logger.warning(f"[REVIEW PIPELINE] Failed to update rollup parent after empty-PR close: {_orig_err}")
+                                logger.warning(
+                                    f"[REVIEW PIPELINE] Failed to update rollup parent after empty-PR close: {_orig_err}"
+                                )
                         task.status = TaskStatus.COMPLETED
                         task.latest_status_message = f"Review complete — PR #{pr_number} closed as empty (obsolete rollup)"
                         session.add(task)
@@ -2727,8 +3784,12 @@ async def _process_post_commit(
                         if original_task_id:
                             try:
                                 await broadcast_to_project(
-                                    str(task.project_id), "task_updated",
-                                    {"task_id": original_task_id, "status": TaskStatus.COMPLETED},
+                                    str(task.project_id),
+                                    "task_updated",
+                                    {
+                                        "task_id": original_task_id,
+                                        "status": TaskStatus.COMPLETED,
+                                    },
                                 )
                             except Exception:
                                 pass
@@ -2737,15 +3798,26 @@ async def _process_post_commit(
                     ci_errors_text = ""
                     ci_check: dict | None = None
                     try:
-                        gh_token, owner, repo = await get_github_token_for_task(task.id, session)
-                        pr_data = await get_pull_request(gh_token, owner, repo, pr_number)
+                        gh_token, owner, repo = await get_github_token_for_task(
+                            task.id, session
+                        )
+                        pr_data = await get_pull_request(
+                            gh_token, owner, repo, pr_number
+                        )
                         head_sha = pr_data.get("head", {}).get("sha", "")
                         if head_sha:
-                            ci_check = await get_check_runs_cached(gh_token, owner, repo, head_sha)
-                            if ci_check.get("conclusion") == "failure" and ci_check.get("failed_logs"):
+                            ci_check = await get_check_runs_cached(
+                                gh_token, owner, repo, head_sha
+                            )
+                            if ci_check.get("conclusion") == "failure" and ci_check.get(
+                                "failed_logs"
+                            ):
                                 ci_errors_text = f"\n\nCI build errors (also need fixing):\n{ci_check['failed_logs']}"
                     except Exception as e:
-                        logger.error(f"[REVIEW PIPELINE] Could not fetch CI errors for fix context: {e}", exc_info=True)
+                        logger.error(
+                            f"[REVIEW PIPELINE] Could not fetch CI errors for fix context: {e}",
+                            exc_info=True,
+                        )
                     # CI vs reviewer build-gate disagreement detector. When the
                     # reviewer flags build/lint complaints but CI shows the
                     # corresponding job GREEN, the issue is almost always a
@@ -2753,33 +3825,52 @@ async def _process_post_commit(
                     # disputes via /tmp/fix_responses rather than thrashing on
                     # source code that isn't broken (PR #3884 saga, 2026-05-06).
                     disagreement_hint = _detect_ci_review_disagreement(
-                        issues, feedback, ci_check, pr_number,
+                        issues,
+                        feedback,
+                        ci_check,
+                        pr_number,
                     )
                     if issues:
+
                         def _fmt_issue(i):
-                            desc = i.get('description', '')
-                            file_ = i.get('file')
-                            line_ = i.get('line')
+                            desc = i.get("description", "")
+                            file_ = i.get("file")
+                            line_ = i.get("line")
                             if file_ and line_ is not None:
                                 return f"- [{file_}:{line_}] {desc}"
                             if file_:
                                 return f"- [{file_}] {desc}"
                             return f"- {desc}"
-                        critical = [i for i in issues if i.get('severity') == 'critical']
-                        major = [i for i in issues if i.get('severity') == 'major']
-                        minor = [i for i in issues if i.get('severity') == 'minor']
+
+                        critical = [
+                            i for i in issues if i.get("severity") == "critical"
+                        ]
+                        major = [i for i in issues if i.get("severity") == "major"]
+                        minor = [i for i in issues if i.get("severity") == "minor"]
                         structured = ""
                         if critical:
-                            structured += "\n\nCRITICAL issues (must fix):\n" + "\n".join(_fmt_issue(i) for i in critical)
+                            structured += (
+                                "\n\nCRITICAL issues (must fix):\n"
+                                + "\n".join(_fmt_issue(i) for i in critical)
+                            )
                         if major:
-                            structured += "\n\nMajor issues:\n" + "\n".join(_fmt_issue(i) for i in major)
+                            structured += "\n\nMajor issues:\n" + "\n".join(
+                                _fmt_issue(i) for i in major
+                            )
                         if minor:
-                            structured += "\n\nMinor issues:\n" + "\n".join(_fmt_issue(i) for i in minor)
+                            structured += "\n\nMinor issues:\n" + "\n".join(
+                                _fmt_issue(i) for i in minor
+                            )
                         fix_prompt_text = f"{disagreement_hint}A code review requested changes. Address the following issues:{structured}{ci_errors_text}"
                     else:
                         fix_prompt_text = f"{disagreement_hint}A code review requested changes. Please address the following feedback:\n\n{feedback}{ci_errors_text}"
                     fix_task, _ = await _spawn_pipeline_task(
-                        task, "fix", session, pr_number, branch, base_branch,
+                        task,
+                        "fix",
+                        session,
+                        pr_number,
+                        branch,
+                        base_branch,
                         fix_prompt=fix_prompt_text,
                         original_prompt=original_prompt,
                         original_task_id=original_task_id,
@@ -2788,7 +3879,9 @@ async def _process_post_commit(
                         investigated_files=investigated_files,
                     )
                     if fix_task:
-                        logger.info(f"[REVIEW PIPELINE] Spawned fix for PR #{pr_number} → task {fix_task.id}")
+                        logger.info(
+                            f"[REVIEW PIPELINE] Spawned fix for PR #{pr_number} → task {fix_task.id}"
+                        )
                         # Reset the parking parent's CI-wait clock: each spawned fix
                         # is a fresh cycle of work, so the 30-min backstop in
                         # services.py should count from here instead of the initial
@@ -2805,25 +3898,46 @@ async def _process_post_commit(
                                 # baseline if reset is missed.
                                 _orig = None
                                 for _attempt in range(3):
-                                    _orig_q = select(Task).where(
-                                        Task.id == uuid.UUID(original_task_id)
-                                    ).with_for_update(skip_locked=True)
-                                    _orig = (await session.execute(_orig_q)).scalars().first()
+                                    _orig_q = (
+                                        select(Task)
+                                        .where(Task.id == uuid.UUID(original_task_id))
+                                        .with_for_update(skip_locked=True)
+                                    )
+                                    _orig = (
+                                        (await session.execute(_orig_q))
+                                        .scalars()
+                                        .first()
+                                    )
                                     if _orig is not None:
                                         break
-                                    _orig_exists = (await session.execute(
-                                        select(Task.id).where(Task.id == uuid.UUID(original_task_id))
-                                    )).first()
+                                    _orig_exists = (
+                                        await session.execute(
+                                            select(Task.id).where(
+                                                Task.id == uuid.UUID(original_task_id)
+                                            )
+                                        )
+                                    ).first()
                                     if _orig_exists is None:
                                         break
                                     await asyncio.sleep(0.5 * (_attempt + 1))
                                 if _orig:
-                                    _orig_loop = dict((_orig.context or {}).get("review_loop", {}) or {})
+                                    _orig_loop = dict(
+                                        (_orig.context or {}).get("review_loop", {})
+                                        or {}
+                                    )
                                     if _orig_loop.get("ci_waiting"):
                                         from app import pause_clock
-                                        _orig_loop["ci_wait_started"] = _utcnow().isoformat()
-                                        _orig_loop["ci_wait_pause_baseline"] = await pause_clock.current_baseline(session)
-                                        _orig.context = {**(_orig.context or {}), "review_loop": _orig_loop}
+
+                                        _orig_loop["ci_wait_started"] = (
+                                            _utcnow().isoformat()
+                                        )
+                                        _orig_loop[
+                                            "ci_wait_pause_baseline"
+                                        ] = await pause_clock.current_baseline(session)
+                                        _orig.context = {
+                                            **(_orig.context or {}),
+                                            "review_loop": _orig_loop,
+                                        }
                                         flag_modified(_orig, "context")
                                         session.add(_orig)
                                 else:
@@ -2838,15 +3952,23 @@ async def _process_post_commit(
                         task.latest_status_message = f"Fix not spawned for PR #{pr_number} — iteration cap reached"
                         task.requires_approval = True
                         session.add(task)
-                        cap_alert_title = f"PR #{pr_number} stalled — iteration cap reached"
-                        existing_cap_alert = (await session.execute(
-                            select(Alert).where(
-                                Alert.project_id == task.project_id,
-                                Alert.severity == AlertSeverity.WARNING,
-                                Alert.dismissed_at.is_(None),
-                                Alert.title == cap_alert_title,
+                        cap_alert_title = (
+                            f"PR #{pr_number} stalled — iteration cap reached"
+                        )
+                        existing_cap_alert = (
+                            (
+                                await session.execute(
+                                    select(Alert).where(
+                                        Alert.project_id == task.project_id,
+                                        Alert.severity == AlertSeverity.WARNING,
+                                        Alert.dismissed_at.is_(None),
+                                        Alert.title == cap_alert_title,
+                                    )
+                                )
                             )
-                        )).scalars().first()
+                            .scalars()
+                            .first()
+                        )
                         if not existing_cap_alert:
                             alert = Alert(
                                 project_id=task.project_id,
@@ -2857,11 +3979,20 @@ async def _process_post_commit(
                             )
                             session.add(alert)
                             await session.commit()
-                            await broadcast_to_project(str(task.project_id), "alert_created",
-                                {"alert_id": str(alert.id), "severity": "WARNING", "title": alert.title})
+                            await broadcast_to_project(
+                                str(task.project_id),
+                                "alert_created",
+                                {
+                                    "alert_id": str(alert.id),
+                                    "severity": "WARNING",
+                                    "title": alert.title,
+                                },
+                            )
                         else:
                             await session.commit()
-                        logger.warning(f"[REVIEW PIPELINE] WARNING: Fix spawn returned None for PR #{pr_number}")
+                        logger.warning(
+                            f"[REVIEW PIPELINE] WARNING: Fix spawn returned None for PR #{pr_number}"
+                        )
                     # On every review rejection, store which issue categories caused it
                     # on the original task.  Iteration 1 → _first_attempt_rejection_categories
                     # (existing field); all iterations → _all_iterations_rejection_categories
@@ -2873,53 +4004,95 @@ async def _process_post_commit(
                                 cache_first_attempt_classification,
                                 _keyword_from_flat,
                             )
+
                             rh_items = [
-                                {"description": i.get("description", ""),
-                                 "severity": i.get("severity", "minor"),
-                                 "iteration": review_iteration}
-                                for i in issues if i.get("description")
+                                {
+                                    "description": i.get("description", ""),
+                                    "severity": i.get("severity", "minor"),
+                                    "iteration": review_iteration,
+                                }
+                                for i in issues
+                                if i.get("description")
                             ]
                             if rh_items:
-                                orig_task = await session.get(Task, uuid.UUID(original_task_id))
+                                orig_task = await session.get(
+                                    Task, uuid.UUID(original_task_id)
+                                )
                                 if orig_task:
                                     task_ctx = dict(orig_task.context or {})
                                     if review_iteration == 1:
-                                        buckets = await cache_first_attempt_classification(task_ctx, rh_items)
+                                        buckets = (
+                                            await cache_first_attempt_classification(
+                                                task_ctx, rh_items
+                                            )
+                                        )
                                     else:
                                         buckets = _keyword_from_flat(rh_items)
-                                    rejection_cats = {cat: len(items) for cat, items in buckets.items() if items}
+                                    rejection_cats = {
+                                        cat: len(items)
+                                        for cat, items in buckets.items()
+                                        if items
+                                    }
                                     if rejection_cats:
                                         if review_iteration == 1:
                                             minor_only = all(
-                                                (i.get("severity", "minor") or "minor").lower() == "minor"
-                                                for i in issues if i.get("description")
+                                                (
+                                                    i.get("severity", "minor")
+                                                    or "minor"
+                                                ).lower()
+                                                == "minor"
+                                                for i in issues
+                                                if i.get("description")
                                             )
-                                            task_ctx["_first_attempt_rejection_categories"] = rejection_cats
-                                            task_ctx["_first_attempt_minor_only"] = minor_only
-                                        existing_all = dict(task_ctx.get("_all_iterations_rejection_categories") or {})
+                                            task_ctx[
+                                                "_first_attempt_rejection_categories"
+                                            ] = rejection_cats
+                                            task_ctx["_first_attempt_minor_only"] = (
+                                                minor_only
+                                            )
+                                        existing_all = dict(
+                                            task_ctx.get(
+                                                "_all_iterations_rejection_categories"
+                                            )
+                                            or {}
+                                        )
                                         for cat, cnt in rejection_cats.items():
-                                            existing_all[cat] = existing_all.get(cat, 0) + cnt
-                                        task_ctx["_all_iterations_rejection_categories"] = existing_all
+                                            existing_all[cat] = (
+                                                existing_all.get(cat, 0) + cnt
+                                            )
+                                        task_ctx[
+                                            "_all_iterations_rejection_categories"
+                                        ] = existing_all
                                     orig_task.context = task_ctx
                                     flag_modified(orig_task, "context")
                                     session.add(orig_task)
                                     await session.commit()
                         except Exception as _cat_e:
-                            logger.warning(f"[REVIEW PIPELINE] Failed to record rejection categories: {_cat_e}")
+                            logger.warning(
+                                f"[REVIEW PIPELINE] Failed to record rejection categories: {_cat_e}"
+                            )
                     action_taken = True
 
                 if not action_taken:
                     task.latest_status_message = f"Review completed but no action taken (verdict={verdict}) — check orchestrator logs"
                     session.add(task)
                     await session.commit()
-                    logger.warning(f"[REVIEW PIPELINE] WARNING: Review {task.id} for PR #{pr_number} completed with no downstream action (verdict={verdict})")
+                    logger.warning(
+                        f"[REVIEW PIPELINE] WARNING: Review {task.id} for PR #{pr_number} completed with no downstream action (verdict={verdict})"
+                    )
 
             # Fix task completed → security scan → spawn new review
             elif task_type == "fix":
-                pr_number = review_loop.get("pr_number") or task_payload.get("pr_number")
+                pr_number = review_loop.get("pr_number") or task_payload.get(
+                    "pr_number"
+                )
                 branch = review_loop.get("branch") or task_payload.get("branch")
-                base_branch = review_loop.get("base_branch") or task_payload.get("base_branch", "main")
-                original_task_id = review_loop.get("original_task_id", "") or task_payload.get("original_task_id", "")
+                base_branch = review_loop.get("base_branch") or task_payload.get(
+                    "base_branch", "main"
+                )
+                original_task_id = review_loop.get(
+                    "original_task_id", ""
+                ) or task_payload.get("original_task_id", "")
 
                 # Backend stamp: ensure fix_iteration is set on the self-review
                 # outcome so the catch-rate dashboard and reviewer priming can
@@ -2933,37 +4106,62 @@ async def _process_post_commit(
                     # fix_iteration = pipeline_iter // 2
                     _fix_iter_n = max(1, _pipeline_iter // 2)
                     _stamped_ctx = dict(task.context)
-                    _stamped_ctx["_self_review_outcome"] = {**_fix_sro, "fix_iteration": _fix_iter_n}
+                    _stamped_ctx["_self_review_outcome"] = {
+                        **_fix_sro,
+                        "fix_iteration": _fix_iter_n,
+                    }
                     task.context = _stamped_ctx
                     flag_modified(task, "context")
                     session.add(task)
 
                 if not pr_number or not branch:
-                    logger.info(f"[REVIEW PIPELINE] Fix task {task.id} missing pr_number ({pr_number}) or branch ({branch}) — cannot continue pipeline")
-                    task.latest_status_message = "Fix pipeline error: missing pr_number or branch"
+                    logger.info(
+                        f"[REVIEW PIPELINE] Fix task {task.id} missing pr_number ({pr_number}) or branch ({branch}) — cannot continue pipeline"
+                    )
+                    task.latest_status_message = (
+                        "Fix pipeline error: missing pr_number or branch"
+                    )
                     session.add(task)
                     await session.commit()
                     return {"status": "accepted"}
 
                 # Early exit: skip if PR is already merged or closed
                 try:
-                    gh_token_check, owner_check, repo_check = await get_github_token_for_task(task.id, session)
-                    pr_data_check = await get_pull_request(gh_token_check, owner_check, repo_check, pr_number)
-                    if pr_data_check.get("state") == "closed" or pr_data_check.get("merged"):
-                        merged_label = "merged" if pr_data_check.get("merged") else "closed"
-                        logger.info(f"[REVIEW PIPELINE] PR #{pr_number} already {merged_label} — skipping fix re-review for task {task.id}")
+                    (
+                        gh_token_check,
+                        owner_check,
+                        repo_check,
+                    ) = await get_github_token_for_task(task.id, session)
+                    pr_data_check = await get_pull_request(
+                        gh_token_check, owner_check, repo_check, pr_number
+                    )
+                    if pr_data_check.get("state") == "closed" or pr_data_check.get(
+                        "merged"
+                    ):
+                        merged_label = (
+                            "merged" if pr_data_check.get("merged") else "closed"
+                        )
+                        logger.info(
+                            f"[REVIEW PIPELINE] PR #{pr_number} already {merged_label} — skipping fix re-review for task {task.id}"
+                        )
                         task.latest_status_message = f"PR #{pr_number} already {merged_label} — re-review skipped"
                         session.add(task)
                         await session.commit()
                         return {"status": "accepted"}
                 except Exception as e:
-                    logger.info(f"[REVIEW PIPELINE] Could not check PR #{pr_number} state: {e} — proceeding")
+                    logger.info(
+                        f"[REVIEW PIPELINE] Could not check PR #{pr_number} state: {e} — proceeding"
+                    )
 
                 # Security scan fix output before re-review
                 scan_blocked = False
                 try:
-                    gh_token, owner, repo = await get_github_token_for_task(task.id, session)
-                    scan_result = await scan_pr_for_injection(gh_token, owner, repo, pr_number)
+                    gh_token, owner, repo = await get_github_token_for_task(
+                        task.id, session
+                    )
+                    scan_result = await scan_pr_for_injection(
+                        gh_token, owner, repo, pr_number
+                    )
                     logger.info(f"[SECURITY] {scan_result['summary']}")
                     if scan_result["blocked"]:
                         scan_blocked = True
@@ -2972,11 +4170,18 @@ async def _process_post_commit(
                         session.add(task)
                         await session.commit()
                     if scan_result["findings"]:
-                        await create_pr_comment(gh_token, owner, repo, pr_number, scan_result["report"])
+                        await create_pr_comment(
+                            gh_token, owner, repo, pr_number, scan_result["report"]
+                        )
                 except Exception as e:
-                    logger.error(f"[SECURITY] Scan failed for fix PR #{pr_number}, flagging for approval: {e}", exc_info=True)
+                    logger.error(
+                        f"[SECURITY] Scan failed for fix PR #{pr_number}, flagging for approval: {e}",
+                        exc_info=True,
+                    )
                     task.requires_approval = True
-                    task.latest_status_message = f"Security scan failed — review will proceed but merge requires manual approval: {type(e).__name__}: {e!r}"[:500]
+                    task.latest_status_message = f"Security scan failed — review will proceed but merge requires manual approval: {type(e).__name__}: {e!r}"[
+                        :500
+                    ]
                     session.add(task)
                     await session.commit()
 
@@ -2992,39 +4197,63 @@ async def _process_post_commit(
                 #                   no-conflict happy path. Wait for CI then merge.
                 if not scan_blocked and fix_reason in ("ci_failure", "merge_conflict"):
                     from app import pause_clock
+
                     ci_loop = review_loop.copy()
                     ci_loop["ci_waiting"] = True
                     ci_loop["review_approved"] = True
                     ci_loop["ci_wait_started"] = _utcnow().isoformat()
-                    ci_loop["ci_wait_pause_baseline"] = await pause_clock.current_baseline(session)
+                    ci_loop[
+                        "ci_wait_pause_baseline"
+                    ] = await pause_clock.current_baseline(session)
                     ci_loop["ci_poll_interval"] = 10
                     task.status = TaskStatus.EVALUATING
                     task.context = {**(task.context or {}), "review_loop": ci_loop}
-                    label = "CI-only fix" if fix_reason == "ci_failure" else "merge-conflict fix"
+                    label = (
+                        "CI-only fix"
+                        if fix_reason == "ci_failure"
+                        else "merge-conflict fix"
+                    )
                     task.latest_status_message = f"{label} applied for PR #{pr_number} — waiting for CI (review skipped: {fix_reason})"
                     session.add(task)
                     await session.commit()
-                    logger.info(f"[REVIEW PIPELINE] {label} for PR #{pr_number} (fix_reason={fix_reason}) — skipping re-review, waiting for CI")
+                    logger.info(
+                        f"[REVIEW PIPELINE] {label} for PR #{pr_number} (fix_reason={fix_reason}) — skipping re-review, waiting for CI"
+                    )
                 elif not scan_blocked:
                     review_task, _ = await _spawn_pipeline_task(
-                        task, "review", session, pr_number, branch, base_branch,
-                        original_task_id=original_task_id
+                        task,
+                        "review",
+                        session,
+                        pr_number,
+                        branch,
+                        base_branch,
+                        original_task_id=original_task_id,
                     )
                     if review_task:
-                        logger.info(f"[REVIEW PIPELINE] Spawned review after fix for PR #{pr_number} → task {review_task.id}")
+                        logger.info(
+                            f"[REVIEW PIPELINE] Spawned review after fix for PR #{pr_number} → task {review_task.id}"
+                        )
                     else:
                         task.latest_status_message = f"Fix applied but review not spawned for PR #{pr_number} — iteration cap reached"
                         task.requires_approval = True
                         session.add(task)
-                        cap_alert_title = f"PR #{pr_number} stalled — iteration cap reached"
-                        existing_cap_alert = (await session.execute(
-                            select(Alert).where(
-                                Alert.project_id == task.project_id,
-                                Alert.severity == AlertSeverity.WARNING,
-                                Alert.dismissed_at.is_(None),
-                                Alert.title == cap_alert_title,
+                        cap_alert_title = (
+                            f"PR #{pr_number} stalled — iteration cap reached"
+                        )
+                        existing_cap_alert = (
+                            (
+                                await session.execute(
+                                    select(Alert).where(
+                                        Alert.project_id == task.project_id,
+                                        Alert.severity == AlertSeverity.WARNING,
+                                        Alert.dismissed_at.is_(None),
+                                        Alert.title == cap_alert_title,
+                                    )
+                                )
                             )
-                        )).scalars().first()
+                            .scalars()
+                            .first()
+                        )
                         if not existing_cap_alert:
                             alert = Alert(
                                 project_id=task.project_id,
@@ -3035,11 +4264,20 @@ async def _process_post_commit(
                             )
                             session.add(alert)
                             await session.commit()
-                            await broadcast_to_project(str(task.project_id), "alert_created",
-                                {"alert_id": str(alert.id), "severity": "WARNING", "title": alert.title})
+                            await broadcast_to_project(
+                                str(task.project_id),
+                                "alert_created",
+                                {
+                                    "alert_id": str(alert.id),
+                                    "severity": "WARNING",
+                                    "title": alert.title,
+                                },
+                            )
                         else:
                             await session.commit()
-                        logger.warning(f"[REVIEW PIPELINE] WARNING: Review spawn after fix returned None for PR #{pr_number}")
+                        logger.warning(
+                            f"[REVIEW PIPELINE] WARNING: Review spawn after fix returned None for PR #{pr_number}"
+                        )
 
             # Completion handlers — wrapped in try/except to prevent VM leak.
             # If a handler throws after the early commit, BackgroundTasks (including
@@ -3062,14 +4300,18 @@ async def _process_post_commit(
                     # a non-None project for design_doc_update tasks).
                     # Canonical order is Project before Task — see
                     # docs/concurrency.md.
-                    await _handle_design_doc_completion(task, doc_logs, session, project=locked_project)
+                    await _handle_design_doc_completion(
+                        task, doc_logs, session, project=locked_project
+                    )
 
                 elif task_type == "strategic_review":
                     review_logs = payload.logs or task.latest_status_message or ""
                     # Round 3 C3 + C4: see _handle_design_doc_completion above.
                     # ``locked_project`` was acquired in canonical
                     # Project → Task order at the top of _process_post_commit.
-                    await _handle_strategic_completion(task, review_logs, session, project=locked_project)
+                    await _handle_strategic_completion(
+                        task, review_logs, session, project=locked_project
+                    )
 
                 elif task_type == "research":
                     research_logs = payload.logs or task.latest_status_message or ""
@@ -3096,10 +4338,20 @@ async def _process_post_commit(
                 )
                 # Detect transient errors (GitHub API, DB, network) and requeue instead of FAILED
                 err_str = str(handler_exc).lower()
-                is_transient = any(kw in err_str for kw in [
-                    "api.github.com", "502", "503", "connection", "timeout",
-                    "rate limit", "ssl", "name resolution", "connection refused",
-                ])
+                is_transient = any(
+                    kw in err_str
+                    for kw in [
+                        "api.github.com",
+                        "502",
+                        "503",
+                        "connection",
+                        "timeout",
+                        "rate limit",
+                        "ssl",
+                        "name resolution",
+                        "connection refused",
+                    ]
+                )
                 if is_transient and task.attempt_count < _runtime_config["max_retries"]:
                     task.status = TaskStatus.QUEUED
                     # The earlier COMPLETED/FAILED assignment fired the SQLAlchemy set
@@ -3107,6 +4359,7 @@ async def _process_post_commit(
                     # JWT. Since the completion handler hit a transient error and we're
                     # requeuing, drop the cache entry so the next VM can claim.
                     from app.routers.agent import _terminated_task_ids
+
                     _terminated_task_ids.pop(str(task.id), None)
                     task.attempt_count += 1
                     task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
@@ -3118,35 +4371,50 @@ async def _process_post_commit(
                     handler_ctx.pop("provision_failures", None)
                     task.context = handler_ctx
                     task.latest_status_message = f"Handler hit transient error, requeuing (attempt {task.attempt_count}): {type(handler_exc).__name__}"
-                    logger.warning(f"[HANDLER] Transient error for {task.id}, requeuing: {handler_exc}")
+                    logger.warning(
+                        f"[HANDLER] Transient error for {task.id}, requeuing: {handler_exc}"
+                    )
                 else:
                     task.status = TaskStatus.FAILED
-                    task.latest_status_message = (
-                        f"Completed but handler failed: {type(handler_exc).__name__}: {str(handler_exc)[:200]}"
-                    )
+                    task.latest_status_message = f"Completed but handler failed: {type(handler_exc).__name__}: {str(handler_exc)[:200]}"
                     from app.failure_classification import persist_failure_category
                     from app.routers.agent_status import record_task_result
+
                     _fc_handler = classify_failure(task)
                     persist_failure_category(task, _fc_handler)
-                    record_task_result(success=False, failure_class=_fc_handler, task_id=str(task.id), task_type=(task.first_payload or {}).get("type", ""))
+                    record_task_result(
+                        success=False,
+                        failure_class=_fc_handler,
+                        task_id=str(task.id),
+                        task_type=(task.first_payload or {}).get("type", ""),
+                    )
                 session.add(task)
 
         # 6. Parent task rollup — delegated to shared function
-        if task.parent_task_id and payload.status in [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]:
+        if task.parent_task_id and payload.status in [
+            TaskStatus.COMPLETED,
+            TaskStatus.FAILED,
+            TaskStatus.CANCELLED,
+        ]:
             try:
                 await _check_and_trigger_rollup(task, session)
             except Exception as e:
-                logger.error(f"[ROLLUP] Rollup check failed for task {task.id}: {e!r}", exc_info=True)
+                logger.error(
+                    f"[ROLLUP] Rollup check failed for task {task.id}: {e!r}",
+                    exc_info=True,
+                )
 
         # 6b. Update direction research history outcomes for child tasks of a research cycle
         _task_ctx = task.context or {}
         if (
             _task_ctx.get("direction_id")
             and _task_ctx.get("research_task_id")
-            and payload.status in [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
+            and payload.status
+            in [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
         ):
             try:
                 from app.direction_outcomes import _update_direction_research_outcomes
+
                 await _update_direction_research_outcomes(
                     task.project_id,
                     _task_ctx["direction_id"],
@@ -3180,18 +4448,26 @@ async def _process_post_commit(
         all_tasks = (await session.execute(all_tasks_stmt)).scalars().all()
         executable_statuses = [t.status for t in all_tasks if t.vm_instance_id]
         parent_tasks = [
-            t for t in all_tasks
+            t
+            for t in all_tasks
             if not t.vm_instance_id
-            and t.status not in [
+            and t.status
+            not in [
                 TaskStatus.QUEUED,  # leaf awaiting claim/warm-handoff, not a parent
-                TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED,
+                TaskStatus.COMPLETED,
+                TaskStatus.FAILED,
+                TaskStatus.CANCELLED,
             ]
         ]
 
         project_stmt = select(Project).where(Project.id == task.project_id)
         project = (await session.execute(project_stmt)).scalars().first()
 
-        if project and project.status != ProjectStatus.CANCELLED and executable_statuses:
+        if (
+            project
+            and project.status != ProjectStatus.CANCELLED
+            and executable_statuses
+        ):
             # 2026-05-05 fix: only transition project status when ALL executable
             # tasks are terminal. Previously the ``any FAILED`` branch fired
             # any time an old FAILED row sat in ``executable_statuses`` (which
@@ -3212,25 +4488,38 @@ async def _process_post_commit(
                     new_project_status = ProjectStatus.COMPLETED
                 elif any(s == TaskStatus.FAILED for s in executable_statuses):
                     new_project_status = ProjectStatus.FAILED
-                elif all(s in [TaskStatus.COMPLETED, TaskStatus.CANCELLED] for s in executable_statuses):
+                elif all(
+                    s in [TaskStatus.COMPLETED, TaskStatus.CANCELLED]
+                    for s in executable_statuses
+                ):
                     new_project_status = ProjectStatus.CANCELLED
 
             if new_project_status:
                 project.status = new_project_status
                 session.add(project)
                 # Update parent/logical tasks to match the project outcome
-                terminal_task_status = TaskStatus.COMPLETED if new_project_status == ProjectStatus.COMPLETED else TaskStatus.FAILED if new_project_status == ProjectStatus.FAILED else TaskStatus.CANCELLED
+                terminal_task_status = (
+                    TaskStatus.COMPLETED
+                    if new_project_status == ProjectStatus.COMPLETED
+                    else TaskStatus.FAILED
+                    if new_project_status == ProjectStatus.FAILED
+                    else TaskStatus.CANCELLED
+                )
                 for pt in parent_tasks:
                     pt.status = terminal_task_status
                     if terminal_task_status == TaskStatus.FAILED:
-                        pt.latest_status_message = "Project aggregation: child task failed"
+                        pt.latest_status_message = (
+                            "Project aggregation: child task failed"
+                        )
                     elif terminal_task_status == TaskStatus.COMPLETED:
                         pt.latest_status_message = "Project completed"
                     else:
                         pt.latest_status_message = "Project cancelled"
                     session.add(pt)
                 await session.commit()
-                await broadcast_to_project(str(project.id), "project_updated", {"status": new_project_status})
+                await broadcast_to_project(
+                    str(project.id), "project_updated", {"status": new_project_status}
+                )
 
         # Audit W2 (D2/D4): backstop for the synchronous strategic chain.
         # If a strategic task (design_doc_update or strategic_review) reached
@@ -3239,21 +4528,32 @@ async def _process_post_commit(
         # forever and the stalled-cycle reaper would have to clean it up
         # later. Catch it here while the task lifecycle still has context.
         try:
-            cycle_id = task.strategic_cycle_id or (task.context or {}).get("strategic_cycle_id")
+            cycle_id = task.strategic_cycle_id or (task.context or {}).get(
+                "strategic_cycle_id"
+            )
             if cycle_id and payload.status in (
-                TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED,
+                TaskStatus.COMPLETED,
+                TaskStatus.FAILED,
+                TaskStatus.CANCELLED,
             ):
                 from app import strategic_cycle
+
                 cycle_row = await strategic_cycle.get(session, cycle_id)
-                if cycle_row is not None and cycle_row.outcome in strategic_cycle.ACTIVE_OUTCOMES:
+                if (
+                    cycle_row is not None
+                    and cycle_row.outcome in strategic_cycle.ACTIVE_OUTCOMES
+                ):
                     task_type = task.first_payload.get("type", "")
-                    failed_phase = "phase1" if task_type == "design_doc_update" else "phase2"
+                    failed_phase = (
+                        "phase1" if task_type == "design_doc_update" else "phase2"
+                    )
                     logger.warning(
                         f"[STRATEGIC] Task {task.id} ({task_type}) reached {payload.status} "
                         f"but cycle {cycle_id} still in {cycle_row.outcome} — backstop marking failed_{failed_phase}"
                     )
                     await strategic_cycle.mark_failure(
-                        session, cycle_id,
+                        session,
+                        cycle_id,
                         phase=failed_phase,
                         reason=f"lifecycle_backstop: task {task.id} terminal in {payload.status} without completion-handler cycle update",
                     )
@@ -3272,10 +4572,10 @@ async def _process_post_commit(
         await broadcast_to_project(
             str(task.project_id),
             "task_updated",
-            {"task_id": str(task.id), "status": payload.status}
+            {"task_id": str(task.id), "status": payload.status},
         )
 
         return {
             "status": "received",
-            "message": f"Status update for task {payload.task_id} recorded."
+            "message": f"Status update for task {payload.task_id} recorded.",
         }

@@ -9,6 +9,7 @@ Covers:
   - Already-merged race condition (PR closed by another task)
   - ci_orig_id status propagation on successful merge
 """
+
 import uuid
 import pytest
 
@@ -26,7 +27,9 @@ def test_normalize_merge_error_empty_string():
 
 
 def test_normalize_merge_error_strips_uuid():
-    out = _normalize_merge_error("merge failed for job 550e8400-e29b-41d4-a716-446655440000 retry")
+    out = _normalize_merge_error(
+        "merge failed for job 550e8400-e29b-41d4-a716-446655440000 retry"
+    )
     assert "550e8400" not in out
     assert "<uuid>" in out
 
@@ -85,7 +88,9 @@ def test_normalize_merge_error_structural_equivalence():
 # ---------------------------------------------------------------------------
 
 
-def _make_task(db_session, project, pr_number: int = 42, ci_loop_extra: dict | None = None):
+def _make_task(
+    db_session, project, pr_number: int = 42, ci_loop_extra: dict | None = None
+):
     """Create a minimal EVALUATING task with a review_loop context."""
     loop = {
         "pr_number": pr_number,
@@ -99,7 +104,14 @@ def _make_task(db_session, project, pr_number: int = 42, ci_loop_extra: dict | N
     task = Task(
         project_id=project.id,
         title="CI merge test task",
-        payloads=[{"type": "review", "pr_number": pr_number, "branch": "blueprint/test-branch", "base_branch": "main"}],
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": pr_number,
+                "branch": "blueprint/test-branch",
+                "base_branch": "main",
+            }
+        ],
         context={"review_loop": loop},
         vm_instance_id=f"agent-vm-ci-{uuid.uuid4().hex[:8]}",
         status=TaskStatus.EVALUATING,
@@ -150,7 +162,9 @@ async def test_merge_retry_succeeds_on_second_attempt_poll(db_session, mocker):
 
     assert result is True, "Should return True after successful retry"
     assert task.status == TaskStatus.COMPLETED
-    assert merge_mock.call_count == 2, "Should have called merge twice (initial + 1 retry)"
+    assert merge_mock.call_count == 2, (
+        "Should have called merge twice (initial + 1 retry)"
+    )
     # sleep called once for attempt=0 → 5*(3^0)=5 seconds
     sleep_mock.assert_called_once_with(5)
 
@@ -203,7 +217,9 @@ async def test_merge_retry_all_attempts_fail_poll(db_session, mocker):
     # initial call + 3 retry attempts = 4 total
     assert merge_mock.call_count == 4
     review_loop = (task.context or {}).get("review_loop", {})
-    assert review_loop.get("merge_failures") == 1, "merge_failures should be incremented"
+    assert review_loop.get("merge_failures") == 1, (
+        "merge_failures should be incremented"
+    )
 
 
 @pytest.mark.asyncio
@@ -293,7 +309,9 @@ async def test_merge_no_retry_for_webhook_source(db_session, mocker):
     )
 
     assert result is False
-    assert merge_mock.call_count == 1, "Webhook source must not retry — exactly 1 merge call"
+    assert merge_mock.call_count == 1, (
+        "Webhook source must not retry — exactly 1 merge call"
+    )
     sleep_mock.assert_not_called()
 
 
@@ -389,8 +407,12 @@ async def test_mergeable_state_behind_calls_update_branch(db_session, mocker):
     assert result is False
     update_mock.assert_called_once()
     review_loop = (task.context or {}).get("review_loop", {})
-    assert review_loop.get("ci_passed") is False, "ci_passed must be reset for fresh CI run"
-    assert review_loop.get("merge_failures", 0) == 0, "behind must not increment retry counter"
+    assert review_loop.get("ci_passed") is False, (
+        "ci_passed must be reset for fresh CI run"
+    )
+    assert review_loop.get("merge_failures", 0) == 0, (
+        "behind must not increment retry counter"
+    )
     assert task.requires_approval is not True
 
 
@@ -428,14 +450,20 @@ async def test_update_branch_failure_increments_counter(db_session, mocker):
     await db_session.refresh(project)
 
     task = _make_task(
-        db_session, project,
+        db_session,
+        project,
         ci_loop_extra={"ci_passed": True, "update_branch_failures": 1},
     )
     await db_session.commit()
     await db_session.refresh(task)
 
     result = await _attempt_merge_with_retry_and_escalation(
-        task, "fake-token", "owner", "repo", db_session, source="webhook",
+        task,
+        "fake-token",
+        "owner",
+        "repo",
+        db_session,
+        source="webhook",
     )
 
     assert result is False
@@ -479,14 +507,20 @@ async def test_update_branch_failure_threshold_spawns_fix(db_session, mocker):
     await db_session.refresh(project)
 
     task = _make_task(
-        db_session, project,
+        db_session,
+        project,
         ci_loop_extra={"ci_passed": True, "update_branch_failures": 2},
     )
     await db_session.commit()
     await db_session.refresh(task)
 
     result = await _attempt_merge_with_retry_and_escalation(
-        task, "fake-token", "owner", "repo", db_session, source="webhook",
+        task,
+        "fake-token",
+        "owner",
+        "repo",
+        db_session,
+        source="webhook",
     )
 
     assert result is False
@@ -534,7 +568,8 @@ async def test_update_branch_threshold_scales_with_merge_budget(db_session, mock
     # Small scope → hard cap 8. With 7 merge_failures consumed, only 1
     # update_branch attempt should be allowed before escalating.
     task = _make_task(
-        db_session, project,
+        db_session,
+        project,
         ci_loop_extra={
             "ci_passed": True,
             "update_branch_failures": 0,
@@ -546,7 +581,12 @@ async def test_update_branch_threshold_scales_with_merge_budget(db_session, mock
     await db_session.refresh(task)
 
     result = await _attempt_merge_with_retry_and_escalation(
-        task, "fake-token", "owner", "repo", db_session, source="webhook",
+        task,
+        "fake-token",
+        "owner",
+        "repo",
+        db_session,
+        source="webhook",
     )
 
     assert result is False
@@ -586,14 +626,20 @@ async def test_update_branch_success_resets_counter(db_session, mocker):
     await db_session.refresh(project)
 
     task = _make_task(
-        db_session, project,
+        db_session,
+        project,
         ci_loop_extra={"ci_passed": True, "update_branch_failures": 2},
     )
     await db_session.commit()
     await db_session.refresh(task)
 
     result = await _attempt_merge_with_retry_and_escalation(
-        task, "fake-token", "owner", "repo", db_session, source="webhook",
+        task,
+        "fake-token",
+        "owner",
+        "repo",
+        db_session,
+        source="webhook",
     )
 
     assert result is False
@@ -653,15 +699,18 @@ async def test_mergeable_state_dirty_spawns_fix(db_session, mocker):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("rule_message", [
-    "Repository rule violations: rule violation found",
-    "Required review by branch protection not met",
-    "required status: pending",
-    "merge restrictions apply",
-    "not allowed to merge",
-    "at least 1 approving review required",
-    "approving review from code owner required",
-])
+@pytest.mark.parametrize(
+    "rule_message",
+    [
+        "Repository rule violations: rule violation found",
+        "Required review by branch protection not met",
+        "required status: pending",
+        "merge restrictions apply",
+        "not allowed to merge",
+        "at least 1 approving review required",
+        "approving review from code owner required",
+    ],
+)
 @pytest.mark.asyncio
 async def test_rule_block_keywords_trigger_escalation(db_session, mocker, rule_message):
     """
@@ -696,10 +745,14 @@ async def test_rule_block_keywords_trigger_escalation(db_session, mocker, rule_m
     )
 
     assert result is False
-    assert task.requires_approval is True, f"requires_approval must be set for: {rule_message}"
+    assert task.requires_approval is True, (
+        f"requires_approval must be set for: {rule_message}"
+    )
     review_loop = (task.context or {}).get("review_loop", {})
     assert review_loop.get("merge_rule_blocked") is True
-    assert review_loop.get("merge_failures", 0) == 0, "rule blocks must not increment merge_failures"
+    assert review_loop.get("merge_failures", 0) == 0, (
+        "rule blocks must not increment merge_failures"
+    )
     assert "manual intervention" in (task.latest_status_message or "")
 
 
@@ -755,9 +808,15 @@ async def test_merge_failure_counter_increments(db_session, mocker):
 
     assert result is False
     review_loop = (task.context or {}).get("review_loop", {})
-    assert review_loop.get("merge_failures") == 5, "merge_failures should have incremented from 4 to 5"
-    assert review_loop.get("merge_rule_blocked") is None, "merge_rule_blocked must not be set"
-    assert task.requires_approval is not True, "requires_approval must not be set for transient failure"
+    assert review_loop.get("merge_failures") == 5, (
+        "merge_failures should have incremented from 4 to 5"
+    )
+    assert review_loop.get("merge_rule_blocked") is None, (
+        "merge_rule_blocked must not be set"
+    )
+    assert task.requires_approval is not True, (
+        "requires_approval must not be set for transient failure"
+    )
     # ci_poll_interval = min(30 * 5, 120) = 120
     assert review_loop.get("ci_poll_interval") == 120
 
@@ -809,7 +868,9 @@ async def test_merge_failure_escalates_at_10_failures(db_session, mocker):
     assert result is False
     review_loop = (task.context or {}).get("review_loop", {})
     assert review_loop.get("merge_failures") == 10
-    assert review_loop.get("merge_escalated") is True, "merge_escalated must be set at 10 failures"
+    assert review_loop.get("merge_escalated") is True, (
+        "merge_escalated must be set at 10 failures"
+    )
     alert_mock.assert_called_once()
     alert_msg = alert_mock.call_args[0][2]
     assert "merge failed" in alert_msg.lower() or "10" in alert_msg
@@ -856,10 +917,14 @@ async def test_merge_failure_final_warn_at_13_failures(db_session, mocker):
 
     # Start at HARD_CAP - 3 with merge_escalated already set; this call pushes
     # failures to HARD_CAP - 2 (13) and should trigger the final-warn alert.
-    task = _make_task(db_session, project, ci_loop_extra={
-        "merge_failures": MERGE_FAILURE_HARD_CAP - 3,
-        "merge_escalated": True,
-    })
+    task = _make_task(
+        db_session,
+        project,
+        ci_loop_extra={
+            "merge_failures": MERGE_FAILURE_HARD_CAP - 3,
+            "merge_escalated": True,
+        },
+    )
     await db_session.commit()
     await db_session.refresh(task)
 
@@ -920,10 +985,14 @@ async def test_merge_failure_does_not_double_escalate(db_session, mocker):
 
     # Already escalated with 10 failures; no new alert should fire on the next
     # transient failure (still below final-warn and hard-cap thresholds).
-    task = _make_task(db_session, project, ci_loop_extra={
-        "merge_failures": 10,
-        "merge_escalated": True,
-    })
+    task = _make_task(
+        db_session,
+        project,
+        ci_loop_extra={
+            "merge_failures": 10,
+            "merge_escalated": True,
+        },
+    )
     await db_session.commit()
     await db_session.refresh(task)
 
@@ -976,11 +1045,15 @@ async def test_merge_failure_hard_cap_marks_failed(db_session, mocker):
 
     # One below the cap so this call crosses it; merge_escalated already True
     # so we test that the cap fires independently of the 10-failure escalation.
-    task = _make_task(db_session, project, ci_loop_extra={
-        "merge_failures": MERGE_FAILURE_HARD_CAP - 1,
-        "merge_escalated": True,
-        "merge_final_warn": True,
-    })
+    task = _make_task(
+        db_session,
+        project,
+        ci_loop_extra={
+            "merge_failures": MERGE_FAILURE_HARD_CAP - 1,
+            "merge_escalated": True,
+            "merge_final_warn": True,
+        },
+    )
     await db_session.commit()
     await db_session.refresh(task)
 
@@ -998,11 +1071,14 @@ async def test_merge_failure_hard_cap_marks_failed(db_session, mocker):
     # Merge hard-cap must classify as EXTERNAL_API (infra), not CODE_ERROR —
     # the phrase "merge failed" in the status message is a keyword match.
     from app.failure_classification import classify_failure  # noqa: PLC0415
+
     assert classify_failure(task) == "EXTERNAL_API"
 
 
 @pytest.mark.asyncio
-async def test_merge_failure_hard_cap_records_deploy_monitoring_result(db_session, mocker):
+async def test_merge_failure_hard_cap_records_deploy_monitoring_result(
+    db_session, mocker
+):
     """
     Hard-cap FAILED terminations must appear in deploy_monitoring.task_results so
     per-type failure gates and anomaly detection see them. Previously these paths
@@ -1037,9 +1113,13 @@ async def test_merge_failure_hard_cap_records_deploy_monitoring_result(db_sessio
     await db_session.commit()
     await db_session.refresh(project)
 
-    task = _make_task(db_session, project, ci_loop_extra={
-        "merge_failures": MERGE_FAILURE_HARD_CAP - 1,
-    })
+    task = _make_task(
+        db_session,
+        project,
+        ci_loop_extra={
+            "merge_failures": MERGE_FAILURE_HARD_CAP - 1,
+        },
+    )
     task.context = {**(task.context or {}), "direction_id": direction_id}
     await db_session.commit()
     await db_session.refresh(task)
@@ -1141,7 +1221,9 @@ async def test_closed_pr_state_also_completes_task(db_session, mocker):
         task, "fake-token", "owner", "repo", db_session, source="webhook"
     )
 
-    assert result is True, "Closed PR (state=closed) should be treated as already handled"
+    assert result is True, (
+        "Closed PR (state=closed) should be treated as already handled"
+    )
     assert task.status == TaskStatus.COMPLETED
 
 
@@ -1187,7 +1269,9 @@ async def test_mergeable_state_blocked_escalates_without_keywords(db_session, mo
     assert task.requires_approval is True
     review_loop = (task.context or {}).get("review_loop", {})
     assert review_loop.get("merge_rule_blocked") is True
-    assert review_loop.get("merge_failures", 0) == 0, "rule blocks must not increment merge_failures"
+    assert review_loop.get("merge_failures", 0) == 0, (
+        "rule blocks must not increment merge_failures"
+    )
 
 
 @pytest.mark.asyncio
@@ -1208,7 +1292,10 @@ async def test_mergeable_state_clean_does_not_escalate_on_keyword(db_session, mo
     )
     mocker.patch(
         "app.github.merge_pull_request",
-        return_value={"merged": False, "message": "at least 1 approving review required"},
+        return_value={
+            "merged": False,
+            "message": "at least 1 approving review required",
+        },
     )
 
     project = Project(name="mergeable_state clean", user_id="test-user")
@@ -1239,7 +1326,9 @@ async def test_mergeable_state_clean_does_not_escalate_on_keyword(db_session, mo
     assert task.requires_approval is not True, "clean mergeable_state must not escalate"
     review_loop = (task.context or {}).get("review_loop", {})
     assert review_loop.get("merge_rule_blocked") is None
-    assert review_loop.get("merge_failures") == 1, "treat as transient — counter should tick"
+    assert review_loop.get("merge_failures") == 1, (
+        "treat as transient — counter should tick"
+    )
 
 
 @pytest.mark.asyncio
@@ -1259,7 +1348,10 @@ async def test_mergeable_state_unknown_falls_back_to_keywords(db_session, mocker
     )
     mocker.patch(
         "app.github.merge_pull_request",
-        return_value={"merged": False, "message": "Repository rule violations: rule violation"},
+        return_value={
+            "merged": False,
+            "message": "Repository rule violations: rule violation",
+        },
     )
 
     project = Project(name="mergeable_state unknown", user_id="test-user")
@@ -1276,7 +1368,9 @@ async def test_mergeable_state_unknown_falls_back_to_keywords(db_session, mocker
     )
 
     assert result is False
-    assert task.requires_approval is True, "unknown mergeable_state must fall back to keyword match"
+    assert task.requires_approval is True, (
+        "unknown mergeable_state must fall back to keyword match"
+    )
     review_loop = (task.context or {}).get("review_loop", {})
     assert review_loop.get("merge_rule_blocked") is True
 
@@ -1320,9 +1414,13 @@ async def test_orig_task_gets_pr_merged_flag_on_success(db_session, mocker):
     await db_session.refresh(orig_task)
 
     # Create the CI parking task that references orig_task
-    task = _make_task(db_session, project, ci_loop_extra={
-        "original_task_id": str(orig_task.id),
-    })
+    task = _make_task(
+        db_session,
+        project,
+        ci_loop_extra={
+            "original_task_id": str(orig_task.id),
+        },
+    )
     await db_session.commit()
     await db_session.refresh(task)
 
@@ -1374,9 +1472,13 @@ async def test_orig_task_evaluating_without_ci_waiting_completes(db_session, moc
     await db_session.commit()
     await db_session.refresh(orig_task)
 
-    task = _make_task(db_session, project, ci_loop_extra={
-        "original_task_id": str(orig_task.id),
-    })
+    task = _make_task(
+        db_session,
+        project,
+        ci_loop_extra={
+            "original_task_id": str(orig_task.id),
+        },
+    )
     await db_session.commit()
     await db_session.refresh(task)
 
@@ -1426,9 +1528,13 @@ async def test_orig_task_with_ci_waiting_stays_evaluating(db_session, mocker):
     await db_session.commit()
     await db_session.refresh(orig_task)
 
-    task = _make_task(db_session, project, ci_loop_extra={
-        "original_task_id": str(orig_task.id),
-    })
+    task = _make_task(
+        db_session,
+        project,
+        ci_loop_extra={
+            "original_task_id": str(orig_task.id),
+        },
+    )
     await db_session.commit()
     await db_session.refresh(task)
 
@@ -1492,7 +1598,10 @@ async def test_ci_wait_started_resets_when_checks_restart(db_session, mocker):
     mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
     mocker.patch(
         "app.github.merge_pull_request",
-        return_value={"merged": False, "message": "Required status check is in progress"},
+        return_value={
+            "merged": False,
+            "message": "Required status check is in progress",
+        },
     )
 
     project = Project(name="ci_wait_started reset", user_id="test-user")
@@ -1513,7 +1622,9 @@ async def test_ci_wait_started_resets_when_checks_restart(db_session, mocker):
     review_loop = (task.context or {}).get("review_loop", {})
     new_ts = review_loop.get("ci_wait_started")
     assert new_ts is not None
-    assert new_ts != stale_ts, "ci_wait_started must be reset, not preserved from prior CI wait"
+    assert new_ts != stale_ts, (
+        "ci_wait_started must be reset, not preserved from prior CI wait"
+    )
 
 
 @pytest.mark.asyncio
@@ -1543,11 +1654,15 @@ async def test_merge_repeated_identical_error_triggers_early_exit(db_session, mo
     await db_session.refresh(project)
 
     # Prior attempt returned "upstream timeout"; this call is the 2nd.
-    task = _make_task(db_session, project, ci_loop_extra={
-        "merge_failures": 1,
-        "merge_last_error": "upstream timeout",
-        "merge_error_streak": 1,
-    })
+    task = _make_task(
+        db_session,
+        project,
+        ci_loop_extra={
+            "merge_failures": 1,
+            "merge_last_error": "upstream timeout",
+            "merge_error_streak": 1,
+        },
+    )
     await db_session.commit()
     await db_session.refresh(task)
 
@@ -1566,7 +1681,9 @@ async def test_merge_repeated_identical_error_triggers_early_exit(db_session, mo
 
 
 @pytest.mark.asyncio
-async def test_merge_deterministic_error_triggers_early_exit_on_first_occurrence(db_session, mocker):
+async def test_merge_deterministic_error_triggers_early_exit_on_first_occurrence(
+    db_session, mocker
+):
     """
     Deterministic non-retryable merge errors (e.g. "head sha can't be blank")
     should trigger immediate early exit on the first occurrence, without
@@ -1646,11 +1763,15 @@ async def test_merge_different_errors_do_not_trigger_early_exit(db_session, mock
     )
     db_session.add(existing_fix)
 
-    task = _make_task(db_session, project, ci_loop_extra={
-        "merge_failures": 2,
-        "merge_last_error": "upstream timeout",
-        "merge_error_streak": 2,
-    })
+    task = _make_task(
+        db_session,
+        project,
+        ci_loop_extra={
+            "merge_failures": 2,
+            "merge_last_error": "upstream timeout",
+            "merge_error_streak": 2,
+        },
+    )
     await db_session.commit()
     await db_session.refresh(task)
 
@@ -1661,7 +1782,9 @@ async def test_merge_different_errors_do_not_trigger_early_exit(db_session, mock
     assert result is False
     assert task.status == TaskStatus.EVALUATING, "should keep retrying on new error"
     review_loop = (task.context or {}).get("review_loop", {})
-    assert review_loop.get("merge_error_streak") == 1, "streak resets when error changes"
+    assert review_loop.get("merge_error_streak") == 1, (
+        "streak resets when error changes"
+    )
     assert review_loop.get("merge_last_error") == "different error"
 
 
@@ -1701,6 +1824,7 @@ async def test_cross_pr_merge_pattern_pauses_retries_and_alerts(db_session, mock
     # Simulate two prior PRs hitting the same error so the window is primed.
     from app.shared_state import record_merge_error_occurrence
     from app.ci_completion import _normalize_merge_error
+
     norm = _normalize_merge_error("base branch rule requires X")
     record_merge_error_occurrence(str(project.id), norm, 101)
     record_merge_error_occurrence(str(project.id), norm, 102)
@@ -1769,9 +1893,11 @@ async def test_cross_pr_merge_pattern_alert_dedups_on_second_hit(db_session, moc
 
 def test_record_merge_error_occurrence_counts_distinct_prs():
     from app.shared_state import (
-        merge_error_occurrences, record_merge_error_occurrence,
+        merge_error_occurrences,
+        record_merge_error_occurrence,
         count_merge_error_pattern_prs,
     )
+
     merge_error_occurrences.clear()
     assert record_merge_error_occurrence("proj-a", "err", 1) == 1
     assert record_merge_error_occurrence("proj-a", "err", 1) == 1  # same PR
@@ -1837,14 +1963,20 @@ async def test_suppress_warm_handoff_update_branch_escalation(db_session, mocker
     await db_session.refresh(project)
 
     task = _make_task(
-        db_session, project,
+        db_session,
+        project,
         ci_loop_extra={"ci_passed": True, "update_branch_failures": 2},
     )
     await db_session.commit()
     await db_session.refresh(task)
 
     await _attempt_merge_with_retry_and_escalation(
-        task, "fake-token", "owner", "repo", db_session, source="webhook",
+        task,
+        "fake-token",
+        "owner",
+        "repo",
+        db_session,
+        source="webhook",
     )
 
     spawn_mock.assert_called_once()
@@ -1975,7 +2107,8 @@ async def test_suppress_warm_handoff_ci_failure(db_session, mocker):
     await db_session.refresh(project)
 
     task = _make_task(
-        db_session, project,
+        db_session,
+        project,
         # review_approved is the gate path used by both branches; ci_passed
         # is irrelevant for the failed-CI path because conclusion='failure'.
     )

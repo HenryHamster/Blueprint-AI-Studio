@@ -8,6 +8,7 @@ Tests cover:
 
 Run with: bash scripts/test-backend.sh testing/test_anomaly_actions.py --standalone
 """
+
 import uuid
 from copy import deepcopy
 
@@ -235,7 +236,8 @@ def test_apply_already_active_no_double_adjust():
     assert result is True
     assert _shared_state.runtime_config["max_concurrent_vms"] == 4
     assert sorted(_shared_state.anomaly_adjustments["trigger_anomalies"]) == [
-        "EXTERNAL_API", "PROVISION_FAILURE"
+        "EXTERNAL_API",
+        "PROVISION_FAILURE",
     ]
 
 
@@ -263,7 +265,9 @@ def test_restoration_when_anomalies_clear():
     assert _shared_state.runtime_config["max_concurrent_vms"] == 4
 
     # Simulate anomaly clearing (occurrence count reset to 0 by _check_anomaly_proposals)
-    _shared_state.persistent_anomalies[proj_id]["PROVISION_FAILURE"]["occurrence_count"] = 0
+    _shared_state.persistent_anomalies[proj_id]["PROVISION_FAILURE"][
+        "occurrence_count"
+    ] = 0
 
     result = _check_anomaly_restoration()
     assert result is True
@@ -483,12 +487,20 @@ def test_expire_stale_anomalies_removes_old_entries():
     fresh_iso = _utcnow().isoformat()
     stale_iso = (_utcnow() - timedelta(hours=49)).isoformat()
     _shared_state.persistent_anomalies[proj] = {
-        "FRESH": {"severity": "high", "occurrence_count": 3,
-                  "first_seen": stale_iso, "last_seen": fresh_iso,
-                  "latest_details": ""},
-        "STALE": {"severity": "high", "occurrence_count": 3,
-                  "first_seen": stale_iso, "last_seen": stale_iso,
-                  "latest_details": ""},
+        "FRESH": {
+            "severity": "high",
+            "occurrence_count": 3,
+            "first_seen": stale_iso,
+            "last_seen": fresh_iso,
+            "latest_details": "",
+        },
+        "STALE": {
+            "severity": "high",
+            "occurrence_count": 3,
+            "first_seen": stale_iso,
+            "last_seen": stale_iso,
+            "latest_details": "",
+        },
     }
     expired = _expire_stale_anomalies()
     assert expired == 1
@@ -501,9 +513,13 @@ def test_expire_stale_anomalies_drops_empty_project():
     proj = str(uuid.uuid4())
     stale_iso = (_utcnow() - timedelta(hours=72)).isoformat()
     _shared_state.persistent_anomalies[proj] = {
-        "STALE": {"severity": "high", "occurrence_count": 3,
-                  "first_seen": stale_iso, "last_seen": stale_iso,
-                  "latest_details": ""},
+        "STALE": {
+            "severity": "high",
+            "occurrence_count": 3,
+            "first_seen": stale_iso,
+            "last_seen": stale_iso,
+            "latest_details": "",
+        },
     }
     _expire_stale_anomalies()
     assert proj not in _shared_state.persistent_anomalies
@@ -519,12 +535,20 @@ def test_expire_stale_anomalies_tolerates_datetime_last_seen():
     fresh_dt = _utcnow()
     stale_dt = _utcnow() - timedelta(hours=49)
     _shared_state.persistent_anomalies[proj] = {
-        "FRESH": {"severity": "high", "occurrence_count": 3,
-                  "first_seen": fresh_dt, "last_seen": fresh_dt,
-                  "latest_details": ""},
-        "STALE": {"severity": "high", "occurrence_count": 3,
-                  "first_seen": stale_dt, "last_seen": stale_dt,
-                  "latest_details": ""},
+        "FRESH": {
+            "severity": "high",
+            "occurrence_count": 3,
+            "first_seen": fresh_dt,
+            "last_seen": fresh_dt,
+            "latest_details": "",
+        },
+        "STALE": {
+            "severity": "high",
+            "occurrence_count": 3,
+            "first_seen": stale_dt,
+            "last_seen": stale_dt,
+            "latest_details": "",
+        },
     }
     # Must not raise.
     expired = _expire_stale_anomalies()
@@ -564,20 +588,24 @@ async def test_maintenance_sweep_restores_after_expiry():
     recent_iso = _utcnow().isoformat()
     _shared_state.persistent_anomalies[proj] = {
         "PROVISION_FAILURE": {
-            "severity": "high", "occurrence_count": 5,
-            "first_seen": stale_iso, "last_seen": stale_iso,
+            "severity": "high",
+            "occurrence_count": 5,
+            "first_seen": stale_iso,
+            "last_seen": stale_iso,
             "latest_details": "",
         }
     }
     # Pre-existing adjustment that should be restored
-    _shared_state.anomaly_adjustments.update({
-        "active": True,
-        "adjusted_at": recent_iso,
-        "trigger_anomalies": ["PROVISION_FAILURE"],
-        "pre_adjustment_max_vms": 10,
-        "pre_adjustment_failure_gate": 0.8,
-        "failure_gate_threshold": 0.6,
-    })
+    _shared_state.anomaly_adjustments.update(
+        {
+            "active": True,
+            "adjusted_at": recent_iso,
+            "trigger_anomalies": ["PROVISION_FAILURE"],
+            "pre_adjustment_max_vms": 10,
+            "pre_adjustment_failure_gate": 0.8,
+            "failure_gate_threshold": 0.6,
+        }
+    )
     _shared_state.runtime_config["max_concurrent_vms"] = 5  # = 10 // 2
     result = await anomaly_maintenance_sweep()
     assert result["expired"] == 1
@@ -807,13 +835,21 @@ def test_mixed_trigger_uses_aggressive_infra_throttle():
 # Fast-recovery path
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _make_result(success: bool, failure_class: str = "", task_type: str = "create", age_minutes: int = 0):
+
+def _make_result(
+    success: bool,
+    failure_class: str = "",
+    task_type: str = "create",
+    age_minutes: int = 0,
+):
     """Build a task_results tuple with a timestamp `age_minutes` ago."""
     ts = (_utcnow() - timedelta(minutes=age_minutes)).isoformat()
     return (ts, "success" if success else "failure", failure_class, task_type)
 
 
-def _setup_active_adjustment(proj_id: str, failure_class: str = "PROVISION_FAILURE", max_vms: int = 8):
+def _setup_active_adjustment(
+    proj_id: str, failure_class: str = "PROVISION_FAILURE", max_vms: int = 8
+):
     """Apply an active adjustment for `failure_class` with `max_vms` pre-adjustment."""
     _shared_state.persistent_anomalies[proj_id] = {
         failure_class: {
@@ -835,7 +871,12 @@ def test_fast_recovery_restores_with_healthy_recent_outcomes():
     _setup_active_adjustment(proj_id, "PROVISION_FAILURE", max_vms=8)
 
     # Anomaly still present (occurrence_count still >= threshold)
-    assert _shared_state.persistent_anomalies[proj_id]["PROVISION_FAILURE"]["occurrence_count"] == 3
+    assert (
+        _shared_state.persistent_anomalies[proj_id]["PROVISION_FAILURE"][
+            "occurrence_count"
+        ]
+        == 3
+    )
 
     # Feed >= MIN_SAMPLE successes in the 2h window, no PROVISION_FAILURE failures
     for _ in range(_FAST_RECOVERY_MIN_SAMPLE):
@@ -861,7 +902,9 @@ def test_fast_recovery_blocked_when_trigger_failures_still_occurring():
             _make_result(success=True, failure_class="", task_type="create")
         )
     _shared_state.deploy_monitoring["task_results"].append(
-        _make_result(success=False, failure_class="PROVISION_FAILURE", task_type="create")
+        _make_result(
+            success=False, failure_class="PROVISION_FAILURE", task_type="create"
+        )
     )
 
     result = _check_anomaly_restoration()
@@ -881,7 +924,9 @@ def test_fast_recovery_tolerates_single_failure_below_rate_threshold():
             _make_result(success=True, failure_class="", task_type="create")
         )
     _shared_state.deploy_monitoring["task_results"].append(
-        _make_result(success=False, failure_class="PROVISION_FAILURE", task_type="create")
+        _make_result(
+            success=False, failure_class="PROVISION_FAILURE", task_type="create"
+        )
     )
 
     result = _check_anomaly_restoration()
@@ -902,7 +947,9 @@ def test_fast_recovery_blocked_when_two_failures_exceed_tolerance():
         )
     for _ in range(2):
         _shared_state.deploy_monitoring["task_results"].append(
-            _make_result(success=False, failure_class="PROVISION_FAILURE", task_type="create")
+            _make_result(
+                success=False, failure_class="PROVISION_FAILURE", task_type="create"
+            )
         )
 
     result = _check_anomaly_restoration()
@@ -1011,14 +1058,16 @@ def test_fast_recovery_blocked_by_provision_timeout_pipeline_event():
         )
 
     # But a recent provision_timeout_pre_claim event exists
-    _shared_state.deploy_monitoring["pipeline_events"].append({
-        "type": "provision_timeout_pre_claim",
-        "ts": _utcnow() - timedelta(minutes=30),  # within 2h window
-        "task_id": str(uuid.uuid4()),
-        "vm_id": None,
-        "zone": "us-central1-a",
-        "account_id": None,
-    })
+    _shared_state.deploy_monitoring["pipeline_events"].append(
+        {
+            "type": "provision_timeout_pre_claim",
+            "ts": _utcnow() - timedelta(minutes=30),  # within 2h window
+            "task_id": str(uuid.uuid4()),
+            "vm_id": None,
+            "zone": "us-central1-a",
+            "account_id": None,
+        }
+    )
 
     result = _check_anomaly_restoration()
     assert result is False
@@ -1036,14 +1085,16 @@ def test_fast_recovery_not_blocked_by_stale_provision_timeout_event():
         )
 
     # Stale event — older than FAST_RECOVERY_WINDOW_HOURS
-    _shared_state.deploy_monitoring["pipeline_events"].append({
-        "type": "provision_timeout_pre_claim",
-        "ts": _utcnow() - timedelta(hours=_FAST_RECOVERY_WINDOW_HOURS + 1),
-        "task_id": str(uuid.uuid4()),
-        "vm_id": None,
-        "zone": "us-central1-a",
-        "account_id": None,
-    })
+    _shared_state.deploy_monitoring["pipeline_events"].append(
+        {
+            "type": "provision_timeout_pre_claim",
+            "ts": _utcnow() - timedelta(hours=_FAST_RECOVERY_WINDOW_HOURS + 1),
+            "task_id": str(uuid.uuid4()),
+            "vm_id": None,
+            "zone": "us-central1-a",
+            "account_id": None,
+        }
+    )
 
     result = _check_anomaly_restoration()
     assert result is True
@@ -1061,14 +1112,16 @@ def test_fast_recovery_external_api_no_provision_check():
         )
 
     # A provision timeout event exists, but the trigger is EXTERNAL_API — should not block
-    _shared_state.deploy_monitoring["pipeline_events"].append({
-        "type": "provision_timeout_pre_claim",
-        "ts": _utcnow() - timedelta(minutes=30),
-        "task_id": str(uuid.uuid4()),
-        "vm_id": None,
-        "zone": "us-central1-a",
-        "account_id": None,
-    })
+    _shared_state.deploy_monitoring["pipeline_events"].append(
+        {
+            "type": "provision_timeout_pre_claim",
+            "ts": _utcnow() - timedelta(minutes=30),
+            "task_id": str(uuid.uuid4()),
+            "vm_id": None,
+            "zone": "us-central1-a",
+            "account_id": None,
+        }
+    )
 
     result = _check_anomaly_restoration()
     assert result is True
@@ -1232,7 +1285,16 @@ class _FakeProject:
         self.directions = directions
 
 
-def _paused_direction(did, fp, *, status="paused", auto_paused=True, paused_at=None, pause_count=1, text="dir"):
+def _paused_direction(
+    did,
+    fp,
+    *,
+    status="paused",
+    auto_paused=True,
+    paused_at=None,
+    pause_count=1,
+    text="dir",
+):
     return {
         "id": did,
         "text": text,
@@ -1253,12 +1315,16 @@ def test_find_directions_sharing_fingerprint_empty_fingerprint():
 
 def test_find_directions_sharing_fingerprint_matches_other_paused_directions():
     """Other auto-paused directions sharing the fingerprint are returned; caller excluded."""
-    project = _FakeProject([
-        _paused_direction("d-self", "fp-shared"),
-        _paused_direction("d-other", "fp-shared", text="some other direction"),
-        _paused_direction("d-mismatch", "fp-different"),
-    ])
-    result = find_directions_sharing_fingerprint(project, "fp-shared", exclude_direction_id="d-self")
+    project = _FakeProject(
+        [
+            _paused_direction("d-self", "fp-shared"),
+            _paused_direction("d-other", "fp-shared", text="some other direction"),
+            _paused_direction("d-mismatch", "fp-different"),
+        ]
+    )
+    result = find_directions_sharing_fingerprint(
+        project, "fp-shared", exclude_direction_id="d-self"
+    )
     assert len(result) == 1
     assert result[0]["id"] == "d-other"
     assert result[0]["text"] == "some other direction"
@@ -1267,23 +1333,29 @@ def test_find_directions_sharing_fingerprint_matches_other_paused_directions():
 
 def test_find_directions_sharing_fingerprint_skips_non_paused_and_user_paused():
     """Active directions and user-paused (not auto_paused) directions are ignored."""
-    project = _FakeProject([
-        _paused_direction("d-active", "fp-x", status="active"),
-        _paused_direction("d-user-paused", "fp-x", auto_paused=False),
-        _paused_direction("d-auto-paused", "fp-x"),
-    ])
+    project = _FakeProject(
+        [
+            _paused_direction("d-active", "fp-x", status="active"),
+            _paused_direction("d-user-paused", "fp-x", auto_paused=False),
+            _paused_direction("d-auto-paused", "fp-x"),
+        ]
+    )
     result = find_directions_sharing_fingerprint(project, "fp-x")
     assert [r["id"] for r in result] == ["d-auto-paused"]
 
 
 def test_find_directions_sharing_fingerprint_skips_stale_pauses():
     """Pauses older than the window are considered stale and excluded."""
-    stale_ts = (_utcnow() - timedelta(hours=_SHARED_FINGERPRINT_PAUSED_WINDOW_HOURS + 1)).isoformat()
+    stale_ts = (
+        _utcnow() - timedelta(hours=_SHARED_FINGERPRINT_PAUSED_WINDOW_HOURS + 1)
+    ).isoformat()
     fresh_ts = (_utcnow() - timedelta(hours=1)).isoformat()
-    project = _FakeProject([
-        _paused_direction("d-stale", "fp-y", paused_at=stale_ts),
-        _paused_direction("d-fresh", "fp-y", paused_at=fresh_ts),
-    ])
+    project = _FakeProject(
+        [
+            _paused_direction("d-stale", "fp-y", paused_at=stale_ts),
+            _paused_direction("d-fresh", "fp-y", paused_at=fresh_ts),
+        ]
+    )
     result = find_directions_sharing_fingerprint(project, "fp-y")
     assert [r["id"] for r in result] == ["d-fresh"]
 
@@ -1326,7 +1398,10 @@ def test_normalize_error_message_strips_pr_numbers():
 
 
 def test_normalize_error_message_strips_branch_name():
-    assert _normalize_error_message("push to feature/foo-bar failed") == "push to <branch> failed"
+    assert (
+        _normalize_error_message("push to feature/foo-bar failed")
+        == "push to <branch> failed"
+    )
     assert _normalize_error_message("blueprint/task-abc123 error") == "<branch> error"
 
 

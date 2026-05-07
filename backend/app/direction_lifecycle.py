@@ -4,6 +4,7 @@ Handles dead direction pruning, auto-recovery from auto-pause, and active
 direction filtering (cooldown enforcement, auto-pause, completion detection).
 Extracted from autonomous_research.py to create headroom in that module.
 """
+
 import logging
 import uuid
 from datetime import datetime, timedelta
@@ -76,7 +77,7 @@ def _detect_partial_remediation_success(direction: dict) -> bool | None:
         return False
     pre: list[dict] = []
     post: list[dict] = []
-    for entry in (direction.get("research_history") or []):
+    for entry in direction.get("research_history") or []:
         ts = entry.get("timestamp")
         if not ts:
             continue
@@ -110,6 +111,7 @@ def _build_escalation_args(direction: dict) -> dict:
     produce identical message bodies when re-derived from the direction.
     """
     from app.strategic_completion import _build_direction_failure_summary
+
     summary = _build_direction_failure_summary(direction)
     rem_summary = (
         f"cycles_analyzed={summary['cycles_analyzed']} "
@@ -132,7 +134,9 @@ def _build_escalation_args(direction: dict) -> dict:
 
 
 async def _compute_direction_error_fingerprint(
-    project_id: uuid.UUID, direction_id: str, session: AsyncSession,
+    project_id: uuid.UUID,
+    direction_id: str,
+    session: AsyncSession,
 ) -> str | None:
     """Return the dominant error fingerprint across this direction's recent failed tasks.
 
@@ -146,17 +150,27 @@ async def _compute_direction_error_fingerprint(
     pattern and the escalation path can compare it against the last
     remediation's fingerprint.
     """
-    from app.anomaly_detection import _task_error_fingerprint, count_matching_fingerprints
+    from app.anomaly_detection import (
+        _task_error_fingerprint,
+        count_matching_fingerprints,
+    )
 
-    base_query = select(Task).where(
-        Task.project_id == project_id,
-        Task.status == TaskStatus.FAILED,
-        Task.context["direction_id"].as_string() == direction_id,
-    ).order_by(Task.created_at.desc()).limit(_FINGERPRINT_SAMPLE_SIZE)
+    base_query = (
+        select(Task)
+        .where(
+            Task.project_id == project_id,
+            Task.status == TaskStatus.FAILED,
+            Task.context["direction_id"].as_string() == direction_id,
+        )
+        .order_by(Task.created_at.desc())
+        .limit(_FINGERPRINT_SAMPLE_SIZE)
+    )
     window_start = _utcnow() - timedelta(days=_FINGERPRINT_RECENCY_DAYS)
-    failed_tasks = (await session.execute(
-        base_query.where(Task.created_at >= window_start)
-    )).scalars().all()
+    failed_tasks = (
+        (await session.execute(base_query.where(Task.created_at >= window_start)))
+        .scalars()
+        .all()
+    )
     if len(failed_tasks) < _FINGERPRINT_MIN_RECURRENCE:
         failed_tasks = (await session.execute(base_query)).scalars().all()
     best_fp: str | None = None
@@ -174,7 +188,10 @@ async def _compute_direction_error_fingerprint(
 
 
 async def _spawn_direction_diagnosis(
-    project: Project, direction: dict, pause_reason: str, session: AsyncSession,
+    project: Project,
+    direction: dict,
+    pause_reason: str,
+    session: AsyncSession,
 ) -> bool:
     """Spawn an investigate task for a code-failure auto-pause.
 
@@ -198,6 +215,7 @@ async def _spawn_direction_diagnosis(
     if not direction_id:
         return False
     from app.autonomous_research import _recent_investigation_exists
+
     if await _recent_investigation_exists(project.id, str(direction_id), session):
         return False
     cutoff = _utcnow() - timedelta(hours=24)
@@ -208,34 +226,49 @@ async def _spawn_direction_diagnosis(
     try:
         if not fingerprint:
             fingerprint = await _compute_direction_error_fingerprint(
-                project.id, str(direction_id), session,
+                project.id,
+                str(direction_id),
+                session,
             )
     except Exception as _fp_exc:
-        logger.warning(f"[DIAGNOSIS] Failed to compute error fingerprint for {direction_id}: {_fp_exc!r}")
+        logger.warning(
+            f"[DIAGNOSIS] Failed to compute error fingerprint for {direction_id}: {_fp_exc!r}"
+        )
         fingerprint = None
     if fingerprint:
-        shared = (await session.execute(
-            select(Task.id).where(
-                Task.project_id == project.id,
-                Task.created_at >= cutoff,
-                Task.payloads[0]["type"].as_string() == "investigate",
-                Task.context["diagnosis_fingerprint"].as_string() == str(fingerprint),
-            ).limit(1)
-        )).first()
+        shared = (
+            await session.execute(
+                select(Task.id)
+                .where(
+                    Task.project_id == project.id,
+                    Task.created_at >= cutoff,
+                    Task.payloads[0]["type"].as_string() == "investigate",
+                    Task.context["diagnosis_fingerprint"].as_string()
+                    == str(fingerprint),
+                )
+                .limit(1)
+            )
+        ).first()
         if shared is not None:
             existing_task_id = str(shared[0])
-            from app.strategic_constants import STRATEGIC_NOTES_HISTORY_MAX, STRATEGIC_RATIONALE_MAX
+            from app.strategic_constants import (
+                STRATEGIC_NOTES_HISTORY_MAX,
+                STRATEGIC_RATIONALE_MAX,
+            )
+
             note_text = (
                 f"Skipped duplicate investigation: shares error fingerprint "
                 f"{str(fingerprint)[:80]} with existing investigate task {existing_task_id}."
             )[:STRATEGIC_RATIONALE_MAX]
             notes = list(direction.get("notes") or [])
-            notes.append({
-                "text": note_text,
-                "added_at": _utcnow().isoformat(),
-                "source": "diagnosis_dedup",
-                "shared_investigation_task_id": existing_task_id,
-            })
+            notes.append(
+                {
+                    "text": note_text,
+                    "added_at": _utcnow().isoformat(),
+                    "source": "diagnosis_dedup",
+                    "shared_investigation_task_id": existing_task_id,
+                }
+            )
             direction["notes"] = notes[-STRATEGIC_NOTES_HISTORY_MAX:]
             logger.info(
                 f"[DIAGNOSIS] Skipping spawn for {direction_id}: shares fingerprint "
@@ -243,22 +276,37 @@ async def _spawn_direction_diagnosis(
             )
             return False
     history = direction.get("research_history") or []
-    recent_lines = "\n".join(
-        f"- created={e.get('tasks_created', 0)} failed={e.get('tasks_failed', 0)} "
-        f"infra_failed={e.get('tasks_failed_infra', 0)} merged={e.get('prs_merged', 0)}"
-        for e in history[-5:]
-    ) or "- (no research history)"
-    recent_failures = (await session.execute(
-        select(Task).where(
-            Task.project_id == project.id,
-            Task.status == TaskStatus.FAILED,
-            Task.context["direction_id"].as_string() == str(direction_id),
-        ).order_by(Task.created_at.desc()).limit(3)
-    )).scalars().all()
-    failure_lines = "\n".join(
-        f"- {(t.latest_status_message or '(no message)').strip()[:200]}"
-        for t in recent_failures
-    ) or "- (no recent failed tasks)"
+    recent_lines = (
+        "\n".join(
+            f"- created={e.get('tasks_created', 0)} failed={e.get('tasks_failed', 0)} "
+            f"infra_failed={e.get('tasks_failed_infra', 0)} merged={e.get('prs_merged', 0)}"
+            for e in history[-5:]
+        )
+        or "- (no research history)"
+    )
+    recent_failures = (
+        (
+            await session.execute(
+                select(Task)
+                .where(
+                    Task.project_id == project.id,
+                    Task.status == TaskStatus.FAILED,
+                    Task.context["direction_id"].as_string() == str(direction_id),
+                )
+                .order_by(Task.created_at.desc())
+                .limit(3)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    failure_lines = (
+        "\n".join(
+            f"- {(t.latest_status_message or '(no message)').strip()[:200]}"
+            for t in recent_failures
+        )
+        or "- (no recent failed tasks)"
+    )
     prior_diagnosis = (direction.get("diagnosis_summary") or "").strip()
     # Cross-direction shared-fingerprint detection. If the same fingerprint
     # already appears on other auto-paused directions, annotate the diagnosis
@@ -266,16 +314,18 @@ async def _spawn_direction_diagnosis(
     # direction-specific scope/code issue.
     shared_directions: list[dict] = []
     if fingerprint:
-        for other in (project.directions or []):
+        for other in project.directions or []:
             if other.get("id") == direction_id:
                 continue
             if other.get("status") != "paused" or not other.get("auto_paused"):
                 continue
             if other.get("error_fingerprint") == fingerprint:
-                shared_directions.append({
-                    "id": other.get("id"),
-                    "text": (other.get("text") or "")[:80],
-                })
+                shared_directions.append(
+                    {
+                        "id": other.get("id"),
+                        "text": (other.get("text") or "")[:80],
+                    }
+                )
     extras = ""
     if fingerprint:
         extras += f"Dominant error fingerprint: {fingerprint[:200]}\n"
@@ -325,7 +375,8 @@ async def _spawn_direction_diagnosis(
             if direction.get("last_remediation_task_id"):
                 try:
                     rem_task = await session.get(
-                        Task, uuid.UUID(str(direction["last_remediation_task_id"])),
+                        Task,
+                        uuid.UUID(str(direction["last_remediation_task_id"])),
                     )
                 except (ValueError, TypeError):
                     rem_task = None
@@ -412,20 +463,29 @@ async def _process_direction_lifecycle(
     """
     from statistics import median
 
-    from app.strategic_completion import _check_direction_health, _check_direction_completion
+    from app.strategic_completion import (
+        _check_direction_health,
+        _check_direction_completion,
+    )
 
     directions_modified = False
     # Prune dead directions (expired/completed/rejected) to prevent JSON bloat
-    live_dirs = [d for d in (project.directions or []) if d.get("status") in ("active", "proposed", "paused")]
+    live_dirs = [
+        d
+        for d in (project.directions or [])
+        if d.get("status") in ("active", "proposed", "paused")
+    ]
     if len(live_dirs) < len(project.directions or []):
-        logger.info(f"[AUTONOMOUS] Pruned {len(project.directions or []) - len(live_dirs)} dead directions from {project.id}")
+        logger.info(
+            f"[AUTONOMOUS] Pruned {len(project.directions or []) - len(live_dirs)} dead directions from {project.id}"
+        )
         project.directions = live_dirs
         flag_modified(project, "directions")
         directions_modified = True
     # Retry BLOCKER escalation notifications whose initial delivery failed.
     # Runs before auto-recovery so a direction that recovers this cycle does
     # not silently lose its pending notification.
-    for d in (project.directions or []):
+    for d in project.directions or []:
         if not d.get("escalation_notification_pending"):
             continue
         retries = int(d.get("escalation_notification_retries", 0))
@@ -441,24 +501,30 @@ async def _process_direction_lifecycle(
                 },
             )
             from app.models import Alert, AlertSeverity
-            session.add(Alert(
-                project_id=project.id,
-                severity=AlertSeverity.ERROR,
-                title="Escalation notification delivery failed",
-                message=(
-                    f"Direction {d.get('id')} ('{(d.get('text') or '')[:80]}') needs manual "
-                    f"intervention but the BLOCKER notification could not be delivered after "
-                    f"{retries} retries. Fingerprint={d.get('error_fingerprint') or '(unknown)'}, "
-                    f"remediation_attempts={int(d.get('remediation_attempts', 0))}."
-                ),
-            ))
+
+            session.add(
+                Alert(
+                    project_id=project.id,
+                    severity=AlertSeverity.ERROR,
+                    title="Escalation notification delivery failed",
+                    message=(
+                        f"Direction {d.get('id')} ('{(d.get('text') or '')[:80]}') needs manual "
+                        f"intervention but the BLOCKER notification could not be delivered after "
+                        f"{retries} retries. Fingerprint={d.get('error_fingerprint') or '(unknown)'}, "
+                        f"remediation_attempts={int(d.get('remediation_attempts', 0))}."
+                    ),
+                )
+            )
             d.pop("escalation_notification_pending", None)
             directions_modified = True
             continue
         try:
             from app.notification_dispatch import post_remediation_escalation_message
+
             await post_remediation_escalation_message(
-                session, project.id, **_build_escalation_args(d),
+                session,
+                project.id,
+                **_build_escalation_args(d),
             )
             d.pop("escalation_notification_pending", None)
             d.pop("escalation_notification_retries", None)
@@ -479,7 +545,7 @@ async def _process_direction_lifecycle(
     # which only gets set on a successful remediation merge. If remediation keeps
     # failing, the flag (and operator alert) persists forever — clear it here
     # once enough time has passed without a monitor ever starting.
-    for d in (project.directions or []):
+    for d in project.directions or []:
         if not d.get("needs_manual_intervention"):
             continue
         if d.get("remediation_monitor_started_at"):
@@ -488,7 +554,9 @@ async def _process_direction_lifecycle(
         if not flagged_at:
             continue
         try:
-            age_h = (_utcnow() - datetime.fromisoformat(flagged_at)).total_seconds() / 3600
+            age_h = (
+                _utcnow() - datetime.fromisoformat(flagged_at)
+            ).total_seconds() / 3600
         except (ValueError, TypeError):
             continue
         if age_h < _STUCK_INTERVENTION_TTL_HOURS:
@@ -502,10 +570,16 @@ async def _process_direction_lifecycle(
         )
     # Auto-recovery: reactivate auto-paused directions past cooldown
     recovery_hours = _runtime_config.get("direction_auto_recovery_hours", 48)
-    for d in (project.directions or []):
-        if d.get("status") != "paused" or not d.get("auto_paused") or not d.get("paused_at"):
+    for d in project.directions or []:
+        if (
+            d.get("status") != "paused"
+            or not d.get("auto_paused")
+            or not d.get("paused_at")
+        ):
             continue
-        hours = (_utcnow() - datetime.fromisoformat(d["paused_at"])).total_seconds() / 3600
+        hours = (
+            _utcnow() - datetime.fromisoformat(d["paused_at"])
+        ).total_seconds() / 3600
         if hours < recovery_hours:
             continue
         if _check_direction_health(d) is None:
@@ -520,7 +594,8 @@ async def _process_direction_lifecycle(
             last_rem_fp = d.get("last_remediation_fingerprint")
             if (
                 d.get("needs_manual_intervention")
-                and current_fp and last_rem_fp
+                and current_fp
+                and last_rem_fp
                 and str(current_fp) != str(last_rem_fp)
             ):
                 d.pop("needs_manual_intervention", None)
@@ -535,11 +610,15 @@ async def _process_direction_lifecycle(
             # when the direction is re-paused while monitoring is active.
             if d.get("last_remediation_result") in ("merged", "partial_success"):
                 d["remediation_monitor_started_at"] = _utcnow().isoformat()
-            logger.info(f"[AUTONOMOUS] Auto-recovered direction {d.get('id')} after {hours:.0f}h cooldown")
+            logger.info(
+                f"[AUTONOMOUS] Auto-recovered direction {d.get('id')} after {hours:.0f}h cooldown"
+            )
             directions_modified = True
         else:
             d["paused_at"] = _utcnow().isoformat()
-            logger.info(f"[AUTONOMOUS] Direction {d.get('id')} still unhealthy, extending pause")
+            logger.info(
+                f"[AUTONOMOUS] Direction {d.get('id')} still unhealthy, extending pause"
+            )
             directions_modified = True
     active_directions = []
     auto_paused_any = False
@@ -555,14 +634,19 @@ async def _process_direction_lifecycle(
                 spend += max(0.0, float(entry.get("estimated_cost_usd") or 0.0))
                 # Legacy fallback: pre-attribution entries lack autonomous_prs_merged;
                 # treat all merges as autonomous so CPM is conservative for old data.
-                autonomous += max(0, int(
-                    entry.get("autonomous_prs_merged", entry.get("prs_merged")) or 0
-                ))
+                autonomous += max(
+                    0,
+                    int(
+                        entry.get("autonomous_prs_merged", entry.get("prs_merged")) or 0
+                    ),
+                )
             except (TypeError, ValueError):
                 continue
         return (spend / autonomous) if autonomous > 0 else None
 
-    def _cost_by_provider_model_window(direction: dict) -> tuple[dict[str, float], float]:
+    def _cost_by_provider_model_window(
+        direction: dict,
+    ) -> tuple[dict[str, float], float]:
         """Sum per-(provider, model) cost across the same rolling window.
 
         Returns (totals_by_key, total_window_cost). Legacy entries lacking
@@ -586,15 +670,18 @@ async def _process_direction_lifecycle(
     except (TypeError, ValueError):
         cpm_window = 6
     try:
-        cpm_multiplier = float(_runtime_config.get("direction_cost_per_merge_multiplier", 2.0) or 2.0)
+        cpm_multiplier = float(
+            _runtime_config.get("direction_cost_per_merge_multiplier", 2.0) or 2.0
+        )
     except (TypeError, ValueError):
         cpm_multiplier = 2.0
     project_cpms = [
-        cpm for cpm in (_cost_per_merge(x) for x in (project.directions or []))
+        cpm
+        for cpm in (_cost_per_merge(x) for x in (project.directions or []))
         if cpm is not None and cpm > 0
     ]
     project_cpm_median = median(project_cpms) if project_cpms else None
-    for d in (project.directions or []):
+    for d in project.directions or []:
         if d.get("status") != "active":
             continue
         did = d.get("id")
@@ -612,7 +699,9 @@ async def _process_direction_lifecycle(
             is_stale = True
             if started_at:
                 try:
-                    age_h = (_utcnow() - datetime.fromisoformat(started_at)).total_seconds() / 3600
+                    age_h = (
+                        _utcnow() - datetime.fromisoformat(started_at)
+                    ).total_seconds() / 3600
                     is_stale = age_h >= _DIAGNOSIS_STALE_HOURS
                 except (ValueError, TypeError):
                     is_stale = True
@@ -634,7 +723,9 @@ async def _process_direction_lifecycle(
             expired = False
             age_desc = ""
             try:
-                age_days = (_utcnow() - datetime.fromisoformat(monitor_started_at)).total_seconds() / 86400
+                age_days = (
+                    _utcnow() - datetime.fromisoformat(monitor_started_at)
+                ).total_seconds() / 86400
                 if age_days > _REMEDIATION_MONITOR_EXPIRY_DAYS:
                     expired = True
                     age_desc = f"age {age_days:.1f}d"
@@ -668,7 +759,9 @@ async def _process_direction_lifecycle(
                 directions_modified = True
         last_researched = d.get("last_researched_at")
         if last_researched:
-            minutes_ago = (now - datetime.fromisoformat(last_researched)).total_seconds() / 60
+            minutes_ago = (
+                now - datetime.fromisoformat(last_researched)
+            ).total_seconds() / 60
             # Adaptive cooldown: shorter after productive cycles (findings spawned tasks),
             # standard after unproductive cycles. Saturation still doubles whichever base applies.
             if d.get("last_cycle_productive"):
@@ -700,7 +793,9 @@ async def _process_direction_lifecycle(
                 continue
         # Cost efficiency escalation: flag expensive directions for retirement consideration.
         direction_cpm = _cost_per_merge(d)
-        threshold = (project_cpm_median * cpm_multiplier) if project_cpm_median else None
+        threshold = (
+            (project_cpm_median * cpm_multiplier) if project_cpm_median else None
+        )
         if direction_cpm and threshold and direction_cpm > threshold:
             d["retirement_consideration_needed"] = True
             d["retirement_consideration_at"] = _utcnow().isoformat()
@@ -732,9 +827,11 @@ async def _process_direction_lifecycle(
         # Auto-pause check — must come after cooldown to only evaluate directions eligible for research
         pause_reason = _check_direction_health(d)
         cumulative_cost = 0.0
-        for entry in (d.get("research_history") or []):
+        for entry in d.get("research_history") or []:
             try:
-                cumulative_cost += max(0.0, float(entry.get("estimated_cost_usd") or 0.0))
+                cumulative_cost += max(
+                    0.0, float(entry.get("estimated_cost_usd") or 0.0)
+                )
             except (TypeError, ValueError):
                 continue
         budget = d.get("cost_budget_usd")
@@ -767,11 +864,15 @@ async def _process_direction_lifecycle(
             # same root cause keeps recurring after remediation.
             if _is_code_failure_pause_reason(pause_reason):
                 try:
-                    fingerprint = await _compute_direction_error_fingerprint(project.id, did, session)
+                    fingerprint = await _compute_direction_error_fingerprint(
+                        project.id, did, session
+                    )
                     if fingerprint:
                         d["error_fingerprint"] = fingerprint
                 except Exception as _fp_exc:
-                    logger.warning(f"[DIAGNOSIS] Failed to compute error fingerprint for {did}: {_fp_exc!r}")
+                    logger.warning(
+                        f"[DIAGNOSIS] Failed to compute error fingerprint for {did}: {_fp_exc!r}"
+                    )
             # Re-pause while remediation monitoring is active means the fix did not hold.
             # Flag for manual intervention once attempts reach the escalation threshold so
             # the diagnostics API and notification dispatcher can surface it to operators.
@@ -779,7 +880,9 @@ async def _process_direction_lifecycle(
             monitor_expired = False
             if monitor_started_at:
                 try:
-                    age_days = (_utcnow() - datetime.fromisoformat(monitor_started_at)).total_seconds() / 86400
+                    age_days = (
+                        _utcnow() - datetime.fromisoformat(monitor_started_at)
+                    ).total_seconds() / 86400
                     if age_days > _REMEDIATION_MONITOR_EXPIRY_DAYS:
                         monitor_expired = True
                         d.pop("remediation_monitor_started_at", None)
@@ -805,7 +908,8 @@ async def _process_direction_lifecycle(
                 not current_fp or not last_rem_fp or str(current_fp) == str(last_rem_fp)
             )
             if (
-                monitor_started_at and not monitor_expired
+                monitor_started_at
+                and not monitor_expired
                 and d.get("remediation_attempts", 0) >= 3
                 and fingerprints_match
             ):
@@ -845,15 +949,22 @@ async def _process_direction_lifecycle(
                         f"after {d.get('remediation_attempts', 0)} remediation attempts"
                     )
                     try:
-                        from app.notification_dispatch import post_remediation_escalation_message
+                        from app.notification_dispatch import (
+                            post_remediation_escalation_message,
+                        )
+
                         await post_remediation_escalation_message(
-                            session, project.id, **_build_escalation_args(d),
+                            session,
+                            project.id,
+                            **_build_escalation_args(d),
                         )
                         # Clear any pending retry stamps from a prior failed escalation
                         d.pop("escalation_notification_pending", None)
                         d.pop("escalation_notification_retries", None)
                     except Exception as _esc_exc:
-                        logger.warning(f"[NOTIFY] Failed to post remediation escalation message: {_esc_exc}")
+                        logger.warning(
+                            f"[NOTIFY] Failed to post remediation escalation message: {_esc_exc}"
+                        )
                         # Stamp for retry on the next lifecycle cycle. Retry count is
                         # preserved if an earlier escalation on this direction was also
                         # pending; the retry loop enforces _MAX_ESCALATION_NOTIFICATION_RETRIES.
@@ -865,23 +976,34 @@ async def _process_direction_lifecycle(
             auto_paused_any = True
             try:
                 from app.notification_dispatch import post_direction_milestone_message  # noqa: PLC0415
+
                 await post_direction_milestone_message(
-                    session, project.id,
+                    session,
+                    project.id,
                     direction_text=d.get("text", ""),
                     milestone="auto-paused",
                     reason=pause_reason,
                     direction_id=did,
                 )
             except Exception as _notify_exc:
-                logger.warning(f"[NOTIFY] Failed to post direction milestone message: {_notify_exc}")
+                logger.warning(
+                    f"[NOTIFY] Failed to post direction milestone message: {_notify_exc}"
+                )
             try:
                 if _is_code_failure_pause_reason(pause_reason):
                     await _spawn_direction_diagnosis(project, d, pause_reason, session)
                 elif not (pause_reason or "").startswith("Budget exceeded:"):
-                    from app.autonomous_research_diagnosis import _spawn_unproductive_diagnosis
-                    await _spawn_unproductive_diagnosis(project, d, pause_reason, session)
+                    from app.autonomous_research_diagnosis import (
+                        _spawn_unproductive_diagnosis,
+                    )
+
+                    await _spawn_unproductive_diagnosis(
+                        project, d, pause_reason, session
+                    )
             except Exception as _e:
-                logger.warning(f"[DIAGNOSIS] Failed to spawn investigate task for {did}: {_e}")
+                logger.warning(
+                    f"[DIAGNOSIS] Failed to spawn investigate task for {did}: {_e}"
+                )
             MAX_AUTO_PAUSE_CYCLES = _MAX_AUTO_PAUSE_CYCLES
             code_pause_count = d.get("code_failure_pause_count", 0)
             if code_pause_count >= MAX_AUTO_PAUSE_CYCLES:
@@ -897,6 +1019,7 @@ async def _process_direction_lifecycle(
                     f"{code_pause_count} code-failure auto-pause cycles: {d.get('text', '')[:60]}"
                 )
                 from app.models import Alert, AlertSeverity
+
                 alert = Alert(
                     project_id=project.id,
                     severity=AlertSeverity.INFO,
@@ -909,16 +1032,22 @@ async def _process_direction_lifecycle(
                 )
                 session.add(alert)
                 try:
-                    from app.notification_dispatch import post_direction_milestone_message  # noqa: PLC0415
+                    from app.notification_dispatch import (
+                        post_direction_milestone_message,
+                    )  # noqa: PLC0415
+
                     await post_direction_milestone_message(
-                        session, project.id,
+                        session,
+                        project.id,
                         direction_text=d.get("text", ""),
                         milestone="auto-retired",
                         reason=d["auto_completed_reason"],
                         direction_id=did,
                     )
                 except Exception as _notify_exc:
-                    logger.warning(f"[NOTIFY] Failed to post direction milestone message: {_notify_exc}")
+                    logger.warning(
+                        f"[NOTIFY] Failed to post direction milestone message: {_notify_exc}"
+                    )
                 directions_modified = True
             else:
                 # Spawn diagnosis research so the agent can investigate the failure
@@ -934,8 +1063,13 @@ async def _process_direction_lifecycle(
                 # noticing the override was load-bearing. Alias it locally to a
                 # different name to dodge F823 and keep the override clear.
                 try:
-                    from app.autonomous_research import _spawn_direction_diagnosis as _spawn_diagnosis_research
-                    if await _spawn_diagnosis_research(project, d, pause_reason, session):
+                    from app.autonomous_research import (
+                        _spawn_direction_diagnosis as _spawn_diagnosis_research,
+                    )
+
+                    if await _spawn_diagnosis_research(
+                        project, d, pause_reason, session
+                    ):
                         d["diagnosis_spawned_at"] = _utcnow().isoformat()
                         directions_modified = True
                 except Exception as _e:
@@ -949,7 +1083,9 @@ async def _process_direction_lifecycle(
             if not d.get("possibly_complete"):
                 d["possibly_complete"] = True
                 d["completion_suggestion"] = completion_suggestion
-                logger.info(f"[AUTONOMOUS] Direction {did} possibly complete: {completion_suggestion}")
+                logger.info(
+                    f"[AUTONOMOUS] Direction {did} possibly complete: {completion_suggestion}"
+                )
                 directions_modified = True
         else:
             if d.get("possibly_complete"):

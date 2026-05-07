@@ -5,11 +5,19 @@ sync helper pulls authoritative values from DeploymentState so each instance
 converges. These tests cover the scalar cols, the JSONB column, the
 PAUSED/HALTED override, and the changed-keys return value.
 """
+
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
 import app.shared_state as _shared_state
 from app.models import DeploymentState, DeploymentStatus
-from app.shared_state import sync_runtime_config_from_state
+from app.shared_state import (
+    dispatcher_cycle_log,
+    get_dispatcher_cycles,
+    record_dispatcher_cycle,
+    sync_runtime_config_from_state,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -147,13 +155,17 @@ async def test_sync_applies_runtime_config_json():
             "require_approval_gates": False,
             "max_provision_retries": 5,
             "provider_settings_defaults": {"anthropic": {"effort": "high"}},
-            "task_type_provider_overrides": {"research": {"anthropic": {"effort": "max"}}},
+            "task_type_provider_overrides": {
+                "research": {"anthropic": {"effort": "max"}}
+            },
         },
     )
     _shared_state.runtime_config["strategic_research_frequency"] = 6
     _shared_state.runtime_config["require_approval_gates"] = True
     _shared_state.runtime_config["max_provision_retries"] = 3
-    _shared_state.runtime_config["provider_settings_defaults"] = {"anthropic": {"effort": "medium"}}
+    _shared_state.runtime_config["provider_settings_defaults"] = {
+        "anthropic": {"effort": "medium"}
+    }
     _shared_state.runtime_config["task_type_provider_overrides"] = {}
 
     changed = await sync_runtime_config_from_state(state)
@@ -161,10 +173,85 @@ async def test_sync_applies_runtime_config_json():
     assert _shared_state.runtime_config["strategic_research_frequency"] == 9
     assert _shared_state.runtime_config["require_approval_gates"] is False
     assert _shared_state.runtime_config["max_provision_retries"] == 5
-    assert _shared_state.runtime_config["provider_settings_defaults"] == {"anthropic": {"effort": "high"}}
-    assert _shared_state.runtime_config["task_type_provider_overrides"] == {"research": {"anthropic": {"effort": "max"}}}
+    assert _shared_state.runtime_config["provider_settings_defaults"] == {
+        "anthropic": {"effort": "high"}
+    }
+    assert _shared_state.runtime_config["task_type_provider_overrides"] == {
+        "research": {"anthropic": {"effort": "max"}}
+    }
     for key in (
-        "strategic_research_frequency", "require_approval_gates",
-        "max_provision_retries", "provider_settings_defaults", "task_type_provider_overrides",
+        "strategic_research_frequency",
+        "require_approval_gates",
+        "max_provision_retries",
+        "provider_settings_defaults",
+        "task_type_provider_overrides",
     ):
         assert key in changed
+
+
+# --- Dispatcher Cycle Log ---
+
+
+@pytest.fixture(autouse=False)
+def clean_dispatcher_log():
+    dispatcher_cycle_log.clear()
+    yield
+    dispatcher_cycle_log.clear()
+
+
+def _make_cycle(project_id="proj-1", offset_hours=0, **kwargs):
+    now = datetime.now(tz=timezone.utc) - timedelta(hours=offset_hours)
+    record_dispatcher_cycle(
+        project_id=project_id,
+        cycle_started_at=now,
+        cycle_finished_at=now + timedelta(seconds=1),
+        signals_evaluated=kwargs.get("signals_evaluated", 3),
+        signals_tripped=kwargs.get("signals_tripped", 1),
+        spawns_emitted=kwargs.get("spawns_emitted", 1),
+        rejections_by_reason=kwargs.get("rejections_by_reason", {}),
+        mttd_p50_sec=kwargs.get("mttd_p50_sec", None),
+    )
+
+
+def test_record_dispatcher_cycle_appends(clean_dispatcher_log):
+    _make_cycle()
+    assert len(dispatcher_cycle_log) == 1
+    rec = dispatcher_cycle_log[-1]
+    assert rec["project_id"] == "proj-1"
+    assert rec["signals_evaluated"] == 3
+    assert rec["signals_tripped"] == 1
+    assert rec["spawns_emitted"] == 1
+    assert rec["rejections_by_reason"] == {}
+    assert rec["mttd_p50_sec"] is None
+
+
+def test_get_dispatcher_cycles_window_filter(clean_dispatcher_log):
+    _make_cycle(offset_hours=0)  # recent
+    _make_cycle(offset_hours=25)  # outside 24h window
+    result = get_dispatcher_cycles(window_hours=24)
+    assert len(result) == 1
+
+
+def test_get_dispatcher_cycles_project_filter(clean_dispatcher_log):
+    _make_cycle(project_id="proj-A")
+    _make_cycle(project_id="proj-B")
+    result = get_dispatcher_cycles(project_id="proj-A")
+    assert len(result) == 1
+    assert result[0]["project_id"] == "proj-A"
+
+
+def test_get_dispatcher_cycles_no_filter_returns_all(clean_dispatcher_log):
+    _make_cycle(project_id="proj-A")
+    _make_cycle(project_id="proj-B")
+    result = get_dispatcher_cycles()
+    assert len(result) == 2
+
+
+def test_record_dispatcher_cycle_rejection_reasons(clean_dispatcher_log):
+    _make_cycle(
+        rejections_by_reason={"cooldown": 2, "dedup": 1},
+        mttd_p50_sec=300.5,
+    )
+    rec = dispatcher_cycle_log[-1]
+    assert rec["rejections_by_reason"] == {"cooldown": 2, "dedup": 1}
+    assert rec["mttd_p50_sec"] == 300.5

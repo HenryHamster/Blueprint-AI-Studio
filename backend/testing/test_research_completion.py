@@ -21,7 +21,9 @@ class TestScopeBudgetGate:
 
     def test_small_5_files_upgrades_to_medium(self):
         files = ["a.py", "b.py", "c.py", "d.py", "e.py"]
-        scope, cal_from, warning, requires_approval = check_scope_budget_mismatch("small", files)
+        scope, cal_from, warning, requires_approval = check_scope_budget_mismatch(
+            "small", files
+        )
         assert scope == "medium"
         assert cal_from == "small"
         assert warning is not None and "scope_budget_mismatch" in warning
@@ -29,7 +31,9 @@ class TestScopeBudgetGate:
 
     def test_medium_12_files_upgrades_to_large(self):
         files = [f"file{i}.py" for i in range(12)]
-        scope, cal_from, warning, requires_approval = check_scope_budget_mismatch("medium", files)
+        scope, cal_from, warning, requires_approval = check_scope_budget_mismatch(
+            "medium", files
+        )
         assert scope == "large"
         assert cal_from == "medium"
         assert warning is not None and "scope_budget_mismatch" in warning
@@ -37,14 +41,18 @@ class TestScopeBudgetGate:
 
     def test_large_30_files_requires_approval(self):
         files = [f"file{i}.py" for i in range(30)]
-        scope, cal_from, warning, requires_approval = check_scope_budget_mismatch("large", files)
+        scope, cal_from, warning, requires_approval = check_scope_budget_mismatch(
+            "large", files
+        )
         assert scope == "large"
         assert cal_from is None
         assert warning is not None and "scope_budget_mismatch" in warning
         assert requires_approval
 
     def test_small_2_files_passes_unchanged(self):
-        scope, cal_from, warning, requires_approval = check_scope_budget_mismatch("small", ["a.py", "b.py"])
+        scope, cal_from, warning, requires_approval = check_scope_budget_mismatch(
+            "small", ["a.py", "b.py"]
+        )
         assert scope == "small"
         assert cal_from is None
         assert warning is None
@@ -52,7 +60,9 @@ class TestScopeBudgetGate:
 
     def test_medium_within_limit_passes_unchanged(self):
         files = [f"file{i}.py" for i in range(MEDIUM_ANALYSIS_PLAN_FILE_LIMIT)]
-        scope, cal_from, warning, requires_approval = check_scope_budget_mismatch("medium", files)
+        scope, cal_from, warning, requires_approval = check_scope_budget_mismatch(
+            "medium", files
+        )
         assert scope == "medium"
         assert cal_from is None
         assert warning is None
@@ -61,21 +71,27 @@ class TestScopeBudgetGate:
     def test_large_within_budget_passes_unchanged(self):
         large_limit = (SCOPE_FILE_BUDGETS.get("large") or {}).get("total_files_max", 20)
         files = [f"file{i}.py" for i in range(large_limit)]
-        scope, cal_from, warning, requires_approval = check_scope_budget_mismatch("large", files)
+        scope, cal_from, warning, requires_approval = check_scope_budget_mismatch(
+            "large", files
+        )
         assert scope == "large"
         assert cal_from is None
         assert warning is None
         assert not requires_approval
 
     def test_empty_files_passes_unchanged(self):
-        scope, cal_from, warning, requires_approval = check_scope_budget_mismatch("small", [])
+        scope, cal_from, warning, requires_approval = check_scope_budget_mismatch(
+            "small", []
+        )
         assert scope == "small"
         assert cal_from is None
         assert warning is None
         assert not requires_approval
 
     def test_none_files_passes_unchanged(self):
-        scope, cal_from, warning, requires_approval = check_scope_budget_mismatch("medium", None)
+        scope, cal_from, warning, requires_approval = check_scope_budget_mismatch(
+            "medium", None
+        )
         assert scope == "medium"
         assert cal_from is None
         assert warning is None
@@ -84,14 +100,18 @@ class TestScopeBudgetGate:
     def test_medium_exactly_at_limit_passes_unchanged(self):
         # MEDIUM_ANALYSIS_PLAN_FILE_LIMIT files is exactly at the limit, not over
         files = [f"file{i}.py" for i in range(MEDIUM_ANALYSIS_PLAN_FILE_LIMIT)]
-        scope, cal_from, warning, requires_approval = check_scope_budget_mismatch("medium", files)
+        scope, cal_from, warning, requires_approval = check_scope_budget_mismatch(
+            "medium", files
+        )
         assert scope == "medium"
         assert cal_from is None
         assert warning is None
 
     def test_medium_one_over_limit_upgrades(self):
         files = [f"file{i}.py" for i in range(MEDIUM_ANALYSIS_PLAN_FILE_LIMIT + 1)]
-        scope, cal_from, warning, requires_approval = check_scope_budget_mismatch("medium", files)
+        scope, cal_from, warning, requires_approval = check_scope_budget_mismatch(
+            "medium", files
+        )
         assert scope == "large"
         assert cal_from == "medium"
 
@@ -154,7 +174,8 @@ class TestLowActionabilityDecay:
 
         # The gate only defers if actionability_grade == "LOW" and no prior deferred_reason
         deferred_for_low_actionability = [
-            f for f in findings
+            f
+            for f in findings
             if f.get("actionability_grade") == "LOW" and not f.get("deferred_reason")
         ]
 
@@ -171,9 +192,8 @@ class TestLowActionabilityDecay:
         }
 
         # The gate checks for no prior deferred_reason, so this doesn't get re-gated
-        should_gate = (
-            finding.get("actionability_grade") == "LOW"
-            and not finding.get("deferred_reason")
+        should_gate = finding.get("actionability_grade") == "LOW" and not finding.get(
+            "deferred_reason"
         )
         assert not should_gate, "Previously-deferred findings should not be re-gated"
 
@@ -181,7 +201,9 @@ class TestLowActionabilityDecay:
         _count = int(finding.get("deferred_count", 0) or 0)
         _reason = finding.get("deferred_reason")
         should_decay = _reason == "low_actionability" and _count >= 3
-        assert not should_decay, "Deferral count=1 should not trigger decay (threshold=3)"
+        assert not should_decay, (
+            "Deferral count=1 should not trigger decay (threshold=3)"
+        )
 
     def test_low_actionability_stamping(self):
         """LOW-graded findings are stamped with correct reason and incremented count."""
@@ -222,7 +244,7 @@ class TestActionabilityGradeNormalization:
     def test_missing_grade_defaults_to_medium(self, caplog):
         """Finding with no actionability_grade is coerced to MEDIUM with a warning."""
         findings = [{"title": "no-grade-finding"}]
-        logger = logging.getLogger("app.research_completion")
+        logger = logging.getLogger("app.research_completion")  # noqa: F841
         with caplog.at_level(logging.WARNING, logger="app.research_completion"):
             normalized = self._normalize(findings)
         assert normalized[0]["actionability_grade"] == "MEDIUM"
@@ -275,8 +297,17 @@ class TestActionabilityGradeNormalization:
 
     def test_thin_finding_is_downgraded_to_low(self):
         """A finding missing claims, sources, and sufficient description is forced to LOW."""
-        finding = {"title": "thin", "actionability_grade": "HIGH", "description": "too short"}
-        structural_grade = "MEDIUM" if (finding.get("claims") or []) and len((finding.get("description") or "").strip()) >= 40 else "LOW"
+        finding = {
+            "title": "thin",
+            "actionability_grade": "HIGH",
+            "description": "too short",
+        }
+        structural_grade = (
+            "MEDIUM"
+            if (finding.get("claims") or [])
+            and len((finding.get("description") or "").strip()) >= 40
+            else "LOW"
+        )
         assert structural_grade == "LOW"
 
 
@@ -370,6 +401,7 @@ class TestSourceRefValidation:
         # being present in the test environment (it isn't, inside the Docker
         # backend test container).
         from app import source_ref_validation as srv
+
         monkeypatch.setattr(srv, "_file_exists_at_head", lambda path: True)
         sources = [
             {
@@ -381,11 +413,12 @@ class TestSourceRefValidation:
         validated = validate_source_refs(sources)
         assert len(validated) == 1
         # Should not have valid: false marker if validation passed
-        assert validated[0].get("valid") != False
+        assert validated[0].get("valid") != False  # noqa: E712
 
     def test_file_source_missing_file(self, monkeypatch):
         """Missing file gets marked with valid: false."""
         from app import source_ref_validation as srv
+
         monkeypatch.setattr(srv, "_file_exists_at_head", lambda path: False)
         sources = [
             {
@@ -397,7 +430,7 @@ class TestSourceRefValidation:
         validated = validate_source_refs(sources)
         assert len(validated) == 1
         # Should be marked as invalid
-        assert validated[0].get("valid") == False
+        assert validated[0].get("valid") == False  # noqa: E712
 
     def test_file_source_missing_ref(self):
         """File source without ref field is dropped."""
@@ -414,6 +447,7 @@ class TestSourceRefValidation:
     def test_file_source_with_line_valid(self, monkeypatch):
         """File source with valid line number."""
         from app import source_ref_validation as srv
+
         monkeypatch.setattr(srv, "_file_exists_at_head", lambda path: True)
         monkeypatch.setattr(srv, "_file_has_line_count", lambda path, n: True)
         sources = [
@@ -425,7 +459,7 @@ class TestSourceRefValidation:
         ]
         validated = validate_source_refs(sources)
         assert len(validated) == 1
-        assert validated[0].get("valid") != False
+        assert validated[0].get("valid") != False  # noqa: E712
 
     def test_non_dict_source_dropped(self):
         """Non-dict source entries are dropped."""
@@ -477,7 +511,7 @@ class TestSourceRefValidation:
         assert validated[2]["type"] == "message"
         assert validated[3]["type"] == "file"
         # Check invalid file is marked
-        assert validated[3].get("valid") == False
+        assert validated[3].get("valid") == False  # noqa: E712
 
     def test_unknown_source_type_passes_through(self):
         """Unknown source types pass through unchanged."""

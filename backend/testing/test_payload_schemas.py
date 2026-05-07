@@ -1,4 +1,5 @@
 """Tests for backend/app/payload_schemas.py."""
+
 import pytest
 
 from app.payload_schemas import (
@@ -14,6 +15,7 @@ from app.payload_schemas import (
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _valid(raw: dict) -> dict:
     """Assert validation succeeds and return the result."""
@@ -34,9 +36,24 @@ def _invalid(raw: dict) -> str:
 # ---------------------------------------------------------------------------
 
 EXPECTED_TYPES = {
-    "create", "review", "fix", "plan", "research", "strategic_review",
-    "design_doc_update", "security_audit", "qa", "deps", "docs", "migrate",
-    "smoketest", "refactor", "debug", "perf", "investigate", "self_audit",
+    "create",
+    "review",
+    "fix",
+    "plan",
+    "research",
+    "strategic_review",
+    "design_doc_update",
+    "security_audit",
+    "qa",
+    "deps",
+    "docs",
+    "migrate",
+    "smoketest",
+    "refactor",
+    "debug",
+    "perf",
+    "investigate",
+    "self_audit",
 }
 
 
@@ -52,11 +69,13 @@ def test_all_task_types_frozenset_matches_enum():
 
 def test_model_for_type_covers_all_task_types():
     from app.payload_schemas import _MODEL_FOR_TYPE
+
     assert set(_MODEL_FOR_TYPE.keys()) == set(TaskType)
 
 
 def test_model_for_type_count_is_18():
     from app.payload_schemas import _MODEL_FOR_TYPE
+
     assert len(_MODEL_FOR_TYPE) == 18
 
 
@@ -64,9 +83,17 @@ def test_model_for_type_count_is_18():
 # All 17 types pass with correct required fields
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("task_type", [
-    "create", "refactor", "plan", "migrate", "investigate",
-])
+
+@pytest.mark.parametrize(
+    "task_type",
+    [
+        "create",
+        "refactor",
+        "plan",
+        "migrate",
+        "investigate",
+    ],
+)
 def test_prompt_required_types_pass(task_type):
     result = _valid({"type": task_type, "prompt": "Do the thing"})
     assert result["type"] == task_type
@@ -80,15 +107,29 @@ def test_review_passes():
 
 
 def test_fix_passes():
-    result = _valid({"type": "fix", "prompt": "Fix it", "pr_number": 7, "branch": "main"})
+    result = _valid(
+        {"type": "fix", "prompt": "Fix it", "pr_number": 7, "branch": "main"}
+    )
     assert result["prompt"] == "Fix it"
     assert result["pr_number"] == 7
 
 
-@pytest.mark.parametrize("task_type", [
-    "debug", "research", "strategic_review", "design_doc_update",
-    "security_audit", "qa", "deps", "docs", "smoketest", "perf", "self_audit",
-])
+@pytest.mark.parametrize(
+    "task_type",
+    [
+        "debug",
+        "research",
+        "strategic_review",
+        "design_doc_update",
+        "security_audit",
+        "qa",
+        "deps",
+        "docs",
+        "smoketest",
+        "perf",
+        "self_audit",
+    ],
+)
 def test_system_populated_types_pass_with_no_extra_fields(task_type):
     result = _valid({"type": task_type})
     assert result["type"] == task_type
@@ -98,9 +139,17 @@ def test_system_populated_types_pass_with_no_extra_fields(task_type):
 # Missing required fields raise ValueError with type name in message
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("task_type", [
-    "create", "refactor", "plan", "migrate", "investigate",
-])
+
+@pytest.mark.parametrize(
+    "task_type",
+    [
+        "create",
+        "refactor",
+        "plan",
+        "migrate",
+        "investigate",
+    ],
+)
 def test_prompt_required_types_fail_without_prompt(task_type):
     msg = _invalid({"type": task_type})
     assert task_type in msg
@@ -135,6 +184,7 @@ def test_fix_fails_without_branch():
 # Unknown / missing type raises ValueError
 # ---------------------------------------------------------------------------
 
+
 def test_unknown_type_raises():
     msg = _invalid({"type": "nonexistent_type", "prompt": "x"})
     assert "nonexistent_type" in msg
@@ -149,6 +199,7 @@ def test_missing_type_field_raises():
 # ---------------------------------------------------------------------------
 # Extra fields are preserved (not stripped)
 # ---------------------------------------------------------------------------
+
 
 def test_extra_fields_preserved_create():
     raw = {
@@ -179,6 +230,7 @@ def test_extra_fields_preserved_research():
 # Branch name validation
 # ---------------------------------------------------------------------------
 
+
 def test_branch_with_dotdot_rejected():
     msg = _invalid({"type": "create", "prompt": "x", "base_branch": "main..evil"})
     assert "create" in msg
@@ -190,7 +242,9 @@ def test_branch_leading_dash_rejected():
 
 
 def test_branch_feature_slash_passes():
-    result = _valid({"type": "create", "prompt": "x", "base_branch": "feature/my-branch"})
+    result = _valid(
+        {"type": "create", "prompt": "x", "base_branch": "feature/my-branch"}
+    )
     assert result["base_branch"] == "feature/my-branch"
 
 
@@ -228,6 +282,7 @@ def test_reserved_git_component_rejected():
 # effort validation
 # ---------------------------------------------------------------------------
 
+
 def test_effort_ultra_rejected():
     msg = _invalid({"type": "create", "prompt": "x", "effort": "ultra"})
     assert "create" in msg
@@ -248,6 +303,7 @@ def test_standard_effort_values_accepted(effort):
 # Return type is plain dict, not Pydantic model
 # ---------------------------------------------------------------------------
 
+
 def test_returns_plain_dict():
     result = validate_task_payload({"type": "research"})
     assert type(result) is dict  # noqa: E721
@@ -256,6 +312,7 @@ def test_returns_plain_dict():
 # ---------------------------------------------------------------------------
 # Backward-compat patterns from existing backend code
 # ---------------------------------------------------------------------------
+
 
 def test_research_completion_pattern():
     """Pattern used by research_completion.py: type + prompt + base_branch + optional fields."""
@@ -307,6 +364,7 @@ def test_fix_pipeline_pattern():
 # validate_internal_payload — fail-open behaviour
 # ---------------------------------------------------------------------------
 
+
 def test_internal_payload_passes_valid():
     raw = {"type": "create", "prompt": "Do it"}
     result = validate_internal_payload(raw, "test_context")
@@ -315,6 +373,7 @@ def test_internal_payload_passes_valid():
 
 def test_internal_payload_returns_original_on_failure(caplog):
     import logging
+
     raw = {"type": "create"}  # missing prompt
     with caplog.at_level(logging.WARNING):
         result = validate_internal_payload(raw, "my_context")
@@ -324,6 +383,7 @@ def test_internal_payload_returns_original_on_failure(caplog):
 
 def test_internal_payload_logs_warning_on_failure(caplog):
     import logging
+
     raw = {"type": "totally_unknown_type"}
     with caplog.at_level(logging.WARNING):
         result = validate_internal_payload(raw, "ctx_label")
@@ -347,6 +407,7 @@ def test_internal_payload_does_not_raise_on_bad_input():
 # ---------------------------------------------------------------------------
 # New Optional typed fields — correct types accepted
 # ---------------------------------------------------------------------------
+
 
 def test_research_payload_optional_fields_accepted():
     raw = {
@@ -528,7 +589,9 @@ def test_fix_optional_fields_accepted():
 
 
 def test_fix_omit_optional_fields_passes():
-    result = _valid({"type": "fix", "prompt": "Fix it", "pr_number": 1, "branch": "main"})
+    result = _valid(
+        {"type": "fix", "prompt": "Fix it", "pr_number": 1, "branch": "main"}
+    )
     assert "original_task_id" not in result
     assert "original_prompt" not in result
 
@@ -560,6 +623,7 @@ def test_security_audit_omit_prompt_passes():
 # ---------------------------------------------------------------------------
 # Edge cases
 # ---------------------------------------------------------------------------
+
 
 def test_pr_number_zero_rejected_for_review():
     msg = _invalid({"type": "review", "pr_number": 0, "branch": "main"})
@@ -593,6 +657,7 @@ def test_type_preserved_in_output():
 # ---------------------------------------------------------------------------
 # Payload-size budget (prevents silent pre-claim death from oversized state)
 # ---------------------------------------------------------------------------
+
 
 def test_oversized_payload_raises_payload_too_large_error():
     """Payloads larger than _MAX_PAYLOAD_BYTES must fail validation hard."""
@@ -654,6 +719,7 @@ def test_validate_internal_payload_swallows_schema_errors():
 # SelfAuditPayload
 # ---------------------------------------------------------------------------
 
+
 def test_self_audit_passes_with_no_fields():
     result = _valid({"type": "self_audit"})
     assert result["type"] == "self_audit"
@@ -711,6 +777,7 @@ def test_self_audit_oversized_payload_raises():
 # SystemMaturity ORM constraint
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_system_maturity_unique_constraint_project_system(db_session):
     """Two SystemMaturity rows with the same (project_id, system_id) must violate the unique constraint."""
@@ -718,17 +785,23 @@ async def test_system_maturity_unique_constraint_project_system(db_session):
     from app.models import SystemMaturity
     from testing.factories import make_project
 
-    project = make_project(name="Maturity Constraint Test", user_id="test-user-maturity")
+    project = make_project(
+        name="Maturity Constraint Test", user_id="test-user-maturity"
+    )
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
 
     system_id = "sys-unique-constraint-check"
-    row1 = SystemMaturity(project_id=project.id, system_id=system_id, score=80, recommended_mode="ship")
+    row1 = SystemMaturity(
+        project_id=project.id, system_id=system_id, score=80, recommended_mode="ship"
+    )
     db_session.add(row1)
     await db_session.commit()
 
-    row2 = SystemMaturity(project_id=project.id, system_id=system_id, score=50, recommended_mode="audit")
+    row2 = SystemMaturity(
+        project_id=project.id, system_id=system_id, score=50, recommended_mode="audit"
+    )
     db_session.add(row2)
     with pytest.raises(IntegrityError):
         await db_session.commit()

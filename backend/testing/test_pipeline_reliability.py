@@ -9,6 +9,7 @@ Covers scenarios that could cause the pipeline to stall or waste resources over 
   5. CI polling retries on transient GitHub failure (500)
   6. Deadlock detection clears failed/cancelled dependencies
 """
+
 import asyncio
 import contextlib
 import pytest
@@ -29,11 +30,15 @@ from app.models import Project, Task, TaskStatus
 # ── SQLite JSONB compatibility ────────────────────────────────────────────────
 
 from sqlalchemy.dialects.sqlite.base import SQLiteTypeCompiler as _SQLiteTypeCompiler
+
 if not hasattr(_SQLiteTypeCompiler, "visit_JSONB"):
-    _SQLiteTypeCompiler.visit_JSONB = lambda self, type_, **kw: self.visit_JSON(type_, **kw)
+    _SQLiteTypeCompiler.visit_JSONB = lambda self, type_, **kw: self.visit_JSON(
+        type_, **kw
+    )
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
 
 def _naive_utc_ago(**kwargs) -> datetime:
     """Return a naive UTC datetime (no tzinfo) that is ``kwargs`` in the past."""
@@ -45,6 +50,7 @@ def _naive_utcnow() -> datetime:
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
+
 
 @pytest_asyncio.fixture()
 async def eval_db(mocker):
@@ -61,8 +67,11 @@ async def eval_db(mocker):
         await conn.run_sync(SQLModel.metadata.create_all)
 
     _Session = sessionmaker(
-        bind=_engine, class_=AsyncSession,
-        autocommit=False, autoflush=False, expire_on_commit=False,
+        bind=_engine,
+        class_=AsyncSession,
+        autocommit=False,
+        autoflush=False,
+        expire_on_commit=False,
     )
     mocker.patch("app.services.AsyncSessionLocal", _Session)
 
@@ -92,8 +101,11 @@ async def orch_db(mocker):
         await conn.run_sync(SQLModel.metadata.create_all)
 
     _Session = sessionmaker(
-        bind=_engine, class_=AsyncSession,
-        autocommit=False, autoflush=False, expire_on_commit=False,
+        bind=_engine,
+        class_=AsyncSession,
+        autocommit=False,
+        autoflush=False,
+        expire_on_commit=False,
     )
 
     mocker.patch("app.orchestrator.AsyncSessionLocal", _Session)
@@ -106,7 +118,9 @@ async def orch_db(mocker):
     mocker.patch("app.main.select_max_plan_account", new_callable=AsyncMock)
     mocker.patch("app.main.release_max_plan_account", new_callable=AsyncMock)
     mocker.patch("app.main.recheck_disabled_accounts", new_callable=AsyncMock)
-    mocker.patch("app.routers.agent_status.record_task_result")  # sync function, no AsyncMock needed
+    mocker.patch(
+        "app.routers.agent_status.record_task_result"
+    )  # sync function, no AsyncMock needed
     mocker.patch("app.deploy_health._check_monitoring_window", new_callable=AsyncMock)
     mocker.patch("app.deploy_health._check_external_health", new_callable=AsyncMock)
     mocker.patch("app.deploy_health._check_pause_mode", new_callable=AsyncMock)
@@ -150,6 +164,7 @@ async def _run_one_cycle(mocker):
 # Test 1 — Backoff escalation
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 @pytest.mark.asyncio
 async def test_orchestrator_backoff_escalates_on_consecutive_errors(mocker):
     """After N consecutive errors, backoff = min(0.5 * 2^(N-1), 60).
@@ -186,7 +201,10 @@ async def test_orchestrator_backoff_escalates_on_consecutive_errors(mocker):
             raise _StopAfter3()
 
     # Force the main try-block to fail by making the DB session raise
-    mocker.patch("app.orchestrator.AsyncSessionLocal", side_effect=RuntimeError("simulated DB error"))
+    mocker.patch(
+        "app.orchestrator.AsyncSessionLocal",
+        side_effect=RuntimeError("simulated DB error"),
+    )
     mocker.patch("asyncio.sleep", side_effect=_capturing_sleep)
     mocker.patch("app.deploy_health._check_monitoring_window", new_callable=AsyncMock)
     mocker.patch("app.deploy_health._check_external_health", new_callable=AsyncMock)
@@ -217,7 +235,9 @@ async def test_orchestrator_backoff_escalates_on_consecutive_errors(mocker):
         f"Expected 3 sleep calls (one per error cycle), got {len(sleep_calls)}: {sleep_calls}"
     )
     # Backoffs include ±20% jitter, so check ranges instead of exact values
-    assert 0.4 <= sleep_calls[0] <= 0.6, f"Error 1: expected ~0.5s, got {sleep_calls[0]}s"
+    assert 0.4 <= sleep_calls[0] <= 0.6, (
+        f"Error 1: expected ~0.5s, got {sleep_calls[0]}s"
+    )
     assert 0.8 <= sleep_calls[1] <= 1.2, (
         f"Error 2: expected ~1.0s, got {sleep_calls[1]}s. "
         f"If ~0.5, the counter is being reset at the start of each cycle (the bug)."
@@ -232,6 +252,7 @@ async def test_orchestrator_backoff_escalates_on_consecutive_errors(mocker):
 # Test 2 — EVALUATING timeout cascades cancel to children
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 @pytest.mark.asyncio
 async def test_evaluating_timeout_cascades_cancel_to_children(eval_db, mocker):
     """When a parent EVALUATING task times out (>6h), all non-terminal children
@@ -241,6 +262,7 @@ async def test_evaluating_timeout_cascades_cancel_to_children(eval_db, mocker):
     # Pin the backstop to 6h for this test (production default is 48h while
     # silent-death stabilizes; tests still validate the 6h boundary behavior).
     from app.shared_state import runtime_config as _rc
+
     mocker.patch.dict(_rc, {"evaluating_fail_hours": 6})
 
     project = Project(name="Cascade Cancel Test", user_id="user1")
@@ -260,7 +282,10 @@ async def test_evaluating_timeout_cascades_cancel_to_children(eval_db, mocker):
     # Set parent to appear 7 hours into EVALUATING
     evaluating_since = _naive_utc_ago(hours=7)
     parent.status_log = [
-        {"t": evaluating_since.isoformat(), "msg": "Status changed: IN_PROGRESS → EVALUATING"}
+        {
+            "t": evaluating_since.isoformat(),
+            "msg": "Status changed: IN_PROGRESS → EVALUATING",
+        }
     ]
     eval_db.add(parent)
     await eval_db.commit()
@@ -307,10 +332,10 @@ async def test_evaluating_timeout_cascades_cancel_to_children(eval_db, mocker):
     )
 
     for child in (child_queued, child_provisioning, child_in_progress):
-        assert "cancelled" in (child.latest_status_message or "").lower() or \
-               "timed out" in (child.latest_status_message or "").lower(), (
-            f"Expected cancel message, got: {child.latest_status_message!r}"
-        )
+        assert (
+            "cancelled" in (child.latest_status_message or "").lower()
+            or "timed out" in (child.latest_status_message or "").lower()
+        ), f"Expected cancel message, got: {child.latest_status_message!r}"
 
     # Parent itself should be FAILED
     await eval_db.refresh(parent)
@@ -322,6 +347,7 @@ async def test_evaluating_timeout_cascades_cancel_to_children(eval_db, mocker):
 # ══════════════════════════════════════════════════════════════════════════════
 # Test 3 — Reaper uses fresh task for provision_failures
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 @pytest.mark.asyncio
 async def test_reaper_uses_fresh_task_for_modifications(orch_db, mocker):
@@ -358,6 +384,7 @@ async def test_reaper_uses_fresh_task_for_modifications(orch_db, mocker):
     # Re-read the task from the DB to see the updated state
     async with _Session() as verify_session:
         from sqlmodel import select as _select
+
         result = await verify_session.execute(_select(Task).where(Task.id == task_id))
         updated = result.scalars().first()
 
@@ -407,7 +434,9 @@ async def test_stale_provision_failure_creates_alert(orch_db, mocker):
     await session.refresh(stale_task)
 
     # Re-patch alert so we can assert on it (overrides the fixture's no-op mock)
-    alert_mock = mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    alert_mock = mocker.patch(
+        "app.main._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     await _run_one_cycle(mocker)
 
     alert_mock.assert_called_once()
@@ -479,13 +508,13 @@ async def test_stale_provisioning_captures_serial_before_vm_delete(orch_db, mock
     delete_mock.assert_called_once()
     deleted_vm = delete_mock.call_args[0][0]
     assert deleted_vm == "agent-vm-serial-001", (
-        f"Expected the stale VM 'agent-vm-serial-001' to be deleted, "
-        f"got {deleted_vm!r}"
+        f"Expected the stale VM 'agent-vm-serial-001' to be deleted, got {deleted_vm!r}"
     )
 
     # --- 3. Captured serial is persisted on the task ---
     async with _Session() as verify_session:
         from sqlmodel import select as _select
+
         result = await verify_session.execute(_select(Task).where(Task.id == task_id))
         updated = result.scalars().first()
 
@@ -504,9 +533,11 @@ async def test_stale_provisioning_captures_serial_before_vm_delete(orch_db, mock
         f"got: {saved!r}"
     )
 
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Test 4 — CI polling fails task on deleted PR (404)
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 @pytest.mark.asyncio
 async def test_ci_polling_deleted_pr_fails_task(orch_db, mocker):
@@ -549,15 +580,19 @@ async def test_ci_polling_deleted_pr_fails_task(orch_db, mocker):
     class _NotFoundError(Exception):
         status_code = 404
 
-    mocker.patch("app.routers.agent.get_github_token_for_task",
-                 return_value=("fake-token", "owner", "repo"))
-    mocker.patch("app.github.get_pull_request",
-                 side_effect=_NotFoundError("PR not found"))
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        return_value=("fake-token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request", side_effect=_NotFoundError("PR not found")
+    )
 
     await _run_one_cycle(mocker)
 
     async with _Session() as verify_session:
         from sqlmodel import select as _select
+
         result = await verify_session.execute(_select(Task).where(Task.id == task_id))
         updated = result.scalars().first()
 
@@ -583,7 +618,9 @@ async def test_ci_polling_deleted_pr_creates_alert(orch_db, mocker):
 
     ci_task = Task(
         project_id=project.id,
-        payloads=[{"type": "create", "prompt": "ci alert test", "branch": "feat/alert"}],
+        payloads=[
+            {"type": "create", "prompt": "ci alert test", "branch": "feat/alert"}
+        ],
         status=TaskStatus.EVALUATING,
         context={
             "review_loop": {
@@ -602,13 +639,18 @@ async def test_ci_polling_deleted_pr_creates_alert(orch_db, mocker):
     class _NotFoundError(Exception):
         status_code = 404
 
-    mocker.patch("app.routers.agent.get_github_token_for_task",
-                 return_value=("fake-token", "owner", "repo"))
-    mocker.patch("app.github.get_pull_request",
-                 side_effect=_NotFoundError("PR not found"))
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        return_value=("fake-token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request", side_effect=_NotFoundError("PR not found")
+    )
 
     # Re-patch alert so we can assert on it (overrides the fixture's no-op mock)
-    alert_mock = mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    alert_mock = mocker.patch(
+        "app.main._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     await _run_one_cycle(mocker)
 
     alert_mock.assert_called_once()
@@ -634,7 +676,9 @@ async def test_ci_polling_closed_without_merge_fails_task(orch_db, mocker):
 
     ci_task = Task(
         project_id=project.id,
-        payloads=[{"type": "create", "prompt": "ci closed task", "branch": "feat/closed"}],
+        payloads=[
+            {"type": "create", "prompt": "ci closed task", "branch": "feat/closed"}
+        ],
         status=TaskStatus.EVALUATING,
         context={
             "review_loop": {
@@ -651,18 +695,29 @@ async def test_ci_polling_closed_without_merge_fails_task(orch_db, mocker):
     await session.refresh(ci_task)
     task_id = ci_task.id
 
-    mocker.patch("app.routers.agent.get_github_token_for_task",
-                 return_value=("fake-token", "owner", "repo"))
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        return_value=("fake-token", "owner", "repo"),
+    )
     # Closed without being merged — human or bot intervention
-    mocker.patch("app.github.get_pull_request",
-                 return_value={"state": "closed", "merged": False,
-                               "head": {"sha": "abc123"}, "mergeable": None})
+    mocker.patch(
+        "app.github.get_pull_request",
+        return_value={
+            "state": "closed",
+            "merged": False,
+            "head": {"sha": "abc123"},
+            "mergeable": None,
+        },
+    )
 
-    alert_mock = mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    alert_mock = mocker.patch(
+        "app.main._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     await _run_one_cycle(mocker)
 
     async with _Session() as verify_session:
         from sqlmodel import select as _select
+
         result = await verify_session.execute(_select(Task).where(Task.id == task_id))
         updated = result.scalars().first()
 
@@ -671,7 +726,9 @@ async def test_ci_polling_closed_without_merge_fails_task(orch_db, mocker):
         f"Expected task to be FAILED when PR closed without merge, got {updated.status}. "
         f"Status message: {updated.latest_status_message!r}"
     )
-    assert "closed without being merged" in (updated.latest_status_message or "").lower()
+    assert (
+        "closed without being merged" in (updated.latest_status_message or "").lower()
+    )
     assert not (updated.context or {}).get("pr_merged"), (
         "pr_merged must not be set when PR was closed without merging"
     )
@@ -698,7 +755,9 @@ async def test_ci_polling_pending_reopen_retry_escalates(orch_db, mocker):
 
     ci_task = Task(
         project_id=project.id,
-        payloads=[{"type": "create", "prompt": "ci reopen task", "branch": "feat/reopen"}],
+        payloads=[
+            {"type": "create", "prompt": "ci reopen task", "branch": "feat/reopen"}
+        ],
         status=TaskStatus.EVALUATING,
         context={
             "review_loop": {
@@ -716,22 +775,40 @@ async def test_ci_polling_pending_reopen_retry_escalates(orch_db, mocker):
     await session.refresh(ci_task)
     task_id = ci_task.id
 
-    mocker.patch("app.routers.agent.get_github_token_for_task",
-                 return_value=("fake-token", "owner", "repo"))
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        return_value=("fake-token", "owner", "repo"),
+    )
     # Simulate a closed PR that needs reopening; reopen always fails
-    mocker.patch("app.github.get_pull_request",
-                 return_value={"state": "closed", "merged": False,
-                               "head": {"sha": "abc123"}, "mergeable": None})
-    reopen_mock = mocker.patch("app.github.reopen_pull_request",
-                               new_callable=AsyncMock, return_value=False)
-    alert_mock = mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.github.get_pull_request",
+        return_value={
+            "state": "closed",
+            "merged": False,
+            "head": {"sha": "abc123"},
+            "mergeable": None,
+        },
+    )
+    reopen_mock = mocker.patch(
+        "app.github.reopen_pull_request", new_callable=AsyncMock, return_value=False
+    )
+    alert_mock = mocker.patch(
+        "app.main._maybe_create_failure_alert", new_callable=AsyncMock
+    )
 
     # Run cycle 1 — counter = 1, no alert yet
     await _run_one_cycle(mocker)
     async with _Session() as verify:
         from sqlmodel import select as _select
-        t = (await verify.execute(_select(Task).where(Task.id == task_id))).scalars().first()
-    assert t.status == TaskStatus.EVALUATING, "Should still be EVALUATING after 1 attempt"
+
+        t = (
+            (await verify.execute(_select(Task).where(Task.id == task_id)))
+            .scalars()
+            .first()
+        )
+    assert t.status == TaskStatus.EVALUATING, (
+        "Should still be EVALUATING after 1 attempt"
+    )
     assert (t.context or {}).get("review_loop", {}).get("reopen_attempts") == 1, (
         f"reopen_attempts should be 1, got {(t.context or {}).get('review_loop', {}).get('reopen_attempts')}"
     )
@@ -743,7 +820,12 @@ async def test_ci_polling_pending_reopen_retry_escalates(orch_db, mocker):
         await _run_one_cycle(mocker)
     async with _Session() as verify:
         from sqlmodel import select as _select
-        t = (await verify.execute(_select(Task).where(Task.id == task_id))).scalars().first()
+
+        t = (
+            (await verify.execute(_select(Task).where(Task.id == task_id)))
+            .scalars()
+            .first()
+        )
     assert t.status == TaskStatus.EVALUATING, "Should still be EVALUATING at threshold"
     assert (t.context or {}).get("review_loop", {}).get("reopen_attempts") == 5
     assert (t.context or {}).get("review_loop", {}).get("reopen_alert_fired") is True
@@ -766,7 +848,12 @@ async def test_ci_polling_pending_reopen_retry_escalates(orch_db, mocker):
     await _run_one_cycle(mocker)
     async with _Session() as verify:
         from sqlmodel import select as _select
-        t = (await verify.execute(_select(Task).where(Task.id == task_id))).scalars().first()
+
+        t = (
+            (await verify.execute(_select(Task).where(Task.id == task_id)))
+            .scalars()
+            .first()
+        )
     assert t.status == TaskStatus.FAILED, (
         f"Should escalate to FAILED at cap (10 attempts), got {t.status}"
     )
@@ -778,9 +865,9 @@ async def test_ci_polling_pending_reopen_retry_escalates(orch_db, mocker):
         f"Cap escalation should fire a second alert, got {alert_mock.call_count}"
     )
     cap_alert_msg = alert_mock.call_args_list[1][0][2]
-    assert "cap" in cap_alert_msg.lower() or "manual intervention" in cap_alert_msg.lower(), (
-        f"Cap alert should mention escalation, got: {cap_alert_msg!r}"
-    )
+    assert (
+        "cap" in cap_alert_msg.lower() or "manual intervention" in cap_alert_msg.lower()
+    ), f"Cap alert should mention escalation, got: {cap_alert_msg!r}"
     # reopen_pull_request was attempted on every failed cycle
     assert reopen_mock.call_count == 10, (
         f"reopen_pull_request should be called once per cycle, got {reopen_mock.call_count}"
@@ -801,7 +888,9 @@ async def test_ci_polling_pending_reopen_success_resets_counter(orch_db, mocker)
 
     ci_task = Task(
         project_id=project.id,
-        payloads=[{"type": "create", "prompt": "ci reopen reset", "branch": "feat/reset"}],
+        payloads=[
+            {"type": "create", "prompt": "ci reopen reset", "branch": "feat/reset"}
+        ],
         status=TaskStatus.EVALUATING,
         context={
             "review_loop": {
@@ -821,22 +910,38 @@ async def test_ci_polling_pending_reopen_success_resets_counter(orch_db, mocker)
     await session.refresh(ci_task)
     task_id = ci_task.id
 
-    mocker.patch("app.routers.agent.get_github_token_for_task",
-                 return_value=("fake-token", "owner", "repo"))
-    mocker.patch("app.github.get_pull_request",
-                 return_value={"state": "closed", "merged": False,
-                               "head": {"sha": "abc123"}, "mergeable": None})
-    mocker.patch("app.github.reopen_pull_request",
-                 new_callable=AsyncMock, return_value=True)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        return_value=("fake-token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        return_value={
+            "state": "closed",
+            "merged": False,
+            "head": {"sha": "abc123"},
+            "mergeable": None,
+        },
+    )
+    mocker.patch(
+        "app.github.reopen_pull_request", new_callable=AsyncMock, return_value=True
+    )
 
     await _run_one_cycle(mocker)
 
     async with _Session() as verify:
         from sqlmodel import select as _select
-        t = (await verify.execute(_select(Task).where(Task.id == task_id))).scalars().first()
+
+        t = (
+            (await verify.execute(_select(Task).where(Task.id == task_id)))
+            .scalars()
+            .first()
+        )
 
     rl = (t.context or {}).get("review_loop", {})
-    assert rl.get("pending_reopen") is False, "pending_reopen should be cleared on success"
+    assert rl.get("pending_reopen") is False, (
+        "pending_reopen should be cleared on success"
+    )
     assert rl.get("reopen_attempts") == 0, (
         f"reopen_attempts should reset to 0 on success, got {rl.get('reopen_attempts')}"
     )
@@ -860,7 +965,9 @@ async def test_ci_polling_merged_pr_marks_completed(orch_db, mocker):
 
     ci_task = Task(
         project_id=project.id,
-        payloads=[{"type": "create", "prompt": "ci merged task", "branch": "feat/merged"}],
+        payloads=[
+            {"type": "create", "prompt": "ci merged task", "branch": "feat/merged"}
+        ],
         status=TaskStatus.EVALUATING,
         context={
             "review_loop": {
@@ -877,16 +984,25 @@ async def test_ci_polling_merged_pr_marks_completed(orch_db, mocker):
     await session.refresh(ci_task)
     task_id = ci_task.id
 
-    mocker.patch("app.routers.agent.get_github_token_for_task",
-                 return_value=("fake-token", "owner", "repo"))
-    mocker.patch("app.github.get_pull_request",
-                 return_value={"state": "closed", "merged": True,
-                               "head": {"sha": "def456"}, "mergeable": None})
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        return_value=("fake-token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        return_value={
+            "state": "closed",
+            "merged": True,
+            "head": {"sha": "def456"},
+            "mergeable": None,
+        },
+    )
 
     await _run_one_cycle(mocker)
 
     async with _Session() as verify_session:
         from sqlmodel import select as _select
+
         result = await verify_session.execute(_select(Task).where(Task.id == task_id))
         updated = result.scalars().first()
 
@@ -902,6 +1018,7 @@ async def test_ci_polling_merged_pr_marks_completed(orch_db, mocker):
 # ══════════════════════════════════════════════════════════════════════════════
 # Test 5 — CI polling transient failure retries
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 @pytest.mark.asyncio
 async def test_ci_polling_transient_failure_retries(orch_db, mocker):
@@ -919,7 +1036,9 @@ async def test_ci_polling_transient_failure_retries(orch_db, mocker):
 
     ci_task = Task(
         project_id=project.id,
-        payloads=[{"type": "create", "prompt": "ci retry task", "branch": "feat/retry"}],
+        payloads=[
+            {"type": "create", "prompt": "ci retry task", "branch": "feat/retry"}
+        ],
         status=TaskStatus.EVALUATING,
         context={
             "review_loop": {
@@ -940,15 +1059,19 @@ async def test_ci_polling_transient_failure_retries(orch_db, mocker):
     class _ServerError(Exception):
         status_code = 500
 
-    mocker.patch("app.routers.agent.get_github_token_for_task",
-                 return_value=("fake-token", "owner", "repo"))
-    mocker.patch("app.github.get_pull_request",
-                 side_effect=_ServerError("Internal Server Error"))
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        return_value=("fake-token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request", side_effect=_ServerError("Internal Server Error")
+    )
 
     await _run_one_cycle(mocker)
 
     async with _Session() as verify_session:
         from sqlmodel import select as _select
+
         result = await verify_session.execute(_select(Task).where(Task.id == task_id))
         updated = result.scalars().first()
 
@@ -963,6 +1086,7 @@ async def test_ci_polling_transient_failure_retries(orch_db, mocker):
 # Test 5b — CI polling non-dirty mergeable_state deferral tracking
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 async def _make_ci_waiting_task(session, pr_number: int, project_name: str):
     project = Project(name=project_name, user_id="user1")
     session.add(project)
@@ -971,7 +1095,9 @@ async def _make_ci_waiting_task(session, pr_number: int, project_name: str):
 
     task = Task(
         project_id=project.id,
-        payloads=[{"type": "create", "prompt": "ci defer test", "branch": "feat/defer"}],
+        payloads=[
+            {"type": "create", "prompt": "ci defer test", "branch": "feat/defer"}
+        ],
         status=TaskStatus.EVALUATING,
         context={
             "review_loop": {
@@ -996,22 +1122,39 @@ async def test_ci_polling_non_dirty_state_tracks_deferral_and_alerts(orch_db, mo
     when the per-state threshold is crossed (10 for blocked/unstable).
     """
     session, _Session = orch_db
-    task = await _make_ci_waiting_task(session, pr_number=551, project_name="CI Defer Blocked")
+    task = await _make_ci_waiting_task(
+        session, pr_number=551, project_name="CI Defer Blocked"
+    )
     task_id = task.id
 
-    mocker.patch("app.routers.agent.get_github_token_for_task",
-                 return_value=("fake-token", "owner", "repo"))
-    mocker.patch("app.github.get_pull_request",
-                 return_value={"state": "open", "merged": False,
-                               "mergeable": False, "mergeable_state": "blocked",
-                               "head": {"sha": "sha-blocked"}})
-    alert_mock = mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        return_value=("fake-token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        return_value={
+            "state": "open",
+            "merged": False,
+            "mergeable": False,
+            "mergeable_state": "blocked",
+            "head": {"sha": "sha-blocked"},
+        },
+    )
+    alert_mock = mocker.patch(
+        "app.main._maybe_create_failure_alert", new_callable=AsyncMock
+    )
 
     from sqlmodel import select as _select
+
     for expected_count in range(1, 11):
         await _run_one_cycle(mocker)
         async with _Session() as verify:
-            t = (await verify.execute(_select(Task).where(Task.id == task_id))).scalars().first()
+            t = (
+                (await verify.execute(_select(Task).where(Task.id == task_id)))
+                .scalars()
+                .first()
+            )
         rl = (t.context or {}).get("review_loop", {})
         assert rl.get("_conflict_deferred_count") == expected_count, (
             f"sweep {expected_count}: expected _conflict_deferred_count={expected_count}, "
@@ -1032,17 +1175,26 @@ async def test_ci_polling_state_change_resets_deferral_counter(orch_db, mocker):
     """When mergeable_state changes between sweeps, the deferral counter must
     reset to 1 so transient flapping does not accidentally escalate."""
     session, _Session = orch_db
-    task = await _make_ci_waiting_task(session, pr_number=552, project_name="CI Defer Flap")
+    task = await _make_ci_waiting_task(
+        session, pr_number=552, project_name="CI Defer Flap"
+    )
     task_id = task.id
 
     pr_state = {"ms": "blocked"}
 
     async def _fake_pr(*_a, **_kw):
-        return {"state": "open", "merged": False, "mergeable": False,
-                "mergeable_state": pr_state["ms"], "head": {"sha": "sha-flap"}}
+        return {
+            "state": "open",
+            "merged": False,
+            "mergeable": False,
+            "mergeable_state": pr_state["ms"],
+            "head": {"sha": "sha-flap"},
+        }
 
-    mocker.patch("app.routers.agent.get_github_token_for_task",
-                 return_value=("fake-token", "owner", "repo"))
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        return_value=("fake-token", "owner", "repo"),
+    )
     mocker.patch("app.github.get_pull_request", side_effect=_fake_pr)
 
     from sqlmodel import select as _select
@@ -1051,14 +1203,22 @@ async def test_ci_polling_state_change_resets_deferral_counter(orch_db, mocker):
     await _run_one_cycle(mocker)
     await _run_one_cycle(mocker)
     async with _Session() as verify:
-        t = (await verify.execute(_select(Task).where(Task.id == task_id))).scalars().first()
+        t = (
+            (await verify.execute(_select(Task).where(Task.id == task_id)))
+            .scalars()
+            .first()
+        )
     assert (t.context or {}).get("review_loop", {}).get("_conflict_deferred_count") == 2
 
     # Switch to unstable → counter resets to 1 on state change
     pr_state["ms"] = "unstable"
     await _run_one_cycle(mocker)
     async with _Session() as verify:
-        t = (await verify.execute(_select(Task).where(Task.id == task_id))).scalars().first()
+        t = (
+            (await verify.execute(_select(Task).where(Task.id == task_id)))
+            .scalars()
+            .first()
+        )
     rl = (t.context or {}).get("review_loop", {})
     assert rl.get("_conflict_deferred_count") == 1
     assert rl.get("_conflict_deferred_state") == "unstable"
@@ -1070,22 +1230,39 @@ async def test_ci_polling_unrecognized_state_uses_lower_threshold(orch_db, mocke
     the known blocked/unstable states, since they indicate GitHub can't compute
     mergeability or returned a value we don't understand."""
     session, _Session = orch_db
-    task = await _make_ci_waiting_task(session, pr_number=553, project_name="CI Defer Unknown")
+    task = await _make_ci_waiting_task(
+        session, pr_number=553, project_name="CI Defer Unknown"
+    )
     task_id = task.id
 
-    mocker.patch("app.routers.agent.get_github_token_for_task",
-                 return_value=("fake-token", "owner", "repo"))
-    mocker.patch("app.github.get_pull_request",
-                 return_value={"state": "open", "merged": False,
-                               "mergeable": False, "mergeable_state": "unknown",
-                               "head": {"sha": "sha-unknown"}})
-    alert_mock = mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        return_value=("fake-token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        return_value={
+            "state": "open",
+            "merged": False,
+            "mergeable": False,
+            "mergeable_state": "unknown",
+            "head": {"sha": "sha-unknown"},
+        },
+    )
+    alert_mock = mocker.patch(
+        "app.main._maybe_create_failure_alert", new_callable=AsyncMock
+    )
 
     from sqlmodel import select as _select
+
     for expected_count in range(1, 6):
         await _run_one_cycle(mocker)
         async with _Session() as verify:
-            t = (await verify.execute(_select(Task).where(Task.id == task_id))).scalars().first()
+            t = (
+                (await verify.execute(_select(Task).where(Task.id == task_id)))
+                .scalars()
+                .first()
+            )
         rl = (t.context or {}).get("review_loop", {})
         assert rl.get("_conflict_deferred_count") == expected_count
         expected_alerts = 1 if expected_count >= 5 else 0
@@ -1100,7 +1277,9 @@ async def test_ci_polling_unrecognized_state_uses_lower_threshold(orch_db, mocke
     ["blocked", "unknown", "unstable", "weird_new_state"],
 )
 async def test_ci_polling_non_dirty_state_continues_without_fix_spawn(
-    orch_db, mocker, mergeable_state,
+    orch_db,
+    mocker,
+    mergeable_state,
 ):
     """When a CI-waiting PR reports mergeable=False with a non-'dirty'
     mergeable_state (blocked / unknown / unstable / unrecognized), the
@@ -1121,8 +1300,14 @@ async def test_ci_polling_non_dirty_state_continues_without_fix_spawn(
 
     ci_task = Task(
         project_id=project.id,
-        payloads=[{"type": "create", "prompt": "ci polling task",
-                   "branch": "feat/non-dirty", "base_branch": "main"}],
+        payloads=[
+            {
+                "type": "create",
+                "prompt": "ci polling task",
+                "branch": "feat/non-dirty",
+                "base_branch": "main",
+            }
+        ],
         status=TaskStatus.EVALUATING,
         context={
             "review_loop": {
@@ -1139,26 +1324,37 @@ async def test_ci_polling_non_dirty_state_continues_without_fix_spawn(
     await session.refresh(ci_task)
     task_id = ci_task.id
 
-    mocker.patch("app.routers.agent.get_github_token_for_task",
-                 return_value=("fake-token", "owner", "repo"))
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        return_value=("fake-token", "owner", "repo"),
+    )
     # Open PR, mergeable=False, non-dirty state → polling must continue.
-    mocker.patch("app.github.get_pull_request",
-                 return_value={"state": "open", "merged": False,
-                               "mergeable": False,
-                               "mergeable_state": mergeable_state,
-                               "head": {"sha": "abc123"}})
+    mocker.patch(
+        "app.github.get_pull_request",
+        return_value={
+            "state": "open",
+            "merged": False,
+            "mergeable": False,
+            "mergeable_state": mergeable_state,
+            "head": {"sha": "abc123"},
+        },
+    )
     # The orchestrator imports _spawn_pipeline_task from app.review_pipeline at
     # call time; patching the source module catches any invocation.
-    spawn_mock = mocker.patch("app.review_pipeline._spawn_pipeline_task",
-                              new_callable=AsyncMock)
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task", new_callable=AsyncMock
+    )
 
     await _run_one_cycle(mocker)
 
     async with _Session() as verify:
         from sqlmodel import select as _select
-        updated = (await verify.execute(
-            _select(Task).where(Task.id == task_id)
-        )).scalars().first()
+
+        updated = (
+            (await verify.execute(_select(Task).where(Task.id == task_id)))
+            .scalars()
+            .first()
+        )
         all_tasks = (await verify.execute(_select(Task))).scalars().all()
 
     assert updated is not None
@@ -1185,36 +1381,57 @@ async def test_ci_polling_non_dirty_state_continues_without_fix_spawn(
 # Test 5c — CI polling 'behind' update-branch retry budget
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 @pytest.mark.asyncio
 async def test_ci_polling_behind_update_branch_failure_defers_without_fix_spawn(
-    orch_db, mocker,
+    orch_db,
+    mocker,
 ):
     """When CI polling sees mergeable_state='behind' and update_branch fails
     transiently, the orchestrator must defer to the next sweep (track a retry
     counter) rather than burning a fix iteration. A single transient API
     failure must not cost a review/fix cycle."""
     session, _Session = orch_db
-    task = await _make_ci_waiting_task(session, pr_number=601, project_name="CI Behind Defer")
+    task = await _make_ci_waiting_task(
+        session, pr_number=601, project_name="CI Behind Defer"
+    )
     task_id = task.id
 
-    mocker.patch("app.routers.agent.get_github_token_for_task",
-                 return_value=("fake-token", "owner", "repo"))
-    mocker.patch("app.github.get_pull_request",
-                 return_value={"state": "open", "merged": False,
-                               "mergeable": False, "mergeable_state": "behind",
-                               "head": {"sha": "sha-behind"}})
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        return_value=("fake-token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        return_value={
+            "state": "open",
+            "merged": False,
+            "mergeable": False,
+            "mergeable_state": "behind",
+            "head": {"sha": "sha-behind"},
+        },
+    )
     update_mock = mocker.patch(
         "app.github.update_branch_with_sha_retry",
         new=AsyncMock(return_value={"updated": False, "message": "GitHub 500 temp"}),
     )
-    spawn_mock = mocker.patch("app.review_pipeline._spawn_pipeline_task", new_callable=AsyncMock)
-    alert_mock = mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task", new_callable=AsyncMock
+    )
+    alert_mock = mocker.patch(
+        "app.main._maybe_create_failure_alert", new_callable=AsyncMock
+    )
 
     await _run_one_cycle(mocker)
 
     from sqlmodel import select as _select
+
     async with _Session() as verify:
-        t = (await verify.execute(_select(Task).where(Task.id == task_id))).scalars().first()
+        t = (
+            (await verify.execute(_select(Task).where(Task.id == task_id)))
+            .scalars()
+            .first()
+        )
 
     assert t.status == TaskStatus.EVALUATING
     rl = (t.context or {}).get("review_loop", {})
@@ -1229,44 +1446,67 @@ async def test_ci_polling_behind_update_branch_failure_defers_without_fix_spawn(
 
 @pytest.mark.asyncio
 async def test_ci_polling_behind_update_branch_exhausted_spawns_fix_with_alert(
-    orch_db, mocker,
+    orch_db,
+    mocker,
 ):
     """Once the behind-update retry budget is exhausted, the orchestrator falls
     through to fix spawn AND fires an alert. The fix prompt must describe the
     behind state, not nonexistent merge conflicts."""
     session, _Session = orch_db
     # Tight budget keeps the test compact.
-    mocker.patch.dict("app.shared_state.runtime_config", {"ci_behind_update_retries": 2})
+    mocker.patch.dict(
+        "app.shared_state.runtime_config", {"ci_behind_update_retries": 2}
+    )
 
-    task = await _make_ci_waiting_task(session, pr_number=602, project_name="CI Behind Exhaust")
+    task = await _make_ci_waiting_task(
+        session, pr_number=602, project_name="CI Behind Exhaust"
+    )
     task_id = task.id
 
-    mocker.patch("app.routers.agent.get_github_token_for_task",
-                 return_value=("fake-token", "owner", "repo"))
-    mocker.patch("app.github.get_pull_request",
-                 return_value={"state": "open", "merged": False,
-                               "mergeable": False, "mergeable_state": "behind",
-                               "head": {"sha": "sha-behind-2"}})
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        return_value=("fake-token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        return_value={
+            "state": "open",
+            "merged": False,
+            "mergeable": False,
+            "mergeable_state": "behind",
+            "head": {"sha": "sha-behind-2"},
+        },
+    )
     mocker.patch(
         "app.github.update_branch_with_sha_retry",
         new=AsyncMock(return_value={"updated": False, "message": "GitHub 500 temp"}),
     )
-    mocker.patch("app.github.get_check_runs_cached",
-                 new=AsyncMock(return_value={"status": "in_progress"}))
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(return_value={"status": "in_progress"}),
+    )
     # A truthy fix_task is needed for the spawn-success branch — the orchestrator
     # only reads .id from the returned object.
     from types import SimpleNamespace
+
     spawn_mock = mocker.patch(
         "app.review_pipeline._spawn_pipeline_task",
         new=AsyncMock(return_value=(SimpleNamespace(id="fix-task-7"), True)),
     )
-    alert_mock = mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    alert_mock = mocker.patch(
+        "app.main._maybe_create_failure_alert", new_callable=AsyncMock
+    )
 
     # Sweep 1 — counter=1, defers under budget
     await _run_one_cycle(mocker)
     from sqlmodel import select as _select
+
     async with _Session() as verify:
-        t = (await verify.execute(_select(Task).where(Task.id == task_id))).scalars().first()
+        t = (
+            (await verify.execute(_select(Task).where(Task.id == task_id)))
+            .scalars()
+            .first()
+        )
     assert (t.context or {}).get("review_loop", {}).get("_behind_update_retries") == 1
     spawn_mock.assert_not_called()
     alert_mock.assert_not_called()
@@ -1274,7 +1514,11 @@ async def test_ci_polling_behind_update_branch_exhausted_spawns_fix_with_alert(
     # Sweep 2 — counter would hit 2, meets budget, falls through to fix spawn + alert
     await _run_one_cycle(mocker)
     async with _Session() as verify:
-        t = (await verify.execute(_select(Task).where(Task.id == task_id))).scalars().first()
+        t = (
+            (await verify.execute(_select(Task).where(Task.id == task_id)))
+            .scalars()
+            .first()
+        )
 
     assert spawn_mock.await_count == 1, "fix task must spawn once budget is exhausted"
     assert alert_mock.await_count == 1
@@ -1291,13 +1535,16 @@ async def test_ci_polling_behind_update_branch_exhausted_spawns_fix_with_alert(
 
 @pytest.mark.asyncio
 async def test_ci_polling_behind_update_branch_success_clears_retry_counter(
-    orch_db, mocker,
+    orch_db,
+    mocker,
 ):
     """A prior transient update_branch failure leaves a counter in review_loop;
     when update_branch later succeeds, the counter must reset so a future
     behind state starts from zero."""
     session, _Session = orch_db
-    task = await _make_ci_waiting_task(session, pr_number=603, project_name="CI Behind Reset")
+    task = await _make_ci_waiting_task(
+        session, pr_number=603, project_name="CI Behind Reset"
+    )
     # Seed a prior retry counter.
     rl = dict((task.context or {}).get("review_loop", {}))
     rl["_behind_update_retries"] = 2
@@ -1306,23 +1553,38 @@ async def test_ci_polling_behind_update_branch_success_clears_retry_counter(
     await session.commit()
     task_id = task.id
 
-    mocker.patch("app.routers.agent.get_github_token_for_task",
-                 return_value=("fake-token", "owner", "repo"))
-    mocker.patch("app.github.get_pull_request",
-                 return_value={"state": "open", "merged": False,
-                               "mergeable": False, "mergeable_state": "behind",
-                               "head": {"sha": "sha-behind-3"}})
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        return_value=("fake-token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        return_value={
+            "state": "open",
+            "merged": False,
+            "mergeable": False,
+            "mergeable_state": "behind",
+            "head": {"sha": "sha-behind-3"},
+        },
+    )
     mocker.patch(
         "app.github.update_branch_with_sha_retry",
         new=AsyncMock(return_value={"updated": True, "message": "branch updated"}),
     )
-    spawn_mock = mocker.patch("app.review_pipeline._spawn_pipeline_task", new_callable=AsyncMock)
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task", new_callable=AsyncMock
+    )
 
     await _run_one_cycle(mocker)
 
     from sqlmodel import select as _select
+
     async with _Session() as verify:
-        t = (await verify.execute(_select(Task).where(Task.id == task_id))).scalars().first()
+        t = (
+            (await verify.execute(_select(Task).where(Task.id == task_id)))
+            .scalars()
+            .first()
+        )
     rl = (t.context or {}).get("review_loop", {})
     assert "_behind_update_retries" not in rl, (
         f"successful update_branch must clear the retry counter; got rl={rl!r}"
@@ -1335,10 +1597,13 @@ async def test_ci_polling_behind_update_branch_success_clears_retry_counter(
 # Test 5d — Rollup parent stays EVALUATING when conflict fix is spawned
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("fix_was_created", [True, False])
 async def test_ci_polling_rollup_parent_stays_evaluating_on_conflict_fix(
-    orch_db, mocker, fix_was_created,
+    orch_db,
+    mocker,
+    fix_was_created,
 ):
     """When the CI-waiting task is itself a rollup parent (``_is_rollup_review=True``
     with ``rollup_pr_number`` set and ``pr_merged`` unset), and the rollup PR is
@@ -1361,8 +1626,14 @@ async def test_ci_polling_rollup_parent_stays_evaluating_on_conflict_fix(
 
     rollup_parent = Task(
         project_id=project.id,
-        payloads=[{"type": "research", "prompt": "rollup parent",
-                   "branch": "rollup/feat-x", "base_branch": "main"}],
+        payloads=[
+            {
+                "type": "research",
+                "prompt": "rollup parent",
+                "branch": "rollup/feat-x",
+                "base_branch": "main",
+            }
+        ],
         status=TaskStatus.EVALUATING,
         context={
             "_is_rollup_review": True,
@@ -1383,21 +1654,33 @@ async def test_ci_polling_rollup_parent_stays_evaluating_on_conflict_fix(
     await session.refresh(rollup_parent)
     rollup_parent.context = {
         **rollup_parent.context,
-        "review_loop": {**rollup_parent.context["review_loop"],
-                        "original_task_id": str(rollup_parent.id)},
+        "review_loop": {
+            **rollup_parent.context["review_loop"],
+            "original_task_id": str(rollup_parent.id),
+        },
     }
     session.add(rollup_parent)
     await session.commit()
     task_id = rollup_parent.id
 
-    mocker.patch("app.routers.agent.get_github_token_for_task",
-                 return_value=("fake-token", "owner", "repo"))
-    mocker.patch("app.github.get_pull_request",
-                 return_value={"state": "open", "merged": False,
-                               "mergeable": False, "mergeable_state": "dirty",
-                               "head": {"sha": "conflictsha"}})
-    mocker.patch("app.github.get_check_runs_cached",
-                 new=AsyncMock(return_value={"status": "in_progress", "details": []}))
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        return_value=("fake-token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        return_value={
+            "state": "open",
+            "merged": False,
+            "mergeable": False,
+            "mergeable_state": "dirty",
+            "head": {"sha": "conflictsha"},
+        },
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(return_value={"status": "in_progress", "details": []}),
+    )
     # Return a fake fix task; ``fix_was_created=False`` simulates the
     # "existing fix continues" branch observed in the original incident.
     fake_fix = Task(
@@ -1417,9 +1700,12 @@ async def test_ci_polling_rollup_parent_stays_evaluating_on_conflict_fix(
 
     async with _Session() as verify:
         from sqlmodel import select as _select
-        updated = (await verify.execute(
-            _select(Task).where(Task.id == task_id)
-        )).scalars().first()
+
+        updated = (
+            (await verify.execute(_select(Task).where(Task.id == task_id)))
+            .scalars()
+            .first()
+        )
 
     assert updated is not None
     assert updated.status == TaskStatus.EVALUATING, (
@@ -1446,7 +1732,8 @@ async def test_ci_polling_rollup_parent_stays_evaluating_on_conflict_fix(
 
 @pytest.mark.asyncio
 async def test_ci_polling_non_rollup_task_completes_on_conflict_fix(
-    orch_db, mocker,
+    orch_db,
+    mocker,
 ):
     """Baseline counterpart to the rollup-parent test: a plain review/CI task
     (no ``_is_rollup_review`` and no ``rollup_pr_number``) MUST still be marked
@@ -1465,8 +1752,14 @@ async def test_ci_polling_non_rollup_task_completes_on_conflict_fix(
 
     ci_task = Task(
         project_id=project.id,
-        payloads=[{"type": "create", "prompt": "plain ci task",
-                   "branch": "feat/plain", "base_branch": "main"}],
+        payloads=[
+            {
+                "type": "create",
+                "prompt": "plain ci task",
+                "branch": "feat/plain",
+                "base_branch": "main",
+            }
+        ],
         status=TaskStatus.EVALUATING,
         context={
             "review_loop": {
@@ -1483,14 +1776,24 @@ async def test_ci_polling_non_rollup_task_completes_on_conflict_fix(
     await session.refresh(ci_task)
     task_id = ci_task.id
 
-    mocker.patch("app.routers.agent.get_github_token_for_task",
-                 return_value=("fake-token", "owner", "repo"))
-    mocker.patch("app.github.get_pull_request",
-                 return_value={"state": "open", "merged": False,
-                               "mergeable": False, "mergeable_state": "dirty",
-                               "head": {"sha": "plainsha"}})
-    mocker.patch("app.github.get_check_runs_cached",
-                 new=AsyncMock(return_value={"status": "in_progress", "details": []}))
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        return_value=("fake-token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        return_value={
+            "state": "open",
+            "merged": False,
+            "mergeable": False,
+            "mergeable_state": "dirty",
+            "head": {"sha": "plainsha"},
+        },
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(return_value={"status": "in_progress", "details": []}),
+    )
     fake_fix = Task(
         project_id=project.id,
         payloads=[{"type": "fix", "prompt": "plain fix", "pr_number": 777}],
@@ -1508,9 +1811,12 @@ async def test_ci_polling_non_rollup_task_completes_on_conflict_fix(
 
     async with _Session() as verify:
         from sqlmodel import select as _select
-        updated = (await verify.execute(
-            _select(Task).where(Task.id == task_id)
-        )).scalars().first()
+
+        updated = (
+            (await verify.execute(_select(Task).where(Task.id == task_id)))
+            .scalars()
+            .first()
+        )
 
     assert updated is not None
     assert updated.status == TaskStatus.COMPLETED, (
@@ -1523,6 +1829,7 @@ async def test_ci_polling_non_rollup_task_completes_on_conflict_fix(
 # ══════════════════════════════════════════════════════════════════════════════
 # Test 6 — Deadlock detection clears failed dependencies
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 @pytest.mark.asyncio
 async def test_deadlock_detection_clears_failed_deps(orch_db, mocker):
@@ -1586,7 +1893,10 @@ async def test_deadlock_detection_clears_failed_deps(orch_db, mocker):
     # Re-read from DB to check updated state
     async with _Session() as verify_session:
         from sqlmodel import select as _select
-        b_result = await verify_session.execute(_select(Task).where(Task.id == task_b_id))
+
+        b_result = await verify_session.execute(
+            _select(Task).where(Task.id == task_b_id)
+        )
         updated_b = b_result.scalars().first()
 
     assert updated_b is not None
@@ -1594,15 +1904,16 @@ async def test_deadlock_detection_clears_failed_deps(orch_db, mocker):
         f"Expected B's depends_on to be cleared after C failed, "
         f"got {updated_b.depends_on!r}"
     )
-    assert "deadlock" in (updated_b.latest_status_message or "").lower() or \
-           "dependencies cleared" in (updated_b.latest_status_message or "").lower(), (
-        f"Expected deadlock message on task B, got: {updated_b.latest_status_message!r}"
-    )
+    assert (
+        "deadlock" in (updated_b.latest_status_message or "").lower()
+        or "dependencies cleared" in (updated_b.latest_status_message or "").lower()
+    ), f"Expected deadlock message on task B, got: {updated_b.latest_status_message!r}"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Test 6b — False-positive: A→B→D(running) must NOT clear A's deps
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 @pytest.mark.asyncio
 async def test_deadlock_no_false_positive_when_dep_has_active_parent(orch_db, mocker):
@@ -1666,9 +1977,14 @@ async def test_deadlock_no_false_positive_when_dep_has_active_parent(orch_db, mo
 
     async with _Session() as verify_session:
         from sqlmodel import select as _select
-        a_result = await verify_session.execute(_select(Task).where(Task.id == task_a_id))
+
+        a_result = await verify_session.execute(
+            _select(Task).where(Task.id == task_a_id)
+        )
         updated_a = a_result.scalars().first()
-        b_result = await verify_session.execute(_select(Task).where(Task.id == task_b_id))
+        b_result = await verify_session.execute(
+            _select(Task).where(Task.id == task_b_id)
+        )
         updated_b = b_result.scalars().first()
 
     # Neither A nor B should be touched — D is still running
@@ -1689,6 +2005,7 @@ async def test_deadlock_no_false_positive_when_dep_has_active_parent(orch_db, mo
 # ══════════════════════════════════════════════════════════════════════════════
 # Test 6c — True cycle: A→B→A clears both tasks
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 @pytest.mark.asyncio
 async def test_deadlock_true_cycle_cleared(orch_db, mocker):
@@ -1739,9 +2056,14 @@ async def test_deadlock_true_cycle_cleared(orch_db, mocker):
 
     async with _Session() as verify_session:
         from sqlmodel import select as _select
-        a_result = await verify_session.execute(_select(Task).where(Task.id == task_a_id))
+
+        a_result = await verify_session.execute(
+            _select(Task).where(Task.id == task_a_id)
+        )
         updated_a = a_result.scalars().first()
-        b_result = await verify_session.execute(_select(Task).where(Task.id == task_b_id))
+        b_result = await verify_session.execute(
+            _select(Task).where(Task.id == task_b_id)
+        )
         updated_b = b_result.scalars().first()
 
     assert updated_a is not None
@@ -1759,6 +2081,7 @@ async def test_deadlock_true_cycle_cleared(orch_db, mocker):
 # ══════════════════════════════════════════════════════════════════════════════
 # Test 7 — CI-waiting backstop timeout
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 @pytest.mark.asyncio
 async def test_ci_waiting_backstop_timeout_fails_stuck_task(eval_db, mocker):
@@ -1791,7 +2114,10 @@ async def test_ci_waiting_backstop_timeout_fails_stuck_task(eval_db, mocker):
     # Set task to appear 90 minutes into EVALUATING (> 60-min backstop default)
     evaluating_since = _naive_utc_ago(minutes=90)
     task.status_log = [
-        {"t": evaluating_since.isoformat(), "msg": "Status changed: IN_PROGRESS → EVALUATING"}
+        {
+            "t": evaluating_since.isoformat(),
+            "msg": "Status changed: IN_PROGRESS → EVALUATING",
+        }
     ]
     eval_db.add(task)
     await eval_db.commit()
@@ -1839,7 +2165,10 @@ async def test_ci_waiting_under_backstop_threshold_not_failed(eval_db, mocker):
     # Only 20 minutes into EVALUATING — well under the 30-min backstop
     evaluating_since = _naive_utc_ago(minutes=20)
     task.status_log = [
-        {"t": evaluating_since.isoformat(), "msg": "Status changed: IN_PROGRESS → EVALUATING"}
+        {
+            "t": evaluating_since.isoformat(),
+            "msg": "Status changed: IN_PROGRESS → EVALUATING",
+        }
     ]
     eval_db.add(task)
     await eval_db.commit()
@@ -1875,11 +2204,13 @@ async def test_backstop_message_accurate_when_ci_wait_started_present(eval_db, m
         project_id=project.id,
         payloads=[{"type": "review", "prompt": "backstop message test"}],
         status=TaskStatus.EVALUATING,
-        context={"review_loop": {
-            "ci_waiting": True,
-            "ci_wait_started": ci_started,
-            "pr_number": 999,
-        }},
+        context={
+            "review_loop": {
+                "ci_waiting": True,
+                "ci_wait_started": ci_started,
+                "pr_number": 999,
+            }
+        },
     )
     eval_db.add(task)
     await eval_db.commit()
@@ -1888,7 +2219,10 @@ async def test_backstop_message_accurate_when_ci_wait_started_present(eval_db, m
     # 90 minutes into EVALUATING (> 60-min backstop default)
     evaluating_since = _naive_utc_ago(minutes=90)
     task.status_log = [
-        {"t": evaluating_since.isoformat(), "msg": "Status changed: IN_PROGRESS → EVALUATING"}
+        {
+            "t": evaluating_since.isoformat(),
+            "msg": "Status changed: IN_PROGRESS → EVALUATING",
+        }
     ]
     eval_db.add(task)
     await eval_db.commit()
@@ -1901,7 +2235,9 @@ async def test_backstop_message_accurate_when_ci_wait_started_present(eval_db, m
         f"Expected task to be FAILED after backstop, got {task.status}"
     )
     msg = (task.latest_status_message or "").lower()
-    assert "backstop" in msg, f"Expected 'backstop' in message, got: {task.latest_status_message!r}"
+    assert "backstop" in msg, (
+        f"Expected 'backstop' in message, got: {task.latest_status_message!r}"
+    )
     assert "missing" not in msg and "corrupt" not in msg, (
         f"Message should NOT say 'missing or corrupt' when ci_wait_started is valid, "
         f"got: {task.latest_status_message!r}"
@@ -1911,6 +2247,7 @@ async def test_backstop_message_accurate_when_ci_wait_started_present(eval_db, m
 # ══════════════════════════════════════════════════════════════════════════════
 # Tests — External health gate (get_confirmed_down_critical_deps)
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 class TestExternalHealthGate:
     """Unit tests for the pre-flight external health gate in the dispatch path.
@@ -1944,6 +2281,7 @@ class TestExternalHealthGate:
     def test_dispatch_skipped_when_github_api_confirmed_down(self):
         """Gate returns github_api when it has >=2 consecutive failures."""
         from app.orchestrator import get_confirmed_down_critical_deps
+
         self._set_consec(github_api=2)
         result = get_confirmed_down_critical_deps()
         assert "github_api" in result
@@ -1951,6 +2289,7 @@ class TestExternalHealthGate:
     def test_dispatch_skipped_when_dispatch_api_confirmed_down(self):
         """Gate returns dispatch_api when it has >=2 consecutive failures."""
         from app.orchestrator import get_confirmed_down_critical_deps
+
         self._set_consec(dispatch_api=3)
         result = get_confirmed_down_critical_deps()
         assert "dispatch_api" in result
@@ -1958,6 +2297,7 @@ class TestExternalHealthGate:
     def test_dispatch_proceeds_when_only_anthropic_api_is_confirmed_down(self):
         """Anthropic-only outages must not block dispatch when aggregate dispatch is healthy."""
         from app.orchestrator import get_confirmed_down_critical_deps
+
         self._set_consec(anthropic_api=3)
         result = get_confirmed_down_critical_deps()
         assert "anthropic_api" not in result
@@ -1966,6 +2306,7 @@ class TestExternalHealthGate:
     def test_dispatch_skipped_when_gcp_confirmed_down(self):
         """Gate returns gcp when it has >=2 consecutive failures."""
         from app.orchestrator import get_confirmed_down_critical_deps
+
         self._set_consec(gcp=5)
         result = get_confirmed_down_critical_deps()
         assert "gcp" in result
@@ -1973,6 +2314,7 @@ class TestExternalHealthGate:
     def test_single_failure_does_not_gate(self):
         """One failure is transient — gate does NOT block dispatch."""
         from app.orchestrator import get_confirmed_down_critical_deps
+
         self._set_consec(github_api=1)
         result = get_confirmed_down_critical_deps()
         assert result == []
@@ -1980,6 +2322,7 @@ class TestExternalHealthGate:
     def test_dispatch_proceeds_when_only_db_is_down(self):
         """DB is not a critical dep for the gate — dispatch still proceeds."""
         from app.orchestrator import get_confirmed_down_critical_deps
+
         self._set_consec(db=10)
         result = get_confirmed_down_critical_deps()
         assert result == []
@@ -1987,6 +2330,7 @@ class TestExternalHealthGate:
     def test_dispatch_proceeds_when_all_deps_healthy(self):
         """All zeros — nothing is blocked."""
         from app.orchestrator import get_confirmed_down_critical_deps
+
         self._set_consec()
         result = get_confirmed_down_critical_deps()
         assert result == []
@@ -1994,6 +2338,7 @@ class TestExternalHealthGate:
     def test_dispatch_resumes_after_recovery(self):
         """Consecutive_failures reset to 0 after recovery — gate clears."""
         from app.orchestrator import get_confirmed_down_critical_deps
+
         self._set_consec(github_api=3)
         assert get_confirmed_down_critical_deps() == ["github_api"]
 
@@ -2004,6 +2349,7 @@ class TestExternalHealthGate:
     def test_multiple_deps_down_all_returned(self):
         """If multiple critical deps are confirmed down, all are returned."""
         from app.orchestrator import get_confirmed_down_critical_deps
+
         self._set_consec(github_api=2, dispatch_api=2)
         result = get_confirmed_down_critical_deps()
         assert "github_api" in result
@@ -2015,6 +2361,7 @@ class TestExternalHealthGate:
 # ══════════════════════════════════════════════════════════════════════════════
 # Test — mergeable=None close/reopen cap stops retrying after N attempts
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 @pytest.mark.asyncio
 async def test_ci_polling_mergeable_null_reopen_cap_stops_retrying(orch_db, mocker):
@@ -2054,23 +2401,39 @@ async def test_ci_polling_mergeable_null_reopen_cap_stops_retrying(orch_db, mock
     await session.refresh(ci_task)
     task_id = ci_task.id
 
-    mocker.patch("app.routers.agent.get_github_token_for_task",
-                 return_value=("fake-token", "owner", "repo"))
-    mocker.patch("app.github.get_pull_request",
-                 return_value={"state": "open", "merged": False,
-                               "head": {"sha": "abc123"}, "mergeable": None})
-    close_mock = mocker.patch("app.github.close_pull_request",
-                              new_callable=AsyncMock, return_value=True)
-    reopen_mock = mocker.patch("app.github.reopen_pull_request",
-                               new_callable=AsyncMock, return_value=True)
-    alert_mock = mocker.patch("app.main._maybe_create_failure_alert",
-                              new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        return_value=("fake-token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        return_value={
+            "state": "open",
+            "merged": False,
+            "head": {"sha": "abc123"},
+            "mergeable": None,
+        },
+    )
+    close_mock = mocker.patch(
+        "app.github.close_pull_request", new_callable=AsyncMock, return_value=True
+    )
+    reopen_mock = mocker.patch(
+        "app.github.reopen_pull_request", new_callable=AsyncMock, return_value=True
+    )
+    alert_mock = mocker.patch(
+        "app.main._maybe_create_failure_alert", new_callable=AsyncMock
+    )
 
     await _run_one_cycle(mocker)
 
     async with _Session() as verify:
         from sqlmodel import select as _select
-        t = (await verify.execute(_select(Task).where(Task.id == task_id))).scalars().first()
+
+        t = (
+            (await verify.execute(_select(Task).where(Task.id == task_id)))
+            .scalars()
+            .first()
+        )
 
     assert t is not None
 

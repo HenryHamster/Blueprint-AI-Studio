@@ -11,6 +11,7 @@ from fastapi import HTTPException
 
 class MockResponse:
     """Reusable mock for httpx responses."""
+
     def __init__(self, status_code, json_data=None, text="", headers=None, links=None):
         self.status_code = status_code
         self._json_data = json_data if json_data is not None else {}
@@ -77,6 +78,7 @@ async def test_validate_fine_grained_pat_unauthorized_raises_401(mocker):
 # Integration tests: POST /api/github/pat endpoint
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_post_github_pat_invalid_format(client, mocker):
     """
@@ -87,7 +89,9 @@ async def test_post_github_pat_invalid_format(client, mocker):
         side_effect=HTTPException(status_code=400, detail="Invalid token format"),
     )
 
-    response = await client.post("/api/github/pat", json={"pat": "ghp_classic_token_123"})
+    response = await client.post(
+        "/api/github/pat", json={"pat": "ghp_classic_token_123"}
+    )
 
     assert response.status_code == 400
 
@@ -107,7 +111,9 @@ async def test_post_github_pat_valid(client, mocker):
         return_value="projects/test/secrets/github-pat-test-user-123",
     )
 
-    response = await client.post("/api/github/pat", json={"pat": "github_pat_valid_token_abc123"})
+    response = await client.post(
+        "/api/github/pat", json={"pat": "github_pat_valid_token_abc123"}
+    )
 
     assert response.status_code == 200
     assert response.json()["status"] == "success"
@@ -123,13 +129,17 @@ async def test_post_github_pat_unauthorized(client, mocker):
         side_effect=HTTPException(status_code=401, detail="Token invalid or expired"),
     )
 
-    response = await client.post("/api/github/pat", json={"pat": "github_pat_expired_token_xyz"})
+    response = await client.post(
+        "/api/github/pat", json={"pat": "github_pat_expired_token_xyz"}
+    )
 
     assert response.status_code == 401
 
 
 @pytest.mark.asyncio
-async def test_post_github_pat_secret_manager_outage_returns_503(client, db_session, mocker):
+async def test_post_github_pat_secret_manager_outage_returns_503(
+    client, db_session, mocker
+):
     """
     When Secret Manager is unavailable during PAT registration, the endpoint
     must return HTTP 503 and must NOT persist the raw PAT in the database.
@@ -169,6 +179,7 @@ async def test_post_github_pat_secret_manager_outage_returns_503(client, db_sess
 # ---------------------------------------------------------------------------
 # Edge-case tests: merge_pull_request, get_check_runs, rate-limiting, expiry
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.asyncio
 async def test_merge_pull_request_already_merged(mocker):
@@ -235,7 +246,9 @@ async def test_reopen_pull_request_failure(mocker):
     from app.github import reopen_pull_request
 
     mock_request = mocker.patch("httpx.AsyncClient.request")
-    mock_request.return_value = MockResponse(422, {"message": "cannot reopen"}, text="cannot reopen")
+    mock_request.return_value = MockResponse(
+        422, {"message": "cannot reopen"}, text="cannot reopen"
+    )
 
     result = await reopen_pull_request("token", "owner", "repo", 42)
 
@@ -263,7 +276,9 @@ async def test_add_issue_label_failure_raises_http_exception(mocker):
     from app.github import add_issue_label
 
     mock_request = mocker.patch("httpx.AsyncClient.request")
-    mock_request.return_value = MockResponse(404, {"message": "Not Found"}, text="Not Found")
+    mock_request.return_value = MockResponse(
+        404, {"message": "Not Found"}, text="Not Found"
+    )
 
     with pytest.raises(HTTPException) as exc_info:
         await add_issue_label("token", "owner", "repo", 42, "scope-overflow")
@@ -276,6 +291,7 @@ async def test_add_issue_label_failure_raises_http_exception(mocker):
 # enable_auto_merge — GraphQL enablePullRequestAutoMerge mutation
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_enable_auto_merge_success(mocker):
     """Happy path: REST fetch returns node_id, GraphQL mutation succeeds."""
@@ -285,15 +301,18 @@ async def test_enable_auto_merge_success(mocker):
         # 1. get_pull_request — returns node_id
         MockResponse(200, {"node_id": "PR_kwABC123", "number": 42}),
         # 2. GraphQL mutation — returns enabledAt timestamp
-        MockResponse(200, {
-            "data": {
-                "enablePullRequestAutoMerge": {
-                    "pullRequest": {
-                        "autoMergeRequest": {"enabledAt": "2026-04-15T08:00:00Z"}
+        MockResponse(
+            200,
+            {
+                "data": {
+                    "enablePullRequestAutoMerge": {
+                        "pullRequest": {
+                            "autoMergeRequest": {"enabledAt": "2026-04-15T08:00:00Z"}
+                        }
                     }
                 }
-            }
-        }),
+            },
+        ),
     ]
 
     async def mock_request(method, *args, **kwargs):
@@ -314,10 +333,13 @@ async def test_enable_auto_merge_rejected_by_github(mocker):
 
     responses = [
         MockResponse(200, {"node_id": "PR_kwABC123", "number": 42}),
-        MockResponse(200, {
-            "data": {"enablePullRequestAutoMerge": None},
-            "errors": [{"message": "Pull request is in clean status"}],
-        }),
+        MockResponse(
+            200,
+            {
+                "data": {"enablePullRequestAutoMerge": None},
+                "errors": [{"message": "Pull request is in clean status"}],
+            },
+        ),
     ]
 
     async def mock_request(method, *args, **kwargs):
@@ -364,7 +386,9 @@ async def test_enable_auto_merge_invalid_merge_method():
     """Invalid merge_method returns {enabled: False} immediately, no API call."""
     from app.github import enable_auto_merge
 
-    result = await enable_auto_merge("token", "owner", "repo", 42, merge_method="INVALID")
+    result = await enable_auto_merge(
+        "token", "owner", "repo", 42, merge_method="INVALID"
+    )
 
     assert result["enabled"] is False
     assert "Invalid merge_method" in result["message"]
@@ -471,6 +495,7 @@ async def test_validate_fine_grained_pat_expired_token_returns_401_not_500(mocke
 # 5xx retry tests
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_github_request_mirrors_rate_limit_headers_into_shared_state(mocker):
     """Every _github_request response populates shared_state.github_quota from
@@ -480,14 +505,20 @@ async def test_github_request_mirrors_rate_limit_headers_into_shared_state(mocke
     from app.github import _github_request
 
     # Reset state so the test is independent
-    _ss.github_quota.update({"remaining": None, "limit": None, "reset_at": None, "last_updated": None})
+    _ss.github_quota.update(
+        {"remaining": None, "limit": None, "reset_at": None, "last_updated": None}
+    )
 
     async def mock_request(method, *args, **kwargs):
-        return MockResponse(200, {"ok": True}, headers={
-            "X-RateLimit-Remaining": "3421",
-            "X-RateLimit-Limit": "5000",
-            "X-RateLimit-Reset": "1776400000",
-        })
+        return MockResponse(
+            200,
+            {"ok": True},
+            headers={
+                "X-RateLimit-Remaining": "3421",
+                "X-RateLimit-Limit": "5000",
+                "X-RateLimit-Reset": "1776400000",
+            },
+        )
 
     mocker.patch("httpx.AsyncClient.request", side_effect=mock_request)
 
@@ -511,14 +542,29 @@ async def test_github_quota_keeps_lowest_remaining_within_reset_window(mocker):
     import app.shared_state as _ss
     from app.github import _github_request
 
-    _ss.github_quota.update({"remaining": None, "limit": None, "reset_at": None, "last_updated": None})
+    _ss.github_quota.update(
+        {"remaining": None, "limit": None, "reset_at": None, "last_updated": None}
+    )
 
     responses = [
-        MockResponse(200, {}, headers={"X-RateLimit-Remaining": "500", "X-RateLimit-Reset": "1776400000"}),
-        MockResponse(200, {}, headers={"X-RateLimit-Remaining": "50",  "X-RateLimit-Reset": "1776400000"}),
-        MockResponse(200, {}, headers={"X-RateLimit-Remaining": "120", "X-RateLimit-Reset": "1776400000"}),
+        MockResponse(
+            200,
+            {},
+            headers={"X-RateLimit-Remaining": "500", "X-RateLimit-Reset": "1776400000"},
+        ),
+        MockResponse(
+            200,
+            {},
+            headers={"X-RateLimit-Remaining": "50", "X-RateLimit-Reset": "1776400000"},
+        ),
+        MockResponse(
+            200,
+            {},
+            headers={"X-RateLimit-Remaining": "120", "X-RateLimit-Reset": "1776400000"},
+        ),
     ]
     it = iter(responses)
+
     async def mock_request(*args, **kwargs):
         return next(it)
 
@@ -531,8 +577,17 @@ async def test_github_quota_keeps_lowest_remaining_within_reset_window(mocker):
 
     # After the reset window rolls over, accept the fresh value.
     _ss.github_quota["reset_at"] = 1776400000  # sanity: still the old window
+
     async def fresh_window(*args, **kwargs):
-        return MockResponse(200, {}, headers={"X-RateLimit-Remaining": "4800", "X-RateLimit-Reset": "1776403600"})
+        return MockResponse(
+            200,
+            {},
+            headers={
+                "X-RateLimit-Remaining": "4800",
+                "X-RateLimit-Reset": "1776403600",
+            },
+        )
+
     mocker.patch("httpx.AsyncClient.request", side_effect=fresh_window)
     await _github_request("GET", "https://api.github.com/test", install_headers)
     assert _ss.github_quota["remaining"] == 4800
@@ -576,7 +631,9 @@ async def test_github_request_returns_5xx_after_max_retries(mocker):
     )
     mocker.patch("asyncio.sleep", return_value=None)
 
-    resp = await _github_request("GET", "https://api.github.com/test", {}, max_retries=3)
+    resp = await _github_request(
+        "GET", "https://api.github.com/test", {}, max_retries=3
+    )
     assert resp.status_code == 503
 
 
@@ -655,8 +712,12 @@ async def test_github_request_fails_fast_when_reset_is_far(mocker):
     import app.shared_state as _ss
 
     # Clear both buckets so the pre-call short-circuit doesn't fire.
-    _ss.github_quota.update({"remaining": None, "limit": None, "reset_at": None, "last_updated": None})
-    _ss.github_jwt_quota.update({"remaining": None, "limit": None, "reset_at": None, "last_updated": None})
+    _ss.github_quota.update(
+        {"remaining": None, "limit": None, "reset_at": None, "last_updated": None}
+    )
+    _ss.github_jwt_quota.update(
+        {"remaining": None, "limit": None, "reset_at": None, "last_updated": None}
+    )
 
     future_reset = int(time.time()) + 60  # 60s away, well past the 5s threshold
     call_count = 0
@@ -677,12 +738,14 @@ async def test_github_request_fails_fast_when_reset_is_far(mocker):
     mock_sleep = mocker.patch("asyncio.sleep", return_value=None)
 
     resp = await _github_request(
-        "GET", "https://api.github.com/test", {},
+        "GET",
+        "https://api.github.com/test",
+        {},
         max_retries=3,
     )
     assert resp.status_code == 403
-    assert call_count == 1                    # no retry
-    assert mock_sleep.call_count == 0         # no sleep
+    assert call_count == 1  # no retry
+    assert mock_sleep.call_count == 0  # no sleep
 
 
 @pytest.mark.asyncio
@@ -694,18 +757,30 @@ async def test_github_request_short_circuits_when_install_bucket_empty(mocker):
     import app.shared_state as _ss
 
     future_reset = int(time.time()) + 120
-    _ss.github_quota.update({
-        "remaining": 0, "limit": 5000, "reset_at": future_reset, "last_updated": None,
-    })
-    _ss.github_jwt_quota.update({
-        "remaining": None, "limit": None, "reset_at": None, "last_updated": None,
-    })
+    _ss.github_quota.update(
+        {
+            "remaining": 0,
+            "limit": 5000,
+            "reset_at": future_reset,
+            "last_updated": None,
+        }
+    )
+    _ss.github_jwt_quota.update(
+        {
+            "remaining": None,
+            "limit": None,
+            "reset_at": None,
+            "last_updated": None,
+        }
+    )
 
     mock_request = mocker.patch("httpx.AsyncClient.request")
 
     install_headers = {"Authorization": "Bearer ghs_fake_token"}
     resp = await _github_request(
-        "GET", "https://api.github.com/test", install_headers,
+        "GET",
+        "https://api.github.com/test",
+        install_headers,
     )
     assert resp.status_code == 403
     # Request was never sent to GitHub
@@ -724,18 +799,30 @@ async def test_github_request_short_circuits_when_jwt_bucket_empty(mocker):
     import app.shared_state as _ss
 
     future_reset = int(time.time()) + 120
-    _ss.github_jwt_quota.update({
-        "remaining": 0, "limit": 60, "reset_at": future_reset, "last_updated": None,
-    })
-    _ss.github_quota.update({
-        "remaining": None, "limit": None, "reset_at": None, "last_updated": None,
-    })
+    _ss.github_jwt_quota.update(
+        {
+            "remaining": 0,
+            "limit": 60,
+            "reset_at": future_reset,
+            "last_updated": None,
+        }
+    )
+    _ss.github_quota.update(
+        {
+            "remaining": None,
+            "limit": None,
+            "reset_at": None,
+            "last_updated": None,
+        }
+    )
 
     mock_request = mocker.patch("httpx.AsyncClient.request")
 
     # URL containing /app/ triggers the JWT bucket classification.
     resp = await _github_request(
-        "GET", "https://api.github.com/app/installations/12345", {},
+        "GET",
+        "https://api.github.com/app/installations/12345",
+        {},
     )
     assert resp.status_code == 403
     mock_request.assert_not_called()
@@ -746,6 +833,7 @@ async def test_github_request_short_circuits_when_jwt_bucket_empty(mocker):
 # ---------------------------------------------------------------------------
 # Cache wrapper tests: check_runs dedup, TTL, counter bump
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.asyncio
 async def test_get_check_runs_cached_dedupes_within_ttl(mocker):
@@ -762,7 +850,12 @@ async def test_get_check_runs_cached_dedupes_within_ttl(mocker):
     mock_inner = mocker.patch(
         "app.github.get_check_runs",
         new_callable=AsyncMock,
-        return_value={"status": "completed", "conclusion": "success", "details": [], "failed_logs": ""},
+        return_value={
+            "status": "completed",
+            "conclusion": "success",
+            "details": [],
+            "failed_logs": "",
+        },
     )
 
     r1 = await gh.get_check_runs_cached("tok", "owner", "repo", "cache_sha_1")
@@ -770,7 +863,7 @@ async def test_get_check_runs_cached_dedupes_within_ttl(mocker):
     r3 = await gh.get_check_runs_cached("tok", "owner", "repo", "cache_sha_1")
 
     assert r1 == r2 == r3
-    assert mock_inner.call_count == 1     # deduped
+    assert mock_inner.call_count == 1  # deduped
     assert _ss.github_cache_hits["check_runs"] == 2  # two hits bump the counter
 
 
@@ -785,7 +878,12 @@ async def test_get_check_runs_cached_expires_after_ttl(mocker):
     mock_inner = mocker.patch(
         "app.github.get_check_runs",
         new_callable=AsyncMock,
-        return_value={"status": "completed", "conclusion": "success", "details": [], "failed_logs": ""},
+        return_value={
+            "status": "completed",
+            "conclusion": "success",
+            "details": [],
+            "failed_logs": "",
+        },
     )
 
     await gh.get_check_runs_cached("tok", "owner", "repo", "cache_sha_ttl", ttl=0)
@@ -805,7 +903,12 @@ async def test_get_check_runs_cached_invalidate_clears_entry(mocker):
     mock_inner = mocker.patch(
         "app.github.get_check_runs",
         new_callable=AsyncMock,
-        return_value={"status": "completed", "conclusion": "success", "details": [], "failed_logs": ""},
+        return_value={
+            "status": "completed",
+            "conclusion": "success",
+            "details": [],
+            "failed_logs": "",
+        },
     )
 
     await gh.get_check_runs_cached("tok", "o", "r", "cache_sha_inv")
@@ -847,8 +950,8 @@ async def test_scan_pr_for_injection_cached_by_head_sha(mocker):
     assert r1 == r2
     # First call hit all three. Second call hits PR (for head_sha) then returns cache.
     assert mock_pr.call_count == 2
-    assert mock_diff.call_count == 1       # skipped on cache hit
-    assert mock_commits.call_count == 1    # skipped on cache hit
+    assert mock_diff.call_count == 1  # skipped on cache hit
+    assert mock_commits.call_count == 1  # skipped on cache hit
     assert _ss.github_cache_hits["scan_pr"] == 1
 
 
@@ -909,6 +1012,7 @@ async def test_pr_merge_negative_cache_skips_refetch(mocker):
             class _S:
                 def first(self_inner):
                     return fake_artifact
+
             return _S()
 
     session = MagicMock()
@@ -985,24 +1089,31 @@ _TEST_WEBHOOK_SECRET = "test-webhook-secret-for-pytest"
 
 def _make_webhook_sig(payload_bytes: bytes) -> str:
     """Compute the x-hub-signature-256 header value for a given payload."""
-    return "sha256=" + hmac.new(
-        _TEST_WEBHOOK_SECRET.encode(), payload_bytes, hashlib.sha256
-    ).hexdigest()
+    return (
+        "sha256="
+        + hmac.new(
+            _TEST_WEBHOOK_SECRET.encode(), payload_bytes, hashlib.sha256
+        ).hexdigest()
+    )
 
 
-def _pr_close_payload(owner: str, repo: str, pr_number: int, *, merged: bool, body: str = "") -> bytes:
+def _pr_close_payload(
+    owner: str, repo: str, pr_number: int, *, merged: bool, body: str = ""
+) -> bytes:
     """Build a minimal pull_request closed webhook payload."""
-    return json.dumps({
-        "action": "closed",
-        "pull_request": {
-            "number": pr_number,
-            "merged": merged,
-            "body": body,
-        },
-        "repository": {
-            "full_name": f"{owner}/{repo}",
-        },
-    }).encode()
+    return json.dumps(
+        {
+            "action": "closed",
+            "pull_request": {
+                "number": pr_number,
+                "merged": merged,
+                "body": body,
+            },
+            "repository": {
+                "full_name": f"{owner}/{repo}",
+            },
+        }
+    ).encode()
 
 
 @pytest.mark.asyncio
@@ -1046,7 +1157,9 @@ async def test_pr_close_without_merge_sets_pr_rejected(client, db_session, mocke
     db_session.add(artifact)
     await db_session.commit()
 
-    payload_bytes = _pr_close_payload("testorg", "testrepo", 42, merged=False, body="Not a good fit")
+    payload_bytes = _pr_close_payload(
+        "testorg", "testrepo", 42, merged=False, body="Not a good fit"
+    )
     resp = await client.post(
         "/api/github/webhook",
         content=payload_bytes,
@@ -1105,7 +1218,9 @@ async def test_pr_close_without_merge_is_idempotent(client, db_session, mocker):
     db_session.add(artifact)
     await db_session.commit()
 
-    payload_bytes = _pr_close_payload("testorg", "idempotentrepo", 7, merged=False, body="second close")
+    payload_bytes = _pr_close_payload(
+        "testorg", "idempotentrepo", 7, merged=False, body="second close"
+    )
     resp = await client.post(
         "/api/github/webhook",
         content=payload_bytes,
@@ -1187,19 +1302,24 @@ async def test_pr_close_without_merge_unmatched_pr_is_noop(client, db_session, m
 # Webhook helpers shared by the three new handler test sections
 # ---------------------------------------------------------------------------
 
-def _make_pr_merged_payload(owner: str, repo: str, pr_number: int, body: str = "") -> bytes:
+
+def _make_pr_merged_payload(
+    owner: str, repo: str, pr_number: int, body: str = ""
+) -> bytes:
     """Build a minimal pull_request closed+merged webhook payload."""
-    return json.dumps({
-        "action": "closed",
-        "pull_request": {
-            "number": pr_number,
-            "merged": True,
-            "body": body,
-        },
-        "repository": {
-            "full_name": f"{owner}/{repo}",
-        },
-    }).encode()
+    return json.dumps(
+        {
+            "action": "closed",
+            "pull_request": {
+                "number": pr_number,
+                "merged": True,
+                "body": body,
+            },
+            "repository": {
+                "full_name": f"{owner}/{repo}",
+            },
+        }
+    ).encode()
 
 
 def _make_check_run_payload(
@@ -1219,24 +1339,26 @@ def _make_check_run_payload(
     can be exercised.
     """
     _prs = [{"number": n} for n in (pr_numbers or [])]
-    return json.dumps({
-        "action": action,
-        "check_run": {
-            "id": 999,
-            "name": "CI / test",
-            "status": "completed",
-            "conclusion": conclusion,
-            "head_sha": head_sha,
-            "pull_requests": _prs,
-            "check_suite": {
-                "head_branch": head_branch,
-                "pull_requests": [],
+    return json.dumps(
+        {
+            "action": action,
+            "check_run": {
+                "id": 999,
+                "name": "CI / test",
+                "status": "completed",
+                "conclusion": conclusion,
+                "head_sha": head_sha,
+                "pull_requests": _prs,
+                "check_suite": {
+                    "head_branch": head_branch,
+                    "pull_requests": [],
+                },
             },
-        },
-        "repository": {
-            "full_name": f"{owner}/{repo}",
-        },
-    }).encode()
+            "repository": {
+                "full_name": f"{owner}/{repo}",
+            },
+        }
+    ).encode()
 
 
 def _make_pr_event_payload(
@@ -1250,20 +1372,22 @@ def _make_pr_event_payload(
     title: str = "My PR",
 ) -> bytes:
     """Build a minimal pull_request opened/synchronize webhook payload."""
-    return json.dumps({
-        "action": action,
-        "pull_request": {
-            "number": pr_number,
-            "merged": False,
-            "body": "",
-            "head": {"ref": branch},
-            "base": {"ref": base_branch},
-            "title": title,
-        },
-        "repository": {
-            "full_name": f"{owner}/{repo}",
-        },
-    }).encode()
+    return json.dumps(
+        {
+            "action": action,
+            "pull_request": {
+                "number": pr_number,
+                "merged": False,
+                "body": "",
+                "head": {"ref": branch},
+                "base": {"ref": base_branch},
+                "title": title,
+            },
+            "repository": {
+                "full_name": f"{owner}/{repo}",
+            },
+        }
+    ).encode()
 
 
 async def _post_webhook(client, payload_bytes: bytes, event_type: str):
@@ -1284,6 +1408,7 @@ async def _post_webhook(client, payload_bytes: bytes, event_type: str):
 # Webhook tests: pull_request closed+merged handler
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_pr_merged_sets_pr_merged_on_matching_task(client, db_session, mocker):
     """
@@ -1293,9 +1418,16 @@ async def test_pr_merged_sets_pr_merged_on_matching_task(client, db_session, moc
     from app.models import Artifact, ArtifactType, Project, Task, TaskStatus
 
     mocker.patch("app.routers.github.GITHUB_WEBHOOK_SECRET", _TEST_WEBHOOK_SECRET)
-    mocker.patch("app.autonomous_research._check_autonomous_research", new_callable=AsyncMock)
-    mocker.patch("app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock)
-    mocker.patch("app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock)
+    mocker.patch(
+        "app.autonomous_research._check_autonomous_research", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
 
     project = Project(
         name="Merge Test",
@@ -1342,10 +1474,15 @@ async def test_pr_merged_dispatches_enriched_payload(client, db_session, mocker)
     from app.models import Artifact, ArtifactType, Project, Task, TaskStatus
 
     mocker.patch("app.routers.github.GITHUB_WEBHOOK_SECRET", _TEST_WEBHOOK_SECRET)
-    mocker.patch("app.autonomous_research._check_autonomous_research", new_callable=AsyncMock)
-    mocker.patch("app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock)
+    mocker.patch(
+        "app.autonomous_research._check_autonomous_research", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock
+    )
     dispatch_mock = mocker.patch(
-        "app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
     )
 
     project = Project(
@@ -1389,10 +1526,14 @@ async def test_pr_merged_dispatches_enriched_payload(client, db_session, mocker)
 
     # ensure_future schedules the coroutine — let event loop run it
     import asyncio as _asyncio
+
     await _asyncio.sleep(0)
 
     assert dispatch_mock.await_count >= 1
-    args, _kwargs = dispatch_mock.await_args_list[0].args, dispatch_mock.await_args_list[0].kwargs
+    args, _kwargs = (
+        dispatch_mock.await_args_list[0].args,
+        dispatch_mock.await_args_list[0].kwargs,
+    )
     assert args[1] == "PR_MERGED"
     body = args[2]
     assert body["direction_id"] == "d-abc123"
@@ -1426,11 +1567,16 @@ async def test_pr_merged_already_merged_task_is_idempotent(client, db_session, m
     from app.models import Artifact, ArtifactType, Project, Task, TaskStatus
 
     mocker.patch("app.routers.github.GITHUB_WEBHOOK_SECRET", _TEST_WEBHOOK_SECRET)
-    mocker.patch("app.autonomous_research._check_autonomous_research", new_callable=AsyncMock)
+    mocker.patch(
+        "app.autonomous_research._check_autonomous_research", new_callable=AsyncMock
+    )
     rollup_mock = mocker.patch(
         "app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock
     )
-    mocker.patch("app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock)
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
 
     project = Project(
         name="Idempotent Merge",
@@ -1479,11 +1625,16 @@ async def test_pr_merged_triggers_rollup_for_affected_tasks(client, db_session, 
     from app.models import Artifact, ArtifactType, Project, Task, TaskStatus
 
     mocker.patch("app.routers.github.GITHUB_WEBHOOK_SECRET", _TEST_WEBHOOK_SECRET)
-    mocker.patch("app.autonomous_research._check_autonomous_research", new_callable=AsyncMock)
+    mocker.patch(
+        "app.autonomous_research._check_autonomous_research", new_callable=AsyncMock
+    )
     rollup_mock = mocker.patch(
         "app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock
     )
-    mocker.patch("app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock)
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
 
     project = Project(
         name="Rollup Test",
@@ -1533,9 +1684,16 @@ async def test_pr_merged_no_matching_artifact_is_noop(client, db_session, mocker
     from app.models import Artifact, ArtifactType, Project, Task, TaskStatus
 
     mocker.patch("app.routers.github.GITHUB_WEBHOOK_SECRET", _TEST_WEBHOOK_SECRET)
-    mocker.patch("app.autonomous_research._check_autonomous_research", new_callable=AsyncMock)
-    mocker.patch("app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock)
-    mocker.patch("app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock)
+    mocker.patch(
+        "app.autonomous_research._check_autonomous_research", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
 
     project = Project(
         name="Noop Merge",
@@ -1580,6 +1738,7 @@ async def test_pr_merged_no_matching_artifact_is_noop(client, db_session, mocker
 # Webhook tests: check_run completed handler
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_check_run_non_completed_action_is_ignored(client, db_session, mocker):
     """
@@ -1611,7 +1770,9 @@ async def test_check_run_unregistered_repo_ignored(client, db_session, mocker):
 
 
 @pytest.mark.asyncio
-async def test_check_run_completed_calls_handle_ci_completion(client, db_session, mocker):
+async def test_check_run_completed_calls_handle_ci_completion(
+    client, db_session, mocker
+):
     """
     A completed check_run whose head_sha matches an EVALUATING ci_waiting task
     calls handle_ci_completion with the task.
@@ -1682,7 +1843,9 @@ async def test_check_run_completed_calls_handle_ci_completion(client, db_session
 
 
 @pytest.mark.asyncio
-async def test_check_run_completed_matches_rollup_parent_by_pr_number(client, db_session, mocker):
+async def test_check_run_completed_matches_rollup_parent_by_pr_number(
+    client, db_session, mocker
+):
     """Rollup parents are set ci_waiting=True + pr_number but NOT head_sha
     (rollup_management.py). A check_run webhook that doesn't match head_sha
     must still route to handle_ci_completion via pr_number, otherwise the
@@ -1703,7 +1866,11 @@ async def test_check_run_completed_matches_rollup_parent_by_pr_number(client, db
     mocker.patch(
         "app.github.get_check_runs",
         new_callable=AsyncMock,
-        return_value={"status": "completed", "conclusion": "success", "failed_logs": ""},
+        return_value={
+            "status": "completed",
+            "conclusion": "success",
+            "failed_logs": "",
+        },
     )
     mock_handle_ci = mocker.patch(
         "app.ci_completion.handle_ci_completion",
@@ -1711,8 +1878,10 @@ async def test_check_run_completed_matches_rollup_parent_by_pr_number(client, db
     )
 
     project = Project(
-        name="Rollup Webhook", user_id="user1",
-        github_owner="rollorg", github_repo="rollrepo",
+        name="Rollup Webhook",
+        user_id="user1",
+        github_owner="rollorg",
+        github_repo="rollrepo",
     )
     db_session.add(project)
     await db_session.commit()
@@ -1754,11 +1923,15 @@ async def test_check_run_completed_matches_rollup_parent_by_pr_number(client, db
     # webhooks can use the fast-path match.  handle_ci_completion commits
     # after we add it in-session; the mock here doesn't commit, but the
     # attribute must be populated by the matching loop before it ran.
-    assert (called_task.context or {}).get("review_loop", {}).get("head_sha") == head_sha
+    assert (called_task.context or {}).get("review_loop", {}).get(
+        "head_sha"
+    ) == head_sha
 
 
 @pytest.mark.asyncio
-async def test_check_run_completed_pending_checks_skips_ci_completion(client, db_session, mocker):
+async def test_check_run_completed_pending_checks_skips_ci_completion(
+    client, db_session, mocker
+):
     """
     When get_check_runs returns status != 'completed' (some checks still pending),
     handle_ci_completion is NOT called.
@@ -1953,8 +2126,11 @@ async def test_check_run_failure_branch_not_in_whitelist(client, db_session, moc
 # Webhook tests: pull_request opened/synchronize auto-review handler
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
-async def test_pr_opened_auto_review_enabled_triggers_review(client, db_session, mocker):
+async def test_pr_opened_auto_review_enabled_triggers_review(
+    client, db_session, mocker
+):
     """
     A pull_request opened webhook triggers _handle_auto_review when the
     project has auto_review enabled.
@@ -1989,7 +2165,9 @@ async def test_pr_opened_auto_review_enabled_triggers_review(client, db_session,
 
 
 @pytest.mark.asyncio
-async def test_pr_synchronize_auto_review_enabled_triggers_review(client, db_session, mocker):
+async def test_pr_synchronize_auto_review_enabled_triggers_review(
+    client, db_session, mocker
+):
     """
     A pull_request synchronize webhook (push to existing PR) also triggers
     _handle_auto_review when auto_review is enabled.
@@ -2044,7 +2222,9 @@ async def test_pr_opened_auto_review_disabled_no_trigger(client, db_session, moc
     db_session.add(project)
     await db_session.commit()
 
-    payload_bytes = _make_pr_event_payload("ardisabledorg", "ardisabledrepo", 5, "opened")
+    payload_bytes = _make_pr_event_payload(
+        "ardisabledorg", "ardisabledrepo", 5, "opened"
+    )
     resp = await _post_webhook(client, payload_bytes, "pull_request")
 
     assert resp.status_code == 200
@@ -2078,13 +2258,19 @@ async def test_update_branch_with_sha_retry_success_first_attempt(mocker):
     from app import github as gh
 
     update_branch_mock = mocker.patch.object(
-        gh, "update_branch", new_callable=AsyncMock,
+        gh,
+        "update_branch",
+        new_callable=AsyncMock,
         return_value={"updated": True, "message": "Update queued"},
     )
     get_pr_mock = mocker.patch.object(gh, "get_pull_request", new_callable=AsyncMock)
 
     result = await gh.update_branch_with_sha_retry(
-        "t", "o", "r", 1, expected_head_sha="abc",
+        "t",
+        "o",
+        "r",
+        1,
+        expected_head_sha="abc",
     )
 
     assert result == {"updated": True, "message": "Update queued"}
@@ -2098,19 +2284,27 @@ async def test_update_branch_with_sha_retry_sha_mismatch_retry_succeeds(mocker):
     from app import github as gh
 
     update_branch_mock = mocker.patch.object(
-        gh, "update_branch", new_callable=AsyncMock,
+        gh,
+        "update_branch",
+        new_callable=AsyncMock,
         side_effect=[
             {"updated": False, "message": "Some error wording GitHub might change"},
             {"updated": True, "message": "Update queued"},
         ],
     )
     mocker.patch.object(
-        gh, "get_pull_request", new_callable=AsyncMock,
+        gh,
+        "get_pull_request",
+        new_callable=AsyncMock,
         return_value={"head": {"sha": "fresh123"}},
     )
 
     result = await gh.update_branch_with_sha_retry(
-        "t", "o", "r", 1, expected_head_sha="stale456",
+        "t",
+        "o",
+        "r",
+        1,
+        expected_head_sha="stale456",
     )
 
     assert result == {"updated": True, "message": "Update queued"}
@@ -2125,16 +2319,24 @@ async def test_update_branch_with_sha_retry_non_sha_failure_no_retry(mocker):
     from app import github as gh
 
     update_branch_mock = mocker.patch.object(
-        gh, "update_branch", new_callable=AsyncMock,
+        gh,
+        "update_branch",
+        new_callable=AsyncMock,
         return_value={"updated": False, "message": "merge conflict"},
     )
     mocker.patch.object(
-        gh, "get_pull_request", new_callable=AsyncMock,
+        gh,
+        "get_pull_request",
+        new_callable=AsyncMock,
         return_value={"head": {"sha": "sameSha"}},
     )
 
     result = await gh.update_branch_with_sha_retry(
-        "t", "o", "r", 1, expected_head_sha="sameSha",
+        "t",
+        "o",
+        "r",
+        1,
+        expected_head_sha="sameSha",
     )
 
     assert result == {"updated": False, "message": "merge conflict"}
@@ -2147,19 +2349,27 @@ async def test_update_branch_with_sha_retry_retry_also_fails(mocker):
     from app import github as gh
 
     update_branch_mock = mocker.patch.object(
-        gh, "update_branch", new_callable=AsyncMock,
+        gh,
+        "update_branch",
+        new_callable=AsyncMock,
         side_effect=[
             {"updated": False, "message": "first failure"},
             {"updated": False, "message": "retry failure"},
         ],
     )
     mocker.patch.object(
-        gh, "get_pull_request", new_callable=AsyncMock,
+        gh,
+        "get_pull_request",
+        new_callable=AsyncMock,
         return_value={"head": {"sha": "fresh999"}},
     )
 
     result = await gh.update_branch_with_sha_retry(
-        "t", "o", "r", 1, expected_head_sha="stale",
+        "t",
+        "o",
+        "r",
+        1,
+        expected_head_sha="stale",
     )
 
     assert result == {"updated": False, "message": "retry failure"}
@@ -2169,6 +2379,7 @@ async def test_update_branch_with_sha_retry_retry_also_fails(mocker):
 # ---------------------------------------------------------------------------
 # build_merge_summary_body + post_merge_summary_comment
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.smoketest
 def test_build_merge_summary_body_all_fields():
@@ -2201,7 +2412,9 @@ def test_build_merge_summary_body_no_detail_lines_is_one_liner():
     """Without provider/model and without direction, body is a simple inline string."""
     from app.github import build_merge_summary_body
 
-    body = build_merge_summary_body(task_type="fix", scope="medium", iteration_count=2, cost_usd=0.10)
+    body = build_merge_summary_body(
+        task_type="fix", scope="medium", iteration_count=2, cost_usd=0.10
+    )
 
     assert "<details>" not in body
     assert "🤖 Blueprint:" in body
@@ -2235,12 +2448,21 @@ async def test_post_merge_summary_comment_returns_true_on_success(mocker):
     """Happy path: posts comment and returns True."""
     from app.github import post_merge_summary_comment
 
-    mock_comment = mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock, return_value={})
+    mock_comment = mocker.patch(
+        "app.github.create_pr_comment", new_callable=AsyncMock, return_value={}
+    )
 
     result = await post_merge_summary_comment(
-        "token", "owner", "repo", 42,
-        task_type="create", scope="small", iteration_count=2,
-        provider="anthropic", model="claude-opus-4-7", cost_usd=0.35,
+        "token",
+        "owner",
+        "repo",
+        42,
+        task_type="create",
+        scope="small",
+        iteration_count=2,
+        provider="anthropic",
+        model="claude-opus-4-7",
+        cost_usd=0.35,
         direction_title="Improve reliability",
     )
 

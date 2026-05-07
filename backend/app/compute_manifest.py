@@ -50,17 +50,26 @@ def build_agent_secret_manifest(
 ) -> dict:
     """Build the provider-aware secret manifest consumed by agent startup."""
     agent_jwt = create_agent_token(
-        str(task_id), vm_instance_id, task_type=task_type, project_id=project_id,
+        str(task_id),
+        vm_instance_id,
+        task_type=task_type,
+        project_id=project_id,
     )
     provider_name = provider or LLMProviderName.ANTHROPIC.value
     provider_enum = LLMProviderName(provider_name)
     resolved_auth_mode = auth_mode or (
-        LLMAuthMode.OAUTH.value if provider_name == LLMProviderName.ANTHROPIC.value and oauth_token else LLMAuthMode.API_KEY.value
+        LLMAuthMode.OAUTH.value
+        if provider_name == LLMProviderName.ANTHROPIC.value and oauth_token
+        else LLMAuthMode.API_KEY.value
     )
     auth_mode_enum = LLMAuthMode(resolved_auth_mode)
     provider_impl = get_provider(provider_enum)
     runtime_secret = oauth_token
-    if runtime_secret is None and provider_enum == LLMProviderName.ANTHROPIC and auth_mode_enum == LLMAuthMode.API_KEY:
+    if (
+        runtime_secret is None
+        and provider_enum == LLMProviderName.ANTHROPIC
+        and auth_mode_enum == LLMAuthMode.API_KEY
+    ):
         runtime_secret = ANTHROPIC_API_KEY or None
     secret_material = provider_impl.secret_material(
         runtime_secret,
@@ -69,7 +78,11 @@ def build_agent_secret_manifest(
     )
     files = list(secret_material.files)
     if claude_config_json:
-        files.append(FileMaterial(path="/home/agent/.claude.json", content=claude_config_json, mode="0600"))
+        files.append(
+            FileMaterial(
+                path="/home/agent/.claude.json", content=claude_config_json, mode="0600"
+            )
+        )
 
     # Translate the resolved provider settings bag into CLI env/args/files/
     # fallbacks. The agent runner consumes LLM_SETTINGS to apply these to

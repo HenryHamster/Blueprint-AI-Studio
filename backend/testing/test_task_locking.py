@@ -6,6 +6,7 @@ Cloud Run quarantines the instance. Each fix site below has a regression
 test that asserts contention surfaces as 429 (handler path) or "skip /
 defer" (loop / post-commit path), never as 500.
 """
+
 import asyncio
 import os
 import uuid
@@ -25,10 +26,9 @@ from app.task_locking import (
 )
 
 
-USE_POSTGRES = (
-    os.getenv("USE_TEST_POSTGRES", "").lower() == "true"
-    and os.getenv("DATABASE_URL", "").startswith("postgresql")
-)
+USE_POSTGRES = os.getenv("USE_TEST_POSTGRES", "").lower() == "true" and os.getenv(
+    "DATABASE_URL", ""
+).startswith("postgresql")
 
 
 async def _add_admin_membership(session, project, user_id="test-user-123"):
@@ -45,6 +45,7 @@ async def _add_admin_membership(session, project, user_id="test-user-123"):
 
 
 # ── Existing concurrency test (kept for regression on Postgres CI) ──────────
+
 
 @pytest.mark.skipif(not USE_POSTGRES, reason="row-lock concurrency requires PostgreSQL")
 @pytest.mark.asyncio
@@ -106,6 +107,7 @@ async def test_concurrent_dispatch_mutations_keep_both_context_updates(db_sessio
 
 # ── Phase A1 helpers ────────────────────────────────────────────────────────
 
+
 def _stub_first_select_returns_none(session, follow_through_match=None):
     """Wrap session.execute so the first call returns an empty result.
 
@@ -152,6 +154,7 @@ def _stub_first_select_returns_none(session, follow_through_match=None):
 
 # ── A1.1 — admin_notifications.py:444 (playbook set) ────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_admin_playbook_set_returns_429_on_lock_contention(
     client, db_session, mocker
@@ -193,6 +196,7 @@ async def test_admin_playbook_set_returns_429_on_lock_contention(
 
 # ── A1.2 — admin_notifications.py:498 (playbook delete) ─────────────────────
 
+
 @pytest.mark.asyncio
 async def test_admin_playbook_delete_returns_429_on_lock_contention(
     client, db_session, mocker
@@ -210,20 +214,21 @@ async def test_admin_playbook_delete_returns_429_on_lock_contention(
 
     async def _stub_lock(session, project_id):
         raise HTTPException(
-            status_code=429, detail="held",
+            status_code=429,
+            detail="held",
             headers={"Retry-After": "2"},
         )
+
     mocker.patch(
         "app.routers.admin_notifications.lock_project_or_429",
         new=AsyncMock(side_effect=_stub_lock),
     )
-    resp = await client.delete(
-        f"/api/admin/projects/{project.id}/playbook/test-key"
-    )
+    resp = await client.delete(f"/api/admin/projects/{project.id}/playbook/test-key")
     assert resp.status_code == 429
 
 
 # ── A1.3 — admin_notifications.py:535 (playbook seed) ───────────────────────
+
 
 @pytest.mark.asyncio
 async def test_admin_playbook_seed_returns_429_on_lock_contention(
@@ -242,20 +247,21 @@ async def test_admin_playbook_seed_returns_429_on_lock_contention(
 
     async def _stub_lock(session, project_id):
         raise HTTPException(
-            status_code=429, detail="held",
+            status_code=429,
+            detail="held",
             headers={"Retry-After": "2"},
         )
+
     mocker.patch(
         "app.routers.admin_notifications.lock_project_or_429",
         new=AsyncMock(side_effect=_stub_lock),
     )
-    resp = await client.post(
-        f"/api/admin/projects/{project.id}/playbook/seed"
-    )
+    resp = await client.post(f"/api/admin/projects/{project.id}/playbook/seed")
     assert resp.status_code == 429
 
 
 # ── A1.4 — directions.py:537 (manual strategic-cycle trigger) ───────────────
+
 
 @pytest.mark.asyncio
 async def test_trigger_strategic_cycle_returns_429_on_lock_contention(
@@ -274,9 +280,11 @@ async def test_trigger_strategic_cycle_returns_429_on_lock_contention(
 
     async def _stub_lock(session, project_id):
         raise HTTPException(
-            status_code=429, detail="held",
+            status_code=429,
+            detail="held",
             headers={"Retry-After": "2"},
         )
+
     mocker.patch(
         "app.routers.directions.lock_project_or_429",
         new=AsyncMock(side_effect=_stub_lock),
@@ -291,6 +299,7 @@ async def test_trigger_strategic_cycle_returns_429_on_lock_contention(
 
 
 # ── A1.5 — task_lifecycle.py:408 (_has_active_strategic_task) ───────────────
+
 
 @pytest.mark.asyncio
 async def test_has_active_strategic_task_returns_true_when_project_locked(
@@ -321,10 +330,9 @@ async def test_has_active_strategic_task_returns_true_when_project_locked(
 
 # ── A1.6 — task_lifecycle.py:1771 / 2232 / 2315 (rollup parent locking) ─────
 
+
 @pytest.mark.asyncio
-async def test_project_lock_helper_yields_none_under_contention(
-    db_session, mocker
-):
+async def test_project_lock_helper_yields_none_under_contention(db_session, mocker):
     """The new project_lock context manager yields None when the row is
     held under skip_locked=True (instead of raising LockNotAvailable).
     This is the primitive used by all post-commit chain sites in
@@ -343,9 +351,7 @@ async def test_project_lock_helper_yields_none_under_contention(
 
 
 @pytest.mark.asyncio
-async def test_lock_project_or_429_raises_429_under_contention(
-    db_session, mocker
-):
+async def test_lock_project_or_429_raises_429_under_contention(db_session, mocker):
     """Direct unit test for the helper used by all 4 handler-path sites.
     Phase A1, exercises the canonical 429 contract that admin_notifications
     and directions inherit.
@@ -367,9 +373,7 @@ async def test_lock_project_or_429_raises_429_under_contention(
 
 
 @pytest.mark.asyncio
-async def test_lock_project_or_429_raises_404_when_project_missing(
-    db_session, mocker
-):
+async def test_lock_project_or_429_raises_404_when_project_missing(db_session, mocker):
     """Distinguishes "row held" (429) from "row genuinely missing" (404).
     Without this, a missing-project bug would be silently retried as 429.
     """
@@ -382,6 +386,7 @@ async def test_lock_project_or_429_raises_404_when_project_missing(
 
 
 # ── A1.7 — task_completion.py:2693 (_handle_design_doc_completion) ──────────
+
 
 @pytest.mark.asyncio
 async def test_handle_design_doc_completion_defers_on_lock_contention(
@@ -451,6 +456,7 @@ async def test_handle_design_doc_completion_defers_on_lock_contention(
 
 
 # ── A1.8 — strategic_completion.py:679 (_handle_strategic_completion) ───────
+
 
 @pytest.mark.asyncio
 async def test_handle_strategic_completion_defers_on_lock_contention(
@@ -526,6 +532,7 @@ async def test_handle_strategic_completion_defers_on_lock_contention(
 
 # ── A1.9 — failure_classification.py:887 / 921 (residual upsert loop) ───────
 
+
 @pytest.mark.asyncio
 async def test_residual_upsert_skips_on_lock_contention(mocker, caplog):
     """When the residual-case row is held by a peer, the background upsert
@@ -556,6 +563,7 @@ async def test_residual_upsert_skips_on_lock_contention(mocker, caplog):
 
     class _ExistsResult:
         """Returned by the non-locking probe: row exists at fake_row_id."""
+
         def first(self):
             return (fake_row_id,)
 
@@ -605,13 +613,12 @@ async def test_residual_upsert_skips_on_lock_contention(mocker, caplog):
     )
 
     from datetime import datetime, timezone
+
     now_dt = datetime.now(tz=timezone.utc)
 
     with caplog.at_level(logging.INFO, logger="app.failure_classification"):
         # Must complete without raising — the helper logs and returns.
-        await _upsert_residual_case_async(
-            project_id, fingerprint, now_dt, "sample"
-        )
+        await _upsert_residual_case_async(project_id, fingerprint, now_dt, "sample")
 
     # Confirm the skip was logged (the helper logs at INFO when it skips)
     skip_logged = any(
@@ -624,6 +631,7 @@ async def test_residual_upsert_skips_on_lock_contention(mocker, caplog):
 
 
 # ── PR-spawn advisory lock ──────────────────────────────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_acquire_pr_spawn_lock_is_noop_on_sqlite(db_session):
@@ -682,7 +690,9 @@ async def test_acquire_pr_spawn_lock_serializes_concurrent_holders(db_session):
 
     await asyncio.gather(hold_lock_first(), acquire_second())
 
-    assert first_released_at and second_acquired_at, "both calls should record timestamps"
+    assert first_released_at and second_acquired_at, (
+        "both calls should record timestamps"
+    )
     # Second acquire must land AFTER first release. Small epsilon for clock
     # jitter; outright failure would have second landing >100ms before first.
     assert second_acquired_at[0] >= first_released_at[0] - 0.005, (
@@ -720,7 +730,8 @@ async def test_acquire_pr_spawn_lock_different_prs_dont_block(db_session):
         # the 0.3s hold — so a spurious dependency surfaces as a timeout.
         async with Session() as session:
             await asyncio.wait_for(
-                acquire_pr_spawn_lock(session, 99101), timeout=0.1,
+                acquire_pr_spawn_lock(session, 99101),
+                timeout=0.1,
             )
             await session.commit()
 

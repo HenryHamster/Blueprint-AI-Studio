@@ -1,4 +1,5 @@
 """Tests for /api/admin/activity PR impact annotations on TASK_COMPLETED events."""
+
 import pytest
 from httpx import AsyncClient
 
@@ -13,7 +14,9 @@ async def _make_project(session, name="Activity Test Project"):
     session.add(project)
     await session.commit()
     await session.refresh(project)
-    session.add(ProjectMember(project_id=project.id, user_id=TEST_USER_ID, role="owner"))
+    session.add(
+        ProjectMember(project_id=project.id, user_id=TEST_USER_ID, role="owner")
+    )
     await session.commit()
     return project
 

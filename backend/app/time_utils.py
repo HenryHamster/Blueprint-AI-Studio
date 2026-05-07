@@ -1,4 +1,5 @@
 """Shared time utilities with no intra-app dependencies."""
+
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -84,7 +85,9 @@ def set_retry_after(task_or_ctx, minutes: float) -> str:
         context = task_or_ctx
         context["retry_after"] = iso
         try:
-            context["_retry_after_resets"] = int(context.get("_retry_after_resets") or 0) + 1
+            context["_retry_after_resets"] = (
+                int(context.get("_retry_after_resets") or 0) + 1
+            )
         except (TypeError, ValueError):
             context["_retry_after_resets"] = 1
     return iso

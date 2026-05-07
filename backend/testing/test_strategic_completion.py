@@ -6,6 +6,7 @@ Covers:
   - _is_direction_duplicate: word-overlap with existing and rejected proposals
   - _record_strategic_task_failure: circuit-breaker increment and cycle history update
 """
+
 import pytest
 import pytest_asyncio
 from datetime import datetime, timedelta, timezone
@@ -34,15 +35,25 @@ from app.strategic_completion import (
     _CREATED_NOTE_PREFIX,
     _RETIRED_NOTE_PREFIX,
 )
-from app.strategic_spawning import _build_previous_decision_outcomes, _build_past_retirement_critiques
+from app.strategic_spawning import (
+    _build_previous_decision_outcomes,
+    _build_past_retirement_critiques,
+)
 from app.strategic_analysis import _build_outcome_evaluation
 from app.models import Project, Task
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
-def _history(n, tasks_created=2, tasks_completed=1, tasks_failed=0,
-             tasks_failed_infra=0, prs_merged=1):
+
+def _history(
+    n,
+    tasks_created=2,
+    tasks_completed=1,
+    tasks_failed=0,
+    tasks_failed_infra=0,
+    prs_merged=1,
+):
     """Build a list of n identical research_history cycle entries."""
     return [
         {
@@ -68,8 +79,8 @@ def _direction(**kwargs):
 
 # ── _check_direction_health ──────────────────────────────────────────────────
 
-class TestCheckDirectionHealth:
 
+class TestCheckDirectionHealth:
     # --- Rule 1: Saturation ---
 
     def test_saturation_exactly_5_cycles_all_le1_task_returns_message(self):
@@ -118,8 +129,9 @@ class TestCheckDirectionHealth:
     def test_zero_merge_5_cycles_all_finished_returns_message(self):
         # All cycles: 0 PRs merged, last cycle fully finished
         d = _direction(
-            research_history=_history(5, prs_merged=0, tasks_created=2,
-                                      tasks_completed=1, tasks_failed=1),
+            research_history=_history(
+                5, prs_merged=0, tasks_created=2, tasks_completed=1, tasks_failed=1
+            ),
         )
         result = _check_direction_health(d)
         assert result is not None
@@ -127,8 +139,9 @@ class TestCheckDirectionHealth:
 
     def test_zero_merge_requires_5_plus_cycles(self):
         d = _direction(
-            research_history=_history(4, prs_merged=0, tasks_created=2,
-                                      tasks_completed=2, tasks_failed=0),
+            research_history=_history(
+                4, prs_merged=0, tasks_created=2, tasks_completed=2, tasks_failed=0
+            ),
         )
         result = _check_direction_health(d)
         assert result is None
@@ -136,8 +149,13 @@ class TestCheckDirectionHealth:
     def test_zero_merge_skipped_when_tasks_still_in_flight(self):
         # tasks_created=3, tasks_completed=1, tasks_failed=1 → finished=2 < created=3
         history = _history(4, prs_merged=0) + [
-            {"tasks_created": 3, "tasks_completed": 1, "tasks_failed": 1,
-             "tasks_failed_infra": 0, "prs_merged": 0}
+            {
+                "tasks_created": 3,
+                "tasks_completed": 1,
+                "tasks_failed": 1,
+                "tasks_failed_infra": 0,
+                "prs_merged": 0,
+            }
         ]
         d = _direction(research_history=history)
         result = _check_direction_health(d)
@@ -146,8 +164,13 @@ class TestCheckDirectionHealth:
     def test_zero_merge_allowed_when_last_cycle_has_zero_tasks(self):
         # tasks_created=0 → guard treats this as finished (0 == 0)
         history = _history(4, prs_merged=0) + [
-            {"tasks_created": 0, "tasks_completed": 0, "tasks_failed": 0,
-             "tasks_failed_infra": 0, "prs_merged": 0}
+            {
+                "tasks_created": 0,
+                "tasks_completed": 0,
+                "tasks_failed": 0,
+                "tasks_failed_infra": 0,
+                "prs_merged": 0,
+            }
         ]
         d = _direction(research_history=history)
         result = _check_direction_health(d)
@@ -156,11 +179,21 @@ class TestCheckDirectionHealth:
 
     def test_zero_merge_not_fired_when_some_prs_merged(self):
         # 5 cycles but 1 merged PR in cycle 3
-        history = _history(2, prs_merged=0) + _history(1, prs_merged=1) + _history(2, prs_merged=0)
+        history = (
+            _history(2, prs_merged=0)
+            + _history(1, prs_merged=1)
+            + _history(2, prs_merged=0)
+        )
         d = _direction(
-            research_history=history + [
-                {"tasks_created": 2, "tasks_completed": 2, "tasks_failed": 0,
-                 "tasks_failed_infra": 0, "prs_merged": 0}
+            research_history=history
+            + [
+                {
+                    "tasks_created": 2,
+                    "tasks_completed": 2,
+                    "tasks_failed": 0,
+                    "tasks_failed_infra": 0,
+                    "prs_merged": 0,
+                }
             ],
         )
         # total_merged > 0 → rule must not fire
@@ -172,8 +205,9 @@ class TestCheckDirectionHealth:
     def test_high_failure_rate_above_threshold_returns_message(self):
         # 3 cycles: 3 tasks each, 3 failed, 0 infra → 9/9 = 100% > 70%
         d = _direction(
-            research_history=_history(3, tasks_created=3, tasks_failed=3,
-                                      tasks_failed_infra=0, prs_merged=0),
+            research_history=_history(
+                3, tasks_created=3, tasks_failed=3, tasks_failed_infra=0, prs_merged=0
+            ),
         )
         result = _check_direction_health(d)
         assert result is not None
@@ -183,9 +217,15 @@ class TestCheckDirectionHealth:
         # 10 tasks total, 7 code failures → 70% == threshold, NOT > 70%
         d = _direction(
             research_history=[
-                {"tasks_created": 10, "tasks_completed": 3, "tasks_failed": 7,
-                 "tasks_failed_infra": 0, "prs_merged": 1},
-            ] * 3,
+                {
+                    "tasks_created": 10,
+                    "tasks_completed": 3,
+                    "tasks_failed": 7,
+                    "tasks_failed_infra": 0,
+                    "prs_merged": 1,
+                },
+            ]
+            * 3,
         )
         result = _check_direction_health(d)
         # 70% is not strictly > 70%, so rule 3 should not fire
@@ -197,27 +237,36 @@ class TestCheckDirectionHealth:
         # Pins the infra-exclusion principle for both rules.
         d = _direction(
             research_history=[
-                {"tasks_created": 10, "tasks_completed": 4, "tasks_failed": 6,
-                 "tasks_failed_infra": 6, "prs_merged": 0},
-            ] * 3,
+                {
+                    "tasks_created": 10,
+                    "tasks_completed": 4,
+                    "tasks_failed": 6,
+                    "tasks_failed_infra": 6,
+                    "prs_merged": 0,
+                },
+            ]
+            * 3,
         )
         result = _check_direction_health(d)
         assert result is None
 
     def test_high_failure_rate_requires_3_plus_cycles(self):
         d = _direction(
-            research_history=_history(2, tasks_created=3, tasks_failed=3,
-                                      tasks_failed_infra=0, prs_merged=0),
+            research_history=_history(
+                2, tasks_created=3, tasks_failed=3, tasks_failed_infra=0, prs_merged=0
+            ),
         )
         result = _check_direction_health(d)
         assert result is None
 
     def test_high_failure_rate_only_uses_last_3_cycles(self):
         # 5 cycles: first 2 have 100% failure; last 3 are healthy
-        bad = _history(2, tasks_created=5, tasks_failed=5,
-                       tasks_failed_infra=0, prs_merged=0)
-        good = _history(3, tasks_created=5, tasks_failed=1,
-                        tasks_failed_infra=0, prs_merged=2)
+        bad = _history(
+            2, tasks_created=5, tasks_failed=5, tasks_failed_infra=0, prs_merged=0
+        )
+        good = _history(
+            3, tasks_created=5, tasks_failed=1, tasks_failed_infra=0, prs_merged=2
+        )
         d = _direction(research_history=bad + good)
         result = _check_direction_health(d)
         assert result is None
@@ -227,8 +276,9 @@ class TestCheckDirectionHealth:
     def test_healthy_direction_returns_none(self):
         d = _direction(
             possibly_saturated=False,
-            research_history=_history(6, tasks_created=3, prs_merged=2,
-                                      tasks_failed=0, tasks_failed_infra=0),
+            research_history=_history(
+                6, tasks_created=3, prs_merged=2, tasks_failed=0, tasks_failed_infra=0
+            ),
         )
         result = _check_direction_health(d)
         assert result is None
@@ -244,13 +294,14 @@ class TestCheckDirectionHealth:
 
 # ── _is_code_failure_pause_reason ────────────────────────────────────────────
 
-class TestIsCodeFailurePauseReason:
 
+class TestIsCodeFailurePauseReason:
     def test_rule3_high_failure_rate_prefix_classified_as_code_failure(self):
         # Use the actual message _check_direction_health produces for Rule 3
         d = _direction(
-            research_history=_history(3, tasks_created=3, tasks_failed=3,
-                                      tasks_failed_infra=0, prs_merged=0),
+            research_history=_history(
+                3, tasks_created=3, tasks_failed=3, tasks_failed_infra=0, prs_merged=0
+            ),
         )
         reason = _check_direction_health(d)
         assert reason is not None
@@ -259,9 +310,14 @@ class TestIsCodeFailurePauseReason:
     def test_rule4_recent_stall_prefix_classified_as_code_failure(self):
         # Rule 4 fires when 3 cycles all have >=1 code failure and 0 merges
         d = _direction(
-            research_history=_history(3, tasks_created=2, tasks_completed=1,
-                                      tasks_failed=1, tasks_failed_infra=0,
-                                      prs_merged=0),
+            research_history=_history(
+                3,
+                tasks_created=2,
+                tasks_completed=1,
+                tasks_failed=1,
+                tasks_failed_infra=0,
+                prs_merged=0,
+            ),
         )
         reason = _check_direction_health(d)
         assert reason is not None
@@ -278,8 +334,9 @@ class TestIsCodeFailurePauseReason:
 
     def test_rule2_unproductive_not_classified_as_code_failure(self):
         d = _direction(
-            research_history=_history(5, prs_merged=0, tasks_created=2,
-                                      tasks_completed=2, tasks_failed=0),
+            research_history=_history(
+                5, prs_merged=0, tasks_created=2, tasks_completed=2, tasks_failed=0
+            ),
         )
         reason = _check_direction_health(d)
         assert reason is not None
@@ -294,14 +351,17 @@ class TestIsCodeFailurePauseReason:
 
 # ── _build_direction_failure_summary ─────────────────────────────────────────
 
-class TestBuildDirectionFailureSummary:
 
+class TestBuildDirectionFailureSummary:
     def test_summarizes_last_3_cycles(self):
         # 5 cycles; only last 3 should be aggregated
-        history = (
-            _history(2, tasks_created=9, tasks_failed=9, prs_merged=0)
-            + _history(3, tasks_created=2, tasks_completed=1, tasks_failed=1,
-                       tasks_failed_infra=0, prs_merged=0)
+        history = _history(2, tasks_created=9, tasks_failed=9, prs_merged=0) + _history(
+            3,
+            tasks_created=2,
+            tasks_completed=1,
+            tasks_failed=1,
+            tasks_failed_infra=0,
+            prs_merged=0,
         )
         d = _direction(research_history=history)
         summary = _build_direction_failure_summary(d)
@@ -314,8 +374,9 @@ class TestBuildDirectionFailureSummary:
 
     def test_excludes_infra_failures_from_code_failed(self):
         d = _direction(
-            research_history=_history(3, tasks_created=10, tasks_failed=6,
-                                      tasks_failed_infra=4, prs_merged=0),
+            research_history=_history(
+                3, tasks_created=10, tasks_failed=6, tasks_failed_infra=4, prs_merged=0
+            ),
         )
         summary = _build_direction_failure_summary(d)
         assert summary["tasks_failed_total"] == 18
@@ -324,8 +385,9 @@ class TestBuildDirectionFailureSummary:
 
     def test_computes_code_failure_rate(self):
         d = _direction(
-            research_history=_history(3, tasks_created=4, tasks_failed=3,
-                                      tasks_failed_infra=0, prs_merged=0),
+            research_history=_history(
+                3, tasks_created=4, tasks_failed=3, tasks_failed_infra=0, prs_merged=0
+            ),
         )
         summary = _build_direction_failure_summary(d)
         # 9 code failed / 12 created = 0.75
@@ -354,8 +416,8 @@ class TestBuildDirectionFailureSummary:
 
 # ── _check_direction_completion ──────────────────────────────────────────────
 
-class TestCheckDirectionCompletion:
 
+class TestCheckDirectionCompletion:
     def test_returns_message_when_all_criteria_met(self):
         # 4+ cycles, 3+ merged, recent 2 cycles low-yield
         history = _history(3, prs_merged=2) + _history(2, tasks_created=1, prs_merged=0)
@@ -379,10 +441,20 @@ class TestCheckDirectionCompletion:
     def test_not_triggered_when_recent_activity_high(self):
         # Last 2 cycles have 3 tasks created (> 2) — still active
         history = _history(3, prs_merged=2) + [
-            {"tasks_created": 3, "tasks_completed": 1, "tasks_failed": 0,
-             "tasks_failed_infra": 0, "prs_merged": 0},
-            {"tasks_created": 3, "tasks_completed": 1, "tasks_failed": 0,
-             "tasks_failed_infra": 0, "prs_merged": 0},
+            {
+                "tasks_created": 3,
+                "tasks_completed": 1,
+                "tasks_failed": 0,
+                "tasks_failed_infra": 0,
+                "prs_merged": 0,
+            },
+            {
+                "tasks_created": 3,
+                "tasks_completed": 1,
+                "tasks_failed": 0,
+                "tasks_failed_infra": 0,
+                "prs_merged": 0,
+            },
         ]
         d = _direction(research_history=history)
         result = _check_direction_completion(d)
@@ -391,10 +463,20 @@ class TestCheckDirectionCompletion:
     def test_not_triggered_when_recent_merged_above_threshold(self):
         # Last 2 cycles have 2 merged PRs (> 1)
         history = _history(2, prs_merged=1) + [
-            {"tasks_created": 1, "tasks_completed": 1, "tasks_failed": 0,
-             "tasks_failed_infra": 0, "prs_merged": 1},
-            {"tasks_created": 1, "tasks_completed": 1, "tasks_failed": 0,
-             "tasks_failed_infra": 0, "prs_merged": 1},
+            {
+                "tasks_created": 1,
+                "tasks_completed": 1,
+                "tasks_failed": 0,
+                "tasks_failed_infra": 0,
+                "prs_merged": 1,
+            },
+            {
+                "tasks_created": 1,
+                "tasks_completed": 1,
+                "tasks_failed": 0,
+                "tasks_failed_infra": 0,
+                "prs_merged": 1,
+            },
         ]
         d = _direction(research_history=history)
         result = _check_direction_completion(d)
@@ -416,8 +498,8 @@ class TestCheckDirectionCompletion:
 
 # ── _is_direction_duplicate ──────────────────────────────────────────────────
 
-class TestIsDirectionDuplicate:
 
+class TestIsDirectionDuplicate:
     def test_duplicate_with_existing_direction(self):
         proposal = "improve caching layer performance database queries"
         existing = [{"text": "improve caching layer performance database queries"}]
@@ -435,15 +517,23 @@ class TestIsDirectionDuplicate:
     def test_duplicate_with_recent_rejected_proposal(self):
         recent = (datetime.now(timezone.utc) - timedelta(days=10)).isoformat()
         proposal = "migrate authentication service new token system"
-        rejected = [{"text": "migrate authentication service new token system",
-                     "rejected_at": recent}]
+        rejected = [
+            {
+                "text": "migrate authentication service new token system",
+                "rejected_at": recent,
+            }
+        ]
         assert _is_direction_duplicate(proposal, [], rejected) is True
 
     def test_old_rejected_proposal_ignored(self):
         old = (datetime.now(timezone.utc) - timedelta(days=40)).isoformat()
         proposal = "migrate authentication service new token system"
-        rejected = [{"text": "migrate authentication service new token system",
-                     "rejected_at": old}]
+        rejected = [
+            {
+                "text": "migrate authentication service new token system",
+                "rejected_at": old,
+            }
+        ]
         assert _is_direction_duplicate(proposal, [], rejected) is False
 
     def test_stopwords_filtered_from_proposal(self):
@@ -478,40 +568,55 @@ class TestIsDirectionDuplicate:
         # 3-word overlap against an expired direction should be flagged (tighter threshold = 3)
         # Note: "improve" is a stopword and is excluded from overlap counting
         proposal = "cache database query performance"
-        existing = [{"text": "cache database query latency optimization", "status": "expired"}]
+        existing = [
+            {"text": "cache database query latency optimization", "status": "expired"}
+        ]
         # Non-stopword overlap: cache, database, query = 3 >= threshold 3 for retired → True
         assert _is_direction_duplicate(proposal, existing, []) is True
 
     def test_active_direction_still_requires_4_words(self):
         # Same 3-word overlap against an active direction should NOT be flagged (threshold 4)
         proposal = "cache database query performance"
-        existing = [{"text": "cache database query latency optimization", "status": "active"}]
+        existing = [
+            {"text": "cache database query latency optimization", "status": "active"}
+        ]
         # Non-stopword overlap: cache, database, query = 3 < threshold 4 for active → False
         assert _is_direction_duplicate(proposal, existing, []) is False
 
     def test_superseded_direction_tighter_threshold(self):
         # superseded status also uses the tighter threshold of 3
         proposal = "migrate authentication service token"
-        existing = [{"text": "migrate authentication service old token system", "status": "superseded"}]
+        existing = [
+            {
+                "text": "migrate authentication service old token system",
+                "status": "superseded",
+            }
+        ]
         # Overlap: migrate, authentication, service, token = 4 >= 3 → True
         assert _is_direction_duplicate(proposal, existing, []) is True
 
     def test_retired_threshold_2_words_does_not_trigger(self):
         # Only 2 shared non-stopword words even against a retired direction → False
         proposal = "caching performance metrics"
-        existing = [{"text": "caching performance strategy deployment", "status": "expired"}]
+        existing = [
+            {"text": "caching performance strategy deployment", "status": "expired"}
+        ]
         # Overlap: caching, performance = 2 < 3 → False
         assert _is_direction_duplicate(proposal, existing, []) is False
 
 
 # ── _record_strategic_task_failure ───────────────────────────────────────────
 
+
 @pytest_asyncio.fixture()
 async def strat_fail_db(mocker):
     """Isolated in-memory DB for _record_strategic_task_failure tests."""
     from sqlalchemy.dialects.sqlite.base import SQLiteTypeCompiler
+
     if not hasattr(SQLiteTypeCompiler, "visit_JSONB"):
-        SQLiteTypeCompiler.visit_JSONB = lambda self, type_, **kw: self.visit_JSON(type_, **kw)
+        SQLiteTypeCompiler.visit_JSONB = lambda self, type_, **kw: self.visit_JSON(
+            type_, **kw
+        )
 
     _engine = create_async_engine(
         "sqlite+aiosqlite:///:memory:",
@@ -522,8 +627,11 @@ async def strat_fail_db(mocker):
         await conn.run_sync(SQLModel.metadata.create_all)
 
     _Session = sessionmaker(
-        bind=_engine, class_=AsyncSession,
-        autocommit=False, autoflush=False, expire_on_commit=False,
+        bind=_engine,
+        class_=AsyncSession,
+        autocommit=False,
+        autoflush=False,
+        expire_on_commit=False,
     )
     async with _Session() as session:
         yield session
@@ -533,8 +641,9 @@ async def strat_fail_db(mocker):
     await _engine.dispose()
 
 
-async def _make_failure_task(session, project, task_type="strategic_review",
-                             context=None, status_message=None):
+async def _make_failure_task(
+    session, project, task_type="strategic_review", context=None, status_message=None
+):
     task = Task(
         project_id=project.id,
         payloads=[{"type": task_type, "prompt": "strategic prompt"}],
@@ -548,7 +657,6 @@ async def _make_failure_task(session, project, task_type="strategic_review",
 
 
 class TestRecordStrategicTaskFailure:
-
     @pytest.mark.asyncio
     async def test_increments_strategic_failures_counter(self, strat_fail_db):
         project = Project(name="P", user_id="u1", vision={"purpose": "test"})
@@ -565,8 +673,9 @@ class TestRecordStrategicTaskFailure:
 
     @pytest.mark.asyncio
     async def test_increments_from_existing_count(self, strat_fail_db):
-        project = Project(name="P", user_id="u1",
-                          vision={"purpose": "test", "_strategic_failures": 2})
+        project = Project(
+            name="P", user_id="u1", vision={"purpose": "test", "_strategic_failures": 2}
+        )
         strat_fail_db.add(project)
         await strat_fail_db.commit()
         await strat_fail_db.refresh(project)
@@ -597,13 +706,15 @@ class TestRecordStrategicTaskFailure:
         # row and verify _record_strategic_task_failure flips its outcome.
         from app import strategic_cycle as sc
         from app.models import StrategicCycle
+
         cycle_id = "cycle-fail-001"
         project = Project(name="P", user_id="u1", vision={"purpose": "test"})
         strat_fail_db.add(project)
         await strat_fail_db.commit()
         await strat_fail_db.refresh(project)
         cycle = StrategicCycle(
-            id=cycle_id, project_id=project.id,
+            id=cycle_id,
+            project_id=project.id,
             outcome=sc.OUTCOME_PHASE2_RUNNING,
             phase1_started_at=_utcnow(),
             phase1_completed_at=_utcnow(),
@@ -613,7 +724,8 @@ class TestRecordStrategicTaskFailure:
         await strat_fail_db.commit()
 
         task = await _make_failure_task(
-            strat_fail_db, project,
+            strat_fail_db,
+            project,
             task_type="strategic_review",
             context={"strategic_cycle_id": cycle_id},
             status_message="Claude API timeout",
@@ -629,13 +741,15 @@ class TestRecordStrategicTaskFailure:
     async def test_updates_cycle_history_for_design_doc_update(self, strat_fail_db):
         from app import strategic_cycle as sc
         from app.models import StrategicCycle
+
         cycle_id = "cycle-fail-002"
         project = Project(name="P", user_id="u1", vision={"purpose": "test"})
         strat_fail_db.add(project)
         await strat_fail_db.commit()
         await strat_fail_db.refresh(project)
         cycle = StrategicCycle(
-            id=cycle_id, project_id=project.id,
+            id=cycle_id,
+            project_id=project.id,
             outcome=sc.OUTCOME_PHASE1_RUNNING,
             phase1_started_at=_utcnow(),
         )
@@ -643,7 +757,8 @@ class TestRecordStrategicTaskFailure:
         await strat_fail_db.commit()
 
         task = await _make_failure_task(
-            strat_fail_db, project,
+            strat_fail_db,
+            project,
             task_type="design_doc_update",
             context={"strategic_cycle_id": cycle_id},
             status_message="VM crash",
@@ -658,7 +773,8 @@ class TestRecordStrategicTaskFailure:
     @pytest.mark.asyncio
     async def test_no_cycle_id_skips_cycle_history_update(self, strat_fail_db):
         project = Project(
-            name="P", user_id="u1",
+            name="P",
+            user_id="u1",
             vision={
                 "purpose": "test",
                 "_strategic_cycle_history": [{"cycle_id": "other", "outcome": "ok"}],
@@ -681,9 +797,12 @@ class TestRecordStrategicTaskFailure:
     async def test_error_truncated_to_200_chars(self, strat_fail_db):
         cycle_id = "cycle-fail-003"
         project = Project(
-            name="P", user_id="u1",
-            vision={"purpose": "test",
-                    "_strategic_cycle_history": [{"cycle_id": cycle_id}]},
+            name="P",
+            user_id="u1",
+            vision={
+                "purpose": "test",
+                "_strategic_cycle_history": [{"cycle_id": cycle_id}],
+            },
         )
         strat_fail_db.add(project)
         await strat_fail_db.commit()
@@ -691,7 +810,8 @@ class TestRecordStrategicTaskFailure:
 
         long_message = "x" * 500
         task = await _make_failure_task(
-            strat_fail_db, project,
+            strat_fail_db,
+            project,
             context={"strategic_cycle_id": cycle_id},
             status_message=long_message,
         )
@@ -705,6 +825,7 @@ class TestRecordStrategicTaskFailure:
     async def test_no_op_when_project_not_found(self, strat_fail_db):
         """Should return silently when project does not exist."""
         import uuid
+
         task = Task(
             project_id=uuid.uuid4(),
             payloads=[{"type": "strategic_review", "prompt": "p"}],
@@ -759,6 +880,7 @@ class TestRecordStrategicTaskFailure:
 
 # ── thinker_artifacts_missing outcome routing ────────────────────────────────
 
+
 class TestThinkerArtifactsMissingOutcome:
     """failure_category=strategic_thinker_artifacts_missing routes the cycle
     to OUTCOME_THINKER_ARTIFACTS_MISSING instead of OUTCOME_FAILED_PHASE2."""
@@ -767,13 +889,15 @@ class TestThinkerArtifactsMissingOutcome:
     async def test_thinker_artifacts_missing_sets_new_outcome(self, strat_fail_db):
         from app import strategic_cycle as sc
         from app.models import StrategicCycle
+
         cycle_id = "cycle-thinker-001"
         project = Project(name="P", user_id="u1", vision={"purpose": "test"})
         strat_fail_db.add(project)
         await strat_fail_db.commit()
         await strat_fail_db.refresh(project)
         cycle = StrategicCycle(
-            id=cycle_id, project_id=project.id,
+            id=cycle_id,
+            project_id=project.id,
             outcome=sc.OUTCOME_PHASE2_RUNNING,
             phase1_started_at=_utcnow(),
             phase1_completed_at=_utcnow(),
@@ -785,11 +909,13 @@ class TestThinkerArtifactsMissingOutcome:
         # Task carries failure_category in its payload
         task = Task(
             project_id=project.id,
-            payloads=[{
-                "type": "strategic_review",
-                "prompt": "p",
-                "failure_category": "strategic_thinker_artifacts_missing",
-            }],
+            payloads=[
+                {
+                    "type": "strategic_review",
+                    "prompt": "p",
+                    "failure_category": "strategic_thinker_artifacts_missing",
+                }
+            ],
             context={"strategic_cycle_id": cycle_id},
             latest_status_message="thinker artifacts missing",
         )
@@ -808,13 +934,15 @@ class TestThinkerArtifactsMissingOutcome:
     async def test_generic_phase2_failure_still_uses_failed_phase2(self, strat_fail_db):
         from app import strategic_cycle as sc
         from app.models import StrategicCycle
+
         cycle_id = "cycle-generic-fail-001"
         project = Project(name="P", user_id="u1", vision={"purpose": "test"})
         strat_fail_db.add(project)
         await strat_fail_db.commit()
         await strat_fail_db.refresh(project)
         cycle = StrategicCycle(
-            id=cycle_id, project_id=project.id,
+            id=cycle_id,
+            project_id=project.id,
             outcome=sc.OUTCOME_PHASE2_RUNNING,
             phase1_started_at=_utcnow(),
             phase1_completed_at=_utcnow(),
@@ -851,14 +979,17 @@ def _active_dir(**kwargs):
 
 
 class TestCheckDirectionStarvation:
-
     @pytest.mark.asyncio
     async def test_no_gaps_resets_counter(self, strat_fail_db, mocker):
         mocker.patch("app.main._create_strategic_alert", new=mocker.AsyncMock())
         # 3 active product directions, not saturated → no gaps
         project = Project(
-            name="P", user_id="u1",
-            vision={"_direction_starvation_count": 3, "_strategic_frequency_override": 2},
+            name="P",
+            user_id="u1",
+            vision={
+                "_direction_starvation_count": 3,
+                "_strategic_frequency_override": 2,
+            },
             directions=[
                 _active_dir(id="1", category="product"),
                 _active_dir(id="2", category="product"),
@@ -868,7 +999,9 @@ class TestCheckDirectionStarvation:
         strat_fail_db.add(project)
         await strat_fail_db.commit()
 
-        await _check_direction_starvation(project, dirs_created=0, session=strat_fail_db)
+        await _check_direction_starvation(
+            project, dirs_created=0, session=strat_fail_db
+        )
 
         assert project.vision.get("_direction_starvation_count") == 0
         assert "_strategic_frequency_override" not in project.vision
@@ -877,30 +1010,42 @@ class TestCheckDirectionStarvation:
     async def test_dirs_created_resets_counter(self, strat_fail_db, mocker):
         mocker.patch("app.main._create_strategic_alert", new=mocker.AsyncMock())
         project = Project(
-            name="P", user_id="u1",
-            vision={"_direction_starvation_count": 4, "_strategic_frequency_override": 2},
+            name="P",
+            user_id="u1",
+            vision={
+                "_direction_starvation_count": 4,
+                "_strategic_frequency_override": 2,
+            },
             directions=[_active_dir(id="1", category="product")],
         )
         strat_fail_db.add(project)
         await strat_fail_db.commit()
 
         # dirs_created > 0 → reset even though has_gaps is True
-        await _check_direction_starvation(project, dirs_created=1, session=strat_fail_db)
+        await _check_direction_starvation(
+            project, dirs_created=1, session=strat_fail_db
+        )
 
         assert project.vision.get("_direction_starvation_count") == 0
         assert "_strategic_frequency_override" not in project.vision
 
     @pytest.mark.asyncio
     async def test_below_minimum_increments_counter(self, strat_fail_db, mocker):
-        alert_mock = mocker.patch("app.main._create_strategic_alert", new=mocker.AsyncMock())
+        alert_mock = mocker.patch(
+            "app.main._create_strategic_alert", new=mocker.AsyncMock()
+        )
         project = Project(
-            name="P", user_id="u1", vision={},
+            name="P",
+            user_id="u1",
+            vision={},
             directions=[_active_dir(id="1", category="product")],
         )
         strat_fail_db.add(project)
         await strat_fail_db.commit()
 
-        await _check_direction_starvation(project, dirs_created=0, session=strat_fail_db)
+        await _check_direction_starvation(
+            project, dirs_created=0, session=strat_fail_db
+        )
 
         assert project.vision.get("_direction_starvation_count") == 1
         # Level 1 — no alert, no override
@@ -908,29 +1053,44 @@ class TestCheckDirectionStarvation:
         alert_mock.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_level_2_creates_alert_and_frequency_override(self, strat_fail_db, mocker):
-        alert_mock = mocker.patch("app.main._create_strategic_alert", new=mocker.AsyncMock())
+    async def test_level_2_creates_alert_and_frequency_override(
+        self, strat_fail_db, mocker
+    ):
+        alert_mock = mocker.patch(
+            "app.main._create_strategic_alert", new=mocker.AsyncMock()
+        )
         project = Project(
-            name="P", user_id="u1",
+            name="P",
+            user_id="u1",
             vision={"_direction_starvation_count": 1},
             directions=[_active_dir(id="1", category="product")],
         )
         strat_fail_db.add(project)
         await strat_fail_db.commit()
 
-        await _check_direction_starvation(project, dirs_created=0, session=strat_fail_db)
+        await _check_direction_starvation(
+            project, dirs_created=0, session=strat_fail_db
+        )
 
         assert project.vision.get("_direction_starvation_count") == 2
         assert project.vision.get("_strategic_frequency_override") == 2
         alert_mock.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_level_5_auto_creates_no_product_fallback(self, strat_fail_db, mocker):
-        alert_mock = mocker.patch("app.main._create_strategic_alert", new=mocker.AsyncMock())
+    async def test_level_5_auto_creates_no_product_fallback(
+        self, strat_fail_db, mocker
+    ):
+        alert_mock = mocker.patch(
+            "app.main._create_strategic_alert", new=mocker.AsyncMock()
+        )
         # Active directions but NONE are product → gap_type=NO_PRODUCT_DIRECTIONS
         project = Project(
-            name="P", user_id="u1",
-            vision={"_direction_starvation_count": 4, "_strategic_frequency_override": 2},
+            name="P",
+            user_id="u1",
+            vision={
+                "_direction_starvation_count": 4,
+                "_strategic_frequency_override": 2,
+            },
             directions=[
                 _active_dir(id="1", category="structural"),
                 _active_dir(id="2", category="structural"),
@@ -940,7 +1100,9 @@ class TestCheckDirectionStarvation:
         strat_fail_db.add(project)
         await strat_fail_db.commit()
 
-        await _check_direction_starvation(project, dirs_created=0, session=strat_fail_db)
+        await _check_direction_starvation(
+            project, dirs_created=0, session=strat_fail_db
+        )
 
         # Fallback direction appended with product category
         assert len(project.directions) == 4
@@ -955,18 +1117,23 @@ class TestCheckDirectionStarvation:
         alert_mock.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_level_5_below_minimum_fallback_no_category(self, strat_fail_db, mocker):
+    async def test_level_5_below_minimum_fallback_no_category(
+        self, strat_fail_db, mocker
+    ):
         mocker.patch("app.main._create_strategic_alert", new=mocker.AsyncMock())
         # 1 active product direction; product_count > 0 but active_count < 3
         project = Project(
-            name="P", user_id="u1",
+            name="P",
+            user_id="u1",
             vision={"_direction_starvation_count": 4},
             directions=[_active_dir(id="1", category="product")],
         )
         strat_fail_db.add(project)
         await strat_fail_db.commit()
 
-        await _check_direction_starvation(project, dirs_created=0, session=strat_fail_db)
+        await _check_direction_starvation(
+            project, dirs_created=0, session=strat_fail_db
+        )
 
         assert len(project.directions) == 2
         new_dir = project.directions[-1]
@@ -978,7 +1145,8 @@ class TestCheckDirectionStarvation:
         mocker.patch("app.main._create_strategic_alert", new=mocker.AsyncMock())
         # 3 active product directions, all saturated → gap_type=ALL_SATURATED
         project = Project(
-            name="P", user_id="u1",
+            name="P",
+            user_id="u1",
             vision={"_direction_starvation_count": 4},
             directions=[
                 _active_dir(id="1", category="product", possibly_saturated=True),
@@ -989,7 +1157,9 @@ class TestCheckDirectionStarvation:
         strat_fail_db.add(project)
         await strat_fail_db.commit()
 
-        await _check_direction_starvation(project, dirs_created=0, session=strat_fail_db)
+        await _check_direction_starvation(
+            project, dirs_created=0, session=strat_fail_db
+        )
 
         assert len(project.directions) == 4
         new_dir = project.directions[-1]
@@ -997,14 +1167,17 @@ class TestCheckDirectionStarvation:
 
     @pytest.mark.asyncio
     async def test_level_5_cap_reached_skips_creation(self, strat_fail_db, mocker):
-        alert_mock = mocker.patch("app.main._create_strategic_alert", new=mocker.AsyncMock())
+        alert_mock = mocker.patch(
+            "app.main._create_strategic_alert", new=mocker.AsyncMock()
+        )
         mocker.patch.dict(
             "app.strategic_completion._runtime_config",
             {"max_active_directions": 2},
             clear=False,
         )
         project = Project(
-            name="P", user_id="u1",
+            name="P",
+            user_id="u1",
             vision={"_direction_starvation_count": 4},
             directions=[
                 _active_dir(id="1", category="structural"),
@@ -1014,7 +1187,9 @@ class TestCheckDirectionStarvation:
         strat_fail_db.add(project)
         await strat_fail_db.commit()
 
-        await _check_direction_starvation(project, dirs_created=0, session=strat_fail_db)
+        await _check_direction_starvation(
+            project, dirs_created=0, session=strat_fail_db
+        )
 
         # No fallback added, counter NOT reset (kept incrementing)
         assert len(project.directions) == 2
@@ -1023,6 +1198,7 @@ class TestCheckDirectionStarvation:
 
 
 # ── Rationale persistence & retrieval ────────────────────────────────────────
+
 
 class TestRationalePersistence:
     def test_extract_rationale_from_notes_returns_latest(self):
@@ -1047,13 +1223,16 @@ class TestRationalePersistence:
 
     def test_collect_rationales_from_directions(self):
         project = Project(
-            name="P", user_id="u1",
+            name="P",
+            user_id="u1",
             directions=[
                 {"id": "d-a", "notes": [{"text": f"{_CREATED_NOTE_PREFIX}because A"}]},
                 {"id": "d-b", "notes": [{"text": f"{_RETIRED_NOTE_PREFIX}because B"}]},
             ],
         )
-        created = _collect_rationales(project, ["d-a", "d-missing"], _CREATED_NOTE_PREFIX)
+        created = _collect_rationales(
+            project, ["d-a", "d-missing"], _CREATED_NOTE_PREFIX
+        )
         retired = _collect_rationales(project, ["d-b"], _RETIRED_NOTE_PREFIX)
         assert created == {"d-a": "because A"}
         assert retired == {"d-b": "because B"}
@@ -1079,10 +1258,13 @@ class TestRationalePersistence:
     def test_build_previous_decision_outcomes_surfaces_rationales(self):
         # Audit W2: cycle history is now passed in (was JSONB on vision).
         project = Project(
-            name="P", user_id="u1",
+            name="P",
+            user_id="u1",
             directions=[
                 {
-                    "id": "d-n", "status": "active", "text": "new dir",
+                    "id": "d-n",
+                    "status": "active",
+                    "text": "new dir",
                     "research_history": [{"prs_merged": 1}],
                 },
             ],
@@ -1104,14 +1286,21 @@ class TestRationalePersistence:
         assert out["cycle_reasoning"] == "focus on velocity"
         assert out["created"][0]["rationale"] == "because new capability"
         assert out["retired"][0] == {
-            "direction_id": "d-gone", "role": "retired",
-            "status": "missing", "rationale": "stalled for 5 cycles",
+            "direction_id": "d-gone",
+            "role": "retired",
+            "status": "missing",
+            "rationale": "stalled for 5 cycles",
         }
 
-    def test_build_previous_decision_outcomes_no_rationales_is_backward_compatible(self):
+    def test_build_previous_decision_outcomes_no_rationales_is_backward_compatible(
+        self,
+    ):
         project = Project(
-            name="P", user_id="u1",
-            directions=[{"id": "d-n", "status": "active", "text": "t", "research_history": []}],
+            name="P",
+            user_id="u1",
+            directions=[
+                {"id": "d-n", "status": "active", "text": "t", "research_history": []}
+            ],
             vision={},
         )
         cycle_history = [
@@ -1138,11 +1327,16 @@ class TestDirectionPredictionCalibration:
 
     def test_build_creation_prediction_counts_similar_past_merges(self):
         similar = {
-            "id": "d0", "text": "cache invalidation dashboard refresh",
+            "id": "d0",
+            "text": "cache invalidation dashboard refresh",
             "research_history": [{"prs_merged": 2}, {"prs_merged": 1}],
         }
-        p = Project(name="P", user_id="u", directions=[similar],
-                    vision={"systems": [{"id": "s", "status": "functional"}]})
+        p = Project(
+            name="P",
+            user_id="u",
+            directions=[similar],
+            vision={"systems": [{"id": "s", "status": "functional"}]},
+        )
         new_d = {"id": "d1", "text": "cache invalidation dashboard refresh strategy"}
         pred = _build_creation_prediction(new_d, p)
         assert pred["similar_past_merges"] == 3
@@ -1161,38 +1355,56 @@ class TestDirectionPredictionCalibration:
         assert isinstance(m["final_quality_score"], float)
 
     def test_collect_predictions_and_metrics_skip_missing_ids(self):
-        p = Project(name="P", user_id="u",
-                    directions=[{"id": "d1", "text": "x" * 60, "research_history": []}],
-                    vision={})
+        p = Project(
+            name="P",
+            user_id="u",
+            directions=[{"id": "d1", "text": "x" * 60, "research_history": []}],
+            vision={},
+        )
         assert _collect_creation_predictions(p, ["d1", "d-missing"]).keys() == {"d1"}
         assert _collect_retirement_metrics(p, ["d1", "d-missing"]).keys() == {"d1"}
 
     def test_build_previous_decision_outcomes_includes_prediction_and_delta(self):
         from app.strategic_spawning import _build_previous_decision_outcomes
+
         project = Project(
-            name="P", user_id="u1",
-            directions=[{
-                "id": "d-n", "status": "active", "text": "new",
-                "research_history": [{"prs_merged": 4}],
-            }],
+            name="P",
+            user_id="u1",
+            directions=[
+                {
+                    "id": "d-n",
+                    "status": "active",
+                    "text": "new",
+                    "research_history": [{"prs_merged": 4}],
+                }
+            ],
             vision={},
         )
         # Audit W2: cycle history is now passed in (was JSONB on vision).
-        cycle_history = [{
-            "cycle_id": "sc-1",
-            "outcome": "completed",
-            "created_direction_ids": ["d-n"],
-            "retired_direction_ids": ["d-gone"],
-            "created_predictions": {"d-n": {
-                "estimated_difficulty": "high", "text_length": 3,
-                "mature_system_count": 0, "similar_direction_count": 1,
-                "similar_past_merges": 1,
-            }},
-            "retired_final_metrics": {"d-gone": {
-                "final_quality_score": 0.2, "final_prs_merged": 0,
-                "final_cycles_active": 5,
-            }},
-        }]
+        cycle_history = [
+            {
+                "cycle_id": "sc-1",
+                "outcome": "completed",
+                "created_direction_ids": ["d-n"],
+                "retired_direction_ids": ["d-gone"],
+                "created_predictions": {
+                    "d-n": {
+                        "estimated_difficulty": "high",
+                        "text_length": 3,
+                        "mature_system_count": 0,
+                        "similar_direction_count": 1,
+                        "similar_past_merges": 1,
+                    }
+                },
+                "retired_final_metrics": {
+                    "d-gone": {
+                        "final_quality_score": 0.2,
+                        "final_prs_merged": 0,
+                        "final_cycles_active": 5,
+                    }
+                },
+            }
+        ]
         out = _build_previous_decision_outcomes(project, cycle_history)
         assert out["created"][0]["prediction"]["estimated_difficulty"] == "high"
         assert out["created"][0]["calibration_delta"] == 3
@@ -1200,6 +1412,7 @@ class TestDirectionPredictionCalibration:
 
 
 # ── recommended_mode normalization + persistence ─────────────────────────────
+
 
 class TestRecommendedModeNormalization:
     """The strategic agent emits `recommended_mode` on direction operations.
@@ -1210,6 +1423,7 @@ class TestRecommendedModeNormalization:
 
     def test_normalize_canonical_modes(self):
         from app.strategic_completion import _normalize_recommended_mode
+
         for value in ("audit", "fundamentals", "ship", "pause"):
             assert _normalize_recommended_mode(value) == value
             assert _normalize_recommended_mode(value.upper()) == value
@@ -1217,12 +1431,15 @@ class TestRecommendedModeNormalization:
 
     def test_normalize_rejects_unknown(self):
         from app.strategic_completion import _normalize_recommended_mode
+
         for value in ("nonsense", "", "audit_now", None, 42, []):
             assert _normalize_recommended_mode(value) is None
 
 
 @pytest.mark.asyncio
-async def test_strategic_completion_persists_recommended_mode_on_create(db_session, mocker):
+async def test_strategic_completion_persists_recommended_mode_on_create(
+    db_session, mocker
+):
     """Direction-op `create` with `recommended_mode='audit'` persists that
     value on the new direction record inside project.directions."""
     from unittest.mock import AsyncMock
@@ -1242,8 +1459,9 @@ async def test_strategic_completion_persists_recommended_mode_on_create(db_sessi
 
     task = Task(
         project_id=project.id,
-        payloads=[{"type": "strategic_review", "prompt": "review",
-                   "vision": {"revision": 1}}],
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
         context={},
     )
     db_session.add(task)
@@ -1251,27 +1469,33 @@ async def test_strategic_completion_persists_recommended_mode_on_create(db_sessi
     await db_session.refresh(task)
 
     import json
-    logs = json.dumps({
-        "vision": {"purpose": "test", "revision": 2},
-        "direction_operations": [
-            {
-                "op": "create",
-                "text": "Audit the auth module",
-                "priority": "high",
-                "rationale": "stale tests",
-                "system_id": "auth",
-                "recommended_mode": "audit",
-                "success_evidence": "Auth tests passing with no regressions",
-                "retirement_condition": "2 consecutive cycles with 0 auth failures",
-            },
-        ],
-    })
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "direction_operations": [
+                {
+                    "op": "create",
+                    "text": "Audit the auth module",
+                    "priority": "high",
+                    "rationale": "stale tests",
+                    "system_id": "auth",
+                    "recommended_mode": "audit",
+                    "success_evidence": "Auth tests passing with no regressions",
+                    "retirement_condition": "2 consecutive cycles with 0 auth failures",
+                },
+            ],
+        }
+    )
 
     await _handle_strategic_completion(task, logs, db_session)
 
     await db_session.refresh(project)
-    new_dirs = [d for d in (project.directions or [])
-                if d.get("text") == "Audit the auth module"]
+    new_dirs = [
+        d
+        for d in (project.directions or [])
+        if d.get("text") == "Audit the auth module"
+    ]
     assert len(new_dirs) == 1
     assert new_dirs[0].get("recommended_mode") == "audit", (
         f"Expected recommended_mode='audit' on created direction; "
@@ -1280,7 +1504,9 @@ async def test_strategic_completion_persists_recommended_mode_on_create(db_sessi
 
 
 @pytest.mark.asyncio
-async def test_strategic_completion_persists_recommended_mode_on_update(db_session, mocker):
+async def test_strategic_completion_persists_recommended_mode_on_update(
+    db_session, mocker
+):
     """Direction-op `update` with `recommended_mode` updates the existing
     direction's record."""
     from unittest.mock import AsyncMock
@@ -1293,8 +1519,14 @@ async def test_strategic_completion_persists_recommended_mode_on_update(db_sessi
         user_id="u1",
         vision={"purpose": "test", "revision": 1},
         directions=[
-            {"id": "d-upd1", "text": "Existing direction", "status": "active",
-             "priority": "medium", "notes": [], "research_history": []},
+            {
+                "id": "d-upd1",
+                "text": "Existing direction",
+                "status": "active",
+                "priority": "medium",
+                "notes": [],
+                "research_history": [],
+            },
         ],
     )
     db_session.add(project)
@@ -1303,8 +1535,9 @@ async def test_strategic_completion_persists_recommended_mode_on_update(db_sessi
 
     task = Task(
         project_id=project.id,
-        payloads=[{"type": "strategic_review", "prompt": "review",
-                   "vision": {"revision": 1}}],
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
         context={},
     )
     db_session.add(task)
@@ -1312,17 +1545,20 @@ async def test_strategic_completion_persists_recommended_mode_on_update(db_sessi
     await db_session.refresh(task)
 
     import json
-    logs = json.dumps({
-        "vision": {"purpose": "test", "revision": 2},
-        "direction_operations": [
-            {
-                "op": "update",
-                "direction_id": "d-upd1",
-                "rationale": "drift detected",
-                "changes": {"recommended_mode": "fundamentals"},
-            },
-        ],
-    })
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "direction_operations": [
+                {
+                    "op": "update",
+                    "direction_id": "d-upd1",
+                    "rationale": "drift detected",
+                    "changes": {"recommended_mode": "fundamentals"},
+                },
+            ],
+        }
+    )
 
     await _handle_strategic_completion(task, logs, db_session)
 
@@ -1351,8 +1587,9 @@ async def test_strategic_completion_drops_invalid_recommended_mode(db_session, m
 
     task = Task(
         project_id=project.id,
-        payloads=[{"type": "strategic_review", "prompt": "review",
-                   "vision": {"revision": 1}}],
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
         context={},
     )
     db_session.add(task)
@@ -1360,20 +1597,23 @@ async def test_strategic_completion_drops_invalid_recommended_mode(db_session, m
     await db_session.refresh(task)
 
     import json
-    logs = json.dumps({
-        "vision": {"purpose": "test", "revision": 2},
-        "direction_operations": [
-            {
-                "op": "create",
-                "text": "A direction",
-                "priority": "medium",
-                "rationale": "x",
-                "recommended_mode": "not-a-canonical-mode",
-                "success_evidence": "All tasks merged",
-                "retirement_condition": "No open tasks remaining",
-            },
-        ],
-    })
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "direction_operations": [
+                {
+                    "op": "create",
+                    "text": "A direction",
+                    "priority": "medium",
+                    "rationale": "x",
+                    "recommended_mode": "not-a-canonical-mode",
+                    "success_evidence": "All tasks merged",
+                    "retirement_condition": "No open tasks remaining",
+                },
+            ],
+        }
+    )
 
     await _handle_strategic_completion(task, logs, db_session)
 
@@ -1386,8 +1626,11 @@ async def test_strategic_completion_drops_invalid_recommended_mode(db_session, m
 
 # ── recommended_mode='pause' auto-pause dispatch ─────────────────────────────
 
+
 @pytest.mark.asyncio
-async def test_strategic_completion_pause_mode_auto_pauses_on_create(db_session, mocker):
+async def test_strategic_completion_pause_mode_auto_pauses_on_create(
+    db_session, mocker
+):
     """create op with recommended_mode='pause' starts the direction in paused state.
 
     This makes the existing spawn-skip (status != 'active') mechanism handle
@@ -1398,7 +1641,8 @@ async def test_strategic_completion_pause_mode_auto_pauses_on_create(db_session,
     mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
 
     project = Project(
-        name="P", user_id="u1",
+        name="P",
+        user_id="u1",
         vision={"purpose": "test", "revision": 1},
         directions=[],
     )
@@ -1408,7 +1652,9 @@ async def test_strategic_completion_pause_mode_auto_pauses_on_create(db_session,
 
     task = Task(
         project_id=project.id,
-        payloads=[{"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}],
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
         context={},
     )
     db_session.add(task)
@@ -1416,17 +1662,28 @@ async def test_strategic_completion_pause_mode_auto_pauses_on_create(db_session,
     await db_session.refresh(task)
 
     import json
-    logs = json.dumps({
-        "vision": {"purpose": "test", "revision": 2},
-        "direction_operations": [{"op": "create", "text": "Paused direction",
-                                   "priority": "medium", "recommended_mode": "pause",
-                                   "success_evidence": "No blockers remain",
-                                   "retirement_condition": "Gap closed for 2 cycles"}],
-    })
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "direction_operations": [
+                {
+                    "op": "create",
+                    "text": "Paused direction",
+                    "priority": "medium",
+                    "recommended_mode": "pause",
+                    "success_evidence": "No blockers remain",
+                    "retirement_condition": "Gap closed for 2 cycles",
+                }
+            ],
+        }
+    )
     await _handle_strategic_completion(task, logs, db_session)
 
     await db_session.refresh(project)
-    new_dirs = [d for d in (project.directions or []) if d.get("text") == "Paused direction"]
+    new_dirs = [
+        d for d in (project.directions or []) if d.get("text") == "Paused direction"
+    ]
     assert len(new_dirs) == 1
     d = new_dirs[0]
     assert d.get("status") == "paused", f"Expected paused, got {d.get('status')!r}"
@@ -1435,7 +1692,9 @@ async def test_strategic_completion_pause_mode_auto_pauses_on_create(db_session,
 
 
 @pytest.mark.asyncio
-async def test_strategic_completion_pause_mode_auto_pauses_on_update(db_session, mocker):
+async def test_strategic_completion_pause_mode_auto_pauses_on_update(
+    db_session, mocker
+):
     """update op with recommended_mode='pause' transitions an active direction to paused."""
     from unittest.mock import AsyncMock
     from app.strategic_completion import _handle_strategic_completion
@@ -1443,11 +1702,18 @@ async def test_strategic_completion_pause_mode_auto_pauses_on_update(db_session,
     mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
 
     project = Project(
-        name="P", user_id="u1",
+        name="P",
+        user_id="u1",
         vision={"purpose": "test", "revision": 1},
         directions=[
-            {"id": "d-pauseme", "text": "Active direction", "status": "active",
-             "priority": "medium", "notes": [], "research_history": []},
+            {
+                "id": "d-pauseme",
+                "text": "Active direction",
+                "status": "active",
+                "priority": "medium",
+                "notes": [],
+                "research_history": [],
+            },
         ],
     )
     db_session.add(project)
@@ -1456,7 +1722,9 @@ async def test_strategic_completion_pause_mode_auto_pauses_on_update(db_session,
 
     task = Task(
         project_id=project.id,
-        payloads=[{"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}],
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
         context={},
     )
     db_session.add(task)
@@ -1464,12 +1732,19 @@ async def test_strategic_completion_pause_mode_auto_pauses_on_update(db_session,
     await db_session.refresh(task)
 
     import json
-    logs = json.dumps({
-        "vision": {"purpose": "test", "revision": 2},
-        "direction_operations": [
-            {"op": "update", "direction_id": "d-pauseme", "changes": {"recommended_mode": "pause"}},
-        ],
-    })
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "direction_operations": [
+                {
+                    "op": "update",
+                    "direction_id": "d-pauseme",
+                    "changes": {"recommended_mode": "pause"},
+                },
+            ],
+        }
+    )
     await _handle_strategic_completion(task, logs, db_session)
 
     await db_session.refresh(project)
@@ -1480,7 +1755,9 @@ async def test_strategic_completion_pause_mode_auto_pauses_on_update(db_session,
 
 
 @pytest.mark.asyncio
-async def test_strategic_completion_non_pause_modes_preserve_active_status(db_session, mocker):
+async def test_strategic_completion_non_pause_modes_preserve_active_status(
+    db_session, mocker
+):
     """update ops with audit/fundamentals/ship modes do not change direction status."""
     from unittest.mock import AsyncMock
     from app.strategic_completion import _handle_strategic_completion
@@ -1488,15 +1765,34 @@ async def test_strategic_completion_non_pause_modes_preserve_active_status(db_se
     mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
 
     project = Project(
-        name="P", user_id="u1",
+        name="P",
+        user_id="u1",
         vision={"purpose": "test", "revision": 1},
         directions=[
-            {"id": "d-a", "text": "Audit dir", "status": "active",
-             "priority": "medium", "notes": [], "research_history": []},
-            {"id": "d-f", "text": "Fundamentals dir", "status": "active",
-             "priority": "medium", "notes": [], "research_history": []},
-            {"id": "d-s", "text": "Ship dir", "status": "active",
-             "priority": "medium", "notes": [], "research_history": []},
+            {
+                "id": "d-a",
+                "text": "Audit dir",
+                "status": "active",
+                "priority": "medium",
+                "notes": [],
+                "research_history": [],
+            },
+            {
+                "id": "d-f",
+                "text": "Fundamentals dir",
+                "status": "active",
+                "priority": "medium",
+                "notes": [],
+                "research_history": [],
+            },
+            {
+                "id": "d-s",
+                "text": "Ship dir",
+                "status": "active",
+                "priority": "medium",
+                "notes": [],
+                "research_history": [],
+            },
         ],
     )
     db_session.add(project)
@@ -1505,7 +1801,9 @@ async def test_strategic_completion_non_pause_modes_preserve_active_status(db_se
 
     task = Task(
         project_id=project.id,
-        payloads=[{"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}],
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
         context={},
     )
     db_session.add(task)
@@ -1513,21 +1811,42 @@ async def test_strategic_completion_non_pause_modes_preserve_active_status(db_se
     await db_session.refresh(task)
 
     import json
-    logs = json.dumps({
-        "vision": {"purpose": "test", "revision": 2},
-        "direction_operations": [
-            {"op": "update", "direction_id": "d-a", "changes": {"recommended_mode": "audit"}},
-            {"op": "update", "direction_id": "d-f", "changes": {"recommended_mode": "fundamentals"}},
-            {"op": "update", "direction_id": "d-s", "changes": {"recommended_mode": "ship"}},
-        ],
-    })
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "direction_operations": [
+                {
+                    "op": "update",
+                    "direction_id": "d-a",
+                    "changes": {"recommended_mode": "audit"},
+                },
+                {
+                    "op": "update",
+                    "direction_id": "d-f",
+                    "changes": {"recommended_mode": "fundamentals"},
+                },
+                {
+                    "op": "update",
+                    "direction_id": "d-s",
+                    "changes": {"recommended_mode": "ship"},
+                },
+            ],
+        }
+    )
     await _handle_strategic_completion(task, logs, db_session)
 
     await db_session.refresh(project)
     by_id = {d["id"]: d for d in (project.directions or [])}
-    for did, expected_mode in [("d-a", "audit"), ("d-f", "fundamentals"), ("d-s", "ship")]:
+    for did, expected_mode in [
+        ("d-a", "audit"),
+        ("d-f", "fundamentals"),
+        ("d-s", "ship"),
+    ]:
         d = by_id[did]
-        assert d.get("status") == "active", f"{did} should stay active for mode={expected_mode}"
+        assert d.get("status") == "active", (
+            f"{did} should stay active for mode={expected_mode}"
+        )
         assert d.get("recommended_mode") == expected_mode
         assert not d.get("auto_paused")
 
@@ -1541,7 +1860,8 @@ def _make_project_and_task_for_structured_fields(db_session):
 
     async def _build():
         project = Project(
-            name="SF", user_id="u1",
+            name="SF",
+            user_id="u1",
             vision={"purpose": "test", "revision": 1},
             directions=[],
         )
@@ -1550,7 +1870,13 @@ def _make_project_and_task_for_structured_fields(db_session):
         await db_session.refresh(project)
         task = Task(
             project_id=project.id,
-            payloads=[{"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}],
+            payloads=[
+                {
+                    "type": "strategic_review",
+                    "prompt": "review",
+                    "vision": {"revision": 1},
+                }
+            ],
             context={},
         )
         db_session.add(task)
@@ -1571,7 +1897,8 @@ async def test_direction_create_persists_structured_fields(db_session, mocker):
     mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
 
     project = Project(
-        name="SF", user_id="u1",
+        name="SF",
+        user_id="u1",
         vision={"purpose": "test", "revision": 1},
         directions=[],
     )
@@ -1581,35 +1908,48 @@ async def test_direction_create_persists_structured_fields(db_session, mocker):
 
     task = Task(
         project_id=project.id,
-        payloads=[{"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}],
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
         context={},
     )
     db_session.add(task)
     await db_session.commit()
     await db_session.refresh(task)
 
-    logs = json.dumps({
-        "vision": {"purpose": "test", "revision": 2},
-        "direction_operations": [{
-            "op": "create",
-            "text": "Users can authenticate via SSO",
-            "priority": "medium",
-            "success_evidence": "Login flow passes end-to-end with SAML provider",
-            "retirement_condition": "3 consecutive cycles with 0 auth-related failures",
-        }],
-    })
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "direction_operations": [
+                {
+                    "op": "create",
+                    "text": "Users can authenticate via SSO",
+                    "priority": "medium",
+                    "success_evidence": "Login flow passes end-to-end with SAML provider",
+                    "retirement_condition": "3 consecutive cycles with 0 auth-related failures",
+                }
+            ],
+        }
+    )
     await _handle_strategic_completion(task, logs, db_session)
 
     await db_session.refresh(project)
     dirs = [d for d in (project.directions or []) if "SSO" in d.get("text", "")]
     assert len(dirs) == 1, "Direction should have been created"
     ctx = dirs[0].get("context") or {}
-    assert ctx.get("success_evidence") == "Login flow passes end-to-end with SAML provider"
-    assert ctx.get("retirement_condition") == "3 consecutive cycles with 0 auth-related failures"
+    assert (
+        ctx.get("success_evidence") == "Login flow passes end-to-end with SAML provider"
+    )
+    assert (
+        ctx.get("retirement_condition")
+        == "3 consecutive cycles with 0 auth-related failures"
+    )
 
 
 @pytest.mark.asyncio
-async def test_direction_create_rejected_when_success_evidence_missing(db_session, mocker, caplog):
+async def test_direction_create_rejected_when_success_evidence_missing(
+    db_session, mocker, caplog
+):
     """A create op missing success_evidence is rejected (direction not created) with a warning log."""
     import json
     import logging
@@ -1619,7 +1959,8 @@ async def test_direction_create_rejected_when_success_evidence_missing(db_sessio
     mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
 
     project = Project(
-        name="SF2", user_id="u1",
+        name="SF2",
+        user_id="u1",
         vision={"purpose": "test", "revision": 1},
         directions=[],
     )
@@ -1629,30 +1970,43 @@ async def test_direction_create_rejected_when_success_evidence_missing(db_sessio
 
     task = Task(
         project_id=project.id,
-        payloads=[{"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}],
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
         context={},
     )
     db_session.add(task)
     await db_session.commit()
     await db_session.refresh(task)
 
-    logs = json.dumps({
-        "vision": {"purpose": "test", "revision": 2},
-        "direction_operations": [{
-            "op": "create",
-            "text": "Improve test coverage",
-            "priority": "medium",
-            # success_evidence intentionally omitted
-            "retirement_condition": "Coverage above 80%",
-        }],
-    })
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "direction_operations": [
+                {
+                    "op": "create",
+                    "text": "Improve test coverage",
+                    "priority": "medium",
+                    # success_evidence intentionally omitted
+                    "retirement_condition": "Coverage above 80%",
+                }
+            ],
+        }
+    )
     with caplog.at_level(logging.WARNING, logger="app.strategic_completion"):
         await _handle_strategic_completion(task, logs, db_session)
 
     await db_session.refresh(project)
-    dirs = [d for d in (project.directions or []) if "test coverage" in d.get("text", "").lower()]
+    dirs = [
+        d
+        for d in (project.directions or [])
+        if "test coverage" in d.get("text", "").lower()
+    ]
     assert len(dirs) == 0, "Direction without success_evidence must not be created"
-    assert any("success_evidence" in r.message or "retirement_condition" in r.message for r in caplog.records)
+    assert any(
+        "success_evidence" in r.message or "retirement_condition" in r.message
+        for r in caplog.records
+    )
 
 
 @pytest.mark.asyncio
@@ -1669,7 +2023,8 @@ async def test_legacy_direction_without_structured_fields_loads(db_session, mock
         # no 'context' key — this is a pre-structured-fields direction
     }
     project = Project(
-        name="Legacy", user_id="u1",
+        name="Legacy",
+        user_id="u1",
         vision={"purpose": "test", "revision": 1},
         directions=[legacy_dir],
     )
@@ -1702,8 +2057,30 @@ class TestBuildPastRetirementCritiques:
 
     def test_incomplete_cycles_skipped(self):
         history = [
-            {"cycle_id": "sc-1", "outcome": "failed_phase2", "retirement_critiques": [{"direction_id": "d-1", "what_it_addressed": "x", "pattern_that_produced_it": "y", "lesson": "z"}]},
-            {"cycle_id": "sc-2", "outcome": "completed", "retirement_critiques": [{"direction_id": "d-2", "what_it_addressed": "a", "pattern_that_produced_it": "b", "lesson": "c"}]},
+            {
+                "cycle_id": "sc-1",
+                "outcome": "failed_phase2",
+                "retirement_critiques": [
+                    {
+                        "direction_id": "d-1",
+                        "what_it_addressed": "x",
+                        "pattern_that_produced_it": "y",
+                        "lesson": "z",
+                    }
+                ],
+            },
+            {
+                "cycle_id": "sc-2",
+                "outcome": "completed",
+                "retirement_critiques": [
+                    {
+                        "direction_id": "d-2",
+                        "what_it_addressed": "a",
+                        "pattern_that_produced_it": "b",
+                        "lesson": "c",
+                    }
+                ],
+            },
         ]
         result = _build_past_retirement_critiques(history)
         assert len(result) == 1
@@ -1711,26 +2088,52 @@ class TestBuildPastRetirementCritiques:
 
     def test_list_critiques_extracted(self):
         critiques = [
-            {"direction_id": "d-abc", "what_it_addressed": "CI pipeline speed", "pattern_that_produced_it": "premature optimization", "lesson": "Wait for evidence before optimizing."},
+            {
+                "direction_id": "d-abc",
+                "what_it_addressed": "CI pipeline speed",
+                "pattern_that_produced_it": "premature optimization",
+                "lesson": "Wait for evidence before optimizing.",
+            },
         ]
-        history = [{"cycle_id": "sc-1", "outcome": "completed", "retirement_critiques": critiques}]
+        history = [
+            {
+                "cycle_id": "sc-1",
+                "outcome": "completed",
+                "retirement_critiques": critiques,
+            }
+        ]
         result = _build_past_retirement_critiques(history)
         assert len(result) == 1
         assert result[0]["direction_id"] == "d-abc"
         assert result[0]["pattern_that_produced_it"] == "premature optimization"
 
     def test_no_eligible_sentinel_preserved(self):
-        history = [{"cycle_id": "sc-1", "outcome": "completed", "retirement_critiques": {"no_eligible_retirements": True}}]
+        history = [
+            {
+                "cycle_id": "sc-1",
+                "outcome": "completed",
+                "retirement_critiques": {"no_eligible_retirements": True},
+            }
+        ]
         result = _build_past_retirement_critiques(history)
         assert result == [{"no_eligible_retirements": True}]
 
     def test_truncates_to_n(self):
         critiques = [
-            {"direction_id": f"d-{i}", "what_it_addressed": "x", "pattern_that_produced_it": "y", "lesson": "z"}
+            {
+                "direction_id": f"d-{i}",
+                "what_it_addressed": "x",
+                "pattern_that_produced_it": "y",
+                "lesson": "z",
+            }
             for i in range(3)
         ]
         history = [
-            {"cycle_id": f"sc-{j}", "outcome": "completed", "retirement_critiques": critiques}
+            {
+                "cycle_id": f"sc-{j}",
+                "outcome": "completed",
+                "retirement_critiques": critiques,
+            }
             for j in range(4)
         ]
         result = _build_past_retirement_critiques(history, n=5)
@@ -1738,11 +2141,20 @@ class TestBuildPastRetirementCritiques:
 
     def test_default_n_is_5(self):
         critiques = [
-            {"direction_id": f"d-{i}", "what_it_addressed": "x", "pattern_that_produced_it": "y", "lesson": "z"}
+            {
+                "direction_id": f"d-{i}",
+                "what_it_addressed": "x",
+                "pattern_that_produced_it": "y",
+                "lesson": "z",
+            }
             for i in range(4)
         ]
         history = [
-            {"cycle_id": f"sc-{j}", "outcome": "completed", "retirement_critiques": critiques}
+            {
+                "cycle_id": f"sc-{j}",
+                "outcome": "completed",
+                "retirement_critiques": critiques,
+            }
             for j in range(10)
         ]
         result = _build_past_retirement_critiques(history)
@@ -1759,9 +2171,17 @@ async def test_retirement_critiques_persisted_via_context_injection(db_session, 
     mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
 
     project = Project(
-        name="RC-API", user_id="u1",
+        name="RC-API",
+        user_id="u1",
         vision={"purpose": "test", "revision": 1},
-        directions=[{"id": "d-ret1", "status": "expired", "text": "Old direction", "research_history": []}],
+        directions=[
+            {
+                "id": "d-ret1",
+                "status": "expired",
+                "text": "Old direction",
+                "research_history": [],
+            }
+        ],
     )
     db_session.add(project)
     await db_session.commit()
@@ -1770,10 +2190,19 @@ async def test_retirement_critiques_persisted_via_context_injection(db_session, 
     cycle = await strategic_cycle.create(db_session, project_id=project.id)
     await db_session.commit()
 
-    critiques = [{"direction_id": "d-ret1", "what_it_addressed": "Speed up CI", "pattern_that_produced_it": "premature optimization", "lesson": "Wait for evidence."}]
+    critiques = [
+        {
+            "direction_id": "d-ret1",
+            "what_it_addressed": "Speed up CI",
+            "pattern_that_produced_it": "premature optimization",
+            "lesson": "Wait for evidence.",
+        }
+    ]
     task = Task(
         project_id=project.id,
-        payloads=[{"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}],
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
         context={
             "_strategic_vision_set": True,
             "strategic_cycle_id": cycle.id,
@@ -1789,7 +2218,9 @@ async def test_retirement_critiques_persisted_via_context_injection(db_session, 
 
     await db_session.refresh(cycle)
     meta = cycle.cycle_metadata or {}
-    assert "retirement_critiques" in meta, "retirement_critiques must be persisted in cycle_metadata"
+    assert "retirement_critiques" in meta, (
+        "retirement_critiques must be persisted in cycle_metadata"
+    )
     assert meta["retirement_critiques"] == critiques
 
 
@@ -1804,7 +2235,8 @@ async def test_retirement_critiques_persisted_via_fallback_path(db_session, mock
     mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
 
     project = Project(
-        name="RC-FB", user_id="u1",
+        name="RC-FB",
+        user_id="u1",
         vision={"purpose": "test", "revision": 1},
         directions=[],
     )
@@ -1815,15 +2247,26 @@ async def test_retirement_critiques_persisted_via_fallback_path(db_session, mock
     cycle = await strategic_cycle.create(db_session, project_id=project.id)
     await db_session.commit()
 
-    critiques = [{"direction_id": "d-old1", "what_it_addressed": "Caching layer", "pattern_that_produced_it": "scope drift", "lesson": "Keep scope tight."}]
-    logs = json.dumps({
-        "vision": {"purpose": "test", "revision": 2},
-        "direction_operations": [],
-        "retired_direction_critiques": critiques,
-    })
+    critiques = [
+        {
+            "direction_id": "d-old1",
+            "what_it_addressed": "Caching layer",
+            "pattern_that_produced_it": "scope drift",
+            "lesson": "Keep scope tight.",
+        }
+    ]
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "direction_operations": [],
+            "retired_direction_critiques": critiques,
+        }
+    )
     task = Task(
         project_id=project.id,
-        payloads=[{"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}],
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
         context={"strategic_cycle_id": cycle.id},
         strategic_cycle_id=cycle.id,
     )
@@ -1835,7 +2278,9 @@ async def test_retirement_critiques_persisted_via_fallback_path(db_session, mock
 
     await db_session.refresh(cycle)
     meta = cycle.cycle_metadata or {}
-    assert "retirement_critiques" in meta, "retirement_critiques must be persisted via fallback path"
+    assert "retirement_critiques" in meta, (
+        "retirement_critiques must be persisted via fallback path"
+    )
     assert meta["retirement_critiques"] == critiques
 
 
@@ -1850,7 +2295,8 @@ async def test_no_eligible_sentinel_stored_without_error(db_session, mocker):
     mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
 
     project = Project(
-        name="RC-NE", user_id="u1",
+        name="RC-NE",
+        user_id="u1",
         vision={"purpose": "test", "revision": 1},
         directions=[],
     )
@@ -1861,14 +2307,18 @@ async def test_no_eligible_sentinel_stored_without_error(db_session, mocker):
     cycle = await strategic_cycle.create(db_session, project_id=project.id)
     await db_session.commit()
 
-    logs = json.dumps({
-        "vision": {"purpose": "test", "revision": 2},
-        "direction_operations": [],
-        "retired_direction_critiques": {"no_eligible_retirements": True},
-    })
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "direction_operations": [],
+            "retired_direction_critiques": {"no_eligible_retirements": True},
+        }
+    )
     task = Task(
         project_id=project.id,
-        payloads=[{"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}],
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
         context={"strategic_cycle_id": cycle.id},
         strategic_cycle_id=cycle.id,
     )
@@ -1887,7 +2337,9 @@ async def test_no_eligible_sentinel_stored_without_error(db_session, mocker):
 
 
 @pytest.mark.asyncio
-async def test_dedup_reasoning_persisted_on_successful_create_fallback_path(db_session, mocker):
+async def test_dedup_reasoning_persisted_on_successful_create_fallback_path(
+    db_session, mocker
+):
     """dedup_reasoning dict is stored in direction.context on a successful fallback-path create."""
     import json
     from unittest.mock import AsyncMock
@@ -1896,7 +2348,8 @@ async def test_dedup_reasoning_persisted_on_successful_create_fallback_path(db_s
     mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
 
     project = Project(
-        name="DR1", user_id="u1",
+        name="DR1",
+        user_id="u1",
         vision={"purpose": "test", "revision": 1},
         directions=[],
     )
@@ -1906,27 +2359,33 @@ async def test_dedup_reasoning_persisted_on_successful_create_fallback_path(db_s
 
     task = Task(
         project_id=project.id,
-        payloads=[{"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}],
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
         context={},
     )
     db_session.add(task)
     await db_session.commit()
     await db_session.refresh(task)
 
-    logs = json.dumps({
-        "vision": {"purpose": "test", "revision": 2},
-        "direction_operations": [{
-            "op": "create",
-            "text": "Migrate auth service to OAuth2",
-            "priority": "medium",
-            "success_evidence": "All auth tests pass",
-            "retirement_condition": "OAuth2 flow live for 3 cycles",
-            "dedup_reasoning": {
-                "closest_directions": ["Improve login flow", "Add SSO support"],
-                "distinction": "Targets the auth backend protocol, not the UI flow",
-            },
-        }],
-    })
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "direction_operations": [
+                {
+                    "op": "create",
+                    "text": "Migrate auth service to OAuth2",
+                    "priority": "medium",
+                    "success_evidence": "All auth tests pass",
+                    "retirement_condition": "OAuth2 flow live for 3 cycles",
+                    "dedup_reasoning": {
+                        "closest_directions": ["Improve login flow", "Add SSO support"],
+                        "distinction": "Targets the auth backend protocol, not the UI flow",
+                    },
+                }
+            ],
+        }
+    )
     await _handle_strategic_completion(task, logs, db_session)
 
     await db_session.refresh(project)
@@ -1949,7 +2408,8 @@ async def test_absent_dedup_reasoning_no_error_on_create(db_session, mocker):
     mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
 
     project = Project(
-        name="DR2", user_id="u1",
+        name="DR2",
+        user_id="u1",
         vision={"purpose": "test", "revision": 1},
         directions=[],
     )
@@ -1959,34 +2419,44 @@ async def test_absent_dedup_reasoning_no_error_on_create(db_session, mocker):
 
     task = Task(
         project_id=project.id,
-        payloads=[{"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}],
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
         context={},
     )
     db_session.add(task)
     await db_session.commit()
     await db_session.refresh(task)
 
-    logs = json.dumps({
-        "vision": {"purpose": "test", "revision": 2},
-        "direction_operations": [{
-            "op": "create",
-            "text": "Reduce p99 API latency",
-            "priority": "high",
-            "success_evidence": "p99 < 200ms",
-            "retirement_condition": "3 cycles below target",
-        }],
-    })
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "direction_operations": [
+                {
+                    "op": "create",
+                    "text": "Reduce p99 API latency",
+                    "priority": "high",
+                    "success_evidence": "p99 < 200ms",
+                    "retirement_condition": "3 cycles below target",
+                }
+            ],
+        }
+    )
     await _handle_strategic_completion(task, logs, db_session)
 
     await db_session.refresh(project)
-    dirs = [d for d in (project.directions or []) if "latency" in d.get("text", "").lower()]
+    dirs = [
+        d for d in (project.directions or []) if "latency" in d.get("text", "").lower()
+    ]
     assert len(dirs) == 1, "Direction should have been created without dedup_reasoning"
     ctx = dirs[0].get("context") or {}
     assert "dedup_reasoning" not in ctx
 
 
 @pytest.mark.asyncio
-async def test_dedup_rejected_with_dedup_reasoning_emits_warning_fallback(db_session, mocker, caplog):
+async def test_dedup_rejected_with_dedup_reasoning_emits_warning_fallback(
+    db_session, mocker, caplog
+):
     """When a duplicate is rejected AND dedup_reasoning.distinction was supplied, a structured warning is logged."""
     import json
     import logging
@@ -2004,7 +2474,8 @@ async def test_dedup_rejected_with_dedup_reasoning_emits_warning_fallback(db_ses
         "research_history": [],
     }
     project = Project(
-        name="DR3", user_id="u1",
+        name="DR3",
+        user_id="u1",
         vision={"purpose": "test", "revision": 1},
         directions=[existing_dir],
     )
@@ -2014,27 +2485,33 @@ async def test_dedup_rejected_with_dedup_reasoning_emits_warning_fallback(db_ses
 
     task = Task(
         project_id=project.id,
-        payloads=[{"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}],
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
         context={},
     )
     db_session.add(task)
     await db_session.commit()
     await db_session.refresh(task)
 
-    logs = json.dumps({
-        "vision": {"purpose": "test", "revision": 2},
-        "direction_operations": [{
-            "op": "create",
-            "text": "Migrate auth service to OAuth2",
-            "priority": "medium",
-            "success_evidence": "All auth tests pass",
-            "retirement_condition": "OAuth2 flow live for 3 cycles",
-            "dedup_reasoning": {
-                "closest_directions": ["d-existing1"],
-                "distinction": "This one focuses on the token refresh path specifically",
-            },
-        }],
-    })
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "direction_operations": [
+                {
+                    "op": "create",
+                    "text": "Migrate auth service to OAuth2",
+                    "priority": "medium",
+                    "success_evidence": "All auth tests pass",
+                    "retirement_condition": "OAuth2 flow live for 3 cycles",
+                    "dedup_reasoning": {
+                        "closest_directions": ["d-existing1"],
+                        "distinction": "This one focuses on the token refresh path specifically",
+                    },
+                }
+            ],
+        }
+    )
     with caplog.at_level(logging.WARNING, logger="app.strategic_completion"):
         await _handle_strategic_completion(task, logs, db_session)
 
@@ -2056,7 +2533,8 @@ async def test_dedup_reasoning_fields_capped_at_max_length(db_session, mocker):
     mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
 
     project = Project(
-        name="DR4", user_id="u1",
+        name="DR4",
+        user_id="u1",
         vision={"purpose": "test", "revision": 1},
         directions=[],
     )
@@ -2066,7 +2544,9 @@ async def test_dedup_reasoning_fields_capped_at_max_length(db_session, mocker):
 
     task = Task(
         project_id=project.id,
-        payloads=[{"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}],
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
         context={},
     )
     db_session.add(task)
@@ -2074,28 +2554,42 @@ async def test_dedup_reasoning_fields_capped_at_max_length(db_session, mocker):
     await db_session.refresh(task)
 
     long_distinction = "x" * 600
-    logs = json.dumps({
-        "vision": {"purpose": "test", "revision": 2},
-        "direction_operations": [{
-            "op": "create",
-            "text": "Consolidate logging infrastructure",
-            "priority": "low",
-            "success_evidence": "Single log sink used everywhere",
-            "retirement_condition": "All services use unified sink for 2 cycles",
-            "dedup_reasoning": {
-                "closest_directions": ["dir-a", "dir-b", "dir-c", "dir-d", "dir-e"],
-                "distinction": long_distinction,
-            },
-        }],
-    })
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "direction_operations": [
+                {
+                    "op": "create",
+                    "text": "Consolidate logging infrastructure",
+                    "priority": "low",
+                    "success_evidence": "Single log sink used everywhere",
+                    "retirement_condition": "All services use unified sink for 2 cycles",
+                    "dedup_reasoning": {
+                        "closest_directions": [
+                            "dir-a",
+                            "dir-b",
+                            "dir-c",
+                            "dir-d",
+                            "dir-e",
+                        ],
+                        "distinction": long_distinction,
+                    },
+                }
+            ],
+        }
+    )
     await _handle_strategic_completion(task, logs, db_session)
 
     await db_session.refresh(project)
-    dirs = [d for d in (project.directions or []) if "logging" in d.get("text", "").lower()]
+    dirs = [
+        d for d in (project.directions or []) if "logging" in d.get("text", "").lower()
+    ]
     assert len(dirs) == 1
     ctx = dirs[0].get("context") or {}
     dr = ctx.get("dedup_reasoning") or {}
-    assert len(dr["closest_directions"]) == 3, "closest_directions should be capped at 3"
+    assert len(dr["closest_directions"]) == 3, (
+        "closest_directions should be capped at 3"
+    )
     assert len(dr["distinction"]) == 500, "distinction should be capped at 500 chars"
 
 
@@ -2103,7 +2597,9 @@ async def test_dedup_reasoning_fields_capped_at_max_length(db_session, mocker):
 
 
 @pytest.mark.asyncio
-async def test_semantic_dedup_blocks_paraphrased_active_direction_fallback(db_session, mocker):
+async def test_semantic_dedup_blocks_paraphrased_active_direction_fallback(
+    db_session, mocker
+):
     """Fallback path: paraphrased active direction is blocked by semantic dedup."""
     import json
     from unittest.mock import AsyncMock
@@ -2120,7 +2616,8 @@ async def test_semantic_dedup_blocks_paraphrased_active_direction_fallback(db_se
         "research_history": [],
     }
     project = Project(
-        name="SD1", user_id="u1",
+        name="SD1",
+        user_id="u1",
         vision={"purpose": "test", "revision": 1},
         directions=[existing_dir],
     )
@@ -2130,7 +2627,9 @@ async def test_semantic_dedup_blocks_paraphrased_active_direction_fallback(db_se
 
     task = Task(
         project_id=project.id,
-        payloads=[{"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}],
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
         context={},
     )
     db_session.add(task)
@@ -2138,16 +2637,20 @@ async def test_semantic_dedup_blocks_paraphrased_active_direction_fallback(db_se
     await db_session.refresh(task)
 
     # Paraphrase of the existing direction (4+ non-stopword words overlap)
-    logs = json.dumps({
-        "vision": {"purpose": "test", "revision": 2},
-        "direction_operations": [{
-            "op": "create",
-            "text": "Transition authentication service OAuth2 token implementation",
-            "priority": "medium",
-            "success_evidence": "All auth flows use OAuth2",
-            "retirement_condition": "OAuth2 live for 3 cycles",
-        }],
-    })
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "direction_operations": [
+                {
+                    "op": "create",
+                    "text": "Transition authentication service OAuth2 token implementation",
+                    "priority": "medium",
+                    "success_evidence": "All auth flows use OAuth2",
+                    "retirement_condition": "OAuth2 live for 3 cycles",
+                }
+            ],
+        }
+    )
     await _handle_strategic_completion(task, logs, db_session)
 
     await db_session.refresh(project)
@@ -2156,7 +2659,9 @@ async def test_semantic_dedup_blocks_paraphrased_active_direction_fallback(db_se
 
 
 @pytest.mark.asyncio
-async def test_semantic_dedup_blocks_paraphrased_retired_direction_fallback(db_session, mocker):
+async def test_semantic_dedup_blocks_paraphrased_retired_direction_fallback(
+    db_session, mocker
+):
     """Fallback path: paraphrased retired direction is blocked by tighter (3-word) threshold."""
     import json
     from unittest.mock import AsyncMock
@@ -2173,7 +2678,8 @@ async def test_semantic_dedup_blocks_paraphrased_retired_direction_fallback(db_s
         "research_history": [],
     }
     project = Project(
-        name="SD2", user_id="u1",
+        name="SD2",
+        user_id="u1",
         vision={"purpose": "test", "revision": 1},
         directions=[retired_dir],
     )
@@ -2183,7 +2689,9 @@ async def test_semantic_dedup_blocks_paraphrased_retired_direction_fallback(db_s
 
     task = Task(
         project_id=project.id,
-        payloads=[{"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}],
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
         context={},
     )
     db_session.add(task)
@@ -2191,16 +2699,20 @@ async def test_semantic_dedup_blocks_paraphrased_retired_direction_fallback(db_s
     await db_session.refresh(task)
 
     # Paraphrase with 3 overlapping non-stopword words (tighter retired threshold)
-    logs = json.dumps({
-        "vision": {"purpose": "test", "revision": 2},
-        "direction_operations": [{
-            "op": "create",
-            "text": "Consolidate logging pipeline distributed system",
-            "priority": "low",
-            "success_evidence": "Single log pipeline in place",
-            "retirement_condition": "Pipeline stable for 2 cycles",
-        }],
-    })
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "direction_operations": [
+                {
+                    "op": "create",
+                    "text": "Consolidate logging pipeline distributed system",
+                    "priority": "low",
+                    "success_evidence": "Single log pipeline in place",
+                    "retirement_condition": "Pipeline stable for 2 cycles",
+                }
+            ],
+        }
+    )
     await _handle_strategic_completion(task, logs, db_session)
 
     await db_session.refresh(project)
@@ -2226,7 +2738,8 @@ async def test_semantic_dedup_allows_distinct_direction_fallback(db_session, moc
         "research_history": [],
     }
     project = Project(
-        name="SD3", user_id="u1",
+        name="SD3",
+        user_id="u1",
         vision={"purpose": "test", "revision": 1},
         directions=[existing_dir],
     )
@@ -2236,7 +2749,9 @@ async def test_semantic_dedup_allows_distinct_direction_fallback(db_session, moc
 
     task = Task(
         project_id=project.id,
-        payloads=[{"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}],
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
         context={},
     )
     db_session.add(task)
@@ -2244,16 +2759,20 @@ async def test_semantic_dedup_allows_distinct_direction_fallback(db_session, moc
     await db_session.refresh(task)
 
     # Genuinely distinct — no meaningful word overlap with existing
-    logs = json.dumps({
-        "vision": {"purpose": "test", "revision": 2},
-        "direction_operations": [{
-            "op": "create",
-            "text": "Reduce database query latency via connection pooling",
-            "priority": "high",
-            "success_evidence": "p99 query time below 50ms",
-            "retirement_condition": "Latency stable for 2 cycles",
-        }],
-    })
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "direction_operations": [
+                {
+                    "op": "create",
+                    "text": "Reduce database query latency via connection pooling",
+                    "priority": "high",
+                    "success_evidence": "p99 query time below 50ms",
+                    "retirement_condition": "Latency stable for 2 cycles",
+                }
+            ],
+        }
+    )
     await _handle_strategic_completion(task, logs, db_session)
 
     await db_session.refresh(project)
@@ -2265,16 +2784,26 @@ async def test_semantic_dedup_allows_distinct_direction_fallback(db_session, moc
 
 
 @pytest.mark.asyncio
-async def test_set_retirement_critiques_list_payload_via_http(client, db_session, mocker):
+async def test_set_retirement_critiques_list_payload_via_http(
+    client, db_session, mocker
+):
     """HTTP API: POST /api/agent/strategic with a list payload returns 200 and stores critiques."""
     from app.auth import create_agent_token
     from app.models import TaskStatus
     from app import strategic_cycle
 
     project = Project(
-        name="RC-HTTP", user_id="u1",
+        name="RC-HTTP",
+        user_id="u1",
         vision={"purpose": "test", "revision": 1},
-        directions=[{"id": "d-ret2", "status": "expired", "text": "Old dir", "research_history": []}],
+        directions=[
+            {
+                "id": "d-ret2",
+                "status": "expired",
+                "text": "Old dir",
+                "research_history": [],
+            }
+        ],
     )
     db_session.add(project)
     await db_session.commit()
@@ -2287,7 +2816,9 @@ async def test_set_retirement_critiques_list_payload_via_http(client, db_session
         project_id=project.id,
         status=TaskStatus.IN_PROGRESS,
         vm_instance_id="vm-rc-http",
-        payloads=[{"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}],
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
         context={"strategic_cycle_id": cycle.id, "_strategic_vision_set": True},
         strategic_cycle_id=cycle.id,
     )
@@ -2306,7 +2837,11 @@ async def test_set_retirement_critiques_list_payload_via_http(client, db_session
     ]
     resp = await client.post(
         "/api/agent/strategic",
-        json={"task_id": str(task.id), "op": "set_retirement_critiques", "data": critiques},
+        json={
+            "task_id": str(task.id),
+            "op": "set_retirement_critiques",
+            "data": critiques,
+        },
         headers={"x-agent-token": token},
     )
     assert resp.status_code == 200, resp.text
@@ -2327,7 +2862,8 @@ async def test_set_retirement_critiques_sentinel_via_http(client, db_session, mo
     from app import strategic_cycle
 
     project = Project(
-        name="RC-HTTP-SENT", user_id="u1",
+        name="RC-HTTP-SENT",
+        user_id="u1",
         vision={"purpose": "test", "revision": 1},
         directions=[],
     )
@@ -2342,7 +2878,9 @@ async def test_set_retirement_critiques_sentinel_via_http(client, db_session, mo
         project_id=project.id,
         status=TaskStatus.IN_PROGRESS,
         vm_instance_id="vm-rc-sent",
-        payloads=[{"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}],
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
         context={"strategic_cycle_id": cycle.id},
         strategic_cycle_id=cycle.id,
     )
@@ -2353,7 +2891,11 @@ async def test_set_retirement_critiques_sentinel_via_http(client, db_session, mo
     token = create_agent_token(str(task.id), "vm-rc-sent", task_type="strategic_review")
     resp = await client.post(
         "/api/agent/strategic",
-        json={"task_id": str(task.id), "op": "set_retirement_critiques", "data": {"no_eligible_retirements": True}},
+        json={
+            "task_id": str(task.id),
+            "op": "set_retirement_critiques",
+            "data": {"no_eligible_retirements": True},
+        },
         headers={"x-agent-token": token},
     )
     assert resp.status_code == 200, resp.text
@@ -2366,14 +2908,17 @@ async def test_set_retirement_critiques_sentinel_via_http(client, db_session, mo
 
 
 @pytest.mark.asyncio
-async def test_set_retirement_critiques_invalid_dict_returns_400(client, db_session, mocker):
+async def test_set_retirement_critiques_invalid_dict_returns_400(
+    client, db_session, mocker
+):
     """HTTP API: a non-sentinel dict payload returns 400."""
     from app.auth import create_agent_token
     from app.models import TaskStatus
     from app import strategic_cycle
 
     project = Project(
-        name="RC-HTTP-BAD", user_id="u1",
+        name="RC-HTTP-BAD",
+        user_id="u1",
         vision={"purpose": "test", "revision": 1},
         directions=[],
     )
@@ -2388,7 +2933,9 @@ async def test_set_retirement_critiques_invalid_dict_returns_400(client, db_sess
         project_id=project.id,
         status=TaskStatus.IN_PROGRESS,
         vm_instance_id="vm-rc-bad",
-        payloads=[{"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}],
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
         context={"strategic_cycle_id": cycle.id},
         strategic_cycle_id=cycle.id,
     )
@@ -2399,7 +2946,11 @@ async def test_set_retirement_critiques_invalid_dict_returns_400(client, db_sess
     token = create_agent_token(str(task.id), "vm-rc-bad", task_type="strategic_review")
     resp = await client.post(
         "/api/agent/strategic",
-        json={"task_id": str(task.id), "op": "set_retirement_critiques", "data": {"some": "dict"}},
+        json={
+            "task_id": str(task.id),
+            "op": "set_retirement_critiques",
+            "data": {"some": "dict"},
+        },
         headers={"x-agent-token": token},
     )
     assert resp.status_code == 400, resp.text
@@ -2409,7 +2960,9 @@ async def test_set_retirement_critiques_invalid_dict_returns_400(client, db_sess
 
 
 @pytest.mark.asyncio
-async def test_strategic_completion_fallback_superseded_update_persists_superseded_by(db_session, mocker):
+async def test_strategic_completion_fallback_superseded_update_persists_superseded_by(
+    db_session, mocker
+):
     """Fallback op=update with status=superseded persists superseded_by on the direction."""
     import json
     from unittest.mock import AsyncMock
@@ -2422,8 +2975,14 @@ async def test_strategic_completion_fallback_superseded_update_persists_supersed
         user_id="u1",
         vision={"purpose": "test", "revision": 1},
         directions=[
-            {"id": "d-old", "text": "Old direction", "status": "active",
-             "priority": "medium", "notes": [], "research_history": []},
+            {
+                "id": "d-old",
+                "text": "Old direction",
+                "status": "active",
+                "priority": "medium",
+                "notes": [],
+                "research_history": [],
+            },
         ],
     )
     db_session.add(project)
@@ -2432,40 +2991,52 @@ async def test_strategic_completion_fallback_superseded_update_persists_supersed
 
     task = Task(
         project_id=project.id,
-        payloads=[{"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}],
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
         context={},
     )
     db_session.add(task)
     await db_session.commit()
     await db_session.refresh(task)
 
-    logs = json.dumps({
-        "vision": {"purpose": "test", "revision": 2},
-        "direction_operations": [
-            {
-                "op": "update",
-                "direction_id": "d-old",
-                "rationale": "superseded by newer approach",
-                "changes": {
-                    "status": "superseded",
-                    "superseded_by": {"direction_id": "d-new", "set_at": "2026-01-01T00:00:00"},
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "direction_operations": [
+                {
+                    "op": "update",
+                    "direction_id": "d-old",
+                    "rationale": "superseded by newer approach",
+                    "changes": {
+                        "status": "superseded",
+                        "superseded_by": {
+                            "direction_id": "d-new",
+                            "set_at": "2026-01-01T00:00:00",
+                        },
+                    },
                 },
-            },
-        ],
-    })
+            ],
+        }
+    )
 
     await _handle_strategic_completion(task, logs, db_session)
 
     await db_session.refresh(project)
     target = next(d for d in (project.directions or []) if d.get("id") == "d-old")
-    assert target.get("status") == "superseded", f"Expected status=superseded, got: {target.get('status')}"
-    assert target.get("superseded_by") == {"direction_id": "d-new", "set_at": "2026-01-01T00:00:00"}, (
-        f"Expected superseded_by to be persisted, got: {target.get('superseded_by')}"
+    assert target.get("status") == "superseded", (
+        f"Expected status=superseded, got: {target.get('status')}"
     )
+    assert target.get("superseded_by") == {
+        "direction_id": "d-new",
+        "set_at": "2026-01-01T00:00:00",
+    }, f"Expected superseded_by to be persisted, got: {target.get('superseded_by')}"
 
 
 @pytest.mark.asyncio
-async def test_strategic_completion_fallback_superseded_derives_superseded_by_from_successor_id(db_session, mocker):
+async def test_strategic_completion_fallback_superseded_derives_superseded_by_from_successor_id(
+    db_session, mocker
+):
     """Fallback op=update: when changes lacks superseded_by, derive it from changes.successor_id."""
     import json
     from unittest.mock import AsyncMock
@@ -2478,8 +3049,14 @@ async def test_strategic_completion_fallback_superseded_derives_superseded_by_fr
         user_id="u1",
         vision={"purpose": "test", "revision": 1},
         directions=[
-            {"id": "d-legacy", "text": "Legacy direction", "status": "active",
-             "priority": "medium", "notes": [], "research_history": []},
+            {
+                "id": "d-legacy",
+                "text": "Legacy direction",
+                "status": "active",
+                "priority": "medium",
+                "notes": [],
+                "research_history": [],
+            },
         ],
     )
     db_session.add(project)
@@ -2488,25 +3065,29 @@ async def test_strategic_completion_fallback_superseded_derives_superseded_by_fr
 
     task = Task(
         project_id=project.id,
-        payloads=[{"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}],
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
         context={},
     )
     db_session.add(task)
     await db_session.commit()
     await db_session.refresh(task)
 
-    logs = json.dumps({
-        "vision": {"purpose": "test", "revision": 2},
-        "direction_operations": [
-            {
-                "op": "update",
-                "direction_id": "d-legacy",
-                "successor_id": "d-successor",
-                "rationale": "replaced",
-                "changes": {"status": "superseded"},
-            },
-        ],
-    })
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "direction_operations": [
+                {
+                    "op": "update",
+                    "direction_id": "d-legacy",
+                    "successor_id": "d-successor",
+                    "rationale": "replaced",
+                    "changes": {"status": "superseded"},
+                },
+            ],
+        }
+    )
 
     await _handle_strategic_completion(task, logs, db_session)
 
@@ -2520,7 +3101,9 @@ async def test_strategic_completion_fallback_superseded_derives_superseded_by_fr
 
 
 @pytest.mark.asyncio
-async def test_strategic_http_update_direction_superseded_persists_superseded_by(client, db_session, mocker):
+async def test_strategic_http_update_direction_superseded_persists_superseded_by(
+    client, db_session, mocker
+):
     """HTTP update_direction with status=superseded persists superseded_by and returns 200."""
     from app.auth import create_agent_token
     from app.models import TaskStatus
@@ -2531,8 +3114,14 @@ async def test_strategic_http_update_direction_superseded_persists_superseded_by
         user_id="u1",
         vision={"purpose": "test", "revision": 1},
         directions=[
-            {"id": "d-http-old", "text": "HTTP old direction", "status": "active",
-             "priority": "medium", "notes": [], "research_history": []},
+            {
+                "id": "d-http-old",
+                "text": "HTTP old direction",
+                "status": "active",
+                "priority": "medium",
+                "notes": [],
+                "research_history": [],
+            },
         ],
     )
     db_session.add(project)
@@ -2546,7 +3135,9 @@ async def test_strategic_http_update_direction_superseded_persists_superseded_by
         project_id=project.id,
         status=TaskStatus.IN_PROGRESS,
         vm_instance_id="vm-sup-http",
-        payloads=[{"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}],
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
         context={"strategic_cycle_id": cycle.id},
         strategic_cycle_id=cycle.id,
     )
@@ -2554,7 +3145,9 @@ async def test_strategic_http_update_direction_superseded_persists_superseded_by
     await db_session.commit()
     await db_session.refresh(task)
 
-    token = create_agent_token(str(task.id), "vm-sup-http", task_type="strategic_review")
+    token = create_agent_token(
+        str(task.id), "vm-sup-http", task_type="strategic_review"
+    )
     resp = await client.post(
         "/api/agent/strategic",
         json={
@@ -2565,7 +3158,10 @@ async def test_strategic_http_update_direction_superseded_persists_superseded_by
                 "rationale": "superseded by new direction",
                 "changes": {
                     "status": "superseded",
-                    "superseded_by": {"direction_id": "d-http-new", "set_at": "2026-01-01T00:00:00"},
+                    "superseded_by": {
+                        "direction_id": "d-http-new",
+                        "set_at": "2026-01-01T00:00:00",
+                    },
                 },
             },
         },
@@ -2576,14 +3172,19 @@ async def test_strategic_http_update_direction_superseded_persists_superseded_by
     await db_session.refresh(project)
     target = next(d for d in (project.directions or []) if d.get("id") == "d-http-old")
     assert target.get("status") == "superseded"
-    assert target.get("superseded_by") == {"direction_id": "d-http-new", "set_at": "2026-01-01T00:00:00"}
+    assert target.get("superseded_by") == {
+        "direction_id": "d-http-new",
+        "set_at": "2026-01-01T00:00:00",
+    }
 
 
 # ── _strategic_dedup_rejections persistence ───────────────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_strategic_http_create_direction_dedup_persists_rejection_record(client, db_session, mocker):
+async def test_strategic_http_create_direction_dedup_persists_rejection_record(
+    client, db_session, mocker
+):
     """HTTP create_direction on a semantic duplicate appends a structured record to
     task.context['_strategic_dedup_rejections'] and still returns 409."""
     from app.auth import create_agent_token
@@ -2596,8 +3197,14 @@ async def test_strategic_http_create_direction_dedup_persists_rejection_record(c
         user_id="u1",
         vision={"purpose": "test", "revision": 1},
         directions=[
-            {"id": "d-exist", "text": existing_text, "status": "active",
-             "priority": "medium", "notes": [], "research_history": []},
+            {
+                "id": "d-exist",
+                "text": existing_text,
+                "status": "active",
+                "priority": "medium",
+                "notes": [],
+                "research_history": [],
+            },
         ],
     )
     db_session.add(project)
@@ -2611,7 +3218,9 @@ async def test_strategic_http_create_direction_dedup_persists_rejection_record(c
         project_id=project.id,
         status=TaskStatus.IN_PROGRESS,
         vm_instance_id="vm-dedup",
-        payloads=[{"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}],
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
         context={"strategic_cycle_id": cycle.id},
         strategic_cycle_id=cycle.id,
     )
@@ -2666,14 +3275,22 @@ class TestBuildOutcomeEvaluationEvidence:
 
     def _make_project(self, **dir_kwargs):
         d = {
-            "id": "d-ev1", "status": "active", "text": "Improve caching layer",
+            "id": "d-ev1",
+            "status": "active",
+            "text": "Improve caching layer",
             "research_history": [],
         }
         d.update(dir_kwargs)
         return Project(name="P", user_id="u1", directions=[d], vision={})
 
     def test_evidence_included_when_present_with_claims(self):
-        evidence = [{"title": "Finding A", "claims": ["c1", "c2"], "source_refs": [{"ref": "backend/foo.py"}]}]
+        evidence = [
+            {
+                "title": "Finding A",
+                "claims": ["c1", "c2"],
+                "source_refs": [{"ref": "backend/foo.py"}],
+            }
+        ]
         project = self._make_project(recent_findings_evidence=evidence)
         result = _build_outcome_evaluation(project)
         direction = result["directions"][0]
@@ -2700,22 +3317,38 @@ class TestBuildOutcomeEvaluationEvidence:
 
     def test_failed_findings_excluded_from_evidence(self):
         ctx = "## Established Findings\n- Finding A (failed: build error)\n"
-        evidence = [{"title": "Finding A", "claims": ["c1"], "source_refs": [{"ref": "backend/foo.py"}]}]
-        project = self._make_project(research_context=ctx, recent_findings_evidence=evidence)
+        evidence = [
+            {
+                "title": "Finding A",
+                "claims": ["c1"],
+                "source_refs": [{"ref": "backend/foo.py"}],
+            }
+        ]
+        project = self._make_project(
+            research_context=ctx, recent_findings_evidence=evidence
+        )
         result = _build_outcome_evaluation(project)
         assert "evidence" not in result["directions"][0]
 
     def test_proposed_findings_included(self):
         ctx = "## Established Findings\n- Finding B (proposed)\n"
         evidence = [{"title": "Finding B", "claims": ["c1"], "source_refs": []}]
-        project = self._make_project(research_context=ctx, recent_findings_evidence=evidence)
+        project = self._make_project(
+            research_context=ctx, recent_findings_evidence=evidence
+        )
         result = _build_outcome_evaluation(project)
         ev = result["directions"][0].get("evidence")
         assert ev is not None
         assert ev[0]["title"] == "Finding B"
 
     def test_claims_capped_at_3_per_finding(self):
-        evidence = [{"title": "Big Finding", "claims": [f"claim{i}" for i in range(6)], "source_refs": [{"ref": "f.py"}]}]
+        evidence = [
+            {
+                "title": "Big Finding",
+                "claims": [f"claim{i}" for i in range(6)],
+                "source_refs": [{"ref": "f.py"}],
+            }
+        ]
         project = self._make_project(recent_findings_evidence=evidence)
         result = _build_outcome_evaluation(project)
         ev = result["directions"][0].get("evidence")
@@ -2733,7 +3366,11 @@ class TestBuildOutcomeEvaluationEvidence:
 
     def test_total_evidence_entries_capped_at_5(self):
         evidence = [
-            {"title": f"Finding {i}", "claims": [f"c{i}"], "source_refs": [{"ref": f"f{i}.py"}]}
+            {
+                "title": f"Finding {i}",
+                "claims": [f"c{i}"],
+                "source_refs": [{"ref": f"f{i}.py"}],
+            }
             for i in range(8)
         ]
         project = self._make_project(recent_findings_evidence=evidence)

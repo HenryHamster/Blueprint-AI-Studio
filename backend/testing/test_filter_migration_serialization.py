@@ -1,4 +1,5 @@
 """Unit tests for filter_migration_serialization in orchestrator_filters."""
+
 import uuid
 import pytest
 from unittest.mock import AsyncMock, MagicMock
@@ -41,7 +42,9 @@ class TestFilterMigrationSerialization:
     async def test_create_task_with_alembic_file_triggers_serialization(self):
         pid = uuid.uuid4()
         ip = _task(
-            pid, TaskStatus.IN_PROGRESS, ttype="create",
+            pid,
+            TaskStatus.IN_PROGRESS,
+            ttype="create",
             files=["backend/alembic/versions/0042_x.py", "backend/app/models.py"],
         )
         c = _task(pid, TaskStatus.QUEUED, ttype="migrate")
@@ -58,7 +61,9 @@ class TestFilterMigrationSerialization:
         pid = uuid.uuid4()
         ip = _task(pid, TaskStatus.IN_PROGRESS, ttype="migrate")
         c = _task(
-            pid, TaskStatus.QUEUED, ttype="create",
+            pid,
+            TaskStatus.QUEUED,
+            ttype="create",
             files=["backend/app/models.py"],
         )
         session = MagicMock()
@@ -110,7 +115,9 @@ class TestFilterMigrationSerialization:
         assert result == [c.id]
 
     @pytest.mark.asyncio
-    async def test_active_tasks_loaded_with_orchestrator_load_only_no_lazy_load(self, db_session):
+    async def test_active_tasks_loaded_with_orchestrator_load_only_no_lazy_load(
+        self, db_session
+    ):
         """Regression: filter must not trigger sync lazy-load on Task.payloads.
 
         The orchestrator dispatch loop fetches active tasks with the
@@ -125,25 +132,43 @@ class TestFilterMigrationSerialization:
         await db_session.commit()
 
         ip = make_task(
-            project_id=project.id, status=TaskStatus.IN_PROGRESS,
+            project_id=project.id,
+            status=TaskStatus.IN_PROGRESS,
             payloads=[{"type": "migrate"}],
         )
         cand = make_task(
-            project_id=project.id, status=TaskStatus.QUEUED,
+            project_id=project.id,
+            status=TaskStatus.QUEUED,
             payloads=[{"type": "migrate"}],
         )
         db_session.add_all([ip, cand])
         await db_session.commit()
         db_session.expunge_all()
 
-        active = (await db_session.execute(
-            select(Task)
-            .where(Task.status.in_([TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]))
-            .options(load_only(*ACTIVE_TASKS_LIGHT_COLUMNS))
-        )).scalars().all()
-        candidates = (await db_session.execute(
-            select(Task).where(Task.status == TaskStatus.QUEUED)
-        )).scalars().all()
+        active = (
+            (
+                await db_session.execute(
+                    select(Task)
+                    .where(
+                        Task.status.in_(
+                            [TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]
+                        )
+                    )
+                    .options(load_only(*ACTIVE_TASKS_LIGHT_COLUMNS))
+                )
+            )
+            .scalars()
+            .all()
+        )
+        candidates = (
+            (
+                await db_session.execute(
+                    select(Task).where(Task.status == TaskStatus.QUEUED)
+                )
+            )
+            .scalars()
+            .all()
+        )
 
         result = await filter_migration_serialization(
             [c.id for c in candidates], candidates, active, db_session, AsyncMock()

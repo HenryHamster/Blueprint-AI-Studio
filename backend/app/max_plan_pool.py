@@ -150,7 +150,9 @@ def get_task_llm_execution_mode(task_or_ctx: Any) -> str | None:
     return None
 
 
-def infer_provider_for_model(model: str | None, runtime_config: Mapping[str, Any]) -> str | None:
+def infer_provider_for_model(
+    model: str | None, runtime_config: Mapping[str, Any]
+) -> str | None:
     if not model:
         return None
     for provider_name in LLMProviderName:
@@ -177,7 +179,9 @@ def infer_quality_tier_for_model(
 
 
 ALL_PROVIDERS: tuple[str, ...] = tuple(p.value for p in LLMProviderName)
-_VALID_SELECTION_MODES: frozenset[str] = frozenset({"balanced", "preferred", "exclusive"})
+_VALID_SELECTION_MODES: frozenset[str] = frozenset(
+    {"balanced", "preferred", "exclusive"}
+)
 VALID_EFFORT_LEVELS: tuple[str, ...] = ("low", "medium", "high", "max")
 DEFAULT_EFFORT_LEVEL = "medium"
 
@@ -189,7 +193,9 @@ def _normalize_provider_list(raw: Any) -> list[str]:
     return [v for v in values if v]
 
 
-def _category_for_task_type(task_type: str, runtime_config: Mapping[str, Any]) -> str | None:
+def _category_for_task_type(
+    task_type: str, runtime_config: Mapping[str, Any]
+) -> str | None:
     """Return the first category whose member list contains ``task_type``.
 
     task_type_categories is ``{category_name: [task_types...]}``. The first
@@ -216,11 +222,17 @@ def _routing_entry(raw: Any) -> tuple[list[str] | None, str | None]:
     if not isinstance(raw, Mapping):
         return None, None
     providers_raw = raw.get("providers")
-    providers = _normalize_provider_list(providers_raw) if providers_raw is not None else None
+    providers = (
+        _normalize_provider_list(providers_raw) if providers_raw is not None else None
+    )
     if providers is not None and not providers:
         providers = None
     effort_raw = raw.get("effort")
-    effort = effort_raw.strip() if isinstance(effort_raw, str) and effort_raw.strip() else None
+    effort = (
+        effort_raw.strip()
+        if isinstance(effort_raw, str) and effort_raw.strip()
+        else None
+    )
     return providers, effort
 
 
@@ -235,7 +247,11 @@ def _ensure_migrated(runtime_config: Mapping[str, Any]) -> Mapping[str, Any]:
         return runtime_config
     has_new = any(
         k in runtime_config
-        for k in ("category_routing", "task_type_routing", "provider_settings_by_effort")
+        for k in (
+            "category_routing",
+            "task_type_routing",
+            "provider_settings_by_effort",
+        )
     )
     has_legacy = any(
         k in runtime_config
@@ -249,10 +265,13 @@ def _ensure_migrated(runtime_config: Mapping[str, Any]) -> Mapping[str, Any]:
     if has_new or not has_legacy:
         return runtime_config
     from app.shared_state import _migrate_legacy_provider_config
+
     return _migrate_legacy_provider_config(dict(runtime_config))
 
 
-def resolve_task_routing(task: Any, runtime_config: Mapping[str, Any]) -> dict[str, Any]:
+def resolve_task_routing(
+    task: Any, runtime_config: Mapping[str, Any]
+) -> dict[str, Any]:
     """Resolve ``{providers, effort}`` for a task, most-specific first.
 
     Order:
@@ -319,17 +338,27 @@ def resolve_task_routing(task: Any, runtime_config: Mapping[str, Any]) -> dict[s
     }
 
 
-def resolve_task_provider_preference(task: Any, runtime_config: Mapping[str, Any]) -> list[str]:
+def resolve_task_provider_preference(
+    task: Any, runtime_config: Mapping[str, Any]
+) -> list[str]:
     """Thin back-compat shim — returns just the provider list."""
     return resolve_task_routing(task, runtime_config)["providers"]
 
 
-def resolve_task_model_preferences(task: Any, runtime_config: Mapping[str, Any]) -> list[dict[str, str]]:
+def resolve_task_model_preferences(
+    task: Any, runtime_config: Mapping[str, Any]
+) -> list[dict[str, str]]:
     ctx = _task_context(task)
     payloads = getattr(task, "payloads", None) or []
     payload = payloads[0] if payloads else {}
     explicit = payload.get("model_preferences") or ctx.get("model_preferences")
-    raw_prefs = explicit if isinstance(explicit, list) else (runtime_config.get("task_type_model_preferences", {}) or {}).get(_task_type(task))
+    raw_prefs = (
+        explicit
+        if isinstance(explicit, list)
+        else (runtime_config.get("task_type_model_preferences", {}) or {}).get(
+            _task_type(task)
+        )
+    )
     if not isinstance(raw_prefs, list):
         return []
     prefs: list[dict[str, str]] = []
@@ -395,7 +424,9 @@ def resolve_task_provider_settings(
     matrix_all = runtime_config.get("provider_settings_by_effort", {}) or {}
     overrides_all = runtime_config.get("task_type_provider_overrides", {}) or {}
 
-    base = defaults_all.get(provider_name) if isinstance(defaults_all, Mapping) else None
+    base = (
+        defaults_all.get(provider_name) if isinstance(defaults_all, Mapping) else None
+    )
 
     effort_bag = None
     effort = resolve_task_routing(task, runtime_config)["effort"]
@@ -407,16 +438,28 @@ def resolve_task_provider_settings(
                 effort_bag = candidate
 
     task_type = _task_type(task)
-    task_override = overrides_all.get(task_type) if isinstance(overrides_all, Mapping) else None
-    type_bag = task_override.get(provider_name) if isinstance(task_override, Mapping) else None
+    task_override = (
+        overrides_all.get(task_type) if isinstance(overrides_all, Mapping) else None
+    )
+    type_bag = (
+        task_override.get(provider_name) if isinstance(task_override, Mapping) else None
+    )
 
     ctx = _task_context(task)
     payloads = getattr(task, "payloads", None) or []
     payload = payloads[0] if payloads else {}
-    payload_settings = payload.get("provider_settings") if isinstance(payload, Mapping) else None
+    payload_settings = (
+        payload.get("provider_settings") if isinstance(payload, Mapping) else None
+    )
     ctx_settings = ctx.get("provider_settings")
-    payload_bag = payload_settings.get(provider_name) if isinstance(payload_settings, Mapping) else None
-    ctx_bag = ctx_settings.get(provider_name) if isinstance(ctx_settings, Mapping) else None
+    payload_bag = (
+        payload_settings.get(provider_name)
+        if isinstance(payload_settings, Mapping)
+        else None
+    )
+    ctx_bag = (
+        ctx_settings.get(provider_name) if isinstance(ctx_settings, Mapping) else None
+    )
 
     merged = merge_settings(base, effort_bag, type_bag, ctx_bag, payload_bag)
     if not merged:
@@ -425,12 +468,16 @@ def resolve_task_provider_settings(
     return provider.validate_settings(merged)
 
 
-
-
 def _account_runtime_ready(acct: dict) -> bool:
-    provider = _normalize_provider_name(acct.get("provider")) or LLMProviderName.ANTHROPIC.value
+    provider = (
+        _normalize_provider_name(acct.get("provider"))
+        or LLMProviderName.ANTHROPIC.value
+    )
     auth_mode = _normalize_auth_mode(acct.get("auth_mode")) or LLMAuthMode.OAUTH.value
-    if provider == LLMProviderName.ANTHROPIC.value and auth_mode == LLMAuthMode.OAUTH.value:
+    if (
+        provider == LLMProviderName.ANTHROPIC.value
+        and auth_mode == LLMAuthMode.OAUTH.value
+    ):
         return bool(acct.get("oauth_token"))
     return bool(acct.get("runtime_ready"))
 
@@ -441,8 +488,12 @@ def _account_runtime_ready(acct: dict) -> bool:
 _max_plan_pools: Dict[str, List[Dict[str, Any]]] = {}  # user_id → accounts
 _account_by_id: Dict[str, Dict[str, Any]] = {}  # account_id → account dict
 _max_plan_pool_lock = asyncio.Lock()
-_pending_rl_persists: List[str] = []  # Account IDs whose rate-limit state failed to persist
-_pending_cap_persists: set = set()  # Account IDs with dirty daily_task_count / disabled_reason to flush
+_pending_rl_persists: List[
+    str
+] = []  # Account IDs whose rate-limit state failed to persist
+_pending_cap_persists: set = (
+    set()
+)  # Account IDs with dirty daily_task_count / disabled_reason to flush
 
 # Exact substrings from Claude Code CLI / Anthropic API rate-limit messages.
 # Shared between classify_failure() and any caller that needs to detect a real
@@ -489,12 +540,16 @@ def cascade_disabled_models(model: str) -> tuple:
     model for unknown names so new variants don't silently cascade to the
     whole account."""
     normalized = _normalize_rl_model(model)
-    return _MODEL_TIER_CASCADE.get(normalized, (normalized,) if normalized else (model,))
+    return _MODEL_TIER_CASCADE.get(
+        normalized, (normalized,) if normalized else (model,)
+    )
 
 
 # Rolling window for account health score computation
 _HEALTH_WINDOW_SECONDS = 24 * 3600  # 24-hour rolling window
-_OUTCOME_WINDOW_SECONDS = 7 * 24 * 3600  # 7-day rolling window for success-rate tracking
+_OUTCOME_WINDOW_SECONDS = (
+    7 * 24 * 3600
+)  # 7-day rolling window for success-rate tracking
 
 # Accounts whose 24h health score is below this threshold are excluded from
 # the healthy candidate list when at least one alternative exists. Prevents
@@ -520,11 +575,15 @@ def _compute_health_score(acct: Dict[str, Any], now: datetime | None = None) -> 
     now = now or _utcnow()
     cutoff = now - timedelta(seconds=_HEALTH_WINDOW_SECONDS)
     rl_count = sum(1 for t in acct.get("rl_events", []) if t > cutoff)
-    completion_count = sum(1 for e in acct.get("completion_events", []) if e["at"] > cutoff)
+    completion_count = sum(
+        1 for e in acct.get("completion_events", []) if e["at"] > cutoff
+    )
     return completion_count - 2.0 * rl_count
 
 
-def _compute_success_rate_7d(acct: Dict[str, Any], now: datetime | None = None) -> float | None:
+def _compute_success_rate_7d(
+    acct: Dict[str, Any], now: datetime | None = None
+) -> float | None:
     """Return 7-day task success rate, or None when fewer than 3 outcomes exist.
 
     Requires ≥3 outcomes so brand-new accounts aren't misranked on one unlucky
@@ -548,7 +607,8 @@ def _compute_success_rate_7d_for_type(
     now = now or _utcnow()
     cutoff = now - timedelta(seconds=_OUTCOME_WINDOW_SECONDS)
     events = [
-        e for e in acct.get("outcome_events", [])
+        e
+        for e in acct.get("outcome_events", [])
         if e["at"] > cutoff and e.get("task_type") == task_type
     ]
     if len(events) < 3:
@@ -568,7 +628,9 @@ def _effective_success_rate(
     return _compute_success_rate_7d(acct, now)
 
 
-def _compute_avg_duration_24h(acct: Dict[str, Any], now: datetime | None = None) -> float | None:
+def _compute_avg_duration_24h(
+    acct: Dict[str, Any], now: datetime | None = None
+) -> float | None:
     """Return 24h average task duration in seconds, or None when fewer than
     _LATENCY_MIN_SAMPLES completions exist so noise doesn't whip the picker."""
     now = now or _utcnow()
@@ -583,25 +645,41 @@ def _compute_avg_duration_24h(acct: Dict[str, Any], now: datetime | None = None)
     return sum(durations) / len(durations)
 
 
-def get_account_health_stats(acct: Dict[str, Any], now: datetime | None = None) -> Dict[str, Any]:
+def get_account_health_stats(
+    acct: Dict[str, Any], now: datetime | None = None
+) -> Dict[str, Any]:
     """Return observable health stats for an account (used by admin endpoints)."""
     now = now or _utcnow()
     cutoff = now - timedelta(seconds=_HEALTH_WINDOW_SECONDS)
     rl_events = [t for t in acct.get("rl_events", []) if t > cutoff]
-    completion_events = [e for e in acct.get("completion_events", []) if e["at"] > cutoff]
-    durations = [e["duration_seconds"] for e in completion_events if e.get("duration_seconds") is not None]
+    completion_events = [
+        e for e in acct.get("completion_events", []) if e["at"] > cutoff
+    ]
+    durations = [
+        e["duration_seconds"]
+        for e in completion_events
+        if e.get("duration_seconds") is not None
+    ]
     outcome_cutoff_7d = now - timedelta(seconds=_OUTCOME_WINDOW_SECONDS)
-    outcome_events_7d = [e for e in acct.get("outcome_events", []) if e["at"] > outcome_cutoff_7d]
-    task_types = sorted({e.get("task_type") for e in outcome_events_7d if e.get("task_type")})
+    outcome_events_7d = [
+        e for e in acct.get("outcome_events", []) if e["at"] > outcome_cutoff_7d
+    ]
+    task_types = sorted(
+        {e.get("task_type") for e in outcome_events_7d if e.get("task_type")}
+    )
     success_by_type: dict[str, float] = {}
     for tt in task_types:
         typed = [e for e in outcome_events_7d if e.get("task_type") == tt]
         if len(typed) >= 3:
-            success_by_type[tt] = round(sum(1 for e in typed if e["success"]) / len(typed), 4)
+            success_by_type[tt] = round(
+                sum(1 for e in typed if e["success"]) / len(typed), 4
+            )
     return {
         "rl_events_24h": len(rl_events),
         "completions_24h": len(completion_events),
-        "avg_duration_seconds": round(sum(durations) / len(durations), 1) if durations else None,
+        "avg_duration_seconds": round(sum(durations) / len(durations), 1)
+        if durations
+        else None,
         "health_score": _compute_health_score(acct, now=now),
         "success_rate_7d": _compute_success_rate_7d(acct, now=now),
         "success_rate_by_type_7d": success_by_type if success_by_type else None,
@@ -614,7 +692,9 @@ def _prune_health_events(acct: Dict[str, Any], now: datetime) -> None:
     if "rl_events" in acct:
         acct["rl_events"] = [t for t in acct["rl_events"] if t > cutoff]
     if "completion_events" in acct:
-        acct["completion_events"] = [e for e in acct["completion_events"] if e["at"] > cutoff]
+        acct["completion_events"] = [
+            e for e in acct["completion_events"] if e["at"] > cutoff
+        ]
 
 
 def _prune_outcome_events(acct: Dict[str, Any], now: datetime) -> None:
@@ -688,9 +768,19 @@ async def load_max_plan_pool():
         accounts = result.scalars().all()
 
         # Count actually active tasks per account to reconcile after restarts
-        active_tasks = (await session.execute(
-            sql_select(Task).where(Task.status.in_([TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]))
-        )).scalars().all()
+        active_tasks = (
+            (
+                await session.execute(
+                    sql_select(Task).where(
+                        Task.status.in_(
+                            [TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]
+                        )
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
         active_per_account: Dict[str, int] = {}
         for t in active_tasks:
             acct_id = get_task_llm_account_id(t)
@@ -707,17 +797,29 @@ async def load_max_plan_pool():
             if runtime_secret and runtime_secret.startswith("projects/"):
                 try:
                     from app.secrets_manager import get_user_secret
+
                     runtime_secret = await get_user_secret(runtime_secret)
                 except Exception:
-                    logger.exception(f"[POOL] Failed to fetch secret from Secret Manager for account {acct.name}")
+                    logger.exception(
+                        f"[POOL] Failed to fetch secret from Secret Manager for account {acct.name}"
+                    )
                     runtime_secret = None
-            token = runtime_secret if provider == LLMProviderName.ANTHROPIC and auth_mode == LLMAuthMode.OAUTH else None
+            token = (
+                runtime_secret
+                if provider == LLMProviderName.ANTHROPIC
+                and auth_mode == LLMAuthMode.OAUTH
+                else None
+            )
             entry = {
                 "id": acct_id,
                 "user_id": acct.user_id,
                 "name": acct.name,
-                "provider": provider.value if isinstance(provider, LLMProviderName) else str(provider),
-                "auth_mode": auth_mode.value if isinstance(auth_mode, LLMAuthMode) else str(auth_mode),
+                "provider": provider.value
+                if isinstance(provider, LLMProviderName)
+                else str(provider),
+                "auth_mode": auth_mode.value
+                if isinstance(auth_mode, LLMAuthMode)
+                else str(auth_mode),
                 "secret_blob_ref": acct.secret_blob_ref,
                 "provider_metadata": acct.provider_metadata or {},
                 "runtime_secret": runtime_secret,
@@ -727,7 +829,9 @@ async def load_max_plan_pool():
                 "enabled": acct.enabled,
                 "active_tasks": active_per_account.get(acct_id, 0),
                 "total_tasks": acct.total_tasks,
-                "token_created_at": acct.token_created_at.isoformat() if acct.token_created_at else None,
+                "token_created_at": acct.token_created_at.isoformat()
+                if acct.token_created_at
+                else None,
                 "daily_task_cap": acct.daily_task_cap,
                 "max_concurrent_tasks": acct.max_concurrent_tasks,
                 "auto_disable_after_rate_limits": acct.auto_disable_after_rate_limits,
@@ -754,7 +858,11 @@ async def load_max_plan_pool():
                         # regression metadata) across restarts so quota_exhausted
                         # / regression accounts aren't silently demoted to an
                         # exponential-rate-limit cooldown.
-                        if info.get("kind") in ("quota_exhausted", "regression", "quarantine"):
+                        if info.get("kind") in (
+                            "quota_exhausted",
+                            "regression",
+                            "quarantine",
+                        ):
                             restored_info["kind"] = info["kind"]
                         hint = info.get("retry_after_seconds")
                         if isinstance(hint, (int, float)) and hint > 0:
@@ -764,11 +872,15 @@ async def load_max_plan_pool():
                         stats = info.get("regression_stats")
                         if isinstance(stats, dict):
                             restored_info["regression_stats"] = dict(stats)
-                        if (now - at_dt).total_seconds() < _cooldown_seconds_for_info(restored_info):
+                        if (now - at_dt).total_seconds() < _cooldown_seconds_for_info(
+                            restored_info
+                        ):
                             restored_dm[model_name] = restored_info
                 if restored_dm:
                     entry["disabled_models"] = restored_dm
-                    logger.info(f"[STARTUP] Restored rate-limit state for {acct.name}: {list(restored_dm.keys())}")
+                    logger.info(
+                        f"[STARTUP] Restored rate-limit state for {acct.name}: {list(restored_dm.keys())}"
+                    )
             # Restore outcome_events from rate_limit_state (7d window)
             outcome_events_raw = rl_state.get("outcome_events", [])
             if outcome_events_raw:
@@ -780,17 +892,21 @@ async def load_max_plan_pool():
                     if at_str:
                         at_dt = datetime.fromisoformat(at_str)
                         if at_dt > oe_cutoff:
-                            restored_oe.append({
-                                "at": at_dt,
-                                "success": bool(ev.get("success")),
-                                "task_type": ev.get("task_type"),
-                            })
+                            restored_oe.append(
+                                {
+                                    "at": at_dt,
+                                    "success": bool(ev.get("success")),
+                                    "task_type": ev.get("task_type"),
+                                }
+                            )
                 if restored_oe:
                     entry["outcome_events"] = restored_oe
             _max_plan_pools.setdefault(acct.user_id, []).append(entry)
             _account_by_id[acct_id] = entry
         total_active = sum(active_per_account.values())
-        logger.info(f"[STARTUP] Loaded {len(_account_by_id)} Max plan accounts for {len(_max_plan_pools)} users ({total_active} active tasks reconciled)")
+        logger.info(
+            f"[STARTUP] Loaded {len(_account_by_id)} Max plan accounts for {len(_max_plan_pools)} users ({total_active} active tasks reconciled)"
+        )
 
 
 _DAILY_WINDOW_SECONDS = 24 * 60 * 60
@@ -816,16 +932,22 @@ def _daily_reset_if_elapsed(acct: dict, now: datetime | None = None) -> bool:
 def _account_at_cap(acct: dict) -> str | None:
     """Return a reason string if the account is at any usage cap, else None."""
     daily_cap = acct.get("daily_task_cap")
-    if daily_cap is not None and int(acct.get("daily_task_count") or 0) >= int(daily_cap):
+    if daily_cap is not None and int(acct.get("daily_task_count") or 0) >= int(
+        daily_cap
+    ):
         return f"daily cap ({daily_cap}) reached"
     concurrent_cap = acct.get("max_concurrent_tasks")
-    if concurrent_cap is not None and int(acct.get("active_tasks") or 0) >= int(concurrent_cap):
+    if concurrent_cap is not None and int(acct.get("active_tasks") or 0) >= int(
+        concurrent_cap
+    ):
         return f"concurrent cap ({concurrent_cap}) reached"
     return None
 
 
 _QUOTA_EXHAUSTED_COOLDOWN_SECONDS = 24 * 60 * 60  # flat 24h for billing walls
-_QUARANTINE_COOLDOWN_SECONDS = 15 * 60  # flat 15-min recheck for confidence-gated quarantine
+_QUARANTINE_COOLDOWN_SECONDS = (
+    15 * 60
+)  # flat 15-min recheck for confidence-gated quarantine
 _REGRESSION_COOLDOWN_SECONDS = 6 * 60 * 60  # flat 6h reprobe for regression quarantine
 QUARANTINE_CONSECUTIVE_N = 3  # consecutive qualifying failures to trip the quarantine
 QUARANTINE_CONFIDENCE_THRESHOLD = 0.8  # minimum per-record confidence to count
@@ -890,18 +1012,24 @@ def _check_quarantine_trigger(account_id: str) -> bool:
     Lazy-imports get_account_failure_class_records to avoid the module-level cycle:
     failure_classification already imports from max_plan_pool at module load time.
     """
-    from app.failure_classification import get_account_failure_class_records  # lazy — avoids cycle
+    from app.failure_classification import (
+        get_account_failure_class_records,
+    )  # lazy — avoids cycle
+
     records = get_account_failure_class_records(account_id)
     if len(records) < QUARANTINE_CONSECUTIVE_N:
         return False
     last_n = records[-QUARANTINE_CONSECUTIVE_N:]
     return all(
-        cls in _QUARANTINE_ELIGIBLE_CLASSES and (conf or 0.0) >= QUARANTINE_CONFIDENCE_THRESHOLD
+        cls in _QUARANTINE_ELIGIBLE_CLASSES
+        and (conf or 0.0) >= QUARANTINE_CONFIDENCE_THRESHOLD
         for cls, conf, _ts in last_n
     )
 
 
-def _account_state_for_model(acct: dict, model: str | None, now: datetime | None = None) -> str:
+def _account_state_for_model(
+    acct: dict, model: str | None, now: datetime | None = None
+) -> str:
     """Derive the circuit-breaker state for an (account, model) pair.
 
     Returns "healthy", "probing", or "unavailable":
@@ -969,7 +1097,9 @@ def _account_available_for_model(acct: dict, model: str | None) -> bool:
     return _account_state_for_model(acct, model) != "unavailable"
 
 
-def summarize_pool_state(model: str | None, user_id: str | None = None) -> Dict[str, Any]:
+def summarize_pool_state(
+    model: str | None, user_id: str | None = None
+) -> Dict[str, Any]:
     """Summarize account pool state for diagnostics. Returns counts per state
     plus the earliest cooldown recovery time across rate-limited accounts.
 
@@ -1062,29 +1192,33 @@ def get_all_account_health_summaries(
                 "hits": info.get("hits", 1),
                 "cooldown_remaining_seconds": int(remaining),
             }
-            if info.get("kind") == "regression" and isinstance(info.get("regression_stats"), dict):
+            if info.get("kind") == "regression" and isinstance(
+                info.get("regression_stats"), dict
+            ):
                 entry["regression_stats"] = dict(info["regression_stats"])
             rate_limited_models.append(entry)
 
-        results.append({
-            "id": acct["id"],
-            "name": acct.get("name", ""),
-            "provider": acct.get("provider", "anthropic"),
-            "auth_mode": acct.get("auth_mode", "oauth"),
-            "state": state,
-            "disabled_reason": acct.get("disabled_reason"),
-            "health_score": health_stats["health_score"],
-            "success_rate_7d": health_stats["success_rate_7d"],
-            "completions_24h": health_stats["completions_24h"],
-            "rl_events_24h": health_stats["rl_events_24h"],
-            "avg_duration_seconds": health_stats["avg_duration_seconds"],
-            "active_tasks": acct.get("active_tasks", 0),
-            "daily_task_count": acct.get("daily_task_count", 0),
-            "daily_task_cap": acct.get("daily_task_cap"),
-            "max_concurrent_tasks": acct.get("max_concurrent_tasks"),
-            "disqualify_threshold": _HEALTH_SCORE_DISQUALIFY_THRESHOLD,
-            "rate_limited_models": rate_limited_models,
-        })
+        results.append(
+            {
+                "id": acct["id"],
+                "name": acct.get("name", ""),
+                "provider": acct.get("provider", "anthropic"),
+                "auth_mode": acct.get("auth_mode", "oauth"),
+                "state": state,
+                "disabled_reason": acct.get("disabled_reason"),
+                "health_score": health_stats["health_score"],
+                "success_rate_7d": health_stats["success_rate_7d"],
+                "completions_24h": health_stats["completions_24h"],
+                "rl_events_24h": health_stats["rl_events_24h"],
+                "avg_duration_seconds": health_stats["avg_duration_seconds"],
+                "active_tasks": acct.get("active_tasks", 0),
+                "daily_task_count": acct.get("daily_task_count", 0),
+                "daily_task_cap": acct.get("daily_task_cap"),
+                "max_concurrent_tasks": acct.get("max_concurrent_tasks"),
+                "disqualify_threshold": _HEALTH_SCORE_DISQUALIFY_THRESHOLD,
+                "rate_limited_models": rate_limited_models,
+            }
+        )
     return results
 
 
@@ -1164,8 +1298,12 @@ def resolve_task_quality_tier(task: Any, runtime_config: Mapping[str, Any]) -> s
     if isinstance(explicit_tier, str) and explicit_tier.strip():
         return explicit_tier.strip()
     explicit_model = payload.get("model") or ctx.get("llm_model")
-    inferred_provider = get_task_llm_provider(task) or infer_provider_for_model(explicit_model, runtime_config)
-    inferred_tier = infer_quality_tier_for_model(inferred_provider, explicit_model, runtime_config)
+    inferred_provider = get_task_llm_provider(task) or infer_provider_for_model(
+        explicit_model, runtime_config
+    )
+    inferred_tier = infer_quality_tier_for_model(
+        inferred_provider, explicit_model, runtime_config
+    )
     return inferred_tier or DEFAULT_QUALITY_TIER
 
 
@@ -1183,7 +1321,9 @@ def _build_rate_limit_state_blob(acct: Dict[str, Any]) -> dict | None:
         pruned_outcomes.append(entry)
     out: dict[str, Any] = {}
     if dm:
-        out["disabled_models"] = {m: _serialize_disabled_model_info(i) for m, i in dm.items()}
+        out["disabled_models"] = {
+            m: _serialize_disabled_model_info(i) for m, i in dm.items()
+        }
     if pruned_outcomes:
         out["outcome_events"] = pruned_outcomes
     return out if out else None
@@ -1194,6 +1334,7 @@ async def _persist_rate_limit_state(acct_id: str) -> None:
     Caller MUST hold _max_plan_pool_lock. Raises on DB failure — caller is
     responsible for queuing retries via _pending_rl_persists."""
     from app.models import MaxPlanAccount
+
     acct = _account_by_id.get(acct_id)
     if acct is None:
         return
@@ -1276,8 +1417,10 @@ async def select_max_plan_account_balanced(
             # so balanced mode would never pick the new account.
             if len(candidates_healthy) > 1:
                 qualified = [
-                    c for c in candidates_healthy
-                    if _compute_health_score(c[0], now) >= _HEALTH_SCORE_DISQUALIFY_THRESHOLD
+                    c
+                    for c in candidates_healthy
+                    if _compute_health_score(c[0], now)
+                    >= _HEALTH_SCORE_DISQUALIFY_THRESHOLD
                 ]
                 if qualified:
                     candidates_healthy = qualified
@@ -1286,13 +1429,18 @@ async def select_max_plan_account_balanced(
                 # Sparse accounts (< 3 outcomes) return None and are treated as
                 # neutral so brand-new accounts are never starved.
                 if len(candidates_healthy) > 1:
-                    rates = [_effective_success_rate(c[0], task_type, now) for c in candidates_healthy]
+                    rates = [
+                        _effective_success_rate(c[0], task_type, now)
+                        for c in candidates_healthy
+                    ]
                     sampled = [r for r in rates if r is not None]
                     if sampled:
                         pool_median = sorted(sampled)[len(sampled) // 2]
                         preferred = [
-                            c for c, r in zip(candidates_healthy, rates)
-                            if r is None or r >= pool_median - _SUCCESS_RATE_DEPRIORITIZE_MARGIN
+                            c
+                            for c, r in zip(candidates_healthy, rates)
+                            if r is None
+                            or r >= pool_median - _SUCCESS_RATE_DEPRIORITIZE_MARGIN
                         ]
                         if preferred:
                             candidates_healthy = preferred
@@ -1354,7 +1502,14 @@ async def select_max_plan_account(
         for a in user_pool:
             if blacklist and a["id"] in blacklist:
                 continue
-            if normalized_provider and (_normalize_provider_name(a.get("provider")) or LLMProviderName.ANTHROPIC.value) != normalized_provider:
+            if (
+                normalized_provider
+                and (
+                    _normalize_provider_name(a.get("provider"))
+                    or LLMProviderName.ANTHROPIC.value
+                )
+                != normalized_provider
+            ):
                 continue
             if _daily_reset_if_elapsed(a, now):
                 dirty_from_reset.append(a["id"])
@@ -1375,23 +1530,33 @@ async def select_max_plan_account(
             # This prevents chronically rate-limited accounts from receiving new tasks
             # while still allowing them as last resort if no other account qualifies.
             if len(healthy) > 1:
-                qualified = [a for a in healthy if _compute_health_score(a, now) >= _HEALTH_SCORE_DISQUALIFY_THRESHOLD]
+                qualified = [
+                    a
+                    for a in healthy
+                    if _compute_health_score(a, now)
+                    >= _HEALTH_SCORE_DISQUALIFY_THRESHOLD
+                ]
                 if qualified:
                     healthy = qualified
             # Rank by health score, then 7d success rate (task-type-scoped when
             # confident, aggregate fallback), then latency (faster is better;
             # None → 0.0 so sparse accounts get no penalty), then fewest active tasks.
-            account = max(healthy, key=lambda a: (
-                _compute_health_score(a, now),
-                _effective_success_rate(a, task_type, now) or 0.0,
-                -(_compute_avg_duration_24h(a, now) or 0.0),
-                -a.get("active_tasks", 0),
-            ))
+            account = max(
+                healthy,
+                key=lambda a: (
+                    _compute_health_score(a, now),
+                    _effective_success_rate(a, task_type, now) or 0.0,
+                    -(_compute_avg_duration_24h(a, now) or 0.0),
+                    -a.get("active_tasks", 0),
+                ),
+            )
         elif probing:
             # Deterministic by id so concurrent selects under the same lock get
             # distinct probes when multiple accounts are eligible.
             account = min(probing, key=lambda a: a["id"])
-            logger.info(f"[POOL] Probing account {account['name']} for model {model} (cooldown elapsed, serializing as probe)")
+            logger.info(
+                f"[POOL] Probing account {account['name']} for model {model} (cooldown elapsed, serializing as probe)"
+            )
         else:
             return None
 
@@ -1410,10 +1575,14 @@ async def select_llm_runtime_for_task(
     explicit_model = _extract_task_model(task)
     mode = provider_selection_mode(runtime_config)
     allow_fallback = mode in ("balanced", "preferred")
-    model_preferences = [] if explicit_model else resolve_task_model_preferences(task, runtime_config)
+    model_preferences = (
+        [] if explicit_model else resolve_task_model_preferences(task, runtime_config)
+    )
     provider_preference = resolve_task_provider_preference(task, runtime_config)
     quality_tier = resolve_task_quality_tier(task, runtime_config)
-    explicit_provider = get_task_llm_provider(task) or infer_provider_for_model(explicit_model, runtime_config)
+    explicit_provider = get_task_llm_provider(task) or infer_provider_for_model(
+        explicit_model, runtime_config
+    )
     routing_task_type = _task_type(task)
 
     # If the inferred explicit_provider isn't allowed by the resolved
@@ -1463,16 +1632,23 @@ async def select_llm_runtime_for_task(
             if account:
                 return LLMSelectionResult(
                     provider=provider_name,
-                    auth_mode=_normalize_auth_mode(account.get("auth_mode")) or LLMAuthMode.OAUTH.value,
+                    auth_mode=_normalize_auth_mode(account.get("auth_mode"))
+                    or LLMAuthMode.OAUTH.value,
                     model=model_name,
-                    quality_tier=infer_quality_tier_for_model(provider_name, model_name, runtime_config),
+                    quality_tier=infer_quality_tier_for_model(
+                        provider_name, model_name, runtime_config
+                    ),
                     account=account,
-                    settings=resolve_task_provider_settings(task, runtime_config, provider_name),
+                    settings=resolve_task_provider_settings(
+                        task, runtime_config, provider_name
+                    ),
                 )
 
     if explicit_provider:
         if allow_fallback:
-            provider_preference = [explicit_provider] + [p for p in provider_preference if p != explicit_provider]
+            provider_preference = [explicit_provider] + [
+                p for p in provider_preference if p != explicit_provider
+            ]
         else:
             provider_preference = [explicit_provider]
     elif explicit_model and provider_preference:
@@ -1489,8 +1665,12 @@ async def select_llm_runtime_for_task(
         provider_models: list[tuple[str, str | None]] = []
         for provider_name in provider_preference:
             provider = get_provider(provider_name)
-            pre_settings = resolve_task_provider_settings(task, runtime_config, provider_name)
-            bag_model = pre_settings.get("model") if isinstance(pre_settings, Mapping) else None
+            pre_settings = resolve_task_provider_settings(
+                task, runtime_config, provider_name
+            )
+            bag_model = (
+                pre_settings.get("model") if isinstance(pre_settings, Mapping) else None
+            )
             if isinstance(bag_model, str) and bag_model:
                 model = bag_model
             else:
@@ -1509,11 +1689,14 @@ async def select_llm_runtime_for_task(
                 account, provider_name, chosen_model = balanced_result
                 return LLMSelectionResult(
                     provider=provider_name,
-                    auth_mode=_normalize_auth_mode(account.get("auth_mode")) or LLMAuthMode.OAUTH.value,
+                    auth_mode=_normalize_auth_mode(account.get("auth_mode"))
+                    or LLMAuthMode.OAUTH.value,
                     model=chosen_model,
                     quality_tier=quality_tier,
                     account=account,
-                    settings=resolve_task_provider_settings(task, runtime_config, provider_name),
+                    settings=resolve_task_provider_settings(
+                        task, runtime_config, provider_name
+                    ),
                 )
             # Fall through to per-provider iteration so the unaccounted-for
             # fallback (no account present, but explicit_provider/model set)
@@ -1524,9 +1707,15 @@ async def select_llm_runtime_for_task(
         # Resolve settings bag first so a bag-pinned `model` (e.g. a task-type
         # override forcing gemini-2.5-flash for smoketest) takes precedence
         # over tier resolution. Explicit payload.model still wins over both.
-        pre_settings = resolve_task_provider_settings(task, runtime_config, provider_name)
-        bag_model = pre_settings.get("model") if isinstance(pre_settings, Mapping) else None
-        if explicit_model and (explicit_provider is None or provider_name == explicit_provider):
+        pre_settings = resolve_task_provider_settings(
+            task, runtime_config, provider_name
+        )
+        bag_model = (
+            pre_settings.get("model") if isinstance(pre_settings, Mapping) else None
+        )
+        if explicit_model and (
+            explicit_provider is None or provider_name == explicit_provider
+        ):
             model = explicit_model
         elif isinstance(bag_model, str) and bag_model:
             model = bag_model
@@ -1544,11 +1733,14 @@ async def select_llm_runtime_for_task(
         if account:
             return LLMSelectionResult(
                 provider=provider_name,
-                auth_mode=_normalize_auth_mode(account.get("auth_mode")) or LLMAuthMode.OAUTH.value,
+                auth_mode=_normalize_auth_mode(account.get("auth_mode"))
+                or LLMAuthMode.OAUTH.value,
                 model=model,
                 quality_tier=quality_tier,
                 account=account,
-                settings=resolve_task_provider_settings(task, runtime_config, provider_name),
+                settings=resolve_task_provider_settings(
+                    task, runtime_config, provider_name
+                ),
             )
 
         # Preview→GA fallback: if the requested model has a GA counterpart
@@ -1571,7 +1763,9 @@ async def select_llm_runtime_for_task(
                 logger.warning(
                     "[LLM_SELECT] No pool account has %s; falling back to GA "
                     "counterpart %s on %s. Recorded on task.context.model_fallback.",
-                    model, fallback, provider_name,
+                    model,
+                    fallback,
+                    provider_name,
                 )
                 _record_model_fallback(
                     task,
@@ -1582,11 +1776,14 @@ async def select_llm_runtime_for_task(
                 )
                 return LLMSelectionResult(
                     provider=provider_name,
-                    auth_mode=_normalize_auth_mode(account.get("auth_mode")) or LLMAuthMode.OAUTH.value,
+                    auth_mode=_normalize_auth_mode(account.get("auth_mode"))
+                    or LLMAuthMode.OAUTH.value,
                     model=fallback,
                     quality_tier=quality_tier,
                     account=account,
-                    settings=resolve_task_provider_settings(task, runtime_config, provider_name),
+                    settings=resolve_task_provider_settings(
+                        task, runtime_config, provider_name
+                    ),
                 )
 
     if explicit_provider and explicit_model:
@@ -1596,20 +1793,26 @@ async def select_llm_runtime_for_task(
             model=explicit_model,
             quality_tier=quality_tier,
             account=None,
-            settings=resolve_task_provider_settings(task, runtime_config, explicit_provider),
+            settings=resolve_task_provider_settings(
+                task, runtime_config, explicit_provider
+            ),
         )
 
     if provider_preference:
         fallback_provider = provider_preference[0]
         provider = get_provider(fallback_provider)
-        fallback_model = explicit_model or provider.tier_to_model(quality_tier, runtime_config)
+        fallback_model = explicit_model or provider.tier_to_model(
+            quality_tier, runtime_config
+        )
         return LLMSelectionResult(
             provider=fallback_provider,
             auth_mode=LLMAuthMode.OAUTH.value,
             model=fallback_model,
             quality_tier=quality_tier,
             account=None,
-            settings=resolve_task_provider_settings(task, runtime_config, fallback_provider),
+            settings=resolve_task_provider_settings(
+                task, runtime_config, fallback_provider
+            ),
         )
 
     return None
@@ -1621,7 +1824,9 @@ async def release_max_plan_account(account_id: str):
         account = _account_by_id.get(account_id)
         if account:
             if account["active_tasks"] <= 0:
-                logger.warning(f"[POOL] Account {account['name']} ({account_id}) release underflow — active_tasks was {account['active_tasks']}")
+                logger.warning(
+                    f"[POOL] Account {account['name']} ({account_id}) release underflow — active_tasks was {account['active_tasks']}"
+                )
             account["active_tasks"] = max(0, account["active_tasks"] - 1)
 
 
@@ -1710,7 +1915,9 @@ async def disable_account_model(
             try:
                 await _persist_rate_limit_state(acct_id)
             except SQLAlchemyError as e:
-                logger.warning(f"[POOL] Failed to persist regression state for {acct_id}: {e} — queued for retry")
+                logger.warning(
+                    f"[POOL] Failed to persist regression state for {acct_id}: {e} — queued for retry"
+                )
                 if acct_id not in _pending_rl_persists:
                     _pending_rl_persists.append(acct_id)
             return
@@ -1734,7 +1941,9 @@ async def disable_account_model(
                 f"(primary {primary_key}, flat 24h cooldown — refill required)"
             )
         else:
-            cooldown = min(30 * (2 ** (primary_hits - 1)), 240) * random.uniform(0.85, 1.15)
+            cooldown = min(30 * (2 ** (primary_hits - 1)), 240) * random.uniform(
+                0.85, 1.15
+            )
             if retry_after_seconds is not None:
                 hint_minutes = retry_after_seconds / 60.0
                 if hint_minutes > cooldown:
@@ -1742,12 +1951,18 @@ async def disable_account_model(
             logger.warning(
                 f"[POOL] Account {acct['name']} disabled models {list(cascade)} "
                 f"(primary {primary_key} hit #{primary_hits}, cooldown {cooldown:.0f}min"
-                + (f", server-hinted {retry_after_seconds}s" if retry_after_seconds else "")
+                + (
+                    f", server-hinted {retry_after_seconds}s"
+                    if retry_after_seconds
+                    else ""
+                )
                 + ")"
             )
 
         auto_disable_threshold = acct.get("auto_disable_after_rate_limits")
-        if auto_disable_threshold is not None and primary_hits >= int(auto_disable_threshold):
+        if auto_disable_threshold is not None and primary_hits >= int(
+            auto_disable_threshold
+        ):
             reason = f"auto-disabled after {primary_hits} rate-limit hit(s) (threshold {auto_disable_threshold})"
             acct["enabled"] = False
             acct["disabled_at"] = now
@@ -1766,7 +1981,9 @@ async def disable_account_model(
         try:
             await _persist_rate_limit_state(acct_id)
         except SQLAlchemyError as e:
-            logger.warning(f"[POOL] Failed to persist rate-limit state for {acct_id}: {e} — queued for retry")
+            logger.warning(
+                f"[POOL] Failed to persist rate-limit state for {acct_id}: {e} — queued for retry"
+            )
             if acct_id not in _pending_rl_persists:
                 _pending_rl_persists.append(acct_id)
 
@@ -1801,17 +2018,23 @@ async def clear_rate_limit_state_on_success(acct_id: str, model: str) -> bool:
             return False
         if not dm:
             acct.pop("disabled_models", None)
-        logger.info(f"[POOL] Account {acct['name']} cleared disabled models {cleared} after successful {model} task")
+        logger.info(
+            f"[POOL] Account {acct['name']} cleared disabled models {cleared} after successful {model} task"
+        )
         try:
             await _persist_rate_limit_state(acct_id)
         except SQLAlchemyError as e:
-            logger.warning(f"[POOL] Failed to persist rate-limit clear for {acct_id}: {e} — queued for retry")
+            logger.warning(
+                f"[POOL] Failed to persist rate-limit clear for {acct_id}: {e} — queued for retry"
+            )
             if acct_id not in _pending_rl_persists:
                 _pending_rl_persists.append(acct_id)
         return True
 
 
-async def clear_account_model_regression(acct_id: str, model: str, provider: str | None = None) -> bool:
+async def clear_account_model_regression(
+    acct_id: str, model: str, provider: str | None = None
+) -> bool:
     """Manually clear a regression-kind disabled_models entry for (account, model).
 
     Returns True iff an entry existed AND its kind was 'regression' (untouched
@@ -1846,11 +2069,15 @@ async def clear_account_model_regression(acct_id: str, model: str, provider: str
         del dm[model]
         if not dm:
             acct.pop("disabled_models", None)
-        logger.info(f"[POOL] Account {acct['name']} cleared regression-quarantine on {model} (manual override)")
+        logger.info(
+            f"[POOL] Account {acct['name']} cleared regression-quarantine on {model} (manual override)"
+        )
         try:
             await _persist_rate_limit_state(acct_id)
         except SQLAlchemyError as e:
-            logger.warning(f"[POOL] Failed to persist regression clear for {acct_id}: {e} — queued for retry")
+            logger.warning(
+                f"[POOL] Failed to persist regression clear for {acct_id}: {e} — queued for retry"
+            )
             if acct_id not in _pending_rl_persists:
                 _pending_rl_persists.append(acct_id)
         return True
@@ -1893,11 +2120,15 @@ async def clear_regression_on_success(acct_id: str, model: str) -> dict | None:
         del dm[model]
         if not dm:
             acct.pop("disabled_models", None)
-        logger.info(f"[POOL] Account {acct['name']} auto-recovered regression on {model} after probe success")
+        logger.info(
+            f"[POOL] Account {acct['name']} auto-recovered regression on {model} after probe success"
+        )
         try:
             await _persist_rate_limit_state(acct_id)
         except SQLAlchemyError as e:
-            logger.warning(f"[POOL] Failed to persist regression recovery for {acct_id}: {e} — queued for retry")
+            logger.warning(
+                f"[POOL] Failed to persist regression recovery for {acct_id}: {e} — queued for retry"
+            )
             if acct_id not in _pending_rl_persists:
                 _pending_rl_persists.append(acct_id)
         return recovery_info
@@ -1977,20 +2208,24 @@ async def scan_account_model_regressions(session) -> list[dict[str, Any]]:
                 provider=cand.provider,
             )
         except Exception as e:
-            logger.warning(f"[POOL] Failed to apply regression quarantine for {acct_id}/{cand.model}: {e}")
+            logger.warning(
+                f"[POOL] Failed to apply regression quarantine for {acct_id}/{cand.model}: {e}"
+            )
             continue
-        fired.append({
-            "account_id": acct_id,
-            "account_label": account_label,
-            "user_id": user_id,
-            "provider": cand.provider,
-            "model": cand.model,
-            "account_rate": cand.account_rate,
-            "project_median": cand.project_median,
-            "sample_size": cand.sample_size,
-            "distinct_accounts": cand.distinct_accounts,
-            "started_at": stats["started_at"],
-        })
+        fired.append(
+            {
+                "account_id": acct_id,
+                "account_label": account_label,
+                "user_id": user_id,
+                "provider": cand.provider,
+                "model": cand.model,
+                "account_rate": cand.account_rate,
+                "project_median": cand.project_median,
+                "sample_size": cand.sample_size,
+                "distinct_accounts": cand.distinct_accounts,
+                "started_at": stats["started_at"],
+            }
+        )
     return fired
 
 
@@ -2018,7 +2253,9 @@ async def recheck_disabled_accounts():
                     acct["enabled"] = True
                     acct["disabled_at"] = None
                     changed_accounts.append(acct)
-                    logger.warning(f"[POOL] Re-enabled account {acct['name']} after {cooldown_minutes:.0f}min cooldown (rl_hit #{rl_hit_count})")
+                    logger.warning(
+                        f"[POOL] Re-enabled account {acct['name']} after {cooldown_minutes:.0f}min cooldown (rl_hit #{rl_hit_count})"
+                    )
 
     # Retry any previously failed rate-limit persists
     if _pending_rl_persists:
@@ -2033,7 +2270,9 @@ async def recheck_disabled_accounts():
         try:
             async with AsyncSessionLocal() as rl_session:
                 for acct in changed_accounts:
-                    db_acct = await rl_session.get(MaxPlanAccount, uuid.UUID(acct["id"]))
+                    db_acct = await rl_session.get(
+                        MaxPlanAccount, uuid.UUID(acct["id"])
+                    )
                     if db_acct:
                         db_acct.rate_limit_state = _build_rate_limit_state_blob(acct)
                         db_acct.enabled = acct.get("enabled", True)
@@ -2067,7 +2306,9 @@ async def recheck_disabled_accounts():
                         _pending_cap_persists.discard(acct_id)
                         continue
                     db_acct.daily_task_count = int(acct.get("daily_task_count") or 0)
-                    db_acct.daily_task_count_reset_at = acct.get("daily_task_count_reset_at")
+                    db_acct.daily_task_count_reset_at = acct.get(
+                        "daily_task_count_reset_at"
+                    )
                     db_acct.disabled_reason = acct.get("disabled_reason")
                     db_acct.enabled = acct.get("enabled", True)
                     db_acct.disabled_at = acct.get("disabled_at")

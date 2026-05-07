@@ -19,7 +19,9 @@ def test_anthropic_provider_validates_oauth_token_and_exposes_rate_limit_pattern
     provider = get_provider(LLMProviderName.ANTHROPIC)
     result = provider.validate_secret("sk-ant-oat01-valid_token", LLMAuthMode.OAUTH, {})
     assert result.secret == "sk-ant-oat01-valid_token"
-    assert "you've hit your usage limit" in provider.rate_limit_patterns(LLMAuthMode.OAUTH)
+    assert "you've hit your usage limit" in provider.rate_limit_patterns(
+        LLMAuthMode.OAUTH
+    )
 
 
 def test_openai_provider_validates_api_key():
@@ -30,7 +32,9 @@ def test_openai_provider_validates_api_key():
 
 def test_openai_provider_oauth_materializes_auth_file():
     provider = get_provider(LLMProviderName.OPENAI)
-    material = provider.secret_material('{"tokens":{"access_token":"abc"}}', LLMAuthMode.OAUTH, {})
+    material = provider.secret_material(
+        '{"tokens":{"access_token":"abc"}}', LLMAuthMode.OAUTH, {}
+    )
 
     assert material.env["CODEX_HOME"] == "/opt/agent/openai"
     assert material.files[0].path == "/opt/agent/openai/auth.json"
@@ -40,14 +44,19 @@ def test_openai_provider_oauth_materializes_auth_file():
 def test_gemini_service_account_requires_metadata_and_service_account_json():
     provider = get_provider(LLMProviderName.GEMINI)
 
-    with pytest.raises(ValueError, match="Missing provider metadata fields: project, location"):
+    with pytest.raises(
+        ValueError, match="Missing provider metadata fields: project, location"
+    ):
         provider.validate_secret(
             '{"type":"service_account","client_email":"bot@example.com","private_key":"abc"}',
             LLMAuthMode.SERVICE_ACCOUNT,
             {},
         )
 
-    with pytest.raises(ValueError, match="Service account JSON missing fields: client_email, private_key"):
+    with pytest.raises(
+        ValueError,
+        match="Service account JSON missing fields: client_email, private_key",
+    ):
         provider.validate_secret(
             '{"type":"service_account"}',
             LLMAuthMode.SERVICE_ACCOUNT,
@@ -95,10 +104,12 @@ def test_gemini_thinking_budget_clamped_to_per_model_cap():
 
     # flash-lite caps at 24576 — 30000 is rejected by the real API as
     # INVALID_ARGUMENT. Clamp silently and record the clamp in unsupported.
-    cli = provider.settings_to_cli({
-        "model": "gemini-2.5-flash-lite",
-        "thinking_budget": 30000,
-    })
+    cli = provider.settings_to_cli(
+        {
+            "model": "gemini-2.5-flash-lite",
+            "thinking_budget": 30000,
+        }
+    )
     settings_blob = cli.settings_files[0].content
     assert '"thinkingBudget": 24576' in settings_blob
     assert any("thinking_budget=30000" in u and "clamped" in u for u in cli.unsupported)
@@ -107,10 +118,12 @@ def test_gemini_thinking_budget_clamped_to_per_model_cap():
 def test_gemini_thinking_budget_within_cap_not_clamped():
     provider = get_provider(LLMProviderName.GEMINI)
 
-    cli = provider.settings_to_cli({
-        "model": "gemini-2.5-pro",
-        "thinking_budget": 16384,
-    })
+    cli = provider.settings_to_cli(
+        {
+            "model": "gemini-2.5-pro",
+            "thinking_budget": 16384,
+        }
+    )
     settings_blob = cli.settings_files[0].content
     assert '"thinkingBudget": 16384' in settings_blob
     assert cli.unsupported == ()
@@ -133,7 +146,9 @@ def test_openai_oauth_rejects_missing_access_token():
     provider = get_provider(LLMProviderName.OPENAI)
 
     with pytest.raises(ValueError, match="access_token"):
-        provider.validate_secret('{"tokens":{"refresh_token":"rt"}}', LLMAuthMode.OAUTH, {})
+        provider.validate_secret(
+            '{"tokens":{"refresh_token":"rt"}}', LLMAuthMode.OAUTH, {}
+        )
 
 
 def test_openai_oauth_accepts_valid_shape():
@@ -148,7 +163,11 @@ def test_providers_expose_default_execution_mode_only():
     is now a per-provider knob under `anthropic.advisor` in the settings bag,
     not a dispatch mode. The base class reports `("default",)` for all
     providers now."""
-    for provider_name in (LLMProviderName.ANTHROPIC, LLMProviderName.OPENAI, LLMProviderName.GEMINI):
+    for provider_name in (
+        LLMProviderName.ANTHROPIC,
+        LLMProviderName.OPENAI,
+        LLMProviderName.GEMINI,
+    ):
         provider = get_provider(provider_name)
         assert provider.supported_execution_modes() == ("default",)
 
@@ -159,40 +178,45 @@ def test_providers_expose_default_execution_mode_only():
 # flex across the provider matrix.
 # ---------------------------------------------------------------------------
 
+
 class TestOpenAIFlexGate:
     @pytest.mark.parametrize("model", ["gpt-5.4", "gpt-5.4-mini"])
     def test_flex_passes_through_on_supported_models(self, model):
         provider = get_provider(LLMProviderName.OPENAI)
-        translation = provider.settings_to_cli({
-            "model": model,
-            "service_tier": "flex",
-        })
+        translation = provider.settings_to_cli(
+            {
+                "model": model,
+                "service_tier": "flex",
+            }
+        )
         config_flags = [
-            translation.args[i + 1]
-            for i, a in enumerate(translation.args) if a == "-c"
+            translation.args[i + 1] for i, a in enumerate(translation.args) if a == "-c"
         ]
         assert 'service_tier="flex"' in config_flags
         assert not any("service_tier=flex" in u for u in translation.unsupported)
 
-    @pytest.mark.parametrize("model", [
-        "gpt-5.3-codex",        # codex variants — no flex column in OpenAI pricing
-        "gpt-5.3-codex-spark",  # spark — likewise
-        "gpt-5.2",              # prior frontier — not in current flex table
-    ])
+    @pytest.mark.parametrize(
+        "model",
+        [
+            "gpt-5.3-codex",  # codex variants — no flex column in OpenAI pricing
+            "gpt-5.3-codex-spark",  # spark — likewise
+            "gpt-5.2",  # prior frontier — not in current flex table
+        ],
+    )
     def test_flex_dropped_on_unsupported_models(self, model):
         provider = get_provider(LLMProviderName.OPENAI)
-        translation = provider.settings_to_cli({
-            "model": model,
-            "service_tier": "flex",
-        })
+        translation = provider.settings_to_cli(
+            {
+                "model": model,
+                "service_tier": "flex",
+            }
+        )
         config_flags = [
-            translation.args[i + 1]
-            for i, a in enumerate(translation.args) if a == "-c"
+            translation.args[i + 1] for i, a in enumerate(translation.args) if a == "-c"
         ]
         assert 'service_tier="flex"' not in config_flags
         assert any(
-            "service_tier=flex" in u and "dropped" in u
-            for u in translation.unsupported
+            "service_tier=flex" in u and "dropped" in u for u in translation.unsupported
         ), f"expected dropped-flex marker for {model}, got {translation.unsupported}"
 
     def test_flex_dropped_when_model_unknown(self):
@@ -200,8 +224,7 @@ class TestOpenAIFlexGate:
         provider = get_provider(LLMProviderName.OPENAI)
         translation = provider.settings_to_cli({"service_tier": "flex"})
         config_flags = [
-            translation.args[i + 1]
-            for i, a in enumerate(translation.args) if a == "-c"
+            translation.args[i + 1] for i, a in enumerate(translation.args) if a == "-c"
         ]
         assert 'service_tier="flex"' not in config_flags
         assert any("service_tier=flex" in u for u in translation.unsupported)
@@ -217,13 +240,11 @@ class TestOpenAIFlexGate:
             auth_mode=LLMAuthMode.OAUTH,
         )
         config_flags = [
-            translation.args[i + 1]
-            for i, a in enumerate(translation.args) if a == "-c"
+            translation.args[i + 1] for i, a in enumerate(translation.args) if a == "-c"
         ]
         assert 'service_tier="flex"' not in config_flags
         assert any(
-            "service_tier=flex" in u and "OAuth" in u
-            for u in translation.unsupported
+            "service_tier=flex" in u and "OAuth" in u for u in translation.unsupported
         ), f"expected OAuth-flex marker, got {translation.unsupported}"
 
     def test_flex_passes_on_api_key_with_flex_capable_model(self):
@@ -235,8 +256,7 @@ class TestOpenAIFlexGate:
             auth_mode=LLMAuthMode.API_KEY,
         )
         config_flags = [
-            translation.args[i + 1]
-            for i, a in enumerate(translation.args) if a == "-c"
+            translation.args[i + 1] for i, a in enumerate(translation.args) if a == "-c"
         ]
         assert 'service_tier="flex"' in config_flags
 
@@ -247,6 +267,7 @@ class TestOpenAIFlexGate:
 # credits that don't exist on pay-as-you-go billing.
 # ---------------------------------------------------------------------------
 
+
 class TestOpenAIFastGate:
     def test_fast_passes_on_oauth(self):
         provider = get_provider(LLMProviderName.OPENAI)
@@ -255,8 +276,7 @@ class TestOpenAIFastGate:
             auth_mode=LLMAuthMode.OAUTH,
         )
         config_flags = [
-            translation.args[i + 1]
-            for i, a in enumerate(translation.args) if a == "-c"
+            translation.args[i + 1] for i, a in enumerate(translation.args) if a == "-c"
         ]
         assert 'service_tier="fast"' in config_flags
 
@@ -267,23 +287,22 @@ class TestOpenAIFastGate:
             auth_mode=LLMAuthMode.API_KEY,
         )
         config_flags = [
-            translation.args[i + 1]
-            for i, a in enumerate(translation.args) if a == "-c"
+            translation.args[i + 1] for i, a in enumerate(translation.args) if a == "-c"
         ]
         assert 'service_tier="fast"' not in config_flags
         assert any(
-            "service_tier=fast" in u and "OAuth" in u
-            for u in translation.unsupported
+            "service_tier=fast" in u and "OAuth" in u for u in translation.unsupported
         ), f"expected OAuth-fast marker, got {translation.unsupported}"
 
     def test_fast_dropped_without_auth_mode(self):
         """Legacy callers that don't pass auth_mode default to the
         conservative API-key interpretation — fast drops."""
         provider = get_provider(LLMProviderName.OPENAI)
-        translation = provider.settings_to_cli({"model": "gpt-5.4", "service_tier": "fast"})
+        translation = provider.settings_to_cli(
+            {"model": "gpt-5.4", "service_tier": "fast"}
+        )
         config_flags = [
-            translation.args[i + 1]
-            for i, a in enumerate(translation.args) if a == "-c"
+            translation.args[i + 1] for i, a in enumerate(translation.args) if a == "-c"
         ]
         assert 'service_tier="fast"' not in config_flags
 
@@ -294,19 +313,21 @@ class TestOpenAIFastGate:
 # confirm the tier map resolves to current picker-visible models.
 # ---------------------------------------------------------------------------
 
+
 class TestOpenAITierAndEffort:
     @pytest.mark.parametrize("effort", ["minimal", "low", "medium", "high", "xhigh"])
     def test_reasoning_effort_passes_through(self, effort):
         """All five reasoning levels are accepted at translation; per-model
         compat gaps surface as runtime 400s (deferred to model/list)."""
         provider = get_provider(LLMProviderName.OPENAI)
-        translation = provider.settings_to_cli({
-            "model": "gpt-5.4",
-            "reasoning_effort": effort,
-        })
+        translation = provider.settings_to_cli(
+            {
+                "model": "gpt-5.4",
+                "reasoning_effort": effort,
+            }
+        )
         config_flags = [
-            translation.args[i + 1]
-            for i, a in enumerate(translation.args) if a == "-c"
+            translation.args[i + 1] for i, a in enumerate(translation.args) if a == "-c"
         ]
         assert f'model_reasoning_effort="{effort}"' in config_flags
 
@@ -323,28 +344,36 @@ class TestOpenAITierAndEffort:
 # model-gated to opus-4-7, opus-4-6, sonnet-4-6.
 # ---------------------------------------------------------------------------
 
+
 class TestAnthropic1MContext:
-    @pytest.mark.parametrize("model", [
-        "claude-opus-4-7",
-        "claude-opus-4-6",
-        "claude-sonnet-4-6",
-    ])
+    @pytest.mark.parametrize(
+        "model",
+        [
+            "claude-opus-4-7",
+            "claude-opus-4-6",
+            "claude-sonnet-4-6",
+        ],
+    )
     def test_1m_suffix_appended_on_compatible_models(self, model):
         provider = get_provider(LLMProviderName.ANTHROPIC)
-        translation = provider.settings_to_cli({
-            "model": model,
-            "use_1m_context": True,
-        })
+        translation = provider.settings_to_cli(
+            {
+                "model": model,
+                "use_1m_context": True,
+            }
+        )
         args = list(translation.args)
         assert args[args.index("--model") + 1] == f"{model}[1m]"
         assert not any("use_1m_context" in u for u in translation.unsupported)
 
     def test_1m_opt_in_on_haiku_drops_suffix_with_marker(self):
         provider = get_provider(LLMProviderName.ANTHROPIC)
-        translation = provider.settings_to_cli({
-            "model": "claude-haiku-4-5-20251001",
-            "use_1m_context": True,
-        })
+        translation = provider.settings_to_cli(
+            {
+                "model": "claude-haiku-4-5-20251001",
+                "use_1m_context": True,
+            }
+        )
         args = list(translation.args)
         assert args[args.index("--model") + 1] == "claude-haiku-4-5-20251001"
         assert any(
@@ -361,10 +390,12 @@ class TestAnthropic1MContext:
 
     def test_1m_explicit_false_emits_plain_model(self):
         provider = get_provider(LLMProviderName.ANTHROPIC)
-        translation = provider.settings_to_cli({
-            "model": "claude-opus-4-7",
-            "use_1m_context": False,
-        })
+        translation = provider.settings_to_cli(
+            {
+                "model": "claude-opus-4-7",
+                "use_1m_context": False,
+            }
+        )
         args = list(translation.args)
         assert args[args.index("--model") + 1] == "claude-opus-4-7"
 
@@ -373,12 +404,16 @@ class TestAnthropic1MContext:
 # Gemini preview / unknown model advisory markers.
 # ---------------------------------------------------------------------------
 
+
 class TestGeminiPreviewAdvisory:
-    @pytest.mark.parametrize("model", [
-        "gemini-3.1-pro-preview",
-        "gemini-3-flash-preview",
-        "gemini-3.1-flash-lite-preview",
-    ])
+    @pytest.mark.parametrize(
+        "model",
+        [
+            "gemini-3.1-pro-preview",
+            "gemini-3-flash-preview",
+            "gemini-3.1-flash-lite-preview",
+        ],
+    )
     def test_preview_models_emit_advisory(self, model):
         provider = get_provider(LLMProviderName.GEMINI)
         translation = provider.settings_to_cli({"model": model})
@@ -387,37 +422,41 @@ class TestGeminiPreviewAdvisory:
             for u in translation.unsupported
         )
 
-    @pytest.mark.parametrize("model", [
-        "gemini-2.5-pro",
-        "gemini-2.5-flash",
-        "gemini-2.5-flash-lite",
-    ])
+    @pytest.mark.parametrize(
+        "model",
+        [
+            "gemini-2.5-pro",
+            "gemini-2.5-flash",
+            "gemini-2.5-flash-lite",
+        ],
+    )
     def test_ga_models_emit_no_advisory(self, model):
         provider = get_provider(LLMProviderName.GEMINI)
         translation = provider.settings_to_cli({"model": model})
         assert not any(
-            "preview" in u or "known-availability" in u
-            for u in translation.unsupported
+            "preview" in u or "known-availability" in u for u in translation.unsupported
         )
 
     def test_unknown_model_emits_advisory(self):
         provider = get_provider(LLMProviderName.GEMINI)
         translation = provider.settings_to_cli({"model": "gemini-99-ultra"})
-        assert any(
-            "known-availability" in u for u in translation.unsupported
-        )
+        assert any("known-availability" in u for u in translation.unsupported)
 
 
 # ---------------------------------------------------------------------------
 # Gemini preview → GA fallback map.
 # ---------------------------------------------------------------------------
 
+
 class TestGeminiFallbackModel:
-    @pytest.mark.parametrize("preview,ga", [
-        ("gemini-3.1-pro-preview",        "gemini-2.5-pro"),
-        ("gemini-3-flash-preview",        "gemini-2.5-flash"),
-        ("gemini-3.1-flash-lite-preview", "gemini-2.5-flash-lite"),
-    ])
+    @pytest.mark.parametrize(
+        "preview,ga",
+        [
+            ("gemini-3.1-pro-preview", "gemini-2.5-pro"),
+            ("gemini-3-flash-preview", "gemini-2.5-flash"),
+            ("gemini-3.1-flash-lite-preview", "gemini-2.5-flash-lite"),
+        ],
+    )
     def test_preview_falls_back_to_ga_counterpart(self, preview, ga):
         provider = get_provider(LLMProviderName.GEMINI)
         assert provider.fallback_model(preview) == ga
@@ -439,39 +478,40 @@ class TestGeminiFallbackModel:
 # rather than silent drops.
 # ---------------------------------------------------------------------------
 
+
 class TestGeminiThinkingConfig:
     def test_budget_on_25_model_emits_clean(self):
         provider = get_provider(LLMProviderName.GEMINI)
-        translation = provider.settings_to_cli({
-            "model": "gemini-2.5-pro",
-            "thinking_budget": 4096,
-        })
+        translation = provider.settings_to_cli(
+            {
+                "model": "gemini-2.5-pro",
+                "thinking_budget": 4096,
+            }
+        )
         # Check the settings.json file payload — it's where the thinking
         # config lands (Gemini CLI has no per-invocation flag).
         assert translation.settings_files
         payload = json.loads(translation.settings_files[0].content)
-        thinking = (
-            payload["modelConfigs"]["customAliases"]["blueprint-runtime"]
-            ["modelConfig"]["generateContentConfig"]["thinkingConfig"]
-        )
+        thinking = payload["modelConfigs"]["customAliases"]["blueprint-runtime"][
+            "modelConfig"
+        ]["generateContentConfig"]["thinkingConfig"]
         assert thinking["thinkingBudget"] == 4096
         # No 3.x-mismatch marker on a 2.5 model.
-        assert not any(
-            "back-compat" in u for u in translation.unsupported
-        )
+        assert not any("back-compat" in u for u in translation.unsupported)
 
     def test_level_on_3x_preview_emits_clean(self):
         provider = get_provider(LLMProviderName.GEMINI)
-        translation = provider.settings_to_cli({
-            "model": "gemini-3.1-pro-preview",
-            "thinking_level": "high",
-        })
+        translation = provider.settings_to_cli(
+            {
+                "model": "gemini-3.1-pro-preview",
+                "thinking_level": "high",
+            }
+        )
         assert translation.settings_files
         payload = json.loads(translation.settings_files[0].content)
-        thinking = (
-            payload["modelConfigs"]["customAliases"]["blueprint-runtime"]
-            ["modelConfig"]["generateContentConfig"]["thinkingConfig"]
-        )
+        thinking = payload["modelConfigs"]["customAliases"]["blueprint-runtime"][
+            "modelConfig"
+        ]["generateContentConfig"]["thinkingConfig"]
         assert thinking["thinkingLevel"] == "high"
         # No 2.5-mismatch marker on a 3.x model.
         assert not any(
@@ -480,20 +520,20 @@ class TestGeminiThinkingConfig:
 
     def test_level_on_25_model_dropped_with_marker(self):
         provider = get_provider(LLMProviderName.GEMINI)
-        translation = provider.settings_to_cli({
-            "model": "gemini-2.5-pro",
-            "thinking_level": "high",
-        })
+        translation = provider.settings_to_cli(
+            {
+                "model": "gemini-2.5-pro",
+                "thinking_level": "high",
+            }
+        )
         # thinking_level is dropped on 2.5; settings_files is only emitted
         # when generate_config is non-empty, so this specific bag ends up
         # with no thinking config at all.
         if translation.settings_files:
             payload = json.loads(translation.settings_files[0].content)
-            tc = (
-                payload["modelConfigs"]["customAliases"]["blueprint-runtime"]
-                ["modelConfig"]["generateContentConfig"]
-                .get("thinkingConfig", {})
-            )
+            tc = payload["modelConfigs"]["customAliases"]["blueprint-runtime"][
+                "modelConfig"
+            ]["generateContentConfig"].get("thinkingConfig", {})
             assert "thinkingLevel" not in tc
         assert any(
             "thinking_level on Gemini 2.5" in u and "dropped" in u
@@ -506,17 +546,18 @@ class TestGeminiThinkingConfig:
         default thinkingLevel that conflicts with budget. Operators need
         to use thinking_level for explicit control on 3.x."""
         provider = get_provider(LLMProviderName.GEMINI)
-        translation = provider.settings_to_cli({
-            "model": "gemini-3.1-pro-preview",
-            "thinking_budget": 4096,
-        })
+        translation = provider.settings_to_cli(
+            {
+                "model": "gemini-3.1-pro-preview",
+                "thinking_budget": 4096,
+            }
+        )
         # No thinkingConfig should be emitted — the CLI's default takes over.
         if translation.settings_files:
             payload = json.loads(translation.settings_files[0].content)
-            cfg = (
-                payload["modelConfigs"]["customAliases"]["blueprint-runtime"]
-                ["modelConfig"]["generateContentConfig"]
-            )
+            cfg = payload["modelConfigs"]["customAliases"]["blueprint-runtime"][
+                "modelConfig"
+            ]["generateContentConfig"]
             tc = cfg.get("thinkingConfig", {})
             assert "thinkingBudget" not in tc
             assert "thinkingLevel" not in tc
@@ -530,21 +571,21 @@ class TestGeminiThinkingConfig:
         only one of thinking budget and thinking level`. On 3.x, prefer
         the newer thinkingLevel knob and drop thinkingBudget."""
         provider = get_provider(LLMProviderName.GEMINI)
-        translation = provider.settings_to_cli({
-            "model": "gemini-3.1-pro-preview",
-            "thinking_budget": 4096,
-            "thinking_level": "high",
-        })
+        translation = provider.settings_to_cli(
+            {
+                "model": "gemini-3.1-pro-preview",
+                "thinking_budget": 4096,
+                "thinking_level": "high",
+            }
+        )
         assert translation.settings_files
         payload = json.loads(translation.settings_files[0].content)
-        thinking = (
-            payload["modelConfigs"]["customAliases"]["blueprint-runtime"]
-            ["modelConfig"]["generateContentConfig"]["thinkingConfig"]
-        )
+        thinking = payload["modelConfigs"]["customAliases"]["blueprint-runtime"][
+            "modelConfig"
+        ]["generateContentConfig"]["thinkingConfig"]
         assert thinking == {"thinkingLevel": "high"}
         assert any(
-            "thinking_budget" in u and "thinking_level" in u
-            and "dropped" in u
+            "thinking_budget" in u and "thinking_level" in u and "dropped" in u
             for u in translation.unsupported
         ), f"expected budget-dropped marker, got {translation.unsupported}"
 
@@ -552,17 +593,18 @@ class TestGeminiThinkingConfig:
         """On 2.5, prefer thinking_budget (the supported knob) and drop
         thinking_level with marker. Prevents the same API-reject pattern."""
         provider = get_provider(LLMProviderName.GEMINI)
-        translation = provider.settings_to_cli({
-            "model": "gemini-2.5-pro",
-            "thinking_budget": 4096,
-            "thinking_level": "high",
-        })
+        translation = provider.settings_to_cli(
+            {
+                "model": "gemini-2.5-pro",
+                "thinking_budget": 4096,
+                "thinking_level": "high",
+            }
+        )
         assert translation.settings_files
         payload = json.loads(translation.settings_files[0].content)
-        thinking = (
-            payload["modelConfigs"]["customAliases"]["blueprint-runtime"]
-            ["modelConfig"]["generateContentConfig"]["thinkingConfig"]
-        )
+        thinking = payload["modelConfigs"]["customAliases"]["blueprint-runtime"][
+            "modelConfig"
+        ]["generateContentConfig"]["thinkingConfig"]
         assert thinking == {"thinkingBudget": 4096}
         assert any(
             "thinking_level on Gemini 2.5" in u and "dropped" in u
@@ -576,12 +618,15 @@ class TestGeminiThinkingConfig:
 # shouldn't hard-fail; rewrite silently with a marker.
 # ---------------------------------------------------------------------------
 
+
 class TestGeminiLegacyAliases:
     def test_3_pro_preview_rewrites_to_3_1(self):
         provider = get_provider(LLMProviderName.GEMINI)
-        translation = provider.settings_to_cli({
-            "model": "gemini-3-pro-preview",
-        })
+        translation = provider.settings_to_cli(
+            {
+                "model": "gemini-3-pro-preview",
+            }
+        )
         # The -m flag should carry either the aliased model or an alias
         # name; for this bag (no generate_config), we expect bare -m with
         # the rewritten ID.
@@ -595,9 +640,11 @@ class TestGeminiLegacyAliases:
 
     def test_live_model_not_rewritten(self):
         provider = get_provider(LLMProviderName.GEMINI)
-        translation = provider.settings_to_cli({
-            "model": "gemini-3.1-pro-preview",
-        })
+        translation = provider.settings_to_cli(
+            {
+                "model": "gemini-3.1-pro-preview",
+            }
+        )
         args = list(translation.args)
         m_idx = args.index("-m")
         assert args[m_idx + 1] == "gemini-3.1-pro-preview"

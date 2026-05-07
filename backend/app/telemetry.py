@@ -10,11 +10,13 @@ from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor
 # Try importing GCP Trace Exporter, fallback to Console if not available or not in GCP
 try:
     from opentelemetry.exporter.cloud_trace import CloudTraceSpanExporter
+
     HAS_GCP_EXPORTER = True
 except ImportError:
     HAS_GCP_EXPORTER = False
 
 logger = logging.getLogger(__name__)
+
 
 def setup_telemetry(app: FastAPI, engine=None):
     """
@@ -26,7 +28,11 @@ def setup_telemetry(app: FastAPI, engine=None):
     trace.set_tracer_provider(provider)
 
     # 2. Configure the Exporter
-    if HAS_GCP_EXPORTER and os.getenv("GCP_PROJECT_ID") and os.getenv("ENABLE_CLOUD_TRACE", "").lower() == "true":
+    if (
+        HAS_GCP_EXPORTER
+        and os.getenv("GCP_PROJECT_ID")
+        and os.getenv("ENABLE_CLOUD_TRACE", "").lower() == "true"
+    ):
         try:
             exporter = CloudTraceSpanExporter(project_id=os.getenv("GCP_PROJECT_ID"))
             processor = BatchSpanProcessor(exporter)
@@ -35,7 +41,9 @@ def setup_telemetry(app: FastAPI, engine=None):
         except Exception as e:
             logger.warning(f"Failed to initialize GCP Cloud Trace Exporter: {e}")
     else:
-        logger.info("OpenTelemetry configured without an exporter (traces will not be sent).")
+        logger.info(
+            "OpenTelemetry configured without an exporter (traces will not be sent)."
+        )
 
     # 3. Instrument FastAPI
     FastAPIInstrumentor.instrument_app(app)

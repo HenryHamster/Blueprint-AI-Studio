@@ -1,4 +1,5 @@
 """Tests for auto_review.py guard rails and task spawning."""
+
 import uuid
 from datetime import timedelta
 
@@ -41,7 +42,14 @@ async def _create_auto_review_task(
     task = Task(
         project_id=project_id,
         title=f"Review PR #{pr_number}: some title",
-        payloads=[{"type": "review", "pr_number": pr_number, "branch": "feature/x", "base_branch": "main"}],
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": pr_number,
+                "branch": "feature/x",
+                "base_branch": "main",
+            }
+        ],
         context={
             "auto_review": True,
             "pr_number": pr_number,
@@ -63,9 +71,11 @@ def _default_config(**overrides) -> dict:
 
 
 async def _count_auto_review_tasks(session: AsyncSession, project_id: uuid.UUID) -> int:
-    tasks = (await session.execute(
-        select(Task).where(Task.project_id == project_id)
-    )).scalars().all()
+    tasks = (
+        (await session.execute(select(Task).where(Task.project_id == project_id)))
+        .scalars()
+        .all()
+    )
     return sum(1 for t in tasks if (t.context or {}).get("auto_review") is True)
 
 
@@ -97,9 +107,11 @@ async def test_happy_path_spawns_task(db_session: AsyncSession):
 
     assert await _count_auto_review_tasks(db_session, project.id) == 1
 
-    tasks = (await db_session.execute(
-        select(Task).where(Task.project_id == project.id)
-    )).scalars().all()
+    tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
     task = tasks[0]
 
     assert task.status == TaskStatus.QUEUED
@@ -131,9 +143,11 @@ async def test_title_truncation(db_session: AsyncSession):
         session=db_session,
     )
 
-    tasks = (await db_session.execute(
-        select(Task).where(Task.project_id == project.id)
-    )).scalars().all()
+    tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
     task = tasks[0]
     # pr_title[:80] is used, so full 100-char title should not appear
     assert long_title not in task.title
@@ -151,11 +165,17 @@ async def test_rate_limit_blocks_at_max(db_session: AsyncSession):
     project = await _create_project(db_session)
 
     # Create max_per_hour=2 recent auto_review tasks (any status)
-    await _create_auto_review_task(db_session, project.id, pr_number=1, status=TaskStatus.COMPLETED)
-    await _create_auto_review_task(db_session, project.id, pr_number=2, status=TaskStatus.COMPLETED)
+    await _create_auto_review_task(
+        db_session, project.id, pr_number=1, status=TaskStatus.COMPLETED
+    )
+    await _create_auto_review_task(
+        db_session, project.id, pr_number=2, status=TaskStatus.COMPLETED
+    )
     await db_session.flush()
 
-    await _call_inner(db_session, project.id, pr_number=3, config=_default_config(max_per_hour=2))
+    await _call_inner(
+        db_session, project.id, pr_number=3, config=_default_config(max_per_hour=2)
+    )
 
     assert await _count_auto_review_tasks(db_session, project.id) == 2
 
@@ -167,17 +187,25 @@ async def test_rate_limit_old_tasks_dont_count(db_session: AsyncSession):
 
     # 2 tasks created more than 1 hour ago
     await _create_auto_review_task(
-        db_session, project.id, pr_number=1,
-        status=TaskStatus.COMPLETED, created_at_offset=timedelta(hours=-2),
+        db_session,
+        project.id,
+        pr_number=1,
+        status=TaskStatus.COMPLETED,
+        created_at_offset=timedelta(hours=-2),
     )
     await _create_auto_review_task(
-        db_session, project.id, pr_number=2,
-        status=TaskStatus.COMPLETED, created_at_offset=timedelta(hours=-2),
+        db_session,
+        project.id,
+        pr_number=2,
+        status=TaskStatus.COMPLETED,
+        created_at_offset=timedelta(hours=-2),
     )
     await db_session.flush()
 
     # With max_per_hour=2, old tasks shouldn't count — spawn should succeed
-    await _call_inner(db_session, project.id, pr_number=3, config=_default_config(max_per_hour=2))
+    await _call_inner(
+        db_session, project.id, pr_number=3, config=_default_config(max_per_hour=2)
+    )
 
     assert await _count_auto_review_tasks(db_session, project.id) == 3
 
@@ -191,7 +219,9 @@ async def test_rate_limit_non_auto_review_tasks_dont_count(db_session: AsyncSess
     regular_task = Task(
         project_id=project.id,
         title="Manual review",
-        payloads=[{"type": "review", "pr_number": 10, "branch": "x", "base_branch": "main"}],
+        payloads=[
+            {"type": "review", "pr_number": 10, "branch": "x", "base_branch": "main"}
+        ],
         context={"pr_number": 10},
         status=TaskStatus.COMPLETED,
         created_by="user",
@@ -200,7 +230,9 @@ async def test_rate_limit_non_auto_review_tasks_dont_count(db_session: AsyncSess
     await db_session.flush()
 
     # With max_per_hour=1, regular task should not block spawn
-    await _call_inner(db_session, project.id, pr_number=11, config=_default_config(max_per_hour=1))
+    await _call_inner(
+        db_session, project.id, pr_number=11, config=_default_config(max_per_hour=1)
+    )
 
     assert await _count_auto_review_tasks(db_session, project.id) == 1
 
@@ -215,7 +247,9 @@ async def test_duplicate_active_pr_blocked(db_session: AsyncSession):
     """Active auto_review task for same PR number blocks a new spawn."""
     project = await _create_project(db_session)
 
-    await _create_auto_review_task(db_session, project.id, pr_number=42, status=TaskStatus.IN_PROGRESS)
+    await _create_auto_review_task(
+        db_session, project.id, pr_number=42, status=TaskStatus.IN_PROGRESS
+    )
     await db_session.flush()
 
     await _call_inner(db_session, project.id, pr_number=42)
@@ -228,11 +262,17 @@ async def test_completed_task_same_pr_not_blocked(db_session: AsyncSession):
     """COMPLETED/FAILED tasks for same PR don't block new spawns."""
     project = await _create_project(db_session)
 
-    await _create_auto_review_task(db_session, project.id, pr_number=42, status=TaskStatus.COMPLETED)
-    await _create_auto_review_task(db_session, project.id, pr_number=42, status=TaskStatus.FAILED)
+    await _create_auto_review_task(
+        db_session, project.id, pr_number=42, status=TaskStatus.COMPLETED
+    )
+    await _create_auto_review_task(
+        db_session, project.id, pr_number=42, status=TaskStatus.FAILED
+    )
     await db_session.flush()
 
-    await _call_inner(db_session, project.id, pr_number=42, config=_default_config(max_per_hour=10))
+    await _call_inner(
+        db_session, project.id, pr_number=42, config=_default_config(max_per_hour=10)
+    )
 
     assert await _count_auto_review_tasks(db_session, project.id) == 3
 
@@ -242,7 +282,9 @@ async def test_active_task_different_pr_not_blocked(db_session: AsyncSession):
     """Active auto_review task for a different PR doesn't block spawn."""
     project = await _create_project(db_session)
 
-    await _create_auto_review_task(db_session, project.id, pr_number=1, status=TaskStatus.IN_PROGRESS)
+    await _create_auto_review_task(
+        db_session, project.id, pr_number=1, status=TaskStatus.IN_PROGRESS
+    )
     await db_session.flush()
 
     await _call_inner(db_session, project.id, pr_number=2)
@@ -260,25 +302,37 @@ async def test_concurrent_limit_blocks_at_max(db_session: AsyncSession):
     """When active auto_review count >= max_concurrent, spawn is blocked."""
     project = await _create_project(db_session)
 
-    await _create_auto_review_task(db_session, project.id, pr_number=1, status=TaskStatus.IN_PROGRESS)
-    await _create_auto_review_task(db_session, project.id, pr_number=2, status=TaskStatus.QUEUED)
+    await _create_auto_review_task(
+        db_session, project.id, pr_number=1, status=TaskStatus.IN_PROGRESS
+    )
+    await _create_auto_review_task(
+        db_session, project.id, pr_number=2, status=TaskStatus.QUEUED
+    )
     await db_session.flush()
 
-    await _call_inner(db_session, project.id, pr_number=3, config=_default_config(max_concurrent=2))
+    await _call_inner(
+        db_session, project.id, pr_number=3, config=_default_config(max_concurrent=2)
+    )
 
     assert await _count_auto_review_tasks(db_session, project.id) == 2
 
 
 @pytest.mark.asyncio
-async def test_concurrent_limit_boundary_allows_at_max_minus_one(db_session: AsyncSession):
+async def test_concurrent_limit_boundary_allows_at_max_minus_one(
+    db_session: AsyncSession,
+):
     """One below max_concurrent allows a new spawn."""
     project = await _create_project(db_session)
 
-    await _create_auto_review_task(db_session, project.id, pr_number=1, status=TaskStatus.IN_PROGRESS)
+    await _create_auto_review_task(
+        db_session, project.id, pr_number=1, status=TaskStatus.IN_PROGRESS
+    )
     await db_session.flush()
 
     # max_concurrent=2, currently 1 active — should allow spawn
-    await _call_inner(db_session, project.id, pr_number=2, config=_default_config(max_concurrent=2))
+    await _call_inner(
+        db_session, project.id, pr_number=2, config=_default_config(max_concurrent=2)
+    )
 
     assert await _count_auto_review_tasks(db_session, project.id) == 2
 
@@ -290,9 +344,13 @@ async def test_concurrent_limit_counts_all_active_pr_numbers(db_session: AsyncSe
 
     # 3 active tasks for 3 different PRs
     for pr in [10, 20, 30]:
-        await _create_auto_review_task(db_session, project.id, pr_number=pr, status=TaskStatus.IN_PROGRESS)
+        await _create_auto_review_task(
+            db_session, project.id, pr_number=pr, status=TaskStatus.IN_PROGRESS
+        )
     await db_session.flush()
 
-    await _call_inner(db_session, project.id, pr_number=99, config=_default_config(max_concurrent=3))
+    await _call_inner(
+        db_session, project.id, pr_number=99, config=_default_config(max_concurrent=3)
+    )
 
     assert await _count_auto_review_tasks(db_session, project.id) == 3

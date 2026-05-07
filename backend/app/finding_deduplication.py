@@ -15,6 +15,7 @@ Four strategies are applied, in order:
   4. Evidence-overlap: skip findings whose source refs (≥80% Jaccard overlap)
      and claims (at least one shared) match recent findings.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -31,11 +32,37 @@ logger = logging.getLogger(__name__)
 
 CODE_ERROR_COOLDOWN = timedelta(hours=48)
 
-_STOPWORDS = frozenset({
-    'the', 'a', 'an', 'to', 'for', 'and', 'or', 'in', 'of', 'is', 'it',
-    'this', 'that', 'with', 'by', 'we', 'should', 'be', 'are', 'on', 'as',
-    'feat', 'fix', 'refactor', 'add', 'update', 'improve',
-})
+_STOPWORDS = frozenset(
+    {
+        "the",
+        "a",
+        "an",
+        "to",
+        "for",
+        "and",
+        "or",
+        "in",
+        "of",
+        "is",
+        "it",
+        "this",
+        "that",
+        "with",
+        "by",
+        "we",
+        "should",
+        "be",
+        "are",
+        "on",
+        "as",
+        "feat",
+        "fix",
+        "refactor",
+        "add",
+        "update",
+        "improve",
+    }
+)
 
 _PRIORITY_ORDER = {"high": 0, "medium": 1, "low": 2}
 
@@ -87,9 +114,7 @@ def is_duplicate(
     for task_dir_id, title in existing:
         overlap = words & (set(title.lower().split()) - _STOPWORDS)
         same_direction = (
-            not finding_dir_id
-            or not task_dir_id
-            or finding_dir_id == task_dir_id
+            not finding_dir_id or not task_dir_id or finding_dir_id == task_dir_id
         )
         threshold = 4 if same_direction else 6
         if len(overlap) >= threshold:
@@ -145,7 +170,9 @@ def build_dedup_state(
             # Exclude CODE_ERROR failures after their task-specific cooldown has
             # elapsed. This is equivalent in intent to "created_at+48h", but is
             # explicit and handles aware/naive timestamps consistently.
-            if failure_class == "CODE_ERROR" and not _within_code_error_cooldown(t, now):
+            if failure_class == "CODE_ERROR" and not _within_code_error_cooldown(
+                t, now
+            ):
                 continue
         recent_finding_hashes.add(fhash)
 
@@ -189,7 +216,7 @@ def _normalize_source_ref(ref: str) -> str:
     if not ref:
         return ""
     # Strip line numbers (e.g., :42) and line ranges (e.g., #L10-L20)
-    ref = ref.split(':')[0].split('#')[0]
+    ref = ref.split(":")[0].split("#")[0]
     return ref.strip()
 
 
@@ -342,38 +369,46 @@ def deduplicate_findings(
                 f"[RESEARCH] Skipping finding '{title}' — hash {fhash} matched {out} task"
             )
             outcome.hash_dedup_count += 1
-            outcome.filtered.append({
-                "title": title[:120],
-                "direction_id": finding_dir_id,
-                "reason": "hash match with prior task"[:80],
-            })
+            outcome.filtered.append(
+                {
+                    "title": title[:120],
+                    "direction_id": finding_dir_id,
+                    "reason": "hash match with prior task"[:80],
+                }
+            )
             continue
 
-        matched_title = _find_overlap_match(title, finding_dir_id, existing_tasks_with_dirs)
+        matched_title = _find_overlap_match(
+            title, finding_dir_id, existing_tasks_with_dirs
+        )
         if matched_title is not None:
             logger.warning(
                 f"[RESEARCH] Skipping duplicate finding '{title}' — matches existing task"
             )
             outcome.word_overlap_count += 1
             reason = f"word overlap with: {matched_title[:60]}"
-            outcome.filtered.append({
-                "title": title[:120],
-                "direction_id": finding_dir_id,
-                "reason": reason[:80],
-            })
+            outcome.filtered.append(
+                {
+                    "title": title[:120],
+                    "direction_id": finding_dir_id,
+                    "reason": reason[:80],
+                }
+            )
             continue
 
-        finding_files = set(finding.get('related_files', []))
+        finding_files = set(finding.get("related_files", []))
         if finding_files and finding_files.issubset(open_pr_files):
             logger.info(
                 f"[RESEARCH] Skipping finding '{title}' — all related files already have open PRs"
             )
             outcome.file_overlap_count += 1
-            outcome.filtered.append({
-                "title": title[:120],
-                "direction_id": finding_dir_id,
-                "reason": "all files covered by open PR"[:80],
-            })
+            outcome.filtered.append(
+                {
+                    "title": title[:120],
+                    "direction_id": finding_dir_id,
+                    "reason": "all files covered by open PR"[:80],
+                }
+            )
             continue
 
         # Evidence-overlap check: compare sources and claims against already-deduped findings
@@ -388,11 +423,13 @@ def deduplicate_findings(
             )
             outcome.evidence_overlap_count += 1
             reason = f"evidence overlap with: {matched_evidence_title[:60]}"
-            outcome.filtered.append({
-                "title": title[:120],
-                "direction_id": finding_dir_id,
-                "reason": reason[:80],
-            })
+            outcome.filtered.append(
+                {
+                    "title": title[:120],
+                    "direction_id": finding_dir_id,
+                    "reason": reason[:80],
+                }
+            )
             continue
 
         outcome.deduplicated.append((orig_i, finding, fhash))
@@ -420,9 +457,7 @@ def _find_overlap_match(
     for task_dir_id, title in existing:
         overlap = words & (set(title.lower().split()) - _STOPWORDS)
         same_direction = (
-            not finding_dir_id
-            or not task_dir_id
-            or finding_dir_id == task_dir_id
+            not finding_dir_id or not task_dir_id or finding_dir_id == task_dir_id
         )
         threshold = 4 if same_direction else 6
         if len(overlap) >= threshold:

@@ -1,4 +1,5 @@
 """Tests for notification_dispatch.py message builder functions."""
+
 import time
 import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -32,8 +33,11 @@ from app.notification_dispatch import (
     post_review_feedback_message,
 )
 from app.models import (
-    MessageType, Project, ProjectMessage,
-    ResidualCaseStatus, ResidualRemediationCase,
+    MessageType,
+    Project,
+    ProjectMessage,
+    ResidualCaseStatus,
+    ResidualRemediationCase,
 )
 from sqlmodel import select as _select
 
@@ -42,11 +46,18 @@ from sqlmodel import select as _select
 # Helpers for dispatch_external_notification tests
 # ---------------------------------------------------------------------------
 
-def _make_runtime_config(webhook_url: str = "https://example.com/hook", enabled_events=None, throttle_seconds: int = 0):
+
+def _make_runtime_config(
+    webhook_url: str = "https://example.com/hook",
+    enabled_events=None,
+    throttle_seconds: int = 0,
+):
     return {
         "notification_config": {
             "webhook_url": webhook_url,
-            "enabled_events": enabled_events if enabled_events is not None else ["test_event"],
+            "enabled_events": enabled_events
+            if enabled_events is not None
+            else ["test_event"],
             "throttle_seconds": throttle_seconds,
         }
     }
@@ -66,11 +77,17 @@ def _reset_stats():
 # dispatch_external_notification — delivery stats
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_dispatch_increments_dispatched_and_delivered_on_success():
     _reset_stats()
-    with patch("app.shared_state.runtime_config", _make_runtime_config()), \
-         patch("app.notification_dispatch._attempt_delivery", new=AsyncMock(return_value=200)):
+    with (
+        patch("app.shared_state.runtime_config", _make_runtime_config()),
+        patch(
+            "app.notification_dispatch._attempt_delivery",
+            new=AsyncMock(return_value=200),
+        ),
+    ):
         await dispatch_external_notification(uuid.uuid4(), "test_event", {"k": "v"})
     stats = get_notification_stats()
     assert stats["total_dispatched"] == 1
@@ -82,9 +99,14 @@ async def test_dispatch_increments_dispatched_and_delivered_on_success():
 @pytest.mark.asyncio
 async def test_dispatch_enqueues_retry_on_502():
     _reset_stats()
-    with patch("app.shared_state.runtime_config", _make_runtime_config()), \
-         patch("app.notification_dispatch._attempt_delivery", new=AsyncMock(return_value=502)), \
-         patch("app.notification_dispatch._drain_retry_queue", new=AsyncMock()):
+    with (
+        patch("app.shared_state.runtime_config", _make_runtime_config()),
+        patch(
+            "app.notification_dispatch._attempt_delivery",
+            new=AsyncMock(return_value=502),
+        ),
+        patch("app.notification_dispatch._drain_retry_queue", new=AsyncMock()),
+    ):
         await dispatch_external_notification(uuid.uuid4(), "test_event", {"k": "v"})
     stats = get_notification_stats()
     assert stats["total_dispatched"] == 1
@@ -98,9 +120,14 @@ async def test_dispatch_enqueues_retry_on_502():
 @pytest.mark.asyncio
 async def test_dispatch_no_retry_on_404():
     _reset_stats()
-    with patch("app.shared_state.runtime_config", _make_runtime_config()), \
-         patch("app.notification_dispatch._attempt_delivery", new=AsyncMock(return_value=404)), \
-         patch("app.notification_dispatch._drain_retry_queue", new=AsyncMock()):
+    with (
+        patch("app.shared_state.runtime_config", _make_runtime_config()),
+        patch(
+            "app.notification_dispatch._attempt_delivery",
+            new=AsyncMock(return_value=404),
+        ),
+        patch("app.notification_dispatch._drain_retry_queue", new=AsyncMock()),
+    ):
         await dispatch_external_notification(uuid.uuid4(), "test_event", {"k": "v"})
     stats = get_notification_stats()
     assert stats["total_dispatched"] == 1
@@ -112,9 +139,14 @@ async def test_dispatch_no_retry_on_404():
 @pytest.mark.asyncio
 async def test_dispatch_no_retry_on_401():
     _reset_stats()
-    with patch("app.shared_state.runtime_config", _make_runtime_config()), \
-         patch("app.notification_dispatch._attempt_delivery", new=AsyncMock(return_value=401)), \
-         patch("app.notification_dispatch._drain_retry_queue", new=AsyncMock()):
+    with (
+        patch("app.shared_state.runtime_config", _make_runtime_config()),
+        patch(
+            "app.notification_dispatch._attempt_delivery",
+            new=AsyncMock(return_value=401),
+        ),
+        patch("app.notification_dispatch._drain_retry_queue", new=AsyncMock()),
+    ):
         await dispatch_external_notification(uuid.uuid4(), "test_event", {})
     stats = get_notification_stats()
     assert stats["total_failed"] == 1
@@ -124,9 +156,14 @@ async def test_dispatch_no_retry_on_401():
 @pytest.mark.asyncio
 async def test_dispatch_no_retry_on_403():
     _reset_stats()
-    with patch("app.shared_state.runtime_config", _make_runtime_config()), \
-         patch("app.notification_dispatch._attempt_delivery", new=AsyncMock(return_value=403)), \
-         patch("app.notification_dispatch._drain_retry_queue", new=AsyncMock()):
+    with (
+        patch("app.shared_state.runtime_config", _make_runtime_config()),
+        patch(
+            "app.notification_dispatch._attempt_delivery",
+            new=AsyncMock(return_value=403),
+        ),
+        patch("app.notification_dispatch._drain_retry_queue", new=AsyncMock()),
+    ):
         await dispatch_external_notification(uuid.uuid4(), "test_event", {})
     stats = get_notification_stats()
     assert stats["total_failed"] == 1
@@ -137,9 +174,15 @@ async def test_dispatch_no_retry_on_403():
 async def test_dispatch_enqueues_retry_on_network_error():
     _reset_stats()
     import httpx
-    with patch("app.shared_state.runtime_config", _make_runtime_config()), \
-         patch("app.notification_dispatch._attempt_delivery", new=AsyncMock(side_effect=httpx.ConnectError("refused"))), \
-         patch("app.notification_dispatch._drain_retry_queue", new=AsyncMock()):
+
+    with (
+        patch("app.shared_state.runtime_config", _make_runtime_config()),
+        patch(
+            "app.notification_dispatch._attempt_delivery",
+            new=AsyncMock(side_effect=httpx.ConnectError("refused")),
+        ),
+        patch("app.notification_dispatch._drain_retry_queue", new=AsyncMock()),
+    ):
         await dispatch_external_notification(uuid.uuid4(), "test_event", {})
     stats = get_notification_stats()
     assert stats["total_dispatched"] == 1
@@ -150,19 +193,22 @@ async def test_dispatch_enqueues_retry_on_network_error():
 # Retry queue bounds
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_retry_queue_bounded_at_50():
     _reset_stats()
     # Fill queue past maxlen by injecting entries directly
     for i in range(60):
-        nd._retry_queue.append(_RetryEntry(
-            project_id=uuid.uuid4(),
-            event_type="test_event",
-            payload={},
-            body={},
-            attempts=0,
-            next_retry_at=time.monotonic() + 9999,
-        ))
+        nd._retry_queue.append(
+            _RetryEntry(
+                project_id=uuid.uuid4(),
+                event_type="test_event",
+                payload={},
+                body={},
+                attempts=0,
+                next_retry_at=time.monotonic() + 9999,
+            )
+        )
     assert len(nd._retry_queue) == 50  # deque(maxlen=50) truncates oldest
 
 
@@ -170,18 +216,23 @@ async def test_retry_queue_bounded_at_50():
 # _drain_retry_queue — retry delivery
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_drain_retry_succeeds_and_updates_delivered():
     _reset_stats()
-    nd._retry_queue.append(_RetryEntry(
-        project_id=uuid.uuid4(),
-        event_type="test_event",
-        payload={},
-        body={"event_type": "test_event"},
-        attempts=0,
-        next_retry_at=time.monotonic() - 1,  # due now
-    ))
-    with patch("app.notification_dispatch._attempt_delivery", new=AsyncMock(return_value=200)):
+    nd._retry_queue.append(
+        _RetryEntry(
+            project_id=uuid.uuid4(),
+            event_type="test_event",
+            payload={},
+            body={"event_type": "test_event"},
+            attempts=0,
+            next_retry_at=time.monotonic() - 1,  # due now
+        )
+    )
+    with patch(
+        "app.notification_dispatch._attempt_delivery", new=AsyncMock(return_value=200)
+    ):
         await nd._drain_retry_queue("https://example.com/hook")
     assert nd.total_delivered == 1
     assert len(nd._retry_queue) == 0
@@ -190,15 +241,19 @@ async def test_drain_retry_succeeds_and_updates_delivered():
 @pytest.mark.asyncio
 async def test_drain_retry_re_enqueues_on_502():
     _reset_stats()
-    nd._retry_queue.append(_RetryEntry(
-        project_id=uuid.uuid4(),
-        event_type="test_event",
-        payload={},
-        body={},
-        attempts=0,
-        next_retry_at=time.monotonic() - 1,
-    ))
-    with patch("app.notification_dispatch._attempt_delivery", new=AsyncMock(return_value=502)):
+    nd._retry_queue.append(
+        _RetryEntry(
+            project_id=uuid.uuid4(),
+            event_type="test_event",
+            payload={},
+            body={},
+            attempts=0,
+            next_retry_at=time.monotonic() - 1,
+        )
+    )
+    with patch(
+        "app.notification_dispatch._attempt_delivery", new=AsyncMock(return_value=502)
+    ):
         await nd._drain_retry_queue("https://example.com/hook")
     # Should be re-enqueued with attempts=1
     assert len(nd._retry_queue) == 1
@@ -209,15 +264,19 @@ async def test_drain_retry_re_enqueues_on_502():
 @pytest.mark.asyncio
 async def test_drain_retry_exhausts_and_counts_failed():
     _reset_stats()
-    nd._retry_queue.append(_RetryEntry(
-        project_id=uuid.uuid4(),
-        event_type="test_event",
-        payload={},
-        body={},
-        attempts=len(_RETRY_DELAYS) - 1,  # last attempt
-        next_retry_at=time.monotonic() - 1,
-    ))
-    with patch("app.notification_dispatch._attempt_delivery", new=AsyncMock(return_value=503)):
+    nd._retry_queue.append(
+        _RetryEntry(
+            project_id=uuid.uuid4(),
+            event_type="test_event",
+            payload={},
+            body={},
+            attempts=len(_RETRY_DELAYS) - 1,  # last attempt
+            next_retry_at=time.monotonic() - 1,
+        )
+    )
+    with patch(
+        "app.notification_dispatch._attempt_delivery", new=AsyncMock(return_value=503)
+    ):
         await nd._drain_retry_queue("https://example.com/hook")
     assert nd.total_failed == 1
     assert len(nd._retry_queue) == 0
@@ -226,15 +285,19 @@ async def test_drain_retry_exhausts_and_counts_failed():
 @pytest.mark.asyncio
 async def test_drain_skips_not_due_entries():
     _reset_stats()
-    nd._retry_queue.append(_RetryEntry(
-        project_id=uuid.uuid4(),
-        event_type="test_event",
-        payload={},
-        body={},
-        attempts=0,
-        next_retry_at=time.monotonic() + 9999,  # not due
-    ))
-    with patch("app.notification_dispatch._attempt_delivery", new=AsyncMock(return_value=200)) as mock_del:
+    nd._retry_queue.append(
+        _RetryEntry(
+            project_id=uuid.uuid4(),
+            event_type="test_event",
+            payload={},
+            body={},
+            attempts=0,
+            next_retry_at=time.monotonic() + 9999,  # not due
+        )
+    )
+    with patch(
+        "app.notification_dispatch._attempt_delivery", new=AsyncMock(return_value=200)
+    ) as mock_del:
         await nd._drain_retry_queue("https://example.com/hook")
     mock_del.assert_not_called()
     assert len(nd._retry_queue) == 1  # still in queue
@@ -243,6 +306,7 @@ async def test_drain_skips_not_due_entries():
 # ---------------------------------------------------------------------------
 # get_notification_stats
 # ---------------------------------------------------------------------------
+
 
 def test_get_notification_stats_initial():
     _reset_stats()
@@ -257,9 +321,7 @@ def test_get_notification_stats_initial():
 @pytest.mark.asyncio
 async def test_post_event_message_basic(db_session):
     project_id = uuid.uuid4()
-    msg = await post_event_message(
-        db_session, project_id, "test_event", "Test summary"
-    )
+    msg = await post_event_message(db_session, project_id, "test_event", "Test summary")
     assert msg.project_id == project_id
     assert msg.content == "Test summary"
     assert msg.context["event_type"] == "test_event"
@@ -276,7 +338,12 @@ async def test_post_event_message_with_context_and_task_id(db_session):
     task_id = uuid.uuid4()
     extra_ctx = {"key": "value", "num": 42}
     msg = await post_event_message(
-        db_session, project_id, "my_event", "Summary", context=extra_ctx, task_id=task_id
+        db_session,
+        project_id,
+        "my_event",
+        "Summary",
+        context=extra_ctx,
+        task_id=task_id,
     )
     assert msg.context["event_type"] == "my_event"
     assert msg.context["key"] == "value"
@@ -288,7 +355,11 @@ async def test_post_event_message_with_context_and_task_id(db_session):
 async def test_post_pr_merged_message(db_session):
     project_id = uuid.uuid4()
     msg = await post_pr_merged_message(
-        db_session, project_id, pr_number=42, direction_text="Add dark mode", task_count=3
+        db_session,
+        project_id,
+        pr_number=42,
+        direction_text="Add dark mode",
+        task_count=3,
     )
     assert msg.project_id == project_id
     assert "42" in msg.content
@@ -315,7 +386,8 @@ async def test_post_pr_merged_message_truncates_direction_text(db_session):
 async def test_post_direction_milestone_message(db_session):
     project_id = uuid.uuid4()
     msg = await post_direction_milestone_message(
-        db_session, project_id,
+        db_session,
+        project_id,
         direction_text="Improve search",
         milestone="auto-completed",
         reason="All tasks merged",
@@ -335,7 +407,8 @@ async def test_post_direction_milestone_message_truncates_text(db_session):
     project_id = uuid.uuid4()
     long_text = "y" * 200
     msg = await post_direction_milestone_message(
-        db_session, project_id,
+        db_session,
+        project_id,
         direction_text=long_text,
         milestone="auto-paused",
         reason="reason",
@@ -348,15 +421,19 @@ async def test_post_direction_milestone_message_fires_webhook(db_session):
     """Creating the milestone message also fires DIRECTION_MILESTONE via the external webhook."""
     project_id = uuid.uuid4()
     dispatch_mock = AsyncMock()
-    with patch("app.notification_dispatch.dispatch_external_notification", new=dispatch_mock):
+    with patch(
+        "app.notification_dispatch.dispatch_external_notification", new=dispatch_mock
+    ):
         await post_direction_milestone_message(
-            db_session, project_id,
+            db_session,
+            project_id,
             direction_text="Improve search relevance",
             milestone="auto-completed",
             reason="Saturated with 5 PRs",
             direction_id="d-abc123",
         )
         import asyncio as _asyncio
+
         await _asyncio.sleep(0)
     dispatch_mock.assert_called_once()
     args, _ = dispatch_mock.call_args
@@ -369,13 +446,18 @@ async def test_post_direction_milestone_message_fires_webhook(db_session):
 
 
 @pytest.mark.asyncio
-async def test_post_direction_milestone_message_adds_reason_code_and_evidence(db_session):
+async def test_post_direction_milestone_message_adds_reason_code_and_evidence(
+    db_session,
+):
     project_id = uuid.uuid4()
     dispatch_mock = AsyncMock()
     evidence = {"cost_per_merge": 12.5, "merge_count": 1}
-    with patch("app.notification_dispatch.dispatch_external_notification", new=dispatch_mock):
+    with patch(
+        "app.notification_dispatch.dispatch_external_notification", new=dispatch_mock
+    ):
         msg = await post_direction_milestone_message(
-            db_session, project_id,
+            db_session,
+            project_id,
             direction_text="Reduce flaky tests",
             milestone="auto-paused",
             reason="Paused: cost per merge is too high",
@@ -383,6 +465,7 @@ async def test_post_direction_milestone_message_adds_reason_code_and_evidence(db
             evidence=evidence,
         )
         import asyncio as _asyncio
+
         await _asyncio.sleep(0)
 
     assert msg.context["reason_code"] == "cost_per_merge_high"
@@ -394,18 +477,24 @@ async def test_post_direction_milestone_message_adds_reason_code_and_evidence(db
 
 
 @pytest.mark.asyncio
-async def test_post_direction_milestone_message_no_reason_code_for_non_paused(db_session):
+async def test_post_direction_milestone_message_no_reason_code_for_non_paused(
+    db_session,
+):
     project_id = uuid.uuid4()
     dispatch_mock = AsyncMock()
-    with patch("app.notification_dispatch.dispatch_external_notification", new=dispatch_mock):
+    with patch(
+        "app.notification_dispatch.dispatch_external_notification", new=dispatch_mock
+    ):
         msg = await post_direction_milestone_message(
-            db_session, project_id,
+            db_session,
+            project_id,
             direction_text="Improve retention",
             milestone="auto-completed",
             reason="Cost per merge improved after rollout",
             direction_id="d-finish1",
         )
         import asyncio as _asyncio
+
         await _asyncio.sleep(0)
 
     assert "reason_code" not in msg.context
@@ -418,15 +507,19 @@ async def test_post_direction_milestone_message_no_reason_code_for_non_paused(db
 async def test_post_direction_milestone_message_reason_code_budget_exceeded(db_session):
     project_id = uuid.uuid4()
     dispatch_mock = AsyncMock()
-    with patch("app.notification_dispatch.dispatch_external_notification", new=dispatch_mock):
+    with patch(
+        "app.notification_dispatch.dispatch_external_notification", new=dispatch_mock
+    ):
         msg = await post_direction_milestone_message(
-            db_session, project_id,
+            db_session,
+            project_id,
             direction_text="Trim infra spend",
             milestone="auto-paused",
             reason="Auto-paused: direction is over budget this cycle",
             direction_id="d-budget1",
         )
         import asyncio as _asyncio
+
         await _asyncio.sleep(0)
 
     assert msg.context["reason_code"] == "budget_exceeded"
@@ -438,15 +531,19 @@ async def test_post_direction_milestone_message_reason_code_budget_exceeded(db_s
 async def test_post_direction_milestone_message_reason_code_low_yield(db_session):
     project_id = uuid.uuid4()
     dispatch_mock = AsyncMock()
-    with patch("app.notification_dispatch.dispatch_external_notification", new=dispatch_mock):
+    with patch(
+        "app.notification_dispatch.dispatch_external_notification", new=dispatch_mock
+    ):
         msg = await post_direction_milestone_message(
-            db_session, project_id,
+            db_session,
+            project_id,
             direction_text="Improve onboarding",
             milestone="auto-paused",
             reason="Auto-paused: low yield after 3 cycles",
             direction_id="d-yield1",
         )
         import asyncio as _asyncio
+
         await _asyncio.sleep(0)
 
     assert msg.context["reason_code"] == "low_yield"
@@ -458,7 +555,8 @@ async def test_post_direction_milestone_message_reason_code_low_yield(db_session
 async def test_post_cycle_summary_message(db_session):
     project_id = uuid.uuid4()
     msg = await post_cycle_summary_message(
-        db_session, project_id,
+        db_session,
+        project_id,
         vision_rev=7,
         dirs_created=3,
         dirs_retired=1,
@@ -495,7 +593,8 @@ async def test_post_failure_alert_message(db_session):
 async def test_post_account_model_regression_message(db_session):
     project_id = uuid.uuid4()
     msg = await post_account_model_regression_message(
-        db_session, project_id,
+        db_session,
+        project_id,
         account_id="acct-123",
         account_label="ProdKey",
         provider="anthropic",
@@ -527,7 +626,8 @@ async def test_post_account_model_regression_message(db_session):
 async def test_post_account_model_regression_recovered_message(db_session):
     project_id = uuid.uuid4()
     msg = await post_account_model_regression_recovered_message(
-        db_session, project_id,
+        db_session,
+        project_id,
         account_id="acct-123",
         account_label="ProdKey",
         provider="anthropic",
@@ -555,7 +655,8 @@ async def test_post_account_model_regression_recovered_message(db_session):
 async def test_post_account_model_regression_recovered_message_no_stats(db_session):
     project_id = uuid.uuid4()
     msg = await post_account_model_regression_recovered_message(
-        db_session, project_id,
+        db_session,
+        project_id,
         account_id="acct-456",
         account_label="DevKey",
         provider="google",
@@ -573,7 +674,8 @@ async def test_post_account_model_regression_recovered_message_no_stats(db_sessi
 async def test_post_auto_fix_spawned_message_few_checks(db_session):
     project_id = uuid.uuid4()
     msg = await post_auto_fix_spawned_message(
-        db_session, project_id,
+        db_session,
+        project_id,
         branch="main",
         failed_checks=["lint", "typecheck"],
     )
@@ -642,7 +744,8 @@ async def test_post_auto_fix_result_review_needed(db_session):
 async def test_post_remediation_escalation_message(db_session):
     project_id = uuid.uuid4()
     msg = await post_remediation_escalation_message(
-        db_session, project_id,
+        db_session,
+        project_id,
         direction_text="Improve CI reliability",
         failure_pattern="AssertionError in test_foo",
         attempts=3,
@@ -666,7 +769,8 @@ async def test_post_remediation_escalation_message_truncates(db_session):
     long_pattern = "p" * 500
     long_summary = "s" * 500
     msg = await post_remediation_escalation_message(
-        db_session, project_id,
+        db_session,
+        project_id,
         direction_text=long_dir,
         failure_pattern=long_pattern,
         attempts=5,
@@ -682,9 +786,12 @@ async def test_post_remediation_escalation_message_fires_webhook(db_session):
     """Creating the escalation message also fires REMEDIATION_ESCALATED via the external webhook."""
     project_id = uuid.uuid4()
     dispatch_mock = AsyncMock()
-    with patch("app.notification_dispatch.dispatch_external_notification", new=dispatch_mock):
+    with patch(
+        "app.notification_dispatch.dispatch_external_notification", new=dispatch_mock
+    ):
         await post_remediation_escalation_message(
-            db_session, project_id,
+            db_session,
+            project_id,
             direction_text="Improve CI reliability",
             failure_pattern="AssertionError in test_foo",
             attempts=3,
@@ -692,6 +799,7 @@ async def test_post_remediation_escalation_message_fires_webhook(db_session):
         )
         # Allow the ensure_future-scheduled coroutine to run
         import asyncio as _asyncio
+
         await _asyncio.sleep(0)
     dispatch_mock.assert_called_once()
     args, _ = dispatch_mock.call_args
@@ -711,7 +819,11 @@ async def test_post_issue_implementation_spawned_message(db_session):
     project_id = uuid.uuid4()
     task_id = uuid.uuid4()
     msg = await post_issue_implementation_spawned_message(
-        db_session, project_id, issue_number=123, issue_title="Fix login bug", task_id=task_id
+        db_session,
+        project_id,
+        issue_number=123,
+        issue_title="Fix login bug",
+        task_id=task_id,
     )
     assert msg.project_id == project_id
     assert "123" in msg.content
@@ -736,7 +848,11 @@ async def test_post_issue_implementation_spawned_message_no_task_id(db_session):
 async def test_post_review_feedback_dismissed(db_session):
     project_id = uuid.uuid4()
     msg = await post_review_feedback_message(
-        db_session, project_id, pr_number=10, signal="review_dismissed", detail="Too broad"
+        db_session,
+        project_id,
+        pr_number=10,
+        signal="review_dismissed",
+        detail="Too broad",
     )
     assert msg.project_id == project_id
     assert "dismissed" in msg.content
@@ -785,7 +901,8 @@ async def test_post_feedback_acknowledgment(db_session):
     project_id = uuid.uuid4()
     original_msg_id = uuid.uuid4()
     msg = await post_feedback_acknowledgment(
-        db_session, project_id,
+        db_session,
+        project_id,
         original_msg_id=original_msg_id,
         resolution="Fixed in latest PR",
     )
@@ -803,7 +920,8 @@ async def test_post_feedback_acknowledgment_with_task_id(db_session):
     original_msg_id = uuid.uuid4()
     task_id = uuid.uuid4()
     msg = await post_feedback_acknowledgment(
-        db_session, project_id,
+        db_session,
+        project_id,
         original_msg_id=original_msg_id,
         resolution="Done",
         task_id=task_id,
@@ -835,7 +953,9 @@ async def _create_ar_project(session, **overrides) -> Project:
 async def test_failure_counter_increments(db_session):
     """result='failed' increments the per-branch failure counter in design_doc."""
     project = await _create_ar_project(db_session)
-    await post_auto_fix_result_message(db_session, project.id, branch="main", result="failed")
+    await post_auto_fix_result_message(
+        db_session, project.id, branch="main", result="failed"
+    )
     await db_session.flush()
     await db_session.refresh(project)
     ar = (project.design_doc or {}).get("_auto_remediation", {})
@@ -845,10 +965,18 @@ async def test_failure_counter_increments(db_session):
 @pytest.mark.asyncio
 async def test_merged_resets_counter(db_session):
     """result='merged' resets the failure counter for the branch."""
-    project = await _create_ar_project(db_session, design_doc={
-        "_auto_remediation": {"enabled": True, "branch_failure_counts": {"main": 2}},
-    })
-    await post_auto_fix_result_message(db_session, project.id, branch="main", result="merged")
+    project = await _create_ar_project(
+        db_session,
+        design_doc={
+            "_auto_remediation": {
+                "enabled": True,
+                "branch_failure_counts": {"main": 2},
+            },
+        },
+    )
+    await post_auto_fix_result_message(
+        db_session, project.id, branch="main", result="merged"
+    )
     await db_session.flush()
     await db_session.refresh(project)
     ar = (project.design_doc or {}).get("_auto_remediation", {})
@@ -859,21 +987,36 @@ async def test_merged_resets_counter(db_session):
 async def test_escalation_at_threshold_suspends_branch(db_session):
     """Three consecutive failures suspend the branch and post an escalation message."""
     from sqlmodel import select
-    project = await _create_ar_project(db_session, design_doc={
-        "_auto_remediation": {"enabled": True, "branch_failure_counts": {"main": 2}},
-    })
+
+    project = await _create_ar_project(
+        db_session,
+        design_doc={
+            "_auto_remediation": {
+                "enabled": True,
+                "branch_failure_counts": {"main": 2},
+            },
+        },
+    )
     with patch("app.notification_dispatch.asyncio") as mock_asyncio:
         mock_asyncio.ensure_future = lambda coro: coro.close() or None
-        await post_auto_fix_result_message(db_session, project.id, branch="main", result="failed")
+        await post_auto_fix_result_message(
+            db_session, project.id, branch="main", result="failed"
+        )
     await db_session.flush()
     await db_session.refresh(project)
     ar = (project.design_doc or {}).get("_auto_remediation", {})
     assert "main" in ar.get("suspended_branches", [])
     assert ar.get("branch_failure_counts", {}).get("main") == 3
     # Escalation message (BLOCKER) should have been posted
-    msgs = (await db_session.execute(
-        select(ProjectMessage).where(ProjectMessage.project_id == project.id)
-    )).scalars().all()
+    msgs = (
+        (
+            await db_session.execute(
+                select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
     escalation_msgs = [m for m in msgs if m.message_type == MessageType.BLOCKER]
     assert len(escalation_msgs) == 1
     assert "suspended" in escalation_msgs[0].content
@@ -883,13 +1026,24 @@ async def test_escalation_at_threshold_suspends_branch(db_session):
 @pytest.mark.asyncio
 async def test_escalation_webhook_payload_is_enriched(db_session):
     """AUTO_FIX_ESCALATED webhook payload includes actionable context fields."""
-    project = await _create_ar_project(db_session, design_doc={
-        "_auto_remediation": {"enabled": True, "branch_failure_counts": {"main": 2}},
-    })
+    project = await _create_ar_project(
+        db_session,
+        design_doc={
+            "_auto_remediation": {
+                "enabled": True,
+                "branch_failure_counts": {"main": 2},
+            },
+        },
+    )
     dispatch_mock = AsyncMock()
-    with patch("app.notification_dispatch.dispatch_external_notification", new=dispatch_mock):
-        await post_auto_fix_result_message(db_session, project.id, branch="main", result="failed")
+    with patch(
+        "app.notification_dispatch.dispatch_external_notification", new=dispatch_mock
+    ):
+        await post_auto_fix_result_message(
+            db_session, project.id, branch="main", result="failed"
+        )
         import asyncio as _asyncio
+
         await _asyncio.sleep(0)
     dispatch_mock.assert_called_once()
     args, _ = dispatch_mock.call_args
@@ -908,14 +1062,19 @@ async def test_escalation_webhook_payload_is_enriched(db_session):
 @pytest.mark.asyncio
 async def test_merged_clears_suspension(db_session):
     """result='merged' removes the branch from suspended_branches."""
-    project = await _create_ar_project(db_session, design_doc={
-        "_auto_remediation": {
-            "enabled": True,
-            "branch_failure_counts": {"main": 3},
-            "suspended_branches": ["main"],
+    project = await _create_ar_project(
+        db_session,
+        design_doc={
+            "_auto_remediation": {
+                "enabled": True,
+                "branch_failure_counts": {"main": 3},
+                "suspended_branches": ["main"],
+            },
         },
-    })
-    await post_auto_fix_result_message(db_session, project.id, branch="main", result="merged")
+    )
+    await post_auto_fix_result_message(
+        db_session, project.id, branch="main", result="merged"
+    )
     await db_session.flush()
     await db_session.refresh(project)
     ar = (project.design_doc or {}).get("_auto_remediation", {})
@@ -924,6 +1083,7 @@ async def test_merged_clears_suspension(db_session):
 
 
 # ─── Residual remediation lifecycle (mirror of CI auto-fix) ──────────────────
+
 
 async def _load_case(session, project_id, fingerprint):
     result = await session.execute(
@@ -941,18 +1101,22 @@ async def test_post_residual_fix_spawned_creates_case_in_remediating(db_session)
     and emits residual_fix_spawned. Future idle-tick spawn-dedup queries
     look at exactly these fields."""
     from app.models import Task, TaskStatus
+
     project = Project(name="Residual Spawned", user_id="u1")
     db_session.add(project)
     await db_session.commit()
     # Real Task row needed: ProjectMessage.from_task_id is FK-enforced.
     fix_task = Task(
-        project_id=project.id, status=TaskStatus.IN_PROGRESS,
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
         payloads=[{"type": "fix"}],
     )
     db_session.add(fix_task)
     await db_session.commit()
     msg = await post_residual_fix_spawned_message(
-        db_session, project.id, fingerprint="abcfp",
+        db_session,
+        project.id,
+        fingerprint="abcfp",
         sample_message="AssertionError in test_foo",
         task_id=fix_task.id,
     )
@@ -975,7 +1139,8 @@ async def test_post_residual_fix_result_merged_resets_counter(db_session):
     await db_session.commit()
     # Pre-populate a case with prior failures
     case = ResidualRemediationCase(
-        project_id=project.id, fingerprint="fp-merge",
+        project_id=project.id,
+        fingerprint="fp-merge",
         status=ResidualCaseStatus.REMEDIATING,
         consecutive_failure_count=2,
     )
@@ -983,8 +1148,11 @@ async def test_post_residual_fix_result_merged_resets_counter(db_session):
     await db_session.commit()
 
     await post_residual_fix_result_message(
-        db_session, project.id, fingerprint="fp-merge",
-        result="merged", pr_number=42,
+        db_session,
+        project.id,
+        fingerprint="fp-merge",
+        result="merged",
+        pr_number=42,
     )
     await db_session.commit()
     refreshed = await _load_case(db_session, project.id, "fp-merge")
@@ -1001,7 +1169,8 @@ async def test_post_residual_fix_result_failed_increments_counter(db_session):
     db_session.add(project)
     await db_session.commit()
     case = ResidualRemediationCase(
-        project_id=project.id, fingerprint="fp-fail",
+        project_id=project.id,
+        fingerprint="fp-fail",
         status=ResidualCaseStatus.REMEDIATING,
         consecutive_failure_count=0,
     )
@@ -1009,7 +1178,10 @@ async def test_post_residual_fix_result_failed_increments_counter(db_session):
     await db_session.commit()
 
     await post_residual_fix_result_message(
-        db_session, project.id, fingerprint="fp-fail", result="failed",
+        db_session,
+        project.id,
+        fingerprint="fp-fail",
+        result="failed",
     )
     await db_session.commit()
     refreshed = await _load_case(db_session, project.id, "fp-fail")
@@ -1029,7 +1201,8 @@ async def test_post_residual_fix_result_threshold_suspends_and_escalates(db_sess
     db_session.add(project)
     await db_session.commit()
     case = ResidualRemediationCase(
-        project_id=project.id, fingerprint="fp-esc",
+        project_id=project.id,
+        fingerprint="fp-esc",
         status=ResidualCaseStatus.REMEDIATING,
         consecutive_failure_count=nd._AUTO_REMEDIATION_ESCALATION_THRESHOLD - 1,
     )
@@ -1037,23 +1210,34 @@ async def test_post_residual_fix_result_threshold_suspends_and_escalates(db_sess
     await db_session.commit()
 
     dispatch_mock = AsyncMock()
-    with patch("app.notification_dispatch.dispatch_external_notification", new=dispatch_mock):
+    with patch(
+        "app.notification_dispatch.dispatch_external_notification", new=dispatch_mock
+    ):
         await post_residual_fix_result_message(
-            db_session, project.id, fingerprint="fp-esc", result="failed",
+            db_session,
+            project.id,
+            fingerprint="fp-esc",
+            result="failed",
         )
         await db_session.commit()
 
     refreshed = await _load_case(db_session, project.id, "fp-esc")
     assert refreshed.status == ResidualCaseStatus.SUSPENDED
-    assert refreshed.consecutive_failure_count == nd._AUTO_REMEDIATION_ESCALATION_THRESHOLD
+    assert (
+        refreshed.consecutive_failure_count == nd._AUTO_REMEDIATION_ESCALATION_THRESHOLD
+    )
     assert refreshed.suspended_at is not None
 
     # Escalation BLOCKER message + webhook were both fired
     msgs_q = await db_session.execute(
         _select(ProjectMessage).where(ProjectMessage.project_id == project.id)
     )
-    blocker_msgs = [m for m in msgs_q.scalars().all() if m.message_type == MessageType.BLOCKER]
-    assert any(m.context.get("event_type") == "residual_fix_escalated" for m in blocker_msgs)
+    blocker_msgs = [
+        m for m in msgs_q.scalars().all() if m.message_type == MessageType.BLOCKER
+    ]
+    assert any(
+        m.context.get("event_type") == "residual_fix_escalated" for m in blocker_msgs
+    )
     dispatch_mock.assert_called_once()
     args = dispatch_mock.call_args.args
     assert args[1] == "RESIDUAL_FIX_ESCALATED"
@@ -1071,7 +1255,8 @@ async def test_post_residual_fix_result_review_needed_preserves_state(db_session
     db_session.add(project)
     await db_session.commit()
     case = ResidualRemediationCase(
-        project_id=project.id, fingerprint="fp-rev",
+        project_id=project.id,
+        fingerprint="fp-rev",
         status=ResidualCaseStatus.REMEDIATING,
         consecutive_failure_count=2,
     )
@@ -1079,8 +1264,11 @@ async def test_post_residual_fix_result_review_needed_preserves_state(db_session
     await db_session.commit()
 
     await post_residual_fix_result_message(
-        db_session, project.id, fingerprint="fp-rev",
-        result="review_needed", pr_number=77,
+        db_session,
+        project.id,
+        fingerprint="fp-rev",
+        result="review_needed",
+        pr_number=77,
     )
     await db_session.commit()
     refreshed = await _load_case(db_session, project.id, "fp-rev")
@@ -1095,7 +1283,10 @@ async def test_post_residual_fix_escalation_message(db_session):
     residual_fix_escalated event_type so external subscribers can filter."""
     project_id = uuid.uuid4()
     msg = await post_residual_fix_escalation_message(
-        db_session, project_id, fingerprint="abc", failure_count=3,
+        db_session,
+        project_id,
+        fingerprint="abc",
+        failure_count=3,
     )
     assert msg.message_type == MessageType.BLOCKER
     assert msg.context["event_type"] == "residual_fix_escalated"
@@ -1105,6 +1296,7 @@ async def test_post_residual_fix_escalation_message(db_session):
 
 # ─── post_remediation_result_message — discriminator at outcome sites ────────
 
+
 @pytest.mark.asyncio
 async def test_remediation_discriminator_routes_residual_to_residual_helper(db_session):
     """A task with spawned_by=residual_fingerprint_remediation routes to
@@ -1113,11 +1305,13 @@ async def test_remediation_discriminator_routes_residual_to_residual_helper(db_s
     agent_status rely on."""
     from app.models import Task, TaskStatus  # noqa: PLC0415
     from app.notification_dispatch import post_remediation_result_message  # noqa: PLC0415
+
     project = Project(name="Discriminator Residual", user_id="u1")
     db_session.add(project)
     await db_session.commit()
     fix_task = Task(
-        project_id=project.id, status=TaskStatus.FAILED,
+        project_id=project.id,
+        status=TaskStatus.FAILED,
         payloads=[{"type": "fix"}],
         context={
             "auto_remediation": True,
@@ -1129,7 +1323,9 @@ async def test_remediation_discriminator_routes_residual_to_residual_helper(db_s
     await db_session.commit()
 
     msg = await post_remediation_result_message(
-        db_session, fix_task, result="failed",
+        db_session,
+        fix_task,
+        result="failed",
     )
     await db_session.commit()
     assert msg.context["event_type"] == "residual_fix_result"
@@ -1143,11 +1339,13 @@ async def test_remediation_discriminator_routes_ci_to_auto_fix_helper(db_session
     for the bulk of auto_remediation tasks that aren't residual."""
     from app.models import Task, TaskStatus  # noqa: PLC0415
     from app.notification_dispatch import post_remediation_result_message  # noqa: PLC0415
+
     project = Project(name="Discriminator CI", user_id="u1")
     db_session.add(project)
     await db_session.commit()
     fix_task = Task(
-        project_id=project.id, status=TaskStatus.FAILED,
+        project_id=project.id,
+        status=TaskStatus.FAILED,
         payloads=[{"type": "fix"}],
         context={
             "auto_remediation": True,
@@ -1158,7 +1356,9 @@ async def test_remediation_discriminator_routes_ci_to_auto_fix_helper(db_session
     await db_session.commit()
 
     msg = await post_remediation_result_message(
-        db_session, fix_task, result="failed",
+        db_session,
+        fix_task,
+        result="failed",
     )
     await db_session.commit()
     assert msg.context["event_type"] == "auto_fix_result"
@@ -1166,6 +1366,7 @@ async def test_remediation_discriminator_routes_ci_to_auto_fix_helper(db_session
 
 
 # ─── is_residual_remediation_task — pure predicate ──────────────────────────
+
 
 def test_is_residual_remediation_task_true():
     """spawned_by=residual_fingerprint_remediation returns True."""
@@ -1177,7 +1378,10 @@ def test_is_residual_remediation_task_true():
 def test_is_residual_remediation_task_false_for_ci_task():
     """CI auto-remediation tasks with different spawned_by return False."""
     task = MagicMock()
-    task.context = {"spawned_by": "ci_auto_remediation_failure", "auto_remediation": True}
+    task.context = {
+        "spawned_by": "ci_auto_remediation_failure",
+        "auto_remediation": True,
+    }
     assert is_residual_remediation_task(task) is False
 
 
@@ -1190,23 +1394,29 @@ def test_is_residual_remediation_task_false_for_no_context():
 
 # ─── post_residual_fix_spawned_message — context fields ─────────────────────
 
+
 @pytest.mark.asyncio
 async def test_post_residual_fix_spawned_records_task_id_in_context(db_session):
     """task_id kwarg is reflected into msg.context so downstream
     subscribers can correlate the notification to the spawned task."""
     from app.models import Task, TaskStatus  # noqa: PLC0415
+
     project = Project(name="Spawned TaskID", user_id="u1")
     db_session.add(project)
     await db_session.commit()
     fix_task = Task(
-        project_id=project.id, status=TaskStatus.IN_PROGRESS,
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
         payloads=[{"type": "fix"}],
     )
     db_session.add(fix_task)
     await db_session.commit()
     msg = await post_residual_fix_spawned_message(
-        db_session, project.id, fingerprint="fp-taskid",
-        sample_message="TypeError in test", task_id=fix_task.id,
+        db_session,
+        project.id,
+        fingerprint="fp-taskid",
+        sample_message="TypeError in test",
+        task_id=fix_task.id,
     )
     await db_session.commit()
     assert msg.context["task_id"] == str(fix_task.id)
@@ -1221,7 +1431,9 @@ async def test_post_residual_fix_spawned_null_task_id_in_context(db_session):
     db_session.add(project)
     await db_session.commit()
     msg = await post_residual_fix_spawned_message(
-        db_session, project.id, fingerprint="fp-notask",
+        db_session,
+        project.id,
+        fingerprint="fp-notask",
         sample_message="NameError: x",
     )
     await db_session.commit()
@@ -1234,21 +1446,28 @@ async def test_post_residual_fix_spawned_fires_external_webhook(db_session):
     """post_residual_fix_spawned_message dispatches a RESIDUAL_FIX_SPAWNED
     external webhook once per spawn, carrying fingerprint, hit_count, and task_id."""
     from app.models import Task, TaskStatus  # noqa: PLC0415
+
     project = Project(name="Spawned Webhook", user_id="u1")
     db_session.add(project)
     await db_session.commit()
     fix_task = Task(
-        project_id=project.id, status=TaskStatus.IN_PROGRESS,
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
         payloads=[{"type": "fix"}],
     )
     db_session.add(fix_task)
     await db_session.commit()
 
     dispatch_mock = AsyncMock()
-    with patch("app.notification_dispatch.dispatch_external_notification", new=dispatch_mock):
+    with patch(
+        "app.notification_dispatch.dispatch_external_notification", new=dispatch_mock
+    ):
         await post_residual_fix_spawned_message(
-            db_session, project.id, fingerprint="fp-wh",
-            sample_message="AssertionError in test_bar", task_id=fix_task.id,
+            db_session,
+            project.id,
+            fingerprint="fp-wh",
+            sample_message="AssertionError in test_bar",
+            task_id=fix_task.id,
         )
         await db_session.commit()
 
@@ -1262,8 +1481,12 @@ async def test_post_residual_fix_spawned_fires_external_webhook(db_session):
 
 # ─── RESOLVED transition on PR merge ─────────────────────────────────────────
 
+
 @pytest.mark.asyncio
-@pytest.mark.xfail(strict=False, reason="close_residual_case_resolved not yet implemented; sibling cluster 1/2 will add it to notification_dispatch")
+@pytest.mark.xfail(
+    strict=False,
+    reason="close_residual_case_resolved not yet implemented; sibling cluster 1/2 will add it to notification_dispatch",
+)
 async def test_close_residual_case_resolved_transitions_to_resolved(db_session):
     """After a residual fix PR merges, close_residual_case_resolved() should
     transition the case to RESOLVED so it is excluded from future DB selection
@@ -1275,14 +1498,17 @@ async def test_close_residual_case_resolved_transitions_to_resolved(db_session):
     await db_session.commit()
 
     case = ResidualRemediationCase(
-        project_id=project.id, fingerprint="fp-resolved-merge",
+        project_id=project.id,
+        fingerprint="fp-resolved-merge",
         status=ResidualCaseStatus.MERGED,
         consecutive_failure_count=0,
     )
     db_session.add(case)
     await db_session.commit()
 
-    await close_residual_case_resolved(db_session, project.id, fingerprint="fp-resolved-merge")
+    await close_residual_case_resolved(
+        db_session, project.id, fingerprint="fp-resolved-merge"
+    )
     await db_session.commit()
 
     refreshed = await _load_case(db_session, project.id, "fp-resolved-merge")
@@ -1291,8 +1517,11 @@ async def test_close_residual_case_resolved_transitions_to_resolved(db_session):
 
 # ─── Audit-deferral escalation message ───────────────────────────────────────
 
+
 @pytest.mark.asyncio
-async def test_post_residual_fix_audit_deferred_escalation_message_creates_blocker(db_session):
+async def test_post_residual_fix_audit_deferred_escalation_message_creates_blocker(
+    db_session,
+):
     """post_residual_fix_audit_deferred_escalation_message emits a BLOCKER
     ProjectMessage with the expected context keys and the correct threshold."""
     project = Project(name="Audit Deferred Esc", user_id="u1")
@@ -1312,7 +1541,9 @@ async def test_post_residual_fix_audit_deferred_escalation_message_creates_block
     assert msg.from_type == "system"
     assert msg.context["event_type"] == "residual_fix_audit_deferred"
     assert msg.context["fingerprint"] == "fp-audit-deferred"
-    assert msg.context["audit_defer_count"] == _RESIDUAL_AUDIT_DEFER_ESCALATION_THRESHOLD
+    assert (
+        msg.context["audit_defer_count"] == _RESIDUAL_AUDIT_DEFER_ESCALATION_THRESHOLD
+    )
     assert msg.context["threshold"] == _RESIDUAL_AUDIT_DEFER_ESCALATION_THRESHOLD
     assert "fp-audit-deferred" in msg.content
 
@@ -1337,18 +1568,26 @@ async def test_post_residual_fix_spawned_resets_audit_defer_fields(db_session):
     await db_session.commit()
 
     await post_residual_fix_spawned_message(
-        db_session, project.id, fingerprint="fp-spawn-reset",
+        db_session,
+        project.id,
+        fingerprint="fp-spawn-reset",
         sample_message="SomeError in foo",
     )
     await db_session.commit()
 
     refreshed = await _load_case(db_session, project.id, "fp-spawn-reset")
-    assert refreshed.audit_defer_count == 0, "audit_defer_count must be reset to 0 on spawn"
-    assert refreshed.audit_deferred_system_id is None, "audit_deferred_system_id must be cleared on spawn"
+    assert refreshed.audit_defer_count == 0, (
+        "audit_defer_count must be reset to 0 on spawn"
+    )
+    assert refreshed.audit_deferred_system_id is None, (
+        "audit_deferred_system_id must be cleared on spawn"
+    )
 
 
 @pytest.mark.asyncio
-async def test_post_residual_fix_audit_deferred_escalation_message_fires_webhook(db_session):
+async def test_post_residual_fix_audit_deferred_escalation_message_fires_webhook(
+    db_session,
+):
     """post_residual_fix_audit_deferred_escalation_message fires RESIDUAL_FIX_AUDIT_DEFERRED
     webhook with the correct payload fields so external subscribers can filter and act."""
     project = Project(name="Audit Defer Webhook", user_id="u1")
@@ -1356,7 +1595,9 @@ async def test_post_residual_fix_audit_deferred_escalation_message_fires_webhook
     await db_session.commit()
 
     dispatch_mock = AsyncMock()
-    with patch("app.notification_dispatch.dispatch_external_notification", new=dispatch_mock):
+    with patch(
+        "app.notification_dispatch.dispatch_external_notification", new=dispatch_mock
+    ):
         await post_residual_fix_audit_deferred_escalation_message(
             db_session,
             project.id,
@@ -1364,6 +1605,7 @@ async def test_post_residual_fix_audit_deferred_escalation_message_fires_webhook
             defer_count=_RESIDUAL_AUDIT_DEFER_ESCALATION_THRESHOLD,
         )
         import asyncio as _asyncio
+
         await _asyncio.sleep(0)
 
     dispatch_mock.assert_called_once()
@@ -1380,7 +1622,9 @@ async def test_post_residual_fix_audit_deferred_escalation_message_fires_webhook
 
 
 @pytest.mark.asyncio
-async def test_post_residual_fix_audit_deferred_escalation_threshold_from_runtime_config(db_session):
+async def test_post_residual_fix_audit_deferred_escalation_threshold_from_runtime_config(
+    db_session,
+):
     """The threshold stored in the webhook payload reflects any runtime_config override,
     not the hardcoded default, so operators can tune without a deploy."""
     project = Project(name="Audit Defer Config", user_id="u1")
@@ -1388,11 +1632,18 @@ async def test_post_residual_fix_audit_deferred_escalation_threshold_from_runtim
     await db_session.commit()
 
     custom_threshold = 10
-    fake_runtime_config = {"residual_audit_defer_escalation_threshold": custom_threshold}
+    fake_runtime_config = {
+        "residual_audit_defer_escalation_threshold": custom_threshold
+    }
 
     dispatch_mock = AsyncMock()
-    with patch("app.notification_dispatch.dispatch_external_notification", new=dispatch_mock), \
-         patch("app.shared_state.runtime_config", fake_runtime_config):
+    with (
+        patch(
+            "app.notification_dispatch.dispatch_external_notification",
+            new=dispatch_mock,
+        ),
+        patch("app.shared_state.runtime_config", fake_runtime_config),
+    ):
         msg = await post_residual_fix_audit_deferred_escalation_message(
             db_session,
             project.id,
@@ -1400,6 +1651,7 @@ async def test_post_residual_fix_audit_deferred_escalation_threshold_from_runtim
             defer_count=custom_threshold,
         )
         import asyncio as _asyncio
+
         await _asyncio.sleep(0)
 
     assert msg.context["threshold"] == custom_threshold

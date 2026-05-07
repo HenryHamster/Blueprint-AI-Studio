@@ -1,8 +1,9 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { X, MessageSquare, Send, Check, AlertTriangle, HelpCircle, Bug, StickyNote, ChevronDown, PlusCircle, Trash2, CheckSquare, ArrowDown, Reply } from 'lucide-react';
+import { X, MessageSquare, Send, Check, AlertTriangle, HelpCircle, Bug, StickyNote, ChevronDown, PlusCircle, Trash2, CheckSquare, ArrowDown, Reply, Settings } from 'lucide-react';
+import { auth } from '../firebase';
 import { apiFetch, API_BASE_URL } from '../api';
 import { parseTimestamp } from '../utils/time';
-import { classifySignalLevel, routineSummary } from './MessagesPanel.utils';
+import { routineSummary, effectiveSignal, loadEventPrefs, EVENT_PREFS_KEY, type EventPref } from './MessagesPanel.utils';
 
 interface ProjectMessage {
   id: string;
@@ -23,6 +24,30 @@ interface MessagesPanelProps {
   onClose: () => void;
   addToast: (message: string, type: 'success' | 'error' | 'info') => void;
   onMessageCountChange?: (count: number) => void;
+}
+
+type MessagesPanelPrefs = { version: 1; routineExpanded: boolean; showResolved: boolean };
+
+function messagesPanelPrefsKey(userId?: string | null): string {
+  return `messages_panel_prefs:${userId || 'anonymous'}`;
+}
+
+function loadMessagesPanelPrefs(userId?: string | null): MessagesPanelPrefs {
+  try {
+    const raw = localStorage.getItem(messagesPanelPrefsKey(userId));
+    if (!raw) return { version: 1, routineExpanded: false, showResolved: false };
+    const parsed = JSON.parse(raw) as Partial<MessagesPanelPrefs>;
+    if (parsed.version !== 1 || typeof parsed.routineExpanded !== 'boolean' || typeof parsed.showResolved !== 'boolean') {
+      return { version: 1, routineExpanded: false, showResolved: false };
+    }
+    return parsed as MessagesPanelPrefs;
+  } catch {
+    return { version: 1, routineExpanded: false, showResolved: false };
+  }
+}
+
+function saveMessagesPanelPrefs(userId: string | null | undefined, prefs: MessagesPanelPrefs): void {
+  try { localStorage.setItem(messagesPanelPrefsKey(userId), JSON.stringify(prefs)); } catch { /* ignore */ }
 }
 
 const TYPE_CONFIG: Record<string, { icon: typeof MessageSquare; color: string; label: string; bubbleBg: string }> = {
@@ -151,6 +176,7 @@ function ContextBadges({ context, fromType }: { context: Record<string, unknown>
   );
 }
 
+
 export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageCountChange }: MessagesPanelProps) {
   const [messages, setMessages] = useState<ProjectMessage[]>([]);
   const [loading, setLoading] = useState(true);
@@ -178,9 +204,12 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
   const prevMessageCountRef = useRef(0);
 
   // Collapsed resolved
-  const [showResolved, setShowResolved] = useState(false);
+  const [showResolved, setShowResolved] = useState(() => loadMessagesPanelPrefs(auth.currentUser?.email).showResolved);
   // Routine ops group collapsed by default
-  const [routineExpanded, setRoutineExpanded] = useState(false);
+  const [routineExpanded, setRoutineExpanded] = useState(() => loadMessagesPanelPrefs(auth.currentUser?.email).routineExpanded);
+  // Per-event-type mute/surface preferences
+  const [eventPrefs, setEventPrefs] = useState<Record<string, EventPref>>(loadEventPrefs);
+  const [showPrefsPanel, setShowPrefsPanel] = useState(false);
 
   // Stable ref for addToast
   const addToastRef = useRef(addToast);
@@ -208,9 +237,29 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
   const resolvedMessages = messages.filter(m => m.status === 'resolved');
   const openFeedbackMessages = openMessages.filter(m => m.message_type === 'FEEDBACK');
 
-  // Split open messages by signal level
-  const highSignalOpen = [...openMessages.filter(m => classifySignalLevel(m) === 'high')].sort(byTime);
-  const routineOpen = [...openMessages.filter(m => classifySignalLevel(m) === 'routine')].sort(byTime);
+  // Split open messages by signal level, respecting per-event-type prefs
+  const highSignalOpen = [...openMessages.filter(m => effectiveSignal(m, eventPrefs) === 'high')].sort(byTime);
+  const routineOpen = [...openMessages.filter(m => effectiveSignal(m, eventPrefs) === 'routine')].sort(byTime);
+
+  const allEventTypes = [...new Set([
+    ...Object.keys(eventPrefs),
+    ...openMessages.flatMap(m => { const et = m.context.event_type as string | undefined; return et ? [et] : []; }),
+  ])];
+  const mutedCount = Object.values(eventPrefs).filter(v => v === 'mute').length;
+
+  function updatePref(et: string, pref: EventPref) {
+    setEventPrefs(prev => {
+      const next = pref === 'routine'
+        ? Object.fromEntries(Object.entries(prev).filter(([k]) => k !== et)) as Record<string, EventPref>
+        : { ...prev, [et]: pref };
+      localStorage.setItem(EVENT_PREFS_KEY, JSON.stringify(next));
+      return next;
+    });
+  }
+
+  useEffect(() => {
+    saveMessagesPanelPrefs(auth.currentUser?.email, { version: 1, routineExpanded, showResolved });
+  }, [routineExpanded, showResolved]);
 
   // Resolved: show last 5 by default, toggle to show all
   const RECENT_RESOLVED = 5;
@@ -598,6 +647,11 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
               {openMessages.length}
             </span>
           )}
+          {mutedCount > 0 && (
+            <button onClick={() => setShowPrefsPanel(true)} className="text-[11px] text-neutral-600 hover:text-neutral-400 transition-colors">
+              {mutedCount} muted
+            </button>
+          )}
         </div>
         <div className="flex items-center gap-1">
           {openFeedbackMessages.length > 1 && (
@@ -613,6 +667,45 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
               {selectMode ? 'Cancel' : 'Select'}
             </button>
           )}
+          <div className="relative">
+            <button
+              onClick={() => setShowPrefsPanel(v => !v)}
+              title="Event type visibility"
+              className={`p-2 rounded-lg transition-colors border min-h-[36px] min-w-[36px] flex items-center justify-center ${showPrefsPanel ? 'text-neutral-300 bg-neutral-800 border-neutral-700' : 'text-neutral-500 hover:text-neutral-300 border-transparent'}`}
+            >
+              <Settings className="w-4 h-4" />
+            </button>
+            {showPrefsPanel && (
+              <>
+                <div className="fixed inset-0 z-40" onClick={() => setShowPrefsPanel(false)} />
+                <div className="absolute right-0 top-full mt-1 z-50 w-60 bg-neutral-900 border border-neutral-700 rounded-xl shadow-xl p-3 space-y-1.5">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-medium text-neutral-300">Event visibility</span>
+                    {Object.keys(eventPrefs).length > 0 && (
+                      <button onClick={() => { setEventPrefs({}); localStorage.removeItem(EVENT_PREFS_KEY); }} className="text-[10px] text-neutral-500 hover:text-red-400 transition-colors">Reset all</button>
+                    )}
+                  </div>
+                  {allEventTypes.length === 0 ? (
+                    <p className="text-[11px] text-neutral-600 py-1">No events loaded</p>
+                  ) : allEventTypes.map(et => {
+                    const pref = eventPrefs[et] ?? 'routine';
+                    return (
+                      <div key={et} className="flex items-center gap-1.5">
+                        <span className="text-[11px] text-neutral-400 truncate flex-1">{et.replace(/_/g, ' ')}</span>
+                        {(['surfaced', 'routine', 'mute'] as EventPref[]).map(p => (
+                          <button key={p} onClick={() => updatePref(et, p)}
+                            title={p}
+                            className={`text-[10px] px-1.5 py-0.5 rounded border transition-colors ${pref === p ? (p === 'mute' ? 'border-red-500/50 text-red-400 bg-red-500/10' : p === 'surfaced' ? 'border-amber-500/50 text-amber-400 bg-amber-500/10' : 'border-neutral-600 text-neutral-300 bg-neutral-800') : 'border-transparent text-neutral-600 hover:text-neutral-400'}`}>
+                            {p === 'surfaced' ? '↑' : p === 'mute' ? '✕' : '·'}
+                          </button>
+                        ))}
+                      </div>
+                    );
+                  })}
+                </div>
+              </>
+            )}
+          </div>
           <button onClick={onClose} className="bg-neutral-800 hover:bg-neutral-700 text-neutral-400 p-2 rounded-lg text-xs transition-colors border border-neutral-700 min-h-[36px] min-w-[36px] flex items-center justify-center">
             <X className="w-4 h-4" />
           </button>

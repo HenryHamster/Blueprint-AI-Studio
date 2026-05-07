@@ -1,4 +1,5 @@
 """Tests for the issue-to-implementation pipeline (issue_implementation.py)."""
+
 import uuid
 from datetime import timedelta
 from unittest.mock import AsyncMock, patch
@@ -77,10 +78,14 @@ def _default_config(**overrides) -> dict:
 
 async def _count_impl_tasks(session: AsyncSession, project_id: uuid.UUID) -> int:
     """Count issue-implementation tasks for the project."""
-    all_tasks = (await session.execute(
-        select(Task).where(Task.project_id == project_id)
-    )).scalars().all()
-    return sum(1 for t in all_tasks if (t.context or {}).get("issue_implementation") is True)
+    all_tasks = (
+        (await session.execute(select(Task).where(Task.project_id == project_id)))
+        .scalars()
+        .all()
+    )
+    return sum(
+        1 for t in all_tasks if (t.context or {}).get("issue_implementation") is True
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -96,14 +101,22 @@ async def test_rate_limit_blocks(db_session: AsyncSession):
     # Create 3 recent issue-implementation tasks (within the last hour)
     for n in (1, 2, 3):
         await _create_issue_impl_task(
-            db_session, project.id, issue_number=n, status=TaskStatus.COMPLETED,
+            db_session,
+            project.id,
+            issue_number=n,
+            status=TaskStatus.COMPLETED,
         )
     await db_session.flush()
 
-    with patch("app.issue_implementation.get_repo_installation_token", new_callable=AsyncMock) as mock_token, \
-         patch("app.issue_implementation.get_single_issue", new_callable=AsyncMock), \
-         patch("app.issue_implementation.get_issue_comments", new_callable=AsyncMock), \
-         patch("app.issue_implementation.create_issue_comment", new_callable=AsyncMock):
+    with (
+        patch(
+            "app.issue_implementation.get_repo_installation_token",
+            new_callable=AsyncMock,
+        ) as mock_token,
+        patch("app.issue_implementation.get_single_issue", new_callable=AsyncMock),
+        patch("app.issue_implementation.get_issue_comments", new_callable=AsyncMock),
+        patch("app.issue_implementation.create_issue_comment", new_callable=AsyncMock),
+    ):
         mock_token.return_value = "ghp_fake_token"
 
         await _handle_issue_implementation_inner(
@@ -127,14 +140,22 @@ async def test_duplicate_blocks(db_session: AsyncSession):
 
     # Existing active task for issue #42
     await _create_issue_impl_task(
-        db_session, project.id, issue_number=42, status=TaskStatus.IN_PROGRESS,
+        db_session,
+        project.id,
+        issue_number=42,
+        status=TaskStatus.IN_PROGRESS,
     )
     await db_session.flush()
 
-    with patch("app.issue_implementation.get_repo_installation_token", new_callable=AsyncMock) as mock_token, \
-         patch("app.issue_implementation.get_single_issue", new_callable=AsyncMock), \
-         patch("app.issue_implementation.get_issue_comments", new_callable=AsyncMock), \
-         patch("app.issue_implementation.create_issue_comment", new_callable=AsyncMock):
+    with (
+        patch(
+            "app.issue_implementation.get_repo_installation_token",
+            new_callable=AsyncMock,
+        ) as mock_token,
+        patch("app.issue_implementation.get_single_issue", new_callable=AsyncMock),
+        patch("app.issue_implementation.get_issue_comments", new_callable=AsyncMock),
+        patch("app.issue_implementation.create_issue_comment", new_callable=AsyncMock),
+    ):
         mock_token.return_value = "ghp_fake_token"
 
         await _handle_issue_implementation_inner(
@@ -159,14 +180,22 @@ async def test_concurrent_limit_blocks(db_session: AsyncSession):
     # Create 3 active issue-implementation tasks (different issue numbers)
     for n in (10, 20, 30):
         await _create_issue_impl_task(
-            db_session, project.id, issue_number=n, status=TaskStatus.IN_PROGRESS,
+            db_session,
+            project.id,
+            issue_number=n,
+            status=TaskStatus.IN_PROGRESS,
         )
     await db_session.flush()
 
-    with patch("app.issue_implementation.get_repo_installation_token", new_callable=AsyncMock) as mock_token, \
-         patch("app.issue_implementation.get_single_issue", new_callable=AsyncMock), \
-         patch("app.issue_implementation.get_issue_comments", new_callable=AsyncMock), \
-         patch("app.issue_implementation.create_issue_comment", new_callable=AsyncMock):
+    with (
+        patch(
+            "app.issue_implementation.get_repo_installation_token",
+            new_callable=AsyncMock,
+        ) as mock_token,
+        patch("app.issue_implementation.get_single_issue", new_callable=AsyncMock),
+        patch("app.issue_implementation.get_issue_comments", new_callable=AsyncMock),
+        patch("app.issue_implementation.create_issue_comment", new_callable=AsyncMock),
+    ):
         mock_token.return_value = "ghp_fake_token"
 
         await _handle_issue_implementation_inner(
@@ -198,11 +227,23 @@ async def test_spawns_task(db_session: AsyncSession):
         {"body": "Great idea!", "user": {"login": "alice"}},
     ]
 
-    with patch("app.issue_implementation.get_repo_installation_token", new_callable=AsyncMock) as mock_token, \
-         patch("app.issue_implementation.get_single_issue", new_callable=AsyncMock) as mock_issue, \
-         patch("app.issue_implementation.get_issue_comments", new_callable=AsyncMock) as mock_comments, \
-         patch("app.issue_implementation.create_issue_comment", new_callable=AsyncMock), \
-         patch("app.issue_implementation.post_issue_implementation_spawned_message", new_callable=AsyncMock) as mock_msg:
+    with (
+        patch(
+            "app.issue_implementation.get_repo_installation_token",
+            new_callable=AsyncMock,
+        ) as mock_token,
+        patch(
+            "app.issue_implementation.get_single_issue", new_callable=AsyncMock
+        ) as mock_issue,
+        patch(
+            "app.issue_implementation.get_issue_comments", new_callable=AsyncMock
+        ) as mock_comments,
+        patch("app.issue_implementation.create_issue_comment", new_callable=AsyncMock),
+        patch(
+            "app.issue_implementation.post_issue_implementation_spawned_message",
+            new_callable=AsyncMock,
+        ) as mock_msg,
+    ):
         mock_token.return_value = "ghp_fake_token"
         mock_issue.return_value = fake_issue
         mock_comments.return_value = fake_comments
@@ -221,9 +262,11 @@ async def test_spawns_task(db_session: AsyncSession):
     # Verify a task was created
     assert await _count_impl_tasks(db_session, project.id) == 1
 
-    tasks = (await db_session.execute(
-        select(Task).where(Task.project_id == project.id)
-    )).scalars().all()
+    tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
     task = tasks[0]
 
     assert task.project_id == project.id
@@ -258,8 +301,14 @@ async def test_extract_issue_context():
         {"body": "a comment", "user": {"login": "alice"}},
     ]
 
-    with patch("app.issue_implementation.get_single_issue", new_callable=AsyncMock) as mock_issue, \
-         patch("app.issue_implementation.get_issue_comments", new_callable=AsyncMock) as mock_comments:
+    with (
+        patch(
+            "app.issue_implementation.get_single_issue", new_callable=AsyncMock
+        ) as mock_issue,
+        patch(
+            "app.issue_implementation.get_issue_comments", new_callable=AsyncMock
+        ) as mock_comments,
+    ):
         mock_issue.return_value = fake_issue
         mock_comments.return_value = fake_comments
 
@@ -284,8 +333,14 @@ async def test_extract_issue_context_caps_body():
         "number": 1,
     }
 
-    with patch("app.issue_implementation.get_single_issue", new_callable=AsyncMock) as mock_issue, \
-         patch("app.issue_implementation.get_issue_comments", new_callable=AsyncMock) as mock_comments:
+    with (
+        patch(
+            "app.issue_implementation.get_single_issue", new_callable=AsyncMock
+        ) as mock_issue,
+        patch(
+            "app.issue_implementation.get_issue_comments", new_callable=AsyncMock
+        ) as mock_comments,
+    ):
         mock_issue.return_value = fake_issue
         mock_comments.return_value = []
 

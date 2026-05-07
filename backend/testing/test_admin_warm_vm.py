@@ -5,6 +5,7 @@ exposes which VMs are heartbeating, which task each is running, queued
 warm-pinned tasks per VM, and the warm-pin clear-rate (a leading indicator
 of warm-VM instability).
 """
+
 from datetime import datetime, timedelta
 
 import pytest
@@ -116,7 +117,9 @@ async def test_warm_vm_state_active_chain(client: AsyncClient, db_session):
         body = resp.json()
         # The endpoint surfaces our test VM at minimum (other tests may share
         # state, so we look it up by id rather than asserting count).
-        ours = next((v for v in body["active_vms"] if v["vm_instance_id"] == vm_id), None)
+        ours = next(
+            (v for v in body["active_vms"] if v["vm_instance_id"] == vm_id), None
+        )
         assert ours is not None, f"vm {vm_id} missing from {body['active_vms']}"
         assert ours["is_alive"] is True
         assert ours["last_heartbeat"] is not None
@@ -155,11 +158,15 @@ async def test_warm_vm_state_stale_heartbeat(client: AsyncClient, db_session):
     try:
         vm_id = "agent-vm-stale"
         # Heartbeat 5 minutes ago — well past the 90s freshness threshold.
-        _shared_state.vm_last_heartbeat[vm_id] = datetime.utcnow() - timedelta(minutes=5)
+        _shared_state.vm_last_heartbeat[vm_id] = datetime.utcnow() - timedelta(
+            minutes=5
+        )
 
         resp = await client.get("/api/admin/warm-vm-state")
         assert resp.status_code == 200
-        ours = next(v for v in resp.json()["active_vms"] if v["vm_instance_id"] == vm_id)
+        ours = next(
+            v for v in resp.json()["active_vms"] if v["vm_instance_id"] == vm_id
+        )
         assert ours["is_alive"] is False
         assert ours["last_heartbeat"] is not None
     finally:
@@ -181,7 +188,9 @@ async def test_warm_vm_state_requires_admin(override_get_session, db_session):
     app.dependency_overrides[get_current_user] = non_admin
     app.dependency_overrides[require_admin] = reject_admin
     try:
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
             resp = await ac.get("/api/admin/warm-vm-state")
         assert resp.status_code == 403
     finally:

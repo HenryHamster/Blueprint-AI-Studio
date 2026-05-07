@@ -10,6 +10,7 @@ Covers:
 
 Uses isolated in-memory SQLite DB (same pattern as test_pipeline_reliability.py).
 """
+
 import asyncio
 import pytest
 import pytest_asyncio
@@ -23,8 +24,14 @@ from sqlmodel import SQLModel, select
 
 import app.shared_state as _shared_state
 from app.models import (
-    Project, Task, TaskStatus, Artifact, ArtifactType,
-    Alert, AlertSeverity, DeploymentState,
+    Project,
+    Task,
+    TaskStatus,
+    Artifact,
+    ArtifactType,
+    Alert,
+    AlertSeverity,
+    DeploymentState,
 )
 from app.routers.agent_status import _check_daily_cost_ceiling
 from app.services import (
@@ -40,10 +47,13 @@ from sqlalchemy.dialects.sqlite.base import SQLiteTypeCompiler as _SQLiteTypeCom
 # ── SQLite JSONB compatibility ────────────────────────────────────────────────
 
 if not hasattr(_SQLiteTypeCompiler, "visit_JSONB"):
-    _SQLiteTypeCompiler.visit_JSONB = lambda self, type_, **kw: self.visit_JSON(type_, **kw)
+    _SQLiteTypeCompiler.visit_JSONB = lambda self, type_, **kw: self.visit_JSON(
+        type_, **kw
+    )
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
 
 def _naive_utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
@@ -54,6 +64,7 @@ def _naive_utc_ago(**kwargs) -> datetime:
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
+
 
 @pytest_asyncio.fixture()
 async def svc_db(mocker):
@@ -70,8 +81,11 @@ async def svc_db(mocker):
         await conn.run_sync(SQLModel.metadata.create_all)
 
     _Session = sessionmaker(
-        bind=_engine, class_=AsyncSession,
-        autocommit=False, autoflush=False, expire_on_commit=False,
+        bind=_engine,
+        class_=AsyncSession,
+        autocommit=False,
+        autoflush=False,
+        expire_on_commit=False,
     )
     mocker.patch("app.services.AsyncSessionLocal", _Session)
 
@@ -94,7 +108,9 @@ async def _make_project(session) -> Project:
     return project
 
 
-async def _make_completed_task(session, project_id, task_type="create", minutes_ago=30) -> Task:
+async def _make_completed_task(
+    session, project_id, task_type="create", minutes_ago=30
+) -> Task:
     """Create a COMPLETED, ORCHESTRATOR-created task of the given type."""
     task = Task(
         project_id=project_id,
@@ -112,6 +128,7 @@ async def _make_completed_task(session, project_id, task_type="create", minutes_
 # ══════════════════════════════════════════════════════════════════════════════
 # _recover_orphaned_tasks
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 @pytest.mark.asyncio
 async def test_orphan_recovery_attempts_github_lookup(svc_db, mocker):
@@ -215,7 +232,9 @@ async def test_orphan_recovery_github_token_failure_skips_gracefully(svc_db, moc
 
 
 @pytest.mark.asyncio
-async def test_orphan_recovery_creates_artifact_and_review_when_pr_found(svc_db, mocker):
+async def test_orphan_recovery_creates_artifact_and_review_when_pr_found(
+    svc_db, mocker
+):
     """When GitHub returns an open PR, a PR artifact and review child must be created."""
     project = await _make_project(svc_db)
     task = await _make_completed_task(svc_db, project.id, task_type="create")
@@ -247,12 +266,18 @@ async def test_orphan_recovery_creates_artifact_and_review_when_pr_found(svc_db,
     await _recover_orphaned_tasks()
 
     # Verify artifact was created
-    artifact = (await svc_db.execute(
-        select(Artifact).where(
-            Artifact.task_id == task.id,
-            Artifact.artifact_type == ArtifactType.PULL_REQUEST,
+    artifact = (
+        (
+            await svc_db.execute(
+                select(Artifact).where(
+                    Artifact.task_id == task.id,
+                    Artifact.artifact_type == ArtifactType.PULL_REQUEST,
+                )
+            )
         )
-    )).scalars().first()
+        .scalars()
+        .first()
+    )
     assert artifact is not None
     assert artifact.pr_url == pr_url
 
@@ -292,6 +317,7 @@ async def test_orphan_recovery_skips_too_recent_tasks(svc_db, mocker):
 # _persist_circuit_breakers
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 @pytest_asyncio.fixture()
 async def deploy_db(mocker):
     """Isolated in-memory SQLite DB for _persist_circuit_breakers / _persist_zone_health tests."""
@@ -304,8 +330,11 @@ async def deploy_db(mocker):
         await conn.run_sync(SQLModel.metadata.create_all)
 
     _Session = sessionmaker(
-        bind=_engine, class_=AsyncSession,
-        autocommit=False, autoflush=False, expire_on_commit=False,
+        bind=_engine,
+        class_=AsyncSession,
+        autocommit=False,
+        autoflush=False,
+        expire_on_commit=False,
     )
     mocker.patch("app.services.AsyncSessionLocal", _Session)
 
@@ -364,7 +393,9 @@ async def test_persist_circuit_breakers_saves_open_breaker(deploy_db, mocker):
 
 
 @pytest.mark.asyncio
-async def test_persist_circuit_breakers_prunes_closed_with_no_failures(deploy_db, mocker):
+async def test_persist_circuit_breakers_prunes_closed_with_no_failures(
+    deploy_db, mocker
+):
     """CLOSED breakers with failure_count=0 are default state and must NOT be persisted."""
     session, _Session = deploy_db
 
@@ -382,7 +413,10 @@ async def test_persist_circuit_breakers_prunes_closed_with_no_failures(deploy_db
 
     mock_state = MagicMock()
     mock_state.circuit_breaker_states = None
-    mocker.patch("app.deploy_health._get_deploy_state_for_update", AsyncMock(return_value=mock_state))
+    mocker.patch(
+        "app.deploy_health._get_deploy_state_for_update",
+        AsyncMock(return_value=mock_state),
+    )
 
     try:
         await _persist_circuit_breakers()
@@ -397,7 +431,9 @@ async def test_persist_circuit_breakers_prunes_closed_with_no_failures(deploy_db
 @pytest.mark.asyncio
 async def test_persist_circuit_breakers_handles_missing_deploy_state(deploy_db, mocker):
     """If _get_deploy_state_for_update returns None, the function must not crash."""
-    mocker.patch("app.deploy_health._get_deploy_state_for_update", AsyncMock(return_value=None))
+    mocker.patch(
+        "app.deploy_health._get_deploy_state_for_update", AsyncMock(return_value=None)
+    )
 
     saved_breakers = _shared_state.circuit_breakers.copy()
     _shared_state.circuit_breakers.clear()
@@ -423,6 +459,7 @@ async def test_persist_circuit_breakers_handles_missing_deploy_state(deploy_db, 
 # _persist_zone_health
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 @pytest.mark.asyncio
 async def test_persist_zone_health_serializes_datetimes(deploy_db, mocker):
     """Zone health datetime fields (e.g. cooldown_expires_at) must be ISO-stringified."""
@@ -439,15 +476,20 @@ async def test_persist_zone_health_serializes_datetimes(deploy_db, mocker):
     mocker.patch("app.compute._zone_health", fake_zone_health)
     # Provide a real non-async lock
     import threading
+
     mocker.patch("app.compute._zone_lock", threading.Lock())
 
     mocker.patch("app.deploy_health._pause_failure_streak", 2)
     from collections import deque as _deque
+
     mocker.patch("app.deploy_health._health_recovery_history", _deque([True], maxlen=5))
 
     mock_state = MagicMock()
     mock_state.zone_health_state = None
-    mocker.patch("app.deploy_health._get_deploy_state_for_update", AsyncMock(return_value=mock_state))
+    mocker.patch(
+        "app.deploy_health._get_deploy_state_for_update",
+        AsyncMock(return_value=mock_state),
+    )
 
     await _persist_zone_health()
 
@@ -465,17 +507,26 @@ async def test_persist_zone_health_includes_streak_counters(deploy_db, mocker):
     """Snapshot must include _pause_failure_streak and _health_recovery_history."""
     mocker.patch("app.compute._zone_health", {})
     import threading
+
     mocker.patch("app.compute._zone_lock", threading.Lock())
     mocker.patch("app.deploy_health._pause_failure_streak", 4)
     from collections import deque as _deque
-    mocker.patch("app.deploy_health._health_recovery_history", _deque([True, False, True], maxlen=5))
+
+    mocker.patch(
+        "app.deploy_health._health_recovery_history",
+        _deque([True, False, True], maxlen=5),
+    )
     from datetime import datetime as _dt
+
     resume_at = _dt(2026, 4, 17, 12, 0, 0)
     mocker.patch("app.deploy_health._last_auto_resume_at", resume_at)
 
     mock_state = MagicMock()
     mock_state.zone_health_state = None
-    mocker.patch("app.deploy_health._get_deploy_state_for_update", AsyncMock(return_value=mock_state))
+    mocker.patch(
+        "app.deploy_health._get_deploy_state_for_update",
+        AsyncMock(return_value=mock_state),
+    )
 
     await _persist_zone_health()
 
@@ -490,11 +541,15 @@ async def test_persist_zone_health_handles_missing_deploy_state(mocker):
     """If _get_deploy_state_for_update returns None, the function must not crash."""
     mocker.patch("app.compute._zone_health", {})
     import threading
+
     mocker.patch("app.compute._zone_lock", threading.Lock())
     mocker.patch("app.deploy_health._pause_failure_streak", 0)
     from collections import deque as _deque
+
     mocker.patch("app.deploy_health._health_recovery_history", _deque(maxlen=5))
-    mocker.patch("app.deploy_health._get_deploy_state_for_update", AsyncMock(return_value=None))
+    mocker.patch(
+        "app.deploy_health._get_deploy_state_for_update", AsyncMock(return_value=None)
+    )
     mocker.patch("app.services.AsyncSessionLocal", MagicMock())
 
     await _persist_zone_health()
@@ -518,8 +573,11 @@ async def gcp_db(mocker):
         await conn.run_sync(SQLModel.metadata.create_all)
 
     _Session = sessionmaker(
-        bind=_engine, class_=AsyncSession,
-        autocommit=False, autoflush=False, expire_on_commit=False,
+        bind=_engine,
+        class_=AsyncSession,
+        autocommit=False,
+        autoflush=False,
+        expire_on_commit=False,
     )
     mocker.patch("app.services.AsyncSessionLocal", _Session)
 
@@ -551,19 +609,29 @@ async def test_gcp_cleanup_passes_active_vm_ids_to_cleanup(gcp_db, mocker):
     Completed/failed task VMs should NOT be included."""
     project = await _make_project(gcp_db)
 
-    await _make_task_with_vm(gcp_db, project.id, TaskStatus.PROVISIONING, "agent-vm-prov-1")
-    await _make_task_with_vm(gcp_db, project.id, TaskStatus.IN_PROGRESS, "agent-vm-ip-1")
+    await _make_task_with_vm(
+        gcp_db, project.id, TaskStatus.PROVISIONING, "agent-vm-prov-1"
+    )
+    await _make_task_with_vm(
+        gcp_db, project.id, TaskStatus.IN_PROGRESS, "agent-vm-ip-1"
+    )
     # These should NOT be included
-    await _make_task_with_vm(gcp_db, project.id, TaskStatus.COMPLETED, "agent-vm-done-1")
+    await _make_task_with_vm(
+        gcp_db, project.id, TaskStatus.COMPLETED, "agent-vm-done-1"
+    )
     await _make_task_with_vm(gcp_db, project.id, TaskStatus.FAILED, "agent-vm-fail-1")
     # Task with no vm_instance_id
     await _make_task_with_vm(gcp_db, project.id, TaskStatus.IN_PROGRESS, None)
 
-    mock_cleanup = AsyncMock(return_value=MagicMock(deleted=[], failed=[], total_gcp_vms=2))
+    mock_cleanup = AsyncMock(
+        return_value=MagicMock(deleted=[], failed=[], total_gcp_vms=2)
+    )
     mocker.patch("app.compute.cleanup_orphaned_vms", mock_cleanup)
 
     # Exit after first cleanup iteration by raising CancelledError on sleep
-    mocker.patch("app.services.asyncio.sleep", AsyncMock(side_effect=asyncio.CancelledError))
+    mocker.patch(
+        "app.services.asyncio.sleep", AsyncMock(side_effect=asyncio.CancelledError)
+    )
 
     await gcp_cleanup_service()
 
@@ -582,8 +650,12 @@ async def test_gcp_cleanup_handles_api_failure_gracefully(gcp_db, mocker):
     project = await _make_project(gcp_db)
     await _make_task_with_vm(gcp_db, project.id, TaskStatus.IN_PROGRESS, "agent-vm-1")
 
-    mocker.patch("app.compute.cleanup_orphaned_vms", side_effect=RuntimeError("GCP API down"))
-    mocker.patch("app.services.asyncio.sleep", AsyncMock(side_effect=asyncio.CancelledError))
+    mocker.patch(
+        "app.compute.cleanup_orphaned_vms", side_effect=RuntimeError("GCP API down")
+    )
+    mocker.patch(
+        "app.services.asyncio.sleep", AsyncMock(side_effect=asyncio.CancelledError)
+    )
 
     # Should not raise
     await gcp_cleanup_service()
@@ -599,7 +671,9 @@ async def test_gcp_cleanup_handles_timeout_gracefully(gcp_db, mocker):
         raise asyncio.TimeoutError()
 
     mocker.patch("app.compute.cleanup_orphaned_vms", side_effect=_slow_cleanup)
-    mocker.patch("app.services.asyncio.sleep", AsyncMock(side_effect=asyncio.CancelledError))
+    mocker.patch(
+        "app.services.asyncio.sleep", AsyncMock(side_effect=asyncio.CancelledError)
+    )
 
     # Should not raise
     await gcp_cleanup_service()
@@ -615,8 +689,12 @@ async def test_gcp_cleanup_updates_vm_count_cache(gcp_db, mocker):
     mock_result.deleted = ["agent-vm-orphan"]
     mock_result.failed = []
     mock_result.total_gcp_vms = 5
-    mocker.patch("app.compute.cleanup_orphaned_vms", AsyncMock(return_value=mock_result))
-    mocker.patch("app.services.asyncio.sleep", AsyncMock(side_effect=asyncio.CancelledError))
+    mocker.patch(
+        "app.compute.cleanup_orphaned_vms", AsyncMock(return_value=mock_result)
+    )
+    mocker.patch(
+        "app.services.asyncio.sleep", AsyncMock(side_effect=asyncio.CancelledError)
+    )
 
     import app.main as _app_main
 
@@ -636,8 +714,12 @@ async def test_gcp_cleanup_logs_partial_failures(gcp_db, mocker):
     mock_result.deleted = []
     mock_result.failed = ["agent-vm-bad-1", "agent-vm-bad-2"]
     mock_result.total_gcp_vms = 3
-    mocker.patch("app.compute.cleanup_orphaned_vms", AsyncMock(return_value=mock_result))
-    mocker.patch("app.services.asyncio.sleep", AsyncMock(side_effect=asyncio.CancelledError))
+    mocker.patch(
+        "app.compute.cleanup_orphaned_vms", AsyncMock(return_value=mock_result)
+    )
+    mocker.patch(
+        "app.services.asyncio.sleep", AsyncMock(side_effect=asyncio.CancelledError)
+    )
 
     # Should not raise despite partial failures
     await gcp_cleanup_service()
@@ -660,14 +742,22 @@ async def cost_db(mocker):
         await conn.run_sync(SQLModel.metadata.create_all)
 
     _Session = sessionmaker(
-        bind=_engine, class_=AsyncSession,
-        autocommit=False, autoflush=False, expire_on_commit=False,
+        bind=_engine,
+        class_=AsyncSession,
+        autocommit=False,
+        autoflush=False,
+        expire_on_commit=False,
     )
 
     # Suppress broadcasts
-    mocker.patch("app.routers.agent_status.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent_status.broadcast_to_project", new_callable=AsyncMock
+    )
     # Suppress external notification dispatch (patching where defined so ensure_future gets a real coroutine)
-    mocker.patch("app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock)
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
 
     async with _Session() as session:
         yield session
@@ -677,7 +767,9 @@ async def cost_db(mocker):
     await _engine.dispose()
 
 
-def _make_cost_task(project_id, vm_secs=3600, is_spot=False, stopped_today=True) -> Task:
+def _make_cost_task(
+    project_id, vm_secs=3600, is_spot=False, stopped_today=True
+) -> Task:
     """Build a completed Task with cost data (not yet committed)."""
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -707,7 +799,11 @@ async def test_cost_ceiling_no_alert_when_disabled(cost_db, mocker):
     with patch.dict(_shared_state.runtime_config, {"daily_cost_ceiling_usd": 0}):
         await _check_daily_cost_ceiling(task, cost_db)
 
-    alert_count = (await cost_db.execute(select(Alert).where(Alert.project_id == project.id))).scalars().all()
+    alert_count = (
+        (await cost_db.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
     assert len(alert_count) == 0
 
 
@@ -726,7 +822,11 @@ async def test_cost_ceiling_no_alert_when_under_ceiling(cost_db, mocker):
     with patch.dict(_shared_state.runtime_config, {"daily_cost_ceiling_usd": 1.0}):
         await _check_daily_cost_ceiling(task, cost_db)
 
-    alerts = (await cost_db.execute(select(Alert).where(Alert.project_id == project.id))).scalars().all()
+    alerts = (
+        (await cost_db.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
     assert len(alerts) == 0
 
 
@@ -747,7 +847,11 @@ async def test_cost_ceiling_alert_created_when_over_ceiling(cost_db, mocker):
 
     # Function adds alert with session.add() but doesn't commit; flush to make it visible.
     await cost_db.flush()
-    alerts = (await cost_db.execute(select(Alert).where(Alert.project_id == project.id))).scalars().all()
+    alerts = (
+        (await cost_db.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
     assert len(alerts) == 1
     assert alerts[0].severity == AlertSeverity.WARNING
     assert alerts[0].title == "Daily cost ceiling exceeded"
@@ -779,7 +883,11 @@ async def test_cost_ceiling_deduplicates_alert(cost_db, mocker):
     with patch.dict(_shared_state.runtime_config, {"daily_cost_ceiling_usd": 0.01}):
         await _check_daily_cost_ceiling(task, cost_db)
 
-    alerts = (await cost_db.execute(select(Alert).where(Alert.project_id == project.id))).scalars().all()
+    alerts = (
+        (await cost_db.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
     # Still only the one pre-existing alert, no duplicate
     assert len(alerts) == 1
 
@@ -804,7 +912,11 @@ async def test_cost_ceiling_excludes_other_day_tasks(cost_db, mocker):
     with patch.dict(_shared_state.runtime_config, {"daily_cost_ceiling_usd": 0.05}):
         await _check_daily_cost_ceiling(today_task, cost_db)
 
-    alerts = (await cost_db.execute(select(Alert).where(Alert.project_id == project.id))).scalars().all()
+    alerts = (
+        (await cost_db.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
     assert len(alerts) == 0
 
 
@@ -824,7 +936,11 @@ async def test_cost_ceiling_spot_rate_used_for_spot_vms(cost_db, mocker):
     with patch.dict(_shared_state.runtime_config, {"daily_cost_ceiling_usd": 0.04}):
         await _check_daily_cost_ceiling(spot_task, cost_db)
 
-    alerts = (await cost_db.execute(select(Alert).where(Alert.project_id == project.id))).scalars().all()
+    alerts = (
+        (await cost_db.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
     assert len(alerts) == 0
 
 
@@ -855,7 +971,11 @@ async def test_cost_ceiling_includes_current_task_cost(cost_db, mocker):
 
     # Function adds alert with session.add() but doesn't commit; flush to make it visible.
     await cost_db.flush()
-    alerts = (await cost_db.execute(select(Alert).where(Alert.project_id == project.id))).scalars().all()
+    alerts = (
+        (await cost_db.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
     assert len(alerts) == 1
     assert "Daily cost ceiling exceeded" in alerts[0].title
 
@@ -872,7 +992,10 @@ async def test_cost_ceiling_budget_exceeded_webhook_enriched(cost_db, mocker):
     )
 
     task = _make_cost_task(project.id, vm_secs=3600, is_spot=False)
-    task.context = {"direction_text": "Improve pipeline throughput", "direction_id": "d-x"}
+    task.context = {
+        "direction_text": "Improve pipeline throughput",
+        "direction_id": "d-x",
+    }
     cost_db.add(task)
     await cost_db.commit()
     await cost_db.refresh(task)
@@ -898,14 +1021,20 @@ async def test_cost_ceiling_budget_exceeded_webhook_enriched(cost_db, mocker):
         f"expected ~$0.067 single-count, got {completed_cost} (possible double-count)"
     )
     # Internal consistency: sum of buckets should equal daily_total_usd.
-    assert abs(sum(payload["cost_by_failure_class"].values()) - payload["daily_total_usd"]) < 0.01
+    assert (
+        abs(sum(payload["cost_by_failure_class"].values()) - payload["daily_total_usd"])
+        < 0.01
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # _run_auto_archive_cycle — age cap + per-project count cap
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def _make_terminal_task(session, project_id, status=TaskStatus.COMPLETED, days_ago=0) -> Task:
+
+async def _make_terminal_task(
+    session, project_id, status=TaskStatus.COMPLETED, days_ago=0
+) -> Task:
     """Create a terminal task with updated_at set days_ago days in the past."""
     when = _naive_utc_ago(days=days_ago)
     task = Task(
@@ -929,10 +1058,13 @@ async def test_auto_archive_age_pass_archives_old_terminal(svc_db):
     old = await _make_terminal_task(svc_db, project.id, days_ago=30)
     fresh = await _make_terminal_task(svc_db, project.id, days_ago=1)
 
-    with patch.dict(_shared_state.runtime_config, {
-        "auto_archive_terminal_after_days": 7,
-        "auto_archive_max_terminal_tasks_per_project": 0,
-    }):
+    with patch.dict(
+        _shared_state.runtime_config,
+        {
+            "auto_archive_terminal_after_days": 7,
+            "auto_archive_max_terminal_tasks_per_project": 0,
+        },
+    ):
         result = await _run_auto_archive_cycle()
 
     assert result["age"] == 1
@@ -948,12 +1080,17 @@ async def test_auto_archive_count_pass_archives_beyond_cap(svc_db):
     """Per-project cap keeps the N most-recent terminal tasks; rest archive."""
     project = await _make_project(svc_db)
     # days_ago=0 is newest; days_ago=4 is oldest
-    tasks = [await _make_terminal_task(svc_db, project.id, days_ago=i) for i in range(5)]
+    tasks = [
+        await _make_terminal_task(svc_db, project.id, days_ago=i) for i in range(5)
+    ]
 
-    with patch.dict(_shared_state.runtime_config, {
-        "auto_archive_terminal_after_days": 90,
-        "auto_archive_max_terminal_tasks_per_project": 3,
-    }):
+    with patch.dict(
+        _shared_state.runtime_config,
+        {
+            "auto_archive_terminal_after_days": 90,
+            "auto_archive_max_terminal_tasks_per_project": 3,
+        },
+    ):
         result = await _run_auto_archive_cycle()
 
     assert result["age"] == 0
@@ -979,19 +1116,34 @@ async def test_auto_archive_count_pass_partitions_by_project(svc_db):
         await _make_terminal_task(svc_db, p1.id, days_ago=i)
     await _make_terminal_task(svc_db, p2.id, days_ago=0)
 
-    with patch.dict(_shared_state.runtime_config, {
-        "auto_archive_terminal_after_days": 90,
-        "auto_archive_max_terminal_tasks_per_project": 2,
-    }):
+    with patch.dict(
+        _shared_state.runtime_config,
+        {
+            "auto_archive_terminal_after_days": 90,
+            "auto_archive_max_terminal_tasks_per_project": 2,
+        },
+    ):
         result = await _run_auto_archive_cycle()
 
     assert result["count"] == 2
-    p1_archived = (await svc_db.execute(
-        select(Task).where(Task.project_id == p1.id, Task.archived.is_(True))
-    )).scalars().all()
-    p2_archived = (await svc_db.execute(
-        select(Task).where(Task.project_id == p2.id, Task.archived.is_(True))
-    )).scalars().all()
+    p1_archived = (
+        (
+            await svc_db.execute(
+                select(Task).where(Task.project_id == p1.id, Task.archived.is_(True))
+            )
+        )
+        .scalars()
+        .all()
+    )
+    p2_archived = (
+        (
+            await svc_db.execute(
+                select(Task).where(Task.project_id == p2.id, Task.archived.is_(True))
+            )
+        )
+        .scalars()
+        .all()
+    )
     assert len(p1_archived) == 2
     assert len(p2_archived) == 0
 
@@ -1003,17 +1155,22 @@ async def test_auto_archive_count_pass_disabled_when_cap_zero(svc_db):
     for i in range(10):
         await _make_terminal_task(svc_db, project.id, days_ago=i)
 
-    with patch.dict(_shared_state.runtime_config, {
-        "auto_archive_terminal_after_days": 90,
-        "auto_archive_max_terminal_tasks_per_project": 0,
-    }):
+    with patch.dict(
+        _shared_state.runtime_config,
+        {
+            "auto_archive_terminal_after_days": 90,
+            "auto_archive_max_terminal_tasks_per_project": 0,
+        },
+    ):
         result = await _run_auto_archive_cycle()
 
     assert result["age"] == 0
     assert result["count"] == 0
-    archived = (await svc_db.execute(
-        select(Task).where(Task.archived.is_(True))
-    )).scalars().all()
+    archived = (
+        (await svc_db.execute(select(Task).where(Task.archived.is_(True))))
+        .scalars()
+        .all()
+    )
     assert len(archived) == 0
 
 
@@ -1022,18 +1179,24 @@ async def test_auto_archive_skips_non_terminal(svc_db):
     """Non-terminal tasks (QUEUED, IN_PROGRESS) are never archived, regardless of age."""
     project = await _make_project(svc_db)
     queued = Task(
-        project_id=project.id, payloads=[{"type": "create"}],
-        status=TaskStatus.QUEUED, created_by="USER",
-        created_at=_naive_utc_ago(days=60), updated_at=_naive_utc_ago(days=60),
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.QUEUED,
+        created_by="USER",
+        created_at=_naive_utc_ago(days=60),
+        updated_at=_naive_utc_ago(days=60),
     )
     svc_db.add(queued)
     await svc_db.commit()
     await svc_db.refresh(queued)
 
-    with patch.dict(_shared_state.runtime_config, {
-        "auto_archive_terminal_after_days": 7,
-        "auto_archive_max_terminal_tasks_per_project": 1,
-    }):
+    with patch.dict(
+        _shared_state.runtime_config,
+        {
+            "auto_archive_terminal_after_days": 7,
+            "auto_archive_max_terminal_tasks_per_project": 1,
+        },
+    ):
         await _run_auto_archive_cycle()
 
     await svc_db.refresh(queued)
@@ -1071,13 +1234,17 @@ async def test_cleanup_old_images_deletes_oldest_beyond_keep(mocker):
     mocker.patch("google.cloud.compute_v1.ImagesClient", return_value=mock_client)
     mocker.patch.object(_compute, "LOCAL_MODE", False)
 
-    result = await _compute.cleanup_old_images(keep=2, family="blueprint-agent", project="my-proj")
+    result = await _compute.cleanup_old_images(
+        keep=2, family="blueprint-agent", project="my-proj"
+    )
 
     assert result["total"] == 5
     assert result["kept"] == 2
     assert result["deleted"] == 3
     assert result["failed"] == []
-    deleted_names = sorted([c.kwargs["image"] for c in mock_client.delete.call_args_list])
+    deleted_names = sorted(
+        [c.kwargs["image"] for c in mock_client.delete.call_args_list]
+    )
     assert deleted_names == ["img-2026-03-25", "img-2026-04-01", "img-2026-04-05"]
 
 
@@ -1087,15 +1254,19 @@ async def test_cleanup_old_images_noop_when_at_or_below_keep(mocker):
     from app import compute as _compute
 
     mock_client = MagicMock()
-    mock_client.list.return_value = iter([
-        _mk_image("img-1", "2026-04-15T10:00:00.000-00:00"),
-        _mk_image("img-2", "2026-04-10T10:00:00.000-00:00"),
-    ])
+    mock_client.list.return_value = iter(
+        [
+            _mk_image("img-1", "2026-04-15T10:00:00.000-00:00"),
+            _mk_image("img-2", "2026-04-10T10:00:00.000-00:00"),
+        ]
+    )
     mock_client.delete = MagicMock()
     mocker.patch("google.cloud.compute_v1.ImagesClient", return_value=mock_client)
     mocker.patch.object(_compute, "LOCAL_MODE", False)
 
-    result = await _compute.cleanup_old_images(keep=5, family="blueprint-agent", project="my-proj")
+    result = await _compute.cleanup_old_images(
+        keep=5, family="blueprint-agent", project="my-proj"
+    )
 
     assert result["deleted"] == 0
     assert result["kept"] == 2
@@ -1107,14 +1278,19 @@ async def test_cleanup_old_images_dry_run_does_not_delete(mocker):
     """dry_run=True must return the planned list but never call delete."""
     from app import compute as _compute
 
-    images = [_mk_image(f"img-{i}", f"2026-04-{i:02d}T10:00:00.000-00:00") for i in range(1, 6)]
+    images = [
+        _mk_image(f"img-{i}", f"2026-04-{i:02d}T10:00:00.000-00:00")
+        for i in range(1, 6)
+    ]
     mock_client = MagicMock()
     mock_client.list.return_value = iter(images)
     mock_client.delete = MagicMock()
     mocker.patch("google.cloud.compute_v1.ImagesClient", return_value=mock_client)
     mocker.patch.object(_compute, "LOCAL_MODE", False)
 
-    result = await _compute.cleanup_old_images(keep=2, family="blueprint-agent", project="my-proj", dry_run=True)
+    result = await _compute.cleanup_old_images(
+        keep=2, family="blueprint-agent", project="my-proj", dry_run=True
+    )
 
     assert result["dry_run"] is True
     assert result["deleted"] == 0
@@ -1128,7 +1304,9 @@ async def test_cleanup_old_images_rejects_keep_less_than_one():
     from app import compute as _compute
 
     with pytest.raises(ValueError):
-        await _compute.cleanup_old_images(keep=0, family="blueprint-agent", project="my-proj")
+        await _compute.cleanup_old_images(
+            keep=0, family="blueprint-agent", project="my-proj"
+        )
 
 
 @pytest.mark.asyncio
@@ -1136,7 +1314,10 @@ async def test_cleanup_old_images_collects_per_image_failures(mocker):
     """A delete failure on one image must not abort the sweep; failures are aggregated."""
     from app import compute as _compute
 
-    images = [_mk_image(f"img-{i}", f"2026-04-{i:02d}T10:00:00.000-00:00") for i in range(1, 6)]
+    images = [
+        _mk_image(f"img-{i}", f"2026-04-{i:02d}T10:00:00.000-00:00")
+        for i in range(1, 6)
+    ]
     mock_client = MagicMock()
     mock_client.list.return_value = iter(images)
 
@@ -1149,7 +1330,9 @@ async def test_cleanup_old_images_collects_per_image_failures(mocker):
     mocker.patch("google.cloud.compute_v1.ImagesClient", return_value=mock_client)
     mocker.patch.object(_compute, "LOCAL_MODE", False)
 
-    result = await _compute.cleanup_old_images(keep=2, family="blueprint-agent", project="my-proj")
+    result = await _compute.cleanup_old_images(
+        keep=2, family="blueprint-agent", project="my-proj"
+    )
 
     assert result["deleted"] == 2
     assert len(result["failed"]) == 1
@@ -1161,8 +1344,11 @@ async def test_cleanup_old_images_collects_per_image_failures(mocker):
 # _sweep_post_commit_pending — admin-cancel must be sticky (regression 2026-05-04)
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 @pytest.mark.asyncio
-async def test_post_commit_sweep_skips_cancelled_tasks_and_clears_pending(svc_db, mocker):
+async def test_post_commit_sweep_skips_cancelled_tasks_and_clears_pending(
+    svc_db, mocker
+):
     """Regression for incident 2026-05-04: an admin-cancelled plan task
     (b9456e05) was zombied 2 hours later when the post-commit sweep retried
     `_handle_plan_completion`. The handler unconditionally set status back to
@@ -1184,7 +1370,9 @@ async def test_post_commit_sweep_skips_cancelled_tasks_and_clears_pending(svc_db
                 "at": _naive_utcnow().isoformat(),
                 "reason": "post_commit_error",
                 "payload": {
-                    "task_id": "irrelevant", "status": "COMPLETED", "logs": "{}",
+                    "task_id": "irrelevant",
+                    "status": "COMPLETED",
+                    "logs": "{}",
                 },
                 "attempts": 1,
             }
@@ -1195,9 +1383,11 @@ async def test_post_commit_sweep_skips_cancelled_tasks_and_clears_pending(svc_db
     await svc_db.refresh(cancelled_task)
 
     # If `_process_post_commit` is called, the test fails — it should never run.
-    mock_process = AsyncMock(side_effect=AssertionError(
-        "_process_post_commit must not run on CANCELLED tasks"
-    ))
+    mock_process = AsyncMock(
+        side_effect=AssertionError(
+            "_process_post_commit must not run on CANCELLED tasks"
+        )
+    )
     mocker.patch("app.routers.agent_status._process_post_commit", mock_process)
 
     await _sweep_post_commit_pending()
@@ -1218,6 +1408,7 @@ async def test_post_commit_sweep_still_retries_completed_and_failed(svc_db, mock
     """The sweep continues to retry COMPLETED and FAILED tasks — only
     CANCELLED is special-cased."""
     import uuid as _uuid
+
     project = await _make_project(svc_db)
     completed_id = _uuid.uuid4()
     failed_id = _uuid.uuid4()
@@ -1228,12 +1419,18 @@ async def test_post_commit_sweep_still_retries_completed_and_failed(svc_db, mock
         status=TaskStatus.COMPLETED,
         created_by="ORCHESTRATOR",
         post_commit_pending=True,
-        context={"_post_commit_pending_meta": {
-            "at": _naive_utcnow().isoformat(),
-            "reason": "post_commit_error",
-            "payload": {"task_id": str(completed_id), "status": "COMPLETED", "logs": "{}"},
-            "attempts": 1,
-        }},
+        context={
+            "_post_commit_pending_meta": {
+                "at": _naive_utcnow().isoformat(),
+                "reason": "post_commit_error",
+                "payload": {
+                    "task_id": str(completed_id),
+                    "status": "COMPLETED",
+                    "logs": "{}",
+                },
+                "attempts": 1,
+            }
+        },
     )
     failed_task = Task(
         id=failed_id,
@@ -1242,12 +1439,18 @@ async def test_post_commit_sweep_still_retries_completed_and_failed(svc_db, mock
         status=TaskStatus.FAILED,
         created_by="ORCHESTRATOR",
         post_commit_pending=True,
-        context={"_post_commit_pending_meta": {
-            "at": _naive_utcnow().isoformat(),
-            "reason": "post_commit_error",
-            "payload": {"task_id": str(failed_id), "status": "FAILED", "logs": "{}"},
-            "attempts": 1,
-        }},
+        context={
+            "_post_commit_pending_meta": {
+                "at": _naive_utcnow().isoformat(),
+                "reason": "post_commit_error",
+                "payload": {
+                    "task_id": str(failed_id),
+                    "status": "FAILED",
+                    "logs": "{}",
+                },
+                "attempts": 1,
+            }
+        },
     )
     svc_db.add_all([completed_task, failed_task])
     await svc_db.commit()
@@ -1265,6 +1468,7 @@ async def test_post_commit_sweep_still_retries_completed_and_failed(svc_db, mock
 # _sweep_post_commit_pending — bump-failure isolation (regression 2026-05-07)
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 @pytest.mark.asyncio
 async def test_post_commit_sweep_bump_failure_does_not_poison_batch(svc_db, mocker):
     """When the attempt-bump fails on one task (e.g. row-lock contention →
@@ -1276,6 +1480,7 @@ async def test_post_commit_sweep_bump_failure_does_not_poison_batch(svc_db, mock
     cycle time per sweep (lock_timeout) → /health 503 → instance kill loop.
     """
     import uuid as _uuid
+
     project = await _make_project(svc_db)
     bad_id = _uuid.uuid4()
     good_id = _uuid.uuid4()
@@ -1286,12 +1491,18 @@ async def test_post_commit_sweep_bump_failure_does_not_poison_batch(svc_db, mock
         status=TaskStatus.COMPLETED,
         created_by="ORCHESTRATOR",
         post_commit_pending=True,
-        context={"_post_commit_pending_meta": {
-            "at": _naive_utcnow().isoformat(),
-            "reason": "post_commit_error",
-            "payload": {"task_id": str(bad_id), "status": "COMPLETED", "logs": "{}"},
-            "attempts": 4,
-        }},
+        context={
+            "_post_commit_pending_meta": {
+                "at": _naive_utcnow().isoformat(),
+                "reason": "post_commit_error",
+                "payload": {
+                    "task_id": str(bad_id),
+                    "status": "COMPLETED",
+                    "logs": "{}",
+                },
+                "attempts": 4,
+            }
+        },
     )
     good_task = Task(
         id=good_id,
@@ -1300,12 +1511,18 @@ async def test_post_commit_sweep_bump_failure_does_not_poison_batch(svc_db, mock
         status=TaskStatus.COMPLETED,
         created_by="ORCHESTRATOR",
         post_commit_pending=True,
-        context={"_post_commit_pending_meta": {
-            "at": _naive_utcnow().isoformat(),
-            "reason": "post_commit_error",
-            "payload": {"task_id": str(good_id), "status": "COMPLETED", "logs": "{}"},
-            "attempts": 1,
-        }},
+        context={
+            "_post_commit_pending_meta": {
+                "at": _naive_utcnow().isoformat(),
+                "reason": "post_commit_error",
+                "payload": {
+                    "task_id": str(good_id),
+                    "status": "COMPLETED",
+                    "logs": "{}",
+                },
+                "attempts": 1,
+            }
+        },
     )
     svc_db.add_all([bad_task, good_task])
     await svc_db.commit()
@@ -1319,13 +1536,16 @@ async def test_post_commit_sweep_bump_failure_does_not_poison_batch(svc_db, mock
         call_log.append(str(task_id))
         raise RuntimeError("simulated _process_post_commit retry exhaustion")
 
-    mocker.patch("app.routers.agent_status._process_post_commit", side_effect=fake_process)
+    mocker.patch(
+        "app.routers.agent_status._process_post_commit", side_effect=fake_process
+    )
 
     # Make ONLY the bad task's bump raise. flag_modified is called inside
     # the bump block before commit; raising there mimics the production
     # LockNotAvailableError on bump_session.commit() (single-point injection
     # since patching commit() across multiple async sessions is awkward).
     from sqlalchemy.orm import attributes as _sa_attrs
+
     real_flag_modified = _sa_attrs.flag_modified
 
     def fake_flag_modified(obj, key):
@@ -1344,7 +1564,9 @@ async def test_post_commit_sweep_bump_failure_does_not_poison_batch(svc_db, mock
 
     # Good task: bump succeeded → attempts advanced 1 → 2.
     await svc_db.refresh(good_task)
-    good_attempts = (good_task.context or {}).get("_post_commit_pending_meta", {}).get("attempts")
+    good_attempts = (
+        (good_task.context or {}).get("_post_commit_pending_meta", {}).get("attempts")
+    )
     assert good_attempts == 2, (
         f"good task's bump should have advanced attempts to 2, got {good_attempts}. "
         f"This means the bad task's bump failure poisoned the batch — the regression is back."
@@ -1353,5 +1575,7 @@ async def test_post_commit_sweep_bump_failure_does_not_poison_batch(svc_db, mock
     # Bad task: bump failed → attempts stays at 4. The sweep must NOT have
     # raised (otherwise the good task wouldn't have been processed).
     await svc_db.refresh(bad_task)
-    bad_attempts = (bad_task.context or {}).get("_post_commit_pending_meta", {}).get("attempts")
+    bad_attempts = (
+        (bad_task.context or {}).get("_post_commit_pending_meta", {}).get("attempts")
+    )
     assert bad_attempts == 4, f"bad task attempts should stay at 4, got {bad_attempts}"

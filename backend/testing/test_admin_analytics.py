@@ -1,4 +1,5 @@
 """Tests for admin_analytics endpoints."""
+
 import uuid
 from collections import deque
 from datetime import timedelta
@@ -28,12 +29,19 @@ def _reset_task_results():
 
 class TestFailingTaskTypes:
     @pytest.mark.asyncio
-    async def test_returns_gated_type_with_rate_and_samples(self, client: AsyncClient, _reset_task_results):
+    async def test_returns_gated_type_with_rate_and_samples(
+        self, client: AsyncClient, _reset_task_results
+    ):
         """Type with >=70% failure rate and >=3 samples appears in gated_types."""
         now = _utcnow()
         for i in range(5):
             shared_state.deploy_monitoring["task_results"].append(
-                ((now - timedelta(minutes=i)).isoformat(), "failure", "CODE_ERROR", "create")
+                (
+                    (now - timedelta(minutes=i)).isoformat(),
+                    "failure",
+                    "CODE_ERROR",
+                    "create",
+                )
             )
         shared_state.deploy_monitoring["task_results"].append(
             ((now - timedelta(minutes=6)).isoformat(), "success", None, "create")
@@ -52,7 +60,9 @@ class TestFailingTaskTypes:
         assert entry["threshold"] == 0.7
 
     @pytest.mark.asyncio
-    async def test_no_gated_types_returns_empty_list(self, client: AsyncClient, _reset_task_results):
+    async def test_no_gated_types_returns_empty_list(
+        self, client: AsyncClient, _reset_task_results
+    ):
         """All-success recent results produce an empty gated_types list."""
         now = _utcnow()
         for i in range(4):
@@ -66,12 +76,19 @@ class TestFailingTaskTypes:
         assert body["gated_types"] == []
 
     @pytest.mark.asyncio
-    async def test_insufficient_samples_not_gated(self, client: AsyncClient, _reset_task_results):
+    async def test_insufficient_samples_not_gated(
+        self, client: AsyncClient, _reset_task_results
+    ):
         """A type with only 2 samples (below n=3 floor) is not reported as gated."""
         now = _utcnow()
         for i in range(2):
             shared_state.deploy_monitoring["task_results"].append(
-                ((now - timedelta(minutes=i)).isoformat(), "failure", "CODE_ERROR", "fix")
+                (
+                    (now - timedelta(minutes=i)).isoformat(),
+                    "failure",
+                    "CODE_ERROR",
+                    "fix",
+                )
             )
 
         resp = await client.get("/api/admin/failing-task-types")
@@ -79,7 +96,9 @@ class TestFailingTaskTypes:
         assert resp.json()["gated_types"] == []
 
     @pytest.mark.asyncio
-    async def test_reports_anomaly_tightened_threshold(self, client: AsyncClient, _reset_task_results):
+    async def test_reports_anomaly_tightened_threshold(
+        self, client: AsyncClient, _reset_task_results
+    ):
         """When anomaly_adjustments.active is True the response reflects the tightened threshold."""
         shared_state.anomaly_adjustments["active"] = True
         shared_state.anomaly_adjustments["failure_gate_threshold"] = 0.6
@@ -91,12 +110,19 @@ class TestFailingTaskTypes:
         assert body["global_failure_threshold"] == 0.6
 
     @pytest.mark.asyncio
-    async def test_healthy_type_excluded_from_gated(self, client: AsyncClient, _reset_task_results):
+    async def test_healthy_type_excluded_from_gated(
+        self, client: AsyncClient, _reset_task_results
+    ):
         """When both a failing and a healthy type exist, only the failing one is gated."""
         now = _utcnow()
         for i in range(4):
             shared_state.deploy_monitoring["task_results"].append(
-                ((now - timedelta(minutes=i)).isoformat(), "failure", "CODE_ERROR", "create")
+                (
+                    (now - timedelta(minutes=i)).isoformat(),
+                    "failure",
+                    "CODE_ERROR",
+                    "create",
+                )
             )
         for i in range(4):
             shared_state.deploy_monitoring["task_results"].append(
@@ -112,7 +138,9 @@ class TestFailingTaskTypes:
 
 class TestTaskDurationStats:
     @pytest.mark.asyncio
-    async def test_scope_duration_stats_computes_p50_p90(self, client: AsyncClient, db_session):
+    async def test_scope_duration_stats_computes_p50_p90(
+        self, client: AsyncClient, db_session
+    ):
         """Completed tasks grouped by context scope get p50, p90, and sample_size."""
         project = make_project()
         db_session.add(project)
@@ -125,15 +153,17 @@ class TestTaskDurationStats:
         for scope, durs in durations_by_scope.items():
             for secs in durs:
                 completed_at = started_at + timedelta(seconds=secs)
-                db_session.add(make_task(
-                    project_id=project.id,
-                    status=TaskStatus.COMPLETED,
-                    payloads=[{"type": "create", "prompt": "x"}],
-                    context={"scope": scope},
-                    started_at=started_at,
-                    status_log=[{"s": "COMPLETED", "t": completed_at.isoformat()}],
-                    created_at=started_at,
-                ))
+                db_session.add(
+                    make_task(
+                        project_id=project.id,
+                        status=TaskStatus.COMPLETED,
+                        payloads=[{"type": "create", "prompt": "x"}],
+                        context={"scope": scope},
+                        started_at=started_at,
+                        status_log=[{"s": "COMPLETED", "t": completed_at.isoformat()}],
+                        created_at=started_at,
+                    )
+                )
         await db_session.commit()
 
         resp = await client.get("/api/admin/task-duration-stats")
@@ -151,7 +181,9 @@ class TestTaskDurationStats:
         assert scope_stats["large"]["p90_seconds"] in (280.0, 300.0)
 
     @pytest.mark.asyncio
-    async def test_scope_duration_stats_skips_insufficient_samples(self, client: AsyncClient, db_session):
+    async def test_scope_duration_stats_skips_insufficient_samples(
+        self, client: AsyncClient, db_session
+    ):
         """Scopes with fewer than 3 samples are omitted from scope_duration_stats."""
         project = make_project()
         db_session.add(project)
@@ -160,15 +192,17 @@ class TestTaskDurationStats:
         started_at = now - timedelta(hours=2)
         for secs in (10, 20):
             completed_at = started_at + timedelta(seconds=secs)
-            db_session.add(make_task(
-                project_id=project.id,
-                status=TaskStatus.COMPLETED,
-                payloads=[{"type": "create", "prompt": "x"}],
-                context={"scope": "medium"},
-                started_at=started_at,
-                status_log=[{"s": "COMPLETED", "t": completed_at.isoformat()}],
-                created_at=started_at,
-            ))
+            db_session.add(
+                make_task(
+                    project_id=project.id,
+                    status=TaskStatus.COMPLETED,
+                    payloads=[{"type": "create", "prompt": "x"}],
+                    context={"scope": "medium"},
+                    started_at=started_at,
+                    status_log=[{"s": "COMPLETED", "t": completed_at.isoformat()}],
+                    created_at=started_at,
+                )
+            )
         await db_session.commit()
 
         resp = await client.get("/api/admin/task-duration-stats")
@@ -188,17 +222,19 @@ class TestTaskDurationStats:
             vm_prov = started_at
             vm_start = vm_prov + timedelta(seconds=prov_s)
             vm_stop = vm_start + timedelta(seconds=exec_s)
-            db_session.add(make_task(
-                project_id=project.id,
-                status=TaskStatus.COMPLETED,
-                payloads=[{"type": "create", "prompt": "x"}],
-                started_at=started_at,
-                status_log=[{"s": "COMPLETED", "t": vm_stop.isoformat()}],
-                created_at=started_at,
-                vm_provisioned_at=vm_prov,
-                vm_started_at=vm_start,
-                vm_stopped_at=vm_stop,
-            ))
+            db_session.add(
+                make_task(
+                    project_id=project.id,
+                    status=TaskStatus.COMPLETED,
+                    payloads=[{"type": "create", "prompt": "x"}],
+                    started_at=started_at,
+                    status_log=[{"s": "COMPLETED", "t": vm_stop.isoformat()}],
+                    created_at=started_at,
+                    vm_provisioned_at=vm_prov,
+                    vm_started_at=vm_start,
+                    vm_stopped_at=vm_stop,
+                )
+            )
         await db_session.commit()
 
         resp = await client.get("/api/admin/task-duration-stats")
@@ -216,7 +252,9 @@ class TestOpenPrs:
         admin_analytics._open_prs_cache.clear()
 
     @staticmethod
-    def _github_pr(number: int, *, title: str = "Open PR", branch: str = "feature/test") -> dict:
+    def _github_pr(
+        number: int, *, title: str = "Open PR", branch: str = "feature/test"
+    ) -> dict:
         return {
             "number": number,
             "html_url": f"https://github.com/acme/widgets/pull/{number}",
@@ -270,7 +308,9 @@ class TestOpenPrs:
         prs_mock.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_falsy_token_returns_empty(self, client: AsyncClient, db_session, monkeypatch):
+    async def test_falsy_token_returns_empty(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
         project = make_project(github_owner="acme", github_repo="widgets")
         db_session.add(project)
         await db_session.commit()
@@ -290,7 +330,9 @@ class TestOpenPrs:
         prs_mock.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_unmatched_github_pr_is_orphaned(self, client: AsyncClient, db_session, monkeypatch):
+    async def test_unmatched_github_pr_is_orphaned(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
         project = make_project(github_owner="acme", github_repo="widgets")
         db_session.add(project)
         await db_session.commit()
@@ -298,7 +340,11 @@ class TestOpenPrs:
         from app import github, services
 
         token_mock = AsyncMock(return_value="token")
-        prs_mock = AsyncMock(return_value=[self._github_pr(17, title="Lonely PR", branch="lonely-branch")])
+        prs_mock = AsyncMock(
+            return_value=[
+                self._github_pr(17, title="Lonely PR", branch="lonely-branch")
+            ]
+        )
         monkeypatch.setattr(services, "_get_project_github_token", token_mock)
         monkeypatch.setattr(github, "get_open_pull_requests", prs_mock)
 
@@ -346,7 +392,11 @@ class TestOpenPrs:
         from app import github, services
 
         token_mock = AsyncMock(return_value="token")
-        prs_mock = AsyncMock(return_value=[self._github_pr(42, title="Monitor PR", branch="feature/monitor")])
+        prs_mock = AsyncMock(
+            return_value=[
+                self._github_pr(42, title="Monitor PR", branch="feature/monitor")
+            ]
+        )
         monkeypatch.setattr(services, "_get_project_github_token", token_mock)
         monkeypatch.setattr(github, "get_open_pull_requests", prs_mock)
 
@@ -365,7 +415,9 @@ class TestOpenPrs:
         ]
 
     @pytest.mark.asyncio
-    async def test_review_loop_pr_number_links_task(self, client: AsyncClient, db_session, monkeypatch):
+    async def test_review_loop_pr_number_links_task(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
         project = make_project(github_owner="acme", github_repo="widgets")
         task = make_task(
             project_id=project.id,
@@ -381,7 +433,11 @@ class TestOpenPrs:
         from app import github, services
 
         token_mock = AsyncMock(return_value="token")
-        prs_mock = AsyncMock(return_value=[self._github_pr(55, title="Review PR", branch="review-branch")])
+        prs_mock = AsyncMock(
+            return_value=[
+                self._github_pr(55, title="Review PR", branch="review-branch")
+            ]
+        )
         monkeypatch.setattr(services, "_get_project_github_token", token_mock)
         monkeypatch.setattr(github, "get_open_pull_requests", prs_mock)
 
@@ -400,7 +456,9 @@ class TestOpenPrs:
         ]
 
     @pytest.mark.asyncio
-    async def test_rollup_pr_number_links_task(self, client: AsyncClient, db_session, monkeypatch):
+    async def test_rollup_pr_number_links_task(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
         project = make_project(github_owner="acme", github_repo="widgets")
         task = make_task(
             project_id=project.id,
@@ -416,7 +474,11 @@ class TestOpenPrs:
         from app import github, services
 
         token_mock = AsyncMock(return_value="token")
-        prs_mock = AsyncMock(return_value=[self._github_pr(56, title="Rollup PR", branch="rollup-branch")])
+        prs_mock = AsyncMock(
+            return_value=[
+                self._github_pr(56, title="Rollup PR", branch="rollup-branch")
+            ]
+        )
         monkeypatch.setattr(services, "_get_project_github_token", token_mock)
         monkeypatch.setattr(github, "get_open_pull_requests", prs_mock)
 
@@ -435,11 +497,14 @@ class TestOpenPrs:
         ]
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("status", [
-        TaskStatus.COMPLETED,
-        TaskStatus.FAILED,
-        TaskStatus.CANCELLED,
-    ])
+    @pytest.mark.parametrize(
+        "status",
+        [
+            TaskStatus.COMPLETED,
+            TaskStatus.FAILED,
+            TaskStatus.CANCELLED,
+        ],
+    )
     async def test_terminal_status_task_is_excluded_even_when_pr_matches(
         self, client: AsyncClient, db_session, monkeypatch, status
     ):
@@ -531,7 +596,9 @@ class TestAdminRecordFailureResult:
         assert task_type == "review"
 
     @pytest.mark.asyncio
-    async def test_updates_direction_streak_for_non_infra_class(self, _reset_task_results):
+    async def test_updates_direction_streak_for_non_infra_class(
+        self, _reset_task_results
+    ):
         """When the task has a direction_id and failure_class is non-infra (e.g. CODE_ERROR),
         record_direction_result updates the direction failure streak."""
         from app.admin import _record_failure_result
@@ -560,7 +627,9 @@ class TestAdminRecordFailureResult:
         shared_state.direction_failure_streaks.pop(direction_id, None)
 
     @pytest.mark.asyncio
-    async def test_agent_timeout_does_not_touch_direction_streak(self, _reset_task_results):
+    async def test_agent_timeout_does_not_touch_direction_streak(
+        self, _reset_task_results
+    ):
         """Infra failures (AGENT_TIMEOUT, RATE_LIMIT, PROVISION_FAILURE, etc.)
         are platform noise — not the direction's fault. They must not
         increment any direction streak or hold flag. Deploy monitoring

@@ -7,6 +7,7 @@ the retry_after sweep (Step 5b), the _copy_analysis_artifacts_to_previous
 helper, and the dependent-task unblocking pass that runs after terminal
 failures.
 """
+
 import uuid as _uuid_mod
 import pytest
 import pytest_asyncio
@@ -21,8 +22,21 @@ from sqlmodel import SQLModel
 
 from sqlmodel import select as _select
 
-from app.models import Alert, AlertSeverity, Artifact, ArtifactType, Project, Task, TaskStatus
-from app.reaper import reaper_service, _copy_analysis_artifacts_to_previous, _reaper_skip_counts, _heartbeat_stale_cutoff
+from app.models import (
+    Alert,
+    AlertSeverity,
+    Artifact,
+    ArtifactType,
+    Project,
+    Task,
+    TaskStatus,
+)
+from app.reaper import (
+    reaper_service,
+    _copy_analysis_artifacts_to_previous,
+    _reaper_skip_counts,
+    _heartbeat_stale_cutoff,
+)
 from app.shared_state import runtime_config as _runtime_config
 
 
@@ -31,7 +45,9 @@ def test_heartbeat_stale_cutoff_respects_runtime_config_override():
     original = _runtime_config.get("heartbeat_stale_seconds_by_scope")
     try:
         _runtime_config["heartbeat_stale_seconds_by_scope"] = {
-            "small": 60, "medium": 120, "large": 900,
+            "small": 60,
+            "medium": 120,
+            "large": 900,
         }
 
         class _T:
@@ -53,6 +69,7 @@ def test_heartbeat_stale_cutoff_respects_runtime_config_override():
 
 def test_heartbeat_stale_cutoff_effort_floor_extends_small_scope_max_effort():
     """Effort floor (max=720s) extends small-scope cutoff (300s) when effort is higher."""
+
     class _T:
         context = {"scope": "small", "effort": "max"}
         first_payload = None
@@ -63,6 +80,7 @@ def test_heartbeat_stale_cutoff_effort_floor_extends_small_scope_max_effort():
 
 def test_heartbeat_stale_cutoff_effort_floor_does_not_weaken_large_scope():
     """Large-scope threshold (900s) wins over low-effort floor (300s)."""
+
     class _T:
         context = {"scope": "large", "effort": "low"}
         first_payload = None
@@ -73,6 +91,7 @@ def test_heartbeat_stale_cutoff_effort_floor_does_not_weaken_large_scope():
 
 def test_heartbeat_stale_cutoff_large_scope_default_is_900s():
     """Large-scope default threshold is 900s (15 minutes) for analysis-heavy tasks."""
+
     class _T:
         context = {"scope": "large"}
         first_payload = None
@@ -83,6 +102,7 @@ def test_heartbeat_stale_cutoff_large_scope_default_is_900s():
 
 def test_heartbeat_stale_cutoff_effort_from_task_type_fallback():
     """Effort falls back to the Anthropic settings bag when not explicit in context."""
+
     class _T:
         context = {"scope": "small", "type": "strategic_review"}
         first_payload = None
@@ -91,7 +111,9 @@ def test_heartbeat_stale_cutoff_effort_from_task_type_fallback():
     original_overrides = _runtime_config.get("task_type_provider_overrides")
     original_defaults = _runtime_config.get("provider_settings_defaults")
     try:
-        _runtime_config["provider_settings_defaults"] = {"anthropic": {"effort": "medium"}}
+        _runtime_config["provider_settings_defaults"] = {
+            "anthropic": {"effort": "medium"}
+        }
         _runtime_config["task_type_provider_overrides"] = {
             "strategic_review": {"anthropic": {"effort": "max"}},
         }
@@ -112,6 +134,7 @@ def test_heartbeat_stale_cutoff_effort_from_task_type_fallback():
 
 def test_heartbeat_stale_cutoff_unknown_effort_uses_scope_threshold():
     """Unknown effort string falls back to scope-only behavior."""
+
     class _T:
         context = {"scope": "small", "effort": "unknown_effort_xyz"}
         first_payload = None
@@ -136,8 +159,11 @@ async def reaper_db(mocker):
         await conn.run_sync(SQLModel.metadata.create_all)
 
     Session = sessionmaker(
-        bind=engine, class_=AsyncSession,
-        autocommit=False, autoflush=False, expire_on_commit=False,
+        bind=engine,
+        class_=AsyncSession,
+        autocommit=False,
+        autoflush=False,
+        expire_on_commit=False,
     )
     mocker.patch("app.reaper.AsyncSessionLocal", Session)
 
@@ -158,10 +184,14 @@ def stop_after_one_cycle(mocker):
 @pytest.fixture()
 def reaper_side_effects(mocker):
     """Neutralize the side-effecting deferred imports used by reaper_service."""
-    mocker.patch("app.main._ensure_vm_deleted", new_callable=AsyncMock, return_value=True)
+    mocker.patch(
+        "app.main._ensure_vm_deleted", new_callable=AsyncMock, return_value=True
+    )
     mocker.patch("app.main.delete_agent_vm", return_value=True)
     mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
-    mocker.patch("app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock)
+    mocker.patch(
+        "app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock
+    )
     mocker.patch("app.reaper._capture_serial_for_vm", return_value=None)
     mocker.patch("app.reaper.record_zone_failure")
     # Disable infra-recovery resurrection so FAILED tasks stay FAILED where asserted.
@@ -248,7 +278,9 @@ async def test_provisioning_absolute_15min_timeout_reaped(
     await _run_reaper_once()
     await reaper_db.refresh(t)
 
-    assert t.status != TaskStatus.PROVISIONING, "reaper must flip the task off PROVISIONING"
+    assert t.status != TaskStatus.PROVISIONING, (
+        "reaper must flip the task off PROVISIONING"
+    )
 
 
 @pytest.mark.asyncio
@@ -579,7 +611,9 @@ async def test_rate_limit_requeue_blacklists_account_and_skips_budget(
     assert t.attempt_count == 1, "rate-limit path must not burn attempt budget"
     assert "acct-123" in (ctx.get("blacklisted_accounts") or [])
     assert "max_plan_account_id" not in ctx
-    assert t.retry_after_until is None, "stale retry_after must be cleared on rate-limit requeue"
+    assert t.retry_after_until is None, (
+        "stale retry_after must be cleared on rate-limit requeue"
+    )
     assert "provision_failures" not in ctx
     # reaper plumbs structured rate-limit signal (retry_after_seconds, kind) through;
     # on a generic Anthropic rate-limit message, the signal resolves to the baseline
@@ -663,7 +697,10 @@ async def test_external_api_retry_delay_escalates_with_attempt_count(
         last_heartbeat=datetime.utcnow() - timedelta(minutes=7),
         # Non-transient error (DNS resolution) routes through the long
         # [5,15,30,60] sequence rather than the adaptive-5xx fast path.
-        context={"last_error": "name resolution failed for api.github.com", "pr_number": 42},
+        context={
+            "last_error": "name resolution failed for api.github.com",
+            "pr_number": 42,
+        },
     )
     reaper_db.add(t)
     await reaper_db.commit()
@@ -675,11 +712,15 @@ async def test_external_api_retry_delay_escalates_with_attempt_count(
     assert t.status == TaskStatus.QUEUED
     assert t.attempt_count == 3
     # Audit W1: retry_after_until is a column.
-    assert t.retry_after_until is not None, "retry_after must be set after a reaped retry"
+    assert t.retry_after_until is not None, (
+        "retry_after must be set after a reaped retry"
+    )
     delay_min = (t.retry_after_until - before).total_seconds() / 60
     # 30 min * 0.9 = 27 min. Without escalation (e.g. general backoff at attempt 3)
     # we'd see min(2^2, 15) * 0.9 = 3.6 min, so the 20-min floor confirms escalation.
-    assert 20 <= delay_min <= 29, f"expected ~27min (30min * 0.9 jitter), got {delay_min:.1f}min"
+    assert 20 <= delay_min <= 29, (
+        f"expected ~27min (30min * 0.9 jitter), got {delay_min:.1f}min"
+    )
 
 
 @pytest.mark.asyncio
@@ -805,7 +846,13 @@ async def test_general_exponential_backoff_capped_at_15_minutes(
     # to 1.0 so the asserted delay is exactly the cap value.
     mocker.patch.dict(
         "app.reaper._runtime_config",
-        {"retry_budgets_by_class": {"AGENT_TIMEOUT": 10, "CODE_ERROR": 2, "EXTERNAL_API": 4}},
+        {
+            "retry_budgets_by_class": {
+                "AGENT_TIMEOUT": 10,
+                "CODE_ERROR": 2,
+                "EXTERNAL_API": 4,
+            }
+        },
     )
     mocker.patch("app.reaper.random.uniform", return_value=1.0)
 
@@ -829,7 +876,9 @@ async def test_general_exponential_backoff_capped_at_15_minutes(
     assert t.status == TaskStatus.QUEUED
     assert t.attempt_count == 6
     # Audit W1: retry_after_until is a column.
-    assert t.retry_after_until is not None, "retry_after must be set after a reaped retry"
+    assert t.retry_after_until is not None, (
+        "retry_after must be set after a reaped retry"
+    )
     delay_min = (t.retry_after_until - before).total_seconds() / 60
     # Cap: min(2^5, 15) = 15. Without the cap it would be 32 → clamped at 30 by set_retry_after.
     assert 14 <= delay_min <= 16, f"expected 15-min cap, got {delay_min:.1f}min"
@@ -1069,13 +1118,15 @@ async def test_step4_all_failed_children_triggers_requeue(
     await reaper_db.refresh(parent)
 
     for _ in range(2):
-        reaper_db.add(Task(
-            project_id=project.id,
-            parent_task_id=parent.id,
-            payloads=[{"type": "create"}],
-            status=TaskStatus.FAILED,
-            context={"failure_category": "CODE_ERROR"},
-        ))
+        reaper_db.add(
+            Task(
+                project_id=project.id,
+                parent_task_id=parent.id,
+                payloads=[{"type": "create"}],
+                status=TaskStatus.FAILED,
+                context={"failure_category": "CODE_ERROR"},
+            )
+        )
     await reaper_db.commit()
 
     await _run_reaper_once()
@@ -1107,20 +1158,24 @@ async def test_step4_mixed_active_children_not_rescued(
     await reaper_db.commit()
     await reaper_db.refresh(parent)
 
-    reaper_db.add(Task(
-        project_id=project.id,
-        parent_task_id=parent.id,
-        payloads=[{"type": "create"}],
-        status=TaskStatus.FAILED,
-    ))
-    reaper_db.add(Task(
-        project_id=project.id,
-        parent_task_id=parent.id,
-        payloads=[{"type": "create"}],
-        status=TaskStatus.IN_PROGRESS,
-        vm_instance_id=None,  # avoid Step 2 orphan reap
-        last_heartbeat=datetime.utcnow(),
-    ))
+    reaper_db.add(
+        Task(
+            project_id=project.id,
+            parent_task_id=parent.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.FAILED,
+        )
+    )
+    reaper_db.add(
+        Task(
+            project_id=project.id,
+            parent_task_id=parent.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.IN_PROGRESS,
+            vm_instance_id=None,  # avoid Step 2 orphan reap
+            last_heartbeat=datetime.utcnow(),
+        )
+    )
     await reaper_db.commit()
 
     await _run_reaper_once()
@@ -1149,20 +1204,32 @@ async def test_step4_diagnostic_summarizes_failure_categories(
     await reaper_db.commit()
     await reaper_db.refresh(parent)
 
-    reaper_db.add(Task(
-        project_id=project.id, parent_task_id=parent.id,
-        payloads=[{"type": "create"}], status=TaskStatus.FAILED,
-        context={"failure_category": "CODE_ERROR"},
-    ))
-    reaper_db.add(Task(
-        project_id=project.id, parent_task_id=parent.id,
-        payloads=[{"type": "create"}], status=TaskStatus.FAILED,
-        context={"failure_category": "AGENT_TIMEOUT"},
-    ))
-    reaper_db.add(Task(
-        project_id=project.id, parent_task_id=parent.id,
-        payloads=[{"type": "create"}], status=TaskStatus.CANCELLED,
-    ))
+    reaper_db.add(
+        Task(
+            project_id=project.id,
+            parent_task_id=parent.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.FAILED,
+            context={"failure_category": "CODE_ERROR"},
+        )
+    )
+    reaper_db.add(
+        Task(
+            project_id=project.id,
+            parent_task_id=parent.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.FAILED,
+            context={"failure_category": "AGENT_TIMEOUT"},
+        )
+    )
+    reaper_db.add(
+        Task(
+            project_id=project.id,
+            parent_task_id=parent.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.CANCELLED,
+        )
+    )
     await reaper_db.commit()
 
     await _run_reaper_once()
@@ -1202,14 +1269,19 @@ async def test_retry_after_sweep_preserves_valid(
 
 # ── skip_locked / force-lock mechanism (Step 2) ──────────────────────────
 
+
 class _FakeResult:
     """Minimal stand-in for an async result so scalars().all()/first() work."""
+
     def __init__(self, items):
         self._items = list(items)
+
     def scalars(self):
         return self
+
     def all(self):
         return list(self._items)
+
     def first(self):
         return self._items[0] if self._items else None
 
@@ -1238,7 +1310,9 @@ def _install_lock_filter(mocker, skip_ids, *, force_raises=False):
                 # Skip-locked contention: filter out skip_ids
                 result = await real_execute(self, stmt, *args, **kwargs)
                 rows = result.scalars().all()
-                return _FakeResult([r for r in rows if getattr(r, "id", None) not in skip_ids])
+                return _FakeResult(
+                    [r for r in rows if getattr(r, "id", None) not in skip_ids]
+                )
             # Second for_update call is the force-lock query.
             if force_raises:
                 raise RuntimeError("force-lock timeout")
@@ -1272,7 +1346,9 @@ async def test_skip_locked_adds_to_skip_counts(
     await reaper_db.refresh(t)
 
     assert clean_skip_counts.get(t.id) == 1
-    assert t.status == TaskStatus.IN_PROGRESS, "skipped task must not be reaped this cycle"
+    assert t.status == TaskStatus.IN_PROGRESS, (
+        "skipped task must not be reaped this cycle"
+    )
 
 
 @pytest.mark.asyncio
@@ -1298,9 +1374,13 @@ async def test_force_lock_triggered_after_five_skips(
     await _run_reaper_once()
     await reaper_db.refresh(t)
 
-    assert state["for_update_calls"] >= 2, "force-lock query must run after skip threshold"
+    assert state["for_update_calls"] >= 2, (
+        "force-lock query must run after skip threshold"
+    )
     assert t.id not in clean_skip_counts, "skip count cleared once force-lock succeeds"
-    assert t.status == TaskStatus.QUEUED, "force-locked task gets reaped/retried like any orphan"
+    assert t.status == TaskStatus.QUEUED, (
+        "force-locked task gets reaped/retried like any orphan"
+    )
     assert t.attempt_count == 1
 
 
@@ -1328,7 +1408,9 @@ async def test_force_lock_timeout_resets_skip_count(
     await reaper_db.refresh(t)
 
     assert t.id not in clean_skip_counts, "force-lock failure must pop skip-count entry"
-    assert t.status == TaskStatus.IN_PROGRESS, "task remains active until next cycle succeeds"
+    assert t.status == TaskStatus.IN_PROGRESS, (
+        "task remains active until next cycle succeeds"
+    )
 
 
 @pytest.mark.asyncio
@@ -1367,11 +1449,15 @@ async def test_force_lock_reverify_healthy_preserves_skip_count(
                 # Step-2 skip-locked: filter out the task so it's not acquired
                 result = await real_execute(self, stmt, *args, **kwargs)
                 rows = result.scalars().all()
-                return _FakeResult([r for r in rows if getattr(r, "id", None) != task_id])
+                return _FakeResult(
+                    [r for r in rows if getattr(r, "id", None) != task_id]
+                )
             # Force-lock query: refresh the heartbeat first, then acquire
             await real_execute(
                 self,
-                _sa_update(Task).where(Task.id == task_id).values(last_heartbeat=fresh_ts),
+                _sa_update(Task)
+                .where(Task.id == task_id)
+                .values(last_heartbeat=fresh_ts),
             )
             await self.commit()
             result = await real_execute(self, stmt, *args, **kwargs)
@@ -1426,7 +1512,9 @@ async def test_heartbeat_refresh_between_step1_and_step2_not_reaped(
             refreshed["done"] = True
             await real_execute(
                 self,
-                _sa_update(Task).where(Task.id == task_id).values(last_heartbeat=fresh_ts),
+                _sa_update(Task)
+                .where(Task.id == task_id)
+                .values(last_heartbeat=fresh_ts),
             )
             await self.commit()
         return await real_execute(self, stmt, *args, **kwargs)
@@ -1436,9 +1524,15 @@ async def test_heartbeat_refresh_between_step1_and_step2_not_reaped(
     await _run_reaper_once()
     await reaper_db.refresh(t)
 
-    assert refreshed["done"], "for_update lock query must have fired (race injection point)"
-    assert t.status == TaskStatus.IN_PROGRESS, "task with refreshed heartbeat must NOT be reaped"
-    assert t.attempt_count == 0, "retry budget must not be burned when Step 2 re-verify skips reap"
+    assert refreshed["done"], (
+        "for_update lock query must have fired (race injection point)"
+    )
+    assert t.status == TaskStatus.IN_PROGRESS, (
+        "task with refreshed heartbeat must NOT be reaped"
+    )
+    assert t.attempt_count == 0, (
+        "retry budget must not be burned when Step 2 re-verify skips reap"
+    )
     assert t.last_heartbeat == fresh_ts, "refreshed heartbeat must be persisted"
 
 
@@ -1491,9 +1585,11 @@ async def test_step6_tier1_info_alert_fires_past_threshold(
     await _run_reaper_once()
     await reaper_db.refresh(t)
 
-    alerts = (await reaper_db.execute(
-        _select(Alert).where(Alert.task_id == t.id)
-    )).scalars().all()
+    alerts = (
+        (await reaper_db.execute(_select(Alert).where(Alert.task_id == t.id)))
+        .scalars()
+        .all()
+    )
     assert len(alerts) == 1
     assert alerts[0].severity == AlertSeverity.INFO
     assert "stalled-task" in alerts[0].title
@@ -1522,9 +1618,11 @@ async def test_step6_tier2_warning_skips_tier1_when_age_exceeds_3x(
     await _run_reaper_once()
     await reaper_db.refresh(t)
 
-    alerts = (await reaper_db.execute(
-        _select(Alert).where(Alert.task_id == t.id)
-    )).scalars().all()
+    alerts = (
+        (await reaper_db.execute(_select(Alert).where(Alert.task_id == t.id)))
+        .scalars()
+        .all()
+    )
     assert len(alerts) == 1
     assert alerts[0].severity == AlertSeverity.WARNING
     assert "tier 2" in alerts[0].message
@@ -1550,9 +1648,11 @@ async def test_step6_duplicate_tier1_suppressed(
 
     await _run_reaper_once()
 
-    alerts = (await reaper_db.execute(
-        _select(Alert).where(Alert.task_id == t.id)
-    )).scalars().all()
+    alerts = (
+        (await reaper_db.execute(_select(Alert).where(Alert.task_id == t.id)))
+        .scalars()
+        .all()
+    )
     assert alerts == []
 
 
@@ -1575,9 +1675,11 @@ async def test_step6_requires_approval_sets_likely_cause(
 
     await _run_reaper_once()
 
-    alerts = (await reaper_db.execute(
-        _select(Alert).where(Alert.task_id == t.id)
-    )).scalars().all()
+    alerts = (
+        (await reaper_db.execute(_select(Alert).where(Alert.task_id == t.id)))
+        .scalars()
+        .all()
+    )
     assert len(alerts) == 1
     assert "awaiting operator approval" in alerts[0].message
 
@@ -1598,9 +1700,7 @@ async def test_terminal_failure_non_provision_finalization(
     broadcast_mock = mocker.patch(
         "app.broadcast.broadcast_to_project", new_callable=AsyncMock
     )
-    record_mock = mocker.patch(
-        "app.routers.agent_status.record_task_result"
-    )
+    record_mock = mocker.patch("app.routers.agent_status.record_task_result")
 
     project = await _make_project(reaper_db)
     # latest_status_message falls through classify_failure to CODE_ERROR (budget=2),
@@ -1630,8 +1730,13 @@ async def test_terminal_failure_non_provision_finalization(
     # rewrites latest_status_message, so the persisted class reflects the
     # refreshed signal rather than the budget-triggering class.
     persisted = ctx.get("failure_category")
-    assert persisted in {"CODE_ERROR", "AGENT_TIMEOUT", "EXTERNAL_API", "RATE_LIMIT", "PROVISION_FAILURE"}, \
-        f"failure_category must be persisted as a canonical class, got {persisted!r}"
+    assert persisted in {
+        "CODE_ERROR",
+        "AGENT_TIMEOUT",
+        "EXTERNAL_API",
+        "RATE_LIMIT",
+        "PROVISION_FAILURE",
+    }, f"failure_category must be persisted as a canonical class, got {persisted!r}"
 
     alert_mock.assert_awaited()
     assert alert_mock.await_args.args[0].id == t.id
@@ -1639,26 +1744,28 @@ async def test_terminal_failure_non_provision_finalization(
     record_mock.assert_called_once()
     kwargs = record_mock.call_args.kwargs
     assert kwargs["success"] is False
-    assert kwargs["failure_class"] == persisted, \
+    assert kwargs["failure_class"] == persisted, (
         "record_task_result must receive the same class that was persisted"
+    )
     assert kwargs["task_id"] == str(t.id)
     assert kwargs["task_type"] == "create"
 
     failed_broadcasts = [
-        call for call in broadcast_mock.await_args_list
+        call
+        for call in broadcast_mock.await_args_list
         if call.args[1] == "task_updated"
         and call.args[2].get("status") == TaskStatus.FAILED
     ]
     assert failed_broadcasts, "expected a task_updated broadcast with status FAILED"
     assert failed_broadcasts[-1].args[0] == str(project.id)
 
-    msg = (t.latest_status_message or "")
+    msg = t.latest_status_message or ""
     # fail_reason ("failed after {N} retries ({class})") is passed through
     # str.capitalize(), which lowercases everything after the first char.
-    assert "code_error" in msg.lower(), \
+    assert "code_error" in msg.lower(), (
         f"status message should carry budget class: {msg!r}"
-    assert "2 retries" in msg, \
-        f"status message should carry retry count: {msg!r}"
+    )
+    assert "2 retries" in msg, f"status message should carry retry count: {msg!r}"
 
 
 @pytest.mark.asyncio
@@ -1862,12 +1969,14 @@ async def test_step5_parent_task_not_resurrected(
     await reaper_db.commit()
     await reaper_db.refresh(parent)
 
-    reaper_db.add(Task(
-        project_id=project.id,
-        parent_task_id=parent.id,
-        payloads=[{"type": "create"}],
-        status=TaskStatus.COMPLETED,
-    ))
+    reaper_db.add(
+        Task(
+            project_id=project.id,
+            parent_task_id=parent.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.COMPLETED,
+        )
+    )
     await reaper_db.commit()
 
     await _run_reaper_once()
@@ -1895,9 +2004,11 @@ async def test_step5_resurrection_creates_info_alert(
 
     await _run_reaper_once()
 
-    alerts = (await reaper_db.execute(
-        _select(Alert).where(Alert.task_id == t.id)
-    )).scalars().all()
+    alerts = (
+        (await reaper_db.execute(_select(Alert).where(Alert.task_id == t.id)))
+        .scalars()
+        .all()
+    )
     assert len(alerts) == 1
     assert alerts[0].severity == AlertSeverity.INFO
     assert "PROVISION_FAILURE" in (alerts[0].message or "")
@@ -2016,7 +2127,9 @@ def _install_dep_unblock_compat(mocker, blocked_id_str: str):
                     class _FakeScalars:
                         def all(self_2):
                             return matching
+
                     return _FakeScalars()
+
             return _FakeResult()
 
         def add(self, obj):
@@ -2267,9 +2380,15 @@ def test_transient_5xx_patterns_constant():
     from app.reaper import _TRANSIENT_5XX_PATTERNS
 
     assert isinstance(_TRANSIENT_5XX_PATTERNS, frozenset)
-    for p in ("http 502", "http 503", "http 504",
-              "502 bad gateway", "503 service", "504 gateway",
-              "server error"):
+    for p in (
+        "http 502",
+        "http 503",
+        "http 504",
+        "502 bad gateway",
+        "503 service",
+        "504 gateway",
+        "server error",
+    ):
         assert p in _TRANSIENT_5XX_PATTERNS
 
 
@@ -2311,7 +2430,8 @@ async def test_orphan_sweep_preserves_hold_when_direction_live(reaper_db):
     _ss.direction_failure_streaks.clear()
     live_did = "d-" + _uuid_mod.uuid4().hex[:8]
     project = Project(
-        name="has-live-dir", user_id="user1",
+        name="has-live-dir",
+        user_id="user1",
         directions=[{"id": live_did, "status": "active", "text": "do the thing"}],
     )
     reaper_db.add(project)
@@ -2341,7 +2461,8 @@ async def test_orphan_sweep_clears_hold_when_direction_completed(reaper_db):
     _ss.direction_failure_streaks.clear()
     completed_did = "d-" + _uuid_mod.uuid4().hex[:8]
     project = Project(
-        name="has-completed-dir", user_id="user1",
+        name="has-completed-dir",
+        user_id="user1",
         directions=[{"id": completed_did, "status": "completed", "text": "done"}],
     )
     reaper_db.add(project)
@@ -2467,7 +2588,9 @@ async def test_sweep_stale_residual_cases_resolves_stale_remediating(reaper_db, 
     from app.models import ResidualRemediationCase, ResidualCaseStatus
     from app.reaper import _sweep_stale_residual_cases
 
-    event_mock = mocker.patch("app.notification_dispatch.post_event_message", new_callable=AsyncMock)
+    event_mock = mocker.patch(
+        "app.notification_dispatch.post_event_message", new_callable=AsyncMock
+    )
     _fc._residual_closed_fingerprints.clear()
     stale_case = ResidualRemediationCase(
         fingerprint="remediating-old-fp",
@@ -2497,7 +2620,9 @@ async def test_sweep_stale_residual_cases_keeps_recent_remediating(reaper_db, mo
     from app.models import ResidualRemediationCase, ResidualCaseStatus
     from app.reaper import _sweep_stale_residual_cases
 
-    event_mock = mocker.patch("app.notification_dispatch.post_event_message", new_callable=AsyncMock)
+    event_mock = mocker.patch(
+        "app.notification_dispatch.post_event_message", new_callable=AsyncMock
+    )
     _fc._residual_closed_fingerprints.clear()
     recent_case = ResidualRemediationCase(
         fingerprint="remediating-recent-fp",
@@ -2538,11 +2663,13 @@ async def test_task_has_open_pr_finds_artifact(reaper_db):
     await reaper_db.commit()
     await reaper_db.refresh(t)
 
-    reaper_db.add(Artifact(
-        task_id=t.id,
-        artifact_type=ArtifactType.PULL_REQUEST,
-        pr_url="https://github.com/HenryHamster/BlueprintAIStudio/pull/2903",
-    ))
+    reaper_db.add(
+        Artifact(
+            task_id=t.id,
+            artifact_type=ArtifactType.PULL_REQUEST,
+            pr_url="https://github.com/HenryHamster/BlueprintAIStudio/pull/2903",
+        )
+    )
     await reaper_db.commit()
 
     has_pr, pr_num = await _task_has_open_pr(t, reaper_db)
@@ -2585,11 +2712,13 @@ async def test_task_has_open_pr_malformed_url(reaper_db):
     await reaper_db.commit()
     await reaper_db.refresh(t)
 
-    reaper_db.add(Artifact(
-        task_id=t.id,
-        artifact_type=ArtifactType.PULL_REQUEST,
-        pr_url="not-a-url",
-    ))
+    reaper_db.add(
+        Artifact(
+            task_id=t.id,
+            artifact_type=ArtifactType.PULL_REQUEST,
+            pr_url="not-a-url",
+        )
+    )
     await reaper_db.commit()
 
     has_pr, pr_num = await _task_has_open_pr(t, reaper_db)
@@ -2605,7 +2734,11 @@ async def test_reap_with_open_pr_goes_to_evaluating(
     The retry-from-scratch path would collide with the already-pushed branch;
     the review pipeline should adjudicate the PR instead.
     """
-    mocker.patch("app.review_pipeline._spawn_pipeline_task", new_callable=AsyncMock, return_value=(None, True))
+    mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        new_callable=AsyncMock,
+        return_value=(None, True),
+    )
 
     project = await _make_project(reaper_db)
     t = Task(
@@ -2621,11 +2754,13 @@ async def test_reap_with_open_pr_goes_to_evaluating(
     await reaper_db.commit()
     await reaper_db.refresh(t)
 
-    reaper_db.add(Artifact(
-        task_id=t.id,
-        artifact_type=ArtifactType.PULL_REQUEST,
-        pr_url="https://github.com/HenryHamster/BlueprintAIStudio/pull/1234",
-    ))
+    reaper_db.add(
+        Artifact(
+            task_id=t.id,
+            artifact_type=ArtifactType.PULL_REQUEST,
+            pr_url="https://github.com/HenryHamster/BlueprintAIStudio/pull/1234",
+        )
+    )
     await reaper_db.commit()
 
     await _run_reaper_once()
@@ -2672,7 +2807,11 @@ async def test_terminal_reap_with_open_pr_goes_to_evaluating(
     The review pipeline gets a chance to adjudicate; the 6h EVALUATING timeout
     and 16-iter review-fix cap guarantee eventual termination.
     """
-    mocker.patch("app.review_pipeline._spawn_pipeline_task", new_callable=AsyncMock, return_value=(None, True))
+    mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        new_callable=AsyncMock,
+        return_value=(None, True),
+    )
 
     project = await _make_project(reaper_db)
     t = Task(
@@ -2688,11 +2827,13 @@ async def test_terminal_reap_with_open_pr_goes_to_evaluating(
     await reaper_db.commit()
     await reaper_db.refresh(t)
 
-    reaper_db.add(Artifact(
-        task_id=t.id,
-        artifact_type=ArtifactType.PULL_REQUEST,
-        pr_url="https://github.com/HenryHamster/BlueprintAIStudio/pull/9999",
-    ))
+    reaper_db.add(
+        Artifact(
+            task_id=t.id,
+            artifact_type=ArtifactType.PULL_REQUEST,
+            pr_url="https://github.com/HenryHamster/BlueprintAIStudio/pull/9999",
+        )
+    )
     await reaper_db.commit()
 
     await _run_reaper_once()
@@ -2764,11 +2905,13 @@ async def test_reap_with_closed_unmerged_pr_marks_failed(
     await reaper_db.commit()
     await reaper_db.refresh(t)
 
-    reaper_db.add(Artifact(
-        task_id=t.id,
-        artifact_type=ArtifactType.PULL_REQUEST,
-        pr_url="https://github.com/HenryHamster/BlueprintAIStudio/pull/3444",
-    ))
+    reaper_db.add(
+        Artifact(
+            task_id=t.id,
+            artifact_type=ArtifactType.PULL_REQUEST,
+            pr_url="https://github.com/HenryHamster/BlueprintAIStudio/pull/3444",
+        )
+    )
     await reaper_db.commit()
 
     await _run_reaper_once()
@@ -2818,11 +2961,13 @@ async def test_reap_with_merged_pr_marks_completed(
     await reaper_db.commit()
     await reaper_db.refresh(t)
 
-    reaper_db.add(Artifact(
-        task_id=t.id,
-        artifact_type=ArtifactType.PULL_REQUEST,
-        pr_url="https://github.com/HenryHamster/BlueprintAIStudio/pull/5555",
-    ))
+    reaper_db.add(
+        Artifact(
+            task_id=t.id,
+            artifact_type=ArtifactType.PULL_REQUEST,
+            pr_url="https://github.com/HenryHamster/BlueprintAIStudio/pull/5555",
+        )
+    )
     await reaper_db.commit()
 
     await _run_reaper_once()
@@ -2871,11 +3016,13 @@ async def test_reap_with_open_pr_via_gh_check_goes_to_evaluating(
     await reaper_db.commit()
     await reaper_db.refresh(t)
 
-    reaper_db.add(Artifact(
-        task_id=t.id,
-        artifact_type=ArtifactType.PULL_REQUEST,
-        pr_url="https://github.com/HenryHamster/BlueprintAIStudio/pull/7777",
-    ))
+    reaper_db.add(
+        Artifact(
+            task_id=t.id,
+            artifact_type=ArtifactType.PULL_REQUEST,
+            pr_url="https://github.com/HenryHamster/BlueprintAIStudio/pull/7777",
+        )
+    )
     await reaper_db.commit()
 
     await _run_reaper_once()
@@ -2918,11 +3065,13 @@ async def test_reap_with_pr_falls_back_to_open_when_gh_unreachable(
     await reaper_db.commit()
     await reaper_db.refresh(t)
 
-    reaper_db.add(Artifact(
-        task_id=t.id,
-        artifact_type=ArtifactType.PULL_REQUEST,
-        pr_url="https://github.com/HenryHamster/BlueprintAIStudio/pull/8888",
-    ))
+    reaper_db.add(
+        Artifact(
+            task_id=t.id,
+            artifact_type=ArtifactType.PULL_REQUEST,
+            pr_url="https://github.com/HenryHamster/BlueprintAIStudio/pull/8888",
+        )
+    )
     await reaper_db.commit()
 
     await _run_reaper_once()
@@ -2987,10 +3136,12 @@ async def test_serial_log_survives_requeue_via_context_copy(
 
 # ── Reaper liveness telemetry ─────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_get_reaper_stats_initial_state_reports_never_completed():
     """Before any cycle runs, stats report cycles=0 and age=-1 sentinel."""
     import app.reaper as _reaper_mod
+
     _reaper_mod._reaper_cycles_completed_count = 0
     _reaper_mod._reaper_last_cycle_completed_at = None
     stats = _reaper_mod.get_reaper_stats()
@@ -3010,6 +3161,7 @@ async def test_get_reaper_stats_reports_recent_age_after_cycle(
     heartbeat staleness.
     """
     import app.reaper as _reaper_mod
+
     _reaper_mod._reaper_cycles_completed_count = 0
     _reaper_mod._reaper_last_cycle_completed_at = None
 

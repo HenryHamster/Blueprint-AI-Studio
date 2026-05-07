@@ -34,6 +34,7 @@ At pause/resume transitions, hooks call :func:`mark_paused` and
 :func:`accumulate_pause_window`. See ``routers/deploy.py`` and
 ``deploy_health.py`` for the entry points.
 """
+
 from __future__ import annotations
 
 from datetime import datetime
@@ -70,7 +71,9 @@ def total_paused_seconds(state: DeploymentState) -> float:
 
     This is the value timers consume — sum of both kinds.
     """
-    closed = (state.total_manual_paused_seconds or 0.0) + (state.total_auto_paused_seconds or 0.0)
+    closed = (state.total_manual_paused_seconds or 0.0) + (
+        state.total_auto_paused_seconds or 0.0
+    )
     return closed + _in_flight_seconds(state)
 
 
@@ -133,8 +136,12 @@ def accumulate_pause_window(state: DeploymentState) -> None:
     delta = _in_flight_seconds(state)
     kind = state.paused_kind or PAUSED_KIND_AUTO
     if kind == PAUSED_KIND_MANUAL:
-        state.total_manual_paused_seconds = (state.total_manual_paused_seconds or 0.0) + delta
+        state.total_manual_paused_seconds = (
+            state.total_manual_paused_seconds or 0.0
+        ) + delta
     else:
-        state.total_auto_paused_seconds = (state.total_auto_paused_seconds or 0.0) + delta
+        state.total_auto_paused_seconds = (
+            state.total_auto_paused_seconds or 0.0
+        ) + delta
     state.paused_at = None
     state.paused_kind = None

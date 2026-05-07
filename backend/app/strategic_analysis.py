@@ -2,6 +2,7 @@
 
 Extracted from app.strategic_completion to keep that module under its line ceiling.
 """
+
 from app.time_utils import _utcnow
 
 # Directions whose cost_per_merged_pr exceeds median * multiplier are flagged
@@ -23,6 +24,7 @@ def _build_outcome_evaluation(project, cycle_history: list | None = None) -> dic
     from app.research_context import _parse_research_context  # noqa: PLC0415
     from app.direction_metrics import _compute_difficulty_index  # noqa: PLC0415
     from app.routers.admin_analytics import ON_DEMAND_RATE  # noqa: PLC0415
+
     vision = project.vision or {}
     directions = project.directions or []
     now_iso = _utcnow().isoformat()
@@ -42,7 +44,9 @@ def _build_outcome_evaluation(project, cycle_history: list | None = None) -> dic
 
         # Filter history to evaluation window
         if window_from:
-            window_history = [h for h in history if (h.get("timestamp") or "") >= window_from]
+            window_history = [
+                h for h in history if (h.get("timestamp") or "") >= window_from
+            ]
         else:
             window_history = list(history)
 
@@ -87,7 +91,11 @@ def _build_outcome_evaluation(project, cycle_history: list | None = None) -> dic
             for h in window_history
             if h.get("avg_time_to_merge_hours") is not None
         ]
-        avg_time_to_merge_hours = round(sum(merge_time_values) / len(merge_time_values), 2) if merge_time_values else None
+        avg_time_to_merge_hours = (
+            round(sum(merge_time_values) / len(merge_time_values), 2)
+            if merge_time_values
+            else None
+        )
 
         outcome: dict = {
             "id": d.get("id"),
@@ -121,14 +129,18 @@ def _build_outcome_evaluation(project, cycle_history: list | None = None) -> dic
         if estimated_cost_usd > 0:
             outcome["estimated_cost_usd"] = estimated_cost_usd
             if autonomous_merged > 0:
-                outcome["cost_per_merged_pr"] = round(estimated_cost_usd / autonomous_merged, 2)
+                outcome["cost_per_merged_pr"] = round(
+                    estimated_cost_usd / autonomous_merged, 2
+                )
         if isinstance(cost_budget_usd, (int, float)) and cost_budget_usd > 0:
             outcome["cost_budget_usd"] = cost_budget_usd
             if estimated_cost_usd > cost_budget_usd:
                 outcome["budget_exceeded"] = True
         if rejected > 0:
             total_prs = merged + rejected
-            outcome["operator_rejection_rate"] = round(rejected / total_prs, 2) if total_prs > 0 else None
+            outcome["operator_rejection_rate"] = (
+                round(rejected / total_prs, 2) if total_prs > 0 else None
+            )
         if confirmed:
             outcome["confirmed"] = confirmed[:15]
         if proposed:
@@ -138,15 +150,23 @@ def _build_outcome_evaluation(project, cycle_history: list | None = None) -> dic
         raw_evidence = d.get("recent_findings_evidence") or []
         if raw_evidence:
             from app.research_context import filter_direction_evidence  # noqa: PLC0415
+
             filtered = filter_direction_evidence(ctx, raw_evidence)
             if filtered:
                 outcome["evidence"] = filtered
         # Include lifetime totals for context
         lifetime_cycles = len(history) + (agg.get("total_cycles") or 0)
-        lifetime_merged = sum(h.get("prs_merged", 0) for h in history) + (agg.get("total_prs_merged") or 0)
-        lifetime_rejected = sum(h.get("prs_rejected", 0) for h in history) + (agg.get("total_prs_rejected") or 0)
+        lifetime_merged = sum(h.get("prs_merged", 0) for h in history) + (
+            agg.get("total_prs_merged") or 0
+        )
+        lifetime_rejected = sum(h.get("prs_rejected", 0) for h in history) + (
+            agg.get("total_prs_rejected") or 0
+        )
         if lifetime_cycles > cycles:
-            lifetime_entry: dict = {"cycles": lifetime_cycles, "merged": lifetime_merged}
+            lifetime_entry: dict = {
+                "cycles": lifetime_cycles,
+                "merged": lifetime_merged,
+            }
             if lifetime_rejected > 0:
                 lifetime_entry["rejected"] = lifetime_rejected
             outcome["lifetime"] = lifetime_entry
@@ -162,7 +182,9 @@ def _build_outcome_evaluation(project, cycle_history: list | None = None) -> dic
         total_typed = sum(type_dist.values())
         if type_dist:
             outcome["type_distribution"] = type_dist
-            outcome["product_ratio"] = round(product_weighted / total_typed, 2) if total_typed > 0 else None
+            outcome["product_ratio"] = (
+                round(product_weighted / total_typed, 2) if total_typed > 0 else None
+            )
 
         # Aggregate scope_breakdown + escalation_outcomes across window cycles.
         # Compact form: per-scope {created, merged, failed}; escalation_outcomes
@@ -184,7 +206,9 @@ def _build_outcome_evaluation(project, cycle_history: list | None = None) -> dic
                 bucket["created"] += created_n
                 bucket["merged"] += merged_n
                 bucket["failed"] += failed_n
-            for esc_key, esc_stats in (cycle_entry.get("escalation_outcomes") or {}).items():
+            for esc_key, esc_stats in (
+                cycle_entry.get("escalation_outcomes") or {}
+            ).items():
                 if not isinstance(esc_stats, dict):
                     continue
                 eb = escalations_agg.setdefault(
@@ -200,12 +224,18 @@ def _build_outcome_evaluation(project, cycle_history: list | None = None) -> dic
 
         # Per-direction trend (first-half vs second-half merge rate over window history)
         if cycles >= 4:
-            sorted_window = sorted(window_history, key=lambda h: h.get("timestamp") or "")
+            sorted_window = sorted(
+                window_history, key=lambda h: h.get("timestamp") or ""
+            )
             mid_d = len(sorted_window) // 2
             first_d = sorted_window[:mid_d]
             second_d = sorted_window[mid_d:]
-            first_rate_d = sum(h.get("prs_merged", 0) for h in first_d) / max(len(first_d), 1)
-            second_rate_d = sum(h.get("prs_merged", 0) for h in second_d) / max(len(second_d), 1)
+            first_rate_d = sum(h.get("prs_merged", 0) for h in first_d) / max(
+                len(first_d), 1
+            )
+            second_rate_d = sum(h.get("prs_merged", 0) for h in second_d) / max(
+                len(second_d), 1
+            )
             if second_rate_d > first_rate_d * 1.3:
                 outcome["trend"] = "improving"
             elif second_rate_d < first_rate_d * 0.7:
@@ -217,8 +247,12 @@ def _build_outcome_evaluation(project, cycle_history: list | None = None) -> dic
         if lifetime_cycles >= 2 and len(window_history) >= 2:
             sorted_full = sorted(history, key=lambda h: h.get("timestamp") or "")
             recent = sorted_full[-2:] if len(sorted_full) >= 2 else sorted_full
-            recent_rate = sum(h.get("prs_merged", 0) for h in recent) / max(len(recent), 1)
-            lifetime_rate = lifetime_merged / lifetime_cycles if lifetime_cycles > 0 else 0
+            recent_rate = sum(h.get("prs_merged", 0) for h in recent) / max(
+                len(recent), 1
+            )
+            lifetime_rate = (
+                lifetime_merged / lifetime_cycles if lifetime_cycles > 0 else 0
+            )
             if lifetime_rate > 0:
                 outcome["velocity"] = round(recent_rate / lifetime_rate, 2)
 
@@ -227,12 +261,15 @@ def _build_outcome_evaluation(project, cycle_history: list | None = None) -> dic
     # Flag directions with cost_per_merged_pr well above project median.
     # Requires at least 2 data points so the median is meaningful.
     _cpm_values = sorted(
-        d["cost_per_merged_pr"] for d in direction_outcomes if d.get("cost_per_merged_pr") is not None
+        d["cost_per_merged_pr"]
+        for d in direction_outcomes
+        if d.get("cost_per_merged_pr") is not None
     )
     if len(_cpm_values) >= 2:
         n = len(_cpm_values)
         _cpm_median = (
-            _cpm_values[n // 2] if n % 2 == 1
+            _cpm_values[n // 2]
+            if n % 2 == 1
             else (_cpm_values[n // 2 - 1] + _cpm_values[n // 2]) / 2
         )
         _cpm_threshold = _cpm_median * _HIGH_COST_PER_MERGE_MULTIPLIER
@@ -262,8 +299,12 @@ def _build_outcome_evaluation(project, cycle_history: list | None = None) -> dic
         mid = len(all_window_entries) // 2
         first_half = all_window_entries[:mid]
         second_half = all_window_entries[mid:]
-        first_rate = sum(h.get("prs_merged", 0) for h in first_half) / max(len(first_half), 1)
-        second_rate = sum(h.get("prs_merged", 0) for h in second_half) / max(len(second_half), 1)
+        first_rate = sum(h.get("prs_merged", 0) for h in first_half) / max(
+            len(first_half), 1
+        )
+        second_rate = sum(h.get("prs_merged", 0) for h in second_half) / max(
+            len(second_half), 1
+        )
         if second_rate > first_rate * 1.3:
             trend = "improving"
         elif second_rate < first_rate * 0.7:
@@ -283,14 +324,16 @@ def _build_outcome_evaluation(project, cycle_history: list | None = None) -> dic
             mapped = [d for d in direction_outcomes if d.get("system_id") == sys_id]
             sys_merged = sum(d["merged"] for d in mapped)
             sys_failed = sum(d["failed"] for d in mapped)
-            systems.append({
-                "id": sys_id,
-                "name": sys.get("name", ""),
-                "planned_status": sys.get("status", "unknown"),
-                "directions_count": len(mapped),
-                "merged": sys_merged,
-                "failed": sys_failed,
-            })
+            systems.append(
+                {
+                    "id": sys_id,
+                    "name": sys.get("name", ""),
+                    "planned_status": sys.get("status", "unknown"),
+                    "directions_count": len(mapped),
+                    "merged": sys_merged,
+                    "failed": sys_failed,
+                }
+            )
 
     # Overall type distribution across all directions
     overall_type_dist: dict = {}
@@ -302,11 +345,18 @@ def _build_outcome_evaluation(project, cycle_history: list | None = None) -> dic
         if d_out.get("product_ratio") is not None:
             overall_product_weighted += d_out["product_ratio"] * tasks_count
     overall_total_typed = sum(overall_type_dist.values())
-    overall_product_ratio = round(overall_product_weighted / overall_total_typed, 2) if overall_total_typed > 0 else None
+    overall_product_ratio = (
+        round(overall_product_weighted / overall_total_typed, 2)
+        if overall_total_typed > 0
+        else None
+    )
 
     overall_summary: dict = {
-        "cycles": total_cycles, "merged": total_merged, "failed": total_failed,
-        "success_rate": success_rate, "trend": trend,
+        "cycles": total_cycles,
+        "merged": total_merged,
+        "failed": total_failed,
+        "success_rate": success_rate,
+        "trend": trend,
     }
     if overall_type_dist:
         overall_summary["type_distribution"] = overall_type_dist
@@ -314,26 +364,35 @@ def _build_outcome_evaluation(project, cycle_history: list | None = None) -> dic
         overall_summary["product_ratio"] = overall_product_ratio
 
     # System-level cost summary and efficiency ranking
-    total_cost_usd = round(sum(d.get("estimated_cost_usd", 0.0) for d in direction_outcomes), 2)
+    total_cost_usd = round(
+        sum(d.get("estimated_cost_usd", 0.0) for d in direction_outcomes), 2
+    )
     if total_cost_usd > 0:
         overall_summary["estimated_cost_usd"] = total_cost_usd
         ranked = [
             {"id": d["id"], "cost_per_merged_pr": d["cost_per_merged_pr"]}
-            for d in direction_outcomes if d.get("cost_per_merged_pr") is not None
+            for d in direction_outcomes
+            if d.get("cost_per_merged_pr") is not None
         ]
         ranked.sort(key=lambda x: x["cost_per_merged_pr"])
         if ranked:
             overall_summary["cost_efficiency_ranking"] = ranked
 
     result: dict = {
-        "window": {"from": window_from or "all_time", "to": now_iso, "vision_revision": vision_rev},
+        "window": {
+            "from": window_from or "all_time",
+            "to": now_iso,
+            "vision_revision": vision_rev,
+        },
         "overall": overall_summary,
     }
     if systems:
         result["systems"] = systems
     if direction_outcomes:
         result["directions"] = direction_outcomes
-    strategic_effectiveness = _build_strategic_effectiveness(directions, cycle_history or [], vision)
+    strategic_effectiveness = _build_strategic_effectiveness(
+        directions, cycle_history or [], vision
+    )
     if strategic_effectiveness:
         result["strategic_effectiveness"] = strategic_effectiveness
     decision_accuracy = _build_decision_accuracy(directions, cycle_history or [])
@@ -354,6 +413,7 @@ def _build_decision_accuracy(directions: list, cycle_history: list) -> dict:
     ``strategic_cycle.recent_for_agent_context``.
     """
     from app.direction_metrics import _compute_direction_quality_score  # noqa: PLC0415
+
     cycle_history = list(cycle_history or [])
     target = None
     for entry in reversed(cycle_history):
@@ -370,11 +430,12 @@ def _build_decision_accuracy(directions: list, cycle_history: list) -> dict:
     def _lifetime_merged(d: dict) -> int:
         history = d.get("research_history") or []
         agg = d.get("history_aggregate") or {}
-        return sum(h.get("prs_merged", 0) for h in history) + (agg.get("total_prs_merged") or 0)
+        return sum(h.get("prs_merged", 0) for h in history) + (
+            agg.get("total_prs_merged") or 0
+        )
 
     quality_scores = [
-        round(_compute_direction_quality_score(d), 3)
-        for d in directions if d.get("id")
+        round(_compute_direction_quality_score(d), 3) for d in directions if d.get("id")
     ]
     quality_scores_sorted = sorted(quality_scores)
     median_quality = 0.0
@@ -383,14 +444,18 @@ def _build_decision_accuracy(directions: list, cycle_history: list) -> dict:
         if n % 2 == 1:
             median_quality = quality_scores_sorted[n // 2]
         else:
-            median_quality = (quality_scores_sorted[n // 2 - 1] + quality_scores_sorted[n // 2]) / 2
+            median_quality = (
+                quality_scores_sorted[n // 2 - 1] + quality_scores_sorted[n // 2]
+            ) / 2
 
     created_breakdown: list = []
     successes = 0
-    for cid in (target.get("created_direction_ids") or []):
+    for cid in target.get("created_direction_ids") or []:
         d = dir_by_id.get(cid)
         if d is None:
-            created_breakdown.append({"direction_id": cid, "status": "missing", "success": False})
+            created_breakdown.append(
+                {"direction_id": cid, "status": "missing", "success": False}
+            )
             continue
         merged = _lifetime_merged(d)
         auto_paused = bool(d.get("auto_paused"))
@@ -399,34 +464,40 @@ def _build_decision_accuracy(directions: list, cycle_history: list) -> dict:
         success = merged >= 1 and not auto_paused
         if success:
             successes += 1
-        created_breakdown.append({
-            "direction_id": cid,
-            "prs_merged": merged,
-            "auto_paused": auto_paused,
-            "quality_score": qscore,
-            "above_median_quality": above_median,
-            "success": success,
-        })
+        created_breakdown.append(
+            {
+                "direction_id": cid,
+                "prs_merged": merged,
+                "auto_paused": auto_paused,
+                "quality_score": qscore,
+                "above_median_quality": above_median,
+                "success": success,
+            }
+        )
 
     retired_breakdown: list = []
     retired_good = 0
     retired_total = 0
-    for rid in (target.get("retired_direction_ids") or []):
+    for rid in target.get("retired_direction_ids") or []:
         retired_total += 1
         d = dir_by_id.get(rid)
         if d is None:
-            retired_breakdown.append({"direction_id": rid, "stayed_retired": True, "status": "missing"})
+            retired_breakdown.append(
+                {"direction_id": rid, "stayed_retired": True, "status": "missing"}
+            )
             retired_good += 1
             continue
         status = d.get("status")
         stayed = status in ("retired", "expired")
         if stayed:
             retired_good += 1
-        retired_breakdown.append({
-            "direction_id": rid,
-            "status": status,
-            "stayed_retired": stayed,
-        })
+        retired_breakdown.append(
+            {
+                "direction_id": rid,
+                "status": status,
+                "stayed_retired": stayed,
+            }
+        )
 
     created_total = len(created_breakdown)
     decision_accuracy_rate = (
@@ -451,7 +522,9 @@ def _build_decision_accuracy(directions: list, cycle_history: list) -> dict:
     return result
 
 
-def _build_strategic_effectiveness(directions: list, cycle_history: list, vision: dict | None = None) -> dict:
+def _build_strategic_effectiveness(
+    directions: list, cycle_history: list, vision: dict | None = None
+) -> dict:
     """Aggregate per-cycle strategic decision quality from cycle history.
 
     Measures whether the strategic agent's own choices (which directions to
@@ -467,8 +540,7 @@ def _build_strategic_effectiveness(directions: list, cycle_history: list, vision
     vision = vision or {}
     cycle_history = list(cycle_history or [])
     completed = [
-        c for c in cycle_history
-        if c.get("outcome") not in (None, "in_progress")
+        c for c in cycle_history if c.get("outcome") not in (None, "in_progress")
     ]
     if not completed:
         return {}
@@ -479,7 +551,9 @@ def _build_strategic_effectiveness(directions: list, cycle_history: list, vision
     def _direction_lifetime_merged(d: dict) -> int:
         history = d.get("research_history") or []
         agg = d.get("history_aggregate") or {}
-        return sum(h.get("prs_merged", 0) for h in history) + (agg.get("total_prs_merged") or 0)
+        return sum(h.get("prs_merged", 0) for h in history) + (
+            agg.get("total_prs_merged") or 0
+        )
 
     recent = completed[-5:]
     cycle_metrics: list = []
@@ -487,29 +561,40 @@ def _build_strategic_effectiveness(directions: list, cycle_history: list, vision
         created_ids = list(entry.get("created_direction_ids") or [])
         retired_ids = list(entry.get("retired_direction_ids") or [])
         created_with_merges = sum(
-            1 for cid in created_ids
+            1
+            for cid in created_ids
             if cid in dir_by_id and _direction_lifetime_merged(dir_by_id[cid]) > 0
         )
         retired_still_retired = sum(
-            1 for rid in retired_ids
-            if rid in dir_by_id and dir_by_id[rid].get("status") in ("retired", "expired")
+            1
+            for rid in retired_ids
+            if rid in dir_by_id
+            and dir_by_id[rid].get("status") in ("retired", "expired")
         )
         decisions_total = len(created_ids) + len(retired_ids)
         successful = created_with_merges + retired_still_retired
-        conversion_rate = round(successful / decisions_total, 2) if decisions_total else None
-        cycle_metrics.append({
-            "cycle_id": entry.get("cycle_id"),
-            "completed_at": entry.get("phase2_completed_at"),
-            "directions_created": len(created_ids),
-            "directions_retired": len(retired_ids),
-            "created_with_merges": created_with_merges,
-            "retired_still_retired": retired_still_retired,
-            "vision_updated": bool(entry.get("vision_updated")),
-            "decision_conversion_rate": conversion_rate,
-        })
+        conversion_rate = (
+            round(successful / decisions_total, 2) if decisions_total else None
+        )
+        cycle_metrics.append(
+            {
+                "cycle_id": entry.get("cycle_id"),
+                "completed_at": entry.get("phase2_completed_at"),
+                "directions_created": len(created_ids),
+                "directions_retired": len(retired_ids),
+                "created_with_merges": created_with_merges,
+                "retired_still_retired": retired_still_retired,
+                "vision_updated": bool(entry.get("vision_updated")),
+                "decision_conversion_rate": conversion_rate,
+            }
+        )
 
     # Trend across cycles: average decision_conversion_rate, first half vs second half.
-    rates = [c["decision_conversion_rate"] for c in cycle_metrics if c["decision_conversion_rate"] is not None]
+    rates = [
+        c["decision_conversion_rate"]
+        for c in cycle_metrics
+        if c["decision_conversion_rate"] is not None
+    ]
     trend = "insufficient_data"
     if len(rates) >= 4:
         mid = len(rates) // 2
@@ -536,7 +621,10 @@ def _build_strategic_effectiveness(directions: list, cycle_history: list, vision
 
 
 def _compute_prediction_calibration_factor(
-    project, cycle_history: list | None = None, lookback_cycles: int = 5, min_samples: int = 3,
+    project,
+    cycle_history: list | None = None,
+    lookback_cycles: int = 5,
+    min_samples: int = 3,
 ) -> float:
     """Compute a scaling factor to correct systematic bias in merge predictions.
 
@@ -582,9 +670,8 @@ def _compute_prediction_calibration_factor(
                 continue
             history = d.get("research_history") or []
             agg = d.get("history_aggregate") or {}
-            actual = (
-                sum(h.get("prs_merged", 0) for h in history)
-                + (agg.get("total_prs_merged") or 0)
+            actual = sum(h.get("prs_merged", 0) for h in history) + (
+                agg.get("total_prs_merged") or 0
             )
             ratios.append(actual / predicted)
 
@@ -601,7 +688,10 @@ def _compute_prediction_calibration_factor(
 
 
 def _compute_prediction_calibration(
-    project, cycle_history: list | None = None, lookback_cycles: int = 5, min_samples: int = 3,
+    project,
+    cycle_history: list | None = None,
+    lookback_cycles: int = 5,
+    min_samples: int = 3,
 ) -> dict:
     """Return calibration factor, human-readable note, and raw sample count.
 
@@ -635,7 +725,10 @@ def _compute_prediction_calibration(
             sample_count += 1
 
     factor = _compute_prediction_calibration_factor(
-        project, cycle_history, lookback_cycles=lookback_cycles, min_samples=min_samples,
+        project,
+        cycle_history,
+        lookback_cycles=lookback_cycles,
+        min_samples=min_samples,
     )
     if abs(factor - 1.0) < 0.05:
         note = f"Predictions are well-calibrated (factor {factor})."

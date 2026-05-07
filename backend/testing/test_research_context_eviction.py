@@ -2,6 +2,7 @@
 Standalone tests for _build_research_context eviction preservation.
 No database required — pure function tests.
 """
+
 import re
 
 from app.research_context import (
@@ -38,10 +39,16 @@ def _make_large_context(
 
 # ── _parse_eviction_counts ───────────────────────────────────────────────────
 
+
 class TestParseEvictionCounts:
     def test_empty_returns_zeros(self):
         result = _parse_eviction_counts(None)
-        assert result == {"established": 0, "failed": 0, "open_questions": 0, "failed_titles": []}
+        assert result == {
+            "established": 0,
+            "failed": 0,
+            "open_questions": 0,
+            "failed_titles": [],
+        }
 
     def test_parses_count_line(self):
         body = "3 established, 2 failed, 1 open question evicted\nFailed: approach A; approach B"
@@ -60,6 +67,7 @@ class TestParseEvictionCounts:
 
 
 # ── _format_eviction_body ────────────────────────────────────────────────────
+
 
 class TestFormatEvictionBody:
     def test_empty_returns_empty(self):
@@ -85,6 +93,7 @@ class TestFormatEvictionBody:
 
 
 # ── _build_research_context: no eviction when under limit ───────────────────
+
 
 class TestNoEvictionWhenUnderLimit:
     def test_fresh_small_context_has_no_eviction_summary(self):
@@ -116,6 +125,7 @@ class TestNoEvictionWhenUnderLimit:
 
 # ── _build_research_context: eviction summary when over limit ────────────────
 
+
 class TestEvictionSummaryWhenOverLimit:
     def test_eviction_summary_present_when_over_limit(self):
         """Contexts that exceed the limit should include an ## Eviction Summary section."""
@@ -137,7 +147,9 @@ class TestEvictionSummaryWhenOverLimit:
         # and a specific failed approach as the oldest entry (will be evicted first
         # if failed section is largest, otherwise established entries get evicted).
         # Use many failed approaches to ensure the failed section is evicted from.
-        specific_approach = "Specific approach to evict: tried using X pattern and it collapsed"
+        specific_approach = (
+            "Specific approach to evict: tried using X pattern and it collapsed"
+        )
         filler_approaches = [f"Approach filler {i}: " + "a" * 60 for i in range(50)]
         filler_established = [f"Established filler {i}: " + "b" * 90 for i in range(50)]
 
@@ -188,7 +200,7 @@ class TestEvictionSummaryWhenOverLimit:
         eviction_text = parsed["eviction_summary"] or ""
 
         if eviction_text:
-            m = re.search(r'(\d+) established', eviction_text)
+            m = re.search(r"(\d+) established", eviction_text)
             if m:
                 # Count is present (not full text of each evicted entry)
                 assert int(m.group(1)) > 0
@@ -197,6 +209,7 @@ class TestEvictionSummaryWhenOverLimit:
 
 
 # ── _build_research_context: eviction summary accumulates ───────────────────
+
 
 class TestEvictionSummaryAccumulation:
     def test_prior_eviction_summary_preserved_when_no_new_evictions(self):
@@ -256,12 +269,14 @@ class TestEvictionSummaryAccumulation:
         eviction_text = parsed["eviction_summary"] or ""
 
         # Established count must be at least 5 (from prior)
-        m = re.search(r'(\d+) established', eviction_text)
-        assert m, f"Expected established count in eviction summary, got: {eviction_text!r}"
+        m = re.search(r"(\d+) established", eviction_text)
+        assert m, (
+            f"Expected established count in eviction summary, got: {eviction_text!r}"
+        )
         assert int(m.group(1)) >= 5
 
         # Failed count must be at least 3 (from prior)
-        m = re.search(r'(\d+) failed', eviction_text)
+        m = re.search(r"(\d+) failed", eviction_text)
         assert m, f"Expected failed count in eviction summary, got: {eviction_text!r}"
         assert int(m.group(1)) >= 3
 
@@ -304,6 +319,7 @@ class TestEvictionSummaryAccumulation:
 
 # ── _build_research_context: prior outcome tagging ──────────────────────────
 
+
 class TestPriorOutcomeTagging:
     def _prior_with_proposed(self, titles):
         parts = ["## Established Findings"]
@@ -318,14 +334,16 @@ class TestPriorOutcomeTagging:
 
     def test_failed_titles_retagged_with_category(self):
         prior = self._prior_with_proposed(["Refactor X", "Add feature Y"])
-        history = [{
-            "finding_titles": ["Refactor X", "Add feature Y"],
-            "tasks_created": 2,
-            "prs_merged": 0,
-            "failed_task_details": [
-                {"title": "Refactor X", "category": "CODE_ERROR"},
-            ],
-        }]
+        history = [
+            {
+                "finding_titles": ["Refactor X", "Add feature Y"],
+                "tasks_created": 2,
+                "prs_merged": 0,
+                "failed_task_details": [
+                    {"title": "Refactor X", "category": "CODE_ERROR"},
+                ],
+            }
+        ]
         result = _build_research_context(
             prior_context=prior,
             finding_titles=[],
@@ -340,12 +358,14 @@ class TestPriorOutcomeTagging:
 
     def test_merged_titles_retagged_when_settled(self):
         prior = self._prior_with_proposed(["Clean up Z"])
-        history = [{
-            "finding_titles": ["Clean up Z"],
-            "tasks_created": 1,
-            "prs_merged": 1,
-            "failed_task_details": [],
-        }]
+        history = [
+            {
+                "finding_titles": ["Clean up Z"],
+                "tasks_created": 1,
+                "prs_merged": 1,
+                "failed_task_details": [],
+            }
+        ]
         result = _build_research_context(
             prior_context=prior,
             finding_titles=[],
@@ -397,7 +417,9 @@ class TestClaimsAndSources:
         result = self._build(
             titles=["feat: add caching"],
             descs=["Add a cache layer."],
-            sources=[[{"type": "file", "ref": "backend/app/cache.py", "excerpt": "line 42"}]],
+            sources=[
+                [{"type": "file", "ref": "backend/app/cache.py", "excerpt": "line 42"}]
+            ],
         )
         assert "Sources: backend/app/cache.py" in result
 
@@ -430,7 +452,9 @@ class TestClaimsAndSources:
         result = self._build(
             titles=["feat: many claims"],
             descs=["Description."],
-            claims=[["claim1", "claim2", "claim3", "claim4", "claim5", "claim6", "claim7"]],
+            claims=[
+                ["claim1", "claim2", "claim3", "claim4", "claim5", "claim6", "claim7"]
+            ],
         )
         assert "claim1" in result
         assert "claim6" in result

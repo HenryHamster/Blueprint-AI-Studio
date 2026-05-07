@@ -8,6 +8,7 @@ Covers:
   5. Failure streak resets to 0 on a healthy cycle
   6. Pre-pause VM count is restored (capped at 2) on resume
 """
+
 import copy
 import os
 from collections import deque
@@ -35,10 +36,13 @@ _REAL_CREATE_FORCED_RESUME_ALERTS = _dh._create_forced_resume_alerts
 # ── SQLite JSONB compatibility ────────────────────────────────────────────────
 
 if not hasattr(_SQLiteTypeCompiler, "visit_JSONB"):
-    _SQLiteTypeCompiler.visit_JSONB = lambda self, type_, **kw: self.visit_JSON(type_, **kw)
+    _SQLiteTypeCompiler.visit_JSONB = lambda self, type_, **kw: self.visit_JSON(
+        type_, **kw
+    )
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
+
 
 @pytest_asyncio.fixture()
 async def dh_db(mocker):
@@ -56,15 +60,20 @@ async def dh_db(mocker):
         await conn.run_sync(SQLModel.metadata.create_all)
 
     _Session = sessionmaker(
-        bind=_engine, class_=AsyncSession,
-        autocommit=False, autoflush=False, expire_on_commit=False,
+        bind=_engine,
+        class_=AsyncSession,
+        autocommit=False,
+        autoflush=False,
+        expire_on_commit=False,
     )
     mocker.patch("app.deploy_health.AsyncSessionLocal", _Session)
 
     # Suppress all side-effects that require running infra
     mocker.patch("app.deploy_health._create_auto_pause_alerts", new_callable=AsyncMock)
     mocker.patch("app.deploy_health._create_auto_resume_alerts", new_callable=AsyncMock)
-    mocker.patch("app.deploy_health._create_forced_resume_alerts", new_callable=AsyncMock)
+    mocker.patch(
+        "app.deploy_health._create_forced_resume_alerts", new_callable=AsyncMock
+    )
     mocker.patch("app.deploy_health.broadcast_deploy_state", new_callable=AsyncMock)
 
     async with _Session() as session:
@@ -119,9 +128,14 @@ def reset_shared_state():
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-async def _make_deploy_state(session, status=DeploymentStatus.STABLE,
-                              pause_reason=None, pre_pause_max_vms=None,
-                              paused_at=None):
+
+async def _make_deploy_state(
+    session,
+    status=DeploymentStatus.STABLE,
+    pause_reason=None,
+    pre_pause_max_vms=None,
+    paused_at=None,
+):
     """Insert a DeploymentState singleton row (id=1) and return it."""
     state = DeploymentState(
         id=1,
@@ -147,6 +161,7 @@ def _set_healthy():
 
 
 # ── Tests: failure streak (no pause until 3rd consecutive) ───────────────────
+
 
 @pytest.mark.asyncio
 async def test_first_failure_does_not_pause(dh_db):
@@ -176,7 +191,9 @@ async def test_provider_specific_failure_without_dispatch_outage_does_not_pause(
 
 
 @pytest.mark.asyncio
-async def test_non_anthropic_provider_failure_without_dispatch_outage_does_not_pause(dh_db):
+async def test_non_anthropic_provider_failure_without_dispatch_outage_does_not_pause(
+    dh_db,
+):
     """A non-Anthropic provider-specific failure that does not produce a dispatch_api outage
     must not trigger auto-pause — only dispatch_api (and db/github/gcp) are critical."""
     await _make_deploy_state(dh_db, status=DeploymentStatus.STABLE)
@@ -225,7 +242,11 @@ async def test_second_consecutive_failure_does_not_pause(dh_db):
     assert _dh._pause_failure_streak == 2
     assert _shared_state.runtime_config["max_concurrent_vms"] == 4
 
-    state = (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1))).scalars().first()
+    state = (
+        (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1)))
+        .scalars()
+        .first()
+    )
     assert state.status == DeploymentStatus.STABLE.value
 
 
@@ -236,7 +257,9 @@ async def test_streak_buildup_broadcasts_health_degrading(dh_db, mocker):
     _shared_state.runtime_config["max_concurrent_vms"] = 4
     _set_critical_failures("db", "gcp")
 
-    bcast = mocker.patch("app.deploy_health.manager.broadcast_to_all", new_callable=AsyncMock)
+    bcast = mocker.patch(
+        "app.deploy_health.manager.broadcast_to_all", new_callable=AsyncMock
+    )
     await _dh._check_pause_mode()
 
     bcast.assert_awaited_once()
@@ -255,7 +278,9 @@ async def test_pause_threshold_does_not_broadcast_health_degrading(dh_db, mocker
     _set_critical_failures("db")
     _dh._pause_failure_streak = 2
 
-    bcast = mocker.patch("app.deploy_health.manager.broadcast_to_all", new_callable=AsyncMock)
+    bcast = mocker.patch(
+        "app.deploy_health.manager.broadcast_to_all", new_callable=AsyncMock
+    )
     await _dh._check_pause_mode()
 
     bcast.assert_not_awaited()
@@ -275,7 +300,11 @@ async def test_third_consecutive_failure_triggers_pause(dh_db):
     assert _dh._pause_failure_streak == 3
     assert _shared_state.runtime_config["max_concurrent_vms"] == 0
 
-    state = (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1))).scalars().first()
+    state = (
+        (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1)))
+        .scalars()
+        .first()
+    )
     assert state.status == DeploymentStatus.PAUSED.value
     assert state.pre_pause_max_vms == 4
     assert state.pause_reason is not None
@@ -298,6 +327,7 @@ async def test_pause_creates_alerts(dh_db):
 
 # ── Tests: failure streak reset on healthy cycle ──────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_failure_streak_resets_on_healthy_cycle(dh_db):
     """If health recovers before the pause threshold, the failure streak resets to 0."""
@@ -314,6 +344,7 @@ async def test_failure_streak_resets_on_healthy_cycle(dh_db):
 
 
 # ── Tests: recovery streak gate ───────────────────────────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_recovery_first_healthy_cycle_does_not_resume(dh_db):
@@ -332,7 +363,11 @@ async def test_recovery_first_healthy_cycle_does_not_resume(dh_db):
     assert list(_dh._health_recovery_history) == [True]
     assert _shared_state.runtime_config["max_concurrent_vms"] == 0  # still paused
 
-    state = (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1))).scalars().first()
+    state = (
+        (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1)))
+        .scalars()
+        .first()
+    )
     assert state.status == DeploymentStatus.PAUSED.value
 
 
@@ -355,7 +390,11 @@ async def test_recovery_second_healthy_cycle_does_not_resume(dh_db):
     assert list(_dh._health_recovery_history) == [True, True]
     assert _shared_state.runtime_config["max_concurrent_vms"] == 0
 
-    state = (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1))).scalars().first()
+    state = (
+        (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1)))
+        .scalars()
+        .first()
+    )
     assert state.status == DeploymentStatus.PAUSED.value
 
 
@@ -379,7 +418,11 @@ async def test_recovery_third_healthy_cycle_resumes(dh_db):
     assert list(_dh._health_recovery_history) == []  # reset after resume
     assert _shared_state.runtime_config["max_concurrent_vms"] == 2  # min(2, 4)
 
-    state = (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1))).scalars().first()
+    state = (
+        (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1)))
+        .scalars()
+        .first()
+    )
     assert state.status == DeploymentStatus.STABLE.value
     assert state.pause_reason is None
     assert state.pre_pause_max_vms is None
@@ -406,6 +449,7 @@ async def test_resume_creates_alerts(dh_db):
 
 
 # ── Tests: pre-pause VM count restoration capped at 2 ────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_resume_vm_count_capped_at_2(dh_db):
@@ -450,6 +494,7 @@ async def test_resume_vm_count_uses_pre_pause_when_less_than_2(dh_db):
 
 # ── Tests: manual pause guard ─────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_manual_pause_is_not_auto_resumed(dh_db):
     """A pause initiated by an admin (pause_reason not starting with 'External dependency down')
@@ -471,7 +516,11 @@ async def test_manual_pause_is_not_auto_resumed(dh_db):
     assert list(_dh._health_recovery_history) == []
     assert _shared_state.runtime_config["max_concurrent_vms"] == 0  # still paused
 
-    state = (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1))).scalars().first()
+    state = (
+        (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1)))
+        .scalars()
+        .first()
+    )
     assert state.status == DeploymentStatus.PAUSED.value
 
 
@@ -495,6 +544,7 @@ async def test_no_pause_reason_is_not_auto_resumed(dh_db):
 
 
 # ── Tests: no DeploymentState row edge case ───────────────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_no_deploy_state_critical_failure_no_crash(dh_db):
@@ -525,6 +575,7 @@ async def test_no_deploy_state_healthy_no_crash(dh_db):
 
 # ── Tests: already PAUSED/HALTED state skips re-pause ────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_already_paused_state_skips_re_pause(dh_db):
     """If the pipeline is already PAUSED, a third failure should not update state again."""
@@ -550,11 +601,16 @@ async def test_already_paused_state_skips_re_pause(dh_db):
 
 # ── Tests: ramp-up after auto-resume ─────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_rampup_increases_toward_target(dh_db):
     """After auto-resume, a healthy cycle with runtime < DB target ramps up by up to 2."""
     await _make_deploy_state(dh_db, status=DeploymentStatus.STABLE)
-    state = (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1))).scalars().first()
+    state = (
+        (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1)))
+        .scalars()
+        .first()
+    )
     state.runtime_max_concurrent_vms = 8
     await dh_db.commit()
 
@@ -579,7 +635,11 @@ async def test_rampup_increases_toward_target(dh_db):
 async def test_rampup_partial_step_to_target(dh_db):
     """When only 1 VM short of target, ramp-up adds exactly 1 (not 2)."""
     await _make_deploy_state(dh_db, status=DeploymentStatus.MONITORING)
-    state = (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1))).scalars().first()
+    state = (
+        (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1)))
+        .scalars()
+        .first()
+    )
     state.runtime_max_concurrent_vms = 3
     await dh_db.commit()
 
@@ -600,7 +660,11 @@ async def test_rampup_skipped_when_paused_state(dh_db):
         pre_pause_max_vms=8,
         paused_at=_dh._utcnow(),
     )
-    state = (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1))).scalars().first()
+    state = (
+        (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1)))
+        .scalars()
+        .first()
+    )
     state.runtime_max_concurrent_vms = 8
     await dh_db.commit()
 
@@ -644,7 +708,11 @@ async def test_resume_followed_by_rampup_reaches_target(dh_db):
 async def test_forced_resume_rampup_gated_without_task_success(dh_db):
     """After a forced resume, ramp-up past 2 VMs requires a recent successful task."""
     await _make_deploy_state(dh_db, status=DeploymentStatus.STABLE)
-    state = (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1))).scalars().first()
+    state = (
+        (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1)))
+        .scalars()
+        .first()
+    )
     state.runtime_max_concurrent_vms = 8
     await dh_db.commit()
 
@@ -661,7 +729,11 @@ async def test_forced_resume_rampup_gated_without_task_success(dh_db):
 async def test_forced_resume_rampup_proceeds_with_task_success(dh_db):
     """A recent successful task unblocks forced-resume ramp-up."""
     await _make_deploy_state(dh_db, status=DeploymentStatus.STABLE)
-    state = (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1))).scalars().first()
+    state = (
+        (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1)))
+        .scalars()
+        .first()
+    )
     state.runtime_max_concurrent_vms = 8
     await dh_db.commit()
 
@@ -680,13 +752,18 @@ async def test_forced_resume_rampup_proceeds_with_task_success(dh_db):
 async def test_forced_resume_gate_stale_success_does_not_count(dh_db):
     """A success older than 5 minutes does not satisfy the forced-resume gate."""
     await _make_deploy_state(dh_db, status=DeploymentStatus.STABLE)
-    state = (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1))).scalars().first()
+    state = (
+        (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1)))
+        .scalars()
+        .first()
+    )
     state.runtime_max_concurrent_vms = 8
     await dh_db.commit()
 
     _dh._last_resume_was_forced = True
     _shared_state.runtime_config["max_concurrent_vms"] = 2
     from datetime import timedelta
+
     stale = (_dh._utcnow() - timedelta(minutes=10)).isoformat()
     _shared_state.deploy_monitoring["task_results"].append(
         (stale, "success", None, "create")
@@ -701,7 +778,11 @@ async def test_forced_resume_gate_stale_success_does_not_count(dh_db):
 async def test_normal_resume_rampup_unaffected_by_gate(dh_db):
     """After a normal (non-forced) resume, ramp-up proceeds without task-success evidence."""
     await _make_deploy_state(dh_db, status=DeploymentStatus.STABLE)
-    state = (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1))).scalars().first()
+    state = (
+        (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1)))
+        .scalars()
+        .first()
+    )
     state.runtime_max_concurrent_vms = 8
     await dh_db.commit()
 
@@ -715,6 +796,7 @@ async def test_normal_resume_rampup_unaffected_by_gate(dh_db):
 
 
 # ── Tests: recovery ring buffer tolerates a single flaky probe ───────────────
+
 
 @pytest.mark.asyncio
 async def test_recovery_streak_resets_on_new_failure(dh_db):
@@ -740,6 +822,7 @@ async def test_recovery_streak_resets_on_new_failure(dh_db):
 
 # ── Tests: 3-of-5 recovery tolerates a flake ─────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_recovery_three_of_five_healthy_resumes(dh_db):
     """Auto-resume fires when 3 of the last 5 probes are healthy, even with a flake in the middle."""
@@ -762,7 +845,11 @@ async def test_recovery_three_of_five_healthy_resumes(dh_db):
     assert list(_dh._health_recovery_history) == []  # cleared after resume
     assert _shared_state.runtime_config["max_concurrent_vms"] == 2  # min(2, 4)
 
-    state = (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1))).scalars().first()
+    state = (
+        (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1)))
+        .scalars()
+        .first()
+    )
     assert state.status == DeploymentStatus.STABLE.value
     assert state.pause_reason is None
 
@@ -792,16 +879,22 @@ async def test_single_flake_does_not_reset_recovery(dh_db):
     _set_healthy()
     await _dh._check_pause_mode()
     assert _shared_state.runtime_config["max_concurrent_vms"] == 2
-    state = (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1))).scalars().first()
+    state = (
+        (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1)))
+        .scalars()
+        .first()
+    )
     assert state.status == DeploymentStatus.STABLE.value
 
 
 # ── Tests: forced resume after max auto-pause duration ───────────────────────
 
+
 @pytest.mark.asyncio
 async def test_forced_resume_after_max_duration(dh_db):
     """After max_auto_pause_duration_seconds, force-resume with 1 VM regardless of health state."""
     from datetime import timedelta
+
     long_ago = _dh._utcnow() - timedelta(seconds=10_000)  # well past default 7200s
     await _make_deploy_state(
         dh_db,
@@ -820,7 +913,11 @@ async def test_forced_resume_after_max_duration(dh_db):
     # Force-resume path: 1 VM, history cleared, CRITICAL alert path invoked.
     assert _shared_state.runtime_config["max_concurrent_vms"] == 1
     assert list(_dh._health_recovery_history) == []
-    state = (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1))).scalars().first()
+    state = (
+        (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1)))
+        .scalars()
+        .first()
+    )
     assert state.status == DeploymentStatus.STABLE.value
     assert state.pause_reason is None
     _dh._create_forced_resume_alerts.assert_awaited_once()
@@ -829,6 +926,7 @@ async def test_forced_resume_after_max_duration(dh_db):
 
 
 # ── Tests: anti-flap grace period after auto-resume ─────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_grace_period_suppresses_repause(dh_db, mocker):
@@ -842,7 +940,9 @@ async def test_grace_period_suppresses_repause(dh_db, mocker):
     _dh._last_auto_resume_at = _dh._utcnow()
     _dh._pause_failure_streak = 2  # next failure would normally trigger pause
 
-    bcast = mocker.patch("app.deploy_health.manager.broadcast_to_all", new_callable=AsyncMock)
+    bcast = mocker.patch(
+        "app.deploy_health.manager.broadcast_to_all", new_callable=AsyncMock
+    )
     await _dh._check_pause_mode()
 
     # Streak still increments and health_degrading still broadcasts so operators see flap.
@@ -855,7 +955,11 @@ async def test_grace_period_suppresses_repause(dh_db, mocker):
 
     # But the pipeline is NOT paused.
     assert _shared_state.runtime_config["max_concurrent_vms"] == 4
-    state = (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1))).scalars().first()
+    state = (
+        (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1)))
+        .scalars()
+        .first()
+    )
     assert state.status == DeploymentStatus.STABLE.value
     _dh._create_auto_pause_alerts.assert_not_awaited()
 
@@ -864,6 +968,7 @@ async def test_grace_period_suppresses_repause(dh_db, mocker):
 async def test_pause_triggers_after_grace_period_expires(dh_db):
     """Health failures AFTER the grace period must re-trigger auto-pause normally."""
     from datetime import timedelta
+
     await _make_deploy_state(dh_db, status=DeploymentStatus.STABLE)
     _shared_state.runtime_config["max_concurrent_vms"] = 4
     _shared_state.runtime_config["auto_resume_grace_period_seconds"] = 300
@@ -877,7 +982,11 @@ async def test_pause_triggers_after_grace_period_expires(dh_db):
 
     assert _dh._pause_failure_streak == 3
     assert _shared_state.runtime_config["max_concurrent_vms"] == 0
-    state = (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1))).scalars().first()
+    state = (
+        (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1)))
+        .scalars()
+        .first()
+    )
     assert state.status == DeploymentStatus.PAUSED.value
 
 
@@ -904,6 +1013,7 @@ async def test_normal_auto_resume_sets_grace_timestamp(dh_db):
 async def test_forced_resume_sets_grace_timestamp(dh_db):
     """A forced resume (max-duration exceeded) must also set _last_auto_resume_at."""
     from datetime import timedelta
+
     long_ago = _dh._utcnow() - timedelta(seconds=10_000)
     await _make_deploy_state(
         dh_db,
@@ -928,6 +1038,7 @@ async def test_forced_resume_sets_grace_timestamp(dh_db):
 def test_restore_health_streaks_roundtrip():
     """_restore_health_streaks must rehydrate all three pieces of state from a snapshot."""
     from datetime import datetime as _dt
+
     resume_at = _dt(2026, 4, 17, 10, 30, 0)
     snapshot = {
         "_pause_failure_streak": 2,
@@ -983,7 +1094,11 @@ async def test_restored_grace_period_suppresses_repause_after_restart(dh_db, moc
 
     # Grace period honored — no pause triggered despite streak reaching 3.
     assert _shared_state.runtime_config["max_concurrent_vms"] == 4
-    state = (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1))).scalars().first()
+    state = (
+        (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1)))
+        .scalars()
+        .first()
+    )
     assert state.status == DeploymentStatus.STABLE.value
 
 
@@ -997,8 +1112,13 @@ async def test_nested_pause_during_rampup_preserves_original_count(dh_db):
     runtime value. Prevents the staircase ratcheting bug."""
     # Simulate post-resume ramp-up state: DB holds target=10, runtime at 2.
     from sqlalchemy import update
+
     await _make_deploy_state(dh_db, status=DeploymentStatus.MONITORING)
-    await dh_db.execute(update(DeploymentState).where(DeploymentState.id == 1).values(runtime_max_concurrent_vms=10))
+    await dh_db.execute(
+        update(DeploymentState)
+        .where(DeploymentState.id == 1)
+        .values(runtime_max_concurrent_vms=10)
+    )
     await dh_db.commit()
     dh_db.expire_all()
 
@@ -1009,7 +1129,11 @@ async def test_nested_pause_during_rampup_preserves_original_count(dh_db):
     await _dh._check_pause_mode()
 
     dh_db.expire_all()
-    state = (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1))).scalars().first()
+    state = (
+        (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1)))
+        .scalars()
+        .first()
+    )
     assert state.status == DeploymentStatus.PAUSED.value
     # Must preserve the ORIGINAL target (10), NOT the intermediate runtime (2).
     assert state.pre_pause_max_vms == 10
@@ -1021,6 +1145,7 @@ async def test_forced_resume_then_pause_preserves_original_count(dh_db):
     """Forced resume leaves the DB ramp-up target intact at the original; a subsequent
     pause must capture that original value, not the forced-resume's 1-VM runtime."""
     from datetime import timedelta
+
     long_ago = _dh._utcnow() - timedelta(seconds=10_000)
     await _make_deploy_state(
         dh_db,
@@ -1039,7 +1164,11 @@ async def test_forced_resume_then_pause_preserves_original_count(dh_db):
     assert _shared_state.runtime_config["max_concurrent_vms"] == 1
 
     dh_db.expire_all()
-    state = (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1))).scalars().first()
+    state = (
+        (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1)))
+        .scalars()
+        .first()
+    )
     # Forced resume must preserve the ORIGINAL target (8) as runtime_max_concurrent_vms,
     # not the forced-resume's initial_vms (=1). Without this, a subsequent pause
     # during ramp-up captures 1 instead of 8.
@@ -1052,8 +1181,13 @@ async def test_full_recovery_pause_captures_target(dh_db):
     """When ramp-up has fully reached the target, a fresh pause correctly captures
     that target (no leftover ratcheting or phantom state)."""
     from sqlalchemy import update
+
     await _make_deploy_state(dh_db, status=DeploymentStatus.STABLE)
-    await dh_db.execute(update(DeploymentState).where(DeploymentState.id == 1).values(runtime_max_concurrent_vms=6))
+    await dh_db.execute(
+        update(DeploymentState)
+        .where(DeploymentState.id == 1)
+        .values(runtime_max_concurrent_vms=6)
+    )
     await dh_db.commit()
     dh_db.expire_all()
 
@@ -1064,11 +1198,14 @@ async def test_full_recovery_pause_captures_target(dh_db):
 
     await _dh._check_pause_mode()
 
-    state = (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1))).scalars().first()
+    state = (
+        (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1)))
+        .scalars()
+        .first()
+    )
     assert state.status == DeploymentStatus.PAUSED.value
     assert state.pre_pause_max_vms == 6
     assert state.runtime_max_concurrent_vms == 6
-
 
 
 # ── Tests: task_results staleness guard (auto-resume deadlock) ───────────────
@@ -1081,22 +1218,28 @@ def _ts(minutes_ago: float) -> str:
 def test_check_gcp_health_stale_provision_failures_return_healthy():
     """Pre-pause PROVISION_FAILURE entries that have aged past the staleness window
     must not keep GCP health failing, or auto-resume deadlocks."""
-    _shared_state.deploy_monitoring["task_results"] = deque([
-        (_ts(30), "failure", "PROVISION_FAILURE", "create"),
-        (_ts(25), "failure", "PROVISION_FAILURE", "create"),
-        (_ts(20), "failure", "PROVISION_FAILURE", "create"),
-    ], maxlen=100)
+    _shared_state.deploy_monitoring["task_results"] = deque(
+        [
+            (_ts(30), "failure", "PROVISION_FAILURE", "create"),
+            (_ts(25), "failure", "PROVISION_FAILURE", "create"),
+            (_ts(20), "failure", "PROVISION_FAILURE", "create"),
+        ],
+        maxlen=100,
+    )
     ext = {"errors": {}}
     assert _hcp.check_gcp_health(ext) is None
     assert ext["gcp"] is True
 
 
 def test_check_gcp_health_fresh_provision_failures_return_failed():
-    _shared_state.deploy_monitoring["task_results"] = deque([
-        (_ts(5), "failure", "PROVISION_FAILURE", "create"),
-        (_ts(4), "failure", "PROVISION_FAILURE", "create"),
-        (_ts(3), "failure", "PROVISION_FAILURE", "create"),
-    ], maxlen=100)
+    _shared_state.deploy_monitoring["task_results"] = deque(
+        [
+            (_ts(5), "failure", "PROVISION_FAILURE", "create"),
+            (_ts(4), "failure", "PROVISION_FAILURE", "create"),
+            (_ts(3), "failure", "PROVISION_FAILURE", "create"),
+        ],
+        maxlen=100,
+    )
     ext = {"errors": {}}
     assert _hcp.check_gcp_health(ext) == "gcp"
     assert ext["gcp"] is False
@@ -1106,13 +1249,16 @@ def test_check_provider_api_health_anthropic_stale_rate_limits_return_healthy(mo
     """Stale RATE_LIMIT entries must not keep Anthropic provider health failing."""
     mocker.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "x"}, clear=False)
     mocker.patch.object(_hcp, "_account_by_id", {})
-    _shared_state.deploy_monitoring["task_results"] = deque([
-        (_ts(30), "failure", "RATE_LIMIT", "create"),
-        (_ts(25), "failure", "RATE_LIMIT", "create"),
-        (_ts(20), "failure", "RATE_LIMIT", "create"),
-        (_ts(19), "failure", "RATE_LIMIT", "create"),
-        (_ts(18), "failure", "RATE_LIMIT", "create"),
-    ], maxlen=100)
+    _shared_state.deploy_monitoring["task_results"] = deque(
+        [
+            (_ts(30), "failure", "RATE_LIMIT", "create"),
+            (_ts(25), "failure", "RATE_LIMIT", "create"),
+            (_ts(20), "failure", "RATE_LIMIT", "create"),
+            (_ts(19), "failure", "RATE_LIMIT", "create"),
+            (_ts(18), "failure", "RATE_LIMIT", "create"),
+        ],
+        maxlen=100,
+    )
     ext = {"errors": {}}
     assert _hcp.check_provider_api_health(ext, "anthropic") is None
     assert ext["anthropic_api"] is True
@@ -1121,13 +1267,16 @@ def test_check_provider_api_health_anthropic_stale_rate_limits_return_healthy(mo
 def test_check_provider_api_health_anthropic_fresh_rate_limits_return_failed(mocker):
     mocker.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "x"}, clear=False)
     mocker.patch.object(_hcp, "_account_by_id", {})
-    _shared_state.deploy_monitoring["task_results"] = deque([
-        (_ts(5), "failure", "RATE_LIMIT", "create"),
-        (_ts(4), "failure", "RATE_LIMIT", "create"),
-        (_ts(3), "failure", "RATE_LIMIT", "create"),
-        (_ts(2), "failure", "RATE_LIMIT", "create"),
-        (_ts(1), "failure", "RATE_LIMIT", "create"),
-    ], maxlen=100)
+    _shared_state.deploy_monitoring["task_results"] = deque(
+        [
+            (_ts(5), "failure", "RATE_LIMIT", "create"),
+            (_ts(4), "failure", "RATE_LIMIT", "create"),
+            (_ts(3), "failure", "RATE_LIMIT", "create"),
+            (_ts(2), "failure", "RATE_LIMIT", "create"),
+            (_ts(1), "failure", "RATE_LIMIT", "create"),
+        ],
+        maxlen=100,
+    )
     ext = {"errors": {}}
     assert _hcp.check_provider_api_health(ext, "anthropic") == "anthropic_api"
     assert ext["anthropic_api"] is False
@@ -1143,7 +1292,9 @@ def test_check_provider_api_health_openai_down_when_no_account_can_dispatch(mock
     }
     mocker.patch.object(_hcp, "_account_by_id", {"acct-openai": account})
     mocker.patch.object(_hcp, "_account_available_for_model", return_value=False)
-    _shared_state.runtime_config["task_type_provider_preference"] = {"create": ["openai"]}
+    _shared_state.runtime_config["task_type_provider_preference"] = {
+        "create": ["openai"]
+    }
     _shared_state.runtime_config["cross_provider_fallback_enabled"] = False
 
     ext = {"errors": {}, "provider_health": {}}
@@ -1153,7 +1304,9 @@ def test_check_provider_api_health_openai_down_when_no_account_can_dispatch(mock
 
 
 def test_get_dispatch_health_snapshot_degrades_when_primary_provider_down_but_fallback_available():
-    _shared_state.runtime_config["task_type_provider_preference"] = {"create": ["anthropic", "openai"]}
+    _shared_state.runtime_config["task_type_provider_preference"] = {
+        "create": ["anthropic", "openai"]
+    }
     _shared_state.runtime_config["task_type_model_preferences"] = {}
     _shared_state.runtime_config["task_type_models"] = {}
     _shared_state.runtime_config["cross_provider_fallback_enabled"] = True
@@ -1193,7 +1346,9 @@ def test_get_dispatch_health_snapshot_uses_task_type_models_to_infer_required_pr
 
 def test_get_dispatch_health_snapshot_down_when_all_providers_down():
     """When every relevant provider is down, dispatch status must be 'down' (not 'degraded')."""
-    _shared_state.runtime_config["task_type_provider_preference"] = {"create": ["anthropic", "openai"]}
+    _shared_state.runtime_config["task_type_provider_preference"] = {
+        "create": ["anthropic", "openai"]
+    }
     _shared_state.runtime_config["task_type_model_preferences"] = {}
     _shared_state.runtime_config["task_type_models"] = {}
     _shared_state.runtime_config["cross_provider_fallback_enabled"] = True
@@ -1241,7 +1396,9 @@ def test_get_dispatch_health_snapshot_uses_task_type_model_preferences():
 async def test_check_github_health_passive_mode_recent_success(mocker):
     """Recent last_github_success (< 60s) → skip API call, report healthy."""
     now = datetime.now(timezone.utc)
-    mocker.patch.object(_hcp._shared_state, "last_github_success", now - timedelta(seconds=30))
+    mocker.patch.object(
+        _hcp._shared_state, "last_github_success", now - timedelta(seconds=30)
+    )
     client_factory = mocker.patch("httpx.AsyncClient")
 
     ext = {"errors": {"github_api": "stale error"}}
@@ -1257,7 +1414,9 @@ async def test_check_github_health_passive_mode_recent_success(mocker):
 async def test_check_github_health_active_mode_stale_success(mocker):
     """Stale last_github_success (> 60s) → active API probe, healthy on 200."""
     now = datetime.now(timezone.utc)
-    mocker.patch.object(_hcp._shared_state, "last_github_success", now - timedelta(seconds=120))
+    mocker.patch.object(
+        _hcp._shared_state, "last_github_success", now - timedelta(seconds=120)
+    )
     mocker.patch("app.github.generate_github_app_jwt", return_value="jwt-token")
 
     mock_resp = mocker.MagicMock(status_code=200)
@@ -1302,7 +1461,9 @@ async def test_check_github_health_active_mode_cold_start(mocker):
 async def test_check_github_health_active_mode_raises(mocker):
     """API call raises → return 'github_api', record error, set unhealthy."""
     now = datetime.now(timezone.utc)
-    mocker.patch.object(_hcp._shared_state, "last_github_success", now - timedelta(seconds=120))
+    mocker.patch.object(
+        _hcp._shared_state, "last_github_success", now - timedelta(seconds=120)
+    )
     mocker.patch("app.github.generate_github_app_jwt", return_value="jwt-token")
 
     mock_client = mocker.MagicMock()
@@ -1324,7 +1485,9 @@ async def test_check_github_health_active_mode_raises(mocker):
 async def test_check_github_health_active_mode_non_200(mocker):
     """API returns non-200 → return 'github_api' with HTTP status in error."""
     now = datetime.now(timezone.utc)
-    mocker.patch.object(_hcp._shared_state, "last_github_success", now - timedelta(seconds=120))
+    mocker.patch.object(
+        _hcp._shared_state, "last_github_success", now - timedelta(seconds=120)
+    )
     mocker.patch("app.github.generate_github_app_jwt", return_value="jwt-token")
 
     mock_resp = mocker.MagicMock(status_code=503)
@@ -1352,7 +1515,9 @@ async def test_check_db_health_success(mocker):
     mock_session.__aenter__ = AsyncMock(return_value=mock_session)
     mock_session.__aexit__ = AsyncMock(return_value=None)
     mock_session.execute = AsyncMock(return_value=mocker.MagicMock())
-    mocker.patch("app.health_check_primitives.AsyncSessionLocal", return_value=mock_session)
+    mocker.patch(
+        "app.health_check_primitives.AsyncSessionLocal", return_value=mock_session
+    )
 
     ext = {"errors": {"db": "stale error"}}
     result = await _hcp.check_db_health(ext)
@@ -1370,7 +1535,9 @@ async def test_check_db_health_failure(mocker):
     mock_session.__aenter__ = AsyncMock(return_value=mock_session)
     mock_session.__aexit__ = AsyncMock(return_value=None)
     mock_session.execute = AsyncMock(side_effect=RuntimeError("connection lost"))
-    mocker.patch("app.health_check_primitives.AsyncSessionLocal", return_value=mock_session)
+    mocker.patch(
+        "app.health_check_primitives.AsyncSessionLocal", return_value=mock_session
+    )
 
     ext = {"errors": {}}
     result = await _hcp.check_db_health(ext)
@@ -1413,13 +1580,16 @@ async def test_single_resume_no_flap_escalation(dh_db):
 async def test_flap_escalation_requires_5_of_5_recovery(dh_db):
     """When already flapping (threshold met), recovery demands 5-of-5 healthy probes."""
     from datetime import timedelta
+
     now = _dh._utcnow()
     # Seed prior recent resumes so we are at the threshold BEFORE this cycle.
-    _dh._recent_auto_resumes.extend([
-        now - timedelta(seconds=600),
-        now - timedelta(seconds=400),
-        now - timedelta(seconds=200),
-    ])
+    _dh._recent_auto_resumes.extend(
+        [
+            now - timedelta(seconds=600),
+            now - timedelta(seconds=400),
+            now - timedelta(seconds=200),
+        ]
+    )
     _shared_state.runtime_config["flap_window_seconds"] = 1800
     _shared_state.runtime_config["flap_threshold"] = 3
 
@@ -1438,7 +1608,11 @@ async def test_flap_escalation_requires_5_of_5_recovery(dh_db):
     await _dh._check_pause_mode()
 
     # Still paused — 3-of-3 did not meet the escalated 5-of-5 bar.
-    state = (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1))).scalars().first()
+    state = (
+        (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1)))
+        .scalars()
+        .first()
+    )
     assert state.status == DeploymentStatus.PAUSED.value
     _dh._create_auto_resume_alerts.assert_not_awaited()
 
@@ -1447,11 +1621,14 @@ async def test_flap_escalation_requires_5_of_5_recovery(dh_db):
 async def test_flap_escalated_resume_creates_error_alert(dh_db):
     """After the 3rd resume lands inside the window, the auto-resume alert is ERROR-severity."""
     from datetime import timedelta
+
     now = _dh._utcnow()
-    _dh._recent_auto_resumes.extend([
-        now - timedelta(seconds=600),
-        now - timedelta(seconds=400),
-    ])
+    _dh._recent_auto_resumes.extend(
+        [
+            now - timedelta(seconds=600),
+            now - timedelta(seconds=400),
+        ]
+    )
     _shared_state.runtime_config["flap_window_seconds"] = 1800
     _shared_state.runtime_config["flap_threshold"] = 3
 
@@ -1479,14 +1656,17 @@ async def test_flap_escalated_resume_creates_error_alert(dh_db):
 def test_flap_window_prunes_stale_entries():
     """Entries older than flap_window_seconds are dropped on the next prune."""
     from datetime import timedelta
+
     _shared_state.runtime_config["flap_window_seconds"] = 300
     _shared_state.runtime_config["flap_threshold"] = 3
     now = _dh._utcnow()
-    _dh._recent_auto_resumes.extend([
-        now - timedelta(seconds=10_000),  # very stale
-        now - timedelta(seconds=5_000),   # stale
-        now - timedelta(seconds=60),      # fresh
-    ])
+    _dh._recent_auto_resumes.extend(
+        [
+            now - timedelta(seconds=10_000),  # very stale
+            now - timedelta(seconds=5_000),  # stale
+            now - timedelta(seconds=60),  # fresh
+        ]
+    )
 
     _dh._prune_flap_window(now)
 
@@ -1498,6 +1678,7 @@ def test_flap_window_prunes_stale_entries():
 async def test_flap_doubles_grace_period(dh_db, mocker):
     """While flapping, the post-resume grace period that suppresses re-pause is doubled."""
     from datetime import timedelta
+
     mocker.patch("app.deploy_health.manager.broadcast_to_all", new_callable=AsyncMock)
 
     await _make_deploy_state(dh_db, status=DeploymentStatus.STABLE)
@@ -1508,11 +1689,13 @@ async def test_flap_doubles_grace_period(dh_db, mocker):
 
     now = _dh._utcnow()
     # Trip flap threshold.
-    _dh._recent_auto_resumes.extend([
-        now - timedelta(seconds=600),
-        now - timedelta(seconds=400),
-        now - timedelta(seconds=200),
-    ])
+    _dh._recent_auto_resumes.extend(
+        [
+            now - timedelta(seconds=600),
+            now - timedelta(seconds=400),
+            now - timedelta(seconds=200),
+        ]
+    )
     # Resumed 400s ago — past the 300s base grace, but within 2*300s=600s flap-doubled grace.
     _dh._last_auto_resume_at = now - timedelta(seconds=400)
 
@@ -1522,7 +1705,11 @@ async def test_flap_doubles_grace_period(dh_db, mocker):
     await _dh._check_pause_mode()
 
     # No pause — doubled grace period absorbed the reading.
-    state = (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1))).scalars().first()
+    state = (
+        (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1)))
+        .scalars()
+        .first()
+    )
     assert state.status == DeploymentStatus.STABLE.value
     assert _shared_state.runtime_config["max_concurrent_vms"] == 4
 
@@ -1531,13 +1718,23 @@ async def test_flap_doubles_grace_period(dh_db, mocker):
 async def test_external_health_uses_short_interval_when_paused(mocker):
     """While paused (max_concurrent_vms == 0), the probe interval drops to 15s."""
     from datetime import datetime as _dt, timedelta as _td
-    mocker.patch("app.deploy_health.check_db_health", new_callable=AsyncMock, return_value=None)
-    mocker.patch("app.deploy_health.check_github_health", new_callable=AsyncMock, return_value=None)
+
+    mocker.patch(
+        "app.deploy_health.check_db_health", new_callable=AsyncMock, return_value=None
+    )
+    mocker.patch(
+        "app.deploy_health.check_github_health",
+        new_callable=AsyncMock,
+        return_value=None,
+    )
     mocker.patch("app.deploy_health.check_provider_api_health", return_value=None)
     mocker.patch("app.deploy_health.check_gcp_health", return_value=None)
     mocker.patch("app.deploy_health.recheck_disabled_accounts", new_callable=AsyncMock)
     mocker.patch("app.deploy_health.log_zone_health_transitions")
-    mocker.patch("app.deploy_health._get_zone_health_summary", return_value={"total_zones": 0, "available": 0, "exhausted": []})
+    mocker.patch(
+        "app.deploy_health._get_zone_health_summary",
+        return_value={"total_zones": 0, "available": 0, "exhausted": []},
+    )
     now_mock = _dt(2026, 4, 17, 12, 0, 0)
     mocker.patch("app.deploy_health._utcnow", return_value=now_mock)
 
@@ -1558,13 +1755,23 @@ async def test_external_health_uses_short_interval_when_paused(mocker):
 async def test_external_health_uses_normal_interval_when_active(mocker):
     """Active pipeline (max_concurrent_vms > 0) keeps the 60s probe cadence."""
     from datetime import datetime as _dt, timedelta as _td
-    mocker.patch("app.deploy_health.check_db_health", new_callable=AsyncMock, return_value=None)
-    mocker.patch("app.deploy_health.check_github_health", new_callable=AsyncMock, return_value=None)
+
+    mocker.patch(
+        "app.deploy_health.check_db_health", new_callable=AsyncMock, return_value=None
+    )
+    mocker.patch(
+        "app.deploy_health.check_github_health",
+        new_callable=AsyncMock,
+        return_value=None,
+    )
     mocker.patch("app.deploy_health.check_provider_api_health", return_value=None)
     mocker.patch("app.deploy_health.check_gcp_health", return_value=None)
     mocker.patch("app.deploy_health.recheck_disabled_accounts", new_callable=AsyncMock)
     mocker.patch("app.deploy_health.log_zone_health_transitions")
-    mocker.patch("app.deploy_health._get_zone_health_summary", return_value={"total_zones": 0, "available": 0, "exhausted": []})
+    mocker.patch(
+        "app.deploy_health._get_zone_health_summary",
+        return_value={"total_zones": 0, "available": 0, "exhausted": []},
+    )
     now_mock = _dt(2026, 4, 17, 12, 0, 0)
     mocker.patch("app.deploy_health._utcnow", return_value=now_mock)
 
@@ -1584,6 +1791,7 @@ async def test_external_health_uses_normal_interval_when_active(mocker):
 def test_restore_health_streaks_restores_recent_auto_resumes():
     """_restore_health_streaks rehydrates the flap-detection deque."""
     from datetime import datetime as _dt
+
     t1 = _dt(2026, 4, 17, 10, 30, 0)
     t2 = _dt(2026, 4, 17, 10, 40, 0)
     snapshot = {"_recent_auto_resumes": [t1.isoformat(), t2.isoformat(), "not-a-date"]}
@@ -1619,7 +1827,10 @@ async def test_orchestrator_persist_zone_health_round_trips_recent_auto_resumes(
     mock_session_ctx.__aenter__ = AsyncMock(return_value=mock_session)
     mock_session_ctx.__aexit__ = AsyncMock(return_value=None)
     mocker.patch("app.orchestrator.AsyncSessionLocal", return_value=mock_session_ctx)
-    mocker.patch("app.deploy_health._get_deploy_state_for_update", AsyncMock(return_value=mock_state))
+    mocker.patch(
+        "app.deploy_health._get_deploy_state_for_update",
+        AsyncMock(return_value=mock_state),
+    )
 
     await _orch_persist()
 
@@ -1633,7 +1844,9 @@ async def test_orchestrator_persist_zone_health_round_trips_recent_auto_resumes(
 
 
 @pytest.mark.asyncio
-async def test_orchestrator_persist_zone_health_round_trips_last_resume_was_forced(mocker):
+async def test_orchestrator_persist_zone_health_round_trips_last_resume_was_forced(
+    mocker,
+):
     """_last_resume_was_forced must survive persist/restore so forced-resume ramp gate holds across restarts."""
     import threading
     from collections import deque as _deque
@@ -1657,7 +1870,10 @@ async def test_orchestrator_persist_zone_health_round_trips_last_resume_was_forc
     mock_session_ctx.__aenter__ = AsyncMock(return_value=mock_session)
     mock_session_ctx.__aexit__ = AsyncMock(return_value=None)
     mocker.patch("app.orchestrator.AsyncSessionLocal", return_value=mock_session_ctx)
-    mocker.patch("app.deploy_health._get_deploy_state_for_update", AsyncMock(return_value=mock_state))
+    mocker.patch(
+        "app.deploy_health._get_deploy_state_for_update",
+        AsyncMock(return_value=mock_state),
+    )
 
     await _orch_persist()
 
@@ -1681,6 +1897,7 @@ async def test_orchestrator_persist_zone_health_round_trips_last_resume_was_forc
 async def test_force_resume_increments_consecutive_counter(dh_db):
     """Each force-resume increments _consecutive_force_resumes."""
     from datetime import timedelta
+
     long_ago = _dh._utcnow() - timedelta(seconds=10_000)
     await _make_deploy_state(
         dh_db,
@@ -1736,6 +1953,7 @@ async def test_force_resume_escalation_threshold_changes_title(dh_db, mocker):
     # Seed a project so the alert helper has somewhere to write.
     from app.models import Alert
     import uuid as _uuid
+
     project = Project(id=_uuid.uuid4(), name="p", user_id="u")
     dh_db.add(project)
     await dh_db.commit()
@@ -1750,7 +1968,9 @@ async def test_force_resume_escalation_threshold_changes_title(dh_db, mocker):
     # Escalated case (counter = 3).
     await _REAL_CREATE_FORCED_RESUME_ALERTS(dh_db, 7200, ["dispatch_api"], 3)
     await dh_db.commit()
-    alerts = (await dh_db.execute(select(Alert).order_by(Alert.created_at))).scalars().all()
+    alerts = (
+        (await dh_db.execute(select(Alert).order_by(Alert.created_at))).scalars().all()
+    )
     escalated = [a for a in alerts if a.title.startswith("Prolonged pipeline stall")]
     assert len(escalated) == 1
     assert "3 consecutive force-resumes" in escalated[0].title
@@ -1770,7 +1990,9 @@ def test_restore_health_streaks_restores_consecutive_force_resumes():
 
 
 @pytest.mark.asyncio
-async def test_orchestrator_persist_zone_health_round_trips_consecutive_force_resumes(mocker):
+async def test_orchestrator_persist_zone_health_round_trips_consecutive_force_resumes(
+    mocker,
+):
     """_consecutive_force_resumes must survive persist/restore so escalation counter holds across restarts."""
     import threading
     from collections import deque as _deque
@@ -1795,7 +2017,10 @@ async def test_orchestrator_persist_zone_health_round_trips_consecutive_force_re
     mock_session_ctx.__aenter__ = AsyncMock(return_value=mock_session)
     mock_session_ctx.__aexit__ = AsyncMock(return_value=None)
     mocker.patch("app.orchestrator.AsyncSessionLocal", return_value=mock_session_ctx)
-    mocker.patch("app.deploy_health._get_deploy_state_for_update", AsyncMock(return_value=mock_state))
+    mocker.patch(
+        "app.deploy_health._get_deploy_state_for_update",
+        AsyncMock(return_value=mock_state),
+    )
 
     await _orch_persist()
 

@@ -6,6 +6,7 @@ Callers own the transaction.
 
 Also provides dispatch_external_notification() for fire-and-forget external webhook delivery.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -21,9 +22,13 @@ import httpx
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import (
-    MessageType, Project, ProjectMessage,
-    ResidualCaseStatus, ResidualRemediationCase,
-    Task, _utcnow,
+    MessageType,
+    Project,
+    ProjectMessage,
+    ResidualCaseStatus,
+    ResidualRemediationCase,
+    Task,
+    _utcnow,
 )
 
 logger = logging.getLogger(__name__)
@@ -115,11 +120,13 @@ async def _drain_retry_queue(webhook_url: str) -> None:
             elif entry.attempts + 1 < len(_RETRY_DELAYS):
                 # Schedule another retry
                 delay = _RETRY_DELAYS[entry.attempts + 1]
-                _retry_queue.append(dataclasses.replace(
-                    entry,
-                    attempts=entry.attempts + 1,
-                    next_retry_at=time.monotonic() + delay,
-                ))
+                _retry_queue.append(
+                    dataclasses.replace(
+                        entry,
+                        attempts=entry.attempts + 1,
+                        next_retry_at=time.monotonic() + delay,
+                    )
+                )
                 logger.warning(
                     f"[NOTIFY] Retry {entry.attempts + 1} failed for {entry.event_type} "
                     f"({status}), next retry in {delay}s"
@@ -134,11 +141,13 @@ async def _drain_retry_queue(webhook_url: str) -> None:
         except Exception as exc:
             if entry.attempts + 1 < len(_RETRY_DELAYS):
                 delay = _RETRY_DELAYS[entry.attempts + 1]
-                _retry_queue.append(dataclasses.replace(
-                    entry,
-                    attempts=entry.attempts + 1,
-                    next_retry_at=time.monotonic() + delay,
-                ))
+                _retry_queue.append(
+                    dataclasses.replace(
+                        entry,
+                        attempts=entry.attempts + 1,
+                        next_retry_at=time.monotonic() + delay,
+                    )
+                )
                 logger.warning(
                     f"[NOTIFY] Retry {entry.attempts + 1} network error for "
                     f"{entry.event_type}: {exc}"
@@ -175,6 +184,7 @@ async def dispatch_external_notification(
 
     try:
         from app.shared_state import runtime_config
+
         nc = runtime_config.get("notification_config", {})
         webhook_url = nc.get("webhook_url", "")
         enabled_events = nc.get("enabled_events", [])
@@ -186,12 +196,20 @@ async def dispatch_external_notification(
             return
         # SSRF guard: only allow http(s) and block internal/metadata IPs
         from urllib.parse import urlparse
+
         parsed_url = urlparse(webhook_url)
         if parsed_url.scheme not in ("http", "https"):
-            logger.warning(f"[NOTIFY] Rejecting non-http(s) webhook URL: {parsed_url.scheme}")
+            logger.warning(
+                f"[NOTIFY] Rejecting non-http(s) webhook URL: {parsed_url.scheme}"
+            )
             return
         _host = parsed_url.hostname or ""
-        if _host in ("169.254.169.254", "metadata.google.internal", "localhost", "127.0.0.1"):
+        if _host in (
+            "169.254.169.254",
+            "metadata.google.internal",
+            "localhost",
+            "127.0.0.1",
+        ):
             logger.warning(f"[NOTIFY] Rejecting internal webhook URL host: {_host}")
             return
 
@@ -228,14 +246,16 @@ async def dispatch_external_notification(
             elif status >= 400:
                 # 5xx or unexpected 4xx — schedule first retry
                 delay = _RETRY_DELAYS[0]
-                _retry_queue.append(_RetryEntry(
-                    project_id=project_id,
-                    event_type=event_type,
-                    payload=payload,
-                    body=body,
-                    attempts=0,
-                    next_retry_at=time.monotonic() + delay,
-                ))
+                _retry_queue.append(
+                    _RetryEntry(
+                        project_id=project_id,
+                        event_type=event_type,
+                        payload=payload,
+                        body=body,
+                        attempts=0,
+                        next_retry_at=time.monotonic() + delay,
+                    )
+                )
                 logger.warning(
                     f"[NOTIFY] External webhook {event_type} returned {status}, "
                     f"scheduled retry in {delay}s"
@@ -246,20 +266,24 @@ async def dispatch_external_notification(
         except Exception as exc:
             # Network/timeout error — schedule first retry
             delay = _RETRY_DELAYS[0]
-            _retry_queue.append(_RetryEntry(
-                project_id=project_id,
-                event_type=event_type,
-                payload=payload,
-                body=body,
-                attempts=0,
-                next_retry_at=time.monotonic() + delay,
-            ))
+            _retry_queue.append(
+                _RetryEntry(
+                    project_id=project_id,
+                    event_type=event_type,
+                    payload=payload,
+                    body=body,
+                    attempts=0,
+                    next_retry_at=time.monotonic() + delay,
+                )
+            )
             logger.warning(
                 f"[NOTIFY] External webhook dispatch failed for {event_type}: {exc}, "
                 f"scheduled retry in {delay}s"
             )
     except Exception as e:
-        logger.warning(f"[NOTIFY] External webhook dispatch failed for {event_type}: {e}")
+        logger.warning(
+            f"[NOTIFY] External webhook dispatch failed for {event_type}: {e}"
+        )
 
 
 async def post_event_message(
@@ -295,15 +319,17 @@ async def post_pr_merged_message(
     task_id: Optional[uuid.UUID] = None,
 ) -> ProjectMessage:
     """Post a message when a rollup PR is auto-merged."""
-    summary = (
-        f"PR #{pr_number} merged — {task_count} subtask(s) shipped for direction: {direction_text}"
-    )
+    summary = f"PR #{pr_number} merged — {task_count} subtask(s) shipped for direction: {direction_text}"
     return await post_event_message(
         session,
         project_id,
         event_type="pr_merged",
         summary=summary,
-        context={"pr_number": pr_number, "task_count": task_count, "direction_text": direction_text[:120]},
+        context={
+            "pr_number": pr_number,
+            "task_count": task_count,
+            "direction_text": direction_text[:120],
+        },
         task_id=task_id,
     )
 
@@ -356,11 +382,13 @@ async def post_direction_milestone_message(
         context=context,
         task_id=task_id,
     )
-    asyncio.ensure_future(dispatch_external_notification(
-        project_id,
-        "DIRECTION_MILESTONE",
-        payload,
-    ))
+    asyncio.ensure_future(
+        dispatch_external_notification(
+            project_id,
+            "DIRECTION_MILESTONE",
+            payload,
+        )
+    )
     return msg
 
 
@@ -475,7 +503,9 @@ async def post_account_model_regression_recovered_message(
     after a successful probe task completes post-cooldown."""
     rate_detail = (
         f" ({account_rate:.0%} vs median {project_median:.0%} on n={sample_size})"
-        if account_rate is not None and project_median is not None and sample_size is not None
+        if account_rate is not None
+        and project_median is not None
+        and sample_size is not None
         else ""
     )
     summary = (
@@ -507,15 +537,19 @@ async def post_auto_fix_spawned_message(
     task_id: Optional[uuid.UUID] = None,
 ) -> ProjectMessage:
     """Post a message when CI auto-remediation spawns a fix task."""
-    check_names = ', '.join(failed_checks[:3])
-    suffix = f' +{len(failed_checks) - 3} more' if len(failed_checks) > 3 else ''
-    summary = f'CI auto-fix spawned: {check_names}{suffix} failed on {branch}'
+    check_names = ", ".join(failed_checks[:3])
+    suffix = f" +{len(failed_checks) - 3} more" if len(failed_checks) > 3 else ""
+    summary = f"CI auto-fix spawned: {check_names}{suffix} failed on {branch}"
     return await post_event_message(
         session,
         project_id,
-        event_type='auto_fix_spawned',
+        event_type="auto_fix_spawned",
         summary=summary,
-        context={'branch': branch, 'failed_checks': failed_checks[:10], 'task_id': str(task_id) if task_id else None},
+        context={
+            "branch": branch,
+            "failed_checks": failed_checks[:10],
+            "task_id": str(task_id) if task_id else None,
+        },
         task_id=task_id,
     )
 
@@ -543,35 +577,40 @@ async def post_auto_fix_result_message(
     For result='merged': resets the counter and clears any suspension for this
     branch.
     """
-    if result == 'merged':
-        summary = f'CI auto-fix merged: PR #{pr_number} fixed {branch}'
-    elif result == 'failed':
-        summary = f'CI auto-fix failed on {branch} — manual intervention needed'
+    if result == "merged":
+        summary = f"CI auto-fix merged: PR #{pr_number} fixed {branch}"
+    elif result == "failed":
+        summary = f"CI auto-fix failed on {branch} — manual intervention needed"
     else:
-        summary = f'CI auto-fix on {branch} needs review: PR #{pr_number}'
+        summary = f"CI auto-fix on {branch} needs review: PR #{pr_number}"
 
     msg = await post_event_message(
         session,
         project_id,
-        event_type='auto_fix_result',
+        event_type="auto_fix_result",
         summary=summary,
-        context={'branch': branch, 'result': result, 'pr_number': pr_number},
+        context={"branch": branch, "result": result, "pr_number": pr_number},
         task_id=task_id,
     )
 
     # Update per-branch failure tracking in the project's auto_remediation config
-    if result in ('failed', 'merged'):
+    if result in ("failed", "merged"):
         try:
             from sqlalchemy.orm.attributes import flag_modified
+
             project = await session.get(Project, project_id)
             if project is not None:
                 design_doc = dict(project.design_doc or {})
-                ar_config = dict(design_doc.get('_auto_remediation', {}))
-                failure_counts: dict[str, int] = dict(ar_config.get('branch_failure_counts', {}))
-                suspended: list[str] = list(ar_config.get('suspended_branches', []))
-                suspension_meta: dict[str, dict] = dict(ar_config.get('suspension_metadata', {}))
+                ar_config = dict(design_doc.get("_auto_remediation", {}))
+                failure_counts: dict[str, int] = dict(
+                    ar_config.get("branch_failure_counts", {})
+                )
+                suspended: list[str] = list(ar_config.get("suspended_branches", []))
+                suspension_meta: dict[str, dict] = dict(
+                    ar_config.get("suspension_metadata", {})
+                )
 
-                if result == 'merged':
+                if result == "merged":
                     # Reset on success, but preserve recovery_attempts so that
                     # a branch which keeps failing-and-fixing eventually escalates
                     # to permanent suspension via exponential backoff.
@@ -579,9 +618,9 @@ async def post_auto_fix_result_message(
                     if branch in suspended:
                         suspended.remove(branch)
                     prior = suspension_meta.get(branch) or {}
-                    prior_attempts = int(prior.get('recovery_attempts', 0) or 0)
+                    prior_attempts = int(prior.get("recovery_attempts", 0) or 0)
                     if prior_attempts > 0:
-                        suspension_meta[branch] = {'recovery_attempts': prior_attempts}
+                        suspension_meta[branch] = {"recovery_attempts": prior_attempts}
                     else:
                         suspension_meta.pop(branch, None)
                 else:
@@ -594,53 +633,72 @@ async def post_auto_fix_result_message(
                     threshold = _AUTO_REMEDIATION_ESCALATION_THRESHOLD
                     if task_id is not None:
                         triggering = await session.get(Task, task_id)
-                        if triggering is not None and (triggering.context or {}).get("regression_of_task_id"):
-                            threshold = _AUTO_REMEDIATION_REGRESSION_ESCALATION_THRESHOLD
+                        if triggering is not None and (triggering.context or {}).get(
+                            "regression_of_task_id"
+                        ):
+                            threshold = (
+                                _AUTO_REMEDIATION_REGRESSION_ESCALATION_THRESHOLD
+                            )
                     if count >= threshold and branch not in suspended:
                         suspended.append(branch)
                         # Preserve recovery_attempts across re-suspensions so
                         # exponential backoff applies on repeated failures.
                         prior = suspension_meta.get(branch) or {}
                         suspension_meta[branch] = {
-                            'suspended_at': _utcnow().isoformat(),
-                            'recovery_attempts': int(prior.get('recovery_attempts', 0) or 0),
+                            "suspended_at": _utcnow().isoformat(),
+                            "recovery_attempts": int(
+                                prior.get("recovery_attempts", 0) or 0
+                            ),
                         }
-                        ar_config['branch_failure_counts'] = failure_counts
-                        ar_config['suspended_branches'] = suspended
-                        ar_config['suspension_metadata'] = suspension_meta
-                        design_doc['_auto_remediation'] = ar_config
+                        ar_config["branch_failure_counts"] = failure_counts
+                        ar_config["suspended_branches"] = suspended
+                        ar_config["suspension_metadata"] = suspension_meta
+                        design_doc["_auto_remediation"] = ar_config
                         project.design_doc = design_doc
-                        flag_modified(project, 'design_doc')
+                        flag_modified(project, "design_doc")
                         session.add(project)
                         # Fire escalation message + webhook
                         await post_auto_fix_escalation_message(
-                            session, project_id, branch=branch, failure_count=count,
-                        )
-                        asyncio.ensure_future(dispatch_external_notification(
+                            session,
                             project_id,
-                            'AUTO_FIX_ESCALATED',
-                            {
-                                'branch': branch,
-                                'consecutive_failures': count,
-                                'threshold': threshold,
-                                'suspended_at': suspension_meta[branch]['suspended_at'],
-                                'recovery_attempts': suspension_meta[branch]['recovery_attempts'],
-                                'severity': 'blocker',
-                                'manual_intervention_required': True,
-                                'summary': summary,
-                            },
-                        ))
+                            branch=branch,
+                            failure_count=count,
+                        )
+                        asyncio.ensure_future(
+                            dispatch_external_notification(
+                                project_id,
+                                "AUTO_FIX_ESCALATED",
+                                {
+                                    "branch": branch,
+                                    "consecutive_failures": count,
+                                    "threshold": threshold,
+                                    "suspended_at": suspension_meta[branch][
+                                        "suspended_at"
+                                    ],
+                                    "recovery_attempts": suspension_meta[branch][
+                                        "recovery_attempts"
+                                    ],
+                                    "severity": "blocker",
+                                    "manual_intervention_required": True,
+                                    "summary": summary,
+                                },
+                            )
+                        )
                         return msg
 
-                ar_config['branch_failure_counts'] = failure_counts
-                ar_config['suspended_branches'] = suspended
-                ar_config['suspension_metadata'] = suspension_meta
-                design_doc['_auto_remediation'] = ar_config
+                ar_config["branch_failure_counts"] = failure_counts
+                ar_config["suspended_branches"] = suspended
+                ar_config["suspension_metadata"] = suspension_meta
+                design_doc["_auto_remediation"] = ar_config
                 project.design_doc = design_doc
-                flag_modified(project, 'design_doc')
+                flag_modified(project, "design_doc")
                 session.add(project)
         except Exception as exc:
-            logger.warning('[AUTO-REMEDIATION] Failed to update failure tracking for %s: %s', branch, exc)
+            logger.warning(
+                "[AUTO-REMEDIATION] Failed to update failure tracking for %s: %s",
+                branch,
+                exc,
+            )
 
     return msg
 
@@ -659,18 +717,18 @@ async def post_auto_fix_escalation_message(
     know manual action is required.
     """
     summary = (
-        f'Auto-remediation suspended for {branch} after {failure_count} consecutive failures. '
-        f'Manual intervention required. Re-enable via the auto-remediation settings.'
+        f"Auto-remediation suspended for {branch} after {failure_count} consecutive failures. "
+        f"Manual intervention required. Re-enable via the auto-remediation settings."
     )
     ctx: dict[str, Any] = {
-        'event_type': 'auto_fix_escalated',
-        'branch': branch,
-        'consecutive_failures': failure_count,
+        "event_type": "auto_fix_escalated",
+        "branch": branch,
+        "consecutive_failures": failure_count,
     }
     msg = ProjectMessage(
         project_id=project_id,
         message_type=MessageType.BLOCKER,
-        from_type='system',
+        from_type="system",
         from_task_id=task_id,
         content=summary,
         context=ctx,
@@ -685,6 +743,7 @@ async def post_auto_fix_escalation_message(
 # is the same: spawned → result(merged|failed|review_needed) →
 # suspended after _AUTO_REMEDIATION_ESCALATION_THRESHOLD consecutive failures.
 
+
 async def _get_or_create_residual_case(
     session: AsyncSession,
     project_id: uuid.UUID,
@@ -695,6 +754,7 @@ async def _get_or_create_residual_case(
     row per fingerprint. Caller is responsible for the surrounding commit.
     """
     from sqlmodel import select
+
     result = await session.execute(
         select(ResidualRemediationCase).where(
             ResidualRemediationCase.project_id == project_id,
@@ -709,7 +769,6 @@ async def _get_or_create_residual_case(
         )
         session.add(case)
     return case
-
 
 
 async def post_residual_fix_spawned_message(
@@ -734,28 +793,30 @@ async def post_residual_fix_spawned_message(
     case.audit_deferred_system_id = None
     session.add(case)
 
-    summary = f'Residual auto-fix spawned for fingerprint {fingerprint[:32]}'
+    summary = f"Residual auto-fix spawned for fingerprint {fingerprint[:32]}"
     msg = await post_event_message(
         session,
         project_id,
-        event_type='residual_fix_spawned',
+        event_type="residual_fix_spawned",
         summary=summary,
         context={
-            'fingerprint': fingerprint,
-            'sample_message': (sample_message or '')[:400],
-            'task_id': str(task_id) if task_id else None,
+            "fingerprint": fingerprint,
+            "sample_message": (sample_message or "")[:400],
+            "task_id": str(task_id) if task_id else None,
         },
         task_id=task_id,
     )
-    asyncio.ensure_future(dispatch_external_notification(
-        project_id,
-        'RESIDUAL_FIX_SPAWNED',
-        {
-            'fingerprint': fingerprint,
-            'hit_count': case.hit_count,
-            'task_id': str(task_id) if task_id else None,
-        },
-    ))
+    asyncio.ensure_future(
+        dispatch_external_notification(
+            project_id,
+            "RESIDUAL_FIX_SPAWNED",
+            {
+                "fingerprint": fingerprint,
+                "hit_count": case.hit_count,
+                "task_id": str(task_id) if task_id else None,
+            },
+        )
+    )
     return msg
 
 
@@ -778,28 +839,31 @@ async def post_residual_fix_result_message(
     result message but does not change the failure counter — a human
     review is the next gate.
     """
-    if result == 'merged':
-        summary = f'Residual auto-fix merged: PR #{pr_number} resolved {fingerprint[:32]}'
-    elif result == 'failed':
-        summary = f'Residual auto-fix failed for {fingerprint[:32]} — manual intervention may be needed'
+    if result == "merged":
+        summary = (
+            f"Residual auto-fix merged: PR #{pr_number} resolved {fingerprint[:32]}"
+        )
+    elif result == "failed":
+        summary = f"Residual auto-fix failed for {fingerprint[:32]} — manual intervention may be needed"
     else:
-        summary = f'Residual auto-fix needs review: PR #{pr_number} for {fingerprint[:32]}'
-
+        summary = (
+            f"Residual auto-fix needs review: PR #{pr_number} for {fingerprint[:32]}"
+        )
 
     msg = await post_event_message(
         session,
         project_id,
-        event_type='residual_fix_result',
+        event_type="residual_fix_result",
         summary=summary,
         context={
-            'fingerprint': fingerprint,
-            'result': result,
-            'pr_number': pr_number,
+            "fingerprint": fingerprint,
+            "result": result,
+            "pr_number": pr_number,
         },
         task_id=task_id,
     )
 
-    if result == 'review_needed':
+    if result == "review_needed":
         # Don't touch the failure counter or status — wait for the human
         # gate. The case stays REMEDIATING.
         if pr_number is not None:
@@ -815,7 +879,7 @@ async def post_residual_fix_result_message(
             case.last_spawned_pr_number = pr_number
         case.updated_at = _utcnow()
 
-        if result == 'merged':
+        if result == "merged":
             case.consecutive_failure_count = 0
             case.status = ResidualCaseStatus.MERGED
             case.suspended_at = None
@@ -826,35 +890,46 @@ async def post_residual_fix_result_message(
         case.consecutive_failure_count = (case.consecutive_failure_count or 0) + 1
         count = case.consecutive_failure_count
 
-        if count >= _AUTO_REMEDIATION_ESCALATION_THRESHOLD and case.status != ResidualCaseStatus.SUSPENDED:
+        if (
+            count >= _AUTO_REMEDIATION_ESCALATION_THRESHOLD
+            and case.status != ResidualCaseStatus.SUSPENDED
+        ):
             case.status = ResidualCaseStatus.SUSPENDED
             case.suspended_at = _utcnow()
             session.add(case)
             await post_residual_fix_escalation_message(
-                session, project_id, fingerprint=fingerprint,
-                failure_count=count, task_id=task_id,
-            )
-            asyncio.ensure_future(dispatch_external_notification(
+                session,
                 project_id,
-                'RESIDUAL_FIX_ESCALATED',
-                {
-                    'fingerprint': fingerprint,
-                    'consecutive_failures': count,
-                    'threshold': _AUTO_REMEDIATION_ESCALATION_THRESHOLD,
-                    'suspended_at': case.suspended_at.isoformat() if case.suspended_at else None,
-                    'severity': 'blocker',
-                    'manual_intervention_required': True,
-                    'summary': summary,
-                },
-            ))
+                fingerprint=fingerprint,
+                failure_count=count,
+                task_id=task_id,
+            )
+            asyncio.ensure_future(
+                dispatch_external_notification(
+                    project_id,
+                    "RESIDUAL_FIX_ESCALATED",
+                    {
+                        "fingerprint": fingerprint,
+                        "consecutive_failures": count,
+                        "threshold": _AUTO_REMEDIATION_ESCALATION_THRESHOLD,
+                        "suspended_at": case.suspended_at.isoformat()
+                        if case.suspended_at
+                        else None,
+                        "severity": "blocker",
+                        "manual_intervention_required": True,
+                        "summary": summary,
+                    },
+                )
+            )
             return msg
 
         case.status = ResidualCaseStatus.FAILED
         session.add(case)
     except Exception as exc:
         logger.warning(
-            '[RESIDUAL-REMEDIATION] Failed to update case row for %s: %s',
-            fingerprint, exc,
+            "[RESIDUAL-REMEDIATION] Failed to update case row for %s: %s",
+            fingerprint,
+            exc,
         )
 
     return msg
@@ -881,7 +956,8 @@ async def post_remediation_result_message(
     the spawned_by check."""
     if is_residual_remediation_task(task):
         return await post_residual_fix_result_message(
-            session, task.project_id,
+            session,
+            task.project_id,
             fingerprint=(task.context or {}).get("error_fingerprint", ""),
             result=result,
             pr_number=pr_number,
@@ -889,7 +965,8 @@ async def post_remediation_result_message(
         )
     branch = (task.context or {}).get("ci_failure_branch", "main")
     return await post_auto_fix_result_message(
-        session, task.project_id,
+        session,
+        task.project_id,
         branch=branch,
         result=result,
         pr_number=pr_number,
@@ -909,20 +986,20 @@ async def post_residual_fix_escalation_message(
     failures. Mirrors post_auto_fix_escalation_message but per-fingerprint.
     """
     summary = (
-        f'Residual auto-fix suspended for fingerprint {fingerprint[:32]} '
-        f'after {failure_count} consecutive failures. Manual intervention '
-        f'required. Re-enable via the Unsuspend button in the dashboard '
-        f'or POST /api/admin/residual-cases/{fingerprint}/unsuspend.'
+        f"Residual auto-fix suspended for fingerprint {fingerprint[:32]} "
+        f"after {failure_count} consecutive failures. Manual intervention "
+        f"required. Re-enable via the Unsuspend button in the dashboard "
+        f"or POST /api/admin/residual-cases/{fingerprint}/unsuspend."
     )
     ctx: dict[str, Any] = {
-        'event_type': 'residual_fix_escalated',
-        'fingerprint': fingerprint,
-        'consecutive_failures': failure_count,
+        "event_type": "residual_fix_escalated",
+        "fingerprint": fingerprint,
+        "consecutive_failures": failure_count,
     }
     msg = ProjectMessage(
         project_id=project_id,
         message_type=MessageType.BLOCKER,
-        from_type='system',
+        from_type="system",
         from_task_id=task_id,
         content=summary,
         context=ctx,
@@ -944,31 +1021,33 @@ async def post_residual_fix_unsuspend_message(
     """
     recovered_at = datetime.now(timezone.utc).isoformat()
     summary = (
-        f'Residual auto-fix re-enabled for fingerprint {fingerprint[:32]}. '
-        f'Case manually unsuspended by operator. Spawn will resume after cooldown.'
+        f"Residual auto-fix re-enabled for fingerprint {fingerprint[:32]}. "
+        f"Case manually unsuspended by operator. Spawn will resume after cooldown."
     )
     msg = await post_event_message(
         session,
         project_id,
-        event_type='residual_fix_unsuspended',
+        event_type="residual_fix_unsuspended",
         summary=summary,
         context={
-            'fingerprint': fingerprint,
-            'recovered_at': recovered_at,
-            'manual_intervention_required': False,
+            "fingerprint": fingerprint,
+            "recovered_at": recovered_at,
+            "manual_intervention_required": False,
         },
         task_id=task_id,
     )
-    asyncio.ensure_future(dispatch_external_notification(
-        project_id,
-        'RESIDUAL_FIX_UNSUSPENDED',
-        {
-            'fingerprint': fingerprint,
-            'recovered_at': recovered_at,
-            'manual_intervention_required': False,
-            'summary': summary,
-        },
-    ))
+    asyncio.ensure_future(
+        dispatch_external_notification(
+            project_id,
+            "RESIDUAL_FIX_UNSUSPENDED",
+            {
+                "fingerprint": fingerprint,
+                "recovered_at": recovered_at,
+                "manual_intervention_required": False,
+                "summary": summary,
+            },
+        )
+    )
     return msg
 
 
@@ -996,45 +1075,50 @@ async def post_residual_fix_audit_deferred_escalation_message(
     """
     try:
         from app.shared_state import runtime_config
-        threshold = int(runtime_config.get(
-            'residual_audit_defer_escalation_threshold',
-            _RESIDUAL_AUDIT_DEFER_ESCALATION_THRESHOLD,
-        ))
+
+        threshold = int(
+            runtime_config.get(
+                "residual_audit_defer_escalation_threshold",
+                _RESIDUAL_AUDIT_DEFER_ESCALATION_THRESHOLD,
+            )
+        )
     except Exception:
         threshold = _RESIDUAL_AUDIT_DEFER_ESCALATION_THRESHOLD
 
     summary = (
-        f'Residual case for fingerprint {fingerprint[:32]} has been deferred by audit '
-        f'{defer_count} times (threshold: {threshold}). No fix has been spawned yet — '
-        f'the case is blocked pending audit completion.'
+        f"Residual case for fingerprint {fingerprint[:32]} has been deferred by audit "
+        f"{defer_count} times (threshold: {threshold}). No fix has been spawned yet — "
+        f"the case is blocked pending audit completion."
     )
     ctx: dict[str, Any] = {
-        'event_type': 'residual_fix_audit_deferred',
-        'fingerprint': fingerprint,
-        'audit_defer_count': defer_count,
-        'threshold': threshold,
+        "event_type": "residual_fix_audit_deferred",
+        "fingerprint": fingerprint,
+        "audit_defer_count": defer_count,
+        "threshold": threshold,
     }
     msg = ProjectMessage(
         project_id=project_id,
         message_type=MessageType.BLOCKER,
-        from_type='system',
+        from_type="system",
         from_task_id=task_id,
         content=summary,
         context=ctx,
     )
     session.add(msg)
-    asyncio.ensure_future(dispatch_external_notification(
-        project_id,
-        'RESIDUAL_FIX_AUDIT_DEFERRED',
-        {
-            'fingerprint': fingerprint,
-            'audit_defer_count': defer_count,
-            'threshold': threshold,
-            'severity': 'blocker',
-            'manual_intervention_required': False,
-            'summary': summary,
-        },
-    ))
+    asyncio.ensure_future(
+        dispatch_external_notification(
+            project_id,
+            "RESIDUAL_FIX_AUDIT_DEFERRED",
+            {
+                "fingerprint": fingerprint,
+                "audit_defer_count": defer_count,
+                "threshold": threshold,
+                "severity": "blocker",
+                "manual_intervention_required": False,
+                "summary": summary,
+            },
+        )
+    )
     return msg
 
 
@@ -1042,7 +1126,7 @@ async def close_residual_case_resolved(
     session: AsyncSession,
     project_id: uuid.UUID,
     fingerprint: str,
-    reason: str = 'fingerprint_went_silent',
+    reason: str = "fingerprint_went_silent",
 ) -> ProjectMessage:
     """Transition a ResidualRemediationCase to RESOLVED and emit a notification.
 
@@ -1055,19 +1139,21 @@ async def close_residual_case_resolved(
     case.updated_at = _utcnow()
     session.add(case)
 
-    summary = f'Residual case auto-resolved: fingerprint {fingerprint[:32]} went silent'
+    summary = f"Residual case auto-resolved: fingerprint {fingerprint[:32]} went silent"
     msg = await post_event_message(
         session,
         project_id,
-        event_type='residual_case_auto_resolved',
+        event_type="residual_case_auto_resolved",
         summary=summary,
-        context={'fingerprint': fingerprint, 'reason': reason},
+        context={"fingerprint": fingerprint, "reason": reason},
     )
-    asyncio.ensure_future(dispatch_external_notification(
-        project_id,
-        'RESIDUAL_CASE_AUTO_RESOLVED',
-        {'fingerprint': fingerprint, 'reason': reason},
-    ))
+    asyncio.ensure_future(
+        dispatch_external_notification(
+            project_id,
+            "RESIDUAL_CASE_AUTO_RESOLVED",
+            {"fingerprint": fingerprint, "reason": reason},
+        )
+    )
     return msg
 
 
@@ -1105,19 +1191,21 @@ async def post_remediation_escalation_message(
         context=ctx,
     )
     session.add(msg)
-    asyncio.ensure_future(dispatch_external_notification(
-        project_id,
-        "REMEDIATION_ESCALATED",
-        {
-            "direction_text": direction_text[:120],
-            "failure_pattern": failure_pattern[:200],
-            "attempts": attempts,
-            "remediation_summary": remediation_summary[:240],
-            "severity": "blocker",
-            "manual_intervention_required": True,
-            "summary": summary,
-        },
-    ))
+    asyncio.ensure_future(
+        dispatch_external_notification(
+            project_id,
+            "REMEDIATION_ESCALATED",
+            {
+                "direction_text": direction_text[:120],
+                "failure_pattern": failure_pattern[:200],
+                "attempts": attempts,
+                "remediation_summary": remediation_summary[:240],
+                "severity": "blocker",
+                "manual_intervention_required": True,
+                "summary": summary,
+            },
+        )
+    )
     return msg
 
 
@@ -1154,11 +1242,15 @@ async def post_review_feedback_message(
 ) -> ProjectMessage:
     """Post a message when a review quality signal is received from GitHub."""
     if signal == "review_dismissed":
-        summary = f"Blueprint review dismissed on PR #{pr_number}" + (f": {detail}" if detail else "")
+        summary = f"Blueprint review dismissed on PR #{pr_number}" + (
+            f": {detail}" if detail else ""
+        )
     elif signal == "user_overrode_review":
         summary = f"User approved PR #{pr_number} after Blueprint requested changes"
     elif signal == "user_caught_issues":
-        summary = f"User requested changes on PR #{pr_number} that Blueprint had approved"
+        summary = (
+            f"User requested changes on PR #{pr_number} that Blueprint had approved"
+        )
     else:
         summary = f"Review feedback on PR #{pr_number}: {signal}"
     return await post_event_message(
@@ -1231,9 +1323,15 @@ async def post_fix_loop_divergence_regression_message(
         summary=summary,
         context={"regressions": regressions, "window_days": window_days},
     )
-    asyncio.ensure_future(dispatch_external_notification(
-        project_id,
-        "FIX_LOOP_DIVERGENCE_REGRESSED",
-        {"regressions": regressions, "window_days": window_days, "summary": summary},
-    ))
+    asyncio.ensure_future(
+        dispatch_external_notification(
+            project_id,
+            "FIX_LOOP_DIVERGENCE_REGRESSED",
+            {
+                "regressions": regressions,
+                "window_days": window_days,
+                "summary": summary,
+            },
+        )
+    )
     return msg

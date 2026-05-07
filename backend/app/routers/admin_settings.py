@@ -24,7 +24,9 @@ from app.models import (
 from app.task_locking import deployment_state_lock
 from app.auth import get_current_user, require_admin
 from app.github import generate_installation_access_token
-from app.max_plan_pool import provider_selection_mode as _provider_selection_mode_from_config
+from app.max_plan_pool import (
+    provider_selection_mode as _provider_selection_mode_from_config,
+)
 from app.providers.registry import get_provider, list_providers
 
 _VALID_PROVIDER_SELECTION_MODES = frozenset({"balanced", "preferred", "exclusive"})
@@ -38,7 +40,9 @@ def _build_provider_catalog(runtime_config: Dict[str, Any]) -> dict[str, Any]:  
         catalog[provider.name.value] = {
             "auth_modes": {
                 mode.value: {
-                    "required_metadata_fields": list(provider.required_metadata_fields(mode)),
+                    "required_metadata_fields": list(
+                        provider.required_metadata_fields(mode)
+                    ),
                 }
                 for mode in provider.supported_auth_modes
             },
@@ -49,10 +53,11 @@ def _build_provider_catalog(runtime_config: Dict[str, Any]) -> dict[str, Any]:  
         }
     return catalog
 
+
 router = APIRouter(
     prefix="/api/admin",
     tags=["admin-settings"],
-    dependencies=[Depends(get_current_user)]
+    dependencies=[Depends(get_current_user)],
 )
 
 
@@ -68,7 +73,17 @@ def _build_notification_config_response(config: dict, *, is_admin: bool) -> dict
     return {
         "webhook_url": "",
         "webhook_url_configured": bool(config.get("webhook_url")),
-        "enabled_events": config.get("enabled_events", ["TASK_FAILED", "APPROVAL_NEEDED", "DEPLOY_HEALTH_ALERT", "REMEDIATION_ESCALATED", "DIRECTION_MILESTONE", "RESIDUAL_FIX_ESCALATED"]),
+        "enabled_events": config.get(
+            "enabled_events",
+            [
+                "TASK_FAILED",
+                "APPROVAL_NEEDED",
+                "DEPLOY_HEALTH_ALERT",
+                "REMEDIATION_ESCALATED",
+                "DIRECTION_MILESTONE",
+                "RESIDUAL_FIX_ESCALATED",
+            ],
+        ),
         "throttle_seconds": config.get("throttle_seconds", 30),
     }
 
@@ -77,10 +92,11 @@ def _build_notification_config_response(config: dict, *, is_admin: bool) -> dict
 # Settings endpoints
 # ---------------------------------------------------------------------------
 
+
 @router.get("/settings")
 async def get_settings(
     session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
 ):
     from app.shared_state import runtime_config as _runtime_config
     from app.max_plan_pool import _max_plan_pools
@@ -88,7 +104,9 @@ async def get_settings(
 
     # Check if the user has a GitHub integration
     github_account = None
-    stmt = select(UserIntegration).where(UserIntegration.user_id == current_user["user_id"])
+    stmt = select(UserIntegration).where(
+        UserIntegration.user_id == current_user["user_id"]
+    )
     integration = (await session.execute(stmt)).scalars().first()
     if integration and integration.github_account_name:
         github_account = integration.github_account_name
@@ -97,88 +115,174 @@ async def get_settings(
     return {
         "max_concurrent_vms": _runtime_config["max_concurrent_vms"],
         "max_retries": _runtime_config["max_retries"],
-        "max_autonomous_tasks_per_hour": _runtime_config["max_autonomous_tasks_per_hour"],
-        "max_global_autonomous_tasks_per_hour": _runtime_config.get("max_global_autonomous_tasks_per_hour", 50),
-        "autonomous_research_interval_minutes": _runtime_config.get("autonomous_research_interval_minutes", 30),
-        "max_concurrent_auto_remediations": _runtime_config.get("max_concurrent_auto_remediations", 2),
-        "residual_remediation_cooldown_hours": _runtime_config.get("residual_remediation_cooldown_hours", 24),
-        "residual_audit_defer_escalation_threshold": int(_runtime_config.get("residual_audit_defer_escalation_threshold", 5)),
+        "max_autonomous_tasks_per_hour": _runtime_config[
+            "max_autonomous_tasks_per_hour"
+        ],
+        "max_global_autonomous_tasks_per_hour": _runtime_config.get(
+            "max_global_autonomous_tasks_per_hour", 50
+        ),
+        "autonomous_research_interval_minutes": _runtime_config.get(
+            "autonomous_research_interval_minutes", 30
+        ),
+        "max_concurrent_auto_remediations": _runtime_config.get(
+            "max_concurrent_auto_remediations", 2
+        ),
+        "residual_remediation_cooldown_hours": _runtime_config.get(
+            "residual_remediation_cooldown_hours", 24
+        ),
+        "residual_audit_defer_escalation_threshold": int(
+            _runtime_config.get("residual_audit_defer_escalation_threshold", 5)
+        ),
         "provider_tier_model_map": _runtime_config.get("provider_tier_model_map", {}),
         "task_type_categories": _runtime_config.get("task_type_categories", {}),
         "category_routing": _runtime_config.get("category_routing", {}),
         "task_type_routing": _runtime_config.get("task_type_routing", {}),
-        "task_type_model_preferences": _runtime_config.get("task_type_model_preferences", {}),
-        "provider_selection_mode": _provider_selection_mode_from_config(_runtime_config),
-        "cross_provider_fallback_enabled": _provider_selection_mode_from_config(_runtime_config) in ("balanced", "preferred"),
+        "task_type_model_preferences": _runtime_config.get(
+            "task_type_model_preferences", {}
+        ),
+        "provider_selection_mode": _provider_selection_mode_from_config(
+            _runtime_config
+        ),
+        "cross_provider_fallback_enabled": _provider_selection_mode_from_config(
+            _runtime_config
+        )
+        in ("balanced", "preferred"),
         "providers": _build_provider_catalog(_runtime_config),
-        "provider_settings_defaults": _runtime_config.get("provider_settings_defaults", {}),
-        "provider_settings_by_effort": _runtime_config.get("provider_settings_by_effort", {}),
-        "task_type_provider_overrides": _runtime_config.get("task_type_provider_overrides", {}),
+        "provider_settings_defaults": _runtime_config.get(
+            "provider_settings_defaults", {}
+        ),
+        "provider_settings_by_effort": _runtime_config.get(
+            "provider_settings_by_effort", {}
+        ),
+        "task_type_provider_overrides": _runtime_config.get(
+            "task_type_provider_overrides", {}
+        ),
         "health_check_urls": _runtime_config.get("health_check_urls", []),
         "agent_prompt_suffixes": _runtime_config.get("agent_prompt_suffixes", {}),
-        "autonomous_periodic_tasks": _runtime_config.get("autonomous_periodic_tasks", {}),
-        "autonomous_direction_cooldown_minutes": _runtime_config.get("autonomous_direction_cooldown_minutes", 240),
-        "productive_direction_cooldown_minutes": _runtime_config.get("productive_direction_cooldown_minutes", 45),
-        "max_parallel_research_per_project": _runtime_config.get("max_parallel_research_per_project", 3),
-        "max_total_research_per_project": _runtime_config.get("max_total_research_per_project", 5),
-        "evaluating_pipeline_timeout_minutes": _runtime_config.get("evaluating_pipeline_timeout_minutes", 120),
+        "autonomous_periodic_tasks": _runtime_config.get(
+            "autonomous_periodic_tasks", {}
+        ),
+        "autonomous_direction_cooldown_minutes": _runtime_config.get(
+            "autonomous_direction_cooldown_minutes", 240
+        ),
+        "productive_direction_cooldown_minutes": _runtime_config.get(
+            "productive_direction_cooldown_minutes", 45
+        ),
+        "max_parallel_research_per_project": _runtime_config.get(
+            "max_parallel_research_per_project", 3
+        ),
+        "max_total_research_per_project": _runtime_config.get(
+            "max_total_research_per_project", 5
+        ),
+        "evaluating_pipeline_timeout_minutes": _runtime_config.get(
+            "evaluating_pipeline_timeout_minutes", 120
+        ),
         "evaluating_fail_hours": _runtime_config.get("evaluating_fail_hours", 48),
-        "ci_backstop_timeout_minutes": _runtime_config.get("ci_backstop_timeout_minutes", 60),
-        "warm_continuity_enabled": bool(_runtime_config.get("warm_continuity_enabled", False)),
-        "next_role_poll_timeout_secs": int(_runtime_config.get("next_role_poll_timeout_secs", 180)),
-        "drift_over_claim_min_claims": int(_runtime_config.get("drift_over_claim_min_claims", 3)),
-        "drift_over_claim_consistency_threshold": float(_runtime_config.get("drift_over_claim_consistency_threshold", 0.4)),
+        "ci_backstop_timeout_minutes": _runtime_config.get(
+            "ci_backstop_timeout_minutes", 60
+        ),
+        "warm_continuity_enabled": bool(
+            _runtime_config.get("warm_continuity_enabled", False)
+        ),
+        "next_role_poll_timeout_secs": int(
+            _runtime_config.get("next_role_poll_timeout_secs", 180)
+        ),
+        "drift_over_claim_min_claims": int(
+            _runtime_config.get("drift_over_claim_min_claims", 3)
+        ),
+        "drift_over_claim_consistency_threshold": float(
+            _runtime_config.get("drift_over_claim_consistency_threshold", 0.4)
+        ),
         "drift_stall_min_claims": int(_runtime_config.get("drift_stall_min_claims", 5)),
-        "reserved_slots_for_types": _runtime_config.get("reserved_slots_for_types", {"create": 1, "research": 1}),
+        "reserved_slots_for_types": _runtime_config.get(
+            "reserved_slots_for_types", {"create": 1, "research": 1}
+        ),
         "max_pipeline_slots": _runtime_config.get("max_pipeline_slots", 4),
-        "strategic_research_frequency": _runtime_config.get("strategic_research_frequency", 6),
+        "strategic_research_frequency": _runtime_config.get(
+            "strategic_research_frequency", 6
+        ),
         "github_account": github_account,
         "require_approval_gates": _runtime_config.get("require_approval_gates", True),
         "daily_cost_ceiling_usd": _runtime_config.get("daily_cost_ceiling_usd", 0),
         "auto_archive_enabled": _runtime_config.get("auto_archive_enabled", True),
-        "auto_archive_terminal_after_days": _runtime_config.get("auto_archive_terminal_after_days", 7),
-        "auto_archive_max_terminal_tasks_per_project": _runtime_config.get("auto_archive_max_terminal_tasks_per_project", 200),
-        "auto_archive_interval_minutes": _runtime_config.get("auto_archive_interval_minutes", 60),
+        "auto_archive_terminal_after_days": _runtime_config.get(
+            "auto_archive_terminal_after_days", 7
+        ),
+        "auto_archive_max_terminal_tasks_per_project": _runtime_config.get(
+            "auto_archive_max_terminal_tasks_per_project", 200
+        ),
+        "auto_archive_interval_minutes": _runtime_config.get(
+            "auto_archive_interval_minutes", 60
+        ),
         "max_provision_retries": _runtime_config.get("max_provision_retries", 3),
         "max_rollup_retries": _runtime_config.get("max_rollup_retries", 5),
-        "architecture_review_frequency": _runtime_config.get("architecture_review_frequency", 3),
+        "architecture_review_frequency": _runtime_config.get(
+            "architecture_review_frequency", 3
+        ),
         "max_active_directions": _runtime_config.get("max_active_directions", 10),
         "webhook_url_configured": bool(os.getenv("PIPELINE_WEBHOOK_URL")),
         "notification_config": _build_notification_config_response(
-            _runtime_config.get("notification_config", {
-                "webhook_url": "",
-                "enabled_events": ["TASK_FAILED", "APPROVAL_NEEDED", "DEPLOY_HEALTH_ALERT", "REMEDIATION_ESCALATED", "DIRECTION_MILESTONE", "RESIDUAL_FIX_ESCALATED"],
-                "throttle_seconds": 30,
-            }),
+            _runtime_config.get(
+                "notification_config",
+                {
+                    "webhook_url": "",
+                    "enabled_events": [
+                        "TASK_FAILED",
+                        "APPROVAL_NEEDED",
+                        "DEPLOY_HEALTH_ALERT",
+                        "REMEDIATION_ESCALATED",
+                        "DIRECTION_MILESTONE",
+                        "RESIDUAL_FIX_ESCALATED",
+                    ],
+                    "throttle_seconds": 30,
+                },
+            ),
             is_admin=current_user.get("role") == "admin",
         ),
-        "using_max_plan": len([
-            a for a in user_pool
-            if a.get("enabled", True)
-            and a.get("provider", LLMProviderName.ANTHROPIC.value) == LLMProviderName.ANTHROPIC.value
-            and a.get("auth_mode", LLMAuthMode.OAUTH.value) == LLMAuthMode.OAUTH.value
-        ]) > 0,
+        "using_max_plan": len(
+            [
+                a
+                for a in user_pool
+                if a.get("enabled", True)
+                and a.get("provider", LLMProviderName.ANTHROPIC.value)
+                == LLMProviderName.ANTHROPIC.value
+                and a.get("auth_mode", LLMAuthMode.OAUTH.value)
+                == LLMAuthMode.OAUTH.value
+            ]
+        )
+        > 0,
         "max_plan_accounts": [
-            {"id": a["id"], "name": a["name"], "enabled": a.get("enabled", True),
-             "provider": a.get("provider", LLMProviderName.ANTHROPIC.value),
-             "auth_mode": a.get("auth_mode", LLMAuthMode.OAUTH.value),
-             "provider_metadata": a.get("provider_metadata", {}),
-             "active_tasks": a["active_tasks"], "total_tasks": a["total_tasks"],
-             "token_created_at": a.get("token_created_at"),
-             "rl_hit_count": a.get("rl_hit_count", 0),
-             "daily_task_cap": a.get("daily_task_cap"),
-             "max_concurrent_tasks": a.get("max_concurrent_tasks"),
-             "auto_disable_after_rate_limits": a.get("auto_disable_after_rate_limits"),
-             "daily_task_count": int(a.get("daily_task_count") or 0),
-             "daily_task_count_reset_at": (
-                 a["daily_task_count_reset_at"].isoformat()
-                 if a.get("daily_task_count_reset_at") else None
-             ),
-             "disabled_reason": a.get("disabled_reason"),
-             "disabled_models": {
-                 model: {"hits": info.get("hits", 0), "at": info["at"].isoformat() if info.get("at") else None}
-                 for model, info in a.get("disabled_models", {}).items()
-             }}
+            {
+                "id": a["id"],
+                "name": a["name"],
+                "enabled": a.get("enabled", True),
+                "provider": a.get("provider", LLMProviderName.ANTHROPIC.value),
+                "auth_mode": a.get("auth_mode", LLMAuthMode.OAUTH.value),
+                "provider_metadata": a.get("provider_metadata", {}),
+                "active_tasks": a["active_tasks"],
+                "total_tasks": a["total_tasks"],
+                "token_created_at": a.get("token_created_at"),
+                "rl_hit_count": a.get("rl_hit_count", 0),
+                "daily_task_cap": a.get("daily_task_cap"),
+                "max_concurrent_tasks": a.get("max_concurrent_tasks"),
+                "auto_disable_after_rate_limits": a.get(
+                    "auto_disable_after_rate_limits"
+                ),
+                "daily_task_count": int(a.get("daily_task_count") or 0),
+                "daily_task_count_reset_at": (
+                    a["daily_task_count_reset_at"].isoformat()
+                    if a.get("daily_task_count_reset_at")
+                    else None
+                ),
+                "disabled_reason": a.get("disabled_reason"),
+                "disabled_models": {
+                    model: {
+                        "hits": info.get("hits", 0),
+                        "at": info["at"].isoformat() if info.get("at") else None,
+                    }
+                    for model, info in a.get("disabled_models", {}).items()
+                },
+            }
             for a in user_pool
         ],
     }
@@ -199,14 +303,17 @@ async def update_settings(
     request: Request,
     payload: Dict[str, Any],
     session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(require_admin)
+    current_user: dict = Depends(require_admin),
 ):
     from app.shared_state import runtime_config as _runtime_config, runtime_config_lock
+
     async with runtime_config_lock:
         return await _apply_settings(payload, session, _runtime_config)
 
 
-async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runtime_config: Dict):
+async def _apply_settings(
+    payload: Dict[str, Any], session: AsyncSession, _runtime_config: Dict
+):
     # Snapshot config so we can restore on DB commit failure
     _config_snapshot = dict(_runtime_config)
     clear_pause_state = False
@@ -215,9 +322,13 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
         try:
             val = int(payload["max_concurrent_vms"])
         except (ValueError, TypeError):
-            raise HTTPException(status_code=400, detail="max_concurrent_vms must be a number")
+            raise HTTPException(
+                status_code=400, detail="max_concurrent_vms must be a number"
+            )
         if not (0 <= val <= 100):
-            raise HTTPException(status_code=400, detail="max_concurrent_vms must be between 0 and 100")
+            raise HTTPException(
+                status_code=400, detail="max_concurrent_vms must be between 0 and 100"
+            )
         _runtime_config["max_concurrent_vms"] = val
         # Clear PAUSED/HALTED state if user explicitly sets VMs > 0
         # Otherwise the next cold start will override back to 0
@@ -229,225 +340,395 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
         except (ValueError, TypeError):
             raise HTTPException(status_code=400, detail="max_retries must be a number")
         if not (0 <= val <= 10):
-            raise HTTPException(status_code=400, detail="max_retries must be between 0 and 10")
+            raise HTTPException(
+                status_code=400, detail="max_retries must be between 0 and 10"
+            )
         _runtime_config["max_retries"] = val
     if "max_autonomous_tasks_per_hour" in payload:
         try:
             val = int(payload["max_autonomous_tasks_per_hour"])
         except (ValueError, TypeError):
-            raise HTTPException(status_code=400, detail="max_autonomous_tasks_per_hour must be a number")
+            raise HTTPException(
+                status_code=400, detail="max_autonomous_tasks_per_hour must be a number"
+            )
         if not (1 <= val <= 50):
-            raise HTTPException(status_code=400, detail="max_autonomous_tasks_per_hour must be between 1 and 50")
+            raise HTTPException(
+                status_code=400,
+                detail="max_autonomous_tasks_per_hour must be between 1 and 50",
+            )
         _runtime_config["max_autonomous_tasks_per_hour"] = val
     if "max_global_autonomous_tasks_per_hour" in payload:
         try:
             val = int(payload["max_global_autonomous_tasks_per_hour"])
         except (ValueError, TypeError):
-            raise HTTPException(status_code=400, detail="max_global_autonomous_tasks_per_hour must be a number")
+            raise HTTPException(
+                status_code=400,
+                detail="max_global_autonomous_tasks_per_hour must be a number",
+            )
         if not (1 <= val <= 500):
-            raise HTTPException(status_code=400, detail="max_global_autonomous_tasks_per_hour must be between 1 and 500")
+            raise HTTPException(
+                status_code=400,
+                detail="max_global_autonomous_tasks_per_hour must be between 1 and 500",
+            )
         _runtime_config["max_global_autonomous_tasks_per_hour"] = val
     if "autonomous_research_interval_minutes" in payload:
         try:
             val = int(payload["autonomous_research_interval_minutes"])
         except (ValueError, TypeError):
-            raise HTTPException(status_code=400, detail="autonomous_research_interval_minutes must be a number")
+            raise HTTPException(
+                status_code=400,
+                detail="autonomous_research_interval_minutes must be a number",
+            )
         if not (1 <= val <= 1440):
-            raise HTTPException(status_code=400, detail="autonomous_research_interval_minutes must be between 1 and 1440")
+            raise HTTPException(
+                status_code=400,
+                detail="autonomous_research_interval_minutes must be between 1 and 1440",
+            )
         _runtime_config["autonomous_research_interval_minutes"] = val
     if "evaluating_pipeline_timeout_minutes" in payload:
         try:
             val = int(payload["evaluating_pipeline_timeout_minutes"])
         except (ValueError, TypeError):
-            raise HTTPException(status_code=400, detail="evaluating_pipeline_timeout_minutes must be a number")
+            raise HTTPException(
+                status_code=400,
+                detail="evaluating_pipeline_timeout_minutes must be a number",
+            )
         if not (1 <= val <= 1440):
-            raise HTTPException(status_code=400, detail="evaluating_pipeline_timeout_minutes must be between 1 and 1440")
+            raise HTTPException(
+                status_code=400,
+                detail="evaluating_pipeline_timeout_minutes must be between 1 and 1440",
+            )
         _runtime_config["evaluating_pipeline_timeout_minutes"] = val
     if "ci_backstop_timeout_minutes" in payload:
         try:
             val = int(payload["ci_backstop_timeout_minutes"])
         except (ValueError, TypeError):
-            raise HTTPException(status_code=400, detail="ci_backstop_timeout_minutes must be a number")
+            raise HTTPException(
+                status_code=400, detail="ci_backstop_timeout_minutes must be a number"
+            )
         if not (1 <= val <= 1440):
-            raise HTTPException(status_code=400, detail="ci_backstop_timeout_minutes must be between 1 and 1440")
+            raise HTTPException(
+                status_code=400,
+                detail="ci_backstop_timeout_minutes must be between 1 and 1440",
+            )
         _runtime_config["ci_backstop_timeout_minutes"] = val
     if "evaluating_fail_hours" in payload:
         try:
             val = int(payload["evaluating_fail_hours"])
         except (ValueError, TypeError):
-            raise HTTPException(status_code=400, detail="evaluating_fail_hours must be a number")
+            raise HTTPException(
+                status_code=400, detail="evaluating_fail_hours must be a number"
+            )
         # Cap at 168h (1 week) — protects against accidental "1000h" typos
         # while leaving plenty of room above the 48h default.
         if not (1 <= val <= 168):
-            raise HTTPException(status_code=400, detail="evaluating_fail_hours must be between 1 and 168")
+            raise HTTPException(
+                status_code=400,
+                detail="evaluating_fail_hours must be between 1 and 168",
+            )
         _runtime_config["evaluating_fail_hours"] = val
     if "max_total_research_per_project" in payload:
         try:
             val = int(payload["max_total_research_per_project"])
         except (ValueError, TypeError):
-            raise HTTPException(status_code=400, detail="max_total_research_per_project must be a number")
+            raise HTTPException(
+                status_code=400,
+                detail="max_total_research_per_project must be a number",
+            )
         if not (1 <= val <= 50):
-            raise HTTPException(status_code=400, detail="max_total_research_per_project must be between 1 and 50")
+            raise HTTPException(
+                status_code=400,
+                detail="max_total_research_per_project must be between 1 and 50",
+            )
         _runtime_config["max_total_research_per_project"] = val
     if "max_concurrent_auto_remediations" in payload:
         try:
             val = int(payload["max_concurrent_auto_remediations"])
         except (ValueError, TypeError):
-            raise HTTPException(status_code=400, detail="max_concurrent_auto_remediations must be a number")
+            raise HTTPException(
+                status_code=400,
+                detail="max_concurrent_auto_remediations must be a number",
+            )
         if not (0 <= val <= 20):
-            raise HTTPException(status_code=400, detail="max_concurrent_auto_remediations must be between 0 and 20")
+            raise HTTPException(
+                status_code=400,
+                detail="max_concurrent_auto_remediations must be between 0 and 20",
+            )
         _runtime_config["max_concurrent_auto_remediations"] = val
     if "residual_remediation_cooldown_hours" in payload:
         try:
             val = int(payload["residual_remediation_cooldown_hours"])
         except (ValueError, TypeError):
-            raise HTTPException(status_code=400, detail="residual_remediation_cooldown_hours must be a number")
+            raise HTTPException(
+                status_code=400,
+                detail="residual_remediation_cooldown_hours must be a number",
+            )
         if not (1 <= val <= 720):
-            raise HTTPException(status_code=400, detail="residual_remediation_cooldown_hours must be between 1 and 720")
+            raise HTTPException(
+                status_code=400,
+                detail="residual_remediation_cooldown_hours must be between 1 and 720",
+            )
         _runtime_config["residual_remediation_cooldown_hours"] = val
     if "residual_audit_defer_escalation_threshold" in payload:
         try:
             val = int(payload["residual_audit_defer_escalation_threshold"])
         except (ValueError, TypeError):
-            raise HTTPException(status_code=400, detail="residual_audit_defer_escalation_threshold must be a number")
+            raise HTTPException(
+                status_code=400,
+                detail="residual_audit_defer_escalation_threshold must be a number",
+            )
         if not (1 <= val <= 50):
-            raise HTTPException(status_code=400, detail="residual_audit_defer_escalation_threshold must be between 1 and 50")
+            raise HTTPException(
+                status_code=400,
+                detail="residual_audit_defer_escalation_threshold must be between 1 and 50",
+            )
         _runtime_config["residual_audit_defer_escalation_threshold"] = val
     if "warm_continuity_enabled" in payload:
         val = payload["warm_continuity_enabled"]
         if not isinstance(val, bool):
-            raise HTTPException(status_code=400, detail="warm_continuity_enabled must be a boolean")
+            raise HTTPException(
+                status_code=400, detail="warm_continuity_enabled must be a boolean"
+            )
         _runtime_config["warm_continuity_enabled"] = val
     if "drift_over_claim_min_claims" in payload:
         try:
             val = int(payload["drift_over_claim_min_claims"])
         except (ValueError, TypeError):
-            raise HTTPException(status_code=400, detail="drift_over_claim_min_claims must be a number")
+            raise HTTPException(
+                status_code=400, detail="drift_over_claim_min_claims must be a number"
+            )
         if not (1 <= val <= 50):
-            raise HTTPException(status_code=400, detail="drift_over_claim_min_claims must be between 1 and 50")
+            raise HTTPException(
+                status_code=400,
+                detail="drift_over_claim_min_claims must be between 1 and 50",
+            )
         _runtime_config["drift_over_claim_min_claims"] = val
     if "drift_over_claim_consistency_threshold" in payload:
         try:
             val = float(payload["drift_over_claim_consistency_threshold"])
         except (ValueError, TypeError):
-            raise HTTPException(status_code=400, detail="drift_over_claim_consistency_threshold must be a number")
+            raise HTTPException(
+                status_code=400,
+                detail="drift_over_claim_consistency_threshold must be a number",
+            )
         if not (0.0 <= val <= 1.0):
-            raise HTTPException(status_code=400, detail="drift_over_claim_consistency_threshold must be between 0.0 and 1.0")
+            raise HTTPException(
+                status_code=400,
+                detail="drift_over_claim_consistency_threshold must be between 0.0 and 1.0",
+            )
         _runtime_config["drift_over_claim_consistency_threshold"] = round(val, 3)
     if "drift_stall_min_claims" in payload:
         try:
             val = int(payload["drift_stall_min_claims"])
         except (ValueError, TypeError):
-            raise HTTPException(status_code=400, detail="drift_stall_min_claims must be a number")
+            raise HTTPException(
+                status_code=400, detail="drift_stall_min_claims must be a number"
+            )
         if not (1 <= val <= 50):
-            raise HTTPException(status_code=400, detail="drift_stall_min_claims must be between 1 and 50")
+            raise HTTPException(
+                status_code=400,
+                detail="drift_stall_min_claims must be between 1 and 50",
+            )
         _runtime_config["drift_stall_min_claims"] = val
     if "next_role_poll_timeout_secs" in payload:
         try:
             val = int(payload["next_role_poll_timeout_secs"])
         except (ValueError, TypeError):
-            raise HTTPException(status_code=400, detail="next_role_poll_timeout_secs must be a number")
+            raise HTTPException(
+                status_code=400, detail="next_role_poll_timeout_secs must be a number"
+            )
         if not (30 <= val <= 600):
-            raise HTTPException(status_code=400, detail="next_role_poll_timeout_secs must be between 30 and 600")
+            raise HTTPException(
+                status_code=400,
+                detail="next_role_poll_timeout_secs must be between 30 and 600",
+            )
         _runtime_config["next_role_poll_timeout_secs"] = val
     if "provider_tier_model_map" in payload:
         val = payload["provider_tier_model_map"]
         if not isinstance(val, dict):
-            raise HTTPException(status_code=400, detail="provider_tier_model_map must be a dict")
+            raise HTTPException(
+                status_code=400, detail="provider_tier_model_map must be a dict"
+            )
         valid_providers = {p.value for p in LLMProviderName}
         valid_tiers = {"opus", "sonnet", "haiku"}
         for provider_name, tier_map in val.items():
             if provider_name not in valid_providers:
-                raise HTTPException(status_code=400, detail=f"Invalid provider in provider_tier_model_map: {provider_name}")
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid provider in provider_tier_model_map: {provider_name}",
+                )
             if not isinstance(tier_map, dict):
-                raise HTTPException(status_code=400, detail=f"provider_tier_model_map[{provider_name}] must be a dict")
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"provider_tier_model_map[{provider_name}] must be a dict",
+                )
             for tier, model in tier_map.items():
                 if tier not in valid_tiers:
-                    raise HTTPException(status_code=400, detail=f"Invalid tier for {provider_name}: {tier}")
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Invalid tier for {provider_name}: {tier}",
+                    )
                 if not isinstance(model, str) or not model.strip():
-                    raise HTTPException(status_code=400, detail=f"Model for {provider_name}/{tier} must be a non-empty string")
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Model for {provider_name}/{tier} must be a non-empty string",
+                    )
         _runtime_config["provider_tier_model_map"] = val
     if "task_type_categories" in payload:
         val = payload["task_type_categories"]
         if not isinstance(val, dict):
-            raise HTTPException(status_code=400, detail="task_type_categories must be a dict")
+            raise HTTPException(
+                status_code=400, detail="task_type_categories must be a dict"
+            )
         for category, members in val.items():
             if not isinstance(category, str) or not category or category == "_default":
-                raise HTTPException(status_code=400, detail="task_type_categories keys must be non-empty strings and not '_default'")
-            if not isinstance(members, list) or not all(isinstance(m, str) and m for m in members):
-                raise HTTPException(status_code=400, detail=f"task_type_categories[{category}] must be a list of task-type strings")
+                raise HTTPException(
+                    status_code=400,
+                    detail="task_type_categories keys must be non-empty strings and not '_default'",
+                )
+            if not isinstance(members, list) or not all(
+                isinstance(m, str) and m for m in members
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"task_type_categories[{category}] must be a list of task-type strings",
+                )
         _runtime_config["task_type_categories"] = val
     if "category_routing" in payload:
         val = payload["category_routing"]
         if not isinstance(val, dict):
-            raise HTTPException(status_code=400, detail="category_routing must be a dict")
+            raise HTTPException(
+                status_code=400, detail="category_routing must be a dict"
+            )
         valid_providers = {p.value for p in LLMProviderName}
         valid_effort = {"low", "medium", "high", "max"}
         for category, entry in val.items():
             # "_default" allowed as a catch-all.
             if not isinstance(category, str) or not category:
-                raise HTTPException(status_code=400, detail="category_routing keys must be non-empty strings")
+                raise HTTPException(
+                    status_code=400,
+                    detail="category_routing keys must be non-empty strings",
+                )
             if not isinstance(entry, dict):
-                raise HTTPException(status_code=400, detail=f"category_routing[{category}] must be an object with providers/effort")
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"category_routing[{category}] must be an object with providers/effort",
+                )
             providers = entry.get("providers")
-            if not isinstance(providers, list) or not all(isinstance(p, str) for p in providers):
-                raise HTTPException(status_code=400, detail=f"category_routing[{category}].providers must be a list of strings")
+            if not isinstance(providers, list) or not all(
+                isinstance(p, str) for p in providers
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"category_routing[{category}].providers must be a list of strings",
+                )
             if not providers:
-                raise HTTPException(status_code=400, detail=f"category_routing[{category}].providers must not be empty — at least one provider is required")
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"category_routing[{category}].providers must not be empty — at least one provider is required",
+                )
             invalid = [p for p in providers if p not in valid_providers]
             if invalid:
-                raise HTTPException(status_code=400, detail=f"Invalid providers in category_routing[{category}]: {', '.join(invalid)}")
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid providers in category_routing[{category}]: {', '.join(invalid)}",
+                )
             effort = entry.get("effort")
             if not isinstance(effort, str) or effort not in valid_effort:
-                raise HTTPException(status_code=400, detail=f"category_routing[{category}].effort must be one of {sorted(valid_effort)}")
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"category_routing[{category}].effort must be one of {sorted(valid_effort)}",
+                )
         _runtime_config["category_routing"] = val
     if "task_type_routing" in payload:
         val = payload["task_type_routing"]
         if not isinstance(val, dict):
-            raise HTTPException(status_code=400, detail="task_type_routing must be a dict")
+            raise HTTPException(
+                status_code=400, detail="task_type_routing must be a dict"
+            )
         valid_providers = {p.value for p in LLMProviderName}
         valid_effort = {"low", "medium", "high", "max"}
         for task_type, entry in val.items():
             if not isinstance(task_type, str) or not task_type:
-                raise HTTPException(status_code=400, detail="task_type_routing keys must be non-empty strings")
+                raise HTTPException(
+                    status_code=400,
+                    detail="task_type_routing keys must be non-empty strings",
+                )
             if not isinstance(entry, dict) or not entry:
-                raise HTTPException(status_code=400, detail=f"task_type_routing[{task_type}] must be a non-empty object with providers and/or effort")
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"task_type_routing[{task_type}] must be a non-empty object with providers and/or effort",
+                )
             if "providers" in entry:
                 providers = entry["providers"]
-                if not isinstance(providers, list) or not all(isinstance(p, str) for p in providers):
-                    raise HTTPException(status_code=400, detail=f"task_type_routing[{task_type}].providers must be a list of strings")
+                if not isinstance(providers, list) or not all(
+                    isinstance(p, str) for p in providers
+                ):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"task_type_routing[{task_type}].providers must be a list of strings",
+                    )
                 if not providers:
-                    raise HTTPException(status_code=400, detail=f"task_type_routing[{task_type}].providers must not be empty — omit the `providers` key to inherit from the category instead")
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"task_type_routing[{task_type}].providers must not be empty — omit the `providers` key to inherit from the category instead",
+                    )
                 invalid = [p for p in providers if p not in valid_providers]
                 if invalid:
-                    raise HTTPException(status_code=400, detail=f"Invalid providers in task_type_routing[{task_type}]: {', '.join(invalid)}")
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Invalid providers in task_type_routing[{task_type}]: {', '.join(invalid)}",
+                    )
             if "effort" in entry:
                 effort = entry["effort"]
                 if not isinstance(effort, str) or effort not in valid_effort:
-                    raise HTTPException(status_code=400, detail=f"task_type_routing[{task_type}].effort must be one of {sorted(valid_effort)}")
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"task_type_routing[{task_type}].effort must be one of {sorted(valid_effort)}",
+                    )
             extra = [k for k in entry if k not in ("providers", "effort")]
             if extra:
-                raise HTTPException(status_code=400, detail=f"task_type_routing[{task_type}] has unknown keys: {', '.join(extra)}")
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"task_type_routing[{task_type}] has unknown keys: {', '.join(extra)}",
+                )
         _runtime_config["task_type_routing"] = val
     if "task_type_model_preferences" in payload:
         val = payload["task_type_model_preferences"]
         if not isinstance(val, dict):
-            raise HTTPException(status_code=400, detail="task_type_model_preferences must be a dict")
+            raise HTTPException(
+                status_code=400, detail="task_type_model_preferences must be a dict"
+            )
         valid_providers = {p.value for p in LLMProviderName}
         for task_type, prefs in val.items():
             if not isinstance(task_type, str) or not task_type:
-                raise HTTPException(status_code=400, detail="task_type_model_preferences keys must be non-empty strings")
+                raise HTTPException(
+                    status_code=400,
+                    detail="task_type_model_preferences keys must be non-empty strings",
+                )
             if not isinstance(prefs, list):
-                raise HTTPException(status_code=400, detail=f"Model preferences for {task_type} must be a list")
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Model preferences for {task_type} must be a list",
+                )
             for pref in prefs:
                 if not isinstance(pref, dict):
-                    raise HTTPException(status_code=400, detail=f"Each model preference for {task_type} must be an object")
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Each model preference for {task_type} must be an object",
+                    )
                 provider_name = pref.get("provider")
                 model_name = pref.get("model")
                 if provider_name not in valid_providers:
-                    raise HTTPException(status_code=400, detail=f"Invalid provider in model preferences for {task_type}: {provider_name}")
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Invalid provider in model preferences for {task_type}: {provider_name}",
+                    )
                 if not isinstance(model_name, str) or not model_name:
-                    raise HTTPException(status_code=400, detail=f"Invalid model in model preferences for {task_type}")
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Invalid model in model preferences for {task_type}",
+                    )
         _runtime_config["task_type_model_preferences"] = val
     # provider_selection_mode is the canonical control; cross_provider_fallback_enabled
     # is accepted as a compatibility shim (True→"preferred", False→"exclusive").
@@ -460,24 +741,38 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
                 detail=f"provider_selection_mode must be one of {sorted(_VALID_PROVIDER_SELECTION_MODES)}",
             )
         _runtime_config["provider_selection_mode"] = val
-        _runtime_config["cross_provider_fallback_enabled"] = val in ("balanced", "preferred")
+        _runtime_config["cross_provider_fallback_enabled"] = val in (
+            "balanced",
+            "preferred",
+        )
     elif "cross_provider_fallback_enabled" in payload:
         val = payload["cross_provider_fallback_enabled"]
         if not isinstance(val, bool):
-            raise HTTPException(status_code=400, detail="cross_provider_fallback_enabled must be a boolean")
+            raise HTTPException(
+                status_code=400,
+                detail="cross_provider_fallback_enabled must be a boolean",
+            )
         _runtime_config["cross_provider_fallback_enabled"] = val
         _runtime_config["provider_selection_mode"] = "preferred" if val else "exclusive"
     if "provider_settings_defaults" in payload:
         val = payload["provider_settings_defaults"]
         if not isinstance(val, dict):
-            raise HTTPException(status_code=400, detail="provider_settings_defaults must be a dict")
+            raise HTTPException(
+                status_code=400, detail="provider_settings_defaults must be a dict"
+            )
         valid_providers = {p.value for p in LLMProviderName}
         cleaned_defaults: dict[str, dict] = {}
         for provider_name, bag in val.items():
             if provider_name not in valid_providers:
-                raise HTTPException(status_code=400, detail=f"Invalid provider in provider_settings_defaults: {provider_name}")
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid provider in provider_settings_defaults: {provider_name}",
+                )
             if not isinstance(bag, dict):
-                raise HTTPException(status_code=400, detail=f"provider_settings_defaults[{provider_name}] must be a dict")
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"provider_settings_defaults[{provider_name}] must be a dict",
+                )
             provider = get_provider(LLMProviderName(provider_name))
             try:
                 cleaned_defaults[provider_name] = provider.validate_settings(bag)
@@ -490,14 +785,22 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
     if "task_type_provider_overrides" in payload:
         val = payload["task_type_provider_overrides"]
         if not isinstance(val, dict):
-            raise HTTPException(status_code=400, detail="task_type_provider_overrides must be a dict")
+            raise HTTPException(
+                status_code=400, detail="task_type_provider_overrides must be a dict"
+            )
         valid_providers = {p.value for p in LLMProviderName}
         cleaned_overrides: dict[str, dict[str, dict]] = {}
         for task_type, per_provider in val.items():
             if not isinstance(task_type, str) or not task_type:
-                raise HTTPException(status_code=400, detail="task_type_provider_overrides keys must be non-empty strings")
+                raise HTTPException(
+                    status_code=400,
+                    detail="task_type_provider_overrides keys must be non-empty strings",
+                )
             if not isinstance(per_provider, dict):
-                raise HTTPException(status_code=400, detail=f"task_type_provider_overrides[{task_type}] must be a dict")
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"task_type_provider_overrides[{task_type}] must be a dict",
+                )
             cleaned_per_provider: dict[str, dict] = {}
             for provider_name, bag in per_provider.items():
                 if provider_name not in valid_providers:
@@ -512,7 +815,9 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
                     )
                 provider = get_provider(LLMProviderName(provider_name))
                 try:
-                    cleaned_per_provider[provider_name] = provider.validate_settings(bag)
+                    cleaned_per_provider[provider_name] = provider.validate_settings(
+                        bag
+                    )
                 except ValueError as exc:
                     raise HTTPException(
                         status_code=400,
@@ -523,7 +828,9 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
     if "provider_settings_by_effort" in payload:
         val = payload["provider_settings_by_effort"]
         if not isinstance(val, dict):
-            raise HTTPException(status_code=400, detail="provider_settings_by_effort must be a dict")
+            raise HTTPException(
+                status_code=400, detail="provider_settings_by_effort must be a dict"
+            )
         valid_providers = {p.value for p in LLMProviderName}
         valid_levels = {"low", "medium", "high", "max"}
         cleaned_matrix: dict[str, dict[str, dict]] = {}
@@ -534,7 +841,10 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
                     detail=f"Invalid provider in provider_settings_by_effort: {provider_name}",
                 )
             if not isinstance(per_level, dict):
-                raise HTTPException(status_code=400, detail=f"provider_settings_by_effort[{provider_name}] must be a dict")
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"provider_settings_by_effort[{provider_name}] must be a dict",
+                )
             cleaned_per_level: dict[str, dict] = {}
             for level, bag in per_level.items():
                 if level not in valid_levels:
@@ -560,29 +870,47 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
     if "agent_prompt_suffixes" in payload:
         val = payload["agent_prompt_suffixes"]
         if not isinstance(val, dict):
-            raise HTTPException(status_code=400, detail="agent_prompt_suffixes must be a dict")
+            raise HTTPException(
+                status_code=400, detail="agent_prompt_suffixes must be a dict"
+            )
         if any(not isinstance(v, str) for v in val.values()):
-            raise HTTPException(status_code=400, detail="agent_prompt_suffixes values must be strings")
+            raise HTTPException(
+                status_code=400, detail="agent_prompt_suffixes values must be strings"
+            )
         _runtime_config["agent_prompt_suffixes"] = val
     if "autonomous_periodic_tasks" in payload:
         val = payload["autonomous_periodic_tasks"]
         if not isinstance(val, dict):
-            raise HTTPException(status_code=400, detail="autonomous_periodic_tasks must be a dict")
+            raise HTTPException(
+                status_code=400, detail="autonomous_periodic_tasks must be a dict"
+            )
         VALID_TYPES = {"security_audit", "qa", "deps"}
         for type_key, type_cfg in val.items():
             if type_key not in VALID_TYPES:
-                raise HTTPException(status_code=400, detail=f"Invalid task type: {type_key}")
+                raise HTTPException(
+                    status_code=400, detail=f"Invalid task type: {type_key}"
+                )
             if not isinstance(type_cfg, dict):
-                raise HTTPException(status_code=400, detail=f"Config for {type_key} must be a dict")
+                raise HTTPException(
+                    status_code=400, detail=f"Config for {type_key} must be a dict"
+                )
             if "enabled" in type_cfg and not isinstance(type_cfg["enabled"], bool):
-                raise HTTPException(status_code=400, detail=f"enabled for {type_key} must be a boolean")
+                raise HTTPException(
+                    status_code=400, detail=f"enabled for {type_key} must be a boolean"
+                )
             if "interval_hours" in type_cfg:
                 try:
                     ih = int(type_cfg["interval_hours"])
                 except (ValueError, TypeError):
-                    raise HTTPException(status_code=400, detail=f"interval_hours for {type_key} must be a number")
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"interval_hours for {type_key} must be a number",
+                    )
                 if not (1 <= ih <= 8760):
-                    raise HTTPException(status_code=400, detail=f"interval_hours for {type_key} must be between 1 and 8760")
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"interval_hours for {type_key} must be between 1 and 8760",
+                    )
         # Merge into existing config (don't replace keys not in the payload)
         existing = _runtime_config.get("autonomous_periodic_tasks", {})
         for type_key, type_cfg in val.items():
@@ -593,189 +921,322 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
         try:
             val = int(payload["autonomous_direction_cooldown_minutes"])
         except (ValueError, TypeError):
-            raise HTTPException(status_code=400, detail="autonomous_direction_cooldown_minutes must be a number")
+            raise HTTPException(
+                status_code=400,
+                detail="autonomous_direction_cooldown_minutes must be a number",
+            )
         if not (1 <= val <= 525600):
-            raise HTTPException(status_code=400, detail="autonomous_direction_cooldown_minutes must be between 1 and 525600")
+            raise HTTPException(
+                status_code=400,
+                detail="autonomous_direction_cooldown_minutes must be between 1 and 525600",
+            )
         _runtime_config["autonomous_direction_cooldown_minutes"] = val
     elif "autonomous_direction_cooldown_hours" in payload:
         try:
             val = int(payload["autonomous_direction_cooldown_hours"])
         except (ValueError, TypeError):
-            raise HTTPException(status_code=400, detail="autonomous_direction_cooldown_hours must be a number")
+            raise HTTPException(
+                status_code=400,
+                detail="autonomous_direction_cooldown_hours must be a number",
+            )
         _runtime_config["autonomous_direction_cooldown_minutes"] = val * 60
     if "productive_direction_cooldown_minutes" in payload:
         try:
             val = int(payload["productive_direction_cooldown_minutes"])
         except (ValueError, TypeError):
-            raise HTTPException(status_code=400, detail="productive_direction_cooldown_minutes must be a number")
+            raise HTTPException(
+                status_code=400,
+                detail="productive_direction_cooldown_minutes must be a number",
+            )
         if not (1 <= val <= 525600):
-            raise HTTPException(status_code=400, detail="productive_direction_cooldown_minutes must be between 1 and 525600")
+            raise HTTPException(
+                status_code=400,
+                detail="productive_direction_cooldown_minutes must be between 1 and 525600",
+            )
         _runtime_config["productive_direction_cooldown_minutes"] = val
     if "strategic_research_frequency" in payload:
         try:
             val = int(payload["strategic_research_frequency"])
         except (ValueError, TypeError):
-            raise HTTPException(status_code=400, detail="strategic_research_frequency must be a number")
+            raise HTTPException(
+                status_code=400, detail="strategic_research_frequency must be a number"
+            )
         if not (0 <= val <= 100):
-            raise HTTPException(status_code=400, detail="strategic_research_frequency must be between 0 and 100 (0 = disabled)")
+            raise HTTPException(
+                status_code=400,
+                detail="strategic_research_frequency must be between 0 and 100 (0 = disabled)",
+            )
         _runtime_config["strategic_research_frequency"] = val
     if "require_approval_gates" in payload:
         val = payload["require_approval_gates"]
         if not isinstance(val, bool):
-            raise HTTPException(status_code=400, detail="require_approval_gates must be a boolean")
+            raise HTTPException(
+                status_code=400, detail="require_approval_gates must be a boolean"
+            )
         _runtime_config["require_approval_gates"] = val
     if "daily_cost_ceiling_usd" in payload:
         try:
             val = float(payload["daily_cost_ceiling_usd"])
         except (ValueError, TypeError):
-            raise HTTPException(status_code=400, detail="daily_cost_ceiling_usd must be a number")
+            raise HTTPException(
+                status_code=400, detail="daily_cost_ceiling_usd must be a number"
+            )
         if not (0 <= val <= 100000):
-            raise HTTPException(status_code=400, detail="daily_cost_ceiling_usd must be between 0 and 100000 (0 = disabled)")
+            raise HTTPException(
+                status_code=400,
+                detail="daily_cost_ceiling_usd must be between 0 and 100000 (0 = disabled)",
+            )
         _runtime_config["daily_cost_ceiling_usd"] = val
     if "auto_archive_enabled" in payload:
         val = payload["auto_archive_enabled"]
         if not isinstance(val, bool):
-            raise HTTPException(status_code=400, detail="auto_archive_enabled must be a boolean")
+            raise HTTPException(
+                status_code=400, detail="auto_archive_enabled must be a boolean"
+            )
         _runtime_config["auto_archive_enabled"] = val
     if "auto_archive_terminal_after_days" in payload:
         try:
             val = int(payload["auto_archive_terminal_after_days"])
         except (ValueError, TypeError):
-            raise HTTPException(status_code=400, detail="auto_archive_terminal_after_days must be a number")
+            raise HTTPException(
+                status_code=400,
+                detail="auto_archive_terminal_after_days must be a number",
+            )
         if not (1 <= val <= 90):
-            raise HTTPException(status_code=400, detail="auto_archive_terminal_after_days must be between 1 and 90")
+            raise HTTPException(
+                status_code=400,
+                detail="auto_archive_terminal_after_days must be between 1 and 90",
+            )
         _runtime_config["auto_archive_terminal_after_days"] = val
     if "auto_archive_max_terminal_tasks_per_project" in payload:
         try:
             val = int(payload["auto_archive_max_terminal_tasks_per_project"])
         except (ValueError, TypeError):
-            raise HTTPException(status_code=400, detail="auto_archive_max_terminal_tasks_per_project must be a number")
+            raise HTTPException(
+                status_code=400,
+                detail="auto_archive_max_terminal_tasks_per_project must be a number",
+            )
         if not (0 <= val <= 10000):
-            raise HTTPException(status_code=400, detail="auto_archive_max_terminal_tasks_per_project must be between 0 and 10000 (0 = disabled)")
+            raise HTTPException(
+                status_code=400,
+                detail="auto_archive_max_terminal_tasks_per_project must be between 0 and 10000 (0 = disabled)",
+            )
         _runtime_config["auto_archive_max_terminal_tasks_per_project"] = val
     if "auto_archive_interval_minutes" in payload:
         try:
             val = int(payload["auto_archive_interval_minutes"])
         except (ValueError, TypeError):
-            raise HTTPException(status_code=400, detail="auto_archive_interval_minutes must be a number")
+            raise HTTPException(
+                status_code=400, detail="auto_archive_interval_minutes must be a number"
+            )
         if not (5 <= val <= 1440):
-            raise HTTPException(status_code=400, detail="auto_archive_interval_minutes must be between 5 and 1440")
+            raise HTTPException(
+                status_code=400,
+                detail="auto_archive_interval_minutes must be between 5 and 1440",
+            )
         _runtime_config["auto_archive_interval_minutes"] = val
     if "max_provision_retries" in payload:
         try:
             val = int(payload["max_provision_retries"])
         except (ValueError, TypeError):
-            raise HTTPException(status_code=400, detail="max_provision_retries must be a number")
+            raise HTTPException(
+                status_code=400, detail="max_provision_retries must be a number"
+            )
         if not (1 <= val <= 10):
-            raise HTTPException(status_code=400, detail="max_provision_retries must be between 1 and 10")
+            raise HTTPException(
+                status_code=400, detail="max_provision_retries must be between 1 and 10"
+            )
         _runtime_config["max_provision_retries"] = val
     if "max_rollup_retries" in payload:
         try:
             val = int(payload["max_rollup_retries"])
         except (ValueError, TypeError):
-            raise HTTPException(status_code=400, detail="max_rollup_retries must be a number")
+            raise HTTPException(
+                status_code=400, detail="max_rollup_retries must be a number"
+            )
         if not (1 <= val <= 20):
-            raise HTTPException(status_code=400, detail="max_rollup_retries must be between 1 and 20")
+            raise HTTPException(
+                status_code=400, detail="max_rollup_retries must be between 1 and 20"
+            )
         _runtime_config["max_rollup_retries"] = val
     if "architecture_review_frequency" in payload:
         try:
             val = int(payload["architecture_review_frequency"])
         except (ValueError, TypeError):
-            raise HTTPException(status_code=400, detail="architecture_review_frequency must be a number")
+            raise HTTPException(
+                status_code=400, detail="architecture_review_frequency must be a number"
+            )
         if not (0 <= val <= 100):
-            raise HTTPException(status_code=400, detail="architecture_review_frequency must be between 0 and 100 (0 = disabled)")
+            raise HTTPException(
+                status_code=400,
+                detail="architecture_review_frequency must be between 0 and 100 (0 = disabled)",
+            )
         _runtime_config["architecture_review_frequency"] = val
     if "max_active_directions" in payload:
         try:
             val = int(payload["max_active_directions"])
         except (ValueError, TypeError):
-            raise HTTPException(status_code=400, detail="max_active_directions must be a number")
+            raise HTTPException(
+                status_code=400, detail="max_active_directions must be a number"
+            )
         if not (1 <= val <= 50):
-            raise HTTPException(status_code=400, detail="max_active_directions must be between 1 and 50")
+            raise HTTPException(
+                status_code=400, detail="max_active_directions must be between 1 and 50"
+            )
         _runtime_config["max_active_directions"] = val
     if "max_parallel_research_per_project" in payload:
         try:
             val = int(payload["max_parallel_research_per_project"])
         except (ValueError, TypeError):
-            raise HTTPException(status_code=400, detail="max_parallel_research_per_project must be a number")
+            raise HTTPException(
+                status_code=400,
+                detail="max_parallel_research_per_project must be a number",
+            )
         if not (1 <= val <= 20):
-            raise HTTPException(status_code=400, detail="max_parallel_research_per_project must be between 1 and 20")
+            raise HTTPException(
+                status_code=400,
+                detail="max_parallel_research_per_project must be between 1 and 20",
+            )
         _runtime_config["max_parallel_research_per_project"] = val
     if "reserved_slots_for_types" in payload:
         val = payload["reserved_slots_for_types"]
         if not isinstance(val, dict):
-            raise HTTPException(status_code=400, detail="reserved_slots_for_types must be a dict")
+            raise HTTPException(
+                status_code=400, detail="reserved_slots_for_types must be a dict"
+            )
         VALID_RESERVED_TYPES = {"create", "research", "plan"}
         normalized: Dict[str, int] = {}
         for type_key, count in val.items():
             if type_key not in VALID_RESERVED_TYPES:
-                raise HTTPException(status_code=400, detail=f"reserved_slots_for_types: invalid task type {type_key}; must be one of {sorted(VALID_RESERVED_TYPES)}")
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"reserved_slots_for_types: invalid task type {type_key}; must be one of {sorted(VALID_RESERVED_TYPES)}",
+                )
             try:
                 cnt = int(count)
             except (ValueError, TypeError):
-                raise HTTPException(status_code=400, detail=f"reserved_slots_for_types[{type_key}] must be a number")
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"reserved_slots_for_types[{type_key}] must be a number",
+                )
             if not (0 <= cnt <= 10):
-                raise HTTPException(status_code=400, detail=f"reserved_slots_for_types[{type_key}] must be between 0 and 10")
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"reserved_slots_for_types[{type_key}] must be between 0 and 10",
+                )
             normalized[type_key] = cnt
         _runtime_config["reserved_slots_for_types"] = normalized
     if "max_pipeline_slots" in payload:
         try:
             val = int(payload["max_pipeline_slots"])
         except (ValueError, TypeError):
-            raise HTTPException(status_code=400, detail="max_pipeline_slots must be a number")
+            raise HTTPException(
+                status_code=400, detail="max_pipeline_slots must be a number"
+            )
         if not (0 <= val <= 100):
-            raise HTTPException(status_code=400, detail="max_pipeline_slots must be between 0 and 100 (0 = disabled)")
+            raise HTTPException(
+                status_code=400,
+                detail="max_pipeline_slots must be between 0 and 100 (0 = disabled)",
+            )
         _runtime_config["max_pipeline_slots"] = val
     if "health_check_urls" in payload:
         val = payload["health_check_urls"]
         if not isinstance(val, list):
-            raise HTTPException(status_code=400, detail="health_check_urls must be a list")
+            raise HTTPException(
+                status_code=400, detail="health_check_urls must be a list"
+            )
         if any(not isinstance(u, str) for u in val):
-            raise HTTPException(status_code=400, detail="health_check_urls entries must be strings")
+            raise HTTPException(
+                status_code=400, detail="health_check_urls entries must be strings"
+            )
         if any(not u.startswith(("http://", "https://")) for u in val if u):
-            raise HTTPException(status_code=400, detail="health_check_urls entries must start with http:// or https://")
+            raise HTTPException(
+                status_code=400,
+                detail="health_check_urls entries must start with http:// or https://",
+            )
         _runtime_config["health_check_urls"] = [u for u in val if u]
     if "notification_config" in payload:
         val = payload["notification_config"]
         if not isinstance(val, dict):
-            raise HTTPException(status_code=400, detail="notification_config must be an object")
+            raise HTTPException(
+                status_code=400, detail="notification_config must be an object"
+            )
         webhook_url = val.get("webhook_url", "")
         if not isinstance(webhook_url, str):
-            raise HTTPException(status_code=400, detail="notification_config.webhook_url must be a string")
+            raise HTTPException(
+                status_code=400,
+                detail="notification_config.webhook_url must be a string",
+            )
         if webhook_url and not webhook_url.startswith(("http://", "https://")):
-            raise HTTPException(status_code=400, detail="notification_config.webhook_url must start with http:// or https://")
-        _VALID_NOTIFICATION_EVENTS = frozenset([
-            "TASK_FAILED", "TASK_COMPLETED", "APPROVAL_NEEDED", "DEPLOY_HEALTH_ALERT",
-            "PR_MERGED", "BUDGET_EXCEEDED", "AUTO_FIX_SPAWNED", "AUTO_FIX_MERGED",
-            "AUTO_FIX_ESCALATED", "REMEDIATION_ESCALATED", "DIRECTION_MILESTONE",
-            # Residual remediation lifecycle (mirrors AUTO_FIX_*).
-            # SPAWNED/MERGED are noisier — opt-in only. ESCALATED is BLOCKER
-            # severity and joins the default-on list per the
-            # direction-milestone-webhook-pattern playbook.
-            "RESIDUAL_FIX_SPAWNED", "RESIDUAL_FIX_MERGED", "RESIDUAL_FIX_ESCALATED",
-            # Recovery event: operator manually unsuspends a suspended fingerprint.
-            # Opt-in only (not in default list) — informational, not urgent.
-            "RESIDUAL_FIX_UNSUSPENDED",
-            # Escalation fired when a case is deferred by audit too many times.
-            "RESIDUAL_FIX_AUDIT_DEFERRED",
-        ])
-        enabled_events = val.get("enabled_events", ["TASK_FAILED", "APPROVAL_NEEDED", "DEPLOY_HEALTH_ALERT", "REMEDIATION_ESCALATED", "DIRECTION_MILESTONE", "RESIDUAL_FIX_ESCALATED"])
+            raise HTTPException(
+                status_code=400,
+                detail="notification_config.webhook_url must start with http:// or https://",
+            )
+        _VALID_NOTIFICATION_EVENTS = frozenset(
+            [
+                "TASK_FAILED",
+                "TASK_COMPLETED",
+                "APPROVAL_NEEDED",
+                "DEPLOY_HEALTH_ALERT",
+                "PR_MERGED",
+                "BUDGET_EXCEEDED",
+                "AUTO_FIX_SPAWNED",
+                "AUTO_FIX_MERGED",
+                "AUTO_FIX_ESCALATED",
+                "REMEDIATION_ESCALATED",
+                "DIRECTION_MILESTONE",
+                # Residual remediation lifecycle (mirrors AUTO_FIX_*).
+                # SPAWNED/MERGED are noisier — opt-in only. ESCALATED is BLOCKER
+                # severity and joins the default-on list per the
+                # direction-milestone-webhook-pattern playbook.
+                "RESIDUAL_FIX_SPAWNED",
+                "RESIDUAL_FIX_MERGED",
+                "RESIDUAL_FIX_ESCALATED",
+                # Recovery event: operator manually unsuspends a suspended fingerprint.
+                # Opt-in only (not in default list) — informational, not urgent.
+                "RESIDUAL_FIX_UNSUSPENDED",
+                # Escalation fired when a case is deferred by audit too many times.
+                "RESIDUAL_FIX_AUDIT_DEFERRED",
+            ]
+        )
+        enabled_events = val.get(
+            "enabled_events",
+            [
+                "TASK_FAILED",
+                "APPROVAL_NEEDED",
+                "DEPLOY_HEALTH_ALERT",
+                "REMEDIATION_ESCALATED",
+                "DIRECTION_MILESTONE",
+                "RESIDUAL_FIX_ESCALATED",
+            ],
+        )
         if not isinstance(enabled_events, list):
-            raise HTTPException(status_code=400, detail="notification_config.enabled_events must be a list")
-        invalid_events = [e for e in enabled_events if e not in _VALID_NOTIFICATION_EVENTS]
+            raise HTTPException(
+                status_code=400,
+                detail="notification_config.enabled_events must be a list",
+            )
+        invalid_events = [
+            e for e in enabled_events if e not in _VALID_NOTIFICATION_EVENTS
+        ]
         if invalid_events:
             raise HTTPException(
                 status_code=400,
                 detail=f"notification_config.enabled_events contains unknown events: {invalid_events}. "
-                       f"Valid values: {sorted(_VALID_NOTIFICATION_EVENTS)}",
+                f"Valid values: {sorted(_VALID_NOTIFICATION_EVENTS)}",
             )
         throttle_seconds = val.get("throttle_seconds", 30)
         try:
             throttle_seconds = int(throttle_seconds)
         except (ValueError, TypeError):
-            raise HTTPException(status_code=400, detail="notification_config.throttle_seconds must be a number")
+            raise HTTPException(
+                status_code=400,
+                detail="notification_config.throttle_seconds must be a number",
+            )
         if not (0 <= throttle_seconds <= 3600):
-            raise HTTPException(status_code=400, detail="notification_config.throttle_seconds must be between 0 and 3600")
+            raise HTTPException(
+                status_code=400,
+                detail="notification_config.throttle_seconds must be between 0 and 3600",
+            )
         _runtime_config["notification_config"] = {
             "webhook_url": webhook_url,
             "enabled_events": enabled_events,
@@ -788,9 +1249,14 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
             raise HTTPException(status_code=400, detail="No webhook URL configured")
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.post(webhook_url, json={"type": "TEST", "message": "Blueprint test notification"})
+                resp = await client.post(
+                    webhook_url,
+                    json={"type": "TEST", "message": "Blueprint test notification"},
+                )
             if resp.status_code >= 400:
-                raise HTTPException(status_code=502, detail=f"Webhook returned {resp.status_code}")
+                raise HTTPException(
+                    status_code=502, detail=f"Webhook returned {resp.status_code}"
+                )
         except httpx.RequestError as e:
             raise HTTPException(status_code=502, detail=f"Webhook request failed: {e}")
         return {"ok": True, "test_notification_sent": True}
@@ -807,77 +1273,173 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
         # can confirm the row exists but is held.
         async with deployment_state_lock(session, skip_locked=True) as state:
             if state is None:
-                exists = (await session.execute(
-                    select(DeploymentState.id).where(DeploymentState.id == 1)
-                )).first()
+                exists = (
+                    await session.execute(
+                        select(DeploymentState.id).where(DeploymentState.id == 1)
+                    )
+                ).first()
                 if exists is None:
                     # No DeploymentState row yet — runtime config is in-memory only.
                     # Skip the persist; the next admin/deploy bootstrap will create the row.
                     return _runtime_config
-                raise HTTPException(status_code=409, detail="Deployment state locked; retry settings update")
-            if clear_pause_state and state.status in (DeploymentStatus.PAUSED, DeploymentStatus.HALTED):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Deployment state locked; retry settings update",
+                )
+            if clear_pause_state and state.status in (
+                DeploymentStatus.PAUSED,
+                DeploymentStatus.HALTED,
+            ):
                 old_status = state.status
                 state.status = DeploymentStatus.STABLE
                 state.pause_reason = None
                 state.paused_at = None
                 state.pre_pause_max_vms = None
-                logger.warning(f"[SETTINGS] Cleared {old_status} state — user set max_vms={_runtime_config['max_concurrent_vms']}")
+                logger.warning(
+                    f"[SETTINGS] Cleared {old_status} state — user set max_vms={_runtime_config['max_concurrent_vms']}"
+                )
             state.runtime_max_concurrent_vms = _runtime_config["max_concurrent_vms"]
             state.runtime_max_retries = _runtime_config["max_retries"]
-            state.runtime_max_autonomous_tasks_per_hour = _runtime_config["max_autonomous_tasks_per_hour"]
-            state.runtime_max_global_autonomous_tasks_per_hour = _runtime_config.get("max_global_autonomous_tasks_per_hour")
-            state.runtime_autonomous_research_interval_minutes = _runtime_config.get("autonomous_research_interval_minutes", 30)
-            state.runtime_autonomous_direction_cooldown_minutes = _runtime_config.get("autonomous_direction_cooldown_minutes", 240)
+            state.runtime_max_autonomous_tasks_per_hour = _runtime_config[
+                "max_autonomous_tasks_per_hour"
+            ]
+            state.runtime_max_global_autonomous_tasks_per_hour = _runtime_config.get(
+                "max_global_autonomous_tasks_per_hour"
+            )
+            state.runtime_autonomous_research_interval_minutes = _runtime_config.get(
+                "autonomous_research_interval_minutes", 30
+            )
+            state.runtime_autonomous_direction_cooldown_minutes = _runtime_config.get(
+                "autonomous_direction_cooldown_minutes", 240
+            )
             # Persist dict/list config fields to JSONB column
             try:
                 state.runtime_config_json = {
-                    "provider_tier_model_map": _runtime_config.get("provider_tier_model_map", {}),
-                    "task_type_categories": _runtime_config.get("task_type_categories", {}),
+                    "provider_tier_model_map": _runtime_config.get(
+                        "provider_tier_model_map", {}
+                    ),
+                    "task_type_categories": _runtime_config.get(
+                        "task_type_categories", {}
+                    ),
                     "category_routing": _runtime_config.get("category_routing", {}),
                     "task_type_routing": _runtime_config.get("task_type_routing", {}),
-                    "task_type_model_preferences": _runtime_config.get("task_type_model_preferences", {}),
-                    "provider_selection_mode": _provider_selection_mode_from_config(_runtime_config),
-                    "cross_provider_fallback_enabled": _provider_selection_mode_from_config(_runtime_config) in ("balanced", "preferred"),
-                    "provider_settings_defaults": _runtime_config.get("provider_settings_defaults", {}),
-                    "provider_settings_by_effort": _runtime_config.get("provider_settings_by_effort", {}),
-                    "task_type_provider_overrides": _runtime_config.get("task_type_provider_overrides", {}),
-                    "agent_prompt_suffixes": _runtime_config.get("agent_prompt_suffixes", {}),
-                    "autonomous_periodic_tasks": _runtime_config.get("autonomous_periodic_tasks", {}),
+                    "task_type_model_preferences": _runtime_config.get(
+                        "task_type_model_preferences", {}
+                    ),
+                    "provider_selection_mode": _provider_selection_mode_from_config(
+                        _runtime_config
+                    ),
+                    "cross_provider_fallback_enabled": _provider_selection_mode_from_config(
+                        _runtime_config
+                    )
+                    in ("balanced", "preferred"),
+                    "provider_settings_defaults": _runtime_config.get(
+                        "provider_settings_defaults", {}
+                    ),
+                    "provider_settings_by_effort": _runtime_config.get(
+                        "provider_settings_by_effort", {}
+                    ),
+                    "task_type_provider_overrides": _runtime_config.get(
+                        "task_type_provider_overrides", {}
+                    ),
+                    "agent_prompt_suffixes": _runtime_config.get(
+                        "agent_prompt_suffixes", {}
+                    ),
+                    "autonomous_periodic_tasks": _runtime_config.get(
+                        "autonomous_periodic_tasks", {}
+                    ),
                     "health_check_urls": _runtime_config.get("health_check_urls", []),
-                    "strategic_research_frequency": _runtime_config.get("strategic_research_frequency", 6),
-                    "require_approval_gates": _runtime_config.get("require_approval_gates", True),
-                    "daily_cost_ceiling_usd": _runtime_config.get("daily_cost_ceiling_usd", 0),
-                    "max_provision_retries": _runtime_config.get("max_provision_retries", 3),
+                    "strategic_research_frequency": _runtime_config.get(
+                        "strategic_research_frequency", 6
+                    ),
+                    "require_approval_gates": _runtime_config.get(
+                        "require_approval_gates", True
+                    ),
+                    "daily_cost_ceiling_usd": _runtime_config.get(
+                        "daily_cost_ceiling_usd", 0
+                    ),
+                    "max_provision_retries": _runtime_config.get(
+                        "max_provision_retries", 3
+                    ),
                     "max_rollup_retries": _runtime_config.get("max_rollup_retries", 5),
-                    "architecture_review_frequency": _runtime_config.get("architecture_review_frequency", 3),
-                    "max_active_directions": _runtime_config.get("max_active_directions", 10),
-                    "max_parallel_research_per_project": _runtime_config.get("max_parallel_research_per_project", 3),
-                    "auto_archive_enabled": _runtime_config.get("auto_archive_enabled", True),
-                    "auto_archive_terminal_after_days": _runtime_config.get("auto_archive_terminal_after_days", 7),
-                    "auto_archive_max_terminal_tasks_per_project": _runtime_config.get("auto_archive_max_terminal_tasks_per_project", 200),
-                    "auto_archive_interval_minutes": _runtime_config.get("auto_archive_interval_minutes", 60),
-                    "reserved_slots_for_types": _runtime_config.get("reserved_slots_for_types", {"create": 1, "research": 1}),
+                    "architecture_review_frequency": _runtime_config.get(
+                        "architecture_review_frequency", 3
+                    ),
+                    "max_active_directions": _runtime_config.get(
+                        "max_active_directions", 10
+                    ),
+                    "max_parallel_research_per_project": _runtime_config.get(
+                        "max_parallel_research_per_project", 3
+                    ),
+                    "auto_archive_enabled": _runtime_config.get(
+                        "auto_archive_enabled", True
+                    ),
+                    "auto_archive_terminal_after_days": _runtime_config.get(
+                        "auto_archive_terminal_after_days", 7
+                    ),
+                    "auto_archive_max_terminal_tasks_per_project": _runtime_config.get(
+                        "auto_archive_max_terminal_tasks_per_project", 200
+                    ),
+                    "auto_archive_interval_minutes": _runtime_config.get(
+                        "auto_archive_interval_minutes", 60
+                    ),
+                    "reserved_slots_for_types": _runtime_config.get(
+                        "reserved_slots_for_types", {"create": 1, "research": 1}
+                    ),
                     "max_pipeline_slots": _runtime_config.get("max_pipeline_slots", 4),
-                    "evaluating_pipeline_timeout_minutes": _runtime_config.get("evaluating_pipeline_timeout_minutes", 120),
-                    "ci_backstop_timeout_minutes": _runtime_config.get("ci_backstop_timeout_minutes", 60),
-                    "max_total_research_per_project": _runtime_config.get("max_total_research_per_project", 5),
-                    "warm_continuity_enabled": bool(_runtime_config.get("warm_continuity_enabled", False)),
-                    "next_role_poll_timeout_secs": int(_runtime_config.get("next_role_poll_timeout_secs", 180)),
-                    "drift_over_claim_min_claims": int(_runtime_config.get("drift_over_claim_min_claims", 3)),
-                    "drift_over_claim_consistency_threshold": float(_runtime_config.get("drift_over_claim_consistency_threshold", 0.4)),
-                    "drift_stall_min_claims": int(_runtime_config.get("drift_stall_min_claims", 5)),
-                    "residual_audit_defer_escalation_threshold": int(_runtime_config.get("residual_audit_defer_escalation_threshold", 5)),
-                    "notification_config": _runtime_config.get("notification_config", {
-                        "webhook_url": "",
-                        "enabled_events": ["TASK_FAILED", "APPROVAL_NEEDED", "DEPLOY_HEALTH_ALERT", "REMEDIATION_ESCALATED", "RESIDUAL_FIX_ESCALATED"],
-                        "throttle_seconds": 30,
-                    }),
+                    "evaluating_pipeline_timeout_minutes": _runtime_config.get(
+                        "evaluating_pipeline_timeout_minutes", 120
+                    ),
+                    "ci_backstop_timeout_minutes": _runtime_config.get(
+                        "ci_backstop_timeout_minutes", 60
+                    ),
+                    "max_total_research_per_project": _runtime_config.get(
+                        "max_total_research_per_project", 5
+                    ),
+                    "warm_continuity_enabled": bool(
+                        _runtime_config.get("warm_continuity_enabled", False)
+                    ),
+                    "next_role_poll_timeout_secs": int(
+                        _runtime_config.get("next_role_poll_timeout_secs", 180)
+                    ),
+                    "drift_over_claim_min_claims": int(
+                        _runtime_config.get("drift_over_claim_min_claims", 3)
+                    ),
+                    "drift_over_claim_consistency_threshold": float(
+                        _runtime_config.get(
+                            "drift_over_claim_consistency_threshold", 0.4
+                        )
+                    ),
+                    "drift_stall_min_claims": int(
+                        _runtime_config.get("drift_stall_min_claims", 5)
+                    ),
+                    "residual_audit_defer_escalation_threshold": int(
+                        _runtime_config.get(
+                            "residual_audit_defer_escalation_threshold", 5
+                        )
+                    ),
+                    "notification_config": _runtime_config.get(
+                        "notification_config",
+                        {
+                            "webhook_url": "",
+                            "enabled_events": [
+                                "TASK_FAILED",
+                                "APPROVAL_NEEDED",
+                                "DEPLOY_HEALTH_ALERT",
+                                "REMEDIATION_ESCALATED",
+                                "RESIDUAL_FIX_ESCALATED",
+                            ],
+                            "throttle_seconds": 30,
+                        },
+                    ),
                 }
             except AttributeError:
                 pass  # Column not yet added (rolling deploy, old schema)
             session.add(state)
         await session.commit()
-        logger.info(f"[SETTINGS] Persisted runtime config: max_vms={state.runtime_max_concurrent_vms if state else 'missing'}")
+        logger.info(
+            f"[SETTINGS] Persisted runtime config: max_vms={state.runtime_max_concurrent_vms if state else 'missing'}"
+        )
     except HTTPException:
         _runtime_config.update(_config_snapshot)
         await session.rollback()
@@ -894,6 +1456,7 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
 
 # --- GitHub Repository & Branch Discovery ---
 
+
 async def _get_installation_token_for_user(user_id: str, session: AsyncSession) -> str:
     """
     Retrieves a GitHub installation access token for the given user.
@@ -905,29 +1468,31 @@ async def _get_installation_token_for_user(user_id: str, session: AsyncSession) 
     if not integration:
         raise HTTPException(
             status_code=400,
-            detail="No GitHub integration found. Please connect your GitHub account first."
+            detail="No GitHub integration found. Please connect your GitHub account first.",
         )
 
     if integration.github_installation_id:
         try:
-            token = await generate_installation_access_token(integration.github_installation_id)
+            token = await generate_installation_access_token(
+                integration.github_installation_id
+            )
             return token
         except HTTPException:
             raise HTTPException(
                 status_code=502,
-                detail="Failed to generate GitHub installation token. The installation may have been removed."
+                detail="Failed to generate GitHub installation token. The installation may have been removed.",
             )
 
     raise HTTPException(
         status_code=400,
-        detail="No GitHub App installation found for your account. Please install the GitHub App first."
+        detail="No GitHub App installation found for your account. Please install the GitHub App first.",
     )
 
 
 @router.get("/github/repos")
 async def list_github_repos(
     session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
 ):
     """
     Lists repositories accessible via the current user's GitHub App installation.
@@ -948,17 +1513,20 @@ async def list_github_repos(
         while url:
             resp = await client.get(url, headers=headers)
             if resp.status_code != 200:
-                logger.error(f"GitHub API error listing repos: {resp.status_code} {resp.text}")
+                logger.error(
+                    f"GitHub API error listing repos: {resp.status_code} {resp.text}"
+                )
                 raise HTTPException(
-                    status_code=502,
-                    detail="Failed to fetch repositories from GitHub."
+                    status_code=502, detail="Failed to fetch repositories from GitHub."
                 )
             data = resp.json()
             for r in data.get("repositories", []):
-                repos.append({
-                    "full_name": r["full_name"],
-                    "default_branch": r.get("default_branch", "main"),
-                })
+                repos.append(
+                    {
+                        "full_name": r["full_name"],
+                        "default_branch": r.get("default_branch", "main"),
+                    }
+                )
             # Follow pagination
             url = resp.links.get("next", {}).get("url")
 
@@ -970,7 +1538,7 @@ async def list_github_repos(
 async def list_github_branches(
     repo: str = Query(..., pattern=r"^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$"),
     session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
 ):
     """
     Lists branches for a specific repository accessible via the user's GitHub App installation.
@@ -994,13 +1562,14 @@ async def list_github_branches(
             if resp.status_code == 404:
                 raise HTTPException(
                     status_code=404,
-                    detail=f"Repository '{repo}' not found or not accessible."
+                    detail=f"Repository '{repo}' not found or not accessible.",
                 )
             if resp.status_code != 200:
-                logger.error(f"GitHub API error listing branches for {repo}: {resp.status_code} {resp.text}")
+                logger.error(
+                    f"GitHub API error listing branches for {repo}: {resp.status_code} {resp.text}"
+                )
                 raise HTTPException(
-                    status_code=502,
-                    detail="Failed to fetch branches from GitHub."
+                    status_code=502, detail="Failed to fetch branches from GitHub."
                 )
             data = resp.json()
             for b in data:
@@ -1013,9 +1582,7 @@ async def list_github_branches(
 
 
 @router.post("/restart-orchestrator")
-async def restart_orchestrator(
-    current_user: dict = Depends(require_admin)
-):
+async def restart_orchestrator(current_user: dict = Depends(require_admin)):
     """Restart the orchestrator background task without restarting the entire service."""
     import asyncio
     from app.shared_state import background_tasks
@@ -1046,8 +1613,12 @@ async def memory_tracemalloc_start(
     identify the leak source. Turn off again with /memory/tracemalloc/stop.
     """
     import tracemalloc
+
     if tracemalloc.is_tracing():
-        return {"status": "already_running", "frames": tracemalloc.get_traceback_limit()}
+        return {
+            "status": "already_running",
+            "frames": tracemalloc.get_traceback_limit(),
+        }
     tracemalloc.start(frames)
     logger.warning(f"[MEMORY] tracemalloc enabled with {frames} frames")
     return {"status": "started", "frames": frames}
@@ -1058,6 +1629,7 @@ async def memory_tracemalloc_stop(
     current_user: dict = Depends(require_admin),
 ):
     import tracemalloc
+
     if not tracemalloc.is_tracing():
         return {"status": "not_running"}
     tracemalloc.stop()
@@ -1102,12 +1674,14 @@ async def memory_snapshot(
     result = []
     for s in stats:
         frame = s.traceback[0]
-        result.append({
-            "file": frame.filename,
-            "line": frame.lineno,
-            "size_mb": round(s.size / (1024 * 1024), 3),
-            "count": s.count,
-        })
+        result.append(
+            {
+                "file": frame.filename,
+                "line": frame.lineno,
+                "size_mb": round(s.size / (1024 * 1024), 3),
+                "count": s.count,
+            }
+        )
     # Log top-10 at WARNING so Cloud Logging retains the snapshot through OOM.
     top_log = "; ".join(
         f"{r['file']}:{r['line']} size={r['size_mb']}MB n={r['count']}"
@@ -1134,6 +1708,7 @@ async def refresh_github_quota(
     """
     import app.shared_state as _ss  # noqa: PLC0415
     from app.github import probe_rate_limit  # noqa: PLC0415
+
     ok = await probe_rate_limit()
     gq = dict(_ss.github_quota)
     remaining = gq.get("remaining")
@@ -1161,13 +1736,20 @@ async def reset_github_quota_tracking(
     filter deployed).
     """
     import app.shared_state as _ss  # noqa: PLC0415
-    _ss.github_quota.update({
-        "remaining": None, "limit": None, "reset_at": None, "last_updated": None,
-    })
+
+    _ss.github_quota.update(
+        {
+            "remaining": None,
+            "limit": None,
+            "reset_at": None,
+            "last_updated": None,
+        }
+    )
     _ss.github_call_counts.clear()
     _ss.github_call_counts_window_reset_at = None
     # Immediately probe to repopulate with a fresh observation.
     from app.github import probe_rate_limit  # noqa: PLC0415
+
     await probe_rate_limit()
     return {"status": "reset", "github_quota": dict(_ss.github_quota)}
 
@@ -1175,20 +1757,27 @@ async def reset_github_quota_tracking(
 @router.post("/repair-state")
 async def repair_state(
     session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(require_admin)
+    current_user: dict = Depends(require_admin),
 ):
     """Post-rollback state audit and repair. Fixes stuck tasks, orphaned parents, stale evaluating tasks."""
     from app.models import TaskHistory
+
     repairs = []
 
     # 1. Tasks stuck in PROVISIONING/IN_PROGRESS with no heartbeat for 15+ min → FAILED
     fifteen_min_ago = _utcnow() - timedelta(minutes=15)
-    stuck_tasks = (await session.execute(
-        select(Task).where(
-            Task.status.in_([TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]),
-            Task.vm_instance_id.isnot(None),
+    stuck_tasks = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.status.in_([TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]),
+                    Task.vm_instance_id.isnot(None),
+                )
+            )
         )
-    )).scalars().all()
+        .scalars()
+        .all()
+    )
 
     for t in stuck_tasks:
         cutoff = t.last_heartbeat or t.started_at or t.created_at
@@ -1197,58 +1786,103 @@ async def repair_state(
             t.status = TaskStatus.FAILED
             t.latest_status_message = f"Repaired: stuck in {original_status} with no heartbeat since {cutoff.isoformat()}"
             from app.failure_classification import persist_failure_category  # noqa: PLC0415
+
             persist_failure_category(t, "AGENT_TIMEOUT")
             session.add(t)
-            session.add(TaskHistory(task_id=t.id, action="REPAIR", details={"reason": "stuck_no_heartbeat", "original_status": str(original_status)}))
+            session.add(
+                TaskHistory(
+                    task_id=t.id,
+                    action="REPAIR",
+                    details={
+                        "reason": "stuck_no_heartbeat",
+                        "original_status": str(original_status),
+                    },
+                )
+            )
             repairs.append(f"Failed stuck task {t.id}")
 
             # Clean up VM
             if t.vm_instance_id:
                 from app.main import _ensure_vm_deleted
+
                 await _ensure_vm_deleted(t, reason="admin_repair")
 
     # 2. EVALUATING tasks where all children are terminal but parent not updated
-    evaluating_tasks = (await session.execute(
-        select(Task).where(Task.status == TaskStatus.EVALUATING)
-    )).scalars().all()
+    evaluating_tasks = (
+        (
+            await session.execute(
+                select(Task).where(Task.status == TaskStatus.EVALUATING)
+            )
+        )
+        .scalars()
+        .all()
+    )
 
     for parent in evaluating_tasks:
-        children = (await session.execute(
-            select(Task).where(Task.parent_task_id == parent.id)
-        )).scalars().all()
+        children = (
+            (
+                await session.execute(
+                    select(Task).where(Task.parent_task_id == parent.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
 
         if not children:
             continue
 
-        all_terminal = all(c.status in [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED] for c in children)
+        all_terminal = all(
+            c.status in [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
+            for c in children
+        )
         if all_terminal:
             # Re-trigger rollup by setting back to EVALUATING (the orchestrator will pick it up)
-            parent.latest_status_message = "Repaired: all children terminal, re-triggering rollup"
+            parent.latest_status_message = (
+                "Repaired: all children terminal, re-triggering rollup"
+            )
             session.add(parent)
-            session.add(TaskHistory(task_id=parent.id, action="REPAIR", details={"reason": "stale_evaluating"}))
+            session.add(
+                TaskHistory(
+                    task_id=parent.id,
+                    action="REPAIR",
+                    details={"reason": "stale_evaluating"},
+                )
+            )
             repairs.append(f"Re-triggered rollup for {parent.id}")
 
     # 3. Tasks with parent_task_id pointing to non-existent tasks
     ParentTask = aliased(Task)
-    orphan_children = (await session.execute(
-        select(Task).where(
-            Task.parent_task_id.isnot(None),
-            ~select(ParentTask.id)
-            .where(ParentTask.id == Task.parent_task_id)
-            .correlate(Task)
-            .exists()
+    orphan_children = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.parent_task_id.isnot(None),
+                    ~select(ParentTask.id)
+                    .where(ParentTask.id == Task.parent_task_id)
+                    .correlate(Task)
+                    .exists(),
+                )
+            )
         )
-    )).scalars().all()
+        .scalars()
+        .all()
+    )
 
     for t in orphan_children:
         t.parent_task_id = None
         t.latest_status_message = "Repaired: cleared orphaned parent reference"
         session.add(t)
-        session.add(TaskHistory(task_id=t.id, action="REPAIR", details={"reason": "orphaned_parent_ref"}))
+        session.add(
+            TaskHistory(
+                task_id=t.id, action="REPAIR", details={"reason": "orphaned_parent_ref"}
+            )
+        )
         repairs.append(f"Cleared orphaned parent ref on {t.id}")
 
     # 4. Circuit breakers stuck in HALF_OPEN with a deleted/non-existent test task
     from app.main import _maybe_create_circuit_breaker_alert, _utcnow as _main_utcnow
+
     for proj_id, breaker in list(_circuit_breakers.items()):
         if breaker.get("state") != "HALF_OPEN":
             continue
@@ -1264,18 +1898,24 @@ async def repair_state(
             breaker["opened_at"] = _main_utcnow()
             breaker["cooldown_seconds"] = min(breaker["cooldown_seconds"] * 2, 7200)
             breaker["half_open_task_id"] = None
-            logger.warning(f"[ADMIN REPAIR] Circuit breaker for {proj_id} stuck in HALF_OPEN — test task {test_id} not found, resetting to OPEN")
+            logger.warning(
+                f"[ADMIN REPAIR] Circuit breaker for {proj_id} stuck in HALF_OPEN — test task {test_id} not found, resetting to OPEN"
+            )
             try:
                 project_uuid = uuid.UUID(proj_id)
                 await _maybe_create_circuit_breaker_alert(
-                    project_uuid, session,
-                    f"HALF_OPEN test task deleted/reaped (admin repair) — circuit breaker re-opened (cooldown: {breaker['cooldown_seconds']}s)"
+                    project_uuid,
+                    session,
+                    f"HALF_OPEN test task deleted/reaped (admin repair) — circuit breaker re-opened (cooldown: {breaker['cooldown_seconds']}s)",
                 )
             except Exception:
-                logger.exception(f"[ADMIN REPAIR] Failed to create circuit breaker alert for {proj_id}")
-            repairs.append(f"Reset HALF_OPEN circuit breaker for project {proj_id} (test task {test_id} not found)")
+                logger.exception(
+                    f"[ADMIN REPAIR] Failed to create circuit breaker alert for {proj_id}"
+                )
+            repairs.append(
+                f"Reset HALF_OPEN circuit breaker for project {proj_id} (test task {test_id} not found)"
+            )
 
     await session.commit()
     logger.warning(f"[ADMIN] State repair completed: {len(repairs)} repairs")
     return {"repairs": repairs, "count": len(repairs)}
-

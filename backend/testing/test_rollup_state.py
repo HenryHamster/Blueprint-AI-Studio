@@ -1,4 +1,5 @@
 """Unit tests for rollup_state pure dict helpers and rollup PR body builder."""
+
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
@@ -90,10 +91,24 @@ class TestIsRollupParentAwaitingMerge:
 
 
 class TestBuildRollupPrBody:
-    def _make_child(self, task_type: str, spot: bool = True, seconds: float | None = None):
+    def _make_child(
+        self, task_type: str, spot: bool = True, seconds: float | None = None
+    ):
         from datetime import timedelta
-        prov = datetime(2024, 1, 1, 0, 0, 0, tzinfo=timezone.utc) if seconds is not None else None
-        stop = (datetime(2024, 1, 1, 0, 0, 0, tzinfo=timezone.utc) + timedelta(seconds=seconds)) if seconds is not None else None
+
+        prov = (
+            datetime(2024, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+            if seconds is not None
+            else None
+        )
+        stop = (
+            (
+                datetime(2024, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+                + timedelta(seconds=seconds)
+            )
+            if seconds is not None
+            else None
+        )
         return SimpleNamespace(
             payloads=[{"type": task_type}],
             vm_spot=spot,
@@ -107,7 +122,9 @@ class TestBuildRollupPrBody:
         assert "*Automated by Blueprint Pipeline*" in body
 
     def test_direction_line_included_when_provided(self):
-        body = _build_rollup_pr_body(2, "rollup/xyz", direction_id="abcd1234", direction_title="My Direction")
+        body = _build_rollup_pr_body(
+            2, "rollup/xyz", direction_id="abcd1234", direction_title="My Direction"
+        )
         assert "**Direction:** My Direction `abcd1234`" in body
 
     def test_direction_id_truncated_to_8_chars(self):
@@ -141,5 +158,7 @@ class TestBuildRollupPrBody:
         assert "*1 subtask(s) failed.*" in body
 
     def test_footer_always_last_line(self):
-        body = _build_rollup_pr_body(1, "rollup/x", direction_title="D", direction_id="aaa")
+        body = _build_rollup_pr_body(
+            1, "rollup/x", direction_title="D", direction_id="aaa"
+        )
         assert body.strip().endswith("*Automated by Blueprint Pipeline*")

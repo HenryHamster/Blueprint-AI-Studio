@@ -2,6 +2,7 @@
 
 Extracted from app.task_completion to keep that module within its size budget.
 """
+
 import json
 import logging
 import re
@@ -41,7 +42,7 @@ def _parse_plan_output(text: str) -> Optional[Dict[str, Any]]:
             if escape_next:
                 escape_next = False
                 continue
-            if c == '\\' and in_string:
+            if c == "\\" and in_string:
                 escape_next = True
                 continue
             if c == '"' and not escape_next:
@@ -49,12 +50,12 @@ def _parse_plan_output(text: str) -> Optional[Dict[str, Any]]:
                 continue
             if in_string:
                 continue
-            if c == '{':
+            if c == "{":
                 depth += 1
-            elif c == '}':
+            elif c == "}":
                 depth -= 1
                 if depth == 0:
-                    candidate = text[start:i + 1]
+                    candidate = text[start : i + 1]
                     return json.loads(candidate)
     except (json.JSONDecodeError, AttributeError) as e:
         logger.warning(f"[PLAN] Failed to parse plan JSON: {e}", exc_info=True)
@@ -101,7 +102,9 @@ def _log_file_overlaps(subtasks: List[Dict], label: str = "PLAN") -> List[tuple]
             if overlap:
                 a_title = a.get("title", f"#{i}")
                 b_title = b.get("title", f"#{j}")
-                logger.info(f"[{label}] File overlap: '{a_title}' and '{b_title}' share {', '.join(sorted(overlap))}")
+                logger.info(
+                    f"[{label}] File overlap: '{a_title}' and '{b_title}' share {', '.join(sorted(overlap))}"
+                )
                 overlaps.append((i, j, overlap))
     return overlaps
 
@@ -129,7 +132,9 @@ def _inject_file_overlap_deps(subtasks: List[Dict], label: str = "PLAN") -> None
                 existing.append(predecessor)
                 succ_title = subtasks[successor].get("title", f"#{successor}")
                 pred_title = subtasks[predecessor].get("title", f"#{predecessor}")
-                logger.debug(f"[{label}] Serializing subtasks {pred_title!r} → {succ_title!r} due to shared file: {file_path}")
+                logger.debug(
+                    f"[{label}] Serializing subtasks {pred_title!r} → {succ_title!r} due to shared file: {file_path}"
+                )
 
 
 async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
@@ -141,13 +146,24 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
     if not plan_data or not plan_data.get("subtasks"):
         task.latest_status_message = "Plan agent produced no valid subtasks"
         task.status = TaskStatus.FAILED
-        from app.failure_classification import classify_failure, persist_failure_category  # noqa: PLC0415
+        from app.failure_classification import (
+            classify_failure,
+            persist_failure_category,
+        )  # noqa: PLC0415
         from app.routers.agent_status import record_task_result  # noqa: PLC0415
+
         _fc = classify_failure(task)
         persist_failure_category(task, _fc)
-        record_task_result(success=False, failure_class=_fc, task_id=str(task.id), task_type=task.first_payload.get("type", ""))
+        record_task_result(
+            success=False,
+            failure_class=_fc,
+            task_id=str(task.id),
+            task_type=task.first_payload.get("type", ""),
+        )
         session.add(task)
-        await _maybe_create_failure_alert(task, session, "Plan agent produced no valid subtasks")
+        await _maybe_create_failure_alert(
+            task, session, "Plan agent produced no valid subtasks"
+        )
         await session.commit()
         return
 
@@ -155,18 +171,31 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
 
     if len(subtasks) > 10:
         subtasks = subtasks[:10]
-        logger.info(f"[PLAN] Capped subtask count from {len(plan_data['subtasks'])} to 10")
+        logger.info(
+            f"[PLAN] Capped subtask count from {len(plan_data['subtasks'])} to 10"
+        )
 
     if not _validate_plan_dependencies(subtasks):
         task.latest_status_message = "Plan has circular dependencies"
         task.status = TaskStatus.FAILED
-        from app.failure_classification import classify_failure, persist_failure_category  # noqa: PLC0415
+        from app.failure_classification import (
+            classify_failure,
+            persist_failure_category,
+        )  # noqa: PLC0415
         from app.routers.agent_status import record_task_result  # noqa: PLC0415
+
         _fc = classify_failure(task)
         persist_failure_category(task, _fc)
-        record_task_result(success=False, failure_class=_fc, task_id=str(task.id), task_type=task.first_payload.get("type", ""))
+        record_task_result(
+            success=False,
+            failure_class=_fc,
+            task_id=str(task.id),
+            task_type=task.first_payload.get("type", ""),
+        )
         session.add(task)
-        await _maybe_create_failure_alert(task, session, "Plan has circular dependencies")
+        await _maybe_create_failure_alert(
+            task, session, "Plan has circular dependencies"
+        )
         await session.commit()
         return
 
@@ -186,7 +215,11 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
         return
     task = relocked
 
-    task.context = {**(task.context or {}), "plan_branch": plan_branch, "parent_base": parent_base}
+    task.context = {
+        **(task.context or {}),
+        "plan_branch": plan_branch,
+        "parent_base": parent_base,
+    }
     session.add(task)
 
     parent_payload = task.first_payload
@@ -194,35 +227,51 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
     # balanced selection for THIS task's run and would anchor every child
     # to the same provider regardless of the operator's category_routing.
     # Let the orchestrator resolve each child fresh from routing.
-    effort = parent_payload.get('effort')
+    effort = parent_payload.get("effort")
     plan_parent_context = {
         "parent_task_id": str(task.id),
         "parent_title": task.title,
-        "parent_prompt": (parent_payload.get("prompt") or parent_payload.get("description") or "")[:500]
+        "parent_prompt": (
+            parent_payload.get("prompt") or parent_payload.get("description") or ""
+        )[:500],
     }
-    parent_direction_id = (task.context or {}).get('direction_id')
-    parent_research_task_id = (task.context or {}).get('research_task_id')
+    parent_direction_id = (task.context or {}).get("direction_id")
+    parent_research_task_id = (task.context or {}).get("research_task_id")
     child_tasks = []
     for subtask_def in subtasks:
         related_files = subtask_def.get("related_files", [])
         prompt_text = subtask_def.get("prompt", "")
-        full_prompt = prompt_text + ("\n\nKey files to review or modify:\n" + "\n".join(f"- {f}" for f in related_files)) if related_files else prompt_text
+        full_prompt = (
+            prompt_text
+            + (
+                "\n\nKey files to review or modify:\n"
+                + "\n".join(f"- {f}" for f in related_files)
+            )
+            if related_files
+            else prompt_text
+        )
         create_suffix = _runtime_config.get("agent_prompt_suffixes", {}).get("create")
-        subtask_priority = TASK_PRIORITY_MAP.get(subtask_def.get("priority", "medium"), 50)
-        subtask_effort = subtask_def.get('effort') or effort
-        child_scope = subtask_def.get('scope', 'small')
+        subtask_priority = TASK_PRIORITY_MAP.get(
+            subtask_def.get("priority", "medium"), 50
+        )
+        subtask_effort = subtask_def.get("effort") or effort
+        child_scope = subtask_def.get("scope", "small")
         # Scope-aware effort floor: small subtasks run cheaper, large subtasks
         # need deeper analysis. Max-by-rank so an explicit subtask or parent
         # effort still wins when it is higher than the scope-derived floor.
         _effort_rank = {"max": 4, "high": 3, "medium": 2, "low": 1}
         _scope_effort = scope_to_effort(child_scope)
-        if _effort_rank.get(_scope_effort, 0) > _effort_rank.get(subtask_effort or "", 0):
+        if _effort_rank.get(_scope_effort, 0) > _effort_rank.get(
+            subtask_effort or "", 0
+        ):
             subtask_effort = _scope_effort
-        child_risk = subtask_def.get('risk', 'low')
-        child_approval_reason = subtask_def.get('approval_reason') if child_risk == 'high' else None
-        _allowed_types = {'create', 'refactor', 'migrate', 'qa'}
-        raw_type = subtask_def.get('type', 'create')
-        subtask_type = raw_type if raw_type in _allowed_types else 'create'
+        child_risk = subtask_def.get("risk", "low")
+        child_approval_reason = (
+            subtask_def.get("approval_reason") if child_risk == "high" else None
+        )
+        _allowed_types = {"create", "refactor", "migrate", "qa"}
+        raw_type = subtask_def.get("type", "create")
+        subtask_type = raw_type if raw_type in _allowed_types else "create"
         # Ignore subtask_def.model and parent plan model — legacy hints
         # that anchored every child to one provider regardless of the
         # operator's category_routing. Respect operator-level
@@ -235,14 +284,19 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
             description=subtask_def.get("prompt", ""),
             parent_task_id=task.id,
             requires_approval=False,
-            payloads=[validate_internal_payload({
-                "type": subtask_type,
-                "prompt": full_prompt,
-                "base_branch": plan_branch,
-                **({"model": subtask_model} if subtask_model else {}),
-                **({"effort": subtask_effort} if subtask_effort else {}),
-                **({"prompt_suffix": create_suffix} if create_suffix else {}),
-            }, f"task_completion:plan_subtask:{subtask_type}")],
+            payloads=[
+                validate_internal_payload(
+                    {
+                        "type": subtask_type,
+                        "prompt": full_prompt,
+                        "base_branch": plan_branch,
+                        **({"model": subtask_model} if subtask_model else {}),
+                        **({"effort": subtask_effort} if subtask_effort else {}),
+                        **({"prompt_suffix": create_suffix} if create_suffix else {}),
+                    },
+                    f"task_completion:plan_subtask:{subtask_type}",
+                )
+            ],
             context={
                 "plan_branch": plan_branch,
                 "parent_base": parent_base,
@@ -250,9 +304,19 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
                 "risk": child_risk,
                 "related_files": related_files,
                 "parent_context": plan_parent_context,
-                **({"approval_reason": child_approval_reason} if child_approval_reason else {}),
-                **({"direction_id": parent_direction_id} if parent_direction_id else {}),
-                **({"research_task_id": parent_research_task_id} if parent_research_task_id else {}),
+                **(
+                    {"approval_reason": child_approval_reason}
+                    if child_approval_reason
+                    else {}
+                ),
+                **(
+                    {"direction_id": parent_direction_id} if parent_direction_id else {}
+                ),
+                **(
+                    {"research_task_id": parent_research_task_id}
+                    if parent_research_task_id
+                    else {}
+                ),
             },
             vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
             status=TaskStatus.QUEUED,
@@ -269,11 +333,15 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
 
     # Inject serial dependencies for subtasks that share files (additive only).
     # Save original (explicit) deps so we can restore them if injection creates a cycle.
-    original_deps = {i: list(st.get("depends_on_indices", [])) for i, st in enumerate(subtasks)}
+    original_deps = {
+        i: list(st.get("depends_on_indices", [])) for i, st in enumerate(subtasks)
+    }
     _inject_file_overlap_deps(subtasks, "PLAN")
 
     if not _validate_plan_dependencies(subtasks):
-        logger.error("[PLAN] Circular dependency after file overlap injection — reverting to explicit deps only")
+        logger.error(
+            "[PLAN] Circular dependency after file overlap injection — reverting to explicit deps only"
+        )
         for i, st in enumerate(subtasks):
             if original_deps.get(i):
                 st["depends_on_indices"] = original_deps[i]
@@ -283,9 +351,7 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
     for i, subtask_def in enumerate(subtasks):
         dep_indices = subtask_def.get("depends_on_indices", [])
         child_tasks[i].depends_on = [
-            str(child_tasks[j].id)
-            for j in dep_indices
-            if 0 <= j < len(child_tasks)
+            str(child_tasks[j].id) for j in dep_indices if 0 <= j < len(child_tasks)
         ]
         session.add(child_tasks[i])
 
@@ -295,12 +361,19 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
 
     for ct in child_tasks:
         history = TaskHistory(
-            task_id=ct.id, action="SPAWNED",
-            details={"spawned_by": "PLAN_DECOMPOSITION", "parent_plan_id": str(task.id)}
+            task_id=ct.id,
+            action="SPAWNED",
+            details={
+                "spawned_by": "PLAN_DECOMPOSITION",
+                "parent_plan_id": str(task.id),
+            },
         )
         session.add(history)
-        await broadcast_to_project(str(task.project_id), "task_updated",
-                                   {"task_id": str(ct.id), "status": TaskStatus.QUEUED})
+        await broadcast_to_project(
+            str(task.project_id),
+            "task_updated",
+            {"task_id": str(ct.id), "status": TaskStatus.QUEUED},
+        )
 
     await session.commit()
     logger.info(f"[PLAN] Created {len(child_tasks)} subtasks from plan {task.id}")

@@ -11,6 +11,7 @@ Covers:
 - clear_direction_hold resets streak
 - get_pipeline_health_snapshot includes held_directions
 """
+
 import uuid
 import pytest
 from datetime import timedelta
@@ -35,6 +36,7 @@ from testing.factories import make_task
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _fresh_direction_id() -> str:
     """Return a unique direction id so tests don't bleed into each other."""
     return str(uuid.uuid4())
@@ -49,6 +51,7 @@ def _setup():
 # Unit tests — record_direction_result
 # ---------------------------------------------------------------------------
 
+
 class TestRecordDirectionResult:
     def setup_method(self):
         _setup()
@@ -58,7 +61,13 @@ class TestRecordDirectionResult:
         EXTERNAL_API, SCOPE_OVERFLOW) are platform noise, not the direction's
         fault — they must NOT count toward any hold streak, ever."""
         did = _fresh_direction_id()
-        for fc in ("PROVISION_FAILURE", "RATE_LIMIT", "AGENT_TIMEOUT", "EXTERNAL_API", "SCOPE_OVERFLOW"):
+        for fc in (
+            "PROVISION_FAILURE",
+            "RATE_LIMIT",
+            "AGENT_TIMEOUT",
+            "EXTERNAL_API",
+            "SCOPE_OVERFLOW",
+        ):
             for _ in range(20):  # way past any threshold
                 record_direction_result(did, success=False, failure_class=fc)
         # Direction state may or may not exist depending on init path; either
@@ -105,7 +114,9 @@ class TestRecordDirectionResult:
         for _ in range(2):
             record_direction_result(did, success=False, failure_class="CODE_ERROR")
         for _ in range(50):  # infra failures should have no effect
-            record_direction_result(did, success=False, failure_class="PROVISION_FAILURE")
+            record_direction_result(
+                did, success=False, failure_class="PROVISION_FAILURE"
+            )
         streak = _ss.direction_failure_streaks[did]
         assert streak["consecutive_failures"] == 2
         assert not streak["held"]
@@ -127,13 +138,16 @@ class TestRecordDirectionResult:
     def test_project_id_stored(self):
         did = _fresh_direction_id()
         pid = str(uuid.uuid4())
-        record_direction_result(did, success=False, failure_class="CODE_ERROR", project_id=pid)
+        record_direction_result(
+            did, success=False, failure_class="CODE_ERROR", project_id=pid
+        )
         assert _ss.direction_failure_streaks[did]["project_id"] == pid
 
 
 # ---------------------------------------------------------------------------
 # Unit tests — clear_direction_hold
 # ---------------------------------------------------------------------------
+
 
 class TestClearDirectionHold:
     def setup_method(self):
@@ -159,6 +173,7 @@ class TestClearDirectionHold:
 # Unit tests — is_direction_held timeout
 # ---------------------------------------------------------------------------
 
+
 class TestIsDirectionHeldTimeout:
     def setup_method(self):
         _setup()
@@ -170,8 +185,8 @@ class TestIsDirectionHeldTimeout:
         assert is_direction_held(did)[0]
 
         # Manually backdate held_at past the timeout window
-        _ss.direction_failure_streaks[did]["held_at"] = (
-            _ss._utcnow() - timedelta(hours=DIRECTION_HOLD_TIMEOUT_HOURS + 1)
+        _ss.direction_failure_streaks[did]["held_at"] = _ss._utcnow() - timedelta(
+            hours=DIRECTION_HOLD_TIMEOUT_HOURS + 1
         )
         held, _ = is_direction_held(did)
         assert not held
@@ -189,6 +204,7 @@ class TestIsDirectionHeldTimeout:
 # ---------------------------------------------------------------------------
 # Unit tests — get_direction_hold_info
 # ---------------------------------------------------------------------------
+
 
 class TestGetDirectionHoldInfo:
     def setup_method(self):
@@ -210,18 +226,24 @@ class TestGetDirectionHoldInfo:
         did = _fresh_direction_id()
         for _ in range(DIRECTION_HOLD_THRESHOLD):
             record_direction_result(did, success=False, failure_class="CODE_ERROR")
-        _ss.direction_failure_streaks[did]["held_at"] = (
-            _ss._utcnow() - timedelta(hours=DIRECTION_HOLD_TIMEOUT_HOURS + 1)
+        _ss.direction_failure_streaks[did]["held_at"] = _ss._utcnow() - timedelta(
+            hours=DIRECTION_HOLD_TIMEOUT_HOURS + 1
         )
 
         info = get_direction_hold_info(did)
-        assert info == {"held": False, "reason": "", "held_at": None, "held_until": None}
+        assert info == {
+            "held": False,
+            "reason": "",
+            "held_at": None,
+            "held_until": None,
+        }
         assert _ss.direction_failure_streaks[did]["held"] is False
 
 
 # ---------------------------------------------------------------------------
 # Unit tests — get_held_directions
 # ---------------------------------------------------------------------------
+
 
 class TestGetHeldDirections:
     def setup_method(self):
@@ -242,8 +264,8 @@ class TestGetHeldDirections:
         did = _fresh_direction_id()
         for _ in range(DIRECTION_HOLD_THRESHOLD):
             record_direction_result(did, success=False, failure_class="CODE_ERROR")
-        _ss.direction_failure_streaks[did]["held_at"] = (
-            _ss._utcnow() - timedelta(hours=DIRECTION_HOLD_TIMEOUT_HOURS + 1)
+        _ss.direction_failure_streaks[did]["held_at"] = _ss._utcnow() - timedelta(
+            hours=DIRECTION_HOLD_TIMEOUT_HOURS + 1
         )
         held = get_held_directions()
         assert did not in held
@@ -252,7 +274,9 @@ class TestGetHeldDirections:
         did = _fresh_direction_id()
         pid = str(uuid.uuid4())
         for _ in range(DIRECTION_HOLD_THRESHOLD):
-            record_direction_result(did, success=False, failure_class="CODE_ERROR", project_id=pid)
+            record_direction_result(
+                did, success=False, failure_class="CODE_ERROR", project_id=pid
+            )
         held = get_held_directions()
         entry = held[did]
         assert entry["consecutive_failures"] == DIRECTION_HOLD_THRESHOLD
@@ -264,6 +288,7 @@ class TestGetHeldDirections:
 # ---------------------------------------------------------------------------
 # Unit tests — get_pipeline_health_snapshot includes held_directions
 # ---------------------------------------------------------------------------
+
 
 class TestPipelineHealthSnapshot:
     def setup_method(self):
@@ -288,6 +313,7 @@ class TestPipelineHealthSnapshot:
 # ---------------------------------------------------------------------------
 # Integration tests — filter_held_directions
 # ---------------------------------------------------------------------------
+
 
 class TestFilterHeldDirections:
     def setup_method(self):
@@ -354,7 +380,9 @@ class TestFilterHeldDirections:
 
         for _ in range(DIRECTION_HOLD_THRESHOLD):
             record_direction_result(did_held, success=False, failure_class="CODE_ERROR")
-        record_direction_result(did_ok, success=False, failure_class="CODE_ERROR")  # only 1
+        record_direction_result(
+            did_ok, success=False, failure_class="CODE_ERROR"
+        )  # only 1
 
         session = MagicMock()
         broadcast_fn = AsyncMock()

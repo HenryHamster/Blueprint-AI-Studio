@@ -3,10 +3,12 @@
 Pure-function tests for _sanitize_log — no DB, no async, no fixtures.
 Run with: bash scripts/test-backend.sh testing/test_broadcast.py --standalone
 """
+
 from app.broadcast import _sanitize_log
 
 
 # --- Individual pattern coverage ---------------------------------------------
+
 
 def test_github_personal_access_token():
     out = _sanitize_log("auth=ghp_abc123XYZ_token end")
@@ -28,7 +30,9 @@ def test_github_pat_token():
 
 
 def test_https_x_access_token():
-    out = _sanitize_log("clone https://x-access-token:ghs_secret@github.com/org/repo.git")
+    out = _sanitize_log(
+        "clone https://x-access-token:ghs_secret@github.com/org/repo.git"
+    )
     assert "ghs_secret" not in out
     assert "https://x-access-token:***@" in out
     assert out.endswith("github.com/org/repo.git")
@@ -86,6 +90,7 @@ def test_pem_private_key_block():
 
 # --- Negative cases (must NOT be sanitized) ----------------------------------
 
+
 def test_bare_prefixes_not_sanitized():
     # Prefixes without suffix characters should not match (require + quantifier)
     for safe in ("ghp_", "ghs_", "github_pat_", "sk-ant-"):
@@ -121,6 +126,7 @@ def test_none_input_returned_as_is():
 
 
 # --- Combination / overlap cases ---------------------------------------------
+
 
 def test_multiple_distinct_secrets_all_redacted():
     text = (

@@ -316,11 +316,19 @@ class LLMProvider(ABC):
     def ensure_supported_auth_mode(self, auth_mode: LLMAuthMode) -> None:
         if auth_mode not in self.supported_auth_modes:
             allowed = ", ".join(mode.value for mode in self.supported_auth_modes)
-            raise ValueError(f"{self.name.value} does not support auth_mode={auth_mode.value!r}; allowed: {allowed}")
+            raise ValueError(
+                f"{self.name.value} does not support auth_mode={auth_mode.value!r}; allowed: {allowed}"
+            )
 
-    def normalize_metadata(self, provider_metadata: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    def normalize_metadata(
+        self, provider_metadata: Mapping[str, Any] | None = None
+    ) -> dict[str, Any]:
         metadata = dict(provider_metadata or {})
-        missing = [field for field in self.required_metadata_fields(self.supported_auth_modes[0]) if field not in metadata]
+        missing = [
+            field
+            for field in self.required_metadata_fields(self.supported_auth_modes[0])
+            if field not in metadata
+        ]
         if missing:
             raise ValueError(f"Missing provider metadata fields: {', '.join(missing)}")
         return metadata
@@ -332,7 +340,11 @@ def validate_required_metadata_fields(
     provider_metadata: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
     metadata = dict(provider_metadata or {})
-    missing = [field for field in provider.required_metadata_fields(auth_mode) if not metadata.get(field)]
+    missing = [
+        field
+        for field in provider.required_metadata_fields(auth_mode)
+        if not metadata.get(field)
+    ]
     if missing:
         raise ValueError(f"Missing provider metadata fields: {', '.join(missing)}")
     return metadata
@@ -360,8 +372,16 @@ def tier_model_from_runtime_config(
     runtime_config: Mapping[str, Any],
     defaults: Mapping[str, str],
 ) -> str | None:
-    provider_map = runtime_config.get("provider_tier_model_map", {}) if isinstance(runtime_config, Mapping) else {}
-    configured = provider_map.get(provider.value, {}) if isinstance(provider_map, Mapping) else {}
+    provider_map = (
+        runtime_config.get("provider_tier_model_map", {})
+        if isinstance(runtime_config, Mapping)
+        else {}
+    )
+    configured = (
+        provider_map.get(provider.value, {})
+        if isinstance(provider_map, Mapping)
+        else {}
+    )
     if isinstance(configured, Mapping) and configured.get(tier):
         return configured[tier]
     return defaults.get(tier)
@@ -376,7 +396,9 @@ def tier_model_from_runtime_config(
 # Raises ValueError with a dotted path on any violation. Unknown keys are
 # rejected when additionalProperties is False (default).
 # ---------------------------------------------------------------------------
-def _validate_against_schema(value: Any, schema: Mapping[str, Any], *, path: str) -> Any:
+def _validate_against_schema(
+    value: Any, schema: Mapping[str, Any], *, path: str
+) -> Any:
     if not isinstance(schema, Mapping):
         return value
     expected = schema.get("type")
@@ -384,7 +406,9 @@ def _validate_against_schema(value: Any, schema: Mapping[str, Any], *, path: str
         if value is None:
             value = {}
         if not isinstance(value, Mapping):
-            raise ValueError(f"{path or '<root>'}: expected object, got {type(value).__name__}")
+            raise ValueError(
+                f"{path or '<root>'}: expected object, got {type(value).__name__}"
+            )
         props = schema.get("properties") or {}
         extra_ok = schema.get("additionalProperties", False)
         required = schema.get("required") or ()
@@ -399,7 +423,9 @@ def _validate_against_schema(value: Any, schema: Mapping[str, Any], *, path: str
                 raise ValueError(f"{path or '<root>'}: unknown key {key!r}")
         missing = [key for key in required if key not in cleaned]
         if missing:
-            raise ValueError(f"{path or '<root>'}: missing required keys: {', '.join(missing)}")
+            raise ValueError(
+                f"{path or '<root>'}: missing required keys: {', '.join(missing)}"
+            )
         return cleaned
     if expected == "string":
         if value is None:
@@ -408,7 +434,9 @@ def _validate_against_schema(value: Any, schema: Mapping[str, Any], *, path: str
             raise ValueError(f"{path}: expected string")
         enum = schema.get("enum")
         if enum is not None and value not in enum:
-            raise ValueError(f"{path}: value {value!r} not in allowed values {list(enum)}")
+            raise ValueError(
+                f"{path}: value {value!r} not in allowed values {list(enum)}"
+            )
         return value
     if expected == "integer":
         if value is None:

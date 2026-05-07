@@ -4,6 +4,7 @@ Extracted from app.task_completion to keep that module focused on plan/security/
 completion handlers. Contains the research findings parser, context builder,
 and the large _handle_research_completion handler.
 """
+
 import asyncio
 import json
 import logging
@@ -45,7 +46,10 @@ from app.finding_deduplication import (
     is_duplicate as _is_duplicate,  # noqa: F401 — re-exported for callers/tests
 )
 from app.payload_schemas import validate_internal_payload
-from app.playbook_learning import RECENT_SUCCESSES_TASK_TYPES, summarize_recent_successes
+from app.playbook_learning import (
+    RECENT_SUCCESSES_TASK_TYPES,
+    summarize_recent_successes,
+)
 from app.research_context import (  # noqa: F401 — re-exported for callers/tests
     _parse_research_context,
     _parse_eviction_counts,
@@ -60,7 +64,11 @@ from app.research_direction_state import (  # noqa: F401 — re-exported for cal
 )
 from app.source_ref_validation import validate_source_refs, _parse_ref
 from app.scope_complexity import _composite_complexity_score
-from app.shared_state import runtime_config as _runtime_config, DEFAULT_TASK_SCOPE, scope_to_effort
+from app.shared_state import (
+    runtime_config as _runtime_config,
+    DEFAULT_TASK_SCOPE,
+    scope_to_effort,
+)
 from app.spawn_calibration import (  # noqa: F401 — re-exported for tests/callers
     _SCOPE_ORDER,
     SCOPE_FILE_BUDGETS,
@@ -118,7 +126,7 @@ def _parse_research_findings(text: str) -> Optional[List[Dict[str, Any]]]:
                 if escape_next:
                     escape_next = False
                     continue
-                if c == '\\' and in_string:
+                if c == "\\" and in_string:
                     escape_next = True
                     continue
                 if c == '"' and not escape_next:
@@ -126,18 +134,20 @@ def _parse_research_findings(text: str) -> Optional[List[Dict[str, Any]]]:
                     continue
                 if in_string:
                     continue
-                if c == '{':
+                if c == "{":
                     depth += 1
-                elif c == '}':
+                elif c == "}":
                     depth -= 1
                     if depth == 0:
                         last_close = i
             if last_close > 0:
                 try:
-                    truncated = json_str[:last_close + 1] + ']'
+                    truncated = json_str[: last_close + 1] + "]"
                     findings = json.loads(truncated)
                     if isinstance(findings, list):
-                        logger.info(f"[RESEARCH] Recovered {len(findings)} findings from truncated JSON")
+                        logger.info(
+                            f"[RESEARCH] Recovered {len(findings)} findings from truncated JSON"
+                        )
                         return findings
                 except json.JSONDecodeError:
                     pass
@@ -158,7 +168,9 @@ async def _parse_research_insights(task_id: str) -> List[Dict[str, Any]]:
             if isinstance(data, list):
                 return [i for i in data if isinstance(i, dict) and "summary" in i]
         except Exception as e:
-            logger.warning(f"[RESEARCH] Failed to read insights file {insights_path}: {e}")
+            logger.warning(
+                f"[RESEARCH] Failed to read insights file {insights_path}: {e}"
+            )
         return []
 
     return await asyncio.to_thread(_read_sync)
@@ -203,6 +215,7 @@ def _compute_prompt_telemetry(
     at higher rates than those that don't".
     """
     import re  # noqa: PLC0415
+
     text = full_prompt or ""
     budget = SCOPE_FILE_BUDGETS.get(scope, {}).get("total_files_max") or 0
     n_related = len(related_files or [])
@@ -210,7 +223,12 @@ def _compute_prompt_telemetry(
         "char_count": len(text),
         "related_file_count": n_related,
         "mentions_tests": bool(re.search(r"\btest", text, re.IGNORECASE)),
-        "mentions_symbols": bool(re.search(r"\b[a-z][a-zA-Z0-9_]*[a-z][A-Z]\w*\b|\b[A-Z][a-zA-Z0-9_]*[a-z]\w*\b\(|\b[a-z_][a-z0-9_]+\(", text)),
+        "mentions_symbols": bool(
+            re.search(
+                r"\b[a-z][a-zA-Z0-9_]*[a-z][A-Z]\w*\b|\b[A-Z][a-zA-Z0-9_]*[a-z]\w*\b\(|\b[a-z_][a-z0-9_]+\(",
+                text,
+            )
+        ),
         "files_to_budget_ratio": round(n_related / budget, 3) if budget > 0 else None,
     }
 
@@ -263,7 +281,7 @@ def _cochange_decomposition_suppressed(
         return False
     total = 0
     merged = 0
-    for entry in (direction.get("research_history") or []):
+    for entry in direction.get("research_history") or []:
         cd = entry.get("cochange_decomposition") or {}
         total += cd.get("sub_findings_total", 0) or 0
         merged += cd.get("sub_findings_merged", 0) or 0
@@ -296,7 +314,8 @@ def _calibrate_finding_scope(
             logger.info(
                 "[RESEARCH] Upgrading scope small→medium for '%s' "
                 "(file-count heuristic: %d related_files >= 4)",
-                title, len(_heuristic_files),
+                title,
+                len(_heuristic_files),
             )
             scope = "medium"
             scope_calibrated_from = "small"
@@ -307,7 +326,8 @@ def _calibrate_finding_scope(
             logger.info(
                 "[RESEARCH] Upgrading scope medium→large for '%s' "
                 "(file-count heuristic: %d related_files >= 8)",
-                title, len(_heuristic_files),
+                title,
+                len(_heuristic_files),
             )
             scope = "large"
             scope_calibrated_from = "medium"
@@ -316,11 +336,15 @@ def _calibrate_finding_scope(
             # (e.g. backend + agent + admin-ui). These face language boundaries,
             # separate build/test systems, and independent CI — upgrade to large
             # for plan decomposition into per-module subtasks.
-            _modules = sorted({f.split("/", 1)[0] for f in _heuristic_files if "/" in f})
+            _modules = sorted(
+                {f.split("/", 1)[0] for f in _heuristic_files if "/" in f}
+            )
             logger.info(
                 "[RESEARCH] Upgrading scope medium→large for '%s' "
                 "(cross-module heuristic: related_files span %d modules: %s)",
-                title, len(_modules), ",".join(_modules),
+                title,
+                len(_modules),
+                ",".join(_modules),
             )
             scope = "large"
             scope_calibrated_from = "medium:cross_module"
@@ -331,9 +355,7 @@ def _calibrate_finding_scope(
             # exceeds the medium overflow threshold (10 in SCOPE_OVERFLOW_THRESHOLDS), route
             # to large for plan decomposition before burning 5-10 minutes on a task that
             # will almost certainly scope-overflow during implementation.
-            _avg_ratio = (
-                _avg_medium_expansion_ratio([direction]) if direction else None
-            )
+            _avg_ratio = _avg_medium_expansion_ratio([direction]) if direction else None
             _ratio_source = "direction"
             if _avg_ratio is None and all_directions:
                 _avg_ratio = _avg_medium_expansion_ratio(all_directions)
@@ -356,7 +378,11 @@ def _calibrate_finding_scope(
                     "[RESEARCH] Upgrading scope medium→large for '%s' "
                     "(expansion-ratio prediction [%s]: %d related_files × %.2f avg_ratio "
                     "= %.1f predicted files > 10 threshold)",
-                    title, _ratio_source, len(_heuristic_files), _avg_ratio, _predicted_files,
+                    title,
+                    _ratio_source,
+                    len(_heuristic_files),
+                    _avg_ratio,
+                    _predicted_files,
                 )
                 scope = "large"
                 scope_calibrated_from = "medium"
@@ -380,12 +406,16 @@ def _calibrate_finding_scope(
                     "[RESEARCH] Upgrading scope medium→large for '%s' "
                     "(pipeline medium merge rate %.3f <= exploration floor %.3f — "
                     "unconditional escalation)",
-                    title, float(_pipeline_medium_rate), MEDIUM_EXPLORATION_FLOOR,
+                    title,
+                    float(_pipeline_medium_rate),
+                    MEDIUM_EXPLORATION_FLOOR,
                 )
                 return "large", "medium:pipeline_floor"
         if scope == "medium":
             _cc_score, _cc_signals = _composite_complexity_score(
-                finding.get("related_files") or [], direction, cochange_index,
+                finding.get("related_files") or [],
+                direction,
+                cochange_index,
             )
             finding["_complexity_score"] = round(_cc_score, 3)
             finding["_complexity_signals"] = _cc_signals
@@ -409,8 +439,12 @@ def _calibrate_finding_scope(
                 logger.info(
                     "[RESEARCH] Upgrading scope medium→large for '%s' "
                     "(composite complexity %.2f < %.2f, pipeline_medium=%s, signals=%s)",
-                    title, _cc_score, _cc_threshold,
-                    f"{_pipeline_medium:.2f}" if isinstance(_pipeline_medium, (int, float)) else "n/a",
+                    title,
+                    _cc_score,
+                    _cc_threshold,
+                    f"{_pipeline_medium:.2f}"
+                    if isinstance(_pipeline_medium, (int, float))
+                    else "n/a",
                     _cc_signals,
                 )
                 scope = "large"
@@ -428,7 +462,9 @@ def _build_preventive_context(
 
     Returns None when no overlap exists, so callers can skip injection.
     """
-    related_files = [f for f in (finding.get("related_files") or []) if isinstance(f, str)]
+    related_files = [
+        f for f in (finding.get("related_files") or []) if isinstance(f, str)
+    ]
     if not related_files:
         return None
     related_set = set(related_files)
@@ -436,7 +472,9 @@ def _build_preventive_context(
 
     hotspot: Optional[Dict[str, Any]] = None
     for d in directions_by_id.values():
-        affected = [a for a in (d.get("diagnosed_affected_files") or []) if isinstance(a, str)]
+        affected = [
+            a for a in (d.get("diagnosed_affected_files") or []) if isinstance(a, str)
+        ]
         overlap = sorted(related_set.intersection(affected))
         if not overlap:
             continue
@@ -466,7 +504,10 @@ def _build_preventive_context(
             if not details:
                 continue
             if any(m and m in details for m in modules):
-                anomaly_match = {"key": key, "details": info.get("latest_details") or ""}
+                anomaly_match = {
+                    "key": key,
+                    "details": info.get("latest_details") or "",
+                }
                 break
 
     if not hotspot and not anomaly_match:
@@ -475,7 +516,9 @@ def _build_preventive_context(
     parts: list[str] = []
     if hotspot:
         files_str = ", ".join(hotspot["overlap_files"][:3])
-        fp_str = f" (fingerprint {hotspot['fingerprint']})" if hotspot["fingerprint"] else ""
+        fp_str = (
+            f" (fingerprint {hotspot['fingerprint']})" if hotspot["fingerprint"] else ""
+        )
         root = hotspot["summary"] or "see direction diagnosis"
         parts.append(
             f"Files {files_str} were recently involved in a recurring failure{fp_str}. "
@@ -580,14 +623,16 @@ async def lookup_findings_by_source_ref(
                 if src_path == ref_path or src_path.startswith(ref_path + "/"):
                     matched_sources.append(src)
             if matched_sources:
-                matches.append({
-                    "task_id": str(task.id),
-                    "direction_id": (task.context or {}).get("direction_id"),
-                    "finding_index": idx,
-                    "finding_title": finding.get("title", ""),
-                    "finding_description": (finding.get("description") or "")[:200],
-                    "matched_sources": matched_sources,
-                })
+                matches.append(
+                    {
+                        "task_id": str(task.id),
+                        "direction_id": (task.context or {}).get("direction_id"),
+                        "finding_index": idx,
+                        "finding_title": finding.get("title", ""),
+                        "finding_description": (finding.get("description") or "")[:200],
+                        "matched_sources": matched_sources,
+                    }
+                )
                 if len(matches) >= limit:
                     return matches
     return matches
@@ -603,10 +648,14 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # where one strategic_review spawned 4 research tasks AT ONCE and
     # immediately tripped the modulo-6 gate for the next strategic_review.
     from sqlalchemy.orm.attributes import flag_modified
+
     project_obj = await session.get(Project, task.project_id)
     if project_obj is not None:
         new_count = ((project_obj.vision or {}).get("_research_spawn_count") or 0) + 1
-        project_obj.vision = {**(project_obj.vision or {}), "_research_spawn_count": new_count}
+        project_obj.vision = {
+            **(project_obj.vision or {}),
+            "_research_spawn_count": new_count,
+        }
         flag_modified(project_obj, "vision")
         session.add(project_obj)
 
@@ -618,7 +667,9 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         task.latest_status_message = f"Research depth limit ({MAX_RESEARCH_DEPTH}) reached — not spawning further tasks"
         session.add(task)
         await session.commit()
-        logger.warning(f"[RESEARCH] Depth limit reached for task {task.id} (depth={research_depth})")
+        logger.warning(
+            f"[RESEARCH] Depth limit reached for task {task.id} (depth={research_depth})"
+        )
         return
 
     findings = _parse_research_findings(logs)
@@ -652,7 +703,9 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             if not isinstance(_f["sources"], list):
                 _f["sources"] = []
             else:
-                _f["sources"] = [s for s in _f["sources"] if isinstance(s, dict) and s.get("ref")]
+                _f["sources"] = [
+                    s for s in _f["sources"] if isinstance(s, dict) and s.get("ref")
+                ]
                 # Validate file-type source refs at write time
                 _f["sources"] = validate_source_refs(_f["sources"])
 
@@ -672,7 +725,11 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # so their hashes would never be stored, allowing identical entries to accumulate).
     direction_proposals = [f for f in findings if f.get("type") == "direction_proposal"]
     direction_notes = [f for f in findings if f.get("type") == "direction_note"]
-    findings = [f for f in findings if f.get("type") not in ("direction_proposal", "direction_note")]
+    findings = [
+        f
+        for f in findings
+        if f.get("type") not in ("direction_proposal", "direction_note")
+    ]
     # Recover findings that were deferred in the previous cycle due to pipeline degradation.
     # These were already researched but couldn't be spawned; prepend them so they go through
     # the full dedup + health gate pipeline alongside this cycle's new findings.
@@ -680,8 +737,10 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     if prior_deferred:
         # Filter out non-actionable types that would have been handled separately above
         prior_actionable = [
-            f for f in prior_deferred
-            if isinstance(f, dict) and f.get("type") not in ("direction_proposal", "direction_note")
+            f
+            for f in prior_deferred
+            if isinstance(f, dict)
+            and f.get("type") not in ("direction_proposal", "direction_note")
         ]
         # Discard findings older than DEFERRED_FINDING_MAX_AGE to prevent stale
         # entries from blocking fresh findings (priority inversion) and to bound
@@ -695,6 +754,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             if isinstance(_stamp, str):
                 try:
                     from datetime import datetime as _dt  # noqa: PLC0415
+
                     _stamp_dt = _dt.fromisoformat(_stamp.replace("Z", "+00:00"))
                     if _stamp_dt.tzinfo is not None:
                         _stamp_dt = _stamp_dt.replace(tzinfo=None)
@@ -745,13 +805,15 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # Compute capacity-aware batch cap — no DB queries, uses in-memory state only
     from app import shared_state as _ss  # noqa: PLC0415
     from app import max_plan_pool as _pool_mod  # noqa: PLC0415
+
     _max_vms = _runtime_config.get("max_concurrent_vms", 8)
     _available_slots = max(0, _max_vms - _ss.tasks_active_gauge)
     _queued_count = _ss.tasks_queued_gauge
     _all_pool_accounts = _pool_mod._all_accounts()
     if _all_pool_accounts:
         _healthy_accounts = sum(
-            1 for a in _all_pool_accounts
+            1
+            for a in _all_pool_accounts
             if _pool_mod._account_available_for_model(a, "claude-opus-4-7")
         )
         _cap_by_accounts = _healthy_accounts * 3
@@ -764,7 +826,9 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # busy, or all accounts temporarily rate-limited) doesn't zero out the cap and
     # permanently discard this research cycle's findings.  Queue depth already has
     # its own max(3, …) floor; consistent treatment here prevents _effective_cap=0.
-    _effective_cap = min(15, max(1, _cap_by_slots), max(1, _cap_by_accounts), _cap_by_queue)
+    _effective_cap = min(
+        15, max(1, _cap_by_slots), max(1, _cap_by_accounts), _cap_by_queue
+    )
     _cap_factors = {
         "max_findings": 15,
         "vm_slots": _cap_by_slots,
@@ -774,7 +838,9 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     _limiting_factor = min(_cap_factors, key=lambda k: _cap_factors[k])
     logger.info(
         "[RESEARCH] Batch cap: %d (limited_by=%s, available_slots=%d, healthy_accounts=%s, queue_depth=%d)",
-        _effective_cap, _limiting_factor, _available_slots,
+        _effective_cap,
+        _limiting_factor,
+        _available_slots,
         _healthy_accounts if _healthy_accounts >= 0 else "n/a",
         _queued_count,
     )
@@ -794,7 +860,9 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     if len(findings) > _effective_cap:
         _ranked = sorted(
             enumerate(findings),
-            key=lambda pair: _BATCH_PRIORITY_ORDER.get(pair[1].get("priority", "medium"), 1),
+            key=lambda pair: _BATCH_PRIORITY_ORDER.get(
+                pair[1].get("priority", "medium"), 1
+            ),
         )
         _kept_orig_indices = sorted(i for i, _ in _ranked[:_effective_cap])
         _kept_set = set(_kept_orig_indices)
@@ -804,10 +872,13 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         for _f in findings:
             _deps = _f.get("depends_on_indices")
             if _deps:
-                _f["depends_on_indices"] = [_old_to_new[d] for d in _deps if d in _old_to_new]
+                _f["depends_on_indices"] = [
+                    _old_to_new[d] for d in _deps if d in _old_to_new
+                ]
         logger.info(
             "[RESEARCH] Batch cap (%d) exceeded — deferring %d lower-priority finding(s) to next cycle",
-            _effective_cap, len(_batch_cap_deferred),
+            _effective_cap,
+            len(_batch_cap_deferred),
         )
 
     original_base = (task.first_payload).get("base_branch", "main")
@@ -818,58 +889,89 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # Round 4 W1 (audit C2): _ensure_branch now returns Task | None.
     # On success, returns the freshly-locked Task (caller mutates under
     # the new lock). On failure or peer-mutation defer, returns None.
-    relocked = await _ensure_branch(task, research_branch, original_base, "RESEARCH", session)
+    relocked = await _ensure_branch(
+        task, research_branch, original_base, "RESEARCH", session
+    )
     if relocked is None:
         return
     task = relocked
 
     # Validate dependencies if present
     if not _validate_plan_dependencies(findings):
-        logger.warning("[RESEARCH] Findings have circular dependencies — ignoring depends_on_indices")
+        logger.warning(
+            "[RESEARCH] Findings have circular dependencies — ignoring depends_on_indices"
+        )
         for f in findings:
             f.pop("depends_on_indices", None)
 
     # Query active/queued tasks for word-overlap deduplication
-    existing_tasks = (await session.execute(
-        select(Task).where(
-            Task.project_id == task.project_id,
-            Task.status.in_([TaskStatus.QUEUED, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING, TaskStatus.PROVISIONING])
+    existing_tasks = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.project_id == task.project_id,
+                    Task.status.in_(
+                        [
+                            TaskStatus.QUEUED,
+                            TaskStatus.IN_PROGRESS,
+                            TaskStatus.EVALUATING,
+                            TaskStatus.PROVISIONING,
+                        ]
+                    ),
+                )
+            )
         )
-    )).scalars().all()
+        .scalars()
+        .all()
+    )
     # Build (direction_id, title) pairs to enable direction-aware dedup thresholds
     existing_tasks_with_dirs = [
-        ((t.context or {}).get("direction_id"), t.title.lower())
-        for t in existing_tasks
+        ((t.context or {}).get("direction_id"), t.title.lower()) for t in existing_tasks
     ]
 
     # Query recent tasks (last 90 days) for hash-based deduplication across research cycles
     ninety_days_ago = _utcnow() - timedelta(days=90)
-    recent_tasks_for_dedup = (await session.execute(
-        select(Task).where(
-            Task.project_id == task.project_id,
-            Task.created_at >= ninety_days_ago,
+    recent_tasks_for_dedup = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.project_id == task.project_id,
+                    Task.created_at >= ninety_days_ago,
+                )
+            )
         )
-    )).scalars().all()
+        .scalars()
+        .all()
+    )
     # Collect parent IDs for COMPLETED+pr_merged tasks to detect ghost merges
     # (code merged to staging branch but parent rollup PR to main failed)
     potential_ghost_parent_ids = {
-        t.parent_task_id for t in recent_tasks_for_dedup
+        t.parent_task_id
+        for t in recent_tasks_for_dedup
         if t.parent_task_id
         and t.status == TaskStatus.COMPLETED
         and (t.context or {}).get("pr_merged")
     }
     failed_parent_ids: set = set()
     if potential_ghost_parent_ids:
-        parent_tasks_rows = (await session.execute(
-            select(Task).where(Task.id.in_(potential_ghost_parent_ids))
-        )).scalars().all()
+        parent_tasks_rows = (
+            (
+                await session.execute(
+                    select(Task).where(Task.id.in_(potential_ghost_parent_ids))
+                )
+            )
+            .scalars()
+            .all()
+        )
         failed_parent_ids = {
-            p.id for p in parent_tasks_rows
+            p.id
+            for p in parent_tasks_rows
             if p.status in (TaskStatus.FAILED, TaskStatus.CANCELLED)
         }
 
     recent_finding_hashes, failed_hashes, prior_failure_by_hash = build_dedup_state(
-        recent_tasks_for_dedup, failed_parent_ids,
+        recent_tasks_for_dedup,
+        failed_parent_ids,
     )
 
     # Query open PR artifacts to detect file-scope conflicts with in-flight work
@@ -880,17 +982,21 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             Task.project_id == task.project_id,
             Artifact.artifact_type == ArtifactType.PULL_REQUEST,
             Artifact.pr_url.isnot(None),
-            Task.status.not_in([TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED])
+            Task.status.not_in(
+                [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
+            ),
         )
         .limit(200)
     )
     open_pr_rows = (await session.execute(open_pr_stmt)).all()
     if len(open_pr_rows) >= 200:
-        logger.warning(f"[RESEARCH] open PR artifact query hit 200-row cap for project {task.project_id} — file-overlap dedup may be incomplete")
+        logger.warning(
+            f"[RESEARCH] open PR artifact query hit 200-row cap for project {task.project_id} — file-overlap dedup may be incomplete"
+        )
     open_pr_files: set[str] = set()
     for _, _, task_ctx in open_pr_rows:
         if task_ctx:
-            for f in (task_ctx.get('related_files') or []):
+            for f in task_ctx.get("related_files") or []:
                 open_pr_files.add(f)
 
     # Sort findings by priority (high → medium → low) and apply the hash,
@@ -918,7 +1024,9 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # Metadata findings (design_doc_observation, direction_update) are processed
     # regardless; only VM-consuming implementation tasks are capped.
     _pipeline_degraded, _health_reason = await _assess_project_spawn_health(
-        session, task.project_id, _effective_cap,
+        session,
+        task.project_id,
+        _effective_cap,
     )
     _impl_spawned = 0
     _degradation_gate_deferred: list[dict] = []
@@ -939,7 +1047,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     _scope_cal_project = await session.get(Project, task.project_id)
     _directions_by_id: dict = {}
     if _scope_cal_project:
-        for _d in (_scope_cal_project.directions or []):
+        for _d in _scope_cal_project.directions or []:
             if _d.get("id"):
                 _directions_by_id[_d["id"]] = _d
     # Also index by parent_direction_id in task context as fallback
@@ -968,14 +1076,18 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             logger.info(
                 "[RESEARCH] Suppressing cochange decomposition for %d finding(s) "
                 "in %d direction(s) with poor historical sub-finding merge rate",
-                len(_skip_decomp), len(_suppressed_decomp_dirs),
+                len(_skip_decomp),
+                len(_suppressed_decomp_dirs),
             )
-        deduplicated = auto_decompose_findings_by_cochange(
-            _to_decomp,
-            _cochange_index_for_decomp,
-            task.context,
-            _finding_hash,
-        ) + _skip_decomp
+        deduplicated = (
+            auto_decompose_findings_by_cochange(
+                _to_decomp,
+                _cochange_index_for_decomp,
+                task.context,
+                _finding_hash,
+            )
+            + _skip_decomp
+        )
     else:
         deduplicated = auto_decompose_findings_by_cochange(
             deduplicated,
@@ -1013,7 +1125,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     for orig_i, finding, fhash in deduplicated:
         scope = finding.get("scope", DEFAULT_TASK_SCOPE)
         risk = finding.get("risk", "low")
-        title = finding.get("title", f"Research finding #{orig_i+1}")
+        title = finding.get("title", f"Research finding #{orig_i + 1}")
         prompt = finding.get("prompt", finding.get("description", ""))
 
         # Pre-spawn scope-budget gate: catch obvious file-count/scope mismatch before
@@ -1033,14 +1145,16 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             if obs_project:
                 doc = dict(obs_project.design_doc or {})
                 proposals = doc.get("proposed_changes", [])
-                proposals.append({
-                    "id": f"pc-{uuid.uuid4().hex[:8]}",
-                    "observation": finding.get("description", "")[:500],
-                    "section": finding.get("section", "general"),
-                    "proposed_by_task": str(task.id),
-                    "proposed_at": _utcnow().isoformat(),
-                    "status": "pending",
-                })
+                proposals.append(
+                    {
+                        "id": f"pc-{uuid.uuid4().hex[:8]}",
+                        "observation": finding.get("description", "")[:500],
+                        "section": finding.get("section", "general"),
+                        "proposed_by_task": str(task.id),
+                        "proposed_at": _utcnow().isoformat(),
+                        "status": "pending",
+                    }
+                )
                 doc["proposed_changes"] = proposals[-30:]  # cap at 30 pending
                 obs_project.design_doc = doc
                 flag_modified(obs_project, "design_doc")
@@ -1063,8 +1177,12 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 if d.get("id") == target_id:
                     d["pending_update"] = {
                         "suggested_text": finding.get("suggested_text", d.get("text")),
-                        "suggested_priority": finding.get("suggested_priority", d.get("priority")),
-                        "suggested_paths": finding.get("suggested_paths", d.get("paths", [])),
+                        "suggested_priority": finding.get(
+                            "suggested_priority", d.get("priority")
+                        ),
+                        "suggested_paths": finding.get(
+                            "suggested_paths", d.get("paths", [])
+                        ),
                         "rationale": finding.get("description", "")[:300],
                         "proposed_at": _utcnow().isoformat(),
                         "proposed_by": str(task.id),
@@ -1093,9 +1211,13 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             continue
 
         # Apply scope calibration from direction's historical merge rates (skip if already calibrated)
-        scope_calibrated_from: str | None = finding.get("scope_calibrated_from") or _sbg_cal_from
+        scope_calibrated_from: str | None = (
+            finding.get("scope_calibrated_from") or _sbg_cal_from
+        )
         _history_calibration_fired = False
-        if not (scope_calibrated_from or (task.context or {}).get("scope_calibrated_from")):
+        if not (
+            scope_calibrated_from or (task.context or {}).get("scope_calibrated_from")
+        ):
             _dir_id = finding.get("direction_id") or _parent_direction_id
             _direction = _directions_by_id.get(str(_dir_id)) if _dir_id else None
             if _direction:
@@ -1105,7 +1227,14 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 # pre-calibration scope, which is the proposed scope at this point.
                 if finding_type == "research":
                     _prelim_task_type: str | None = "research"
-                elif finding_type in ("security_audit", "qa", "deps", "docs", "migrate", "perf"):
+                elif finding_type in (
+                    "security_audit",
+                    "qa",
+                    "deps",
+                    "docs",
+                    "migrate",
+                    "perf",
+                ):
                     _prelim_task_type = finding_type
                 elif finding_type == "refactor":
                     _prelim_task_type = "refactor"
@@ -1113,7 +1242,9 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     _prelim_task_type = "plan"
                 else:
                     _prelim_task_type = "create"
-                scope, scope_calibrated_from = _calibrate_scope(scope, _direction, _scope_cal_project, _prelim_task_type)
+                scope, scope_calibrated_from = _calibrate_scope(
+                    scope, _direction, _scope_cal_project, _prelim_task_type
+                )
                 _history_calibration_fired = scope_calibrated_from is not None
 
         # Pre-spawn scope-upgrade heuristics (file count, cross-module span,
@@ -1132,9 +1263,14 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         _skip_auto_decomp = finding.get("auto_decomposed") and scope == "small"
         if not _history_calibration_fired and not _skip_auto_decomp:
             _heur_dir_id = finding.get("direction_id") or _parent_direction_id
-            _heur_direction = _directions_by_id.get(str(_heur_dir_id)) if _heur_dir_id else None
+            _heur_direction = (
+                _directions_by_id.get(str(_heur_dir_id)) if _heur_dir_id else None
+            )
             scope, _heur_calibrated_from = _calibrate_finding_scope(
-                finding, scope, _heur_direction, _cochange_index_for_decomp,
+                finding,
+                scope,
+                _heur_direction,
+                _cochange_index_for_decomp,
                 all_directions=list(_directions_by_id.values()),
             )
             if _heur_calibrated_from is not None:
@@ -1142,21 +1278,30 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
 
         if finding_type == "research":
             task_type = "research"  # deeper investigation before implementation
-        elif finding_type in ("security_audit", "qa", "deps", "docs", "migrate", "perf"):
+        elif finding_type in (
+            "security_audit",
+            "qa",
+            "deps",
+            "docs",
+            "migrate",
+            "perf",
+        ):
             task_type = finding_type  # spawn specialized agent
         elif finding_type == "refactor":
             task_type = "refactor"  # code quality improvement, no behavior change
         elif scope == "large":
-            task_type = "plan"     # large scope needs decomposition
+            task_type = "plan"  # large scope needs decomposition
         else:
-            task_type = "create"   # small/medium scope is single-PR work
+            task_type = "create"  # small/medium scope is single-PR work
 
         # Low-actionability gate: defer findings with actionability_grade == LOW.
         # These findings are under-specified and spawn implementers that cannot succeed.
         # Defer with decay rule: discard after 3 consecutive deferrals (mirrors degradation_gate).
         # Only apply to new findings; previously-deferred findings have their reason stamped
         # from the prior cycle and are handled by the decay logic.
-        if finding.get("actionability_grade") == "LOW" and not finding.get("deferred_reason"):
+        if finding.get("actionability_grade") == "LOW" and not finding.get(
+            "deferred_reason"
+        ):
             _low_actionability_deferred.append(finding)
             logger.info(
                 "[RESEARCH] Deferring low-actionability finding '%s' "
@@ -1168,9 +1313,12 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         # Apply failure-feedback mitigation: downscope when rejection patterns are high
         # for this direction, and bias toward smaller scopes with proven success patterns.
         _mit_dir_id = finding.get("direction_id") or _parent_direction_id
-        _mit_direction = _directions_by_id.get(str(_mit_dir_id)) if _mit_dir_id else None
+        _mit_direction = (
+            _directions_by_id.get(str(_mit_dir_id)) if _mit_dir_id else None
+        )
         if _mit_direction and _scope_cal_project:
             from app.strategic_spawning import _build_failure_feedback_mitigation  # noqa: PLC0415
+
             scope, _, _ = _build_failure_feedback_mitigation(
                 _mit_direction, scope, task_type, _scope_cal_project.design_doc
             )
@@ -1190,46 +1338,69 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         # flow through.
         finding_model = _runtime_config.get("task_type_models", {}).get(task_type)
         _effort_rank = {"max": 4, "high": 3, "medium": 2, "low": 1}
-        finding_effort = finding.get('effort')
+        finding_effort = finding.get("effort")
         config_effort = _runtime_config.get("task_type_efforts", {}).get(task_type)
         if finding_effort and config_effort:
-            finding_effort = finding_effort if _effort_rank.get(finding_effort, 0) >= _effort_rank.get(config_effort, 0) else config_effort
+            finding_effort = (
+                finding_effort
+                if _effort_rank.get(finding_effort, 0)
+                >= _effort_rank.get(config_effort, 0)
+                else config_effort
+            )
         elif config_effort:
             finding_effort = config_effort
 
         related_files = finding.get("related_files", [])
-        full_prompt = prompt + ("\n\nKey files to review or modify:\n" + "\n".join(f"- {f}" for f in related_files)) if related_files else prompt
+        full_prompt = (
+            prompt
+            + (
+                "\n\nKey files to review or modify:\n"
+                + "\n".join(f"- {f}" for f in related_files)
+            )
+            if related_files
+            else prompt
+        )
         type_suffix = _runtime_config.get("agent_prompt_suffixes", {}).get(task_type)
 
         # For sub-research tasks, enrich prompt with parent context to avoid duplication
         if task_type == "research":
             sibling_titles = [
-                f.get('title', '') for _, f, _ in deduplicated
-                if f.get('title') and f != finding
+                f.get("title", "")
+                for _, f, _ in deduplicated
+                if f.get("title") and f != finding
             ][:5]
             if sibling_titles:
                 parent_summary = (
-                    '\n\nContext from parent research task: '
-                    f'This sub-research is part of a broader investigation (task {str(task.id)[:8]}) '
-                    f'that also produced these parallel findings:\n' +
-                    '\n'.join(f'- {t}' for t in sibling_titles) +
-                    '\nFocus your investigation on the specific area described above without duplicating these parallel efforts.'
+                    "\n\nContext from parent research task: "
+                    f"This sub-research is part of a broader investigation (task {str(task.id)[:8]}) "
+                    f"that also produced these parallel findings:\n"
+                    + "\n".join(f"- {t}" for t in sibling_titles)
+                    + "\nFocus your investigation on the specific area described above without duplicating these parallel efforts."
                 )
                 full_prompt = full_prompt + parent_summary
 
         # Predict spawn success probability using in-memory direction + project data
         _confidence_threshold = _runtime_config.get("spawn_confidence_threshold", 0.25)
         _pred_dir_id = finding.get("direction_id") or _parent_direction_id
-        _pred_direction = _directions_by_id.get(str(_pred_dir_id)) if _pred_dir_id else {}
+        _pred_direction = (
+            _directions_by_id.get(str(_pred_dir_id)) if _pred_dir_id else {}
+        )
         _pred_p = predict_spawn_success(
-            scope, _pred_direction or {}, _scope_cal_project, related_files=related_files,
+            scope,
+            _pred_direction or {},
+            _scope_cal_project,
+            related_files=related_files,
             complexity_score=finding.get("_complexity_score"),
         )
         _low_confidence = _pred_p < _confidence_threshold
         if _low_confidence:
             logger.info(
                 "[RESEARCH] Low-confidence spawn '%s' (scope=%s, type=%s): P(success)=%.2f < threshold=%.2f",
-                title, scope, task_type, _pred_p, _confidence_threshold,
+                title,
+                scope,
+                task_type,
+                _pred_p,
+                _confidence_threshold,
             )
         # Hard skip gate: ultra-low-confidence medium findings are dropped
         # entirely rather than spawned, escalated, or explored. Runs BEFORE
@@ -1255,14 +1426,21 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             logger.info(
                 "[RESEARCH] Hard-skipping ultra-low-confidence finding '%s' "
                 "(scope=%s): P(success)=%.2f < hard_skip=%.2f",
-                title, scope, _pred_p, float(_hard_skip_threshold),
+                title,
+                scope,
+                _pred_p,
+                float(_hard_skip_threshold),
             )
             _low_conf_skipped_findings.append(finding)
             _scope_skip_counts[scope] = _scope_skip_counts.get(scope, 0) + 1
             continue
 
         _medium_exploration = False
-        if _low_confidence and scope == "medium" and not _poor_decomp_history(_pred_direction or {}):
+        if (
+            _low_confidence
+            and scope == "medium"
+            and not _poor_decomp_history(_pred_direction or {})
+        ):
             # Exploration fraction: let a configurable share of medium findings bypass the
             # confidence gate so the pipeline can accumulate real medium-scope conversion
             # data. Without this, medium rates stay low because no medium tasks ever run,
@@ -1289,7 +1467,11 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     _explore_frac = _base * (_exp_rate / 0.5)
                 logger.info(
                     "[RESEARCH] Adaptive exploration fraction for direction %s: rate=%.2f (%d/%d), frac=%.3f",
-                    _pred_dir_id, _exp_rate, _exp_merged, _exp_created, float(_explore_frac),
+                    _pred_dir_id,
+                    _exp_rate,
+                    _exp_merged,
+                    _exp_created,
+                    float(_explore_frac),
                 )
             elif _exp_created == 0 and isinstance(_explore_frac, (int, float)):
                 # No direction-level exploration history: use pipeline-wide medium
@@ -1303,11 +1485,15 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 # fraction stays suppressed forever. Use the base fraction so the
                 # direction gets a fair chance to collect its own medium data.
                 _has_medium_history = False
-                for _entry in ((_pred_direction or {}).get("research_history") or [])[-3:]:
+                for _entry in ((_pred_direction or {}).get("research_history") or [])[
+                    -3:
+                ]:
                     if (_entry.get("scope_breakdown") or {}).get("medium"):
                         _has_medium_history = True
                         break
-                _pipeline_rates = _runtime_config.get("pipeline_scope_merge_rates") or {}
+                _pipeline_rates = (
+                    _runtime_config.get("pipeline_scope_merge_rates") or {}
+                )
                 _pipeline_medium = _pipeline_rates.get("medium")
                 if (
                     _has_medium_history
@@ -1319,13 +1505,16 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     logger.info(
                         "[RESEARCH] Pipeline-prior exploration fraction for direction %s: "
                         "pipeline_medium=%.2f, frac=%.3f",
-                        _pred_dir_id, float(_pipeline_medium), float(_explore_frac),
+                        _pred_dir_id,
+                        float(_pipeline_medium),
+                        float(_explore_frac),
                     )
                 elif not _has_medium_history:
                     logger.info(
                         "[RESEARCH] Data-starved direction %s: no medium history, "
                         "using base exploration fraction=%.3f (pipeline prior skipped)",
-                        _pred_dir_id, float(_explore_frac),
+                        _pred_dir_id,
+                        float(_explore_frac),
                     )
             # Suppress exploration when medium→large escalations in this direction
             # have also been failing: if both direct medium execution and the
@@ -1334,7 +1523,9 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             _esc_attempted = 0
             _esc_merged = 0
             for _entry in ((_pred_direction or {}).get("research_history") or [])[-3:]:
-                _esc = (_entry.get("escalation_outcomes") or {}).get("medium_to_large") or {}
+                _esc = (_entry.get("escalation_outcomes") or {}).get(
+                    "medium_to_large"
+                ) or {}
                 _esc_attempted += int(_esc.get("attempted") or 0)
                 _esc_merged += int(_esc.get("merged") or 0)
             if (
@@ -1346,8 +1537,11 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 logger.info(
                     "[RESEARCH] Suppressing exploration for direction %s: medium→large "
                     "escalation rate=%.2f (%d/%d) < 0.30, frac=%.3f",
-                    _pred_dir_id, _esc_merged / _esc_attempted, _esc_merged,
-                    _esc_attempted, float(_explore_frac),
+                    _pred_dir_id,
+                    _esc_merged / _esc_attempted,
+                    _esc_merged,
+                    _esc_attempted,
+                    float(_explore_frac),
                 )
             # Per-finding modulation: structurally complex findings (low
             # composite complexity score) are more likely to overflow at medium
@@ -1365,7 +1559,9 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 logger.info(
                     "[RESEARCH] Complexity-modulated exploration for '%s': "
                     "complexity_score=%.2f < 0.35, frac=%.3f",
-                    title, float(_cs), float(_explore_frac),
+                    title,
+                    float(_cs),
+                    float(_explore_frac),
                 )
             # Enforce a minimum exploration fraction so directions with zero
             # observed exploration merges still occasionally attempt medium scope —
@@ -1380,7 +1576,9 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             # rate is already at or below the floor, new directions shouldn't
             # independently re-discover that medium is unviable — treat the
             # pipeline signal as sufficient proof and skip the floor.
-            _pipeline_rates_cfg = _runtime_config.get("pipeline_scope_merge_rates") or {}
+            _pipeline_rates_cfg = (
+                _runtime_config.get("pipeline_scope_merge_rates") or {}
+            )
             _pipeline_medium_cfg = _pipeline_rates_cfg.get("medium")
             _pipeline_proven_unviable = (
                 isinstance(_pipeline_medium_cfg, (int, float))
@@ -1395,13 +1593,25 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 and not _pipeline_proven_unviable
             ):
                 _explore_frac = MEDIUM_EXPLORATION_FLOOR
-            if isinstance(_explore_frac, (int, float)) and _explore_frac > 0 and random.random() < float(_explore_frac):
+            if (
+                isinstance(_explore_frac, (int, float))
+                and _explore_frac > 0
+                and random.random() < float(_explore_frac)
+            ):
                 _medium_exploration = True
-                logger.info("[RESEARCH] Exploration bypass keeping medium scope for '%s' (P=%.2f, explore_frac=%.2f)",
-                            title, _pred_p, float(_explore_frac))
+                logger.info(
+                    "[RESEARCH] Exploration bypass keeping medium scope for '%s' (P=%.2f, explore_frac=%.2f)",
+                    title,
+                    _pred_p,
+                    float(_explore_frac),
+                )
             else:
-                logger.info("[RESEARCH] Auto-escalating scope medium→large for '%s' (low-confidence spawn: P=%.2f < %.2f)",
-                            title, _pred_p, _confidence_threshold)
+                logger.info(
+                    "[RESEARCH] Auto-escalating scope medium→large for '%s' (low-confidence spawn: P=%.2f < %.2f)",
+                    title,
+                    _pred_p,
+                    _confidence_threshold,
+                )
                 scope, scope_calibrated_from, task_type = "large", "medium", "plan"
 
         finding_priority = TASK_PRIORITY_MAP.get(finding.get("priority", "medium"), 50)
@@ -1429,36 +1639,59 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             # so research-spawned retries get the same buildRetryContext rendering as
             # inline retries (failure stage labels, recurring warnings, error summary).
             try:
-                from app.anomaly_detection import _error_fingerprint, _is_recurring_failure_class  # noqa: PLC0415
+                from app.anomaly_detection import (
+                    _error_fingerprint,
+                    _is_recurring_failure_class,
+                )  # noqa: PLC0415
                 from app.task_lifecycle import _derive_failure_stage  # noqa: PLC0415
                 from app import shared_state as _ss  # noqa: PLC0415
+
                 error_msg = _prior.latest_status_message or ""
-                prior_retry_ctx["_previous_error_fingerprint"] = _error_fingerprint(error_msg)
+                prior_retry_ctx["_previous_error_fingerprint"] = _error_fingerprint(
+                    error_msg
+                )
                 if failure_class_val:
                     stage = _derive_failure_stage(failure_class_val, error_msg)
                     if stage:
                         prior_retry_ctx["_previous_failure_stage"] = stage
                     if failure_class_val == "CODE_ERROR":
                         prior_retry_ctx["_previous_error_summary"] = error_msg[:500]
-                    proj_anomalies = _ss.persistent_anomalies.get(str(_prior.project_id), {})
+                    proj_anomalies = _ss.persistent_anomalies.get(
+                        str(_prior.project_id), {}
+                    )
                     if _is_recurring_failure_class(proj_anomalies, failure_class_val):
                         prior_retry_ctx["_previous_is_recurring"] = True
             except Exception:
-                logger.exception("[RESEARCH_COMPLETION] Failed to enrich prior_retry_ctx for finding %s", fhash)
+                logger.exception(
+                    "[RESEARCH_COMPLETION] Failed to enrich prior_retry_ctx for finding %s",
+                    fhash,
+                )
             if _prior_ctx.get("_analysis_plan"):
-                prior_retry_ctx["_previous_analysis_plan"] = _prior_ctx["_analysis_plan"]
+                prior_retry_ctx["_previous_analysis_plan"] = _prior_ctx[
+                    "_analysis_plan"
+                ]
             if _prior_ctx.get("_pr_changed_files"):
-                prior_retry_ctx["_previous_changed_files"] = _prior_ctx["_pr_changed_files"]
+                prior_retry_ctx["_previous_changed_files"] = _prior_ctx[
+                    "_pr_changed_files"
+                ]
             if _prior_ctx.get("_pr_diff_summary"):
-                prior_retry_ctx["_previous_diff_summary"] = _prior_ctx["_pr_diff_summary"]
+                prior_retry_ctx["_previous_diff_summary"] = _prior_ctx[
+                    "_pr_diff_summary"
+                ]
             if _prior_ctx.get("_pr_url"):
                 prior_retry_ctx["_previous_pr_url"] = _prior_ctx["_pr_url"]
             if _prior_ctx.get("_test_failure_summary"):
-                prior_retry_ctx["_previous_test_failure_summary"] = _prior_ctx["_test_failure_summary"]
+                prior_retry_ctx["_previous_test_failure_summary"] = _prior_ctx[
+                    "_test_failure_summary"
+                ]
             if _prior_ctx.get("_self_review_outcome"):
-                prior_retry_ctx["_previous_self_review_outcome"] = _prior_ctx["_self_review_outcome"]
+                prior_retry_ctx["_previous_self_review_outcome"] = _prior_ctx[
+                    "_self_review_outcome"
+                ]
             if _prior_ctx.get("_file_change_details"):
-                prior_retry_ctx["_previous_file_change_details"] = _prior_ctx["_file_change_details"]
+                prior_retry_ctx["_previous_file_change_details"] = _prior_ctx[
+                    "_file_change_details"
+                ]
             # Tighten analysis plan file limit for medium-scope retries whose
             # prior attempt tripped a scope gate or touched ≥80% of the medium
             # file threshold. The agent reads _analysis_plan_file_limit and
@@ -1467,8 +1700,15 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             if scope == "medium":
                 _prior_scope_gate = _prior_ctx.get("scope_gate_triggered")
                 _prior_changed = _prior_ctx.get("_pr_changed_files") or []
-                _prior_file_count = len(_prior_changed) if isinstance(_prior_changed, list) else 0
-                _tight_triggers = {"scope_trim", "analysis_overflow", "post_review_overflow", "small_overflow"}
+                _prior_file_count = (
+                    len(_prior_changed) if isinstance(_prior_changed, list) else 0
+                )
+                _tight_triggers = {
+                    "scope_trim",
+                    "analysis_overflow",
+                    "post_review_overflow",
+                    "small_overflow",
+                }
                 if _prior_scope_gate in _tight_triggers or _prior_file_count >= 8:
                     prior_retry_ctx["_analysis_plan_file_limit"] = 5
             # Generate failure-class-specific retry guidance, mirroring
@@ -1476,6 +1716,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             # same tailored prompt_suffix as directly requeued retries.
             try:
                 from app.task_lifecycle import _build_retry_prompt_suffix  # noqa: PLC0415
+
                 _retry_prompt_suffix, _scope_override = _build_retry_prompt_suffix(
                     failure_class_val,
                     _prior.latest_status_message,
@@ -1487,10 +1728,15 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     scope = _scope_override
                     prior_retry_ctx["_scope_reduced"] = True
             except Exception:
-                logger.exception("[RESEARCH_COMPLETION] Failed to build retry prompt_suffix for finding %s", fhash)
+                logger.exception(
+                    "[RESEARCH_COMPLETION] Failed to build retry prompt_suffix for finding %s",
+                    fhash,
+                )
         _combined_suffix = _retry_prompt_suffix
         if type_suffix:
-            _combined_suffix = (_combined_suffix + ("\n" if _combined_suffix else "") + type_suffix)
+            _combined_suffix = (
+                _combined_suffix + ("\n" if _combined_suffix else "") + type_suffix
+            )
         # Scope-aware effort override for implementation task types: the scope
         # (calibrated through history/heuristic/low-confidence/retry) drives the
         # baseline effort — small→low, medium→medium, large→high — replacing
@@ -1498,8 +1744,10 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         # wins when it ranks higher.
         if task_type in _SCOPE_AWARE_EFFORT_TYPES:
             _scope_effort = scope_to_effort(scope)
-            _finding_explicit = finding.get('effort')
-            if _finding_explicit and _effort_rank.get(_finding_explicit, 0) > _effort_rank.get(_scope_effort, 0):
+            _finding_explicit = finding.get("effort")
+            if _finding_explicit and _effort_rank.get(
+                _finding_explicit, 0
+            ) > _effort_rank.get(_scope_effort, 0):
                 finding_effort = _finding_explicit
             else:
                 finding_effort = _scope_effort
@@ -1507,7 +1755,11 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             # score) get elevated effort so the agent has deeper inference to
             # navigate the complexity without requiring a scope upgrade.
             _cscore = finding.get("_complexity_score")
-            if _cscore is not None and _cscore < 0.4 and _effort_rank.get(finding_effort, 0) < _effort_rank["high"]:
+            if (
+                _cscore is not None
+                and _cscore < 0.4
+                and _effort_rank.get(finding_effort, 0) < _effort_rank["high"]
+            ):
                 finding_effort = "high"
         # Predicted file-budget utilization for medium-scope tasks: gives the
         # implementing agent early visibility into budget pressure before it
@@ -1517,13 +1769,19 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         _file_budget_warning: Optional[str] = None
         if scope == "medium" and related_files:
             _util_ratio = (
-                _avg_medium_expansion_ratio([_pred_direction]) if _pred_direction else None
+                _avg_medium_expansion_ratio([_pred_direction])
+                if _pred_direction
+                else None
             )
             if _util_ratio is None:
-                _util_ratio = _avg_medium_expansion_ratio(list(_directions_by_id.values()))
+                _util_ratio = _avg_medium_expansion_ratio(
+                    list(_directions_by_id.values())
+                )
             if _util_ratio is None:
                 _util_ratio = 2.0
-            _medium_budget = SCOPE_FILE_BUDGETS.get("medium", {}).get("total_files_max") or 10
+            _medium_budget = (
+                SCOPE_FILE_BUDGETS.get("medium", {}).get("total_files_max") or 10
+            )
             _predicted_utilization = round(
                 len(related_files) * _util_ratio / _medium_budget, 3
             )
@@ -1535,9 +1793,12 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     f"would push the change past the budget."
                 )
         from app import shared_state as _ss_pc  # noqa: PLC0415
+
         _project_anomalies = _ss_pc.persistent_anomalies.get(str(task.project_id))
         _preventive = _build_preventive_context(
-            finding, _directions_by_id, _project_anomalies,
+            finding,
+            _directions_by_id,
+            _project_anomalies,
         )
 
         # Surface 'what has compounded here' from prior playbook/success-* entries.
@@ -1552,14 +1813,17 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             if _recent:
                 full_prompt = full_prompt + "\n\n" + _recent
 
-        finding_payload = validate_internal_payload({
-            "type": task_type,
-            "prompt": full_prompt,
-            "base_branch": research_branch,
-            **(({'model': finding_model} if finding_model else {})),
-            **(({'effort': finding_effort} if finding_effort else {})),
-            **({"prompt_suffix": _combined_suffix} if _combined_suffix else {}),
-        }, f"research_completion:finding:{task_type}")
+        finding_payload = validate_internal_payload(
+            {
+                "type": task_type,
+                "prompt": full_prompt,
+                "base_branch": research_branch,
+                **({"model": finding_model} if finding_model else {}),
+                **({"effort": finding_effort} if finding_effort else {}),
+                **({"prompt_suffix": _combined_suffix} if _combined_suffix else {}),
+            },
+            f"research_completion:finding:{task_type}",
+        )
         # Audit W1: previous_error_fingerprint is a column. Pull it out of
         # prior_retry_ctx so it lands on the column, not in JSONB context.
         _prev_fp_col = prior_retry_ctx.pop("_previous_error_fingerprint", None)
@@ -1581,18 +1845,66 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 "research_depth": research_depth + 1,
                 "related_files": related_files,
                 "finding_hash": fhash,
-                **({"direction_id": direction_id} if direction_id else ({"direction_id": parent_direction_id} if parent_direction_id else {})),
-                **({"parent_direction_id": parent_direction_id} if parent_direction_id else {}),
-                **({"scope_calibrated_from": scope_calibrated_from} if scope_calibrated_from else {}),
-                **({"complexity_score": finding["_complexity_score"], "complexity_signals": finding.get("_complexity_signals", {})} if "_complexity_score" in finding else {}),
-                **({"low_confidence_spawn": True, "low_confidence_spawn_rate": round(_pred_p, 3)} if _low_confidence else {}),
+                **(
+                    {"direction_id": direction_id}
+                    if direction_id
+                    else (
+                        {"direction_id": parent_direction_id}
+                        if parent_direction_id
+                        else {}
+                    )
+                ),
+                **(
+                    {"parent_direction_id": parent_direction_id}
+                    if parent_direction_id
+                    else {}
+                ),
+                **(
+                    {"scope_calibrated_from": scope_calibrated_from}
+                    if scope_calibrated_from
+                    else {}
+                ),
+                **(
+                    {
+                        "complexity_score": finding["_complexity_score"],
+                        "complexity_signals": finding.get("_complexity_signals", {}),
+                    }
+                    if "_complexity_score" in finding
+                    else {}
+                ),
+                **(
+                    {
+                        "low_confidence_spawn": True,
+                        "low_confidence_spawn_rate": round(_pred_p, 3),
+                    }
+                    if _low_confidence
+                    else {}
+                ),
                 **({"medium_exploration": True} if _medium_exploration else {}),
                 **({"auto_decomposed": True} if finding.get("auto_decomposed") else {}),
-                **({"_predicted_file_utilization": _predicted_utilization} if _predicted_utilization is not None else {}),
-                **({"_file_budget_warning": _file_budget_warning} if _file_budget_warning else {}),
-                **({"scope_budget_warning": _scope_budget_warning} if _scope_budget_warning else {}),
-                **({"preventive_context": _preventive, "has_preventive_context": True} if _preventive else {}),
-                "prompt_telemetry": _compute_prompt_telemetry(full_prompt, related_files, scope),
+                **(
+                    {"_predicted_file_utilization": _predicted_utilization}
+                    if _predicted_utilization is not None
+                    else {}
+                ),
+                **(
+                    {"_file_budget_warning": _file_budget_warning}
+                    if _file_budget_warning
+                    else {}
+                ),
+                **(
+                    {"scope_budget_warning": _scope_budget_warning}
+                    if _scope_budget_warning
+                    else {}
+                ),
+                **(
+                    {"preventive_context": _preventive, "has_preventive_context": True}
+                    if _preventive
+                    else {}
+                ),
+                "prompt_telemetry": _compute_prompt_telemetry(
+                    full_prompt, related_files, scope
+                ),
                 **prior_retry_ctx,
             },
             vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
@@ -1626,7 +1938,10 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         + [_stamp_deferral(f, "degradation_gate") for f in _degradation_gate_deferred]
         + [_stamp_deferral(f, "batch_cap") for f in _batch_cap_deferred]
         + [
-            {**_stamp_deferral(f, "ultra_low_confidence"), "skip_reason": "ultra_low_confidence"}
+            {
+                **_stamp_deferral(f, "ultra_low_confidence"),
+                "skip_reason": "ultra_low_confidence",
+            }
             for f in _low_conf_skipped_findings
         ]
     )
@@ -1641,9 +1956,13 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         session.add(task)
         _deferral_reasons: list[str] = []
         if _low_actionability_deferred:
-            _deferral_reasons.append(f"low_actionability ({len(_low_actionability_deferred)})")
+            _deferral_reasons.append(
+                f"low_actionability ({len(_low_actionability_deferred)})"
+            )
         if _degradation_gate_deferred:
-            _deferral_reasons.append(f"degradation gate ({_health_reason}; {len(_degradation_gate_deferred)})")
+            _deferral_reasons.append(
+                f"degradation gate ({_health_reason}; {len(_degradation_gate_deferred)})"
+            )
         if _batch_cap_deferred:
             _deferral_reasons.append(f"batch cap ({len(_batch_cap_deferred)})")
         _reason = " + ".join(_deferral_reasons) if _deferral_reasons else "unknown"
@@ -1692,16 +2011,18 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
 
     # Log file overlap warnings for observability and surface them to agents
     overlaps = _log_file_overlaps(findings, "RESEARCH")
-    for (i, j, shared_files) in overlaps:
+    for i, j, shared_files in overlaps:
         for fi in (i, j):
             ci = finding_to_child.get(fi)
             if ci is not None and ci < len(child_tasks):
                 ctx = dict(child_tasks[ci].context or {})
-                warnings = ctx.get('file_overlap_warnings', [])
+                warnings = ctx.get("file_overlap_warnings", [])
                 other_fi = j if fi == i else i
-                other_title = findings[other_fi].get('title', f'#{other_fi}')
-                warnings.append({'shared_files': sorted(shared_files), 'with_task': other_title})
-                ctx['file_overlap_warnings'] = warnings
+                other_title = findings[other_fi].get("title", f"#{other_fi}")
+                warnings.append(
+                    {"shared_files": sorted(shared_files), "with_task": other_title}
+                )
+                ctx["file_overlap_warnings"] = warnings
                 child_tasks[ci].context = ctx
                 session.add(child_tasks[ci])
 
@@ -1771,7 +2092,9 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         did = (ct.context or {}).get("direction_id")
         if did:
             tasks_by_dir[did] = tasks_by_dir.get(did, 0) + 1
-    current_direction_id = (task.context or {}).get("direction_id") or (task.first_payload).get("current_direction_id")
+    current_direction_id = (task.context or {}).get("direction_id") or (
+        task.first_payload
+    ).get("current_direction_id")
     touched_dir_ids = set(tasks_by_dir.keys())
     if current_direction_id:
         touched_dir_ids.add(current_direction_id)
@@ -1788,9 +2111,9 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     if productive:
                         d["consecutive_unproductive_cycles"] = 0
                     else:
-                        d["consecutive_unproductive_cycles"] = int(
-                            d.get("consecutive_unproductive_cycles", 0) or 0
-                        ) + 1
+                        d["consecutive_unproductive_cycles"] = (
+                            int(d.get("consecutive_unproductive_cycles", 0) or 0) + 1
+                        )
                     changed = True
             if changed:
                 project.directions = directions
@@ -1834,7 +2157,9 @@ async def _record_research_task_failure(task: Task, session: AsyncSession) -> No
     """
     from app.failure_classification import INFRA_CLASSES, classify_failure  # noqa: PLC0415
 
-    direction_id = (task.context or {}).get("direction_id") or task.first_payload.get("current_direction_id")
+    direction_id = (task.context or {}).get("direction_id") or task.first_payload.get(
+        "current_direction_id"
+    )
     if not direction_id:
         return
     project = await session.get(Project, task.project_id)
@@ -1875,9 +2200,9 @@ async def _record_research_task_failure(task: Task, session: AsyncSession) -> No
     if productive:
         target["consecutive_unproductive_cycles"] = 0
     else:
-        target["consecutive_unproductive_cycles"] = int(
-            target.get("consecutive_unproductive_cycles", 0) or 0
-        ) + 1
+        target["consecutive_unproductive_cycles"] = (
+            int(target.get("consecutive_unproductive_cycles", 0) or 0) + 1
+        )
     project.directions = directions
     flag_modified(project, "directions")
     session.add(project)

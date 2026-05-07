@@ -4,6 +4,7 @@ Extracted from app.task_completion to keep that module focused on plan/security/
 completion handlers. Contains direction health/completion checks, duplicate detection,
 and the _handle_strategic_completion handler.
 """
+
 import json
 import logging
 import uuid
@@ -110,9 +111,11 @@ async def _record_strategic_task_failure(
         if project is None:
             # Disambiguate "missing" vs "held under contention" so logs
             # remain useful for postmortems.
-            exists = (await session.execute(
-                select(Project.id).where(Project.id == task.project_id)
-            )).first()
+            exists = (
+                await session.execute(
+                    select(Project.id).where(Project.id == task.project_id)
+                )
+            ).first()
             if exists is None:
                 logger.warning(
                     f"[STRATEGIC] _record_strategic_task_failure: project "
@@ -146,7 +149,8 @@ async def _record_strategic_task_failure(
             else None
         )
         await strategic_cycle.mark_failure(
-            session, cycle_id,
+            session,
+            cycle_id,
             phase=failed_phase,
             reason=(task.latest_status_message or "task failed")[:200],
             outcome_override=outcome_override,
@@ -191,7 +195,7 @@ def _extract_rationale_from_notes(direction: dict | None, prefix: str) -> str | 
     for note in reversed(notes):
         text = (note.get("text") or "") if isinstance(note, dict) else ""
         if text.startswith(prefix):
-            rationale = text[len(prefix):].strip()
+            rationale = text[len(prefix) :].strip()
             if rationale:
                 return rationale[:_RATIONALE_PERSIST_MAX]
     return None
@@ -211,9 +215,33 @@ def _collect_rationales(
 
 
 _PRED_STOPWORDS = {
-    "the", "a", "an", "to", "for", "and", "or", "in", "of", "is", "it", "this",
-    "that", "with", "by", "we", "should", "be", "are", "on", "as", "feat", "fix",
-    "refactor", "add", "update", "improve",
+    "the",
+    "a",
+    "an",
+    "to",
+    "for",
+    "and",
+    "or",
+    "in",
+    "of",
+    "is",
+    "it",
+    "this",
+    "that",
+    "with",
+    "by",
+    "we",
+    "should",
+    "be",
+    "are",
+    "on",
+    "as",
+    "feat",
+    "fix",
+    "refactor",
+    "add",
+    "update",
+    "improve",
 }
 
 
@@ -239,14 +267,15 @@ def _build_creation_prediction(
         estimated_difficulty = "low"
     systems = (project.vision or {}).get("systems") or []
     mature = sum(
-        1 for s in systems
+        1
+        for s in systems
         if isinstance(s, dict) and s.get("status") in ("functional", "mature")
     )
     words = set(text.lower().split()) - _PRED_STOPWORDS
     similar_past_merges_raw = 0
     similar_count = 0
     own_id = direction.get("id")
-    for d in (project.directions or []):
+    for d in project.directions or []:
         if d.get("id") == own_id:
             continue
         other_words = set((d.get("text") or "").lower().split()) - _PRED_STOPWORDS
@@ -285,13 +314,16 @@ def _collect_creation_predictions(
     project: Project, direction_ids: list
 ) -> Dict[str, Dict[str, Any]]:
     from app.strategic_analysis import _compute_prediction_calibration_factor  # noqa: PLC0415
+
     calibration_factor = _compute_prediction_calibration_factor(project)
     by_id = {d.get("id"): d for d in (project.directions or []) if d.get("id")}
     result: Dict[str, Dict[str, Any]] = {}
     for did in direction_ids:
         d = by_id.get(did)
         if d is not None:
-            result[did] = _build_creation_prediction(d, project, calibration_factor=calibration_factor)
+            result[did] = _build_creation_prediction(
+                d, project, calibration_factor=calibration_factor
+            )
     return result
 
 
@@ -364,6 +396,7 @@ def _check_direction_health(direction: dict) -> str | None:
     # as Rule 3: they're uncorrelated with direction quality.
     if len(history) >= 3:
         recent3 = history[-3:]
+
         def _cycle_failed(e: dict) -> bool:
             if e.get("research_task_failed"):
                 return True
@@ -371,8 +404,11 @@ def _check_direction_health(direction: dict) -> str | None:
             infra_failed = e.get("tasks_failed_infra", 0)
             code_failed = max(0, total_failed - infra_failed)
             return code_failed > 0 and e.get("prs_merged", 0) == 0
+
         if all(_cycle_failed(e) for e in recent3):
-            return "Recent stall: last 3 research cycles all failed or produced no merges"
+            return (
+                "Recent stall: last 3 research cycles all failed or produced no merges"
+            )
 
     return None
 
@@ -445,14 +481,42 @@ def _check_direction_completion(direction: dict) -> str | None:
 
 _RETIRED_DIRECTION_STATUSES = frozenset({"expired", "retired", "superseded"})
 
-_DIRECTION_DEDUP_STOPWORDS = frozenset({
-    'the', 'a', 'an', 'to', 'for', 'and', 'or', 'in', 'of', 'is', 'it',
-    'this', 'that', 'with', 'by', 'we', 'should', 'be', 'are', 'on', 'as',
-    'feat', 'fix', 'refactor', 'add', 'update', 'improve',
-})
+_DIRECTION_DEDUP_STOPWORDS = frozenset(
+    {
+        "the",
+        "a",
+        "an",
+        "to",
+        "for",
+        "and",
+        "or",
+        "in",
+        "of",
+        "is",
+        "it",
+        "this",
+        "that",
+        "with",
+        "by",
+        "we",
+        "should",
+        "be",
+        "are",
+        "on",
+        "as",
+        "feat",
+        "fix",
+        "refactor",
+        "add",
+        "update",
+        "improve",
+    }
+)
 
 
-def _is_direction_duplicate(proposal_text: str, existing_directions: list, rejected_proposals: list) -> bool:
+def _is_direction_duplicate(
+    proposal_text: str, existing_directions: list, rejected_proposals: list
+) -> bool:
     """Return True if proposal_text overlaps with an existing or recently rejected direction.
 
     Retired directions (expired/retired/superseded) use a tighter threshold (3 shared
@@ -472,13 +536,17 @@ def _is_direction_duplicate(proposal_text: str, existing_directions: list, rejec
     for entry in rejected_proposals:
         if entry.get("rejected_at", "") < cutoff:
             continue
-        rejected_words = set((entry.get("text") or "").lower().split()) - _DIRECTION_DEDUP_STOPWORDS
+        rejected_words = (
+            set((entry.get("text") or "").lower().split()) - _DIRECTION_DEDUP_STOPWORDS
+        )
         if len(words & rejected_words) >= 4:
             return True
     return False
 
 
-def _find_matching_direction(proposal_text: str, existing_directions: list) -> dict | None:
+def _find_matching_direction(
+    proposal_text: str, existing_directions: list
+) -> dict | None:
     """Return the direction that triggered the dup-match, using the same
     tokenization/threshold as `_is_direction_duplicate`.
 
@@ -522,12 +590,12 @@ async def _check_direction_starvation(
     directions = project.directions or []
     active_count = sum(1 for d in directions if d.get("status") == "active")
     product_count = sum(
-        1 for d in directions
+        1
+        for d in directions
         if d.get("status") == "active" and d.get("category") == "product"
     )
-    all_saturated = (
-        active_count > 0
-        and all(d.get("possibly_saturated") for d in directions if d.get("status") == "active")
+    all_saturated = active_count > 0 and all(
+        d.get("possibly_saturated") for d in directions if d.get("status") == "active"
     )
     has_gaps = active_count < 3 or product_count == 0 or all_saturated
 
@@ -546,19 +614,27 @@ async def _check_direction_starvation(
                     fallback_category = "product"
                 elif active_count < 3:
                     gap_type = "BELOW_MINIMUM"
-                    fallback_text = "Expand system capabilities beyond current directions"
+                    fallback_text = (
+                        "Expand system capabilities beyond current directions"
+                    )
                     fallback_category = None
                 else:
                     gap_type = "ALL_SATURATED"
-                    fallback_text = "Explore and improve underserved areas of the system"
+                    fallback_text = (
+                        "Explore and improve underserved areas of the system"
+                    )
                     fallback_category = None
 
                 # Audit W2/D8: dedup the fallback against existing directions
                 # AND recently-rejected proposals before creating. The previous
                 # version skipped dedup, so a saturated project would loop
                 # creating near-identical fallbacks every 5 cycles.
-                rejected_proposals = list((vision or {}).get("rejected_proposals") or [])
-                if _is_direction_duplicate(fallback_text, directions, rejected_proposals):
+                rejected_proposals = list(
+                    (vision or {}).get("rejected_proposals") or []
+                )
+                if _is_direction_duplicate(
+                    fallback_text, directions, rejected_proposals
+                ):
                     logger.warning(
                         f"[STRATEGIC] Starvation fallback dedup'd for project {project.id}: "
                         f"text '{fallback_text}' overlaps with existing/rejected direction. "
@@ -569,7 +645,8 @@ async def _check_direction_starvation(
                     flag_modified(project, "vision")
                     session.add(project)
                     await _create_strategic_alert(
-                        project.id, session,
+                        project.id,
+                        session,
                         f"Direction starvation reached {starvation_count} cycles but the fallback "
                         f"direction '{fallback_text}' would duplicate an existing or recently-rejected "
                         f"direction (gap: {gap_type}). Manual intervention required — review "
@@ -583,13 +660,15 @@ async def _check_direction_starvation(
                     "text": fallback_text,
                     "status": "active",
                     "priority": "medium",
-                    "notes": [{
-                        "text": (
-                            f"Auto-created by starvation handler after {starvation_count} "
-                            f"consecutive cycles with no direction creation"
-                        ),
-                        "added_at": _utcnow().isoformat(),
-                    }],
+                    "notes": [
+                        {
+                            "text": (
+                                f"Auto-created by starvation handler after {starvation_count} "
+                                f"consecutive cycles with no direction creation"
+                            ),
+                            "added_at": _utcnow().isoformat(),
+                        }
+                    ],
                     "research_history": [],
                 }
                 if fallback_category:
@@ -611,7 +690,8 @@ async def _check_direction_starvation(
                     f"gap_type={gap_type}, dir_id={fallback_dir['id']}"
                 )
                 await _create_strategic_alert(
-                    project.id, session,
+                    project.id,
+                    session,
                     f"Direction starvation fallback: auto-created direction '{fallback_text}' "
                     f"after {starvation_count} consecutive cycles with 0 new directions "
                     f"(gap: {gap_type}).",
@@ -629,7 +709,9 @@ async def _check_direction_starvation(
         elif starvation_count >= 2:
             gap_parts = []
             if active_count < 3:
-                gap_parts.append(f"only {active_count} active directions (min 3 needed)")
+                gap_parts.append(
+                    f"only {active_count} active directions (min 3 needed)"
+                )
             if product_count == 0:
                 gap_parts.append("no product-category directions")
             if all_saturated:
@@ -639,7 +721,8 @@ async def _check_direction_starvation(
             project.vision = vision
             flag_modified(project, "vision")
             await _create_strategic_alert(
-                project.id, session,
+                project.id,
+                session,
                 f"Direction starvation: {starvation_count} consecutive cycles with 0 new "
                 f"directions ({gap_desc}). Boosting strategic frequency.",
             )
@@ -704,7 +787,9 @@ async def _handle_strategic_completion(
         return
 
     vision_rev = (project.vision or {}).get("revision", 0)
-    active_dirs = sum(1 for d in (project.directions or []) if d.get("status") == "active")
+    active_dirs = sum(
+        1 for d in (project.directions or []) if d.get("status") == "active"
+    )
 
     # Check if the agent used the new incremental API during execution
     task_payload = task.first_payload
@@ -726,16 +811,24 @@ async def _handle_strategic_completion(
         created_ids = list((task.context or {}).get("_strategic_created_ids", []))
         retired_ids = list((task.context or {}).get("_strategic_retired_ids", []))
         if cycle_id:
-            _vision_updated = (task.context or {}).get("_strategic_vision_set", False) or vision_rev > spawned_vision_rev
+            _vision_updated = (task.context or {}).get(
+                "_strategic_vision_set", False
+            ) or vision_rev > spawned_vision_rev
             _spawn_suffix = f", {tasks_spawned} tasks spawned" if tasks_spawned else ""
             _summary = f"rev {vision_rev}, {active_dirs} active, {dirs_created} created, {dirs_retired} retired{_spawn_suffix}"
-            created_rationales = _collect_rationales(project, created_ids, _CREATED_NOTE_PREFIX)
-            retired_rationales = _collect_rationales(project, retired_ids, _RETIRED_NOTE_PREFIX)
+            created_rationales = _collect_rationales(
+                project, created_ids, _CREATED_NOTE_PREFIX
+            )
+            retired_rationales = _collect_rationales(
+                project, retired_ids, _RETIRED_NOTE_PREFIX
+            )
             created_predictions = _collect_creation_predictions(project, created_ids)
             retired_final_metrics = _collect_retirement_metrics(project, retired_ids)
             # Audit W2: cycle outcome lives on the StrategicCycle row;
             # per-direction maps land in cycle_metadata.
-            _retirement_critiques = (task.context or {}).get("_strategic_retirement_critiques")
+            _retirement_critiques = (task.context or {}).get(
+                "_strategic_retirement_critiques"
+            )
             _extra: dict = {
                 "created_direction_ids": created_ids,
                 "retired_direction_ids": retired_ids,
@@ -747,7 +840,8 @@ async def _handle_strategic_completion(
             if _retirement_critiques is not None:
                 _extra["retirement_critiques"] = _retirement_critiques
             await strategic_cycle.mark_phase2_completed(
-                session, cycle_id,
+                session,
+                cycle_id,
                 summary_text=_summary,
                 cycle_reasoning=_extract_cycle_reasoning(task),
                 directions_created=dirs_created,
@@ -763,7 +857,9 @@ async def _handle_strategic_completion(
         session.add(task)
         # Audit: check for unaddressed FEEDBACK messages
         remaining_feedback_result = await session.execute(
-            select(func.count()).select_from(ProjectMessage).where(
+            select(func.count())
+            .select_from(ProjectMessage)
+            .where(
                 ProjectMessage.project_id == project.id,
                 ProjectMessage.status == "open",
                 ProjectMessage.message_type == MessageType.FEEDBACK,
@@ -783,7 +879,9 @@ async def _handle_strategic_completion(
         # project.running_update as a living markdown document it rewrites
         # each cycle. Replaces the previous one-message-per-cycle noise.
         await session.commit()
-        logger.info(f"[STRATEGIC] Task {task.id} complete via API: vision rev {vision_rev}, {active_dirs} active directions")
+        logger.info(
+            f"[STRATEGIC] Task {task.id} complete via API: vision rev {vision_rev}, {active_dirs} active directions"
+        )
         return
 
     # Fallback: try log-based parsing for backward compatibility
@@ -802,11 +900,14 @@ async def _handle_strategic_completion(
             current_vision["_strategic_failures_at"] = _utcnow().isoformat()
             project.vision = current_vision
             flag_modified(project, "vision")
-            cycle_id = task.strategic_cycle_id or (task.context or {}).get("strategic_cycle_id")
+            cycle_id = task.strategic_cycle_id or (task.context or {}).get(
+                "strategic_cycle_id"
+            )
             if cycle_id:
                 # Audit W2: failure recorded on the StrategicCycle row.
                 await strategic_cycle.mark_failure(
-                    session, cycle_id,
+                    session,
+                    cycle_id,
                     phase="phase2",
                     reason="strategic_review unparseable output",
                 )
@@ -815,10 +916,15 @@ async def _handle_strategic_completion(
         session.add(task)
         await session.commit()
         failure_num = current_vision.get("_strategic_failures", "?") if project else "?"
-        logger.warning(f"[STRATEGIC] Task {task.id}: unparseable output (failure #{failure_num})")
+        logger.warning(
+            f"[STRATEGIC] Task {task.id}: unparseable output (failure #{failure_num})"
+        )
         if project:
-            await _create_strategic_alert(task.project_id, session,
-                f"Strategic review could not parse agent output (failure #{failure_num}, task {str(task.id)[:8]})")
+            await _create_strategic_alert(
+                task.project_id,
+                session,
+                f"Strategic review could not parse agent output (failure #{failure_num}, task {str(task.id)[:8]})",
+            )
         return
 
     new_vision = parsed.get("vision")
@@ -832,22 +938,30 @@ async def _handle_strategic_completion(
     # ``lock_project_for_strategic_transition`` helper.
     if not caller_holds_lock:
         from app.task_locking import lock_project_for_strategic_transition
+
         project = await lock_project_for_strategic_transition(session, task.project_id)
         if project is None:
             # Helper returns None for both "missing" and "held past retries";
             # disambiguate so we surface the right error.
-            exists = (await session.execute(
-                select(Project.id).where(Project.id == task.project_id)
-            )).first()
+            exists = (
+                await session.execute(
+                    select(Project.id).where(Project.id == task.project_id)
+                )
+            ).first()
             if exists is None:
-                logger.error(f"[STRATEGIC] Task {task.id}: project {task.project_id} not found")
+                logger.error(
+                    f"[STRATEGIC] Task {task.id}: project {task.project_id} not found"
+                )
                 return
             logger.warning(
                 f"[STRATEGIC] Task {task.id}: project {task.project_id} held under contention "
                 f"after retries; deferring mutation to next cycle"
             )
-            await _create_strategic_alert(task.project_id, session,
-                f"Strategic completion: project row contended (task {str(task.id)[:8]}) — mutation deferred")
+            await _create_strategic_alert(
+                task.project_id,
+                session,
+                f"Strategic completion: project row contended (task {str(task.id)[:8]}) — mutation deferred",
+            )
             return
 
     # Store raw output for admin visibility
@@ -859,13 +973,16 @@ async def _handle_strategic_completion(
     # extends to systems/priorities/context lists, not just purpose/success_criteria.
     if new_vision and isinstance(new_vision, dict):
         from app.vision_merge import append_rejected_edits, merge_vision  # noqa: PLC0415
+
         current_vision = dict(project.vision or {})
         payload_vision_rev = (task.first_payload.get("vision") or {}).get("revision", 0)
         db_vision_rev = current_vision.get("revision", 0)
         # Baseline: prefer the snapshot the cycle row captured at spawn time
         # (StrategicCycle.cycle_metadata.baseline_vision). Falls back to the
         # payload vision if the cycle row is unavailable (legacy task).
-        cycle_id = task.strategic_cycle_id or (task.context or {}).get("strategic_cycle_id")
+        cycle_id = task.strategic_cycle_id or (task.context or {}).get(
+            "strategic_cycle_id"
+        )
         baseline_vision = task.first_payload.get("vision") or {}
         if cycle_id:
             cycle_row = await strategic_cycle.get(session, cycle_id)
@@ -903,7 +1020,9 @@ async def _handle_strategic_completion(
                     continue
                 sys_id = sys["id"]
                 # Count directions mapped to this system and their merged PRs
-                mapped_dirs = [d for d in directions_list if d.get("system_id") == sys_id]
+                mapped_dirs = [
+                    d for d in directions_list if d.get("system_id") == sys_id
+                ]
                 total_merged = 0
                 for d in mapped_dirs:
                     for h in d.get("research_history", []):
@@ -912,7 +1031,12 @@ async def _handle_strategic_completion(
                     total_merged += agg.get("total_prs_merged", 0)
                 # Only upgrade status, never downgrade what the agent set
                 agent_status = sys.get("status", "planned")
-                STATUS_RANK = {"planned": 0, "in_progress": 1, "functional": 2, "mature": 3}
+                STATUS_RANK = {
+                    "planned": 0,
+                    "in_progress": 1,
+                    "functional": 2,
+                    "mature": 3,
+                }
                 agent_rank = STATUS_RANK.get(agent_status, 0)
                 if total_merged >= 5 and agent_rank < 2:
                     sys["status"] = "functional"
@@ -920,7 +1044,9 @@ async def _handle_strategic_completion(
                     sys["status"] = "in_progress"
         project.vision = new_vision
         flag_modified(project, "vision")
-        logger.info(f"[STRATEGIC] Updated vision for project {project.id} to revision {new_vision['revision']}")
+        logger.info(
+            f"[STRATEGIC] Updated vision for project {project.id} to revision {new_vision['revision']}"
+        )
 
     # Apply problem_model update — new strategic source of truth running
     # alongside vision during the migration. Failures here are logged and
@@ -931,6 +1057,7 @@ async def _handle_strategic_completion(
             from pydantic import ValidationError as _PmValidationError
 
             from app.problem_model import apply_agent_update
+
             try:
                 new_pm_raw, pm_diff = apply_agent_update(
                     current_raw=project.problem_model,
@@ -950,7 +1077,9 @@ async def _handle_strategic_completion(
                     f"to revision {new_pm_raw.get('revision')} ({pm_diff or 'no diff'})"
                 )
         except Exception:
-            logger.exception("[STRATEGIC] Failed to apply problem_model update (non-fatal)")
+            logger.exception(
+                "[STRATEGIC] Failed to apply problem_model update (non-fatal)"
+            )
 
     # Replace project.running_update with the agent's refined markdown
     # document. Unlike the old per-cycle append, the document is a living
@@ -976,12 +1105,15 @@ async def _handle_strategic_completion(
             from pydantic import ValidationError as _SrValidationError
 
             from app.problem_model import SelfReflectionEntry, append_self_reflection
+
             try:
-                entry = SelfReflectionEntry.model_validate({
-                    "ts": _utcnow().isoformat(),
-                    "cycle_task_id": str(task.id),
-                    **new_reflection,
-                })
+                entry = SelfReflectionEntry.model_validate(
+                    {
+                        "ts": _utcnow().isoformat(),
+                        "cycle_task_id": str(task.id),
+                        **new_reflection,
+                    }
+                )
             except _SrValidationError as sr_err:
                 logger.warning(
                     f"[STRATEGIC] Task {task.id}: self_reflection validation failed — "
@@ -1007,10 +1139,15 @@ async def _handle_strategic_completion(
         current_vision["_strategic_failures_at"] = _utcnow().isoformat()
         project.vision = current_vision
         flag_modified(project, "vision")
-        logger.warning(f"[STRATEGIC] Task {task.id}: no vision produced (failure #{failures})")
+        logger.warning(
+            f"[STRATEGIC] Task {task.id}: no vision produced (failure #{failures})"
+        )
         if failures >= 2:
-            await _create_strategic_alert(task.project_id, session,
-                f"Strategic review produced no vision ({failures} consecutive failures, task {str(task.id)[:8]})")
+            await _create_strategic_alert(
+                task.project_id,
+                session,
+                f"Strategic review produced no vision ({failures} consecutive failures, task {str(task.id)[:8]})",
+            )
 
     # Process direction operations (capped to prevent flooding)
     MAX_DIRECTION_OPS = 10
@@ -1023,7 +1160,9 @@ async def _handle_strategic_completion(
     retired_rationales_fb: Dict[str, str] = {}
     if direction_ops and isinstance(direction_ops, list):
         if len(direction_ops) > MAX_DIRECTION_OPS:
-            logger.warning(f"[STRATEGIC] Task {task.id}: truncating {len(direction_ops)} direction ops to {MAX_DIRECTION_OPS}")
+            logger.warning(
+                f"[STRATEGIC] Task {task.id}: truncating {len(direction_ops)} direction ops to {MAX_DIRECTION_OPS}"
+            )
             direction_ops = direction_ops[:MAX_DIRECTION_OPS]
         directions = list(project.directions or [])
         creates_count = 0
@@ -1042,7 +1181,9 @@ async def _handle_strategic_completion(
             op = op_entry.get("op")
             rationale = str(op_entry.get("rationale", ""))
             if len(rationale) > STRATEGIC_RATIONALE_MAX:
-                logger.warning(f"[STRATEGIC] Task {task.id}: truncating rationale {len(rationale)}→{STRATEGIC_RATIONALE_MAX} chars")
+                logger.warning(
+                    f"[STRATEGIC] Task {task.id}: truncating rationale {len(rationale)}→{STRATEGIC_RATIONALE_MAX} chars"
+                )
                 rationale = rationale[:STRATEGIC_RATIONALE_MAX]
 
             if op == "create":
@@ -1052,32 +1193,47 @@ async def _handle_strategic_completion(
                 if not text:
                     continue
                 if len(text) > STRATEGIC_DIRECTION_TEXT_MAX:
-                    logger.warning(f"[STRATEGIC] Task {task.id}: truncating direction text {len(text)}→{STRATEGIC_DIRECTION_TEXT_MAX} chars")
+                    logger.warning(
+                        f"[STRATEGIC] Task {task.id}: truncating direction text {len(text)}→{STRATEGIC_DIRECTION_TEXT_MAX} chars"
+                    )
                 text = text[:STRATEGIC_DIRECTION_TEXT_MAX]
                 # Dedup: skip if a semantically similar direction already exists
                 raw_dedup_reasoning = op_entry.get("dedup_reasoning")
-                _rejected_proposals = list((project.vision or {}).get("rejected_proposals") or [])
+                _rejected_proposals = list(
+                    (project.vision or {}).get("rejected_proposals") or []
+                )
                 if _is_direction_duplicate(text, directions, _rejected_proposals):
                     if isinstance(raw_dedup_reasoning, dict):
-                        distinction = str(raw_dedup_reasoning.get("distinction") or "").strip()
+                        distinction = str(
+                            raw_dedup_reasoning.get("distinction") or ""
+                        ).strip()
                         if distinction:
                             logger.warning(
                                 "[STRATEGIC_DEDUP_DISAGREEMENT] Fallback path: direction rejected as duplicate but "
                                 "agent claimed distinction='%s'; matched text='%s'; project=%s",
-                                distinction[:200], text[:60], project.id,
+                                distinction[:200],
+                                text[:60],
+                                project.id,
                             )
                     matched = _find_matching_direction(text, directions)
                     if matched:
                         logger.info(
                             "[STRATEGIC] Skipping semantic duplicate direction '%s' for project %s — "
                             "matched existing direction '%s' (status=%s)",
-                            text[:60], project.id, (matched.get("text") or "")[:60], matched.get("status"),
+                            text[:60],
+                            project.id,
+                            (matched.get("text") or "")[:60],
+                            matched.get("status"),
                         )
                     else:
-                        logger.info(f"[STRATEGIC] Skipping duplicate direction '{text[:60]}' for project {project.id}")
+                        logger.info(
+                            f"[STRATEGIC] Skipping duplicate direction '{text[:60]}' for project {project.id}"
+                        )
                     continue
                 success_evidence = str(op_entry.get("success_evidence", "")).strip()
-                retirement_condition = str(op_entry.get("retirement_condition", "")).strip()
+                retirement_condition = str(
+                    op_entry.get("retirement_condition", "")
+                ).strip()
                 if not success_evidence or not retirement_condition:
                     logger.warning(
                         f"[STRATEGIC] Task {task.id}: direction create '{text[:60]}' rejected — "
@@ -1085,29 +1241,46 @@ async def _handle_strategic_completion(
                     )
                     continue
                 raw_priority = op_entry.get("priority", "medium")
-                priority = raw_priority if raw_priority in ("high", "medium", "low") else "medium"
+                priority = (
+                    raw_priority
+                    if raw_priority in ("high", "medium", "low")
+                    else "medium"
+                )
                 _DIR_FIELD_MAX = 500
                 new_dir = {
                     "id": f"d-{uuid.uuid4().hex[:8]}",
                     "text": text,
                     "status": "active",
                     "priority": priority,
-                    "notes": [{"text": f"Created by strategic review: {rationale}", "added_at": _utcnow().isoformat()}] if rationale else [],
+                    "notes": [
+                        {
+                            "text": f"Created by strategic review: {rationale}",
+                            "added_at": _utcnow().isoformat(),
+                        }
+                    ]
+                    if rationale
+                    else [],
                     "research_history": [],
                     "context": {
                         "success_evidence": success_evidence[:_DIR_FIELD_MAX],
                         "retirement_condition": retirement_condition[:_DIR_FIELD_MAX],
                     },
                 }
-                impl_constraints = str(op_entry.get("implementation_constraints", "")).strip()
+                impl_constraints = str(
+                    op_entry.get("implementation_constraints", "")
+                ).strip()
                 if impl_constraints:
-                    new_dir["context"]["implementation_constraints"] = impl_constraints[:_DIR_FIELD_MAX]
+                    new_dir["context"]["implementation_constraints"] = impl_constraints[
+                        :_DIR_FIELD_MAX
+                    ]
                 if isinstance(raw_dedup_reasoning, dict):
                     dr: dict = {}
                     closest = raw_dedup_reasoning.get("closest_directions")
                     if isinstance(closest, list):
                         dr["closest_directions"] = closest[:3]
-                    distinction = str(raw_dedup_reasoning.get("distinction") or "").strip()
+                    distinction = str(
+                        raw_dedup_reasoning.get("distinction") or ""
+                    ).strip()
                     if distinction:
                         dr["distinction"] = distinction[:_DIR_FIELD_MAX]
                     if dr:
@@ -1122,9 +1295,14 @@ async def _handle_strategic_completion(
                 if op_entry.get("system_id"):
                     sid = str(op_entry["system_id"])
                     if len(sid) > STRATEGIC_SYSTEM_ID_MAX:
-                        logger.warning(f"[STRATEGIC] Task {task.id}: truncating system_id {len(sid)}→{STRATEGIC_SYSTEM_ID_MAX} chars")
+                        logger.warning(
+                            f"[STRATEGIC] Task {task.id}: truncating system_id {len(sid)}→{STRATEGIC_SYSTEM_ID_MAX} chars"
+                        )
                     new_dir["system_id"] = sid[:STRATEGIC_SYSTEM_ID_MAX]
-                if op_entry.get("category") and op_entry["category"] in ("product", "structural"):
+                if op_entry.get("category") and op_entry["category"] in (
+                    "product",
+                    "structural",
+                ):
                     new_dir["category"] = op_entry["category"]
                 # Optional mode hint from the strategic agent — persisted only
                 # when canonical (audit | fundamentals | ship | pause).
@@ -1136,26 +1314,40 @@ async def _handle_strategic_completion(
                         "source": RECOMMENDED_MODE_SOURCE_STRATEGIC,
                         "source_task_id": str(task.id),
                         "set_at": _utcnow().isoformat(),
-                        "strategic_cycle_id": str(task.strategic_cycle_id or (task.context or {}).get("strategic_cycle_id") or ""),
+                        "strategic_cycle_id": str(
+                            task.strategic_cycle_id
+                            or (task.context or {}).get("strategic_cycle_id")
+                            or ""
+                        ),
                     }
-                current_active = sum(1 for d in directions if d.get('status') == 'active')
-                if current_active >= _runtime_config.get('max_active_directions', 5):
-                    logger.warning(f'[STRATEGIC] Skipping direction create: active count {current_active} >= cap')
+                current_active = sum(
+                    1 for d in directions if d.get("status") == "active"
+                )
+                if current_active >= _runtime_config.get("max_active_directions", 5):
+                    logger.warning(
+                        f"[STRATEGIC] Skipping direction create: active count {current_active} >= cap"
+                    )
                     continue
                 # Translate recommended_mode='pause' to paused status so the
                 # existing spawn-skip (status != 'active') mechanism handles it.
                 if rec_mode == "pause":
                     new_dir["status"] = "paused"
                     new_dir["auto_paused"] = True
-                    new_dir["paused_reason"] = "Strategic review: recommended_mode=pause"
+                    new_dir["paused_reason"] = (
+                        "Strategic review: recommended_mode=pause"
+                    )
                     new_dir["paused_at"] = _utcnow().isoformat()
                 directions.append(new_dir)
                 ops_applied += 1
                 creates_count += 1
                 created_ids_fb.append(new_dir["id"])
                 if rationale:
-                    created_rationales_fb[new_dir["id"]] = rationale[:_RATIONALE_PERSIST_MAX]
-                logger.info(f"[STRATEGIC] Created direction '{text[:60]}' for project {project.id}")
+                    created_rationales_fb[new_dir["id"]] = rationale[
+                        :_RATIONALE_PERSIST_MAX
+                    ]
+                logger.info(
+                    f"[STRATEGIC] Created direction '{text[:60]}' for project {project.id}"
+                )
 
             elif op == "update":
                 dir_id = op_entry.get("direction_id")
@@ -1167,9 +1359,15 @@ async def _handle_strategic_completion(
                         if "text" in changes:
                             new_text = str(changes["text"])
                             if len(new_text) > STRATEGIC_DIRECTION_TEXT_MAX:
-                                logger.warning(f"[STRATEGIC] Task {task.id}: truncating direction text {len(new_text)}→{STRATEGIC_DIRECTION_TEXT_MAX} chars")
+                                logger.warning(
+                                    f"[STRATEGIC] Task {task.id}: truncating direction text {len(new_text)}→{STRATEGIC_DIRECTION_TEXT_MAX} chars"
+                                )
                             d["text"] = new_text[:STRATEGIC_DIRECTION_TEXT_MAX]
-                        if "priority" in changes and changes["priority"] in ("high", "medium", "low"):
+                        if "priority" in changes and changes["priority"] in (
+                            "high",
+                            "medium",
+                            "low",
+                        ):
                             d["priority"] = changes["priority"]
                         if "paths" in changes:
                             d["paths"] = changes["paths"]
@@ -1177,34 +1375,58 @@ async def _handle_strategic_completion(
                             if changes["system_id"]:
                                 sid_new = str(changes["system_id"])
                                 if len(sid_new) > STRATEGIC_SYSTEM_ID_MAX:
-                                    logger.warning(f"[STRATEGIC] Task {task.id}: truncating system_id {len(sid_new)}→{STRATEGIC_SYSTEM_ID_MAX} chars")
+                                    logger.warning(
+                                        f"[STRATEGIC] Task {task.id}: truncating system_id {len(sid_new)}→{STRATEGIC_SYSTEM_ID_MAX} chars"
+                                    )
                                 d["system_id"] = sid_new[:STRATEGIC_SYSTEM_ID_MAX]
                             else:
                                 d["system_id"] = None
-                        if "status" in changes and changes["status"] in ("active", "paused", "expired", "superseded"):
+                        if "status" in changes and changes["status"] in (
+                            "active",
+                            "paused",
+                            "expired",
+                            "superseded",
+                        ):
                             # Block reactivating a direction the user manually paused
-                            if changes["status"] == "active" and d.get("status") == "paused" and not d.get("auto_paused"):
-                                logger.warning(f"[STRATEGIC] Blocked reactivation of user-paused direction {dir_id}")
+                            if (
+                                changes["status"] == "active"
+                                and d.get("status") == "paused"
+                                and not d.get("auto_paused")
+                            ):
+                                logger.warning(
+                                    f"[STRATEGIC] Blocked reactivation of user-paused direction {dir_id}"
+                                )
                             else:
                                 d["status"] = changes["status"]
                                 if changes["status"] == "superseded":
                                     superseded_by = changes.get("superseded_by")
                                     if not superseded_by:
                                         succ_id = (
-                                            changes.get("successor_id") or changes.get("superseded_by_id")
-                                            or op_entry.get("successor_id") or op_entry.get("superseded_by_id")
+                                            changes.get("successor_id")
+                                            or changes.get("superseded_by_id")
+                                            or op_entry.get("successor_id")
+                                            or op_entry.get("superseded_by_id")
                                         )
                                         if succ_id:
-                                            superseded_by = {"direction_id": str(succ_id), "set_at": _utcnow().isoformat()}
+                                            superseded_by = {
+                                                "direction_id": str(succ_id),
+                                                "set_at": _utcnow().isoformat(),
+                                            }
                                     if superseded_by:
                                         d["superseded_by"] = superseded_by
                         if "category" in changes:
-                            if changes["category"] in ("product", "structural", "mixed"):
+                            if changes["category"] in (
+                                "product",
+                                "structural",
+                                "mixed",
+                            ):
                                 d["category"] = changes["category"]
                             elif changes["category"] is None:
                                 d.pop("category", None)
                         if "recommended_mode" in changes:
-                            new_mode = _normalize_recommended_mode(changes["recommended_mode"])
+                            new_mode = _normalize_recommended_mode(
+                                changes["recommended_mode"]
+                            )
                             if new_mode:
                                 d["recommended_mode"] = new_mode
                                 d[RECOMMENDED_MODE_META_KEY] = {
@@ -1212,7 +1434,13 @@ async def _handle_strategic_completion(
                                     "source": RECOMMENDED_MODE_SOURCE_STRATEGIC,
                                     "source_task_id": str(task.id),
                                     "set_at": _utcnow().isoformat(),
-                                    "strategic_cycle_id": str(task.strategic_cycle_id or (task.context or {}).get("strategic_cycle_id") or ""),
+                                    "strategic_cycle_id": str(
+                                        task.strategic_cycle_id
+                                        or (task.context or {}).get(
+                                            "strategic_cycle_id"
+                                        )
+                                        or ""
+                                    ),
                                 }
                             elif changes["recommended_mode"] is None:
                                 d.pop("recommended_mode", None)
@@ -1220,7 +1448,9 @@ async def _handle_strategic_completion(
                         # Also accept top-level recommended_mode on the
                         # operation so the agent can emit it without
                         # nesting it inside a changes block.
-                        top_level_mode = _normalize_recommended_mode(op_entry.get("recommended_mode"))
+                        top_level_mode = _normalize_recommended_mode(
+                            op_entry.get("recommended_mode")
+                        )
                         if top_level_mode:
                             d["recommended_mode"] = top_level_mode
                             d[RECOMMENDED_MODE_META_KEY] = {
@@ -1228,24 +1458,42 @@ async def _handle_strategic_completion(
                                 "source": RECOMMENDED_MODE_SOURCE_STRATEGIC,
                                 "source_task_id": str(task.id),
                                 "set_at": _utcnow().isoformat(),
-                                "strategic_cycle_id": str(task.strategic_cycle_id or (task.context or {}).get("strategic_cycle_id") or ""),
+                                "strategic_cycle_id": str(
+                                    task.strategic_cycle_id
+                                    or (task.context or {}).get("strategic_cycle_id")
+                                    or ""
+                                ),
                             }
                         # Translate recommended_mode='pause' to paused direction
                         # status so existing spawn-skip logic handles it.
-                        if d.get("recommended_mode") == "pause" and d.get("status") == "active":
+                        if (
+                            d.get("recommended_mode") == "pause"
+                            and d.get("status") == "active"
+                        ):
                             d["status"] = "paused"
                             d["auto_paused"] = True
-                            d["paused_reason"] = "Strategic review: recommended_mode=pause"
+                            d["paused_reason"] = (
+                                "Strategic review: recommended_mode=pause"
+                            )
                             d["paused_at"] = _utcnow().isoformat()
                         # Record rationale as a note
                         if rationale:
                             notes = d.get("notes", [])
-                            notes.append({"text": f"Strategic update: {rationale}", "added_at": _utcnow().isoformat()})
+                            notes.append(
+                                {
+                                    "text": f"Strategic update: {rationale}",
+                                    "added_at": _utcnow().isoformat(),
+                                }
+                            )
                             if len(notes) > STRATEGIC_NOTES_HISTORY_MAX:
-                                logger.warning(f"[STRATEGIC] Task {task.id}: dropping {len(notes) - STRATEGIC_NOTES_HISTORY_MAX} oldest notes on direction {dir_id}")
+                                logger.warning(
+                                    f"[STRATEGIC] Task {task.id}: dropping {len(notes) - STRATEGIC_NOTES_HISTORY_MAX} oldest notes on direction {dir_id}"
+                                )
                             d["notes"] = notes[-STRATEGIC_NOTES_HISTORY_MAX:]
                         ops_applied += 1
-                        logger.info(f"[STRATEGIC] Updated direction {dir_id} for project {project.id}: {list(changes.keys())}")
+                        logger.info(
+                            f"[STRATEGIC] Updated direction {dir_id} for project {project.id}: {list(changes.keys())}"
+                        )
                         break
 
             elif op == "retire":
@@ -1257,16 +1505,27 @@ async def _handle_strategic_completion(
                         d["status"] = "expired"
                         if rationale:
                             notes = d.get("notes", [])
-                            notes.append({"text": f"Retired by strategic review: {rationale}", "added_at": _utcnow().isoformat()})
+                            notes.append(
+                                {
+                                    "text": f"Retired by strategic review: {rationale}",
+                                    "added_at": _utcnow().isoformat(),
+                                }
+                            )
                             if len(notes) > STRATEGIC_NOTES_HISTORY_MAX:
-                                logger.warning(f"[STRATEGIC] Task {task.id}: dropping {len(notes) - STRATEGIC_NOTES_HISTORY_MAX} oldest notes on direction {dir_id}")
+                                logger.warning(
+                                    f"[STRATEGIC] Task {task.id}: dropping {len(notes) - STRATEGIC_NOTES_HISTORY_MAX} oldest notes on direction {dir_id}"
+                                )
                             d["notes"] = notes[-STRATEGIC_NOTES_HISTORY_MAX:]
                         ops_applied += 1
                         retires_applied += 1
                         retired_ids_fb.append(dir_id)
                         if rationale:
-                            retired_rationales_fb[dir_id] = rationale[:_RATIONALE_PERSIST_MAX]
-                        logger.info(f"[STRATEGIC] Retired direction {dir_id} for project {project.id}")
+                            retired_rationales_fb[dir_id] = rationale[
+                                :_RATIONALE_PERSIST_MAX
+                            ]
+                        logger.info(
+                            f"[STRATEGIC] Retired direction {dir_id} for project {project.id}"
+                        )
                         break
 
         if ops_applied > 0:
@@ -1276,11 +1535,15 @@ async def _handle_strategic_completion(
     # Update cycle history with final outcome
     # Audit W2: cycle outcome lives on the StrategicCycle row.
     cycle_id = task.strategic_cycle_id or (task.context or {}).get("strategic_cycle_id")
-    dirs_created = creates_count if direction_ops and isinstance(direction_ops, list) else 0
+    dirs_created = (
+        creates_count if direction_ops and isinstance(direction_ops, list) else 0
+    )
     if cycle_id:
         dirs_retired = retires_applied
         vision_produced = bool(new_vision and isinstance(new_vision, dict))
-        _active_dirs_fb = sum(1 for d in (project.directions or []) if d.get("status") == "active")
+        _active_dirs_fb = sum(
+            1 for d in (project.directions or []) if d.get("status") == "active"
+        )
         _vision_rev_fb = (project.vision or {}).get("revision", 0)
         _summary_fb = f"rev {_vision_rev_fb}, {_active_dirs_fb} active, {dirs_created} created, {dirs_retired} retired"
         if vision_produced:
@@ -1289,14 +1552,19 @@ async def _handle_strategic_completion(
                 "retired_direction_ids": list(retired_ids_fb),
                 "created_rationales": dict(created_rationales_fb),
                 "retired_rationales": dict(retired_rationales_fb),
-                "created_predictions": _collect_creation_predictions(project, created_ids_fb),
-                "retired_final_metrics": _collect_retirement_metrics(project, retired_ids_fb),
+                "created_predictions": _collect_creation_predictions(
+                    project, created_ids_fb
+                ),
+                "retired_final_metrics": _collect_retirement_metrics(
+                    project, retired_ids_fb
+                ),
             }
             _fb_critiques = parsed.get("retired_direction_critiques")
             if _fb_critiques is not None:
                 _fb_extra["retirement_critiques"] = _fb_critiques
             await strategic_cycle.mark_phase2_completed(
-                session, cycle_id,
+                session,
+                cycle_id,
                 summary_text=_summary_fb,
                 cycle_reasoning=_extract_cycle_reasoning(task),
                 directions_created=dirs_created,
@@ -1306,7 +1574,9 @@ async def _handle_strategic_completion(
             )
         else:
             await strategic_cycle.mark_failure(
-                session, cycle_id, phase="phase2",
+                session,
+                cycle_id,
+                phase="phase2",
                 reason="strategic_review fallback path produced no vision",
             )
 
@@ -1314,7 +1584,10 @@ async def _handle_strategic_completion(
     session.add(project)
 
     # Deferred import of message/resolution caps — same STRATEGIC_* namespace
-    from app.strategic_constants import STRATEGIC_MESSAGE_CONTENT_MAX, STRATEGIC_RESOLUTION_MAX
+    from app.strategic_constants import (
+        STRATEGIC_MESSAGE_CONTENT_MAX,
+        STRATEGIC_RESOLUTION_MAX,
+    )
 
     # Process messages from agent (questions, blockers, notes)
     msgs_created = 0
@@ -1325,7 +1598,9 @@ async def _handle_strategic_completion(
         if not content:
             continue
         if len(content) > STRATEGIC_MESSAGE_CONTENT_MAX:
-            logger.warning(f"[STRATEGIC] Task {task.id}: truncating message content {len(content)}→{STRATEGIC_MESSAGE_CONTENT_MAX} chars")
+            logger.warning(
+                f"[STRATEGIC] Task {task.id}: truncating message content {len(content)}→{STRATEGIC_MESSAGE_CONTENT_MAX} chars"
+            )
             content = content[:STRATEGIC_MESSAGE_CONTENT_MAX]
         try:
             msg_type = MessageType(msg_entry.get("type", "NOTE").upper())
@@ -1348,18 +1623,26 @@ async def _handle_strategic_completion(
     resolved_entries = parsed.get("resolved_messages") or []
     if not resolved_entries:
         # Fall back to legacy format (plain ID list)
-        resolved_entries = [{"id": mid} for mid in (parsed.get("resolved_message_ids") or [])]
+        resolved_entries = [
+            {"id": mid} for mid in (parsed.get("resolved_message_ids") or [])
+        ]
     for entry in resolved_entries[:10]:
         try:
             msg_id = entry.get("id") if isinstance(entry, dict) else str(entry)
-            resolution_text = entry.get("resolution", "Addressed by strategic review") if isinstance(entry, dict) else "Addressed by strategic review"
+            resolution_text = (
+                entry.get("resolution", "Addressed by strategic review")
+                if isinstance(entry, dict)
+                else "Addressed by strategic review"
+            )
             msg = await session.get(ProjectMessage, uuid.UUID(str(msg_id)))
             if msg and msg.project_id == project.id and msg.status == "open":
                 msg.status = "resolved"
                 if resolution_text:
                     rt = str(resolution_text)
                     if len(rt) > STRATEGIC_RESOLUTION_MAX:
-                        logger.warning(f"[STRATEGIC] Task {task.id}: truncating resolution {len(rt)}→{STRATEGIC_RESOLUTION_MAX} chars")
+                        logger.warning(
+                            f"[STRATEGIC] Task {task.id}: truncating resolution {len(rt)}→{STRATEGIC_RESOLUTION_MAX} chars"
+                        )
                     msg.resolution = rt[:STRATEGIC_RESOLUTION_MAX]
                 else:
                     msg.resolution = "Addressed by strategic review"
@@ -1368,20 +1651,29 @@ async def _handle_strategic_completion(
                 msgs_resolved += 1
                 if msg.message_type == MessageType.FEEDBACK:
                     try:
-                        from app.notification_dispatch import post_feedback_acknowledgment
+                        from app.notification_dispatch import (
+                            post_feedback_acknowledgment,
+                        )
+
                         await post_feedback_acknowledgment(
-                            session, project.id, msg.id,
+                            session,
+                            project.id,
+                            msg.id,
                             msg.resolution or "Addressed by strategic review",
                             task.id,
                         )
                     except Exception as _e:
-                        logger.warning(f"[NOTIFY] Failed to post feedback acknowledgment: {_e}")
+                        logger.warning(
+                            f"[NOTIFY] Failed to post feedback acknowledgment: {_e}"
+                        )
         except (ValueError, TypeError):
             pass
 
     # Audit: check for unaddressed FEEDBACK messages
     remaining_feedback_result = await session.execute(
-        select(func.count()).select_from(ProjectMessage).where(
+        select(func.count())
+        .select_from(ProjectMessage)
+        .where(
             ProjectMessage.project_id == project.id,
             ProjectMessage.status == "open",
             ProjectMessage.message_type == MessageType.FEEDBACK,
@@ -1404,5 +1696,9 @@ async def _handle_strategic_completion(
     # cycle; the user acknowledges to stamp a read-marker.
     task.latest_status_message = f"Strategic review complete — vision rev {vision_rev}, {ops_applied} direction ops, {msgs_created} messages, {msgs_resolved} resolved"
     session.add(task)
-    await session.commit()  # Single commit: vision + directions + messages + task status
-    logger.info(f"[STRATEGIC] Task {task.id} complete: vision rev {vision_rev}, {ops_applied} direction ops, {msgs_created} msgs created, {msgs_resolved} resolved")
+    await (
+        session.commit()
+    )  # Single commit: vision + directions + messages + task status
+    logger.info(
+        f"[STRATEGIC] Task {task.id} complete: vision rev {vision_rev}, {ops_applied} direction ops, {msgs_created} msgs created, {msgs_resolved} resolved"
+    )

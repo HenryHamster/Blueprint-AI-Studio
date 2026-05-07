@@ -1,4 +1,5 @@
 """Task failure classification for deployment monitoring in Blueprint AI Studio."""
+
 import logging
 import re
 import time
@@ -168,18 +169,26 @@ def _provider_model_config_rejection(combined: str) -> bool:
 # agent lifecycle) got in the way, or the scope was structurally mismatched
 # (SCOPE_OVERFLOW — wrong budget, not bad code). Imported by direction_outcomes
 # and research_completion so both stay in sync.
-INFRA_CLASSES: frozenset[str] = frozenset({
-    PROVISION_FAILURE,
-    RATE_LIMIT,
-    AGENT_TIMEOUT,
-    EXTERNAL_API,
-    SCOPE_OVERFLOW,
-    BLOCKED_PRECONDITION,
-})
+INFRA_CLASSES: frozenset[str] = frozenset(
+    {
+        PROVISION_FAILURE,
+        RATE_LIMIT,
+        AGENT_TIMEOUT,
+        EXTERNAL_API,
+        SCOPE_OVERFLOW,
+        BLOCKED_PRECONDITION,
+    }
+)
 
 # Ordered tuple of all canonical failure classes for per-account health panel display.
 ALL_FAILURE_CLASSES: tuple[str, ...] = (
-    CODE_ERROR, RATE_LIMIT, EXTERNAL_API, PROVISION_FAILURE, MIGRATION_ERROR, AGENT_TIMEOUT, SCOPE_OVERFLOW,
+    CODE_ERROR,
+    RATE_LIMIT,
+    EXTERNAL_API,
+    PROVISION_FAILURE,
+    MIGRATION_ERROR,
+    AGENT_TIMEOUT,
+    SCOPE_OVERFLOW,
     BLOCKED_PRECONDITION,
 )
 
@@ -195,17 +204,35 @@ TAXONOMY_INFRA_RELATED = "infra_related"
 
 
 _REVIEW_QUALITY_KEYWORDS = (
-    "pytest", "jest", "ruff", "eslint", "tsc", "mypy",
-    "lint_failed", "test_failed", "build_failed",
-    "lint error", "lint failed", "tests failed", "test failure",
-    "type error", "typecheck", "type check",
-    "style", "formatting",
+    "pytest",
+    "jest",
+    "ruff",
+    "eslint",
+    "tsc",
+    "mypy",
+    "lint_failed",
+    "test_failed",
+    "build_failed",
+    "lint error",
+    "lint failed",
+    "tests failed",
+    "test failure",
+    "type error",
+    "typecheck",
+    "type check",
+    "style",
+    "formatting",
 )
 
 _SCOPE_KEYWORDS = (
-    "too many changes", "too many files", "multi-file conflict",
-    "scope too large", "exceeds scope",
-    "scope complexity", "implementation complexity exceeds", "complexity budget",
+    "too many changes",
+    "too many files",
+    "multi-file conflict",
+    "scope too large",
+    "exceeds scope",
+    "scope complexity",
+    "implementation complexity exceeds",
+    "complexity budget",
 )
 
 
@@ -239,9 +266,8 @@ def classify_failure_taxonomy(task: "Task") -> str:
         return TAXONOMY_REVIEW_QUALITY
 
     expansion_ratio = ctx.get("expansion_ratio")
-    has_scope_evidence = (
-        any(kw in status_msg for kw in _SCOPE_KEYWORDS)
-        or (isinstance(expansion_ratio, (int, float)) and expansion_ratio > 1.5)
+    has_scope_evidence = any(kw in status_msg for kw in _SCOPE_KEYWORDS) or (
+        isinstance(expansion_ratio, (int, float)) and expansion_ratio > 1.5
     )
     # scope_calibrated_from alone is not evidence — a calibrated task can fail
     # for unrelated code defects. Require corroborating scope evidence.
@@ -308,11 +334,13 @@ def should_trigger_code_defect_investigation(task: "Task") -> bool:
 # or process crash) worth investigating. Operational sub-types (cascade, iteration
 # limit, execution timeout) are excluded — they reflect orchestrator decisions or
 # wall-clock limits, not defects in the code under test.
-INVESTIGATABLE_TIMEOUT_SUBTYPES: frozenset[str] = frozenset({
-    "oom",
-    "process_crash",
-    "heartbeat_lost",
-})
+INVESTIGATABLE_TIMEOUT_SUBTYPES: frozenset[str] = frozenset(
+    {
+        "oom",
+        "process_crash",
+        "heartbeat_lost",
+    }
+)
 
 
 def should_trigger_timeout_investigation(task: "Task") -> bool:
@@ -336,7 +364,7 @@ def should_trigger_timeout_investigation(task: "Task") -> bool:
 
 
 _AGENT_CATEGORY_TO_CLASS: dict[str, str] = {
-    'clone_failed': PROVISION_FAILURE,
+    "clone_failed": PROVISION_FAILURE,
     # build_failed = test setup couldn't run (Postgres sidecar startup, Docker
     # build, dependency install). Agent emits this when the test environment
     # itself failed to come up, NOT when user code failed to compile — the
@@ -344,35 +372,37 @@ _AGENT_CATEGORY_TO_CLASS: dict[str, str] = {
     # PROVISION_FAILURE gets the 5-min infra backoff and resurrection-sweep
     # eligibility instead of burning the code-error retry budget on something
     # the agent can't fix by editing code.
-    'build_failed': PROVISION_FAILURE,
-    'test_failed': CODE_ERROR,
-    'lint_failed': CODE_ERROR,
-    'pr_creation_failed': EXTERNAL_API,
-    'claude_code_failed': CODE_ERROR,
-    'parse_failed': CODE_ERROR,
-    'fatal': CODE_ERROR,
-    'rate_limited': RATE_LIMIT,
-    'scope_overflow': SCOPE_OVERFLOW,
-    'timeout': AGENT_TIMEOUT,
+    "build_failed": PROVISION_FAILURE,
+    "test_failed": CODE_ERROR,
+    "lint_failed": CODE_ERROR,
+    "pr_creation_failed": EXTERNAL_API,
+    "claude_code_failed": CODE_ERROR,
+    "parse_failed": CODE_ERROR,
+    "fatal": CODE_ERROR,
+    "rate_limited": RATE_LIMIT,
+    "scope_overflow": SCOPE_OVERFLOW,
+    "timeout": AGENT_TIMEOUT,
     # 2026-05-04: emitted by the new Claude-driven flow.
     # ``agent_self_failed`` — Claude called ``./fail "<reason>"`` because the
     # task fundamentally couldn't be completed (scope wrong, blocker, etc.).
     # The reason text is preserved as latest_status_message; the category
     # routes through the CODE_ERROR retry budget so the orchestrator's
     # diagnosis pipeline (direction-hold investigation, etc.) still fires.
-    'agent_self_failed': CODE_ERROR,
+    "agent_self_failed": CODE_ERROR,
     # ``incomplete`` — wrapper-fallback when Claude exited without calling
     # ./done|./fail and didn't open a PR. Distinct from claude_code_failed
     # (which is for non-zero exit) so analytics can separate "Claude bailed
     # silently" from "Claude crashed."
-    'incomplete': CODE_ERROR,
+    "incomplete": CODE_ERROR,
 }
 
 
-_GENERIC_AGENT_CODE_LABELS: frozenset[str] = frozenset({
-    "claude_code_failed",
-    "fatal",
-})
+_GENERIC_AGENT_CODE_LABELS: frozenset[str] = frozenset(
+    {
+        "claude_code_failed",
+        "fatal",
+    }
+)
 
 
 def _persist_rate_limit_signal_context(task: "Task", signal) -> None:
@@ -497,14 +527,20 @@ def persist_failure_category(
     ctx["failure_category"] = failure_class
     if failure_class == AGENT_TIMEOUT:
         status_msg = task.latest_status_message or ""
-        ctx["timeout_subtype"] = _timeout_subtype_from_message(status_msg + " " + (logs or ""))
+        ctx["timeout_subtype"] = _timeout_subtype_from_message(
+            status_msg + " " + (logs or "")
+        )
     if failure_class == EXTERNAL_API:
         status_msg = task.latest_status_message or ""
-        ctx["external_api_subtype"] = _external_api_subtype_from_message(status_msg + " " + (logs or ""))
+        ctx["external_api_subtype"] = _external_api_subtype_from_message(
+            status_msg + " " + (logs or "")
+        )
     task.context = ctx
     account_id = ctx.get("llm_account_id") or ctx.get("max_plan_account_id")
     if account_id:
-        record_account_failure_class(str(account_id), failure_class, confidence=confidence)
+        record_account_failure_class(
+            str(account_id), failure_class, confidence=confidence
+        )
 
 
 def normalize_agent_failure_category(raw: str | None, task: "Task") -> str:
@@ -531,7 +567,8 @@ def normalize_agent_failure_category(raw: str | None, task: "Task") -> str:
         return label
     logger.warning(
         "[FAILURE_CLASS] Unknown agent failure_category=%r on task %s; falling back to classify_failure",
-        raw, getattr(task, "id", "?"),
+        raw,
+        getattr(task, "id", "?"),
     )
     return classify_failure(task)
 
@@ -560,19 +597,38 @@ def _timeout_subtype_from_message(combined: str) -> str:
 
     if stripped.startswith("cancelled:") or "superseded" in combined:
         return TIMEOUT_CASCADE
-    if any(kw in combined for kw in ("iteration cap", "review not spawned",
-                                     "fix not spawned", "review-fix cap reached",
-                                     "review-fix cycle limit",
-                                     "ci wait exceeded", "ci wait timed out")):
+    if any(
+        kw in combined
+        for kw in (
+            "iteration cap",
+            "review not spawned",
+            "fix not spawned",
+            "review-fix cap reached",
+            "review-fix cycle limit",
+            "ci wait exceeded",
+            "ci wait timed out",
+        )
+    ):
         return TIMEOUT_ITERATION_LIMIT
-    if any(kw in combined for kw in ("out of memory", "oom-kill", "memory limit",
-                                     "cannot allocate", "cgroup",
-                                     "exit code 137", "oom killer")):
+    if any(
+        kw in combined
+        for kw in (
+            "out of memory",
+            "oom-kill",
+            "memory limit",
+            "cannot allocate",
+            "cgroup",
+            "exit code 137",
+            "oom killer",
+        )
+    ):
         return TIMEOUT_OOM
     if any(kw in combined for kw in ("no heartbeat", "reaped", "never started")):
         return TIMEOUT_HEARTBEAT_LOST
-    if any(kw in combined for kw in ("[fatal:", "fatal error", "process crashed",
-                                     "node process killed")):
+    if any(
+        kw in combined
+        for kw in ("[fatal:", "fatal error", "process crashed", "node process killed")
+    ):
         return TIMEOUT_PROCESS_CRASH
     if any(kw in combined for kw in ("execution timed out", "sigterm")):
         return TIMEOUT_EXECUTION
@@ -605,57 +661,98 @@ def _external_api_subtype_from_message(combined: str) -> str:
 
     # Database connectivity — checked first because psycopg/asyncpg errors can
     # contain generic "connection" substrings that would otherwise match network_transient.
-    if any(kw in combined for kw in (
-        "could not connect to server", "connection to server",
-        "database connection", "psycopg", "asyncpg",
-        "operator does not exist",
-    )):
+    if any(
+        kw in combined
+        for kw in (
+            "could not connect to server",
+            "connection to server",
+            "database connection",
+            "psycopg",
+            "asyncpg",
+            "operator does not exist",
+        )
+    ):
         return EXTERNAL_API_SUBTYPE_DB_CONNECTIVITY
 
     if _provider_model_config_rejection(combined):
         return EXTERNAL_API_SUBTYPE_PROVIDER_MODEL_CONFIG
 
     # Provider auth — token/credential failures from any upstream API.
-    if any(kw in combined for kw in (
-        "401", "unauthorized", "bad credentials",
-        "token expired", "token invalid", "token revoked",
-        "authentication failed", "invalid api key",
-    )):
+    if any(
+        kw in combined
+        for kw in (
+            "401",
+            "unauthorized",
+            "bad credentials",
+            "token expired",
+            "token invalid",
+            "token revoked",
+            "authentication failed",
+            "invalid api key",
+        )
+    ):
         return EXTERNAL_API_SUBTYPE_PROVIDER_AUTH
 
     # GitHub PR creation / merge-block failures.
-    if ("failed to create" in combined and "branch" in combined) or \
-       any(kw in combined for kw in (
-           "failed to create pull request", "rollup pr creation failed",
-           "merge blocked", "merge attempt", "merge conflicts",
-           "merge failed", "merge hard-cap", "merge hard cap",
-           "merge check failed", "not mergeable",
-           "repository rule", "rule violations",
-           "required status check", "branch protection",
-       )):
+    if ("failed to create" in combined and "branch" in combined) or any(
+        kw in combined
+        for kw in (
+            "failed to create pull request",
+            "rollup pr creation failed",
+            "merge blocked",
+            "merge attempt",
+            "merge conflicts",
+            "merge failed",
+            "merge hard-cap",
+            "merge hard cap",
+            "merge check failed",
+            "not mergeable",
+            "repository rule",
+            "rule violations",
+            "required status check",
+            "branch protection",
+        )
+    ):
         return EXTERNAL_API_SUBTYPE_GITHUB_PR_CREATE
 
     # GitHub rate limits.
-    if any(gh_kw in combined for gh_kw in ("github", "api.github.com")) and \
-       any(kw in combined for kw in ("rate limit", "429", "too many requests")):
+    if any(gh_kw in combined for gh_kw in ("github", "api.github.com")) and any(
+        kw in combined for kw in ("rate limit", "429", "too many requests")
+    ):
         return EXTERNAL_API_SUBTYPE_PROVIDER_QUOTA
 
     # Provider quota / rate exhaustion / capacity (non-auth upstream limits).
-    if any(kw in combined for kw in (
-        "overloaded", "rate limit", "429", "too many requests",
-        "context_length_exceeded", "token limit exceeded",
-        "quota exceeded", "resource exhausted",
-    )):
+    if any(
+        kw in combined
+        for kw in (
+            "overloaded",
+            "rate limit",
+            "429",
+            "too many requests",
+            "context_length_exceeded",
+            "token limit exceeded",
+            "quota exceeded",
+            "resource exhausted",
+        )
+    ):
         return EXTERNAL_API_SUBTYPE_PROVIDER_QUOTA
 
     # Transient network / TLS / DNS errors.
-    if any(kw in combined for kw in (
-        "connection timed out", "name resolution failed",
-        "ssl", "certificate",
-        "could not resolve hostname", "name or service not known",
-        "network unreachable",
-        "500 internal server error", "502 bad gateway", "503 service unavailable",
-    )):
+    if any(
+        kw in combined
+        for kw in (
+            "connection timed out",
+            "name resolution failed",
+            "ssl",
+            "certificate",
+            "could not resolve hostname",
+            "name or service not known",
+            "network unreachable",
+            "500 internal server error",
+            "502 bad gateway",
+            "503 service unavailable",
+        )
+    ):
         return EXTERNAL_API_SUBTYPE_NETWORK_TRANSIENT
 
     return EXTERNAL_API_SUBTYPE_OTHER
@@ -697,16 +794,16 @@ def _reactivate_residual_case(fingerprint: str) -> None:
 _account_failure_log: dict[str, list[tuple[str, float | None, float]]] = {}
 
 _RE_UUID = re.compile(
-    r'\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b',
+    r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
     re.IGNORECASE,
 )
-_RE_HEX = re.compile(r'\b[0-9a-f]{7,40}\b', re.IGNORECASE)
+_RE_HEX = re.compile(r"\b[0-9a-f]{7,40}\b", re.IGNORECASE)
 # Accept decimal memory readings ([10.5mb], [10.5MB cg:512.4MB]) — the old
 # integer-only prefix regex let decimal variants slip through as distinct
 # fingerprints, creating one "residual CODE_ERROR" per memory reading.
 _RE_MEM_PREFIX = re.compile(
-    r'^\s*\[\d+(?:\.\d+)?\s*(?:mb|gb|kb|b)'
-    r'(?:\s+cg:\d+(?:\.\d+)?\s*(?:mb|gb|kb|b))?\]\s*',
+    r"^\s*\[\d+(?:\.\d+)?\s*(?:mb|gb|kb|b)"
+    r"(?:\s+cg:\d+(?:\.\d+)?\s*(?:mb|gb|kb|b))?\]\s*",
     re.IGNORECASE,
 )
 # Generic size/duration tokens with unit adjacency — these don't hit word
@@ -714,10 +811,10 @@ _RE_MEM_PREFIX = re.compile(
 # before numbering so "10.5mb" and "10.4mb" collapse together rather than
 # leaving stray "5mb"/"4mb" differentiators.
 _RE_SIZE_TOKEN = re.compile(
-    r'\b\d+(?:\.\d+)?\s*(?:gib|mib|kib|gb|mb|kb|bytes?|b|ms|s)\b',
+    r"\b\d+(?:\.\d+)?\s*(?:gib|mib|kib|gb|mb|kb|bytes?|b|ms|s)\b",
     re.IGNORECASE,
 )
-_RE_NUM = re.compile(r'\b\d+\b')
+_RE_NUM = re.compile(r"\b\d+\b")
 
 
 # Structural patterns that mark a LINE as error-shaped. Each must match
@@ -733,28 +830,28 @@ _RE_NUM = re.compile(r'\b\d+\b')
 # out and structured-data lines (JSON objects starting with ``{``) out.
 _ERROR_LINE_PATTERNS: tuple[re.Pattern[str], ...] = (
     # Bracketed log-level prefix: [ERROR], [FATAL]
-    re.compile(r'^\s*\[(error|fatal)\]', re.I),
+    re.compile(r"^\s*\[(error|fatal)\]", re.I),
     # ``Error:`` / ``FAIL:`` / ``FAILED:`` at line start
-    re.compile(r'^\s*(error|fail(ed)?)\s*:', re.I),
+    re.compile(r"^\s*(error|fail(ed)?)\s*:", re.I),
     # Python tracebacks always start with this
-    re.compile(r'^\s*traceback\b', re.I),
+    re.compile(r"^\s*traceback\b", re.I),
     # Filesystem / lookup negatives at line start
-    re.compile(r'^\s*(no such|cannot)\s', re.I),
+    re.compile(r"^\s*(no such|cannot)\s", re.I),
     # Python exception classes at line start (optionally preceded by
     # ``raise``), followed by ``:`` or ``(`` to require structural
     # error-log shape rather than just a word mention.
     re.compile(
-        r'^\s*(?:raise\s+)?('
-        r'AssertionError|TypeError|ValueError|KeyError|AttributeError|'
-        r'NameError|IndexError|RuntimeError|ImportError|ModuleNotFoundError|'
-        r'FileNotFoundError|PermissionError|ConnectionError|HTTPError|'
-        r'IntegrityError|NotImplementedError|StopIteration|MemoryError|'
-        r'RecursionError|SystemError|OSError|IOError|LookupError|'
-        r'ArithmeticError|OverflowError|ZeroDivisionError|ReferenceError|'
-        r'UnicodeError|UnicodeDecodeError|UnicodeEncodeError|EOFError|'
-        r'UnboundLocalError|SyntaxError|IndentationError|EnvironmentError|'
-        r'Exception'
-        r')\s*[:(]',
+        r"^\s*(?:raise\s+)?("
+        r"AssertionError|TypeError|ValueError|KeyError|AttributeError|"
+        r"NameError|IndexError|RuntimeError|ImportError|ModuleNotFoundError|"
+        r"FileNotFoundError|PermissionError|ConnectionError|HTTPError|"
+        r"IntegrityError|NotImplementedError|StopIteration|MemoryError|"
+        r"RecursionError|SystemError|OSError|IOError|LookupError|"
+        r"ArithmeticError|OverflowError|ZeroDivisionError|ReferenceError|"
+        r"UnicodeError|UnicodeDecodeError|UnicodeEncodeError|EOFError|"
+        r"UnboundLocalError|SyntaxError|IndentationError|EnvironmentError|"
+        r"Exception"
+        r")\s*[:(]",
     ),
 )
 
@@ -770,7 +867,7 @@ def _looks_like_error(text: str) -> bool:
     if not text:
         return False
     s = text.strip()
-    if not s or s[0] == '{':
+    if not s or s[0] == "{":
         return False
     return any(p.search(s) for p in _ERROR_LINE_PATTERNS)
 
@@ -787,14 +884,14 @@ def _extract_error_signature(logs: str | None) -> str:
     inputs).
     """
     if not logs:
-        return ''
+        return ""
     for line in logs.splitlines():
         stripped = line.strip()
         if not stripped:
             continue
         if _looks_like_error(stripped):
             return stripped[:500]
-    return ''
+    return ""
 
 
 def _fingerprint_message(msg: str) -> str:
@@ -806,12 +903,12 @@ def _fingerprint_message(msg: str) -> str:
     single fingerprint instead of spawning redundant remediations.
     """
     s = (msg or "").lower().strip()
-    s = _RE_MEM_PREFIX.sub('', s)
-    s = _RE_SIZE_TOKEN.sub('<size>', s)
-    s = _RE_UUID.sub('<id>', s)
-    s = _RE_HEX.sub('<hash>', s)
-    s = _RE_NUM.sub('<n>', s)
-    s = re.sub(r'\s+', ' ', s).strip()
+    s = _RE_MEM_PREFIX.sub("", s)
+    s = _RE_SIZE_TOKEN.sub("<size>", s)
+    s = _RE_UUID.sub("<id>", s)
+    s = _RE_HEX.sub("<hash>", s)
+    s = _RE_NUM.sub("<n>", s)
+    s = re.sub(r"\s+", " ", s).strip()
     return s[:200]
 
 
@@ -849,10 +946,11 @@ def record_residual_fingerprint(task: "Task", logs: str | None = None) -> None:
     """
     # Gate 1: only FAILED tasks contribute residual fingerprints.
     from app.models import TaskStatus
-    task_status = getattr(task, 'status', None)
+
+    task_status = getattr(task, "status", None)
     if task_status != TaskStatus.FAILED:
         return
-    task_id = str(getattr(task, 'id', '') or '')
+    task_id = str(getattr(task, "id", "") or "")
     if not task_id or task_id in _residual_seen_task_ids:
         return
     # Gate 2: must have an error-shaped line in logs. No status_msg fallback.
@@ -862,13 +960,13 @@ def record_residual_fingerprint(task: "Task", logs: str | None = None) -> None:
     # Both gates passed — claim the dedup slot now.
     if len(_residual_seen_task_ids) < _RESIDUAL_SEEN_MAX:
         _residual_seen_task_ids.add(task_id)
-    status_msg = task.latest_status_message or ''
+    status_msg = task.latest_status_message or ""
     fingerprint_source = err_line
     # Always error-shaped at this point (Gate 2 guarantees err_line is
     # non-empty + structurally matched). Field retained for backward
     # compat with autonomous_research's threshold gate; it now no-ops.
     is_error_shaped = True
-    fp = _fingerprint_message(fingerprint_source) or '<empty>'
+    fp = _fingerprint_message(fingerprint_source) or "<empty>"
     now = time.time()
     trimmed_sample = fingerprint_source[:500]
     trimmed_status = status_msg[:500]
@@ -877,52 +975,54 @@ def record_residual_fingerprint(task: "Task", logs: str | None = None) -> None:
 
     if fp in _residual_store:
         entry = _residual_store[fp]
-        entry['count'] += 1
-        entry['last_seen'] = now
+        entry["count"] += 1
+        entry["last_seen"] = now
         # Sticky-true: a cluster counts as error-shaped if any
         # contribution had error-shaped logs/status. Once true, keep
         # true so later heartbeat-only contributions don't downgrade
         # the cluster's threshold.
         if is_error_shaped:
-            entry['is_error_shaped'] = True
-        if task_id not in entry['task_ids'] and len(entry['task_ids']) < 5:
-            entry['task_ids'].append(task_id)
+            entry["is_error_shaped"] = True
+        if task_id not in entry["task_ids"] and len(entry["task_ids"]) < 5:
+            entry["task_ids"].append(task_id)
         # Accumulate distinct samples across tasks that share this
         # fingerprint. The fingerprint is a normalized clustering key —
         # individual task error lines can still vary (line numbers,
         # param values, adjacent context) and each variation is useful
         # signal for the remediation agent. Cap at 5 distinct entries.
-        samples = entry.setdefault('sample_messages', [entry.get('sample_message', '')])
+        samples = entry.setdefault("sample_messages", [entry.get("sample_message", "")])
         if trimmed_sample and trimmed_sample not in samples and len(samples) < 5:
             samples.append(trimmed_sample)
-        statuses = entry.setdefault('sample_statuses', [entry.get('sample_status', '')])
+        statuses = entry.setdefault("sample_statuses", [entry.get("sample_status", "")])
         if trimmed_status and trimmed_status not in statuses and len(statuses) < 5:
             statuses.append(trimmed_status)
     else:
         if len(_residual_store) >= _RESIDUAL_MAX_FINGERPRINTS:
-            oldest = min(_residual_store, key=lambda k: _residual_store[k]['last_seen'])
+            oldest = min(_residual_store, key=lambda k: _residual_store[k]["last_seen"])
             del _residual_store[oldest]
         _residual_store[fp] = {
-            'count': 1,
-            'first_seen': now,
-            'last_seen': now,
-            'is_error_shaped': is_error_shaped,
+            "count": 1,
+            "first_seen": now,
+            "last_seen": now,
+            "is_error_shaped": is_error_shaped,
             # First/primary samples — kept for backward-compat with code
             # that reads `sample_message`/`sample_status`.
-            'sample_message': trimmed_sample,
-            'sample_status': trimmed_status,
+            "sample_message": trimmed_sample,
+            "sample_status": trimmed_status,
             # Distinct-sample lists (up to 5 each) built as additional
             # tasks hit this fingerprint. Richer context for remediation.
-            'sample_messages': [trimmed_sample] if trimmed_sample else [],
-            'sample_statuses': [trimmed_status] if trimmed_status else [],
-            'task_ids': [task_id],
+            "sample_messages": [trimmed_sample] if trimmed_sample else [],
+            "sample_statuses": [trimmed_status] if trimmed_status else [],
+            "task_ids": [task_id],
         }
 
     # Persist to DB for durability across restarts.
-    project_id = getattr(task, 'project_id', None)
+    project_id = getattr(task, "project_id", None)
     if project_id is not None:
         now_dt = datetime.fromtimestamp(now, tz=timezone.utc)
-        _schedule_residual_db_upsert(project_id, fp, now_dt, trimmed_sample or trimmed_status)
+        _schedule_residual_db_upsert(
+            project_id, fp, now_dt, trimmed_sample or trimmed_status
+        )
 
 
 async def _upsert_residual_case_async(
@@ -983,12 +1083,14 @@ async def _upsert_residual_case_async(
         # If the SELECT returned nothing, distinguish "row doesn't exist" from
         # "row held under skip_locked" with a non-locking probe.
         if existing is None:
-            probe = (await session.execute(
-                select(ResidualRemediationCase.id).where(
-                    ResidualRemediationCase.project_id == project_id,
-                    ResidualRemediationCase.fingerprint == fingerprint,
+            probe = (
+                await session.execute(
+                    select(ResidualRemediationCase.id).where(
+                        ResidualRemediationCase.project_id == project_id,
+                        ResidualRemediationCase.fingerprint == fingerprint,
+                    )
                 )
-            )).first()
+            ).first()
             if probe is not None:
                 # Row exists but is held — skip this upsert; next hit will retry.
                 logger.info(
@@ -997,15 +1099,17 @@ async def _upsert_residual_case_async(
                 )
                 return False
             # Genuinely missing — INSERT.
-            session.add(ResidualRemediationCase(
-                project_id=project_id,
-                fingerprint=fingerprint,
-                status=ResidualCaseStatus.ACTIVE,
-                first_seen_at=now_dt,
-                last_seen_at=now_dt,
-                hit_count=1,
-                sample_message=sample_message or None,
-            ))
+            session.add(
+                ResidualRemediationCase(
+                    project_id=project_id,
+                    fingerprint=fingerprint,
+                    status=ResidualCaseStatus.ACTIVE,
+                    first_seen_at=now_dt,
+                    last_seen_at=now_dt,
+                    hit_count=1,
+                    sample_message=sample_message or None,
+                )
+            )
             return True
         await _atomic_increment(
             session,
@@ -1035,13 +1139,15 @@ async def _upsert_residual_case_async(
                         await _atomic_increment(
                             session,
                             existing.id,
-                            reopen=existing.status == ResidualCaseStatus.CLOSED_ORGANICALLY,
+                            reopen=existing.status
+                            == ResidualCaseStatus.CLOSED_ORGANICALLY,
                         )
                     # If still None here, the contending writer is mid-INSERT;
                     # leave it — they'll commit and our next hit will see it.
     except Exception:
         logger.exception(
-            "[FAILURE_CLASS] Residual case DB upsert failed (fingerprint=%r)", fingerprint
+            "[FAILURE_CLASS] Residual case DB upsert failed (fingerprint=%r)",
+            fingerprint,
         )
 
 
@@ -1053,6 +1159,7 @@ def _schedule_residual_db_upsert(
 ) -> None:
     """Schedule a fire-and-forget DB upsert when an event loop is running."""
     import asyncio
+
     try:
         loop = asyncio.get_running_loop()
         loop.create_task(
@@ -1062,7 +1169,9 @@ def _schedule_residual_db_upsert(
         pass  # No running loop (e.g. tests); in-memory store is the only path
 
 
-def get_top_residual_fingerprints(window_seconds: int = 86400, top_n: int = 10) -> list[dict]:
+def get_top_residual_fingerprints(
+    window_seconds: int = 86400, top_n: int = 10
+) -> list[dict]:
     """Return the top-N residual CODE_ERROR fingerprints within the time window.
 
     Each result dict contains: fingerprint, count, last_seen (epoch float),
@@ -1073,21 +1182,22 @@ def get_top_residual_fingerprints(window_seconds: int = 86400, top_n: int = 10) 
     cutoff = time.time() - window_seconds
     results = [
         {
-            'fingerprint': fp,
-            'count': entry['count'],
-            'last_seen': entry['last_seen'],
-            'is_error_shaped': entry.get('is_error_shaped', True),
-            'sample_message': entry['sample_message'],
-            'sample_status': entry.get('sample_status', ''),
-            'sample_messages': entry.get('sample_messages', [entry['sample_message']]),
-            'sample_statuses': entry.get('sample_statuses', [entry.get('sample_status', '')]),
-            'task_ids': entry['task_ids'],
+            "fingerprint": fp,
+            "count": entry["count"],
+            "last_seen": entry["last_seen"],
+            "is_error_shaped": entry.get("is_error_shaped", True),
+            "sample_message": entry["sample_message"],
+            "sample_status": entry.get("sample_status", ""),
+            "sample_messages": entry.get("sample_messages", [entry["sample_message"]]),
+            "sample_statuses": entry.get(
+                "sample_statuses", [entry.get("sample_status", "")]
+            ),
+            "task_ids": entry["task_ids"],
         }
         for fp, entry in _residual_store.items()
-        if entry['last_seen'] >= cutoff
-        and fp not in _residual_closed_fingerprints
+        if entry["last_seen"] >= cutoff and fp not in _residual_closed_fingerprints
     ]
-    results.sort(key=lambda x: x['count'], reverse=True)
+    results.sort(key=lambda x: x["count"], reverse=True)
     return results[:top_n]
 
 
@@ -1116,20 +1226,30 @@ def get_account_failure_class_records(
     return [rec for rec in records if rec[2] >= cutoff]
 
 
-def get_account_failure_class_counts(account_id: str, window_seconds: int = 86400) -> dict[str, int]:
+def get_account_failure_class_counts(
+    account_id: str, window_seconds: int = 86400
+) -> dict[str, int]:
     """Return per-failure-class counts for an account within the time window."""
-    records = get_account_failure_class_records(account_id, window_seconds=window_seconds)
+    records = get_account_failure_class_records(
+        account_id, window_seconds=window_seconds
+    )
     return {
-        cls: sum(1 for failure_class, _confidence, _ts in records if failure_class == cls)
+        cls: sum(
+            1 for failure_class, _confidence, _ts in records if failure_class == cls
+        )
         for cls in ALL_FAILURE_CLASSES
     }
 
 
-def classify_failure_with_confidence(task: "Task", logs: str | None = None) -> FailureClassification:
+def classify_failure_with_confidence(
+    task: "Task", logs: str | None = None
+) -> FailureClassification:
     """Classify a failure and return a cheap rule-derived confidence score."""
     failure_class = _classify_failure_class(task, logs)
     agent_category = (task.context or {}).get("failure_category")
-    combined = ((task.latest_status_message or "").lower() + " " + (logs or "").lower()).strip()
+    combined = (
+        (task.latest_status_message or "").lower() + " " + (logs or "").lower()
+    ).strip()
     combined_lower = combined.lower()
     if agent_category:
         return FailureClassification(failure_class=failure_class, confidence=0.9)
@@ -1149,15 +1269,29 @@ def classify_failure_with_confidence(task: "Task", logs: str | None = None) -> F
     if failure_class == PROVISION_FAILURE and _PROVISION_PHRASE_RE.search(combined):
         return FailureClassification(failure_class=failure_class, confidence=0.8)
     if failure_class == EXTERNAL_API:
-        if any(kw in combined_lower for kw in (
-            "could not connect to server", "connection to server", "database connection",
-            "psycopg", "asyncpg", "operator does not exist",
-        )):
+        if any(
+            kw in combined_lower
+            for kw in (
+                "could not connect to server",
+                "connection to server",
+                "database connection",
+                "psycopg",
+                "asyncpg",
+                "operator does not exist",
+            )
+        ):
             return FailureClassification(failure_class=failure_class, confidence=0.8)
         if _provider_model_config_rejection(combined_lower):
             return FailureClassification(failure_class=failure_class, confidence=0.8)
     if failure_class == AGENT_TIMEOUT and any(
-        kw in combined_lower for kw in ("no heartbeat", "reaped", "never started", "cancelled:", "superseded")
+        kw in combined_lower
+        for kw in (
+            "no heartbeat",
+            "reaped",
+            "never started",
+            "cancelled:",
+            "superseded",
+        )
     ):
         return FailureClassification(failure_class=failure_class, confidence=0.7)
     if failure_class == BLOCKED_PRECONDITION:
@@ -1186,14 +1320,18 @@ def _classify_failure_class(task: "Task", logs: str | None = None) -> str:
     # Fast path: agent already reported a structured category — prefer it over regex.
     # Accept both the legacy lowercase labels (pre-normalization writes) and the
     # canonical uppercase names written by normalize_agent_failure_category().
-    agent_category = (task.context or {}).get('failure_category')
+    agent_category = (task.context or {}).get("failure_category")
     if agent_category:
         agent_label = str(agent_category).strip()
         agent_lower = agent_label.lower()
         if agent_lower in _AGENT_CATEGORY_TO_CLASS:
             mapped = _AGENT_CATEGORY_TO_CLASS[agent_lower]
             if mapped == CODE_ERROR and agent_lower in _GENERIC_AGENT_CODE_LABELS:
-                combined = (task.latest_status_message or "").lower() + " " + (logs or "").lower()
+                combined = (
+                    (task.latest_status_message or "").lower()
+                    + " "
+                    + (logs or "").lower()
+                )
                 override = _text_provider_failure_override(task, combined)
                 if override:
                     return override
@@ -1228,9 +1366,17 @@ def _classify_failure_class(task: "Task", logs: str | None = None) -> str:
     # Database / internal service unavailable — checked before provision failures because
     # PostgreSQL errors like "could not connect to server: Connection refused" contain
     # "connection refused" which would otherwise be misclassified as PROVISION_FAILURE.
-    if any(kw in combined for kw in ["could not connect to server", "connection to server",
-                                      "database connection", "psycopg", "asyncpg",
-                                      "operator does not exist"]):
+    if any(
+        kw in combined
+        for kw in [
+            "could not connect to server",
+            "connection to server",
+            "database connection",
+            "psycopg",
+            "asyncpg",
+            "operator does not exist",
+        ]
+    ):
         return "EXTERNAL_API"
 
     # Provision failures — GCP quota, network, VM startup issues, SSH/init script errors, disk exhaustion.
@@ -1249,16 +1395,25 @@ def _classify_failure_class(task: "Task", logs: str | None = None) -> str:
     # for actual provisioning-quota errors; LLM-provider quota errors
     # fall through to the rate-limit signal detection below.
     if _PROVISION_PHRASE_RE.search(combined) or any(
-        kw in combined for kw in [
-            "cpus_all_regions", "in_use_addresses",
+        kw in combined
+        for kw in [
+            "cpus_all_regions",
+            "in_use_addresses",
             "vm failed to start",
-            "connection refused", "connection reset by peer",
-            "timed out waiting for operation", "sshd", "startup script",
-            "no space left on device", "disk quota exceeded",
+            "connection refused",
+            "connection reset by peer",
+            "timed out waiting for operation",
+            "sshd",
+            "startup script",
+            "no space left on device",
+            "disk quota exceeded",
             "filesystem is full",
-            "address already in use", "failed to connect",
-            "service is temporarily unavailable", "compute.googleapis.com",
-            "resource not found", "container killed",
+            "address already in use",
+            "failed to connect",
+            "service is temporarily unavailable",
+            "compute.googleapis.com",
+            "resource not found",
+            "container killed",
         ]
     ):
         return PROVISION_FAILURE
@@ -1272,8 +1427,9 @@ def _classify_failure_class(task: "Task", logs: str | None = None) -> str:
     # RATE_LIMIT_PATTERNS is now specific enough that a plain "API rate limit
     # exceeded" from GitHub can't match it, but we still route GitHub errors to
     # EXTERNAL_API so they don't fall through to CODE_ERROR.
-    if any(gh_kw in combined for gh_kw in ["github", "api.github.com"]) and \
-       any(kw in combined for kw in ["rate limit", "429", "too many requests"]):
+    if any(gh_kw in combined for gh_kw in ["github", "api.github.com"]) and any(
+        kw in combined for kw in ["rate limit", "429", "too many requests"]
+    ):
         return "EXTERNAL_API"
 
     # Claude API rate limit — exact Claude Code / Anthropic API error strings only.
@@ -1298,28 +1454,52 @@ def _classify_failure_class(task: "Task", logs: str | None = None) -> str:
     #   "Rate limited — requeued, waiting for account cooldown"
     #   "All accounts rate-limited — waiting for cooldown"
     #   "Auto-failed after N retry_after cycles; Pool state: all accounts in rate-limit cooldown"
-    if any(rl in combined for rl in ("rate limited", "rate-limit")) and \
-            any(pl in combined for pl in ("requeued", "cooldown")):
+    if any(rl in combined for rl in ("rate limited", "rate-limit")) and any(
+        pl in combined for pl in ("requeued", "cooldown")
+    ):
         return RATE_LIMIT
 
     # Workflow limits — iteration caps, spawn failures due to pipeline state (not code errors).
     # Checked before merge-blocking EXTERNAL_API so a message like "merge blocked, fix not spawned
     # (iteration cap)" is correctly classified as AGENT_TIMEOUT rather than EXTERNAL_API.
-    if any(kw in combined for kw in ["iteration cap", "review not spawned", "fix not spawned",
-                                      "review-fix cap reached", "review-fix cycle limit",
-                                      "ci wait exceeded", "ci wait timed out", "ci in progress",
-                                      "stuck in ci-wait",
-                                      "backstop timeout", "evaluation timeout"]):
+    if any(
+        kw in combined
+        for kw in [
+            "iteration cap",
+            "review not spawned",
+            "fix not spawned",
+            "review-fix cap reached",
+            "review-fix cycle limit",
+            "ci wait exceeded",
+            "ci wait timed out",
+            "ci in progress",
+            "stuck in ci-wait",
+            "backstop timeout",
+            "evaluation timeout",
+        ]
+    ):
         return "AGENT_TIMEOUT"
 
     # Merge-blocking GitHub responses — branch protection, rule violations, not-mergeable states.
     # These are GitHub operation blocks, not agent code defects.
-    if any(kw in combined for kw in ["merge blocked", "merge attempt", "merge conflicts",
-                                      "merge failed", "merge hard-cap", "merge hard cap",
-                                      "merge check failed", "not mergeable",
-                                      "repository rule", "rule violations",
-                                      "required status check", "branch protection",
-                                      "closed without merging"]):
+    if any(
+        kw in combined
+        for kw in [
+            "merge blocked",
+            "merge attempt",
+            "merge conflicts",
+            "merge failed",
+            "merge hard-cap",
+            "merge hard cap",
+            "merge check failed",
+            "not mergeable",
+            "repository rule",
+            "rule violations",
+            "required status check",
+            "branch protection",
+            "closed without merging",
+        ]
+    ):
         return "EXTERNAL_API"
 
     # External API failures — GitHub, Claude API outages, DNS/TLS/network errors.
@@ -1333,21 +1513,36 @@ def _classify_failure_class(task: "Task", logs: str | None = None) -> str:
     # incompatibility lands before the gate list is updated.
     if _provider_model_config_rejection(combined):
         return "EXTERNAL_API"
-    if ("failed to create" in combined and "branch" in combined) or \
-       any(kw in combined for kw in ["api.github.com", "api.anthropic.com",
-                                      "500 internal server error",
-                                      "502 bad gateway", "503 service unavailable",
-                                      "github api error", "claude api",
-                                      "connection timed out", "name resolution failed",
-                                      "ssl", "certificate",
-                                      "context_length_exceeded", "token limit exceeded",
-                                      "could not resolve hostname", "name or service not known",
-                                      "network unreachable",
-                                      "failed to create pull request",
-                                      "rollup pr creation failed",
-                                      "staging branch",
-                                      "401", "unauthorized", "bad credentials",
-                                      "token expired", "token invalid", "token revoked"]):
+    if ("failed to create" in combined and "branch" in combined) or any(
+        kw in combined
+        for kw in [
+            "api.github.com",
+            "api.anthropic.com",
+            "500 internal server error",
+            "502 bad gateway",
+            "503 service unavailable",
+            "github api error",
+            "claude api",
+            "connection timed out",
+            "name resolution failed",
+            "ssl",
+            "certificate",
+            "context_length_exceeded",
+            "token limit exceeded",
+            "could not resolve hostname",
+            "name or service not known",
+            "network unreachable",
+            "failed to create pull request",
+            "rollup pr creation failed",
+            "staging branch",
+            "401",
+            "unauthorized",
+            "bad credentials",
+            "token expired",
+            "token invalid",
+            "token revoked",
+        ]
+    ):
         return "EXTERNAL_API"
 
     # Agent timeout — reaped by heartbeat, execution timeout, process killed by OS/orchestrator, OOM.
@@ -1360,22 +1555,40 @@ def _classify_failure_class(task: "Task", logs: str | None = None) -> str:
     # "using tool: " is the agent's heartbeat during a Claude Code tool call (Grep, Read, Edit, etc.).
     # Tasks reaped mid-tool-call (VM kill, network drop, OOM of the Claude subprocess) leave this
     # as latest_status_message; they are infrastructure deaths, not code defects.
-    if any(kw in combined for kw in ["no heartbeat", "reaped", "never started",
-                                      "execution timed out", "sigterm",
-                                      "out of memory", "oom-kill", "memory limit exceeded",
-                                      "cannot allocate memory",
-                                      "exit code 137", "exit code 143",
-                                      "exit code 124", "exit code 139",
-                                      "node process killed",
-                                      "oom killer", "killed by", "cgroup",
-                                      "[fatal:", "fatal error", "process crashed",
-                                      "creating pull request for blueprint/",
-                                      "using tool: "]):
+    if any(
+        kw in combined
+        for kw in [
+            "no heartbeat",
+            "reaped",
+            "never started",
+            "execution timed out",
+            "sigterm",
+            "out of memory",
+            "oom-kill",
+            "memory limit exceeded",
+            "cannot allocate memory",
+            "exit code 137",
+            "exit code 143",
+            "exit code 124",
+            "exit code 139",
+            "node process killed",
+            "oom killer",
+            "killed by",
+            "cgroup",
+            "[fatal:",
+            "fatal error",
+            "process crashed",
+            "creating pull request for blueprint/",
+            "using tool: ",
+        ]
+    ):
         return "AGENT_TIMEOUT"
 
     # Orchestration constraints — dependency waits are not code defects
-    if any(kw in combined for kw in ["waiting on", "dependencies cleared",
-                                      "serializing migration"]):
+    if any(
+        kw in combined
+        for kw in ["waiting on", "dependencies cleared", "serializing migration"]
+    ):
         return "AGENT_TIMEOUT"
 
     # Cascade cancellations — any task cancelled by the orchestrator/services is an infrastructure
@@ -1405,6 +1618,7 @@ def classify_failure(task: "Task", logs: str | None = None) -> str:
 # ---------------------------------------------------------------------------
 # Close-loop verification for RegressionRemediationCase
 # ---------------------------------------------------------------------------
+
 
 async def _transition_regression_case_async(
     project_id,
@@ -1444,7 +1658,9 @@ async def _transition_regression_case_async(
                 if case is None:
                     return
                 if action == "merge":
-                    case.mark_merged(kwargs["pr_number"], kwargs.get("signal_snapshot") or {})
+                    case.mark_merged(
+                        kwargs["pr_number"], kwargs.get("signal_snapshot") or {}
+                    )
                 elif action == "recover":
                     case.mark_closed()
                 elif action == "rearm":
@@ -1453,7 +1669,8 @@ async def _transition_regression_case_async(
     except Exception:
         logger.exception(
             "[FAILURE_CLASS] Regression case transition failed (class=%r action=%s)",
-            regression_class, action,
+            regression_class,
+            action,
         )
 
 
@@ -1464,10 +1681,13 @@ def _schedule_regression_case_transition(
     **kwargs,
 ) -> None:
     import asyncio
+
     try:
         loop = asyncio.get_running_loop()
         loop.create_task(
-            _transition_regression_case_async(project_id, regression_class, action, **kwargs)
+            _transition_regression_case_async(
+                project_id, regression_class, action, **kwargs
+            )
         )
     except RuntimeError:
         pass  # No running event loop (e.g. sync tests); caller must await directly
@@ -1481,8 +1701,11 @@ def schedule_regression_close_loop_merge(
 ) -> None:
     """Fire-and-forget ACTIVE → MERGED after a remediation PR merges."""
     _schedule_regression_case_transition(
-        project_id, regression_class, "merge",
-        pr_number=pr_number, signal_snapshot=signal_snapshot or {},
+        project_id,
+        regression_class,
+        "merge",
+        pr_number=pr_number,
+        signal_snapshot=signal_snapshot or {},
     )
 
 

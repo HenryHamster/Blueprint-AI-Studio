@@ -6,6 +6,7 @@ Each config endpoint pair (GET/PATCH) reads and merges stored project config
 with module-level defaults, then persists partial updates back into
 ``Project.design_doc``.
 """
+
 import uuid
 import logging
 from typing import Dict, Any
@@ -28,39 +29,43 @@ logger = logging.getLogger(__name__)
 router = APIRouter(
     prefix="/api/admin",
     tags=["admin-project-config"],
-    dependencies=[Depends(get_current_user)]
+    dependencies=[Depends(get_current_user)],
 )
 
 
-@router.get('/cost-summary')
+@router.get("/cost-summary")
 async def cost_summary(
     session: AsyncSession = Depends(get_session),
     days: int = Query(7, ge=1, le=365),
     current_user: dict = Depends(require_admin),
 ):
     cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=days)
-    tasks = (await session.execute(
-        select(Task).where(Task.created_at >= cutoff)
-    )).scalars().all()
+    tasks = (
+        (await session.execute(select(Task).where(Task.created_at >= cutoff)))
+        .scalars()
+        .all()
+    )
 
     # e2-standard-2 pricing: ~$0.067/hr on-demand, ~$0.020/hr spot
     ON_DEMAND_RATE = 0.067 / 3600  # per second
     SPOT_RATE = 0.020 / 3600
 
-    by_type = defaultdict(lambda: {'count': 0, 'total_seconds': 0, 'estimated_cost': 0.0})
+    by_type = defaultdict(
+        lambda: {"count": 0, "total_seconds": 0, "estimated_cost": 0.0}
+    )
     for t in tasks:
         if t.vm_provisioned_at and t.vm_stopped_at:
             seconds = (t.vm_stopped_at - t.vm_provisioned_at).total_seconds()
             rate = SPOT_RATE if t.vm_spot else ON_DEMAND_RATE
-            task_type = t.first_payload.get('type', 'unknown')
-            by_type[task_type]['count'] += 1
-            by_type[task_type]['total_seconds'] += seconds
-            by_type[task_type]['estimated_cost'] += seconds * rate
+            task_type = t.first_payload.get("type", "unknown")
+            by_type[task_type]["count"] += 1
+            by_type[task_type]["total_seconds"] += seconds
+            by_type[task_type]["estimated_cost"] += seconds * rate
 
     return {
-        'period_days': days,
-        'by_task_type': dict(by_type),
-        'total_estimated_cost': sum(v['estimated_cost'] for v in by_type.values()),
+        "period_days": days,
+        "by_task_type": dict(by_type),
+        "total_estimated_cost": sum(v["estimated_cost"] for v in by_type.values()),
     }
 
 
@@ -85,7 +90,9 @@ async def get_auto_remediation_config(
     current_user: dict = Depends(get_current_user),
 ):
     """Return the current auto-remediation config and activity stats for a project."""
-    project = await _get_user_project_with_role(project_id, current_user["user_id"], session, "member")
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
     stored = (project.design_doc or {}).get("_auto_remediation", {})
     config = {**_AUTO_REMEDIATION_DEFAULTS, **stored}
 
@@ -94,23 +101,45 @@ async def get_auto_remediation_config(
     seven_days_ago = now - timedelta(days=7)
     twenty_four_hours_ago = now - timedelta(hours=24)
 
-    recent_rows = (await session.execute(
-        select(Task).where(
-            Task.project_id == project_id,
-            Task.created_at >= seven_days_ago,
-        ).options(
-            load_only(Task.id, Task.status, Task.title, Task.context, Task.created_at)
-        ).order_by(Task.created_at.desc())
-    )).scalars().all()
+    recent_rows = (
+        (
+            await session.execute(
+                select(Task)
+                .where(
+                    Task.project_id == project_id,
+                    Task.created_at >= seven_days_ago,
+                )
+                .options(
+                    load_only(
+                        Task.id, Task.status, Task.title, Task.context, Task.created_at
+                    )
+                )
+                .order_by(Task.created_at.desc())
+            )
+        )
+        .scalars()
+        .all()
+    )
 
-    auto_tasks = [t for t in recent_rows if (t.context or {}).get("auto_remediation") is True]
-    spawned_24h = sum(1 for t in auto_tasks if t.created_at and t.created_at >= twenty_four_hours_ago)
+    auto_tasks = [
+        t for t in recent_rows if (t.context or {}).get("auto_remediation") is True
+    ]
+    spawned_24h = sum(
+        1 for t in auto_tasks if t.created_at and t.created_at >= twenty_four_hours_ago
+    )
     spawned_7d = len(auto_tasks)
 
-    terminal = [t for t in auto_tasks if t.status in (TaskStatus.COMPLETED, TaskStatus.FAILED)]
+    terminal = [
+        t for t in auto_tasks if t.status in (TaskStatus.COMPLETED, TaskStatus.FAILED)
+    ]
     success_rate = (
-        round(sum(1 for t in terminal if t.status == TaskStatus.COMPLETED) / len(terminal) * 100)
-        if terminal else None
+        round(
+            sum(1 for t in terminal if t.status == TaskStatus.COMPLETED)
+            / len(terminal)
+            * 100
+        )
+        if terminal
+        else None
     )
 
     recent_tasks_data = [
@@ -144,13 +173,17 @@ async def update_auto_remediation_config(
     current_user: dict = Depends(get_current_user),
 ):
     """Update auto-remediation config fields (partial update)."""
-    project = await _get_user_project_with_role(project_id, current_user["user_id"], session, "owner")
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
 
     # Validate incoming fields
     allowed = set(_AUTO_REMEDIATION_DEFAULTS.keys())
     unknown = set(body.keys()) - allowed
     if unknown:
-        raise HTTPException(status_code=422, detail=f"Unknown config fields: {sorted(unknown)}")
+        raise HTTPException(
+            status_code=422, detail=f"Unknown config fields: {sorted(unknown)}"
+        )
 
     if "enabled" in body and not isinstance(body["enabled"], bool):
         raise HTTPException(status_code=422, detail="'enabled' must be a boolean")
@@ -158,25 +191,38 @@ async def update_auto_remediation_config(
     if "branch_whitelist" in body:
         bw = body["branch_whitelist"]
         if not isinstance(bw, list) or not all(isinstance(b, str) and b for b in bw):
-            raise HTTPException(status_code=422, detail="'branch_whitelist' must be a list of non-empty strings")
+            raise HTTPException(
+                status_code=422,
+                detail="'branch_whitelist' must be a list of non-empty strings",
+            )
 
     if "max_per_hour" in body:
         v = body["max_per_hour"]
         if not isinstance(v, int) or isinstance(v, bool) or not (1 <= v <= 10):
-            raise HTTPException(status_code=422, detail="'max_per_hour' must be an integer between 1 and 10")
+            raise HTTPException(
+                status_code=422,
+                detail="'max_per_hour' must be an integer between 1 and 10",
+            )
 
     if "max_concurrent" in body:
         v = body["max_concurrent"]
         if not isinstance(v, int) or isinstance(v, bool) or not (1 <= v <= 5):
-            raise HTTPException(status_code=422, detail="'max_concurrent' must be an integer between 1 and 5")
+            raise HTTPException(
+                status_code=422,
+                detail="'max_concurrent' must be an integer between 1 and 5",
+            )
 
     if "require_review" in body and not isinstance(body["require_review"], bool):
-        raise HTTPException(status_code=422, detail="'require_review' must be a boolean")
+        raise HTTPException(
+            status_code=422, detail="'require_review' must be a boolean"
+        )
 
     if "suspended_branches" in body:
         sb = body["suspended_branches"]
         if not isinstance(sb, list) or not all(isinstance(b, str) for b in sb):
-            raise HTTPException(status_code=422, detail="'suspended_branches' must be a list of strings")
+            raise HTTPException(
+                status_code=422, detail="'suspended_branches' must be a list of strings"
+            )
 
     # Merge into existing stored config
     design_doc = dict(project.design_doc or {})
@@ -213,7 +259,9 @@ async def get_issue_implementation_config(
     current_user: dict = Depends(get_current_user),
 ):
     """Return the current issue-implementation config for a project, merged with defaults."""
-    project = await _get_user_project_with_role(project_id, current_user["user_id"], session, "member")
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
     stored = (project.design_doc or {}).get("_issue_implementation", {})
     config = {**_ISSUE_IMPLEMENTATION_DEFAULTS, **stored}
     return {"project_id": str(project_id), "config": config}
@@ -227,13 +275,17 @@ async def update_issue_implementation_config(
     current_user: dict = Depends(get_current_user),
 ):
     """Update issue-implementation config fields (partial update)."""
-    project = await _get_user_project_with_role(project_id, current_user["user_id"], session, "owner")
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
 
     # Validate incoming fields
     allowed = set(_ISSUE_IMPLEMENTATION_DEFAULTS.keys())
     unknown = set(body.keys()) - allowed
     if unknown:
-        raise HTTPException(status_code=422, detail=f"Unknown config fields: {sorted(unknown)}")
+        raise HTTPException(
+            status_code=422, detail=f"Unknown config fields: {sorted(unknown)}"
+        )
 
     if "enabled" in body and not isinstance(body["enabled"], bool):
         raise HTTPException(status_code=422, detail="'enabled' must be a boolean")
@@ -241,27 +293,40 @@ async def update_issue_implementation_config(
     if "trigger_label" in body:
         v = body["trigger_label"]
         if not isinstance(v, str) or not v.strip():
-            raise HTTPException(status_code=422, detail="'trigger_label' must be a non-empty string")
+            raise HTTPException(
+                status_code=422, detail="'trigger_label' must be a non-empty string"
+            )
 
     if "max_per_hour" in body:
         v = body["max_per_hour"]
         if not isinstance(v, int) or isinstance(v, bool) or not (1 <= v <= 10):
-            raise HTTPException(status_code=422, detail="'max_per_hour' must be an integer between 1 and 10")
+            raise HTTPException(
+                status_code=422,
+                detail="'max_per_hour' must be an integer between 1 and 10",
+            )
 
     if "max_concurrent" in body:
         v = body["max_concurrent"]
         if not isinstance(v, int) or isinstance(v, bool) or not (1 <= v <= 5):
-            raise HTTPException(status_code=422, detail="'max_concurrent' must be an integer between 1 and 5")
+            raise HTTPException(
+                status_code=422,
+                detail="'max_concurrent' must be an integer between 1 and 5",
+            )
 
     if "base_branch" in body:
         v = body["base_branch"]
         if not isinstance(v, str) or not v.strip():
-            raise HTTPException(status_code=422, detail="'base_branch' must be a non-empty string")
+            raise HTTPException(
+                status_code=422, detail="'base_branch' must be a non-empty string"
+            )
 
     if "default_effort" in body:
         v = body["default_effort"]
         if not isinstance(v, str) or v not in ("low", "medium", "high"):
-            raise HTTPException(status_code=422, detail="'default_effort' must be one of: low, medium, high")
+            raise HTTPException(
+                status_code=422,
+                detail="'default_effort' must be one of: low, medium, high",
+            )
 
     # Merge into existing stored config
     design_doc = dict(project.design_doc or {})
@@ -295,7 +360,9 @@ async def get_auto_review_config(
     current_user: dict = Depends(get_current_user),
 ):
     """Return the current auto-review config for a project, merged with defaults."""
-    project = await _get_user_project_with_role(project_id, current_user["user_id"], session, "member")
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
     stored = (project.design_doc or {}).get("_auto_review", {})
     config = {**_AUTO_REVIEW_DEFAULTS, **stored}
     return {"project_id": str(project_id), "config": config}
@@ -309,13 +376,17 @@ async def update_auto_review_config(
     current_user: dict = Depends(get_current_user),
 ):
     """Update auto-review config fields (partial update)."""
-    project = await _get_user_project_with_role(project_id, current_user["user_id"], session, "owner")
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
 
     # Validate incoming fields
     allowed = set(_AUTO_REVIEW_DEFAULTS.keys())
     unknown = set(body.keys()) - allowed
     if unknown:
-        raise HTTPException(status_code=422, detail=f"Unknown config fields: {sorted(unknown)}")
+        raise HTTPException(
+            status_code=422, detail=f"Unknown config fields: {sorted(unknown)}"
+        )
 
     if "enabled" in body and not isinstance(body["enabled"], bool):
         raise HTTPException(status_code=422, detail="'enabled' must be a boolean")
@@ -323,12 +394,18 @@ async def update_auto_review_config(
     if "max_per_hour" in body:
         v = body["max_per_hour"]
         if not isinstance(v, int) or isinstance(v, bool) or not (1 <= v <= 20):
-            raise HTTPException(status_code=422, detail="'max_per_hour' must be an integer between 1 and 20")
+            raise HTTPException(
+                status_code=422,
+                detail="'max_per_hour' must be an integer between 1 and 20",
+            )
 
     if "max_concurrent" in body:
         v = body["max_concurrent"]
         if not isinstance(v, int) or isinstance(v, bool) or not (1 <= v <= 10):
-            raise HTTPException(status_code=422, detail="'max_concurrent' must be an integer between 1 and 10")
+            raise HTTPException(
+                status_code=422,
+                detail="'max_concurrent' must be an integer between 1 and 10",
+            )
 
     # Merge into existing stored config
     design_doc = dict(project.design_doc or {})
@@ -348,6 +425,7 @@ async def update_auto_review_config(
 # Playbook Inspector endpoints
 # ---------------------------------------------------------------------------
 
+
 @router.patch("/projects/{project_id}/playbook/{key:path}")
 async def update_playbook_entry(
     project_id: uuid.UUID,
@@ -359,9 +437,13 @@ async def update_playbook_entry(
     """Apply an operation to a playbook entry: promote, demote, or archive."""
     action = body.get("action")
     if action not in ("promote", "demote", "archive"):
-        raise HTTPException(status_code=422, detail="'action' must be one of: promote, demote, archive")
+        raise HTTPException(
+            status_code=422, detail="'action' must be one of: promote, demote, archive"
+        )
 
-    project = await _get_user_project_with_role(project_id, current_user["user_id"], session, "member")
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
     doc = dict(project.design_doc or {})
     full_key = f"playbook/{key}"
     if full_key not in doc or not isinstance(doc[full_key], dict):
@@ -397,12 +479,22 @@ async def update_playbook_entry(
     await session.commit()
 
     if action == "archive":
-        return {"project_id": str(project_id), "key": key, "action": action, "archived": True}
+        return {
+            "project_id": str(project_id),
+            "key": key,
+            "action": action,
+            "archived": True,
+        }
     confirmed = entry.get("confirmed_count", 0)
     referenced = entry.get("reference_count", 0)
-    return {"project_id": str(project_id), "key": key, "action": action, "entry": {
-        "confirmed_count": confirmed,
-        "reference_count": referenced,
-        "stale": bool(entry.get("stale")),
-        "effectiveness_score": min(round(confirmed / max(referenced, 1), 3), 1.0),
-    }}
+    return {
+        "project_id": str(project_id),
+        "key": key,
+        "action": action,
+        "entry": {
+            "confirmed_count": confirmed,
+            "reference_count": referenced,
+            "stale": bool(entry.get("stale")),
+            "effectiveness_score": min(round(confirmed / max(referenced, 1), 3), 1.0),
+        },
+    }

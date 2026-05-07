@@ -4,6 +4,7 @@ These dataclasses describe lifecycle intent. They are intentionally not task
 payload schemas; callers may continue to pass open-ended task payload/context
 metadata through the service.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field

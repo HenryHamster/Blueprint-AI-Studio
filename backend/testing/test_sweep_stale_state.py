@@ -6,6 +6,7 @@ were never removed once their condition resolved, so long-lived Cloud Run
 instances leaked memory toward the 4GB ceiling. sweep_stale_in_memory_state
 reclaims them; these tests pin the retention semantics.
 """
+
 from collections import deque
 from datetime import timedelta
 

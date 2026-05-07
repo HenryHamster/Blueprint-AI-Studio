@@ -37,7 +37,9 @@ SQLiteTypeCompiler.visit_JSONB = _sqlite_visit_JSONB  # type: ignore[attr-define
 _orig_instance_expire = _InstanceState._expire
 
 
-def _noop_expire(self, dict_, modified_set, instance_dict=None, no_autoflush_expiry=False):
+def _noop_expire(
+    self, dict_, modified_set, instance_dict=None, no_autoflush_expiry=False
+):
     pass  # Don't expire — keep attributes readable without DB round-trip
 
 

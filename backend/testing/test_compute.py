@@ -5,6 +5,7 @@ Covers:
 - _store_agent_secret IAM policy ETag retry + idempotency.
 - Zone success-rate tracking (rolling window, zone ordering, reset, summary).
 """
+
 from collections import deque
 from datetime import datetime, timezone, timedelta
 from unittest.mock import MagicMock, patch
@@ -31,7 +32,11 @@ class _FakePolicy:
         self.bindings = list(bindings or [])
 
 
-def _make_client(existing_policy_bindings=None, set_iam_side_effects=None, payload: bytes | None = None):
+def _make_client(
+    existing_policy_bindings=None,
+    set_iam_side_effects=None,
+    payload: bytes | None = None,
+):
     """Build a MagicMock SecretManagerServiceClient with sensible defaults.
 
     - create_secret returns an object whose .name looks like a real secret resource
@@ -55,7 +60,9 @@ def _make_client(existing_policy_bindings=None, set_iam_side_effects=None, paylo
 
     # get_iam_policy returns a fresh policy each call so retries re-read it
     client.get_iam_policy.side_effect = lambda request: _FakePolicy(
-        bindings=[_FakeBinding(b.role, b.members) for b in (existing_policy_bindings or [])]
+        bindings=[
+            _FakeBinding(b.role, b.members) for b in (existing_policy_bindings or [])
+        ]
     )
 
     if set_iam_side_effects is not None:
@@ -101,9 +108,13 @@ class TestStoreAgentSecretIamRetry:
             None,
         ]
         payload = '{"token": "abc"}'
-        client = _make_client(set_iam_side_effects=side_effects, payload=payload.encode("utf-8"))
+        client = _make_client(
+            set_iam_side_effects=side_effects, payload=payload.encode("utf-8")
+        )
 
-        with patch("google.cloud.secretmanager.SecretManagerServiceClient", return_value=client):
+        with patch(
+            "google.cloud.secretmanager.SecretManagerServiceClient", return_value=client
+        ):
             result = compute._store_agent_secret("vm123", payload)
 
         assert result == "projects/test-proj/secrets/agent-creds-vm123/versions/1"
@@ -125,9 +136,13 @@ class TestStoreAgentSecretIamRetry:
             ),
         ]
         payload = '{"token": "abc"}'
-        client = _make_client(existing_policy_bindings=existing, payload=payload.encode("utf-8"))
+        client = _make_client(
+            existing_policy_bindings=existing, payload=payload.encode("utf-8")
+        )
 
-        with patch("google.cloud.secretmanager.SecretManagerServiceClient", return_value=client):
+        with patch(
+            "google.cloud.secretmanager.SecretManagerServiceClient", return_value=client
+        ):
             result = compute._store_agent_secret("vm123", payload)
 
         assert result == "projects/test-proj/secrets/agent-creds-vm123/versions/1"
@@ -143,7 +158,9 @@ class TestStoreAgentSecretIamRetry:
         side_effects = [Aborted(f"etag mismatch {i}") for i in range(6)]
         client = _make_client(set_iam_side_effects=side_effects)
 
-        with patch("google.cloud.secretmanager.SecretManagerServiceClient", return_value=client):
+        with patch(
+            "google.cloud.secretmanager.SecretManagerServiceClient", return_value=client
+        ):
             with pytest.raises(Aborted):
                 compute._store_agent_secret("vm123", '{"token": "abc"}')
 
@@ -210,7 +227,10 @@ class TestAgentSecretManifest:
             provider_metadata={"project": "demo-proj", "location": "us-central1"},
         )
 
-        assert manifest["env"]["GOOGLE_APPLICATION_CREDENTIALS"] == "/opt/agent/gemini/sa.json"
+        assert (
+            manifest["env"]["GOOGLE_APPLICATION_CREDENTIALS"]
+            == "/opt/agent/gemini/sa.json"
+        )
         assert manifest["env"]["GOOGLE_CLOUD_PROJECT"] == "demo-proj"
         assert manifest["env"]["GOOGLE_CLOUD_LOCATION"] == "us-central1"
         assert manifest["files"][0]["path"] == "/opt/agent/gemini/sa.json"
@@ -218,6 +238,7 @@ class TestAgentSecretManifest:
 
 
 # ─── Zone success-rate tracking tests ────────────────────────────────────────
+
 
 @pytest.fixture(autouse=False)
 def clean_zone_health():
@@ -257,7 +278,9 @@ class TestZoneSuccessRate:
         """3 failures + 1 success out of 4 provisions → 25% success rate."""
         zone = "us-central1-f"
         compute._zone_health[zone] = {
-            "recent_outcomes": deque([False, False, False, True], maxlen=compute.ZONE_HISTORY_WINDOW),
+            "recent_outcomes": deque(
+                [False, False, False, True], maxlen=compute.ZONE_HISTORY_WINDOW
+            ),
         }
         assert compute._zone_success_rate(zone) == pytest.approx(0.25)
 
@@ -315,7 +338,9 @@ class TestZoneOrdering:
             "recent_outcomes": deque([False] * 10, maxlen=compute.ZONE_HISTORY_WINDOW),
         }
 
-        assert compute._zone_success_rate(good_zone) > compute._zone_success_rate(bad_zone)
+        assert compute._zone_success_rate(good_zone) > compute._zone_success_rate(
+            bad_zone
+        )
 
     def test_no_history_zone_gets_neutral_rate(self, clean_zone_health):
         """A zone with no history is treated as neutral (0.5), not pessimistic."""
@@ -331,7 +356,9 @@ class TestZoneHealthOutput:
         compute._zone_health[zone] = {
             "last_success": datetime.now(timezone.utc),
             "consecutive_failures": 0,
-            "recent_outcomes": deque([True, True, False], maxlen=compute.ZONE_HISTORY_WINDOW),
+            "recent_outcomes": deque(
+                [True, True, False], maxlen=compute.ZONE_HISTORY_WINDOW
+            ),
         }
         result = compute.get_zone_health()
         assert zone in result
@@ -350,7 +377,9 @@ class TestZoneHealthOutput:
         zone = "us-central1-f"
         compute._zone_health[zone] = {
             "consecutive_failures": 0,
-            "recent_outcomes": deque([True, False, True, True], maxlen=compute.ZONE_HISTORY_WINDOW),
+            "recent_outcomes": deque(
+                [True, False, True, True], maxlen=compute.ZONE_HISTORY_WINDOW
+            ),
         }
         summary = compute.get_zone_health_summary()
         assert "zone_success_rates" in summary
@@ -359,6 +388,7 @@ class TestZoneHealthOutput:
 
 
 # ─── Spot preemption override tests ──────────────────────────────────────────
+
 
 class TestSpotPreemptionOverride:
     """provision_agent_vm respects the provisioning_model override parameter.
@@ -421,11 +451,15 @@ class TestSpotPreemptionOverride:
 
         monkeypatch.setattr(compute, "_provision_gcp", fake_gcp)
 
-        await compute.provision_agent_vm("vm-2nd-preempt", uuid.uuid4(), provisioning_model="STANDARD")
+        await compute.provision_agent_vm(
+            "vm-2nd-preempt", uuid.uuid4(), provisioning_model="STANDARD"
+        )
         # STANDARD override must arrive at _provision_gcp even though global env is SPOT
         assert captured["provisioning_model"] == "STANDARD"
 
-    def test_get_zone_health_summary_empty_rates_when_no_history(self, clean_zone_health):
+    def test_get_zone_health_summary_empty_rates_when_no_history(
+        self, clean_zone_health
+    ):
         """zone_success_rates is empty when no zone has any history."""
         summary = compute.get_zone_health_summary()
         assert summary["zone_success_rates"] == {}
@@ -444,14 +478,21 @@ class TestZoneHealthRestoreDeque:
                 continue
             restored = {}
             for k, v in data.items():
-                if isinstance(v, str) and k in ("last_success", "last_failure", "cooldown_expires_at"):
+                if isinstance(v, str) and k in (
+                    "last_success",
+                    "last_failure",
+                    "cooldown_expires_at",
+                ):
                     try:
                         restored[k] = datetime.fromisoformat(v)
                     except ValueError:
                         continue
                 elif k == "recent_outcomes" and isinstance(v, list):
                     valid = [e for e in v if isinstance(e, bool)]
-                    restored[k] = _deque(valid[-compute.ZONE_HISTORY_WINDOW:], maxlen=compute.ZONE_HISTORY_WINDOW)
+                    restored[k] = _deque(
+                        valid[-compute.ZONE_HISTORY_WINDOW :],
+                        maxlen=compute.ZONE_HISTORY_WINDOW,
+                    )
                 elif k == "consecutive_failures":
                     restored[k] = v if isinstance(v, int) else 0
                 elif k == "last_failure_reason":
@@ -463,7 +504,9 @@ class TestZoneHealthRestoreDeque:
     def test_recent_outcomes_restored_as_deque(self):
         """recent_outcomes list from DB is converted to a deque with correct maxlen."""
         zone = "us-central1-f"
-        self._restore_zone_health({zone: {"consecutive_failures": 0, "recent_outcomes": [True, False, True]}})
+        self._restore_zone_health(
+            {zone: {"consecutive_failures": 0, "recent_outcomes": [True, False, True]}}
+        )
         outcomes = compute._zone_health[zone]["recent_outcomes"]
         assert isinstance(outcomes, deque)
         assert outcomes.maxlen == compute.ZONE_HISTORY_WINDOW
@@ -503,7 +546,9 @@ class TestZoneHealthRestoreDeque:
     def test_recent_outcomes_corrupted_elements_filtered(self):
         """Non-boolean elements in recent_outcomes are dropped; valid booleans kept."""
         zone = "us-central1-f"
-        self._restore_zone_health({zone: {"recent_outcomes": [True, "bad", None, False, 1]}})
+        self._restore_zone_health(
+            {zone: {"recent_outcomes": [True, "bad", None, False, 1]}}
+        )
         outcomes = compute._zone_health[zone]["recent_outcomes"]
         assert isinstance(outcomes, deque)
         # Only the two actual booleans should survive
@@ -574,20 +619,23 @@ class TestValidatePayloadUri:
     def test_valid_with_allowed_special_chars(self):
         compute.validate_payload_uri("gs://bucket.name_1-2/a_b.c-d/e.json")
 
-    @pytest.mark.parametrize("uri", [
-        "",
-        "   ",
-        "http://bucket/object",
-        "s3://bucket/object",
-        "gs://bucket",
-        "gs://bucket/",
-        "gs:///object",
-        "gs://bucket/object with spaces",
-        "gs://bucket/obj#frag",
-        "gs://bucket/obj?query",
-        "gs://bucket/obj*",
-        "/local/path",
-    ])
+    @pytest.mark.parametrize(
+        "uri",
+        [
+            "",
+            "   ",
+            "http://bucket/object",
+            "s3://bucket/object",
+            "gs://bucket",
+            "gs://bucket/",
+            "gs:///object",
+            "gs://bucket/object with spaces",
+            "gs://bucket/obj#frag",
+            "gs://bucket/obj?query",
+            "gs://bucket/obj*",
+            "/local/path",
+        ],
+    )
     def test_invalid_uris_raise_value_error(self, uri):
         with pytest.raises(ValueError, match="Invalid payload_uri"):
             compute.validate_payload_uri(uri)
@@ -609,7 +657,9 @@ class TestAnyZoneAvailable:
         future = datetime.now(timezone.utc) + timedelta(minutes=5)
         _cooldown_all_zones(future)
         # Clear cooldown on one zone
-        compute._zone_health[compute.FALLBACK_ZONES[0][0]] = {"cooldown_expires_at": None}
+        compute._zone_health[compute.FALLBACK_ZONES[0][0]] = {
+            "cooldown_expires_at": None
+        }
         assert compute.any_zone_available() is True
 
     def test_all_zones_in_cooldown_returns_false(self, clean_zone_health):
@@ -632,7 +682,9 @@ class TestSoonestZoneRecovery:
     def test_one_zone_available_returns_none(self, clean_zone_health):
         future = datetime.now(timezone.utc) + timedelta(minutes=5)
         _cooldown_all_zones(future)
-        compute._zone_health[compute.FALLBACK_ZONES[0][0]] = {"cooldown_expires_at": None}
+        compute._zone_health[compute.FALLBACK_ZONES[0][0]] = {
+            "cooldown_expires_at": None
+        }
         assert compute.soonest_zone_recovery() is None
 
     def test_all_in_cooldown_returns_earliest(self, clean_zone_health):
@@ -654,7 +706,9 @@ class TestZoneInDisabledRegion:
     """Tests for _zone_in_disabled_region()."""
 
     def test_zone_in_disabled_region_extracts_region(self, monkeypatch):
-        monkeypatch.setattr(compute, "_DISABLED_REGIONS", frozenset(["us-east1", "us-west1"]))
+        monkeypatch.setattr(
+            compute, "_DISABLED_REGIONS", frozenset(["us-east1", "us-west1"])
+        )
         assert compute._zone_in_disabled_region("us-east1-a") is True
         assert compute._zone_in_disabled_region("us-east1-c") is True
         assert compute._zone_in_disabled_region("us-west1-b") is True
@@ -686,7 +740,9 @@ class TestActiveFallbackZones:
 
     def test_filters_three_regions_leaves_central(self, monkeypatch):
         monkeypatch.setattr(
-            compute, "_DISABLED_REGIONS", frozenset(["us-east1", "us-east4", "us-west1"])
+            compute,
+            "_DISABLED_REGIONS",
+            frozenset(["us-east1", "us-east4", "us-west1"]),
         )
         result = compute._active_fallback_zones()
         result_zones = [z for z, _ in result]
@@ -699,7 +755,10 @@ class TestFormatOrphanStatus:
 
     def test_terminated_in_spot_mode_annotated(self, monkeypatch):
         monkeypatch.setattr(compute, "VM_PROVISIONING_MODEL", "SPOT")
-        assert compute._format_orphan_status("TERMINATED") == "TERMINATED (likely spot preemption)"
+        assert (
+            compute._format_orphan_status("TERMINATED")
+            == "TERMINATED (likely spot preemption)"
+        )
 
     def test_terminated_in_standard_mode_passthrough(self, monkeypatch):
         monkeypatch.setattr(compute, "VM_PROVISIONING_MODEL", "STANDARD")
@@ -751,10 +810,14 @@ class TestDisabledRegionsParsing:
         )
 
     def test_whitespace_normalized(self):
-        assert self._parse(" us-east1 ; us-east4 ") == frozenset({"us-east1", "us-east4"})
+        assert self._parse(" us-east1 ; us-east4 ") == frozenset(
+            {"us-east1", "us-east4"}
+        )
 
     def test_trailing_separators_dropped(self):
-        assert self._parse(";us-east1;;us-east4;") == frozenset({"us-east1", "us-east4"})
+        assert self._parse(";us-east1;;us-east4;") == frozenset(
+            {"us-east1", "us-east4"}
+        )
 
     def test_duplicate_collapsed(self):
         assert self._parse("us-east1,us-east1") == frozenset({"us-east1"})
@@ -769,6 +832,7 @@ class TestGetVmStatus:
 
     def test_running_status(self):
         from unittest.mock import MagicMock, patch
+
         mock_instance = MagicMock()
         mock_instance.status = "RUNNING"
         with patch("google.cloud.compute_v1.InstancesClient") as mock_client:
@@ -777,16 +841,22 @@ class TestGetVmStatus:
 
     def test_terminated_status(self):
         from unittest.mock import MagicMock, patch
+
         mock_instance = MagicMock()
         mock_instance.status = "TERMINATED"
         with patch("google.cloud.compute_v1.InstancesClient") as mock_client:
             mock_client.return_value.get.return_value = mock_instance
-            assert compute.get_vm_status("agent-vm-abc", "us-central1-a") == "TERMINATED"
+            assert (
+                compute.get_vm_status("agent-vm-abc", "us-central1-a") == "TERMINATED"
+            )
 
     def test_not_found_returns_deleted(self):
         from unittest.mock import patch
+
         with patch("google.cloud.compute_v1.InstancesClient") as mock_client:
-            mock_client.return_value.get.side_effect = Exception("404 was not found in zone")
+            mock_client.return_value.get.side_effect = Exception(
+                "404 was not found in zone"
+            )
             # SPOT VMs use DELETE termination action, so preempted VMs become 404.
             # get_vm_status returns the synthetic "DELETED" so reaper can distinguish
             # vanished from API-failed.
@@ -794,6 +864,7 @@ class TestGetVmStatus:
 
     def test_other_api_error_returns_none(self):
         from unittest.mock import patch
+
         with patch("google.cloud.compute_v1.InstancesClient") as mock_client:
             mock_client.return_value.get.side_effect = Exception("503 backend timeout")
             assert compute.get_vm_status("agent-vm-abc", "us-central1-a") is None

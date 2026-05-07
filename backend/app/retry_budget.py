@@ -15,6 +15,7 @@ guardrail. Three pieces live here:
 - :data:`CODE_ERROR_STAGE_GUIDANCE` provides per-pipeline-stage retry hints
   for CODE_ERROR failures, used by ``_build_retry_prompt_suffix``.
 """
+
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -137,8 +138,13 @@ def append_failure_class_history(
     return history[-FAILURE_CLASS_HISTORY_MAX:]
 
 
-def failure_class_history_classes(raw_history: object, *, now: datetime | None = None) -> list[str]:
-    return [entry["class"] for entry in normalize_failure_class_history(raw_history, now=now)]
+def failure_class_history_classes(
+    raw_history: object, *, now: datetime | None = None
+) -> list[str]:
+    return [
+        entry["class"]
+        for entry in normalize_failure_class_history(raw_history, now=now)
+    ]
 
 
 async def compute_effective_max_requeues(
@@ -163,21 +169,34 @@ async def compute_effective_max_requeues(
       exhausting the full CODE_ERROR budget.
     """
     from app.task_lifecycle import _extract_failing_tests
-    children = (await session.execute(
-        select(Task).where(
-            Task.parent_task_id == parent.id,
-            Task.status == TaskStatus.FAILED,
+
+    children = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.parent_task_id == parent.id,
+                    Task.status == TaskStatus.FAILED,
+                )
+            )
         )
-    )).scalars().all()
+        .scalars()
+        .all()
+    )
     reduction = 0
     recurring_tests = False
     for child in children:
         ctx = child.context or {}
         current_class = classify_failure(child, logs=ctx.get("last_error") or None)
         prev_class = ctx.get("_previous_failure_class")
-        if prev_class and current_class == prev_class and current_class not in INFRA_CLASSES:
+        if (
+            prev_class
+            and current_class == prev_class
+            and current_class not in INFRA_CLASSES
+        ):
             reduction = max(reduction, 1)
-        history = failure_class_history_classes(ctx.get("_failure_class_history"), now=_utcnow())
+        history = failure_class_history_classes(
+            ctx.get("_failure_class_history"), now=_utcnow()
+        )
         if history:
             counts: dict[str, int] = {}
             for cls in history:
@@ -209,6 +228,7 @@ async def compute_effective_max_requeues(
             child_ctx = dict(child.context or {})
             if not child_ctx.get("fix_loop_abandoned"):
                 from sqlalchemy.orm.attributes import flag_modified as _flag_modified
+
                 child_ctx["fix_loop_abandoned"] = {
                     "loop": loop_name,
                     "exit_reason": exit_reason,

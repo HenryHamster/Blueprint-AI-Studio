@@ -7,6 +7,7 @@ _recorded_task_ids.
 All deferred imports from app.main are intentional — they avoid circular imports
 (agent_status is imported BY main) and preserve test-patchability.
 """
+
 import asyncio
 import contextlib
 import json
@@ -21,8 +22,14 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 from app.database import get_session
 from app.models import (
-    Task, Artifact, TaskHistory, Alert, AlertSeverity,
-    TaskStatus, ArtifactType, Project,
+    Task,
+    Artifact,
+    TaskHistory,
+    Alert,
+    AlertSeverity,
+    TaskStatus,
+    ArtifactType,
+    Project,
 )
 from app.schemas import AgentStatusPayload
 from app.shared_state import limiter
@@ -153,6 +160,7 @@ def record_task_result(
     been threaded through with a Task object in scope.
     """
     from app.shared_state import deploy_monitoring
+
     # Deduplicate: only record one result per task
     if task_id:
         if task_id in _recorded_task_ids:
@@ -166,8 +174,15 @@ def record_task_result(
     if auto_remediation or (task_context and task_context.get("auto_remediation")):
         task_type = "auto_remediation"
 
-    entry = (_utcnow().isoformat(), "success" if success else "failure", failure_class, task_type)
-    deploy_monitoring["task_results"].append(entry)  # deque(maxlen=100) handles cap automatically
+    entry = (
+        _utcnow().isoformat(),
+        "success" if success else "failure",
+        failure_class,
+        task_type,
+    )
+    deploy_monitoring["task_results"].append(
+        entry
+    )  # deque(maxlen=100) handles cap automatically
 
     if success:
         _shared_state.deploy_monitoring["last_completion_time"] = _utcnow()
@@ -188,14 +203,16 @@ async def _check_daily_cost_ceiling(task: Task, session: AsyncSession) -> None:
     )
     # Exclude current task from DB query to avoid double-counting (its vm_stopped_at
     # was just set in-memory and may be flushed before the query runs).
-    rows = (await session.execute(
-        select(Task.vm_provisioned_at, Task.vm_stopped_at, Task.vm_spot).where(
-            Task.project_id == task.project_id,
-            Task.id != task.id,
-            Task.vm_stopped_at >= today_start,
-            Task.vm_provisioned_at.is_not(None),
+    rows = (
+        await session.execute(
+            select(Task.vm_provisioned_at, Task.vm_stopped_at, Task.vm_spot).where(
+                Task.project_id == task.project_id,
+                Task.id != task.id,
+                Task.vm_stopped_at >= today_start,
+                Task.vm_provisioned_at.is_not(None),
+            )
         )
-    )).all()
+    ).all()
 
     daily_total = 0.0
     for prov_at, stop_at, is_spot in rows:
@@ -205,7 +222,11 @@ async def _check_daily_cost_ceiling(task: Task, session: AsyncSession) -> None:
             daily_total += secs * rate
 
     # Always include the current task's cost explicitly (it is in-memory, not yet committed).
-    if task.vm_provisioned_at and task.vm_stopped_at and task.vm_stopped_at >= today_start:
+    if (
+        task.vm_provisioned_at
+        and task.vm_stopped_at
+        and task.vm_stopped_at >= today_start
+    ):
         secs = (task.vm_stopped_at - task.vm_provisioned_at).total_seconds()
         daily_total += secs * (SPOT_RATE if task.vm_spot else ON_DEMAND_RATE)
 
@@ -213,15 +234,21 @@ async def _check_daily_cost_ceiling(task: Task, session: AsyncSession) -> None:
         return
 
     alert_title = "Daily cost ceiling exceeded"
-    existing = (await session.execute(
-        select(Alert).where(
-            Alert.project_id == task.project_id,
-            Alert.task_id.is_(None),
-            Alert.severity == AlertSeverity.WARNING,
-            Alert.dismissed_at.is_(None),
-            Alert.title == alert_title,
+    existing = (
+        (
+            await session.execute(
+                select(Alert).where(
+                    Alert.project_id == task.project_id,
+                    Alert.task_id.is_(None),
+                    Alert.severity == AlertSeverity.WARNING,
+                    Alert.dismissed_at.is_(None),
+                    Alert.title == alert_title,
+                )
+            )
         )
-    )).scalars().first()
+        .scalars()
+        .first()
+    )
     if existing is not None:
         return
 
@@ -244,62 +271,174 @@ async def _check_daily_cost_ceiling(task: Task, session: AsyncSession) -> None:
     try:
         from app.notification_dispatch import dispatch_external_notification  # noqa: PLC0415
         from app.failure_classification import classify_failure  # noqa: PLC0415
+
         ctx = task.context or {}
         first_payload = task.first_payload or {}
-        direction_text = (ctx.get("direction_text") or first_payload.get("direction_text") or "")
+        direction_text = (
+            ctx.get("direction_text") or first_payload.get("direction_text") or ""
+        )
         # Aggregate today's cost by failure class across this project's tasks.
         # Exclude current task (added explicitly below) to avoid double-counting via identity map.
-        cost_rows = (await session.execute(
-            select(Task).where(
-                Task.project_id == task.project_id,
-                Task.id != task.id,
-                Task.vm_stopped_at >= today_start,
-                Task.vm_provisioned_at.is_not(None),
+        cost_rows = (
+            (
+                await session.execute(
+                    select(Task).where(
+                        Task.project_id == task.project_id,
+                        Task.id != task.id,
+                        Task.vm_stopped_at >= today_start,
+                        Task.vm_provisioned_at.is_not(None),
+                    )
+                )
             )
-        )).scalars().all()
+            .scalars()
+            .all()
+        )
         cost_by_failure_class: dict[str, float] = {}
         for t in list(cost_rows) + [task]:
             if not (t.vm_provisioned_at and t.vm_stopped_at):
                 continue
             secs = (t.vm_stopped_at - t.vm_provisioned_at).total_seconds()
             rate = SPOT_RATE if t.vm_spot else ON_DEMAND_RATE
-            status_val = getattr(t.status, "value", None) or (t.status if isinstance(t.status, str) else "UNKNOWN")
-            bucket = classify_failure(t) if status_val == TaskStatus.FAILED.value else status_val
-            cost_by_failure_class[bucket] = round(cost_by_failure_class.get(bucket, 0.0) + secs * rate, 4)
-        asyncio.ensure_future(dispatch_external_notification(
-            task.project_id,
-            "BUDGET_EXCEEDED",
-            {
-                "task_id": str(task.id),
-                "daily_total_usd": round(daily_total, 2),
-                "ceiling_usd": round(ceiling, 2),
-                "direction_text": direction_text[:200],
-                "cost_by_failure_class": cost_by_failure_class,
-            },
-        ))
+            status_val = getattr(t.status, "value", None) or (
+                t.status if isinstance(t.status, str) else "UNKNOWN"
+            )
+            bucket = (
+                classify_failure(t)
+                if status_val == TaskStatus.FAILED.value
+                else status_val
+            )
+            cost_by_failure_class[bucket] = round(
+                cost_by_failure_class.get(bucket, 0.0) + secs * rate, 4
+            )
+        asyncio.ensure_future(
+            dispatch_external_notification(
+                task.project_id,
+                "BUDGET_EXCEEDED",
+                {
+                    "task_id": str(task.id),
+                    "daily_total_usd": round(daily_total, 2),
+                    "ceiling_usd": round(ceiling, 2),
+                    "direction_text": direction_text[:200],
+                    "cost_by_failure_class": cost_by_failure_class,
+                },
+            )
+        )
     except Exception as _ne:
         logger.warning(f"[NOTIFY] BUDGET_EXCEEDED dispatch setup failed: {_ne}")
 
 
-_STOPWORDS = frozenset([
-    "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for",
-    "of", "with", "by", "from", "is", "was", "are", "were", "be", "been",
-    "being", "have", "has", "had", "do", "does", "did", "will", "would",
-    "could", "should", "may", "might", "shall", "can", "not", "no", "nor",
-    "so", "yet", "both", "either", "neither", "each", "few", "more", "most",
-    "other", "some", "such", "than", "too", "very", "just", "task", "error",
-    "failed", "failure", "retries", "exhausted", "attempt", "status",
-    "message", "timeout", "unknown", "none", "null", "true", "false",
-    "code", "line", "file", "test", "run", "running", "agent", "vm",
-    # Words that recur in *templated* failure messages (e.g.
-    # "Lint/build checks failed after max fix attempts. See logs above
-    # for details.") and surface as noise in keyword-frequency auto
-    # playbook entries — they describe the template, not the failure.
-    "above", "after", "before", "details", "logs", "log", "max", "fix",
-    "attempts", "build", "checks", "check", "see", "lint", "report",
-    "session", "session_id", "init", "complete", "completed", "children",
-    "child", "evaluation", "evaluating", "hours", "minutes",
-])
+_STOPWORDS = frozenset(
+    [
+        "a",
+        "an",
+        "the",
+        "and",
+        "or",
+        "but",
+        "in",
+        "on",
+        "at",
+        "to",
+        "for",
+        "of",
+        "with",
+        "by",
+        "from",
+        "is",
+        "was",
+        "are",
+        "were",
+        "be",
+        "been",
+        "being",
+        "have",
+        "has",
+        "had",
+        "do",
+        "does",
+        "did",
+        "will",
+        "would",
+        "could",
+        "should",
+        "may",
+        "might",
+        "shall",
+        "can",
+        "not",
+        "no",
+        "nor",
+        "so",
+        "yet",
+        "both",
+        "either",
+        "neither",
+        "each",
+        "few",
+        "more",
+        "most",
+        "other",
+        "some",
+        "such",
+        "than",
+        "too",
+        "very",
+        "just",
+        "task",
+        "error",
+        "failed",
+        "failure",
+        "retries",
+        "exhausted",
+        "attempt",
+        "status",
+        "message",
+        "timeout",
+        "unknown",
+        "none",
+        "null",
+        "true",
+        "false",
+        "code",
+        "line",
+        "file",
+        "test",
+        "run",
+        "running",
+        "agent",
+        "vm",
+        # Words that recur in *templated* failure messages (e.g.
+        # "Lint/build checks failed after max fix attempts. See logs above
+        # for details.") and surface as noise in keyword-frequency auto
+        # playbook entries — they describe the template, not the failure.
+        "above",
+        "after",
+        "before",
+        "details",
+        "logs",
+        "log",
+        "max",
+        "fix",
+        "attempts",
+        "build",
+        "checks",
+        "check",
+        "see",
+        "lint",
+        "report",
+        "session",
+        "session_id",
+        "init",
+        "complete",
+        "completed",
+        "children",
+        "child",
+        "evaluation",
+        "evaluating",
+        "hours",
+        "minutes",
+    ]
+)
 
 _AUTO_PLAYBOOK_CAP = 5
 
@@ -319,14 +458,24 @@ async def _check_recurring_failures(task: Task, session: AsyncSession) -> None:
 
     cutoff = _utcnow() - timedelta(days=7)
 
-    recent_failed = (await session.execute(
-        select(Task).where(
-            Task.project_id == task.project_id,
-            Task.id != task.id,  # exclude current task (session-commit-exclusion-pattern)
-            Task.status == TaskStatus.FAILED,
-            Task.created_at >= cutoff,
-        ).order_by(Task.created_at.desc()).limit(30)
-    )).scalars().all()
+    recent_failed = (
+        (
+            await session.execute(
+                select(Task)
+                .where(
+                    Task.project_id == task.project_id,
+                    Task.id
+                    != task.id,  # exclude current task (session-commit-exclusion-pattern)
+                    Task.status == TaskStatus.FAILED,
+                    Task.created_at >= cutoff,
+                )
+                .order_by(Task.created_at.desc())
+                .limit(30)
+            )
+        )
+        .scalars()
+        .all()
+    )
 
     # Add the current task's contribution manually (it was excluded above)
     all_failed = list(recent_failed) + [task]
@@ -371,7 +520,9 @@ async def _check_recurring_failures(task: Task, session: AsyncSession) -> None:
         # Infer scope: direction-scoped only when ALL tasks have a direction_id
         # and they all share the same one.  Tasks without a direction_id must NOT
         # be silently dropped — their presence means the pattern is universal.
-        all_have_direction = all((t.context or {}).get("direction_id") for t in tasks_in_class)
+        all_have_direction = all(
+            (t.context or {}).get("direction_id") for t in tasks_in_class
+        )
         task_direction_ids = {
             (t.context or {}).get("direction_id")
             for t in tasks_in_class
@@ -401,14 +552,18 @@ async def _check_recurring_failures(task: Task, session: AsyncSession) -> None:
                     f"Agents should check for this issue before starting work."
                 )
                 updated_entry["updated_at"] = _utcnow().isoformat()
-                updated_entry["applicable_types"] = _get_applicable_types(tasks_in_class)
+                updated_entry["applicable_types"] = _get_applicable_types(
+                    tasks_in_class
+                )
                 updated_entry["scope"] = inferred_scope
                 updated_entry["learned_from_direction"] = inferred_direction
                 doc[existing_key] = updated_entry
                 project.design_doc = doc
                 flag_modified(project, "design_doc")
                 session.add(project)
-                logger.info(f"[PLAYBOOK] Updated existing auto-entry {existing_key} for {failure_class} pattern")
+                logger.info(
+                    f"[PLAYBOOK] Updated existing auto-entry {existing_key} for {failure_class} pattern"
+                )
                 already_covered = True
                 break
 
@@ -417,11 +572,15 @@ async def _check_recurring_failures(task: Task, session: AsyncSession) -> None:
 
         # Cap at 5 auto-generated entries
         if len(existing_auto_keys) >= _AUTO_PLAYBOOK_CAP:
-            logger.info(f"[PLAYBOOK] Auto-playbook cap ({_AUTO_PLAYBOOK_CAP}) reached for project {task.project_id}, skipping")
+            logger.info(
+                f"[PLAYBOOK] Auto-playbook cap ({_AUTO_PLAYBOOK_CAP}) reached for project {task.project_id}, skipping"
+            )
             continue
 
         # Create a new auto-entry
-        short_hash = _hashlib.md5(",".join(sorted(common_keywords)).encode()).hexdigest()[:6]
+        short_hash = _hashlib.md5(
+            ",".join(sorted(common_keywords)).encode()
+        ).hexdigest()[:6]
         entry_key = f"playbook/auto-{failure_class.lower()}-{short_hash}"
 
         applicable_types = _get_applicable_types(tasks_in_class)
@@ -492,26 +651,39 @@ async def _persist_post_commit_pending(factory, task_id, reason: str, payload_du
     for attempt in range(5):
         try:
             async with factory() as s:
-                locked = (await s.execute(
-                    select(Task).where(Task.id == task_id).with_for_update(skip_locked=True)
-                )).scalars().first()
+                locked = (
+                    (
+                        await s.execute(
+                            select(Task)
+                            .where(Task.id == task_id)
+                            .with_for_update(skip_locked=True)
+                        )
+                    )
+                    .scalars()
+                    .first()
+                )
                 if locked is None:
                     # Row exists but held by peer; short sleep and retry.
-                    exists = (await s.execute(
-                        select(Task.id).where(Task.id == task_id)
-                    )).first()
+                    exists = (
+                        await s.execute(select(Task.id).where(Task.id == task_id))
+                    ).first()
                     if exists is None:
                         return
                     await asyncio.sleep(1 + attempt)
                     continue
                 locked.post_commit_pending = True
-                prior_meta = (locked.context or {}).get("_post_commit_pending_meta") or {}
-                locked.context = {**(locked.context or {}), "_post_commit_pending_meta": {
-                    "at": _utcnow().isoformat(),
-                    "reason": reason,
-                    "payload": payload_dump,
-                    "attempts": int(prior_meta.get("attempts", 0)) + 1,
-                }}
+                prior_meta = (locked.context or {}).get(
+                    "_post_commit_pending_meta"
+                ) or {}
+                locked.context = {
+                    **(locked.context or {}),
+                    "_post_commit_pending_meta": {
+                        "at": _utcnow().isoformat(),
+                        "reason": reason,
+                        "payload": payload_dump,
+                        "attempts": int(prior_meta.get("attempts", 0)) + 1,
+                    },
+                }
                 flag_modified(locked, "context")
                 s.add(locked)
                 await s.commit()
@@ -523,7 +695,9 @@ async def _persist_post_commit_pending(factory, task_id, reason: str, payload_du
         raise last_exc
 
 
-async def _propagate_pipeline_failure_to_original(task: Task, session: AsyncSession) -> None:
+async def _propagate_pipeline_failure_to_original(
+    task: Task, session: AsyncSession
+) -> None:
     """When a review/fix task fails permanently, cancel its original create task
     (so rollup excludes it) and, if the original was an auto-remediation task,
     propagate the failure to the branch's auto-fix escalation counter."""
@@ -531,8 +705,9 @@ async def _propagate_pipeline_failure_to_original(task: Task, session: AsyncSess
     task_type = task_payload.get("type", "")
     if task_type not in ("review", "fix"):
         return
-    original_task_id = ((task.context or {}).get("review_loop", {}).get("original_task_id", "")
-                        or task_payload.get("original_task_id", ""))
+    original_task_id = (task.context or {}).get("review_loop", {}).get(
+        "original_task_id", ""
+    ) or task_payload.get("original_task_id", "")
     if not original_task_id:
         return
     try:
@@ -540,24 +715,34 @@ async def _propagate_pipeline_failure_to_original(task: Task, session: AsyncSess
         if not (orig and orig.status == TaskStatus.COMPLETED):
             return
         orig.status = TaskStatus.CANCELLED
-        orig.latest_status_message = f"Pipeline {task_type} task failed — PR excluded from rollup"
+        orig.latest_status_message = (
+            f"Pipeline {task_type} task failed — PR excluded from rollup"
+        )
         session.add(orig)
         await session.commit()
         if orig.parent_task_id:
             await _check_and_trigger_rollup(orig, session)
-        logger.error(f"[PIPELINE] Cancelled original task {original_task_id} — {task_type} failed, skipping in rollup")
+        logger.error(
+            f"[PIPELINE] Cancelled original task {original_task_id} — {task_type} failed, skipping in rollup"
+        )
         # Auto-remediation: review/fix cycle exhaustion means the remediation
         # attempt failed. The review task itself doesn't carry auto_remediation,
         # so propagate via the original create task. (Audit W1: column now.)
         if orig.auto_remediation:
             try:
                 from app.notification_dispatch import post_remediation_result_message
+
                 await post_remediation_result_message(
-                    session, orig, result="failed",
+                    session,
+                    orig,
+                    result="failed",
                 )
                 await session.commit()
             except Exception as _ar_exc:
-                logger.warning("[AUTO-REMEDIATION] Failed to post failure result after pipeline exhaustion: %s", _ar_exc)
+                logger.warning(
+                    "[AUTO-REMEDIATION] Failed to post failure result after pipeline exhaustion: %s",
+                    _ar_exc,
+                )
                 # WHY: post_remediation_result_message does session.add() and the
                 # following session.commit() can raise on FK/serialization conflict,
                 # leaving the session in pending-rollback state. Without this rollback
@@ -566,7 +751,10 @@ async def _propagate_pipeline_failure_to_original(task: Task, session: AsyncSess
                 with contextlib.suppress(Exception):
                     await session.rollback()
     except Exception as e:
-        logger.warning(f"[PIPELINE] Failed to propagate failure to {original_task_id}: {e}", exc_info=True)
+        logger.warning(
+            f"[PIPELINE] Failed to propagate failure to {original_task_id}: {e}",
+            exc_info=True,
+        )
         # WHY: session.commit() at line ~510 (and the rollup helper that may
         # call session.execute beneath it) can raise on serialization conflict
         # / FK violation / lock contention, leaving the session in
@@ -577,7 +765,6 @@ async def _propagate_pipeline_failure_to_original(task: Task, session: AsyncSess
             await session.rollback()
 
 
-
 @router.post("/api/agent/status")
 @limiter.limit("120/minute")
 async def update_agent_status(
@@ -585,7 +772,7 @@ async def update_agent_status(
     payload: AgentStatusPayload,
     background_tasks: BackgroundTasks,
     session: AsyncSession = Depends(get_session),
-    token: dict = Depends(verify_agent_token)
+    token: dict = Depends(verify_agent_token),
 ):
     """
     Endpoint for agents to report progress, save git artifacts, and update task status.
@@ -613,10 +800,14 @@ async def update_agent_status(
     #   - the lock holder (post-commit) commits before its long GitHub calls
     #     (early-commit pattern at line ~1635), so the contention window is
     #     bounded to the few-ms early-commit phase, not the full post-commit
-    stmt = select(Task).where(
-        Task.id == payload.task_id,
-        Task.vm_instance_id == token.get("vm_instance_id")
-    ).with_for_update(skip_locked=True)
+    stmt = (
+        select(Task)
+        .where(
+            Task.id == payload.task_id,
+            Task.vm_instance_id == token.get("vm_instance_id"),
+        )
+        .with_for_update(skip_locked=True)
+    )
     result = await session.execute(stmt)
     task = result.scalars().first()
 
@@ -633,7 +824,11 @@ async def update_agent_status(
         # in-flight lock holder is post-commit processing for a prior POST —
         # this retry would just hit the idempotency guard, so short-circuit
         # without waiting for the lock.
-        if check_task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
+        if check_task.status in (
+            TaskStatus.COMPLETED,
+            TaskStatus.FAILED,
+            TaskStatus.CANCELLED,
+        ):
             return {"status": "already_terminal", "task_id": str(check_task.id)}
         if check_task.status == TaskStatus.EVALUATING:
             return {"status": "already_evaluating", "task_id": str(check_task.id)}
@@ -679,12 +874,16 @@ async def update_agent_status(
     # even though the in-memory `task` object was loaded earlier in the
     # request and has stale context.
     if task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
-        pending_row = (await session.execute(
-            select(Task.post_commit_pending).where(Task.id == task.id)
-        )).first()
+        pending_row = (
+            await session.execute(
+                select(Task.post_commit_pending).where(Task.id == task.id)
+            )
+        ).first()
         is_pending = bool(pending_row and pending_row[0])
         if is_pending:
-            logger.info(f"[PIPELINE] Retrying post-commit for terminal task {task.id} (post_commit_pending set)")
+            logger.info(
+                f"[PIPELINE] Retrying post-commit for terminal task {task.id} (post_commit_pending set)"
+            )
             # Release the outer FOR UPDATE SKIP LOCKED row lock before calling
             # _process_post_commit: it opens a separate session and takes its
             # own FOR UPDATE (task_lifecycle.py:559) on the same row. Holding
@@ -692,16 +891,23 @@ async def update_agent_status(
             # (30s) → LockNotAvailableError → 500 → Cloud Run ContainerError.
             await session.commit()
             _bind = session.bind
-            _factory = async_sessionmaker(_bind, class_=AsyncSession, expire_on_commit=False)
+            _factory = async_sessionmaker(
+                _bind, class_=AsyncSession, expire_on_commit=False
+            )
             try:
-                result = await _process_post_commit(task.id, payload, _session_factory=_factory)
+                result = await _process_post_commit(
+                    task.id, payload, _session_factory=_factory
+                )
                 await session.refresh(task)
                 task.post_commit_pending = False
                 session.add(task)
                 await session.commit()
                 return result
             except Exception as e:
-                logger.error(f"[PIPELINE] Post-commit retry also failed for {task.id}: {e}", exc_info=True)
+                logger.error(
+                    f"[PIPELINE] Post-commit retry also failed for {task.id}: {e}",
+                    exc_info=True,
+                )
                 raise
         return {"status": "already_terminal", "task_id": str(task.id)}
     if task.status == TaskStatus.EVALUATING:
@@ -718,7 +924,7 @@ async def update_agent_status(
             model=payload.model or (task.context or {}).get("llm_model"),
             execution_mode=payload.execution_mode or get_task_llm_execution_mode(task),
         )
-        flag_modified(task, 'context')
+        flag_modified(task, "context")
     payloads = list(task.payloads or [])
     if payloads:
         payload_updated = False
@@ -730,7 +936,7 @@ async def update_agent_status(
             payload_updated = True
         if payload_updated:
             task.payloads = payloads
-            flag_modified(task, 'payloads')
+            flag_modified(task, "payloads")
     # Preserve logs as status message when:
     # - no artifact is created (e.g., "no changes" completion), OR
     # - task is failing (artifact-bearing failures must not silently lose diagnostic text)
@@ -739,42 +945,52 @@ async def update_agent_status(
     # '…' mock") almost always land at the tail of test/build output.
     # Head-slicing (previous 2000-char cap) was clipping off the useful
     # part and leaving boilerplate ("RUN v2.1.9", setup noise).
-    if payload.logs and (not payload.artifact_type or payload.status == TaskStatus.FAILED):
+    if payload.logs and (
+        not payload.artifact_type or payload.status == TaskStatus.FAILED
+    ):
         task.latest_status_message = payload.logs[-8000:]
     if payload.failure_category:
         from app.failure_classification import normalize_agent_failure_category  # noqa: PLC0415
-        normalized_failure_category = normalize_agent_failure_category(payload.failure_category, task)
+
+        normalized_failure_category = normalize_agent_failure_category(
+            payload.failure_category, task
+        )
         ctx = dict(task.context or {})
-        ctx['failure_category'] = normalized_failure_category
+        ctx["failure_category"] = normalized_failure_category
         # Preserve the raw lowercase agent label (e.g. "incomplete",
         # "claude_code_failed") alongside the normalized class. Normalization
         # collapses every CODE_ERROR sub-flavour into a single string, but
         # retry-guidance routing in task_lifecycle.py needs the sub-category
         # to distinguish "agent printed a diff but never shipped" (incomplete)
         # from real build/test failures.
-        ctx['agent_failure_category_raw'] = payload.failure_category.strip().lower()
+        ctx["agent_failure_category_raw"] = payload.failure_category.strip().lower()
         task.context = ctx
     if payload.scope_gate_triggered:
         ctx = dict(task.context or {})
-        ctx['scope_gate_triggered'] = payload.scope_gate_triggered
+        ctx["scope_gate_triggered"] = payload.scope_gate_triggered
         task.context = ctx
-        flag_modified(task, 'context')
+        flag_modified(task, "context")
     if payload.file_change_details:
         ctx = dict(task.context or {})
-        ctx['_file_change_details'] = payload.file_change_details[:50]
+        ctx["_file_change_details"] = payload.file_change_details[:50]
         task.context = ctx
-        flag_modified(task, 'context')
+        flag_modified(task, "context")
     if payload.fix_loop_events:
         # Fold optional fix-loop telemetry events into Task.fix_loop_history.
         # Same loose-validation pattern as the heartbeat path: invalid entries
         # log + drop instead of 422'ing the whole status update.
         from app.fix_loop_telemetry import FixLoopEventIn, apply_fix_loop_events  # noqa: PLC0415
+
         validated: list[FixLoopEventIn] = []
         for raw in payload.fix_loop_events:
             try:
                 validated.append(FixLoopEventIn(**raw))
             except Exception as exc:
-                logger.info("[FIX_LOOP] dropping invalid event for task %s: %s", payload.task_id, exc)
+                logger.info(
+                    "[FIX_LOOP] dropping invalid event for task %s: %s",
+                    payload.task_id,
+                    exc,
+                )
         if validated:
             apply_fix_loop_events(task, validated)
     # Persist prompt fingerprint on the terminal status path. Mirrors the
@@ -783,9 +999,9 @@ async def update_agent_status(
     if payload.prompt_fingerprint:
         if task.prompt_fingerprint != payload.prompt_fingerprint:
             task.prompt_fingerprint = payload.prompt_fingerprint
-        if (task.context or {}).get('prompt_fingerprint') != payload.prompt_fingerprint:
+        if (task.context or {}).get("prompt_fingerprint") != payload.prompt_fingerprint:
             ctx = dict(task.context or {})
-            ctx['prompt_fingerprint'] = payload.prompt_fingerprint
+            ctx["prompt_fingerprint"] = payload.prompt_fingerprint
             task.context = ctx
     session.add(task)
 
@@ -796,14 +1012,22 @@ async def update_agent_status(
     # IntegrityError; we catch it and treat as the dedup-skip path.
     if payload.artifact_type:
         if payload.artifact_type == ArtifactType.PULL_REQUEST:
-            existing = (await session.execute(
-                select(Artifact).where(
-                    Artifact.task_id == task.id,
-                    Artifact.artifact_type == ArtifactType.PULL_REQUEST
+            existing = (
+                (
+                    await session.execute(
+                        select(Artifact).where(
+                            Artifact.task_id == task.id,
+                            Artifact.artifact_type == ArtifactType.PULL_REQUEST,
+                        )
+                    )
                 )
-            )).scalars().first()
+                .scalars()
+                .first()
+            )
             if existing:
-                logger.info(f"[STATUS] Task {task.id} already has PR artifact, skipping duplicate")
+                logger.info(
+                    f"[STATUS] Task {task.id} already has PR artifact, skipping duplicate"
+                )
             else:
                 artifact = Artifact(
                     task_id=task.id,
@@ -812,7 +1036,7 @@ async def update_agent_status(
                     repo_url=payload.repo_url,
                     pr_url=payload.pr_url,
                     storage_uri=payload.storage_uri,
-                    logs=payload.logs
+                    logs=payload.logs,
                 )
                 session.add(artifact)
                 try:
@@ -826,26 +1050,39 @@ async def update_agent_status(
                     )
                     return {"status": "accepted_dedup_race"}
                 # Store changed files and enriched retry info in task context
-                if payload.changed_files or payload.diff_summary or payload.self_review_outcome or payload.fix_agent_responses:
+                if (
+                    payload.changed_files
+                    or payload.diff_summary
+                    or payload.self_review_outcome
+                    or payload.fix_agent_responses
+                ):
                     ctx = dict(task.context or {})
                     if payload.changed_files:
-                        ctx['_pr_changed_files'] = payload.changed_files[:50]
-                        related = ctx.get('related_files') or task.first_payload.get('related_files') or []
+                        ctx["_pr_changed_files"] = payload.changed_files[:50]
+                        related = (
+                            ctx.get("related_files")
+                            or task.first_payload.get("related_files")
+                            or []
+                        )
                         if related:
-                            ctx['expansion_ratio'] = round(len(payload.changed_files) / len(related), 2)
-                    ctx['_pr_url'] = payload.pr_url or ''
+                            ctx["expansion_ratio"] = round(
+                                len(payload.changed_files) / len(related), 2
+                            )
+                    ctx["_pr_url"] = payload.pr_url or ""
                     if payload.diff_summary:
-                        ctx['_pr_diff_summary'] = payload.diff_summary[:50]
+                        ctx["_pr_diff_summary"] = payload.diff_summary[:50]
                     if payload.self_review_outcome:
-                        ctx['_self_review_outcome'] = payload.self_review_outcome
+                        ctx["_self_review_outcome"] = payload.self_review_outcome
                     if payload.test_failure_summary:
-                        ctx['_test_failure_summary'] = payload.test_failure_summary[:5000]
+                        ctx["_test_failure_summary"] = payload.test_failure_summary[
+                            :5000
+                        ]
                     if payload.fix_agent_responses:
                         # _spawn_pipeline_task carries this forward to the next
                         # reviewer's review_loop.fix_agent_responses for verify-mode.
-                        ctx['_fix_agent_responses'] = payload.fix_agent_responses
+                        ctx["_fix_agent_responses"] = payload.fix_agent_responses
                     task.context = ctx
-                    flag_modified(task, 'context')
+                    flag_modified(task, "context")
         else:
             artifact = Artifact(
                 task_id=task.id,
@@ -854,27 +1091,39 @@ async def update_agent_status(
                 repo_url=payload.repo_url,
                 pr_url=payload.pr_url,
                 storage_uri=payload.storage_uri,
-                logs=payload.logs
+                logs=payload.logs,
             )
             session.add(artifact)
             # Persist enriched retry info for non-PR failures (e.g. test/lint failures)
-            if payload.changed_files or payload.diff_summary or payload.test_failure_summary or payload.analysis_plan or payload.fix_agent_responses:
+            if (
+                payload.changed_files
+                or payload.diff_summary
+                or payload.test_failure_summary
+                or payload.analysis_plan
+                or payload.fix_agent_responses
+            ):
                 ctx = dict(task.context or {})
                 if payload.changed_files:
-                    ctx['_pr_changed_files'] = payload.changed_files[:50]
-                    related = ctx.get('related_files') or task.first_payload.get('related_files') or []
+                    ctx["_pr_changed_files"] = payload.changed_files[:50]
+                    related = (
+                        ctx.get("related_files")
+                        or task.first_payload.get("related_files")
+                        or []
+                    )
                     if related:
-                        ctx['expansion_ratio'] = round(len(payload.changed_files) / len(related), 2)
+                        ctx["expansion_ratio"] = round(
+                            len(payload.changed_files) / len(related), 2
+                        )
                 if payload.diff_summary:
-                    ctx['_pr_diff_summary'] = payload.diff_summary[:50]
+                    ctx["_pr_diff_summary"] = payload.diff_summary[:50]
                 if payload.test_failure_summary:
-                    ctx['_test_failure_summary'] = payload.test_failure_summary[:5000]
+                    ctx["_test_failure_summary"] = payload.test_failure_summary[:5000]
                 if payload.analysis_plan:
-                    ctx['_analysis_plan'] = payload.analysis_plan[:5000]
+                    ctx["_analysis_plan"] = payload.analysis_plan[:5000]
                 if payload.fix_agent_responses:
-                    ctx['_fix_agent_responses'] = payload.fix_agent_responses
+                    ctx["_fix_agent_responses"] = payload.fix_agent_responses
                 task.context = ctx
-                flag_modified(task, 'context')
+                flag_modified(task, "context")
 
         # Broadcast artifact creation (e.g., new logs or screenshot available)
         await broadcast_to_project(
@@ -884,8 +1133,8 @@ async def update_agent_status(
                 "task_id": str(task.id),
                 "artifact_type": payload.artifact_type,
                 "logs": payload.logs,
-                "storage_uri": payload.storage_uri
-            }
+                "storage_uri": payload.storage_uri,
+            },
         )
 
     # 3b. Parse and store smoketest result in task.plan_output + document in history
@@ -898,37 +1147,64 @@ async def update_agent_status(
             all_tests = smoketest_data.get("tests", [])
             pass_count = len([t for t in all_tests if t.get("status") == "pass"])
             fail_count = len([t for t in all_tests if t.get("status") == "fail"])
-            session.add(TaskHistory(
-                task_id=task.id, action="SMOKETEST_RESULT",
-                details={
-                    "passed": smoketest_data.get("passed", False),
-                    "total_tests": len(all_tests),
-                    "passed_count": pass_count,
-                    "failed_count": fail_count,
-                    "suite_results": smoketest_data.get("suites", {}),
-                    "guardrail_violations": smoketest_data.get("guardrail_violations", []),
-                }
-            ))
+            session.add(
+                TaskHistory(
+                    task_id=task.id,
+                    action="SMOKETEST_RESULT",
+                    details={
+                        "passed": smoketest_data.get("passed", False),
+                        "total_tests": len(all_tests),
+                        "passed_count": pass_count,
+                        "failed_count": fail_count,
+                        "suite_results": smoketest_data.get("suites", {}),
+                        "guardrail_violations": smoketest_data.get(
+                            "guardrail_violations", []
+                        ),
+                    },
+                )
+            )
         except (json.JSONDecodeError, Exception) as e:
-            logger.warning(f"[SMOKETEST] Failed to parse smoketest result for task {_task_id_str}: {e}", exc_info=True)
+            logger.warning(
+                f"[SMOKETEST] Failed to parse smoketest result for task {_task_id_str}: {e}",
+                exc_info=True,
+            )
 
     # 3b-ii. On smoketest failure, spawn a plan task and create a persistent alert
-    if payload.artifact_type == ArtifactType.SMOKETEST_RESULT and payload.status == TaskStatus.FAILED and payload.logs:
+    if (
+        payload.artifact_type == ArtifactType.SMOKETEST_RESULT
+        and payload.status == TaskStatus.FAILED
+        and payload.logs
+    ):
         try:
             smoketest_data = json.loads(payload.logs)
             if not smoketest_data.get("passed"):
-                failed_tests = [t for t in smoketest_data.get("tests", []) if t.get("status") == "fail"]
+                failed_tests = [
+                    t
+                    for t in smoketest_data.get("tests", [])
+                    if t.get("status") == "fail"
+                ]
                 if failed_tests:
                     # Duplicate prevention: skip if a fix task already exists for this smoketest
-                    existing_fix = (await session.execute(
-                        select(Task).where(Task.parent_task_id == task.id).limit(1)
-                    )).scalars().first()
+                    existing_fix = (
+                        (
+                            await session.execute(
+                                select(Task)
+                                .where(Task.parent_task_id == task.id)
+                                .limit(1)
+                            )
+                        )
+                        .scalars()
+                        .first()
+                    )
                     if existing_fix:
-                        logger.info(f"[SMOKETEST] Fix task {existing_fix.id} already exists for smoketest {task.id}, skipping duplicate")
+                        logger.info(
+                            f"[SMOKETEST] Fix task {existing_fix.id} already exists for smoketest {task.id}, skipping duplicate"
+                        )
                     else:
                         base_branch = (task.first_payload).get("base_branch", "main")
                         failure_summary = "\n".join(
-                            f"- {t['name']}: {t.get('message', 'no details')}" for t in failed_tests
+                            f"- {t['name']}: {t.get('message', 'no details')}"
+                            for t in failed_tests
                         )
 
                         # Determine priority based on which suite failed (higher = dispatched first)
@@ -940,41 +1216,64 @@ async def update_agent_status(
                         else:
                             fix_priority = 50  # Regression-only failure — normal
 
-                        type_model = _runtime_config.get("task_type_models", {}).get("plan") or None
-                        type_effort = _runtime_config.get("task_type_efforts", {}).get("plan") or None
+                        type_model = (
+                            _runtime_config.get("task_type_models", {}).get("plan")
+                            or None
+                        )
+                        type_effort = (
+                            _runtime_config.get("task_type_efforts", {}).get("plan")
+                            or None
+                        )
                         plan_task = Task(
                             project_id=task.project_id,
                             title=f"Fix smoketest failures on {base_branch}",
                             description=f"{len(failed_tests)} smoke test(s) failed after merge to {base_branch}",
                             parent_task_id=task.id,
                             priority=fix_priority,
-                            payloads=[_validate_internal_payload({
-                                "type": "plan",
-                                "prompt": (
-                                    f"Smoke tests failed after a merge to {base_branch}. "
-                                    f"Investigate and plan fixes for these failures:\n\n"
-                                    f"{failure_summary}\n\n"
-                                    f"IMPORTANT GUARDRAILS:\n"
-                                    f"- Do NOT delete or skip tests just to make them pass\n"
-                                    f"- First diagnose: is the failure in the CODE or the TEST?\n"
-                                    f"- If the test is wrong, fix it to correctly test the intended behavior\n"
-                                    f"- If the code is wrong, fix the code\n"
-                                    f"- Tests may only be removed if the tested functionality was removed — explain why\n"
-                                    f"- Do NOT weaken assertions without justification\n"
-                                    f"Diagnose root causes, identify which recent changes caused each failure, "
-                                    f"and produce subtasks to fix them."
-                                ),
-                                "base_branch": base_branch,
-                                **({"model": type_model} if type_model else {}),
-                                **({"effort": type_effort} if type_effort else {}),
-                            }, "main:smoketest_fix_plan")],
+                            payloads=[
+                                _validate_internal_payload(
+                                    {
+                                        "type": "plan",
+                                        "prompt": (
+                                            f"Smoke tests failed after a merge to {base_branch}. "
+                                            f"Investigate and plan fixes for these failures:\n\n"
+                                            f"{failure_summary}\n\n"
+                                            f"IMPORTANT GUARDRAILS:\n"
+                                            f"- Do NOT delete or skip tests just to make them pass\n"
+                                            f"- First diagnose: is the failure in the CODE or the TEST?\n"
+                                            f"- If the test is wrong, fix it to correctly test the intended behavior\n"
+                                            f"- If the code is wrong, fix the code\n"
+                                            f"- Tests may only be removed if the tested functionality was removed — explain why\n"
+                                            f"- Do NOT weaken assertions without justification\n"
+                                            f"Diagnose root causes, identify which recent changes caused each failure, "
+                                            f"and produce subtasks to fix them."
+                                        ),
+                                        "base_branch": base_branch,
+                                        **({"model": type_model} if type_model else {}),
+                                        **(
+                                            {"effort": type_effort}
+                                            if type_effort
+                                            else {}
+                                        ),
+                                    },
+                                    "main:smoketest_fix_plan",
+                                )
+                            ],
                             context={
                                 "smoketest_task_id": str(task.id),
                                 "failed_tests": [t["name"] for t in failed_tests],
                                 "suite_results": suite_results,
-                                "guardrail_violations": smoketest_data.get("guardrail_violations", []),
+                                "guardrail_violations": smoketest_data.get(
+                                    "guardrail_violations", []
+                                ),
                                 "total_tests": len(smoketest_data.get("tests", [])),
-                                "passed_count": len([t for t in smoketest_data.get("tests", []) if t.get("status") == "pass"]),
+                                "passed_count": len(
+                                    [
+                                        t
+                                        for t in smoketest_data.get("tests", [])
+                                        if t.get("status") == "pass"
+                                    ]
+                                ),
                                 "failed_count": len(failed_tests),
                             },
                             vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
@@ -984,39 +1283,65 @@ async def update_agent_status(
                         session.add(plan_task)
                         await session.flush()
                         history = TaskHistory(
-                            task_id=plan_task.id, action="SPAWNED",
-                            details={"spawned_by": "SMOKETEST_FAILURE", "priority": fix_priority, "failed_tests": [t["name"] for t in failed_tests]}
+                            task_id=plan_task.id,
+                            action="SPAWNED",
+                            details={
+                                "spawned_by": "SMOKETEST_FAILURE",
+                                "priority": fix_priority,
+                                "failed_tests": [t["name"] for t in failed_tests],
+                            },
                         )
                         session.add(history)
 
                         # Build suite breakdown for alert message
                         suite_detail = ""
                         for suite_name, suite_data in suite_results.items():
-                            if isinstance(suite_data, dict) and suite_data.get("passed") is False:
-                                suite_fails = [t for t in suite_data.get("tests", []) if t.get("status") == "fail"]
+                            if (
+                                isinstance(suite_data, dict)
+                                and suite_data.get("passed") is False
+                            ):
+                                suite_fails = [
+                                    t
+                                    for t in suite_data.get("tests", [])
+                                    if t.get("status") == "fail"
+                                ]
                                 if suite_fails:
-                                    suite_detail += f" [{suite_name}: {len(suite_fails)} failed]"
+                                    suite_detail += (
+                                        f" [{suite_name}: {len(suite_fails)} failed]"
+                                    )
 
                         alert = Alert(
                             project_id=task.project_id,
                             severity=AlertSeverity.ERROR,
                             title=f"Smoke tests failed on {base_branch}",
                             message=f"{len(failed_tests)} test(s) failed: {', '.join(t['name'] for t in failed_tests[:5])}"
-                                    + (f" (+{len(failed_tests) - 5} more)" if len(failed_tests) > 5 else "")
-                                    + (suite_detail if suite_detail else ""),
+                            + (
+                                f" (+{len(failed_tests) - 5} more)"
+                                if len(failed_tests) > 5
+                                else ""
+                            )
+                            + (suite_detail if suite_detail else ""),
                             task_id=task.id,
                         )
                         session.add(alert)
 
                         await broadcast_to_project(
-                            str(task.project_id), "task_updated",
-                            {"task_id": str(plan_task.id), "status": TaskStatus.QUEUED}
+                            str(task.project_id),
+                            "task_updated",
+                            {"task_id": str(plan_task.id), "status": TaskStatus.QUEUED},
                         )
                         await broadcast_to_project(
-                            str(task.project_id), "alert_created",
-                            {"alert_id": str(alert.id), "severity": alert.severity, "title": alert.title}
+                            str(task.project_id),
+                            "alert_created",
+                            {
+                                "alert_id": str(alert.id),
+                                "severity": alert.severity,
+                                "title": alert.title,
+                            },
                         )
-                        logger.error(f"[SMOKETEST] Spawned plan task {plan_task.id} (priority={fix_priority}) + alert for {len(failed_tests)} failed smoke tests")
+                        logger.error(
+                            f"[SMOKETEST] Spawned plan task {plan_task.id} (priority={fix_priority}) + alert for {len(failed_tests)} failed smoke tests"
+                        )
         except Exception as e:
             # Audit W5/A6: smoketest plan-task spawn used to silently log-and-continue.
             # That hid genuine breakage of the smoketest → fix-spawn → CI loop. Now
@@ -1035,7 +1360,9 @@ async def update_agent_status(
             _rolled_back = await _recover_poisoned_session(session, _task_id_str)
             if _rolled_back:
                 task.status = payload.status
-                if payload.logs and (not payload.artifact_type or payload.status == TaskStatus.FAILED):
+                if payload.logs and (
+                    not payload.artifact_type or payload.status == TaskStatus.FAILED
+                ):
                     task.latest_status_message = payload.logs[-8000:]
             task.spawn_failed = True
             try:
@@ -1052,8 +1379,13 @@ async def update_agent_status(
                 )
                 session.add(spawn_alert)
                 await broadcast_to_project(
-                    str(task.project_id), "alert_created",
-                    {"alert_id": str(spawn_alert.id), "severity": spawn_alert.severity, "title": spawn_alert.title},
+                    str(task.project_id),
+                    "alert_created",
+                    {
+                        "alert_id": str(spawn_alert.id),
+                        "severity": spawn_alert.severity,
+                        "title": spawn_alert.title,
+                    },
                 )
             except Exception as alert_err:
                 logger.error(
@@ -1074,7 +1406,11 @@ async def update_agent_status(
                 failed_task_id = (task.context or {}).get("failed_task_id", "")
                 base_branch = (task.first_payload).get("base_branch", "main")
                 debug_title = task.title or ""
-                fix_title = debug_title.removeprefix("Debug: ") if debug_title.startswith("Debug: ") else debug_title
+                fix_title = (
+                    debug_title.removeprefix("Debug: ")
+                    if debug_title.startswith("Debug: ")
+                    else debug_title
+                )
 
                 # Dedup: if _requeue_parent_task already replaced the failed task with a
                 # clone (marked by _replaced_by_task_id on the cancelled child), spawning
@@ -1084,20 +1420,27 @@ async def update_agent_status(
                 if failed_task_id:
                     try:
                         _failed_uuid = uuid.UUID(failed_task_id)
-                        _failed_task_obj = (await session.execute(
-                            select(Task).where(Task.id == _failed_uuid)
-                        )).scalar_one_or_none()
+                        _failed_task_obj = (
+                            await session.execute(
+                                select(Task).where(Task.id == _failed_uuid)
+                            )
+                        ).scalar_one_or_none()
                         if (
                             _failed_task_obj is not None
                             and _failed_task_obj.status == TaskStatus.CANCELLED
-                            and (_failed_task_obj.context or {}).get("_replaced_by_task_id")
+                            and (_failed_task_obj.context or {}).get(
+                                "_replaced_by_task_id"
+                            )
                         ):
                             _skip_fix_spawn = True
-                            _replacement_id = (_failed_task_obj.context or {}).get("_replaced_by_task_id", "")
+                            _replacement_id = (_failed_task_obj.context or {}).get(
+                                "_replaced_by_task_id", ""
+                            )
                             logger.info(
                                 "[DEBUG] Skipping Fix: spawn — failed task %s already replaced "
                                 "by requeue (→ task %s)",
-                                failed_task_id[:8], _replacement_id[:8],
+                                failed_task_id[:8],
+                                _replacement_id[:8],
                             )
                     except Exception:
                         logger.exception(
@@ -1111,11 +1454,16 @@ async def update_agent_status(
                         title=f"Fix: {fix_title}",
                         description=debug_data["fix_prompt"],
                         parent_task_id=task.parent_task_id or task.id,
-                        payloads=[_validate_internal_payload({
-                            "type": "create",
-                            "prompt": debug_data["fix_prompt"],
-                            "base_branch": base_branch,
-                        }, "main:debug_auto_fix")],
+                        payloads=[
+                            _validate_internal_payload(
+                                {
+                                    "type": "create",
+                                    "prompt": debug_data["fix_prompt"],
+                                    "base_branch": base_branch,
+                                },
+                                "main:debug_auto_fix",
+                            )
+                        ],
                         context={
                             "debug_task_id": str(task.id),
                             "failed_task_id": failed_task_id,
@@ -1130,7 +1478,10 @@ async def update_agent_status(
 
                     # Mark the failed task so _requeue_parent_task can see the debug-fix
                     # path already claimed it and avoid spawning a second replacement.
-                    if _failed_task_obj is not None and _failed_task_obj.status == TaskStatus.FAILED:
+                    if (
+                        _failed_task_obj is not None
+                        and _failed_task_obj.status == TaskStatus.FAILED
+                    ):
                         _failed_task_obj.context = {
                             **(_failed_task_obj.context or {}),
                             "_debug_fix_spawned_task_id": str(fix_task.id),
@@ -1141,18 +1492,29 @@ async def update_agent_status(
                     await broadcast_to_project(
                         str(task.project_id),
                         "task_updated",
-                        {"task_id": str(fix_task.id), "status": TaskStatus.QUEUED, "title": fix_task.title}
+                        {
+                            "task_id": str(fix_task.id),
+                            "status": TaskStatus.QUEUED,
+                            "title": fix_task.title,
+                        },
                     )
-                    logger.info(f"[DEBUG] Spawned fix task {fix_task.id} from debug analysis (high confidence)")
+                    logger.info(
+                        f"[DEBUG] Spawned fix task {fix_task.id} from debug analysis (high confidence)"
+                    )
         except (json.JSONDecodeError, Exception) as e:
-            logger.warning(f"[DEBUG] Failed to parse debug result for task {_task_id_str}: {e}", exc_info=True)
+            logger.warning(
+                f"[DEBUG] Failed to parse debug result for task {_task_id_str}: {e}",
+                exc_info=True,
+            )
             # Same poisoning concern as the smoketest spawn block: the
             # session.flush() at line ~1018 can raise on FK/serialization,
             # leaving the session in pending-rollback state and breaking
             # downstream commits. Recover and re-apply core task mutations.
             if await _recover_poisoned_session(session, _task_id_str):
                 task.status = payload.status
-                if payload.logs and (not payload.artifact_type or payload.status == TaskStatus.FAILED):
+                if payload.logs and (
+                    not payload.artifact_type or payload.status == TaskStatus.FAILED
+                ):
                     task.latest_status_message = payload.logs[-8000:]
                 session.add(task)
 
@@ -1161,6 +1523,7 @@ async def update_agent_status(
     from app.failure_classification import classify_failure  # noqa: PLC0415
     from app.main import _ensure_vm_deleted  # noqa: PLC0415 — deferred to avoid circular import
     from app.main import _maybe_create_circuit_breaker_alert  # noqa: PLC0415 — deferred to avoid circular import
+
     if payload.status in [TaskStatus.COMPLETED, TaskStatus.FAILED]:
         # Record result for deployment monitoring and update Prometheus counters
         # Wrapped in try-except so slot release (below) always runs even if
@@ -1169,7 +1532,13 @@ async def update_agent_status(
             _direction_id = str((task.context or {}).get("direction_id") or "")
             _project_id = str(task.project_id) if task.project_id else ""
             if payload.status == TaskStatus.COMPLETED:
-                record_task_result(success=True, task_id=str(task.id), task_type=task.first_payload.get("type", ""), task_context=dict(task.context or {}), auto_remediation=task.auto_remediation)
+                record_task_result(
+                    success=True,
+                    task_id=str(task.id),
+                    task_type=task.first_payload.get("type", ""),
+                    task_context=dict(task.context or {}),
+                    auto_remediation=task.auto_remediation,
+                )
                 _shared_state.tasks_completed_total += 1
                 if _direction_id:
                     _shared_state.record_direction_result(
@@ -1181,17 +1550,55 @@ async def update_agent_status(
                 model_clear = _extract_task_model(task)
                 if acct_id_clear and model_clear:
                     try:
-                        await clear_rate_limit_state_on_success(acct_id_clear, model_clear)
+                        await clear_rate_limit_state_on_success(
+                            acct_id_clear, model_clear
+                        )
                     except Exception as e:
-                        logger.warning(f"[STATUS] clear_rate_limit_state_on_success failed for {acct_id_clear}: {e}", exc_info=True)
+                        logger.warning(
+                            f"[STATUS] clear_rate_limit_state_on_success failed for {acct_id_clear}: {e}",
+                            exc_info=True,
+                        )
                     try:
-                        _rr = await clear_regression_on_success(acct_id_clear, model_clear)
+                        _rr = await clear_regression_on_success(
+                            acct_id_clear, model_clear
+                        )
                         if _rr and task.project_id:
-                            from app.notification_dispatch import post_account_model_regression_recovered_message, dispatch_external_notification  # noqa: PLC0415
-                            await post_account_model_regression_recovered_message(session, task.project_id, account_id=_rr["account_id"], account_label=_rr["account_label"], provider=_rr.get("provider") or "", model=_rr["model"], account_rate=_rr.get("account_rate"), project_median=_rr.get("project_median"), sample_size=_rr.get("sample_size"))
-                            asyncio.ensure_future(dispatch_external_notification(task.project_id, "account_model_regression_recovered", {k: _rr.get(k) for k in ("account_id", "account_label", "provider", "model")}))  # noqa: RUF006
+                            from app.notification_dispatch import (
+                                post_account_model_regression_recovered_message,
+                                dispatch_external_notification,
+                            )  # noqa: PLC0415
+
+                            await post_account_model_regression_recovered_message(
+                                session,
+                                task.project_id,
+                                account_id=_rr["account_id"],
+                                account_label=_rr["account_label"],
+                                provider=_rr.get("provider") or "",
+                                model=_rr["model"],
+                                account_rate=_rr.get("account_rate"),
+                                project_median=_rr.get("project_median"),
+                                sample_size=_rr.get("sample_size"),
+                            )
+                            asyncio.ensure_future(
+                                dispatch_external_notification(
+                                    task.project_id,
+                                    "account_model_regression_recovered",
+                                    {
+                                        k: _rr.get(k)
+                                        for k in (
+                                            "account_id",
+                                            "account_label",
+                                            "provider",
+                                            "model",
+                                        )
+                                    },
+                                )
+                            )  # noqa: RUF006
                     except Exception as e:
-                        logger.warning(f"[STATUS] regression recovery failed for {acct_id_clear}: {e}", exc_info=True)
+                        logger.warning(
+                            f"[STATUS] regression recovery failed for {acct_id_clear}: {e}",
+                            exc_info=True,
+                        )
                         # WHY: post_account_model_regression_recovered_message
                         # → post_event_message issues session.add(ProjectMessage).
                         # Any autoflush triggered along the way (e.g. by an
@@ -1202,24 +1609,43 @@ async def update_agent_status(
                             await session.rollback()
                 if acct_id_clear and task.vm_provisioned_at:
                     try:
-                        duration_secs = (_utcnow() - task.vm_provisioned_at).total_seconds()
+                        duration_secs = (
+                            _utcnow() - task.vm_provisioned_at
+                        ).total_seconds()
                         await record_completion_event(acct_id_clear, duration_secs)
                     except Exception as e:
-                        logger.warning(f"[STATUS] record_completion_event failed for {acct_id_clear}: {e}", exc_info=True)
+                        logger.warning(
+                            f"[STATUS] record_completion_event failed for {acct_id_clear}: {e}",
+                            exc_info=True,
+                        )
             else:
                 from app.failure_classification import classify_failure_with_confidence  # noqa: PLC0415
+
                 classification = classify_failure_with_confidence(task, payload.logs)
                 failure_class = classification.failure_class
                 from app.failure_classification import (  # noqa: PLC0415
                     EXTERNAL_API_SUBTYPE_PROVIDER_MODEL_CONFIG,
                     persist_failure_category,
                 )
-                persist_failure_category(task, failure_class, confidence=classification.confidence)
-                record_task_result(success=False, failure_class=failure_class, task_id=str(task.id), task_type=task.first_payload.get("type", ""), task_context=dict(task.context or {}), auto_remediation=task.auto_remediation)
+
+                persist_failure_category(
+                    task, failure_class, confidence=classification.confidence
+                )
+                record_task_result(
+                    success=False,
+                    failure_class=failure_class,
+                    task_id=str(task.id),
+                    task_type=task.first_payload.get("type", ""),
+                    task_context=dict(task.context or {}),
+                    auto_remediation=task.auto_remediation,
+                )
                 _shared_state.tasks_failed_total += 1
                 if _direction_id:
                     _shared_state.record_direction_result(
-                        _direction_id, success=False, failure_class=failure_class, project_id=_project_id
+                        _direction_id,
+                        success=False,
+                        failure_class=failure_class,
+                        project_id=_project_id,
                     )
 
                 # Rate-limited or transient API failures: requeue instead of permanently failing
@@ -1241,7 +1667,9 @@ async def update_agent_status(
                             await disable_account_model(
                                 acct_id,
                                 model,
-                                retry_after_seconds=_rl_ctx.get("rate_limit_retry_after_seconds"),
+                                retry_after_seconds=_rl_ctx.get(
+                                    "rate_limit_retry_after_seconds"
+                                ),
                                 kind=_rl_ctx.get("rate_limit_kind") or "rate_limit",
                             )
                         # EXTERNAL_API: don't disable account (transient outage)
@@ -1258,14 +1686,20 @@ async def update_agent_status(
                     should_requeue = True
                     if failure_class == "EXTERNAL_API":
                         external_api_subtype = ctx.get("external_api_subtype")
-                        if external_api_subtype == EXTERNAL_API_SUBTYPE_PROVIDER_MODEL_CONFIG:
+                        if (
+                            external_api_subtype
+                            == EXTERNAL_API_SUBTYPE_PROVIDER_MODEL_CONFIG
+                        ):
                             provider_name = get_task_llm_provider(task)
                             current_model = model or _extract_task_model(task)
                             fallback_model = None
                             if provider_name and current_model:
                                 try:
                                     from app.providers.registry import get_provider  # noqa: PLC0415
-                                    fallback_model = get_provider(provider_name).fallback_model(current_model)
+
+                                    fallback_model = get_provider(
+                                        provider_name
+                                    ).fallback_model(current_model)
                                 except Exception as e:
                                     logger.warning(
                                         "[AGENT STATUS] Could not resolve provider model fallback "
@@ -1293,7 +1727,9 @@ async def update_agent_status(
                                     "at": _utcnow().isoformat(),
                                 }
                                 ctx.pop("_api_failure_retries", None)
-                                task.retry_after_until = None  # audit W1: column is source of truth
+                                task.retry_after_until = (
+                                    None  # audit W1: column is source of truth
+                                )
                                 ctx.pop("blacklisted_accounts", None)
                                 payloads = list(task.payloads or [])
                                 if payloads and isinstance(payloads[0], dict):
@@ -1317,18 +1753,22 @@ async def update_agent_status(
                                     provider_name,
                                     current_model,
                                 )
-                                task.latest_status_message = (
-                                    "External API model/config failure - update provider model/settings and retry."
-                                )
+                                task.latest_status_message = "External API model/config failure - update provider model/settings and retry."
                                 task.attempt_count = _runtime_config["max_retries"]
                                 should_requeue = False
                         # Permanent auth failures (bad/expired credentials) should never be
                         # retried — they will keep failing until the operator re-authenticates.
                         # Detect these by inspecting the failure message before burning retries.
-                        elif any(ind in (payload.logs or "").lower() for ind in (
-                            "token expired", "token revoked", "bad credentials",
-                            "unauthorized", "401",
-                        )):
+                        elif any(
+                            ind in (payload.logs or "").lower()
+                            for ind in (
+                                "token expired",
+                                "token revoked",
+                                "bad credentials",
+                                "unauthorized",
+                                "401",
+                            )
+                        ):
                             logger.warning(
                                 f"[AGENT STATUS] Task {task.id} EXTERNAL_API permanent auth failure "
                                 f"— not requeuing (operator must re-authenticate)"
@@ -1347,12 +1787,16 @@ async def update_agent_status(
                             api_retries = ctx.get("_api_failure_retries", 0) + 1
                             ctx["_api_failure_retries"] = api_retries
                             if api_retries > 5:
-                                logger.warning(f"[AGENT STATUS] Task {task.id} hit {api_retries} EXTERNAL_API failures — not requeuing")
+                                logger.warning(
+                                    f"[AGENT STATUS] Task {task.id} hit {api_retries} EXTERNAL_API failures — not requeuing"
+                                )
                                 should_requeue = False
                             else:
-                                delay = min(2 ** api_retries * 120, 1800)
+                                delay = min(2**api_retries * 120, 1800)
                                 set_retry_after(ctx, delay / 60)
-                                logger.info(f"[AGENT STATUS] Task {task.id} EXTERNAL_API retry {api_retries} — backoff {delay}s")
+                                logger.info(
+                                    f"[AGENT STATUS] Task {task.id} EXTERNAL_API retry {api_retries} — backoff {delay}s"
+                                )
 
                     if should_requeue:
                         old_vm_id_rl = task.vm_instance_id  # Save BEFORE reassignment
@@ -1362,11 +1806,14 @@ async def update_agent_status(
                         # Since we're requeuing, drop the cache entry so the next
                         # provisioned VM can successfully claim.
                         from app.routers.agent import _terminated_task_ids  # noqa: PLC0415
+
                         _terminated_task_ids.pop(str(task.id), None)
                         task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
                         task.last_heartbeat = None
                         task.started_at = None
-                        task.latest_status_message = f"{failure_class.replace('_', ' ').title()} — requeued"
+                        task.latest_status_message = (
+                            f"{failure_class.replace('_', ' ').title()} — requeued"
+                        )
                         # For rate-limited tasks: check if any account is still available.
                         # If all are exhausted, set retry_after based on earliest recovery
                         # to prevent rapid cycling through exhausted accounts.
@@ -1398,21 +1845,34 @@ async def update_agent_status(
                                         disabled_at = info.get("at")
                                         if disabled_at:
                                             hits = info.get("hits", 1)
-                                            cooldown_min = min(30 * (2 ** (hits - 1)), 240)
-                                            recovery_dt = disabled_at + timedelta(minutes=cooldown_min)
-                                            if earliest_recovery is None or recovery_dt < earliest_recovery:
+                                            cooldown_min = min(
+                                                30 * (2 ** (hits - 1)), 240
+                                            )
+                                            recovery_dt = disabled_at + timedelta(
+                                                minutes=cooldown_min
+                                            )
+                                            if (
+                                                earliest_recovery is None
+                                                or recovery_dt < earliest_recovery
+                                            ):
                                                 earliest_recovery = recovery_dt
                             if any_available:
-                                task.retry_after_until = None  # audit W1: column source of truth
+                                task.retry_after_until = (
+                                    None  # audit W1: column source of truth
+                                )
                             elif earliest_recovery:
-                                minutes_until = (earliest_recovery - _utcnow()).total_seconds() / 60
+                                minutes_until = (
+                                    earliest_recovery - _utcnow()
+                                ).total_seconds() / 60
                                 set_retry_after(task, minutes_until)
                                 task.latest_status_message = "Rate Limited — all accounts exhausted, waiting for recovery"
                             else:
                                 set_retry_after(task, 5)
                                 task.latest_status_message = "Rate Limited — all accounts exhausted, retrying in 5min"
                         elif failure_class != "EXTERNAL_API":
-                            task.retry_after_until = None  # audit W1: column source of truth
+                            task.retry_after_until = (
+                                None  # audit W1: column source of truth
+                            )
                         # Preserve llm_* runtime identity keys (provider/model/auth_mode/
                         # execution_mode) for observability — debugging which provider failed
                         # and per-provider metrics need this. The blacklisted_accounts list
@@ -1425,13 +1885,23 @@ async def update_agent_status(
                         task.context = ctx
                         session.add(task)
                         await session.commit()
-                        await broadcast_to_project(str(task.project_id), "task_updated",
-                            {"task_id": str(task.id), "status": TaskStatus.QUEUED})
-                        logger.info(f"[AGENT STATUS] Task {task.id} {failure_class} — requeued without burning retry")
-                        await _ensure_vm_deleted(old_vm_id_rl, reason="rate_limit_requeue")
+                        await broadcast_to_project(
+                            str(task.project_id),
+                            "task_updated",
+                            {"task_id": str(task.id), "status": TaskStatus.QUEUED},
+                        )
+                        logger.info(
+                            f"[AGENT STATUS] Task {task.id} {failure_class} — requeued without burning retry"
+                        )
+                        await _ensure_vm_deleted(
+                            old_vm_id_rl, reason="rate_limit_requeue"
+                        )
                         return {"status": "accepted"}
         except Exception as e:
-            logger.error(f"[STATUS] Exception during result recording for task {_task_id_str}: {e!r}", exc_info=True)
+            logger.error(
+                f"[STATUS] Exception during result recording for task {_task_id_str}: {e!r}",
+                exc_info=True,
+            )
             # If the swallowed exception left the session in pending-rollback
             # state — most likely the rate-limit-requeue commit at line ~1276
             # raising on a serialization conflict / deadlock — every subsequent
@@ -1443,14 +1913,21 @@ async def update_agent_status(
             # depend on.
             if await _recover_poisoned_session(session, _task_id_str):
                 task.status = payload.status
-                if payload.logs and (not payload.artifact_type or payload.status == TaskStatus.FAILED):
+                if payload.logs and (
+                    not payload.artifact_type or payload.status == TaskStatus.FAILED
+                ):
                     task.latest_status_message = payload.logs[-8000:]
                 if payload.failure_category:
-                    from app.failure_classification import normalize_agent_failure_category
+                    from app.failure_classification import (
+                        normalize_agent_failure_category,
+                    )
+
                     ctx = dict(task.context or {})
-                    ctx['failure_category'] = normalize_agent_failure_category(payload.failure_category, task)
+                    ctx["failure_category"] = normalize_agent_failure_category(
+                        payload.failure_category, task
+                    )
                     task.context = ctx
-                    flag_modified(task, 'context')
+                    flag_modified(task, "context")
                 session.add(task)
 
         # Release Max plan account slot (idempotent — skip if already released by reaper)
@@ -1473,11 +1950,13 @@ async def update_agent_status(
 
         task.vm_stopped_at = _utcnow()
         if task.vm_provisioned_at:
-            _runtime_secs = (task.vm_stopped_at - task.vm_provisioned_at).total_seconds()
+            _runtime_secs = (
+                task.vm_stopped_at - task.vm_provisioned_at
+            ).total_seconds()
             _rate = SPOT_RATE if task.vm_spot else ON_DEMAND_RATE
             ctx = dict(task.context or {})
             _estimated_cost = round(_runtime_secs * _rate, 4)
-            ctx['estimated_cost_usd'] = _estimated_cost
+            ctx["estimated_cost_usd"] = _estimated_cost
             task.context = ctx
             task.estimated_cost_usd = _estimated_cost
             await _check_daily_cost_ceiling(task, session)
@@ -1492,6 +1971,7 @@ async def update_agent_status(
         # recorded synchronously inside _ensure_vm_deleted before its first
         # await, so the reaper sees the orchestrator action immediately.
         from app.main import fire_and_forget_vm_delete  # noqa: PLC0415
+
         fire_and_forget_vm_delete(old_vm_id, reason="agent_completion")
 
         # Open-PR handoff: if a previous attempt already pushed a branch and
@@ -1505,9 +1985,12 @@ async def update_agent_status(
         if payload.status == TaskStatus.FAILED:
             try:
                 from app.reaper import _task_has_open_pr
+
                 _has_pr_artifact, _pr_num = await _task_has_open_pr(task, session)
             except Exception as _pr_check_err:
-                logger.warning(f"[AGENT_STATUS] PR-artifact lookup failed for task {task.id}: {_pr_check_err}")
+                logger.warning(
+                    f"[AGENT_STATUS] PR-artifact lookup failed for task {task.id}: {_pr_check_err}"
+                )
                 _has_pr_artifact, _pr_num = False, None
             if _has_pr_artifact and _pr_num:
                 # ── RELEASE FOR UPDATE BEFORE SLOW GITHUB I/O ──
@@ -1559,6 +2042,7 @@ async def update_agent_status(
                 #   the request retries cleanly with an idempotency guard.
                 task.status = TaskStatus.EVALUATING
                 from app.routers.agent import _terminated_task_ids  # noqa: PLC0415
+
                 _terminated_task_ids.pop(str(task.id), None)
                 task.last_heartbeat = None
                 task.latest_status_message = (
@@ -1579,8 +2063,13 @@ async def update_agent_status(
                 try:
                     from app.routers.agent import get_github_token_for_task
                     from app.github import get_pull_request
-                    _gh_token, _gh_owner, _gh_repo = await get_github_token_for_task(task.id, session)
-                    _pr_data = await get_pull_request(_gh_token, _gh_owner, _gh_repo, _pr_num)
+
+                    _gh_token, _gh_owner, _gh_repo = await get_github_token_for_task(
+                        task.id, session
+                    )
+                    _pr_data = await get_pull_request(
+                        _gh_token, _gh_owner, _gh_repo, _pr_num
+                    )
                     _gh_pr_state = _pr_data.get("state")
                     _gh_pr_merged = bool(_pr_data.get("merged"))
                 except Exception as _gh_exc:
@@ -1643,7 +2132,9 @@ async def update_agent_status(
                     )
                     return {
                         "status": "accepted_pr_check_raced",
-                        "final_status": fresh.status.value if hasattr(fresh.status, "value") else str(fresh.status),
+                        "final_status": fresh.status.value
+                        if hasattr(fresh.status, "value")
+                        else str(fresh.status),
                     }
                 task = fresh
                 _ctx = dict(task.context or {})
@@ -1658,12 +2149,15 @@ async def update_agent_status(
                     task.status = TaskStatus.COMPLETED
                     task.vm_instance_id = None
                     task.last_heartbeat = None
-                    task.latest_status_message = f"Reported FAILED; PR #{_pr_num} was merged out-of-band"
+                    task.latest_status_message = (
+                        f"Reported FAILED; PR #{_pr_num} was merged out-of-band"
+                    )
                     task.context = {**(task.context or {}), "pr_merged": True}
                     session.add(task)
                     await session.commit()
                     await broadcast_to_project(
-                        str(task.project_id), "task_updated",
+                        str(task.project_id),
+                        "task_updated",
                         {"task_id": str(task.id), "status": task.status},
                     )
                     return {"status": "accepted_pr_merged"}
@@ -1675,14 +2169,17 @@ async def update_agent_status(
                     task.status = TaskStatus.FAILED
                     task.vm_instance_id = None
                     task.last_heartbeat = None
-                    task.latest_status_message = f"Reported FAILED; PR #{_pr_num} was closed without merging"
+                    task.latest_status_message = (
+                        f"Reported FAILED; PR #{_pr_num} was closed without merging"
+                    )
                     task.context = {**(task.context or {}), "pr_closed_unmerged": True}
                     # Exhaust retries so the orphan-resurrection sweep skips it.
                     task.attempt_count = _runtime_config["max_retries"]
                     session.add(task)
                     await session.commit()
                     await broadcast_to_project(
-                        str(task.project_id), "task_updated",
+                        str(task.project_id),
+                        "task_updated",
                         {"task_id": str(task.id), "status": task.status},
                     )
                     return {"status": "accepted_pr_closed"}
@@ -1695,26 +2192,39 @@ async def update_agent_status(
                 task.status = TaskStatus.EVALUATING
                 task.vm_instance_id = None
                 task.last_heartbeat = None
-                task.latest_status_message = (
-                    f"Reported FAILED with open PR #{_pr_num}; handed off to review pipeline ({failure_class})"
-                )
+                task.latest_status_message = f"Reported FAILED with open PR #{_pr_num}; handed off to review pipeline ({failure_class})"
                 session.add(task)
                 try:
                     from app.review_pipeline import _spawn_pipeline_task
+
                     _short_id = str(task.id).replace("-", "")[:8]
                     _task_type = (task.first_payload or {}).get("type", "") or ""
                     _type_prefix_map = {
-                        "docs": "docs", "deps": "deps", "migrate": "migrate",
-                        "refactor": "refactor", "perf": "task", "qa": "task",
-                        "security_audit": "task", "debug": "task", "smoketest": "task",
+                        "docs": "docs",
+                        "deps": "deps",
+                        "migrate": "migrate",
+                        "refactor": "refactor",
+                        "perf": "task",
+                        "qa": "task",
+                        "security_audit": "task",
+                        "debug": "task",
+                        "smoketest": "task",
                     }
                     _branch_prefix = _type_prefix_map.get(_task_type, "task")
                     _branch = f"blueprint/{_branch_prefix}-{_short_id}"
                     _base_branch = (task.first_payload or {}).get("base_branch", "main")
-                    _original_prompt = (task.first_payload or {}).get("prompt", task.description or "")
+                    _original_prompt = (task.first_payload or {}).get(
+                        "prompt", task.description or ""
+                    )
                     await _spawn_pipeline_task(
-                        task, "review", session, _pr_num, _branch, _base_branch,
-                        original_prompt=_original_prompt, original_task_id=str(task.id),
+                        task,
+                        "review",
+                        session,
+                        _pr_num,
+                        _branch,
+                        _base_branch,
+                        original_prompt=_original_prompt,
+                        original_task_id=str(task.id),
                     )
                 except Exception as _spawn_exc:
                     # Best-effort: if review-spawn fails, the reaper's stale-EVALUATING
@@ -1740,13 +2250,17 @@ async def update_agent_status(
                         session.add(task)
                 await session.commit()
                 await broadcast_to_project(
-                    str(task.project_id), "task_updated",
+                    str(task.project_id),
+                    "task_updated",
                     {"task_id": str(task.id), "status": task.status},
                 )
                 return {"status": "accepted_pr_handoff"}
 
         # Retry logic for failed tasks
-        if payload.status == TaskStatus.FAILED and task.attempt_count < _runtime_config["max_retries"]:
+        if (
+            payload.status == TaskStatus.FAILED
+            and task.attempt_count < _runtime_config["max_retries"]
+        ):
             task.attempt_count += 1
             task.status = TaskStatus.QUEUED
             # The earlier FAILED assignment fired the SQLAlchemy set event
@@ -1754,6 +2268,7 @@ async def update_agent_status(
             # Since we're retrying, drop the cache entry so the next
             # provisioned VM can successfully claim.
             from app.routers.agent import _terminated_task_ids  # noqa: PLC0415
+
             _terminated_task_ids.pop(str(task.id), None)
             task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
             task.last_heartbeat = None
@@ -1776,7 +2291,9 @@ async def update_agent_status(
                 task.context = ctx
                 retry_after = set_retry_after(task, delay_minutes)
                 ctx = dict(task.context or {})
-                logger.info(f"[ORCHESTRATOR] Task {task.id} rate-limited (hit #{rl_hit_count}) — holding back {delay_minutes:.0f}min (retry_after={retry_after})")
+                logger.info(
+                    f"[ORCHESTRATOR] Task {task.id} rate-limited (hit #{rl_hit_count}) — holding back {delay_minutes:.0f}min (retry_after={retry_after})"
+                )
                 # Blacklist rate-limited account so the retry picks a different one
                 if acct_id:
                     blacklisted = list(ctx.get("blacklisted_accounts") or [])
@@ -1788,7 +2305,9 @@ async def update_agent_status(
                 task.context = ctx
                 retry_after = set_retry_after(task, delay_minutes)
                 ctx = dict(task.context or {})
-                logger.info(f"[ORCHESTRATOR] Task {task.id} provision failure — holding back {delay_minutes:.1f}min (retry_after={retry_after})")
+                logger.info(
+                    f"[ORCHESTRATOR] Task {task.id} provision failure — holding back {delay_minutes:.1f}min (retry_after={retry_after})"
+                )
             else:
                 task.retry_after_until = None  # audit W1: column source of truth
                 # Agent reached the point of POSTing a result, so provisioning worked —
@@ -1816,9 +2335,16 @@ async def update_agent_status(
             await broadcast_to_project(
                 str(task.project_id),
                 "task_updated",
-                {"task_id": str(task.id), "status": TaskStatus.QUEUED, "attempt_count": task.attempt_count}
+                {
+                    "task_id": str(task.id),
+                    "status": TaskStatus.QUEUED,
+                    "attempt_count": task.attempt_count,
+                },
             )
-            return {"status": "retrying", "message": f"Task {task.id} failed, retrying (Attempt {task.attempt_count}/3)"}
+            return {
+                "status": "retrying",
+                "message": f"Task {task.id} failed, retrying (Attempt {task.attempt_count}/3)",
+            }
 
         else:
             # Retries exhausted — annotate the final status message with context
@@ -1833,7 +2359,11 @@ async def update_agent_status(
                     session.add(task)
                 # Record CODE_ERROR-class failures to 7-day account success-rate tracking.
                 # RATE_LIMIT is tracked via disable_account_model; COMPLETED via record_completion_event.
-                if failure_class not in ("RATE_LIMIT", "EXTERNAL_API", "PROVISION_FAILURE"):
+                if failure_class not in (
+                    "RATE_LIMIT",
+                    "EXTERNAL_API",
+                    "PROVISION_FAILURE",
+                ):
                     _acct_id_outcome = get_task_llm_account_id(task)
                     if _acct_id_outcome:
                         try:
@@ -1844,10 +2374,12 @@ async def update_agent_status(
                             )
                 try:
                     from app.main import _maybe_create_failure_alert  # noqa: PLC0415
+
                     await _maybe_create_failure_alert(
                         task,
                         session,
-                        task.latest_status_message or f"[{failure_class}] Retries exhausted ({task.attempt_count}/{max_r})",
+                        task.latest_status_message
+                        or f"[{failure_class}] Retries exhausted ({task.attempt_count}/{max_r})",
                     )
                 except Exception as _alert_err:
                     # Audit 2026-04-25 A15: alert-creation failure was logged-and-continued.
@@ -1886,7 +2418,11 @@ async def update_agent_status(
                         await broadcast_to_project(
                             str(task.project_id),
                             "alert_created",
-                            {"alert_id": str(meta_alert.id), "severity": "WARNING", "title": meta_alert.title},
+                            {
+                                "alert_id": str(meta_alert.id),
+                                "severity": "WARNING",
+                                "title": meta_alert.title,
+                            },
                         )
                     except Exception as _meta_err:
                         # Last-resort: if even the meta-alert fails, give up gracefully
@@ -1932,9 +2468,15 @@ async def update_agent_status(
                 _proj = None
                 try:
                     _proj = await session.get(Project, task.project_id)
-                    _playbook_count = sum(
-                        1 for k in (_proj.design_doc or {}) if k.startswith("playbook/")
-                    ) if _proj else 0
+                    _playbook_count = (
+                        sum(
+                            1
+                            for k in (_proj.design_doc or {})
+                            if k.startswith("playbook/")
+                        )
+                        if _proj
+                        else 0
+                    )
                 except Exception:
                     _playbook_count = 0
                     # WHY: session.get(Project) can raise OperationalError /
@@ -1959,15 +2501,24 @@ async def update_agent_status(
                     try:
                         _task_type = task.first_payload.get("type", "create")
                         _PLAYBOOK_DEFAULT_TYPES = {
-                            "create", "fix", "refactor", "review", "qa", "smoketest",
-                            "deps", "migrate", "debug", "docs",
+                            "create",
+                            "fix",
+                            "refactor",
+                            "review",
+                            "qa",
+                            "smoketest",
+                            "deps",
+                            "migrate",
+                            "debug",
+                            "docs",
                         }
                         _doc = dict(_proj.design_doc or {})
                         _confirmed_changed = False
                         _now_iso = _utcnow().isoformat()
                         # Keys shown to this task (stored at claim time for accurate outcome tracking)
                         _shown_keys = {
-                            f"playbook/{k}" for k in (_ctx.get("_shown_playbook_keys") or [])
+                            f"playbook/{k}"
+                            for k in (_ctx.get("_shown_playbook_keys") or [])
                         }
                         for _pk, _pv in list(_doc.items()):
                             if _pk.startswith("playbook/") and isinstance(_pv, dict):
@@ -1978,7 +2529,9 @@ async def update_agent_status(
                                 elif _task_type not in _PLAYBOOK_DEFAULT_TYPES:
                                     continue
                                 _entry = dict(_pv)
-                                _entry["confirmed_count"] = _entry.get("confirmed_count", 0) + 1
+                                _entry["confirmed_count"] = (
+                                    _entry.get("confirmed_count", 0) + 1
+                                )
                                 _entry["last_confirmed_at"] = _now_iso
                                 # Update rolling recent_outcomes only for entries shown to this task
                                 if _pk in _shown_keys:
@@ -1999,7 +2552,9 @@ async def update_agent_status(
                                     _ref = _entry.get("reference_count", 0)
                                     _conf = _entry.get("confirmed_count", 0)
                                     if _conf > 0 or _ref > 0:
-                                        _entry["effectiveness_score"] = round(_conf / max(_ref, 1), 4)
+                                        _entry["effectiveness_score"] = round(
+                                            _conf / max(_ref, 1), 4
+                                        )
                                 _doc[_pk] = _entry
                                 _confirmed_changed = True
                         if _confirmed_changed:
@@ -2007,14 +2562,19 @@ async def update_agent_status(
                             flag_modified(_proj, "design_doc")
                             session.add(_proj)
                     except Exception as _pce:
-                        logger.warning(f"[PLAYBOOK] Failed to increment confirmed_count for task {_task_id_str}: {_pce}")
+                        logger.warning(
+                            f"[PLAYBOOK] Failed to increment confirmed_count for task {_task_id_str}: {_pce}"
+                        )
                 # Capture positive pattern for sampling-eligible first-attempt successes
                 if _ctx["_first_attempt_succeeded"] and _proj:
                     try:
                         from app.playbook_learning import capture_success_pattern  # noqa: PLC0415
+
                         await capture_success_pattern(task, session)
                     except Exception as _sce:
-                        logger.warning(f"[PLAYBOOK] Failed to capture success pattern for task {_task_id_str}: {_sce}")
+                        logger.warning(
+                            f"[PLAYBOOK] Failed to capture success pattern for task {_task_id_str}: {_sce}"
+                        )
                         # WHY: capture_success_pattern issues a COUNT query
                         # (session.execute) and session.get(Project, ...) — both
                         # may raise on serialization / lock-timeout / connection
@@ -2027,7 +2587,9 @@ async def update_agent_status(
                             await session.rollback()
                         _attrs_may_be_expired = True
             except Exception as _e:
-                logger.warning(f"[METRICS] Failed to record first-attempt metrics for task {_task_id_str}: {_e}")
+                logger.warning(
+                    f"[METRICS] Failed to record first-attempt metrics for task {_task_id_str}: {_e}"
+                )
                 # WHY: the metrics block also touches session.get and session.add;
                 # any inner op raising past the inner try/excepts (e.g. on a
                 # poisoned session that we already failed to recover) lands here.
@@ -2041,7 +2603,9 @@ async def update_agent_status(
             try:
                 await _check_recurring_failures(task, session)
             except Exception as _pbe:
-                logger.warning(f"[PLAYBOOK] Failed to check recurring failures for task {_task_id_str}: {_pbe}")
+                logger.warning(
+                    f"[PLAYBOOK] Failed to check recurring failures for task {_task_id_str}: {_pbe}"
+                )
                 # WHY: _check_recurring_failures issues session.execute() (SELECT),
                 # session.get(Project, ...), and session.add(project) without an
                 # internal flush. A serialization/lock-timeout/connection error
@@ -2075,20 +2639,28 @@ async def update_agent_status(
         failed_task_type = failed_task_payload.get("type", "")
         _is_user_submitted = task.created_by in ("USER", "ADMIN")
         _user_debug_allowed = (
-            not _is_user_submitted or
-            _shared_state.count_recent_user_debug_spawns(str(task.project_id), _utcnow()) < _shared_state.USER_DEBUG_MAX_PER_HOUR
+            not _is_user_submitted
+            or _shared_state.count_recent_user_debug_spawns(
+                str(task.project_id), _utcnow()
+            )
+            < _shared_state.USER_DEBUG_MAX_PER_HOUR
         )
         should_auto_debug = (
-            payload.status == TaskStatus.FAILED and  # Only for failed tasks (failure_class is unset for COMPLETED)
-            failed_task_type != "debug" and  # Don't recursively debug debug tasks
-            (task.context or {}).get("debug_task_id") is None and  # Don't re-debug fix tasks spawned by debug
-            payload.logs and
-            failure_class == "CODE_ERROR" and  # Only debug actual code errors, not infra/timeout/rate-limit
-            _user_debug_allowed and
-            (
-                (task.context or {}).get("auto_debug") is True or
-                task.parent_task_id is not None or  # Part of a pipeline (plan/research subtask)
-                task.created_by in ("ORCHESTRATOR", "USER", "ADMIN")  # Include user-submitted tasks
+            payload.status
+            == TaskStatus.FAILED  # Only for failed tasks (failure_class is unset for COMPLETED)
+            and failed_task_type != "debug"  # Don't recursively debug debug tasks
+            and (task.context or {}).get("debug_task_id")
+            is None  # Don't re-debug fix tasks spawned by debug
+            and payload.logs
+            and failure_class
+            == "CODE_ERROR"  # Only debug actual code errors, not infra/timeout/rate-limit
+            and _user_debug_allowed
+            and (
+                (task.context or {}).get("auto_debug") is True
+                or task.parent_task_id
+                is not None  # Part of a pipeline (plan/research subtask)
+                or task.created_by
+                in ("ORCHESTRATOR", "USER", "ADMIN")  # Include user-submitted tasks
             )
         )
         if should_auto_debug:
@@ -2098,15 +2670,24 @@ async def update_agent_status(
                 title=f"Debug: {task.title}",
                 description=f"Automated root cause analysis for failed task: {task.title}",
                 parent_task_id=task.id,
-                payloads=[_validate_internal_payload({
-                    "type": "debug",
-                    "failed_task_id": str(task.id),
-                    "failed_task_title": task.title,
-                    "error_logs": (payload.logs or "")[:20000],
-                    "base_branch": base_branch,
-                    "failed_task_prompt": (failed_task_payload.get("prompt") or task.description or "")[:2000],
-                    "failed_task_type": failed_task_type,
-                }, "main:auto_debug")],
+                payloads=[
+                    _validate_internal_payload(
+                        {
+                            "type": "debug",
+                            "failed_task_id": str(task.id),
+                            "failed_task_title": task.title,
+                            "error_logs": (payload.logs or "")[:20000],
+                            "base_branch": base_branch,
+                            "failed_task_prompt": (
+                                failed_task_payload.get("prompt")
+                                or task.description
+                                or ""
+                            )[:2000],
+                            "failed_task_type": failed_task_type,
+                        },
+                        "main:auto_debug",
+                    )
+                ],
                 context={
                     "failed_task_id": str(task.id),
                     "parent_base": base_branch,
@@ -2125,9 +2706,15 @@ async def update_agent_status(
             await broadcast_to_project(
                 str(task.project_id),
                 "task_updated",
-                {"task_id": str(debug_task.id), "status": TaskStatus.QUEUED, "title": debug_task.title}
+                {
+                    "task_id": str(debug_task.id),
+                    "status": TaskStatus.QUEUED,
+                    "title": debug_task.title,
+                },
             )
-            logger.error(f"[DEBUG] Spawned debug task {debug_task.id} for permanently failed task {task.id}")
+            logger.error(
+                f"[DEBUG] Spawned debug task {debug_task.id} for permanently failed task {task.id}"
+            )
 
         # Circuit breaker for autonomous tasks (CLOSED/OPEN/HALF-OPEN)
         # Tracks two separate failure classes:
@@ -2140,25 +2727,38 @@ async def update_agent_status(
             project_key = str(task.project_id)
             breaker = _shared_state.get_circuit_breaker(project_key)
             is_code_failure = _cb_failure_class in ("CODE_ERROR", "AGENT_TIMEOUT")
-            is_infra_failure = _cb_failure_class in ("PROVISION_FAILURE", "RATE_LIMIT", "EXTERNAL_API")
+            is_infra_failure = _cb_failure_class in (
+                "PROVISION_FAILURE",
+                "RATE_LIMIT",
+                "EXTERNAL_API",
+            )
             if is_code_failure:
                 breaker["failure_count"] += 1
                 breaker["success_count"] = 0
             elif is_infra_failure:
-                breaker["infra_failure_count"] = breaker.get("infra_failure_count", 0) + 1
+                breaker["infra_failure_count"] = (
+                    breaker.get("infra_failure_count", 0) + 1
+                )
                 breaker["success_count"] = 0
 
             # HALF-OPEN test task failed → back to OPEN with doubled cooldown
             # (any failure on the test task re-opens, including infra failures)
-            if breaker["state"] == "HALF_OPEN" and str(task.id) == breaker.get("half_open_task_id"):
+            if breaker["state"] == "HALF_OPEN" and str(task.id) == breaker.get(
+                "half_open_task_id"
+            ):
                 breaker["state"] = "OPEN"
-                breaker["cooldown_seconds"] = min(breaker["cooldown_seconds"] * 2, 7200)  # cap at 2 hours
+                breaker["cooldown_seconds"] = min(
+                    breaker["cooldown_seconds"] * 2, 7200
+                )  # cap at 2 hours
                 breaker["opened_at"] = _utcnow()
                 breaker["half_open_task_id"] = None
-                logger.warning(f"[CIRCUIT BREAKER] HALF-OPEN → OPEN for {project_key} (cooldown doubled to {breaker['cooldown_seconds']}s)")
+                logger.warning(
+                    f"[CIRCUIT BREAKER] HALF-OPEN → OPEN for {project_key} (cooldown doubled to {breaker['cooldown_seconds']}s)"
+                )
                 await _maybe_create_circuit_breaker_alert(
-                    task.project_id, session,
-                    f"HALF-OPEN test task failed — circuit breaker re-opened (cooldown: {breaker['cooldown_seconds']}s)"
+                    task.project_id,
+                    session,
+                    f"HALF-OPEN test task failed — circuit breaker re-opened (cooldown: {breaker['cooldown_seconds']}s)",
                 )
 
             # CLOSED → OPEN after 3 consecutive code failures
@@ -2167,19 +2767,32 @@ async def update_agent_status(
                 breaker["open_reason"] = "code"
                 breaker["opened_at"] = _utcnow()
                 breaker["cooldown_seconds"] = breaker["base_cooldown"]
-                await broadcast_to_project(project_key, "autonomous_paused",
-                                           {"reason": f"Circuit breaker OPEN after {breaker['failure_count']} consecutive code failures"})
-                logger.warning(f"[CIRCUIT BREAKER] CLOSED → OPEN (code) for {project_key} after {breaker['failure_count']} failures")
+                await broadcast_to_project(
+                    project_key,
+                    "autonomous_paused",
+                    {
+                        "reason": f"Circuit breaker OPEN after {breaker['failure_count']} consecutive code failures"
+                    },
+                )
+                logger.warning(
+                    f"[CIRCUIT BREAKER] CLOSED → OPEN (code) for {project_key} after {breaker['failure_count']} failures"
+                )
                 _cb_alert_text = f"Circuit breaker opened after {breaker['failure_count']} consecutive code failures (cooldown: {breaker['cooldown_seconds']}s)"
                 await _maybe_create_circuit_breaker_alert(
-                    task.project_id, session,
+                    task.project_id,
+                    session,
                     _cb_alert_text,
                 )
                 try:
                     from app.notification_dispatch import post_failure_alert_message  # noqa: PLC0415
-                    await post_failure_alert_message(session, task.project_id, _cb_alert_text, task.id)
+
+                    await post_failure_alert_message(
+                        session, task.project_id, _cb_alert_text, task.id
+                    )
                 except Exception as _e:
-                    logger.warning(f"[NOTIFY] Failed to post circuit breaker message: {_e}")
+                    logger.warning(
+                        f"[NOTIFY] Failed to post circuit breaker message: {_e}"
+                    )
                     # WHY: post_failure_alert_message → post_event_message does
                     # session.add(ProjectMessage). Most failures here are pre-add
                     # (import / no-flush), but autoflush triggered by any
@@ -2191,28 +2804,44 @@ async def update_agent_status(
                         await session.rollback()
 
             # CLOSED → OPEN after 5 consecutive infra failures (wall of provisioning/rate-limit)
-            elif breaker["state"] == "CLOSED" and breaker.get("infra_failure_count", 0) >= 5:
+            elif (
+                breaker["state"] == "CLOSED"
+                and breaker.get("infra_failure_count", 0) >= 5
+            ):
                 breaker["state"] = "OPEN"
                 breaker["open_reason"] = "infra"
                 breaker["opened_at"] = _utcnow()
                 # Shorter cooldown than code breaker — infra outages usually self-heal faster
                 breaker["cooldown_seconds"] = 300  # 5 min
-                await broadcast_to_project(project_key, "autonomous_paused",
-                                           {"reason": f"Circuit breaker OPEN after {breaker['infra_failure_count']} consecutive infra failures ({_cb_failure_class})"})
-                logger.warning(f"[CIRCUIT BREAKER] CLOSED → OPEN (infra) for {project_key} after {breaker['infra_failure_count']} infra failures")
+                await broadcast_to_project(
+                    project_key,
+                    "autonomous_paused",
+                    {
+                        "reason": f"Circuit breaker OPEN after {breaker['infra_failure_count']} consecutive infra failures ({_cb_failure_class})"
+                    },
+                )
+                logger.warning(
+                    f"[CIRCUIT BREAKER] CLOSED → OPEN (infra) for {project_key} after {breaker['infra_failure_count']} infra failures"
+                )
                 _cb_alert_text = (
                     f"Circuit breaker opened: {breaker['infra_failure_count']} consecutive infra failures "
                     f"({_cb_failure_class}). Cooldown: {breaker['cooldown_seconds']}s."
                 )
                 await _maybe_create_circuit_breaker_alert(
-                    task.project_id, session,
+                    task.project_id,
+                    session,
                     _cb_alert_text,
                 )
                 try:
                     from app.notification_dispatch import post_failure_alert_message  # noqa: PLC0415
-                    await post_failure_alert_message(session, task.project_id, _cb_alert_text, task.id)
+
+                    await post_failure_alert_message(
+                        session, task.project_id, _cb_alert_text, task.id
+                    )
                 except Exception as _e:
-                    logger.warning(f"[NOTIFY] Failed to post circuit breaker message: {_e}")
+                    logger.warning(
+                        f"[NOTIFY] Failed to post circuit breaker message: {_e}"
+                    )
                     # WHY: same poison risk as the CODE-class branch above —
                     # post_event_message does session.add and an autoflush could
                     # raise. Roll back so the early commit at ~1979 doesn't
@@ -2240,12 +2869,16 @@ async def update_agent_status(
             breaker["success_count"] += 1
 
             # HALF-OPEN test task succeeded → back to CLOSED
-            if breaker["state"] == "HALF_OPEN" and str(task.id) == breaker.get("half_open_task_id"):
+            if breaker["state"] == "HALF_OPEN" and str(task.id) == breaker.get(
+                "half_open_task_id"
+            ):
                 breaker["state"] = "CLOSED"
                 breaker["open_reason"] = None
                 breaker["cooldown_seconds"] = breaker["base_cooldown"]
                 breaker["half_open_task_id"] = None
-                logger.warning(f"[CIRCUIT BREAKER] HALF-OPEN → CLOSED for {project_key} (test task succeeded)")
+                logger.warning(
+                    f"[CIRCUIT BREAKER] HALF-OPEN → CLOSED for {project_key} (test task succeeded)"
+                )
             elif breaker["state"] == "OPEN":
                 # Shouldn't happen (OPEN blocks spawning), but reset if it does
                 breaker["state"] = "CLOSED"
@@ -2261,25 +2894,34 @@ async def update_agent_status(
         if payload.status == TaskStatus.COMPLETED:
             try:
                 from app.notification_dispatch import dispatch_external_notification  # noqa: PLC0415
+
                 ctx = task.context or {}
                 first_payload = task.first_payload or {}
                 changed_files = ctx.get("_pr_changed_files") or []
-                direction_text = (ctx.get("direction_text") or first_payload.get("direction_text") or "")
-                asyncio.ensure_future(dispatch_external_notification(
-                    task.project_id,
-                    "TASK_COMPLETED",
-                    {
-                        "task_id": str(task.id),
-                        "task_title": task.title or str(task.id)[:8],
-                        "task_type": task.first_payload.get("type", ""),
-                        "pr_url": ctx.get("_pr_url") or ctx.get("pr_url") or "",
-                        "changed_files_count": len(changed_files),
-                        "direction_id": ctx.get("direction_id") or "",
-                        "direction_text": direction_text[:200],
-                        "scope": ctx.get("scope") or first_payload.get("scope") or "",
-                        "review_iterations": int(ctx.get("review_iterations") or 0),
-                    },
-                ))
+                direction_text = (
+                    ctx.get("direction_text")
+                    or first_payload.get("direction_text")
+                    or ""
+                )
+                asyncio.ensure_future(
+                    dispatch_external_notification(
+                        task.project_id,
+                        "TASK_COMPLETED",
+                        {
+                            "task_id": str(task.id),
+                            "task_title": task.title or str(task.id)[:8],
+                            "task_type": task.first_payload.get("type", ""),
+                            "pr_url": ctx.get("_pr_url") or ctx.get("pr_url") or "",
+                            "changed_files_count": len(changed_files),
+                            "direction_id": ctx.get("direction_id") or "",
+                            "direction_text": direction_text[:200],
+                            "scope": ctx.get("scope")
+                            or first_payload.get("scope")
+                            or "",
+                            "review_iterations": int(ctx.get("review_iterations") or 0),
+                        },
+                    )
+                )
             except Exception as _ne:
                 logger.warning(f"[NOTIFY] TASK_COMPLETED dispatch setup failed: {_ne}")
 
@@ -2334,7 +2976,10 @@ async def update_agent_status(
             if session.in_transaction():
                 await session.commit()
         except Exception as early_exc:
-            logger.error(f"[PIPELINE] Early commit failed for {_task_id_str}: {early_exc}", exc_info=True)
+            logger.error(
+                f"[PIPELINE] Early commit failed for {_task_id_str}: {early_exc}",
+                exc_info=True,
+            )
             try:
                 await session.rollback()
             except Exception:
@@ -2345,7 +2990,9 @@ async def update_agent_status(
         # In production this is AsyncSessionLocal; in tests it's the test engine.
         # This ensures the helper's fresh session doesn't bypass test DB overrides.
         _bind = session.bind
-        _factory = async_sessionmaker(_bind, class_=AsyncSession, expire_on_commit=False)
+        _factory = async_sessionmaker(
+            _bind, class_=AsyncSession, expire_on_commit=False
+        )
         # Audit Phase C4 (M-C6): release the request-session connection back to
         # the pool now. _process_post_commit and _persist_post_commit_pending
         # both use `_factory` (a fresh session), and the early-commit above
@@ -2360,7 +3007,9 @@ async def update_agent_status(
         try:
             await session.close()
         except Exception as _close_exc:
-            logger.debug(f"[PIPELINE] Early session close failed (non-fatal): {_close_exc}")
+            logger.debug(
+                f"[PIPELINE] Early session close failed (non-fatal): {_close_exc}"
+            )
         # Cloud Run's default request timeout is 300s. Post-commit makes
         # multiple GitHub calls (review posting, check-run update, PR state
         # check, merge attempts) that each retry with up to 3x120s backoff on

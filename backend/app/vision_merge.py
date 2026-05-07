@@ -32,6 +32,7 @@ Lists (``systems``, ``priorities``, ``success_criteria`` items):
   - Reorders are not detected (treated as no-op); item adds/removes
     follow the rule (user removal beats agent re-add, agent add lands).
 """
+
 from __future__ import annotations
 
 from typing import Any, Iterable, Mapping, Optional
@@ -46,7 +47,13 @@ REJECTED_EDITS_MAX = 30
 # Top-level vision fields the agent is allowed to author (the merge
 # operates on these; the agent can add new keys outside this set, those
 # fall through as agent-wins by default).
-_KNOWN_AGENT_FIELDS = ("purpose", "success_criteria", "systems", "priorities", "context")
+_KNOWN_AGENT_FIELDS = (
+    "purpose",
+    "success_criteria",
+    "systems",
+    "priorities",
+    "context",
+)
 
 
 def _item_key(item: Any) -> Optional[str]:
@@ -63,8 +70,12 @@ def _item_key(item: Any) -> Optional[str]:
 
 
 def _merge_list(
-    baseline: list, agent: list, current: list, *,
-    field_path: str, rejected: list,
+    baseline: list,
+    agent: list,
+    current: list,
+    *,
+    field_path: str,
+    rejected: list,
 ) -> list:
     """Per-item field-level merge for a list of dicts (or strings).
 
@@ -79,7 +90,7 @@ def _merge_list(
     merged: list = []
     seen: set[str] = set()
     # Walk current order to preserve user's ordering / additions.
-    for item in (current or []):
+    for item in current or []:
         key = _item_key(item)
         if key is None:
             merged.append(item)
@@ -94,19 +105,22 @@ def _merge_list(
             merged.append(item)
             if key in base_by_key:
                 # Agent removed an item the baseline had — log the rejection.
-                rejected.append({
-                    "at": _utcnow().isoformat(),
-                    "field": f"{field_path}[{key}]",
-                    "kind": "removal_rejected",
-                    "user_value": item,
-                    "agent_value": None,
-                })
+                rejected.append(
+                    {
+                        "at": _utcnow().isoformat(),
+                        "field": f"{field_path}[{key}]",
+                        "kind": "removal_rejected",
+                        "user_value": item,
+                        "agent_value": None,
+                    }
+                )
             continue
         # Both have it. Field-level merge if dict; else user wins.
         if isinstance(item, dict) and isinstance(agent_item, dict):
             merged_item = _merge_dict(
                 baseline_item if isinstance(baseline_item, dict) else {},
-                agent_item, item,
+                agent_item,
+                item,
                 field_path=f"{field_path}[{key}]",
                 rejected=rejected,
             )
@@ -114,13 +128,15 @@ def _merge_list(
         else:
             # Scalar list items: user wins on conflict.
             if item != agent_item and item != baseline_item:
-                rejected.append({
-                    "at": _utcnow().isoformat(),
-                    "field": f"{field_path}[{key}]",
-                    "kind": "value_conflict",
-                    "user_value": item,
-                    "agent_value": agent_item,
-                })
+                rejected.append(
+                    {
+                        "at": _utcnow().isoformat(),
+                        "field": f"{field_path}[{key}]",
+                        "kind": "value_conflict",
+                        "user_value": item,
+                        "agent_value": agent_item,
+                    }
+                )
             merged.append(item)
     # Items only in agent (additions).
     for key, agent_item in agent_by_key.items():
@@ -128,13 +144,15 @@ def _merge_list(
             continue
         if key in base_by_key:
             # Existed in baseline, current dropped it — user removed it. Don't re-add.
-            rejected.append({
-                "at": _utcnow().isoformat(),
-                "field": f"{field_path}[{key}]",
-                "kind": "user_removed_agent_kept",
-                "user_value": None,
-                "agent_value": agent_item,
-            })
+            rejected.append(
+                {
+                    "at": _utcnow().isoformat(),
+                    "field": f"{field_path}[{key}]",
+                    "kind": "user_removed_agent_kept",
+                    "user_value": None,
+                    "agent_value": agent_item,
+                }
+            )
             continue
         # Brand new item from agent: user hasn't seen it, take it.
         merged.append(agent_item)
@@ -170,23 +188,31 @@ def _merge_dict(
         # else keep user's value and log the rejection.
         if isinstance(a, dict) and isinstance(c, dict):
             merged[k] = _merge_dict(
-                b if isinstance(b, dict) else {}, a, c,
-                field_path=f"{field_path}.{k}", rejected=rejected,
+                b if isinstance(b, dict) else {},
+                a,
+                c,
+                field_path=f"{field_path}.{k}",
+                rejected=rejected,
             )
         elif isinstance(a, list) and isinstance(c, list):
             merged[k] = _merge_list(
-                b if isinstance(b, list) else [], a, c,
-                field_path=f"{field_path}.{k}", rejected=rejected,
+                b if isinstance(b, list) else [],
+                a,
+                c,
+                field_path=f"{field_path}.{k}",
+                rejected=rejected,
             )
         else:
             # Scalar conflict: user wins, log agent's intent.
-            rejected.append({
-                "at": _utcnow().isoformat(),
-                "field": f"{field_path}.{k}",
-                "kind": "value_conflict",
-                "user_value": c,
-                "agent_value": a,
-            })
+            rejected.append(
+                {
+                    "at": _utcnow().isoformat(),
+                    "field": f"{field_path}.{k}",
+                    "kind": "value_conflict",
+                    "user_value": c,
+                    "agent_value": a,
+                }
+            )
             # merged already has c (user value); leave it.
     return merged
 
@@ -204,8 +230,11 @@ def merge_vision(
     """
     rejected: list = []
     merged = _merge_dict(
-        baseline or {}, agent or {}, current or {},
-        field_path="vision", rejected=rejected,
+        baseline or {},
+        agent or {},
+        current or {},
+        field_path="vision",
+        rejected=rejected,
     )
     return merged, rejected
 

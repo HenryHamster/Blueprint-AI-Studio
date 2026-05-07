@@ -9,6 +9,7 @@ Covers:
   requested model
 - Preview→GA fallback in select_llm_runtime_for_task
 """
+
 from __future__ import annotations
 
 import uuid
@@ -43,6 +44,7 @@ OPUS = "claude-opus-4-7"
 # Gemini list_available_models — happy path and soft-failure path.
 # ---------------------------------------------------------------------------
 
+
 class TestGeminiListAvailableModels:
     @pytest.mark.asyncio
     async def test_api_key_parses_models_prefix(self, mocker):
@@ -50,17 +52,19 @@ class TestGeminiListAvailableModels:
         Strip the `models/` prefix so output is plain IDs."""
         provider = get_provider(LLMProviderName.GEMINI)
         mock_resp = mocker.MagicMock(status_code=200)
-        mock_resp.json = mocker.MagicMock(return_value={
-            "models": [
-                {"name": "models/gemini-2.5-pro"},
-                {"name": "models/gemini-2.5-flash"},
-                {"name": "models/gemini-3.1-pro-preview"},
-                # Duplicates + malformed entries must not crash the parser.
-                {"name": "models/gemini-2.5-pro"},
-                {"not_a_name": "bogus"},
-                None,
-            ]
-        })
+        mock_resp.json = mocker.MagicMock(
+            return_value={
+                "models": [
+                    {"name": "models/gemini-2.5-pro"},
+                    {"name": "models/gemini-2.5-flash"},
+                    {"name": "models/gemini-3.1-pro-preview"},
+                    # Duplicates + malformed entries must not crash the parser.
+                    {"name": "models/gemini-2.5-pro"},
+                    {"not_a_name": "bogus"},
+                    None,
+                ]
+            }
+        )
         mock_resp.raise_for_status = mocker.MagicMock()
         mock_client = mocker.MagicMock()
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)
@@ -109,12 +113,15 @@ class TestGeminiListAvailableModels:
     async def test_empty_secret_returns_none(self):
         provider = get_provider(LLMProviderName.GEMINI)
         assert await provider.list_available_models("", LLMAuthMode.API_KEY, {}) is None
-        assert await provider.list_available_models(None, LLMAuthMode.API_KEY, {}) is None
+        assert (
+            await provider.list_available_models(None, LLMAuthMode.API_KEY, {}) is None
+        )
 
 
 # ---------------------------------------------------------------------------
 # OpenAI list_available_models.
 # ---------------------------------------------------------------------------
+
 
 class TestOpenAIListAvailableModels:
     @pytest.mark.asyncio
@@ -122,14 +129,16 @@ class TestOpenAIListAvailableModels:
         """v1/models response: {"data":[{"id":"gpt-5.4", ...}, ...]}."""
         provider = get_provider(LLMProviderName.OPENAI)
         mock_resp = mocker.MagicMock(status_code=200)
-        mock_resp.json = mocker.MagicMock(return_value={
-            "data": [
-                {"id": "gpt-5.4", "object": "model"},
-                {"id": "gpt-5.4-mini"},
-                {"id": "gpt-5.3-codex"},
-                {"no_id": True},  # malformed; skip
-            ]
-        })
+        mock_resp.json = mocker.MagicMock(
+            return_value={
+                "data": [
+                    {"id": "gpt-5.4", "object": "model"},
+                    {"id": "gpt-5.4-mini"},
+                    {"id": "gpt-5.3-codex"},
+                    {"no_id": True},  # malformed; skip
+                ]
+            }
+        )
         mock_resp.raise_for_status = mocker.MagicMock()
         mock_client = mocker.MagicMock()
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)
@@ -154,6 +163,7 @@ class TestOpenAIListAvailableModels:
 # ---------------------------------------------------------------------------
 # Availability cache helpers — account_has_model / refresh.
 # ---------------------------------------------------------------------------
+
 
 class TestAccountHasModel:
     def test_returns_true_when_in_list(self):
@@ -184,9 +194,9 @@ class TestRefreshAccountAvailableModels:
     @pytest.mark.asyncio
     async def test_stashes_result_and_timestamp(self, mocker):
         mock_resp = mocker.MagicMock(status_code=200)
-        mock_resp.json = mocker.MagicMock(return_value={
-            "models": [{"name": "models/gemini-2.5-pro"}]
-        })
+        mock_resp.json = mocker.MagicMock(
+            return_value={"models": [{"name": "models/gemini-2.5-pro"}]}
+        )
         mock_resp.raise_for_status = mocker.MagicMock()
         mock_client = mocker.MagicMock()
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)
@@ -253,24 +263,35 @@ class TestStalenessDetection:
 
     def test_recent_is_fresh(self):
         from datetime import datetime, timezone
+
         now = datetime.now(timezone.utc)
-        acct = {"provider_metadata": {
-            "available_models_refreshed_at": (now - timedelta(minutes=5)).isoformat(),
-        }}
+        acct = {
+            "provider_metadata": {
+                "available_models_refreshed_at": (
+                    now - timedelta(minutes=5)
+                ).isoformat(),
+            }
+        }
         assert account_availability_is_stale(acct, now=now) is False
 
     def test_old_timestamp_is_stale(self):
         from datetime import datetime, timezone
+
         now = datetime.now(timezone.utc)
-        acct = {"provider_metadata": {
-            "available_models_refreshed_at": (now - timedelta(hours=12)).isoformat(),
-        }}
+        acct = {
+            "provider_metadata": {
+                "available_models_refreshed_at": (
+                    now - timedelta(hours=12)
+                ).isoformat(),
+            }
+        }
         assert account_availability_is_stale(acct, now=now) is True
 
 
 class TestAccountSuccessRate7d:
     def _naive_now(self):
         from datetime import datetime, timezone
+
         return datetime.now(timezone.utc).replace(tzinfo=None)
 
     def test_returns_none_when_no_events(self):
@@ -279,51 +300,61 @@ class TestAccountSuccessRate7d:
 
     def test_returns_none_when_fewer_than_min_samples(self):
         now = self._naive_now()
-        acct = {"outcome_events": [
-            {"at": now - timedelta(hours=1), "success": True},
-            {"at": now - timedelta(hours=2), "success": True},
-        ]}
+        acct = {
+            "outcome_events": [
+                {"at": now - timedelta(hours=1), "success": True},
+                {"at": now - timedelta(hours=2), "success": True},
+            ]
+        }
         assert account_success_rate_7d(acct, now=now) is None
 
     def test_returns_correct_rate(self):
         now = self._naive_now()
-        acct = {"outcome_events": [
-            {"at": now - timedelta(hours=1), "success": True},
-            {"at": now - timedelta(hours=2), "success": True},
-            {"at": now - timedelta(hours=3), "success": False},
-            {"at": now - timedelta(hours=4), "success": True},
-        ]}
+        acct = {
+            "outcome_events": [
+                {"at": now - timedelta(hours=1), "success": True},
+                {"at": now - timedelta(hours=2), "success": True},
+                {"at": now - timedelta(hours=3), "success": False},
+                {"at": now - timedelta(hours=4), "success": True},
+            ]
+        }
         rate = account_success_rate_7d(acct, now=now)
         assert rate is not None
         assert abs(rate - 0.75) < 1e-9
 
     def test_ignores_events_outside_window(self):
         now = self._naive_now()
-        acct = {"outcome_events": [
-            {"at": now - timedelta(hours=1), "success": True},
-            {"at": now - timedelta(hours=2), "success": True},
-            {"at": now - timedelta(hours=3), "success": True},
-            # Older than 7 days — must not be counted.
-            {"at": now - timedelta(days=8), "success": False},
-            {"at": now - timedelta(days=9), "success": False},
-        ]}
+        acct = {
+            "outcome_events": [
+                {"at": now - timedelta(hours=1), "success": True},
+                {"at": now - timedelta(hours=2), "success": True},
+                {"at": now - timedelta(hours=3), "success": True},
+                # Older than 7 days — must not be counted.
+                {"at": now - timedelta(days=8), "success": False},
+                {"at": now - timedelta(days=9), "success": False},
+            ]
+        }
         rate = account_success_rate_7d(acct, now=now)
         assert rate == 1.0
 
     def test_returns_zero_when_all_failures(self):
         now = self._naive_now()
-        acct = {"outcome_events": [
-            {"at": now - timedelta(hours=i + 1), "success": False} for i in range(5)
-        ]}
+        acct = {
+            "outcome_events": [
+                {"at": now - timedelta(hours=i + 1), "success": False} for i in range(5)
+            ]
+        }
         assert account_success_rate_7d(acct, now=now) == 0.0
 
     def test_skips_events_with_missing_at(self):
         now = self._naive_now()
-        acct = {"outcome_events": [
-            {"success": True},  # no "at" — skip
-            {"at": now - timedelta(hours=1), "success": True},
-            {"at": now - timedelta(hours=2), "success": True},
-        ]}
+        acct = {
+            "outcome_events": [
+                {"success": True},  # no "at" — skip
+                {"at": now - timedelta(hours=1), "success": True},
+                {"at": now - timedelta(hours=2), "success": True},
+            ]
+        }
         # Only 2 valid events → below min sample threshold
         assert account_success_rate_7d(acct, now=now) is None
 
@@ -335,11 +366,15 @@ class TestAccountSuccessRate7d:
         comparing aware cutoff with naive event timestamps.
         """
         from datetime import timezone as _tz
+
         aware_now = datetime.now(_tz.utc)
         naive_now = aware_now.replace(tzinfo=None)
-        acct = {"outcome_events": [
-            {"at": naive_now - timedelta(hours=i + 1), "success": True} for i in range(3)
-        ]}
+        acct = {
+            "outcome_events": [
+                {"at": naive_now - timedelta(hours=i + 1), "success": True}
+                for i in range(3)
+            ]
+        }
         # Must not raise; must return a valid rate.
         rate = account_success_rate_7d(acct, now=aware_now)
         assert rate == 1.0
@@ -355,18 +390,33 @@ class TestAccountSuccessRateByType:
 
     def _naive_now(self):
         from datetime import timezone
+
         return datetime.now(timezone.utc).replace(tzinfo=None)
 
     @pytest.mark.xfail(strict=False, reason="task_type kwarg added by cluster 1/2")
     def test_per_type_rate_returned_when_sufficient_samples(self):
         """With ≥MIN_SAMPLES type-specific events, per-type rate is returned."""
         now = self._naive_now()
-        acct = {"outcome_events": (
-            [{"at": now - timedelta(hours=i + 1), "success": True, "task_type": "create"}
-             for i in range(5)] +
-            [{"at": now - timedelta(hours=i + 6), "success": False, "task_type": "review"}
-             for i in range(5)]
-        )}
+        acct = {
+            "outcome_events": (
+                [
+                    {
+                        "at": now - timedelta(hours=i + 1),
+                        "success": True,
+                        "task_type": "create",
+                    }
+                    for i in range(5)
+                ]
+                + [
+                    {
+                        "at": now - timedelta(hours=i + 6),
+                        "success": False,
+                        "task_type": "review",
+                    }
+                    for i in range(5)
+                ]
+            )
+        }
         # create-type = 5/5 = 1.0; aggregate = 5/10 = 0.5
         rate = account_success_rate_7d(acct, task_type="create", now=now)
         assert rate == 1.0
@@ -375,12 +425,30 @@ class TestAccountSuccessRateByType:
     def test_sparse_type_falls_back_to_aggregate(self):
         """< MIN_SAMPLES type-specific events → falls back to aggregate rate."""
         now = self._naive_now()
-        acct = {"outcome_events": (
-            [{"at": now - timedelta(hours=1), "success": True, "task_type": "create"},
-             {"at": now - timedelta(hours=2), "success": False, "task_type": "create"}] +
-            [{"at": now - timedelta(hours=i + 3), "success": True, "task_type": "review"}
-             for i in range(5)]
-        )}
+        acct = {
+            "outcome_events": (
+                [
+                    {
+                        "at": now - timedelta(hours=1),
+                        "success": True,
+                        "task_type": "create",
+                    },
+                    {
+                        "at": now - timedelta(hours=2),
+                        "success": False,
+                        "task_type": "create",
+                    },
+                ]
+                + [
+                    {
+                        "at": now - timedelta(hours=i + 3),
+                        "success": True,
+                        "task_type": "review",
+                    }
+                    for i in range(5)
+                ]
+            )
+        }
         # 2 "create" events (< MIN_SAMPLES=3) → fallback to aggregate (6/7)
         rate = account_success_rate_7d(acct, task_type="create", now=now)
         assert rate is not None
@@ -389,10 +457,16 @@ class TestAccountSuccessRateByType:
     def test_no_task_type_matches_existing_behavior(self):
         """Omitting task_type returns the aggregate rate — backward compatible."""
         now = self._naive_now()
-        acct = {"outcome_events": [
-            {"at": now - timedelta(hours=i + 1), "success": i < 3, "task_type": "create"}
-            for i in range(5)
-        ]}
+        acct = {
+            "outcome_events": [
+                {
+                    "at": now - timedelta(hours=i + 1),
+                    "success": i < 3,
+                    "task_type": "create",
+                }
+                for i in range(5)
+            ]
+        }
         # 3 successes out of 5 = 0.6
         rate = account_success_rate_7d(acct, now=now)
         assert rate is not None
@@ -431,7 +505,9 @@ class TestSuccessRateSelection:
             _account_by_id[has_model_id] = has_model
 
         try:
-            selected = await select_max_plan_account(user_id=user_id, model="claude-opus-4-7")
+            selected = await select_max_plan_account(
+                user_id=user_id, model="claude-opus-4-7"
+            )
             assert selected is not None
             assert selected["id"] == has_model_id
         finally:
@@ -455,7 +531,10 @@ class TestSuccessRateSelection:
             "oauth_token": "tok-low",
             "active_tasks": 0,  # Would have won on active_tasks alone.
             "provider_metadata": {"available_models": ["claude-opus-4-7"]},
-            "outcome_events": [{"at": now - timedelta(hours=i + 1), "success": i == 0} for i in range(5)],
+            "outcome_events": [
+                {"at": now - timedelta(hours=i + 1), "success": i == 0}
+                for i in range(5)
+            ],
         }
         high_success = {
             "id": high_success_id,
@@ -464,7 +543,9 @@ class TestSuccessRateSelection:
             "oauth_token": "tok-high",
             "active_tasks": 1,
             "provider_metadata": {"available_models": ["claude-opus-4-7"]},
-            "outcome_events": [{"at": now - timedelta(hours=i + 1), "success": i < 4} for i in range(5)],
+            "outcome_events": [
+                {"at": now - timedelta(hours=i + 1), "success": i < 4} for i in range(5)
+            ],
         }
 
         async with _max_plan_pool_lock:
@@ -473,7 +554,9 @@ class TestSuccessRateSelection:
             _account_by_id[high_success_id] = high_success
 
         try:
-            selected = await select_max_plan_account(user_id=user_id, model="claude-opus-4-7")
+            selected = await select_max_plan_account(
+                user_id=user_id, model="claude-opus-4-7"
+            )
             assert selected is not None
             assert selected["id"] == high_success_id
         finally:
@@ -486,6 +569,7 @@ class TestSuccessRateSelection:
 # ---------------------------------------------------------------------------
 # select_max_plan_account_balanced — success-rate biasing
 # ---------------------------------------------------------------------------
+
 
 class TestBalancedSuccessRateSelection:
     """Covers four scenarios for balanced-mode dispatch with 7d success rate.
@@ -546,7 +630,9 @@ class TestBalancedSuccessRateSelection:
                 _account_by_id.pop(high_success_id, None)
 
     @pytest.mark.asyncio
-    @pytest.mark.xfail(strict=False, reason="Balanced success-rate tiebreak added by cluster 1/2")
+    @pytest.mark.xfail(
+        strict=False, reason="Balanced success-rate tiebreak added by cluster 1/2"
+    )
     async def test_equal_load_high_sample_high_success_wins(self):
         """Among healthy candidates with equal active_tasks, the account with a
         materially higher 7d success rate should be selected over one with a low
@@ -656,7 +742,11 @@ class TestBalancedSuccessRateSelection:
             "oauth_token": "tok",
             "active_tasks": 0,
             "outcome_events": [
-                {"at": now - timedelta(hours=i + 1), "success": True, "task_type": "create"}
+                {
+                    "at": now - timedelta(hours=i + 1),
+                    "success": True,
+                    "task_type": "create",
+                }
                 for i in range(3)
             ],
         }
@@ -667,7 +757,11 @@ class TestBalancedSuccessRateSelection:
             "oauth_token": "tok",
             "active_tasks": 0,
             "outcome_events": [
-                {"at": now - timedelta(hours=i + 1), "success": False, "task_type": "create"}
+                {
+                    "at": now - timedelta(hours=i + 1),
+                    "success": False,
+                    "task_type": "create",
+                }
                 for i in range(5)
             ],
         }
@@ -705,7 +799,9 @@ class TestBalancedSuccessRateSelection:
             "oauth_token": "tok",
             "active_tasks": 2,
             # 0% success — lowest possible
-            "outcome_events": [{"at": now - timedelta(hours=i + 1), "success": False} for i in range(5)],
+            "outcome_events": [
+                {"at": now - timedelta(hours=i + 1), "success": False} for i in range(5)
+            ],
         }
         idle = {
             "id": idle_id,
@@ -714,7 +810,10 @@ class TestBalancedSuccessRateSelection:
             "oauth_token": "tok",
             "active_tasks": 0,
             # 20% success — also low, but this account is idle
-            "outcome_events": [{"at": now - timedelta(hours=i + 1), "success": i == 0} for i in range(5)],
+            "outcome_events": [
+                {"at": now - timedelta(hours=i + 1), "success": i == 0}
+                for i in range(5)
+            ],
         }
         async with _max_plan_pool_lock:
             _max_plan_pools[user_id] = [busy, idle]
@@ -775,84 +874,152 @@ class TestBalancedSuccessRateSelection:
 # account_success_rate_7d_for_type
 # ---------------------------------------------------------------------------
 
+
 class TestAccountSuccessRate7dForType:
     def _naive_now(self):
         from datetime import timezone as _tz
+
         return datetime.now(_tz.utc).replace(tzinfo=None)
 
     def test_returns_none_with_no_events(self):
         assert account_success_rate_7d_for_type({}, "create") is None
-        assert account_success_rate_7d_for_type({"outcome_events": []}, "create") is None
+        assert (
+            account_success_rate_7d_for_type({"outcome_events": []}, "create") is None
+        )
 
     def test_returns_none_below_min_samples(self):
         now = self._naive_now()
-        acct = {"outcome_events": [
-            {"at": now - timedelta(hours=1), "success": True, "task_type": "create"},
-            {"at": now - timedelta(hours=2), "success": True, "task_type": "create"},
-        ]}
+        acct = {
+            "outcome_events": [
+                {
+                    "at": now - timedelta(hours=1),
+                    "success": True,
+                    "task_type": "create",
+                },
+                {
+                    "at": now - timedelta(hours=2),
+                    "success": True,
+                    "task_type": "create",
+                },
+            ]
+        }
         assert len(acct["outcome_events"]) < SUCCESS_RATE_MIN_SAMPLES
         assert account_success_rate_7d_for_type(acct, "create") is None
 
     def test_returns_correct_rate(self):
         now = self._naive_now()
-        acct = {"outcome_events": [
-            {"at": now - timedelta(hours=1), "success": True, "task_type": "create"},
-            {"at": now - timedelta(hours=2), "success": True, "task_type": "create"},
-            {"at": now - timedelta(hours=3), "success": False, "task_type": "create"},
-        ]}
+        acct = {
+            "outcome_events": [
+                {
+                    "at": now - timedelta(hours=1),
+                    "success": True,
+                    "task_type": "create",
+                },
+                {
+                    "at": now - timedelta(hours=2),
+                    "success": True,
+                    "task_type": "create",
+                },
+                {
+                    "at": now - timedelta(hours=3),
+                    "success": False,
+                    "task_type": "create",
+                },
+            ]
+        }
         assert account_success_rate_7d_for_type(acct, "create") == 2 / 3
 
     def test_ignores_events_with_different_task_type(self):
         now = self._naive_now()
-        acct = {"outcome_events": [
-            {"at": now - timedelta(hours=i + 1), "success": True, "task_type": "create"}
-            for i in range(3)
-        ] + [
-            {"at": now - timedelta(hours=i + 4), "success": False, "task_type": "review"}
-            for i in range(5)
-        ]}
+        acct = {
+            "outcome_events": [
+                {
+                    "at": now - timedelta(hours=i + 1),
+                    "success": True,
+                    "task_type": "create",
+                }
+                for i in range(3)
+            ]
+            + [
+                {
+                    "at": now - timedelta(hours=i + 4),
+                    "success": False,
+                    "task_type": "review",
+                }
+                for i in range(5)
+            ]
+        }
         assert account_success_rate_7d_for_type(acct, "create") == 1.0
 
     def test_ignores_events_without_task_type_key(self):
         now = self._naive_now()
-        acct = {"outcome_events": [
-            {"at": now - timedelta(hours=1), "success": False},
-            {"at": now - timedelta(hours=2), "success": False},
-            {"at": now - timedelta(hours=3), "success": False},
-            {"at": now - timedelta(hours=4), "success": True, "task_type": "create"},
-        ]}
+        acct = {
+            "outcome_events": [
+                {"at": now - timedelta(hours=1), "success": False},
+                {"at": now - timedelta(hours=2), "success": False},
+                {"at": now - timedelta(hours=3), "success": False},
+                {
+                    "at": now - timedelta(hours=4),
+                    "success": True,
+                    "task_type": "create",
+                },
+            ]
+        }
         # Only 1 event matches "create" — below MIN_SAMPLES.
         assert account_success_rate_7d_for_type(acct, "create") is None
 
     def test_excludes_events_outside_7d_window(self):
         now = self._naive_now()
         old = now - SUCCESS_RATE_WINDOW - timedelta(seconds=60)
-        acct = {"outcome_events": [
-            {"at": old, "success": True, "task_type": "create"},
-            {"at": old, "success": True, "task_type": "create"},
-            {"at": old, "success": True, "task_type": "create"},
-        ]}
+        acct = {
+            "outcome_events": [
+                {"at": old, "success": True, "task_type": "create"},
+                {"at": old, "success": True, "task_type": "create"},
+                {"at": old, "success": True, "task_type": "create"},
+            ]
+        }
         assert account_success_rate_7d_for_type(acct, "create") is None
 
     def test_skips_events_with_none_at(self):
         now = self._naive_now()
-        acct = {"outcome_events": [
-            {"at": None, "success": True, "task_type": "create"},
-            {"at": now - timedelta(hours=1), "success": True, "task_type": "create"},
-            {"at": now - timedelta(hours=2), "success": True, "task_type": "create"},
-        ]}
+        acct = {
+            "outcome_events": [
+                {"at": None, "success": True, "task_type": "create"},
+                {
+                    "at": now - timedelta(hours=1),
+                    "success": True,
+                    "task_type": "create",
+                },
+                {
+                    "at": now - timedelta(hours=2),
+                    "success": True,
+                    "task_type": "create",
+                },
+            ]
+        }
         # Only 2 valid (at is not None) — below MIN_SAMPLES.
         assert account_success_rate_7d_for_type(acct, "create") is None
 
     def test_type_scoped_rate_differs_from_aggregate_when_types_differ(self):
         now = self._naive_now()
-        acct = {"outcome_events": [
-            {"at": now - timedelta(hours=i + 1), "success": True, "task_type": "create"}
-            for i in range(3)
-        ] + [
-            {"at": now - timedelta(hours=i + 4), "success": False, "task_type": "review"}
-            for i in range(5)
-        ]}
+        acct = {
+            "outcome_events": [
+                {
+                    "at": now - timedelta(hours=i + 1),
+                    "success": True,
+                    "task_type": "create",
+                }
+                for i in range(3)
+            ]
+            + [
+                {
+                    "at": now - timedelta(hours=i + 4),
+                    "success": False,
+                    "task_type": "review",
+                }
+                for i in range(5)
+            ]
+        }
         typed = account_success_rate_7d_for_type(acct, "create")
         aggregate = account_success_rate_7d(acct)
         assert typed == 1.0
@@ -860,11 +1027,18 @@ class TestAccountSuccessRate7dForType:
 
     def test_accepts_aware_now_without_typeerror(self):
         from datetime import timezone as _tz
+
         aware_now = datetime.now(_tz.utc)
         naive_now = aware_now.replace(tzinfo=None)
-        acct = {"outcome_events": [
-            {"at": naive_now - timedelta(hours=i + 1), "success": True, "task_type": "create"}
-            for i in range(3)
-        ]}
+        acct = {
+            "outcome_events": [
+                {
+                    "at": naive_now - timedelta(hours=i + 1),
+                    "success": True,
+                    "task_type": "create",
+                }
+                for i in range(3)
+            ]
+        }
         rate = account_success_rate_7d_for_type(acct, "create", now=aware_now)
         assert rate == 1.0

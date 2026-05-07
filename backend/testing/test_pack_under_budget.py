@@ -5,6 +5,7 @@ caps a payload at *budget* bytes by tier-priority, summarizing or dropping
 items as needed and surfacing what changed via ``_packer_meta`` so the
 agent prompt can ask the operator (or fetch endpoints) for the dropped state.
 """
+
 import json
 import logging
 

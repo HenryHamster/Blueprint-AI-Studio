@@ -9,6 +9,7 @@ Covers _check_evaluating_timeouts() and _check_and_trigger_rollup() edge cases:
   - Rollup guard: only review/fix children after ROLLUP_TYPES filter → COMPLETED
   - Unmerged-PR verification triggers rollup path
 """
+
 import uuid
 
 import pytest
@@ -33,6 +34,7 @@ from app.models import Project, Task, TaskStatus, Alert, AlertSeverity
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
+
 def _naive_utc_ago(**kwargs) -> datetime:
     """Return a naive UTC datetime (no tzinfo) that is ``kwargs`` in the past.
 
@@ -44,6 +46,7 @@ def _naive_utc_ago(**kwargs) -> datetime:
 
 # ── Shared fixture ────────────────────────────────────────────────────────────
 
+
 @pytest_asyncio.fixture()
 async def eval_db(mocker):
     """Isolated in-memory SQLite DB for evaluating-timeout tests.
@@ -53,8 +56,11 @@ async def eval_db(mocker):
     reaper_db and rollup_db fixtures in other test modules.
     """
     from sqlalchemy.dialects.sqlite.base import SQLiteTypeCompiler
+
     if not hasattr(SQLiteTypeCompiler, "visit_JSONB"):
-        SQLiteTypeCompiler.visit_JSONB = lambda self, type_, **kw: self.visit_JSON(type_, **kw)
+        SQLiteTypeCompiler.visit_JSONB = lambda self, type_, **kw: self.visit_JSON(
+            type_, **kw
+        )
 
     _engine = create_async_engine(
         "sqlite+aiosqlite:///:memory:",
@@ -65,8 +71,11 @@ async def eval_db(mocker):
         await conn.run_sync(SQLModel.metadata.create_all)
 
     _Session = sessionmaker(
-        bind=_engine, class_=AsyncSession,
-        autocommit=False, autoflush=False, expire_on_commit=False,
+        bind=_engine,
+        class_=AsyncSession,
+        autocommit=False,
+        autoflush=False,
+        expire_on_commit=False,
     )
     mocker.patch("app.services.AsyncSessionLocal", _Session)
 
@@ -80,12 +89,15 @@ async def eval_db(mocker):
 
 # ── Tests ─────────────────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_evaluating_all_children_terminal_triggers_rollup(eval_db, mocker):
     """When all children are terminal but the parent is still EVALUATING, the
     missed-rollup recovery path should call _check_and_trigger_rollup."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mock_rollup = mocker.patch("app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock)
+    mock_rollup = mocker.patch(
+        "app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock
+    )
 
     project = Project(name="Eval Rollup Test", user_id="user1")
     eval_db.add(project)
@@ -126,6 +138,7 @@ async def test_evaluating_hard_timeout_marks_failed(eval_db, mocker):
     # Pin the backstop to 6h for this test (production default is 48h while
     # silent-death stabilizes; tests still validate the 6h boundary behavior).
     from app.shared_state import runtime_config as _rc
+
     mocker.patch.dict(_rc, {"evaluating_fail_hours": 6})
 
     project = Project(name="Hard Timeout Test", user_id="user1")
@@ -146,7 +159,10 @@ async def test_evaluating_hard_timeout_marks_failed(eval_db, mocker):
     # _check_evaluating_timeouts searches for this marker to compute elapsed time.
     evaluating_since = _naive_utc_ago(hours=7)
     parent.status_log = [
-        {"t": evaluating_since.isoformat(), "msg": "Status changed: IN_PROGRESS → EVALUATING"}
+        {
+            "t": evaluating_since.isoformat(),
+            "msg": "Status changed: IN_PROGRESS → EVALUATING",
+        }
     ]
     eval_db.add(parent)
     await eval_db.commit()
@@ -180,7 +196,9 @@ async def test_evaluating_ci_waiting_skipped(eval_db, mocker):
     sweep while under the 30-minute CI backstop threshold — the normal 20-min
     CI escalation in orchestrator.py handles them instead."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mock_rollup = mocker.patch("app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock)
+    mock_rollup = mocker.patch(
+        "app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock
+    )
 
     project = Project(name="CI Waiting Test", user_id="user1")
     eval_db.add(project)
@@ -201,7 +219,10 @@ async def test_evaluating_ci_waiting_skipped(eval_db, mocker):
     # The normal orchestrator CI timeout should handle it, not this sweep.
     evaluating_since = _naive_utc_ago(minutes=25)
     parent.status_log = [
-        {"t": evaluating_since.isoformat(), "msg": "Status changed: IN_PROGRESS → EVALUATING"}
+        {
+            "t": evaluating_since.isoformat(),
+            "msg": "Status changed: IN_PROGRESS → EVALUATING",
+        }
     ]
     eval_db.add(parent)
     await eval_db.commit()
@@ -228,7 +249,9 @@ async def test_evaluating_ci_backstop_uses_ci_wait_started(eval_db, mocker):
     subtasks).
     """
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock)
+    mocker.patch(
+        "app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock
+    )
 
     project = Project(name="CI Backstop Time Base", user_id="user1")
     eval_db.add(project)
@@ -250,7 +273,10 @@ async def test_evaluating_ci_backstop_uses_ci_wait_started(eval_db, mocker):
     # But CI wait only actually started 3 minutes ago — still healthy.
     ci_wait_started = _naive_utc_ago(minutes=3)
     parent.status_log = [
-        {"t": evaluating_since.isoformat(), "msg": "Status changed: COMPLETED → EVALUATING"}
+        {
+            "t": evaluating_since.isoformat(),
+            "msg": "Status changed: COMPLETED → EVALUATING",
+        }
     ]
     parent.context = {
         "review_loop": {
@@ -276,7 +302,9 @@ async def test_evaluating_ci_backstop_fires_when_ci_wait_started_old(eval_db, mo
     """Complement: when review_loop.ci_wait_started IS older than the backstop
     threshold, the task must be hard-killed."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock)
+    mocker.patch(
+        "app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock
+    )
 
     project = Project(name="CI Backstop Fires", user_id="user1")
     eval_db.add(project)
@@ -295,8 +323,10 @@ async def test_evaluating_ci_backstop_fires_when_ci_wait_started_old(eval_db, mo
     # CI wait started 90 minutes ago — over the 60-min backstop default.
     ci_wait_started = _naive_utc_ago(minutes=90)
     parent.status_log = [
-        {"t": _naive_utc_ago(minutes=120).isoformat(),
-         "msg": "Status changed: COMPLETED → EVALUATING"}
+        {
+            "t": _naive_utc_ago(minutes=120).isoformat(),
+            "msg": "Status changed: COMPLETED → EVALUATING",
+        }
     ]
     parent.context = {
         "review_loop": {
@@ -341,7 +371,10 @@ async def test_evaluating_warning_alert_created(eval_db, mocker):
     # 3 hours: past the 2-hour warning threshold, but below the 6-hour fail threshold.
     evaluating_since = _naive_utc_ago(hours=3)
     parent.status_log = [
-        {"t": evaluating_since.isoformat(), "msg": "Status changed: IN_PROGRESS → EVALUATING"}
+        {
+            "t": evaluating_since.isoformat(),
+            "msg": "Status changed: IN_PROGRESS → EVALUATING",
+        }
     ]
     eval_db.add(parent)
     await eval_db.commit()
@@ -504,7 +537,9 @@ async def test_recent_rollup_query_builds_against_updated_at(eval_db):
     await eval_db.refresh(recent)
 
     result = await eval_db.execute(
-        select(_func.count()).select_from(Task).where(
+        select(_func.count())
+        .select_from(Task)
+        .where(
             Task.status == TaskStatus.COMPLETED,
             Task.updated_at >= _naive_utc_ago(hours=1),
         )
@@ -523,7 +558,9 @@ async def test_check_and_trigger_rollup_computes_age_from_updated_at(eval_db, mo
     child (updated within the stale threshold) is skipped by the respawn
     loop (respawn count stays at 0)."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.rollup_management._verify_pr_merged", new=AsyncMock(return_value=False))
+    mocker.patch(
+        "app.rollup_management._verify_pr_merged", new=AsyncMock(return_value=False)
+    )
     mock_spawn = mocker.patch(
         "app.rollup_management._spawn_pipeline_task",
         new=AsyncMock(return_value=(None, None)),
@@ -593,11 +630,13 @@ async def test_verify_pr_merged_closed_pr_sets_status_message(eval_db, mocker):
     await eval_db.commit()
     await eval_db.refresh(task)
 
-    eval_db.add(Artifact(
-        task_id=task.id,
-        artifact_type=ArtifactType.PULL_REQUEST,
-        pr_url="https://github.com/foo/bar/pull/42",
-    ))
+    eval_db.add(
+        Artifact(
+            task_id=task.id,
+            artifact_type=ArtifactType.PULL_REQUEST,
+            pr_url="https://github.com/foo/bar/pull/42",
+        )
+    )
     await eval_db.commit()
 
     # _verify_pr_merged imports these inside the function body, so patch at the
@@ -619,7 +658,9 @@ async def test_verify_pr_merged_closed_pr_sets_status_message(eval_db, mocker):
 
     result = await _verify_pr_merged(task, eval_db)
 
-    assert result is True, "verifier should return True so callers don't block on FAILED tasks"
+    assert result is True, (
+        "verifier should return True so callers don't block on FAILED tasks"
+    )
     assert task.status == TaskStatus.FAILED
     assert task.context.get("pr_closed_unmerged") is True
     assert task.latest_status_message == "PR #42 closed without merging", (
@@ -628,6 +669,7 @@ async def test_verify_pr_merged_closed_pr_sets_status_message(eval_db, mocker):
 
 
 # ── skip_locked lock contention tests ────────────────────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_rollup_skips_when_parent_lock_held(eval_db, mocker, caplog):
@@ -638,6 +680,7 @@ async def test_rollup_skips_when_parent_lock_held(eval_db, mocker, caplog):
     stale EVALUATING sweep retries within 15 minutes as the safety net.
     """
     import logging
+
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
 
     project = Project(name="Lock Skip Test", user_id="user1")
@@ -700,7 +743,9 @@ async def test_rollup_skips_when_parent_lock_held(eval_db, mocker, caplog):
     assert any(
         "Skipped rollup check" in rec.message and "parent lock held" in rec.message
         for rec in caplog.records
-    ), f"Expected '[ROLLUP] Skipped rollup check ... parent lock held' log, got: {[r.message for r in caplog.records]}"
+    ), (
+        f"Expected '[ROLLUP] Skipped rollup check ... parent lock held' log, got: {[r.message for r in caplog.records]}"
+    )
 
     # Parent status must remain EVALUATING (rollup was deferred, not processed)
     await eval_db.refresh(parent)
@@ -787,11 +832,15 @@ async def test_backstop_reason_names_review_when_ci_passed(eval_db, mocker):
     await eval_db.commit()
     await eval_db.refresh(parent)
 
-    ci_wait_started = _naive_utc_ago(minutes=90)  # well past the 60-min backstop default
-    parent.status_log = [{
-        "t": _naive_utc_ago(minutes=120).isoformat(),
-        "msg": "Status changed: IN_PROGRESS → EVALUATING",
-    }]
+    ci_wait_started = _naive_utc_ago(
+        minutes=90
+    )  # well past the 60-min backstop default
+    parent.status_log = [
+        {
+            "t": _naive_utc_ago(minutes=120).isoformat(),
+            "msg": "Status changed: IN_PROGRESS → EVALUATING",
+        }
+    ]
     parent.context = {
         "review_loop": {
             "ci_waiting": True,
@@ -858,10 +907,12 @@ async def test_backstop_spawns_recovery_review_once(eval_db, mocker):
     await eval_db.refresh(parent)
 
     ci_wait_started = _naive_utc_ago(minutes=90)
-    parent.status_log = [{
-        "t": _naive_utc_ago(minutes=120).isoformat(),
-        "msg": "Status changed: IN_PROGRESS → EVALUATING",
-    }]
+    parent.status_log = [
+        {
+            "t": _naive_utc_ago(minutes=120).isoformat(),
+            "msg": "Status changed: IN_PROGRESS → EVALUATING",
+        }
+    ]
     parent.context = {
         "review_loop": {
             "ci_waiting": True,
@@ -944,11 +995,13 @@ async def test_backstop_early_recovery_when_review_child_terminal(eval_db, mocke
     # Review child task: FAILED without posting a verdict.
     dead_review = Task(
         project_id=project.id,
-        payloads=[{
-            "type": "review",
-            "pr_number": 55555,
-            "original_task_id": str(parent.id),
-        }],
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 55555,
+                "original_task_id": str(parent.id),
+            }
+        ],
         status=TaskStatus.FAILED,
     )
     eval_db.add(dead_review)
@@ -968,7 +1021,9 @@ async def test_backstop_early_recovery_when_review_child_terminal(eval_db, mocke
 
 
 @pytest.mark.asyncio
-async def test_backstop_no_early_recovery_when_review_child_in_progress(eval_db, mocker):
+async def test_backstop_no_early_recovery_when_review_child_in_progress(
+    eval_db, mocker
+):
     """Guard: if the review child is still running (not terminal), the early
     trigger must NOT fire — the elapsed guard should still cause a skip."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
@@ -1008,11 +1063,13 @@ async def test_backstop_no_early_recovery_when_review_child_in_progress(eval_db,
 
     live_review = Task(
         project_id=project.id,
-        payloads=[{
-            "type": "review",
-            "pr_number": 66666,
-            "original_task_id": str(parent.id),
-        }],
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 66666,
+                "original_task_id": str(parent.id),
+            }
+        ],
         status=TaskStatus.IN_PROGRESS,
     )
     eval_db.add(live_review)
@@ -1028,6 +1085,7 @@ async def test_backstop_no_early_recovery_when_review_child_in_progress(eval_db,
 
 
 # ── Chain-active / hard-timeout bypass tests ──────────────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_chain_active_queued_review_recent_counts_live(eval_db):
@@ -1051,11 +1109,13 @@ async def test_chain_active_queued_review_recent_counts_live(eval_db):
 
     queued_review = Task(
         project_id=project.id,
-        payloads=[{
-            "type": "review",
-            "pr_number": 77001,
-            "original_task_id": "chain-abc",
-        }],
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 77001,
+                "original_task_id": "chain-abc",
+            }
+        ],
         status=TaskStatus.QUEUED,
         last_heartbeat=None,
     )
@@ -1088,11 +1148,13 @@ async def test_chain_active_stale_provisioning_does_not_count(eval_db):
 
     stale_fix = Task(
         project_id=project.id,
-        payloads=[{
-            "type": "fix",
-            "pr_number": 77002,
-            "original_task_id": "chain-def",
-        }],
+        payloads=[
+            {
+                "type": "fix",
+                "pr_number": 77002,
+                "original_task_id": "chain-def",
+            }
+        ],
         status=TaskStatus.PROVISIONING,
         last_heartbeat=None,
     )
@@ -1169,6 +1231,7 @@ async def test_evaluating_approval_gate_within_window_not_failed(eval_db, mocker
 
 # ── Backstop recovery: supersede long-queued blocking pipeline tasks ──────────
 
+
 @pytest.mark.asyncio
 async def test_supersede_cancels_long_queued_fix_blocking_recovery(eval_db):
     """A fix task QUEUED past the abandon threshold (30 min) without ever
@@ -1196,11 +1259,13 @@ async def test_supersede_cancels_long_queued_fix_blocking_recovery(eval_db):
 
     stuck_fix = Task(
         project_id=project.id,
-        payloads=[{
-            "type": "fix",
-            "pr_number": 90001,
-            "original_task_id": str(parent.id),
-        }],
+        payloads=[
+            {
+                "type": "fix",
+                "pr_number": 90001,
+                "original_task_id": str(parent.id),
+            }
+        ],
         status=TaskStatus.QUEUED,
         last_heartbeat=None,
         started_at=None,
@@ -1211,14 +1276,19 @@ async def test_supersede_cancels_long_queued_fix_blocking_recovery(eval_db):
     await eval_db.refresh(stuck_fix)
 
     superseded_count = await _supersede_long_queued_pipeline_tasks(
-        parent, eval_db, pr_number=90001, original_task_id=str(parent.id),
+        parent,
+        eval_db,
+        pr_number=90001,
+        original_task_id=str(parent.id),
     )
     await eval_db.commit()
 
     assert superseded_count == 1
     await eval_db.refresh(stuck_fix)
     assert stuck_fix.status == TaskStatus.CANCELLED
-    assert "Superseded by CI backstop recovery" in (stuck_fix.latest_status_message or "")
+    assert "Superseded by CI backstop recovery" in (
+        stuck_fix.latest_status_message or ""
+    )
 
 
 @pytest.mark.asyncio
@@ -1241,11 +1311,13 @@ async def test_supersede_skips_recently_queued_fix(eval_db):
 
     fresh_fix = Task(
         project_id=project.id,
-        payloads=[{
-            "type": "fix",
-            "pr_number": 90002,
-            "original_task_id": str(parent.id),
-        }],
+        payloads=[
+            {
+                "type": "fix",
+                "pr_number": 90002,
+                "original_task_id": str(parent.id),
+            }
+        ],
         status=TaskStatus.QUEUED,
         last_heartbeat=None,
         started_at=None,
@@ -1256,7 +1328,10 @@ async def test_supersede_skips_recently_queued_fix(eval_db):
     await eval_db.refresh(fresh_fix)
 
     superseded_count = await _supersede_long_queued_pipeline_tasks(
-        parent, eval_db, pr_number=90002, original_task_id=str(parent.id),
+        parent,
+        eval_db,
+        pr_number=90002,
+        original_task_id=str(parent.id),
     )
 
     assert superseded_count == 0
@@ -1286,11 +1361,13 @@ async def test_supersede_skips_already_claimed_fix(eval_db):
     # QUEUED but with last_heartbeat set (e.g., requeued mid-flight)
     requeued_fix = Task(
         project_id=project.id,
-        payloads=[{
-            "type": "fix",
-            "pr_number": 90003,
-            "original_task_id": str(parent.id),
-        }],
+        payloads=[
+            {
+                "type": "fix",
+                "pr_number": 90003,
+                "original_task_id": str(parent.id),
+            }
+        ],
         status=TaskStatus.QUEUED,
         last_heartbeat=_naive_utc_ago(minutes=5),
         started_at=_naive_utc_ago(minutes=10),
@@ -1301,7 +1378,10 @@ async def test_supersede_skips_already_claimed_fix(eval_db):
     await eval_db.refresh(requeued_fix)
 
     superseded_count = await _supersede_long_queued_pipeline_tasks(
-        parent, eval_db, pr_number=90003, original_task_id=str(parent.id),
+        parent,
+        eval_db,
+        pr_number=90003,
+        original_task_id=str(parent.id),
     )
 
     assert superseded_count == 0
@@ -1331,11 +1411,13 @@ async def test_supersede_only_matches_chain(eval_db):
     # Different PR
     other_pr_fix = Task(
         project_id=project.id,
-        payloads=[{
-            "type": "fix",
-            "pr_number": 99999,
-            "original_task_id": str(parent.id),
-        }],
+        payloads=[
+            {
+                "type": "fix",
+                "pr_number": 99999,
+                "original_task_id": str(parent.id),
+            }
+        ],
         status=TaskStatus.QUEUED,
     )
     other_pr_fix.created_at = _naive_utc_ago(minutes=60)
@@ -1344,11 +1426,13 @@ async def test_supersede_only_matches_chain(eval_db):
     # Different chain (different original_task_id) on same PR
     other_chain_fix = Task(
         project_id=project.id,
-        payloads=[{
-            "type": "fix",
-            "pr_number": 90004,
-            "original_task_id": "some-other-chain-id",
-        }],
+        payloads=[
+            {
+                "type": "fix",
+                "pr_number": 90004,
+                "original_task_id": "some-other-chain-id",
+            }
+        ],
         status=TaskStatus.QUEUED,
     )
     other_chain_fix.created_at = _naive_utc_ago(minutes=60)
@@ -1356,7 +1440,10 @@ async def test_supersede_only_matches_chain(eval_db):
     await eval_db.commit()
 
     superseded_count = await _supersede_long_queued_pipeline_tasks(
-        parent, eval_db, pr_number=90004, original_task_id=str(parent.id),
+        parent,
+        eval_db,
+        pr_number=90004,
+        original_task_id=str(parent.id),
     )
 
     assert superseded_count == 0
@@ -1368,8 +1455,11 @@ async def test_supersede_only_matches_chain(eval_db):
 
 # ── Recoverable-FAILED defer tests ────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
-async def test_evaluating_hard_timeout_defers_with_recoverable_failed_child(eval_db, mocker):
+async def test_evaluating_hard_timeout_defers_with_recoverable_failed_child(
+    eval_db, mocker
+):
     """Parent past 6h with a child FAILED + PROVISION_FAILURE must NOT be killed.
     The child is eligible for resurrection sweep / operator requeue, so cascade-
     cancelling it would destroy salvageable work. Regression for incident
@@ -1377,6 +1467,7 @@ async def test_evaluating_hard_timeout_defers_with_recoverable_failed_child(eval
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
     mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
     from app.shared_state import runtime_config as _rc
+
     mocker.patch.dict(_rc, {"evaluating_fail_hours": 6})
 
     project = Project(name="Recoverable Defer", user_id="user1")
@@ -1388,8 +1479,12 @@ async def test_evaluating_hard_timeout_defers_with_recoverable_failed_child(eval
         project_id=project.id,
         payloads=[{"type": "research", "prompt": "research parent"}],
         status=TaskStatus.EVALUATING,
-        status_log=[{"t": _naive_utc_ago(hours=7).isoformat(),
-                     "msg": "Status changed: IN_PROGRESS → EVALUATING"}],
+        status_log=[
+            {
+                "t": _naive_utc_ago(hours=7).isoformat(),
+                "msg": "Status changed: IN_PROGRESS → EVALUATING",
+            }
+        ],
     )
     eval_db.add(parent)
     await eval_db.commit()
@@ -1427,12 +1522,15 @@ async def test_evaluating_hard_timeout_defers_with_recoverable_failed_child(eval
 
 
 @pytest.mark.asyncio
-async def test_evaluating_hard_timeout_kills_when_failed_child_is_code_error(eval_db, mocker):
+async def test_evaluating_hard_timeout_kills_when_failed_child_is_code_error(
+    eval_db, mocker
+):
     """A FAILED child with CODE_ERROR (not infra-recoverable) must NOT trigger
     the defer path — the existing 6h kill path runs as before."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
     mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
     from app.shared_state import runtime_config as _rc
+
     mocker.patch.dict(_rc, {"evaluating_fail_hours": 6})
 
     project = Project(name="Code Error Kill", user_id="user1")
@@ -1444,8 +1542,12 @@ async def test_evaluating_hard_timeout_kills_when_failed_child_is_code_error(eva
         project_id=project.id,
         payloads=[{"type": "research", "prompt": "research parent"}],
         status=TaskStatus.EVALUATING,
-        status_log=[{"t": _naive_utc_ago(hours=7).isoformat(),
-                     "msg": "Status changed: IN_PROGRESS → EVALUATING"}],
+        status_log=[
+            {
+                "t": _naive_utc_ago(hours=7).isoformat(),
+                "msg": "Status changed: IN_PROGRESS → EVALUATING",
+            }
+        ],
     )
     eval_db.add(parent)
     await eval_db.commit()
@@ -1487,6 +1589,7 @@ async def test_evaluating_defer_window_exhausted_kills(eval_db, mocker):
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
     mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
     from app.shared_state import runtime_config as _rc
+
     mocker.patch.dict(_rc, {"evaluating_fail_hours": 6})
 
     project = Project(name="Defer Window Exhausted", user_id="user1")
@@ -1499,8 +1602,12 @@ async def test_evaluating_defer_window_exhausted_kills(eval_db, mocker):
         project_id=project.id,
         payloads=[{"type": "research", "prompt": "long-deferred"}],
         status=TaskStatus.EVALUATING,
-        status_log=[{"t": _naive_utc_ago(hours=32).isoformat(),
-                     "msg": "Status changed: IN_PROGRESS → EVALUATING"}],
+        status_log=[
+            {
+                "t": _naive_utc_ago(hours=32).isoformat(),
+                "msg": "Status changed: IN_PROGRESS → EVALUATING",
+            }
+        ],
         context={"_eval_timeout_first_defer_at": _naive_utc_ago(hours=25).isoformat()},
     )
     eval_db.add(parent)
@@ -1568,11 +1675,13 @@ async def test_chain_has_recoverable_failed_work_via_descendant_pipeline_task(ev
 
     fix_descendant = Task(
         project_id=project.id,
-        payloads=[{
-            "type": "fix",
-            "pr_number": 80001,
-            "original_task_id": str(create_child.id),
-        }],
+        payloads=[
+            {
+                "type": "fix",
+                "pr_number": 80001,
+                "original_task_id": str(create_child.id),
+            }
+        ],
         status=TaskStatus.FAILED,
         context={"failure_category": "PROVISION_FAILURE"},
     )

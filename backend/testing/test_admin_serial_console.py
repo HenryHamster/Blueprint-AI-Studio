@@ -2,13 +2,12 @@
 
 Tests the on-demand serial console fetch for task VMs.
 """
+
 import uuid
 import pytest
-from datetime import datetime, timedelta
 from httpx import AsyncClient
 
 from app.models import Project, ProjectMember, Task, TaskStatus
-from app.compute import get_vm_zone
 
 
 @pytest.mark.asyncio
@@ -19,10 +18,9 @@ async def test_serial_console_task_not_found(client: AsyncClient, db_session):
     assert resp.status_code == 404
     data = resp.json()
     # Check error message in either format (detail or error.message)
-    assert (
-        "Task not found" in data.get("detail", "") or
-        "Task not found" in data.get("error", {}).get("message", "")
-    )
+    assert "Task not found" in data.get("detail", "") or "Task not found" in data.get(
+        "error", {}
+    ).get("message", "")
 
 
 @pytest.mark.asyncio
@@ -33,9 +31,7 @@ async def test_serial_console_no_vm(client: AsyncClient, db_session):
     await db_session.commit()
     await db_session.refresh(project)
 
-    member = ProjectMember(
-        project_id=project.id, user_id="test-user-123", role="owner"
-    )
+    member = ProjectMember(project_id=project.id, user_id="test-user-123", role="owner")
     db_session.add(member)
 
     # Task with no VM
@@ -53,23 +49,22 @@ async def test_serial_console_no_vm(client: AsyncClient, db_session):
     resp = await client.get(f"/api/admin/tasks/{task.id}/serial-console")
     assert resp.status_code == 404
     data = resp.json()
-    assert (
-        "no vm_instance_id" in data.get("detail", "") or
-        "no vm_instance_id" in data.get("error", {}).get("message", "")
-    )
+    assert "no vm_instance_id" in data.get(
+        "detail", ""
+    ) or "no vm_instance_id" in data.get("error", {}).get("message", "")
 
 
 @pytest.mark.asyncio
-async def test_serial_console_live_capture(client: AsyncClient, db_session, monkeypatch):
+async def test_serial_console_live_capture(
+    client: AsyncClient, db_session, monkeypatch
+):
     """Returns live serial console when VM exists and _capture_serial_for_vm succeeds."""
     project = Project(name="Test Project", user_id="test-user-123")
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
 
-    member = ProjectMember(
-        project_id=project.id, user_id="test-user-123", role="owner"
-    )
+    member = ProjectMember(project_id=project.id, user_id="test-user-123", role="owner")
     db_session.add(member)
 
     vm_id = "test-vm-123"
@@ -134,9 +129,7 @@ async def test_serial_console_cached_fallback(
     await db_session.commit()
     await db_session.refresh(project)
 
-    member = ProjectMember(
-        project_id=project.id, user_id="test-user-123", role="owner"
-    )
+    member = ProjectMember(project_id=project.id, user_id="test-user-123", role="owner")
     db_session.add(member)
 
     vm_id = "deleted-vm-456"
@@ -198,9 +191,7 @@ async def test_serial_console_no_cached_fallback(
     await db_session.commit()
     await db_session.refresh(project)
 
-    member = ProjectMember(
-        project_id=project.id, user_id="test-user-123", role="owner"
-    )
+    member = ProjectMember(project_id=project.id, user_id="test-user-123", role="owner")
     db_session.add(member)
 
     vm_id = "lost-vm-789"
@@ -261,9 +252,7 @@ async def test_serial_console_falls_back_to_context_provision_zone(
     await db_session.commit()
     await db_session.refresh(project)
 
-    member = ProjectMember(
-        project_id=project.id, user_id="test-user-123", role="owner"
-    )
+    member = ProjectMember(project_id=project.id, user_id="test-user-123", role="owner")
     db_session.add(member)
 
     vm_id = "orphan-vm-999"
@@ -328,9 +317,7 @@ async def test_serial_console_unknown_zone_with_no_context_fallback(
     await db_session.commit()
     await db_session.refresh(project)
 
-    member = ProjectMember(
-        project_id=project.id, user_id="test-user-123", role="owner"
-    )
+    member = ProjectMember(project_id=project.id, user_id="test-user-123", role="owner")
     db_session.add(member)
 
     vm_id = "orphan-vm-no-ctx"

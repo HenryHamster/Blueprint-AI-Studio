@@ -5,6 +5,7 @@ bodies. Clock-time forms ("resets on 2:49 PM", "try again at Apr 17th") are
 intentionally unsupported — parse_retry_hint_seconds returns None for those
 because we don't trust the client clock enough to convert them to a delta.
 """
+
 from __future__ import annotations
 
 import pytest

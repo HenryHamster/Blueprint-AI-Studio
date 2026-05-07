@@ -4,6 +4,7 @@ These tests avoid the in-memory pool dicts and DB — they construct account
 dicts directly and pass an explicit `now` where the function supports it,
 keeping assertions deterministic without fixtures or locks.
 """
+
 import time
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
@@ -46,13 +47,19 @@ HAIKU = "claude-haiku-4-5-20251001"
 
 
 def _acct(**kw) -> dict:
-    base = {"id": "a", "name": "a", "enabled": True, "active_tasks": 0,
-            "oauth_token": "sk-ant-test"}
+    base = {
+        "id": "a",
+        "name": "a",
+        "enabled": True,
+        "active_tasks": 0,
+        "oauth_token": "sk-ant-test",
+    }
     base.update(kw)
     return base
 
 
 # ── _normalize_rl_model ─────────────────────────────────────────────────────
+
 
 class TestNormalizeRlModel:
     def test_haiku_maps_to_opus(self):
@@ -70,6 +77,7 @@ class TestNormalizeRlModel:
 
 # ── cascade_disabled_models ─────────────────────────────────────────────────
 
+
 class TestCascadeDisabledModels:
     def test_opus_cascades_to_opus(self):
         assert cascade_disabled_models(OPUS) == (OPUS,)
@@ -84,6 +92,7 @@ class TestCascadeDisabledModels:
 
 
 # ── _compute_health_score ───────────────────────────────────────────────────
+
 
 class TestComputeHealthScore:
     def test_empty_history_scores_zero(self):
@@ -114,12 +123,17 @@ class TestComputeHealthScore:
 
 # ── get_account_health_stats ────────────────────────────────────────────────
 
+
 class TestGetAccountHealthStats:
     def test_structure_contains_expected_keys(self):
         stats = get_account_health_stats(_acct())
         assert set(stats.keys()) == {
-            "rl_events_24h", "completions_24h", "avg_duration_seconds", "health_score",
-            "success_rate_7d", "success_rate_by_type_7d",
+            "rl_events_24h",
+            "completions_24h",
+            "avg_duration_seconds",
+            "health_score",
+            "success_rate_7d",
+            "success_rate_by_type_7d",
         }
 
     def test_aggregates_counts_and_durations(self):
@@ -142,6 +156,7 @@ class TestGetAccountHealthStats:
 
 
 # ── _prune_health_events ────────────────────────────────────────────────────
+
 
 class TestPruneHealthEvents:
     def test_removes_events_older_than_cutoff(self):
@@ -169,6 +184,7 @@ class TestPruneHealthEvents:
 
 # ── _daily_reset_if_elapsed ─────────────────────────────────────────────────
 
+
 class TestDailyResetIfElapsed:
     def test_seeds_reset_at_when_missing(self):
         now = datetime.utcnow()
@@ -180,19 +196,24 @@ class TestDailyResetIfElapsed:
 
     def test_no_reset_within_window(self):
         now = datetime.utcnow()
-        acct = _acct(daily_task_count=5, daily_task_count_reset_at=now - timedelta(hours=12))
+        acct = _acct(
+            daily_task_count=5, daily_task_count_reset_at=now - timedelta(hours=12)
+        )
         assert _daily_reset_if_elapsed(acct, now) is False
         assert acct["daily_task_count"] == 5
 
     def test_resets_after_window_elapsed(self):
         now = datetime.utcnow()
-        acct = _acct(daily_task_count=42, daily_task_count_reset_at=now - timedelta(hours=25))
+        acct = _acct(
+            daily_task_count=42, daily_task_count_reset_at=now - timedelta(hours=25)
+        )
         assert _daily_reset_if_elapsed(acct, now) is True
         assert acct["daily_task_count"] == 0
         assert acct["daily_task_count_reset_at"] == now
 
 
 # ── _account_at_cap ─────────────────────────────────────────────────────────
+
 
 class TestAccountAtCap:
     def test_no_caps_configured_returns_none(self):
@@ -221,6 +242,7 @@ class TestAccountAtCap:
 
 # ── _account_available_for_model ────────────────────────────────────────────
 
+
 class TestAccountAvailableForModel:
     def test_available_when_healthy(self):
         assert _account_available_for_model(_acct(), OPUS) is True
@@ -238,13 +260,16 @@ class TestAccountAvailableForModel:
 
     def test_available_as_probing_after_cooldown_elapses(self):
         # hits=1 → 30 min cooldown; 60 min ago → cooldown elapsed → probing (still "available").
-        acct = _acct(disabled_models={
-            OPUS: {"hits": 1, "at": datetime.utcnow() - timedelta(minutes=60)}
-        })
+        acct = _acct(
+            disabled_models={
+                OPUS: {"hits": 1, "at": datetime.utcnow() - timedelta(minutes=60)}
+            }
+        )
         assert _account_available_for_model(acct, OPUS) is True
 
 
 # ── describe_pool_blockage ──────────────────────────────────────────────────
+
 
 class TestDescribePoolBlockage:
     def _reset_pools(self):
@@ -254,7 +279,10 @@ class TestDescribePoolBlockage:
     def test_no_accounts_configured(self):
         self._reset_pools()
         try:
-            assert describe_pool_blockage(OPUS, user_id="nobody") == "no accounts configured"
+            assert (
+                describe_pool_blockage(OPUS, user_id="nobody")
+                == "no accounts configured"
+            )
         finally:
             self._reset_pools()
 
@@ -262,8 +290,11 @@ class TestDescribePoolBlockage:
         self._reset_pools()
         try:
             now = datetime.utcnow()
-            acct = _acct(id="r1", user_id="u",
-                         disabled_models={OPUS: {"hits": 1, "at": now - timedelta(minutes=5)}})
+            acct = _acct(
+                id="r1",
+                user_id="u",
+                disabled_models={OPUS: {"hits": 1, "at": now - timedelta(minutes=5)}},
+            )
             _account_by_id[acct["id"]] = acct
             _max_plan_pools.setdefault("u", []).append(acct)
             msg = describe_pool_blockage(OPUS, user_id="u")
@@ -277,8 +308,9 @@ class TestDescribePoolBlockage:
         try:
             now = datetime.utcnow()
             healthy = _acct(id="h", user_id="u")
-            rl = _acct(id="r", user_id="u",
-                       disabled_models={OPUS: {"hits": 1, "at": now}})
+            rl = _acct(
+                id="r", user_id="u", disabled_models={OPUS: {"hits": 1, "at": now}}
+            )
             for a in (healthy, rl):
                 _account_by_id[a["id"]] = a
                 _max_plan_pools.setdefault("u", []).append(a)
@@ -293,12 +325,16 @@ class TestDescribePoolBlockage:
             acct = _acct(id="h", user_id="u")
             _account_by_id[acct["id"]] = acct
             _max_plan_pools.setdefault("u", []).append(acct)
-            assert describe_pool_blockage(OPUS, user_id="u") == "no eligible accounts or slot contention"
+            assert (
+                describe_pool_blockage(OPUS, user_id="u")
+                == "no eligible accounts or slot contention"
+            )
         finally:
             self._reset_pools()
 
 
 # ── summarize_pool_state ────────────────────────────────────────────────────
+
 
 class TestSummarizePoolState:
     def _reset_pools(self):
@@ -310,8 +346,11 @@ class TestSummarizePoolState:
         try:
             now = datetime.utcnow()
             healthy = _acct(id="h", user_id="u")
-            rl = _acct(id="r", user_id="u",
-                       disabled_models={OPUS: {"hits": 1, "at": now - timedelta(minutes=5)}})
+            rl = _acct(
+                id="r",
+                user_id="u",
+                disabled_models={OPUS: {"hits": 1, "at": now - timedelta(minutes=5)}},
+            )
             no_token = _acct(id="n", user_id="u", oauth_token=None)
             for a in (healthy, rl, no_token):
                 _account_by_id[a["id"]] = a
@@ -339,6 +378,7 @@ class TestSummarizePoolState:
 
 
 # ── _HEALTH_SCORE_DISQUALIFY_THRESHOLD constant ──────────────────────────────
+
 
 class TestHealthScoreDisqualifyThreshold:
     def test_threshold_is_negative(self):
@@ -368,6 +408,7 @@ class TestHealthScoreDisqualifyThreshold:
 
 # ── _cooldown_seconds_for_info ───────────────────────────────────────────────
 
+
 class TestCooldownSecondsForInfo:
     def test_exponential_curve_default(self):
         # hits=1 → 30 min
@@ -381,31 +422,36 @@ class TestCooldownSecondsForInfo:
 
     def test_quota_exhausted_flat_24h(self):
         """Billing-wall accounts get a flat 24h cooldown regardless of hit count."""
-        assert _cooldown_seconds_for_info(
-            {"hits": 1, "kind": "quota_exhausted"}
-        ) == _QUOTA_EXHAUSTED_COOLDOWN_SECONDS
+        assert (
+            _cooldown_seconds_for_info({"hits": 1, "kind": "quota_exhausted"})
+            == _QUOTA_EXHAUSTED_COOLDOWN_SECONDS
+        )
         # Even high hit counts stay flat at 24h (not the 4h exponential cap).
-        assert _cooldown_seconds_for_info(
-            {"hits": 99, "kind": "quota_exhausted"}
-        ) == _QUOTA_EXHAUSTED_COOLDOWN_SECONDS
+        assert (
+            _cooldown_seconds_for_info({"hits": 99, "kind": "quota_exhausted"})
+            == _QUOTA_EXHAUSTED_COOLDOWN_SECONDS
+        )
 
     def test_retry_after_seconds_is_floor(self):
         """Server-provided retry hint lifts the exponential cooldown when larger."""
         # hits=1 → exponential=1800s. Hint of 3600s should win.
-        assert _cooldown_seconds_for_info(
-            {"hits": 1, "retry_after_seconds": 3600}
-        ) == 3600
+        assert (
+            _cooldown_seconds_for_info({"hits": 1, "retry_after_seconds": 3600}) == 3600
+        )
         # Hint smaller than exponential is ignored.
-        assert _cooldown_seconds_for_info(
-            {"hits": 1, "retry_after_seconds": 60}
-        ) == 30 * 60
+        assert (
+            _cooldown_seconds_for_info({"hits": 1, "retry_after_seconds": 60})
+            == 30 * 60
+        )
         # Non-numeric hint is ignored.
-        assert _cooldown_seconds_for_info(
-            {"hits": 1, "retry_after_seconds": "unknown"}
-        ) == 30 * 60
+        assert (
+            _cooldown_seconds_for_info({"hits": 1, "retry_after_seconds": "unknown"})
+            == 30 * 60
+        )
 
 
 # ── _serialize_disabled_model_info ──────────────────────────────────────────
+
 
 class TestSerializeDisabledModelInfo:
     def test_minimal_entry(self):
@@ -444,11 +490,14 @@ class TestSerializeDisabledModelInfo:
     def test_omits_unknown_kind(self):
         """Only quota_exhausted is preserved; rate_limit is implicit (omitted)."""
         at = datetime(2026, 4, 22, 3, 0, tzinfo=timezone.utc)
-        out = _serialize_disabled_model_info({"hits": 1, "at": at, "kind": "rate_limit"})
+        out = _serialize_disabled_model_info(
+            {"hits": 1, "at": at, "kind": "rate_limit"}
+        )
         assert "kind" not in out
 
 
 # ── get_all_account_health_summaries ─────────────────────────────────────────
+
 
 class TestGetAllAccountHealthSummaries:
     def _reset_pools(self):
@@ -485,8 +534,11 @@ class TestGetAllAccountHealthSummaries:
         self._reset_pools()
         try:
             now = datetime.utcnow()
-            acct = _acct(id="r1", user_id="u",
-                         disabled_models={OPUS: {"hits": 1, "at": now - timedelta(minutes=5)}})
+            acct = _acct(
+                id="r1",
+                user_id="u",
+                disabled_models={OPUS: {"hits": 1, "at": now - timedelta(minutes=5)}},
+            )
             _account_by_id["r1"] = acct
             _max_plan_pools["u"] = [acct]
             summaries = get_all_account_health_summaries(user_id="u", now=now)
@@ -504,8 +556,12 @@ class TestGetAllAccountHealthSummaries:
         self._reset_pools()
         try:
             now = datetime.utcnow()
-            acct = _acct(id="d1", user_id="u", enabled=False,
-                         disabled_reason="auto-disabled after 5 rate-limit hits")
+            acct = _acct(
+                id="d1",
+                user_id="u",
+                enabled=False,
+                disabled_reason="auto-disabled after 5 rate-limit hits",
+            )
             _account_by_id["d1"] = acct
             _max_plan_pools["u"] = [acct]
             summaries = get_all_account_health_summaries(user_id="u", now=now)
@@ -520,8 +576,11 @@ class TestGetAllAccountHealthSummaries:
         try:
             now = datetime.utcnow()
             # 3 rl_events → score = -6, below threshold of -4
-            acct = _acct(id="q1", user_id="u",
-                         rl_events=[now - timedelta(hours=i) for i in range(1, 4)])
+            acct = _acct(
+                id="q1",
+                user_id="u",
+                rl_events=[now - timedelta(hours=i) for i in range(1, 4)],
+            )
             _account_by_id["q1"] = acct
             _max_plan_pools["u"] = [acct]
             summaries = get_all_account_health_summaries(user_id="u", now=now)
@@ -536,9 +595,17 @@ class TestGetAllAccountHealthSummaries:
         self._reset_pools()
         try:
             now = datetime.utcnow()
-            acct = _acct(id="qe1", user_id="u",
-                         disabled_models={OPUS: {"hits": 1, "at": now - timedelta(minutes=5),
-                                                  "kind": "quota_exhausted"}})
+            acct = _acct(
+                id="qe1",
+                user_id="u",
+                disabled_models={
+                    OPUS: {
+                        "hits": 1,
+                        "at": now - timedelta(minutes=5),
+                        "kind": "quota_exhausted",
+                    }
+                },
+            )
             _account_by_id["qe1"] = acct
             _max_plan_pools["u"] = [acct]
             summaries = get_all_account_health_summaries(user_id="u", now=now)
@@ -554,10 +621,14 @@ class TestGetAllAccountHealthSummaries:
         self._reset_pools()
         try:
             now = datetime.utcnow()
-            acct = _acct(id="s1", user_id="u", outcome_events=[
-                {"at": now - timedelta(hours=i + 1), "success": i < 4}
-                for i in range(5)
-            ])
+            acct = _acct(
+                id="s1",
+                user_id="u",
+                outcome_events=[
+                    {"at": now - timedelta(hours=i + 1), "success": i < 4}
+                    for i in range(5)
+                ],
+            )
             _account_by_id["s1"] = acct
             _max_plan_pools["u"] = [acct]
             summaries = get_all_account_health_summaries(user_id="u", now=now)
@@ -569,54 +640,66 @@ class TestGetAllAccountHealthSummaries:
 
 # ── _compute_success_rate_7d ─────────────────────────────────────────────────
 
+
 class TestComputeSuccessRate7d:
     def test_returns_none_when_no_events(self):
         assert _compute_success_rate_7d(_acct()) is None
 
     def test_returns_none_when_fewer_than_3_events(self):
         now = datetime.utcnow()
-        acct = _acct(outcome_events=[
-            {"at": now - timedelta(hours=1), "success": True},
-            {"at": now - timedelta(hours=2), "success": False},
-        ])
+        acct = _acct(
+            outcome_events=[
+                {"at": now - timedelta(hours=1), "success": True},
+                {"at": now - timedelta(hours=2), "success": False},
+            ]
+        )
         assert _compute_success_rate_7d(acct, now) is None
 
     def test_returns_rate_from_3_plus_events(self):
         now = datetime.utcnow()
-        acct = _acct(outcome_events=[
-            {"at": now - timedelta(hours=1), "success": True},
-            {"at": now - timedelta(hours=2), "success": True},
-            {"at": now - timedelta(hours=3), "success": False},
-        ])
+        acct = _acct(
+            outcome_events=[
+                {"at": now - timedelta(hours=1), "success": True},
+                {"at": now - timedelta(hours=2), "success": True},
+                {"at": now - timedelta(hours=3), "success": False},
+            ]
+        )
         rate = _compute_success_rate_7d(acct, now)
         assert rate == 2 / 3
 
     def test_excludes_events_older_than_7d(self):
         now = datetime.utcnow()
         old = now - timedelta(seconds=_OUTCOME_WINDOW_SECONDS + 60)
-        acct = _acct(outcome_events=[
-            {"at": old, "success": False},
-            {"at": old, "success": False},
-            {"at": old, "success": False},
-        ])
+        acct = _acct(
+            outcome_events=[
+                {"at": old, "success": False},
+                {"at": old, "success": False},
+                {"at": old, "success": False},
+            ]
+        )
         assert _compute_success_rate_7d(acct, now) is None
 
     def test_perfect_success_rate(self):
         now = datetime.utcnow()
-        acct = _acct(outcome_events=[
-            {"at": now - timedelta(hours=i + 1), "success": True} for i in range(5)
-        ])
+        acct = _acct(
+            outcome_events=[
+                {"at": now - timedelta(hours=i + 1), "success": True} for i in range(5)
+            ]
+        )
         assert _compute_success_rate_7d(acct, now) == 1.0
 
     def test_zero_success_rate(self):
         now = datetime.utcnow()
-        acct = _acct(outcome_events=[
-            {"at": now - timedelta(hours=i + 1), "success": False} for i in range(3)
-        ])
+        acct = _acct(
+            outcome_events=[
+                {"at": now - timedelta(hours=i + 1), "success": False} for i in range(3)
+            ]
+        )
         assert _compute_success_rate_7d(acct, now) == 0.0
 
 
 # ── _compute_success_rate_7d — per-task-type scoping ─────────────────────────
+
 
 class TestComputeSuccessRateByType:
     """TDD specs for task_type-scoped success rate (cluster 1/2 implements the kwarg).
@@ -630,12 +713,26 @@ class TestComputeSuccessRateByType:
     def test_per_type_rate_when_confident(self):
         """≥3 type-matching events → per-type rate, not the aggregate."""
         now = datetime.utcnow()
-        acct = _acct(outcome_events=(
-            [{"at": now - timedelta(hours=i + 1), "success": True, "task_type": "create"}
-             for i in range(5)] +
-            [{"at": now - timedelta(hours=i + 6), "success": False, "task_type": "review"}
-             for i in range(5)]
-        ))
+        acct = _acct(
+            outcome_events=(
+                [
+                    {
+                        "at": now - timedelta(hours=i + 1),
+                        "success": True,
+                        "task_type": "create",
+                    }
+                    for i in range(5)
+                ]
+                + [
+                    {
+                        "at": now - timedelta(hours=i + 6),
+                        "success": False,
+                        "task_type": "review",
+                    }
+                    for i in range(5)
+                ]
+            )
+        )
         # aggregate = 5/10 = 0.5; create-type = 5/5 = 1.0
         rate = _compute_success_rate_7d(acct, task_type="create", now=now)
         assert rate == 1.0
@@ -644,12 +741,30 @@ class TestComputeSuccessRateByType:
     def test_sparse_type_falls_back_to_aggregate(self):
         """< 3 type-matching events → aggregate rate used as fallback."""
         now = datetime.utcnow()
-        acct = _acct(outcome_events=(
-            [{"at": now - timedelta(hours=1), "success": True, "task_type": "create"},
-             {"at": now - timedelta(hours=2), "success": False, "task_type": "create"}] +
-            [{"at": now - timedelta(hours=i + 3), "success": True, "task_type": "review"}
-             for i in range(5)]
-        ))
+        acct = _acct(
+            outcome_events=(
+                [
+                    {
+                        "at": now - timedelta(hours=1),
+                        "success": True,
+                        "task_type": "create",
+                    },
+                    {
+                        "at": now - timedelta(hours=2),
+                        "success": False,
+                        "task_type": "create",
+                    },
+                ]
+                + [
+                    {
+                        "at": now - timedelta(hours=i + 3),
+                        "success": True,
+                        "task_type": "review",
+                    }
+                    for i in range(5)
+                ]
+            )
+        )
         # 2 "create" events (< 3 floor) → fallback to aggregate (6/7)
         rate = _compute_success_rate_7d(acct, task_type="create", now=now)
         assert rate is not None
@@ -658,12 +773,26 @@ class TestComputeSuccessRateByType:
     def test_no_task_type_returns_aggregate_unchanged(self):
         """Omitting task_type returns the aggregate — backward compatible."""
         now = datetime.utcnow()
-        acct = _acct(outcome_events=(
-            [{"at": now - timedelta(hours=i + 1), "success": True, "task_type": "create"}
-             for i in range(3)] +
-            [{"at": now - timedelta(hours=i + 4), "success": False, "task_type": "review"}
-             for i in range(3)]
-        ))
+        acct = _acct(
+            outcome_events=(
+                [
+                    {
+                        "at": now - timedelta(hours=i + 1),
+                        "success": True,
+                        "task_type": "create",
+                    }
+                    for i in range(3)
+                ]
+                + [
+                    {
+                        "at": now - timedelta(hours=i + 4),
+                        "success": False,
+                        "task_type": "review",
+                    }
+                    for i in range(3)
+                ]
+            )
+        )
         # 3 successes out of 6 total = 0.5 aggregate
         rate = _compute_success_rate_7d(acct, now=now)
         assert rate is not None
@@ -672,17 +801,24 @@ class TestComputeSuccessRateByType:
 
 # ── selection tiebreaking by success rate ─────────────────────────────────────
 
+
 class TestSuccessRateTiebreaking:
     def test_higher_success_rate_scores_higher(self):
         """_compute_success_rate_7d should rank high-success above low-success accounts."""
         now = datetime.utcnow()
-        good = _acct(id="good", outcome_events=[
-            {"at": now - timedelta(hours=i + 1), "success": True} for i in range(5)
-        ])
-        bad = _acct(id="bad", outcome_events=[
-            {"at": now - timedelta(hours=i + 1), "success": i < 1}  # 1/5 success
-            for i in range(5)
-        ])
+        good = _acct(
+            id="good",
+            outcome_events=[
+                {"at": now - timedelta(hours=i + 1), "success": True} for i in range(5)
+            ],
+        )
+        bad = _acct(
+            id="bad",
+            outcome_events=[
+                {"at": now - timedelta(hours=i + 1), "success": i < 1}  # 1/5 success
+                for i in range(5)
+            ],
+        )
         good_rate = _compute_success_rate_7d(good, now)
         bad_rate = _compute_success_rate_7d(bad, now)
         assert good_rate is not None and bad_rate is not None
@@ -698,12 +834,20 @@ class TestSuccessRateTiebreaking:
         """The selection key (health, success_rate, -active_tasks) ranks the
         high-success account ahead of the low-success account."""
         now = datetime.utcnow()
-        hi = _acct(id="hi", active_tasks=1, outcome_events=[
-            {"at": now - timedelta(hours=i + 1), "success": True} for i in range(5)
-        ])
-        lo = _acct(id="lo", active_tasks=0, outcome_events=[
-            {"at": now - timedelta(hours=i + 1), "success": False} for i in range(5)
-        ])
+        hi = _acct(
+            id="hi",
+            active_tasks=1,
+            outcome_events=[
+                {"at": now - timedelta(hours=i + 1), "success": True} for i in range(5)
+            ],
+        )
+        lo = _acct(
+            id="lo",
+            active_tasks=0,
+            outcome_events=[
+                {"at": now - timedelta(hours=i + 1), "success": False} for i in range(5)
+            ],
+        )
         key = lambda a: (  # noqa: E731
             _compute_health_score(a, now),
             _compute_success_rate_7d(a, now) or 0.0,
@@ -717,10 +861,13 @@ class TestSuccessRateTiebreaking:
         Both contribute 0.0 to the selection key via `or 0.0`, so a new account
         is never penalised relative to another new account."""
         now = datetime.utcnow()
-        low_sample = _acct(id="new", outcome_events=[
-            {"at": now - timedelta(hours=1), "success": False},
-            {"at": now - timedelta(hours=2), "success": True},
-        ])  # 2 events — below MIN_SAMPLES threshold
+        low_sample = _acct(
+            id="new",
+            outcome_events=[
+                {"at": now - timedelta(hours=1), "success": False},
+                {"at": now - timedelta(hours=2), "success": True},
+            ],
+        )  # 2 events — below MIN_SAMPLES threshold
         no_data = _acct(id="fresh")  # 0 events
         assert _compute_success_rate_7d(low_sample, now) is None
         assert _compute_success_rate_7d(no_data, now) is None
@@ -733,13 +880,23 @@ class TestSuccessRateTiebreaking:
         """When two accounts have the same success rate, the one with fewer
         active_tasks ranks higher in the selection key."""
         now = datetime.utcnow()
-        busy = _acct(id="busy", active_tasks=3, outcome_events=[
-            {"at": now - timedelta(hours=i + 1), "success": True} for i in range(4)
-        ])
-        idle = _acct(id="idle", active_tasks=0, outcome_events=[
-            {"at": now - timedelta(hours=i + 1), "success": True} for i in range(4)
-        ])
-        assert _compute_success_rate_7d(busy, now) == _compute_success_rate_7d(idle, now)
+        busy = _acct(
+            id="busy",
+            active_tasks=3,
+            outcome_events=[
+                {"at": now - timedelta(hours=i + 1), "success": True} for i in range(4)
+            ],
+        )
+        idle = _acct(
+            id="idle",
+            active_tasks=0,
+            outcome_events=[
+                {"at": now - timedelta(hours=i + 1), "success": True} for i in range(4)
+            ],
+        )
+        assert _compute_success_rate_7d(busy, now) == _compute_success_rate_7d(
+            idle, now
+        )
         key = lambda a: (  # noqa: E731
             _compute_health_score(a, now),
             _compute_success_rate_7d(a, now) or 0.0,
@@ -750,15 +907,24 @@ class TestSuccessRateTiebreaking:
 
 # ── select_max_plan_account_balanced — success-rate bias ─────────────────────
 
+
 class TestBalancedSuccessRateBias:
     """Tests for the pool-median success-rate filter in select_max_plan_account_balanced."""
 
     _USER = "test-balanced-bias-user"
 
-    def _acct_with_rate(self, id_, success_rate=None, active_tasks=0, provider="anthropic"):
+    def _acct_with_rate(
+        self, id_, success_rate=None, active_tasks=0, provider="anthropic"
+    ):
         now = datetime.utcnow()
-        acct = {"id": id_, "name": id_, "enabled": True, "active_tasks": active_tasks,
-                "oauth_token": "sk-ant-test", "provider": provider}
+        acct = {
+            "id": id_,
+            "name": id_,
+            "enabled": True,
+            "active_tasks": active_tasks,
+            "oauth_token": "sk-ant-test",
+            "provider": provider,
+        }
         if success_rate is not None:
             n = round(success_rate * 5)
             acct["outcome_events"] = [
@@ -777,16 +943,22 @@ class TestBalancedSuccessRateBias:
         good = self._acct_with_rate("good", success_rate=1.0)
         bad = self._acct_with_rate("bad", success_rate=0.0)
         _max_plan_pools[self._USER] = [good, bad]
-        result = await select_max_plan_account_balanced(self._USER, [("anthropic", None)])
+        result = await select_max_plan_account_balanced(
+            self._USER, [("anthropic", None)]
+        )
         assert result is not None
         assert result[0]["id"] == "good"
 
     async def test_sparse_account_not_penalized_by_filter(self):
         """Account with fewer than 3 outcomes (rate=None) is never excluded by the filter."""
-        sparse = self._acct_with_rate("sparse", active_tasks=0)  # no outcome_events → None
+        sparse = self._acct_with_rate(
+            "sparse", active_tasks=0
+        )  # no outcome_events → None
         rich = self._acct_with_rate("rich", success_rate=1.0, active_tasks=1)
         _max_plan_pools[self._USER] = [sparse, rich]
-        result = await select_max_plan_account_balanced(self._USER, [("anthropic", None)])
+        result = await select_max_plan_account_balanced(
+            self._USER, [("anthropic", None)]
+        )
         assert result is not None
         # sparse wins on load (active_tasks=0 < 1); verifies it wasn't filtered out
         assert result[0]["id"] == "sparse"
@@ -795,7 +967,9 @@ class TestBalancedSuccessRateBias:
         """With only one candidate the filter is never applied; any success rate is ok."""
         only = self._acct_with_rate("only", success_rate=0.0)
         _max_plan_pools[self._USER] = [only]
-        result = await select_max_plan_account_balanced(self._USER, [("anthropic", None)])
+        result = await select_max_plan_account_balanced(
+            self._USER, [("anthropic", None)]
+        )
         assert result is not None
         assert result[0]["id"] == "only"
 
@@ -807,7 +981,9 @@ class TestBalancedSuccessRateBias:
         # 4/5 = 0.80 exactly — at threshold, should be kept
         edge = self._acct_with_rate("edge", success_rate=0.8)
         _max_plan_pools[self._USER] = [hi, edge]
-        result = await select_max_plan_account_balanced(self._USER, [("anthropic", None)])
+        result = await select_max_plan_account_balanced(
+            self._USER, [("anthropic", None)]
+        )
         assert result is not None
         # edge (rate=0.8) >= 1.0 - 0.20 = 0.80 → kept; winner is hi (also at 0 active_tasks)
         # both kept means result can be either; just assert no crash and winner is valid
@@ -816,11 +992,15 @@ class TestBalancedSuccessRateBias:
 
 # ── _check_quarantine_trigger + disable_account_model quarantine integration ──
 
+
 class TestQuarantineTrigger:
     """Tests for the confidence-gated quarantine trip-wire."""
 
-    def _set_records(self, account_id: str, records: list[tuple[str, float | None]]) -> None:
+    def _set_records(
+        self, account_id: str, records: list[tuple[str, float | None]]
+    ) -> None:
         from app.failure_classification import _account_failure_log
+
         now_ts = time.time()
         _account_failure_log[account_id] = [
             (cls, conf, now_ts - (len(records) - i) * 100)
@@ -829,67 +1009,109 @@ class TestQuarantineTrigger:
 
     def setup_method(self):
         from app.failure_classification import _account_failure_log
+
         _account_failure_log.clear()
         _account_by_id.clear()
         _max_plan_pools.clear()
 
     def teardown_method(self):
         from app.failure_classification import _account_failure_log
+
         _account_failure_log.clear()
         _account_by_id.clear()
         _max_plan_pools.clear()
 
     def test_triggers_when_last_n_are_rate_limit_high_confidence(self):
-        self._set_records("a", [
-            ("RATE_LIMIT", 0.9), ("RATE_LIMIT", 0.9), ("RATE_LIMIT", 0.9),
-        ])
+        self._set_records(
+            "a",
+            [
+                ("RATE_LIMIT", 0.9),
+                ("RATE_LIMIT", 0.9),
+                ("RATE_LIMIT", 0.9),
+            ],
+        )
         assert _check_quarantine_trigger("a") is True
 
     def test_triggers_when_last_n_are_provision_failure_high_confidence(self):
-        self._set_records("a", [
-            ("PROVISION_FAILURE", 0.85), ("RATE_LIMIT", 0.9), ("PROVISION_FAILURE", 0.9),
-        ])
+        self._set_records(
+            "a",
+            [
+                ("PROVISION_FAILURE", 0.85),
+                ("RATE_LIMIT", 0.9),
+                ("PROVISION_FAILURE", 0.9),
+            ],
+        )
         assert _check_quarantine_trigger("a") is True
 
     def test_no_trigger_when_confidence_below_threshold(self):
-        self._set_records("a", [
-            ("RATE_LIMIT", 0.5), ("RATE_LIMIT", 0.5), ("RATE_LIMIT", 0.5),
-        ])
+        self._set_records(
+            "a",
+            [
+                ("RATE_LIMIT", 0.5),
+                ("RATE_LIMIT", 0.5),
+                ("RATE_LIMIT", 0.5),
+            ],
+        )
         assert _check_quarantine_trigger("a") is False
 
     def test_no_trigger_when_mixed_classes_break_streak(self):
-        self._set_records("a", [
-            ("RATE_LIMIT", 0.9), ("CODE_ERROR", 0.9), ("RATE_LIMIT", 0.9),
-        ])
+        self._set_records(
+            "a",
+            [
+                ("RATE_LIMIT", 0.9),
+                ("CODE_ERROR", 0.9),
+                ("RATE_LIMIT", 0.9),
+            ],
+        )
         assert _check_quarantine_trigger("a") is False
 
     def test_no_trigger_when_fewer_than_n_records(self):
-        self._set_records("a", [
-            ("RATE_LIMIT", 0.9), ("RATE_LIMIT", 0.9),
-        ])
+        self._set_records(
+            "a",
+            [
+                ("RATE_LIMIT", 0.9),
+                ("RATE_LIMIT", 0.9),
+            ],
+        )
         assert _check_quarantine_trigger("a") is False
 
     def test_no_trigger_for_code_error_regardless_of_confidence(self):
-        self._set_records("a", [
-            ("CODE_ERROR", 0.95), ("CODE_ERROR", 0.95), ("CODE_ERROR", 0.95),
-        ])
+        self._set_records(
+            "a",
+            [
+                ("CODE_ERROR", 0.95),
+                ("CODE_ERROR", 0.95),
+                ("CODE_ERROR", 0.95),
+            ],
+        )
         assert _check_quarantine_trigger("a") is False
 
     def test_no_trigger_when_earlier_records_disqualify_last_n(self):
         # 5 records: last 3 must all qualify; position [2] is CODE_ERROR
-        self._set_records("a", [
-            ("RATE_LIMIT", 0.9), ("RATE_LIMIT", 0.9),
-            ("CODE_ERROR", 0.9), ("RATE_LIMIT", 0.9), ("RATE_LIMIT", 0.9),
-        ])
+        self._set_records(
+            "a",
+            [
+                ("RATE_LIMIT", 0.9),
+                ("RATE_LIMIT", 0.9),
+                ("CODE_ERROR", 0.9),
+                ("RATE_LIMIT", 0.9),
+                ("RATE_LIMIT", 0.9),
+            ],
+        )
         assert _check_quarantine_trigger("a") is False
 
     async def test_disable_account_model_sets_quarantine_kind(self):
         acct_id = "a"
         acct = _acct(id=acct_id)
         _account_by_id[acct_id] = acct
-        self._set_records(acct_id, [
-            ("RATE_LIMIT", 0.9), ("RATE_LIMIT", 0.9), ("RATE_LIMIT", 0.9),
-        ])
+        self._set_records(
+            acct_id,
+            [
+                ("RATE_LIMIT", 0.9),
+                ("RATE_LIMIT", 0.9),
+                ("RATE_LIMIT", 0.9),
+            ],
+        )
         with patch("app.max_plan_pool._persist_rate_limit_state"):
             await disable_account_model(acct_id, OPUS, kind="rate_limit")
         assert acct["disabled_models"][OPUS]["kind"] == "quarantine"
@@ -898,9 +1120,14 @@ class TestQuarantineTrigger:
         acct_id = "a"
         acct = _acct(id=acct_id)
         _account_by_id[acct_id] = acct
-        self._set_records(acct_id, [
-            ("RATE_LIMIT", 0.5), ("RATE_LIMIT", 0.5), ("RATE_LIMIT", 0.5),
-        ])
+        self._set_records(
+            acct_id,
+            [
+                ("RATE_LIMIT", 0.5),
+                ("RATE_LIMIT", 0.5),
+                ("RATE_LIMIT", 0.5),
+            ],
+        )
         with patch("app.max_plan_pool._persist_rate_limit_state"):
             await disable_account_model(acct_id, OPUS, kind="rate_limit")
         assert acct["disabled_models"][OPUS].get("kind") != "quarantine"
@@ -909,21 +1136,34 @@ class TestQuarantineTrigger:
         acct_id = "a"
         acct = _acct(id=acct_id)
         _account_by_id[acct_id] = acct
-        self._set_records(acct_id, [
-            ("RATE_LIMIT", 0.9), ("RATE_LIMIT", 0.9), ("RATE_LIMIT", 0.9),
-        ])
+        self._set_records(
+            acct_id,
+            [
+                ("RATE_LIMIT", 0.9),
+                ("RATE_LIMIT", 0.9),
+                ("RATE_LIMIT", 0.9),
+            ],
+        )
         with patch("app.max_plan_pool._persist_rate_limit_state"):
             await disable_account_model(acct_id, OPUS, kind="rate_limit")
         assert acct["disabled_models"][OPUS]["kind"] == "quarantine"
-        assert _cooldown_seconds_for_info(acct["disabled_models"][OPUS]) == _QUARANTINE_COOLDOWN_SECONDS
+        assert (
+            _cooldown_seconds_for_info(acct["disabled_models"][OPUS])
+            == _QUARANTINE_COOLDOWN_SECONDS
+        )
 
     async def test_quota_exhausted_not_overridden_by_quarantine(self):
         acct_id = "a"
         acct = _acct(id=acct_id)
         _account_by_id[acct_id] = acct
-        self._set_records(acct_id, [
-            ("RATE_LIMIT", 0.9), ("RATE_LIMIT", 0.9), ("RATE_LIMIT", 0.9),
-        ])
+        self._set_records(
+            acct_id,
+            [
+                ("RATE_LIMIT", 0.9),
+                ("RATE_LIMIT", 0.9),
+                ("RATE_LIMIT", 0.9),
+            ],
+        )
         with patch("app.max_plan_pool._persist_rate_limit_state"):
             await disable_account_model(acct_id, OPUS, kind="quota_exhausted")
         assert acct["disabled_models"][OPUS].get("kind") == "quota_exhausted"
@@ -931,102 +1171,180 @@ class TestQuarantineTrigger:
 
 # ── _compute_success_rate_7d_for_type ────────────────────────────────────────
 
+
 class TestComputeSuccessRate7dForType:
     def test_returns_none_when_no_typed_events(self):
         now = datetime.utcnow()
-        acct = _acct(outcome_events=[
-            {"at": now - timedelta(hours=i + 1), "success": True, "task_type": "review"}
-            for i in range(5)
-        ])
+        acct = _acct(
+            outcome_events=[
+                {
+                    "at": now - timedelta(hours=i + 1),
+                    "success": True,
+                    "task_type": "review",
+                }
+                for i in range(5)
+            ]
+        )
         assert _compute_success_rate_7d_for_type(acct, "create", now) is None
 
     def test_returns_none_below_min_sample_threshold(self):
         now = datetime.utcnow()
-        acct = _acct(outcome_events=[
-            {"at": now - timedelta(hours=1), "success": True, "task_type": "create"},
-            {"at": now - timedelta(hours=2), "success": False, "task_type": "create"},
-        ])
+        acct = _acct(
+            outcome_events=[
+                {
+                    "at": now - timedelta(hours=1),
+                    "success": True,
+                    "task_type": "create",
+                },
+                {
+                    "at": now - timedelta(hours=2),
+                    "success": False,
+                    "task_type": "create",
+                },
+            ]
+        )
         assert _compute_success_rate_7d_for_type(acct, "create", now) is None
 
     def test_returns_type_scoped_rate_ignoring_other_types(self):
         now = datetime.utcnow()
-        acct = _acct(outcome_events=[
-            {"at": now - timedelta(hours=1), "success": True, "task_type": "create"},
-            {"at": now - timedelta(hours=2), "success": True, "task_type": "create"},
-            {"at": now - timedelta(hours=3), "success": True, "task_type": "create"},
-            # These should NOT count toward "create" rate.
-            {"at": now - timedelta(hours=4), "success": False, "task_type": "review"},
-            {"at": now - timedelta(hours=5), "success": False, "task_type": "review"},
-            {"at": now - timedelta(hours=6), "success": False, "task_type": "review"},
-        ])
+        acct = _acct(
+            outcome_events=[
+                {
+                    "at": now - timedelta(hours=1),
+                    "success": True,
+                    "task_type": "create",
+                },
+                {
+                    "at": now - timedelta(hours=2),
+                    "success": True,
+                    "task_type": "create",
+                },
+                {
+                    "at": now - timedelta(hours=3),
+                    "success": True,
+                    "task_type": "create",
+                },
+                # These should NOT count toward "create" rate.
+                {
+                    "at": now - timedelta(hours=4),
+                    "success": False,
+                    "task_type": "review",
+                },
+                {
+                    "at": now - timedelta(hours=5),
+                    "success": False,
+                    "task_type": "review",
+                },
+                {
+                    "at": now - timedelta(hours=6),
+                    "success": False,
+                    "task_type": "review",
+                },
+            ]
+        )
         assert _compute_success_rate_7d_for_type(acct, "create", now) == 1.0
 
     def test_excludes_events_outside_7d_window(self):
         now = datetime.utcnow()
         old = now - timedelta(seconds=_OUTCOME_WINDOW_SECONDS + 60)
-        acct = _acct(outcome_events=[
-            {"at": old, "success": True, "task_type": "create"},
-            {"at": old, "success": True, "task_type": "create"},
-            {"at": old, "success": True, "task_type": "create"},
-        ])
+        acct = _acct(
+            outcome_events=[
+                {"at": old, "success": True, "task_type": "create"},
+                {"at": old, "success": True, "task_type": "create"},
+                {"at": old, "success": True, "task_type": "create"},
+            ]
+        )
         assert _compute_success_rate_7d_for_type(acct, "create", now) is None
 
     def test_events_without_task_type_excluded(self):
         now = datetime.utcnow()
-        acct = _acct(outcome_events=[
-            {"at": now - timedelta(hours=1), "success": True},
-            {"at": now - timedelta(hours=2), "success": True},
-            {"at": now - timedelta(hours=3), "success": True},
-            {"at": now - timedelta(hours=4), "success": True, "task_type": "create"},
-        ])
+        acct = _acct(
+            outcome_events=[
+                {"at": now - timedelta(hours=1), "success": True},
+                {"at": now - timedelta(hours=2), "success": True},
+                {"at": now - timedelta(hours=3), "success": True},
+                {
+                    "at": now - timedelta(hours=4),
+                    "success": True,
+                    "task_type": "create",
+                },
+            ]
+        )
         assert _compute_success_rate_7d_for_type(acct, "create", now) is None
 
 
 # ── _effective_success_rate ──────────────────────────────────────────────────
 
+
 class TestEffectiveSuccessRate:
     def test_returns_typed_rate_when_sufficient_typed_samples(self):
         now = datetime.utcnow()
-        acct = _acct(outcome_events=[
-            {"at": now - timedelta(hours=i + 1), "success": True, "task_type": "create"}
-            for i in range(3)
-        ] + [
-            {"at": now - timedelta(hours=i + 4), "success": False, "task_type": "review"}
-            for i in range(5)
-        ])
+        acct = _acct(
+            outcome_events=[
+                {
+                    "at": now - timedelta(hours=i + 1),
+                    "success": True,
+                    "task_type": "create",
+                }
+                for i in range(3)
+            ]
+            + [
+                {
+                    "at": now - timedelta(hours=i + 4),
+                    "success": False,
+                    "task_type": "review",
+                }
+                for i in range(5)
+            ]
+        )
         rate = _effective_success_rate(acct, "create", now)
         assert rate == 1.0
 
     def test_falls_back_to_aggregate_when_typed_sample_sparse(self):
         now = datetime.utcnow()
-        acct = _acct(outcome_events=[
-            {"at": now - timedelta(hours=1), "success": True, "task_type": "create"},
-            # Only 1 "create" event — sparse; falls back to aggregate of 4 events.
-            {"at": now - timedelta(hours=2), "success": False},
-            {"at": now - timedelta(hours=3), "success": False},
-            {"at": now - timedelta(hours=4), "success": False},
-        ])
+        acct = _acct(
+            outcome_events=[
+                {
+                    "at": now - timedelta(hours=1),
+                    "success": True,
+                    "task_type": "create",
+                },
+                # Only 1 "create" event — sparse; falls back to aggregate of 4 events.
+                {"at": now - timedelta(hours=2), "success": False},
+                {"at": now - timedelta(hours=3), "success": False},
+                {"at": now - timedelta(hours=4), "success": False},
+            ]
+        )
         # Aggregate: 1 success / 4 total = 0.25
         rate = _effective_success_rate(acct, "create", now)
         assert rate == 0.25
 
     def test_falls_back_to_aggregate_when_task_type_is_none(self):
         now = datetime.utcnow()
-        acct = _acct(outcome_events=[
-            {"at": now - timedelta(hours=i + 1), "success": i < 3} for i in range(5)
-        ])
+        acct = _acct(
+            outcome_events=[
+                {"at": now - timedelta(hours=i + 1), "success": i < 3} for i in range(5)
+            ]
+        )
         rate = _effective_success_rate(acct, None, now)
         assert rate == _compute_success_rate_7d(acct, now)
 
     def test_returns_none_when_both_typed_and_aggregate_sparse(self):
         now = datetime.utcnow()
-        acct = _acct(outcome_events=[
-            {"at": now - timedelta(hours=1), "success": True, "task_type": "create"},
-        ])
+        acct = _acct(
+            outcome_events=[
+                {
+                    "at": now - timedelta(hours=1),
+                    "success": True,
+                    "task_type": "create",
+                },
+            ]
+        )
         assert _effective_success_rate(acct, "create", now) is None
 
 
 # ── _compute_avg_duration_24h ────────────────────────────────────────────────
+
 
 class TestComputeAvgDuration24h:
     def test_returns_none_when_no_completions(self):
@@ -1034,54 +1352,77 @@ class TestComputeAvgDuration24h:
 
     def test_returns_none_below_min_samples(self):
         now = datetime.utcnow()
-        acct = _acct(completion_events=[
-            {"at": now - timedelta(hours=1), "duration_seconds": 60.0}
-            for _ in range(_LATENCY_MIN_SAMPLES - 1)
-        ])
+        acct = _acct(
+            completion_events=[
+                {"at": now - timedelta(hours=1), "duration_seconds": 60.0}
+                for _ in range(_LATENCY_MIN_SAMPLES - 1)
+            ]
+        )
         assert _compute_avg_duration_24h(acct, now) is None
 
     def test_returns_average_at_min_samples(self):
         now = datetime.utcnow()
-        acct = _acct(completion_events=[
-            {"at": now - timedelta(hours=i + 1), "duration_seconds": float((i + 1) * 60)}
-            for i in range(_LATENCY_MIN_SAMPLES)
-        ])
+        acct = _acct(
+            completion_events=[
+                {
+                    "at": now - timedelta(hours=i + 1),
+                    "duration_seconds": float((i + 1) * 60),
+                }
+                for i in range(_LATENCY_MIN_SAMPLES)
+            ]
+        )
         result = _compute_avg_duration_24h(acct, now)
         assert result is not None
-        expected = sum((i + 1) * 60.0 for i in range(_LATENCY_MIN_SAMPLES)) / _LATENCY_MIN_SAMPLES
+        expected = (
+            sum((i + 1) * 60.0 for i in range(_LATENCY_MIN_SAMPLES))
+            / _LATENCY_MIN_SAMPLES
+        )
         assert abs(result - expected) < 0.01
 
     def test_excludes_events_outside_24h_window(self):
         now = datetime.utcnow()
         old = now - timedelta(seconds=_HEALTH_WINDOW_SECONDS + 60)
-        acct = _acct(completion_events=[
-            {"at": old, "duration_seconds": 10.0},
-            {"at": old, "duration_seconds": 10.0},
-            {"at": old, "duration_seconds": 10.0},
-        ])
+        acct = _acct(
+            completion_events=[
+                {"at": old, "duration_seconds": 10.0},
+                {"at": old, "duration_seconds": 10.0},
+                {"at": old, "duration_seconds": 10.0},
+            ]
+        )
         assert _compute_avg_duration_24h(acct, now) is None
 
     def test_events_missing_duration_are_skipped(self):
         now = datetime.utcnow()
-        acct = _acct(completion_events=[
-            {"at": now - timedelta(hours=1)},  # no duration_seconds
-            {"at": now - timedelta(hours=2)},
-            {"at": now - timedelta(hours=3)},
-        ])
+        acct = _acct(
+            completion_events=[
+                {"at": now - timedelta(hours=1)},  # no duration_seconds
+                {"at": now - timedelta(hours=2)},
+                {"at": now - timedelta(hours=3)},
+            ]
+        )
         assert _compute_avg_duration_24h(acct, now) is None
 
 
 # ── latency-aware selection ───────────────────────────────────────────────────
+
 
 class TestLatencyAwareSelection:
     """Faster accounts are preferred when health/success rate are comparable."""
 
     _USER = "test-latency-user"
 
-    def _acct_with_duration(self, id_, avg_seconds=None, active_tasks=0, provider="anthropic"):
+    def _acct_with_duration(
+        self, id_, avg_seconds=None, active_tasks=0, provider="anthropic"
+    ):
         now = datetime.utcnow()
-        acct = {"id": id_, "name": id_, "enabled": True, "active_tasks": active_tasks,
-                "oauth_token": "sk-ant-test", "provider": provider}
+        acct = {
+            "id": id_,
+            "name": id_,
+            "enabled": True,
+            "active_tasks": active_tasks,
+            "oauth_token": "sk-ant-test",
+            "provider": provider,
+        }
         if avg_seconds is not None:
             acct["completion_events"] = [
                 {"at": now - timedelta(hours=i + 1), "duration_seconds": avg_seconds}
@@ -1100,22 +1441,32 @@ class TestLatencyAwareSelection:
         fast = self._acct_with_duration("fast", avg_seconds=60.0)
         slow = self._acct_with_duration("slow", avg_seconds=300.0)
         _max_plan_pools[self._USER] = [fast, slow]
-        result = await select_max_plan_account_balanced(self._USER, [("anthropic", None)])
+        result = await select_max_plan_account_balanced(
+            self._USER, [("anthropic", None)]
+        )
         assert result is not None
         assert result[0]["id"] == "fast"
 
     async def test_sample_floor_prevents_whip(self):
         """Account with fewer than _LATENCY_MIN_SAMPLES completions does not lose to a fast one."""
         now = datetime.utcnow()
-        sparse = {"id": "sparse", "name": "sparse", "enabled": True, "active_tasks": 0,
-                  "oauth_token": "sk-ant-test", "provider": "anthropic",
-                  "completion_events": [
-                      {"at": now - timedelta(hours=1), "duration_seconds": 999.0}
-                      for _ in range(_LATENCY_MIN_SAMPLES - 1)
-                  ]}
+        sparse = {
+            "id": "sparse",
+            "name": "sparse",
+            "enabled": True,
+            "active_tasks": 0,
+            "oauth_token": "sk-ant-test",
+            "provider": "anthropic",
+            "completion_events": [
+                {"at": now - timedelta(hours=1), "duration_seconds": 999.0}
+                for _ in range(_LATENCY_MIN_SAMPLES - 1)
+            ],
+        }
         fast = self._acct_with_duration("fast", avg_seconds=60.0, active_tasks=1)
         _max_plan_pools[self._USER] = [sparse, fast]
-        result = await select_max_plan_account_balanced(self._USER, [("anthropic", None)])
+        result = await select_max_plan_account_balanced(
+            self._USER, [("anthropic", None)]
+        )
         assert result is not None
         # sparse wins on load (0 < 1); latency signal is None so doesn't penalise it
         assert result[0]["id"] == "sparse"
@@ -1124,24 +1475,29 @@ class TestLatencyAwareSelection:
         """Very slow account is selected when it is the only healthy candidate."""
         slow = self._acct_with_duration("slow", avg_seconds=600.0)
         _max_plan_pools[self._USER] = [slow]
-        result = await select_max_plan_account_balanced(self._USER, [("anthropic", None)])
+        result = await select_max_plan_account_balanced(
+            self._USER, [("anthropic", None)]
+        )
         assert result is not None
         assert result[0]["id"] == "slow"
 
 
 # ── disable_account_model(kind="regression") + clear_account_model_regression ─
 
+
 class TestRegressionQuarantine:
     """Unit tests for the regression-kind disabled_models entry shape."""
 
     def setup_method(self):
         from app.failure_classification import _account_failure_log
+
         _account_failure_log.clear()
         _account_by_id.clear()
         _max_plan_pools.clear()
 
     def teardown_method(self):
         from app.failure_classification import _account_failure_log
+
         _account_failure_log.clear()
         _account_by_id.clear()
         _max_plan_pools.clear()
@@ -1155,11 +1511,16 @@ class TestRegressionQuarantine:
         _account_by_id[acct_id] = acct
         with patch("app.max_plan_pool._persist_rate_limit_state"):
             await disable_account_model(
-                acct_id, "claude-sonnet-4-5",
+                acct_id,
+                "claude-sonnet-4-5",
                 kind="regression",
-                regression_stats={"account_rate": 0.1, "project_median": 0.9,
-                                  "sample_size": 5, "distinct_accounts": 2,
-                                  "started_at": "2026-04-29T00:00:00+00:00"},
+                regression_stats={
+                    "account_rate": 0.1,
+                    "project_median": 0.9,
+                    "sample_size": 5,
+                    "distinct_accounts": 2,
+                    "started_at": "2026-04-29T00:00:00+00:00",
+                },
                 provider="anthropic",
             )
         dm = acct["disabled_models"]
@@ -1174,11 +1535,17 @@ class TestRegressionQuarantine:
         acct_id = "a"
         acct = _acct(id=acct_id)
         _account_by_id[acct_id] = acct
-        stats = {"account_rate": 0.2, "project_median": 0.8, "sample_size": 6,
-                 "distinct_accounts": 3, "started_at": "2026-04-29T00:00:00+00:00"}
+        stats = {
+            "account_rate": 0.2,
+            "project_median": 0.8,
+            "sample_size": 6,
+            "distinct_accounts": 3,
+            "started_at": "2026-04-29T00:00:00+00:00",
+        }
         with patch("app.max_plan_pool._persist_rate_limit_state"):
             await disable_account_model(
-                acct_id, OPUS,
+                acct_id,
+                OPUS,
                 kind="regression",
                 regression_stats=stats,
                 provider="anthropic",
@@ -1189,17 +1556,26 @@ class TestRegressionQuarantine:
         assert info["regression_stats"] == stats
 
     async def test_regression_cooldown_is_six_hours(self):
-        from app.max_plan_pool import _REGRESSION_COOLDOWN_SECONDS, disable_account_model
+        from app.max_plan_pool import (
+            _REGRESSION_COOLDOWN_SECONDS,
+            disable_account_model,
+        )
 
         acct_id = "a"
         acct = _acct(id=acct_id)
         _account_by_id[acct_id] = acct
         with patch("app.max_plan_pool._persist_rate_limit_state"):
             await disable_account_model(
-                acct_id, OPUS, kind="regression",
-                regression_stats={"account_rate": 0.1, "project_median": 0.9,
-                                  "sample_size": 5, "distinct_accounts": 2,
-                                  "started_at": "2026-04-29T00:00:00+00:00"},
+                acct_id,
+                OPUS,
+                kind="regression",
+                regression_stats={
+                    "account_rate": 0.1,
+                    "project_median": 0.9,
+                    "sample_size": 5,
+                    "distinct_accounts": 2,
+                    "started_at": "2026-04-29T00:00:00+00:00",
+                },
                 provider="anthropic",
             )
         info = acct["disabled_models"][OPUS]
@@ -1216,10 +1592,16 @@ class TestRegressionQuarantine:
         _account_by_id[acct_id] = acct
         with patch("app.max_plan_pool._persist_rate_limit_state"):
             await disable_account_model(
-                acct_id, OPUS, kind="regression",
-                regression_stats={"account_rate": 0.1, "project_median": 0.9,
-                                  "sample_size": 5, "distinct_accounts": 2,
-                                  "started_at": "2026-04-29T00:00:00+00:00"},
+                acct_id,
+                OPUS,
+                kind="regression",
+                regression_stats={
+                    "account_rate": 0.1,
+                    "project_median": 0.9,
+                    "sample_size": 5,
+                    "distinct_accounts": 2,
+                    "started_at": "2026-04-29T00:00:00+00:00",
+                },
                 provider="anthropic",
             )
         assert acct.get("rl_events") in (None, [])
@@ -1231,12 +1613,20 @@ class TestRegressionQuarantine:
         acct_id = "a"
         acct = _acct(id=acct_id)
         _account_by_id[acct_id] = acct
-        stats = {"account_rate": 0.2, "project_median": 0.8, "sample_size": 6,
-                 "distinct_accounts": 3, "started_at": "2026-04-29T00:00:00+00:00"}
+        stats = {
+            "account_rate": 0.2,
+            "project_median": 0.8,
+            "sample_size": 6,
+            "distinct_accounts": 3,
+            "started_at": "2026-04-29T00:00:00+00:00",
+        }
         with patch("app.max_plan_pool._persist_rate_limit_state"):
             await disable_account_model(
-                acct_id, OPUS, kind="regression",
-                regression_stats=stats, provider="anthropic",
+                acct_id,
+                OPUS,
+                kind="regression",
+                regression_stats=stats,
+                provider="anthropic",
             )
         serialized = _serialize_disabled_model_info(acct["disabled_models"][OPUS])
         assert serialized["kind"] == "regression"
@@ -1275,10 +1665,16 @@ class TestRegressionQuarantine:
         _account_by_id[acct_id] = acct
         with patch("app.max_plan_pool._persist_rate_limit_state"):
             await disable_account_model(
-                acct_id, OPUS, kind="regression",
-                regression_stats={"account_rate": 0.1, "project_median": 0.9,
-                                  "sample_size": 5, "distinct_accounts": 2,
-                                  "started_at": "2026-04-29T00:00:00+00:00"},
+                acct_id,
+                OPUS,
+                kind="regression",
+                regression_stats={
+                    "account_rate": 0.1,
+                    "project_median": 0.9,
+                    "sample_size": 5,
+                    "distinct_accounts": 2,
+                    "started_at": "2026-04-29T00:00:00+00:00",
+                },
                 provider="anthropic",
             )
         with patch("app.max_plan_pool._persist_rate_limit_state"):
@@ -1304,10 +1700,16 @@ class TestRegressionQuarantine:
         _account_by_id[acct_id] = acct
         with patch("app.max_plan_pool._persist_rate_limit_state"):
             await disable_account_model(
-                acct_id, HAIKU, kind="regression",
-                regression_stats={"account_rate": 0.1, "project_median": 0.9,
-                                  "sample_size": 5, "distinct_accounts": 2,
-                                  "started_at": "2026-04-29T00:00:00+00:00"},
+                acct_id,
+                HAIKU,
+                kind="regression",
+                regression_stats={
+                    "account_rate": 0.1,
+                    "project_median": 0.9,
+                    "sample_size": 5,
+                    "distinct_accounts": 2,
+                    "started_at": "2026-04-29T00:00:00+00:00",
+                },
                 provider="anthropic",
             )
         # Entry stored under the actual Haiku key (not Opus-normalized).
@@ -1331,15 +1733,23 @@ class TestRegressionQuarantine:
         _account_by_id[acct_id] = acct
         with patch("app.max_plan_pool._persist_rate_limit_state"):
             await disable_account_model(
-                acct_id, OPUS, kind="regression",
-                regression_stats={"account_rate": 0.1, "project_median": 0.9,
-                                  "sample_size": 5, "distinct_accounts": 2,
-                                  "started_at": "2026-04-29T00:00:00+00:00"},
+                acct_id,
+                OPUS,
+                kind="regression",
+                regression_stats={
+                    "account_rate": 0.1,
+                    "project_median": 0.9,
+                    "sample_size": 5,
+                    "distinct_accounts": 2,
+                    "started_at": "2026-04-29T00:00:00+00:00",
+                },
                 provider="anthropic",
             )
         with patch("app.max_plan_pool._persist_rate_limit_state"):
             # Wrong provider — must be rejected.
-            cleared = await clear_account_model_regression(acct_id, OPUS, provider="google")
+            cleared = await clear_account_model_regression(
+                acct_id, OPUS, provider="google"
+            )
         assert cleared is False
         # Entry must still be present.
         assert OPUS in acct["disabled_models"]
@@ -1351,11 +1761,21 @@ class TestRegressionQuarantine:
         acct_id = "a"
         acct = _acct(id=acct_id, user_id="u1", name="TestAcct")
         _account_by_id[acct_id] = acct
-        stats = {"account_rate": 0.2, "project_median": 0.8, "sample_size": 5,
-                 "distinct_accounts": 2, "started_at": "2026-04-29T00:00:00+00:00"}
+        stats = {
+            "account_rate": 0.2,
+            "project_median": 0.8,
+            "sample_size": 5,
+            "distinct_accounts": 2,
+            "started_at": "2026-04-29T00:00:00+00:00",
+        }
         with patch("app.max_plan_pool._persist_rate_limit_state"):
-            await disable_account_model(acct_id, OPUS, kind="regression",
-                                        regression_stats=stats, provider="anthropic")
+            await disable_account_model(
+                acct_id,
+                OPUS,
+                kind="regression",
+                regression_stats=stats,
+                provider="anthropic",
+            )
         with patch("app.max_plan_pool._persist_rate_limit_state"):
             result = await clear_regression_on_success(acct_id, OPUS)
         assert result is not None
@@ -1401,11 +1821,17 @@ class TestRegressionQuarantine:
         # Inject directly to avoid cascade interference between model tiers.
         acct["disabled_models"] = {
             sonnet: {
-                "kind": "regression", "hits": 1, "at": datetime.utcnow(),
+                "kind": "regression",
+                "hits": 1,
+                "at": datetime.utcnow(),
                 "provider": "anthropic",
-                "regression_stats": {"account_rate": 0.1, "project_median": 0.9,
-                                     "sample_size": 5, "distinct_accounts": 2,
-                                     "started_at": "2026-04-29T00:00:00+00:00"},
+                "regression_stats": {
+                    "account_rate": 0.1,
+                    "project_median": 0.9,
+                    "sample_size": 5,
+                    "distinct_accounts": 2,
+                    "started_at": "2026-04-29T00:00:00+00:00",
+                },
             },
             OPUS: {"kind": "quota_exhausted", "hits": 1, "at": datetime.utcnow()},
         }
@@ -1420,6 +1846,7 @@ class TestRegressionQuarantine:
 
 
 # ── scan_account_model_regressions dedupe ───────────────────────────────────
+
 
 class TestScanRegressionsDedupe:
     """Tests for scanner idempotency: a steady-state regression must NOT
@@ -1456,14 +1883,21 @@ class TestScanRegressionsDedupe:
         # Even if find_account_model_regressions still flags the cell, scan
         # must dedupe and return an empty list (no new event to dispatch).
         candidate = RegressionCandidate(
-            account_id=acct_id, provider="anthropic", model="claude-r",
-            account_rate=0.0, project_median=0.5,
-            sample_size=5, distinct_accounts=2,
+            account_id=acct_id,
+            provider="anthropic",
+            model="claude-r",
+            account_rate=0.0,
+            project_median=0.5,
+            sample_size=5,
+            distinct_accounts=2,
         )
-        with patch(
-            "app.account_model_regression.find_account_model_regressions",
-            new=AsyncMock(return_value=[candidate]),
-        ), patch("app.max_plan_pool._persist_rate_limit_state"):
+        with (
+            patch(
+                "app.account_model_regression.find_account_model_regressions",
+                new=AsyncMock(return_value=[candidate]),
+            ),
+            patch("app.max_plan_pool._persist_rate_limit_state"),
+        ):
             fired = await scan_account_model_regressions(session=None)
         assert fired == []
         # Within cooldown the entry must NOT have been bumped — at_dt unchanged.
@@ -1480,14 +1914,21 @@ class TestScanRegressionsDedupe:
         _account_by_id[acct_id] = acct
 
         candidate = RegressionCandidate(
-            account_id=acct_id, provider="anthropic", model="claude-r",
-            account_rate=0.1, project_median=0.9,
-            sample_size=5, distinct_accounts=2,
+            account_id=acct_id,
+            provider="anthropic",
+            model="claude-r",
+            account_rate=0.1,
+            project_median=0.9,
+            sample_size=5,
+            distinct_accounts=2,
         )
-        with patch(
-            "app.account_model_regression.find_account_model_regressions",
-            new=AsyncMock(return_value=[candidate]),
-        ), patch("app.max_plan_pool._persist_rate_limit_state"):
+        with (
+            patch(
+                "app.account_model_regression.find_account_model_regressions",
+                new=AsyncMock(return_value=[candidate]),
+            ),
+            patch("app.max_plan_pool._persist_rate_limit_state"),
+        ):
             fired = await scan_account_model_regressions(session=None)
         assert len(fired) == 1
         ev = fired[0]

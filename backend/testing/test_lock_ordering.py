@@ -13,6 +13,7 @@ against regression.
 Postgres-only: SQLite has no row-level locking semantics, so contention
 is trivial there. The deadlock risk only exists on Postgres.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -27,10 +28,9 @@ from app.models import Project, Task, TaskStatus
 from app.task_locking import lock_project_then_task
 
 
-USE_POSTGRES = (
-    os.getenv("USE_TEST_POSTGRES", "").lower() == "true"
-    and os.getenv("DATABASE_URL", "").startswith("postgresql")
-)
+USE_POSTGRES = os.getenv("USE_TEST_POSTGRES", "").lower() == "true" and os.getenv(
+    "DATABASE_URL", ""
+).startswith("postgresql")
 
 
 @pytest.mark.skipif(not USE_POSTGRES, reason="row-level locking requires PostgreSQL")
@@ -69,9 +69,16 @@ async def test_lock_project_then_task_canonical_order_no_deadlock(db_session):
     outcomes: list[str] = []
 
     async def first_flow() -> None:
-        async with Session() as s, lock_project_then_task(
-            s, project.id, task.id, skip_locked=False, timeout=5,
-        ) as (proj, t):
+        async with (
+            Session() as s,
+            lock_project_then_task(
+                s,
+                project.id,
+                task.id,
+                skip_locked=False,
+                timeout=5,
+            ) as (proj, t),
+        ):
             assert proj is not None and t is not None
             first_holds_project.set()
             # Hold both locks briefly so the second flow's project-lock
@@ -82,9 +89,15 @@ async def test_lock_project_then_task_canonical_order_no_deadlock(db_session):
 
     async def second_flow() -> None:
         await first_holds_project.wait()
-        async with Session() as s, lock_project_then_task(
-            s, project.id, task.id, skip_locked=True,
-        ) as (proj, t):
+        async with (
+            Session() as s,
+            lock_project_then_task(
+                s,
+                project.id,
+                task.id,
+                skip_locked=True,
+            ) as (proj, t),
+        ):
             # Under SKIP LOCKED, the second flow must observe the project
             # row as held — and per the helper contract, the task lock is
             # NOT attempted in that case (we don't sit on a half-pair).
@@ -123,7 +136,10 @@ async def test_lock_project_then_task_yields_none_on_missing_project(db_session)
     missing_project_id = uuid.uuid4()
     missing_task_id = uuid.uuid4()
     async with lock_project_then_task(
-        db_session, missing_project_id, missing_task_id, skip_locked=True,
+        db_session,
+        missing_project_id,
+        missing_task_id,
+        skip_locked=True,
     ) as (proj, t):
         assert proj is None
         assert t is None

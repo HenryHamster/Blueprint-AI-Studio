@@ -1,4 +1,5 @@
 """Alert, message, and playbook management endpoints."""
+
 import logging
 import re
 import uuid
@@ -24,11 +25,12 @@ logger = logging.getLogger(__name__)
 router = APIRouter(
     prefix="/api/admin",
     tags=["admin-notifications"],
-    dependencies=[Depends(get_current_user)]
+    dependencies=[Depends(get_current_user)],
 )
 
 
 # ── Pydantic Models ───────────────────────────────────────────────────────────
+
 
 class MessageCreate(BaseModel):
     project_id: str
@@ -36,18 +38,24 @@ class MessageCreate(BaseModel):
     content: str
     context: Optional[Dict[str, Any]] = None
 
+
 class MessageResolve(BaseModel):
     resolution: Optional[str] = None
 
+
 class AdminPlaybookSet(BaseModel):
-    key: str = Field(..., description="Playbook key: alphanumeric + hyphens, max 50 chars")
+    key: str = Field(
+        ..., description="Playbook key: alphanumeric + hyphens, max 50 chars"
+    )
     value: str = Field(..., description="Playbook value: plain text, max 2048 bytes")
-    applicable_types: Optional[List[str]] = Field(None, description="Task types this entry applies to; None = shown to all types")
+    applicable_types: Optional[List[str]] = Field(
+        None, description="Task types this entry applies to; None = shown to all types"
+    )
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-_ADMIN_PLAYBOOK_KEY_RE = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9\-]{0,49}$')
+_ADMIN_PLAYBOOK_KEY_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9\-]{0,49}$")
 
 from app.payload_schemas import ALL_TASK_TYPES as _VALID_TASK_TYPES  # noqa: E402
 
@@ -59,7 +67,15 @@ _SEED_ENTRIES: Dict[str, dict] = {
             "Standalone (no DB): `bash scripts/test-backend.sh --standalone`. "
             "Do NOT use pytest directly."
         ),
-        "applicable_types": ["create", "fix", "refactor", "qa", "migrate", "deps", "smoketest"],
+        "applicable_types": [
+            "create",
+            "fix",
+            "refactor",
+            "qa",
+            "migrate",
+            "deps",
+            "smoketest",
+        ],
     },
     "build-frontend": {
         "content": (
@@ -135,6 +151,7 @@ _SEED_ENTRIES: Dict[str, dict] = {
 
 # ── Alert Endpoints ───────────────────────────────────────────────────────────
 
+
 @router.get("/alerts")
 async def get_alerts(
     project_id: Optional[str] = None,
@@ -144,7 +161,11 @@ async def get_alerts(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
-    query = select(Alert).where(Alert.project_id.in_(_user_project_ids(current_user["user_id"]))).order_by(Alert.created_at.desc())
+    query = (
+        select(Alert)
+        .where(Alert.project_id.in_(_user_project_ids(current_user["user_id"])))
+        .order_by(Alert.created_at.desc())
+    )
     if project_id:
         query = query.where(Alert.project_id == uuid.UUID(project_id))
     if not include_dismissed:
@@ -177,9 +198,14 @@ async def dismiss_alert(
     if not alert:
         raise HTTPException(status_code=404, detail="Alert not found")
     # Verify alert belongs to user's project (via membership)
-    member = (await session.execute(
-        select(ProjectMember).where(ProjectMember.project_id == alert.project_id, ProjectMember.user_id == current_user["user_id"])
-    )).scalar_one_or_none()
+    member = (
+        await session.execute(
+            select(ProjectMember).where(
+                ProjectMember.project_id == alert.project_id,
+                ProjectMember.user_id == current_user["user_id"],
+            )
+        )
+    ).scalar_one_or_none()
     if not member:
         raise HTTPException(status_code=404, detail="Alert not found")
     alert.dismissed_at = _utcnow()
@@ -194,7 +220,10 @@ async def dismiss_all_alerts(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
-    stmt = update(Alert).where(Alert.dismissed_at.is_(None), Alert.project_id.in_(_user_project_ids(current_user["user_id"])))
+    stmt = update(Alert).where(
+        Alert.dismissed_at.is_(None),
+        Alert.project_id.in_(_user_project_ids(current_user["user_id"])),
+    )
     if project_id:
         stmt = stmt.where(Alert.project_id == project_id)
     stmt = stmt.values(dismissed_at=_utcnow())
@@ -204,6 +233,7 @@ async def dismiss_all_alerts(
 
 
 # ── Project Message Endpoints ─────────────────────────────────────────────────
+
 
 @router.get("/messages")
 async def list_messages(
@@ -224,17 +254,24 @@ async def list_messages(
             raise HTTPException(status_code=400, detail="Invalid project_id format")
     if status and status != "all":
         if status not in ("open", "resolved"):
-            raise HTTPException(status_code=400, detail="Invalid status filter. Must be 'open', 'resolved', or 'all'")
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid status filter. Must be 'open', 'resolved', or 'all'",
+            )
         filters.append(ProjectMessage.status == status)
 
-    total = (await session.execute(
-        select(func.count()).select_from(ProjectMessage).where(*filters)
-    )).scalar() or 0
+    total = (
+        await session.execute(
+            select(func.count()).select_from(ProjectMessage).where(*filters)
+        )
+    ).scalar() or 0
 
     result = await session.execute(
-        select(ProjectMessage).where(*filters)
+        select(ProjectMessage)
+        .where(*filters)
         .order_by(ProjectMessage.created_at.desc())
-        .offset(offset).limit(limit)
+        .offset(offset)
+        .limit(limit)
     )
     messages = result.scalars().all()
 
@@ -258,6 +295,7 @@ async def list_messages(
         "total": total,
     }
 
+
 @router.post("/messages")
 async def create_message(
     payload: MessageCreate,
@@ -275,7 +313,10 @@ async def create_message(
     valid_types = {t.value for t in MessageType}
     msg_type = payload.message_type.upper()
     if msg_type not in valid_types:
-        raise HTTPException(status_code=400, detail=f"Invalid message_type. Must be one of: {', '.join(valid_types)}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid message_type. Must be one of: {', '.join(valid_types)}",
+        )
     if not payload.content.strip():
         raise HTTPException(status_code=400, detail="Content cannot be empty")
     # Cap context size to prevent storage abuse
@@ -294,6 +335,7 @@ async def create_message(
     await session.commit()
     await session.refresh(msg)
     return {"id": str(msg.id), "status": "created"}
+
 
 @router.patch("/messages/{message_id}")
 async def resolve_message(
@@ -318,6 +360,7 @@ async def resolve_message(
     await session.commit()
     return {"id": str(msg.id), "status": "resolved"}
 
+
 @router.delete("/messages/{message_id}")
 async def delete_message(
     message_id: uuid.UUID,
@@ -336,6 +379,7 @@ async def delete_message(
 
 # ── Admin Playbook Endpoints ──────────────────────────────────────────────────
 
+
 @router.get("/projects/{project_id}/playbook")
 @limiter.limit("60/minute")
 async def admin_playbook_list(
@@ -345,12 +389,14 @@ async def admin_playbook_list(
     current_user: dict = Depends(get_current_user),
 ):
     """List all playbook entries for a project with full metadata."""
-    project = await _get_user_project_with_role(project_id, current_user["user_id"], session, "member")
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
     doc = project.design_doc or {}
     entries = {}
     for k, v in doc.items():
         if k.startswith("playbook/") and isinstance(v, dict):
-            short_key = k[len("playbook/"):]
+            short_key = k[len("playbook/") :]
             last_referenced_at = v.get("last_referenced_at")
             updated_at = v.get("updated_at", "")
             # Compute stale: stored flag (auto-archived for low effectiveness) OR no reference in 30 days
@@ -361,23 +407,29 @@ async def admin_playbook_list(
                 if last_referenced_at:
                     try:
                         from datetime import datetime
+
                         ts = datetime.fromisoformat(last_referenced_at)
                         if ts.tzinfo is not None:
                             ts = ts.replace(tzinfo=None)
                         stale = (now_utc - ts).days >= _STALE_DAYS
                     except Exception:
-                        logger.exception(f"[PLAYBOOK] Failed to parse last_referenced_at={last_referenced_at}")
+                        logger.exception(
+                            f"[PLAYBOOK] Failed to parse last_referenced_at={last_referenced_at}"
+                        )
                 elif not v.get("reference_count", 0):
                     # Never referenced: use updated_at as staleness proxy
                     if updated_at:
                         try:
                             from datetime import datetime
+
                             ts = datetime.fromisoformat(updated_at)
                             if ts.tzinfo is not None:
                                 ts = ts.replace(tzinfo=None)
                             stale = (now_utc - ts).days >= _STALE_DAYS
                         except Exception:
-                            logger.exception(f"[PLAYBOOK] Failed to parse updated_at={updated_at}")
+                            logger.exception(
+                                f"[PLAYBOOK] Failed to parse updated_at={updated_at}"
+                            )
                     else:
                         stale = True
                 # reference_count > 0 but no last_referenced_at → unknown recency, not stale
@@ -385,6 +437,7 @@ async def admin_playbook_list(
             if updated_at:
                 try:
                     from datetime import datetime as _dt
+
                     _ts = _dt.fromisoformat(updated_at.replace("Z", "+00:00"))
                     if _ts.tzinfo is not None:
                         _ts = _ts.replace(tzinfo=None)
@@ -402,7 +455,9 @@ async def admin_playbook_list(
                 "reference_count": referenced,
                 "last_referenced_at": last_referenced_at,
                 "last_confirmed_at": v.get("last_confirmed_at"),
-                "effectiveness_score": round(confirmed / max(referenced, 1), 3) if (confirmed > 0 or referenced > 0) else v.get("effectiveness_score"),
+                "effectiveness_score": round(confirmed / max(referenced, 1), 3)
+                if (confirmed > 0 or referenced > 0)
+                else v.get("effectiveness_score"),
                 "stale": stale,
                 "source": v.get("source", ""),
                 "age_days": age_days,
@@ -420,7 +475,9 @@ async def admin_playbook_set(
     current_user: dict = Depends(get_current_user),
 ):
     """Create or update a playbook entry."""
-    await _get_user_project_with_role(project_id, current_user["user_id"], session, "member")
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
 
     key = payload.key.strip()
     if not _ADMIN_PLAYBOOK_KEY_RE.match(key):
@@ -452,7 +509,9 @@ async def admin_playbook_set(
         "content": payload.value,
         "source_task_id": None,
         "updated_at": _utcnow().isoformat(),
-        "confirmed_count": existing.get("confirmed_count", 0) if isinstance(existing, dict) else 0,
+        "confirmed_count": existing.get("confirmed_count", 0)
+        if isinstance(existing, dict)
+        else 0,
     }
     if payload.applicable_types is not None:
         new_entry["applicable_types"] = payload.applicable_types
@@ -491,7 +550,9 @@ async def admin_playbook_delete(
     current_user: dict = Depends(get_current_user),
 ):
     """Delete a playbook entry by key."""
-    await _get_user_project_with_role(project_id, current_user["user_id"], session, "member")
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
 
     # Phase A1: skip_locked + 429 on contention so 30s lock_timeout doesn't
     # propagate as 500 and trigger Cloud Run instance quarantine.
@@ -527,7 +588,9 @@ async def admin_playbook_seed(
     current_user: dict = Depends(get_current_user),
 ):
     """Populate the playbook with default operational knowledge. Skips entries that already exist."""
-    await _get_user_project_with_role(project_id, current_user["user_id"], session, "member")
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
 
     # Phase A1: skip_locked + 429 on contention so 30s lock_timeout doesn't
     # propagate as 500 and trigger Cloud Run instance quarantine.

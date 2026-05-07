@@ -106,26 +106,32 @@ _THINKING_BUDGET_DEFAULT_CAP = 32768
 # add it to `_GEMINI_GA_MODELS` (and `_THINKING_BUDGET_CAPS` above). The
 # settings-schema enum in `GeminiProvider.settings_schema` must stay in sync
 # — test_gemini_known_models_match_budget_caps enforces that.
-_GEMINI_GA_MODELS: frozenset[str] = frozenset({
-    "gemini-2.5-pro",
-    "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
-})
-_GEMINI_PREVIEW_MODELS: frozenset[str] = frozenset({
-    "gemini-3.1-pro-preview",
-    "gemini-3-flash-preview",
-    "gemini-3.1-flash-lite-preview",
-})
+_GEMINI_GA_MODELS: frozenset[str] = frozenset(
+    {
+        "gemini-2.5-pro",
+        "gemini-2.5-flash",
+        "gemini-2.5-flash-lite",
+    }
+)
+_GEMINI_PREVIEW_MODELS: frozenset[str] = frozenset(
+    {
+        "gemini-3.1-pro-preview",
+        "gemini-3-flash-preview",
+        "gemini-3.1-flash-lite-preview",
+    }
+)
 
 # Gemini 3.x text models. Matters because the thinking surface bifurcated:
 # 3.x uses `thinkingLevel` (minimal|low|medium|high) as the primary knob,
 # while 2.5 uses `thinkingBudget` (int). thinkingBudget on 3.x is
 # back-compat only and may behave unexpectedly on 3 Pro per Google's docs.
-_GEMINI_3_X_MODELS: frozenset[str] = frozenset({
-    "gemini-3.1-pro-preview",
-    "gemini-3-flash-preview",
-    "gemini-3.1-flash-lite-preview",
-})
+_GEMINI_3_X_MODELS: frozenset[str] = frozenset(
+    {
+        "gemini-3.1-pro-preview",
+        "gemini-3-flash-preview",
+        "gemini-3.1-flash-lite-preview",
+    }
+)
 
 
 # Retired/renamed preview IDs Google has repointed to live equivalents.
@@ -146,13 +152,15 @@ _LEGACY_MODEL_ALIASES: dict[str, str] = {
 # No mapping ⇒ no fallback ⇒ dispatch fails loudly so the operator knows to
 # enable preview access somewhere. Keep in sync with _GEMINI_PREVIEW_MODELS.
 _PREVIEW_TO_GA_FALLBACK: dict[str, str] = {
-    "gemini-3.1-pro-preview":        "gemini-2.5-pro",
-    "gemini-3-flash-preview":        "gemini-2.5-flash",
+    "gemini-3.1-pro-preview": "gemini-2.5-pro",
+    "gemini-3-flash-preview": "gemini-2.5-flash",
     "gemini-3.1-flash-lite-preview": "gemini-2.5-flash-lite",
 }
 
 
-_GEMINI_API_KEY_LIST_MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+_GEMINI_API_KEY_LIST_MODELS_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models"
+)
 _MODEL_LISTING_TIMEOUT_SECONDS = 5.0
 
 
@@ -202,13 +210,17 @@ class GeminiProvider(LLMProvider):
         required_secret_keys = ("type", "client_email", "private_key")
         missing_keys = [key for key in required_secret_keys if not parsed.get(key)]
         if missing_keys:
-            raise ValueError(f"Service account JSON missing fields: {', '.join(missing_keys)}")
+            raise ValueError(
+                f"Service account JSON missing fields: {', '.join(missing_keys)}"
+            )
         if parsed.get("type") != "service_account":
             raise ValueError("Service account JSON must have type='service_account'")
         return ValidationResult(secret=raw, provider_metadata=metadata)
 
     def tier_to_model(self, tier: str, runtime_config: Mapping[str, Any]) -> str | None:
-        return tier_model_from_runtime_config(self.name, tier, runtime_config, _DEFAULT_TIER_MODELS)
+        return tier_model_from_runtime_config(
+            self.name, tier, runtime_config, _DEFAULT_TIER_MODELS
+        )
 
     def rate_limit_patterns(self, auth_mode: LLMAuthMode) -> tuple[str, ...]:
         self.ensure_supported_auth_mode(auth_mode)
@@ -251,14 +263,18 @@ class GeminiProvider(LLMProvider):
                     # redundant, mirrors the GEMINI_SANDBOX/yolo rationale.
                     "GEMINI_CLI_TRUST_WORKSPACE": "true",
                 },
-                files=(FileMaterial(path=secret_path, content=secret or "", mode="0600"),),
+                files=(
+                    FileMaterial(path=secret_path, content=secret or "", mode="0600"),
+                ),
             )
-        return SecretMaterial(env={
-            "GEMINI_API_KEY": secret or "",
-            # Ephemeral VM is the isolation boundary — trust gate is redundant,
-            # mirrors the GEMINI_SANDBOX/yolo rationale already in place.
-            "GEMINI_CLI_TRUST_WORKSPACE": "true",
-        })
+        return SecretMaterial(
+            env={
+                "GEMINI_API_KEY": secret or "",
+                # Ephemeral VM is the isolation boundary — trust gate is redundant,
+                # mirrors the GEMINI_SANDBOX/yolo rationale already in place.
+                "GEMINI_CLI_TRUST_WORKSPACE": "true",
+            }
+        )
 
     def settings_schema(self) -> dict[str, Any]:
         # Approval mode / sandbox / safety filters / sampling knobs are
@@ -455,7 +471,11 @@ class GeminiProvider(LLMProvider):
                         f"unknown model {model!r}; thinking_budget dropped"
                     )
             elif has_budget:
-                cap = _THINKING_BUDGET_CAPS.get(model, _THINKING_BUDGET_DEFAULT_CAP) if isinstance(model, str) else _THINKING_BUDGET_DEFAULT_CAP
+                cap = (
+                    _THINKING_BUDGET_CAPS.get(model, _THINKING_BUDGET_DEFAULT_CAP)
+                    if isinstance(model, str)
+                    else _THINKING_BUDGET_DEFAULT_CAP
+                )
                 budget = raw_budget
                 if budget > cap:
                     unsupported.append(
@@ -548,7 +568,9 @@ class GeminiProvider(LLMProvider):
             logger.warning("[GEMINI] httpx unavailable; skipping list_available_models")
             return None
         try:
-            async with httpx.AsyncClient(timeout=_MODEL_LISTING_TIMEOUT_SECONDS) as client:
+            async with httpx.AsyncClient(
+                timeout=_MODEL_LISTING_TIMEOUT_SECONDS
+            ) as client:
                 resp = await client.get(
                     _GEMINI_API_KEY_LIST_MODELS_URL,
                     params={"key": secret, "pageSize": 1000},
@@ -571,7 +593,7 @@ class GeminiProvider(LLMProvider):
             name = entry.get("name")
             # Response shape: {"name": "models/gemini-2.5-pro", ...}
             if isinstance(name, str) and name.startswith("models/"):
-                ids.append(name[len("models/"):])
+                ids.append(name[len("models/") :])
         # Sort for stable diffs when operators inspect stored snapshots.
         return sorted(set(ids))
 

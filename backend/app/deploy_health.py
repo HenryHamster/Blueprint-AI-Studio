@@ -41,6 +41,7 @@ def _get_zone_health_summary() -> dict:
     """Get zone health summary from compute module, with fallback if not in GCP mode."""
     try:
         from app.compute import get_zone_health_summary
+
         return get_zone_health_summary()
     except Exception:
         return {"total_zones": 0, "available": 0, "exhausted": []}
@@ -50,7 +51,7 @@ def _get_zone_health_summary() -> dict:
 # Module-level state for deploy health monitoring
 # ---------------------------------------------------------------------------
 
-_pause_failure_streak: int = 0   # consecutive health check cycles with critical failures
+_pause_failure_streak: int = 0  # consecutive health check cycles with critical failures
 _last_quota_probe: "datetime | None" = None  # gate probe_rate_limit to every 5min
 # Ring buffer of the last 5 health check results while PAUSED (True == healthy).
 # Auto-resume fires once >= 3 of the last 5 are healthy, tolerating a single flaky probe.
@@ -58,7 +59,9 @@ _HEALTH_HISTORY_SIZE = 5
 _HEALTH_HISTORY_HEALTHY_REQUIRED = 3
 _health_recovery_history: "deque[bool]" = deque(maxlen=_HEALTH_HISTORY_SIZE)
 _last_exhausted_zones: set = set()  # tracks zone health for transition logging
-_last_auto_resume_at: "datetime | None" = None  # timestamp of most recent auto-resume (normal or forced)
+_last_auto_resume_at: "datetime | None" = (
+    None  # timestamp of most recent auto-resume (normal or forced)
+)
 # True when the most recent auto-resume was forced (max pause duration exceeded).
 # Forced resume fires precisely because health checks never stabilized, so ramp-up past
 # 2 VMs additionally requires evidence of real task success (not just healthy probes).
@@ -94,7 +97,10 @@ def get_recovery_history_snapshot() -> list:
 def _prune_flap_window(now: datetime) -> None:
     """Drop _recent_auto_resumes entries older than the configured flap window."""
     window = _runtime_config.get("flap_window_seconds", 1800)
-    while _recent_auto_resumes and (now - _recent_auto_resumes[0]).total_seconds() > window:
+    while (
+        _recent_auto_resumes
+        and (now - _recent_auto_resumes[0]).total_seconds() > window
+    ):
         _recent_auto_resumes.popleft()
 
 
@@ -111,7 +117,11 @@ def _restore_health_streaks(snapshot: dict) -> None:
     Called once at startup. Tolerates missing keys, legacy int history format, and
     invalid ISO timestamps — corrupt values fall back to safe defaults (0 / empty / None).
     """
-    global _pause_failure_streak, _last_auto_resume_at, _last_resume_was_forced, _consecutive_force_resumes
+    global \
+        _pause_failure_streak, \
+        _last_auto_resume_at, \
+        _last_resume_was_forced, \
+        _consecutive_force_resumes
     _pause_failure_streak = int(snapshot.get("_pause_failure_streak") or 0)
     _last_resume_was_forced = bool(snapshot.get("_last_resume_was_forced") or False)
     _consecutive_force_resumes = int(snapshot.get("_consecutive_force_resumes") or 0)
@@ -129,7 +139,9 @@ def _restore_health_streaks(snapshot: dict) -> None:
                 parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
             _last_auto_resume_at = parsed
         except ValueError:
-            logger.warning(f"[DEPLOY] Invalid _last_auto_resume_at in persisted state: {raw!r}")
+            logger.warning(
+                f"[DEPLOY] Invalid _last_auto_resume_at in persisted state: {raw!r}"
+            )
     _recent_auto_resumes.clear()
     raw_resumes = snapshot.get("_recent_auto_resumes")
     if isinstance(raw_resumes, list):
@@ -166,7 +178,11 @@ def should_rollback() -> tuple:
 
     # Minimum sample size — don't make rollback decisions on tiny data
     if len(results) < 5:
-        return False, f"Insufficient data ({len(results)} results, need 5+)", "SELF_HEAL"
+        return (
+            False,
+            f"Insufficient data ({len(results)} results, need 5+)",
+            "SELF_HEAL",
+        )
 
     # 1. Are we already on last_known_good? Rollback won't help.
     # (This is checked by the caller against DeploymentState)
@@ -174,7 +190,11 @@ def should_rollback() -> tuple:
     # 2. Were things already broken before this deploy?
     pre_rate = deploy_monitoring.get("pre_deploy_failure_rate", 0.0)
     if pre_rate > 0.3:
-        return False, f"System was already failing before deploy (pre-deploy rate: {pre_rate:.0%})", "SELF_HEAL"
+        return (
+            False,
+            f"System was already failing before deploy (pre-deploy rate: {pre_rate:.0%})",
+            "SELF_HEAL",
+        )
 
     # 3. Are external services down?
     failed_deps = external_health.get("failed_deps", [])
@@ -189,25 +209,47 @@ def should_rollback() -> tuple:
 
     # If all failures are non-code (provision, external), don't rollback
     if post_failures and not post_code_errors:
-        return False, "All failures are external (provision/API), not code errors", "PAUSE"
+        return (
+            False,
+            "All failures are external (provision/API), not code errors",
+            "PAUSE",
+        )
 
     # 5. Check if failure rate is significantly higher than pre-deploy
     if post_failure_rate <= pre_rate + 0.1:
-        return False, f"Failure rate unchanged ({post_failure_rate:.0%} vs {pre_rate:.0%} pre-deploy)", "SELF_HEAL"
+        return (
+            False,
+            f"Failure rate unchanged ({post_failure_rate:.0%} vs {pre_rate:.0%} pre-deploy)",
+            "SELF_HEAL",
+        )
 
     # 6. High code error rate after deploy — likely caused by the deploy
     if len(post_code_errors) >= 3 and post_failure_rate > 0.5:
-        return True, f"High code error rate after deploy: {post_failure_rate:.0%} ({len(post_code_errors)} code errors)", "ROLLBACK"
+        return (
+            True,
+            f"High code error rate after deploy: {post_failure_rate:.0%} ({len(post_code_errors)} code errors)",
+            "ROLLBACK",
+        )
 
     # 7. 100% failure rate is a strong signal
     if post_failure_rate == 1.0 and len(results) >= 3:
-        return True, f"100% failure rate across {len(results)} tasks after deploy", "ROLLBACK"
+        return (
+            True,
+            f"100% failure rate across {len(results)} tasks after deploy",
+            "ROLLBACK",
+        )
 
     # Not enough signal to attribute to deploy
-    return False, f"Failure rate {post_failure_rate:.0%} — monitoring, not yet attributable", "SELF_HEAL"
+    return (
+        False,
+        f"Failure rate {post_failure_rate:.0%} — monitoring, not yet attributable",
+        "SELF_HEAL",
+    )
 
 
-async def _get_deploy_state_for_update(session: AsyncSession) -> "DeploymentState | None":
+async def _get_deploy_state_for_update(
+    session: AsyncSession,
+) -> "DeploymentState | None":
     """Fetch DeploymentState with FOR UPDATE SKIP LOCKED.
 
     skip_locked=True returns None when the row is already locked by a concurrent
@@ -216,12 +258,22 @@ async def _get_deploy_state_for_update(session: AsyncSession) -> "DeploymentStat
     in the orchestrator cold path was silently hanging entire instances when a
     prior OOM'd transaction left the row locked.
     """
-    return (await session.execute(
-        select(DeploymentState).where(DeploymentState.id == 1).with_for_update(skip_locked=True)
-    )).scalars().first()
+    return (
+        (
+            await session.execute(
+                select(DeploymentState)
+                .where(DeploymentState.id == 1)
+                .with_for_update(skip_locked=True)
+            )
+        )
+        .scalars()
+        .first()
+    )
 
 
-def get_deploy_monitoring_defer_until(deploy_state: DeploymentState | None) -> "datetime | None":
+def get_deploy_monitoring_defer_until(
+    deploy_state: DeploymentState | None,
+) -> "datetime | None":
     """Return the monitoring-window deadline for regression-spawn deferral."""
     if deploy_state is None or deploy_state.status != DeploymentStatus.MONITORING:
         return None
@@ -231,7 +283,9 @@ def get_deploy_monitoring_defer_until(deploy_state: DeploymentState | None) -> "
     return deployed_at + _DEPLOY_MONITORING_DEFER_WINDOW
 
 
-_DEPLOY_MONITORING_DEFER_TITLE = "Regression signal deferred: deploy in monitoring window"
+_DEPLOY_MONITORING_DEFER_TITLE = (
+    "Regression signal deferred: deploy in monitoring window"
+)
 
 
 async def record_deploy_monitoring_deferral(
@@ -250,14 +304,26 @@ async def record_deploy_monitoring_deferral(
     defer_until = get_deploy_monitoring_defer_until(deploy_state)
     if defer_until is None:
         return None
-    deployed_at = deploy_state.deployed_at.replace(tzinfo=None) if deploy_state.deployed_at.tzinfo else deploy_state.deployed_at
-    existing = (await session.execute(
-        select(Alert).where(
-            Alert.project_id == project_id,
-            Alert.title == _DEPLOY_MONITORING_DEFER_TITLE,
-            Alert.created_at >= deployed_at,
-        ).limit(1)
-    )).scalars().first()
+    deployed_at = (
+        deploy_state.deployed_at.replace(tzinfo=None)
+        if deploy_state.deployed_at.tzinfo
+        else deploy_state.deployed_at
+    )
+    existing = (
+        (
+            await session.execute(
+                select(Alert)
+                .where(
+                    Alert.project_id == project_id,
+                    Alert.title == _DEPLOY_MONITORING_DEFER_TITLE,
+                    Alert.created_at >= deployed_at,
+                )
+                .limit(1)
+            )
+        )
+        .scalars()
+        .first()
+    )
     if existing is not None:
         return defer_until
     alert = Alert(
@@ -283,11 +349,16 @@ async def record_deploy_monitoring_deferral(
 async def _check_monitoring_window():
     """Called each orchestrator cycle. If monitoring window has elapsed without issues, mark STABLE."""
     from app.shared_state import deploy_monitoring
+
     window_start = deploy_monitoring.get("window_start")
     if not window_start:
         return
 
-    duration = deploy_monitoring["extended_window"] if deploy_monitoring["is_extended"] else deploy_monitoring["window_duration"]
+    duration = (
+        deploy_monitoring["extended_window"]
+        if deploy_monitoring["is_extended"]
+        else deploy_monitoring["window_duration"]
+    )
     elapsed = (_utcnow() - window_start).total_seconds()
 
     if elapsed < duration:
@@ -308,12 +379,17 @@ async def _check_monitoring_window():
                     state.rollback_count = 0
                     session.add(state)
                     await session.commit()
-                    logger.info("[DEPLOY] Monitoring idle timeout — no tasks ran, marking STABLE")
-                    logger.info('deployment_monitor_state_change', extra={
-                        'old_status': str(old_status),
-                        'new_status': str(state.status),
-                        'rollback_triggered': False,
-                    })
+                    logger.info(
+                        "[DEPLOY] Monitoring idle timeout — no tasks ran, marking STABLE"
+                    )
+                    logger.info(
+                        "deployment_monitor_state_change",
+                        extra={
+                            "old_status": str(old_status),
+                            "new_status": str(state.status),
+                            "rollback_triggered": False,
+                        },
+                    )
             deploy_monitoring["window_start"] = None
         return
 
@@ -348,40 +424,63 @@ async def _check_monitoring_window():
                     await broadcast_to_project(
                         str(project.id),
                         "alert_created",
-                        {"alert_id": str(alert.id), "severity": "ERROR", "title": rollback_title},
+                        {
+                            "alert_id": str(alert.id),
+                            "severity": "ERROR",
+                            "title": rollback_title,
+                        },
                     )
                     try:
-                        from app.notification_dispatch import post_rollback_recommendation_message  # noqa: PLC0415
-                        await post_rollback_recommendation_message(session, project.id, reason)
+                        from app.notification_dispatch import (
+                            post_rollback_recommendation_message,
+                        )  # noqa: PLC0415
+
+                        await post_rollback_recommendation_message(
+                            session, project.id, reason
+                        )
                     except Exception as _me:
-                        logger.warning(f"[NOTIFY] post_rollback_recommendation_message failed: {_me}")
+                        logger.warning(
+                            f"[NOTIFY] post_rollback_recommendation_message failed: {_me}"
+                        )
                 await session.commit()
                 logger.warning(f"[DEPLOY] ROLLBACK RECOMMENDED: {reason}")
-                logger.info('deployment_monitor_state_change', extra={
-                    'old_status': str(state.status),
-                    'new_status': str(state.status),
-                    'rollback_triggered': True,
-                })
+                logger.info(
+                    "deployment_monitor_state_change",
+                    extra={
+                        "old_status": str(state.status),
+                        "new_status": str(state.status),
+                        "rollback_triggered": True,
+                    },
+                )
                 # Dispatch external webhook notifications (fire-and-forget)
                 try:
                     import asyncio as _asyncio  # noqa: PLC0415
                     from app.notification_dispatch import dispatch_external_notification  # noqa: PLC0415
+
                     for project in projects:
-                        _asyncio.ensure_future(dispatch_external_notification(
-                            project.id,
-                            "ROLLBACK_RECOMMENDED",
-                            {"reason": reason, "revision": state.current_revision},
-                        ))
+                        _asyncio.ensure_future(
+                            dispatch_external_notification(
+                                project.id,
+                                "ROLLBACK_RECOMMENDED",
+                                {"reason": reason, "revision": state.current_revision},
+                            )
+                        )
                 except Exception as _ne:
-                    logger.warning(f"[NOTIFY] ROLLBACK_RECOMMENDED dispatch setup failed: {_ne}")
+                    logger.warning(
+                        f"[NOTIFY] ROLLBACK_RECOMMENDED dispatch setup failed: {_ne}"
+                    )
                 # Broadcast updated deploy state (includes rollback_reason)
                 await broadcast_deploy_state()
             else:
                 # No rollback target available — stay in MONITORING, don't promote to STABLE
-                state.rollback_reason = f"Issues detected but no rollback target: {reason}"
+                state.rollback_reason = (
+                    f"Issues detected but no rollback target: {reason}"
+                )
                 session.add(state)
                 await session.commit()
-                logger.warning("[DEPLOY] Issues detected but no rollback target — staying in MONITORING")
+                logger.warning(
+                    "[DEPLOY] Issues detected but no rollback target — staying in MONITORING"
+                )
                 return  # Don't clear window_start so we keep monitoring
         elif response == "PAUSE":
             # External issue — handled by _check_pause_mode
@@ -395,12 +494,17 @@ async def _check_monitoring_window():
             state.rollback_count = 0
             session.add(state)
             await session.commit()
-            logger.info(f"[DEPLOY] Monitoring window passed — marked STABLE (revision={state.current_revision})")
-            logger.info('deployment_monitor_state_change', extra={
-                'old_status': str(old_status),
-                'new_status': str(state.status),
-                'rollback_triggered': False,
-            })
+            logger.info(
+                f"[DEPLOY] Monitoring window passed — marked STABLE (revision={state.current_revision})"
+            )
+            logger.info(
+                "deployment_monitor_state_change",
+                extra={
+                    "old_status": str(old_status),
+                    "new_status": str(state.status),
+                    "rollback_triggered": False,
+                },
+            )
 
     deploy_monitoring["window_start"] = None
 
@@ -461,13 +565,22 @@ async def _check_external_health():
         _last_quota_probe = now
         try:
             from app.github import probe_rate_limit  # noqa: PLC0415
+
             await probe_rate_limit()
         except Exception:
             logger.debug("[HEALTH] GitHub rate_limit probe failed", exc_info=True)
 
     # Track consecutive failure counts per dependency (used by dispatch gate)
     consec = ext.setdefault("consecutive_failures", {})
-    for dep in ("github_api", "anthropic_api", "openai_api", "gemini_api", "dispatch_api", "gcp", "db"):
+    for dep in (
+        "github_api",
+        "anthropic_api",
+        "openai_api",
+        "gemini_api",
+        "dispatch_api",
+        "gcp",
+        "db",
+    ):
         if dep in failed:
             consec[dep] = consec.get(dep, 0) + 1
         else:
@@ -524,15 +637,18 @@ def _build_rate_limit_details() -> "dict | None":
 async def _create_auto_pause_alerts(session: AsyncSession, failed_deps: list) -> None:
     """Create WARNING alerts on all projects when the pipeline auto-pauses due to external dep failures."""
     from app.main import _send_webhook_notification  # noqa: PLC0415 — deferred to avoid circular import
+
     title = "Pipeline auto-paused: external dependencies down"
-    dispatch_health = (_shared_state.external_health.get("dispatch_health", {}) or {})
+    dispatch_health = _shared_state.external_health.get("dispatch_health", {}) or {}
     rl_details = _build_rate_limit_details() if "anthropic_api" in failed_deps else None
     if rl_details:
         suffix_parts = [
             f"{rl_details['rate_limited_accounts']}/{rl_details['total_accounts']} accounts rate-limited"
         ]
         if rl_details["blocked_models"]:
-            suffix_parts.append(f"models blocked: {', '.join(rl_details['blocked_models'])}")
+            suffix_parts.append(
+                f"models blocked: {', '.join(rl_details['blocked_models'])}"
+            )
         if rl_details["earliest_recovery"]:
             suffix_parts.append(f"earliest recovery: {rl_details['earliest_recovery']}")
         rl_suffix = " (" + "; ".join(suffix_parts) + ")"
@@ -542,22 +658,30 @@ async def _create_auto_pause_alerts(session: AsyncSession, failed_deps: list) ->
     if "dispatch_api" in failed_deps and dispatch_health:
         down_providers = dispatch_health.get("down_providers", [])
         if down_providers:
-            dispatch_suffix = f" (no dispatchable providers: {', '.join(down_providers)})"
+            dispatch_suffix = (
+                f" (no dispatchable providers: {', '.join(down_providers)})"
+            )
     msg = (
         f"Pipeline auto-paused: external dependencies down — {', '.join(failed_deps)}{rl_suffix}{dispatch_suffix}. "
         "Will auto-resume when healthy."
     )
     projects = (await session.execute(select(Project))).scalars().all()
     for project in projects:
-        existing = (await session.execute(
-            select(Alert).where(
-                Alert.project_id == project.id,
-                Alert.task_id.is_(None),
-                Alert.severity == AlertSeverity.WARNING,
-                Alert.dismissed_at.is_(None),
-                Alert.title == title,
+        existing = (
+            (
+                await session.execute(
+                    select(Alert).where(
+                        Alert.project_id == project.id,
+                        Alert.task_id.is_(None),
+                        Alert.severity == AlertSeverity.WARNING,
+                        Alert.dismissed_at.is_(None),
+                        Alert.title == title,
+                    )
+                )
             )
-        )).scalars().first()
+            .scalars()
+            .first()
+        )
         if existing is not None:
             continue
         alert = Alert(
@@ -576,16 +700,19 @@ async def _create_auto_pause_alerts(session: AsyncSession, failed_deps: list) ->
     try:
         import asyncio as _asyncio  # noqa: PLC0415
         from app.notification_dispatch import dispatch_external_notification  # noqa: PLC0415
+
         for project in projects:
-            _asyncio.ensure_future(dispatch_external_notification(
-                project.id,
-                "DEPLOY_HEALTH_ALERT",
-                {
-                    "failed_deps": failed_deps,
-                    "title": title,
-                    **({"rate_limit": rl_details} if rl_details else {}),
-                },
-            ))
+            _asyncio.ensure_future(
+                dispatch_external_notification(
+                    project.id,
+                    "DEPLOY_HEALTH_ALERT",
+                    {
+                        "failed_deps": failed_deps,
+                        "title": title,
+                        **({"rate_limit": rl_details} if rl_details else {}),
+                    },
+                )
+            )
     except Exception as _ne:
         logger.warning(f"[NOTIFY] DEPLOY_HEALTH_ALERT dispatch setup failed: {_ne}")
 
@@ -605,6 +732,7 @@ async def _create_forced_resume_alerts(
     title, not a severity bump.
     """
     from app.main import _send_webhook_notification  # noqa: PLC0415 — deferred to avoid circular import
+
     pause_title = "Pipeline auto-paused: external dependencies down"
     escalated = consecutive_force_resumes >= _FORCE_RESUME_ESCALATION_THRESHOLD
     if escalated:
@@ -627,14 +755,20 @@ async def _create_forced_resume_alerts(
     now = _utcnow()
     projects = (await session.execute(select(Project))).scalars().all()
     for project in projects:
-        existing_warnings = (await session.execute(
-            select(Alert).where(
-                Alert.project_id == project.id,
-                Alert.severity == AlertSeverity.WARNING,
-                Alert.dismissed_at.is_(None),
-                Alert.title == pause_title,
+        existing_warnings = (
+            (
+                await session.execute(
+                    select(Alert).where(
+                        Alert.project_id == project.id,
+                        Alert.severity == AlertSeverity.WARNING,
+                        Alert.dismissed_at.is_(None),
+                        Alert.title == pause_title,
+                    )
+                )
             )
-        )).scalars().all()
+            .scalars()
+            .all()
+        )
         for w in existing_warnings:
             w.dismissed_at = now
             session.add(w)
@@ -654,21 +788,26 @@ async def _create_forced_resume_alerts(
     try:
         import asyncio as _asyncio  # noqa: PLC0415
         from app.notification_dispatch import dispatch_external_notification  # noqa: PLC0415
+
         for project in projects:
-            _asyncio.ensure_future(dispatch_external_notification(
-                project.id,
-                "FORCED_RESUME",
-                {
-                    "pause_duration_seconds": int(pause_duration_seconds),
-                    "failed_deps": failed_deps,
-                    "title": title,
-                },
-            ))
+            _asyncio.ensure_future(
+                dispatch_external_notification(
+                    project.id,
+                    "FORCED_RESUME",
+                    {
+                        "pause_duration_seconds": int(pause_duration_seconds),
+                        "failed_deps": failed_deps,
+                        "title": title,
+                    },
+                )
+            )
     except Exception as _ne:
         logger.warning(f"[NOTIFY] FORCED_RESUME dispatch setup failed: {_ne}")
 
 
-async def _create_auto_resume_alerts(session: AsyncSession, flapping: bool = False) -> None:
+async def _create_auto_resume_alerts(
+    session: AsyncSession, flapping: bool = False
+) -> None:
     """Create INFO alerts and dismiss existing auto-pause warnings when the pipeline auto-resumes.
 
     When ``flapping`` is True (rapid pause/resume cycles detected), escalate to an ERROR alert
@@ -676,7 +815,9 @@ async def _create_auto_resume_alerts(session: AsyncSession, flapping: bool = Fal
     """
     pause_title = "Pipeline auto-paused: external dependencies down"
     if flapping:
-        resume_title = "Pipeline auto-resumed (FLAPPING): rapid pause/resume cycles detected."
+        resume_title = (
+            "Pipeline auto-resumed (FLAPPING): rapid pause/resume cycles detected."
+        )
         severity = AlertSeverity.ERROR
     else:
         resume_title = "Pipeline auto-resumed: all external dependencies healthy."
@@ -685,14 +826,20 @@ async def _create_auto_resume_alerts(session: AsyncSession, flapping: bool = Fal
     projects = (await session.execute(select(Project))).scalars().all()
     for project in projects:
         # Dismiss existing auto-pause WARNING alerts for this project
-        existing_warnings = (await session.execute(
-            select(Alert).where(
-                Alert.project_id == project.id,
-                Alert.severity == AlertSeverity.WARNING,
-                Alert.dismissed_at.is_(None),
-                Alert.title == pause_title,
+        existing_warnings = (
+            (
+                await session.execute(
+                    select(Alert).where(
+                        Alert.project_id == project.id,
+                        Alert.severity == AlertSeverity.WARNING,
+                        Alert.dismissed_at.is_(None),
+                        Alert.title == pause_title,
+                    )
+                )
             )
-        )).scalars().all()
+            .scalars()
+            .all()
+        )
         for w in existing_warnings:
             w.dismissed_at = now
             session.add(w)
@@ -706,10 +853,15 @@ async def _create_auto_resume_alerts(session: AsyncSession, flapping: bool = Fal
         await broadcast_to_project(
             str(project.id),
             "alert_created",
-            {"alert_id": str(alert.id), "severity": severity.name, "title": alert.title},
+            {
+                "alert_id": str(alert.id),
+                "severity": severity.name,
+                "title": alert.title,
+            },
         )
     if flapping:
         from app.main import _send_webhook_notification  # noqa: PLC0415 — deferred to avoid circular import
+
         # Surface the actual root cause: which dep is flapping, and how
         # often. Without this the FLAPPING_RESUME alert was a vague
         # "something keeps going down" signal — operators had to pull
@@ -722,17 +874,22 @@ async def _create_auto_resume_alerts(session: AsyncSession, flapping: bool = Fal
         }
         webhook_msg = resume_title
         if recent_failed:
-            webhook_msg = f"{resume_title} (current failed deps: {', '.join(recent_failed)})"
+            webhook_msg = (
+                f"{resume_title} (current failed deps: {', '.join(recent_failed)})"
+            )
         await _send_webhook_notification("FLAPPING_RESUME", resume_title, webhook_msg)
         try:
             import asyncio as _asyncio  # noqa: PLC0415
             from app.notification_dispatch import dispatch_external_notification  # noqa: PLC0415
+
             for project in projects:
-                _asyncio.ensure_future(dispatch_external_notification(
-                    project.id,
-                    "FLAPPING_RESUME",
-                    flap_payload,
-                ))
+                _asyncio.ensure_future(
+                    dispatch_external_notification(
+                        project.id,
+                        "FLAPPING_RESUME",
+                        flap_payload,
+                    )
+                )
         except Exception as _ne:
             logger.warning(f"[NOTIFY] FLAPPING_RESUME dispatch setup failed: {_ne}")
 
@@ -744,24 +901,35 @@ async def _check_pause_mode():
     auto-pause duration forces resume (with reduced VMs) if healthy probes never
     reach the threshold — preventing indefinite pause under intermittent failures.
     """
-    global _pause_failure_streak, _last_auto_resume_at, _last_resume_was_forced, _consecutive_force_resumes
+    global \
+        _pause_failure_streak, \
+        _last_auto_resume_at, \
+        _last_resume_was_forced, \
+        _consecutive_force_resumes
     ext = _shared_state.external_health
     failed = ext.get("failed_deps", [])
     # Auto-pause only when critical infrastructure is down or no dispatchable provider path remains.
-    critical_failures = [d for d in failed if d in ("db", "github_api", "gcp", "dispatch_api")]
+    critical_failures = [
+        d for d in failed if d in ("db", "github_api", "gcp", "dispatch_api")
+    ]
     is_healthy = not critical_failures
 
     if critical_failures:
         _pause_failure_streak += 1
         # Require 3 consecutive failures before pausing (avoid flaky single checks)
         if _pause_failure_streak < 3:
-            logger.warning(f"[PAUSE] Health check failure {_pause_failure_streak}/3: {', '.join(critical_failures)} — not pausing yet")
+            logger.warning(
+                f"[PAUSE] Health check failure {_pause_failure_streak}/3: {', '.join(critical_failures)} — not pausing yet"
+            )
             try:
-                await manager.broadcast_to_all("health_degrading", {
-                    "streak": _pause_failure_streak,
-                    "threshold": 3,
-                    "failed_deps": critical_failures,
-                })
+                await manager.broadcast_to_all(
+                    "health_degrading",
+                    {
+                        "streak": _pause_failure_streak,
+                        "threshold": 3,
+                        "failed_deps": critical_failures,
+                    },
+                )
             except Exception as _be:
                 logger.warning(f"[WS] health_degrading broadcast failed: {_be}")
             # Still record into recovery history while PAUSED so a single flake doesn't reset progress
@@ -795,23 +963,38 @@ async def _check_pause_mode():
                     in_grace_period = True
                     grace_remaining = grace - elapsed
 
-            if critical_failures and _pause_failure_streak >= 3 and _runtime_config["max_concurrent_vms"] > 0 and in_grace_period:
+            if (
+                critical_failures
+                and _pause_failure_streak >= 3
+                and _runtime_config["max_concurrent_vms"] > 0
+                and in_grace_period
+            ):
                 logger.warning(
                     f"[PAUSE] Suppressing auto-pause during post-resume grace period "
                     f"({int(grace_remaining)}s remaining); failed={critical_failures}"
                 )
                 try:
-                    await manager.broadcast_to_all("health_degrading", {
-                        "streak": _pause_failure_streak,
-                        "threshold": 3,
-                        "failed_deps": critical_failures,
-                        "in_grace_period": True,
-                        "grace_remaining_seconds": int(grace_remaining),
-                    })
+                    await manager.broadcast_to_all(
+                        "health_degrading",
+                        {
+                            "streak": _pause_failure_streak,
+                            "threshold": 3,
+                            "failed_deps": critical_failures,
+                            "in_grace_period": True,
+                            "grace_remaining_seconds": int(grace_remaining),
+                        },
+                    )
                 except Exception as _be:
                     logger.warning(f"[WS] health_degrading broadcast failed: {_be}")
-            elif critical_failures and _pause_failure_streak >= 3 and _runtime_config["max_concurrent_vms"] > 0:
-                if state.status not in (DeploymentStatus.PAUSED, DeploymentStatus.HALTED):
+            elif (
+                critical_failures
+                and _pause_failure_streak >= 3
+                and _runtime_config["max_concurrent_vms"] > 0
+            ):
+                if state.status not in (
+                    DeploymentStatus.PAUSED,
+                    DeploymentStatus.HALTED,
+                ):
                     # During ramp-up after a prior auto-resume, _runtime_config holds the
                     # intermediate (small) VM count while state.runtime_max_concurrent_vms
                     # holds the original pre-pause target. Preserve the larger so nested
@@ -819,15 +1002,21 @@ async def _check_pause_mode():
                     # Anomaly throttling may have already reduced both runtime config and
                     # DB state below the true original capacity — consult the anomaly
                     # pre-adjustment stash so restoration doesn't permanently shrink.
-                    anomaly_pre = _shared_state.anomaly_adjustments.get("pre_adjustment_max_vms") or 0
+                    anomaly_pre = (
+                        _shared_state.anomaly_adjustments.get("pre_adjustment_max_vms")
+                        or 0
+                    )
                     original_capacity = max(
                         _runtime_config["max_concurrent_vms"],
                         state.runtime_max_concurrent_vms or 0,
                         anomaly_pre,
                     )
                     from app import pause_clock  # noqa: PLC0415 — local import to avoid cycle at module load
+
                     state.status = DeploymentStatus.PAUSED
-                    state.pause_reason = f"External dependency down: {', '.join(critical_failures)}"
+                    state.pause_reason = (
+                        f"External dependency down: {', '.join(critical_failures)}"
+                    )
                     pause_clock.mark_paused(state, pause_clock.PAUSED_KIND_AUTO)
                     state.pre_pause_max_vms = original_capacity
                     state.runtime_max_concurrent_vms = original_capacity
@@ -835,14 +1024,19 @@ async def _check_pause_mode():
                     await _create_auto_pause_alerts(session, critical_failures)
                     await session.commit()
                     _runtime_config["max_concurrent_vms"] = 0
-                    logger.warning(f"[PAUSE] Auto-paused pipeline — {', '.join(critical_failures)} down")
+                    logger.warning(
+                        f"[PAUSE] Auto-paused pipeline — {', '.join(critical_failures)} down"
+                    )
                     await broadcast_deploy_state()
             elif (
                 not critical_failures
-                and state.status in (DeploymentStatus.MONITORING, DeploymentStatus.STABLE)
+                and state.status
+                in (DeploymentStatus.MONITORING, DeploymentStatus.STABLE)
                 and state.pre_pause_max_vms is None
                 and state.runtime_max_concurrent_vms is not None
-                and 0 < _runtime_config["max_concurrent_vms"] < state.runtime_max_concurrent_vms
+                and 0
+                < _runtime_config["max_concurrent_vms"]
+                < state.runtime_max_concurrent_vms
             ):
                 # Gradual ramp-up after auto-resume: DB holds the target, runtime starts low.
                 target = state.runtime_max_concurrent_vms
@@ -850,7 +1044,11 @@ async def _check_pause_mode():
                 # After a forced resume, health probes alone are weak signal — they're what
                 # failed to stabilize in the first place. Gate ramp-up past 2 VMs on evidence
                 # of a real task succeeding in the last 5 minutes.
-                if _last_resume_was_forced and current >= 2 and not _has_recent_task_success(minutes=5):
+                if (
+                    _last_resume_was_forced
+                    and current >= 2
+                    and not _has_recent_task_success(minutes=5)
+                ):
                     logger.info(
                         f"[RAMP] forced-resume gate: holding max_concurrent_vms at {current} "
                         f"(target: {target}) — no task success in last 5 minutes"
@@ -858,7 +1056,9 @@ async def _check_pause_mode():
                     return
                 step = min(2, target - current)
                 _runtime_config["max_concurrent_vms"] = current + step
-                logger.info(f"[RAMP] max_concurrent_vms {current} → {current + step} (target: {target})")
+                logger.info(
+                    f"[RAMP] max_concurrent_vms {current} → {current + step} (target: {target})"
+                )
                 await broadcast_deploy_state()
             return
 
@@ -881,7 +1081,9 @@ async def _check_pause_mode():
         # When flapping, tighten the recovery bar so we don't resume on marginal signal.
         flapping_now = _is_flapping(_utcnow())
         healthy_required = (
-            _FLAP_ESCALATED_HEALTHY_REQUIRED if flapping_now else _HEALTH_HISTORY_HEALTHY_REQUIRED
+            _FLAP_ESCALATED_HEALTHY_REQUIRED
+            if flapping_now
+            else _HEALTH_HISTORY_HEALTHY_REQUIRED
         )
 
         should_force_resume = pause_duration >= max_duration > 0
@@ -891,10 +1093,20 @@ async def _check_pause_mode():
         )
 
         if not (should_force_resume or should_normal_resume):
-            tracked_deps = ("db", "github_api", "gcp", "dispatch_api", "anthropic_api", "openai_api", "gemini_api")
+            tracked_deps = (
+                "db",
+                "github_api",
+                "gcp",
+                "dispatch_api",
+                "anthropic_api",
+                "openai_api",
+                "gemini_api",
+            )
             consec_map = ext.get("consecutive_failures", {}) or {}
             failed_set = set(failed)
-            still_failing = {d: consec_map.get(d, 0) for d in tracked_deps if d in failed_set}
+            still_failing = {
+                d: consec_map.get(d, 0) for d in tracked_deps if d in failed_set
+            }
             recovered = [d for d in tracked_deps if d not in failed_set]
             logger.info(
                 f"[PAUSE] Recovery progress: {healthy_count}/{len(history_snapshot)} healthy "
@@ -905,17 +1117,20 @@ async def _check_pause_mode():
                 f"still_failing={still_failing or 'none'}"
             )
             try:
-                await manager.broadcast_to_all("health_recovering", {
-                    "healthy_count": healthy_count,
-                    "history_len": len(history_snapshot),
-                    "healthy_required": healthy_required,
-                    "history_size": _HEALTH_HISTORY_SIZE,
-                    "flapping": flapping_now,
-                    "pause_duration_seconds": int(pause_duration),
-                    "max_auto_pause_duration_seconds": max_duration,
-                    "healthy_deps": recovered,
-                    "still_failing_deps": still_failing,
-                })
+                await manager.broadcast_to_all(
+                    "health_recovering",
+                    {
+                        "healthy_count": healthy_count,
+                        "history_len": len(history_snapshot),
+                        "healthy_required": healthy_required,
+                        "history_size": _HEALTH_HISTORY_SIZE,
+                        "flapping": flapping_now,
+                        "pause_duration_seconds": int(pause_duration),
+                        "max_auto_pause_duration_seconds": max_duration,
+                        "healthy_deps": recovered,
+                        "still_failing_deps": still_failing,
+                    },
+                )
             except Exception as _be:
                 logger.warning(f"[WS] health_recovering broadcast failed: {_be}")
             return
@@ -927,7 +1142,12 @@ async def _check_pause_mode():
             initial_vms = min(2, restore)
 
         from app import pause_clock  # noqa: PLC0415 — local import to avoid cycle at module load
-        state.status = DeploymentStatus.MONITORING if _shared_state.deploy_monitoring["window_start"] else DeploymentStatus.STABLE
+
+        state.status = (
+            DeploymentStatus.MONITORING
+            if _shared_state.deploy_monitoring["window_start"]
+            else DeploymentStatus.STABLE
+        )
         state.pause_reason = None
         pause_clock.accumulate_pause_window(state)
         state.pre_pause_max_vms = None
@@ -939,7 +1159,9 @@ async def _check_pause_mode():
         now = _utcnow()
         _recent_auto_resumes.append(now)
         _prune_flap_window(now)
-        flap_escalated = len(_recent_auto_resumes) >= _runtime_config.get("flap_threshold", 3)
+        flap_escalated = len(_recent_auto_resumes) >= _runtime_config.get(
+            "flap_threshold", 3
+        )
 
         _last_resume_was_forced = bool(should_force_resume)
 
@@ -995,6 +1217,7 @@ async def broadcast_deploy_state():
     """Assemble and broadcast current deploy state to all connected WebSocket clients."""
     try:
         from app.admin import build_deploy_state_payload
+
         async with AsyncSessionLocal() as session:
             payload = await build_deploy_state_payload(session)
         await manager.broadcast_to_all("deploy_state", payload)

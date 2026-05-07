@@ -22,6 +22,7 @@ Snapshots and resets app.shared_state.runtime_config["warm_continuity_enabled"]
 and shared_state.vm_last_heartbeat so a regression in this flag's default
 or a stale heartbeat from a prior test won't pollute neighbours.
 """
+
 from datetime import datetime, timedelta
 
 import pytest
@@ -45,8 +46,12 @@ async def test_warm_vm_full_flow_spawn_heartbeat_next_role_claim(
     import app.shared_state as _shared_state
     from app.shared_state import runtime_config as _runtime_config
 
-    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=mocker.AsyncMock)
-    mocker.patch("app.routers.agent.broadcast_to_project", new_callable=mocker.AsyncMock)
+    mocker.patch(
+        "app.review_pipeline.broadcast_to_project", new_callable=mocker.AsyncMock
+    )
+    mocker.patch(
+        "app.routers.agent.broadcast_to_project", new_callable=mocker.AsyncMock
+    )
 
     # Snapshot mutable shared state and restore in finally so we don't pollute
     # neighbouring tests.
@@ -65,13 +70,15 @@ async def test_warm_vm_full_flow_spawn_heartbeat_next_role_claim(
         source_task = Task(
             project_id=project.id,
             title="Create task that opened PR #6543",
-            payloads=[{
-                "type": "create",
-                "pr_number": 6543,
-                "branch": "feat/warm-int",
-                "base_branch": "main",
-                "prompt": "implement X",
-            }],
+            payloads=[
+                {
+                    "type": "create",
+                    "pr_number": 6543,
+                    "branch": "feat/warm-int",
+                    "base_branch": "main",
+                    "prompt": "implement X",
+                }
+            ],
             vm_instance_id=source_vm_id,
             status=TaskStatus.IN_PROGRESS,
             context={"scope": "small", "review_loop": {"iteration": 0}},
@@ -186,8 +193,12 @@ async def test_warm_vm_next_role_skips_when_heartbeat_missing(
     import app.shared_state as _shared_state
     from app.shared_state import runtime_config as _runtime_config
 
-    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=mocker.AsyncMock)
-    mocker.patch("app.routers.agent.broadcast_to_project", new_callable=mocker.AsyncMock)
+    mocker.patch(
+        "app.review_pipeline.broadcast_to_project", new_callable=mocker.AsyncMock
+    )
+    mocker.patch(
+        "app.routers.agent.broadcast_to_project", new_callable=mocker.AsyncMock
+    )
 
     prior_warm_continuity = _runtime_config.get("warm_continuity_enabled")
     prior_heartbeat = dict(_shared_state.vm_last_heartbeat)

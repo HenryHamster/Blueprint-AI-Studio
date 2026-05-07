@@ -39,6 +39,7 @@ def scope_to_effort(scope: Optional[str]) -> str:
     """
     return _SCOPE_EFFORT_MAP.get(scope or "", "medium")
 
+
 # Rate limiter — shared between main.py and admin.py
 # Only enforced in Cloud Run (K_REVISION set), disabled locally for dev/test
 # Uses Redis for cross-instance coordination when REDIS_URL is set,
@@ -73,8 +74,12 @@ runtime_config: Dict = {
     # (keeps QUEUED) review/fix tasks above the budget — they run as soon
     # as a pipeline slot frees up. 0 disables the cap entirely.
     "max_pipeline_slots": int(os.getenv("MAX_PIPELINE_SLOTS", "4")),
-    "max_auto_pause_duration_seconds": int(os.getenv("MAX_AUTO_PAUSE_DURATION_SECONDS", "7200")),
-    "auto_resume_grace_period_seconds": int(os.getenv("AUTO_RESUME_GRACE_PERIOD_SECONDS", "300")),
+    "max_auto_pause_duration_seconds": int(
+        os.getenv("MAX_AUTO_PAUSE_DURATION_SECONDS", "7200")
+    ),
+    "auto_resume_grace_period_seconds": int(
+        os.getenv("AUTO_RESUME_GRACE_PERIOD_SECONDS", "300")
+    ),
     # Flap detection: N auto-resumes inside `flap_window_seconds` escalates
     # (ERROR alert, raised recovery bar, doubled grace period).
     "flap_window_seconds": int(os.getenv("FLAP_WINDOW_SECONDS", "1800")),
@@ -83,8 +88,12 @@ runtime_config: Dict = {
     "max_provision_retries": int(os.getenv("MAX_PROVISION_RETRIES", "3")),
     "max_rollup_retries": int(os.getenv("MAX_ROLLUP_RETRIES", "5")),
     "queued_age_alert_hours": int(os.getenv("QUEUED_AGE_ALERT_HOURS", "2")),
-    "retry_after_reset_alert_threshold": int(os.getenv("RETRY_AFTER_RESET_ALERT_THRESHOLD", "8")),
-    "retry_after_reset_fail_threshold": int(os.getenv("RETRY_AFTER_RESET_FAIL_THRESHOLD", "16")),
+    "retry_after_reset_alert_threshold": int(
+        os.getenv("RETRY_AFTER_RESET_ALERT_THRESHOLD", "8")
+    ),
+    "retry_after_reset_fail_threshold": int(
+        os.getenv("RETRY_AFTER_RESET_FAIL_THRESHOLD", "16")
+    ),
     "max_autonomous_tasks_per_hour": 12,
     "max_global_autonomous_tasks_per_hour": 50,  # Cross-project cap (default 10x per-project)
     "autonomous_research_interval_minutes": 30,
@@ -92,7 +101,9 @@ runtime_config: Dict = {
     # once their pipeline-side merge cycle exceeds this threshold. Set above
     # the typical PR lifecycle (CI + review + fix + re-review + merge) so new
     # research only spawns when a parent is genuinely stuck, not just slow.
-    "evaluating_pipeline_timeout_minutes": int(os.getenv("EVALUATING_PIPELINE_TIMEOUT_MINUTES", "120")),
+    "evaluating_pipeline_timeout_minutes": int(
+        os.getenv("EVALUATING_PIPELINE_TIMEOUT_MINUTES", "120")
+    ),
     # Hard kill for EVALUATING tasks waiting on CI/review verdict. Tuned above
     # a single review-fix iteration (5-15 min agent + queueing) so multi-pass
     # cycles don't trigger a premature kill of in-flight children.
@@ -108,7 +119,9 @@ runtime_config: Dict = {
     # accumulation: each EVALUATING parent has children waiting to merge
     # into a research branch and then to main; piling up rollup PRs makes
     # each subsequent merge incrementally more conflict-prone.
-    "max_total_research_per_project": int(os.getenv("MAX_TOTAL_RESEARCH_PER_PROJECT", "5")),
+    "max_total_research_per_project": int(
+        os.getenv("MAX_TOTAL_RESEARCH_PER_PROJECT", "5")
+    ),
     # Auto-remediation governors (residual CODE_ERROR fingerprint spawner).
     # Global cap on concurrent/queued auto-remediation tasks prevents queue
     # ballooning when many distinct fingerprints accumulate. Cooldown is
@@ -150,7 +163,10 @@ runtime_config: Dict = {
     # effort value indexes into provider_settings_by_effort below to pick the
     # concrete settings bag (including model).
     "category_routing": {
-        "_default": {"providers": ["anthropic", "openai", "gemini"], "effort": "medium"},
+        "_default": {
+            "providers": ["anthropic", "openai", "gemini"],
+            "effort": "medium",
+        },
         "strategic": {"providers": ["anthropic", "openai", "gemini"], "effort": "max"},
         "build": {"providers": ["anthropic", "openai", "gemini"], "effort": "medium"},
         "review": {"providers": ["anthropic", "openai", "gemini"], "effort": "high"},
@@ -201,10 +217,26 @@ runtime_config: Dict = {
             # review (high) gets medium so review comments can explain.
             # strategic (max) gets high because the prose *is* the deliverable
             # (design docs, research, plans).
-            "low": {"model": "gpt-5.4-mini", "reasoning_effort": "low", "verbosity": "low"},
-            "medium": {"model": "gpt-5.4-mini", "reasoning_effort": "medium", "verbosity": "low"},
-            "high": {"model": "gpt-5.4", "reasoning_effort": "high", "verbosity": "medium"},
-            "max": {"model": "gpt-5.4", "reasoning_effort": "xhigh", "verbosity": "high"},
+            "low": {
+                "model": "gpt-5.4-mini",
+                "reasoning_effort": "low",
+                "verbosity": "low",
+            },
+            "medium": {
+                "model": "gpt-5.4-mini",
+                "reasoning_effort": "medium",
+                "verbosity": "low",
+            },
+            "high": {
+                "model": "gpt-5.4",
+                "reasoning_effort": "high",
+                "verbosity": "medium",
+            },
+            "max": {
+                "model": "gpt-5.4",
+                "reasoning_effort": "xhigh",
+                "verbosity": "high",
+            },
         },
         "gemini": {
             "low": {"model": "gemini-2.5-flash-lite", "thinking_budget": 1024},
@@ -223,8 +255,8 @@ runtime_config: Dict = {
     # Periodic autonomous spawning for non-research task types (opt-in)
     "autonomous_periodic_tasks": {
         "security_audit": {"interval_hours": 168, "enabled": False},  # weekly
-        "qa": {"interval_hours": 72, "enabled": False},               # every 3 days
-        "deps": {"interval_hours": 168, "enabled": False},            # weekly
+        "qa": {"interval_hours": 72, "enabled": False},  # every 3 days
+        "deps": {"interval_hours": 168, "enabled": False},  # weekly
     },
     "autonomous_direction_cooldown_minutes": 240,
     "productive_direction_cooldown_minutes": 45,
@@ -269,6 +301,14 @@ runtime_config: Dict = {
     "cross_cutting_gate_enabled": True,
     "cross_cutting_gate_medium_module_threshold": 3,
     "cross_cutting_gate_overflow_line_threshold": 100,
+    # How long a NEEDS_MANUAL_INTERVENTION regression case must observe its
+    # underlying signal back below threshold before the dispatcher watchdog
+    # auto-closes it as 'recovered_unattended'. 24h gives an unrelated PR or
+    # platform fix time to land and the signal time to settle before we
+    # reclaim the operator queue slot. Operator override via env var.
+    "regression_recovered_unattended_window_hours": int(
+        os.getenv("REGRESSION_RECOVERED_UNATTENDED_WINDOW_HOURS", "24")
+    ),
     # TTL (days) for deferred findings carried forward by autonomous_research.
     # Findings older than this window are dropped rather than reprocessed, so
     # stale context doesn't keep surfacing work the system already declined to
@@ -386,7 +426,11 @@ def _migrate_legacy_provider_config(config: Dict[str, Any]) -> Dict[str, Any]:
                 if not isinstance(providers, list):
                     continue
                 effort = default_effort
-                members = legacy_categories.get(cat) if isinstance(legacy_categories, dict) else None
+                members = (
+                    legacy_categories.get(cat)
+                    if isinstance(legacy_categories, dict)
+                    else None
+                )
                 if isinstance(members, list):
                     for task in members:
                         if isinstance(legacy_task_profile, dict):
@@ -397,10 +441,12 @@ def _migrate_legacy_provider_config(config: Dict[str, Any]) -> Dict[str, Any]:
                 cat_routing[cat] = {"providers": list(providers), "effort": effort}
         if "_default" not in cat_routing:
             default_providers = (
-                (legacy_pref.get("_default") if isinstance(legacy_pref, dict) else None)
-                or ["anthropic", "openai", "gemini"]
-            )
-            cat_routing["_default"] = {"providers": list(default_providers), "effort": default_effort}
+                legacy_pref.get("_default") if isinstance(legacy_pref, dict) else None
+            ) or ["anthropic", "openai", "gemini"]
+            cat_routing["_default"] = {
+                "providers": list(default_providers),
+                "effort": default_effort,
+            }
         if cat_routing:
             config["category_routing"] = cat_routing
 
@@ -484,17 +530,35 @@ async def sync_runtime_config_from_state(state) -> list[str]:
             if state.runtime_max_retries is not None:
                 _set("max_retries", int(state.runtime_max_retries))
             if state.runtime_max_autonomous_tasks_per_hour is not None:
-                _set("max_autonomous_tasks_per_hour", int(state.runtime_max_autonomous_tasks_per_hour))
-            if getattr(state, "runtime_max_global_autonomous_tasks_per_hour", None) is not None:
-                _set("max_global_autonomous_tasks_per_hour", int(state.runtime_max_global_autonomous_tasks_per_hour))
+                _set(
+                    "max_autonomous_tasks_per_hour",
+                    int(state.runtime_max_autonomous_tasks_per_hour),
+                )
+            if (
+                getattr(state, "runtime_max_global_autonomous_tasks_per_hour", None)
+                is not None
+            ):
+                _set(
+                    "max_global_autonomous_tasks_per_hour",
+                    int(state.runtime_max_global_autonomous_tasks_per_hour),
+                )
         except Exception as e:
             logger.warning(f"[CONFIG-SYNC] Could not sync scalar config cols: {e}")
 
         try:
             if state.runtime_autonomous_research_interval_minutes is not None:
-                _set("autonomous_research_interval_minutes", int(state.runtime_autonomous_research_interval_minutes))
-            if getattr(state, "runtime_autonomous_direction_cooldown_minutes", None) is not None:
-                _set("autonomous_direction_cooldown_minutes", int(state.runtime_autonomous_direction_cooldown_minutes))
+                _set(
+                    "autonomous_research_interval_minutes",
+                    int(state.runtime_autonomous_research_interval_minutes),
+                )
+            if (
+                getattr(state, "runtime_autonomous_direction_cooldown_minutes", None)
+                is not None
+            ):
+                _set(
+                    "autonomous_direction_cooldown_minutes",
+                    int(state.runtime_autonomous_direction_cooldown_minutes),
+                )
         except Exception as e:
             logger.warning(f"[CONFIG-SYNC] Could not sync autonomous cols: {e}")
 
@@ -515,24 +579,44 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     "provider_selection_mode",
                     "cross_provider_fallback_enabled",
                     "agent_prompt_suffixes",
-                    "provider_settings_defaults", "task_type_provider_overrides",
-                    "autonomous_periodic_tasks", "health_check_urls", "notification_config",
+                    "provider_settings_defaults",
+                    "task_type_provider_overrides",
+                    "autonomous_periodic_tasks",
+                    "health_check_urls",
+                    "notification_config",
                 ):
                     if key in config_json:
                         _set(key, config_json[key])
                 if "strategic_research_frequency" in config_json:
-                    _set("strategic_research_frequency", int(config_json["strategic_research_frequency"]))
+                    _set(
+                        "strategic_research_frequency",
+                        int(config_json["strategic_research_frequency"]),
+                    )
                 if "require_approval_gates" in config_json:
-                    _set("require_approval_gates", bool(config_json["require_approval_gates"]))
+                    _set(
+                        "require_approval_gates",
+                        bool(config_json["require_approval_gates"]),
+                    )
                 if "daily_cost_ceiling_usd" in config_json:
-                    _set("daily_cost_ceiling_usd", float(config_json["daily_cost_ceiling_usd"]))
+                    _set(
+                        "daily_cost_ceiling_usd",
+                        float(config_json["daily_cost_ceiling_usd"]),
+                    )
                 if "auto_archive_enabled" in config_json:
-                    _set("auto_archive_enabled", bool(config_json["auto_archive_enabled"]))
+                    _set(
+                        "auto_archive_enabled",
+                        bool(config_json["auto_archive_enabled"]),
+                    )
                 if "warm_continuity_enabled" in config_json:
-                    _set("warm_continuity_enabled", bool(config_json["warm_continuity_enabled"]))
+                    _set(
+                        "warm_continuity_enabled",
+                        bool(config_json["warm_continuity_enabled"]),
+                    )
                 for int_key in (
-                    "max_provision_retries", "max_rollup_retries",
-                    "architecture_review_frequency", "max_active_directions",
+                    "max_provision_retries",
+                    "max_rollup_retries",
+                    "architecture_review_frequency",
+                    "max_active_directions",
                     "max_parallel_research_per_project",
                     "auto_archive_terminal_after_days",
                     "auto_archive_max_terminal_tasks_per_project",
@@ -547,7 +631,10 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     if int_key in config_json:
                         _set(int_key, int(config_json[int_key]))
                 if "reserved_slots_for_types" in config_json:
-                    _set("reserved_slots_for_types", config_json["reserved_slots_for_types"])
+                    _set(
+                        "reserved_slots_for_types",
+                        config_json["reserved_slots_for_types"],
+                    )
         except Exception as e:
             logger.warning(f"[CONFIG-SYNC] Could not sync runtime_config_json: {e}")
 
@@ -602,6 +689,7 @@ def resolve_retry_budget(failure_class: str, scope: Optional[str]) -> int:
         failure_class, runtime_config["max_retries"]
     )
 
+
 # --- Autonomous Loop State ---
 autonomous_failure_counts: Dict[str, int] = {}  # project_id -> consecutive failures
 last_idle_check: Optional[datetime] = None
@@ -638,11 +726,15 @@ async def hydrate_persistent_anomalies(session) -> int:
                     target[key] = entry
             loaded += len(stored)
     except Exception:
-        logger.warning("[ANOMALY_PERSIST] hydrate_persistent_anomalies failed", exc_info=True)
+        logger.warning(
+            "[ANOMALY_PERSIST] hydrate_persistent_anomalies failed", exc_info=True
+        )
     return loaded
 
 
-async def persist_anomaly_snapshot(project_id: str, proj_anomalies: dict, session) -> None:
+async def persist_anomaly_snapshot(
+    project_id: str, proj_anomalies: dict, session
+) -> None:
     """Write anomaly fingerprints for one project into Project.design_doc.
 
     Called after each anomaly detection cycle so the state survives the next
@@ -665,20 +757,83 @@ async def persist_anomaly_snapshot(project_id: str, proj_anomalies: dict, sessio
     flag_modified(project, "design_doc")
     session.add(project)
 
+
+# --- Regression Signal State (first-tripped timestamps for MTTD) ---
+# project_id -> {regression_class -> ISO datetime string}
+# Populated at startup from Project.regression_signal_state and updated after
+# each dispatcher spawn/recovery so first-tripped times survive pod restarts.
+regression_signal_first_tripped: Dict[str, Dict[str, str]] = {}
+
+
+async def hydrate_regression_signal_state(session) -> int:
+    """Load regression signal first-tripped timestamps from Project.regression_signal_state.
+
+    Call once at startup so timestamps survive pod restarts.
+    In-memory entries always win over stored ones (no clobber on concurrent startup).
+    Returns the total number of per-class entries loaded across all projects.
+    """
+    from app.models import Project  # noqa: PLC0415
+    from sqlmodel import select  # noqa: PLC0415
+
+    loaded = 0
+    try:
+        projects = (await session.execute(select(Project))).scalars().all()
+        for project in projects:
+            stored = project.regression_signal_state
+            if not isinstance(stored, dict) or not stored:
+                continue
+            proj_key = str(project.id)
+            target = regression_signal_first_tripped.setdefault(proj_key, {})
+            for cls, iso_str in stored.items():
+                if cls not in target:
+                    target[cls] = iso_str
+                    loaded += 1
+    except Exception:
+        logger.warning(
+            "[REGRESSION_SIGNAL] hydrate_regression_signal_state failed", exc_info=True
+        )
+    return loaded
+
+
+async def persist_regression_signal_snapshot(
+    project_id: str, per_project_state: Dict[str, str], session
+) -> None:
+    """Write regression signal first-tripped timestamps for one project to DB.
+
+    per_project_state maps regression_class -> ISO datetime string.
+    Called after each spawn or recovery so timestamps survive pod restarts.
+    Safe to call within an already-open session (caller commits).
+    """
+    from app.models import Project  # noqa: PLC0415
+    from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
+    import uuid as _uuid  # noqa: PLC0415
+
+    try:
+        pid = _uuid.UUID(project_id)
+    except (TypeError, ValueError):
+        return
+    project = await session.get(Project, pid)
+    if project is None:
+        return
+    project.regression_signal_state = dict(per_project_state)
+    flag_modified(project, "regression_signal_state")
+    session.add(project)
+
+
 # --- Anomaly-Driven Pipeline Adjustments ---
 # When high-severity anomalies (PROVISION_FAILURE, EXTERNAL_API) persist,
 # the system automatically reduces blast radius by lowering max_concurrent_vms
 # and tightening the failure-rate dispatch gate.
 anomaly_adjustments: Dict[str, Any] = {
     "active": False,
-    "adjusted_at": None,             # ISO timestamp when adjustments were applied
-    "trigger_anomalies": [],         # anomaly keys that triggered the adjustment
+    "adjusted_at": None,  # ISO timestamp when adjustments were applied
+    "trigger_anomalies": [],  # anomaly keys that triggered the adjustment
     "pre_adjustment_max_vms": None,  # stored to restore on clearing
     "pre_adjustment_failure_gate": None,
-    "failure_gate_threshold": 0.8,   # default; lowered to 0.6 during anomaly response
-    "forced_restoration_count": 0,   # cumulative count of max-duration forced restorations
-    "forced_restored_at": None,      # ISO timestamp of last forced restoration
-    "adjusted_max_vms": None,        # target max_concurrent_vms we set; used to detect deploy_health/admin overrides
+    "failure_gate_threshold": 0.8,  # default; lowered to 0.6 during anomaly response
+    "forced_restoration_count": 0,  # cumulative count of max-duration forced restorations
+    "forced_restored_at": None,  # ISO timestamp of last forced restoration
+    "adjusted_max_vms": None,  # target max_concurrent_vms we set; used to detect deploy_health/admin overrides
 }
 
 # --- Circuit Breaker (Hystrix-inspired) ---
@@ -686,28 +841,33 @@ anomaly_adjustments: Dict[str, Any] = {
 # States: CLOSED (normal), OPEN (tripped), HALF_OPEN (testing one task)
 circuit_breakers: Dict[str, Dict] = {}  # project_id -> breaker state
 
+
 def get_circuit_breaker(project_id: str) -> Dict:
     """Get or create circuit breaker state for a project."""
     if project_id not in circuit_breakers:
         circuit_breakers[project_id] = {
-            "state": "CLOSED",           # CLOSED, OPEN, HALF_OPEN
-            "failure_count": 0,          # consecutive code-quality failures (CODE_ERROR, AGENT_TIMEOUT)
-            "infra_failure_count": 0,    # consecutive infra failures (PROVISION_FAILURE, RATE_LIMIT, EXTERNAL_API)
-            "success_count": 0,          # consecutive successes (for half-open)
-            "opened_at": None,           # when the breaker tripped
-            "cooldown_seconds": 1800,    # 30 min initial cooldown
-            "base_cooldown": 1800,       # for exponential backoff reset
-            "half_open_task_id": None,   # the test task in HALF_OPEN
-            "open_reason": None,         # "code" or "infra" — why the breaker opened
+            "state": "CLOSED",  # CLOSED, OPEN, HALF_OPEN
+            "failure_count": 0,  # consecutive code-quality failures (CODE_ERROR, AGENT_TIMEOUT)
+            "infra_failure_count": 0,  # consecutive infra failures (PROVISION_FAILURE, RATE_LIMIT, EXTERNAL_API)
+            "success_count": 0,  # consecutive successes (for half-open)
+            "opened_at": None,  # when the breaker tripped
+            "cooldown_seconds": 1800,  # 30 min initial cooldown
+            "base_cooldown": 1800,  # for exponential backoff reset
+            "half_open_task_id": None,  # the test task in HALF_OPEN
+            "open_reason": None,  # "code" or "infra" — why the breaker opened
         }
     return circuit_breakers[project_id]
+
 
 # --- User-submitted Auto-Debug Rate Limiting ---
 # Tracks timestamps of user-submitted debug spawns per project to enforce hourly cap.
 # Structure: project_id -> deque of datetime (UTC) of recent spawns
 user_debug_spawn_times: Dict[str, deque] = {}
 
-USER_DEBUG_MAX_PER_HOUR = 3  # max debug tasks spawned for user/admin tasks per project per hour
+USER_DEBUG_MAX_PER_HOUR = (
+    3  # max debug tasks spawned for user/admin tasks per project per hour
+)
+
 
 def record_user_debug_spawn(project_id: str, now: datetime) -> None:
     """Record a user-submitted debug spawn and prune old entries."""
@@ -719,6 +879,7 @@ def record_user_debug_spawn(project_id: str, now: datetime) -> None:
     while dq and dq[0] < cutoff:
         dq.popleft()
 
+
 def count_recent_user_debug_spawns(project_id: str, now: datetime) -> int:
     """Count user-submitted debug spawns in the last hour for a project."""
     dq = user_debug_spawn_times.get(project_id)
@@ -726,6 +887,7 @@ def count_recent_user_debug_spawns(project_id: str, now: datetime) -> int:
         return 0
     cutoff = now - timedelta(hours=1)
     return sum(1 for t in dq if t >= cutoff)
+
 
 # --- Cross-PR Merge Error Pattern Tracking ---
 # When the same normalized merge error blocks multiple PRs in a project within a
@@ -834,19 +996,21 @@ is_leader: bool = True
 
 # --- Deployment Monitoring (Phase A: detect + alert) ---
 deploy_monitoring: Dict = {
-    "window_start": None,           # datetime when monitoring began for current deploy
-    "window_duration": 900,         # 15 minutes default
-    "extended_window": 1800,        # 30 min for large/infra changes
-    "is_extended": False,           # set True when infra files are touched
-    "task_results": deque(maxlen=100),  # (timestamp_iso, "success"|"failure", failure_class, task_type)
-    "pre_deploy_failure_rate": 0.0, # baseline from before deploy
+    "window_start": None,  # datetime when monitoring began for current deploy
+    "window_duration": 900,  # 15 minutes default
+    "extended_window": 1800,  # 30 min for large/infra changes
+    "is_extended": False,  # set True when infra files are touched
+    "task_results": deque(
+        maxlen=100
+    ),  # (timestamp_iso, "success"|"failure", failure_class, task_type)
+    "pre_deploy_failure_rate": 0.0,  # baseline from before deploy
     "health_checks": {
-        "dispatch_working": True,   # orchestrator picked up a task in last 5 min
-        "completions_received": True, # at least one agent reported back
-        "db_accessible": True,       # can read/write tasks
+        "dispatch_working": True,  # orchestrator picked up a task in last 5 min
+        "completions_received": True,  # at least one agent reported back
+        "db_accessible": True,  # can read/write tasks
     },
-    "last_dispatch_time": None,     # last time orchestrator dispatched a task
-    "last_completion_time": None,   # last time an agent reported completion
+    "last_dispatch_time": None,  # last time orchestrator dispatched a task
+    "last_completion_time": None,  # last time an agent reported completion
     "consecutive_health_failures": 0,
     # Bounded ring buffer of pipeline-health events written by the reaper.
     # Each entry: {"type": str, "ts": datetime, "task_id": str,
@@ -859,13 +1023,15 @@ deploy_monitoring: Dict = {
 
 # Pipeline-health event taxonomy. The reaper writes one of these into
 # deploy_monitoring["pipeline_events"] at each terminal decision point.
-PIPELINE_EVENT_TYPES = frozenset({
-    "heartbeat_timeout_post_claim",
-    "provision_timeout_pre_claim",
-    "absolute_timeout",
-    "never_started",
-    "account_blacklisted",
-})
+PIPELINE_EVENT_TYPES = frozenset(
+    {
+        "heartbeat_timeout_post_claim",
+        "provision_timeout_pre_claim",
+        "absolute_timeout",
+        "never_started",
+        "account_blacklisted",
+    }
+)
 
 # Threshold counts (per 1h window) that trigger a system-level alert.
 # "reap_rate_per_hour" aggregates all reap-reason events to catch
@@ -879,12 +1045,14 @@ PIPELINE_ALERT_THRESHOLDS = {
 PIPELINE_ALERT_DEDUP_SECONDS = 1800
 
 # Reap-reason codes that contribute to the aggregate reap_rate counter.
-_REAP_REASON_EVENT_TYPES = frozenset({
-    "heartbeat_timeout_post_claim",
-    "provision_timeout_pre_claim",
-    "absolute_timeout",
-    "never_started",
-})
+_REAP_REASON_EVENT_TYPES = frozenset(
+    {
+        "heartbeat_timeout_post_claim",
+        "provision_timeout_pre_claim",
+        "absolute_timeout",
+        "never_started",
+    }
+)
 
 
 def record_pipeline_event(event_type: str, **kwargs: Any) -> None:
@@ -913,11 +1081,15 @@ def count_pipeline_events(event_type: str, window_seconds: int = 3600) -> int:
     cutoff = _utcnow() - timedelta(seconds=window_seconds)
     if event_type == "reap_rate_per_hour":
         return sum(
-            1 for e in deploy_monitoring["pipeline_events"]
-            if e.get("ts") and e["ts"] >= cutoff and e.get("type") in _REAP_REASON_EVENT_TYPES
+            1
+            for e in deploy_monitoring["pipeline_events"]
+            if e.get("ts")
+            and e["ts"] >= cutoff
+            and e.get("type") in _REAP_REASON_EVENT_TYPES
         )
     return sum(
-        1 for e in deploy_monitoring["pipeline_events"]
+        1
+        for e in deploy_monitoring["pipeline_events"]
         if e.get("ts") and e["ts"] >= cutoff and e.get("type") == event_type
     )
 
@@ -942,7 +1114,8 @@ def get_pipeline_health_snapshot() -> Dict[str, Any]:
                 last_event_ts[et] = iso
 
     alerts_active = [
-        et for et, threshold in PIPELINE_ALERT_THRESHOLDS.items()
+        et
+        for et, threshold in PIPELINE_ALERT_THRESHOLDS.items()
         if counts.get(et, 0) >= threshold
     ]
 
@@ -991,11 +1164,17 @@ def _post_pipeline_alert(category: str, count: int, threshold: int) -> None:
     )
     logger.error(
         title,
-        extra={"alert": True, "type": "pipeline_health", "category": category,
-               "count": count, "threshold": threshold},
+        extra={
+            "alert": True,
+            "type": "pipeline_health",
+            "category": category,
+            "count": count,
+            "threshold": threshold,
+        },
     )
     try:
         from app.main import _send_webhook_notification  # noqa: PLC0415
+
         # Detached task — webhook is fire-and-forget by design.
         # asyncio.get_running_loop() raises RuntimeError outside an event loop;
         # that's the correct signal to skip dispatch (e.g. sync tests).
@@ -1007,6 +1186,7 @@ def _post_pipeline_alert(category: str, count: int, threshold: int) -> None:
         pass
     except Exception as e:
         logger.warning(f"[PIPELINE_HEALTH] webhook dispatch skipped: {e}")
+
 
 # --- Direction-Level Failure Streak Tracking ---
 # direction_id -> {
@@ -1047,17 +1227,20 @@ def record_direction_result(
     if not direction_id:
         return
 
-    streak = direction_failure_streaks.setdefault(direction_id, {
-        "consecutive_failures": 0,
-        "consecutive_infra_failures": 0,
-        "last_failure_class": "",
-        "last_failure_at": None,
-        "held": False,
-        "held_at": None,
-        "held_reason": "",
-        "held_failure_class": "",
-        "project_id": project_id,
-    })
+    streak = direction_failure_streaks.setdefault(
+        direction_id,
+        {
+            "consecutive_failures": 0,
+            "consecutive_infra_failures": 0,
+            "last_failure_class": "",
+            "last_failure_at": None,
+            "held": False,
+            "held_at": None,
+            "held_reason": "",
+            "held_failure_class": "",
+            "project_id": project_id,
+        },
+    )
     # Backfill new fields for entries created before infra tracking existed.
     streak.setdefault("consecutive_infra_failures", 0)
     streak.setdefault("held_reason", "")
@@ -1087,7 +1270,10 @@ def record_direction_result(
     streak["consecutive_failures"] += 1
     streak["last_failure_class"] = failure_class
     streak["last_failure_at"] = _utcnow()
-    if streak["consecutive_failures"] >= DIRECTION_HOLD_THRESHOLD and not streak["held"]:
+    if (
+        streak["consecutive_failures"] >= DIRECTION_HOLD_THRESHOLD
+        and not streak["held"]
+    ):
         streak["held"] = True
         streak["held_at"] = _utcnow()
         streak["held_reason"] = "code"
@@ -1132,15 +1318,22 @@ def get_direction_hold_info(direction_id: str) -> Dict[str, Any]:
         return base
 
     held_at = streak.get("held_at")
-    if held_at and (_utcnow() - held_at).total_seconds() > DIRECTION_HOLD_TIMEOUT_HOURS * 3600:
+    if (
+        held_at
+        and (_utcnow() - held_at).total_seconds() > DIRECTION_HOLD_TIMEOUT_HOURS * 3600
+    ):
         streak["held"] = False
         streak["held_at"] = None
         streak["held_reason"] = ""
         streak["held_failure_class"] = ""
-        logger.info(f"[DIRECTION HEALTH] Direction {direction_id} hold expired (timeout).")
+        logger.info(
+            f"[DIRECTION HEALTH] Direction {direction_id} hold expired (timeout)."
+        )
         return base
 
-    held_until = held_at + timedelta(hours=DIRECTION_HOLD_TIMEOUT_HOURS) if held_at else None
+    held_until = (
+        held_at + timedelta(hours=DIRECTION_HOLD_TIMEOUT_HOURS) if held_at else None
+    )
     if streak.get("held_reason") == "infra":
         count = streak.get("consecutive_infra_failures", 0)
         fc = streak.get("held_failure_class") or streak["last_failure_class"] or "INFRA"
@@ -1150,7 +1343,11 @@ def get_direction_hold_info(direction_id: str) -> Dict[str, Any]:
         )
     else:
         count = streak["consecutive_failures"]
-        fc = streak.get("held_failure_class") or streak["last_failure_class"] or "CODE_ERROR"
+        fc = (
+            streak.get("held_failure_class")
+            or streak["last_failure_class"]
+            or "CODE_ERROR"
+        )
         reason = f"Held: direction has {count} consecutive {fc} failures — awaiting investigation"
 
     return {
@@ -1180,10 +1377,16 @@ def get_held_directions() -> Dict[str, Dict]:
         if held:
             result[did] = {
                 "consecutive_failures": streak["consecutive_failures"],
-                "consecutive_infra_failures": streak.get("consecutive_infra_failures", 0),
+                "consecutive_infra_failures": streak.get(
+                    "consecutive_infra_failures", 0
+                ),
                 "last_failure_class": streak["last_failure_class"],
-                "last_failure_at": streak["last_failure_at"].isoformat() if streak.get("last_failure_at") else None,
-                "held_at": streak["held_at"].isoformat() if streak.get("held_at") else None,
+                "last_failure_at": streak["last_failure_at"].isoformat()
+                if streak.get("last_failure_at")
+                else None,
+                "held_at": streak["held_at"].isoformat()
+                if streak.get("held_at")
+                else None,
                 "held_reason": streak.get("held_reason", "code"),
                 "project_id": streak.get("project_id", ""),
                 "reason": reason,
@@ -1225,7 +1428,9 @@ def sweep_stale_in_memory_state() -> Dict[str, int]:
     for did, streak in list(direction_failure_streaks.items()):
         if streak.get("held"):
             continue
-        if streak.get("consecutive_failures", 0) or streak.get("consecutive_infra_failures", 0):
+        if streak.get("consecutive_failures", 0) or streak.get(
+            "consecutive_infra_failures", 0
+        ):
             continue
         last = streak.get("last_failure_at")
         if last is None or last < streak_cutoff:
@@ -1285,7 +1490,9 @@ def sweep_stale_in_memory_state() -> Dict[str, int]:
     return pruned
 
 
-def get_task_type_failure_rate(task_type: str, window_minutes: int = 15) -> tuple[float, int]:
+def get_task_type_failure_rate(
+    task_type: str, window_minutes: int = 15
+) -> tuple[float, int]:
     """Compute failure rate for a specific task_type within the trailing window.
 
     Backward-compatible: entries without a task_type field (old format or empty
@@ -1295,7 +1502,8 @@ def get_task_type_failure_rate(task_type: str, window_minutes: int = 15) -> tupl
     """
     cutoff = (_utcnow() - timedelta(minutes=window_minutes)).isoformat()
     relevant = [
-        r for r in deploy_monitoring["task_results"]
+        r
+        for r in deploy_monitoring["task_results"]
         if r[0] >= cutoff and (len(r) < 4 or not r[3] or r[3] == task_type)
     ]
     if not relevant:
@@ -1321,12 +1529,12 @@ external_health: Dict = {
     "dispatch_api": True,
     "gcp": True,
     "db": True,
-    "provider_health": {},          # provider_name -> structured provider health snapshot
-    "dispatch_health": {},          # aggregate dispatchability summary
-    "last_check": None,             # datetime of last health check
-    "failed_deps": [],              # list of currently-failed dependency names
-    "errors": {},                   # dep_name -> last error message
-    "consecutive_failures": {},     # dep_name -> int count of consecutive failed health checks
+    "provider_health": {},  # provider_name -> structured provider health snapshot
+    "dispatch_health": {},  # aggregate dispatchability summary
+    "last_check": None,  # datetime of last health check
+    "failed_deps": [],  # list of currently-failed dependency names
+    "errors": {},  # dep_name -> last error message
+    "consecutive_failures": {},  # dep_name -> int count of consecutive failed health checks
 }
 
 # --- GitHub API Quota Tracking ---
@@ -1335,10 +1543,10 @@ external_health: Dict = {
 # and drives the dashboard quota widget + WARNING alert when remaining < 100.
 # Treat None values as "not yet observed — no recent GitHub call".
 github_quota: Dict = {
-    "remaining": None,              # int, lowest remaining seen since last reset
-    "limit": None,                  # int, 5000 for GitHub App installs
-    "reset_at": None,               # int unix ts, when quota resets
-    "last_updated": None,           # isoformat str, last observation
+    "remaining": None,  # int, lowest remaining seen since last reset
+    "limit": None,  # int, 5000 for GitHub App installs
+    "reset_at": None,  # int unix ts, when quota resets
+    "last_updated": None,  # isoformat str, last observation
 }
 
 # Separate bucket for App-JWT (~60/hr). Used by /app/installations/*/access_tokens
@@ -1380,4 +1588,64 @@ github_cache_hits: Dict[str, int] = {
 # making an active API call that competes for the shared connection pool.
 # Seed with current time so the first health check uses the passive path
 # instead of an active probe that can fail on cold start.
-last_github_success: Optional[datetime] = datetime.utcnow()  # Module-level init, _utcnow not available here
+last_github_success: Optional[datetime] = (
+    datetime.utcnow()
+)  # Module-level init, _utcnow not available here
+
+
+# --- Dispatcher Cycle Log (ring buffer for throughput/gating observability) ---
+# Bounded to the last 1000 records; entries older than 30 days are excluded by
+# get_dispatcher_cycles() callers but not proactively evicted (deque handles FIFO).
+# Each record is a plain dict so it stays JSON-serialisable without extra deps.
+_DISPATCHER_CYCLE_LOG_MAXLEN = 1000
+_DISPATCHER_CYCLE_TTL_DAYS = 30
+
+dispatcher_cycle_log: deque = deque(maxlen=_DISPATCHER_CYCLE_LOG_MAXLEN)
+
+
+def record_dispatcher_cycle(
+    *,
+    project_id: str,
+    cycle_started_at: datetime,
+    cycle_finished_at: datetime,
+    signals_evaluated: int,
+    signals_tripped: int,
+    spawns_emitted: int,
+    rejections_by_reason: Optional[Dict[str, int]] = None,
+    mttd_p50_sec: Optional[float] = None,
+) -> None:
+    """Append one dispatcher cycle record to the ring buffer.
+
+    Called at the end of each pipeline_regression_dispatcher.run_once() tick.
+    The deque maxlen caps memory; get_dispatcher_cycles() applies the 30-day TTL.
+    """
+    dispatcher_cycle_log.append(
+        {
+            "project_id": project_id,
+            "cycle_started_at": cycle_started_at.isoformat(),
+            "cycle_finished_at": cycle_finished_at.isoformat(),
+            "signals_evaluated": signals_evaluated,
+            "signals_tripped": signals_tripped,
+            "spawns_emitted": spawns_emitted,
+            "rejections_by_reason": dict(rejections_by_reason or {}),
+            "mttd_p50_sec": mttd_p50_sec,
+        }
+    )
+
+
+def get_dispatcher_cycles(
+    project_id: Optional[str] = None,
+    window_hours: int = 24,
+) -> list[Dict]:
+    """Return dispatcher cycle records within the trailing window.
+
+    Filters to `project_id` when provided; returns all projects otherwise.
+    Records older than `window_hours` are excluded.
+    """
+    cutoff = (_utcnow() - timedelta(hours=window_hours)).isoformat()
+    return [
+        r
+        for r in dispatcher_cycle_log
+        if r.get("cycle_started_at", "") >= cutoff
+        and (project_id is None or r.get("project_id") == project_id)
+    ]

@@ -4,6 +4,7 @@ from httpx import AsyncClient
 from app.models import Project, ProjectMember, ProjectStatus, Task, TaskStatus
 from app.auth import create_agent_token
 
+
 @pytest.mark.smoketest
 @pytest.mark.asyncio
 async def test_read_root(client: AsyncClient):
@@ -13,6 +14,7 @@ async def test_read_root(client: AsyncClient):
     response = await client.get("/")
     assert response.status_code == 200
     assert response.json() == {"status": "online", "service": "Blueprint Orchestrator"}
+
 
 @pytest.mark.asyncio
 async def test_deploy_blueprint(client: AsyncClient, mocker):
@@ -26,7 +28,7 @@ async def test_deploy_blueprint(client: AsyncClient, mocker):
     payload = {
         "name": "Test Project",
         "payloads": [{"type": "smoketest"}],
-        "storage_uris": []
+        "storage_uris": [],
     }
 
     response = await client.post("/api/deploy", json=payload)
@@ -43,6 +45,7 @@ async def test_deploy_blueprint(client: AsyncClient, mocker):
     assert project_data["name"] == "Test Project"
     assert project_data["status"] == ProjectStatus.DEPLOYING
 
+
 @pytest.mark.smoketest
 @pytest.mark.asyncio
 async def test_list_projects_empty(client: AsyncClient):
@@ -55,6 +58,7 @@ async def test_list_projects_empty(client: AsyncClient):
     assert data["projects"] == []
     assert "pagination" in data
 
+
 @pytest.mark.asyncio
 async def test_get_project_tasks(client: AsyncClient, mocker):
     """
@@ -66,7 +70,7 @@ async def test_get_project_tasks(client: AsyncClient, mocker):
     payload = {
         "name": "Test Project Tasks",
         "payloads": [{"type": "smoketest"}],
-        "storage_uris": []
+        "storage_uris": [],
     }
     create_resp = await client.post("/api/deploy", json=payload)
     project_id = create_resp.json()["project_id"]
@@ -81,23 +85,50 @@ async def test_get_project_tasks(client: AsyncClient, mocker):
     assert len(child_tasks) == 1
     assert child_tasks[0]["payloads"][0]["type"] == "smoketest"
 
+
 @pytest.mark.asyncio
-async def test_get_project_tasks_filter_by_direction_and_type(client: AsyncClient, db_session):
+async def test_get_project_tasks_filter_by_direction_and_type(
+    client: AsyncClient, db_session
+):
     """Filter tasks by direction_id (JSONB context) and task_type (first payload)."""
-    project = Project(name="Filter Test", user_id="test-user-123", status=ProjectStatus.DEPLOYING)
+    project = Project(
+        name="Filter Test", user_id="test-user-123", status=ProjectStatus.DEPLOYING
+    )
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
-    db_session.add(ProjectMember(project_id=project.id, user_id="test-user-123", role="owner"))
+    db_session.add(
+        ProjectMember(project_id=project.id, user_id="test-user-123", role="owner")
+    )
 
-    t1 = Task(project_id=project.id, title="A", status=TaskStatus.QUEUED,
-              payloads=[{"type": "research"}], context={"direction_id": "d-1"})
-    t2 = Task(project_id=project.id, title="B", status=TaskStatus.QUEUED,
-              payloads=[{"type": "create"}], context={"direction_id": "d-1"})
-    t3 = Task(project_id=project.id, title="C", status=TaskStatus.QUEUED,
-              payloads=[{"type": "research"}], context={"direction_id": "d-2"})
-    t4 = Task(project_id=project.id, title="D", status=TaskStatus.QUEUED,
-              payloads=[{"type": "create"}], context={})
+    t1 = Task(
+        project_id=project.id,
+        title="A",
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "research"}],
+        context={"direction_id": "d-1"},
+    )
+    t2 = Task(
+        project_id=project.id,
+        title="B",
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "create"}],
+        context={"direction_id": "d-1"},
+    )
+    t3 = Task(
+        project_id=project.id,
+        title="C",
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "research"}],
+        context={"direction_id": "d-2"},
+    )
+    t4 = Task(
+        project_id=project.id,
+        title="D",
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "create"}],
+        context={},
+    )
     for t in (t1, t2, t3, t4):
         db_session.add(t)
     await db_session.commit()
@@ -133,7 +164,9 @@ async def test_get_project_tasks_includes_cost_fields(client: AsyncClient, db_se
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
-    db_session.add(ProjectMember(project_id=project.id, user_id="test-user-123", role="owner"))
+    db_session.add(
+        ProjectMember(project_id=project.id, user_id="test-user-123", role="owner")
+    )
 
     start = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=1)
     stop = start + timedelta(seconds=3600)
@@ -161,7 +194,9 @@ async def test_get_project_tasks_includes_cost_fields(client: AsyncClient, db_se
     assert resp.status_code == 200
     by_title = {t["title"]: t for t in resp.json()["tasks"]}
     assert by_title["Completed"]["duration_seconds"] == pytest.approx(3600.0)
-    assert by_title["Completed"]["estimated_cost_usd"] == pytest.approx(3600.0 * (0.067 / 3600))
+    assert by_title["Completed"]["estimated_cost_usd"] == pytest.approx(
+        3600.0 * (0.067 / 3600)
+    )
     assert by_title["Pending"]["duration_seconds"] is None
     assert by_title["Pending"]["estimated_cost_usd"] is None
 
@@ -172,6 +207,7 @@ async def test_get_project_tasks_not_found(client: AsyncClient):
     Tests that requesting tasks for a non-existent project returns 404.
     """
     import uuid
+
     fake_id = str(uuid.uuid4())
     resp = await client.get(f"/api/projects/{fake_id}/tasks")
     assert resp.status_code == 404
@@ -179,14 +215,13 @@ async def test_get_project_tasks_not_found(client: AsyncClient):
 
 # --- Validation and Error Handling Tests ---
 
+
 @pytest.mark.asyncio
 async def test_deploy_missing_name_returns_422(client: AsyncClient):
     """
     POST /api/deploy without the required `name` field should return 422.
     """
-    payload = {
-        "payloads": [{"command": "echo hello"}]
-    }
+    payload = {"payloads": [{"command": "echo hello"}]}
     response = await client.post("/api/deploy", json=payload)
     assert response.status_code == 422
 
@@ -196,10 +231,7 @@ async def test_deploy_null_name_returns_422(client: AsyncClient):
     """
     POST /api/deploy with `name` set to null should return 422 since name is required str.
     """
-    payload = {
-        "name": None,
-        "payloads": [{"command": "echo hello"}]
-    }
+    payload = {"name": None, "payloads": [{"command": "echo hello"}]}
     response = await client.post("/api/deploy", json=payload)
     assert response.status_code == 422
 
@@ -215,7 +247,7 @@ async def test_deploy_extra_fields_are_ignored(client: AsyncClient, mocker):
         "name": "Test Extra Fields",
         "payloads": [{"type": "smoketest"}],
         "unexpected_field": "should be ignored",
-        "another_extra": 42
+        "another_extra": 42,
     }
     response = await client.post("/api/deploy", json=payload)
     assert response.status_code == 200
@@ -233,7 +265,7 @@ async def test_get_project_different_user_returns_404(client: AsyncClient, db_se
     other_project = Project(
         name="Other User's Project",
         user_id="other-user-456",
-        status=ProjectStatus.DEPLOYING
+        status=ProjectStatus.DEPLOYING,
     )
     db_session.add(other_project)
     await db_session.commit()
@@ -244,7 +276,9 @@ async def test_get_project_different_user_returns_404(client: AsyncClient, db_se
 
 
 @pytest.mark.asyncio
-async def test_get_project_tasks_different_user_returns_404(client: AsyncClient, db_session):
+async def test_get_project_tasks_different_user_returns_404(
+    client: AsyncClient, db_session
+):
     """
     GET /api/projects/{id}/tasks where the project belongs to a different user_id should
     return 404, since the app verifies project ownership before fetching tasks.
@@ -252,7 +286,7 @@ async def test_get_project_tasks_different_user_returns_404(client: AsyncClient,
     other_project = Project(
         name="Other User's Tasks Project",
         user_id="other-user-456",
-        status=ProjectStatus.DEPLOYING
+        status=ProjectStatus.DEPLOYING,
     )
     db_session.add(other_project)
     await db_session.commit()
@@ -272,7 +306,7 @@ async def test_list_projects_pagination_beyond_results(client: AsyncClient, db_s
         project = Project(
             name=f"Pagination Project {i}",
             user_id="test-user-123",
-            status=ProjectStatus.DEPLOYING
+            status=ProjectStatus.DEPLOYING,
         )
         db_session.add(project)
     await db_session.commit()
@@ -295,17 +329,15 @@ async def test_list_projects_status_filter(client: AsyncClient, db_session):
     completed_project = Project(
         name="Completed Project",
         user_id="test-user-123",
-        status=ProjectStatus.COMPLETED
+        status=ProjectStatus.COMPLETED,
     )
     deploying_project = Project(
         name="Deploying Project",
         user_id="test-user-123",
-        status=ProjectStatus.DEPLOYING
+        status=ProjectStatus.DEPLOYING,
     )
     failed_project = Project(
-        name="Failed Project",
-        user_id="test-user-123",
-        status=ProjectStatus.FAILED
+        name="Failed Project", user_id="test-user-123", status=ProjectStatus.FAILED
     )
     db_session.add(completed_project)
     db_session.add(deploying_project)
@@ -313,7 +345,9 @@ async def test_list_projects_status_filter(client: AsyncClient, db_session):
     await db_session.commit()
     for p in [completed_project, deploying_project, failed_project]:
         await db_session.refresh(p)
-        db_session.add(ProjectMember(project_id=p.id, user_id="test-user-123", role="owner"))
+        db_session.add(
+            ProjectMember(project_id=p.id, user_id="test-user-123", role="owner")
+        )
     await db_session.commit()
 
     response = await client.get("/api/projects?status=COMPLETED")
@@ -376,6 +410,7 @@ async def test_fix_task_receives_project_context(client: AsyncClient, db_session
 
 # --- Bulk Action Tests ---
 
+
 async def _make_task(db_session, project, status, requires_approval=False):
     """Helper: create a task belonging to a project with test user as member."""
     task = Task(
@@ -401,7 +436,9 @@ async def _make_project_with_member(db_session):
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
-    db_session.add(ProjectMember(project_id=project.id, user_id="test-user-123", role="owner"))
+    db_session.add(
+        ProjectMember(project_id=project.id, user_id="test-user-123", role="owner")
+    )
     await db_session.commit()
     return project
 
@@ -450,8 +487,12 @@ async def test_admin_tasks_include_estimated_cost_usd(client: AsyncClient, db_se
     list_resp = await client.get("/api/admin/tasks", params={"limit": 100})
     assert list_resp.status_code == 200
     by_id = {t["id"]: t for t in list_resp.json()["tasks"]}
-    assert by_id[str(spot_task.id)]["estimated_cost_usd"] == pytest.approx(3600 * SPOT_RATE)
-    assert by_id[str(ondemand_task.id)]["estimated_cost_usd"] == pytest.approx(3600 * ON_DEMAND_RATE)
+    assert by_id[str(spot_task.id)]["estimated_cost_usd"] == pytest.approx(
+        3600 * SPOT_RATE
+    )
+    assert by_id[str(ondemand_task.id)]["estimated_cost_usd"] == pytest.approx(
+        3600 * ON_DEMAND_RATE
+    )
     assert by_id[str(no_timing_task.id)]["estimated_cost_usd"] is None
 
     detail_resp = await client.get(f"/api/admin/tasks/{spot_task.id}")
@@ -464,27 +505,53 @@ async def test_admin_tasks_include_estimated_cost_usd(client: AsyncClient, db_se
 
 
 @pytest.mark.asyncio
-async def test_admin_tasks_filter_by_direction_and_type(client: AsyncClient, db_session):
+async def test_admin_tasks_filter_by_direction_and_type(
+    client: AsyncClient, db_session
+):
     """Admin /api/admin/tasks supports direction_id and task_type filters."""
     project = await _make_project_with_member(db_session)
 
-    t1 = Task(project_id=project.id, title="A", status=TaskStatus.QUEUED,
-              payloads=[{"type": "research"}], context={"direction_id": "d-1"})
-    t2 = Task(project_id=project.id, title="B", status=TaskStatus.QUEUED,
-              payloads=[{"type": "create"}], context={"direction_id": "d-1"})
-    t3 = Task(project_id=project.id, title="C", status=TaskStatus.QUEUED,
-              payloads=[{"type": "research"}], context={"direction_id": "d-2"})
-    t4 = Task(project_id=project.id, title="D", status=TaskStatus.QUEUED,
-              payloads=[{"type": "create"}], context={})
+    t1 = Task(
+        project_id=project.id,
+        title="A",
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "research"}],
+        context={"direction_id": "d-1"},
+    )
+    t2 = Task(
+        project_id=project.id,
+        title="B",
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "create"}],
+        context={"direction_id": "d-1"},
+    )
+    t3 = Task(
+        project_id=project.id,
+        title="C",
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "research"}],
+        context={"direction_id": "d-2"},
+    )
+    t4 = Task(
+        project_id=project.id,
+        title="D",
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "create"}],
+        context={},
+    )
     db_session.add_all([t1, t2, t3, t4])
     await db_session.commit()
 
-    resp = await client.get("/api/admin/tasks", params={"direction_id": "d-1", "limit": 100})
+    resp = await client.get(
+        "/api/admin/tasks", params={"direction_id": "d-1", "limit": 100}
+    )
     assert resp.status_code == 200
     titles = sorted(t["title"] for t in resp.json()["tasks"])
     assert titles == ["A", "B"]
 
-    resp = await client.get("/api/admin/tasks", params={"task_type": "research", "limit": 100})
+    resp = await client.get(
+        "/api/admin/tasks", params={"task_type": "research", "limit": 100}
+    )
     titles = sorted(t["title"] for t in resp.json()["tasks"])
     assert titles == ["A", "C"]
 
@@ -507,7 +574,9 @@ async def test_bulk_action_invalid_action(client: AsyncClient):
 
 
 @pytest.mark.asyncio
-async def test_bulk_action_retry_requeues_tasks(client: AsyncClient, db_session, mocker):
+async def test_bulk_action_retry_requeues_tasks(
+    client: AsyncClient, db_session, mocker
+):
     """Bulk retry sets status=QUEUED, assigns new vm_instance_id, and creates TaskHistory."""
     mocker.patch("app.main._ensure_vm_deleted", return_value=None)
 
@@ -533,11 +602,17 @@ async def test_bulk_action_retry_requeues_tasks(client: AsyncClient, db_session,
 
 
 @pytest.mark.asyncio
-async def test_bulk_action_approve_clears_approval_flag(client: AsyncClient, db_session):
+async def test_bulk_action_approve_clears_approval_flag(
+    client: AsyncClient, db_session
+):
     """Bulk approve clears requires_approval and creates TaskHistory."""
     project = await _make_project_with_member(db_session)
-    task1 = await _make_task(db_session, project, TaskStatus.QUEUED, requires_approval=True)
-    task2 = await _make_task(db_session, project, TaskStatus.QUEUED, requires_approval=True)
+    task1 = await _make_task(
+        db_session, project, TaskStatus.QUEUED, requires_approval=True
+    )
+    task2 = await _make_task(
+        db_session, project, TaskStatus.QUEUED, requires_approval=True
+    )
 
     response = await client.post(
         "/api/admin/tasks/bulk-action",
@@ -580,7 +655,9 @@ async def test_bulk_action_partial_errors(client: AsyncClient, db_session, mocke
 
 
 @pytest.mark.asyncio
-async def test_bulk_action_cancel_sets_cancelled(client: AsyncClient, db_session, mocker):
+async def test_bulk_action_cancel_sets_cancelled(
+    client: AsyncClient, db_session, mocker
+):
     """Bulk cancel sets status=CANCELLED and creates TaskHistory."""
     mocker.patch("app.main._ensure_vm_deleted", return_value=None)
     mocker.patch("app.max_plan_pool.release_max_plan_account", return_value=None)
@@ -604,7 +681,9 @@ async def test_bulk_action_cancel_sets_cancelled(client: AsyncClient, db_session
 
 
 @pytest.mark.asyncio
-async def test_bulk_action_cancel_skips_terminal_tasks(client: AsyncClient, db_session, mocker):
+async def test_bulk_action_cancel_skips_terminal_tasks(
+    client: AsyncClient, db_session, mocker
+):
     """Bulk cancel returns error for already-terminal tasks."""
     mocker.patch("app.main._ensure_vm_deleted", return_value=None)
 

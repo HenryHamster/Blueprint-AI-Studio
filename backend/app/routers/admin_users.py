@@ -1,4 +1,5 @@
 """User and project member management endpoints."""
+
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -12,13 +13,12 @@ from app.auth import get_current_user, require_admin
 from app.admin import _get_user_project, _get_user_project_with_role
 
 router = APIRouter(
-    prefix="/api/admin",
-    tags=["admin-users"],
-    dependencies=[Depends(get_current_user)]
+    prefix="/api/admin", tags=["admin-users"], dependencies=[Depends(get_current_user)]
 )
 
 
 # ── Pydantic Models ───────────────────────────────────────────────────────────
+
 
 class MemberCreate(BaseModel):
     email: str
@@ -76,6 +76,7 @@ class UserUpdate(BaseModel):
 
 # ── Project Member Endpoints ──────────────────────────────────────────────────
 
+
 @router.get("/projects/{project_id}/members")
 async def list_project_members(
     project_id: uuid.UUID,
@@ -111,29 +112,47 @@ async def add_project_member(
     current_user: dict = Depends(get_current_user),
 ):
     """Add a member to a project. Owner-only."""
-    await _get_user_project_with_role(project_id, current_user["user_id"], session, "owner")
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
 
     # Look up user by email in AllowedUser table
-    allowed = (await session.execute(
-        select(AllowedUser).where(AllowedUser.email == payload.email.strip().lower())
-    )).scalar_one_or_none()
+    allowed = (
+        await session.execute(
+            select(AllowedUser).where(
+                AllowedUser.email == payload.email.strip().lower()
+            )
+        )
+    ).scalar_one_or_none()
     if not allowed:
-        raise HTTPException(status_code=404, detail="User not found. They must be added to the system first.")
+        raise HTTPException(
+            status_code=404,
+            detail="User not found. They must be added to the system first.",
+        )
     target_user_id = allowed.firebase_uid
     if not target_user_id:
-        raise HTTPException(status_code=400, detail="User has not signed in yet (no Firebase UID linked)")
+        raise HTTPException(
+            status_code=400,
+            detail="User has not signed in yet (no Firebase UID linked)",
+        )
 
     # Check if already a member
-    existing = (await session.execute(
-        select(ProjectMember).where(
-            ProjectMember.project_id == project_id,
-            ProjectMember.user_id == target_user_id,
+    existing = (
+        await session.execute(
+            select(ProjectMember).where(
+                ProjectMember.project_id == project_id,
+                ProjectMember.user_id == target_user_id,
+            )
         )
-    )).scalar_one_or_none()
+    ).scalar_one_or_none()
     if existing:
-        raise HTTPException(status_code=409, detail="User is already a member of this project")
+        raise HTTPException(
+            status_code=409, detail="User is already a member of this project"
+        )
 
-    member = ProjectMember(project_id=project_id, user_id=target_user_id, role=payload.role)
+    member = ProjectMember(
+        project_id=project_id, user_id=target_user_id, role=payload.role
+    )
     session.add(member)
     await session.commit()
     await session.refresh(member)
@@ -155,7 +174,9 @@ async def update_project_member(
     current_user: dict = Depends(get_current_user),
 ):
     """Update a member's role. Owner-only. Cannot change owner's own role."""
-    await _get_user_project_with_role(project_id, current_user["user_id"], session, "owner")
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
 
     member = await session.get(ProjectMember, member_id)
     if not member or member.project_id != project_id:
@@ -187,7 +208,9 @@ async def remove_project_member(
 
     # Non-owners can only remove themselves (leave)
     if member.user_id != current_user["user_id"]:
-        await _get_user_project_with_role(project_id, current_user["user_id"], session, "owner")
+        await _get_user_project_with_role(
+            project_id, current_user["user_id"], session, "owner"
+        )
 
     await session.delete(member)
     await session.commit()
@@ -195,6 +218,7 @@ async def remove_project_member(
 
 
 # ── User Management Endpoints ─────────────────────────────────────────────────
+
 
 @router.get("/users")
 async def list_users(
@@ -224,11 +248,15 @@ async def add_user(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(require_admin),
 ):
-    existing = (await session.execute(
-        select(AllowedUser).where(AllowedUser.email == payload.email)
-    )).scalar_one_or_none()
+    existing = (
+        await session.execute(
+            select(AllowedUser).where(AllowedUser.email == payload.email)
+        )
+    ).scalar_one_or_none()
     if existing:
-        raise HTTPException(status_code=409, detail="User with this email already exists")
+        raise HTTPException(
+            status_code=409, detail="User with this email already exists"
+        )
 
     user = AllowedUser(email=payload.email, role=payload.role)
     session.add(user)
@@ -280,7 +308,9 @@ async def remove_user(
         raise HTTPException(status_code=404, detail="User not found")
 
     # Prevent self-deletion
-    if user.firebase_uid == current_user.get("user_id") or user.email == current_user.get("email"):
+    if user.firebase_uid == current_user.get(
+        "user_id"
+    ) or user.email == current_user.get("email"):
         raise HTTPException(status_code=400, detail="Cannot remove your own access")
 
     await session.delete(user)

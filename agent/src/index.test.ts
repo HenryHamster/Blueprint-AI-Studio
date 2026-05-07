@@ -356,6 +356,7 @@ describe('runProjectLintChecks', () => {
     vi.clearAllMocks();
     // Return empty string (not Buffer) so sendLog/sanitize don't receive a Buffer
     (vi.mocked(execFileSync) as unknown as { mockReturnValue: (v: string) => void }).mockReturnValue('');
+    vi.mocked(execSync).mockReturnValue('');
   });
 
   it('uses dynamic lint_cmd when buildConfig is provided with a touched directory', () => {

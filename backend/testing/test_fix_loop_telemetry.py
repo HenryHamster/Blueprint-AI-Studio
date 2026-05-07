@@ -7,8 +7,8 @@ Covers:
     loop arrive via /api/agent/heartbeat and land on Task.fix_loop_history.
   - the admin read endpoint returns the stored history + summary.
 """
+
 import uuid
-from datetime import datetime, timedelta
 
 import pytest
 from httpx import AsyncClient
@@ -42,6 +42,7 @@ def _ev(loop: str, iteration: int, **kw):
 
 # --- ingest helper unit tests ---------------------------------------------
 
+
 def test_apply_fix_loop_events_appends_new_iterations():
     task = Task(project_id=uuid.uuid4(), payloads=[{"cmd": "x"}])
     events = [
@@ -55,15 +56,21 @@ def test_apply_fix_loop_events_appends_new_iterations():
 
 def test_apply_fix_loop_events_replaces_by_loop_iteration():
     task = Task(project_id=uuid.uuid4(), payloads=[{"cmd": "x"}])
-    apply_fix_loop_events(task, [FixLoopEventIn(**_ev("lint", 1, exit_reason="in_progress"))])
-    apply_fix_loop_events(task, [FixLoopEventIn(**_ev("lint", 1, exit_reason="passed"))])
+    apply_fix_loop_events(
+        task, [FixLoopEventIn(**_ev("lint", 1, exit_reason="in_progress"))]
+    )
+    apply_fix_loop_events(
+        task, [FixLoopEventIn(**_ev("lint", 1, exit_reason="passed"))]
+    )
     assert len(task.fix_loop_history["lint"]) == 1
     assert task.fix_loop_history["lint"][0]["exit_reason"] == "passed"
 
 
 def test_apply_fix_loop_events_caps_per_loop_list():
     task = Task(project_id=uuid.uuid4(), payloads=[{"cmd": "x"}])
-    events = [FixLoopEventIn(**_ev("test", i)) for i in range(1, MAX_ATTEMPTS_PER_LOOP + 11)]
+    events = [
+        FixLoopEventIn(**_ev("test", i)) for i in range(1, MAX_ATTEMPTS_PER_LOOP + 11)
+    ]
     apply_fix_loop_events(task, events)
     # Capped to MAX_ATTEMPTS_PER_LOOP, oldest dropped — newest must remain.
     bucket = task.fix_loop_history["test"]
@@ -74,11 +81,14 @@ def test_apply_fix_loop_events_caps_per_loop_list():
 
 def test_apply_fix_loop_events_isolates_loops():
     task = Task(project_id=uuid.uuid4(), payloads=[{"cmd": "x"}])
-    apply_fix_loop_events(task, [
-        FixLoopEventIn(**_ev("lint", 1)),
-        FixLoopEventIn(**_ev("test", 1)),
-        FixLoopEventIn(**_ev("check", 1)),
-    ])
+    apply_fix_loop_events(
+        task,
+        [
+            FixLoopEventIn(**_ev("lint", 1)),
+            FixLoopEventIn(**_ev("test", 1)),
+            FixLoopEventIn(**_ev("check", 1)),
+        ],
+    )
     assert len(task.fix_loop_history["lint"]) == 1
     assert len(task.fix_loop_history["test"]) == 1
     assert len(task.fix_loop_history["check"]) == 1
@@ -104,6 +114,7 @@ def test_summarize_fix_loop_history_reports_terminal_reason():
 
 # --- end-to-end via heartbeat + admin read endpoint ----------------------
 
+
 @pytest.mark.asyncio
 async def test_heartbeat_persists_fix_loop_events_and_admin_read(
     client: AsyncClient, db_session
@@ -116,7 +127,9 @@ async def test_heartbeat_persists_fix_loop_events_and_admin_read(
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
-    db_session.add(ProjectMember(project_id=project.id, user_id="test-user-123", role="owner"))
+    db_session.add(
+        ProjectMember(project_id=project.id, user_id="test-user-123", role="owner")
+    )
     await db_session.commit()
 
     task = Task(
@@ -251,6 +264,7 @@ async def test_heartbeat_drops_invalid_fix_loop_events(client: AsyncClient, db_s
 
 # --- fix-loop convergence aggregate endpoint ---------------------------------
 
+
 @pytest.mark.asyncio
 async def test_convergence_endpoint_empty(client: AsyncClient):
     """No tasks with fix-loop history → tasks_with_fix_loops == 0, all loops have zero count."""
@@ -272,7 +286,9 @@ async def test_convergence_endpoint_mixed_loops(client: AsyncClient, db_session)
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
-    db_session.add(ProjectMember(project_id=project.id, user_id="test-user-123", role="owner"))
+    db_session.add(
+        ProjectMember(project_id=project.id, user_id="test-user-123", role="owner")
+    )
     await db_session.commit()
 
     # Task 1: lint passed in 2 iterations, test passed in 1
@@ -297,7 +313,11 @@ async def test_convergence_endpoint_mixed_loops(client: AsyncClient, db_session)
         status=TaskStatus.FAILED,
         fix_loop_history={
             "lint": [
-                {"loop": "lint", "iteration": i, "exit_reason": "in_progress" if i < 4 else "max_attempts"}
+                {
+                    "loop": "lint",
+                    "iteration": i,
+                    "exit_reason": "in_progress" if i < 4 else "max_attempts",
+                }
                 for i in range(1, 5)
             ],
         },
@@ -327,13 +347,17 @@ async def test_convergence_endpoint_mixed_loops(client: AsyncClient, db_session)
 
 
 @pytest.mark.asyncio
-async def test_convergence_endpoint_iteration_distribution(client: AsyncClient, db_session):
+async def test_convergence_endpoint_iteration_distribution(
+    client: AsyncClient, db_session
+):
     """Iteration distribution buckets (1, 2, 3, 4+) are counted correctly."""
     project = Project(name="Iter dist test", user_id="test-user-123")
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
-    db_session.add(ProjectMember(project_id=project.id, user_id="test-user-123", role="owner"))
+    db_session.add(
+        ProjectMember(project_id=project.id, user_id="test-user-123", role="owner")
+    )
     await db_session.commit()
 
     buckets = [1, 1, 2, 3, 5]  # two 1-iter, one 2-iter, one 3-iter, one 4+ (5 iters)
@@ -344,7 +368,11 @@ async def test_convergence_endpoint_iteration_distribution(client: AsyncClient, 
             status=TaskStatus.COMPLETED,
             fix_loop_history={
                 "lint": [
-                    {"loop": "lint", "iteration": i, "exit_reason": "passed" if i == n else "in_progress"}
+                    {
+                        "loop": "lint",
+                        "iteration": i,
+                        "exit_reason": "passed" if i == n else "in_progress",
+                    }
                     for i in range(1, n + 1)
                 ]
             },
@@ -364,6 +392,7 @@ async def test_convergence_endpoint_iteration_distribution(client: AsyncClient, 
 
 # --- has_terminal_divergence unit tests --------------------------------------
 
+
 def test_divergence_exit_reasons_is_frozenset():
     assert isinstance(DIVERGENCE_EXIT_REASONS, frozenset)
     # Core names must be present
@@ -379,8 +408,18 @@ def test_has_terminal_divergence_empty_history():
 def test_has_terminal_divergence_fires_on_diverged_loop():
     history = {
         "lint": [
-            {"loop": "lint", "iteration": 1, "exit_reason": "in_progress", "ended_at": "2026-05-05T10:00:00"},
-            {"loop": "lint", "iteration": 2, "exit_reason": "divergence_oscillation", "ended_at": "2026-05-05T10:01:00"},
+            {
+                "loop": "lint",
+                "iteration": 1,
+                "exit_reason": "in_progress",
+                "ended_at": "2026-05-05T10:00:00",
+            },
+            {
+                "loop": "lint",
+                "iteration": 2,
+                "exit_reason": "divergence_oscillation",
+                "ended_at": "2026-05-05T10:01:00",
+            },
         ],
     }
     result = has_terminal_divergence(history)
@@ -391,8 +430,18 @@ def test_has_terminal_divergence_ignores_in_progress_tail():
     # Last entry is in_progress; last terminal is divergence → still fires
     history = {
         "lint": [
-            {"loop": "lint", "iteration": 1, "exit_reason": "divergence_detected", "ended_at": "2026-05-05T10:00:00"},
-            {"loop": "lint", "iteration": 2, "exit_reason": "in_progress", "ended_at": "2026-05-05T10:01:00"},
+            {
+                "loop": "lint",
+                "iteration": 1,
+                "exit_reason": "divergence_detected",
+                "ended_at": "2026-05-05T10:00:00",
+            },
+            {
+                "loop": "lint",
+                "iteration": 2,
+                "exit_reason": "in_progress",
+                "ended_at": "2026-05-05T10:01:00",
+            },
         ],
     }
     result = has_terminal_divergence(history)
@@ -413,10 +462,20 @@ def test_has_terminal_divergence_conservative_old_divergence_new_unrelated():
     """Old divergence in lint but most recently touched loop (test) ended with non-divergence."""
     history = {
         "lint": [
-            {"loop": "lint", "iteration": 1, "exit_reason": "divergence_oscillation", "ended_at": "2026-05-05T09:00:00"},
+            {
+                "loop": "lint",
+                "iteration": 1,
+                "exit_reason": "divergence_oscillation",
+                "ended_at": "2026-05-05T09:00:00",
+            },
         ],
         "test": [
-            {"loop": "test", "iteration": 1, "exit_reason": "max_attempts", "ended_at": "2026-05-05T10:00:00"},
+            {
+                "loop": "test",
+                "iteration": 1,
+                "exit_reason": "max_attempts",
+                "ended_at": "2026-05-05T10:00:00",
+            },
         ],
     }
     # test loop is most recent and did NOT diverge → must not fire
@@ -427,10 +486,20 @@ def test_has_terminal_divergence_most_recent_loop_wins():
     """Most recently touched loop (check) diverged even though lint passed."""
     history = {
         "lint": [
-            {"loop": "lint", "iteration": 1, "exit_reason": "passed", "ended_at": "2026-05-05T09:00:00"},
+            {
+                "loop": "lint",
+                "iteration": 1,
+                "exit_reason": "passed",
+                "ended_at": "2026-05-05T09:00:00",
+            },
         ],
         "check": [
-            {"loop": "check", "iteration": 1, "exit_reason": "runaway_detected", "ended_at": "2026-05-05T10:00:00"},
+            {
+                "loop": "check",
+                "iteration": 1,
+                "exit_reason": "runaway_detected",
+                "ended_at": "2026-05-05T10:00:00",
+            },
         ],
     }
     result = has_terminal_divergence(history)
@@ -438,6 +507,7 @@ def test_has_terminal_divergence_most_recent_loop_wins():
 
 
 # --- retry budget + divergence suppression integration -----------------------
+
 
 @pytest.mark.asyncio
 async def test_compute_effective_max_requeues_diverged_child_caps_budget(
@@ -470,8 +540,18 @@ async def test_compute_effective_max_requeues_diverged_child_caps_budget(
         status=TaskStatus.FAILED,
         fix_loop_history={
             "lint": [
-                {"loop": "lint", "iteration": 1, "exit_reason": "in_progress", "ended_at": "2026-05-05T10:00:00"},
-                {"loop": "lint", "iteration": 2, "exit_reason": "divergence_oscillation", "ended_at": "2026-05-05T10:01:00"},
+                {
+                    "loop": "lint",
+                    "iteration": 1,
+                    "exit_reason": "in_progress",
+                    "ended_at": "2026-05-05T10:00:00",
+                },
+                {
+                    "loop": "lint",
+                    "iteration": 2,
+                    "exit_reason": "divergence_oscillation",
+                    "ended_at": "2026-05-05T10:01:00",
+                },
             ],
         },
     )
@@ -520,7 +600,12 @@ async def test_compute_effective_max_requeues_non_diverged_child_unchanged(
         status=TaskStatus.FAILED,
         fix_loop_history={
             "lint": [
-                {"loop": "lint", "iteration": 1, "exit_reason": "max_attempts", "ended_at": "2026-05-05T10:00:00"},
+                {
+                    "loop": "lint",
+                    "iteration": 1,
+                    "exit_reason": "max_attempts",
+                    "ended_at": "2026-05-05T10:00:00",
+                },
             ],
         },
     )
@@ -572,6 +657,7 @@ async def test_compute_effective_max_requeues_no_fix_loop_history_unchanged(
 
 # --- admin endpoint divergence counter ---------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_convergence_endpoint_abandoned_counter(client: AsyncClient, db_session):
     """tasks_abandoned_on_divergence increments when a task has fix_loop_abandoned set."""
@@ -579,20 +665,32 @@ async def test_convergence_endpoint_abandoned_counter(client: AsyncClient, db_se
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
-    db_session.add(ProjectMember(project_id=project.id, user_id="test-user-123", role="owner"))
+    db_session.add(
+        ProjectMember(project_id=project.id, user_id="test-user-123", role="owner")
+    )
     await db_session.commit()
 
     task_normal = Task(
         project_id=project.id,
         payloads=[{"cmd": "x"}],
         status=TaskStatus.FAILED,
-        fix_loop_history={"lint": [{"loop": "lint", "iteration": 1, "exit_reason": "max_attempts"}]},
+        fix_loop_history={
+            "lint": [{"loop": "lint", "iteration": 1, "exit_reason": "max_attempts"}]
+        },
     )
     task_abandoned = Task(
         project_id=project.id,
         payloads=[{"cmd": "x"}],
         status=TaskStatus.FAILED,
-        fix_loop_history={"lint": [{"loop": "lint", "iteration": 1, "exit_reason": "divergence_oscillation"}]},
+        fix_loop_history={
+            "lint": [
+                {
+                    "loop": "lint",
+                    "iteration": 1,
+                    "exit_reason": "divergence_oscillation",
+                }
+            ]
+        },
         context={
             "fix_loop_abandoned": {
                 "loop": "lint",
@@ -616,6 +714,7 @@ async def test_convergence_endpoint_abandoned_counter(client: AsyncClient, db_se
 
 # --- fix-loop diverged-tasks drill-down endpoint -----------------------------
 
+
 @pytest.mark.asyncio
 async def test_diverged_tasks_endpoint_happy_path(client: AsyncClient, db_session):
     """Diverged-tasks endpoint returns rows with task_type from payloads,
@@ -624,7 +723,9 @@ async def test_diverged_tasks_endpoint_happy_path(client: AsyncClient, db_sessio
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
-    db_session.add(ProjectMember(project_id=project.id, user_id="test-user-123", role="owner"))
+    db_session.add(
+        ProjectMember(project_id=project.id, user_id="test-user-123", role="owner")
+    )
     await db_session.commit()
 
     # Diverged via oscillation on lint
@@ -636,12 +737,24 @@ async def test_diverged_tasks_endpoint_happy_path(client: AsyncClient, db_sessio
         status=TaskStatus.FAILED,
         fix_loop_history={
             "lint": [
-                {"loop": "lint", "iteration": 1, "exit_reason": "in_progress",
-                 "error_tail": "old error"},
-                {"loop": "lint", "iteration": 2, "exit_reason": "in_progress",
-                 "error_tail": "new error"},
-                {"loop": "lint", "iteration": 3, "exit_reason": "divergence_oscillation",
-                 "error_tail": "fingerprints A->B->A"},
+                {
+                    "loop": "lint",
+                    "iteration": 1,
+                    "exit_reason": "in_progress",
+                    "error_tail": "old error",
+                },
+                {
+                    "loop": "lint",
+                    "iteration": 2,
+                    "exit_reason": "in_progress",
+                    "error_tail": "new error",
+                },
+                {
+                    "loop": "lint",
+                    "iteration": 3,
+                    "exit_reason": "divergence_oscillation",
+                    "error_tail": "fingerprints A->B->A",
+                },
             ],
         },
     )
@@ -683,13 +796,17 @@ async def test_diverged_tasks_endpoint_happy_path(client: AsyncClient, db_sessio
 
 
 @pytest.mark.asyncio
-async def test_diverged_tasks_endpoint_filter_by_exit_reason(client: AsyncClient, db_session):
+async def test_diverged_tasks_endpoint_filter_by_exit_reason(
+    client: AsyncClient, db_session
+):
     """exit_reason query param filters rows to only that terminal reason."""
     project = Project(name="Diverged filter test", user_id="test-user-123")
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
-    db_session.add(ProjectMember(project_id=project.id, user_id="test-user-123", role="owner"))
+    db_session.add(
+        ProjectMember(project_id=project.id, user_id="test-user-123", role="owner")
+    )
     await db_session.commit()
 
     osc_task = Task(
@@ -698,7 +815,13 @@ async def test_diverged_tasks_endpoint_filter_by_exit_reason(client: AsyncClient
         payloads=[{"type": "fix"}],
         status=TaskStatus.FAILED,
         fix_loop_history={
-            "lint": [{"loop": "lint", "iteration": 1, "exit_reason": "divergence_oscillation"}],
+            "lint": [
+                {
+                    "loop": "lint",
+                    "iteration": 1,
+                    "exit_reason": "divergence_oscillation",
+                }
+            ],
         },
     )
     sim_task = Task(
@@ -707,7 +830,13 @@ async def test_diverged_tasks_endpoint_filter_by_exit_reason(client: AsyncClient
         payloads=[{"type": "fix"}],
         status=TaskStatus.FAILED,
         fix_loop_history={
-            "lint": [{"loop": "lint", "iteration": 1, "exit_reason": "divergence_similar_error"}],
+            "lint": [
+                {
+                    "loop": "lint",
+                    "iteration": 1,
+                    "exit_reason": "divergence_similar_error",
+                }
+            ],
         },
     )
     max_task = Task(

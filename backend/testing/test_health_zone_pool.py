@@ -4,6 +4,7 @@ Tests for:
   (2) Zone health logic (app/compute.py)
   (3) Max Plan account pool logic (app/main.py)
 """
+
 import pytest
 import pytest_asyncio
 from datetime import datetime, timedelta, timezone
@@ -44,6 +45,7 @@ from app.compute import (
 
 # ─── Shared Fixtures ────────────────────────────────────────────────────────
 
+
 @pytest.fixture()
 def clean_zone_state():
     """Reset zone health dicts before and after each zone test."""
@@ -56,16 +58,21 @@ def clean_zone_state():
 
 _TEST_USER = "test-user-123"
 
+
 def _add_to_pool(entry: dict):
     """Helper: add an account entry to the test user's pool and flat lookup."""
     entry.setdefault("user_id", _TEST_USER)
-    entry.setdefault("oauth_token", "sk-ant-test-token")  # Accounts need a token to be selectable
+    entry.setdefault(
+        "oauth_token", "sk-ant-test-token"
+    )  # Accounts need a token to be selectable
     _max_plan_pools.setdefault(_TEST_USER, []).append(entry)
     _account_by_id[entry["id"]] = entry
+
 
 def _pool_list() -> list:
     """Helper: return flat list of all accounts (for assertions)."""
     return list(_account_by_id.values())
+
 
 @pytest.fixture()
 def clean_max_plan_pool():
@@ -98,20 +105,22 @@ def healthy_orchestrator():
 def all_deps_healthy():
     """Ensure all external deps are True for the duration of the test."""
     original = dict(_shared_state.external_health)
-    _shared_state.external_health.update({
-        "github_api": True,
-        "anthropic_api": True,
-        "openai_api": True,
-        "gemini_api": True,
-        "dispatch_api": True,
-        "gcp": True,
-        "db": True,
-        "provider_health": {},
-        "dispatch_health": {},
-        "last_check": None,
-        "failed_deps": [],
-        "errors": {},
-    })
+    _shared_state.external_health.update(
+        {
+            "github_api": True,
+            "anthropic_api": True,
+            "openai_api": True,
+            "gemini_api": True,
+            "dispatch_api": True,
+            "gcp": True,
+            "db": True,
+            "provider_health": {},
+            "dispatch_health": {},
+            "last_check": None,
+            "failed_deps": [],
+            "errors": {},
+        }
+    )
     yield
     _shared_state.external_health.clear()
     _shared_state.external_health.update(original)
@@ -121,11 +130,14 @@ def all_deps_healthy():
 async def health_client():
     """Lightweight AsyncClient for /health — no DB dependency needed.
     The health endpoint is unauthenticated and does not touch the database."""
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as ac:
         yield ac
 
 
 # ─── /health Endpoint ────────────────────────────────────────────────────────
+
 
 @pytest.mark.smoketest
 class TestHealthEndpoint:
@@ -212,7 +224,9 @@ class TestHealthEndpoint:
     ):
         """Returns 503 when the orchestrator last ran more than 60 seconds ago."""
         original = _orch_module._orchestrator_last_cycle
-        _orch_module._orchestrator_last_cycle = datetime.utcnow() - timedelta(seconds=90)
+        _orch_module._orchestrator_last_cycle = datetime.utcnow() - timedelta(
+            seconds=90
+        )
         try:
             resp = await health_client.get("/health")
             assert resp.status_code == 503
@@ -226,7 +240,9 @@ class TestHealthEndpoint:
     ):
         """orchestrator_cycle_age_seconds is roughly the time since last cycle."""
         original = _orch_module._orchestrator_last_cycle
-        _orch_module._orchestrator_last_cycle = datetime.utcnow() - timedelta(seconds=10)
+        _orch_module._orchestrator_last_cycle = datetime.utcnow() - timedelta(
+            seconds=10
+        )
         try:
             resp = await health_client.get("/health")
             age = resp.json().get("orchestrator_cycle_age_seconds")
@@ -243,7 +259,15 @@ class TestHealthEndpoint:
         """external_deps contains each dependency key."""
         resp = await health_client.get("/health")
         deps = resp.json()["external_deps"]
-        for key in ("github_api", "anthropic_api", "openai_api", "gemini_api", "dispatch_api", "gcp", "db"):
+        for key in (
+            "github_api",
+            "anthropic_api",
+            "openai_api",
+            "gemini_api",
+            "dispatch_api",
+            "gcp",
+            "db",
+        ):
             assert key in deps
 
     @pytest.mark.asyncio
@@ -267,11 +291,14 @@ class TestHealthEndpoint:
 
 # ─── Zone Health Logic ───────────────────────────────────────────────────────
 
+
 class TestZoneHealth:
     """Unit tests for zone cooldown, recovery, and summary logic in compute.py."""
 
     @pytest.mark.smoketest
-    def test_get_zone_health_returns_entry_for_every_fallback_zone(self, clean_zone_state):
+    def test_get_zone_health_returns_entry_for_every_fallback_zone(
+        self, clean_zone_state
+    ):
         """get_zone_health() has an entry for each zone in FALLBACK_ZONES."""
         result = get_zone_health()
         for zone, _ in FALLBACK_ZONES:
@@ -297,7 +324,8 @@ class TestZoneHealth:
             "consecutive_failures": 1,
             "last_failure": datetime.now(timezone.utc),
             "last_failure_reason": "RESOURCE_POOL_EXHAUSTED",
-            "cooldown_expires_at": datetime.now(timezone.utc) + timedelta(seconds=ZONE_COOLDOWN_SECONDS),
+            "cooldown_expires_at": datetime.now(timezone.utc)
+            + timedelta(seconds=ZONE_COOLDOWN_SECONDS),
         }
 
         result = get_zone_health()
@@ -308,7 +336,9 @@ class TestZoneHealth:
     def test_zone_status_recovering_after_cooldown_expires(self, clean_zone_state):
         """A zone whose cooldown window has passed reports status=recovering."""
         zone = FALLBACK_ZONES[0][0]
-        old_time = datetime.now(timezone.utc) - timedelta(seconds=ZONE_COOLDOWN_SECONDS + 10)
+        old_time = datetime.now(timezone.utc) - timedelta(
+            seconds=ZONE_COOLDOWN_SECONDS + 10
+        )
         _zone_failures[zone] = old_time
         _zone_health[zone] = {
             "consecutive_failures": 2,
@@ -374,15 +404,22 @@ class TestZoneHealth:
         """get_zone_health_summary() returns exactly the expected keys."""
         summary = get_zone_health_summary()
         assert set(summary.keys()) == {
-            "total_zones", "active_zones", "disabled", "available",
-            "exhausted", "cooldown_recovery", "zone_success_rates",
+            "total_zones",
+            "active_zones",
+            "disabled",
+            "available",
+            "exhausted",
+            "cooldown_recovery",
+            "zone_success_rates",
         }
         assert isinstance(summary["disabled"], list)
         assert isinstance(summary["exhausted"], list)
         assert isinstance(summary["cooldown_recovery"], dict)
         assert isinstance(summary["zone_success_rates"], dict)
 
-    def test_get_zone_health_summary_total_zones_matches_fallback_list(self, clean_zone_state):
+    def test_get_zone_health_summary_total_zones_matches_fallback_list(
+        self, clean_zone_state
+    ):
         """total_zones equals the length of FALLBACK_ZONES."""
         assert get_zone_health_summary()["total_zones"] == len(FALLBACK_ZONES)
 
@@ -401,7 +438,8 @@ class TestZoneHealth:
                 "consecutive_failures": 1,
                 "last_failure": datetime.now(timezone.utc),
                 "last_failure_reason": "RESOURCE_POOL_EXHAUSTED",
-                "cooldown_expires_at": datetime.now(timezone.utc) + timedelta(seconds=ZONE_COOLDOWN_SECONDS),
+                "cooldown_expires_at": datetime.now(timezone.utc)
+                + timedelta(seconds=ZONE_COOLDOWN_SECONDS),
             }
 
         summary = get_zone_health_summary()
@@ -418,7 +456,8 @@ class TestZoneHealth:
                 "consecutive_failures": 3,
                 "last_failure": datetime.now(timezone.utc),
                 "last_failure_reason": "RESOURCE_POOL_EXHAUSTED",
-                "cooldown_expires_at": datetime.now(timezone.utc) + timedelta(seconds=ZONE_COOLDOWN_SECONDS),
+                "cooldown_expires_at": datetime.now(timezone.utc)
+                + timedelta(seconds=ZONE_COOLDOWN_SECONDS),
             }
 
         summary = get_zone_health_summary()
@@ -434,11 +473,14 @@ class TestZoneHealth:
         _zone_failures[zone_exhausted] = datetime.now(timezone.utc)
         _zone_health[zone_exhausted] = {
             "consecutive_failures": 1,
-            "cooldown_expires_at": datetime.now(timezone.utc) + timedelta(seconds=ZONE_COOLDOWN_SECONDS),
+            "cooldown_expires_at": datetime.now(timezone.utc)
+            + timedelta(seconds=ZONE_COOLDOWN_SECONDS),
         }
 
         # zone_recovering: cooldown expired
-        _zone_failures[zone_recovering] = datetime.now(timezone.utc) - timedelta(seconds=ZONE_COOLDOWN_SECONDS + 10)
+        _zone_failures[zone_recovering] = datetime.now(timezone.utc) - timedelta(
+            seconds=ZONE_COOLDOWN_SECONDS + 10
+        )
         _zone_health[zone_recovering] = {
             "consecutive_failures": 1,
             "cooldown_expires_at": datetime.now(timezone.utc) - timedelta(seconds=10),
@@ -465,7 +507,8 @@ class TestZoneHealth:
         for zone, _ in FALLBACK_ZONES[:-1]:
             _zone_health[zone] = {
                 "consecutive_failures": 1,
-                "cooldown_expires_at": datetime.now(timezone.utc) + timedelta(seconds=300),
+                "cooldown_expires_at": datetime.now(timezone.utc)
+                + timedelta(seconds=300),
             }
         assert any_zone_available() is True
 
@@ -474,7 +517,8 @@ class TestZoneHealth:
         for zone, _ in FALLBACK_ZONES:
             _zone_health[zone] = {
                 "consecutive_failures": 1,
-                "cooldown_expires_at": datetime.now(timezone.utc) + timedelta(seconds=300),
+                "cooldown_expires_at": datetime.now(timezone.utc)
+                + timedelta(seconds=300),
             }
         assert any_zone_available() is False
 
@@ -483,7 +527,8 @@ class TestZoneHealth:
         for zone, _ in FALLBACK_ZONES:
             _zone_health[zone] = {
                 "consecutive_failures": 1,
-                "cooldown_expires_at": datetime.now(timezone.utc) - timedelta(seconds=10),
+                "cooldown_expires_at": datetime.now(timezone.utc)
+                - timedelta(seconds=10),
             }
         assert any_zone_available() is True
 
@@ -532,16 +577,21 @@ class TestZoneHealth:
 
 # ─── Max Plan Account Pool ───────────────────────────────────────────────────
 
+
 class TestMaxPlanAccountPool:
     """Unit tests for Max Plan account selection, cooldown, and re-enable logic."""
 
     @pytest.mark.asyncio
-    async def test_select_max_plan_account_empty_pool_returns_none(self, clean_max_plan_pool):
+    async def test_select_max_plan_account_empty_pool_returns_none(
+        self, clean_max_plan_pool
+    ):
         """Returns None when the pool is empty."""
         assert await select_max_plan_account(_TEST_USER) is None
 
     @pytest.mark.asyncio
-    async def test_select_max_plan_account_all_disabled_returns_none(self, clean_max_plan_pool):
+    async def test_select_max_plan_account_all_disabled_returns_none(
+        self, clean_max_plan_pool
+    ):
         """Returns None when all pool accounts are disabled."""
         _add_to_pool({"id": "a1", "name": "acct1", "enabled": False, "active_tasks": 0})
         _add_to_pool({"id": "a2", "name": "acct2", "enabled": False, "active_tasks": 0})
@@ -550,40 +600,78 @@ class TestMaxPlanAccountPool:
     @pytest.mark.asyncio
     async def test_select_max_plan_account_skips_null_token(self, clean_max_plan_pool):
         """Accounts with no oauth_token (e.g. Secret Manager failure) are skipped."""
-        _add_to_pool({"id": "a1", "name": "no_token", "enabled": True, "active_tasks": 0, "oauth_token": None})
-        _add_to_pool({"id": "a2", "name": "has_token", "enabled": True, "active_tasks": 0})
+        _add_to_pool(
+            {
+                "id": "a1",
+                "name": "no_token",
+                "enabled": True,
+                "active_tasks": 0,
+                "oauth_token": None,
+            }
+        )
+        _add_to_pool(
+            {"id": "a2", "name": "has_token", "enabled": True, "active_tasks": 0}
+        )
         result = await select_max_plan_account(_TEST_USER)
         assert result is not None
         assert result["id"] == "a2"
 
     @pytest.mark.asyncio
-    async def test_select_max_plan_account_all_null_tokens_returns_none(self, clean_max_plan_pool):
+    async def test_select_max_plan_account_all_null_tokens_returns_none(
+        self, clean_max_plan_pool
+    ):
         """Returns None when all accounts have null tokens."""
-        _add_to_pool({"id": "a1", "name": "no_token1", "enabled": True, "active_tasks": 0, "oauth_token": None})
-        _add_to_pool({"id": "a2", "name": "no_token2", "enabled": True, "active_tasks": 0, "oauth_token": None})
+        _add_to_pool(
+            {
+                "id": "a1",
+                "name": "no_token1",
+                "enabled": True,
+                "active_tasks": 0,
+                "oauth_token": None,
+            }
+        )
+        _add_to_pool(
+            {
+                "id": "a2",
+                "name": "no_token2",
+                "enabled": True,
+                "active_tasks": 0,
+                "oauth_token": None,
+            }
+        )
         assert await select_max_plan_account(_TEST_USER) is None
 
     @pytest.mark.asyncio
-    async def test_select_max_plan_account_selects_lowest_active_tasks(self, clean_max_plan_pool):
+    async def test_select_max_plan_account_selects_lowest_active_tasks(
+        self, clean_max_plan_pool
+    ):
         """Selects the enabled account with the fewest active tasks."""
-        _add_to_pool({"id": "a1", "name": "busy",   "enabled": True, "active_tasks": 5})
-        _add_to_pool({"id": "a2", "name": "idle",   "enabled": True, "active_tasks": 1})
+        _add_to_pool({"id": "a1", "name": "busy", "enabled": True, "active_tasks": 5})
+        _add_to_pool({"id": "a2", "name": "idle", "enabled": True, "active_tasks": 1})
         _add_to_pool({"id": "a3", "name": "medium", "enabled": True, "active_tasks": 3})
         result = await select_max_plan_account(_TEST_USER)
         assert result is not None
         assert result["id"] == "a2"
 
     @pytest.mark.asyncio
-    async def test_select_max_plan_account_skips_disabled_accounts(self, clean_max_plan_pool):
+    async def test_select_max_plan_account_skips_disabled_accounts(
+        self, clean_max_plan_pool
+    ):
         """Skips disabled accounts even when they have zero active tasks."""
-        _add_to_pool({"id": "a1", "name": "disabled_idle", "enabled": False, "active_tasks": 0})
-        _add_to_pool({"id": "a2", "name": "enabled_busy",  "enabled": True,  "active_tasks": 10})
+        _add_to_pool(
+            {"id": "a1", "name": "disabled_idle", "enabled": False, "active_tasks": 0}
+        )
+        _add_to_pool(
+            {"id": "a2", "name": "enabled_busy", "enabled": True, "active_tasks": 10}
+        )
         result = await select_max_plan_account(_TEST_USER)
         assert result is not None
         assert result["id"] == "a2"
 
     @pytest.mark.asyncio
-    async def test_select_max_plan_account_single_enabled_account(self, clean_max_plan_pool):
+    async def test_select_max_plan_account_single_enabled_account(
+        self, clean_max_plan_pool
+    ):
         """Returns the only enabled account when there is just one."""
         _add_to_pool({"id": "a1", "name": "only", "enabled": True, "active_tasks": 2})
         result = await select_max_plan_account(_TEST_USER)
@@ -591,7 +679,9 @@ class TestMaxPlanAccountPool:
         assert result["id"] == "a1"
 
     @pytest.mark.asyncio
-    async def test_select_max_plan_account_defaults_missing_enabled_key_to_true(self, clean_max_plan_pool):
+    async def test_select_max_plan_account_defaults_missing_enabled_key_to_true(
+        self, clean_max_plan_pool
+    ):
         """An account without an 'enabled' key is treated as enabled (default=True)."""
         _add_to_pool(
             {"id": "a1", "name": "no_key", "active_tasks": 0}
@@ -602,7 +692,9 @@ class TestMaxPlanAccountPool:
         assert result["id"] == "a1"
 
     @pytest.mark.asyncio
-    async def test_release_max_plan_account_decrements_active_tasks(self, clean_max_plan_pool):
+    async def test_release_max_plan_account_decrements_active_tasks(
+        self, clean_max_plan_pool
+    ):
         """Releasing an account decrements its active_tasks by one."""
         _add_to_pool({"id": "a1", "name": "acct", "enabled": True, "active_tasks": 3})
         await release_max_plan_account("a1")
@@ -616,87 +708,113 @@ class TestMaxPlanAccountPool:
         assert _account_by_id["a1"]["active_tasks"] == 0
 
     @pytest.mark.asyncio
-    async def test_release_max_plan_account_unknown_id_is_noop(self, clean_max_plan_pool):
+    async def test_release_max_plan_account_unknown_id_is_noop(
+        self, clean_max_plan_pool
+    ):
         """Releasing an unknown account ID neither raises nor modifies other accounts."""
         _add_to_pool({"id": "a1", "name": "acct", "enabled": True, "active_tasks": 2})
         await release_max_plan_account("does-not-exist")
         assert _account_by_id["a1"]["active_tasks"] == 2
 
     @pytest.mark.asyncio
-    async def test_recheck_disabled_accounts_re_enables_after_30min_cooldown(self, clean_max_plan_pool):
+    async def test_recheck_disabled_accounts_re_enables_after_30min_cooldown(
+        self, clean_max_plan_pool
+    ):
         """An account disabled more than 30 minutes ago is re-enabled."""
-        _add_to_pool({
-            "id": "a1",
-            "name": "rate_limited",
-            "enabled": False,
-            "active_tasks": 0,
-            "disabled_at": datetime.utcnow() - timedelta(minutes=31),
-        })
+        _add_to_pool(
+            {
+                "id": "a1",
+                "name": "rate_limited",
+                "enabled": False,
+                "active_tasks": 0,
+                "disabled_at": datetime.utcnow() - timedelta(minutes=31),
+            }
+        )
         await recheck_disabled_accounts()
         assert _account_by_id["a1"]["enabled"] is True
         assert _account_by_id["a1"]["disabled_at"] is None
 
     @pytest.mark.asyncio
-    async def test_recheck_disabled_accounts_stays_disabled_before_cooldown(self, clean_max_plan_pool):
+    async def test_recheck_disabled_accounts_stays_disabled_before_cooldown(
+        self, clean_max_plan_pool
+    ):
         """An account disabled less than 30 minutes ago remains disabled."""
-        _add_to_pool({
-            "id": "a1",
-            "name": "rate_limited",
-            "enabled": False,
-            "active_tasks": 0,
-            "disabled_at": datetime.utcnow() - timedelta(minutes=10),
-        })
+        _add_to_pool(
+            {
+                "id": "a1",
+                "name": "rate_limited",
+                "enabled": False,
+                "active_tasks": 0,
+                "disabled_at": datetime.utcnow() - timedelta(minutes=10),
+            }
+        )
         await recheck_disabled_accounts()
         assert _account_by_id["a1"]["enabled"] is False
 
     @pytest.mark.asyncio
-    async def test_recheck_disabled_accounts_exactly_at_boundary_re_enables(self, clean_max_plan_pool):
+    async def test_recheck_disabled_accounts_exactly_at_boundary_re_enables(
+        self, clean_max_plan_pool
+    ):
         """An account disabled exactly 30 minutes ago is re-enabled (condition uses >=)."""
-        _add_to_pool({
-            "id": "a1",
-            "name": "rate_limited",
-            "enabled": False,
-            "active_tasks": 0,
-            "disabled_at": datetime.utcnow() - timedelta(minutes=30),
-        })
+        _add_to_pool(
+            {
+                "id": "a1",
+                "name": "rate_limited",
+                "enabled": False,
+                "active_tasks": 0,
+                "disabled_at": datetime.utcnow() - timedelta(minutes=30),
+            }
+        )
         await recheck_disabled_accounts()
         # recheck_disabled_accounts uses >= COOLDOWN_MINUTES * 60, so exactly 30 min qualifies
         assert _account_by_id["a1"]["enabled"] is True
 
     @pytest.mark.asyncio
-    async def test_recheck_disabled_accounts_ignores_enabled_accounts(self, clean_max_plan_pool):
+    async def test_recheck_disabled_accounts_ignores_enabled_accounts(
+        self, clean_max_plan_pool
+    ):
         """recheck_disabled_accounts does not modify accounts that are already enabled."""
-        _add_to_pool({
-            "id": "a1",
-            "name": "healthy",
-            "enabled": True,
-            "active_tasks": 1,
-        })
+        _add_to_pool(
+            {
+                "id": "a1",
+                "name": "healthy",
+                "enabled": True,
+                "active_tasks": 1,
+            }
+        )
         await recheck_disabled_accounts()
         assert _account_by_id["a1"]["enabled"] is True
 
     @pytest.mark.asyncio
-    async def test_recheck_disabled_accounts_skips_missing_disabled_at(self, clean_max_plan_pool):
+    async def test_recheck_disabled_accounts_skips_missing_disabled_at(
+        self, clean_max_plan_pool
+    ):
         """A disabled account without a disabled_at timestamp is left alone."""
-        _add_to_pool({
-            "id": "a1",
-            "name": "no_timestamp",
-            "enabled": False,
-            "active_tasks": 0,
-            # no "disabled_at" key — simulates an old record before the field was added
-        })
+        _add_to_pool(
+            {
+                "id": "a1",
+                "name": "no_timestamp",
+                "enabled": False,
+                "active_tasks": 0,
+                # no "disabled_at" key — simulates an old record before the field was added
+            }
+        )
         await recheck_disabled_accounts()
         assert _account_by_id["a1"]["enabled"] is False
 
     @pytest.mark.asyncio
-    async def test_rate_limit_disables_account_and_cooldown_re_enables(self, clean_max_plan_pool):
+    async def test_rate_limit_disables_account_and_cooldown_re_enables(
+        self, clean_max_plan_pool
+    ):
         """Full cycle: account disabled on rate limit, cooldown expires, re-enabled."""
-        _add_to_pool({
-            "id": "a1",
-            "name": "claude",
-            "enabled": True,
-            "active_tasks": 1,
-        })
+        _add_to_pool(
+            {
+                "id": "a1",
+                "name": "claude",
+                "enabled": True,
+                "active_tasks": 1,
+            }
+        )
 
         # Simulate the disable-on-RATE_LIMIT path from update_agent_status
         for acct in _account_by_id.values():
@@ -716,106 +834,130 @@ class TestMaxPlanAccountPool:
         assert _account_by_id["a1"]["enabled"] is True
 
     @pytest.mark.asyncio
-    async def test_recheck_multiple_accounts_re_enables_only_eligible(self, clean_max_plan_pool):
+    async def test_recheck_multiple_accounts_re_enables_only_eligible(
+        self, clean_max_plan_pool
+    ):
         """Only accounts past their cooldown are re-enabled; others remain disabled."""
-        _add_to_pool({
-            "id": "a1",
-            "name": "expired",
-            "enabled": False,
-            "active_tasks": 0,
-            "disabled_at": datetime.utcnow() - timedelta(minutes=45),
-        })
-        _add_to_pool({
-            "id": "a2",
-            "name": "fresh",
-            "enabled": False,
-            "active_tasks": 0,
-            "disabled_at": datetime.utcnow() - timedelta(minutes=5),
-        })
+        _add_to_pool(
+            {
+                "id": "a1",
+                "name": "expired",
+                "enabled": False,
+                "active_tasks": 0,
+                "disabled_at": datetime.utcnow() - timedelta(minutes=45),
+            }
+        )
+        _add_to_pool(
+            {
+                "id": "a2",
+                "name": "fresh",
+                "enabled": False,
+                "active_tasks": 0,
+                "disabled_at": datetime.utcnow() - timedelta(minutes=5),
+            }
+        )
         await recheck_disabled_accounts()
         pool = dict(_account_by_id)
-        assert pool["a1"]["enabled"] is True   # cooldown expired
+        assert pool["a1"]["enabled"] is True  # cooldown expired
         assert pool["a2"]["enabled"] is False  # still in cooldown
 
     # ── Exponential backoff cooldown tests ────────────────────────────────────
 
     @pytest.mark.asyncio
-    async def test_recheck_exponential_backoff_rl_hit_count_2(self, clean_max_plan_pool):
+    async def test_recheck_exponential_backoff_rl_hit_count_2(
+        self, clean_max_plan_pool
+    ):
         """rl_hit_count=2 → 60 min cooldown: re-enables after 61 min, not after 59 min."""
-        _add_to_pool({
-            "id": "a1",
-            "name": "twice_limited",
-            "enabled": False,
-            "active_tasks": 0,
-            "disabled_at": datetime.utcnow() - timedelta(minutes=59),
-            "rl_hit_count": 2,
-        })
+        _add_to_pool(
+            {
+                "id": "a1",
+                "name": "twice_limited",
+                "enabled": False,
+                "active_tasks": 0,
+                "disabled_at": datetime.utcnow() - timedelta(minutes=59),
+                "rl_hit_count": 2,
+            }
+        )
         await recheck_disabled_accounts()
         assert _account_by_id["a1"]["enabled"] is False  # 59 min < 60 min cooldown
 
         _account_by_id["a1"]["disabled_at"] = datetime.utcnow() - timedelta(minutes=61)
         await recheck_disabled_accounts()
-        assert _account_by_id["a1"]["enabled"] is True   # 61 min >= 60 min cooldown
+        assert _account_by_id["a1"]["enabled"] is True  # 61 min >= 60 min cooldown
 
     @pytest.mark.asyncio
-    async def test_recheck_exponential_backoff_rl_hit_count_3(self, clean_max_plan_pool):
+    async def test_recheck_exponential_backoff_rl_hit_count_3(
+        self, clean_max_plan_pool
+    ):
         """rl_hit_count=3 → 120 min cooldown: re-enables after 121 min, not after 119 min."""
-        _add_to_pool({
-            "id": "a1",
-            "name": "thrice_limited",
-            "enabled": False,
-            "active_tasks": 0,
-            "disabled_at": datetime.utcnow() - timedelta(minutes=119),
-            "rl_hit_count": 3,
-        })
+        _add_to_pool(
+            {
+                "id": "a1",
+                "name": "thrice_limited",
+                "enabled": False,
+                "active_tasks": 0,
+                "disabled_at": datetime.utcnow() - timedelta(minutes=119),
+                "rl_hit_count": 3,
+            }
+        )
         await recheck_disabled_accounts()
         assert _account_by_id["a1"]["enabled"] is False  # 119 min < 120 min cooldown
 
         _account_by_id["a1"]["disabled_at"] = datetime.utcnow() - timedelta(minutes=121)
         await recheck_disabled_accounts()
-        assert _account_by_id["a1"]["enabled"] is True   # 121 min >= 120 min cooldown
+        assert _account_by_id["a1"]["enabled"] is True  # 121 min >= 120 min cooldown
 
     @pytest.mark.asyncio
-    async def test_recheck_exponential_backoff_rl_hit_count_4_capped_at_240(self, clean_max_plan_pool):
+    async def test_recheck_exponential_backoff_rl_hit_count_4_capped_at_240(
+        self, clean_max_plan_pool
+    ):
         """rl_hit_count=4 → 240 min cap: re-enables after 241 min, not after 239 min."""
-        _add_to_pool({
-            "id": "a1",
-            "name": "quad_limited",
-            "enabled": False,
-            "active_tasks": 0,
-            "disabled_at": datetime.utcnow() - timedelta(minutes=239),
-            "rl_hit_count": 4,
-        })
+        _add_to_pool(
+            {
+                "id": "a1",
+                "name": "quad_limited",
+                "enabled": False,
+                "active_tasks": 0,
+                "disabled_at": datetime.utcnow() - timedelta(minutes=239),
+                "rl_hit_count": 4,
+            }
+        )
         await recheck_disabled_accounts()
         assert _account_by_id["a1"]["enabled"] is False  # 239 min < 240 min cooldown
 
         _account_by_id["a1"]["disabled_at"] = datetime.utcnow() - timedelta(minutes=241)
         await recheck_disabled_accounts()
-        assert _account_by_id["a1"]["enabled"] is True   # 241 min >= 240 min cap
+        assert _account_by_id["a1"]["enabled"] is True  # 241 min >= 240 min cap
 
     @pytest.mark.asyncio
-    async def test_recheck_exponential_backoff_high_rl_hit_count_still_capped(self, clean_max_plan_pool):
+    async def test_recheck_exponential_backoff_high_rl_hit_count_still_capped(
+        self, clean_max_plan_pool
+    ):
         """rl_hit_count=10 is still capped at 240 min, not 30*2^9=15360 min."""
-        _add_to_pool({
-            "id": "a1",
-            "name": "many_limited",
-            "enabled": False,
-            "active_tasks": 0,
-            "disabled_at": datetime.utcnow() - timedelta(minutes=241),
-            "rl_hit_count": 10,
-        })
+        _add_to_pool(
+            {
+                "id": "a1",
+                "name": "many_limited",
+                "enabled": False,
+                "active_tasks": 0,
+                "disabled_at": datetime.utcnow() - timedelta(minutes=241),
+                "rl_hit_count": 10,
+            }
+        )
         await recheck_disabled_accounts()
-        assert _account_by_id["a1"]["enabled"] is True   # 241 min >= 240 min cap
+        assert _account_by_id["a1"]["enabled"] is True  # 241 min >= 240 min cap
 
     @pytest.mark.asyncio
     async def test_disable_path_increments_rl_hit_count(self, clean_max_plan_pool):
         """The rate-limit disable path increments rl_hit_count on each hit."""
-        _add_to_pool({
-            "id": "a1",
-            "name": "fresh",
-            "enabled": True,
-            "active_tasks": 1,
-        })
+        _add_to_pool(
+            {
+                "id": "a1",
+                "name": "fresh",
+                "enabled": True,
+                "active_tasks": 1,
+            }
+        )
 
         # Simulate the inline disable-on-RATE_LIMIT code from update_agent_status
         async with _max_plan_pool_lock:
@@ -825,7 +967,9 @@ class TestMaxPlanAccountPool:
                     acct["disabled_at"] = datetime.utcnow()
                     acct["rl_hit_count"] = acct.get("rl_hit_count", 0) + 1
 
-        assert _account_by_id["a1"]["rl_hit_count"] == 1  # first hit → count=1 → 30 min cooldown
+        assert (
+            _account_by_id["a1"]["rl_hit_count"] == 1
+        )  # first hit → count=1 → 30 min cooldown
 
         # Re-enable manually, then simulate a second hit
         _account_by_id["a1"]["enabled"] = True
@@ -836,7 +980,9 @@ class TestMaxPlanAccountPool:
                     acct["disabled_at"] = datetime.utcnow()
                     acct["rl_hit_count"] = acct.get("rl_hit_count", 0) + 1
 
-        assert _account_by_id["a1"]["rl_hit_count"] == 2  # second hit → count=2 → 60 min cooldown
+        assert (
+            _account_by_id["a1"]["rl_hit_count"] == 2
+        )  # second hit → count=2 → 60 min cooldown
 
     # ── Model tier cascade tests ──────────────────────────────────────────────
     # Post-opus-4-7 migration: all new tasks use claude-opus-4-7. Haiku shares
@@ -871,56 +1017,95 @@ class TestMaxPlanAccountPool:
 
     def test_cascade_disabled_models_unknown_falls_back_to_single(self):
         # Unknown variants must not silently cascade to the whole account.
-        assert cascade_disabled_models("claude-some-future-model") == ("claude-some-future-model",)
+        assert cascade_disabled_models("claude-some-future-model") == (
+            "claude-some-future-model",
+        )
 
-    def test_opus_rate_limit_blocks_opus_and_haiku_via_mark_cascade(self, clean_max_plan_pool):
+    def test_opus_rate_limit_blocks_opus_and_haiku_via_mark_cascade(
+        self, clean_max_plan_pool
+    ):
         """After an Opus-4-7 429, the mark path writes the opus-4-7 cascade entry.
         A Haiku lookup normalizes to Opus-4-7, so haiku requests are also blocked."""
         now = datetime.utcnow()
         acct = {
-            "id": "a1", "name": "evan", "enabled": True, "active_tasks": 0,
+            "id": "a1",
+            "name": "evan",
+            "enabled": True,
+            "active_tasks": 0,
             "oauth_token": "sk-ant-test",
-            "disabled_models": {m: {"hits": 1, "at": now} for m in cascade_disabled_models("claude-opus-4-7")},
+            "disabled_models": {
+                m: {"hits": 1, "at": now}
+                for m in cascade_disabled_models("claude-opus-4-7")
+            },
         }
         assert _account_available_for_model(acct, "claude-opus-4-7") is False
         # Haiku normalizes to Opus-4-7 → also blocked (shared meter).
         assert _account_available_for_model(acct, "claude-haiku-4-5-20251001") is False
 
-    def test_account_available_unknown_model_skips_account_with_disables(self, clean_max_plan_pool):
+    def test_account_available_unknown_model_skips_account_with_disables(
+        self, clean_max_plan_pool
+    ):
         """model=None must NOT bypass the rate-limit check when disables exist.
         Previously returned True, which caused rate-limited accounts to be picked
         for tasks whose model resolution failed upstream."""
         acct = {
-            "id": "a1", "name": "evan", "enabled": True, "active_tasks": 0,
+            "id": "a1",
+            "name": "evan",
+            "enabled": True,
+            "active_tasks": 0,
             "oauth_token": "sk-ant-test",
-            "disabled_models": {"claude-opus-4-7": {"hits": 1, "at": datetime.utcnow()}},
+            "disabled_models": {
+                "claude-opus-4-7": {"hits": 1, "at": datetime.utcnow()}
+            },
         }
         assert _account_available_for_model(acct, None) is False
 
-    def test_account_available_unknown_model_no_disables_allowed(self, clean_max_plan_pool):
+    def test_account_available_unknown_model_no_disables_allowed(
+        self, clean_max_plan_pool
+    ):
         """model=None on a healthy account is still allowed (only disables skip it)."""
         acct = {
-            "id": "a1", "name": "evan", "enabled": True, "active_tasks": 0,
+            "id": "a1",
+            "name": "evan",
+            "enabled": True,
+            "active_tasks": 0,
             "oauth_token": "sk-ant-test",
         }
         assert _account_available_for_model(acct, None) is True
 
     @pytest.mark.asyncio
-    async def test_select_skips_account_after_opus_rate_limit_cascade(self, clean_max_plan_pool):
+    async def test_select_skips_account_after_opus_rate_limit_cascade(
+        self, clean_max_plan_pool
+    ):
         """After an Opus-4-7 429 marks the opus-4-7 meter, another Opus-4-7 request must
         skip that account in favor of a healthy one — even if the healthy
         account has more active tasks."""
         now = datetime.utcnow()
-        _add_to_pool({
-            "id": "a1", "name": "rate_limited", "enabled": True, "active_tasks": 0,
-            "disabled_models": {m: {"hits": 1, "at": now} for m in cascade_disabled_models("claude-opus-4-7")},
-        })
-        _add_to_pool({
-            "id": "a2", "name": "healthy", "enabled": True, "active_tasks": 5,
-        })
+        _add_to_pool(
+            {
+                "id": "a1",
+                "name": "rate_limited",
+                "enabled": True,
+                "active_tasks": 0,
+                "disabled_models": {
+                    m: {"hits": 1, "at": now}
+                    for m in cascade_disabled_models("claude-opus-4-7")
+                },
+            }
+        )
+        _add_to_pool(
+            {
+                "id": "a2",
+                "name": "healthy",
+                "enabled": True,
+                "active_tasks": 5,
+            }
+        )
         result = await select_max_plan_account(_TEST_USER, model="claude-opus-4-7")
         assert result is not None
-        assert result["id"] == "a2"  # healthy account chosen despite higher active_tasks
+        assert (
+            result["id"] == "a2"
+        )  # healthy account chosen despite higher active_tasks
 
 
 # ─── Circuit Breaker (healthy / probing / unavailable) ──────────────────────
@@ -957,14 +1142,23 @@ class TestCircuitBreaker:
     # ── State machine ────────────────────────────────────────────────────────
 
     def test_state_healthy_with_no_disables(self, clean_max_plan_pool):
-        acct = {"id": "a1", "name": "clean", "enabled": True, "oauth_token": "sk-ant-test"}
+        acct = {
+            "id": "a1",
+            "name": "clean",
+            "enabled": True,
+            "oauth_token": "sk-ant-test",
+        }
         assert _account_state_for_model(acct, OPUS) == "healthy"
 
-    def test_state_unavailable_when_availability_excludes_model(self, clean_max_plan_pool):
+    def test_state_unavailable_when_availability_excludes_model(
+        self, clean_max_plan_pool
+    ):
         """account_has_model returns False (confirmed not in visible-models)
         → skip the account for this model so dispatch doesn't 404."""
         acct = {
-            "id": "a1", "name": "gemini-ga-only", "enabled": True,
+            "id": "a1",
+            "name": "gemini-ga-only",
+            "enabled": True,
             "oauth_token": "AIza-x",
             "provider_metadata": {
                 "available_models": ["gemini-2.5-pro", "gemini-2.5-flash"],
@@ -974,7 +1168,9 @@ class TestCircuitBreaker:
 
     def test_state_healthy_when_availability_includes_model(self, clean_max_plan_pool):
         acct = {
-            "id": "a1", "name": "preview-ok", "enabled": True,
+            "id": "a1",
+            "name": "preview-ok",
+            "enabled": True,
             "oauth_token": "AIza-x",
             "provider_metadata": {
                 "available_models": ["gemini-2.5-pro", "gemini-3.1-pro-preview"],
@@ -986,7 +1182,9 @@ class TestCircuitBreaker:
         """Unknown availability must NOT skip — fail open. Otherwise a failed
         refresh would starve every account that wasn't probed yet."""
         acct = {
-            "id": "a1", "name": "not-probed", "enabled": True,
+            "id": "a1",
+            "name": "not-probed",
+            "enabled": True,
             "oauth_token": "AIza-x",
             "provider_metadata": {},  # no available_models key
         }
@@ -1007,18 +1205,29 @@ class TestCircuitBreaker:
     @pytest.mark.asyncio
     async def test_select_prefers_healthy_over_probing(self, clean_max_plan_pool):
         """A healthy account with high load still wins over an idle probing account."""
-        _add_to_pool(_acct_with_disables("probe", {OPUS: _disabled_entry(minutes_ago=35)}))
-        _add_to_pool({
-            "id": "healthy", "name": "healthy", "enabled": True, "active_tasks": 5,
-            "oauth_token": "sk-ant-test",
-        })
+        _add_to_pool(
+            _acct_with_disables("probe", {OPUS: _disabled_entry(minutes_ago=35)})
+        )
+        _add_to_pool(
+            {
+                "id": "healthy",
+                "name": "healthy",
+                "enabled": True,
+                "active_tasks": 5,
+                "oauth_token": "sk-ant-test",
+            }
+        )
         result = await select_max_plan_account(_TEST_USER, model=OPUS)
         assert result is not None
         assert result["id"] == "healthy"
 
     @pytest.mark.asyncio
-    async def test_select_falls_back_to_probing_when_no_healthy(self, clean_max_plan_pool):
-        _add_to_pool(_acct_with_disables("probe", {OPUS: _disabled_entry(minutes_ago=35)}))
+    async def test_select_falls_back_to_probing_when_no_healthy(
+        self, clean_max_plan_pool
+    ):
+        _add_to_pool(
+            _acct_with_disables("probe", {OPUS: _disabled_entry(minutes_ago=35)})
+        )
         result = await select_max_plan_account(_TEST_USER, model=OPUS)
         assert result is not None
         assert result["id"] == "probe"
@@ -1027,7 +1236,9 @@ class TestCircuitBreaker:
     @pytest.mark.asyncio
     async def test_select_serializes_probing_account(self, clean_max_plan_pool):
         """Single probing account, already mid-probe (active_tasks=1) → select returns None."""
-        acct = _acct_with_disables("probe", {OPUS: _disabled_entry(minutes_ago=35)}, active_tasks=1)
+        acct = _acct_with_disables(
+            "probe", {OPUS: _disabled_entry(minutes_ago=35)}, active_tasks=1
+        )
         _add_to_pool(acct)
         result = await select_max_plan_account(_TEST_USER, model=OPUS)
         assert result is None
@@ -1036,8 +1247,12 @@ class TestCircuitBreaker:
     async def test_select_parallel_probing_across_accounts(self, clean_max_plan_pool):
         """Two probing accounts both idle → two selects return distinct accounts,
         third returns None (each account serialized to one in-flight probe)."""
-        _add_to_pool(_acct_with_disables("probe1", {OPUS: _disabled_entry(minutes_ago=35)}))
-        _add_to_pool(_acct_with_disables("probe2", {OPUS: _disabled_entry(minutes_ago=35)}))
+        _add_to_pool(
+            _acct_with_disables("probe1", {OPUS: _disabled_entry(minutes_ago=35)})
+        )
+        _add_to_pool(
+            _acct_with_disables("probe2", {OPUS: _disabled_entry(minutes_ago=35)})
+        )
         r1 = await select_max_plan_account(_TEST_USER, model=OPUS)
         r2 = await select_max_plan_account(_TEST_USER, model=OPUS)
         r3 = await select_max_plan_account(_TEST_USER, model=OPUS)
@@ -1048,10 +1263,14 @@ class TestCircuitBreaker:
     # ── Thundering-herd regression ───────────────────────────────────────────
 
     @pytest.mark.asyncio
-    async def test_thundering_herd_prevented_on_single_probing_account(self, clean_max_plan_pool):
+    async def test_thundering_herd_prevented_on_single_probing_account(
+        self, clean_max_plan_pool
+    ):
         """The core regression: when cooldown expires on the only account, only
         ONE task gets dispatched (the probe), not N tasks in parallel."""
-        _add_to_pool(_acct_with_disables("probe", {OPUS: _disabled_entry(minutes_ago=35)}))
+        _add_to_pool(
+            _acct_with_disables("probe", {OPUS: _disabled_entry(minutes_ago=35)})
+        )
         r1 = await select_max_plan_account(_TEST_USER, model=OPUS)
         r2 = await select_max_plan_account(_TEST_USER, model=OPUS)
         r3 = await select_max_plan_account(_TEST_USER, model=OPUS)
@@ -1065,42 +1284,68 @@ class TestCircuitBreaker:
     # so success clears only the opus-4-7 bucket. Haiku still normalizes to opus-4-7.
 
     @pytest.mark.asyncio
-    async def test_clear_opus_success_clears_opus_bucket(self, clean_max_plan_pool, monkeypatch):
+    async def test_clear_opus_success_clears_opus_bucket(
+        self, clean_max_plan_pool, monkeypatch
+    ):
         """Opus success clears the opus-4-7 bucket — the shared meter for all tasks."""
         now = datetime.utcnow()
-        _add_to_pool(_acct_with_disables("a1", {
-            OPUS: {"hits": 1, "at": now},
-        }))
+        _add_to_pool(
+            _acct_with_disables(
+                "a1",
+                {
+                    OPUS: {"hits": 1, "at": now},
+                },
+            )
+        )
         monkeypatch.setattr("app.max_plan_pool._persist_rate_limit_state", _async_noop)
         assert await clear_rate_limit_state_on_success("a1", OPUS) is True
-        assert "disabled_models" not in _account_by_id["a1"] or not _account_by_id["a1"]["disabled_models"]
+        assert (
+            "disabled_models" not in _account_by_id["a1"]
+            or not _account_by_id["a1"]["disabled_models"]
+        )
 
     @pytest.mark.asyncio
-    async def test_clear_haiku_success_clears_opus_bucket(self, clean_max_plan_pool, monkeypatch):
+    async def test_clear_haiku_success_clears_opus_bucket(
+        self, clean_max_plan_pool, monkeypatch
+    ):
         """Haiku success proves Opus-4-7's meter is fine (shared bucket) —
         clearing Haiku normalizes to clearing the opus-4-7 entry."""
         now = datetime.utcnow()
-        _add_to_pool(_acct_with_disables("a1", {
-            OPUS: {"hits": 1, "at": now},
-        }))
+        _add_to_pool(
+            _acct_with_disables(
+                "a1",
+                {
+                    OPUS: {"hits": 1, "at": now},
+                },
+            )
+        )
         monkeypatch.setattr("app.max_plan_pool._persist_rate_limit_state", _async_noop)
         assert await clear_rate_limit_state_on_success("a1", HAIKU) is True
         dm = _account_by_id["a1"].get("disabled_models") or {}
         assert dm == {}
 
     @pytest.mark.asyncio
-    async def test_clear_on_healthy_account_is_noop(self, clean_max_plan_pool, monkeypatch):
-        _add_to_pool({
-            "id": "a1", "name": "clean", "enabled": True, "active_tasks": 0,
-            "oauth_token": "sk-ant-test",
-        })
+    async def test_clear_on_healthy_account_is_noop(
+        self, clean_max_plan_pool, monkeypatch
+    ):
+        _add_to_pool(
+            {
+                "id": "a1",
+                "name": "clean",
+                "enabled": True,
+                "active_tasks": 0,
+                "oauth_token": "sk-ant-test",
+            }
+        )
         monkeypatch.setattr("app.max_plan_pool._persist_rate_limit_state", _async_noop)
         assert await clear_rate_limit_state_on_success("a1", OPUS) is False
 
     # ── Full probe lifecycle ─────────────────────────────────────────────────
 
     @pytest.mark.asyncio
-    async def test_probe_success_restores_healthy(self, clean_max_plan_pool, monkeypatch):
+    async def test_probe_success_restores_healthy(
+        self, clean_max_plan_pool, monkeypatch
+    ):
         """Mark → fast-forward → probing → select → simulate success (clear) → healthy."""
         _add_to_pool(_acct_with_disables("a1", {OPUS: _disabled_entry(minutes_ago=35)}))
         monkeypatch.setattr("app.max_plan_pool._persist_rate_limit_state", _async_noop)
@@ -1133,7 +1378,10 @@ class TestCircuitBreaker:
 
         # Simulate the mark path re-stamping on 429: hits=2, at=now → 60min cooldown
         async with _max_plan_pool_lock:
-            _account_by_id["a1"]["disabled_models"][OPUS] = {"hits": 2, "at": datetime.utcnow()}
+            _account_by_id["a1"]["disabled_models"][OPUS] = {
+                "hits": 2,
+                "at": datetime.utcnow(),
+            }
         await release_max_plan_account("a1")
 
         # Now unavailable (fresh 60min cooldown, 0 min elapsed)
@@ -1173,25 +1421,32 @@ class TestHealthScoreComputation:
     def test_completions_increase_score(self):
         """Each completion adds +1 to the health score."""
         now = datetime.utcnow()
-        acct = _make_acct("a1", completion_events=[
-            {"at": now - timedelta(hours=1), "duration_seconds": 120.0},
-            {"at": now - timedelta(hours=2), "duration_seconds": 90.0},
-        ])
+        acct = _make_acct(
+            "a1",
+            completion_events=[
+                {"at": now - timedelta(hours=1), "duration_seconds": 120.0},
+                {"at": now - timedelta(hours=2), "duration_seconds": 90.0},
+            ],
+        )
         assert _compute_health_score(acct, now=now) == 2.0
 
     def test_rate_limit_events_decrease_score(self):
         """Each rate-limit event subtracts 2 from the health score."""
         now = datetime.utcnow()
-        acct = _make_acct("a1", rl_events=[
-            now - timedelta(hours=1),
-            now - timedelta(hours=3),
-        ])
+        acct = _make_acct(
+            "a1",
+            rl_events=[
+                now - timedelta(hours=1),
+                now - timedelta(hours=3),
+            ],
+        )
         assert _compute_health_score(acct, now=now) == -4.0
 
     def test_mixed_events_combined_correctly(self):
         """Health score = completions - 2 * rl_events."""
         now = datetime.utcnow()
-        acct = _make_acct("a1",
+        acct = _make_acct(
+            "a1",
             completion_events=[
                 {"at": now - timedelta(hours=1), "duration_seconds": 60.0},
                 {"at": now - timedelta(hours=2), "duration_seconds": 80.0},
@@ -1206,7 +1461,8 @@ class TestHealthScoreComputation:
         """Events older than 24h are not counted in the health score."""
         now = datetime.utcnow()
         cutoff_plus_one = now - timedelta(seconds=_HEALTH_WINDOW_SECONDS + 1)
-        acct = _make_acct("a1",
+        acct = _make_acct(
+            "a1",
             completion_events=[{"at": cutoff_plus_one, "duration_seconds": 60.0}],
             rl_events=[cutoff_plus_one],
         )
@@ -1216,7 +1472,8 @@ class TestHealthScoreComputation:
         """Events exactly at the 24h cutoff (not strictly greater) are excluded."""
         now = datetime.utcnow()
         exactly_at_cutoff = now - timedelta(seconds=_HEALTH_WINDOW_SECONDS)
-        acct = _make_acct("a1",
+        acct = _make_acct(
+            "a1",
             completion_events=[{"at": exactly_at_cutoff, "duration_seconds": 30.0}],
         )
         assert _compute_health_score(acct, now=now) == 0.0
@@ -1225,15 +1482,25 @@ class TestHealthScoreComputation:
         """get_account_health_stats returns the expected keys."""
         acct = _make_acct("a1")
         stats = get_account_health_stats(acct)
-        assert set(stats.keys()) == {"rl_events_24h", "completions_24h", "avg_duration_seconds", "health_score", "success_rate_7d", "success_rate_by_type_7d"}
+        assert set(stats.keys()) == {
+            "rl_events_24h",
+            "completions_24h",
+            "avg_duration_seconds",
+            "health_score",
+            "success_rate_7d",
+            "success_rate_by_type_7d",
+        }
 
     def test_get_account_health_stats_avg_duration(self):
         """avg_duration_seconds is the mean of recent completion durations."""
         now = datetime.utcnow()
-        acct = _make_acct("a1", completion_events=[
-            {"at": now - timedelta(hours=1), "duration_seconds": 60.0},
-            {"at": now - timedelta(hours=2), "duration_seconds": 120.0},
-        ])
+        acct = _make_acct(
+            "a1",
+            completion_events=[
+                {"at": now - timedelta(hours=1), "duration_seconds": 60.0},
+                {"at": now - timedelta(hours=2), "duration_seconds": 120.0},
+            ],
+        )
         stats = get_account_health_stats(acct, now=now)
         assert stats["avg_duration_seconds"] == 90.0
         assert stats["completions_24h"] == 2
@@ -1246,11 +1513,14 @@ class TestHealthScoreComputation:
     def test_get_account_health_stats_rl_count(self):
         """rl_events_24h counts rate-limit events within the window."""
         now = datetime.utcnow()
-        acct = _make_acct("a1", rl_events=[
-            now - timedelta(hours=1),
-            now - timedelta(hours=23),
-            now - timedelta(hours=25),  # outside window
-        ])
+        acct = _make_acct(
+            "a1",
+            rl_events=[
+                now - timedelta(hours=1),
+                now - timedelta(hours=23),
+                now - timedelta(hours=25),  # outside window
+            ],
+        )
         stats = get_account_health_stats(acct, now=now)
         assert stats["rl_events_24h"] == 2
 
@@ -1263,18 +1533,32 @@ class TestAccountSelectionByHealthScore:
         """Account with more completions and fewer rate limits is preferred over idle account."""
         now = datetime.utcnow()
         # Healthy account with good track record
-        _add_to_pool(_make_acct("good", active_tasks=1, completion_events=[
-            {"at": now - timedelta(hours=1), "duration_seconds": 60.0},
-            {"at": now - timedelta(hours=2), "duration_seconds": 90.0},
-        ]))
+        _add_to_pool(
+            _make_acct(
+                "good",
+                active_tasks=1,
+                completion_events=[
+                    {"at": now - timedelta(hours=1), "duration_seconds": 60.0},
+                    {"at": now - timedelta(hours=2), "duration_seconds": 90.0},
+                ],
+            )
+        )
         # Idle account with recent rate limits (lower health score)
-        _add_to_pool(_make_acct("bad", active_tasks=0, rl_events=[
-            now - timedelta(hours=1),
-            now - timedelta(hours=3),
-        ]))
+        _add_to_pool(
+            _make_acct(
+                "bad",
+                active_tasks=0,
+                rl_events=[
+                    now - timedelta(hours=1),
+                    now - timedelta(hours=3),
+                ],
+            )
+        )
         result = await select_max_plan_account(_TEST_USER)
         assert result is not None
-        assert result["id"] == "good", "Account with better health score should be preferred"
+        assert result["id"] == "good", (
+            "Account with better health score should be preferred"
+        )
 
     @pytest.mark.asyncio
     async def test_select_uses_active_tasks_as_tiebreaker(self, clean_max_plan_pool):
@@ -1287,7 +1571,9 @@ class TestAccountSelectionByHealthScore:
         assert result["id"] == "idle"
 
     @pytest.mark.asyncio
-    async def test_select_new_accounts_neutral_score_compete_by_load(self, clean_max_plan_pool):
+    async def test_select_new_accounts_neutral_score_compete_by_load(
+        self, clean_max_plan_pool
+    ):
         """New accounts with no history all score 0 — load balancing takes over."""
         _add_to_pool(_make_acct("a1", active_tasks=0))
         _add_to_pool(_make_acct("a2", active_tasks=2))
@@ -1297,7 +1583,9 @@ class TestAccountSelectionByHealthScore:
         assert result["id"] == "a1"  # fewest tasks among equal-score accounts
 
     @pytest.mark.asyncio
-    async def test_disable_account_model_records_rl_event(self, clean_max_plan_pool, monkeypatch):
+    async def test_disable_account_model_records_rl_event(
+        self, clean_max_plan_pool, monkeypatch
+    ):
         """disable_account_model records a rate-limit event for health tracking."""
         monkeypatch.setattr("app.max_plan_pool._persist_rate_limit_state", _async_noop)
         _add_to_pool(_make_acct("a1"))
@@ -1305,7 +1593,9 @@ class TestAccountSelectionByHealthScore:
         assert len(_account_by_id["a1"].get("rl_events", [])) == 1
 
     @pytest.mark.asyncio
-    async def test_multiple_rate_limits_accumulate_in_rl_events(self, clean_max_plan_pool, monkeypatch):
+    async def test_multiple_rate_limits_accumulate_in_rl_events(
+        self, clean_max_plan_pool, monkeypatch
+    ):
         """Each disable call appends to rl_events, lowering the health score."""
         monkeypatch.setattr("app.max_plan_pool._persist_rate_limit_state", _async_noop)
         _add_to_pool(_make_acct("a1"))
@@ -1327,12 +1617,18 @@ class TestAccountSelectionByHealthScore:
         assert isinstance(events[0]["at"], datetime)
 
     @pytest.mark.asyncio
-    async def test_record_completion_event_unknown_account_noop(self, clean_max_plan_pool):
+    async def test_record_completion_event_unknown_account_noop(
+        self, clean_max_plan_pool
+    ):
         """record_completion_event for an unknown account silently does nothing."""
-        await record_completion_event("does-not-exist", duration_seconds=60.0)  # no raise
+        await record_completion_event(
+            "does-not-exist", duration_seconds=60.0
+        )  # no raise
 
     @pytest.mark.asyncio
-    async def test_health_score_improves_after_completion_event(self, clean_max_plan_pool, monkeypatch):
+    async def test_health_score_improves_after_completion_event(
+        self, clean_max_plan_pool, monkeypatch
+    ):
         """After a successful task, health score increases and the account remains preferred."""
         monkeypatch.setattr("app.max_plan_pool._persist_rate_limit_state", _async_noop)
         # Account with one past rate limit
@@ -1347,23 +1643,33 @@ class TestAccountSelectionByHealthScore:
         assert score_after_completion == -1.0  # -2 + 1 = -1
 
     @pytest.mark.asyncio
-    async def test_select_deprefers_chronically_rate_limited_account(self, clean_max_plan_pool, monkeypatch):
+    async def test_select_deprefers_chronically_rate_limited_account(
+        self, clean_max_plan_pool, monkeypatch
+    ):
         """An account with multiple recent rate limits loses to a healthier alternative."""
         monkeypatch.setattr("app.max_plan_pool._persist_rate_limit_state", _async_noop)
         now = datetime.utcnow()
 
         # Chronically rate-limited account (but currently healthy — models cleared)
-        _add_to_pool(_make_acct("chronic", active_tasks=0, rl_events=[
-            now - timedelta(hours=1),
-            now - timedelta(hours=3),
-            now - timedelta(hours=6),
-        ]))
+        _add_to_pool(
+            _make_acct(
+                "chronic",
+                active_tasks=0,
+                rl_events=[
+                    now - timedelta(hours=1),
+                    now - timedelta(hours=3),
+                    now - timedelta(hours=6),
+                ],
+            )
+        )
         # Clean account with modest load
         _add_to_pool(_make_acct("clean", active_tasks=2))
 
         result = await select_max_plan_account(_TEST_USER)
         assert result is not None
-        assert result["id"] == "clean", "Healthier account should be chosen despite higher load"
+        assert result["id"] == "clean", (
+            "Healthier account should be chosen despite higher load"
+        )
 
 
 class TestDisabledStatePersistenceAndRestoration:
@@ -1381,22 +1687,34 @@ class TestDisabledStatePersistenceAndRestoration:
         async def _capture_persist(acct_id):
             persist_calls.append(acct_id)
 
-        monkeypatch.setattr("app.max_plan_pool._persist_rate_limit_state", _capture_persist)
+        monkeypatch.setattr(
+            "app.max_plan_pool._persist_rate_limit_state", _capture_persist
+        )
         _add_to_pool(_make_acct("a1"))
         await disable_account_model("a1", OPUS)
-        assert "a1" in persist_calls, "_persist_rate_limit_state must be called on rate limit"
+        assert "a1" in persist_calls, (
+            "_persist_rate_limit_state must be called on rate limit"
+        )
 
     @pytest.mark.asyncio
-    async def test_clear_on_success_persists_to_db(self, clean_max_plan_pool, monkeypatch):
+    async def test_clear_on_success_persists_to_db(
+        self, clean_max_plan_pool, monkeypatch
+    ):
         """clear_rate_limit_state_on_success calls _persist_rate_limit_state."""
         persist_calls = []
 
         async def _capture_persist(acct_id):
             persist_calls.append(acct_id)
 
-        monkeypatch.setattr("app.max_plan_pool._persist_rate_limit_state", _capture_persist)
+        monkeypatch.setattr(
+            "app.max_plan_pool._persist_rate_limit_state", _capture_persist
+        )
         now = datetime.now(timezone.utc)
-        _add_to_pool(_acct_with_disables("a1", {OPUS: {"hits": 1, "at": now - timedelta(minutes=5)}}))
+        _add_to_pool(
+            _acct_with_disables(
+                "a1", {OPUS: {"hits": 1, "at": now - timedelta(minutes=5)}}
+            )
+        )
         await clear_rate_limit_state_on_success("a1", OPUS)
         assert "a1" in persist_calls
 
@@ -1407,6 +1725,7 @@ class TestDisabledStatePersistenceAndRestoration:
         by simulating the state that would come from the DB.
         """
         from app.max_plan_pool import _account_state_for_model
+
         # _utcnow() returns naive datetimes — use datetime.utcnow() to match
         now = datetime.utcnow()
         # Build an entry that simulates what load_max_plan_pool would restore
@@ -1417,7 +1736,10 @@ class TestDisabledStatePersistenceAndRestoration:
             "active_tasks": 0,
             "oauth_token": "sk-ant-test",
             "disabled_models": {
-                OPUS: {"hits": 1, "at": now - timedelta(minutes=10)},  # 30min cooldown, only 10min elapsed
+                OPUS: {
+                    "hits": 1,
+                    "at": now - timedelta(minutes=10),
+                },  # 30min cooldown, only 10min elapsed
             },
         }
         # The in-memory dict uses datetime objects for "at" (as load_max_plan_pool converts ISO strings)
@@ -1426,6 +1748,7 @@ class TestDisabledStatePersistenceAndRestoration:
     def test_load_max_plan_pool_skips_expired_cooldown_on_restore(self):
         """Cooldowns that elapsed while the service was down are not restored."""
         from app.max_plan_pool import _account_state_for_model
+
         now = datetime.utcnow()
         # Cooldown elapsed (hits=1 → 30min, but 45min have passed)
         expired_entry = {
@@ -1444,20 +1767,49 @@ class TestDisabledStatePersistenceAndRestoration:
     def test_summarize_pool_state_distinguishes_rate_limited_from_other(self):
         """summarize_pool_state should count healthy/probing/rate_limited buckets
         and surface the earliest cooldown recovery time."""
-        from app.max_plan_pool import summarize_pool_state, _account_by_id, _max_plan_pools
+        from app.max_plan_pool import (
+            summarize_pool_state,
+            _account_by_id,
+            _max_plan_pools,
+        )
+
         _account_by_id.clear()
         _max_plan_pools.clear()
         now = datetime.utcnow()
-        a_healthy = {"id": "h", "name": "h", "user_id": "u",
-                     "enabled": True, "active_tasks": 0, "oauth_token": "sk-ant-1"}
-        a_rl_short = {"id": "r1", "name": "r1", "user_id": "u",
-                      "enabled": True, "active_tasks": 0, "oauth_token": "sk-ant-2",
-                      "disabled_models": {OPUS: {"hits": 1, "at": now - timedelta(minutes=5)}}}
-        a_rl_long = {"id": "r2", "name": "r2", "user_id": "u",
-                     "enabled": True, "active_tasks": 0, "oauth_token": "sk-ant-3",
-                     "disabled_models": {OPUS: {"hits": 2, "at": now - timedelta(minutes=1)}}}
-        a_no_token = {"id": "n", "name": "n", "user_id": "u",
-                      "enabled": True, "active_tasks": 0, "oauth_token": None}
+        a_healthy = {
+            "id": "h",
+            "name": "h",
+            "user_id": "u",
+            "enabled": True,
+            "active_tasks": 0,
+            "oauth_token": "sk-ant-1",
+        }
+        a_rl_short = {
+            "id": "r1",
+            "name": "r1",
+            "user_id": "u",
+            "enabled": True,
+            "active_tasks": 0,
+            "oauth_token": "sk-ant-2",
+            "disabled_models": {OPUS: {"hits": 1, "at": now - timedelta(minutes=5)}},
+        }
+        a_rl_long = {
+            "id": "r2",
+            "name": "r2",
+            "user_id": "u",
+            "enabled": True,
+            "active_tasks": 0,
+            "oauth_token": "sk-ant-3",
+            "disabled_models": {OPUS: {"hits": 2, "at": now - timedelta(minutes=1)}},
+        }
+        a_no_token = {
+            "id": "n",
+            "name": "n",
+            "user_id": "u",
+            "enabled": True,
+            "active_tasks": 0,
+            "oauth_token": None,
+        }
         for a in (a_healthy, a_rl_short, a_rl_long, a_no_token):
             _account_by_id[a["id"]] = a
             _max_plan_pools.setdefault("u", []).append(a)
@@ -1489,7 +1841,9 @@ class TestDisableAccountModel:
     / opus-4-6 also cascade into opus-4-7."""
 
     @pytest.mark.asyncio
-    async def test_disables_opus_writes_single_bucket(self, clean_max_plan_pool, monkeypatch):
+    async def test_disables_opus_writes_single_bucket(
+        self, clean_max_plan_pool, monkeypatch
+    ):
         """Opus-4-7 429 writes the single opus-4-7 cascade entry — no sonnet key
         under the post-migration single-tier architecture."""
         _add_to_pool({"id": "a1", "name": "opus_limited", "active_tasks": 0})
@@ -1506,7 +1860,9 @@ class TestDisableAccountModel:
         assert _account_state_for_model(_account_by_id["a1"], HAIKU) == "unavailable"
 
     @pytest.mark.asyncio
-    async def test_opus_disable_blocks_haiku_via_shared_meter(self, clean_max_plan_pool, monkeypatch):
+    async def test_opus_disable_blocks_haiku_via_shared_meter(
+        self, clean_max_plan_pool, monkeypatch
+    ):
         """Opus-4-7 429 writes {opus-4-7}. Haiku lookup normalizes to Opus-4-7,
         so haiku requests are also blocked (shared meter)."""
         _add_to_pool({"id": "a1", "name": "opus_limited", "active_tasks": 0})
@@ -1520,7 +1876,9 @@ class TestDisableAccountModel:
         assert _account_state_for_model(_account_by_id["a1"], HAIKU) == "unavailable"
 
     @pytest.mark.asyncio
-    async def test_disable_haiku_marks_opus_shared_meter(self, clean_max_plan_pool, monkeypatch):
+    async def test_disable_haiku_marks_opus_shared_meter(
+        self, clean_max_plan_pool, monkeypatch
+    ):
         """Haiku 429 normalizes to Opus-4-7: writes {opus-4-7}, blocks both haiku and opus-4-7."""
         _add_to_pool({"id": "a1", "name": "haiku_limited", "active_tasks": 0})
         monkeypatch.setattr("app.max_plan_pool._persist_rate_limit_state", _async_noop)
@@ -1534,7 +1892,9 @@ class TestDisableAccountModel:
         assert _account_state_for_model(_account_by_id["a1"], HAIKU) == "unavailable"
 
     @pytest.mark.asyncio
-    async def test_repeated_disable_increments_hits(self, clean_max_plan_pool, monkeypatch):
+    async def test_repeated_disable_increments_hits(
+        self, clean_max_plan_pool, monkeypatch
+    ):
         """Each call to disable_account_model bumps the hit counter and timestamp."""
         _add_to_pool({"id": "a1", "name": "repeat", "active_tasks": 0})
         monkeypatch.setattr("app.max_plan_pool._persist_rate_limit_state", _async_noop)
@@ -1549,7 +1909,9 @@ class TestDisableAccountModel:
         assert _account_by_id["a1"]["disabled_models"][OPUS]["hits"] == 3
 
     @pytest.mark.asyncio
-    async def test_missing_account_is_silent_noop(self, clean_max_plan_pool, monkeypatch):
+    async def test_missing_account_is_silent_noop(
+        self, clean_max_plan_pool, monkeypatch
+    ):
         """Calling with an unknown account id is a silent no-op (doesn't raise)."""
         monkeypatch.setattr("app.max_plan_pool._persist_rate_limit_state", _async_noop)
         await disable_account_model("does-not-exist", OPUS)  # should not raise
@@ -1576,7 +1938,9 @@ class TestDisableAccountModel:
         _pending_rl_persists.clear()
 
     @pytest.mark.asyncio
-    async def test_blacklist_pruning_preserves_disabled_account(self, clean_max_plan_pool, monkeypatch):
+    async def test_blacklist_pruning_preserves_disabled_account(
+        self, clean_max_plan_pool, monkeypatch
+    ):
         """End-to-end regression: after disable_account_model, the orchestrator's
         blacklist-pruning predicate must keep the account in the blacklist.
 
@@ -1591,14 +1955,20 @@ class TestDisableAccountModel:
 
         # Before disable: account is healthy → blacklist entry gets pruned.
         pre_blacklist = ["a1"]
-        pre_pruned = [aid for aid in pre_blacklist
-                      if not _account_available_for_model(_account_by_id[aid], OPUS)]
+        pre_pruned = [
+            aid
+            for aid in pre_blacklist
+            if not _account_available_for_model(_account_by_id[aid], OPUS)
+        ]
         assert pre_pruned == [], "healthy account should be pruned from task blacklist"
 
         # After disable: account is unavailable → blacklist entry is preserved.
         await disable_account_model("a1", OPUS)
-        post_pruned = [aid for aid in pre_blacklist
-                       if not _account_available_for_model(_account_by_id[aid], OPUS)]
+        post_pruned = [
+            aid
+            for aid in pre_blacklist
+            if not _account_available_for_model(_account_by_id[aid], OPUS)
+        ]
         assert post_pruned == ["a1"], (
             "disabled account must stay in blacklist so it isn't re-selected — this is "
             "the fix for the hit #17 thundering-herd loop"

@@ -5,6 +5,7 @@ defining their payload shape. Payload validation stays in payload_schemas.py
 and remains extra-field tolerant so new task fields can be introduced without
 turning this registry into a product constraint.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -190,18 +191,28 @@ TASK_CAPABILITY_BY_VALUE: dict[str, TaskCapability] = {
 }
 
 # Backward-compatible constants consumed by existing code.
-ALL_TASK_TYPES: frozenset[str] = frozenset(capability.id.value for capability in TASK_CAPABILITIES)
+ALL_TASK_TYPES: frozenset[str] = frozenset(
+    capability.id.value for capability in TASK_CAPABILITIES
+)
 READ_ONLY_TASK_TYPES: frozenset[str] = frozenset(
-    capability.id.value for capability in TASK_CAPABILITIES if capability.agent_mode == "read_only"
+    capability.id.value
+    for capability in TASK_CAPABILITIES
+    if capability.agent_mode == "read_only"
 )
 WRITE_TASK_TYPES: frozenset[str] = frozenset(
-    capability.id.value for capability in TASK_CAPABILITIES if capability.agent_mode == "write"
+    capability.id.value
+    for capability in TASK_CAPABILITIES
+    if capability.agent_mode == "write"
 )
 USER_LAUNCHABLE_TASK_TYPES: tuple[str, ...] = tuple(
-    capability.id.value for capability in TASK_CAPABILITIES if capability.user_launchable
+    capability.id.value
+    for capability in TASK_CAPABILITIES
+    if capability.user_launchable
 )
 PROVIDER_CONFIGURABLE_TASK_TYPES: tuple[str, ...] = tuple(
-    capability.id.value for capability in TASK_CAPABILITIES if capability.provider_configurable
+    capability.id.value
+    for capability in TASK_CAPABILITIES
+    if capability.provider_configurable
 )
 FILTER_VISIBLE_TASK_TYPES: tuple[str, ...] = tuple(
     capability.id.value for capability in TASK_CAPABILITIES if capability.filter_visible

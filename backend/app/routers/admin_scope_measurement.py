@@ -1,4 +1,5 @@
 """Scope-level conversion rate measurement endpoints."""
+
 import uuid
 import logging
 from collections import defaultdict
@@ -32,7 +33,9 @@ def _compute_scope_baselines(tasks: list, lookback_days: int) -> dict:
     computing merge_rate = COMPLETED / total terminal per bucket.  Also returns
     an overall summary per scope with trend derived from first-to-last week delta.
     """
-    bucket: Dict[Tuple[str, str], Dict[str, int]] = defaultdict(lambda: {"created": 0, "merged": 0})
+    bucket: Dict[Tuple[str, str], Dict[str, int]] = defaultdict(
+        lambda: {"created": 0, "merged": 0}
+    )
 
     for t in tasks:
         # `.get("scope", "unknown")` would return None if context has
@@ -56,29 +59,41 @@ def _compute_scope_baselines(tasks: list, lookback_days: int) -> dict:
         created = counts["created"]
         merged = counts["merged"]
         merge_rate = round(merged / created, 3) if created > 0 else None
-        series.append({
-            "week": week,
-            "scope": scope,
-            "created": created,
-            "merged": merged,
-            "merge_rate": merge_rate,
-        })
+        series.append(
+            {
+                "week": week,
+                "scope": scope,
+                "created": created,
+                "merged": merged,
+                "merge_rate": merge_rate,
+            }
+        )
 
     # Build per-scope summary: overall rate + trend from first-to-last week
     all_scopes: set = {scope for (_, scope) in bucket}
     summary: Dict[str, Any] = {}
     for scope in sorted(all_scopes):
-        total_created = sum(c["created"] for (_, sc), c in bucket.items() if sc == scope)
+        total_created = sum(
+            c["created"] for (_, sc), c in bucket.items() if sc == scope
+        )
         total_merged = sum(c["merged"] for (_, sc), c in bucket.items() if sc == scope)
-        overall_rate = round(total_merged / total_created, 3) if total_created > 0 else None
+        overall_rate = (
+            round(total_merged / total_created, 3) if total_created > 0 else None
+        )
 
         scope_weeks = sorted((wk, c) for (wk, sc), c in bucket.items() if sc == scope)
         scope_trend: str | None = None
         if len(scope_weeks) >= 2:
             first_c = scope_weeks[0][1]
             last_c = scope_weeks[-1][1]
-            first_rate = first_c["merged"] / first_c["created"] if first_c["created"] > 0 else None
-            last_rate = last_c["merged"] / last_c["created"] if last_c["created"] > 0 else None
+            first_rate = (
+                first_c["merged"] / first_c["created"]
+                if first_c["created"] > 0
+                else None
+            )
+            last_rate = (
+                last_c["merged"] / last_c["created"] if last_c["created"] > 0 else None
+            )
             if first_rate is not None and last_rate is not None:
                 delta = last_rate - first_rate
                 if delta > 0.05:
@@ -112,7 +127,9 @@ def _weekly_merge_rate_deltas(tasks: list) -> List[Dict[str, Any]]:
         {week: ISO Monday date, created: int, merged: int,
          merge_rate: float|None, merge_rate_delta: float|None}
     """
-    week_bucket: Dict[str, Dict[str, int]] = defaultdict(lambda: {"created": 0, "merged": 0})
+    week_bucket: Dict[str, Dict[str, int]] = defaultdict(
+        lambda: {"created": 0, "merged": 0}
+    )
     for t in tasks:
         if not t.created_at:
             continue
@@ -134,14 +151,20 @@ def _weekly_merge_rate_deltas(tasks: list) -> List[Dict[str, Any]]:
             delta = None
         else:
             prev_rate = out[i - 1]["merge_rate"]
-            delta = round(merge_rate - prev_rate, 3) if (merge_rate is not None and prev_rate is not None) else None
-        out.append({
-            "week": week_key,
-            "created": created,
-            "merged": merged,
-            "merge_rate": merge_rate,
-            "merge_rate_delta": delta,
-        })
+            delta = (
+                round(merge_rate - prev_rate, 3)
+                if (merge_rate is not None and prev_rate is not None)
+                else None
+            )
+        out.append(
+            {
+                "week": week_key,
+                "created": created,
+                "merged": merged,
+                "merge_rate": merge_rate,
+                "merge_rate_delta": delta,
+            }
+        )
     return out
 
 
@@ -160,10 +183,13 @@ def _compute_medium_scope_measurement(
     # --- Headline ---
     total_created = len(medium_tasks)
     total_merged = sum(
-        1 for t in medium_tasks
+        1
+        for t in medium_tasks
         if t.status == TaskStatus.COMPLETED and (t.context or {}).get("pr_merged")
     )
-    medium_scope_conversion_rate = round(total_merged / total_created, 3) if total_created > 0 else None
+    medium_scope_conversion_rate = (
+        round(total_merged / total_created, 3) if total_created > 0 else None
+    )
 
     # --- Find target direction ---
     resolved_direction_id: Optional[str] = direction_id
@@ -204,7 +230,11 @@ def _compute_medium_scope_measurement(
 
     _TERMINAL_STATUSES = (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED)
 
-    def _window_stats(tasks_subset: list, window_start: Optional[datetime], window_end: Optional[datetime]) -> Dict[str, Any]:
+    def _window_stats(
+        tasks_subset: list,
+        window_start: Optional[datetime],
+        window_end: Optional[datetime],
+    ) -> Dict[str, Any]:
         """Count ``tasks_subset`` once, using terminal-updated-in-window
         semantics. Callers that pre-filter by created_at produce in-flight
         bias on short windows — use ``_rolling_window_stats`` for those.
@@ -213,7 +243,8 @@ def _compute_medium_scope_measurement(
         finished = [t for t in tasks_subset if t.status in _TERMINAL_STATUSES]
         created = len(finished)
         merged = sum(
-            1 for t in finished
+            1
+            for t in finished
             if t.status == TaskStatus.COMPLETED and (t.context or {}).get("pr_merged")
         )
         return {
@@ -266,8 +297,12 @@ def _compute_medium_scope_measurement(
     pre_investment: Optional[Dict[str, Any]] = None
     post_investment: Optional[Dict[str, Any]] = None
     if investment_start is not None:
-        pre_tasks = [t for t in medium_tasks if t.created_at and t.created_at < investment_start]
-        post_tasks = [t for t in medium_tasks if t.created_at and t.created_at >= investment_start]
+        pre_tasks = [
+            t for t in medium_tasks if t.created_at and t.created_at < investment_start
+        ]
+        post_tasks = [
+            t for t in medium_tasks if t.created_at and t.created_at >= investment_start
+        ]
 
         pre_start = min((t.created_at for t in pre_tasks if t.created_at), default=None)
         post_end = max((t.created_at for t in post_tasks if t.created_at), default=None)
@@ -302,7 +337,9 @@ def _compute_medium_scope_measurement(
         recent_30d = None
 
     # --- Weekly time series ---
-    week_bucket: Dict[str, Dict[str, int]] = defaultdict(lambda: {"created": 0, "merged": 0, "direction_merges": 0})
+    week_bucket: Dict[str, Dict[str, int]] = defaultdict(
+        lambda: {"created": 0, "merged": 0, "direction_merges": 0}
+    )
 
     for t in medium_tasks:
         if not t.created_at:
@@ -311,10 +348,16 @@ def _compute_medium_scope_measurement(
         week_monday = task_date - timedelta(days=task_date.weekday())
         week_key = week_monday.isoformat()
         week_bucket[week_key]["created"] += 1
-        is_merged = t.status == TaskStatus.COMPLETED and (t.context or {}).get("pr_merged")
+        is_merged = t.status == TaskStatus.COMPLETED and (t.context or {}).get(
+            "pr_merged"
+        )
         if is_merged:
             week_bucket[week_key]["merged"] += 1
-        if is_merged and resolved_direction_id and (t.context or {}).get("direction_id") == resolved_direction_id:
+        if (
+            is_merged
+            and resolved_direction_id
+            and (t.context or {}).get("direction_id") == resolved_direction_id
+        ):
             week_bucket[week_key]["direction_merges"] += 1
 
     sorted_weeks = sorted(week_bucket.keys())
@@ -328,17 +371,25 @@ def _compute_medium_scope_measurement(
             merge_rate_delta = None
         else:
             prev_rate = weekly_series[i - 1]["merge_rate"]
-            merge_rate_delta = round(merge_rate - prev_rate, 3) if (merge_rate is not None and prev_rate is not None) else None
-        weekly_series.append({
-            "week": week_key,
-            "created": created,
-            "merged": merged,
-            "merge_rate": merge_rate,
-            "direction_merges": counts["direction_merges"],
-            "merge_rate_delta": merge_rate_delta,
-        })
+            merge_rate_delta = (
+                round(merge_rate - prev_rate, 3)
+                if (merge_rate is not None and prev_rate is not None)
+                else None
+            )
+        weekly_series.append(
+            {
+                "week": week_key,
+                "created": created,
+                "merged": merged,
+                "merge_rate": merge_rate,
+                "direction_merges": counts["direction_merges"],
+                "merge_rate_delta": merge_rate_delta,
+            }
+        )
 
-    week_rate_delta: Dict[str, Optional[float]] = {e["week"]: e["merge_rate_delta"] for e in weekly_series}
+    week_rate_delta: Dict[str, Optional[float]] = {
+        e["week"]: e["merge_rate_delta"] for e in weekly_series
+    }
 
     # --- Daily time series (for finer-grained trend chart) ---
     # Kept alongside weekly_series so existing UI / callers don't break.
@@ -350,7 +401,9 @@ def _compute_medium_scope_measurement(
     # today so far, how much merged?" (the latter is always low because
     # many tasks are still running).
     daily_cutoff = _now - timedelta(days=lookback_days)
-    day_bucket: Dict[str, Dict[str, int]] = defaultdict(lambda: {"created": 0, "merged": 0, "direction_merges": 0})
+    day_bucket: Dict[str, Dict[str, int]] = defaultdict(
+        lambda: {"created": 0, "merged": 0, "direction_merges": 0}
+    )
     for t in medium_tasks:
         if t.status not in _TERMINAL_STATUSES:
             continue
@@ -358,11 +411,19 @@ def _compute_medium_scope_measurement(
         if not resolved_at or resolved_at < daily_cutoff:
             continue
         day_key = resolved_at.date().isoformat()
-        day_bucket[day_key]["created"] += 1  # legacy key = denominator (finished-in-day)
-        is_merged = t.status == TaskStatus.COMPLETED and (t.context or {}).get("pr_merged")
+        day_bucket[day_key]["created"] += (
+            1  # legacy key = denominator (finished-in-day)
+        )
+        is_merged = t.status == TaskStatus.COMPLETED and (t.context or {}).get(
+            "pr_merged"
+        )
         if is_merged:
             day_bucket[day_key]["merged"] += 1
-        if is_merged and resolved_direction_id and (t.context or {}).get("direction_id") == resolved_direction_id:
+        if (
+            is_merged
+            and resolved_direction_id
+            and (t.context or {}).get("direction_id") == resolved_direction_id
+        ):
             day_bucket[day_key]["direction_merges"] += 1
 
     sorted_days = sorted(day_bucket.keys())
@@ -376,15 +437,21 @@ def _compute_medium_scope_measurement(
             merge_rate_delta = None
         else:
             prev_rate = daily_series[i - 1]["merge_rate"]
-            merge_rate_delta = round(merge_rate - prev_rate, 3) if (merge_rate is not None and prev_rate is not None) else None
-        daily_series.append({
-            "day": day_key,
-            "created": created,
-            "merged": merged,
-            "merge_rate": merge_rate,
-            "direction_merges": counts["direction_merges"],
-            "merge_rate_delta": merge_rate_delta,
-        })
+            merge_rate_delta = (
+                round(merge_rate - prev_rate, 3)
+                if (merge_rate is not None and prev_rate is not None)
+                else None
+            )
+        daily_series.append(
+            {
+                "day": day_key,
+                "created": created,
+                "merged": merged,
+                "merge_rate": merge_rate,
+                "direction_merges": counts["direction_merges"],
+                "merge_rate_delta": merge_rate_delta,
+            }
+        )
 
     # --- Correlated changes: direction-associated merged tasks with weekly delta ---
     correlated_changes: List[Dict[str, Any]] = []
@@ -392,18 +459,22 @@ def _compute_medium_scope_measurement(
         for t in medium_tasks:
             if (t.context or {}).get("direction_id") != resolved_direction_id:
                 continue
-            if not (t.status == TaskStatus.COMPLETED and (t.context or {}).get("pr_merged")):
+            if not (
+                t.status == TaskStatus.COMPLETED and (t.context or {}).get("pr_merged")
+            ):
                 continue
             if not t.created_at:
                 continue
             task_date = t.created_at.date()
             week_monday = task_date - timedelta(days=task_date.weekday())
             week_key = week_monday.isoformat()
-            correlated_changes.append({
-                "title": t.title,
-                "week": week_key,
-                "merge_rate_delta": week_rate_delta.get(week_key),
-            })
+            correlated_changes.append(
+                {
+                    "title": t.title,
+                    "week": week_key,
+                    "merge_rate_delta": week_rate_delta.get(week_key),
+                }
+            )
 
     return {
         "medium_scope_conversion_rate": medium_scope_conversion_rate,
@@ -433,14 +504,19 @@ def _compute_first_attempt_measurement(
     time-series (using _derive_completed_at for timestamps), and by_category
     breakdown of rejection reasons from _first_attempt_rejection_categories.
     """
+
     def _fa_rate(task_list: list) -> Optional[float]:
-        measured = [t for t in task_list if "_first_attempt_succeeded" in (t.context or {})]
+        measured = [
+            t for t in task_list if "_first_attempt_succeeded" in (t.context or {})
+        ]
         if not measured:
             return None
         successes = sum(1 for t in measured if t.context["_first_attempt_succeeded"])
         return round(successes / len(measured), 2)
 
-    measured_tasks = [t for t in tasks if "_first_attempt_succeeded" in (t.context or {})]
+    measured_tasks = [
+        t for t in tasks if "_first_attempt_succeeded" in (t.context or {})
+    ]
     headline_rate = _fa_rate(tasks)
     sample_size = len(measured_tasks)
 
@@ -448,11 +524,25 @@ def _compute_first_attempt_measurement(
     pre_split: Optional[Dict[str, Any]] = None
     post_split: Optional[Dict[str, Any]] = None
     if split_date is not None:
-        split_naive = split_date.replace(tzinfo=None) if split_date.tzinfo else split_date
-        pre_tasks = [t for t in measured_tasks if _derive_completed_at(t).replace(tzinfo=None) < split_naive]
-        post_tasks = [t for t in measured_tasks if _derive_completed_at(t).replace(tzinfo=None) >= split_naive]
+        split_naive = (
+            split_date.replace(tzinfo=None) if split_date.tzinfo else split_date
+        )
+        pre_tasks = [
+            t
+            for t in measured_tasks
+            if _derive_completed_at(t).replace(tzinfo=None) < split_naive
+        ]
+        post_tasks = [
+            t
+            for t in measured_tasks
+            if _derive_completed_at(t).replace(tzinfo=None) >= split_naive
+        ]
 
-        def _window_stats(task_subset: list, window_start: Optional[datetime], window_end: Optional[datetime]) -> Dict[str, Any]:
+        def _window_stats(
+            task_subset: list,
+            window_start: Optional[datetime],
+            window_end: Optional[datetime],
+        ) -> Dict[str, Any]:
             return {
                 "rate": _fa_rate(task_subset),
                 "sample_size": len(task_subset),
@@ -466,7 +556,9 @@ def _compute_first_attempt_measurement(
         post_split = _window_stats(post_tasks, split_naive, post_end)
 
     # --- Weekly time series using _derive_completed_at for timestamp bucketing ---
-    week_bucket: Dict[str, Dict[str, int]] = defaultdict(lambda: {"measured": 0, "succeeded": 0})
+    week_bucket: Dict[str, Dict[str, int]] = defaultdict(
+        lambda: {"measured": 0, "succeeded": 0}
+    )
     for t in measured_tasks:
         completed = _derive_completed_at(t)
         task_date = completed.date()
@@ -487,16 +579,24 @@ def _compute_first_attempt_measurement(
             delta = None
         else:
             prev_rate = weekly_series[i - 1]["rate"]
-            delta = round(rate - prev_rate, 2) if (rate is not None and prev_rate is not None) else None
-        weekly_series.append({
-            "week": week_key,
-            "rate": rate,
-            "sample_size": measured,
-            "delta_from_previous": delta,
-        })
+            delta = (
+                round(rate - prev_rate, 2)
+                if (rate is not None and prev_rate is not None)
+                else None
+            )
+        weekly_series.append(
+            {
+                "week": week_key,
+                "rate": rate,
+                "sample_size": measured,
+                "delta_from_previous": delta,
+            }
+        )
 
     # --- By-category breakdown from _first_attempt_rejection_categories ---
-    tasks_with_cats = [t for t in tasks if "_first_attempt_rejection_categories" in (t.context or {})]
+    tasks_with_cats = [
+        t for t in tasks if "_first_attempt_rejection_categories" in (t.context or {})
+    ]
     by_category: Optional[Dict[str, float]] = None
     if tasks_with_cats:
         total_with_cats = len(tasks_with_cats)
@@ -536,15 +636,21 @@ async def get_scope_baselines(
     """
     cutoff = _utcnow() - timedelta(days=lookback_days)
     filters = [
-        Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]),
+        Task.status.in_(
+            [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
+        ),
         Task.created_at >= cutoff,
     ]
     if project_id:
         filters.append(Task.project_id == project_id)
 
     result = await session.execute(
-        select(Task).where(*filters).options(
-            load_only(Task.id, Task.status, Task.context, Task.created_at, Task.project_id)
+        select(Task)
+        .where(*filters)
+        .options(
+            load_only(
+                Task.id, Task.status, Task.context, Task.created_at, Task.project_id
+            )
         )
     )
     tasks = result.scalars().all()
@@ -569,7 +675,9 @@ async def get_medium_scope_measurement(
     cutoff = _utcnow() - timedelta(days=lookback_days)
     result = await session.execute(
         select(Task).where(
-            Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]),
+            Task.status.in_(
+                [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
+            ),
             Task.created_at >= cutoff,
             Task.project_id == project_id,
         )
@@ -579,7 +687,9 @@ async def get_medium_scope_measurement(
 
     project = await session.get(Project, project_id)
 
-    return _compute_medium_scope_measurement(medium_tasks, project, direction_id, lookback_days)
+    return _compute_medium_scope_measurement(
+        medium_tasks, project, direction_id, lookback_days
+    )
 
 
 @router.get("/first-attempt-measurement")
@@ -599,7 +709,9 @@ async def get_first_attempt_measurement(
     cutoff = _utcnow() - timedelta(days=lookback_days)
     result = await session.execute(
         select(Task).where(
-            Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]),
+            Task.status.in_(
+                [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
+            ),
             Task.created_at >= cutoff,
             Task.project_id == project_id,
         )
@@ -613,4 +725,6 @@ async def get_first_attempt_measurement(
         except (ValueError, TypeError):
             pass
 
-    return _compute_first_attempt_measurement(list(all_tasks), parsed_split_date, lookback_days)
+    return _compute_first_attempt_measurement(
+        list(all_tasks), parsed_split_date, lookback_days
+    )

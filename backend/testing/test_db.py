@@ -2,6 +2,7 @@ import pytest
 from app.models import Artifact, ProjectStatus, TaskStatus, ArtifactType
 from testing.factories import make_project, make_task
 
+
 @pytest.mark.asyncio
 async def test_project_creation(db_session):
     """
@@ -15,6 +16,7 @@ async def test_project_creation(db_session):
     assert project.id is not None
     assert project.status == ProjectStatus.DRAFT
 
+
 @pytest.mark.asyncio
 async def test_task_cascading(db_session):
     """
@@ -25,13 +27,16 @@ async def test_task_cascading(db_session):
     await db_session.commit()
     await db_session.refresh(project)
 
-    task = make_task(project_id=project.id, payloads=[{"cmd": "ls"}], vm_instance_id="vm-1")
+    task = make_task(
+        project_id=project.id, payloads=[{"cmd": "ls"}], vm_instance_id="vm-1"
+    )
     db_session.add(task)
     await db_session.commit()
     await db_session.refresh(task)
 
     assert task.project_id == project.id
     assert task.status == TaskStatus.QUEUED
+
 
 @pytest.mark.asyncio
 async def test_artifact_linking(db_session):
@@ -43,12 +48,16 @@ async def test_artifact_linking(db_session):
     await db_session.commit()
     await db_session.refresh(project)
 
-    task = make_task(project_id=project.id, payloads=[{"cmd": "ls"}], vm_instance_id="vm-1")
+    task = make_task(
+        project_id=project.id, payloads=[{"cmd": "ls"}], vm_instance_id="vm-1"
+    )
     db_session.add(task)
     await db_session.commit()
     await db_session.refresh(task)
 
-    artifact = Artifact(task_id=task.id, artifact_type=ArtifactType.ERROR_LOG, logs="test logs")
+    artifact = Artifact(
+        task_id=task.id, artifact_type=ArtifactType.ERROR_LOG, logs="test logs"
+    )
     db_session.add(artifact)
     await db_session.commit()
     await db_session.refresh(artifact)

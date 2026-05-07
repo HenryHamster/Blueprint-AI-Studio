@@ -5,6 +5,7 @@ markdown documents. Extracted from app.research_completion to keep that
 module focused on pipeline orchestration. These functions have no coupling
 to DB, LLM, or broadcast layers — they operate only on strings and dicts.
 """
+
 import datetime
 import re
 from typing import Optional
@@ -12,7 +13,12 @@ from typing import Optional
 
 def _parse_research_context(text: str) -> dict:
     """Parse a research_context string into its 3 sections and optional eviction summary."""
-    result: dict = {"established": [], "failed": [], "open_questions": [], "eviction_summary": None}
+    result: dict = {
+        "established": [],
+        "failed": [],
+        "open_questions": [],
+        "eviction_summary": None,
+    }
     if not text:
         return result
     section_map = {
@@ -42,23 +48,30 @@ def _parse_research_context(text: str) -> dict:
 
 def _parse_eviction_counts(summary_text: Optional[str]) -> dict:
     """Parse counts and failed titles from an eviction summary body."""
-    result: dict = {"established": 0, "failed": 0, "open_questions": 0, "failed_titles": []}
+    result: dict = {
+        "established": 0,
+        "failed": 0,
+        "open_questions": 0,
+        "failed_titles": [],
+    }
     if not summary_text:
         return result
     for line in summary_text.splitlines():
         line = line.strip()
         # Check "Failed:" prefix before "evicted" keyword — titles may themselves contain "evicted"
         if line.startswith("Failed:"):
-            titles_str = line[len("Failed:"):].strip()
-            result["failed_titles"] = [t.strip() for t in titles_str.split(";") if t.strip()]
+            titles_str = line[len("Failed:") :].strip()
+            result["failed_titles"] = [
+                t.strip() for t in titles_str.split(";") if t.strip()
+            ]
         elif "evicted" in line:
-            m = re.search(r'(\d+) established', line)
+            m = re.search(r"(\d+) established", line)
             if m:
                 result["established"] = int(m.group(1))
-            m = re.search(r'(\d+) failed', line)
+            m = re.search(r"(\d+) failed", line)
             if m:
                 result["failed"] = int(m.group(1))
-            m = re.search(r'(\d+) open question', line)
+            m = re.search(r"(\d+) open question", line)
             if m:
                 result["open_questions"] = int(m.group(1))
     return result
@@ -87,7 +100,9 @@ def _format_evicted_failed(entry: str, max_len: int = 60) -> str:
     return f"{truncated}{suffix}"
 
 
-def _format_eviction_body(established: int, failed: int, open_questions: int, failed_titles: list) -> str:
+def _format_eviction_body(
+    established: int, failed: int, open_questions: int, failed_titles: list
+) -> str:
     """Format the eviction summary body content (without the ## header line)."""
     count_parts = []
     if established > 0:
@@ -159,7 +174,11 @@ def _apply_prior_outcomes(established: list, prior_history: list) -> list:
     outcomes: dict = {}
     for entry in prior_history:
         failed = entry.get("failed_task_details") or []
-        failed_map = {(f.get("title") or "").strip(): (f.get("category") or "") for f in failed if f.get("title")}
+        failed_map = {
+            (f.get("title") or "").strip(): (f.get("category") or "")
+            for f in failed
+            if f.get("title")
+        }
         prs_merged = entry.get("prs_merged", 0) or 0
         tasks_created = entry.get("tasks_created", 0) or 0
         settled = tasks_created > 0 and (prs_merged + len(failed)) >= tasks_created
@@ -204,7 +223,9 @@ def _build_research_context(
     """Build a compounding research_context document deterministically (no LLM)."""
     parsed = _parse_research_context(prior_context or "")
     if prior_history:
-        parsed["established"] = _apply_prior_outcomes(parsed["established"], prior_history)
+        parsed["established"] = _apply_prior_outcomes(
+            parsed["established"], prior_history
+        )
 
     # Parse prior eviction summary for accumulation
     prior_eviction = _parse_eviction_counts(parsed["eviction_summary"])
@@ -212,15 +233,25 @@ def _build_research_context(
     # Append new findings to Established Findings as (proposed)
     for i, title in enumerate(finding_titles):
         desc = key_finding_descriptions[i] if i < len(key_finding_descriptions) else ""
-        scope = (finding_scopes[i] if finding_scopes and i < len(finding_scopes) else None) or "small"
+        scope = (
+            finding_scopes[i] if finding_scopes and i < len(finding_scopes) else None
+        ) or "small"
         scope_tag = f" [{scope}]"
         if desc:
             first_sentence = desc.split(".")[0].strip()
-            entry_text = f"{title}{scope_tag} (proposed). {first_sentence}" if first_sentence else f"{title}{scope_tag} (proposed)"
+            entry_text = (
+                f"{title}{scope_tag} (proposed). {first_sentence}"
+                if first_sentence
+                else f"{title}{scope_tag} (proposed)"
+            )
         else:
             entry_text = f"{title}{scope_tag} (proposed)"
-        _claims = (finding_claims[i] if finding_claims and i < len(finding_claims) else None) or []
-        _sources = (finding_sources[i] if finding_sources and i < len(finding_sources) else None) or []
+        _claims = (
+            finding_claims[i] if finding_claims and i < len(finding_claims) else None
+        ) or []
+        _sources = (
+            finding_sources[i] if finding_sources and i < len(finding_sources) else None
+        ) or []
         if _claims:
             entry_text += ". Claims: " + "; ".join(str(c)[:80] for c in _claims[:6])
         if _sources:
@@ -268,7 +299,11 @@ def _build_research_context(
     doc = _format_doc(parsed)
     if len(doc) <= MAX_MAIN_CHARS:
         # No trimming needed; preserve any existing eviction summary
-        if prior_eviction["established"] or prior_eviction["failed"] or prior_eviction["open_questions"]:
+        if (
+            prior_eviction["established"]
+            or prior_eviction["failed"]
+            or prior_eviction["open_questions"]
+        ):
             eviction_body = _format_eviction_body(
                 prior_eviction["established"],
                 prior_eviction["failed"],
@@ -279,7 +314,11 @@ def _build_research_context(
         return doc
 
     # Snapshot sections before trimming
-    before = {k: list(v) for k, v in parsed.items() if k in ("established", "failed", "open_questions")}
+    before = {
+        k: list(v)
+        for k, v in parsed.items()
+        if k in ("established", "failed", "open_questions")
+    }
 
     # Trim oldest entries (from top of each section) to stay under main limit
     while len(doc) > MAX_MAIN_CHARS:
@@ -302,7 +341,9 @@ def _build_research_context(
     new_oq = len(before["open_questions"]) - len(parsed["open_questions"])
 
     evicted_failed_titles = (
-        [_format_evicted_failed(e) for e in before["failed"][:new_failed]] if new_failed > 0 else []
+        [_format_evicted_failed(e) for e in before["failed"][:new_failed]]
+        if new_failed > 0
+        else []
     )
 
     # Populate structured eviction records for callers that want audit history
@@ -313,9 +354,25 @@ def _build_research_context(
             rec["evicted_at"] = _evicted_at
             evicted_out.append(rec)
         for e in before["failed"][:new_failed]:
-            evicted_out.append({"title": e[:200], "claims": [], "source_refs": [], "status": "failed", "evicted_at": _evicted_at})
+            evicted_out.append(
+                {
+                    "title": e[:200],
+                    "claims": [],
+                    "source_refs": [],
+                    "status": "failed",
+                    "evicted_at": _evicted_at,
+                }
+            )
         for e in before["open_questions"][:new_oq]:
-            evicted_out.append({"title": e[:200], "claims": [], "source_refs": [], "status": "open_question", "evicted_at": _evicted_at})
+            evicted_out.append(
+                {
+                    "title": e[:200],
+                    "claims": [],
+                    "source_refs": [],
+                    "status": "open_question",
+                    "evicted_at": _evicted_at,
+                }
+            )
 
     # Merge with prior eviction summary
     total_established = prior_eviction["established"] + new_established
@@ -323,11 +380,13 @@ def _build_research_context(
     total_oq = prior_eviction["open_questions"] + new_oq
     all_failed_titles = prior_eviction["failed_titles"] + evicted_failed_titles
 
-    eviction_body = _format_eviction_body(total_established, total_failed, total_oq, all_failed_titles)
+    eviction_body = _format_eviction_body(
+        total_established, total_failed, total_oq, all_failed_titles
+    )
     return _format_doc(parsed, eviction_body[:EVICTION_MAX])[:TOTAL_MAX]
 
 
-_EVIDENCE_TITLE_RE = re.compile(r'^(.*?)\s*(?:\[.*?\])?\s*\(([^)]+)\)')
+_EVIDENCE_TITLE_RE = re.compile(r"^(.*?)\s*(?:\[.*?\])?\s*\(([^)]+)\)")
 
 
 def filter_direction_evidence(
@@ -390,10 +449,18 @@ def build_recent_findings_evidence(
     total_chars = 0
     for i in range(max(0, n - max_findings), n):
         title = finding_titles[i]
-        claims = list((finding_claims[i] if finding_claims and i < len(finding_claims) else None) or [])
-        raw_sources = (finding_sources[i] if finding_sources and i < len(finding_sources) else None) or []
+        claims = list(
+            (finding_claims[i] if finding_claims and i < len(finding_claims) else None)
+            or []
+        )
+        raw_sources = (
+            finding_sources[i] if finding_sources and i < len(finding_sources) else None
+        ) or []
         source_refs = [
-            {"ref": s["ref"], **({"excerpt": s["excerpt"][:120]} if s.get("excerpt") else {})}
+            {
+                "ref": s["ref"],
+                **({"excerpt": s["excerpt"][:120]} if s.get("excerpt") else {}),
+            }
             for s in raw_sources
             if isinstance(s, dict) and s.get("ref")
         ]

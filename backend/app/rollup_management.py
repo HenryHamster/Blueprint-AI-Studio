@@ -24,8 +24,11 @@ from sqlmodel import select
 
 from app.database import AsyncSessionLocal
 from app.models import (
-    Task, Artifact, Project,
-    TaskStatus, ArtifactType,
+    Task,
+    Artifact,
+    Project,
+    TaskStatus,
+    ArtifactType,
 )
 from app.review_pipeline import _spawn_pipeline_task, _is_pipeline_task_stale
 from app.rollup_state import (  # noqa: F401 — re-exported for legacy callers/tests
@@ -228,7 +231,8 @@ async def _relock_parent(
     if fresh is None:
         logger.info(
             "[ROLLUP] Re-lock skipped for parent %s — row held by peer, "
-            "deferring to next cycle", parent_id,
+            "deferring to next cycle",
+            parent_id,
         )
         return None
     if expected_snapshot is not None:
@@ -237,7 +241,9 @@ async def _relock_parent(
             logger.info(
                 "[ROLLUP] Re-lock detected concurrent mutation on parent %s "
                 "(expected snapshot=%s, found %s) — deferring to next cycle",
-                parent_id, expected_snapshot, actual,
+                parent_id,
+                expected_snapshot,
+                actual,
             )
             return None
     return fresh
@@ -252,6 +258,7 @@ def _record_rollup_failure_signals(task: Task, failure_class: str) -> None:
     """
     from app.routers.agent_status import record_task_result
     from app.shared_state import record_direction_result
+
     record_task_result(
         success=False,
         failure_class=failure_class,
@@ -278,6 +285,7 @@ async def _dispatch_rollup_approval_alert(
     import asyncio as _asyncio
     from app.main import _maybe_create_failure_alert
     from app.notification_dispatch import dispatch_external_notification
+
     try:
         await _maybe_create_failure_alert(parent, session, reason)
     except Exception as e:
@@ -290,31 +298,40 @@ async def _dispatch_rollup_approval_alert(
             repo_full = parent_ctx.get("repo_full_name") or parent_ctx.get("repo") or ""
             if repo_full:
                 pr_url = f"https://github.com/{repo_full}/pull/{pr_number}"
-        raw_critical = parent_ctx.get("critical_files") or parent_ctx.get("_pr_changed_files") or []
+        raw_critical = (
+            parent_ctx.get("critical_files")
+            or parent_ctx.get("_pr_changed_files")
+            or []
+        )
         critical_files = (
             [f for f in raw_critical if isinstance(f, str)][:10]
-            if isinstance(raw_critical, list) else []
+            if isinstance(raw_critical, list)
+            else []
         )
         direction_text = (
-            parent_ctx.get("direction_text") or parent_payload.get("direction_text") or ""
+            parent_ctx.get("direction_text")
+            or parent_payload.get("direction_text")
+            or ""
         )
         scope = parent_ctx.get("scope") or parent_payload.get("scope") or ""
-        _asyncio.ensure_future(dispatch_external_notification(  # noqa: RUF006
-            parent.project_id,
-            "APPROVAL_NEEDED",
-            {
-                "task_id": str(parent.id),
-                "task_title": parent.title or str(parent.id)[:8],
-                "pr_number": pr_number,
-                "reason": reason,
-                "approval_reason": reason,
-                "pr_url": pr_url,
-                "critical_files": critical_files,
-                "direction_id": parent_ctx.get("direction_id") or "",
-                "direction_text": direction_text[:200],
-                "scope": scope,
-            },
-        ))
+        _asyncio.ensure_future(
+            dispatch_external_notification(  # noqa: RUF006
+                parent.project_id,
+                "APPROVAL_NEEDED",
+                {
+                    "task_id": str(parent.id),
+                    "task_title": parent.title or str(parent.id)[:8],
+                    "pr_number": pr_number,
+                    "reason": reason,
+                    "approval_reason": reason,
+                    "pr_url": pr_url,
+                    "critical_files": critical_files,
+                    "direction_id": parent_ctx.get("direction_id") or "",
+                    "direction_text": direction_text[:200],
+                    "scope": scope,
+                },
+            )
+        )
     except Exception as e:
         logger.warning(f"[NOTIFY] APPROVAL_NEEDED dispatch setup failed: {e}")
 
@@ -339,14 +356,23 @@ async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
     # task.id — session-independent so the check works regardless of whether
     # the caller commits between fan-out calls.
     _last_negative = _pr_merge_negative_cache.get(task.id)
-    if _last_negative is not None and (time.time() - _last_negative) < _PR_MERGE_NEGATIVE_TTL_S:
+    if (
+        _last_negative is not None
+        and (time.time() - _last_negative) < _PR_MERGE_NEGATIVE_TTL_S
+    ):
         import app.shared_state as _ss
-        _ss.github_cache_hits["pr_merge_negative"] = _ss.github_cache_hits.get("pr_merge_negative", 0) + 1
+
+        _ss.github_cache_hits["pr_merge_negative"] = (
+            _ss.github_cache_hits.get("pr_merge_negative", 0) + 1
+        )
         return False
 
     # Look for PR artifact to verify via API
     art_result = await session.execute(
-        select(Artifact).where(Artifact.task_id == task.id, Artifact.artifact_type == ArtifactType.PULL_REQUEST)
+        select(Artifact).where(
+            Artifact.task_id == task.id,
+            Artifact.artifact_type == ArtifactType.PULL_REQUEST,
+        )
     )
     artifact = art_result.scalars().first()
     if not artifact or not artifact.pr_url:
@@ -384,13 +410,20 @@ async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
                     raise
                 if api_err.status_code != 401:
                     # Transient GitHub API failure — can't verify now, will retry next cycle
-                    logger.warning(f"[PR_VERIFY] GitHub API error ({api_err.status_code}) checking PR #{pr_number} for task {task.id} — skipping")
+                    logger.warning(
+                        f"[PR_VERIFY] GitHub API error ({api_err.status_code}) checking PR #{pr_number} for task {task.id} — skipping"
+                    )
                     return False
                 # Token expired — invalidate cache and retry once with a fresh token
                 from app.routers.agent import invalidate_github_token_cache
+
                 invalidate_github_token_cache(str(task.project_id))
-                logger.warning(f"[PR_VERIFY] Auth failure for task {task.id} PR #{pr_number} — retrying with fresh token")
-                gh_token, owner, repo = await get_github_token_for_task(task.id, session, force_refresh=True)
+                logger.warning(
+                    f"[PR_VERIFY] Auth failure for task {task.id} PR #{pr_number} — retrying with fresh token"
+                )
+                gh_token, owner, repo = await get_github_token_for_task(
+                    task.id, session, force_refresh=True
+                )
                 pr_data = await get_pull_request(gh_token, owner, repo, pr_number)
             if pr_data.get("merged"):
                 # Update in-memory first so caller sees the change even if DB write fails
@@ -402,22 +435,33 @@ async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
                     async with AsyncSessionLocal() as write_session:
                         db_task = await write_session.get(Task, task.id)
                         if db_task:
-                            db_task.context = {**(db_task.context or {}), "pr_merged": True}
+                            db_task.context = {
+                                **(db_task.context or {}),
+                                "pr_merged": True,
+                            }
                             write_session.add(db_task)
                             await write_session.commit()
                 except Exception as write_err:
-                    logger.warning(f"[PR_VERIFY] Failed to persist pr_merged for task {task.id}: {write_err}")
+                    logger.warning(
+                        f"[PR_VERIFY] Failed to persist pr_merged for task {task.id}: {write_err}"
+                    )
                 return True
             # Detect closed-but-not-merged (rejected/abandoned PR) — don't block rollup forever
             if pr_data.get("state") == "closed" and not pr_data.get("merged"):
-                logger.warning(f"[PR_VERIFY] Task {task.id} PR #{pr_number} was closed without merging — marking as rejected")
+                logger.warning(
+                    f"[PR_VERIFY] Task {task.id} PR #{pr_number} was closed without merging — marking as rejected"
+                )
                 # Update in-memory first — set message AND status together so the
                 # outer session's commit always carries the explanatory message,
                 # even if the separate write_session below fails (row lock, etc.).
                 task.context = {**(task.context or {}), "pr_closed_unmerged": True}
                 task.status = TaskStatus.FAILED
                 task.latest_status_message = f"PR #{pr_number} closed without merging"
-                from app.failure_classification import classify_failure, persist_failure_category
+                from app.failure_classification import (
+                    classify_failure,
+                    persist_failure_category,
+                )
+
                 _fc = classify_failure(task)
                 persist_failure_category(task, _fc)
                 _record_rollup_failure_signals(task, _fc)
@@ -431,18 +475,26 @@ async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
                                 "failure_category": _fc,
                             }
                             db_task.status = TaskStatus.FAILED
-                            db_task.latest_status_message = f"PR #{pr_number} closed without merging"
+                            db_task.latest_status_message = (
+                                f"PR #{pr_number} closed without merging"
+                            )
                             write_session.add(db_task)
                             await _maybe_create_failure_alert(
-                                db_task, write_session,
-                                f"PR #{pr_number} was closed without merging"
+                                db_task,
+                                write_session,
+                                f"PR #{pr_number} was closed without merging",
                             )
                             await write_session.commit()
                 except Exception as write_err:
-                    logger.warning(f"[PR_VERIFY] Failed to persist pr_closed_unmerged for task {task.id}: {write_err}")
+                    logger.warning(
+                        f"[PR_VERIFY] Failed to persist pr_closed_unmerged for task {task.id}: {write_err}"
+                    )
                 return True  # Return True so callers don't block — task is now FAILED which they handle
         except Exception as e:
-            logger.warning(f"[PR_VERIFY] Failed to verify PR merge for task {task.id}: {e}", exc_info=True)
+            logger.warning(
+                f"[PR_VERIFY] Failed to verify PR merge for task {task.id}: {e}",
+                exc_info=True,
+            )
     # Stamp the negative cache so the next caller within the TTL skips the
     # GitHub round-trip.  Lazy eviction: keep it lightweight, drop entries
     # that are clearly stale whenever we detect the dict is oversized.
@@ -452,6 +504,7 @@ async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
         for k in [k for k, ts in _pr_merge_negative_cache.items() if ts < cutoff]:
             _pr_merge_negative_cache.pop(k, None)
     return False
+
 
 async def _cleanup_branches(task: Task, session: AsyncSession) -> None:
     """Delete staging and feature branches that are no longer needed."""
@@ -471,7 +524,10 @@ async def _cleanup_branches(task: Task, session: AsyncSession) -> None:
     # Staging branches (research/*, plan/*) are shared by ALL sibling tasks.
     # Only delete when the PARENT task completes (rollup), not on individual child completion.
     # Check if this task IS the parent (has plan_output or is a research task).
-    is_parent = task.plan_output is not None or (task.first_payload).get("type") in ("research", "plan")
+    is_parent = task.plan_output is not None or (task.first_payload).get("type") in (
+        "research",
+        "plan",
+    )
     if is_parent:
         # Route by task_type so we only target the staging branch THIS task
         # itself owns. A plan child of a research task inherits the parent's
@@ -494,51 +550,82 @@ async def _cleanup_branches(task: Task, session: AsyncSession) -> None:
             staging = None
         if staging:
             # Guard 1: Don't delete if children are still active (they push to this branch)
-            active_children = (await session.execute(
-                select(Task).where(
-                    Task.parent_task_id == task.id,
-                    Task.status.in_([
-                        TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS
-                    ])
+            active_children = (
+                (
+                    await session.execute(
+                        select(Task).where(
+                            Task.parent_task_id == task.id,
+                            Task.status.in_(
+                                [
+                                    TaskStatus.QUEUED,
+                                    TaskStatus.PROVISIONING,
+                                    TaskStatus.IN_PROGRESS,
+                                ]
+                            ),
+                        )
+                    )
                 )
-            )).scalars().all()
+                .scalars()
+                .all()
+            )
             if active_children:
-                logger.warning(f"[CLEANUP] Skipping deletion of {staging} — "
-                               f"{len(active_children)} child task(s) still active")
+                logger.warning(
+                    f"[CLEANUP] Skipping deletion of {staging} — "
+                    f"{len(active_children)} child task(s) still active"
+                )
             else:
                 # Guard 2: Don't delete branches that are target branches for other active rollups
                 from sqlalchemy import or_ as sa_or
-                referencing_parents = (await session.execute(
-                    select(Task).where(
-                        Task.status == TaskStatus.EVALUATING,
-                        Task.id != task.id,
-                        sa_or(
-                            Task.context["parent_base"].as_string() == staging,
-                            Task.context["original_base"].as_string() == staging,
+
+                referencing_parents = (
+                    (
+                        await session.execute(
+                            select(Task).where(
+                                Task.status == TaskStatus.EVALUATING,
+                                Task.id != task.id,
+                                sa_or(
+                                    Task.context["parent_base"].as_string() == staging,
+                                    Task.context["original_base"].as_string()
+                                    == staging,
+                                ),
+                            )
                         )
                     )
-                )).scalars().all()
+                    .scalars()
+                    .all()
+                )
                 if referencing_parents:
-                    logger.warning(f"[CLEANUP] Skipping deletion of {staging} — "
-                                   f"{len(referencing_parents)} active parent(s) target it as rollup base")
+                    logger.warning(
+                        f"[CLEANUP] Skipping deletion of {staging} — "
+                        f"{len(referencing_parents)} active parent(s) target it as rollup base"
+                    )
                 else:
                     # Guard 3: Don't delete if there are still open PRs targeting it
                     try:
-                        _gh, _owner, _repo = await get_github_token_for_task(task.id, session)
+                        _gh, _owner, _repo = await get_github_token_for_task(
+                            task.id, session
+                        )
                         from app.github import get_open_pull_requests
-                        open_prs = await get_open_pull_requests(_gh, _owner, _repo, staging)
+
+                        open_prs = await get_open_pull_requests(
+                            _gh, _owner, _repo, staging
+                        )
                         if open_prs:
                             pr_nums = [f"#{p['number']}" for p in open_prs]
-                            logger.warning(f"[CLEANUP] Skipping deletion of {staging} — {len(open_prs)} open PR(s) targeting it: {', '.join(pr_nums)}")
+                            logger.warning(
+                                f"[CLEANUP] Skipping deletion of {staging} — {len(open_prs)} open PR(s) targeting it: {', '.join(pr_nums)}"
+                            )
                         else:
                             branches_to_delete.append(staging)
                     except Exception:
                         # If we can't check, don't delete (safe default)
-                        logger.warning(f"[CLEANUP] Skipping deletion of {staging} — could not verify open PRs")
+                        logger.warning(
+                            f"[CLEANUP] Skipping deletion of {staging} — could not verify open PRs"
+                        )
 
     # Feature branches after PR merge
     if ctx.get("pr_merged"):
-        for payload in (task.payloads or []):
+        for payload in task.payloads or []:
             branch = payload.get("branch")
             if branch and branch.startswith("blueprint/"):
                 branches_to_delete.append(branch)
@@ -551,6 +638,7 @@ async def _cleanup_branches(task: Task, session: AsyncSession) -> None:
                 logger.info(f"[CLEANUP] Deleted branch {branch} (task {task.id})")
         except Exception as e:  # noqa: PERF203 — per-branch try is required so one delete failure doesn't abort the rest
             logger.warning(f"[CLEANUP] Failed to delete {branch}: {e}", exc_info=True)
+
 
 def _build_rollup_pr_body(
     task_count: int,
@@ -575,6 +663,7 @@ def _build_rollup_pr_body(
 
     if children:
         from collections import Counter
+
         type_counts: Counter = Counter()
         total_cost: float = 0.0
         has_cost = False
@@ -586,11 +675,14 @@ def _build_rollup_pr_body(
             stop_at = getattr(c, "vm_stopped_at", None)
             if prov_at and stop_at:
                 from app.admin import SPOT_RATE, ON_DEMAND_RATE
+
                 rate = SPOT_RATE if getattr(c, "vm_spot", False) else ON_DEMAND_RATE
                 total_cost += (stop_at - prov_at).total_seconds() * rate
                 has_cost = True
         if type_counts:
-            breakdown = ", ".join(f"{cnt} {typ}" for typ, cnt in sorted(type_counts.items()))
+            breakdown = ", ".join(
+                f"{cnt} {typ}" for typ, cnt in sorted(type_counts.items())
+            )
             lines.append("")
             lines.append(f"**Tasks:** {breakdown}")
         if has_cost:
@@ -616,9 +708,15 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
     from app.routers.agent import get_github_token_for_task
     from app.security import scan_pr_for_injection
     from app.github import (
-        create_pr_comment, delete_branch, create_pull_request,
-        merge_pull_request, get_pull_request, get_pr_files, get_branch_sha,
-        close_pull_request, update_branch_with_sha_retry,
+        create_pr_comment,
+        delete_branch,
+        create_pull_request,
+        merge_pull_request,
+        get_pull_request,
+        get_pr_files,
+        get_branch_sha,
+        close_pull_request,
+        update_branch_with_sha_retry,
     )
 
     if not child_task.parent_task_id:
@@ -627,9 +725,17 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
     # Lock parent row to serialize concurrent rollup checks from sibling completions.
     # skip_locked: if a sibling child is already running this check, defer — the
     # reaper's EVALUATING stale-parent sweep retries within 15 min as safety net.
-    parent = (await session.execute(
-        select(Task).where(Task.id == child_task.parent_task_id).with_for_update(skip_locked=True)
-    )).scalars().first()
+    parent = (
+        (
+            await session.execute(
+                select(Task)
+                .where(Task.id == child_task.parent_task_id)
+                .with_for_update(skip_locked=True)
+            )
+        )
+        .scalars()
+        .first()
+    )
     if parent is None:
         logger.info(
             f"[ROLLUP] Skipped rollup check for task {child_task.id} — parent lock held, "
@@ -641,9 +747,17 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
 
     # Lock children with skip_locked to avoid deadlocks with concurrent
     # agent status updates that hold FOR UPDATE on individual child rows.
-    all_children = (await session.execute(
-        select(Task).where(Task.parent_task_id == parent.id).with_for_update(skip_locked=True)
-    )).scalars().all()
+    all_children = (
+        (
+            await session.execute(
+                select(Task)
+                .where(Task.parent_task_id == parent.id)
+                .with_for_update(skip_locked=True)
+            )
+        )
+        .scalars()
+        .all()
+    )
 
     # Verify we locked all children — if some were skipped (held by agent_status
     # or another rollup), defer to avoid acting on incomplete data.
@@ -659,21 +773,44 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
 
     # Consider create, refactor, plan, research, and specialized agent tasks for rollup decisions.
     # Review/fix tasks are pipeline helpers that operate on the same PR — excluded.
-    ROLLUP_TYPES = {"create", "refactor", "migrate", "", "plan", "research", "security_audit", "qa", "deps", "docs", "smoketest", "perf"}
-    children = [c for c in all_children
-                if (c.first_payload).get("type", "create") in ROLLUP_TYPES]
+    ROLLUP_TYPES = {
+        "create",
+        "refactor",
+        "migrate",
+        "",
+        "plan",
+        "research",
+        "security_audit",
+        "qa",
+        "deps",
+        "docs",
+        "smoketest",
+        "perf",
+    }
+    children = [
+        c
+        for c in all_children
+        if (c.first_payload).get("type", "create") in ROLLUP_TYPES
+    ]
 
     # Guard: if all children are review/fix types (none in ROLLUP_TYPES), mark parent COMPLETED
     if not children and all_children:
         parent.status = TaskStatus.COMPLETED
         parent.context = _clear_rollup_transient_state(parent.context)
-        parent.latest_status_message = "All subtasks were pipeline tasks (review/fix) — no rollup needed"
+        parent.latest_status_message = (
+            "All subtasks were pipeline tasks (review/fix) — no rollup needed"
+        )
         session.add(parent)
         await session.commit()
         await _cleanup_branches(parent, session)
-        await broadcast_to_project(str(parent.project_id), "task_updated",
-                                   {"task_id": str(parent.id), "status": TaskStatus.COMPLETED})
-        logger.info(f"[ROLLUP] Parent {parent.id} completed — all children were review/fix pipeline tasks")
+        await broadcast_to_project(
+            str(parent.project_id),
+            "task_updated",
+            {"task_id": str(parent.id), "status": TaskStatus.COMPLETED},
+        )
+        logger.info(
+            f"[ROLLUP] Parent {parent.id} completed — all children were review/fix pipeline tasks"
+        )
         return
 
     # Also check if any review/fix pipeline tasks are still active — don't rollup
@@ -684,7 +821,12 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
     for c in all_children:
         if (c.first_payload).get("type") not in ("review", "fix"):
             continue
-        if c.status not in (TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING):
+        if c.status not in (
+            TaskStatus.QUEUED,
+            TaskStatus.PROVISIONING,
+            TaskStatus.IN_PROGRESS,
+            TaskStatus.EVALUATING,
+        ):
             continue
         if _is_pipeline_task_stale(c):
             logger.warning(
@@ -707,7 +849,12 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
         if c.status == TaskStatus.CANCELLED:
             cancelled_count += 1
             continue
-        if c.status in (TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING):
+        if c.status in (
+            TaskStatus.QUEUED,
+            TaskStatus.PROVISIONING,
+            TaskStatus.IN_PROGRESS,
+            TaskStatus.EVALUATING,
+        ):
             active_count += 1
             all_done = False
             continue
@@ -719,8 +866,12 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
 
     # Don't rollup if there are still active tasks or active review/fix pipeline
     if active_count > 0 or pipeline_active:
-        if pipeline_active and (parent.latest_status_message or "").startswith("Blocked:"):
-            parent.latest_status_message = "Fix/review pipeline running — waiting for PR to merge"
+        if pipeline_active and (parent.latest_status_message or "").startswith(
+            "Blocked:"
+        ):
+            parent.latest_status_message = (
+                "Fix/review pipeline running — waiting for PR to merge"
+            )
             session.add(parent)
             await session.commit()
         return
@@ -763,7 +914,9 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
     # finalizes the parent. Preserving this contract by carrying
     # `all_done` from the verify loop forward to the existing dispatch.
     parent = await _relock_parent(
-        session, parent_id_local, pre_verify_snapshot,
+        session,
+        parent_id_local,
+        pre_verify_snapshot,
         parent_in_session=parent,
     )
     if parent is None:
@@ -779,13 +932,19 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
         # transitions them to FAILED with failure_detail=review_cap_exhausted;
         # this filter defensively covers any legacy COMPLETED+requires_approval
         # children that predate the fix.
-        unmerged = [c for c in children
-                    if c.status == TaskStatus.COMPLETED
-                    and not (c.context or {}).get("pr_merged")
-                    and not c.requires_approval]
+        unmerged = [
+            c
+            for c in children
+            if c.status == TaskStatus.COMPLETED
+            and not (c.context or {}).get("pr_merged")
+            and not c.requires_approval
+        ]
         failed = [c for c in children if c.status == TaskStatus.FAILED]
-        completed_merged = [c for c in children
-                           if c.status == TaskStatus.COMPLETED and (c.context or {}).get("pr_merged")]
+        completed_merged = [
+            c
+            for c in children
+            if c.status == TaskStatus.COMPLETED and (c.context or {}).get("pr_merged")
+        ]
 
         if unmerged:
             # Some completed but PRs not yet merged.
@@ -798,35 +957,57 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                 if age < stale_threshold.total_seconds():
                     continue  # Too recent — normal pipeline may still be working
                 # Look up PR artifact to get pr_number and branch
-                pr_art = (await session.execute(
-                    select(Artifact).where(
-                        Artifact.task_id == c.id,
-                        Artifact.artifact_type == ArtifactType.PULL_REQUEST,
-                    ).limit(1)
-                )).scalars().first()
+                pr_art = (
+                    (
+                        await session.execute(
+                            select(Artifact)
+                            .where(
+                                Artifact.task_id == c.id,
+                                Artifact.artifact_type == ArtifactType.PULL_REQUEST,
+                            )
+                            .limit(1)
+                        )
+                    )
+                    .scalars()
+                    .first()
+                )
                 if not pr_art or not pr_art.pr_url:
                     # No PR artifact — _verify_pr_merged should have handled this.
                     # Force-set pr_merged so next cycle picks it up.
                     c.context = {**(c.context or {}), "pr_merged": True}
                     session.add(c)
-                    logger.info(f"[ROLLUP] Child {str(c.id)[:8]} has no PR artifact — marking as merged")
+                    logger.info(
+                        f"[ROLLUP] Child {str(c.id)[:8]} has no PR artifact — marking as merged"
+                    )
                     continue
                 try:
                     pr_number = int(pr_art.pr_url.rstrip("/").split("/")[-1])
                 except (ValueError, IndexError):
-                    logger.warning(f"[ROLLUP] Could not parse PR number from {pr_art.pr_url} for child {str(c.id)[:8]}")
+                    logger.warning(
+                        f"[ROLLUP] Could not parse PR number from {pr_art.pr_url} for child {str(c.id)[:8]}"
+                    )
                     continue
                 c_payload = c.first_payload
-                branch = (c.context or {}).get("branch") or f"blueprint/task-{str(c.id).replace('-', '')[:8]}"
+                branch = (c.context or {}).get(
+                    "branch"
+                ) or f"blueprint/task-{str(c.id).replace('-', '')[:8]}"
                 base_branch = c_payload.get("base_branch", "main")
                 original_prompt = c_payload.get("prompt", c.description or "")
                 review_task, _ = await _spawn_pipeline_task(
-                    c, "review", session, pr_number, branch, base_branch,
-                    original_prompt=original_prompt, original_task_id=str(c.id),
+                    c,
+                    "review",
+                    session,
+                    pr_number,
+                    branch,
+                    base_branch,
+                    original_prompt=original_prompt,
+                    original_task_id=str(c.id),
                 )
                 if review_task and review_task.id != c.id:
                     respawned += 1
-                    logger.warning(f"[ROLLUP] Respawned review for stale child {str(c.id)[:8]} PR #{pr_number} → review {str(review_task.id)[:8]}")
+                    logger.warning(
+                        f"[ROLLUP] Respawned review for stale child {str(c.id)[:8]} PR #{pr_number} → review {str(review_task.id)[:8]}"
+                    )
                 elif review_task is None and c.requires_approval:
                     # Cap exhaustion: _spawn_pipeline_task sets requires_approval=True on
                     # the child. But the child is COMPLETED, so the EVALUATING approval-gate
@@ -842,18 +1023,23 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                         )
                         try:
                             await _maybe_create_failure_alert(
-                                parent, session,
+                                parent,
+                                session,
                                 f"Rollup blocked: child PR #{pr_number} review-fix cap exhausted — manual intervention required",
                             )
                         except Exception as _alert_err:
-                            logger.warning(f"[ROLLUP] Failed to create cap-exhaustion alert for parent {parent.id}: {_alert_err}")
+                            logger.warning(
+                                f"[ROLLUP] Failed to create cap-exhaustion alert for parent {parent.id}: {_alert_err}"
+                            )
 
             titles = [c.title[:40] for c in unmerged]
             if respawned:
                 parent.latest_status_message = f"Recovering: respawned {respawned} review(s) for unmerged PR(s) — {', '.join(titles)}"
             else:
                 parent.latest_status_message = f"Blocked: {len(unmerged)} subtask(s) completed but PR not merged — {', '.join(titles)}"
-            logger.info(f"[ROLLUP] Parent {parent.id} — {len(unmerged)} unmerged, {respawned} reviews respawned")
+            logger.info(
+                f"[ROLLUP] Parent {parent.id} — {len(unmerged)} unmerged, {respawned} reviews respawned"
+            )
             session.add(parent)
             await session.commit()
             return
@@ -863,8 +1049,11 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
         # Cap-exhausted children are terminal: their PR was auto-closed and a
         # fresh retry would hit the same merge conflict that triggered the cap.
         # Exclude them from requeue; count them as failed-for-rollup-decision only.
-        retriable_failed = [c for c in failed
-                            if (c.context or {}).get("failure_detail") != "review_cap_exhausted"]
+        retriable_failed = [
+            c
+            for c in failed
+            if (c.context or {}).get("failure_detail") != "review_cap_exhausted"
+        ]
         if retriable_failed:
             MAX_PARENT_REQUEUES = 3
             parent_ctx = parent.context or {}
@@ -874,6 +1063,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                 # Next rollup cycle will produce a full rollup if retries succeed, or fall
                 # through to partial rollup once the requeue limit is exhausted.
                 from app.task_lifecycle import _requeue_parent_task
+
                 logger.info(
                     f"[ROLLUP] Parent {parent.id} — {len(retriable_failed)} retriable failed, "
                     f"{len(failed) - len(retriable_failed)} cap-exhausted, "
@@ -890,24 +1080,39 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
 
         if completed_merged:
             # Some succeeded — proceed with partial rollup of what worked
-            logger.warning(f"[ROLLUP] Parent {parent.id} — {len(failed)} failed, {len(completed_merged)} succeeded. Rolling up successes.")
+            logger.warning(
+                f"[ROLLUP] Parent {parent.id} — {len(failed)} failed, {len(completed_merged)} succeeded. Rolling up successes."
+            )
             all_done = True  # Let rollup proceed with merged children
             # Fall through to rollup logic below
         else:
             # Nothing succeeded — fail the parent immediately
             parent.status = TaskStatus.FAILED
-            parent.latest_status_message = f"{len(failed)} of {len(children)} subtask(s) failed, none succeeded"
-            from app.failure_classification import worst_child_failure_category, persist_failure_category
+            parent.latest_status_message = (
+                f"{len(failed)} of {len(children)} subtask(s) failed, none succeeded"
+            )
+            from app.failure_classification import (
+                worst_child_failure_category,
+                persist_failure_category,
+            )
+
             _fc = worst_child_failure_category(failed)
             persist_failure_category(parent, _fc)
             _record_rollup_failure_signals(parent, _fc)
             parent.context = _clear_rollup_transient_state(parent.context)
             session.add(parent)
-            await _maybe_create_failure_alert(parent, session, f"{len(failed)} subtasks failed, none succeeded")
+            await _maybe_create_failure_alert(
+                parent, session, f"{len(failed)} subtasks failed, none succeeded"
+            )
             await session.commit()
-            await broadcast_to_project(str(parent.project_id), "task_updated",
-                {"task_id": str(parent.id), "status": TaskStatus.FAILED})
-            logger.error(f"[ROLLUP] Parent {parent.id} — all {len(failed)} children failed, marking parent FAILED")
+            await broadcast_to_project(
+                str(parent.project_id),
+                "task_updated",
+                {"task_id": str(parent.id), "status": TaskStatus.FAILED},
+            )
+            logger.error(
+                f"[ROLLUP] Parent {parent.id} — all {len(failed)} children failed, marking parent FAILED"
+            )
             return
 
     child_statuses = [c.status for c in children]
@@ -920,15 +1125,20 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
         session.add(parent)
         await session.commit()
         await _cleanup_branches(parent, session)
-        await broadcast_to_project(str(parent.project_id), "task_updated",
-                                   {"task_id": str(parent.id), "status": TaskStatus.CANCELLED})
+        await broadcast_to_project(
+            str(parent.project_id),
+            "task_updated",
+            {"task_id": str(parent.id), "status": TaskStatus.CANCELLED},
+        )
         logger.info(f"[ROLLUP] Parent {parent.id} cancelled — all children cancelled")
         return
 
     if all_done and (len(children) - cancelled_count) > 0:
         # All non-cancelled children merged — create rollup PR
         parent_ctx = parent.context or {}
-        staging_branch = parent_ctx.get("plan_branch") or parent_ctx.get("research_branch")
+        staging_branch = parent_ctx.get("plan_branch") or parent_ctx.get(
+            "research_branch"
+        )
         target_branch = parent_ctx.get("parent_base") or parent_ctx.get("original_base")
 
         failed_children = [c for c in children if c.status == TaskStatus.FAILED]
@@ -946,26 +1156,35 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
             parent.latest_status_message = (
                 f"{failed_count} of {len(children)} subtask(s) failed, none succeeded"
             )
-            from app.failure_classification import worst_child_failure_category, persist_failure_category
+            from app.failure_classification import (
+                worst_child_failure_category,
+                persist_failure_category,
+            )
+
             _fc = worst_child_failure_category(failed_children)
             persist_failure_category(parent, _fc)
             _record_rollup_failure_signals(parent, _fc)
             session.add(parent)
             await _maybe_create_failure_alert(
-                parent, session,
-                f"{failed_count} subtasks failed, none succeeded"
+                parent, session, f"{failed_count} subtasks failed, none succeeded"
             )
             await session.commit()
-            await broadcast_to_project(str(parent.project_id), "task_updated",
-                {"task_id": str(parent.id), "status": TaskStatus.FAILED})
+            await broadcast_to_project(
+                str(parent.project_id),
+                "task_updated",
+                {"task_id": str(parent.id), "status": TaskStatus.FAILED},
+            )
             logger.error(
                 f"[ROLLUP] Parent {parent.id} — all {failed_count} non-cancelled "
                 f"children failed after PR verification, marking parent FAILED"
             )
             return
 
-        cap_exhausted_children = [c for c in failed_children
-                                  if (c.context or {}).get("failure_detail") == "review_cap_exhausted"]
+        cap_exhausted_children = [
+            c
+            for c in failed_children
+            if (c.context or {}).get("failure_detail") == "review_cap_exhausted"
+        ]
         plain_failed_count = failed_count - len(cap_exhausted_children)
         rollup_note = ""
         if cancelled_count > 0:
@@ -993,7 +1212,9 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
             parent_id_local = parent.id
             project_id_local = parent.project_id
             try:
-                gh_token, owner, repo = await get_github_token_for_task(parent.id, session)
+                gh_token, owner, repo = await get_github_token_for_task(
+                    parent.id, session
+                )
 
                 # ── Phase B3 lock-window break ──
                 # The next three GitHub calls (get_open_pull_requests,
@@ -1020,17 +1241,29 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
 
                 # Verify all PRs targeting the staging branch are resolved before rolling up
                 from app.github import get_open_pull_requests
+
                 try:
-                    open_prs = await get_open_pull_requests(gh_token, owner, repo, staging_branch)
+                    open_prs = await get_open_pull_requests(
+                        gh_token, owner, repo, staging_branch
+                    )
                 except HTTPException as api_err:
                     if api_err.status_code == 401:
                         from app.routers.agent import invalidate_github_token_cache
+
                         invalidate_github_token_cache(str(project_id_local))
-                        logger.warning(f"[ROLLUP] Auth failure listing open PRs for {owner}/{repo} — retrying with fresh token")
-                        gh_token, owner, repo = await get_github_token_for_task(parent_id_local, session, force_refresh=True)
-                        open_prs = await get_open_pull_requests(gh_token, owner, repo, staging_branch)
+                        logger.warning(
+                            f"[ROLLUP] Auth failure listing open PRs for {owner}/{repo} — retrying with fresh token"
+                        )
+                        gh_token, owner, repo = await get_github_token_for_task(
+                            parent_id_local, session, force_refresh=True
+                        )
+                        open_prs = await get_open_pull_requests(
+                            gh_token, owner, repo, staging_branch
+                        )
                     elif api_err.status_code in (403, 500, 502, 503):
-                        logger.warning(f"[ROLLUP] GitHub error {api_err.status_code} listing open PRs — deferring to next cycle")
+                        logger.warning(
+                            f"[ROLLUP] GitHub error {api_err.status_code} listing open PRs — deferring to next cycle"
+                        )
                         return
                     else:
                         raise
@@ -1067,16 +1300,24 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                         # Use `parent_id_local` (captured pre-release) instead
                         # of `parent.id` to make the snapshot-stale contract
                         # explicit: see audit-C4 (M-C1) note above.
-                        logger.warning(f"[ROLLUP] Staging branch '{staging_branch}' not found (404) for task {parent_id_local}")
+                        logger.warning(
+                            f"[ROLLUP] Staging branch '{staging_branch}' not found (404) for task {parent_id_local}"
+                        )
                         staging_branch_missing = True
                     elif http_err.status_code in (401, 403):
-                        logger.exception(f"[ROLLUP] Auth error {http_err.status_code} checking staging branch — deferring")
+                        logger.exception(
+                            f"[ROLLUP] Auth error {http_err.status_code} checking staging branch — deferring"
+                        )
                         return
                     else:
-                        logger.warning(f"[ROLLUP] GitHub {http_err.status_code} checking staging branch — deferring")
+                        logger.warning(
+                            f"[ROLLUP] GitHub {http_err.status_code} checking staging branch — deferring"
+                        )
                         return
                 except Exception as e:
-                    logger.warning(f"[ROLLUP] Error checking staging branch '{staging_branch}': {e} — deferring")
+                    logger.warning(
+                        f"[ROLLUP] Error checking staging branch '{staging_branch}': {e} — deferring"
+                    )
                     return
 
                 # ── Phase B3: re-acquire the lock before applying mutations ──
@@ -1084,7 +1325,9 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                 # Validate updated_at hasn't changed; if it has, another writer
                 # mutated the parent during our window — defer to next cycle.
                 parent = await _relock_parent(
-                    session, parent_id_local, pre_gh_snapshot,
+                    session,
+                    parent_id_local,
+                    pre_gh_snapshot,
                     parent_in_session=parent,
                 )
                 if parent is None:
@@ -1099,7 +1342,9 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                     parent.latest_status_message = f"Rollup waiting: {len(open_prs)} open PR(s) targeting {staging_branch}: {', '.join(pr_nums)}"
                     session.add(parent)
                     await session.commit()
-                    logger.info(f"[ROLLUP] Parent {parent.id} has {len(open_prs)} open PR(s) targeting {staging_branch}: {', '.join(pr_nums)} — waiting")
+                    logger.info(
+                        f"[ROLLUP] Parent {parent.id} has {len(open_prs)} open PR(s) targeting {staging_branch}: {', '.join(pr_nums)} — waiting"
+                    )
                     return
 
                 if staging_branch_missing:
@@ -1126,11 +1371,13 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                                 for d in directions:
                                     if d.get("id") == dir_id:
                                         notes = d.get("notes") or []
-                                        notes.append({
-                                            "text": "Research cycle completed with no actionable changes — all findings already implemented or not applicable.",
-                                            "added_at": _utcnow().isoformat(),
-                                            "source": "rollup_empty_diff",
-                                        })
+                                        notes.append(
+                                            {
+                                                "text": "Research cycle completed with no actionable changes — all findings already implemented or not applicable.",
+                                                "added_at": _utcnow().isoformat(),
+                                                "source": "rollup_empty_diff",
+                                            }
+                                        )
                                         d["notes"] = notes[-10:]  # Keep last 10
                                         break
                                 project.directions = directions
@@ -1140,8 +1387,9 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                         await session.commit()
                         await _cleanup_branches(parent, session)
                         await broadcast_to_project(
-                            str(parent.project_id), "task_updated",
-                            {"task_id": str(parent.id), "status": TaskStatus.COMPLETED}
+                            str(parent.project_id),
+                            "task_updated",
+                            {"task_id": str(parent.id), "status": TaskStatus.COMPLETED},
                         )
                         return
                     raise Exception(
@@ -1149,22 +1397,30 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                         f"{failed_count} child(ren) failed — cannot create rollup PR"
                     )
 
-                is_target_intermediate = target_branch.startswith("research/") or target_branch.startswith("plan/")
+                is_target_intermediate = target_branch.startswith(
+                    "research/"
+                ) or target_branch.startswith("plan/")
 
                 # Resume from prior crash — skip PR creation if already done
                 existing_pr = parent_ctx.get("rollup_pr_number")
                 if existing_pr:
                     # ── Phase B3: release lock around get_pull_request ──
-                    pre_existing_pr_snapshot = await _release_parent_lock(parent, session)
+                    pre_existing_pr_snapshot = await _release_parent_lock(
+                        parent, session
+                    )
                     pr_state: dict | None = None
                     pr_state_err: Exception | None = None
                     try:
-                        pr_state = await get_pull_request(gh_token, owner, repo, existing_pr)
+                        pr_state = await get_pull_request(
+                            gh_token, owner, repo, existing_pr
+                        )
                     except Exception as e:
                         pr_state_err = e
                     # Re-acquire and validate
                     parent = await _relock_parent(
-                        session, parent_id_local, pre_existing_pr_snapshot,
+                        session,
+                        parent_id_local,
+                        pre_existing_pr_snapshot,
                         parent_in_session=parent,
                     )
                     if parent is None:
@@ -1175,23 +1431,43 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                     # Re-read existing_pr from fresh context (a peer may have cleared it)
                     existing_pr = parent_ctx.get("rollup_pr_number")
                     if pr_state_err is not None:
-                        logger.warning(f"[ROLLUP] Could not verify PR #{existing_pr} state: {pr_state_err} — proceeding with existing marker")
+                        logger.warning(
+                            f"[ROLLUP] Could not verify PR #{existing_pr} state: {pr_state_err} — proceeding with existing marker"
+                        )
                     elif existing_pr is not None and pr_state is not None:
                         if pr_state.get("merged"):
-                            logger.info(f"[ROLLUP] PR #{existing_pr} already merged — marking COMPLETED")
+                            logger.info(
+                                f"[ROLLUP] PR #{existing_pr} already merged — marking COMPLETED"
+                            )
                             parent.status = TaskStatus.COMPLETED
-                            parent.context = {**_clear_rollup_transient_state(parent_ctx), "pr_merged": True}
-                            parent.latest_status_message = f"Rollup PR #{existing_pr} already merged"
+                            parent.context = {
+                                **_clear_rollup_transient_state(parent_ctx),
+                                "pr_merged": True,
+                            }
+                            parent.latest_status_message = (
+                                f"Rollup PR #{existing_pr} already merged"
+                            )
                             session.add(parent)
                             await session.commit()
                             await _cleanup_branches(parent, session)
-                            await broadcast_to_project(str(parent.project_id), "task_updated",
-                                                       {"task_id": str(parent.id), "status": TaskStatus.COMPLETED})
+                            await broadcast_to_project(
+                                str(parent.project_id),
+                                "task_updated",
+                                {
+                                    "task_id": str(parent.id),
+                                    "status": TaskStatus.COMPLETED,
+                                },
+                            )
                             return
                         if pr_state.get("state") == "closed":
-                            logger.warning(f"[ROLLUP] PR #{existing_pr} was closed without merge — clearing marker, will retry")
-                            parent.context = {k: v for k, v in parent_ctx.items()
-                                             if k not in ("rollup_pr_number", "rollup_pr_url")}
+                            logger.warning(
+                                f"[ROLLUP] PR #{existing_pr} was closed without merge — clearing marker, will retry"
+                            )
+                            parent.context = {
+                                k: v
+                                for k, v in parent_ctx.items()
+                                if k not in ("rollup_pr_number", "rollup_pr_url")
+                            }
                             parent_ctx = parent.context
                             existing_pr = None
                             session.add(parent)
@@ -1200,12 +1476,18 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                 if existing_pr:
                     rollup_pr_number = existing_pr
                     rollup_pr_url = parent_ctx.get("rollup_pr_url", "")
-                    logger.info(f"[ROLLUP] Resuming with existing PR #{rollup_pr_number}")
+                    logger.info(
+                        f"[ROLLUP] Resuming with existing PR #{rollup_pr_number}"
+                    )
                 else:
                     pr_title = f"[Blueprint] Rollup: {parent.title}"
-                    _dir_id = parent.first_payload.get("current_direction_id") or parent_ctx.get("direction_id")
+                    _dir_id = parent.first_payload.get(
+                        "current_direction_id"
+                    ) or parent_ctx.get("direction_id")
                     _dir_title = parent_ctx.get("direction_title") or parent.title
-                    _completed_children = [c for c in children if c.status == TaskStatus.COMPLETED]
+                    _completed_children = [
+                        c for c in children if c.status == TaskStatus.COMPLETED
+                    ]
                     pr_body = _build_rollup_pr_body(
                         completed_count,
                         staging_branch,
@@ -1225,11 +1507,21 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                     project_id_str = str(parent.project_id)
                     pre_create_snapshot = await _release_parent_lock(parent, session)
 
-                    pr_result = await create_pull_request(gh_token, owner, repo,
-                        title=pr_title, head=staging_branch, base=target_branch, body=pr_body, project_id=project_id_str)
+                    pr_result = await create_pull_request(
+                        gh_token,
+                        owner,
+                        repo,
+                        title=pr_title,
+                        head=staging_branch,
+                        base=target_branch,
+                        body=pr_body,
+                        project_id=project_id_str,
+                    )
 
                     parent = await _relock_parent(
-                        session, parent_id_local, pre_create_snapshot,
+                        session,
+                        parent_id_local,
+                        pre_create_snapshot,
                         parent_in_session=parent,
                     )
                     if parent is None:
@@ -1253,28 +1545,41 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
 
                     # Empty diff — branches are identical, nothing to merge
                     if pr_result.get("empty_diff"):
-                        logger.info(f"[ROLLUP] Empty diff for {staging_branch} → {target_branch} — marking COMPLETED")
+                        logger.info(
+                            f"[ROLLUP] Empty diff for {staging_branch} → {target_branch} — marking COMPLETED"
+                        )
                         parent.status = TaskStatus.COMPLETED
                         parent.context = _clear_rollup_transient_state(parent.context)
                         parent.latest_status_message = f"✓ All {completed_count} subtasks completed — no new changes to merge (fixes already on {target_branch})"
                         try:
                             await delete_branch(gh_token, owner, repo, staging_branch)
                         except Exception as e:
-                            logger.warning(f"[ROLLUP] Failed to delete staging branch '{staging_branch}' for task {parent.id}: {e}")
+                            logger.warning(
+                                f"[ROLLUP] Failed to delete staging branch '{staging_branch}' for task {parent.id}: {e}"
+                            )
                         session.add(parent)
                         await session.commit()
                         await _cleanup_branches(parent, session)
-                        await broadcast_to_project(str(parent.project_id), "task_updated",
-                                                   {"task_id": str(parent.id), "status": TaskStatus.COMPLETED})
+                        await broadcast_to_project(
+                            str(parent.project_id),
+                            "task_updated",
+                            {"task_id": str(parent.id), "status": TaskStatus.COMPLETED},
+                        )
                         return
 
                     rollup_pr_url = pr_result.get("html_url", "")
                     rollup_pr_number = pr_result.get("number")
-                    logger.info(f"[ROLLUP] Created PR #{rollup_pr_number}: {staging_branch} → {target_branch}")
+                    logger.info(
+                        f"[ROLLUP] Created PR #{rollup_pr_number}: {staging_branch} → {target_branch}"
+                    )
 
                     # Commit marker immediately — if we crash after this point,
                     # restart will find the marker and skip PR creation
-                    parent.context = {**parent_ctx, "rollup_pr_number": rollup_pr_number, "rollup_pr_url": rollup_pr_url}
+                    parent.context = {
+                        **parent_ctx,
+                        "rollup_pr_number": rollup_pr_number,
+                        "rollup_pr_url": rollup_pr_url,
+                    }
                     parent_ctx = parent.context  # Update local ref
                     session.add(parent)
                     await session.commit()
@@ -1283,9 +1588,17 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                 # skip_locked: rollup PR marker is already persisted, so if a concurrent
                 # sibling holds the lock we defer safely — reaper sweep will retry within 15 min.
                 parent_id = parent.id
-                parent = (await session.execute(
-                    select(Task).where(Task.id == parent_id).with_for_update(skip_locked=True)
-                )).scalars().first()
+                parent = (
+                    (
+                        await session.execute(
+                            select(Task)
+                            .where(Task.id == parent_id)
+                            .with_for_update(skip_locked=True)
+                        )
+                    )
+                    .scalars()
+                    .first()
+                )
                 if parent is None:
                     logger.info(
                         f"[ROLLUP] Skipped merge phase for parent {parent_id} — lock held, "
@@ -1296,7 +1609,9 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
 
                 # Guard: concurrent sibling may have created a different rollup PR in the gap
                 if parent_ctx.get("rollup_pr_number") != rollup_pr_number:
-                    logger.info(f"[ROLLUP] Concurrent sibling created rollup PR for parent {parent.id} — yielding")
+                    logger.info(
+                        f"[ROLLUP] Concurrent sibling created rollup PR for parent {parent.id} — yielding"
+                    )
                     return
 
                 # Check if any child task was high-risk — if so, require approval on the final merge.
@@ -1308,25 +1623,40 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                     (c.context or {}).get("risk") == "high"
                     for c in children
                     if c.status == TaskStatus.COMPLETED
-                    and (c.first_payload or {}).get("type") != "refactor"  # refactors are structural, not behavioral risk
+                    and (c.first_payload or {}).get("type")
+                    != "refactor"  # refactors are structural, not behavioral risk
                 )
-                if has_high_risk_child and not is_target_intermediate and _runtime_config.get("require_approval_gates", True):
+                if (
+                    has_high_risk_child
+                    and not is_target_intermediate
+                    and _runtime_config.get("require_approval_gates", True)
+                ):
                     parent.requires_approval = True
                     parent.latest_status_message = (
                         f"All {completed_count} subtasks merged, rollup PR #{rollup_pr_number} awaiting approval "
                         f"(contains high-risk changes)"
                     )
-                    parent.context = {**parent_ctx, "rollup_pr_url": rollup_pr_url, "rollup_pr_number": rollup_pr_number}
+                    parent.context = {
+                        **parent_ctx,
+                        "rollup_pr_url": rollup_pr_url,
+                        "rollup_pr_number": rollup_pr_number,
+                    }
                     session.add(parent)
                     await _dispatch_rollup_approval_alert(
-                        parent, session,
+                        parent,
+                        session,
                         f"Rollup PR #{rollup_pr_number} awaiting approval — contains high-risk changes",
                         pr_number=rollup_pr_number,
                     )
                     await session.commit()
-                    await broadcast_to_project(str(parent.project_id), "task_updated",
-                                               {"task_id": str(parent.id), "status": parent.status})
-                    logger.info(f"[ROLLUP] PR #{rollup_pr_number} has high-risk children — requires approval before merge to {target_branch}")
+                    await broadcast_to_project(
+                        str(parent.project_id),
+                        "task_updated",
+                        {"task_id": str(parent.id), "status": parent.status},
+                    )
+                    logger.info(
+                        f"[ROLLUP] PR #{rollup_pr_number} has high-risk children — requires approval before merge to {target_branch}"
+                    )
                     return
 
                 # Auto-merge small rollups on intermediate branches; review large ones
@@ -1338,10 +1668,20 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                 project_id_str = str(parent.project_id)
                 pre_diff_snapshot = await _release_parent_lock(parent, session)
                 try:
-                    pr_detail = await get_pull_request(gh_token, owner, repo, rollup_pr_number, project_id=project_id_str)
-                    lines_changed = pr_detail.get("additions", 0) + pr_detail.get("deletions", 0)
+                    pr_detail = await get_pull_request(
+                        gh_token,
+                        owner,
+                        repo,
+                        rollup_pr_number,
+                        project_id=project_id_str,
+                    )
+                    lines_changed = pr_detail.get("additions", 0) + pr_detail.get(
+                        "deletions", 0
+                    )
                 except Exception as e:
-                    logger.warning(f"[ROLLUP] Failed to fetch PR #{rollup_pr_number} diff size for task {parent_id_local}: {e}")
+                    logger.warning(
+                        f"[ROLLUP] Failed to fetch PR #{rollup_pr_number} diff size for task {parent_id_local}: {e}"
+                    )
                     lines_changed = 999  # assume large if we can't check
                     pr_detail = None
                 head_sha = (pr_detail.get("head") or {}).get("sha") if pr_detail else None
@@ -1349,18 +1689,32 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                 # Zero-diff guard: squash-merged commits can produce a PR with commits
                 # but no file changes. Close before spawning review/fix VMs.
                 if pr_detail is not None and lines_changed == 0:
-                    logger.info(f"[ROLLUP] PR #{rollup_pr_number} has zero lines changed — closing and marking COMPLETED")
+                    logger.info(
+                        f"[ROLLUP] PR #{rollup_pr_number} has zero lines changed — closing and marking COMPLETED"
+                    )
                     try:
-                        await close_pull_request(gh_token, owner, repo, rollup_pr_number, project_id=project_id_str)
+                        await close_pull_request(
+                            gh_token,
+                            owner,
+                            repo,
+                            rollup_pr_number,
+                            project_id=project_id_str,
+                        )
                     except Exception as e:
-                        logger.warning(f"[ROLLUP] Failed to close zero-diff PR #{rollup_pr_number}: {e}")
+                        logger.warning(
+                            f"[ROLLUP] Failed to close zero-diff PR #{rollup_pr_number}: {e}"
+                        )
                     try:
                         await delete_branch(gh_token, owner, repo, staging_branch)
                     except Exception as e:
-                        logger.warning(f"[ROLLUP] Failed to delete staging branch '{staging_branch}' for task {parent_id_local}: {e}")
+                        logger.warning(
+                            f"[ROLLUP] Failed to delete staging branch '{staging_branch}' for task {parent_id_local}: {e}"
+                        )
                     # Re-acquire to apply mutation
                     parent = await _relock_parent(
-                        session, parent_id_local, pre_diff_snapshot,
+                        session,
+                        parent_id_local,
+                        pre_diff_snapshot,
                         parent_in_session=parent,
                     )
                     if parent is None:
@@ -1368,18 +1722,26 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                     parent.status = TaskStatus.COMPLETED
                     parent.latest_status_message = f"✓ All {completed_count} subtasks completed — rollup PR #{rollup_pr_number} had no file changes (already on {target_branch})"
                     _cleared = _clear_rollup_transient_state(parent.context)
-                    parent.context = {k: v for k, v in _cleared.items()
-                                      if k not in ("rollup_pr_number", "rollup_pr_url")}
+                    parent.context = {
+                        k: v
+                        for k, v in _cleared.items()
+                        if k not in ("rollup_pr_number", "rollup_pr_url")
+                    }
                     session.add(parent)
                     await session.commit()
                     await _cleanup_branches(parent, session)
-                    await broadcast_to_project(str(parent.project_id), "task_updated",
-                                               {"task_id": str(parent.id), "status": TaskStatus.COMPLETED})
+                    await broadcast_to_project(
+                        str(parent.project_id),
+                        "task_updated",
+                        {"task_id": str(parent.id), "status": TaskStatus.COMPLETED},
+                    )
                     return
 
                 # Non-zero-diff path: re-acquire for downstream mutations.
                 parent = await _relock_parent(
-                    session, parent_id_local, pre_diff_snapshot,
+                    session,
+                    parent_id_local,
+                    pre_diff_snapshot,
                     parent_in_session=parent,
                 )
                 if parent is None:
@@ -1399,15 +1761,15 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                         f"[ROLLUP] Deferring review for PR #{rollup_pr_number} — could not verify "
                         f"diff size; will retry next cycle"
                     )
-                    parent.latest_status_message = (
-                        f"Rollup PR #{rollup_pr_number} — diff size unverified, retrying next cycle"
-                    )
+                    parent.latest_status_message = f"Rollup PR #{rollup_pr_number} — diff size unverified, retrying next cycle"
                     session.add(parent)
                     await session.commit()
                     return
 
                 is_small_rollup = lines_changed <= 100
-                logger.info(f"[ROLLUP] PR #{rollup_pr_number}: {lines_changed} lines changed, {'auto-merge' if is_small_rollup and is_target_intermediate else 'review'}")
+                logger.info(
+                    f"[ROLLUP] PR #{rollup_pr_number}: {lines_changed} lines changed, {'auto-merge' if is_small_rollup and is_target_intermediate else 'review'}"
+                )
                 if is_target_intermediate and is_small_rollup:
                     # ── Phase B3: release lock around security scan + comment + merge ──
                     # The scan inspects PR diffs (multiple GH API calls), the comment
@@ -1418,15 +1780,22 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                     rollup_scan: dict | None = None
                     rollup_scan_err: Exception | None = None
                     try:
-                        rollup_scan = await scan_pr_for_injection(gh_token, owner, repo, rollup_pr_number)
+                        rollup_scan = await scan_pr_for_injection(
+                            gh_token, owner, repo, rollup_pr_number
+                        )
                         logger.info(f"[SECURITY] Rollup scan: {rollup_scan['summary']}")
                     except Exception as e:
                         rollup_scan_err = e
-                        logger.error(f"[SECURITY] Rollup scan failed for PR #{rollup_pr_number}, blocking: {e}", exc_info=True)
+                        logger.error(
+                            f"[SECURITY] Rollup scan failed for PR #{rollup_pr_number}, blocking: {e}",
+                            exc_info=True,
+                        )
 
                     # Re-acquire to apply mutations / dispatch alerts.
                     parent = await _relock_parent(
-                        session, parent_id_local, pre_merge_snapshot,
+                        session,
+                        parent_id_local,
+                        pre_merge_snapshot,
                         parent_in_session=parent,
                     )
                     if parent is None:
@@ -1437,11 +1806,18 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
 
                     if rollup_scan_err is not None:
                         parent.requires_approval = True
-                        parent.latest_status_message = f"Rollup security scan failed — requires manual approval: {type(rollup_scan_err).__name__}: {rollup_scan_err!r}"[:500]
-                        parent.context = {**parent_ctx, "rollup_pr_url": rollup_pr_url, "rollup_pr_number": rollup_pr_number}
+                        parent.latest_status_message = f"Rollup security scan failed — requires manual approval: {type(rollup_scan_err).__name__}: {rollup_scan_err!r}"[
+                            :500
+                        ]
+                        parent.context = {
+                            **parent_ctx,
+                            "rollup_pr_url": rollup_pr_url,
+                            "rollup_pr_number": rollup_pr_number,
+                        }
                         session.add(parent)
                         await _dispatch_rollup_approval_alert(
-                            parent, session,
+                            parent,
+                            session,
                             f"Rollup PR #{rollup_pr_number} security scan failed — requires manual approval: {type(rollup_scan_err).__name__}",
                             pr_number=rollup_pr_number,
                         )
@@ -1450,12 +1826,19 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
 
                     if rollup_scan["blocked"]:
                         parent.requires_approval = True
-                        parent.latest_status_message = f"Rollup security scan blocked: {rollup_scan['summary']}"
-                        parent.context = {**parent_ctx, "rollup_pr_url": rollup_pr_url, "rollup_pr_number": rollup_pr_number}
+                        parent.latest_status_message = (
+                            f"Rollup security scan blocked: {rollup_scan['summary']}"
+                        )
+                        parent.context = {
+                            **parent_ctx,
+                            "rollup_pr_url": rollup_pr_url,
+                            "rollup_pr_number": rollup_pr_number,
+                        }
                         # Persist + commit BEFORE the comment (releases lock for I/O).
                         session.add(parent)
                         await _dispatch_rollup_approval_alert(
-                            parent, session,
+                            parent,
+                            session,
                             f"Rollup PR #{rollup_pr_number} blocked by security scan: {rollup_scan['summary']}",
                             pr_number=rollup_pr_number,
                         )
@@ -1463,17 +1846,33 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                         # Comment after the lock is released — it's an external side-effect.
                         if rollup_scan["findings"]:
                             try:
-                                await create_pr_comment(gh_token, owner, repo, rollup_pr_number, rollup_scan["report"])
+                                await create_pr_comment(
+                                    gh_token,
+                                    owner,
+                                    repo,
+                                    rollup_pr_number,
+                                    rollup_scan["report"],
+                                )
                             except Exception as e:
-                                logger.warning(f"[ROLLUP] Failed to post scan-block comment on PR #{rollup_pr_number}: {e}")
+                                logger.warning(
+                                    f"[ROLLUP] Failed to post scan-block comment on PR #{rollup_pr_number}: {e}"
+                                )
                         return
                     if rollup_scan["findings"]:
                         # Findings but not blocked — post comment outside lock window
                         # is fine; we don't mutate the parent for this case.
                         try:
-                            await create_pr_comment(gh_token, owner, repo, rollup_pr_number, rollup_scan["report"])
+                            await create_pr_comment(
+                                gh_token,
+                                owner,
+                                repo,
+                                rollup_pr_number,
+                                rollup_scan["report"],
+                            )
                         except Exception as e:
-                            logger.warning(f"[ROLLUP] Failed to post scan comment on PR #{rollup_pr_number}: {e}")
+                            logger.warning(
+                                f"[ROLLUP] Failed to post scan comment on PR #{rollup_pr_number}: {e}"
+                            )
 
                     # Release lock around the actual merge call (slowest of all).
                     pre_actual_merge_snapshot = await _release_parent_lock(parent, session)
@@ -1567,7 +1966,9 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                             return
                     merge_result = await merge_pull_request(gh_token, owner, repo, rollup_pr_number, project_id=str(parent.project_id))
                     parent = await _relock_parent(
-                        session, parent_id_local, pre_actual_merge_snapshot,
+                        session,
+                        parent_id_local,
+                        pre_actual_merge_snapshot,
                         parent_in_session=parent,
                     )
                     if parent is None:
@@ -1586,25 +1987,36 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                         try:
                             await delete_branch(gh_token, owner, repo, staging_branch)
                         except Exception as del_err:
-                            logger.warning(f"[ROLLUP] Failed to delete staging branch {staging_branch}: {del_err}")
+                            logger.warning(
+                                f"[ROLLUP] Failed to delete staging branch {staging_branch}: {del_err}"
+                            )
                         logger.info(f"[ROLLUP] Auto-merged rollup into {target_branch}")
                         try:
                             from app.notification_dispatch import post_pr_merged_message
+
                             _direction_id = (parent.context or {}).get("direction_id")
                             _direction_text = "unknown direction"
                             if _direction_id:
                                 _proj = await session.get(Project, parent.project_id)
                                 if _proj:
-                                    for _d in (_proj.directions or []):
+                                    for _d in _proj.directions or []:
                                         if str(_d.get("id", "")) == str(_direction_id):
-                                            _direction_text = _d.get("text", "unknown direction")
+                                            _direction_text = _d.get(
+                                                "text", "unknown direction"
+                                            )
                                             break
                             await post_pr_merged_message(
-                                session, parent.project_id, rollup_pr_number,
-                                _direction_text, completed_count, parent.id,
+                                session,
+                                parent.project_id,
+                                rollup_pr_number,
+                                _direction_text,
+                                completed_count,
+                                parent.id,
                             )
                         except Exception as _e:
-                            logger.warning(f"[NOTIFY] Failed to post PR merged message: {_e}")
+                            logger.warning(
+                                f"[NOTIFY] Failed to post PR merged message: {_e}"
+                            )
                     else:
                         # Merge failed (conflicts) — spawn review/fix cycle instead of giving up
                         merge_msg = merge_result.get("message", "unknown")
@@ -1615,19 +2027,29 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                         _pr_refetch_failed = False
                         try:
                             _pr_detail = await get_pull_request(
-                                gh_token, owner, repo, rollup_pr_number, project_id=str(parent.project_id),
+                                gh_token,
+                                owner,
+                                repo,
+                                rollup_pr_number,
+                                project_id=str(parent.project_id),
                             )
                         except Exception as _pr_exc:
                             _pr_detail = {}
                             _pr_refetch_failed = True
-                            logger.debug(f"[ROLLUP] Could not refetch PR #{rollup_pr_number} for behind-check: {_pr_exc}")
+                            logger.debug(
+                                f"[ROLLUP] Could not refetch PR #{rollup_pr_number} for behind-check: {_pr_exc}"
+                            )
                         # PR refetch retry budget: transient GitHub API errors (500,
                         # 503, network timeouts) shouldn't burn a fix VM. Defer the
                         # sweep on early failures; only fall through to fix-spawn
                         # once consecutive failures exhaust the budget.
                         if _pr_refetch_failed:
-                            _refetch_failures = parent_ctx.get("_refetch_failure_count", 0) + 1
-                            _refetch_budget = _runtime_config.get("rollup_refetch_failure_retries", 3)
+                            _refetch_failures = (
+                                parent_ctx.get("_refetch_failure_count", 0) + 1
+                            )
+                            _refetch_budget = _runtime_config.get(
+                                "rollup_refetch_failure_retries", 3
+                            )
                             if _refetch_failures < _refetch_budget:
                                 parent.context = {
                                     **parent_ctx,
@@ -1646,13 +2068,21 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                                     f"(attempt {_refetch_failures}/{_refetch_budget}) — deferring fix spawn"
                                 )
                                 return
-                            parent_ctx = {k: v for k, v in parent_ctx.items() if k != "_refetch_failure_count"}
+                            parent_ctx = {
+                                k: v
+                                for k, v in parent_ctx.items()
+                                if k != "_refetch_failure_count"
+                            }
                             logger.warning(
                                 f"[ROLLUP] PR #{rollup_pr_number} refetch failed {_refetch_failures} consecutive "
                                 f"sweeps — falling through to fix spawn"
                             )
                         elif "_refetch_failure_count" in parent_ctx:
-                            parent_ctx = {k: v for k, v in parent_ctx.items() if k != "_refetch_failure_count"}
+                            parent_ctx = {
+                                k: v
+                                for k, v in parent_ctx.items()
+                                if k != "_refetch_failure_count"
+                            }
                         # Classify mergeable_state before assuming this is a real
                         # conflict. Only 'dirty' (and 'behind' as fall-through if
                         # update_branch fails) warrant a fix VM. 'blocked' and
@@ -1673,14 +2103,22 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                             )
                         elif _ms == "behind":
                             _upd = await update_branch_with_sha_retry(
-                                gh_token, owner, repo, rollup_pr_number,
-                                expected_head_sha=_pr_detail.get("head", {}).get("sha") or None,
+                                gh_token,
+                                owner,
+                                repo,
+                                rollup_pr_number,
+                                expected_head_sha=_pr_detail.get("head", {}).get("sha")
+                                or None,
                                 project_id=str(parent.project_id),
                             )
                             if _upd.get("updated"):
                                 # Reset the behind-retry counter — update succeeded, so any
                                 # prior transient failures were just that, transient.
-                                _new_ctx = {**parent_ctx, "rollup_pr_url": rollup_pr_url, "rollup_pr_number": rollup_pr_number}
+                                _new_ctx = {
+                                    **parent_ctx,
+                                    "rollup_pr_url": rollup_pr_url,
+                                    "rollup_pr_number": rollup_pr_number,
+                                }
                                 _new_ctx.pop("_behind_update_retries", None)
                                 parent.context = _new_ctx
                                 parent.latest_status_message = (
@@ -1699,8 +2137,12 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                             # only fall through to fix spawn once the retry budget is
                             # exhausted. Prevents premature fix VMs from wasting a
                             # review/fix cycle on a PR that just needs another API call.
-                            _behind_retries = parent_ctx.get("_behind_update_retries", 0) + 1
-                            _behind_budget = _runtime_config.get("rollup_behind_update_retries", 3)
+                            _behind_retries = (
+                                parent_ctx.get("_behind_update_retries", 0) + 1
+                            )
+                            _behind_budget = _runtime_config.get(
+                                "rollup_behind_update_retries", 3
+                            )
                             _upd_msg = _upd.get("message") or "unknown"
                             if _behind_retries < _behind_budget:
                                 parent.context = {
@@ -1721,12 +2163,17 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                                 )
                                 return
                             await _maybe_create_failure_alert(
-                                parent, session,
+                                parent,
+                                session,
                                 f"Rollup PR #{rollup_pr_number} behind {target_branch} — update_branch failed "
-                                f"{_behind_retries} consecutive sweeps ({_upd_msg}); falling through to fix spawn"
+                                f"{_behind_retries} consecutive sweeps ({_upd_msg}); falling through to fix spawn",
                             )
                             # Clear the counter so a future behind state starts fresh.
-                            parent_ctx = {k: v for k, v in parent_ctx.items() if k != "_behind_update_retries"}
+                            parent_ctx = {
+                                k: v
+                                for k, v in parent_ctx.items()
+                                if k != "_behind_update_retries"
+                            }
                             logger.warning(
                                 f"[ROLLUP] PR #{rollup_pr_number} behind {target_branch} — update_branch failed "
                                 f"{_behind_retries} times ({_upd_msg}); falling through to fix spawn"
@@ -1741,7 +2188,12 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                             # are handled above and never reach this branch.
                             _ms_key = _ms or "empty"
                             _ms_display = _ms or "missing (field absent)"
-                            _is_unrecognized = _ms_key not in ("blocked", "unstable", "unknown", "empty")
+                            _is_unrecognized = _ms_key not in (
+                                "blocked",
+                                "unstable",
+                                "unknown",
+                                "empty",
+                            )
                             # For blocked/unstable, ask GitHub to auto-merge once gates
                             # clear — mirrors the task_lifecycle auto-merge fallback so a
                             # passing rollup PR lands without waiting on the reaper's
@@ -1750,8 +2202,12 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                             if _ms_key in ("blocked", "unstable"):
                                 try:
                                     from app.github import enable_auto_merge
+
                                     am_result = await enable_auto_merge(
-                                        gh_token, owner, repo, rollup_pr_number,
+                                        gh_token,
+                                        owner,
+                                        repo,
+                                        rollup_pr_number,
                                         project_id=str(parent.project_id),
                                     )
                                     if am_result.get("enabled"):
@@ -1770,17 +2226,29 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                                         f"#{rollup_pr_number}: {_am_exc}"
                                     )
                             prev_state = parent_ctx.get("_merge_deferred_state")
-                            deferred_count = (parent_ctx.get("_merge_deferred_count", 0) + 1) if prev_state == _ms_key else 1
+                            deferred_count = (
+                                (parent_ctx.get("_merge_deferred_count", 0) + 1)
+                                if prev_state == _ms_key
+                                else 1
+                            )
                             # Total-deferral counter: increments on every deferral regardless
                             # of state change. Prevents a flapping PR (blocked↔unstable↔…) from
                             # evading the per-state threshold forever.
-                            total_deferrals = parent_ctx.get("_merge_total_deferrals", 0) + 1
+                            total_deferrals = (
+                                parent_ctx.get("_merge_total_deferrals", 0) + 1
+                            )
                             now = _utcnow()
-                            first_deferred_at = parent_ctx.get("_merge_first_deferred_at") or now.isoformat()
+                            first_deferred_at = (
+                                parent_ctx.get("_merge_first_deferred_at")
+                                or now.isoformat()
+                            )
                             try:
                                 from datetime import datetime as _dt
+
                                 _first_dt = _dt.fromisoformat(first_deferred_at)
-                                elapsed_minutes = (now - _first_dt).total_seconds() / 60.0
+                                elapsed_minutes = (
+                                    now - _first_dt
+                                ).total_seconds() / 60.0
                             except (TypeError, ValueError):
                                 elapsed_minutes = 0.0
                             # 'unknown' / empty = GitHub stuck computing mergeability or refetch
@@ -1789,20 +2257,30 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                             # which legitimately wait for checks/reviews.
                             _fast_escalate = _ms_key not in ("blocked", "unstable")
                             alert_threshold = _runtime_config.get(
-                                "rollup_merge_deferred_alert_unknown" if _fast_escalate
-                                else "rollup_merge_deferred_alert", 5 if _fast_escalate else 10
+                                "rollup_merge_deferred_alert_unknown"
+                                if _fast_escalate
+                                else "rollup_merge_deferred_alert",
+                                5 if _fast_escalate else 10,
                             )
-                            approval_threshold = _runtime_config.get("rollup_merge_deferred_approval", 30)
+                            approval_threshold = _runtime_config.get(
+                                "rollup_merge_deferred_approval", 30
+                            )
                             total_alert_threshold = alert_threshold * 2
                             total_approval_threshold = approval_threshold * 2
-                            time_alert_minutes = _runtime_config.get("rollup_merge_deferred_time_alert_minutes", 30)
-                            time_approval_minutes = _runtime_config.get("rollup_merge_deferred_time_approval_minutes", 60)
+                            time_alert_minutes = _runtime_config.get(
+                                "rollup_merge_deferred_time_alert_minutes", 30
+                            )
+                            time_approval_minutes = _runtime_config.get(
+                                "rollup_merge_deferred_time_approval_minutes", 60
+                            )
                             # Per-state alert latch: tracks which states have already
                             # fired an alert so a flapping PR (blocked→unstable→blocked)
                             # doesn't re-fire the per-state alert each time a state
                             # re-crosses its threshold. A new state triggers a fresh
                             # alert; a state that's already alerted stays quiet.
-                            alerted_states = set(parent_ctx.get("_merge_alerted_states") or [])
+                            alerted_states = set(
+                                parent_ctx.get("_merge_alerted_states") or []
+                            )
                             parent.context = {
                                 **parent_ctx,
                                 "rollup_pr_url": rollup_pr_url,
@@ -1824,40 +2302,67 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                             # approval dispatch is wrapped in try/except so dispatch
                             # failures don't prevent the counter-persisting commit —
                             # otherwise counters reset each sweep and thresholds never fire.
-                            if deferred_count >= alert_threshold and _ms_key not in alerted_states:
+                            if (
+                                deferred_count >= alert_threshold
+                                and _ms_key not in alerted_states
+                            ):
                                 try:
                                     await _maybe_create_failure_alert(
-                                        parent, session,
+                                        parent,
+                                        session,
                                         f"Rollup PR #{rollup_pr_number} stuck in mergeable_state={_ms_display} "
-                                        f"for {deferred_count} consecutive sweeps"
+                                        f"for {deferred_count} consecutive sweeps",
                                     )
                                 except Exception as _alert_err:
-                                    logger.warning(f"[ROLLUP] Failed to create per-state deferral alert for PR #{rollup_pr_number}: {_alert_err}")
+                                    logger.warning(
+                                        f"[ROLLUP] Failed to create per-state deferral alert for PR #{rollup_pr_number}: {_alert_err}"
+                                    )
                                 alerted_states.add(_ms_key)
-                                parent.context = {**parent.context, "_merge_alerted_states": sorted(alerted_states)}
+                                parent.context = {
+                                    **parent.context,
+                                    "_merge_alerted_states": sorted(alerted_states),
+                                }
                             # Total-count alert: fires once when total crosses threshold,
                             # catching state-flapping PRs that evade the per-state counter.
-                            if total_deferrals >= total_alert_threshold and not parent_ctx.get("_merge_total_alerted"):
+                            if (
+                                total_deferrals >= total_alert_threshold
+                                and not parent_ctx.get("_merge_total_alerted")
+                            ):
                                 try:
                                     await _maybe_create_failure_alert(
-                                        parent, session,
+                                        parent,
+                                        session,
                                         f"Rollup PR #{rollup_pr_number} merge deferred {total_deferrals} times across "
-                                        f"states (flapping) — manual investigation required"
+                                        f"states (flapping) — manual investigation required",
                                     )
                                 except Exception as _alert_err:
-                                    logger.warning(f"[ROLLUP] Failed to create total-deferral alert for PR #{rollup_pr_number}: {_alert_err}")
-                                parent.context = {**parent.context, "_merge_total_alerted": True}
+                                    logger.warning(
+                                        f"[ROLLUP] Failed to create total-deferral alert for PR #{rollup_pr_number}: {_alert_err}"
+                                    )
+                                parent.context = {
+                                    **parent.context,
+                                    "_merge_total_alerted": True,
+                                }
                             # Time-based alert: fires once after total deferral time crosses threshold
-                            if elapsed_minutes >= time_alert_minutes and not parent_ctx.get("_merge_time_alerted"):
+                            if (
+                                elapsed_minutes >= time_alert_minutes
+                                and not parent_ctx.get("_merge_time_alerted")
+                            ):
                                 try:
                                     await _maybe_create_failure_alert(
-                                        parent, session,
+                                        parent,
+                                        session,
                                         f"Rollup PR #{rollup_pr_number} merge has been deferred for "
-                                        f"{elapsed_minutes:.0f} minutes — manual investigation required"
+                                        f"{elapsed_minutes:.0f} minutes — manual investigation required",
                                     )
                                 except Exception as _alert_err:
-                                    logger.warning(f"[ROLLUP] Failed to create time-based deferral alert for PR #{rollup_pr_number}: {_alert_err}")
-                                parent.context = {**parent.context, "_merge_time_alerted": True}
+                                    logger.warning(
+                                        f"[ROLLUP] Failed to create time-based deferral alert for PR #{rollup_pr_number}: {_alert_err}"
+                                    )
+                                parent.context = {
+                                    **parent.context,
+                                    "_merge_time_alerted": True,
+                                }
                             # Approval gate: any of per-state, total, or time thresholds can fire it.
                             # Only one approval dispatch — the first condition wins.
                             if not parent.requires_approval:
@@ -1865,35 +2370,44 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                                     parent.requires_approval = True
                                     try:
                                         await _dispatch_rollup_approval_alert(
-                                            parent, session,
+                                            parent,
+                                            session,
                                             f"Rollup PR #{rollup_pr_number} stuck in mergeable_state={_ms_display} "
                                             f"for {deferred_count} sweeps — manual investigation required",
                                             pr_number=rollup_pr_number,
                                         )
                                     except Exception as _alert_err:
-                                        logger.warning(f"[ROLLUP] Failed to dispatch per-state approval alert for PR #{rollup_pr_number}: {_alert_err}")
+                                        logger.warning(
+                                            f"[ROLLUP] Failed to dispatch per-state approval alert for PR #{rollup_pr_number}: {_alert_err}"
+                                        )
                                 elif total_deferrals >= total_approval_threshold:
                                     parent.requires_approval = True
                                     try:
                                         await _dispatch_rollup_approval_alert(
-                                            parent, session,
+                                            parent,
+                                            session,
                                             f"Rollup PR #{rollup_pr_number} deferred {total_deferrals} times across "
                                             f"states — manual investigation required",
                                             pr_number=rollup_pr_number,
                                         )
                                     except Exception as _alert_err:
-                                        logger.warning(f"[ROLLUP] Failed to dispatch total-deferral approval alert for PR #{rollup_pr_number}: {_alert_err}")
+                                        logger.warning(
+                                            f"[ROLLUP] Failed to dispatch total-deferral approval alert for PR #{rollup_pr_number}: {_alert_err}"
+                                        )
                                 elif elapsed_minutes >= time_approval_minutes:
                                     parent.requires_approval = True
                                     try:
                                         await _dispatch_rollup_approval_alert(
-                                            parent, session,
+                                            parent,
+                                            session,
                                             f"Rollup PR #{rollup_pr_number} has been deferred for "
                                             f"{elapsed_minutes:.0f} minutes — manual investigation required",
                                             pr_number=rollup_pr_number,
                                         )
                                     except Exception as _alert_err:
-                                        logger.warning(f"[ROLLUP] Failed to dispatch time-based approval alert for PR #{rollup_pr_number}: {_alert_err}")
+                                        logger.warning(
+                                            f"[ROLLUP] Failed to dispatch time-based approval alert for PR #{rollup_pr_number}: {_alert_err}"
+                                        )
                             session.add(parent)
                             await session.commit()
                             _log = logger.warning if _is_unrecognized else logger.info
@@ -1912,32 +2426,52 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                             # operator and matches ``ix_task_context_gin``;
                             # the prior ``as_string().is_not(None)`` form
                             # bypassed the index.
-                            recent_rollups = (await session.execute(
-                                select(_func.count()).select_from(Task).where(
-                                    Task.status == TaskStatus.COMPLETED,
-                                    Task.id != parent.id,
-                                    Task.updated_at >= _utcnow() - timedelta(hours=1),
-                                    Task.context.has_key("rollup_pr_url"),
+                            recent_rollups = (
+                                await session.execute(
+                                    select(_func.count())
+                                    .select_from(Task)
+                                    .where(
+                                        Task.status == TaskStatus.COMPLETED,
+                                        Task.id != parent.id,
+                                        Task.updated_at
+                                        >= _utcnow() - timedelta(hours=1),
+                                        Task.context.has_key("rollup_pr_url"),
+                                    )
                                 )
-                            )).scalar() or 0
+                            ).scalar() or 0
                             if recent_rollups > 0:
                                 logger.warning(
                                     f"[ROLLUP] Conflict on PR #{rollup_pr_number} may be stale-window: "
                                     f"{recent_rollups} other rollup(s) merged to {target_branch} in the last hour"
                                 )
                         except Exception as e:
-                            logger.warning(f"[ROLLUP] Failed to query concurrent rollup count for PR #{rollup_pr_number} (task {parent.id}): {e}")
-                        parent.context = {**parent_ctx, "rollup_pr_url": rollup_pr_url, "rollup_pr_number": rollup_pr_number, "_is_rollup_review": True}
+                            logger.warning(
+                                f"[ROLLUP] Failed to query concurrent rollup count for PR #{rollup_pr_number} (task {parent.id}): {e}"
+                            )
+                        parent.context = {
+                            **parent_ctx,
+                            "rollup_pr_url": rollup_pr_url,
+                            "rollup_pr_number": rollup_pr_number,
+                            "_is_rollup_review": True,
+                        }
                         parent.latest_status_message = f"Rollup PR #{rollup_pr_number} merge blocked: {merge_msg} — spawning fix task"
                         try:
-                            pr_files = await get_pr_files(gh_token, owner, repo, rollup_pr_number)
-                            files_list = "\n".join(f"  - {f['filename']} ({f['status']})" for f in pr_files)
+                            pr_files = await get_pr_files(
+                                gh_token, owner, repo, rollup_pr_number
+                            )
+                            files_list = "\n".join(
+                                f"  - {f['filename']} ({f['status']})" for f in pr_files
+                            )
                         except Exception as e:
-                            logger.warning(f"[ROLLUP] Failed to fetch PR #{rollup_pr_number} file list for task {parent.id}: {e}")
+                            logger.warning(
+                                f"[ROLLUP] Failed to fetch PR #{rollup_pr_number} file list for task {parent.id}: {e}"
+                            )
                             files_list = "  (could not fetch file list)"
                             pr_files = []
                         has_migrations = any(
-                            (f.get("filename") or "").startswith("backend/alembic/versions/")
+                            (f.get("filename") or "").startswith(
+                                "backend/alembic/versions/"
+                            )
                             for f in pr_files
                         )
                         migration_guidance = ""
@@ -1967,12 +2501,19 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                             f"{migration_guidance}"
                         )
                         fix_task, _ = await _spawn_pipeline_task(
-                            parent, "fix", session, rollup_pr_number, staging_branch, target_branch,
+                            parent,
+                            "fix",
+                            session,
+                            rollup_pr_number,
+                            staging_branch,
+                            target_branch,
                             fix_prompt=fix_prompt,
-                            original_task_id=str(parent.id)
+                            original_task_id=str(parent.id),
                         )
                         if fix_task:
-                            logger.error(f"[ROLLUP] Merge blocked for rollup PR #{rollup_pr_number}, spawned fix → task {fix_task.id}")
+                            logger.error(
+                                f"[ROLLUP] Merge blocked for rollup PR #{rollup_pr_number}, spawned fix → task {fix_task.id}"
+                            )
                         else:
                             from app.review_pipeline import (
                                 SPAWN_REASON_KEY,
@@ -1980,8 +2521,12 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                                 SPAWN_REASON_DEDUP,
                                 SPAWN_REASON_ALREADY_MERGED,
                             )
+
                             spawn_reason = (parent.context or {}).get(SPAWN_REASON_KEY)
-                            if spawn_reason in (SPAWN_REASON_DEFERRED, SPAWN_REASON_DEDUP):
+                            if spawn_reason in (
+                                SPAWN_REASON_DEFERRED,
+                                SPAWN_REASON_DEDUP,
+                            ):
                                 # Another review/fix is in flight on this PR — leave
                                 # parent EVALUATING; next rollup sweep retries once the
                                 # in-flight task finishes. latest_status_message was
@@ -1998,17 +2543,29 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                             else:
                                 # cap / stuck / unknown — terminal.
                                 parent.status = TaskStatus.FAILED
-                                parent.context = _clear_rollup_transient_state(parent.context)
+                                parent.context = _clear_rollup_transient_state(
+                                    parent.context
+                                )
                                 parent.latest_status_message = (
                                     f"Rollup PR #{rollup_pr_number} merge blocked, fix not spawned "
                                     f"({spawn_reason or 'unknown'})"
                                 )
-                                from app.failure_classification import classify_failure, persist_failure_category
+                                from app.failure_classification import (
+                                    classify_failure,
+                                    persist_failure_category,
+                                )
+
                                 _fc = classify_failure(parent)
                                 persist_failure_category(parent, _fc)
                                 _record_rollup_failure_signals(parent, _fc)
-                                await _maybe_create_failure_alert(parent, session, f"Rollup PR #{rollup_pr_number} merge blocked — fix iteration cap exhausted, manual intervention required")
-                                logger.warning(f"[ROLLUP] WARNING: Rollup fix spawn returned None for PR #{rollup_pr_number} (reason={spawn_reason})")
+                                await _maybe_create_failure_alert(
+                                    parent,
+                                    session,
+                                    f"Rollup PR #{rollup_pr_number} merge blocked — fix iteration cap exhausted, manual intervention required",
+                                )
+                                logger.warning(
+                                    f"[ROLLUP] WARNING: Rollup fix spawn returned None for PR #{rollup_pr_number} (reason={spawn_reason})"
+                                )
                             # NOTE: Do NOT delete staging_branch here — it contains
                             # all merged child work and requeueing should be possible.
                 else:
@@ -2021,25 +2578,34 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                     # Do NOT pre-seed review_approved here — the spawned review task
                     # writes it back to this parent's review_loop on APPROVE.
                     parent.latest_status_message = f"All {completed_count} subtasks merged, rollup PR #{rollup_pr_number} awaiting review"
-                    parent.context = {**parent_ctx,
-                                      "rollup_pr_url": rollup_pr_url,
-                                      "rollup_pr_number": rollup_pr_number,
-                                      "_is_rollup_review": True,
-                                      "review_loop": {
-                                          "ci_waiting": True,
-                                          "pr_number": rollup_pr_number,
-                                          "branch": staging_branch,
-                                          "base_branch": target_branch,
-                                          "original_task_id": str(parent.id),
-                                          "ci_wait_started": _utcnow().isoformat(),
-                                      }}
+                    parent.context = {
+                        **parent_ctx,
+                        "rollup_pr_url": rollup_pr_url,
+                        "rollup_pr_number": rollup_pr_number,
+                        "_is_rollup_review": True,
+                        "review_loop": {
+                            "ci_waiting": True,
+                            "pr_number": rollup_pr_number,
+                            "branch": staging_branch,
+                            "base_branch": target_branch,
+                            "original_task_id": str(parent.id),
+                            "ci_wait_started": _utcnow().isoformat(),
+                        },
+                    }
                     review_task, _ = await _spawn_pipeline_task(
-                        parent, "review", session, rollup_pr_number, staging_branch, target_branch,
+                        parent,
+                        "review",
+                        session,
+                        rollup_pr_number,
+                        staging_branch,
+                        target_branch,
                         original_prompt=parent.description or parent.title,
-                        original_task_id=str(parent.id)
+                        original_task_id=str(parent.id),
                     )
                     if review_task:
-                        logger.info(f"[ROLLUP] Spawned review for rollup PR #{rollup_pr_number} → task {review_task.id}")
+                        logger.info(
+                            f"[ROLLUP] Spawned review for rollup PR #{rollup_pr_number} → task {review_task.id}"
+                        )
                     else:
                         from app.review_pipeline import (
                             SPAWN_REASON_KEY,
@@ -2047,6 +2613,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                             SPAWN_REASON_DEDUP,
                             SPAWN_REASON_ALREADY_MERGED,
                         )
+
                         spawn_reason = (parent.context or {}).get(SPAWN_REASON_KEY)
                         if spawn_reason in (SPAWN_REASON_DEFERRED, SPAWN_REASON_DEDUP):
                             # An active review/fix already owns this PR — leave parent
@@ -2062,17 +2629,29 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                             )
                         else:
                             parent.status = TaskStatus.FAILED
-                            parent.context = _clear_rollup_transient_state(parent.context)
+                            parent.context = _clear_rollup_transient_state(
+                                parent.context
+                            )
                             parent.latest_status_message = (
                                 f"Rollup PR #{rollup_pr_number} created but review not spawned "
                                 f"({spawn_reason or 'unknown'})"
                             )
-                            from app.failure_classification import classify_failure, persist_failure_category
+                            from app.failure_classification import (
+                                classify_failure,
+                                persist_failure_category,
+                            )
+
                             _fc = classify_failure(parent)
                             persist_failure_category(parent, _fc)
                             _record_rollup_failure_signals(parent, _fc)
-                            await _maybe_create_failure_alert(parent, session, f"Rollup PR #{rollup_pr_number} created but review task could not be spawned — iteration cap exhausted")
-                            logger.warning(f"[ROLLUP] WARNING: Rollup review spawn returned None for PR #{rollup_pr_number} (reason={spawn_reason})")
+                            await _maybe_create_failure_alert(
+                                parent,
+                                session,
+                                f"Rollup PR #{rollup_pr_number} created but review task could not be spawned — iteration cap exhausted",
+                            )
+                            logger.warning(
+                                f"[ROLLUP] WARNING: Rollup review spawn returned None for PR #{rollup_pr_number} (reason={spawn_reason})"
+                            )
                         # NOTE: Do NOT delete staging_branch here — it contains
                         # all merged child work and requeueing should be possible.
             except Exception as e:
@@ -2092,8 +2671,16 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                 # pre-release in this same scope at lines 981-982) which
                 # always hold the original parent identifiers regardless of
                 # whether ``parent`` got reassigned to None mid-flow.
-                _err_parent_id = parent_id_local if parent_id_local is not None else (parent.id if parent is not None else None)
-                _err_project_id = project_id_local if project_id_local is not None else (parent.project_id if parent is not None else None)
+                _err_parent_id = (
+                    parent_id_local
+                    if parent_id_local is not None
+                    else (parent.id if parent is not None else None)
+                )
+                _err_project_id = (
+                    project_id_local
+                    if project_id_local is not None
+                    else (parent.project_id if parent is not None else None)
+                )
                 if rollup_pr_number is not None and _err_parent_id is not None:
                     try:
                         async with AsyncSessionLocal() as rescue_session:
@@ -2129,36 +2716,71 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                     return
                 err_str = str(e).lower()
                 # Auth failures: invalidate the cached token so the next retry uses a fresh one
-                if isinstance(e, HTTPException) and e.status_code == 401 and _err_project_id is not None:
+                if (
+                    isinstance(e, HTTPException)
+                    and e.status_code == 401
+                    and _err_project_id is not None
+                ):
                     from app.routers.agent import invalidate_github_token_cache
+
                     invalidate_github_token_cache(str(_err_project_id))
-                    logger.warning(f"[ROLLUP] Auth failure (401) for parent {_err_parent_id} — invalidated token cache")
+                    logger.warning(
+                        f"[ROLLUP] Auth failure (401) for parent {_err_parent_id} — invalidated token cache"
+                    )
                 is_transient = (
-                    isinstance(e, HTTPException) and e.status_code in (401, 500, 502, 503, 504)
-                ) or any(kw in err_str for kw in [
-                    "api.github.com",
-                    "500 internal server error", "502 bad gateway", "503 service unavailable", "504 gateway timeout",
-                    "internal server error",
-                    "connection", "timeout",
-                    "rate limit", "ssl", "name resolution",
-                    # Staging branch may have been deleted by a race — retry
-                    # to allow recovery or manual intervention
-                    "staging branch", "validation failed",
-                    # Auth failures — token expired/revoked; cache is invalidated above
-                    "unauthorized", "bad credentials", "token expired",
-                ])
+                    isinstance(e, HTTPException)
+                    and e.status_code in (401, 500, 502, 503, 504)
+                ) or any(
+                    kw in err_str
+                    for kw in [
+                        "api.github.com",
+                        "500 internal server error",
+                        "502 bad gateway",
+                        "503 service unavailable",
+                        "504 gateway timeout",
+                        "internal server error",
+                        "connection",
+                        "timeout",
+                        "rate limit",
+                        "ssl",
+                        "name resolution",
+                        # Staging branch may have been deleted by a race — retry
+                        # to allow recovery or manual intervention
+                        "staging branch",
+                        "validation failed",
+                        # Auth failures — token expired/revoked; cache is invalidated above
+                        "unauthorized",
+                        "bad credentials",
+                        "token expired",
+                    ]
+                )
                 rollup_retries = (parent.context or {}).get("_rollup_retries", 0) + 1
-                if is_transient and rollup_retries <= (max_rollup := _runtime_config.get("max_rollup_retries", 5)):
+                if is_transient and rollup_retries <= (
+                    max_rollup := _runtime_config.get("max_rollup_retries", 5)
+                ):
                     # Transient GitHub error — leave parent EVALUATING, retry next cycle
-                    parent.context = {**(parent.context or {}), "_rollup_retries": rollup_retries}
+                    parent.context = {
+                        **(parent.context or {}),
+                        "_rollup_retries": rollup_retries,
+                    }
                     parent.latest_status_message = f"Rollup PR creation failed (attempt {rollup_retries}/{max_rollup}), will retry: {type(e).__name__}"
-                    logger.warning(f"[ROLLUP] Transient error creating rollup PR (attempt {rollup_retries}): {e}")
+                    logger.warning(
+                        f"[ROLLUP] Transient error creating rollup PR (attempt {rollup_retries}): {e}"
+                    )
                 else:
-                    logger.warning(f"[ROLLUP] Failed to create rollup PR: {e}", exc_info=True)
+                    logger.warning(
+                        f"[ROLLUP] Failed to create rollup PR: {e}", exc_info=True
+                    )
                     parent.status = TaskStatus.FAILED
                     parent.context = _clear_rollup_transient_state(parent.context)
-                    parent.latest_status_message = f"All {completed_count} subtasks done but rollup PR creation failed: {type(e).__name__}: {e!r}"[:500]
-                    from app.failure_classification import classify_failure, persist_failure_category
+                    parent.latest_status_message = f"All {completed_count} subtasks done but rollup PR creation failed: {type(e).__name__}: {e!r}"[
+                        :500
+                    ]
+                    from app.failure_classification import (
+                        classify_failure,
+                        persist_failure_category,
+                    )
+
                     _fc = classify_failure(parent)
                     persist_failure_category(parent, _fc)
                     _record_rollup_failure_signals(parent, _fc)
@@ -2174,7 +2796,9 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                     # stale branch cleanup service after 7 days.
         else:
             parent.status = TaskStatus.COMPLETED
-            parent.latest_status_message = f"All {completed_count} subtasks completed and merged"
+            parent.latest_status_message = (
+                f"All {completed_count} subtasks completed and merged"
+            )
 
         # Final guard: a parent with an unmerged rollup PR is not done yet —
         # the review/fix/CI pipeline is still working on landing the code.
@@ -2187,7 +2811,9 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
             parent.status = TaskStatus.EVALUATING
             _rpr = _pctx["rollup_pr_number"]
             parent.latest_status_message = f"All {completed_count} subtasks done — rollup PR #{_rpr} awaiting merge"
-            logger.info(f"[ROLLUP] Parent {parent.id} — blocked COMPLETED: rollup PR #{_rpr} not yet merged")
+            logger.info(
+                f"[ROLLUP] Parent {parent.id} — blocked COMPLETED: rollup PR #{_rpr} not yet merged"
+            )
 
         # Terminal transition — scrub transient deferral/retry counters so a
         # future re-entry (admin requeue, reused parent) starts from zero.
@@ -2196,17 +2822,28 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
 
         session.add(parent)
         await session.commit()
-        await broadcast_to_project(str(parent.project_id), "task_updated",
-                                   {"task_id": str(parent.id), "status": parent.status})
-        logger.info(f"[ROLLUP] Parent {parent.id} — all children done (completed={completed_count}, cancelled={cancelled_count})")
+        await broadcast_to_project(
+            str(parent.project_id),
+            "task_updated",
+            {"task_id": str(parent.id), "status": parent.status},
+        )
+        logger.info(
+            f"[ROLLUP] Parent {parent.id} — all children done (completed={completed_count}, cancelled={cancelled_count})"
+        )
 
     elif any(s == TaskStatus.FAILED for s in child_statuses) and active_count == 0:
         # All done but some failed — mark parent as failed but keep staging branch
         # (it may contain merged work from successful children that can be salvaged)
         parent.status = TaskStatus.FAILED
         failed_count = sum(1 for s in child_statuses if s == TaskStatus.FAILED)
-        parent.latest_status_message = f"{failed_count} of {len(children)} subtasks failed"
-        from app.failure_classification import worst_child_failure_category, persist_failure_category
+        parent.latest_status_message = (
+            f"{failed_count} of {len(children)} subtasks failed"
+        )
+        from app.failure_classification import (
+            worst_child_failure_category,
+            persist_failure_category,
+        )
+
         _failed_children = [c for c in children if c.status == TaskStatus.FAILED]
         _fc = worst_child_failure_category(_failed_children)
         persist_failure_category(parent, _fc)

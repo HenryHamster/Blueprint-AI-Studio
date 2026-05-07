@@ -25,6 +25,7 @@ These tests document the intentional behavior change:
   - Concurrent stale ORM writes no longer raise ``StaleDataError`` —
     they apply unconditionally, last-writer-wins.
 """
+
 import pytest
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -120,9 +121,7 @@ async def test_explicit_version_bump_via_core_update(db_session):
 
     # A second explicit bump.
     await db_session.execute(
-        update(Task)
-        .where(Task.id == task_id)
-        .values(version=Task.version + 1)
+        update(Task).where(Task.id == task_id).values(version=Task.version + 1)
     )
     await db_session.commit()
     refreshed_2 = await db_session.get(Task, task_id)

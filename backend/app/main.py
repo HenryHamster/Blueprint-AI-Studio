@@ -9,7 +9,14 @@ import asyncio
 from collections import deque
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Literal, Optional
-from fastapi import FastAPI, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import (
+    FastAPI,
+    Depends,
+    HTTPException,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.exceptions import RequestValidationError
@@ -21,7 +28,17 @@ from sqlalchemy import func as _func
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 from app.database import get_session, AsyncSessionLocal, engine
-from app.models import Project, Task, TaskStatus, DeploymentState, DeploymentStatus, Alert, AlertSeverity, ProjectMessage, MessageType
+from app.models import (
+    Project,
+    Task,
+    TaskStatus,
+    DeploymentState,
+    DeploymentStatus,
+    Alert,
+    AlertSeverity,
+    ProjectMessage,
+    MessageType,
+)
 from app.compute import delete_agent_vm, provision_agent_vm  # noqa: F401  (provision_agent_vm re-exported for test patches; see main.py:108 docstring)
 from app.auth import get_current_user, verify_agent_jwt
 from app.telemetry import setup_telemetry
@@ -44,7 +61,9 @@ from app.routers.admin_analytics import router as admin_analytics_router
 from app.routers.admin_digest import router as admin_digest_router
 from app.routers.admin_activity import router as admin_activity_router
 from app.routers.admin_health import router as admin_health_router
-from app.routers.admin_orchestrator_errors import router as admin_orchestrator_errors_router
+from app.routers.admin_orchestrator_errors import (
+    router as admin_orchestrator_errors_router,
+)
 from app.routers.admin_scope_measurement import router as admin_scope_measurement_router
 from app.routers.agent_status import router as agent_status_router
 from app.routers.admin_onboard import router as admin_onboard_router
@@ -58,7 +77,10 @@ from app.broadcast import manager, broadcast_to_project, _sanitize_log
 
 logger = logging.getLogger(__name__)
 
-def _cap_str(value: Any, max_len: int, field_name: str, warnings: Optional[List[str]] = None) -> str:
+
+def _cap_str(
+    value: Any, max_len: int, field_name: str, warnings: Optional[List[str]] = None
+) -> str:
     """Cap a string field, appending a human-readable warning if truncation occurred."""
     s = str(value) if value is not None else ""
     if len(s) > max_len:
@@ -70,7 +92,10 @@ def _cap_str(value: Any, max_len: int, field_name: str, warnings: Optional[List[
         return s[:max_len]
     return s
 
-def _cap_list(lst: list, max_items: int, field_name: str, warnings: Optional[List[str]] = None) -> list:
+
+def _cap_list(
+    lst: list, max_items: int, field_name: str, warnings: Optional[List[str]] = None
+) -> list:
     """Cap a list to the last N items, warning if older items were dropped."""
     if len(lst) > max_items:
         dropped = len(lst) - max_items
@@ -81,6 +106,7 @@ def _cap_list(lst: list, max_items: int, field_name: str, warnings: Optional[Lis
             )
         return lst[-max_items:]
     return lst
+
 
 from app.strategic_constants import (  # noqa: E402
     STRATEGIC_DIRECTION_TEXT_MAX,
@@ -93,7 +119,7 @@ from app.strategic_constants import (  # noqa: E402
 
 # Expected schema revision — must match the latest alembic migration.
 # Update this when adding new migrations.
-EXPECTED_SCHEMA_REVISION = "0083"
+EXPECTED_SCHEMA_REVISION = "0084"
 
 # --- Task Priority Map ---
 # Maps priority string labels to integer values stored on Task.priority.
@@ -134,7 +160,11 @@ def is_orchestrator_initiated_delete(vm_id: str) -> tuple[bool, str | None]:
     dep on `_ensure_vm_deleted`.
     """
     now = time.time()
-    expired = [k for k, (ts, _) in _orchestrator_deleted_vms.items() if now - ts > _ORCHESTRATOR_DELETE_TTL]
+    expired = [
+        k
+        for k, (ts, _) in _orchestrator_deleted_vms.items()
+        if now - ts > _ORCHESTRATOR_DELETE_TTL
+    ]
     for k in expired:
         _orchestrator_deleted_vms.pop(k, None)
     # Hard-cap eviction: oldest entries first. Defensive — if the dict still
@@ -142,18 +172,22 @@ def is_orchestrator_initiated_delete(vm_id: str) -> tuple[bool, str | None]:
     # fits. Logged so operators see the eviction and can investigate why
     # writes outpaced reads.
     if len(_orchestrator_deleted_vms) > _ORCHESTRATOR_DELETE_MAX_ENTRIES:
-        sorted_by_ts = sorted(_orchestrator_deleted_vms.items(), key=lambda kv: kv[1][0])
+        sorted_by_ts = sorted(
+            _orchestrator_deleted_vms.items(), key=lambda kv: kv[1][0]
+        )
         excess = len(_orchestrator_deleted_vms) - _ORCHESTRATOR_DELETE_MAX_ENTRIES
         for k, _ in sorted_by_ts[:excess]:
             _orchestrator_deleted_vms.pop(k, None)
         logger.warning(
             "[VM TRACK] _orchestrator_deleted_vms exceeded %d entries — evicted %d oldest",
-            _ORCHESTRATOR_DELETE_MAX_ENTRIES, excess,
+            _ORCHESTRATOR_DELETE_MAX_ENTRIES,
+            excess,
         )
     entry = _orchestrator_deleted_vms.get(vm_id)
     if entry is None:
         return False, None
     return True, entry[1]
+
 
 # --- Max Plan Account Pool ---
 # Pool state and logic extracted to max_plan_pool.py. Re-exported here for
@@ -181,7 +215,10 @@ from app.max_plan_pool import (  # noqa: E402,F401
 _current_revision: str = os.getenv("K_REVISION", "local-dev")
 _current_sha: str = os.getenv("DEPLOY_SHA", "unknown")
 
-async def _ensure_vm_deleted(task_or_vm_id, *, reason: str = "terminal_transition") -> bool:
+
+async def _ensure_vm_deleted(
+    task_or_vm_id, *, reason: str = "terminal_transition"
+) -> bool:
     """Guarantee VM deletion for any terminal state transition.
 
     Accepts either a Task object or a raw vm_instance_id string.
@@ -215,17 +252,26 @@ async def _ensure_vm_deleted(task_or_vm_id, *, reason: str = "terminal_transitio
                 logger.info(f"[VM CLEANUP] Deleted VM {vm_id}")
                 if _last_gcp_vm_count > 0:
                     _last_gcp_vm_count -= 1
-                    logger.info(f"[VM CLEANUP] Decremented cached VM count to {_last_gcp_vm_count}")
+                    logger.info(
+                        f"[VM CLEANUP] Decremented cached VM count to {_last_gcp_vm_count}"
+                    )
                 return True
             else:
-                logger.warning(f"[VM CLEANUP] delete_agent_vm returned False for {vm_id} (attempt {attempt + 1}/3)")
+                logger.warning(
+                    f"[VM CLEANUP] delete_agent_vm returned False for {vm_id} (attempt {attempt + 1}/3)"
+                )
         except Exception as e:
-            logger.error(f"[VM CLEANUP] Failed to delete VM {vm_id} (attempt {attempt + 1}/3): {e}", exc_info=True)
+            logger.error(
+                f"[VM CLEANUP] Failed to delete VM {vm_id} (attempt {attempt + 1}/3): {e}",
+                exc_info=True,
+            )
 
         if attempt < 2:
-            await asyncio.sleep(2 ** attempt)  # 1s, 2s backoff
+            await asyncio.sleep(2**attempt)  # 1s, 2s backoff
 
-    logger.error(f"[VM CLEANUP] FAILED to delete VM {vm_id} after 3 attempts — will rely on cleanup sweep")
+    logger.error(
+        f"[VM CLEANUP] FAILED to delete VM {vm_id} after 3 attempts — will rely on cleanup sweep"
+    )
     return False
 
 
@@ -285,18 +331,22 @@ async def _get_actual_gcp_vm_count() -> int:
         return _last_gcp_vm_count
 
     from app.compute import FALLBACK_ZONES, _list_vms_in_zone, LOCAL_MODE
+
     if LOCAL_MODE:
         from app.compute import _local_processes
+
         _last_gcp_vm_count = len(_local_processes)
         _last_gcp_vm_check = now
         return _last_gcp_vm_count
 
     try:
         unique_zones = list({z for z, _ in FALLBACK_ZONES})
-        zone_tasks = [asyncio.to_thread(_list_vms_in_zone, zone) for zone in unique_zones]
+        zone_tasks = [
+            asyncio.to_thread(_list_vms_in_zone, zone) for zone in unique_zones
+        ]
         zone_results = await asyncio.wait_for(
             asyncio.gather(*zone_tasks, return_exceptions=True),
-            timeout=10  # Short timeout — cache is usually fresh from cleanup service
+            timeout=10,  # Short timeout — cache is usually fresh from cleanup service
         )
         total = 0
         for zr in zone_results:
@@ -309,32 +359,43 @@ async def _get_actual_gcp_vm_count() -> int:
         logger.warning(f"[GCP] Failed to count VMs: {e}")
         return _last_gcp_vm_count  # Return stale count on failure
 
+
 # Webhook dedup state moved to app.routers.github
+
 
 async def _verify_schema_version():
     """Verify the database schema matches the expected alembic revision.
     Fail fast on mismatch to prevent runtime errors from missing columns."""
     from sqlalchemy import text as sa_text
+
     async with AsyncSessionLocal() as session:
         try:
-            result = await session.execute(sa_text(
-                "SELECT version_num FROM alembic_version LIMIT 1"))
+            result = await session.execute(
+                sa_text("SELECT version_num FROM alembic_version LIMIT 1")
+            )
             row = result.first()
             if not row:
-                logger.warning("[STARTUP] No alembic_version row — database may be uninitialized")
+                logger.warning(
+                    "[STARTUP] No alembic_version row — database may be uninitialized"
+                )
                 return
             # Exact equality required — `0055_a` != `0055_b` would slip past startswith.
             # Raise unconditionally so dev environments catch mismatches the same way Cloud Run does.
             if row[0] != EXPECTED_SCHEMA_REVISION:
-                msg = (f"Schema version mismatch: database at '{row[0]}', "
-                       f"code expects '{EXPECTED_SCHEMA_REVISION}'")
+                msg = (
+                    f"Schema version mismatch: database at '{row[0]}', "
+                    f"code expects '{EXPECTED_SCHEMA_REVISION}'"
+                )
                 logger.error(f"[STARTUP] {msg}")
                 raise RuntimeError(msg)
         except Exception as e:
             if "alembic_version" in str(e).lower():
-                logger.warning("[STARTUP] alembic_version table not found — skipping schema check")
+                logger.warning(
+                    "[STARTUP] alembic_version table not found — skipping schema check"
+                )
                 return
             raise
+
 
 async def _init_deployment_state():
     """Check/initialize deployment state on startup. Detects new deploys and rollbacks."""
@@ -356,7 +417,9 @@ async def _init_deployment_state():
                 )
                 session.add(state)
                 await session.commit()
-                logger.info(f"[DEPLOY] First boot — initialized deployment state (revision={_current_revision})")
+                logger.info(
+                    f"[DEPLOY] First boot — initialized deployment state (revision={_current_revision})"
+                )
                 return
             except Exception:
                 await session.rollback()
@@ -369,95 +432,145 @@ async def _init_deployment_state():
         # Shared with the periodic cross-instance sync (see sync_runtime_config_loop).
         try:
             from app.shared_state import sync_runtime_config_from_state  # noqa: PLC0415
+
             restored = await sync_runtime_config_from_state(state)
             if restored:
                 logger.info(f"[DEPLOY] Restored runtime config from DB: {restored}")
         except Exception as e:
-            logger.warning(f"[DEPLOY] Could not restore runtime config (migration pending?): {e}", exc_info=True)
+            logger.warning(
+                f"[DEPLOY] Could not restore runtime config (migration pending?): {e}",
+                exc_info=True,
+            )
         # Restore circuit breaker state — prevents deploy from clearing tripped breakers
         try:
             if state.circuit_breaker_states:
                 for proj_id, breaker_data in state.circuit_breaker_states.items():
                     restored = {**breaker_data}
-                    if restored.get("opened_at") and isinstance(restored["opened_at"], str):
-                        restored["opened_at"] = datetime.fromisoformat(restored["opened_at"])
+                    if restored.get("opened_at") and isinstance(
+                        restored["opened_at"], str
+                    ):
+                        restored["opened_at"] = datetime.fromisoformat(
+                            restored["opened_at"]
+                        )
                     _shared_state.circuit_breakers[proj_id] = restored
-                logger.info(f"[DEPLOY] Restored circuit breaker state for {len(state.circuit_breaker_states)} projects")
+                logger.info(
+                    f"[DEPLOY] Restored circuit breaker state for {len(state.circuit_breaker_states)} projects"
+                )
         except Exception as e:
-            logger.warning(f"[DEPLOY] Could not restore circuit breaker state: {e}", exc_info=True)
+            logger.warning(
+                f"[DEPLOY] Could not restore circuit breaker state: {e}", exc_info=True
+            )
 
         # Restore zone health — prevents retry storms on exhausted zones after restart
         try:
             if state.zone_health_state:
                 from app.compute import _zone_health, _zone_lock, _zone_failures
                 from datetime import timezone as tz
+
                 with _zone_lock:
                     for zone, data in state.zone_health_state.items():
                         if not isinstance(data, dict):
                             continue
                         restored = {}
                         for k, v in data.items():
-                            if isinstance(v, str) and k in ("last_success", "last_failure", "cooldown_expires_at"):
+                            if isinstance(v, str) and k in (
+                                "last_success",
+                                "last_failure",
+                                "cooldown_expires_at",
+                            ):
                                 try:
                                     restored[k] = datetime.fromisoformat(v)
                                 except ValueError:
                                     if k == "cooldown_expires_at":
-                                        fallback = datetime.now(tz.utc) + timedelta(minutes=30)
-                                        logger.warning(f"[DEPLOY] Corrupted cooldown_expires_at for zone {zone} ({v!r}); failing safe to {fallback.isoformat()}")
+                                        fallback = datetime.now(tz.utc) + timedelta(
+                                            minutes=30
+                                        )
+                                        logger.warning(
+                                            f"[DEPLOY] Corrupted cooldown_expires_at for zone {zone} ({v!r}); failing safe to {fallback.isoformat()}"
+                                        )
                                         restored[k] = fallback
                                     elif k == "last_failure":
                                         fallback = datetime.now(tz.utc)
-                                        logger.warning(f"[DEPLOY] Corrupted last_failure for zone {zone} ({v!r}); failing safe to {fallback.isoformat()}")
+                                        logger.warning(
+                                            f"[DEPLOY] Corrupted last_failure for zone {zone} ({v!r}); failing safe to {fallback.isoformat()}"
+                                        )
                                         restored[k] = fallback
                                     else:
-                                        logger.warning(f"[DEPLOY] Skipping corrupted zone health key {k} for zone {zone}: {v!r}")
+                                        logger.warning(
+                                            f"[DEPLOY] Skipping corrupted zone health key {k} for zone {zone}: {v!r}"
+                                        )
                                         continue
                             elif k == "recent_outcomes" and isinstance(v, list):
                                 from collections import deque as _deque
                                 from app.compute import ZONE_HISTORY_WINDOW
+
                                 valid = [e for e in v if isinstance(e, bool)]
                                 if len(valid) < len(v):
-                                    logger.warning(f"[DEPLOY] Filtered {len(v) - len(valid)} non-boolean element(s) from recent_outcomes for zone {zone}")
-                                restored[k] = _deque(valid[-ZONE_HISTORY_WINDOW:], maxlen=ZONE_HISTORY_WINDOW)
+                                    logger.warning(
+                                        f"[DEPLOY] Filtered {len(v) - len(valid)} non-boolean element(s) from recent_outcomes for zone {zone}"
+                                    )
+                                restored[k] = _deque(
+                                    valid[-ZONE_HISTORY_WINDOW:],
+                                    maxlen=ZONE_HISTORY_WINDOW,
+                                )
                             elif k == "consecutive_failures":
                                 if isinstance(v, int):
                                     restored[k] = v
                                 else:
-                                    logger.warning(f"[DEPLOY] consecutive_failures for zone {zone} is not an int ({v!r}), defaulting to 0")
+                                    logger.warning(
+                                        f"[DEPLOY] consecutive_failures for zone {zone} is not an int ({v!r}), defaulting to 0"
+                                    )
                                     restored[k] = 0
                             elif k == "last_failure_reason":
                                 if v is None or isinstance(v, str):
                                     restored[k] = v
                                 else:
-                                    logger.warning(f"[DEPLOY] last_failure_reason for zone {zone} is not a string ({v!r}), defaulting to None")
+                                    logger.warning(
+                                        f"[DEPLOY] last_failure_reason for zone {zone} is not a string ({v!r}), defaulting to None"
+                                    )
                                     restored[k] = None
                             else:
                                 restored[k] = v
                         _zone_health[zone] = restored
                         # Restore _zone_failures for zones still in cooldown
-                        if restored.get("cooldown_expires_at") and restored["cooldown_expires_at"] > datetime.now(tz.utc):
-                            _zone_failures[zone] = restored.get("last_failure", datetime.now(tz.utc))
-                logger.info(f"[DEPLOY] Restored zone health state for {len(state.zone_health_state)} zones")
+                        if restored.get("cooldown_expires_at") and restored[
+                            "cooldown_expires_at"
+                        ] > datetime.now(tz.utc):
+                            _zone_failures[zone] = restored.get(
+                                "last_failure", datetime.now(tz.utc)
+                            )
+                logger.info(
+                    f"[DEPLOY] Restored zone health state for {len(state.zone_health_state)} zones"
+                )
         except Exception as e:
-            logger.warning(f"[DEPLOY] Could not restore zone health state: {e}", exc_info=True)
+            logger.warning(
+                f"[DEPLOY] Could not restore zone health state: {e}", exc_info=True
+            )
 
         # Restore pause/health streaks
         try:
             if state.zone_health_state:
                 import app.deploy_health as _dh
+
                 _dh._restore_health_streaks(state.zone_health_state)
-                if _dh._pause_failure_streak or _dh._health_recovery_history or _dh._last_auto_resume_at:
+                if (
+                    _dh._pause_failure_streak
+                    or _dh._health_recovery_history
+                    or _dh._last_auto_resume_at
+                ):
                     logger.info(
                         f"[DEPLOY] Restored health streaks: pause_failures={_dh._pause_failure_streak}, "
                         f"recovery_history={list(_dh._health_recovery_history)}, "
                         f"last_auto_resume_at={_dh._last_auto_resume_at}"
                     )
         except Exception as e:
-            logger.warning(f"[DEPLOY] Could not restore health streaks: {e}", exc_info=True)
+            logger.warning(
+                f"[DEPLOY] Could not restore health streaks: {e}", exc_info=True
+            )
 
         # Restore persistent anomaly state — preserves occurrence counts across restarts
         try:
-            pstate = getattr(state, 'persistent_anomaly_state', None)
+            pstate = getattr(state, "persistent_anomaly_state", None)
             if pstate and isinstance(pstate, dict):
                 raw_anomalies = pstate.get("persistent_anomalies", {})
                 for proj_id, proj_anomalies in raw_anomalies.items():
@@ -469,7 +582,9 @@ async def _init_deployment_state():
                             # written and compared (anomaly_detection.py). Coerce any
                             # pre-existing datetime back to isoformat so legacy
                             # persisted pods don't crash the stale-cutoff comparison.
-                            if fk in ("first_seen", "last_seen") and isinstance(fv, datetime):
+                            if fk in ("first_seen", "last_seen") and isinstance(
+                                fv, datetime
+                            ):
                                 entry[fk] = fv.isoformat()
                             else:
                                 entry[fk] = fv
@@ -483,29 +598,40 @@ async def _init_deployment_state():
                     adj = _shared_state.anomaly_adjustments
                     pre_vms = adj.get("pre_adjustment_max_vms")
                     if pre_vms is not None:
-                        _shared_state.runtime_config["max_concurrent_vms"] = max(2, pre_vms // 2)
+                        _shared_state.runtime_config["max_concurrent_vms"] = max(
+                            2, pre_vms // 2
+                        )
                     logger.info(
                         "[DEPLOY] Re-applied active anomaly adjustments: "
                         f"max_vms={_shared_state.runtime_config['max_concurrent_vms']}, "
                         f"failure_gate={adj.get('failure_gate_threshold')}"
                     )
-                logger.info(f"[DEPLOY] Restored anomaly state for {len(raw_anomalies)} projects")
+                logger.info(
+                    f"[DEPLOY] Restored anomaly state for {len(raw_anomalies)} projects"
+                )
         except Exception as e:
-            logger.warning(f"[DEPLOY] Could not restore anomaly state: {e}", exc_info=True)
+            logger.warning(
+                f"[DEPLOY] Could not restore anomaly state: {e}", exc_info=True
+            )
 
         # Seed task_results from DB so fast-recovery has data after restart
         # (in-memory deque is empty otherwise, blocking recovery for ~2h).
         if _shared_state.anomaly_adjustments.get("active"):
             try:
                 from app.anomaly_detection import seed_task_results_from_db  # noqa: PLC0415
+
                 seeded = await seed_task_results_from_db(session)
-                logger.info(f"[DEPLOY] Seeded {seeded} task_results from DB for fast-recovery")
+                logger.info(
+                    f"[DEPLOY] Seeded {seeded} task_results from DB for fast-recovery"
+                )
             except Exception as e:
-                logger.warning(f"[DEPLOY] Could not seed task_results from DB: {e}", exc_info=True)
+                logger.warning(
+                    f"[DEPLOY] Could not seed task_results from DB: {e}", exc_info=True
+                )
 
         # Restore direction failure streaks — holds survive restarts silently
         try:
-            dstate = getattr(state, 'direction_streak_state', None)
+            dstate = getattr(state, "direction_streak_state", None)
             if dstate and isinstance(dstate, dict):
                 for direction_id, streak in dstate.items():
                     restored_streak: dict = {}
@@ -517,20 +643,26 @@ async def _init_deployment_state():
                                 restored_streak[k] = v
                         else:
                             restored_streak[k] = v
-                    _shared_state.direction_failure_streaks[direction_id] = restored_streak
+                    _shared_state.direction_failure_streaks[direction_id] = (
+                        restored_streak
+                    )
                 held_count = sum(1 for s in dstate.values() if s.get("held"))
                 logger.info(
                     f"[DEPLOY] Restored direction failure streaks for {len(dstate)} directions "
                     f"({held_count} held)"
                 )
         except Exception as e:
-            logger.warning(f"[DEPLOY] Could not restore direction failure streaks: {e}", exc_info=True)
+            logger.warning(
+                f"[DEPLOY] Could not restore direction failure streaks: {e}",
+                exc_info=True,
+            )
 
         # Restore pipeline events ring buffer — alert windows survive restarts
         try:
-            estate = getattr(state, 'pipeline_events_state', None)
+            estate = getattr(state, "pipeline_events_state", None)
             if estate and isinstance(estate, dict):
                 from collections import deque as _deque
+
                 events_list = estate.get("events", [])
                 restored_events: _deque = _deque(maxlen=500)
                 for e in events_list:
@@ -547,7 +679,9 @@ async def _init_deployment_state():
                 _shared_state.deploy_monitoring["pipeline_events"] = restored_events
                 logger.info(f"[DEPLOY] Restored {len(restored_events)} pipeline events")
         except Exception as e:
-            logger.warning(f"[DEPLOY] Could not restore pipeline events: {e}", exc_info=True)
+            logger.warning(
+                f"[DEPLOY] Could not restore pipeline events: {e}", exc_info=True
+            )
 
         # Auto-recovery from HALTED after 1 hour cooldown
         if state.status == DeploymentStatus.HALTED:
@@ -560,39 +694,56 @@ async def _init_deployment_state():
                         state.halted_at = None
                         state.deployed_at = _utcnow()
                         # Restore VM capacity so dispatch actually works
-                        restored = state.pre_pause_max_vms or int(os.getenv("MAX_CONCURRENT_VMS", "5"))
+                        restored = state.pre_pause_max_vms or int(
+                            os.getenv("MAX_CONCURRENT_VMS", "5")
+                        )
                         _runtime_config["max_concurrent_vms"] = restored
                         state.pre_pause_max_vms = None
                         session.add(state)
                         await session.commit()
-                        logger.warning(f"[DEPLOY] Auto-recovery from HALTED after {elapsed:.0f}s cooldown — max_concurrent_vms restored to {restored}")
+                        logger.warning(
+                            f"[DEPLOY] Auto-recovery from HALTED after {elapsed:.0f}s cooldown — max_concurrent_vms restored to {restored}"
+                        )
                         await _create_halted_recovery_alerts(session)
                         await session.commit()
                     else:
                         remaining = 3600 - elapsed
-                        logger.info(f"[DEPLOY] HALTED — {remaining:.0f}s remaining until auto-recovery")
+                        logger.info(
+                            f"[DEPLOY] HALTED — {remaining:.0f}s remaining until auto-recovery"
+                        )
             except Exception as e:
-                logger.warning(f"[DEPLOY] Could not check HALTED auto-recovery (halted_at column may not exist yet): {e}")
+                logger.warning(
+                    f"[DEPLOY] Could not check HALTED auto-recovery (halted_at column may not exist yet): {e}"
+                )
 
         # Respect paused/halted state — these override the persisted value
         if state.status in (DeploymentStatus.PAUSED, DeploymentStatus.HALTED):
             _runtime_config["max_concurrent_vms"] = 0
-            logger.info(f"[DEPLOY] max_concurrent_vms forced to 0 — state is {state.status} "
-                  f"(reason: {state.pause_reason or 'unknown'}). "
-                  f"Set max VMs > 0 in settings to resume.")
+            logger.info(
+                f"[DEPLOY] max_concurrent_vms forced to 0 — state is {state.status} "
+                f"(reason: {state.pause_reason or 'unknown'}). "
+                f"Set max VMs > 0 in settings to resume."
+            )
 
         if state.current_revision == _current_revision:
             # Same revision — normal restart (cold start, scale event, etc.)
-            logger.info(f"[DEPLOY] Normal restart — same revision {_current_revision}, status={state.status}")
+            logger.info(
+                f"[DEPLOY] Normal restart — same revision {_current_revision}, status={state.status}"
+            )
             return
 
         # Revision changed — is it a new deploy or a rollback?
-        if _current_revision == state.last_known_good_revision and state.status == DeploymentStatus.MONITORING:
+        if (
+            _current_revision == state.last_known_good_revision
+            and state.status == DeploymentStatus.MONITORING
+        ):
             # We're back on the last known good revision while we were monitoring a new deploy
             # This means the new deploy was rolled back (externally or via Cloud Run)
             state.status = DeploymentStatus.ROLLED_BACK
             state.rolled_back_from_sha = state.current_sha
-            state.rollback_reason = "Revision reverted to last known good during monitoring window"
+            state.rollback_reason = (
+                "Revision reverted to last known good during monitoring window"
+            )
             state.rollback_count += 1
             state.current_revision = _current_revision
             state.current_sha = _current_sha
@@ -600,10 +751,14 @@ async def _init_deployment_state():
             session.add(state)
             await session.commit()
 
-            logger.warning(f"[DEPLOY] ROLLBACK DETECTED — reverted from {state.rolled_back_from_sha[:8]} to {_current_sha[:8]} "
-                  f"(consecutive rollbacks: {state.rollback_count})")
+            logger.warning(
+                f"[DEPLOY] ROLLBACK DETECTED — reverted from {state.rolled_back_from_sha[:8]} to {_current_sha[:8]} "
+                f"(consecutive rollbacks: {state.rollback_count})"
+            )
 
-            await _create_rollback_alerts(session, state.rolled_back_from_sha or "", _current_sha)
+            await _create_rollback_alerts(
+                session, state.rolled_back_from_sha or "", _current_sha
+            )
             await session.commit()
 
             if state.rollback_count >= 3:
@@ -611,9 +766,16 @@ async def _init_deployment_state():
                 state.halted_at = _utcnow()
                 session.add(state)
                 await session.commit()
-                logger.error(f"[DEPLOY] HALTED — {state.rollback_count} consecutive rollbacks, manual intervention required")
+                logger.error(
+                    f"[DEPLOY] HALTED — {state.rollback_count} consecutive rollbacks, manual intervention required"
+                )
                 _runtime_config["max_concurrent_vms"] = 0
-                await _create_halted_alerts(session, state.rollback_count, state.last_known_good_revision, state.halted_at)
+                await _create_halted_alerts(
+                    session,
+                    state.rollback_count,
+                    state.last_known_good_revision,
+                    state.halted_at,
+                )
                 await session.commit()
             return
 
@@ -633,6 +795,7 @@ async def _init_deployment_state():
         # Resetting monitoring data while paused would lose baseline context.
         if state.status not in (DeploymentStatus.PAUSED, DeploymentStatus.HALTED):
             from app.shared_state import deploy_monitoring
+
             results = deploy_monitoring["task_results"]
             results_list = list(results)
             # E11: split the deque into 3 chunks and use the median rate as
@@ -660,7 +823,9 @@ async def _init_deployment_state():
                 deploy_monitoring["pre_deploy_failure_rate_samples"] = rates
             elif results_list:
                 failures = sum(1 for r in results_list if r[1] == "failure")
-                deploy_monitoring["pre_deploy_failure_rate"] = failures / len(results_list)
+                deploy_monitoring["pre_deploy_failure_rate"] = failures / len(
+                    results_list
+                )
                 deploy_monitoring["pre_deploy_failure_rate_samples"] = [
                     deploy_monitoring["pre_deploy_failure_rate"]
                 ]
@@ -669,13 +834,18 @@ async def _init_deployment_state():
                 deploy_monitoring["pre_deploy_failure_rate"] = 0.15
                 deploy_monitoring["pre_deploy_failure_rate_samples"] = [0.15]
             deploy_monitoring["previous_window_results"] = list(results)
-            deploy_monitoring["previous_window_start"] = deploy_monitoring.get("window_start")
+            deploy_monitoring["previous_window_start"] = deploy_monitoring.get(
+                "window_start"
+            )
             deploy_monitoring["task_results"] = deque(maxlen=100)
             deploy_monitoring["window_start"] = _utcnow()
             state.status = DeploymentStatus.MONITORING
         session.add(state)
         await session.commit()
-        logger.info(f"[DEPLOY] New deploy detected — revision={_current_revision}, status={state.status}, starting monitoring window")
+        logger.info(
+            f"[DEPLOY] New deploy detected — revision={_current_revision}, status={state.status}, starting monitoring window"
+        )
+
 
 async def _send_webhook_notification(event_type: str, title: str, details: str) -> None:
     """Fire-and-forget webhook notification for critical pipeline events."""
@@ -683,6 +853,7 @@ async def _send_webhook_notification(event_type: str, title: str, details: str) 
     if not url:
         return
     import httpx
+
     payload = {
         "event_type": event_type,
         "title": title,
@@ -697,7 +868,10 @@ async def _send_webhook_notification(event_type: str, title: str, details: str) 
     except Exception as e:
         logger.warning(f"[WEBHOOK] Failed to send notification: {e}")
 
-async def _create_orchestrator_error_alerts(session: AsyncSession, consecutive_errors: int) -> None:
+
+async def _create_orchestrator_error_alerts(
+    session: AsyncSession, consecutive_errors: int
+) -> None:
     """Create ERROR alerts on all projects when the orchestrator hits repeated errors (deduplicated)."""
     title = "Orchestrator error loop"
     msg = (
@@ -706,15 +880,21 @@ async def _create_orchestrator_error_alerts(session: AsyncSession, consecutive_e
     )
     projects = (await session.execute(select(Project))).scalars().all()
     project_ids = [p.id for p in projects]
-    existing_rows = (await session.execute(
-        select(Alert.project_id).where(
-            Alert.project_id.in_(project_ids),
-            Alert.task_id.is_(None),
-            Alert.severity == AlertSeverity.ERROR,
-            Alert.dismissed_at.is_(None),
-            Alert.title == title,
-        )
-    )).all() if project_ids else []
+    existing_rows = (
+        (
+            await session.execute(
+                select(Alert.project_id).where(
+                    Alert.project_id.in_(project_ids),
+                    Alert.task_id.is_(None),
+                    Alert.severity == AlertSeverity.ERROR,
+                    Alert.dismissed_at.is_(None),
+                    Alert.title == title,
+                )
+            )
+        ).all()
+        if project_ids
+        else []
+    )
     projects_with_alert = {row[0] for row in existing_rows}
     for project in projects:
         if project.id in projects_with_alert:
@@ -732,7 +912,13 @@ async def _create_orchestrator_error_alerts(session: AsyncSession, consecutive_e
             {"alert_id": str(alert.id), "severity": "ERROR", "title": alert.title},
         )
 
-async def _create_halted_alerts(session: AsyncSession, rollback_count: int, last_known_good: str, halted_at: "datetime") -> None:
+
+async def _create_halted_alerts(
+    session: AsyncSession,
+    rollback_count: int,
+    last_known_good: str,
+    halted_at: "datetime",
+) -> None:
     """Create ERROR alerts on all projects when deployment enters HALTED state."""
     title = f"Deployment HALTED — {rollback_count} consecutive rollbacks, manual intervention required"
     msg = (
@@ -757,7 +943,10 @@ async def _create_halted_alerts(session: AsyncSession, rollback_count: int, last
         )
     await _send_webhook_notification("PIPELINE_HALTED", title, msg)
 
-async def _create_rollback_alerts(session: AsyncSession, rolled_back_from: str, rolled_back_to: str) -> None:
+
+async def _create_rollback_alerts(
+    session: AsyncSession, rolled_back_from: str, rolled_back_to: str
+) -> None:
     """Create WARNING alerts on all projects when an automatic rollback is detected.
     Deduplicates: skips if an undismissed rollback alert already exists for a project."""
     title = "Automatic rollback detected — revision reverted to last known good"
@@ -767,14 +956,20 @@ async def _create_rollback_alerts(session: AsyncSession, rolled_back_from: str, 
     )
     projects = (await session.execute(select(Project))).scalars().all()
     for project in projects:
-        existing = (await session.execute(
-            select(Alert).where(
-                Alert.project_id == project.id,
-                Alert.task_id.is_(None),
-                Alert.dismissed_at.is_(None),
-                Alert.title.contains("Automatic rollback"),
+        existing = (
+            (
+                await session.execute(
+                    select(Alert).where(
+                        Alert.project_id == project.id,
+                        Alert.task_id.is_(None),
+                        Alert.dismissed_at.is_(None),
+                        Alert.title.contains("Automatic rollback"),
+                    )
+                )
             )
-        )).scalars().first()
+            .scalars()
+            .first()
+        )
         if existing is not None:
             continue
         alert = Alert(
@@ -790,6 +985,7 @@ async def _create_rollback_alerts(session: AsyncSession, rolled_back_from: str, 
             {"alert_id": str(alert.id), "severity": "WARNING", "title": alert.title},
         )
 
+
 async def _create_halted_recovery_alerts(session: AsyncSession) -> None:
     """Create INFO alerts and dismiss existing HALTED ERROR alerts when deployment auto-recovers."""
     recovery_title = "Deployment auto-recovered from HALTED state after 1h cooldown"
@@ -797,14 +993,20 @@ async def _create_halted_recovery_alerts(session: AsyncSession) -> None:
     projects = (await session.execute(select(Project))).scalars().all()
     for project in projects:
         # Dismiss existing HALTED ERROR alerts for this project
-        existing_halted = (await session.execute(
-            select(Alert).where(
-                Alert.project_id == project.id,
-                Alert.severity == AlertSeverity.ERROR,
-                Alert.dismissed_at.is_(None),
-                Alert.title.contains("HALTED"),
+        existing_halted = (
+            (
+                await session.execute(
+                    select(Alert).where(
+                        Alert.project_id == project.id,
+                        Alert.severity == AlertSeverity.ERROR,
+                        Alert.dismissed_at.is_(None),
+                        Alert.title.contains("HALTED"),
+                    )
+                )
             )
-        )).scalars().all()
+            .scalars()
+            .all()
+        )
         for h in existing_halted:
             h.dismissed_at = now
             session.add(h)
@@ -855,31 +1057,42 @@ async def _maybe_create_failure_alert(
     )
     try:
         from app.notification_dispatch import dispatch_external_notification  # noqa: PLC0415
-        from app.failure_classification import classify_failure, classify_failure_taxonomy  # noqa: PLC0415
+        from app.failure_classification import (
+            classify_failure,
+            classify_failure_taxonomy,
+        )  # noqa: PLC0415
         import asyncio as _asyncio
+
         ctx = task.context or {}
         payload = task.first_payload or {}
-        direction_text = (ctx.get("direction_text") or payload.get("direction_text") or "")
-        pr_url = ctx.get("pr_url") or ctx.get("rollup_pr_url") or payload.get("pr_url") or ""
-        _asyncio.ensure_future(dispatch_external_notification(
-            task.project_id,
-            "TASK_FAILED",
-            {
-                "task_id": str(task.id),
-                "task_title": task.title or str(task.id)[:8],
-                "task_type": task_type,
-                "error_snippet": error_snippet or "",
-                "failure_class": classify_failure(task),
-                "taxonomy": classify_failure_taxonomy(task),
-                "direction_id": ctx.get("direction_id") or "",
-                "direction_text": direction_text[:200],
-                "scope": ctx.get("scope") or payload.get("scope") or "",
-                "pr_url": pr_url,
-                "attempt_count": int(task.attempt_count or 0),
-            },
-        ))
+        direction_text = (
+            ctx.get("direction_text") or payload.get("direction_text") or ""
+        )
+        pr_url = (
+            ctx.get("pr_url") or ctx.get("rollup_pr_url") or payload.get("pr_url") or ""
+        )
+        _asyncio.ensure_future(
+            dispatch_external_notification(
+                task.project_id,
+                "TASK_FAILED",
+                {
+                    "task_id": str(task.id),
+                    "task_title": task.title or str(task.id)[:8],
+                    "task_type": task_type,
+                    "error_snippet": error_snippet or "",
+                    "failure_class": classify_failure(task),
+                    "taxonomy": classify_failure_taxonomy(task),
+                    "direction_id": ctx.get("direction_id") or "",
+                    "direction_text": direction_text[:200],
+                    "scope": ctx.get("scope") or payload.get("scope") or "",
+                    "pr_url": pr_url,
+                    "attempt_count": int(task.attempt_count or 0),
+                },
+            )
+        )
     except Exception as _ne:
         logger.warning(f"[NOTIFY] TASK_FAILED dispatch setup failed: {_ne}")
+
 
 async def _maybe_create_circuit_breaker_alert(
     project_id: "uuid.UUID",
@@ -913,6 +1126,7 @@ async def _maybe_create_circuit_breaker_alert(
     )
     await _send_webhook_notification("CIRCUIT_BREAKER_OPEN", alert.title, alert.message)
 
+
 async def _create_strategic_alert(
     project_id: "uuid.UUID",
     session: AsyncSession,
@@ -939,14 +1153,16 @@ async def _create_strategic_alert(
     session.add(alert)
     await session.commit()
     await broadcast_to_project(
-        str(project_id), "alert_created",
+        str(project_id),
+        "alert_created",
         {"alert_id": str(alert.id), "severity": "WARNING", "title": title},
     )
+
 
 app = FastAPI(
     title="Blueprint Orchestrator",
     description="Secure Orchestration & State Management",
-    lifespan=lifespan
+    lifespan=lifespan,
 )
 
 # Telemetry must be set up before the app starts (cannot add middleware during lifespan)
@@ -975,10 +1191,12 @@ app.include_router(agent_status_router)
 app.include_router(agent_credentials_router)
 app.include_router(admin_onboard_router)
 
+
 def _get_zone_health_summary() -> dict:
     """Get zone health summary from compute module, with fallback if not in GCP mode."""
     try:
         from app.compute import get_zone_health_summary
+
         return get_zone_health_summary()
     except Exception:
         return {"total_zones": 0, "available": 0, "exhausted": []}
@@ -988,21 +1206,34 @@ def _get_notification_stats() -> dict:
     """Return notification delivery stats from notification_dispatch module."""
     try:
         from app.notification_dispatch import get_notification_stats  # noqa: PLC0415
+
         return get_notification_stats()
     except Exception:
         return {}
 
 
 @app.get("/api/debug/orchestrator")
-async def debug_orchestrator(session: AsyncSession = Depends(get_session), current_user: dict = Depends(get_current_user)):
+async def debug_orchestrator(
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
     """Diagnostic endpoint: check if the orchestrator loop is alive."""
     from sqlalchemy import func
-    queued = (await session.execute(
-        select(func.count()).select_from(Task).where(Task.status == TaskStatus.QUEUED, Task.requires_approval.is_(False))
-    )).scalar() or 0
-    active = (await session.execute(
-        select(func.count()).select_from(Task).where(Task.status.in_([TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]))
-    )).scalar() or 0
+
+    queued = (
+        await session.execute(
+            select(func.count())
+            .select_from(Task)
+            .where(Task.status == TaskStatus.QUEUED, Task.requires_approval.is_(False))
+        )
+    ).scalar() or 0
+    active = (
+        await session.execute(
+            select(func.count())
+            .select_from(Task)
+            .where(Task.status.in_([TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]))
+        )
+    ).scalar() or 0
     ago = None
     if _orch._orchestrator_last_cycle:
         ago = (_utcnow() - _orch._orchestrator_last_cycle).total_seconds()
@@ -1012,24 +1243,39 @@ async def debug_orchestrator(session: AsyncSession = Depends(get_session), curre
         state = await session.get(DeploymentState, 1)
         if state:
             monitoring_since = _shared_state.deploy_monitoring.get("window_start")
-            recent_results = list(_shared_state.deploy_monitoring.get("task_results", []))[-10:]
+            recent_results = list(
+                _shared_state.deploy_monitoring.get("task_results", [])
+            )[-10:]
             deploy_state = {
                 "revision": state.current_revision,
                 "sha": state.current_sha[:8] if state.current_sha else "",
                 "status": state.status,
-                "deployed_at": state.deployed_at.isoformat() if state.deployed_at else None,
-                "last_known_good_sha": state.last_known_good_sha[:8] if state.last_known_good_sha else "",
+                "deployed_at": state.deployed_at.isoformat()
+                if state.deployed_at
+                else None,
+                "last_known_good_sha": state.last_known_good_sha[:8]
+                if state.last_known_good_sha
+                else "",
                 "rollback_count": state.rollback_count,
                 "rollback_reason": state.rollback_reason,
                 "pause_reason": state.pause_reason,
-                "monitoring_since": monitoring_since.isoformat() if monitoring_since else None,
+                "monitoring_since": monitoring_since.isoformat()
+                if monitoring_since
+                else None,
                 "recent_outcomes": [
-                    {"created_at": r[0], "status": r[1], "failure_class": r[2] if len(r) > 2 else ""}
+                    {
+                        "created_at": r[0],
+                        "status": r[1],
+                        "failure_class": r[2] if len(r) > 2 else "",
+                    }
                     for r in recent_results
                 ],
             }
     except Exception as e:
-        logger.warning(f"[DEBUG] Failed to fetch deployment state for /api/debug/orchestrator: {e}", exc_info=True)
+        logger.warning(
+            f"[DEBUG] Failed to fetch deployment state for /api/debug/orchestrator: {e}",
+            exc_info=True,
+        )
 
     # Snapshot pool under lock for consistent read
     all_accts = _all_accounts()
@@ -1043,8 +1289,14 @@ async def debug_orchestrator(session: AsyncSession = Depends(get_session), curre
                     "name": a["name"],
                     "enabled": a.get("enabled", True),
                     "active": a["active_tasks"],
-                    "disabled_at": a["disabled_at"].isoformat() if a.get("disabled_at") else None,
-                    "reenable_at": (a["disabled_at"] + timedelta(minutes=30)).isoformat() if a.get("disabled_at") else None,
+                    "disabled_at": a["disabled_at"].isoformat()
+                    if a.get("disabled_at")
+                    else None,
+                    "reenable_at": (
+                        a["disabled_at"] + timedelta(minutes=30)
+                    ).isoformat()
+                    if a.get("disabled_at")
+                    else None,
                 }
                 for a in all_accts
             ],
@@ -1053,7 +1305,9 @@ async def debug_orchestrator(session: AsyncSession = Depends(get_session), curre
     hung = False
     if _orch._orchestrator_cycle_started and _orch._orchestrator_last_cycle:
         if _orch._orchestrator_cycle_started > _orch._orchestrator_last_cycle:
-            hung_seconds = (_utcnow() - _orch._orchestrator_cycle_started).total_seconds()
+            hung_seconds = (
+                _utcnow() - _orch._orchestrator_cycle_started
+            ).total_seconds()
             hung = hung_seconds > 300  # 5 minutes without completing a cycle
 
     return {
@@ -1064,25 +1318,40 @@ async def debug_orchestrator(session: AsyncSession = Depends(get_session), curre
         "active_tasks": active,
         "max_concurrent_vms": _runtime_config["max_concurrent_vms"],
         "actual_gcp_vm_count": _last_gcp_vm_count,
-        "gcp_vm_count_age_seconds": int(time.time() - _last_gcp_vm_check) if _last_gcp_vm_check else None,
+        "gcp_vm_count_age_seconds": int(time.time() - _last_gcp_vm_check)
+        if _last_gcp_vm_check
+        else None,
         "pool_size": pool_snapshot["size"],
         "available_count": pool_snapshot["available"],
         "disabled_count": pool_snapshot["disabled"],
         "pool_accounts": pool_snapshot["accounts"],
         "deploy_state": deploy_state,
         "deploy_monitoring": {
-            "window_active": _shared_state.deploy_monitoring["window_start"] is not None,
+            "window_active": _shared_state.deploy_monitoring["window_start"]
+            is not None,
             "task_results_count": len(_shared_state.deploy_monitoring["task_results"]),
-            "last_dispatch": _shared_state.deploy_monitoring["last_dispatch_time"].isoformat() if _shared_state.deploy_monitoring["last_dispatch_time"] else None,
-            "last_completion": _shared_state.deploy_monitoring["last_completion_time"].isoformat() if _shared_state.deploy_monitoring["last_completion_time"] else None,
+            "last_dispatch": _shared_state.deploy_monitoring[
+                "last_dispatch_time"
+            ].isoformat()
+            if _shared_state.deploy_monitoring["last_dispatch_time"]
+            else None,
+            "last_completion": _shared_state.deploy_monitoring[
+                "last_completion_time"
+            ].isoformat()
+            if _shared_state.deploy_monitoring["last_completion_time"]
+            else None,
             "external_health": _shared_state.external_health,
         },
         "zone_health": _get_zone_health_summary(),
         "notification_stats": _get_notification_stats(),
     }
 
+
 @app.get("/api/health/detailed")
-async def health_detailed(session: AsyncSession = Depends(get_session), current_user: dict = Depends(get_current_user)):
+async def health_detailed(
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
     """Authenticated endpoint returning structured health status for all system components."""
     import time
     from sqlalchemy import text
@@ -1108,7 +1377,9 @@ async def health_detailed(session: AsyncSession = Depends(get_session), current_
     last_check = _shared_state.external_health.get("last_check")
     components["github_api"] = {
         "status": "ok" if gh_ok else "down",
-        "last_check": last_check.isoformat() if isinstance(last_check, datetime) else last_check,
+        "last_check": last_check.isoformat()
+        if isinstance(last_check, datetime)
+        else last_check,
     }
 
     provider_health = _shared_state.external_health.get("provider_health", {}) or {}
@@ -1136,12 +1407,24 @@ async def health_detailed(session: AsyncSession = Depends(get_session), current_
     else:
         orch_status = "down"
     try:
-        queued = (await session.execute(
-            select(func.count()).select_from(Task).where(Task.status == TaskStatus.QUEUED, Task.requires_approval.is_(False))
-        )).scalar() or 0
-        active = (await session.execute(
-            select(func.count()).select_from(Task).where(Task.status.in_([TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]))
-        )).scalar() or 0
+        queued = (
+            await session.execute(
+                select(func.count())
+                .select_from(Task)
+                .where(
+                    Task.status == TaskStatus.QUEUED, Task.requires_approval.is_(False)
+                )
+            )
+        ).scalar() or 0
+        active = (
+            await session.execute(
+                select(func.count())
+                .select_from(Task)
+                .where(
+                    Task.status.in_([TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS])
+                )
+            )
+        ).scalar() or 0
     except Exception:
         queued = active = 0
     components["orchestrator"] = {
@@ -1166,7 +1449,9 @@ async def health_detailed(session: AsyncSession = Depends(get_session), current_
 
     # --- Max Plan Pool ---
     total_accounts = len(_account_by_id)
-    available_accounts = sum(1 for a in _account_by_id.values() if a.get("enabled", True))
+    available_accounts = sum(
+        1 for a in _account_by_id.values() if a.get("enabled", True)
+    )
     if total_accounts == 0:
         pool_status = "ok"  # not using Max Plan accounts
     elif available_accounts > 0:
@@ -1193,13 +1478,19 @@ async def health_detailed(session: AsyncSession = Depends(get_session), current_
         breaker_states[project_id] = {
             "state": breaker.get("state", "CLOSED"),
             "failure_count": breaker.get("failure_count", 0),
-            "opened_at": breaker["opened_at"].isoformat() if breaker.get("opened_at") else None,
+            "opened_at": breaker["opened_at"].isoformat()
+            if breaker.get("opened_at")
+            else None,
         }
     components["circuit_breaker"] = {"status": "ok", "projects": breaker_states}
 
     # --- Autonomous ---
     autonomous_enabled = _runtime_config.get("max_concurrent_vms", 0) > 0
-    consecutive_failures = sum(_shared_state.autonomous_failure_counts.values()) if _shared_state.autonomous_failure_counts else 0
+    consecutive_failures = (
+        sum(_shared_state.autonomous_failure_counts.values())
+        if _shared_state.autonomous_failure_counts
+        else 0
+    )
     components["autonomous"] = {
         "status": "ok" if consecutive_failures < 3 else "degraded",
         "enabled": autonomous_enabled,
@@ -1249,7 +1540,11 @@ async def health_detailed(session: AsyncSession = Depends(get_session), current_
     components["pipeline_health"] = dict(ph_snapshot, status=ph_status)
 
     # --- Overall Status ---
-    statuses = [c["status"] for c in components.values() if isinstance(c, dict) and "status" in c]
+    statuses = [
+        c["status"]
+        for c in components.values()
+        if isinstance(c, dict) and "status" in c
+    ]
     if "down" in statuses:
         overall = "unhealthy"
     elif "degraded" in statuses:
@@ -1258,6 +1553,7 @@ async def health_detailed(session: AsyncSession = Depends(get_session), current_
         overall = "healthy"
 
     return {"status": overall, "components": components, "pipeline_health": ph_snapshot}
+
 
 @app.get("/api/me")
 async def get_me(current_user: dict = Depends(get_current_user)):
@@ -1268,10 +1564,12 @@ async def get_me(current_user: dict = Depends(get_current_user)):
         "role": current_user["role"],
     }
 
+
 @app.get("/api/version")
 async def get_version():
     """Public endpoint returning current backend version for frontend compatibility checks."""
     return {"sha": _current_sha, "revision": _current_revision}
+
 
 @app.get("/health")
 async def health_check():
@@ -1296,23 +1594,35 @@ async def health_check():
         cycle_age = (_utcnow() - _orch._orchestrator_last_cycle).total_seconds()
 
     # Orchestrator is unhealthy if it hasn't cycled in 60+ seconds
-    orchestrator_healthy = orchestrator_alive and (cycle_age is not None and cycle_age < 60)
+    orchestrator_healthy = orchestrator_alive and (
+        cycle_age is not None and cycle_age < 60
+    )
 
     # Detect hung orchestrator (cycle started but not completed in 5+ minutes)
     orchestrator_hung = False
     if _orch._orchestrator_cycle_started and _orch._orchestrator_last_cycle:
         if _orch._orchestrator_cycle_started > _orch._orchestrator_last_cycle:
-            hung_seconds = (_utcnow() - _orch._orchestrator_cycle_started).total_seconds()
+            hung_seconds = (
+                _utcnow() - _orch._orchestrator_cycle_started
+            ).total_seconds()
             orchestrator_hung = hung_seconds > 300
 
     # Only DB is critical for 503 — provider or external API outages shouldn't remove us from LB.
     critical_healthy = external_health.get("db", True)
-    degraded_deps = [dep for dep in (external_health.get("failed_deps", []) or []) if dep != "db"]
+    degraded_deps = [
+        dep for dep in (external_health.get("failed_deps", []) or []) if dep != "db"
+    ]
     if orchestrator_hung:
         degraded_deps.append("orchestrator_hung")
 
     healthy = orchestrator_healthy and critical_healthy
-    status = "healthy" if healthy and not degraded_deps else "degraded" if healthy else "unhealthy"
+    status = (
+        "healthy"
+        if healthy and not degraded_deps
+        else "degraded"
+        if healthy
+        else "unhealthy"
+    )
     status_code = 200 if healthy else 503
 
     return JSONResponse(
@@ -1324,14 +1634,24 @@ async def health_check():
             "orchestrator_alive": orchestrator_alive,
             "orchestrator_cycle_age_seconds": cycle_age,
             "external_deps": {
-                k: v for k, v in external_health.items()
-                if k not in ("last_check", "failed_deps", "errors", "provider_health", "dispatch_health")
+                k: v
+                for k, v in external_health.items()
+                if k
+                not in (
+                    "last_check",
+                    "failed_deps",
+                    "errors",
+                    "provider_health",
+                    "dispatch_health",
+                )
             },
             "degraded_deps": degraded_deps,
-        }
+        },
     )
 
+
 _METRICS_TOKEN = os.getenv("METRICS_TOKEN", "")
+
 
 @app.get("/metrics")
 async def prometheus_metrics(request: Request):
@@ -1350,11 +1670,17 @@ async def prometheus_metrics(request: Request):
         cycle_age = (_utcnow() - _orch._orchestrator_last_cycle).total_seconds()
 
     active_vms = sum(a.get("active_tasks", 0) for a in _account_by_id.values())
-    consecutive_failures = sum(_shared_state.autonomous_failure_counts.values()) if _shared_state.autonomous_failure_counts else 0
+    consecutive_failures = (
+        sum(_shared_state.autonomous_failure_counts.values())
+        if _shared_state.autonomous_failure_counts
+        else 0
+    )
 
     lines: list[str] = []
 
-    def gauge(name: str, help_text: str, value: float, labels: Optional[Dict[str, str]] = None) -> None:
+    def gauge(
+        name: str, help_text: str, value: float, labels: Optional[Dict[str, str]] = None
+    ) -> None:
         lines.append(f"# HELP {name} {help_text}")
         lines.append(f"# TYPE {name} gauge")
         label_str = ""
@@ -1367,21 +1693,51 @@ async def prometheus_metrics(request: Request):
         lines.append(f"# TYPE {name} counter")
         lines.append(f"{name} {value}")
 
-    gauge("blueprint_tasks_queued", "Number of tasks currently queued", _shared_state.tasks_queued_gauge)
-    gauge("blueprint_tasks_active", "Number of tasks currently provisioning or in progress", _shared_state.tasks_active_gauge)
-    counter("blueprint_tasks_completed_total", "Cumulative number of completed tasks", _shared_state.tasks_completed_total)
-    counter("blueprint_tasks_failed_total", "Cumulative number of failed tasks", _shared_state.tasks_failed_total)
-    gauge("blueprint_orchestrator_cycle_age_seconds", "Seconds since last orchestrator cycle", cycle_age if cycle_age is not None else -1)
-    gauge("blueprint_active_vms", "Current active VM count from Max Plan pool", active_vms)
+    gauge(
+        "blueprint_tasks_queued",
+        "Number of tasks currently queued",
+        _shared_state.tasks_queued_gauge,
+    )
+    gauge(
+        "blueprint_tasks_active",
+        "Number of tasks currently provisioning or in progress",
+        _shared_state.tasks_active_gauge,
+    )
+    counter(
+        "blueprint_tasks_completed_total",
+        "Cumulative number of completed tasks",
+        _shared_state.tasks_completed_total,
+    )
+    counter(
+        "blueprint_tasks_failed_total",
+        "Cumulative number of failed tasks",
+        _shared_state.tasks_failed_total,
+    )
+    gauge(
+        "blueprint_orchestrator_cycle_age_seconds",
+        "Seconds since last orchestrator cycle",
+        cycle_age if cycle_age is not None else -1,
+    )
+    gauge(
+        "blueprint_active_vms", "Current active VM count from Max Plan pool", active_vms
+    )
 
     if _shared_state.circuit_breakers:
-        lines.append("# HELP blueprint_circuit_breaker_open 1 if circuit breaker is OPEN, 0 otherwise")
+        lines.append(
+            "# HELP blueprint_circuit_breaker_open 1 if circuit breaker is OPEN, 0 otherwise"
+        )
         lines.append("# TYPE blueprint_circuit_breaker_open gauge")
         for project_id, breaker in _shared_state.circuit_breakers.items():
             is_open = 1 if breaker.get("state") == "OPEN" else 0
-            lines.append(f'blueprint_circuit_breaker_open{{project_id="{project_id}"}} {is_open}')
+            lines.append(
+                f'blueprint_circuit_breaker_open{{project_id="{project_id}"}} {is_open}'
+            )
 
-    gauge("blueprint_autonomous_consecutive_failures", "Consecutive autonomous task failures", consecutive_failures)
+    gauge(
+        "blueprint_autonomous_consecutive_failures",
+        "Consecutive autonomous task failures",
+        consecutive_failures,
+    )
 
     # DB pool invalidation telemetry (handle_error event listener in
     # database.py). Gives us a direct signal whether the cutover-safe
@@ -1389,6 +1745,7 @@ async def prometheus_metrics(request: Request):
     # be measured against the 2026-05-04 cascade baseline.
     try:
         from app.database import get_db_pool_invalidation_stats
+
         _db_stats = get_db_pool_invalidation_stats()
         counter(
             "blueprint_db_pool_invalidations_total",
@@ -1422,6 +1779,7 @@ async def prometheus_metrics(request: Request):
     # catch any reaper crash-loop within ~5 successful-cycle windows.
     try:
         from app.reaper import get_reaper_stats  # noqa: PLC0415
+
         _reaper_stats = get_reaper_stats()
         counter(
             "blueprint_reaper_cycles_completed_total",
@@ -1438,7 +1796,11 @@ async def prometheus_metrics(request: Request):
 
     body = "\n".join(lines) + "\n"
     from fastapi.responses import PlainTextResponse
-    return PlainTextResponse(content=body, media_type="text/plain; version=0.0.4; charset=utf-8")
+
+    return PlainTextResponse(
+        content=body, media_type="text/plain; version=0.0.4; charset=utf-8"
+    )
+
 
 # Attach the rate limiter to the app
 app.state.limiter = limiter
@@ -1454,7 +1816,9 @@ def _cors_aware_rate_limit_handler(request: Request, exc: RateLimitExceeded):
     """
     resp = JSONResponse(
         status_code=429,
-        content={"error": {"code": 429, "message": f"Rate limit exceeded: {exc.detail}"}},
+        content={
+            "error": {"code": 429, "message": f"Rate limit exceeded: {exc.detail}"}
+        },
         headers={"Retry-After": "5"},
     )
     origin = request.headers.get("origin")
@@ -1471,12 +1835,14 @@ def _cors_aware_rate_limit_handler(request: Request, exc: RateLimitExceeded):
 
 app.add_exception_handler(RateLimitExceeded, _cors_aware_rate_limit_handler)
 
+
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
     return JSONResponse(
         status_code=exc.status_code,
         content={"error": {"code": exc.status_code, "message": exc.detail}},
     )
+
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
@@ -1490,16 +1856,23 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
         errors.append(clean)
     return JSONResponse(
         status_code=422,
-        content={"error": {"code": 422, "message": "Validation Error", "details": errors}},
+        content={
+            "error": {"code": 422, "message": "Validation Error", "details": errors}
+        },
     )
+
 
 @app.exception_handler(Exception)
 async def generic_exception_handler(request: Request, exc: Exception):
-    logger.error(f"[UNHANDLED] {request.method} {request.url.path}: {type(exc).__name__}: {exc}", exc_info=True)
+    logger.error(
+        f"[UNHANDLED] {request.method} {request.url.path}: {type(exc).__name__}: {exc}",
+        exc_info=True,
+    )
     return JSONResponse(
         status_code=500,
         content={"detail": f"{type(exc).__name__}: {str(exc)[:200]}"},
     )
+
 
 # Add CORS Middleware so the frontend can call these APIs
 # In production, set ALLOWED_ORIGINS to the specific frontend domain (e.g., "https://my-app.com")
@@ -1508,7 +1881,9 @@ allowed_origins_env = os.getenv("ALLOWED_ORIGINS", "")
 if allowed_origins_env == "*":
     allowed_origins = ["*"]
 elif allowed_origins_env:
-    allowed_origins = [origin.strip() for origin in allowed_origins_env.split(",") if origin.strip()]
+    allowed_origins = [
+        origin.strip() for origin in allowed_origins_env.split(",") if origin.strip()
+    ]
 else:
     allowed_origins = [
         "http://localhost:3000",
@@ -1522,7 +1897,13 @@ app.add_middleware(
     allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type", "Accept", "Origin", "X-Requested-With"],
+    allow_headers=[
+        "Authorization",
+        "Content-Type",
+        "Accept",
+        "Origin",
+        "X-Requested-With",
+    ],
 )
 
 
@@ -1530,7 +1911,9 @@ app.add_middleware(
 def read_root():
     return {"status": "online", "service": "Blueprint Orchestrator"}
 
+
 # --- Agent APIs ---
+
 
 @app.websocket("/api/agent/ws/{task_id}")
 async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
@@ -1572,11 +1955,12 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
 
     try:
         import time
+
         last_message_time = time.time()
         message_count = 0
         while True:
             text_data = await websocket.receive_text()
-            if len(text_data) > 100000: # 100KB limit for agent logs
+            if len(text_data) > 100000:  # 100KB limit for agent logs
                 await websocket.close(code=1009, reason="Message too big")
                 return
 
@@ -1597,10 +1981,14 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
                 continue
 
             if data.get("type") == "log":
-                await broadcast_to_project(project_id, "agent_log", {
-                    "task_id": str(task_id),
-                    "log": _sanitize_log(data.get("content", ""))
-                })
+                await broadcast_to_project(
+                    project_id,
+                    "agent_log",
+                    {
+                        "task_id": str(task_id),
+                        "log": _sanitize_log(data.get("content", "")),
+                    },
+                )
             elif data.get("type") == "status":
                 # Optionally handle status updates via WS too
                 pass
@@ -1608,9 +1996,6 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
         pass
     finally:
         manager.remove_ip(websocket)
-
-
-
 
 
 from app.strategic_completion import (  # noqa: E402
@@ -1626,10 +2011,12 @@ from app.task_locking import lock_project_or_429 as _lock_project_or_429  # noqa
 
 class DesignDocUpdate(BaseModel):
     """Incremental design doc page update from an agent."""
+
     task_id: uuid.UUID
     op: str  # "set", "delete", "list"
     key: Optional[str] = None
     value: Optional[Any] = None
+
 
 @app.post("/api/agent/design-doc")
 @limiter.limit("60/minute")
@@ -1649,8 +2036,14 @@ async def update_design_doc(
         raise HTTPException(status_code=404, detail="Task not found")
 
     # Write operations restricted to strategic agents; reads open to all
-    if payload.op not in ("list", "get") and token.get("task_type") not in ("design_doc_update", "strategic_review"):
-        raise HTTPException(status_code=403, detail="Write operations restricted to design_doc_update/strategic_review agents")
+    if payload.op not in ("list", "get") and token.get("task_type") not in (
+        "design_doc_update",
+        "strategic_review",
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Write operations restricted to design_doc_update/strategic_review agents",
+        )
 
     if payload.op == "list":
         project = await session.get(Project, task.project_id)
@@ -1664,14 +2057,18 @@ async def update_design_doc(
             raise HTTPException(status_code=400, detail="key is required for get")
         value = doc.get(payload.key)
         if value is None:
-            raise HTTPException(status_code=404, detail=f"Key '{payload.key}' not found")
+            raise HTTPException(
+                status_code=404, detail=f"Key '{payload.key}' not found"
+            )
         return {"key": payload.key, "value": value}
 
     if not payload.key or not isinstance(payload.key, str):
         raise HTTPException(status_code=400, detail="key is required for set/delete")
     key = payload.key.strip()
     if not key or len(key) > 100 or key.startswith("_"):
-        raise HTTPException(status_code=400, detail="Invalid key (max 100 chars, no _ prefix)")
+        raise HTTPException(
+            status_code=400, detail="Invalid key (max 100 chars, no _ prefix)"
+        )
 
     # Lock project for atomic update (skip_locked + 429 avoids lock_timeout cascade)
     project = await _lock_project_or_429(session, task.project_id)
@@ -1684,20 +2081,26 @@ async def update_design_doc(
             raise HTTPException(status_code=400, detail="value is required for set")
         # Size check: individual value max 50KB, total doc max 500KB
         import json as _json
+
         val_size = len(_json.dumps(payload.value))
         if val_size > 50_000:
-            raise HTTPException(status_code=400, detail=f"Value too large ({val_size} bytes, max 50KB)")
+            raise HTTPException(
+                status_code=400, detail=f"Value too large ({val_size} bytes, max 50KB)"
+            )
         doc[key] = payload.value
         total_size = len(_json.dumps(doc))
         if total_size > 500_000:
             del doc[key]  # rollback
-            raise HTTPException(status_code=400, detail=f"Total design doc too large ({total_size} bytes, max 500KB)")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Total design doc too large ({total_size} bytes, max 500KB)",
+            )
         # Rebuild file-to-system reverse index atomically when a systems/* key is set
         if key.startswith("systems/"):
             file_to_system: dict = {}
             for doc_key, doc_val in doc.items():
                 if doc_key.startswith("systems/") and isinstance(doc_val, dict):
-                    sys_id = doc_key[len("systems/"):]
+                    sys_id = doc_key[len("systems/") :]
                     for fpath in doc_val.get("modules", []):
                         if isinstance(fpath, str):
                             file_to_system[fpath] = sys_id
@@ -1709,7 +2112,7 @@ async def update_design_doc(
             file_to_system: dict = {}
             for doc_key, doc_val in doc.items():
                 if doc_key.startswith("systems/") and isinstance(doc_val, dict):
-                    sys_id = doc_key[len("systems/"):]
+                    sys_id = doc_key[len("systems/") :]
                     for fpath in doc_val.get("modules", []):
                         if isinstance(fpath, str):
                             file_to_system[fpath] = sys_id
@@ -1729,20 +2132,29 @@ async def update_design_doc(
 
     return {"status": "ok", "op": payload.op, "key": key, "revision": meta["revision"]}
 
+
 # ── Agent Playbook ───────────────────────────────────────────────────────
 # Any agent task type can read/write persistent operational knowledge stored
 # as playbook/* keys in the project's design_doc JSONB column.
 
-from app.payload_schemas import ALL_TASK_TYPES as _VALID_TASK_TYPES, validate_internal_payload as _validate_internal_payload  # noqa: E402
+from app.payload_schemas import (  # noqa: E402
+    ALL_TASK_TYPES as _VALID_TASK_TYPES,
+    validate_internal_payload as _validate_internal_payload,
+)  # noqa: E402
+
 
 class PlaybookUpdate(BaseModel):
     task_id: uuid.UUID
     op: str  # "get", "set", "delete", "list"
     key: Optional[str] = None  # alphanumeric + hyphens, max 50 chars
     value: Optional[str] = None  # plain text, max 2KB
-    applicable_types: Optional[List[str]] = None  # task types this entry applies to; None = all types
+    applicable_types: Optional[List[str]] = (
+        None  # task types this entry applies to; None = all types
+    )
 
-_PLAYBOOK_KEY_RE = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9\-]{0,49}$')
+
+_PLAYBOOK_KEY_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9\-]{0,49}$")
+
 
 @app.post("/api/agent/playbook")
 @limiter.limit("120/minute")
@@ -1777,7 +2189,7 @@ async def update_playbook(
                 pending_source = v.get("pending_source")
                 if pending_source and pending_source != my_id:
                     continue
-            keys.append(k[len("playbook/"):])
+            keys.append(k[len("playbook/") :])
         return {"status": "ok", "op": op, "keys": keys}
 
     if op == "get":
@@ -1793,7 +2205,7 @@ async def update_playbook(
                 pending_source = v.get("pending_source")
                 if pending_source and pending_source != my_id:
                     continue
-                short_key = k[len("playbook/"):]
+                short_key = k[len("playbook/") :]
                 entries[short_key] = {
                     "content": v.get("content", ""),
                     "updated_at": v.get("updated_at", ""),
@@ -1806,12 +2218,16 @@ async def update_playbook(
         raise HTTPException(status_code=400, detail="key is required for set/delete")
     key = payload.key.strip()
     if key.startswith("_") or not _PLAYBOOK_KEY_RE.match(key):
-        raise HTTPException(status_code=400, detail="Invalid key: must be alphanumeric+hyphens, max 50 chars, no _ prefix")
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid key: must be alphanumeric+hyphens, max 50 chars, no _ prefix",
+        )
 
     # Lock project for atomic update (skip_locked + 429 avoids lock_timeout cascade)
     project = await _lock_project_or_429(session, task.project_id)
 
     import json as _json
+
     doc = dict(project.design_doc or {})
     meta = doc.get("_meta", {"revision": 0})
 
@@ -1819,11 +2235,19 @@ async def update_playbook(
         if payload.value is None:
             raise HTTPException(status_code=400, detail="value is required for set")
         if len(payload.value) > 2048:
-            raise HTTPException(status_code=400, detail=f"Value too large ({len(payload.value)} bytes, max 2KB)")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Value too large ({len(payload.value)} bytes, max 2KB)",
+            )
         if payload.applicable_types is not None:
-            invalid = [t for t in payload.applicable_types if t not in _VALID_TASK_TYPES]
+            invalid = [
+                t for t in payload.applicable_types if t not in _VALID_TASK_TYPES
+            ]
             if invalid:
-                raise HTTPException(status_code=400, detail=f"Invalid task type(s): {invalid}. Must be one of: {sorted(_VALID_TASK_TYPES)}")
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid task type(s): {invalid}. Must be one of: {sorted(_VALID_TASK_TYPES)}",
+                )
         playbook_key = f"playbook/{key}"
         existing = doc.get(playbook_key, {})
         entry: dict = {
@@ -1850,7 +2274,10 @@ async def update_playbook(
         )
         if playbook_total > 30_000:
             del doc[playbook_key]  # rollback
-            raise HTTPException(status_code=400, detail=f"Playbook too large ({playbook_total} bytes, max 30KB total)")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Playbook too large ({playbook_total} bytes, max 30KB total)",
+            )
     elif op == "delete":
         doc.pop(f"playbook/{key}", None)
 
@@ -1866,23 +2293,26 @@ async def update_playbook(
 
     return {"status": "ok", "op": op, "key": key, "revision": meta["revision"]}
 
+
 # ── Agent Annotations ───────────────────────────────────────────────────
 # Any agent can leave comments, issues, or vision suggestions.
 # Stored as ProjectMessages so design-doc and strategic agents pick them up
 # via the existing open_messages flow.
+
 
 class AgentAnnotation(BaseModel):
     task_id: uuid.UUID
     annotation_type: Literal["comment", "issue", "vision", "size_breach"]
     content: str = ""  # free-form prose (comment/issue/vision); ignored for size_breach
     target_page: Optional[str] = None  # design doc page key (for comments)
-    severity: Optional[str] = None     # low/medium/high (for issues)
+    severity: Optional[str] = None  # low/medium/high (for issues)
     # size_breach fields — programmatic signal from a test-invariant failure.
     # Server bumps the limit (policy-driven, not agent-judgment) and returns
     # new_limit; the agent applies it to module_size_limits.json and commits.
     file_path: Optional[str] = None
     current_size: Optional[int] = None
     change_summary: Optional[str] = None
+
 
 _ANNOTATION_TYPE_MAP = {
     "comment": MessageType.NOTE,
@@ -1903,6 +2333,7 @@ def _bump_size_limit(current_size: int) -> int:
     raw = max(floor, proportional)
     return ((raw + 49) // 50) * 50
 
+
 @app.post("/api/agent/annotate")
 @limiter.limit("30/minute")
 async def agent_annotate(
@@ -1918,22 +2349,34 @@ async def agent_annotate(
     is_size_breach = payload.annotation_type == "size_breach"
     if is_size_breach:
         if not payload.file_path or not payload.file_path.strip():
-            raise HTTPException(status_code=400, detail="size_breach requires file_path")
+            raise HTTPException(
+                status_code=400, detail="size_breach requires file_path"
+            )
         if not payload.current_size or payload.current_size <= 0:
-            raise HTTPException(status_code=400, detail="size_breach requires positive current_size")
+            raise HTTPException(
+                status_code=400, detail="size_breach requires positive current_size"
+            )
         if not payload.change_summary or not payload.change_summary.strip():
-            raise HTTPException(status_code=400, detail="size_breach requires change_summary")
+            raise HTTPException(
+                status_code=400, detail="size_breach requires change_summary"
+            )
         if len(payload.file_path) > 200:
             raise HTTPException(status_code=400, detail="file_path too long")
         if len(payload.change_summary) > 500:
-            raise HTTPException(status_code=400, detail="change_summary exceeds 500 character limit")
+            raise HTTPException(
+                status_code=400, detail="change_summary exceeds 500 character limit"
+            )
     else:
         if len(payload.content) > 2000:
-            raise HTTPException(status_code=400, detail="Content exceeds 2000 character limit")
+            raise HTTPException(
+                status_code=400, detail="Content exceeds 2000 character limit"
+            )
         if not payload.content.strip():
             raise HTTPException(status_code=400, detail="Content cannot be empty")
     if payload.severity and payload.severity not in ("low", "medium", "high"):
-        raise HTTPException(status_code=400, detail="Severity must be low, medium, or high")
+        raise HTTPException(
+            status_code=400, detail="Severity must be low, medium, or high"
+        )
     if payload.target_page and len(payload.target_page) > 100:
         raise HTTPException(status_code=400, detail="Target page key too long")
 
@@ -1942,9 +2385,13 @@ async def agent_annotate(
         raise HTTPException(status_code=404, detail="Task not found")
 
     # Cap: max 10 annotations per task
-    count_stmt = select(_func.count()).select_from(ProjectMessage).where(
-        ProjectMessage.from_task_id == task.id,
-        ProjectMessage.from_type == "agent",
+    count_stmt = (
+        select(_func.count())
+        .select_from(ProjectMessage)
+        .where(
+            ProjectMessage.from_task_id == task.id,
+            ProjectMessage.from_type == "agent",
+        )
     )
     count = (await session.execute(count_stmt)).scalar() or 0
     if count >= 10:
@@ -1984,17 +2431,22 @@ async def agent_annotate(
     session.add(msg)
     await session.commit()
 
-    logger.info(f"[ANNOTATE] {payload.annotation_type} from task {task.id} ({token.get('task_type', '?')})")
+    logger.info(
+        f"[ANNOTATE] {payload.annotation_type} from task {task.id} ({token.get('task_type', '?')})"
+    )
     response: dict[str, Any] = {"status": "ok", "annotation_id": str(msg.id)}
     if is_size_breach:
         response["new_limit"] = ctx["new_limit"]
     return response
 
+
 class StrategicOp(BaseModel):
     """Incremental strategic review operation from an agent."""
+
     task_id: uuid.UUID
     op: str  # "set_vision", "create_direction", "update_direction", "retire_direction", "create_message", "resolve_message", "spawn_task"
     data: Any = {}
+
 
 @app.post("/api/agent/strategic")
 @limiter.limit("60/minute")
@@ -2010,8 +2462,13 @@ async def strategic_operation(
     # Message ops (create/resolve) are available to all agent types.
     # Direction/vision ops are restricted to strategic_review only.
     MESSAGE_OPS = ("create_message", "resolve_message")
-    if payload.op not in MESSAGE_OPS and token.get("task_type") not in ("strategic_review",):
-        raise HTTPException(status_code=403, detail="Only strategic_review agents can modify directions/vision")
+    if payload.op not in MESSAGE_OPS and token.get("task_type") not in (
+        "strategic_review",
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Only strategic_review agents can modify directions/vision",
+        )
 
     task = await session.get(Task, payload.task_id)
     if not task:
@@ -2025,7 +2482,9 @@ async def strategic_operation(
 
     # Size guard — prevent agents from bloating project JSONB columns
     if len(json.dumps(data, default=str)) > 100_000:
-        raise HTTPException(status_code=400, detail="Data payload too large (max 100KB)")
+        raise HTTPException(
+            status_code=400, detail="Data payload too large (max 100KB)"
+        )
 
     def _resp(body: dict) -> dict:
         if warnings:
@@ -2034,11 +2493,23 @@ async def strategic_operation(
 
     if payload.op == "set_vision":
         if not isinstance(data, dict) or not data.get("purpose"):
-            raise HTTPException(status_code=400, detail="Vision must have a 'purpose' field")
+            raise HTTPException(
+                status_code=400, detail="Vision must have a 'purpose' field"
+            )
         current = dict(project.vision or {})
-        new_vision = {**dict(data), "revision": (current.get("revision", 0) or 0) + 1, "last_updated": _utcnow().isoformat()}
+        new_vision = {
+            **dict(data),
+            "revision": (current.get("revision", 0) or 0) + 1,
+            "last_updated": _utcnow().isoformat(),
+        }
         # Preserve internal tracking fields; reset failure counters on success
-        new_vision.update({k: v for k, v in current.items() if k.startswith("_") and k not in new_vision})
+        new_vision.update(
+            {
+                k: v
+                for k, v in current.items()
+                if k.startswith("_") and k not in new_vision
+            }
+        )
         new_vision.pop("_strategic_failures", None)
         new_vision.pop("_strategic_failures_at", None)
         project.vision = new_vision
@@ -2049,8 +2520,12 @@ async def strategic_operation(
         flag_modified(task, "context")
         session.add(task)
         await session.commit()
-        logger.info(f"[STRATEGIC API] Vision updated for project {project.id} (rev {new_vision['revision']})")
-        return _resp({"status": "ok", "op": "set_vision", "revision": new_vision["revision"]})
+        logger.info(
+            f"[STRATEGIC API] Vision updated for project {project.id} (rev {new_vision['revision']})"
+        )
+        return _resp(
+            {"status": "ok", "op": "set_vision", "revision": new_vision["revision"]}
+        )
 
     elif payload.op == "create_direction":
         raw_text = str(data.get("text", "")).strip()
@@ -2058,12 +2533,18 @@ async def strategic_operation(
             raise HTTPException(status_code=400, detail="Direction text is required")
         text = _cap_str(raw_text, STRATEGIC_DIRECTION_TEXT_MAX, "text", warnings)
         raw_priority = data.get("priority", "medium")
-        priority = raw_priority if raw_priority in ("high", "medium", "low") else "medium"
-        rationale = _cap_str(data.get("rationale", ""), STRATEGIC_RATIONALE_MAX, "rationale", warnings)
+        priority = (
+            raw_priority if raw_priority in ("high", "medium", "low") else "medium"
+        )
+        rationale = _cap_str(
+            data.get("rationale", ""), STRATEGIC_RATIONALE_MAX, "rationale", warnings
+        )
         raw_dedup_reasoning = data.get("dedup_reasoning")
         directions = list(project.directions or [])
         # Dedup: skip if semantically similar direction already exists
-        _rejected_proposals = list((project.vision or {}).get("rejected_proposals") or [])
+        _rejected_proposals = list(
+            (project.vision or {}).get("rejected_proposals") or []
+        )
         if _is_direction_duplicate(text, directions, _rejected_proposals):
             if isinstance(raw_dedup_reasoning, dict):
                 distinction = str(raw_dedup_reasoning.get("distinction") or "").strip()
@@ -2071,14 +2552,19 @@ async def strategic_operation(
                     logger.warning(
                         "[STRATEGIC_DEDUP_DISAGREEMENT] API path: direction rejected as duplicate but agent claimed "
                         "distinction='%s'; matched text='%s'; project=%s",
-                        distinction[:200], text[:60], project.id,
+                        distinction[:200],
+                        text[:60],
+                        project.id,
                     )
             matched = _find_matching_direction(text, directions)
             if matched:
                 logger.info(
                     "[STRATEGIC] API path: rejecting semantic duplicate direction '%s' for project %s — "
                     "matched existing direction '%s' (status=%s)",
-                    text[:60], project.id, (matched.get("text") or "")[:60], matched.get("status"),
+                    text[:60],
+                    project.id,
+                    (matched.get("text") or "")[:60],
+                    matched.get("status"),
                 )
             ctx = task.context or {}
             dedup_rejections = list(ctx.get("_strategic_dedup_rejections") or [])
@@ -2092,11 +2578,18 @@ async def strategic_operation(
                 if distinction:
                     rejection_record["dedup_reasoning"] = distinction[:500]
             dedup_rejections.append(rejection_record)
-            task.context = {**ctx, "_strategic_api_called": True, "_strategic_dedup_rejections": dedup_rejections}
+            task.context = {
+                **ctx,
+                "_strategic_api_called": True,
+                "_strategic_dedup_rejections": dedup_rejections,
+            }
             flag_modified(task, "context")
             session.add(task)
             await session.commit()
-            return JSONResponse(content=_resp({"status": "skipped", "reason": "semantic_duplicate"}), status_code=409)
+            return JSONResponse(
+                content=_resp({"status": "skipped", "reason": "semantic_duplicate"}),
+                status_code=409,
+            )
         success_evidence = str(data.get("success_evidence", "")).strip()
         retirement_condition = str(data.get("retirement_condition", "")).strip()
         if not success_evidence or not retirement_condition:
@@ -2104,22 +2597,37 @@ async def strategic_operation(
                 status_code=400,
                 detail="success_evidence and retirement_condition are required for direction creation",
             )
-        active_count = sum(1 for d in directions if d.get('status') == 'active')
-        max_active = _runtime_config.get('max_active_directions', 5)
+        active_count = sum(1 for d in directions if d.get("status") == "active")
+        max_active = _runtime_config.get("max_active_directions", 5)
         if active_count >= max_active:
             ctx = task.context or {}
             task.context = {**ctx, "_strategic_api_called": True}
             flag_modified(task, "context")
             session.add(task)
             await session.commit()
-            return JSONResponse(content=_resp({'status': 'skipped', 'reason': f'Direction cap reached: {active_count}/{max_active} active'}), status_code=409)
+            return JSONResponse(
+                content=_resp(
+                    {
+                        "status": "skipped",
+                        "reason": f"Direction cap reached: {active_count}/{max_active} active",
+                    }
+                ),
+                status_code=409,
+            )
         _DIR_FIELD_MAX = 500
         new_dir: dict = {
             "id": f"d-{uuid.uuid4().hex[:8]}",
             "text": text,
             "status": "active",
             "priority": priority,
-            "notes": [{"text": f"Created by strategic review: {rationale}", "added_at": _utcnow().isoformat()}] if rationale else [],
+            "notes": [
+                {
+                    "text": f"Created by strategic review: {rationale}",
+                    "added_at": _utcnow().isoformat(),
+                }
+            ]
+            if rationale
+            else [],
             "research_history": [],
             "context": {
                 "success_evidence": success_evidence[:_DIR_FIELD_MAX],
@@ -2128,7 +2636,9 @@ async def strategic_operation(
         }
         impl_constraints = str(data.get("implementation_constraints", "")).strip()
         if impl_constraints:
-            new_dir["context"]["implementation_constraints"] = impl_constraints[:_DIR_FIELD_MAX]
+            new_dir["context"]["implementation_constraints"] = impl_constraints[
+                :_DIR_FIELD_MAX
+            ]
         if isinstance(raw_dedup_reasoning, dict):
             dr: dict = {}
             closest = raw_dedup_reasoning.get("closest_directions")
@@ -2140,7 +2650,9 @@ async def strategic_operation(
             if dr:
                 new_dir["context"]["dedup_reasoning"] = dr
         if data.get("system_id"):
-            new_dir["system_id"] = _cap_str(data["system_id"], STRATEGIC_SYSTEM_ID_MAX, "system_id", warnings)
+            new_dir["system_id"] = _cap_str(
+                data["system_id"], STRATEGIC_SYSTEM_ID_MAX, "system_id", warnings
+            )
         if data.get("paths"):
             new_dir["paths"] = data["paths"]
         if data.get("category") and data["category"] in ("product", "structural"):
@@ -2164,43 +2676,88 @@ async def strategic_operation(
         flag_modified(task, "context")
         session.add(task)
         await session.commit()
-        logger.info(f"[STRATEGIC API] Created direction '{text[:60]}' for project {project.id}")
-        return _resp({"status": "ok", "op": "create_direction", "direction_id": new_dir["id"]})
+        logger.info(
+            f"[STRATEGIC API] Created direction '{text[:60]}' for project {project.id}"
+        )
+        return _resp(
+            {"status": "ok", "op": "create_direction", "direction_id": new_dir["id"]}
+        )
 
     elif payload.op == "update_direction":
         dir_id = data.get("direction_id")
         changes = data.get("changes", {})
         if not dir_id or not changes:
-            raise HTTPException(status_code=400, detail="direction_id and changes required")
-        rationale = _cap_str(data.get("rationale", ""), STRATEGIC_RATIONALE_MAX, "rationale", warnings)
+            raise HTTPException(
+                status_code=400, detail="direction_id and changes required"
+            )
+        rationale = _cap_str(
+            data.get("rationale", ""), STRATEGIC_RATIONALE_MAX, "rationale", warnings
+        )
         directions = list(project.directions or [])
         updated = False
         for d in directions:
             if d.get("id") == dir_id:
                 if "text" in changes:
-                    d["text"] = _cap_str(changes["text"], STRATEGIC_DIRECTION_TEXT_MAX, "changes.text", warnings)
-                if "priority" in changes and changes["priority"] in ("high", "medium", "low"):
+                    d["text"] = _cap_str(
+                        changes["text"],
+                        STRATEGIC_DIRECTION_TEXT_MAX,
+                        "changes.text",
+                        warnings,
+                    )
+                if "priority" in changes and changes["priority"] in (
+                    "high",
+                    "medium",
+                    "low",
+                ):
                     d["priority"] = changes["priority"]
                 if "system_id" in changes:
-                    d["system_id"] = _cap_str(changes["system_id"], STRATEGIC_SYSTEM_ID_MAX, "changes.system_id", warnings) if changes["system_id"] else None
-                if "status" in changes and changes["status"] in ("active", "paused", "expired", "superseded"):
-                    if changes["status"] == "active" and d.get("status") == "paused" and not d.get("auto_paused"):
+                    d["system_id"] = (
+                        _cap_str(
+                            changes["system_id"],
+                            STRATEGIC_SYSTEM_ID_MAX,
+                            "changes.system_id",
+                            warnings,
+                        )
+                        if changes["system_id"]
+                        else None
+                    )
+                if "status" in changes and changes["status"] in (
+                    "active",
+                    "paused",
+                    "expired",
+                    "superseded",
+                ):
+                    if (
+                        changes["status"] == "active"
+                        and d.get("status") == "paused"
+                        and not d.get("auto_paused")
+                    ):
                         ctx = task.context or {}
                         task.context = {**ctx, "_strategic_api_called": True}
                         flag_modified(task, "context")
                         session.add(task)
                         await session.commit()
-                        return _resp({"status": "blocked", "reason": "Cannot reactivate user-paused direction"})
+                        return _resp(
+                            {
+                                "status": "blocked",
+                                "reason": "Cannot reactivate user-paused direction",
+                            }
+                        )
                     d["status"] = changes["status"]
                     if changes["status"] == "superseded":
                         superseded_by = changes.get("superseded_by")
                         if not superseded_by:
                             succ_id = (
-                                changes.get("successor_id") or changes.get("superseded_by_id")
-                                or data.get("successor_id") or data.get("superseded_by_id")
+                                changes.get("successor_id")
+                                or changes.get("superseded_by_id")
+                                or data.get("successor_id")
+                                or data.get("superseded_by_id")
                             )
                             if succ_id:
-                                superseded_by = {"direction_id": str(succ_id), "set_at": _utcnow().isoformat()}
+                                superseded_by = {
+                                    "direction_id": str(succ_id),
+                                    "set_at": _utcnow().isoformat(),
+                                }
                         if superseded_by:
                             d["superseded_by"] = superseded_by
                 if "recommended_mode" in changes:
@@ -2209,8 +2766,15 @@ async def strategic_operation(
                         d["recommended_mode"] = mode
                 if rationale:
                     notes = d.get("notes", [])
-                    notes.append({"text": f"Strategic update: {rationale}", "added_at": _utcnow().isoformat()})
-                    d["notes"] = _cap_list(notes, STRATEGIC_NOTES_HISTORY_MAX, "notes", warnings)
+                    notes.append(
+                        {
+                            "text": f"Strategic update: {rationale}",
+                            "added_at": _utcnow().isoformat(),
+                        }
+                    )
+                    d["notes"] = _cap_list(
+                        notes, STRATEGIC_NOTES_HISTORY_MAX, "notes", warnings
+                    )
                 updated = True
                 break
         if not updated:
@@ -2230,15 +2794,24 @@ async def strategic_operation(
         dir_id = data.get("direction_id")
         if not dir_id:
             raise HTTPException(status_code=400, detail="direction_id required")
-        rationale = _cap_str(data.get("rationale", ""), STRATEGIC_RATIONALE_MAX, "rationale", warnings)
+        rationale = _cap_str(
+            data.get("rationale", ""), STRATEGIC_RATIONALE_MAX, "rationale", warnings
+        )
         directions = list(project.directions or [])
         retired = False
         for d in directions:
             if d.get("id") == dir_id:
                 d["status"] = "expired"
                 notes = d.get("notes", [])
-                notes.append({"text": f"Retired by strategic review: {rationale}", "added_at": _utcnow().isoformat()})
-                d["notes"] = _cap_list(notes, STRATEGIC_NOTES_HISTORY_MAX, "notes", warnings)
+                notes.append(
+                    {
+                        "text": f"Retired by strategic review: {rationale}",
+                        "added_at": _utcnow().isoformat(),
+                    }
+                )
+                d["notes"] = _cap_list(
+                    notes, STRATEGIC_NOTES_HISTORY_MAX, "notes", warnings
+                )
                 retired = True
                 break
         if not retired:
@@ -2267,14 +2840,21 @@ async def strategic_operation(
         dir_id = data.get("direction_id")
         if not dir_id:
             raise HTTPException(status_code=400, detail="direction_id required")
-        rationale = _cap_str(data.get("rationale", ""), STRATEGIC_RATIONALE_MAX, "rationale", warnings)
+        rationale = _cap_str(
+            data.get("rationale", ""), STRATEGIC_RATIONALE_MAX, "rationale", warnings
+        )
         directions = list(project.directions or [])
         target = next((d for d in directions if d.get("id") == dir_id), None)
         if not target:
             raise HTTPException(status_code=404, detail=f"Direction {dir_id} not found")
         if target.get("status") != "proposed":
             return JSONResponse(
-                content=_resp({"status": "skipped", "reason": f"Direction is '{target.get('status')}', not 'proposed'"}),
+                content=_resp(
+                    {
+                        "status": "skipped",
+                        "reason": f"Direction is '{target.get('status')}', not 'proposed'",
+                    }
+                ),
                 status_code=409,
             )
         active_count = sum(1 for d in directions if d.get("status") == "active")
@@ -2286,27 +2866,46 @@ async def strategic_operation(
             session.add(task)
             await session.commit()
             return JSONResponse(
-                content=_resp({"status": "skipped", "reason": f"Direction cap reached: {active_count}/{max_active} active"}),
+                content=_resp(
+                    {
+                        "status": "skipped",
+                        "reason": f"Direction cap reached: {active_count}/{max_active} active",
+                    }
+                ),
                 status_code=409,
             )
         target["status"] = "active"
         target["activated_at"] = _utcnow().isoformat()
         notes = target.get("notes", [])
-        notes.append({
-            "text": f"Approved by strategic review: {rationale}" if rationale else "Approved by strategic review",
-            "added_at": _utcnow().isoformat(),
-        })
-        target["notes"] = _cap_list(notes, STRATEGIC_NOTES_HISTORY_MAX, "notes", warnings)
+        notes.append(
+            {
+                "text": f"Approved by strategic review: {rationale}"
+                if rationale
+                else "Approved by strategic review",
+                "added_at": _utcnow().isoformat(),
+            }
+        )
+        target["notes"] = _cap_list(
+            notes, STRATEGIC_NOTES_HISTORY_MAX, "notes", warnings
+        )
         project.directions = directions
         flag_modified(project, "directions")
         session.add(project)
         ctx = task.context or {}
-        task.context = {**ctx, "_strategic_proposals_approved": ctx.get("_strategic_proposals_approved", 0) + 1}
+        task.context = {
+            **ctx,
+            "_strategic_proposals_approved": ctx.get("_strategic_proposals_approved", 0)
+            + 1,
+        }
         flag_modified(task, "context")
         session.add(task)
         await session.commit()
-        logger.info(f"[STRATEGIC API] Approved proposal {dir_id} for project {project.id}")
-        return _resp({"status": "ok", "op": "approve_direction", "direction_id": dir_id})
+        logger.info(
+            f"[STRATEGIC API] Approved proposal {dir_id} for project {project.id}"
+        )
+        return _resp(
+            {"status": "ok", "op": "approve_direction", "direction_id": dir_id}
+        )
 
     elif payload.op == "reject_direction":
         # Reject a proposal — replace with a tombstone (status='rejected') so the
@@ -2315,14 +2914,21 @@ async def strategic_operation(
         dir_id = data.get("direction_id")
         if not dir_id:
             raise HTTPException(status_code=400, detail="direction_id required")
-        rationale = _cap_str(data.get("rationale", ""), STRATEGIC_RATIONALE_MAX, "rationale", warnings)
+        rationale = _cap_str(
+            data.get("rationale", ""), STRATEGIC_RATIONALE_MAX, "rationale", warnings
+        )
         directions = list(project.directions or [])
         target = next((d for d in directions if d.get("id") == dir_id), None)
         if not target:
             raise HTTPException(status_code=404, detail=f"Direction {dir_id} not found")
         if target.get("status") != "proposed":
             return JSONResponse(
-                content=_resp({"status": "skipped", "reason": f"Direction is '{target.get('status')}', not 'proposed'"}),
+                content=_resp(
+                    {
+                        "status": "skipped",
+                        "reason": f"Direction is '{target.get('status')}', not 'proposed'",
+                    }
+                ),
                 status_code=409,
             )
         rejected_text = (target.get("text") or "")[:200].strip()
@@ -2353,7 +2959,9 @@ async def strategic_operation(
         vm_ids_to_delete: List[str] = []
         for t in cancelled_tasks:
             t.status = TaskStatus.CANCELLED
-            t.latest_status_message = f"Cancelled: proposal {dir_id} was rejected by strategic review"
+            t.latest_status_message = (
+                f"Cancelled: proposal {dir_id} was rejected by strategic review"
+            )
             session.add(t)
             if t.vm_instance_id:
                 vm_ids_to_delete.append(t.vm_instance_id)
@@ -2361,20 +2969,35 @@ async def strategic_operation(
         flag_modified(project, "directions")
         session.add(project)
         ctx = task.context or {}
-        task.context = {**ctx, "_strategic_proposals_rejected": ctx.get("_strategic_proposals_rejected", 0) + 1}
+        task.context = {
+            **ctx,
+            "_strategic_proposals_rejected": ctx.get("_strategic_proposals_rejected", 0)
+            + 1,
+        }
         flag_modified(task, "context")
         session.add(task)
         await session.commit()
         for vm_id in vm_ids_to_delete:
             await _ensure_vm_deleted(vm_id, reason="proposal_rejected")
-        logger.info(f"[STRATEGIC API] Rejected proposal {dir_id} for project {project.id} (cancelled {len(cancelled_tasks)} tasks)")
-        return _resp({"status": "ok", "op": "reject_direction", "direction_id": dir_id, "cancelled_tasks": len(cancelled_tasks)})
+        logger.info(
+            f"[STRATEGIC API] Rejected proposal {dir_id} for project {project.id} (cancelled {len(cancelled_tasks)} tasks)"
+        )
+        return _resp(
+            {
+                "status": "ok",
+                "op": "reject_direction",
+                "direction_id": dir_id,
+                "cancelled_tasks": len(cancelled_tasks),
+            }
+        )
 
     elif payload.op == "create_message":
         raw_content = str(data.get("content", "")).strip()
         if not raw_content:
             raise HTTPException(status_code=400, detail="Message content required")
-        content = _cap_str(raw_content, STRATEGIC_MESSAGE_CONTENT_MAX, "content", warnings)
+        content = _cap_str(
+            raw_content, STRATEGIC_MESSAGE_CONTENT_MAX, "content", warnings
+        )
         try:
             msg_type = MessageType(str(data.get("type", "NOTE")).upper())
         except ValueError:
@@ -2391,10 +3014,17 @@ async def strategic_operation(
         await session.commit()
         # Broadcast so the UI can update immediately instead of waiting for poll
         await broadcast_to_project(
-            str(project.id), "message_created",
-            {"message_id": str(new_msg.id), "type": msg_type.value, "from": "strategic"},
+            str(project.id),
+            "message_created",
+            {
+                "message_id": str(new_msg.id),
+                "type": msg_type.value,
+                "from": "strategic",
+            },
         )
-        return _resp({"status": "ok", "op": "create_message", "message_id": str(new_msg.id)})
+        return _resp(
+            {"status": "ok", "op": "create_message", "message_id": str(new_msg.id)}
+        )
 
     elif payload.op == "resolve_message":
         msg_id = data.get("message_id")
@@ -2410,11 +3040,15 @@ async def strategic_operation(
             return _resp({"status": "already_resolved"})
         msg.status = "resolved"
         resolution_raw = data.get("resolution", "Addressed by strategic review")
-        msg.resolution = _cap_str(resolution_raw, STRATEGIC_RESOLUTION_MAX, "resolution", warnings)
+        msg.resolution = _cap_str(
+            resolution_raw, STRATEGIC_RESOLUTION_MAX, "resolution", warnings
+        )
         msg.resolved_at = _utcnow()
         session.add(msg)
         await session.commit()
-        return _resp({"status": "ok", "op": "resolve_message", "message_id": str(msg.id)})
+        return _resp(
+            {"status": "ok", "op": "resolve_message", "message_id": str(msg.id)}
+        )
 
     elif payload.op == "spawn_task":
         # Allow strategic review to directly spawn a research or plan task for
@@ -2441,7 +3075,9 @@ async def strategic_operation(
         if direction_id and not any(
             d.get("id") == direction_id for d in (project.directions or [])
         ):
-            raise HTTPException(status_code=400, detail=f"Unknown direction_id: {direction_id}")
+            raise HTTPException(
+                status_code=400, detail=f"Unknown direction_id: {direction_id}"
+            )
 
         # Build payload — use the same validator the research/plan spawners use
         # so the new task is indistinguishable from normal autonomous spawns
@@ -2456,7 +3092,9 @@ async def strategic_operation(
             spawn_payload["direction_id"] = direction_id
         # Apply per-type model/effort defaults
         type_model = _runtime_config.get("task_type_models", {}).get(spawn_type) or None
-        type_effort = _runtime_config.get("task_type_efforts", {}).get(spawn_type) or None
+        type_effort = (
+            _runtime_config.get("task_type_efforts", {}).get(spawn_type) or None
+        )
         if type_model:
             spawn_payload["model"] = type_model
         if type_effort:
@@ -2498,13 +3136,15 @@ async def strategic_operation(
             f"[STRATEGIC API] Spawned {spawn_type} task {new_task.id} "
             f"(priority=100) from strategic review {task.id} for project {project.id}"
         )
-        return _resp({
-            "status": "ok",
-            "op": "spawn_task",
-            "task_id": str(new_task.id),
-            "type": spawn_type,
-            "priority": 100,
-        })
+        return _resp(
+            {
+                "status": "ok",
+                "op": "spawn_task",
+                "task_id": str(new_task.id),
+                "type": spawn_type,
+                "priority": 100,
+            }
+        )
 
     elif payload.op == "set_problem_model":
         # Full-model replacement. Validated and merged via apply_agent_update:
@@ -2514,8 +3154,11 @@ async def strategic_operation(
         from pydantic import ValidationError as _PmValidationError
 
         from app.problem_model import apply_agent_update
+
         if not isinstance(data, dict):
-            raise HTTPException(status_code=400, detail="problem_model must be an object")
+            raise HTTPException(
+                status_code=400, detail="problem_model must be an object"
+            )
         try:
             new_pm_raw, pm_diff = apply_agent_update(
                 current_raw=project.problem_model,
@@ -2523,12 +3166,18 @@ async def strategic_operation(
                 now_iso=_utcnow().isoformat(),
             )
         except _PmValidationError as ve:
-            raise HTTPException(status_code=400, detail=f"Invalid problem_model: {ve}") from None
+            raise HTTPException(
+                status_code=400, detail=f"Invalid problem_model: {ve}"
+            ) from None
         project.problem_model = new_pm_raw
         flag_modified(project, "problem_model")
         session.add(project)
         ctx = task.context or {}
-        task.context = {**ctx, "_strategic_api_called": True, "_strategic_problem_model_set": True}
+        task.context = {
+            **ctx,
+            "_strategic_api_called": True,
+            "_strategic_problem_model_set": True,
+        }
         flag_modified(task, "context")
         session.add(task)
         await session.commit()
@@ -2536,12 +3185,14 @@ async def strategic_operation(
             f"[STRATEGIC API] problem_model updated for project {project.id} "
             f"to revision {new_pm_raw.get('revision')} ({pm_diff or 'no diff'})"
         )
-        return _resp({
-            "status": "ok",
-            "op": "set_problem_model",
-            "revision": new_pm_raw.get("revision"),
-            "diff": pm_diff,
-        })
+        return _resp(
+            {
+                "status": "ok",
+                "op": "set_problem_model",
+                "revision": new_pm_raw.get("revision"),
+                "diff": pm_diff,
+            }
+        )
 
     elif payload.op == "set_running_update":
         # Replace project.running_update with a single markdown document the
@@ -2558,7 +3209,11 @@ async def strategic_operation(
         project.running_update = doc
         session.add(project)
         ctx = task.context or {}
-        task.context = {**ctx, "_strategic_api_called": True, "_strategic_running_update_set": True}
+        task.context = {
+            **ctx,
+            "_strategic_api_called": True,
+            "_strategic_running_update_set": True,
+        }
         flag_modified(task, "context")
         session.add(task)
         await session.commit()
@@ -2566,11 +3221,13 @@ async def strategic_operation(
             f"[STRATEGIC API] Set running_update for project {project.id} "
             f"(length: {len(doc)} chars)"
         )
-        return _resp({
-            "status": "ok",
-            "op": "set_running_update",
-            "length": len(doc),
-        })
+        return _resp(
+            {
+                "status": "ok",
+                "op": "set_running_update",
+                "length": len(doc),
+            }
+        )
 
     elif payload.op == "reflect":
         # Append a self-reflection entry to project.self_reflection_log.
@@ -2578,17 +3235,26 @@ async def strategic_operation(
         from pydantic import ValidationError as _SrValidationError
 
         from app.problem_model import SelfReflectionEntry, append_self_reflection
+
         if not isinstance(data, dict):
-            raise HTTPException(status_code=400, detail="self_reflection entry must be an object")
+            raise HTTPException(
+                status_code=400, detail="self_reflection entry must be an object"
+            )
         try:
-            entry = SelfReflectionEntry.model_validate({
-                "ts": _utcnow().isoformat(),
-                "cycle_task_id": str(task.id),
-                **data,
-            })
+            entry = SelfReflectionEntry.model_validate(
+                {
+                    "ts": _utcnow().isoformat(),
+                    "cycle_task_id": str(task.id),
+                    **data,
+                }
+            )
         except _SrValidationError as ve:
-            raise HTTPException(status_code=400, detail=f"Invalid self_reflection entry: {ve}") from None
-        project.self_reflection_log = append_self_reflection(project.self_reflection_log, entry)
+            raise HTTPException(
+                status_code=400, detail=f"Invalid self_reflection entry: {ve}"
+            ) from None
+        project.self_reflection_log = append_self_reflection(
+            project.self_reflection_log, entry
+        )
         flag_modified(project, "self_reflection_log")
         session.add(project)
         ctx = task.context or {}
@@ -2600,11 +3266,13 @@ async def strategic_operation(
             f"[STRATEGIC API] Appended self_reflection for project {project.id} "
             f"(log size: {len(project.self_reflection_log)})"
         )
-        return _resp({
-            "status": "ok",
-            "op": "reflect",
-            "log_size": len(project.self_reflection_log),
-        })
+        return _resp(
+            {
+                "status": "ok",
+                "op": "reflect",
+                "log_size": len(project.self_reflection_log),
+            }
+        )
 
     elif payload.op == "pending_confirm":
         # Add a pending_user_confirmation item to the problem_model.
@@ -2616,16 +3284,23 @@ async def strategic_operation(
             PendingConfirmation,
             parse_problem_model,
         )
+
         if not isinstance(data, dict):
-            raise HTTPException(status_code=400, detail="pending_confirmation must be an object")
+            raise HTTPException(
+                status_code=400, detail="pending_confirmation must be an object"
+            )
         try:
-            pending = PendingConfirmation.model_validate({
-                "id": data.get("id") or f"p-{uuid.uuid4().hex[:8]}",
-                "created_at": _utcnow().isoformat(),
-                **data,
-            })
+            pending = PendingConfirmation.model_validate(
+                {
+                    "id": data.get("id") or f"p-{uuid.uuid4().hex[:8]}",
+                    "created_at": _utcnow().isoformat(),
+                    **data,
+                }
+            )
         except _PcValidationError as ve:
-            raise HTTPException(status_code=400, detail=f"Invalid pending_confirmation: {ve}") from None
+            raise HTTPException(
+                status_code=400, detail=f"Invalid pending_confirmation: {ve}"
+            ) from None
         current_model = parse_problem_model(project.problem_model)
         current_model.pending_user_confirmation.append(pending)
         project.problem_model = current_model.model_dump()
@@ -2639,11 +3314,13 @@ async def strategic_operation(
         logger.info(
             f"[STRATEGIC API] Added pending_confirmation '{pending.id}' to project {project.id}"
         )
-        return _resp({
-            "status": "ok",
-            "op": "pending_confirm",
-            "id": pending.id,
-        })
+        return _resp(
+            {
+                "status": "ok",
+                "op": "pending_confirm",
+                "id": pending.id,
+            }
+        )
 
     elif payload.op == "set_retirement_critiques":
         # Store structured critique(s) of retired directions so the completion
@@ -2661,12 +3338,14 @@ async def strategic_operation(
                 pattern = str(item.get("pattern_that_produced_it", "")).strip()
                 lesson = str(item.get("lesson", "")).strip()
                 if direction_id and what_addressed and pattern and lesson:
-                    cleaned.append({
-                        "direction_id": direction_id[:64],
-                        "what_it_addressed": what_addressed[:500],
-                        "pattern_that_produced_it": pattern[:500],
-                        "lesson": lesson[:300],
-                    })
+                    cleaned.append(
+                        {
+                            "direction_id": direction_id[:64],
+                            "what_it_addressed": what_addressed[:500],
+                            "pattern_that_produced_it": pattern[:500],
+                            "lesson": lesson[:300],
+                        }
+                    )
             critiques = cleaned
         else:
             raise HTTPException(
@@ -2707,7 +3386,10 @@ if os.path.exists(static_dir):
     # Use api_route to handle all methods — prevents 405 for missing API routes
     # (a GET-only catch-all causes Starlette to return 405 for POST/PATCH/DELETE
     # on paths not registered in any router, even if those paths start with "api/")
-    @app.api_route("/{full_path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])
+    @app.api_route(
+        "/{full_path:path}",
+        methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"],
+    )
     async def serve_spa(full_path: str, request: Request = None):
         # Don't intercept API routes or WebSocket upgrade requests
         if full_path.startswith("api/"):

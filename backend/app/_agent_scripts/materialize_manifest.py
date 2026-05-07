@@ -13,6 +13,7 @@ semantics are unambiguous — the 0bcfd031 / c94d6d9b post-mortem traced
 a multi-hour outage to Python f-string interpolation mangling the
 inline heredoc's backslash escapes, causing SyntaxError on every VM.
 """
+
 from __future__ import annotations
 
 import json

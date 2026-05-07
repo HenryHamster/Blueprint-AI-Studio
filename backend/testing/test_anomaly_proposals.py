@@ -3,6 +3,7 @@
 These tests do not require a database — all DB calls are mocked.
 Run with: bash scripts/test-backend.sh testing/test_anomaly_proposals.py --standalone
 """
+
 import uuid
 from datetime import timedelta
 from unittest.mock import AsyncMock, MagicMock
@@ -73,6 +74,7 @@ def _clean_persistent_anomalies():
 # Persistent anomaly tracking in _compute_research_anomalies
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_anomalies_tracked_in_shared_state():
     """Detected anomalies should be persisted in _shared_state.persistent_anomalies."""
@@ -123,7 +125,10 @@ async def test_occurrence_count_increments_across_calls():
         await _compute_research_anomalies(project_id, session)
 
     proj_key = str(project_id)
-    assert _shared_state.persistent_anomalies[proj_key]["CODE_ERROR"]["occurrence_count"] == 3
+    assert (
+        _shared_state.persistent_anomalies[proj_key]["CODE_ERROR"]["occurrence_count"]
+        == 3
+    )
 
 
 @pytest.mark.asyncio
@@ -182,6 +187,7 @@ async def test_recent_unseen_anomaly_not_expired():
 # _check_anomaly_proposals
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_proposal_created_after_3_occurrences():
     """Anomaly with occurrence_count >= 3 generates a direction proposal."""
@@ -214,7 +220,10 @@ async def test_proposal_created_after_3_occurrences():
     assert d["priority"] == "high"
 
     # Occurrence count should be reset
-    assert _shared_state.persistent_anomalies[proj_key]["CODE_ERROR"]["occurrence_count"] == 0
+    assert (
+        _shared_state.persistent_anomalies[proj_key]["CODE_ERROR"]["occurrence_count"]
+        == 0
+    )
 
 
 @pytest.mark.asyncio
@@ -327,11 +336,13 @@ async def test_duplicate_proposal_skipped():
     }
 
     # Existing direction that overlaps with the proposal text
-    existing = [{
-        "id": "d-existing1",
-        "text": "Investigate and reduce CODE_ERROR task failures in the pipeline",
-        "status": "active",
-    }]
+    existing = [
+        {
+            "id": "d-existing1",
+            "text": "Investigate and reduce CODE_ERROR task failures in the pipeline",
+            "status": "active",
+        }
+    ]
     project = make_project(directions=existing)
     project.id = project_id
     session = _make_proposal_session()
@@ -413,7 +424,12 @@ async def test_end_to_end_3_cycles_generates_proposal():
         await _compute_research_anomalies(project_id, session)
 
     proj_key = str(project_id)
-    assert _shared_state.persistent_anomalies[proj_key]["PROVISION_FAILURE"]["occurrence_count"] == 3
+    assert (
+        _shared_state.persistent_anomalies[proj_key]["PROVISION_FAILURE"][
+            "occurrence_count"
+        ]
+        == 3
+    )
 
     # Now check for proposals
     project.id = project_id
@@ -425,12 +441,18 @@ async def test_end_to_end_3_cycles_generates_proposal():
     assert "PROVISION_FAILURE" in project.directions[0]["text"]
 
     # Occurrence count reset after proposal
-    assert _shared_state.persistent_anomalies[proj_key]["PROVISION_FAILURE"]["occurrence_count"] == 0
+    assert (
+        _shared_state.persistent_anomalies[proj_key]["PROVISION_FAILURE"][
+            "occurrence_count"
+        ]
+        == 0
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Direction-level anomaly tracking and proposals
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_direction_anomalies_tracked_with_unique_keys():
@@ -502,7 +524,12 @@ async def test_direction_anomaly_proposal_after_3_occurrences():
     assert d["status"] == "proposed"
     assert d["proposed_by"] == "ANOMALY_DETECTOR"
     assert "Direction_d-test0001" in d["text"]
-    assert _shared_state.persistent_anomalies[proj_key]["Direction_d-test0001"]["occurrence_count"] == 0
+    assert (
+        _shared_state.persistent_anomalies[proj_key]["Direction_d-test0001"][
+            "occurrence_count"
+        ]
+        == 0
+    )
 
 
 @pytest.mark.asyncio
@@ -548,6 +575,7 @@ async def test_multiple_direction_anomalies_tracked_independently():
 # _expire_stale_proposals
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def _make_expire_session(projects: list):
     """Build a mock AsyncSession whose execute returns the given projects."""
     session = AsyncMock()
@@ -592,12 +620,14 @@ async def test_expire_recent_proposal_preserved():
     recent_iso = (now - timedelta(days=5)).isoformat()
     project = make_project(
         autonomous_enabled=True,
-        directions=[{
-            "id": "d-recent",
-            "text": "recent proposal",
-            "status": "proposed",
-            "proposed_at": recent_iso,
-        }],
+        directions=[
+            {
+                "id": "d-recent",
+                "text": "recent proposal",
+                "status": "proposed",
+                "proposed_at": recent_iso,
+            }
+        ],
     )
     session = _make_expire_session(projects=[project])
     count = await _expire_stale_proposals(session)
@@ -614,12 +644,14 @@ async def test_expire_old_proposal_marked_expired():
     old_iso = (now - timedelta(days=40)).isoformat()
     project = make_project(
         autonomous_enabled=True,
-        directions=[{
-            "id": "d-old",
-            "text": "old proposal",
-            "status": "proposed",
-            "proposed_at": old_iso,
-        }],
+        directions=[
+            {
+                "id": "d-old",
+                "text": "old proposal",
+                "status": "proposed",
+                "proposed_at": old_iso,
+            }
+        ],
     )
     session = _make_expire_session(projects=[project])
     count = await _expire_stale_proposals(session)
@@ -638,7 +670,12 @@ async def test_expire_ignores_non_proposed_directions():
         autonomous_enabled=True,
         directions=[
             {"id": "d-active", "text": "a", "status": "active", "proposed_at": old_iso},
-            {"id": "d-expired", "text": "b", "status": "expired", "proposed_at": old_iso},
+            {
+                "id": "d-expired",
+                "text": "b",
+                "status": "expired",
+                "proposed_at": old_iso,
+            },
         ],
     )
     session = _make_expire_session(projects=[project])
@@ -659,20 +696,42 @@ async def test_expire_multiple_projects_mixed():
     p1 = make_project(
         autonomous_enabled=True,
         directions=[
-            {"id": "d-p1-old", "text": "x", "status": "proposed", "proposed_at": old_iso},
-            {"id": "d-p1-new", "text": "y", "status": "proposed", "proposed_at": recent_iso},
+            {
+                "id": "d-p1-old",
+                "text": "x",
+                "status": "proposed",
+                "proposed_at": old_iso,
+            },
+            {
+                "id": "d-p1-new",
+                "text": "y",
+                "status": "proposed",
+                "proposed_at": recent_iso,
+            },
         ],
     )
     p2 = make_project(
         autonomous_enabled=True,
         directions=[
-            {"id": "d-p2-old1", "text": "z", "status": "proposed", "proposed_at": old_iso},
-            {"id": "d-p2-old2", "text": "w", "status": "proposed", "proposed_at": old_iso},
+            {
+                "id": "d-p2-old1",
+                "text": "z",
+                "status": "proposed",
+                "proposed_at": old_iso,
+            },
+            {
+                "id": "d-p2-old2",
+                "text": "w",
+                "status": "proposed",
+                "proposed_at": old_iso,
+            },
         ],
     )
     p3 = make_project(
         autonomous_enabled=True,
-        directions=[{"id": "d-p3", "text": "v", "status": "proposed", "proposed_at": recent_iso}],
+        directions=[
+            {"id": "d-p3", "text": "v", "status": "proposed", "proposed_at": recent_iso}
+        ],
     )
     session = _make_expire_session(projects=[p1, p2, p3])
     count = await _expire_stale_proposals(session)

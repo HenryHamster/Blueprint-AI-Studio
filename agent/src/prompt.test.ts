@@ -3623,6 +3623,8 @@ describe('writeCodeChangeHelpers — self-review fallback', () => {
     expect(checkScript).toContain('$HOME/.cache/ms-playwright');
     expect(checkScript).toContain('npx playwright install chromium');
     expect(checkScript).toContain('npx playwright install --with-deps chromium');
+    expect(checkScript).toContain('Retrying inside');
+    expect(checkScript).toContain('mcr.microsoft.com/playwright:v1.59.1-jammy');
     expect(checkScript).not.toContain('npm run test:run');
     expect(checkScript.indexOf('admin-ui playwright chromium')).toBeLessThan(checkScript.indexOf('admin-ui viewport'));
     expect(checkScript.indexOf('admin-ui viewport')).toBeLessThan(checkScript.indexOf('admin-ui build'));

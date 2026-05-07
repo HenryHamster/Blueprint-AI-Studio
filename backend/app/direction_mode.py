@@ -79,7 +79,10 @@ def maybe_auto_clear_mode(
         return False
 
     meta = direction.get(_RECOMMENDED_MODE_META_KEY) or {}
-    if not isinstance(meta, dict) or meta.get("source") not in _AUTO_CLEAR_CLEARABLE_SOURCES:
+    if (
+        not isinstance(meta, dict)
+        or meta.get("source") not in _AUTO_CLEAR_CLEARABLE_SOURCES
+    ):
         # Operator-pinned or unknown provenance — never auto-clear.
         return False
 

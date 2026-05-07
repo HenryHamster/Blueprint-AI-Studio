@@ -24,6 +24,7 @@ Directions remain first-class entities in the DB. Each direction carries
 a ``gap_id`` pointer linking it to the gap it attempts to close; moves
 are a projected view over directions, not a separate store.
 """
+
 from __future__ import annotations
 
 from typing import Any, Literal
@@ -113,6 +114,7 @@ class ProjectContext(BaseModel):
 # ---------------------------------------------------------------------------
 # Capabilities
 # ---------------------------------------------------------------------------
+
 
 class Capability(BaseModel):
     """A functional thing the codebase currently does (or plans to)."""
@@ -252,6 +254,7 @@ class PendingConfirmation(BaseModel):
 # Revision log
 # ---------------------------------------------------------------------------
 
+
 class RevisionLogEntry(BaseModel):
     """One entry describing what changed in a given revision.
 
@@ -269,6 +272,7 @@ class RevisionLogEntry(BaseModel):
 # ---------------------------------------------------------------------------
 # Top-level model
 # ---------------------------------------------------------------------------
+
 
 class ProblemModel(BaseModel):
     """The strategic layer's durable model of a project.
@@ -341,6 +345,7 @@ class SelfReflectionEntry(BaseModel):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def parse_problem_model(raw: dict | None) -> ProblemModel:
     """Safely parse a JSONB blob into a ProblemModel.
@@ -421,6 +426,7 @@ def is_empty(model: ProblemModel) -> bool:
 # Diff helpers
 # ---------------------------------------------------------------------------
 
+
 def _compute_diff(current: ProblemModel, proposed: ProblemModel) -> dict[str, Any]:
     """Compare two model states and return a compact change summary.
 
@@ -429,8 +435,7 @@ def _compute_diff(current: ProblemModel, proposed: ProblemModel) -> dict[str, An
     cur_gap_ids = {g.id for g in current.gaps}
     prop_gap_ids = {g.id for g in proposed.gaps}
     prop_closed_ids = {
-        g.id for g in proposed.gaps
-        if g.status in ("closed", "abandoned")
+        g.id for g in proposed.gaps if g.status in ("closed", "abandoned")
     }
 
     diff: dict[str, Any] = {}
@@ -462,7 +467,8 @@ def _compute_diff(current: ProblemModel, proposed: ProblemModel) -> dict[str, An
     cur_cap_status = {c.name: c.status for c in current.capabilities}
     prop_cap_status = {c.name: c.status for c in proposed.capabilities}
     cap_changes = [
-        name for name, status in prop_cap_status.items()
+        name
+        for name, status in prop_cap_status.items()
         if cur_cap_status.get(name) != status
     ]
     if cap_changes:
@@ -492,6 +498,7 @@ def _diff_summary(diff: dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 # Agent update application
 # ---------------------------------------------------------------------------
+
 
 def apply_agent_update(
     current_raw: dict | None,

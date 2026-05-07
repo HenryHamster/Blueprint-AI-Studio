@@ -88,10 +88,12 @@ _DEFAULT_TIER_MODELS = {
 # than prefix match: the research showed prefix matching would have
 # reopened the 400 on codex variants and on older models with no
 # documented flex tier.
-_FLEX_SUPPORTED_MODELS: frozenset[str] = frozenset({
-    "gpt-5.4",
-    "gpt-5.4-mini",
-})
+_FLEX_SUPPORTED_MODELS: frozenset[str] = frozenset(
+    {
+        "gpt-5.4",
+        "gpt-5.4-mini",
+    }
+)
 
 
 def _model_supports_flex(model: str | None) -> bool:
@@ -121,7 +123,9 @@ class OpenAIProvider(LLMProvider):
                 raise ValueError("OpenAI API key should start with 'sk-'")
             if not _API_KEY_RE.fullmatch(secret):
                 raise ValueError("OpenAI API key contains invalid characters")
-            return ValidationResult(secret=secret, provider_metadata=dict(provider_metadata or {}))
+            return ValidationResult(
+                secret=secret, provider_metadata=dict(provider_metadata or {})
+            )
         # OAuth: Codex expects auth.json with a nested `tokens` object.
         # A plain API key or ChatGPT session cookie will parse as JSON but
         # Codex will fail opaquely at runtime — reject here with a clear
@@ -135,10 +139,14 @@ class OpenAIProvider(LLMProvider):
             )
         if not tokens.get("access_token"):
             raise ValueError("Codex OAuth auth.json missing tokens.access_token")
-        return ValidationResult(secret=raw, provider_metadata=dict(provider_metadata or {}))
+        return ValidationResult(
+            secret=raw, provider_metadata=dict(provider_metadata or {})
+        )
 
     def tier_to_model(self, tier: str, runtime_config: Mapping[str, Any]) -> str | None:
-        return tier_model_from_runtime_config(self.name, tier, runtime_config, _DEFAULT_TIER_MODELS)
+        return tier_model_from_runtime_config(
+            self.name, tier, runtime_config, _DEFAULT_TIER_MODELS
+        )
 
     def rate_limit_patterns(self, auth_mode: LLMAuthMode) -> tuple[str, ...]:
         self.ensure_supported_auth_mode(auth_mode)
@@ -167,9 +175,13 @@ class OpenAIProvider(LLMProvider):
             auth_path = "/opt/agent/openai/auth.json"
             return SecretMaterial(
                 env={"CODEX_HOME": "/opt/agent/openai"},
-                files=(FileMaterial(path=auth_path, content=secret or "", mode="0600"),),
+                files=(
+                    FileMaterial(path=auth_path, content=secret or "", mode="0600"),
+                ),
             )
-        return SecretMaterial(env={"OPENAI_API_KEY": secret or "", "CODEX_API_KEY": secret or ""})
+        return SecretMaterial(
+            env={"OPENAI_API_KEY": secret or "", "CODEX_API_KEY": secret or ""}
+        )
 
     def settings_schema(self) -> dict[str, Any]:
         # Intentionally tight surface: only the knobs worth tuning in practice.
@@ -363,7 +375,9 @@ class OpenAIProvider(LLMProvider):
             logger.warning("[OPENAI] httpx unavailable; skipping list_available_models")
             return None
         try:
-            async with httpx.AsyncClient(timeout=_MODEL_LISTING_TIMEOUT_SECONDS) as client:
+            async with httpx.AsyncClient(
+                timeout=_MODEL_LISTING_TIMEOUT_SECONDS
+            ) as client:
                 resp = await client.get(
                     _OPENAI_LIST_MODELS_URL,
                     headers={"Authorization": f"Bearer {secret}"},

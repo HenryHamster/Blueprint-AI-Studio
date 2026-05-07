@@ -1,4 +1,5 @@
 """Task lifecycle service facade."""
+
 from __future__ import annotations
 
 from collections.abc import Iterable
@@ -196,7 +197,9 @@ class TaskLifecycleService:
                 )
 
             if command.context_patch and not command.context_patch.is_empty:
-                task.context = apply_context_patch(task.context or {}, command.context_patch)
+                task.context = apply_context_patch(
+                    task.context or {}, command.context_patch
+                )
                 flag_modified(task, "context")
 
             if command.message is not None:

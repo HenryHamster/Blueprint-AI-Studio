@@ -13,7 +13,12 @@ from typing import Optional
 
 import app.shared_state as _shared_state
 from app.database import AsyncSessionLocal
-from app.max_plan_pool import _OPUS_MODEL, _account_available_for_model, _account_by_id, infer_provider_for_model
+from app.max_plan_pool import (
+    _OPUS_MODEL,
+    _account_available_for_model,
+    _account_by_id,
+    infer_provider_for_model,
+)
 from app.models import LLMProviderName, Task
 from app.providers.registry import get_provider
 from sqlmodel import select
@@ -76,6 +81,7 @@ async def check_github_health(ext: dict, now: datetime) -> Optional[str]:
     try:
         import httpx
         from app.github import generate_github_app_jwt
+
         jwt_token = generate_github_app_jwt()
         async with httpx.AsyncClient(timeout=10.0) as health_client:
             resp = await health_client.get(
@@ -89,13 +95,20 @@ async def check_github_health(ext: dict, now: datetime) -> Optional[str]:
             return None
         else:
             logger.warning(f"[HEALTH] GitHub API returned {resp.status_code}")
-            ext["errors"]["github_api"] = f"HTTP {resp.status_code} (check: {check_method})"
+            ext["errors"]["github_api"] = (
+                f"HTTP {resp.status_code} (check: {check_method})"
+            )
             return "github_api"
     except Exception as e:
-        logger.warning(f"[HEALTH] GitHub API health check failed: {type(e).__name__}: {e!r}")
+        logger.warning(
+            f"[HEALTH] GitHub API health check failed: {type(e).__name__}: {e!r}"
+        )
         ext["github_api"] = False
-        ext["errors"]["github_api"] = f"{type(e).__name__}: {str(e)[:200]} (check: {check_method})"
+        ext["errors"]["github_api"] = (
+            f"{type(e).__name__}: {str(e)[:200]} (check: {check_method})"
+        )
         return "github_api"
+
 
 def _normalized_provider_name(raw: str | LLMProviderName | None) -> str | None:
     if isinstance(raw, LLMProviderName):
@@ -113,7 +126,10 @@ def _provider_dep_key(provider_name: str | LLMProviderName) -> str:
 
 
 def _has_raw_provider_credentials(provider_name: str) -> bool:
-    return any(bool(os.getenv(env_name)) for env_name in _RAW_PROVIDER_ENV_VARS.get(provider_name, ()))
+    return any(
+        bool(os.getenv(env_name))
+        for env_name in _RAW_PROVIDER_ENV_VARS.get(provider_name, ())
+    )
 
 
 def _dispatch_provider_sets() -> tuple[set[str], set[str]]:
@@ -181,7 +197,9 @@ def _provider_rate_limit_bursting(provider_name: str) -> bool:
     if provider_name != LLMProviderName.ANTHROPIC.value:
         return False
     recent_results = list(_shared_state.deploy_monitoring["task_results"])[-5:]
-    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=_TASK_RESULT_STALENESS_MINUTES)).isoformat()
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(minutes=_TASK_RESULT_STALENESS_MINUTES)
+    ).isoformat()
     fresh_results = [r for r in recent_results if r[0] >= cutoff]
     rate_limit_count = sum(1 for r in fresh_results if r[2] == "RATE_LIMIT")
     return rate_limit_count >= 3
@@ -193,18 +211,33 @@ def get_provider_health_snapshot(provider_name: str | LLMProviderName) -> dict:
         raise ValueError("provider_name is required")
     provider = get_provider(normalized)
     accounts = [
-        account for account in _account_by_id.values()
-        if (_normalized_provider_name(account.get("provider")) or LLMProviderName.ANTHROPIC.value) == normalized
+        account
+        for account in _account_by_id.values()
+        if (
+            _normalized_provider_name(account.get("provider"))
+            or LLMProviderName.ANTHROPIC.value
+        )
+        == normalized
     ]
     raw_credentials = _has_raw_provider_credentials(normalized)
     relevant_providers = _dispatch_relevant_providers()
     dispatch_relevant = normalized in relevant_providers
     configured = dispatch_relevant or bool(accounts) or raw_credentials
-    primary_model = provider.tier_to_model("opus", _shared_state.runtime_config) or _OPUS_MODEL
+    primary_model = (
+        provider.tier_to_model("opus", _shared_state.runtime_config) or _OPUS_MODEL
+    )
 
     enabled_accounts = [account for account in accounts if account.get("enabled", True)]
-    ready_accounts = [account for account in enabled_accounts if provider.account_has_credentials(account)]
-    dispatchable_accounts = [account for account in ready_accounts if _account_available_for_model(account, primary_model)]
+    ready_accounts = [
+        account
+        for account in enabled_accounts
+        if provider.account_has_credentials(account)
+    ]
+    dispatchable_accounts = [
+        account
+        for account in ready_accounts
+        if _account_available_for_model(account, primary_model)
+    ]
 
     status = "inactive"
     reason = None
@@ -247,14 +280,18 @@ def get_provider_health_snapshot(provider_name: str | LLMProviderName) -> dict:
     }
 
 
-def check_provider_api_health(ext: dict, provider_name: str | LLMProviderName) -> Optional[str]:
+def check_provider_api_health(
+    ext: dict, provider_name: str | LLMProviderName
+) -> Optional[str]:
     snapshot = get_provider_health_snapshot(provider_name)
     provider_key = snapshot["provider"]
     dep_key = snapshot["dep_name"]
     ext.setdefault("provider_health", {})[provider_key] = snapshot
     ext[dep_key] = snapshot["status"] != "down"
     if snapshot["status"] == "down" and snapshot["configured"]:
-        ext.setdefault("errors", {})[dep_key] = snapshot["reason"] or "provider unavailable"
+        ext.setdefault("errors", {})[dep_key] = (
+            snapshot["reason"] or "provider unavailable"
+        )
         return dep_key
     ext.setdefault("errors", {}).pop(dep_key, None)
     return None
@@ -268,7 +305,9 @@ def get_dispatch_health_snapshot(ext: dict) -> dict:
     down = []
     inactive = []
     for provider_name in relevant_providers:
-        snapshot = provider_health.get(provider_name) or get_provider_health_snapshot(provider_name)
+        snapshot = provider_health.get(provider_name) or get_provider_health_snapshot(
+            provider_name
+        )
         status = snapshot.get("status", "inactive")
         if status in ("ok", "degraded"):
             available.append(provider_name)
@@ -290,7 +329,9 @@ def get_dispatch_health_snapshot(ext: dict) -> dict:
 
     return {
         "status": status,
-        "fallback_enabled": bool(_shared_state.runtime_config.get("cross_provider_fallback_enabled", False)),
+        "fallback_enabled": bool(
+            _shared_state.runtime_config.get("cross_provider_fallback_enabled", False)
+        ),
         "required_providers": relevant_providers,
         "available_providers": available,
         "degraded_providers": degraded,
@@ -304,14 +345,20 @@ def check_gcp_health(ext: dict) -> Optional[str]:
 
     Returns 'gcp' if failed, None if healthy.
     """
-    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=_TASK_RESULT_STALENESS_MINUTES)).isoformat()
-    fresh_all = [r for r in _shared_state.deploy_monitoring["task_results"] if r[0] >= cutoff]
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(minutes=_TASK_RESULT_STALENESS_MINUTES)
+    ).isoformat()
+    fresh_all = [
+        r for r in _shared_state.deploy_monitoring["task_results"] if r[0] >= cutoff
+    ]
     recent_provisions = [r for r in fresh_all if r[2] == "PROVISION_FAILURE"]
     if len(recent_provisions) >= 3:
         # Check if ALL recent failures are provision failures (guard against empty filter)
         recent_all = fresh_all[-5:]
         recent_failures = [r for r in recent_all if r[1] == "failure"]
-        if recent_failures and all(r[2] == "PROVISION_FAILURE" for r in recent_failures):
+        if recent_failures and all(
+            r[2] == "PROVISION_FAILURE" for r in recent_failures
+        ):
             ext["gcp"] = False
             return "gcp"
     ext["gcp"] = True
@@ -329,10 +376,18 @@ def log_zone_health_transitions(
     for zone in current_exhausted - previous_exhausted:
         logger.warning(
             "zone_health_exhausted",
-            extra={"zone": zone, "available_zones": available_zones, "total_zones": total_zones},
+            extra={
+                "zone": zone,
+                "available_zones": available_zones,
+                "total_zones": total_zones,
+            },
         )
     for zone in previous_exhausted - current_exhausted:
         logger.info(
             "zone_health_recovered",
-            extra={"zone": zone, "available_zones": available_zones, "total_zones": total_zones},
+            extra={
+                "zone": zone,
+                "available_zones": available_zones,
+                "total_zones": total_zones,
+            },
         )

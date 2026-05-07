@@ -8,6 +8,7 @@ Infra failures (PROVISION_FAILURE, RATE_LIMIT, AGENT_TIMEOUT, EXTERNAL_API,
 SCOPE_OVERFLOW) are excluded from both numerator and denominator — they reflect
 infrastructure issues, not account/model quality.
 """
+
 from __future__ import annotations
 
 import uuid as _uuid
@@ -60,15 +61,14 @@ async def compute_provider_model_breakdown(
 
     cutoff = _utcnow() - timedelta(days=7)
     terminal = [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
-    stmt = (
-        select(Task.provider, Task.model, Task.account_id, Task.status, Task.context)
-        .where(
-            Task.created_at >= cutoff,
-            Task.status.in_(terminal),
-            Task.provider.isnot(None),
-            Task.model.isnot(None),
-            Task.account_id.in_(account_ids),
-        )
+    stmt = select(
+        Task.provider, Task.model, Task.account_id, Task.status, Task.context
+    ).where(
+        Task.created_at >= cutoff,
+        Task.status.in_(terminal),
+        Task.provider.isnot(None),
+        Task.model.isnot(None),
+        Task.account_id.in_(account_ids),
     )
     task_rows = (await session.execute(stmt)).all()
 
@@ -96,8 +96,9 @@ async def compute_provider_model_breakdown(
         if valid_uuids:
             rl_rows = (
                 await session.execute(
-                    select(MaxPlanAccount.id, MaxPlanAccount.rate_limit_state)
-                    .where(MaxPlanAccount.id.in_(valid_uuids))
+                    select(MaxPlanAccount.id, MaxPlanAccount.rate_limit_state).where(
+                        MaxPlanAccount.id.in_(valid_uuids)
+                    )
                 )
             ).all()
             for acct_id, rl_state in rl_rows:
@@ -132,23 +133,31 @@ async def compute_provider_model_breakdown(
             "total_tasks": total_tasks,
             "success_count": success_count,
             "success_rate": round(success_count / total_tasks, 4),
-            "distinct_accounts": len({a["account_id"] for a in accounts if a["account_id"]}),
+            "distinct_accounts": len(
+                {a["account_id"] for a in accounts if a["account_id"]}
+            ),
             "project_median_success_rate": round(median, 4),
         }
         if expand_accounts:
             entry["accounts"] = []
             for a in sorted(accounts, key=lambda x: x["total"], reverse=True):
                 acct_rate = round(a["successes"] / a["total"], 4) if a["total"] else 0.0
-                below_median = a["total"] >= 3 and (a["successes"] / a["total"]) < median * 0.8
-                quarantine_status = _quarantine_status(rl_state_by_account, a["account_id"], model)
-                entry["accounts"].append({
-                    "account_id": a["account_id"],
-                    "total_tasks": a["total"],
-                    "success_count": a["successes"],
-                    "success_rate": acct_rate,
-                    "below_median": below_median,
-                    "quarantine_status": quarantine_status,
-                })
+                below_median = (
+                    a["total"] >= 3 and (a["successes"] / a["total"]) < median * 0.8
+                )
+                quarantine_status = _quarantine_status(
+                    rl_state_by_account, a["account_id"], model
+                )
+                entry["accounts"].append(
+                    {
+                        "account_id": a["account_id"],
+                        "total_tasks": a["total"],
+                        "success_count": a["successes"],
+                        "success_rate": acct_rate,
+                        "below_median": below_median,
+                        "quarantine_status": quarantine_status,
+                    }
+                )
         result.append(entry)
 
     result.sort(key=lambda x: x["total_tasks"], reverse=True)
@@ -188,7 +197,9 @@ async def find_account_model_regressions(
     - account_rate < project_median * REGRESSION_RELATIVE_THRESHOLD (0.8)
     - project_median - account_rate >= REGRESSION_ABSOLUTE_THRESHOLD (0.15)
     """
-    rows = await compute_provider_model_breakdown(session, account_ids, expand_accounts=True)
+    rows = await compute_provider_model_breakdown(
+        session, account_ids, expand_accounts=True
+    )
     candidates: list[RegressionCandidate] = []
     for row in rows:
         if row["distinct_accounts"] < 2:

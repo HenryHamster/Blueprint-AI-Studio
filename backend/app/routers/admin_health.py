@@ -1,4 +1,5 @@
 """Unified health overview endpoint."""
+
 import uuid
 import logging
 from typing import Dict, Any, List
@@ -12,7 +13,12 @@ from sqlmodel import select
 from app.database import get_session
 from app.digest_cache import DigestCache, get_digest_cache
 from app.models import (
-    Task, TaskStatus, Project, DeploymentState, DeploymentStatus, _utcnow,
+    Task,
+    TaskStatus,
+    Project,
+    DeploymentState,
+    DeploymentStatus,
+    _utcnow,
 )
 from app.auth import get_current_user, require_admin
 from app.shared_state import external_health, circuit_breakers, get_circuit_breaker
@@ -24,9 +30,7 @@ from app.routers.admin_debug import _build_stuck_tasks
 logger = logging.getLogger(__name__)
 
 router = APIRouter(
-    prefix="/api/admin",
-    tags=["admin-health"],
-    dependencies=[Depends(get_current_user)]
+    prefix="/api/admin", tags=["admin-health"], dependencies=[Depends(get_current_user)]
 )
 
 
@@ -46,7 +50,11 @@ async def get_health_overview(
     request. Cache key is (project_id, lookback_hours) — the response does
     not vary per user. Default TTL 15s; tune in digest_cache.
     """
-    cache_key = ("health-overview", str(project_id) if project_id else None, lookback_hours)
+    cache_key = (
+        "health-overview",
+        str(project_id) if project_id else None,
+        lookback_hours,
+    )
     return await cache.get_or_compute(
         cache_key,
         lambda: _compute_health_overview(
@@ -69,7 +77,9 @@ async def _compute_health_overview(
 
     # --- 1. Success rate ---
     if project_id:
-        health_summary = await compute_pipeline_health_summary(session, project_id, lookback_hours=lookback_hours)
+        health_summary = await compute_pipeline_health_summary(
+            session, project_id, lookback_hours=lookback_hours
+        )
         success_rate_value = health_summary.get("success_rate")
         sr_trend = health_summary.get("trend")
     else:
@@ -81,13 +91,14 @@ async def _compute_health_overview(
         # payloads, plan_output) stay deferred via load_only.
         _XP_LIMIT = 5000
         xp_result = await session.execute(
-            select(Task).where(
+            select(Task)
+            .where(
                 Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
                 Task.created_at >= prev_window_start,
                 Task.archived.is_(False),
-            ).options(
-                load_only(Task.id, Task.status, Task.created_at, Task.status_log)
-            ).limit(_XP_LIMIT)
+            )
+            .options(load_only(Task.id, Task.status, Task.created_at, Task.status_log))
+            .limit(_XP_LIMIT)
         )
         xp_tasks = xp_result.scalars().all()
         if len(xp_tasks) >= _XP_LIMIT:
@@ -95,7 +106,8 @@ async def _compute_health_overview(
                 "[HEALTH-OVERVIEW] success-rate scan hit cap=%d rows over %dh — "
                 "result truncated; consider narrowing the lookback window or "
                 "adding a project_id filter",
-                _XP_LIMIT, lookback_hours * 2,
+                _XP_LIMIT,
+                lookback_hours * 2,
             )
 
         def _derive_at(t: Task):
@@ -106,13 +118,33 @@ async def _compute_health_overview(
                     pass
             return t.created_at
 
-        xp_completed = [t for t in xp_tasks if t.status == TaskStatus.COMPLETED and _derive_at(t) >= window_start]
-        xp_failed = [t for t in xp_tasks if t.status == TaskStatus.FAILED and _derive_at(t) >= window_start]
+        xp_completed = [
+            t
+            for t in xp_tasks
+            if t.status == TaskStatus.COMPLETED and _derive_at(t) >= window_start
+        ]
+        xp_failed = [
+            t
+            for t in xp_tasks
+            if t.status == TaskStatus.FAILED and _derive_at(t) >= window_start
+        ]
         xp_total = len(xp_completed) + len(xp_failed)
-        success_rate_value = round(len(xp_completed) / xp_total, 2) if xp_total > 0 else None
+        success_rate_value = (
+            round(len(xp_completed) / xp_total, 2) if xp_total > 0 else None
+        )
 
-        prev_completed = [t for t in xp_tasks if t.status == TaskStatus.COMPLETED and prev_window_start <= _derive_at(t) < window_start]
-        prev_failed = [t for t in xp_tasks if t.status == TaskStatus.FAILED and prev_window_start <= _derive_at(t) < window_start]
+        prev_completed = [
+            t
+            for t in xp_tasks
+            if t.status == TaskStatus.COMPLETED
+            and prev_window_start <= _derive_at(t) < window_start
+        ]
+        prev_failed = [
+            t
+            for t in xp_tasks
+            if t.status == TaskStatus.FAILED
+            and prev_window_start <= _derive_at(t) < window_start
+        ]
         prev_total = len(prev_completed) + len(prev_failed)
         prev_sr = round(len(prev_completed) / prev_total, 2) if prev_total > 0 else None
         sr_trend: str | None = None
@@ -142,10 +174,20 @@ async def _compute_health_overview(
     if project_id:
         active_filters.append(Task.project_id == project_id)
     active_result = await session.execute(
-        select(Task).where(*active_filters).options(
-            load_only(Task.id, Task.status, Task.title, Task.project_id,
-                      Task.created_at, Task.started_at, Task.last_heartbeat,
-                      Task.vm_instance_id, Task.depends_on)
+        select(Task)
+        .where(*active_filters)
+        .options(
+            load_only(
+                Task.id,
+                Task.status,
+                Task.title,
+                Task.project_id,
+                Task.created_at,
+                Task.started_at,
+                Task.last_heartbeat,
+                Task.vm_instance_id,
+                Task.depends_on,
+            )
         )
     )
     active_tasks = active_result.scalars().all()
@@ -174,138 +216,176 @@ async def _compute_health_overview(
                 hint = f"Zone(s) {', '.join(exhausted)} exhausted. Tasks retry when zones recover."
             else:
                 hint = "VM provisioning timed out. Tasks will be reaped and retried automatically."
-            actionable_issues.append({
-                "severity": "warning",
-                "title": f"{count} task(s) stuck on VM provisioning",
-                "hint": hint,
-                "task_ids": task_ids,
-                "category": "stuck_tasks",
-            })
+            actionable_issues.append(
+                {
+                    "severity": "warning",
+                    "title": f"{count} task(s) stuck on VM provisioning",
+                    "hint": hint,
+                    "task_ids": task_ids,
+                    "category": "stuck_tasks",
+                }
+            )
         elif reason == "no_heartbeat":
-            actionable_issues.append({
-                "severity": "warning",
-                "title": f"{count} task(s) lost heartbeat",
-                "hint": "The reaper will reclaim and retry these tasks automatically.",
-                "task_ids": task_ids,
-                "category": "stuck_tasks",
-            })
+            actionable_issues.append(
+                {
+                    "severity": "warning",
+                    "title": f"{count} task(s) lost heartbeat",
+                    "hint": "The reaper will reclaim and retry these tasks automatically.",
+                    "task_ids": task_ids,
+                    "category": "stuck_tasks",
+                }
+            )
         elif reason == "long_queued":
             if available == 0:
                 hint = "All zones exhausted — no capacity available. Check zone health."
             else:
                 hint = "Tasks queued >30 min. Check whether max_concurrent_vms limit is reached."
-            actionable_issues.append({
-                "severity": "warning",
-                "title": f"{count} task(s) long-queued (>30 min)",
-                "hint": hint,
-                "task_ids": task_ids,
-                "category": "stuck_tasks",
-            })
+            actionable_issues.append(
+                {
+                    "severity": "warning",
+                    "title": f"{count} task(s) long-queued (>30 min)",
+                    "hint": hint,
+                    "task_ids": task_ids,
+                    "category": "stuck_tasks",
+                }
+            )
         elif reason == "stuck_deps":
             all_dep_ids: List[str] = []
             for t in s_tasks:
                 all_dep_ids.extend(t.get("unresolvable_deps", []))
             unique_deps = list(dict.fromkeys(all_dep_ids))
-            dep_str = ", ".join(unique_deps[:5]) + ("..." if len(unique_deps) > 5 else "")
-            actionable_issues.append({
-                "severity": "warning",
-                "title": f"{count} task(s) blocked by failed dependencies",
-                "hint": f"Blocking dep(s): {dep_str}. Cancel or requeue the blocking tasks.",
-                "task_ids": task_ids,
-                "category": "stuck_tasks",
-            })
+            dep_str = ", ".join(unique_deps[:5]) + (
+                "..." if len(unique_deps) > 5 else ""
+            )
+            actionable_issues.append(
+                {
+                    "severity": "warning",
+                    "title": f"{count} task(s) blocked by failed dependencies",
+                    "hint": f"Blocking dep(s): {dep_str}. Cancel or requeue the blocking tasks.",
+                    "task_ids": task_ids,
+                    "category": "stuck_tasks",
+                }
+            )
         elif reason == "evaluation_timeout":
-            actionable_issues.append({
-                "severity": "warning",
-                "title": f"{count} task(s) stuck in evaluation (>2 h)",
-                "hint": "Evaluation exceeded the 2-hour threshold. Consider manual review or cancellation.",
-                "task_ids": task_ids,
-                "category": "stuck_tasks",
-            })
+            actionable_issues.append(
+                {
+                    "severity": "warning",
+                    "title": f"{count} task(s) stuck in evaluation (>2 h)",
+                    "hint": "Evaluation exceeded the 2-hour threshold. Consider manual review or cancellation.",
+                    "task_ids": task_ids,
+                    "category": "stuck_tasks",
+                }
+            )
 
     # --- 3. Circuit breaker ---
     if project_id:
         cb = get_circuit_breaker(str(project_id))
         if cb["state"] == "OPEN":
-            actionable_issues.append({
-                "severity": "critical",
-                "title": "Circuit breaker OPEN — autonomous dispatch halted",
-                "hint": f"Too many consecutive failures tripped the breaker. Auto-recovers after {cb.get('cooldown_seconds', 1800) // 60} min cooldown.",
-                "task_ids": [],
-                "category": "circuit_breaker",
-            })
+            actionable_issues.append(
+                {
+                    "severity": "critical",
+                    "title": "Circuit breaker OPEN — autonomous dispatch halted",
+                    "hint": f"Too many consecutive failures tripped the breaker. Auto-recovers after {cb.get('cooldown_seconds', 1800) // 60} min cooldown.",
+                    "task_ids": [],
+                    "category": "circuit_breaker",
+                }
+            )
         elif cb["state"] == "HALF_OPEN":
-            actionable_issues.append({
-                "severity": "warning",
-                "title": "Circuit breaker HALF_OPEN — testing recovery",
-                "hint": "One test task is running to verify recovery. Monitor for success.",
-                "task_ids": [],
-                "category": "circuit_breaker",
-            })
+            actionable_issues.append(
+                {
+                    "severity": "warning",
+                    "title": "Circuit breaker HALF_OPEN — testing recovery",
+                    "hint": "One test task is running to verify recovery. Monitor for success.",
+                    "task_ids": [],
+                    "category": "circuit_breaker",
+                }
+            )
     else:
         for proj_id, cb in circuit_breakers.items():
             if cb["state"] == "OPEN":
-                actionable_issues.append({
-                    "severity": "critical",
-                    "title": f"Circuit breaker OPEN for project {proj_id[:8]}",
-                    "hint": f"Auto-recovers after {cb.get('cooldown_seconds', 1800) // 60} min cooldown.",
-                    "task_ids": [],
-                    "category": "circuit_breaker",
-                })
+                actionable_issues.append(
+                    {
+                        "severity": "critical",
+                        "title": f"Circuit breaker OPEN for project {proj_id[:8]}",
+                        "hint": f"Auto-recovers after {cb.get('cooldown_seconds', 1800) // 60} min cooldown.",
+                        "task_ids": [],
+                        "category": "circuit_breaker",
+                    }
+                )
             elif cb["state"] == "HALF_OPEN":
-                actionable_issues.append({
-                    "severity": "warning",
-                    "title": f"Circuit breaker HALF_OPEN for project {proj_id[:8]}",
-                    "hint": "One test task running to verify recovery.",
-                    "task_ids": [],
-                    "category": "circuit_breaker",
-                })
+                actionable_issues.append(
+                    {
+                        "severity": "warning",
+                        "title": f"Circuit breaker HALF_OPEN for project {proj_id[:8]}",
+                        "hint": "One test task running to verify recovery.",
+                        "task_ids": [],
+                        "category": "circuit_breaker",
+                    }
+                )
 
     # --- 4. Zone health ---
     exhausted_zones = zone_summary.get("exhausted", [])
     available_zones = zone_summary.get("available", 0)
     total_zones = available_zones + len(exhausted_zones)
     if total_zones > 0 and len(exhausted_zones) > total_zones / 2:
-        actionable_issues.append({
-            "severity": "warning",
-            "title": f"{len(exhausted_zones)}/{total_zones} zones exhausted",
-            "hint": f"Exhausted: {', '.join(exhausted_zones)}. New task dispatch may be delayed.",
-            "task_ids": [],
-            "category": "zone_exhaustion",
-        })
+        actionable_issues.append(
+            {
+                "severity": "warning",
+                "title": f"{len(exhausted_zones)}/{total_zones} zones exhausted",
+                "hint": f"Exhausted: {', '.join(exhausted_zones)}. New task dispatch may be delayed.",
+                "task_ids": [],
+                "category": "zone_exhaustion",
+            }
+        )
 
     # --- 5. External dependency health ---
     failed_deps = external_health.get("failed_deps", [])
     if failed_deps:
-        actionable_issues.append({
-            "severity": "critical",
-            "title": f"External dependency failure: {', '.join(failed_deps)}",
-            "hint": "One or more external services unreachable. Check service status dashboards.",
-            "task_ids": [],
-            "category": "external_dep",
-        })
+        actionable_issues.append(
+            {
+                "severity": "critical",
+                "title": f"External dependency failure: {', '.join(failed_deps)}",
+                "hint": "One or more external services unreachable. Check service status dashboards.",
+                "task_ids": [],
+                "category": "external_dep",
+            }
+        )
 
     # --- 6. Deploy state ---
     deploy_state = await session.get(DeploymentState, 1)
     if deploy_state:
         if deploy_state.status == DeploymentStatus.MONITORING:
-            sha_short = deploy_state.current_sha[:7] if deploy_state.current_sha else "unknown"
-            actionable_issues.append({
-                "severity": "warning",
-                "title": f"Deploy {sha_short} in monitoring window",
-                "hint": "Current deploy is being monitored for stability. Avoid config changes.",
-                "task_ids": [],
-                "category": "deploy_state",
-            })
-        elif deploy_state.status in (DeploymentStatus.PAUSED, DeploymentStatus.ROLLED_BACK, DeploymentStatus.HALTED):
-            reason_msg = deploy_state.pause_reason or deploy_state.rollback_reason or "Manual intervention may be required."
-            actionable_issues.append({
-                "severity": "warning",
-                "title": f"Deploy status: {deploy_state.status}",
-                "hint": reason_msg,
-                "task_ids": [],
-                "category": "deploy_state",
-            })
+            sha_short = (
+                deploy_state.current_sha[:7] if deploy_state.current_sha else "unknown"
+            )
+            actionable_issues.append(
+                {
+                    "severity": "warning",
+                    "title": f"Deploy {sha_short} in monitoring window",
+                    "hint": "Current deploy is being monitored for stability. Avoid config changes.",
+                    "task_ids": [],
+                    "category": "deploy_state",
+                }
+            )
+        elif deploy_state.status in (
+            DeploymentStatus.PAUSED,
+            DeploymentStatus.ROLLED_BACK,
+            DeploymentStatus.HALTED,
+        ):
+            reason_msg = (
+                deploy_state.pause_reason
+                or deploy_state.rollback_reason
+                or "Manual intervention may be required."
+            )
+            actionable_issues.append(
+                {
+                    "severity": "warning",
+                    "title": f"Deploy status: {deploy_state.status}",
+                    "hint": reason_msg,
+                    "task_ids": [],
+                    "category": "deploy_state",
+                }
+            )
 
     # Sort by severity (critical first) and return top 3
     _sev_order = {"critical": 0, "warning": 1, "info": 2}
@@ -342,7 +422,8 @@ async def _compute_health_overview(
 
     for proj in projects_for_dirs:
         active_dirs = [
-            d for d in (proj.directions or [])
+            d
+            for d in (proj.directions or [])
             if d.get("status") not in ("retired", "paused")
         ]
         for d in active_dirs:
@@ -362,7 +443,11 @@ async def _compute_health_overview(
     # --- 9. Queue depth ---
     queue_depth = {
         "queued": sum(1 for t in active_tasks if t.status == TaskStatus.QUEUED),
-        "active": sum(1 for t in active_tasks if t.status in (TaskStatus.IN_PROGRESS, TaskStatus.PROVISIONING)),
+        "active": sum(
+            1
+            for t in active_tasks
+            if t.status in (TaskStatus.IN_PROGRESS, TaskStatus.PROVISIONING)
+        ),
         "evaluating": sum(1 for t in active_tasks if t.status == TaskStatus.EVALUATING),
     }
 
@@ -380,6 +465,7 @@ async def _compute_health_overview(
 # operators can see at a glance: which VMs are alive, what task each is running,
 # how many warm-pinned tasks are queued, and how often the orchestrator is
 # clearing warm pins (a leading indicator of warm-VM instability).
+
 
 @router.get("/warm-vm-state")
 async def get_warm_vm_state(
@@ -426,11 +512,19 @@ async def _compute_warm_vm_state(*, session: AsyncSession) -> Dict[str, Any]:
     in_progress_stmt = (
         select(Task)
         .where(Task.status == TaskStatus.IN_PROGRESS, Task.vm_instance_id.is_not(None))
-        .options(load_only(
-            Task.id, Task.vm_instance_id, Task.title, Task.payloads,
-            Task.status, Task.context, Task.started_at, Task.project_id,
-            Task.status_log,
-        ))
+        .options(
+            load_only(
+                Task.id,
+                Task.vm_instance_id,
+                Task.title,
+                Task.payloads,
+                Task.status,
+                Task.context,
+                Task.started_at,
+                Task.project_id,
+                Task.status_log,
+            )
+        )
         .limit(_WARM_VM_SCAN_LIMIT)
     )
     in_progress_tasks = (await session.execute(in_progress_stmt)).scalars().all()
@@ -464,10 +558,15 @@ async def _compute_warm_vm_state(*, session: AsyncSession) -> Dict[str, Any]:
     pinned_stmt = (
         select(Task)
         .where(*pinned_where)
-        .options(load_only(
-            Task.id, Task.context, Task.payloads, Task.project_id,
-            Task.status_log,
-        ))
+        .options(
+            load_only(
+                Task.id,
+                Task.context,
+                Task.payloads,
+                Task.project_id,
+                Task.status_log,
+            )
+        )
         .limit(_WARM_VM_SCAN_LIMIT)
     )
     pinned_tasks = (await session.execute(pinned_stmt)).scalars().all()
@@ -490,18 +589,25 @@ async def _compute_warm_vm_state(*, session: AsyncSession) -> Dict[str, Any]:
             Task.vm_instance_id.is_not(None),
             Task.last_heartbeat >= now - timedelta(hours=1),
         )
-        .options(load_only(
-            Task.id, Task.vm_instance_id, Task.payloads, Task.last_heartbeat,
-            Task.status, Task.title, Task.status_log,
-        ))
+        .options(
+            load_only(
+                Task.id,
+                Task.vm_instance_id,
+                Task.payloads,
+                Task.last_heartbeat,
+                Task.status,
+                Task.title,
+                Task.status_log,
+            )
+        )
         .order_by(Task.last_heartbeat.desc())
         .limit(_WARM_VM_SCAN_LIMIT)
     )
     completed_tasks = (await session.execute(completed_stmt)).scalars().all()
     if len(completed_tasks) >= _WARM_VM_SCAN_LIMIT:
         logger.warning(
-            "[WARM-VM-STATE] recent completion scan hit cap=%d rows — "
-            "result truncated", _WARM_VM_SCAN_LIMIT,
+            "[WARM-VM-STATE] recent completion scan hit cap=%d rows — result truncated",
+            _WARM_VM_SCAN_LIMIT,
         )
     completed_by_vm: Dict[str, List[Task]] = {}
     for t in completed_tasks:
@@ -510,7 +616,12 @@ async def _compute_warm_vm_state(*, session: AsyncSession) -> Dict[str, Any]:
             if len(bucket) < 5:
                 bucket.append(t)
 
-    all_vms = heartbeat_vms | inprogress_by_vm.keys() | pinned_by_vm.keys() | completed_by_vm.keys()
+    all_vms = (
+        heartbeat_vms
+        | inprogress_by_vm.keys()
+        | pinned_by_vm.keys()
+        | completed_by_vm.keys()
+    )
 
     def _payload_type(t: Task) -> str:
         try:
@@ -548,7 +659,9 @@ async def _compute_warm_vm_state(*, session: AsyncSession) -> Dict[str, Any]:
                 "id": str(cur.id),
                 "title": cur.title or "",
                 "task_type": _payload_type(cur),
-                "status": cur.status.value if hasattr(cur.status, "value") else str(cur.status),
+                "status": cur.status.value
+                if hasattr(cur.status, "value")
+                else str(cur.status),
                 "warm_start": bool(timing.get("warm_start", False)),
                 "prior_role_vm_id": timing.get("prior_role_vm_id"),
                 "setup_secs": timing.get("setup_secs"),
@@ -560,30 +673,42 @@ async def _compute_warm_vm_state(*, session: AsyncSession) -> Dict[str, Any]:
         pinned_out = []
         for t in pinned_by_vm.get(vm_id, []):
             ctx = t.context or {}
-            pinned_out.append({
-                "id": str(t.id),
-                "task_type": _payload_type(t),
-                "warm_target_pr": ctx.get("warm_target_pr") if isinstance(ctx.get("warm_target_pr"), int) else None,
-                "warm_handoff_deadline": ctx.get("warm_handoff_deadline"),
-            })
+            pinned_out.append(
+                {
+                    "id": str(t.id),
+                    "task_type": _payload_type(t),
+                    "warm_target_pr": ctx.get("warm_target_pr")
+                    if isinstance(ctx.get("warm_target_pr"), int)
+                    else None,
+                    "warm_handoff_deadline": ctx.get("warm_handoff_deadline"),
+                }
+            )
 
         recent_out = []
         for t in completed_by_vm.get(vm_id, []):
-            recent_out.append({
-                "id": str(t.id),
-                "task_type": _payload_type(t),
-                "completed_at": t.last_heartbeat.isoformat() if t.last_heartbeat else None,
-                "status": t.status.value if hasattr(t.status, "value") else str(t.status),
-            })
+            recent_out.append(
+                {
+                    "id": str(t.id),
+                    "task_type": _payload_type(t),
+                    "completed_at": t.last_heartbeat.isoformat()
+                    if t.last_heartbeat
+                    else None,
+                    "status": t.status.value
+                    if hasattr(t.status, "value")
+                    else str(t.status),
+                }
+            )
 
-        active_vms_out.append({
-            "vm_instance_id": vm_id,
-            "last_heartbeat": last_hb.isoformat() if last_hb else None,
-            "is_alive": bool(is_alive),
-            "current_task": cur_out,
-            "warm_pinned_queued": pinned_out,
-            "recent_completions": recent_out,
-        })
+        active_vms_out.append(
+            {
+                "vm_instance_id": vm_id,
+                "last_heartbeat": last_hb.isoformat() if last_hb else None,
+                "is_alive": bool(is_alive),
+                "current_task": cur_out,
+                "warm_pinned_queued": pinned_out,
+                "recent_completions": recent_out,
+            }
+        )
 
     # Distinct VMs that currently host an IN_PROGRESS warm-start task.
     active_warm_chains = sum(
@@ -600,6 +725,10 @@ async def _compute_warm_vm_state(*, session: AsyncSession) -> Dict[str, Any]:
             "active_pinned_queued_total": sum(len(v) for v in pinned_by_vm.values()),
             "active_warm_chains": active_warm_chains,
         },
-        "warm_continuity_enabled": bool(_shared_state.runtime_config.get("warm_continuity_enabled", False)),
-        "next_role_poll_timeout_secs": int(_shared_state.runtime_config.get("next_role_poll_timeout_secs", 180)),
+        "warm_continuity_enabled": bool(
+            _shared_state.runtime_config.get("warm_continuity_enabled", False)
+        ),
+        "next_role_poll_timeout_secs": int(
+            _shared_state.runtime_config.get("next_role_poll_timeout_secs", 180)
+        ),
     }

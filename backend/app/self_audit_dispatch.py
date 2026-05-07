@@ -4,6 +4,7 @@ Decouples the audit-decision and audit-spawn code from autonomous_research
 so the larger module stays under its size guardrail. The two entry points
 are imported and called by ``autonomous_research._spawn_research_task_inner``.
 """
+
 from __future__ import annotations
 
 import logging
@@ -30,14 +31,16 @@ def _record_auto_clear_note(direction: dict, cleared_from: str, count: int) -> N
     alongside the self_audit dispatch logic rather than in the general completion module.
     """
     notes = list(direction.get("notes") or [])
-    notes.append({
-        "text": (
-            f"Auto-cleared from '{cleared_from}': system health recovered "
-            f"({count} consecutive 'ship' maturity assessments)"
-        ),
-        "source": "auto_clear",
-        "created_at": _utcnow().isoformat(),
-    })
+    notes.append(
+        {
+            "text": (
+                f"Auto-cleared from '{cleared_from}': system health recovered "
+                f"({count} consecutive 'ship' maturity assessments)"
+            ),
+            "source": "auto_clear",
+            "created_at": _utcnow().isoformat(),
+        }
+    )
     direction["notes"] = notes
 
 
@@ -53,7 +56,8 @@ _SELF_AUDIT_FOCUS_SYSTEMS_CAP = 3
 
 
 async def _should_dispatch_self_audit(
-    project: Project, session: AsyncSession,
+    project: Project,
+    session: AsyncSession,
 ) -> dict | None:
     """Decide whether this tick should dispatch a self_audit task.
 
@@ -101,7 +105,8 @@ async def _should_dispatch_self_audit(
             last_dispatched = None
         if last_dispatched is not None:
             cooldown_h = _runtime_config.get(
-                "self_audit_dispatch_cooldown_hours", 6,
+                "self_audit_dispatch_cooldown_hours",
+                6,
             )
             if (_utcnow() - last_dispatched).total_seconds() < cooldown_h * 3600:
                 # An audit was recently dispatched. Don't queue another
@@ -109,7 +114,8 @@ async def _should_dispatch_self_audit(
                 return None
 
     staleness_days = _runtime_config.get(
-        "self_audit_staleness_days", _SELF_AUDIT_DEFAULT_STALENESS_DAYS,
+        "self_audit_staleness_days",
+        _SELF_AUDIT_DEFAULT_STALENESS_DAYS,
     )
     staleness_cutoff = _utcnow() - timedelta(days=staleness_days)
 
@@ -119,7 +125,7 @@ async def _should_dispatch_self_audit(
     direction_system_ids: set[str] = set()
     dir_mode_by_sid: dict[str, str] = {}
     high_drift_directions: list[str] = []
-    for d in (project.directions or []):
+    for d in project.directions or []:
         sid = d.get("system_id")
         if not sid:
             continue
@@ -140,12 +146,18 @@ async def _should_dispatch_self_audit(
         return None
 
     # Fetch existing maturity rows for every direction system_id.
-    existing = (await session.execute(
-        select(SystemMaturity).where(
-            SystemMaturity.project_id == project.id,
-            SystemMaturity.system_id.in_(direction_system_ids),
+    existing = (
+        (
+            await session.execute(
+                select(SystemMaturity).where(
+                    SystemMaturity.project_id == project.id,
+                    SystemMaturity.system_id.in_(direction_system_ids),
+                )
+            )
         )
-    )).scalars().all()
+        .scalars()
+        .all()
+    )
     by_sid = {row.system_id: row for row in existing}
 
     candidate_systems: list[str] = []
@@ -223,12 +235,14 @@ async def _record_residual_audit_deferral(
     """
     from app.models import ResidualRemediationCase
 
-    case = (await session.execute(
-        select(ResidualRemediationCase).where(
-            ResidualRemediationCase.project_id == project_id,
-            ResidualRemediationCase.fingerprint == fingerprint,
+    case = (
+        await session.execute(
+            select(ResidualRemediationCase).where(
+                ResidualRemediationCase.project_id == project_id,
+                ResidualRemediationCase.fingerprint == fingerprint,
+            )
         )
-    )).scalar_one_or_none()
+    ).scalar_one_or_none()
     if case is None:
         return
     case.audit_defer_count = (case.audit_defer_count or 0) + 1
@@ -244,10 +258,13 @@ async def _record_residual_audit_deferral(
         _RESIDUAL_AUDIT_DEFER_ESCALATION_THRESHOLD,
         post_residual_fix_audit_deferred_escalation_message,
     )
-    threshold = int(_runtime_config.get(
-        'residual_audit_defer_escalation_threshold',
-        _RESIDUAL_AUDIT_DEFER_ESCALATION_THRESHOLD,
-    ))
+
+    threshold = int(
+        _runtime_config.get(
+            "residual_audit_defer_escalation_threshold",
+            _RESIDUAL_AUDIT_DEFER_ESCALATION_THRESHOLD,
+        )
+    )
     if case.audit_defer_count == threshold:
         await post_residual_fix_audit_deferred_escalation_message(
             session,
@@ -258,7 +275,9 @@ async def _record_residual_audit_deferral(
 
 
 async def _spawn_self_audit_task(
-    project: Project, session: AsyncSession, audit_payload: dict,
+    project: Project,
+    session: AsyncSession,
+    audit_payload: dict,
 ) -> bool:
     """Create and queue a self_audit task with focus_systems set.
 
@@ -268,27 +287,44 @@ async def _spawn_self_audit_task(
     ``_should_dispatch_self_audit`` can short-circuit subsequent ticks.
     """
     # Guard: don't queue a second self_audit when one is already in flight.
-    active = (await session.execute(
-        select(func.count()).select_from(Task).where(
-            Task.project_id == project.id,
-            Task.status.in_([
-                TaskStatus.QUEUED, TaskStatus.PROVISIONING,
-                TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING,
-            ]),
+    active = (
+        await session.execute(
+            select(func.count())
+            .select_from(Task)
+            .where(
+                Task.project_id == project.id,
+                Task.status.in_(
+                    [
+                        TaskStatus.QUEUED,
+                        TaskStatus.PROVISIONING,
+                        TaskStatus.IN_PROGRESS,
+                        TaskStatus.EVALUATING,
+                    ]
+                ),
+            )
         )
-    )).scalar() or 0
+    ).scalar() or 0
     if active:
         # Inspect first_payload of recent active tasks to check for a
         # self_audit specifically; cheaper than a JSONB query.
-        active_tasks = (await session.execute(
-            select(Task).where(
-                Task.project_id == project.id,
-                Task.status.in_([
-                    TaskStatus.QUEUED, TaskStatus.PROVISIONING,
-                    TaskStatus.IN_PROGRESS,
-                ]),
+        active_tasks = (
+            (
+                await session.execute(
+                    select(Task).where(
+                        Task.project_id == project.id,
+                        Task.status.in_(
+                            [
+                                TaskStatus.QUEUED,
+                                TaskStatus.PROVISIONING,
+                                TaskStatus.IN_PROGRESS,
+                            ]
+                        ),
+                    )
+                )
             )
-        )).scalars().all()
+            .scalars()
+            .all()
+        )
         for t in active_tasks:
             if (t.first_payload or {}).get("type") == "self_audit":
                 logger.info(
@@ -317,7 +353,8 @@ async def _spawn_self_audit_task(
         payload["max_systems"] = audit_payload["max_systems"]
     try:
         payload = validate_internal_payload(
-            payload, "autonomous_research:self_audit",
+            payload,
+            "autonomous_research:self_audit",
         )
     except PayloadTooLargeError as e:
         logger.warning(
@@ -341,7 +378,8 @@ async def _spawn_self_audit_task(
     session.add(new_task)
     await session.flush()
     history = TaskHistory(
-        task_id=new_task.id, action="SPAWNED",
+        task_id=new_task.id,
+        action="SPAWNED",
         details={
             "spawned_by": "AUTONOMOUS",
             "task_type": "self_audit",

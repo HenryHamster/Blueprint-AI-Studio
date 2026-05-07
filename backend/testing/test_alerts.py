@@ -3,6 +3,7 @@
 Covers: failure alerts, circuit breaker alerts, auto-pause/resume alerts,
 and deduplication logic.
 """
+
 import pytest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
@@ -30,6 +31,7 @@ def _utcnow() -> datetime:
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 async def _all_alerts(db_session, **filters):
     """Return all Alert rows, optionally filtered by column equality."""
     stmt = sql_select(Alert)
@@ -49,6 +51,7 @@ async def _undismissed_alerts(db_session, **filters):
 # Task failure alerts
 # ---------------------------------------------------------------------------
 
+
 class TestFailureAlert:
     """Tests for _maybe_create_failure_alert."""
 
@@ -60,7 +63,9 @@ class TestFailureAlert:
         await db_session.commit()
         await db_session.refresh(project)
 
-        task = make_task(project_id=project.id, status=TaskStatus.FAILED, title="Deploy widget")
+        task = make_task(
+            project_id=project.id, status=TaskStatus.FAILED, title="Deploy widget"
+        )
         db_session.add(task)
         await db_session.commit()
         await db_session.refresh(task)
@@ -122,7 +127,9 @@ class TestFailureAlert:
         assert len(alerts) == 0
 
     @pytest.mark.asyncio
-    async def test_deduplication_skips_if_undismissed_alert_exists(self, db_session, mocker):
+    async def test_deduplication_skips_if_undismissed_alert_exists(
+        self, db_session, mocker
+    ):
         mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
         project = make_project()
         db_session.add(project)
@@ -188,6 +195,7 @@ class TestFailureAlert:
     @pytest.mark.asyncio
     async def test_task_failed_dispatch_payload_is_enriched(self, db_session, mocker):
         import asyncio
+
         mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
         dispatch_mock = mocker.patch(
             "app.notification_dispatch.dispatch_external_notification",
@@ -254,6 +262,7 @@ class TestFailureAlert:
 # Circuit breaker alerts
 # ---------------------------------------------------------------------------
 
+
 class TestCircuitBreakerAlert:
     """Tests for _maybe_create_circuit_breaker_alert."""
 
@@ -270,31 +279,44 @@ class TestCircuitBreakerAlert:
         )
         await db_session.commit()
 
-        alerts = await _undismissed_alerts(db_session, project_id=project.id, severity=AlertSeverity.WARNING)
+        alerts = await _undismissed_alerts(
+            db_session, project_id=project.id, severity=AlertSeverity.WARNING
+        )
         assert len(alerts) == 1
         assert alerts[0].title == "Circuit breaker opened: autonomous tasks paused"
         assert "3 consecutive failures" in alerts[0].message
         assert alerts[0].task_id is None
 
     @pytest.mark.asyncio
-    async def test_deduplication_skips_if_undismissed_alert_exists(self, db_session, mocker):
+    async def test_deduplication_skips_if_undismissed_alert_exists(
+        self, db_session, mocker
+    ):
         mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
         project = make_project()
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
 
-        await _maybe_create_circuit_breaker_alert(project.id, db_session, "first reason")
+        await _maybe_create_circuit_breaker_alert(
+            project.id, db_session, "first reason"
+        )
         await db_session.commit()
 
-        await _maybe_create_circuit_breaker_alert(project.id, db_session, "second reason")
+        await _maybe_create_circuit_breaker_alert(
+            project.id, db_session, "second reason"
+        )
         await db_session.commit()
 
         alerts = await _all_alerts(
-            db_session, project_id=project.id,
+            db_session,
+            project_id=project.id,
         )
         # Filter to circuit breaker alerts specifically
-        cb_alerts = [a for a in alerts if a.title == "Circuit breaker opened: autonomous tasks paused"]
+        cb_alerts = [
+            a
+            for a in alerts
+            if a.title == "Circuit breaker opened: autonomous tasks paused"
+        ]
         assert len(cb_alerts) == 1
         assert "first reason" in cb_alerts[0].message
 
@@ -307,15 +329,23 @@ class TestCircuitBreakerAlert:
         await db_session.refresh(project)
 
         # Create and dismiss first alert
-        await _maybe_create_circuit_breaker_alert(project.id, db_session, "first reason")
+        await _maybe_create_circuit_breaker_alert(
+            project.id, db_session, "first reason"
+        )
         await db_session.commit()
 
-        first = (await db_session.execute(
-            sql_select(Alert).where(
-                Alert.project_id == project.id,
-                Alert.dismissed_at.is_(None),
+        first = (
+            (
+                await db_session.execute(
+                    sql_select(Alert).where(
+                        Alert.project_id == project.id,
+                        Alert.dismissed_at.is_(None),
+                    )
+                )
             )
-        )).scalars().first()
+            .scalars()
+            .first()
+        )
         first.dismissed_at = _utcnow()
         db_session.add(first)
         await db_session.commit()
@@ -325,7 +355,8 @@ class TestCircuitBreakerAlert:
         await db_session.commit()
 
         all_cb = [
-            a for a in await _all_alerts(db_session, project_id=project.id)
+            a
+            for a in await _all_alerts(db_session, project_id=project.id)
             if a.title == "Circuit breaker opened: autonomous tasks paused"
         ]
         assert len(all_cb) == 2
@@ -360,6 +391,7 @@ class TestCircuitBreakerAlert:
 # Auto-pause alerts
 # ---------------------------------------------------------------------------
 
+
 class TestAutoPauseAlerts:
     """Tests for _create_auto_pause_alerts."""
 
@@ -378,7 +410,9 @@ class TestAutoPauseAlerts:
         await db_session.commit()
 
         for pid in (p1.id, p2.id):
-            alerts = await _undismissed_alerts(db_session, project_id=pid, severity=AlertSeverity.WARNING)
+            alerts = await _undismissed_alerts(
+                db_session, project_id=pid, severity=AlertSeverity.WARNING
+            )
             assert len(alerts) == 1
             assert "auto-paused" in alerts[0].title.lower()
             assert "gcp" in alerts[0].message
@@ -416,7 +450,9 @@ class TestAutoPauseAlerts:
         await _create_auto_pause_alerts(db_session, ["gcp", "github_api"])
         await db_session.commit()
 
-        alerts = await _undismissed_alerts(db_session, project_id=project.id, severity=AlertSeverity.WARNING)
+        alerts = await _undismissed_alerts(
+            db_session, project_id=project.id, severity=AlertSeverity.WARNING
+        )
         assert len(alerts) == 1
 
     @pytest.mark.asyncio
@@ -434,11 +470,14 @@ class TestAutoPauseAlerts:
 # Auto-resume alerts
 # ---------------------------------------------------------------------------
 
+
 class TestAutoResumeAlerts:
     """Tests for _create_auto_resume_alerts."""
 
     @pytest.mark.asyncio
-    async def test_creates_info_alert_and_dismisses_pause_warnings(self, db_session, mocker):
+    async def test_creates_info_alert_and_dismisses_pause_warnings(
+        self, db_session, mocker
+    ):
         mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
         project = make_project()
         db_session.add(project)
@@ -454,25 +493,36 @@ class TestAutoResumeAlerts:
         await db_session.commit()
 
         # Pause alert should be dismissed
-        pause_alerts = (await db_session.execute(
-            sql_select(Alert).where(
-                Alert.project_id == project.id,
-                Alert.severity == AlertSeverity.WARNING,
-                Alert.title == "Pipeline auto-paused: external dependencies down",
+        pause_alerts = (
+            (
+                await db_session.execute(
+                    sql_select(Alert).where(
+                        Alert.project_id == project.id,
+                        Alert.severity == AlertSeverity.WARNING,
+                        Alert.title
+                        == "Pipeline auto-paused: external dependencies down",
+                    )
+                )
             )
-        )).scalars().all()
+            .scalars()
+            .all()
+        )
         assert len(pause_alerts) == 1
         assert pause_alerts[0].dismissed_at is not None
 
         # Resume alert should exist
         resume_alerts = await _undismissed_alerts(
-            db_session, project_id=project.id, severity=AlertSeverity.INFO,
+            db_session,
+            project_id=project.id,
+            severity=AlertSeverity.INFO,
         )
         assert len(resume_alerts) == 1
         assert "auto-resumed" in resume_alerts[0].title.lower()
 
     @pytest.mark.asyncio
-    async def test_resume_without_prior_pause_still_creates_info_alert(self, db_session, mocker):
+    async def test_resume_without_prior_pause_still_creates_info_alert(
+        self, db_session, mocker
+    ):
         mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
         project = make_project()
         db_session.add(project)
@@ -482,7 +532,9 @@ class TestAutoResumeAlerts:
         await _create_auto_resume_alerts(db_session)
         await db_session.commit()
 
-        alerts = await _undismissed_alerts(db_session, project_id=project.id, severity=AlertSeverity.INFO)
+        alerts = await _undismissed_alerts(
+            db_session, project_id=project.id, severity=AlertSeverity.INFO
+        )
         assert len(alerts) == 1
         assert "auto-resumed" in alerts[0].title.lower()
 
@@ -510,16 +562,24 @@ class TestAutoResumeAlerts:
         await db_session.commit()
 
         # Both warnings dismissed
-        warnings = (await db_session.execute(
-            sql_select(Alert).where(
-                Alert.project_id == project.id,
-                Alert.severity == AlertSeverity.WARNING,
+        warnings = (
+            (
+                await db_session.execute(
+                    sql_select(Alert).where(
+                        Alert.project_id == project.id,
+                        Alert.severity == AlertSeverity.WARNING,
+                    )
+                )
             )
-        )).scalars().all()
+            .scalars()
+            .all()
+        )
         assert all(w.dismissed_at is not None for w in warnings)
 
         # One INFO resume alert
-        infos = await _undismissed_alerts(db_session, project_id=project.id, severity=AlertSeverity.INFO)
+        infos = await _undismissed_alerts(
+            db_session, project_id=project.id, severity=AlertSeverity.INFO
+        )
         assert len(infos) == 1
 
     @pytest.mark.asyncio
@@ -541,21 +601,30 @@ class TestAutoResumeAlerts:
 
         for pid in (p1.id, p2.id):
             # Each project gets an INFO alert
-            infos = await _undismissed_alerts(db_session, project_id=pid, severity=AlertSeverity.INFO)
+            infos = await _undismissed_alerts(
+                db_session, project_id=pid, severity=AlertSeverity.INFO
+            )
             assert len(infos) == 1
             # Each project's pause alert is dismissed
-            warnings = (await db_session.execute(
-                sql_select(Alert).where(
-                    Alert.project_id == pid,
-                    Alert.severity == AlertSeverity.WARNING,
+            warnings = (
+                (
+                    await db_session.execute(
+                        sql_select(Alert).where(
+                            Alert.project_id == pid,
+                            Alert.severity == AlertSeverity.WARNING,
+                        )
+                    )
                 )
-            )).scalars().all()
+                .scalars()
+                .all()
+            )
             assert all(w.dismissed_at is not None for w in warnings)
 
 
 # ---------------------------------------------------------------------------
 # Cross-cutting deduplication
 # ---------------------------------------------------------------------------
+
 
 class TestAlertDeduplication:
     """End-to-end deduplication scenarios across alert types."""
@@ -578,7 +647,11 @@ class TestAlertDeduplication:
         await db_session.commit()
 
         cb_title = "Circuit breaker opened: autonomous tasks paused"
-        all_cb = [a for a in await _all_alerts(db_session, project_id=project.id) if a.title == cb_title]
+        all_cb = [
+            a
+            for a in await _all_alerts(db_session, project_id=project.id)
+            if a.title == cb_title
+        ]
         assert len(all_cb) == 1
 
         # 3) Dismiss
@@ -590,14 +663,20 @@ class TestAlertDeduplication:
         await _maybe_create_circuit_breaker_alert(project.id, db_session, "reason C")
         await db_session.commit()
 
-        all_cb = [a for a in await _all_alerts(db_session, project_id=project.id) if a.title == cb_title]
+        all_cb = [
+            a
+            for a in await _all_alerts(db_session, project_id=project.id)
+            if a.title == cb_title
+        ]
         assert len(all_cb) == 2
         undismissed = [a for a in all_cb if a.dismissed_at is None]
         assert len(undismissed) == 1
         assert "reason C" in undismissed[0].message
 
     @pytest.mark.asyncio
-    async def test_failure_alert_dedup_allows_new_after_dismiss(self, db_session, mocker):
+    async def test_failure_alert_dedup_allows_new_after_dismiss(
+        self, db_session, mocker
+    ):
         """Dismissed failure alert should not block a new one for the same task."""
         mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
         project = make_project()
@@ -648,13 +727,20 @@ class TestAlertDeduplication:
         await _create_auto_pause_alerts(db_session, ["github_api"])
         await db_session.commit()
 
-        warnings = (await db_session.execute(
-            sql_select(Alert).where(
-                Alert.project_id == project.id,
-                Alert.severity == AlertSeverity.WARNING,
-                Alert.title == "Pipeline auto-paused: external dependencies down",
+        warnings = (
+            (
+                await db_session.execute(
+                    sql_select(Alert).where(
+                        Alert.project_id == project.id,
+                        Alert.severity == AlertSeverity.WARNING,
+                        Alert.title
+                        == "Pipeline auto-paused: external dependencies down",
+                    )
+                )
             )
-        )).scalars().all()
+            .scalars()
+            .all()
+        )
         assert len(warnings) == 2
         undismissed = [w for w in warnings if w.dismissed_at is None]
         assert len(undismissed) == 1
@@ -664,15 +750,21 @@ class TestAlertDeduplication:
 # External notification dispatch for high-severity resume events
 # ---------------------------------------------------------------------------
 
+
 class TestForcedResumeExternalNotifications:
     """Forced resume must dispatch external notifications (webhook + per-project)."""
 
     @pytest.mark.asyncio
-    async def test_forced_resume_dispatches_webhook_and_external_notifications(self, db_session, mocker):
+    async def test_forced_resume_dispatches_webhook_and_external_notifications(
+        self, db_session, mocker
+    ):
         mocker.patch("app.deploy_health.broadcast_to_project", new_callable=AsyncMock)
-        webhook_mock = mocker.patch("app.main._send_webhook_notification", new_callable=AsyncMock)
+        webhook_mock = mocker.patch(
+            "app.main._send_webhook_notification", new_callable=AsyncMock
+        )
         dispatch_mock = mocker.patch(
-            "app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock,
+            "app.notification_dispatch.dispatch_external_notification",
+            new_callable=AsyncMock,
         )
         p1 = make_project(name="P1")
         p2 = make_project(name="P2")
@@ -702,11 +794,16 @@ class TestForcedResumeExternalNotifications:
             assert "force-resumed" in payload["title"].lower()
 
     @pytest.mark.asyncio
-    async def test_forced_resume_no_projects_still_calls_webhook(self, db_session, mocker):
+    async def test_forced_resume_no_projects_still_calls_webhook(
+        self, db_session, mocker
+    ):
         mocker.patch("app.deploy_health.broadcast_to_project", new_callable=AsyncMock)
-        webhook_mock = mocker.patch("app.main._send_webhook_notification", new_callable=AsyncMock)
+        webhook_mock = mocker.patch(
+            "app.main._send_webhook_notification", new_callable=AsyncMock
+        )
         dispatch_mock = mocker.patch(
-            "app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock,
+            "app.notification_dispatch.dispatch_external_notification",
+            new_callable=AsyncMock,
         )
 
         await _create_forced_resume_alerts(db_session, 3600.0, [])
@@ -720,11 +817,16 @@ class TestFlappingResumeExternalNotifications:
     """Flapping auto-resume must dispatch external notifications; non-flapping must not."""
 
     @pytest.mark.asyncio
-    async def test_flapping_resume_dispatches_webhook_and_external_notifications(self, db_session, mocker):
+    async def test_flapping_resume_dispatches_webhook_and_external_notifications(
+        self, db_session, mocker
+    ):
         mocker.patch("app.deploy_health.broadcast_to_project", new_callable=AsyncMock)
-        webhook_mock = mocker.patch("app.main._send_webhook_notification", new_callable=AsyncMock)
+        webhook_mock = mocker.patch(
+            "app.main._send_webhook_notification", new_callable=AsyncMock
+        )
         dispatch_mock = mocker.patch(
-            "app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock,
+            "app.notification_dispatch.dispatch_external_notification",
+            new_callable=AsyncMock,
         )
         project = make_project()
         db_session.add(project)
@@ -746,11 +848,16 @@ class TestFlappingResumeExternalNotifications:
         assert "flapping" in call.args[2]["title"].lower()
 
     @pytest.mark.asyncio
-    async def test_non_flapping_resume_skips_external_notifications(self, db_session, mocker):
+    async def test_non_flapping_resume_skips_external_notifications(
+        self, db_session, mocker
+    ):
         mocker.patch("app.deploy_health.broadcast_to_project", new_callable=AsyncMock)
-        webhook_mock = mocker.patch("app.main._send_webhook_notification", new_callable=AsyncMock)
+        webhook_mock = mocker.patch(
+            "app.main._send_webhook_notification", new_callable=AsyncMock
+        )
         dispatch_mock = mocker.patch(
-            "app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock,
+            "app.notification_dispatch.dispatch_external_notification",
+            new_callable=AsyncMock,
         )
         project = make_project()
         db_session.add(project)
@@ -767,6 +874,7 @@ class TestFlappingResumeExternalNotifications:
 # ---------------------------------------------------------------------------
 # SR catch-rate baseline-floor alert
 # ---------------------------------------------------------------------------
+
 
 def _make_sr_floor_task(project_id, *, age_days: float, hit: bool) -> Task:
     """Task where SR catches (hit=True) or misses (hit=False) a 'security' issue."""
@@ -787,7 +895,8 @@ def _make_sr_floor_task(project_id, *, age_days: float, hit: bool) -> Task:
 
 def _floor_dispatch_calls(mock_dispatch):
     return [
-        c for c in mock_dispatch.call_args_list
+        c
+        for c in mock_dispatch.call_args_list
         if (c.kwargs.get("event_type") or (c.args[1] if len(c.args) > 1 else ""))
         == "sr_catch_rate_below_floor"
     ]
@@ -796,7 +905,9 @@ def _floor_dispatch_calls(mock_dispatch):
 class TestSRCatchRateFloorAlert:
     """baseline-floor alert (sr_catch_rate_below_floor) in compute_sr_catch_rate_trends."""
 
-    def _tasks(self, project_id, *, current_hits: int, current_misses: int, prev: int = 5):
+    def _tasks(
+        self, project_id, *, current_hits: int, current_misses: int, prev: int = 5
+    ):
         """Build task lists spanning current (age_days=2) and previous (age_days=20) windows."""
         tasks = []
         for _ in range(current_hits):
@@ -814,12 +925,14 @@ class TestSRCatchRateFloorAlert:
         # Pre-seed rate_history with 2 below-floor entries (threshold=0.50).
         # computed_at yesterday → is_new_window=False → history preserved.
         yesterday = (_utcnow() - timedelta(days=1)).isoformat()
-        project = make_project(design_doc={
-            "sr_catch_rate_trends": {
-                "computed_at": yesterday,
-                "categories": {"security": {"rate_history": [0.35, 0.40]}},
-            },
-        })
+        project = make_project(
+            design_doc={
+                "sr_catch_rate_trends": {
+                    "computed_at": yesterday,
+                    "categories": {"security": {"rate_history": [0.35, 0.40]}},
+                },
+            }
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -829,9 +942,19 @@ class TestSRCatchRateFloorAlert:
             db_session.add(t)
         await db_session.flush()
 
-        with patch("app.notification_dispatch.post_failure_alert_message", new_callable=AsyncMock), \
-             patch("app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock) as mock_dispatch, \
-             patch("asyncio.ensure_future", side_effect=lambda coro: coro.close() or None):
+        with (
+            patch(
+                "app.notification_dispatch.post_failure_alert_message",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "app.notification_dispatch.dispatch_external_notification",
+                new_callable=AsyncMock,
+            ) as mock_dispatch,
+            patch(
+                "asyncio.ensure_future", side_effect=lambda coro: coro.close() or None
+            ),
+        ):
             result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
 
         assert result is not None
@@ -842,21 +965,27 @@ class TestSRCatchRateFloorAlert:
         payload = floor_calls[0].kwargs.get("payload") or floor_calls[0].args[2]
         assert "below_floor_categories" in payload
         assert payload["floor_threshold"] == 0.5
-        sec = next(c for c in payload["below_floor_categories"] if c["category"] == "security")
+        sec = next(
+            c for c in payload["below_floor_categories"] if c["category"] == "security"
+        )
         assert sec["current_hit_rate"] is not None
         assert sec["sample_size"] > 0
 
     @pytest.mark.asyncio
-    async def test_floor_alert_dedup_does_not_fire_twice_in_same_window(self, db_session):
+    async def test_floor_alert_dedup_does_not_fire_twice_in_same_window(
+        self, db_session
+    ):
         from app.playbook_learning import compute_sr_catch_rate_trends
 
         yesterday = (_utcnow() - timedelta(days=1)).isoformat()
-        project = make_project(design_doc={
-            "sr_catch_rate_trends": {
-                "computed_at": yesterday,
-                "categories": {"security": {"rate_history": [0.35, 0.40]}},
-            },
-        })
+        project = make_project(
+            design_doc={
+                "sr_catch_rate_trends": {
+                    "computed_at": yesterday,
+                    "categories": {"security": {"rate_history": [0.35, 0.40]}},
+                },
+            }
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -866,9 +995,19 @@ class TestSRCatchRateFloorAlert:
             db_session.add(t)
         await db_session.flush()
 
-        with patch("app.notification_dispatch.post_failure_alert_message", new_callable=AsyncMock), \
-             patch("app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock) as d1, \
-             patch("asyncio.ensure_future", side_effect=lambda coro: coro.close() or None):
+        with (
+            patch(
+                "app.notification_dispatch.post_failure_alert_message",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "app.notification_dispatch.dispatch_external_notification",
+                new_callable=AsyncMock,
+            ) as d1,
+            patch(
+                "asyncio.ensure_future", side_effect=lambda coro: coro.close() or None
+            ),
+        ):
             await compute_sr_catch_rate_trends(project.id, db_session, tasks)
 
         await db_session.refresh(project)
@@ -876,9 +1015,19 @@ class TestSRCatchRateFloorAlert:
         assert len(_floor_dispatch_calls(d1)) == 1
 
         # Second call in same window — should be deduped
-        with patch("app.notification_dispatch.post_failure_alert_message", new_callable=AsyncMock), \
-             patch("app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock) as d2, \
-             patch("asyncio.ensure_future", side_effect=lambda coro: coro.close() or None):
+        with (
+            patch(
+                "app.notification_dispatch.post_failure_alert_message",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "app.notification_dispatch.dispatch_external_notification",
+                new_callable=AsyncMock,
+            ) as d2,
+            patch(
+                "asyncio.ensure_future", side_effect=lambda coro: coro.close() or None
+            ),
+        ):
             await compute_sr_catch_rate_trends(project.id, db_session, tasks)
 
         assert len(_floor_dispatch_calls(d2)) == 0
@@ -888,12 +1037,14 @@ class TestSRCatchRateFloorAlert:
         from app.playbook_learning import compute_sr_catch_rate_trends
 
         yesterday = (_utcnow() - timedelta(days=1)).isoformat()
-        project = make_project(design_doc={
-            "sr_catch_rate_trends": {
-                "computed_at": yesterday,
-                "categories": {"security": {"rate_history": [0.60, 0.70]}},
-            },
-        })
+        project = make_project(
+            design_doc={
+                "sr_catch_rate_trends": {
+                    "computed_at": yesterday,
+                    "categories": {"security": {"rate_history": [0.60, 0.70]}},
+                },
+            }
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -904,9 +1055,19 @@ class TestSRCatchRateFloorAlert:
             db_session.add(t)
         await db_session.flush()
 
-        with patch("app.notification_dispatch.post_failure_alert_message", new_callable=AsyncMock), \
-             patch("app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock) as mock_dispatch, \
-             patch("asyncio.ensure_future", side_effect=lambda coro: coro.close() or None):
+        with (
+            patch(
+                "app.notification_dispatch.post_failure_alert_message",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "app.notification_dispatch.dispatch_external_notification",
+                new_callable=AsyncMock,
+            ) as mock_dispatch,
+            patch(
+                "asyncio.ensure_future", side_effect=lambda coro: coro.close() or None
+            ),
+        ):
             result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
 
         assert result is not None
@@ -914,18 +1075,22 @@ class TestSRCatchRateFloorAlert:
         assert len(_floor_dispatch_calls(mock_dispatch)) == 0
 
     @pytest.mark.asyncio
-    async def test_regression_alert_unaffected_when_floor_also_triggers(self, db_session):
+    async def test_regression_alert_unaffected_when_floor_also_triggers(
+        self, db_session
+    ):
         """A simultaneous regression and floor violation fires both distinct events."""
         from app.playbook_learning import compute_sr_catch_rate_trends
 
         yesterday = (_utcnow() - timedelta(days=1)).isoformat()
         # rate_history below floor; current window will also be decreasing vs previous
-        project = make_project(design_doc={
-            "sr_catch_rate_trends": {
-                "computed_at": yesterday,
-                "categories": {"security": {"rate_history": [0.30, 0.35]}},
-            },
-        })
+        project = make_project(
+            design_doc={
+                "sr_catch_rate_trends": {
+                    "computed_at": yesterday,
+                    "categories": {"security": {"rate_history": [0.30, 0.35]}},
+                },
+            }
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -939,9 +1104,19 @@ class TestSRCatchRateFloorAlert:
             db_session.add(t)
         await db_session.flush()
 
-        with patch("app.notification_dispatch.post_failure_alert_message", new_callable=AsyncMock), \
-             patch("app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock) as mock_dispatch, \
-             patch("asyncio.ensure_future", side_effect=lambda coro: coro.close() or None):
+        with (
+            patch(
+                "app.notification_dispatch.post_failure_alert_message",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "app.notification_dispatch.dispatch_external_notification",
+                new_callable=AsyncMock,
+            ) as mock_dispatch,
+            patch(
+                "asyncio.ensure_future", side_effect=lambda coro: coro.close() or None
+            ),
+        ):
             result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
 
         assert result is not None
@@ -964,7 +1139,9 @@ class TestSRCatchRateFloorAlert:
 class TestSRCatchRateFloorAlertRow:
     """Verify floor-firing path inserts an ERROR Alert row and dismisses on clear."""
 
-    def _tasks(self, project_id, *, current_hits: int, current_misses: int, prev: int = 5):
+    def _tasks(
+        self, project_id, *, current_hits: int, current_misses: int, prev: int = 5
+    ):
         tasks = []
         for _ in range(current_hits):
             tasks.append(_make_sr_floor_task(project_id, age_days=2, hit=True))
@@ -982,12 +1159,14 @@ class TestSRCatchRateFloorAlertRow:
         )
 
         yesterday = (_utcnow() - timedelta(days=1)).isoformat()
-        project = make_project(design_doc={
-            "sr_catch_rate_trends": {
-                "computed_at": yesterday,
-                "categories": {"security": {"rate_history": [0.35, 0.40]}},
-            },
-        })
+        project = make_project(
+            design_doc={
+                "sr_catch_rate_trends": {
+                    "computed_at": yesterday,
+                    "categories": {"security": {"rate_history": [0.35, 0.40]}},
+                },
+            }
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -997,14 +1176,26 @@ class TestSRCatchRateFloorAlertRow:
             db_session.add(t)
         await db_session.flush()
 
-        with patch("app.notification_dispatch.post_failure_alert_message", new_callable=AsyncMock), \
-             patch("app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock), \
-             patch("asyncio.ensure_future", side_effect=lambda coro: coro.close() or None):
+        with (
+            patch(
+                "app.notification_dispatch.post_failure_alert_message",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "app.notification_dispatch.dispatch_external_notification",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "asyncio.ensure_future", side_effect=lambda coro: coro.close() or None
+            ),
+        ):
             await compute_sr_catch_rate_trends(project.id, db_session, tasks)
         await db_session.commit()
 
         rows = await _undismissed_alerts(db_session, project_id=project.id)
-        floor_rows = [r for r in rows if r.title.startswith(_SR_FLOOR_ALERT_TITLE_PREFIX)]
+        floor_rows = [
+            r for r in rows if r.title.startswith(_SR_FLOOR_ALERT_TITLE_PREFIX)
+        ]
         assert len(floor_rows) == 1
         row = floor_rows[0]
         assert row.severity == AlertSeverity.ERROR
@@ -1022,12 +1213,14 @@ class TestSRCatchRateFloorAlertRow:
         )
 
         yesterday = (_utcnow() - timedelta(days=1)).isoformat()
-        project = make_project(design_doc={
-            "sr_catch_rate_trends": {
-                "computed_at": yesterday,
-                "categories": {"security": {"rate_history": [0.35, 0.40]}},
-            },
-        })
+        project = make_project(
+            design_doc={
+                "sr_catch_rate_trends": {
+                    "computed_at": yesterday,
+                    "categories": {"security": {"rate_history": [0.35, 0.40]}},
+                },
+            }
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -1037,16 +1230,28 @@ class TestSRCatchRateFloorAlertRow:
             db_session.add(t)
         await db_session.flush()
 
-        with patch("app.notification_dispatch.post_failure_alert_message", new_callable=AsyncMock), \
-             patch("app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock), \
-             patch("asyncio.ensure_future", side_effect=lambda coro: coro.close() or None):
+        with (
+            patch(
+                "app.notification_dispatch.post_failure_alert_message",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "app.notification_dispatch.dispatch_external_notification",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "asyncio.ensure_future", side_effect=lambda coro: coro.close() or None
+            ),
+        ):
             await compute_sr_catch_rate_trends(project.id, db_session, tasks)
             await db_session.commit()
             await compute_sr_catch_rate_trends(project.id, db_session, tasks)
             await db_session.commit()
 
         rows = await _undismissed_alerts(db_session, project_id=project.id)
-        floor_rows = [r for r in rows if r.title.startswith(_SR_FLOOR_ALERT_TITLE_PREFIX)]
+        floor_rows = [
+            r for r in rows if r.title.startswith(_SR_FLOOR_ALERT_TITLE_PREFIX)
+        ]
         assert len(floor_rows) == 1
 
     @pytest.mark.asyncio
@@ -1058,12 +1263,14 @@ class TestSRCatchRateFloorAlertRow:
         )
 
         yesterday = (_utcnow() - timedelta(days=1)).isoformat()
-        project = make_project(design_doc={
-            "sr_catch_rate_trends": {
-                "computed_at": yesterday,
-                "categories": {"security": {"rate_history": [0.35, 0.40]}},
-            },
-        })
+        project = make_project(
+            design_doc={
+                "sr_catch_rate_trends": {
+                    "computed_at": yesterday,
+                    "categories": {"security": {"rate_history": [0.35, 0.40]}},
+                },
+            }
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -1073,9 +1280,19 @@ class TestSRCatchRateFloorAlertRow:
         for t in firing_tasks:
             db_session.add(t)
         await db_session.flush()
-        with patch("app.notification_dispatch.post_failure_alert_message", new_callable=AsyncMock), \
-             patch("app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock), \
-             patch("asyncio.ensure_future", side_effect=lambda coro: coro.close() or None):
+        with (
+            patch(
+                "app.notification_dispatch.post_failure_alert_message",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "app.notification_dispatch.dispatch_external_notification",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "asyncio.ensure_future", side_effect=lambda coro: coro.close() or None
+            ),
+        ):
             await compute_sr_catch_rate_trends(project.id, db_session, firing_tasks)
         await db_session.commit()
         await db_session.refresh(project)
@@ -1094,6 +1311,7 @@ class TestSRCatchRateFloorAlertRow:
         doc["sr_catch_rate_trends"] = trends
         project.design_doc = doc
         from sqlalchemy.orm.attributes import flag_modified
+
         flag_modified(project, "design_doc")
         db_session.add(project)
         await db_session.commit()
@@ -1102,20 +1320,34 @@ class TestSRCatchRateFloorAlertRow:
         for t in clearing_tasks:
             db_session.add(t)
         await db_session.flush()
-        with patch("app.notification_dispatch.post_failure_alert_message", new_callable=AsyncMock), \
-             patch("app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock), \
-             patch("asyncio.ensure_future", side_effect=lambda coro: coro.close() or None):
+        with (
+            patch(
+                "app.notification_dispatch.post_failure_alert_message",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "app.notification_dispatch.dispatch_external_notification",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "asyncio.ensure_future", side_effect=lambda coro: coro.close() or None
+            ),
+        ):
             await compute_sr_catch_rate_trends(project.id, db_session, clearing_tasks)
         await db_session.commit()
         await db_session.refresh(project)
 
         assert "sr_catch_rate_floor_alert" not in (project.design_doc or {})
         rows = await _undismissed_alerts(db_session, project_id=project.id)
-        floor_rows = [r for r in rows if r.title.startswith(_SR_FLOOR_ALERT_TITLE_PREFIX)]
+        floor_rows = [
+            r for r in rows if r.title.startswith(_SR_FLOOR_ALERT_TITLE_PREFIX)
+        ]
         assert floor_rows == []
         # Original row is still present in the table but dismissed
         all_rows = await _all_alerts(db_session, project_id=project.id)
-        prior = [r for r in all_rows if r.title.startswith(_SR_FLOOR_ALERT_TITLE_PREFIX)]
+        prior = [
+            r for r in all_rows if r.title.startswith(_SR_FLOOR_ALERT_TITLE_PREFIX)
+        ]
         assert len(prior) >= 1
         assert all(r.dismissed_at is not None for r in prior)
 
@@ -1143,21 +1375,33 @@ class TestSRCatchRateRegressionAlertRow:
         tasks = []
         # current: 3/5 hits → 0.60
         for _ in range(3):
-            tasks.append(self._make_sr_task(
-                project_id, age_days=2,
-                human_cats={"test-coverage": 1}, sr_failed_cats=["test-coverage"],
-            ))
+            tasks.append(
+                self._make_sr_task(
+                    project_id,
+                    age_days=2,
+                    human_cats={"test-coverage": 1},
+                    sr_failed_cats=["test-coverage"],
+                )
+            )
         for _ in range(2):
-            tasks.append(self._make_sr_task(
-                project_id, age_days=2,
-                human_cats={"test-coverage": 1}, sr_failed_cats=[],
-            ))
+            tasks.append(
+                self._make_sr_task(
+                    project_id,
+                    age_days=2,
+                    human_cats={"test-coverage": 1},
+                    sr_failed_cats=[],
+                )
+            )
         # previous: 5/5 hits → 1.00
         for _ in range(5):
-            tasks.append(self._make_sr_task(
-                project_id, age_days=20,
-                human_cats={"test-coverage": 1}, sr_failed_cats=["test-coverage"],
-            ))
+            tasks.append(
+                self._make_sr_task(
+                    project_id,
+                    age_days=20,
+                    human_cats={"test-coverage": 1},
+                    sr_failed_cats=["test-coverage"],
+                )
+            )
         return tasks
 
     @pytest.mark.asyncio
@@ -1177,14 +1421,26 @@ class TestSRCatchRateRegressionAlertRow:
             db_session.add(t)
         await db_session.flush()
 
-        with patch("app.notification_dispatch.post_failure_alert_message", new_callable=AsyncMock), \
-             patch("app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock), \
-             patch("asyncio.ensure_future", side_effect=lambda coro: coro.close() or None):
+        with (
+            patch(
+                "app.notification_dispatch.post_failure_alert_message",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "app.notification_dispatch.dispatch_external_notification",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "asyncio.ensure_future", side_effect=lambda coro: coro.close() or None
+            ),
+        ):
             await compute_sr_catch_rate_trends(project.id, db_session, tasks)
         await db_session.commit()
 
         rows = await _undismissed_alerts(db_session, project_id=project.id)
-        reg_rows = [r for r in rows if r.title.startswith(_SR_REGRESSION_ALERT_TITLE_PREFIX)]
+        reg_rows = [
+            r for r in rows if r.title.startswith(_SR_REGRESSION_ALERT_TITLE_PREFIX)
+        ]
         assert len(reg_rows) == 1
         row = reg_rows[0]
         assert row.severity == AlertSeverity.WARNING
@@ -1211,16 +1467,28 @@ class TestSRCatchRateRegressionAlertRow:
             db_session.add(t)
         await db_session.flush()
 
-        with patch("app.notification_dispatch.post_failure_alert_message", new_callable=AsyncMock), \
-             patch("app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock), \
-             patch("asyncio.ensure_future", side_effect=lambda coro: coro.close() or None):
+        with (
+            patch(
+                "app.notification_dispatch.post_failure_alert_message",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "app.notification_dispatch.dispatch_external_notification",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "asyncio.ensure_future", side_effect=lambda coro: coro.close() or None
+            ),
+        ):
             await compute_sr_catch_rate_trends(project.id, db_session, tasks)
             await db_session.commit()
             await compute_sr_catch_rate_trends(project.id, db_session, tasks)
             await db_session.commit()
 
         rows = await _undismissed_alerts(db_session, project_id=project.id)
-        reg_rows = [r for r in rows if r.title.startswith(_SR_REGRESSION_ALERT_TITLE_PREFIX)]
+        reg_rows = [
+            r for r in rows if r.title.startswith(_SR_REGRESSION_ALERT_TITLE_PREFIX)
+        ]
         assert len(reg_rows) == 1
 
     @pytest.mark.asyncio
@@ -1240,9 +1508,19 @@ class TestSRCatchRateRegressionAlertRow:
         for t in firing_tasks:
             db_session.add(t)
         await db_session.flush()
-        with patch("app.notification_dispatch.post_failure_alert_message", new_callable=AsyncMock), \
-             patch("app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock), \
-             patch("asyncio.ensure_future", side_effect=lambda coro: coro.close() or None):
+        with (
+            patch(
+                "app.notification_dispatch.post_failure_alert_message",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "app.notification_dispatch.dispatch_external_notification",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "asyncio.ensure_future", side_effect=lambda coro: coro.close() or None
+            ),
+        ):
             await compute_sr_catch_rate_trends(project.id, db_session, firing_tasks)
         await db_session.commit()
         await db_session.refresh(project)
@@ -1254,26 +1532,46 @@ class TestSRCatchRateRegressionAlertRow:
         # irrelevant to this call's analysis).
         stable_tasks = []
         for _ in range(5):
-            stable_tasks.append(self._make_sr_task(
-                project.id, age_days=2,
-                human_cats={"test-coverage": 1}, sr_failed_cats=["test-coverage"],
-            ))
+            stable_tasks.append(
+                self._make_sr_task(
+                    project.id,
+                    age_days=2,
+                    human_cats={"test-coverage": 1},
+                    sr_failed_cats=["test-coverage"],
+                )
+            )
         for _ in range(5):
-            stable_tasks.append(self._make_sr_task(
-                project.id, age_days=20,
-                human_cats={"test-coverage": 1}, sr_failed_cats=["test-coverage"],
-            ))
+            stable_tasks.append(
+                self._make_sr_task(
+                    project.id,
+                    age_days=20,
+                    human_cats={"test-coverage": 1},
+                    sr_failed_cats=["test-coverage"],
+                )
+            )
         for t in stable_tasks:
             db_session.add(t)
         await db_session.flush()
-        with patch("app.notification_dispatch.post_failure_alert_message", new_callable=AsyncMock), \
-             patch("app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock), \
-             patch("asyncio.ensure_future", side_effect=lambda coro: coro.close() or None):
+        with (
+            patch(
+                "app.notification_dispatch.post_failure_alert_message",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "app.notification_dispatch.dispatch_external_notification",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "asyncio.ensure_future", side_effect=lambda coro: coro.close() or None
+            ),
+        ):
             await compute_sr_catch_rate_trends(project.id, db_session, stable_tasks)
         await db_session.commit()
         await db_session.refresh(project)
 
         assert "sr_catch_rate_trends_alert" not in (project.design_doc or {})
         rows = await _undismissed_alerts(db_session, project_id=project.id)
-        reg_rows = [r for r in rows if r.title.startswith(_SR_REGRESSION_ALERT_TITLE_PREFIX)]
+        reg_rows = [
+            r for r in rows if r.title.startswith(_SR_REGRESSION_ALERT_TITLE_PREFIX)
+        ]
         assert reg_rows == []

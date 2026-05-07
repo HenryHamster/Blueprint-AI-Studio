@@ -4,6 +4,7 @@ When a check_run webhook arrives with conclusion=failure on a protected branch
 (e.g. main/master), this module spawns a create-type task that analyzes the
 failure and opens a fix PR.  Guard rails prevent runaway spawning.
 """
+
 import logging
 import re
 import uuid
@@ -45,7 +46,7 @@ def _suspension_cooldown_elapsed(meta: dict, now: datetime) -> bool:
         suspended_at = datetime.fromisoformat(suspended_at_str)
     except (TypeError, ValueError):
         return False
-    cooldown = timedelta(hours=SUSPENSION_BASE_COOLDOWN_HOURS * (2 ** attempts))
+    cooldown = timedelta(hours=SUSPENSION_BASE_COOLDOWN_HOURS * (2**attempts))
     return now >= suspended_at + cooldown
 
 
@@ -70,7 +71,10 @@ async def _try_auto_recover_suspension(
     if not _suspension_cooldown_elapsed(meta, now):
         # Backfill missing timestamp so the first auto-recovery can happen
         # after a full cooldown from this point.
-        if not meta.get("suspended_at") and int(meta.get("recovery_attempts", 0) or 0) < MAX_AUTO_RECOVERY_ATTEMPTS:
+        if (
+            not meta.get("suspended_at")
+            and int(meta.get("recovery_attempts", 0) or 0) < MAX_AUTO_RECOVERY_ATTEMPTS
+        ):
             project = await session.get(Project, project_id)
             if project is not None:
                 design_doc = dict(project.design_doc or {})
@@ -111,7 +115,9 @@ async def _try_auto_recover_suspension(
     await session.flush()
     logger.info(
         "[AUTO-REMEDIATION] Auto-recovering suspended branch %s (attempt %d/%d)",
-        branch, attempts + 1, MAX_AUTO_RECOVERY_ATTEMPTS,
+        branch,
+        attempts + 1,
+        MAX_AUTO_RECOVERY_ATTEMPTS,
     )
     return True
 
@@ -143,7 +149,11 @@ async def _handle_main_branch_ci_failure(
     except Exception as exc:
         logger.error(
             "[AUTO-REMEDIATION] Error handling CI failure on %s/%s@%s: %s",
-            owner, repo, head_sha[:8], exc, exc_info=True,
+            owner,
+            repo,
+            head_sha[:8],
+            exc,
+            exc_info=True,
         )
 
 
@@ -166,7 +176,10 @@ async def _handle_main_branch_ci_failure_inner(
     suspended_branches = config.get("suspended_branches", [])
     if head_branch in suspended_branches:
         recovered = await _try_auto_recover_suspension(
-            project_id=project_id, branch=head_branch, config=config, session=session,
+            project_id=project_id,
+            branch=head_branch,
+            config=config,
+            session=session,
         )
         if not recovered:
             logger.info(
@@ -179,13 +192,19 @@ async def _handle_main_branch_ci_failure_inner(
                 try:
                     from app.main import _send_webhook_notification  # noqa: PLC0415
                     import asyncio  # noqa: PLC0415
-                    asyncio.ensure_future(_send_webhook_notification(
-                        "AUTO_FIX_PERMANENT_ESCALATION",
-                        f"Branch {head_branch} permanently suspended",
-                        f"Auto-recovery exhausted after {MAX_AUTO_RECOVERY_ATTEMPTS} attempts — manual intervention required",
-                    ))
+
+                    asyncio.ensure_future(
+                        _send_webhook_notification(
+                            "AUTO_FIX_PERMANENT_ESCALATION",
+                            f"Branch {head_branch} permanently suspended",
+                            f"Auto-recovery exhausted after {MAX_AUTO_RECOVERY_ATTEMPTS} attempts — manual intervention required",
+                        )
+                    )
                 except Exception as exc:
-                    logger.warning("[AUTO-REMEDIATION] Failed to send permanent-escalation webhook: %s", exc)
+                    logger.warning(
+                        "[AUTO-REMEDIATION] Failed to send permanent-escalation webhook: %s",
+                        exc,
+                    )
             return
 
     # ── Guard: rate limit ──
@@ -193,17 +212,23 @@ async def _handle_main_branch_ci_failure_inner(
     # query can push the filter into SQL instead of scanning all recent tasks
     # and filtering in Python.
     one_hour_ago = now - timedelta(hours=1)
-    recent_auto_count = (await session.execute(
-        select(_func.count()).select_from(Task).where(
-            Task.project_id == project_id,
-            Task.created_at >= one_hour_ago,
-            Task.auto_remediation.is_(True),
+    recent_auto_count = (
+        await session.execute(
+            select(_func.count())
+            .select_from(Task)
+            .where(
+                Task.project_id == project_id,
+                Task.created_at >= one_hour_ago,
+                Task.auto_remediation.is_(True),
+            )
         )
-    )).scalar() or 0
+    ).scalar() or 0
     if recent_auto_count >= max_per_hour:
         logger.info(
             "[AUTO-REMEDIATION] Rate limit hit (%d/%d in last hour) for project %s",
-            recent_auto_count, max_per_hour, project_id,
+            recent_auto_count,
+            max_per_hour,
+            project_id,
         )
         return
 
@@ -211,22 +236,31 @@ async def _handle_main_branch_ci_failure_inner(
     # A fix task for the same branch is already working on the problem.
     # It clones latest, so it covers any new pushes to that branch.
     active_statuses = [
-        TaskStatus.QUEUED, TaskStatus.PROVISIONING,
-        TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING,
+        TaskStatus.QUEUED,
+        TaskStatus.PROVISIONING,
+        TaskStatus.IN_PROGRESS,
+        TaskStatus.EVALUATING,
     ]
-    active_tasks = (await session.execute(
-        select(Task).where(
-            Task.project_id == project_id,
-            Task.status.in_(active_statuses),
-            Task.auto_remediation.is_(True),
+    active_tasks = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.project_id == project_id,
+                    Task.status.in_(active_statuses),
+                    Task.auto_remediation.is_(True),
+                )
+            )
         )
-    )).scalars().all()
+        .scalars()
+        .all()
+    )
     for t in active_tasks:
         ctx = t.context or {}
         if ctx.get("ci_failure_branch") == head_branch:
             logger.info(
                 "[AUTO-REMEDIATION] Duplicate: active task %s already covers branch %s",
-                t.id, head_branch,
+                t.id,
+                head_branch,
             )
             return
 
@@ -237,7 +271,9 @@ async def _handle_main_branch_ci_failure_inner(
     if active_auto_count >= max_concurrent:
         logger.info(
             "[AUTO-REMEDIATION] Concurrent limit hit (%d/%d) for project %s",
-            active_auto_count, max_concurrent, project_id,
+            active_auto_count,
+            max_concurrent,
+            project_id,
         )
         return
 
@@ -246,19 +282,28 @@ async def _handle_main_branch_ci_failure_inner(
     # have fixed the issue. Verify the branch tip is still failing.
     try:
         from app.github import get_branch_sha
+
         latest_sha = await get_branch_sha(
             await get_repo_installation_token(owner, repo),
-            owner, repo, head_branch,
+            owner,
+            repo,
+            head_branch,
         )
         if latest_sha != head_sha:
             latest_ci = await get_check_runs_cached(
                 await get_repo_installation_token(owner, repo),
-                owner, repo, latest_sha,
+                owner,
+                repo,
+                latest_sha,
             )
-            if latest_ci.get("status") == "completed" and latest_ci.get("conclusion") == "success":
+            if (
+                latest_ci.get("status") == "completed"
+                and latest_ci.get("conclusion") == "success"
+            ):
                 logger.info(
                     "[AUTO-REMEDIATION] CI already passing on latest %s@%s — skipping",
-                    head_branch, latest_sha[:8],
+                    head_branch,
+                    latest_sha[:8],
                 )
                 return
             # Update to latest SHA so the fix task prompt shows the current failure
@@ -268,8 +313,17 @@ async def _handle_main_branch_ci_failure_inner(
         # Proceed anyway — better to spawn a potentially unnecessary task than miss a real failure
 
     # ── CI context extraction ──
-    failed_checks, error_summary, failure_type, structured_signals = await _extract_ci_context(
-        owner, repo, head_sha, project_id, session,
+    (
+        failed_checks,
+        error_summary,
+        failure_type,
+        structured_signals,
+    ) = await _extract_ci_context(
+        owner,
+        repo,
+        head_sha,
+        project_id,
+        session,
     )
 
     # ── Guard: skip if no useful CI context was extracted ──
@@ -277,18 +331,24 @@ async def _handle_main_branch_ci_failure_inner(
         logger.warning(
             "[AUTO-REMEDIATION] Skipping task creation for %s@%s: "
             "CI context extraction returned no useful information (no failed checks, no error summary)",
-            head_branch, head_sha[:8],
+            head_branch,
+            head_sha[:8],
         )
         try:
             from app.main import _send_webhook_notification
             import asyncio
-            asyncio.ensure_future(_send_webhook_notification(
-                "AUTO_FIX_SKIPPED",
-                f"CI auto-remediation skipped on {head_branch}: insufficient context",
-                f"SHA: {head_sha[:8]} — no failed checks, no error logs extracted",
-            ))
+
+            asyncio.ensure_future(
+                _send_webhook_notification(
+                    "AUTO_FIX_SKIPPED",
+                    f"CI auto-remediation skipped on {head_branch}: insufficient context",
+                    f"SHA: {head_sha[:8]} — no failed checks, no error logs extracted",
+                )
+            )
         except Exception as exc:
-            logger.warning("[AUTO-REMEDIATION] Failed to send skip webhook notification: %s", exc)
+            logger.warning(
+                "[AUTO-REMEDIATION] Failed to send skip webhook notification: %s", exc
+            )
         return
 
     # ── Guard: per-fingerprint repeat-attempt cap ──
@@ -303,9 +363,13 @@ async def _handle_main_branch_ci_failure_inner(
     # CI text into build/test/lint/etc.
     from app.anomaly_detection import _error_fingerprint
     from app.failure_stage import _derive_failure_stage
+
     fingerprint = (
-        _error_fingerprint(error_summary, _derive_failure_stage("CODE_ERROR", error_summary))
-        if error_summary else ""
+        _error_fingerprint(
+            error_summary, _derive_failure_stage("CODE_ERROR", error_summary)
+        )
+        if error_summary
+        else ""
     )
     if fingerprint:
         max_per_fingerprint = config.get("max_per_fingerprint", 3)
@@ -315,35 +379,51 @@ async def _handle_main_branch_ci_failure_inner(
         # FAILED/CANCELLED so concurrent in-flight remediations count toward
         # the cap (fixes the parallel-spawn-overshoot race).
         cap_states = [
-            TaskStatus.FAILED, TaskStatus.CANCELLED,
-            TaskStatus.QUEUED, TaskStatus.PROVISIONING,
-            TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING,
+            TaskStatus.FAILED,
+            TaskStatus.CANCELLED,
+            TaskStatus.QUEUED,
+            TaskStatus.PROVISIONING,
+            TaskStatus.IN_PROGRESS,
+            TaskStatus.EVALUATING,
         ]
-        fp_failed_count = (await session.execute(
-            select(_func.count()).select_from(Task).where(
-                Task.project_id == project_id,
-                Task.created_at >= fp_window_start,
-                Task.status.in_(cap_states),
-                Task.auto_remediation.is_(True),
-                Task.previous_error_fingerprint == fingerprint,
+        fp_failed_count = (
+            await session.execute(
+                select(_func.count())
+                .select_from(Task)
+                .where(
+                    Task.project_id == project_id,
+                    Task.created_at >= fp_window_start,
+                    Task.status.in_(cap_states),
+                    Task.auto_remediation.is_(True),
+                    Task.previous_error_fingerprint == fingerprint,
+                )
             )
-        )).scalar() or 0
+        ).scalar() or 0
         if fp_failed_count >= max_per_fingerprint:
             logger.warning(
                 "[AUTO-REMEDIATION] Per-fingerprint cap hit (%d/%d) for branch %s "
                 "fingerprint %s — skipping repeat attempt",
-                fp_failed_count, max_per_fingerprint, head_branch, fingerprint[:16],
+                fp_failed_count,
+                max_per_fingerprint,
+                head_branch,
+                fingerprint[:16],
             )
             try:
                 from app.main import _send_webhook_notification
                 import asyncio
-                asyncio.ensure_future(_send_webhook_notification(
-                    "AUTO_FIX_SKIPPED",
-                    f"CI auto-remediation skipped on {head_branch}: fingerprint cap reached",
-                    f"SHA: {head_sha[:8]} — {fp_failed_count} prior failed attempts with same fingerprint",
-                ))
+
+                asyncio.ensure_future(
+                    _send_webhook_notification(
+                        "AUTO_FIX_SKIPPED",
+                        f"CI auto-remediation skipped on {head_branch}: fingerprint cap reached",
+                        f"SHA: {head_sha[:8]} — {fp_failed_count} prior failed attempts with same fingerprint",
+                    )
+                )
             except Exception as exc:
-                logger.warning("[AUTO-REMEDIATION] Failed to send fingerprint skip webhook: %s", exc)
+                logger.warning(
+                    "[AUTO-REMEDIATION] Failed to send fingerprint skip webhook: %s",
+                    exc,
+                )
             return
 
     # ── Look up prior investigation that may have diagnosed this failure ──
@@ -358,6 +438,7 @@ async def _handle_main_branch_ci_failure_inner(
     if error_summary:
         from app.anomaly_detection import _error_fingerprint as _fp
         from app.failure_stage import _derive_failure_stage
+
         # Match the stage-aware fingerprint that new remediation tasks persist
         # (see below) so regression lookups can actually hit on prior stored rows.
         _probe_stage = _derive_failure_stage("CODE_ERROR", error_summary)
@@ -382,7 +463,10 @@ async def _handle_main_branch_ci_failure_inner(
     )
 
     from app.failure_classification import _external_api_subtype_from_message  # noqa: PLC0415
-    _ext_api_subtype = _external_api_subtype_from_message(error_summary) if error_summary else None
+
+    _ext_api_subtype = (
+        _external_api_subtype_from_message(error_summary) if error_summary else None
+    )
 
     task_context: dict[str, Any] = {
         "auto_remediation": True,
@@ -390,20 +474,24 @@ async def _handle_main_branch_ci_failure_inner(
         "ci_failure_branch": head_branch,
         "ci_failure_checks": failed_checks,
         "ci_failure_type": failure_type,
-        "trigger_failure_class": "MIGRATION_ERROR" if failure_type == "migration" else "CODE_ERROR",
+        "trigger_failure_class": "MIGRATION_ERROR"
+        if failure_type == "migration"
+        else "CODE_ERROR",
     }
     if _ext_api_subtype and _ext_api_subtype != "other":
         task_context["external_api_subtype"] = _ext_api_subtype
     if regression_of is not None:
         task_context["regression_of_task_id"] = str(regression_of.id)
-        prev_pr = (regression_of.context or {}).get("merged_pr_number") \
-            or (regression_of.context or {}).get("pr_number")
+        prev_pr = (regression_of.context or {}).get("merged_pr_number") or (
+            regression_of.context or {}
+        ).get("pr_number")
         if prev_pr:
             task_context["regression_prior_pr_number"] = prev_pr
     fingerprint: str | None = None
     if error_summary:
         from app.anomaly_detection import _error_fingerprint
         from app.failure_stage import _derive_failure_stage
+
         # CI remediation tasks classify as CODE_ERROR; stage is inferred from
         # the error text so build/test/lint failures fingerprint distinctly.
         stage = _derive_failure_stage("CODE_ERROR", error_summary)
@@ -420,7 +508,9 @@ async def _handle_main_branch_ci_failure_inner(
         if prior_direction_id:
             task_context["diagnosis_task_id"] = str(prior_investigation.id)
             task_context["direction_id"] = str(prior_direction_id)
-            prior_fingerprint = prior_ctx.get("diagnosis_fingerprint") or prior_ctx.get("error_fingerprint")
+            prior_fingerprint = prior_ctx.get("diagnosis_fingerprint") or prior_ctx.get(
+                "error_fingerprint"
+            )
             if prior_fingerprint:
                 task_context["diagnosis_fingerprint"] = str(prior_fingerprint)
     # Fallback: no prior-investigation linkage, but if the CI error fingerprint
@@ -428,7 +518,9 @@ async def _handle_main_branch_ci_failure_inner(
     # fix's outcome still reaches _record_remediation_outcome.
     if "direction_id" not in task_context and fingerprint:
         matched_direction_id = await _find_direction_by_fingerprint(
-            project_id=project_id, fingerprint=fingerprint, session=session,
+            project_id=project_id,
+            fingerprint=fingerprint,
+            session=session,
         )
         if matched_direction_id:
             task_context["direction_id"] = matched_direction_id
@@ -442,13 +534,15 @@ async def _handle_main_branch_ci_failure_inner(
     task = Task(
         project_id=project_id,
         title=f"Auto-fix: CI failure on {head_branch}",
-        payloads=[{
-            "type": "create",
-            "effort": "medium",
-            "base_branch": head_branch,
-            "title": f"fix: auto-remediate CI failure on {head_branch}",
-            "prompt": prompt,
-        }],
+        payloads=[
+            {
+                "type": "create",
+                "effort": "medium",
+                "base_branch": head_branch,
+                "title": f"fix: auto-remediate CI failure on {head_branch}",
+                "prompt": prompt,
+            }
+        ],
         context=task_context,
         status=TaskStatus.QUEUED,
         created_by="SYSTEM_AUTO_REMEDIATION",
@@ -484,18 +578,26 @@ async def _handle_main_branch_ci_failure_inner(
     try:
         from app.main import _send_webhook_notification
         import asyncio
-        asyncio.ensure_future(_send_webhook_notification(
-            "AUTO_FIX_SPAWNED",
-            f"CI failure auto-remediation on {head_branch}",
-            f"SHA: {head_sha[:8]}, failed checks: {', '.join(failed_checks[:5])}",
-        ))
+
+        asyncio.ensure_future(
+            _send_webhook_notification(
+                "AUTO_FIX_SPAWNED",
+                f"CI failure auto-remediation on {head_branch}",
+                f"SHA: {head_sha[:8]}, failed checks: {', '.join(failed_checks[:5])}",
+            )
+        )
     except Exception as exc:
-        logger.warning("[AUTO-REMEDIATION] Failed to send webhook notification: %s", exc)
+        logger.warning(
+            "[AUTO-REMEDIATION] Failed to send webhook notification: %s", exc
+        )
 
     await session.commit()
     logger.info(
         "[AUTO-REMEDIATION] Spawned task %s for CI failure on %s@%s (%s)",
-        task.id, head_branch, head_sha[:8], failure_type,
+        task.id,
+        head_branch,
+        head_sha[:8],
+        failure_type,
     )
 
 
@@ -503,19 +605,24 @@ async def _handle_main_branch_ci_failure_inner(
 # the 3000-char truncation so critical test names / file paths / error lines
 # beyond the cutoff still reach the remediation prompt.
 _FAILING_TEST_PATTERNS = (
-    re.compile(r"FAILED\s+(\S+::\S+)"),                    # pytest: FAILED tests/x.py::test_y
-    re.compile(r"^FAIL\s+(\S+)", re.MULTILINE),            # jest/generic: FAIL path/to/spec
-    re.compile(r"✗\s+(\S+)"),                              # vitest/tap-style failure marker
+    re.compile(r"FAILED\s+(\S+::\S+)"),  # pytest: FAILED tests/x.py::test_y
+    re.compile(r"^FAIL\s+(\S+)", re.MULTILINE),  # jest/generic: FAIL path/to/spec
+    re.compile(r"✗\s+(\S+)"),  # vitest/tap-style failure marker
 )
 _FILE_LOCATION_PATTERNS = (
-    re.compile(r'File "([^"]+)", line (\d+)'),             # python traceback
-    re.compile(r"^\s*(\S+\.(?:ts|tsx|js|jsx|py)):(\d+)(?::\d+)?", re.MULTILINE),  # tsc/eslint/pytest short
+    re.compile(r'File "([^"]+)", line (\d+)'),  # python traceback
+    re.compile(
+        r"^\s*(\S+\.(?:ts|tsx|js|jsx|py)):(\d+)(?::\d+)?", re.MULTILINE
+    ),  # tsc/eslint/pytest short
 )
 _ERROR_MESSAGE_PATTERNS = (
     re.compile(r"([A-Z][A-Za-z0-9_.]*Error:[^\n]*)"),
     re.compile(r"^(assert [^\n]+)", re.MULTILINE),
     re.compile(r"(error TS\d+:[^\n]+)"),
-    re.compile(r"^\s*([A-Za-z0-9_./-]+\.(?:ts|tsx|js|jsx|py):\d+:\d+\s+error\s+[^\n]+)", re.MULTILINE),
+    re.compile(
+        r"^\s*([A-Za-z0-9_./-]+\.(?:ts|tsx|js|jsx|py):\d+:\d+\s+error\s+[^\n]+)",
+        re.MULTILINE,
+    ),
 )
 
 
@@ -526,7 +633,9 @@ def _extract_structured_signals(raw_logs: str) -> dict[str, list[str]]:
     still reach the agent prompt via the structured-signals section.
     """
     signals: dict[str, list[str]] = {
-        "failing_tests": [], "error_locations": [], "error_messages": [],
+        "failing_tests": [],
+        "error_locations": [],
+        "error_messages": [],
     }
     if not raw_logs:
         return signals
@@ -563,16 +672,22 @@ async def _extract_ci_context(
     error_summary = ""
     failure_type = "unknown"
     structured_signals: dict[str, list[str]] = {
-        "failing_tests": [], "error_locations": [], "error_messages": [],
+        "failing_tests": [],
+        "error_locations": [],
+        "error_messages": [],
     }
 
     try:
         token = await get_repo_installation_token(owner, repo)
         if not token:
-            logger.warning("[AUTO-REMEDIATION] No GitHub token available for %s/%s", owner, repo)
+            logger.warning(
+                "[AUTO-REMEDIATION] No GitHub token available for %s/%s", owner, repo
+            )
             return failed_checks, error_summary, failure_type, structured_signals
 
-        ci_result = await get_check_runs_cached(token, owner, repo, head_sha, project_id=str(project_id))
+        ci_result = await get_check_runs_cached(
+            token, owner, repo, head_sha, project_id=str(project_id)
+        )
         details = ci_result.get("details", [])
         if not isinstance(details, list):
             details = []
@@ -594,11 +709,16 @@ async def _extract_ci_context(
         if raw_logs:
             logs_lower = raw_logs.lower()
             from app.failure_classification import _MIGRATION_PATTERNS  # noqa: PLC0415
+
             if any(p in logs_lower for p in _MIGRATION_PATTERNS):
                 failure_type = "migration"
             elif "importerror" in logs_lower or "syntaxerror" in logs_lower:
                 failure_type = "build"
-            elif "assertionerror" in logs_lower or "assert " in logs_lower or "pytest" in logs_lower:
+            elif (
+                "assertionerror" in logs_lower
+                or "assert " in logs_lower
+                or "pytest" in logs_lower
+            ):
                 failure_type = "test"
             elif "error:" in logs_lower and any(
                 c.isdigit() for c in raw_logs.split("error:")[0][-20:] if c
@@ -627,10 +747,13 @@ async def _find_direction_by_fingerprint(
     if not project:
         return None
     matches: list[dict] = []
-    for d in (project.directions or []):
+    for d in project.directions or []:
         if not d.get("id"):
             continue
-        if d.get("error_fingerprint") == fingerprint or d.get("last_remediation_fingerprint") == fingerprint:
+        if (
+            d.get("error_fingerprint") == fingerprint
+            or d.get("last_remediation_fingerprint") == fingerprint
+        ):
             matches.append(d)
     if not matches:
         return None
@@ -639,10 +762,12 @@ async def _find_direction_by_fingerprint(
         # Lower tuple sorts first. Prefer status == "active" and not auto_paused,
         # then most recent last_remediation_at (descending via negation trick:
         # use string compare, and invert by sorting reverse within bucket).
-        is_active = 0 if (d.get("status") == "active" and not d.get("auto_paused")) else 1
+        is_active = (
+            0 if (d.get("status") == "active" and not d.get("auto_paused")) else 1
+        )
         return (is_active, str(d.get("last_remediation_at") or ""))
 
-    matches.sort(key=lambda d: (_rank(d)[0], ))
+    matches.sort(key=lambda d: (_rank(d)[0],))
     top_bucket = _rank(matches[0])[0]
     top = [d for d in matches if _rank(d)[0] == top_bucket]
     top.sort(key=lambda d: str(d.get("last_remediation_at") or ""), reverse=True)
@@ -668,15 +793,23 @@ async def _find_recent_merged_remediation(
         return None
     cutoff = _utcnow() - timedelta(hours=window_hours)
     # Audit W1: filter on the indexed columns instead of scanning JSONB.
-    rows = (await session.execute(
-        select(Task).where(
-            Task.project_id == project_id,
-            Task.status == TaskStatus.COMPLETED,
-            Task.created_at >= cutoff,
-            Task.auto_remediation.is_(True),
-            Task.previous_error_fingerprint == fingerprint,
-        ).order_by(Task.created_at.desc())
-    )).scalars().all()
+    rows = (
+        (
+            await session.execute(
+                select(Task)
+                .where(
+                    Task.project_id == project_id,
+                    Task.status == TaskStatus.COMPLETED,
+                    Task.created_at >= cutoff,
+                    Task.auto_remediation.is_(True),
+                    Task.previous_error_fingerprint == fingerprint,
+                )
+                .order_by(Task.created_at.desc())
+            )
+        )
+        .scalars()
+        .all()
+    )
     for t in rows:
         ctx = t.context or {}
         if ctx.get("ci_failure_branch") == branch:
@@ -699,13 +832,19 @@ async def _find_matching_prior_investigation(
     if not error_summary:
         return None
     cutoff = _utcnow() - timedelta(hours=48)
-    rows = (await session.execute(
-        select(Task).where(
-            Task.project_id == project_id,
-            Task.status == TaskStatus.COMPLETED,
-            Task.created_at >= cutoff,
+    rows = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.project_id == project_id,
+                    Task.status == TaskStatus.COMPLETED,
+                    Task.created_at >= cutoff,
+                )
+            )
         )
-    )).scalars().all()
+        .scalars()
+        .all()
+    )
 
     err_lower = error_summary.lower()
     err_tokens = set(re.findall(r"[a-zA-Z_][a-zA-Z0-9_]{3,}", err_lower))
@@ -725,15 +864,17 @@ async def _find_matching_prior_investigation(
             continue
 
         score = 0
-        for entry in (po.get("affected_files") or []):
+        for entry in po.get("affected_files") or []:
             p = entry.get("path") if isinstance(entry, dict) else entry
             if isinstance(p, str) and p and p.lower() in err_lower:
                 score += 5
 
-        diag_tokens = set(re.findall(
-            r"[a-zA-Z_][a-zA-Z0-9_]{3,}",
-            (summary + " " + root_cause).lower(),
-        ))
+        diag_tokens = set(
+            re.findall(
+                r"[a-zA-Z_][a-zA-Z0-9_]{3,}",
+                (summary + " " + root_cause).lower(),
+            )
+        )
         score += len(err_tokens & diag_tokens)
 
         if score > best_score and score >= 3:
@@ -755,13 +896,24 @@ def _extract_migration_chain_signals(error_summary: str) -> str:
     bullets: list[str] = []
 
     # Schema version mismatch: "database at 'XXXX', code expects 'YYYY'"
-    m = re.search(r"database at ['\"]([0-9a-f_]+)['\"][^'\"]*expects ['\"]([0-9a-f_]+)['\"]", text, re.IGNORECASE)
+    m = re.search(
+        r"database at ['\"]([0-9a-f_]+)['\"][^'\"]*expects ['\"]([0-9a-f_]+)['\"]",
+        text,
+        re.IGNORECASE,
+    )
     if m:
-        bullets.append(f"- Schema mismatch: database revision `{m.group(1)}`, code EXPECTED_SCHEMA_REVISION `{m.group(2)}` — bump EXPECTED_SCHEMA_REVISION in backend/app/main.py or add the missing migration.")
+        bullets.append(
+            f"- Schema mismatch: database revision `{m.group(1)}`, code EXPECTED_SCHEMA_REVISION `{m.group(2)}` — bump EXPECTED_SCHEMA_REVISION in backend/app/main.py or add the missing migration."
+        )
     else:
-        m2 = re.search(r"expected_schema_revision[^0-9a-f]*([0-9a-f_]{4,})[^0-9a-f]+([0-9a-f_]{4,})", lower)
+        m2 = re.search(
+            r"expected_schema_revision[^0-9a-f]*([0-9a-f_]{4,})[^0-9a-f]+([0-9a-f_]{4,})",
+            lower,
+        )
         if m2:
-            bullets.append(f"- EXPECTED_SCHEMA_REVISION mismatch involving `{m2.group(1)}` and `{m2.group(2)}`.")
+            bullets.append(
+                f"- EXPECTED_SCHEMA_REVISION mismatch involving `{m2.group(1)}` and `{m2.group(2)}`."
+            )
 
     # Multiple head revisions: alembic prints them like "Multiple head revisions are present for given argument 'head'; please specify a specific target revision, '<branchname>@head' to narrow to a specific head, or 'heads' for all heads"
     # Try to capture explicit revision IDs mentioned nearby.
@@ -769,17 +921,33 @@ def _extract_migration_chain_signals(error_summary: str) -> str:
         ids = re.findall(r"\b([0-9a-f]{8,12}|\d{4})\b", text)
         unique_ids = list(dict.fromkeys(ids))[:6]
         if unique_ids:
-            bullets.append(f"- Multiple alembic heads detected. Candidate revision IDs from logs: {', '.join('`' + i + '`' for i in unique_ids)}. Re-chain so exactly one head remains.")
+            bullets.append(
+                f"- Multiple alembic heads detected. Candidate revision IDs from logs: {', '.join('`' + i + '`' for i in unique_ids)}. Re-chain so exactly one head remains."
+            )
         else:
-            bullets.append("- Multiple alembic heads detected — inspect `alembic heads` and re-chain so exactly one head remains.")
+            bullets.append(
+                "- Multiple alembic heads detected — inspect `alembic heads` and re-chain so exactly one head remains."
+            )
 
     # Can't locate revision: alembic message "Can't locate revision identified by 'XXXX'"
-    for m in re.finditer(r"can'?t locate revision identified by ['\"]([0-9a-f_]+)['\"]", text, re.IGNORECASE):
-        bullets.append(f"- Missing revision `{m.group(1)}` referenced as down_revision but no file defines it. Restore the file or fix the down_revision pointer.")
+    for m in re.finditer(
+        r"can'?t locate revision identified by ['\"]([0-9a-f_]+)['\"]",
+        text,
+        re.IGNORECASE,
+    ):
+        bullets.append(
+            f"- Missing revision `{m.group(1)}` referenced as down_revision but no file defines it. Restore the file or fix the down_revision pointer."
+        )
 
     # UndefinedColumn: extract column name
-    for m in re.finditer(r"undefinedcolumn[^a-z]+(?:column )?['\"]?([a-zA-Z_][a-zA-Z0-9_.]*)['\"]?", text, re.IGNORECASE):
-        bullets.append(f"- UndefinedColumn on `{m.group(1)}` — a migration adding this column is missing or out of order.")
+    for m in re.finditer(
+        r"undefinedcolumn[^a-z]+(?:column )?['\"]?([a-zA-Z_][a-zA-Z0-9_.]*)['\"]?",
+        text,
+        re.IGNORECASE,
+    ):
+        bullets.append(
+            f"- UndefinedColumn on `{m.group(1)}` — a migration adding this column is missing or out of order."
+        )
         break
 
     return "\n".join(bullets)
@@ -797,11 +965,21 @@ def _build_remediation_prompt(
     structured_signals: dict[str, list[str]] | None = None,
 ) -> str:
     """Build the agent prompt for a CI auto-remediation task."""
-    checks_text = "\n".join(f"  - {name}" for name in failed_checks) if failed_checks else "  (check names not available)"
+    checks_text = (
+        "\n".join(f"  - {name}" for name in failed_checks)
+        if failed_checks
+        else "  (check names not available)"
+    )
     # Truncate error summary for prompt to avoid excessive token usage
-    summary_text = error_summary[:2000] if error_summary else "(no error logs available)"
+    summary_text = (
+        error_summary[:2000] if error_summary else "(no error logs available)"
+    )
 
-    migration_chain_hint = _extract_migration_chain_signals(error_summary) if failure_type == "migration" else ""
+    migration_chain_hint = (
+        _extract_migration_chain_signals(error_summary)
+        if failure_type == "migration"
+        else ""
+    )
 
     type_guidance_map = {
         "test": "Focus on test assertions, fixtures, and test setup — the production code may be fine but tests may need updating to match changed behavior.",
@@ -816,14 +994,20 @@ def _build_remediation_prompt(
             "multiple heads), UndefinedColumn errors imply a missing or misordered "
             "migration, and re-run the backend invariant tests "
             "(bash scripts/test-backend.sh testing/test_invariants.py) to verify."
-            + (f"\n\nExtracted chain state from logs:\n{migration_chain_hint}" if migration_chain_hint else "")
+            + (
+                f"\n\nExtracted chain state from logs:\n{migration_chain_hint}"
+                if migration_chain_hint
+                else ""
+            )
         ),
         "unknown": "Diagnose the failure type from the error output before applying a fix.",
     }
     type_guidance = type_guidance_map.get(failure_type, type_guidance_map["unknown"])
 
     diagnosis_section = ""
-    if prior_investigation is not None and isinstance(prior_investigation.plan_output, dict):
+    if prior_investigation is not None and isinstance(
+        prior_investigation.plan_output, dict
+    ):
         po = prior_investigation.plan_output
         root_cause = str(po.get("root_cause") or "").strip()
         recommended_fix = str(po.get("recommended_fix") or "").strip()
@@ -850,9 +1034,14 @@ def _build_remediation_prompt(
         )
 
     signals_section = ""
-    if structured_signals and any(structured_signals.get(k) for k in ("failing_tests", "error_locations", "error_messages")):
-        lines = ["\n## Structured Failure Signals\n"
-                 "(Extracted from full logs before truncation — use these as authoritative even if the raw log below is cut off.)\n"]
+    if structured_signals and any(
+        structured_signals.get(k)
+        for k in ("failing_tests", "error_locations", "error_messages")
+    ):
+        lines = [
+            "\n## Structured Failure Signals\n"
+            "(Extracted from full logs before truncation — use these as authoritative even if the raw log below is cut off.)\n"
+        ]
         if structured_signals.get("failing_tests"):
             lines.append("Failing tests:")
             lines.extend(f"  - {t}" for t in structured_signals["failing_tests"])

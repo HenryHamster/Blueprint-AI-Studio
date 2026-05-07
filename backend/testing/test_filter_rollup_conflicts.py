@@ -6,6 +6,7 @@ or fix tasks spawned for sibling PRs) must NOT be deferred against that
 rollup, because they ARE the rollup pipeline — blocking them deadlocks the
 rollup it depends on.
 """
+
 import uuid
 import pytest
 from unittest.mock import AsyncMock
@@ -22,8 +23,16 @@ async def _mk_project(session, name="Rollup Filter Test"):
     return project
 
 
-async def _mk_task(session, project_id, *, status, payloads, context=None,
-                   parent_task_id=None, title=None):
+async def _mk_task(
+    session,
+    project_id,
+    *,
+    status,
+    payloads,
+    context=None,
+    parent_task_id=None,
+    title=None,
+):
     task = Task(
         project_id=project_id,
         title=title or f"task-{uuid.uuid4().hex[:8]}",
@@ -41,6 +50,7 @@ async def _mk_task(session, project_id, *, status, payloads, context=None,
 # ══════════════════════════════════════════════════════════════════════════════
 # Regression: sibling review/fix tasks must NOT be deferred by their own rollup
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 class TestRollupFilterSiblingExemption:
     """The dispatch filter must not defer a review/fix task against the very
@@ -63,7 +73,8 @@ class TestRollupFilterSiblingExemption:
         project = await _mk_project(db_session, "Review Exemption")
 
         rollup_parent = await _mk_task(
-            db_session, project.id,
+            db_session,
+            project.id,
             status=TaskStatus.EVALUATING,
             payloads=[{"type": "research"}],
             title="Research: admin_analytics refactor",
@@ -74,7 +85,8 @@ class TestRollupFilterSiblingExemption:
         ]
         # Sibling refactor child that fed the rollup.
         await _mk_task(
-            db_session, project.id,
+            db_session,
+            project.id,
             status=TaskStatus.COMPLETED,
             parent_task_id=rollup_parent.id,
             payloads=[{"type": "refactor"}],
@@ -83,11 +95,17 @@ class TestRollupFilterSiblingExemption:
         )
         # Review task for that refactor's PR — sibling under the same rollup parent.
         review_task = await _mk_task(
-            db_session, project.id,
+            db_session,
+            project.id,
             status=TaskStatus.QUEUED,
             parent_task_id=rollup_parent.id,
-            payloads=[{"type": "review", "pr_number": 2063,
-                       "base_branch": f"research/{str(rollup_parent.id)[:8]}"}],
+            payloads=[
+                {
+                    "type": "review",
+                    "pr_number": 2063,
+                    "base_branch": f"research/{str(rollup_parent.id)[:8]}",
+                }
+            ],
             context={"related_files": overlapping_files},
             title="Review PR #2063",
         )
@@ -103,7 +121,9 @@ class TestRollupFilterSiblingExemption:
             "deadlocks the rollup, since the rollup can't advance until this "
             "review signs off on the sibling's PR."
         )
-        assert "overlaps pending rollup" not in (review_task.latest_status_message or ""), (
+        assert "overlaps pending rollup" not in (
+            review_task.latest_status_message or ""
+        ), (
             f"Sibling review must not be marked with the rollup-deferral status "
             f"message, got {review_task.latest_status_message!r}"
         )
@@ -118,14 +138,16 @@ class TestRollupFilterSiblingExemption:
         project = await _mk_project(db_session, "External Defer")
 
         rollup_parent = await _mk_task(
-            db_session, project.id,
+            db_session,
+            project.id,
             status=TaskStatus.EVALUATING,
             payloads=[{"type": "research"}],
             title="Research: module decomposition",
         )
         files = ["backend/app/main.py", "backend/app/models.py", "backend/app/admin.py"]
         await _mk_task(
-            db_session, project.id,
+            db_session,
+            project.id,
             status=TaskStatus.COMPLETED,
             parent_task_id=rollup_parent.id,
             payloads=[{"type": "refactor"}],
@@ -134,7 +156,8 @@ class TestRollupFilterSiblingExemption:
         )
         # External task — NO parent link to rollup_parent, files fully overlap.
         external = await _mk_task(
-            db_session, project.id,
+            db_session,
+            project.id,
             status=TaskStatus.QUEUED,
             parent_task_id=None,
             payloads=[{"type": "create"}],
@@ -167,20 +190,25 @@ class TestRollupFilterSiblingExemption:
         project = await _mk_project(db_session, "Sibling No Overlap")
 
         rollup_parent = await _mk_task(
-            db_session, project.id,
+            db_session,
+            project.id,
             status=TaskStatus.EVALUATING,
             payloads=[{"type": "research"}],
         )
         await _mk_task(
-            db_session, project.id,
+            db_session,
+            project.id,
             status=TaskStatus.COMPLETED,
             parent_task_id=rollup_parent.id,
             payloads=[{"type": "refactor"}],
-            context={"scope": "large",
-                     "related_files": ["backend/app/main.py", "backend/app/admin.py"]},
+            context={
+                "scope": "large",
+                "related_files": ["backend/app/main.py", "backend/app/admin.py"],
+            },
         )
         sibling = await _mk_task(
-            db_session, project.id,
+            db_session,
+            project.id,
             status=TaskStatus.QUEUED,
             parent_task_id=rollup_parent.id,
             payloads=[{"type": "fix", "pr_number": 9000}],

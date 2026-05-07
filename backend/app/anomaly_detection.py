@@ -4,6 +4,7 @@ Extracted from app.task_completion to keep that module focused on completion
 handlers. Functions here analyze task failure patterns and propose directions
 based on persistent anomalies.
 """
+
 import hashlib
 import logging
 import re
@@ -48,15 +49,29 @@ def _normalize_error_message(msg: str) -> str:
     if not msg:
         return ""
     # Strip UUIDs (8-4-4-4-12 hex)
-    normalized = re.sub(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', '<uuid>', msg, flags=re.IGNORECASE)
+    normalized = re.sub(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+        "<uuid>",
+        msg,
+        flags=re.IGNORECASE,
+    )
     # Strip PR numbers (e.g. PR #123, #123, pr/123)
-    normalized = re.sub(r'(?:PR\s*)?#\d+', '<pr>', normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"(?:PR\s*)?#\d+", "<pr>", normalized, flags=re.IGNORECASE)
     # Strip branch names like blueprint/task-abc123 or feature/some-branch-42
-    normalized = re.sub(r'\b[a-z][a-z0-9_-]*/[a-z0-9][a-z0-9_-]*\b', '<branch>', normalized, flags=re.IGNORECASE)
+    normalized = re.sub(
+        r"\b[a-z][a-z0-9_-]*/[a-z0-9][a-z0-9_-]*\b",
+        "<branch>",
+        normalized,
+        flags=re.IGNORECASE,
+    )
     # Strip ISO timestamps (2026-04-11T12:34:56.789Z etc.)
-    normalized = re.sub(r'\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?', '<ts>', normalized)
+    normalized = re.sub(
+        r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?",
+        "<ts>",
+        normalized,
+    )
     # Strip remaining standalone numbers (keep short words that happen to be digits like exit codes)
-    normalized = re.sub(r'\b\d{4,}\b', '<id>', normalized)
+    normalized = re.sub(r"\b\d{4,}\b", "<id>", normalized)
     return normalized.strip()
 
 
@@ -82,6 +97,7 @@ def _task_error_fingerprint(task) -> "str | None":
     try:
         from app.failure_classification import classify_failure  # noqa: PLC0415
         from app.failure_stage import _derive_failure_stage  # noqa: PLC0415
+
         cls = classify_failure(task) or ""
         stage = _derive_failure_stage(cls, msg)
     except Exception:
@@ -118,7 +134,9 @@ _SHARED_FINGERPRINT_PAUSED_WINDOW_HOURS = 48
 
 
 def find_directions_sharing_fingerprint(
-    project, target_fingerprint: str, exclude_direction_id: Optional[str] = None,
+    project,
+    target_fingerprint: str,
+    exclude_direction_id: Optional[str] = None,
 ) -> list[dict]:
     """Return other recently auto-paused directions that share ``target_fingerprint``.
 
@@ -140,7 +158,7 @@ def find_directions_sharing_fingerprint(
         return []
     cutoff = _utcnow() - timedelta(hours=_SHARED_FINGERPRINT_PAUSED_WINDOW_HOURS)
     matches: list[dict] = []
-    for d in (getattr(project, "directions", None) or []):
+    for d in getattr(project, "directions", None) or []:
         if exclude_direction_id and d.get("id") == exclude_direction_id:
             continue
         if d.get("status") != "paused" or not d.get("auto_paused"):
@@ -157,12 +175,14 @@ def find_directions_sharing_fingerprint(
                     continue
             except (TypeError, ValueError):
                 pass
-        matches.append({
-            "id": d.get("id"),
-            "text": (d.get("text") or "")[:100],
-            "paused_at": paused_at_raw,
-            "auto_pause_count": int(d.get("auto_pause_count", 0) or 0),
-        })
+        matches.append(
+            {
+                "id": d.get("id"),
+                "text": (d.get("text") or "")[:100],
+                "paused_at": paused_at_raw,
+                "auto_pause_count": int(d.get("auto_pause_count", 0) or 0),
+            }
+        )
     return matches
 
 
@@ -212,28 +232,49 @@ async def _compute_research_anomalies(project_id, session: AsyncSession) -> list
     momentum_window_start = now - timedelta(hours=72)
 
     # Query last 50 terminal tasks for this project
-    terminal_tasks = (await session.execute(
-        select(Task).where(
-            Task.project_id == project_id,
-            Task.status.in_([TaskStatus.FAILED, TaskStatus.CANCELLED]),
-        ).order_by(Task.created_at.desc()).limit(50)
-    )).scalars().all()
+    terminal_tasks = (
+        (
+            await session.execute(
+                select(Task)
+                .where(
+                    Task.project_id == project_id,
+                    Task.status.in_([TaskStatus.FAILED, TaskStatus.CANCELLED]),
+                )
+                .order_by(Task.created_at.desc())
+                .limit(50)
+            )
+        )
+        .scalars()
+        .all()
+    )
 
     # All tasks (any status) in the 72h momentum window — used as the denominator
     # for failure-rate momentum detection. Separate from terminal_tasks because
     # rate-based momentum needs total volume, not just failure count.
-    all_tasks_72h = (await session.execute(
-        select(Task).where(
-            Task.project_id == project_id,
-            Task.created_at >= momentum_window_start,
+    all_tasks_72h = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.project_id == project_id,
+                    Task.created_at >= momentum_window_start,
+                )
+            )
         )
-    )).scalars().all()
+        .scalars()
+        .all()
+    )
 
     anomalies = []
 
     # --- Failure class analysis ---
-    recent_failures = [t for t in terminal_tasks if t.created_at and t.created_at >= window_48h]
-    prior_failures = [t for t in terminal_tasks if t.created_at and prior_window_start <= t.created_at < window_48h]
+    recent_failures = [
+        t for t in terminal_tasks if t.created_at and t.created_at >= window_48h
+    ]
+    prior_failures = [
+        t
+        for t in terminal_tasks
+        if t.created_at and prior_window_start <= t.created_at < window_48h
+    ]
 
     # Group by failure class
     recent_by_class: dict = {}
@@ -258,10 +299,16 @@ async def _compute_research_anomalies(project_id, session: AsyncSession) -> list
                 msg = t.latest_status_message or ""
                 fp = _error_fingerprint(msg)
                 if fp not in pattern_counts:
-                    pattern_counts[fp] = {"fingerprint": fp, "count": 0, "example_message": msg}
+                    pattern_counts[fp] = {
+                        "fingerprint": fp,
+                        "count": 0,
+                        "example_message": msg,
+                    }
                 pattern_counts[fp]["count"] += 1
             # Sort descending by count, take top 3
-            top_patterns = sorted(pattern_counts.values(), key=lambda x: x["count"], reverse=True)[:3]
+            top_patterns = sorted(
+                pattern_counts.values(), key=lambda x: x["count"], reverse=True
+            )[:3]
 
         if count > 3 and prior_count > 0 and count >= prior_count * 2:
             anomaly: dict = {
@@ -276,9 +323,14 @@ async def _compute_research_anomalies(project_id, session: AsyncSession) -> list
                 anomaly["top_patterns"] = top_patterns
             anomalies.append(anomaly)
         elif count > 3:
-            pattern_summary = "; ".join(
-                f"({p['count']}x) \"{p['example_message'][:80]}\"" for p in top_patterns
-            ) if top_patterns else ""
+            pattern_summary = (
+                "; ".join(
+                    f'({p["count"]}x) "{p["example_message"][:80]}"'
+                    for p in top_patterns
+                )
+                if top_patterns
+                else ""
+            )
             detail_msg = (
                 f"{count} tasks failed with class {cls} in the last 48h. "
                 "Consider investigating shared root causes."
@@ -299,9 +351,10 @@ async def _compute_research_anomalies(project_id, session: AsyncSession) -> list
     # 48h windows) misses: a steadily rising failure rate across three
     # consecutive 24h windows. Complementary, not a replacement.
     momentum_buckets = [0, 0, 0]  # [72-48h, 48-24h, 24-0h] failures
-    total_buckets = [0, 0, 0]     # same windows, all-status totals
+    total_buckets = [0, 0, 0]  # same windows, all-status totals
     momentum_dirs: set[str] = set()
     from app.time_utils import _to_naive_utc
+
     for t in terminal_tasks:
         # Task.created_at TIMESTAMPTZ since 0061; momentum_window_start + now are naive.
         t_created = _to_naive_utc(t.created_at)
@@ -329,33 +382,33 @@ async def _compute_research_anomalies(project_id, session: AsyncSession) -> list
         else:
             total_buckets[0] += 1
     if all(total_buckets[i] >= 3 for i in range(3)):
-        rates = [
-            momentum_buckets[i] / total_buckets[i] for i in range(3)
-        ]
+        rates = [momentum_buckets[i] / total_buckets[i] for i in range(3)]
         if rates[0] < rates[1] < rates[2] and rates[2] >= 0.20:
-            anomalies.append({
-                "signal": (
-                    f"FailureRateMomentum: {rates[0]:.0%} → {rates[1]:.0%} → "
-                    f"{rates[2]:.0%} across last 3x24h windows"
-                ),
-                "severity": "medium",
-                "details": (
-                    f"Failure rate has risen monotonically across three "
-                    f"consecutive 24h windows (72-48h: {rates[0]:.0%} "
-                    f"[{momentum_buckets[0]}/{total_buckets[0]}], 48-24h: "
-                    f"{rates[1]:.0%} [{momentum_buckets[1]}/{total_buckets[1]}], "
-                    f"24-0h: {rates[2]:.0%} [{momentum_buckets[2]}/{total_buckets[2]}]). "
-                    "Gradual acceleration suggests an emerging systemic issue "
-                    "before the surge threshold trips."
-                ),
-                "rate_progression": [f"{r:.0%}" for r in rates],
-                "affected_directions": sorted(momentum_dirs),
-                "suggested_action": (
-                    "Investigate the upward trend before it trips the surge "
-                    "threshold — check recent deploys, infra health, and "
-                    "direction-level failure patterns."
-                ),
-            })
+            anomalies.append(
+                {
+                    "signal": (
+                        f"FailureRateMomentum: {rates[0]:.0%} → {rates[1]:.0%} → "
+                        f"{rates[2]:.0%} across last 3x24h windows"
+                    ),
+                    "severity": "medium",
+                    "details": (
+                        f"Failure rate has risen monotonically across three "
+                        f"consecutive 24h windows (72-48h: {rates[0]:.0%} "
+                        f"[{momentum_buckets[0]}/{total_buckets[0]}], 48-24h: "
+                        f"{rates[1]:.0%} [{momentum_buckets[1]}/{total_buckets[1]}], "
+                        f"24-0h: {rates[2]:.0%} [{momentum_buckets[2]}/{total_buckets[2]}]). "
+                        "Gradual acceleration suggests an emerging systemic issue "
+                        "before the surge threshold trips."
+                    ),
+                    "rate_progression": [f"{r:.0%}" for r in rates],
+                    "affected_directions": sorted(momentum_dirs),
+                    "suggested_action": (
+                        "Investigate the upward trend before it trips the surge "
+                        "threshold — check recent deploys, infra health, and "
+                        "direction-level failure patterns."
+                    ),
+                }
+            )
 
     # --- Cross-direction systemic pattern analysis ---
     # When one normalized error fingerprint recurs across multiple directions in
@@ -397,22 +450,24 @@ async def _compute_research_anomalies(project_id, session: AsyncSession) -> list
         if len(dirs) < 2 or fp_counts[fp] < 3:
             continue
         dir_list = sorted(dirs)
-        anomalies.append({
-            "signal": (
-                f"CrossDirectionFingerprint_{fp} spans {len(dirs)} directions "
-                f"with {fp_counts[fp]} recent failures"
-            ),
-            "severity": "high",
-            "details": (
-                f"Fingerprint {fp} ({fp_counts[fp]} recent failures) affects "
-                f"{len(dirs)} directions: {', '.join(dir_list)[:200]}. "
-                f"Example message: \"{fp_example[fp][:120]}\". "
-                "Suggests a systemic root cause (shared infra/framework/dep) "
-                "rather than direction-specific scope or code issues."
-            ),
-            "fingerprint": fp,
-            "affected_directions": dir_list,
-        })
+        anomalies.append(
+            {
+                "signal": (
+                    f"CrossDirectionFingerprint_{fp} spans {len(dirs)} directions "
+                    f"with {fp_counts[fp]} recent failures"
+                ),
+                "severity": "high",
+                "details": (
+                    f"Fingerprint {fp} ({fp_counts[fp]} recent failures) affects "
+                    f"{len(dirs)} directions: {', '.join(dir_list)[:200]}. "
+                    f'Example message: "{fp_example[fp][:120]}". '
+                    "Suggests a systemic root cause (shared infra/framework/dep) "
+                    "rather than direction-specific scope or code issues."
+                ),
+                "fingerprint": fp,
+                "affected_directions": dir_list,
+            }
+        )
 
     # --- Intra-direction recurring fingerprint analysis ---
     # Same normalized fingerprint recurring 3+ times *within one direction* in
@@ -425,29 +480,31 @@ async def _compute_research_anomalies(project_id, session: AsyncSession) -> list
             continue
         if len(fp_directions.get(fp, set())) >= 2 and fp_counts.get(fp, 0) >= 3:
             continue
-        anomalies.append({
-            "signal": (
-                f"IntraDirectionFingerprint_{fp}_{did} "
-                f"{count} recent failures in one direction"
-            ),
-            "severity": "high",
-            "details": (
-                f"Fingerprint {fp} recurred {count} times in direction {did} "
-                f"within the last 48h. "
-                f"Example message: \"{intra_fp_example[(fp, did)][:120]}\". "
-                "Investigate the root cause before the direction auto-pauses."
-            ),
-            "fingerprint": fp,
-            "direction_id": did,
-            "failure_count": count,
-        })
+        anomalies.append(
+            {
+                "signal": (
+                    f"IntraDirectionFingerprint_{fp}_{did} "
+                    f"{count} recent failures in one direction"
+                ),
+                "severity": "high",
+                "details": (
+                    f"Fingerprint {fp} recurred {count} times in direction {did} "
+                    f"within the last 48h. "
+                    f'Example message: "{intra_fp_example[(fp, did)][:120]}". '
+                    "Investigate the root cause before the direction auto-pauses."
+                ),
+                "fingerprint": fp,
+                "direction_id": did,
+                "failure_count": count,
+            }
+        )
 
     # --- Direction merge rate and failure rate analysis ---
-    project = (await session.execute(
-        select(Project).where(Project.id == project_id)
-    )).scalar_one_or_none()
+    project = (
+        await session.execute(select(Project).where(Project.id == project_id))
+    ).scalar_one_or_none()
     if project:
-        for direction in (project.directions or []):
+        for direction in project.directions or []:
             if direction.get("status") != "active":
                 continue
             history = direction.get("research_history") or []
@@ -463,15 +520,17 @@ async def _compute_research_anomalies(project_id, session: AsyncSession) -> list
                     merged = entry.get("prs_merged", 0)
                     rates.append(merged / created if created > 0 else 0.0)
                 if rates[0] > rates[1] > rates[2] and rates[0] > 0.1:
-                    anomalies.append({
-                        "signal": f"Direction '{d_id}' merge rate declining: {rates[0]:.2f} → {rates[1]:.2f} → {rates[2]:.2f}",
-                        "severity": "medium",
-                        "details": (
-                            f"Direction \"{d_text}\" (id: {d_id}) has seen a consistent decline in "
-                            f"merge rate over the last 3 cycles ({rates[0]:.2f} → {rates[1]:.2f} → {rates[2]:.2f}). "
-                            "May indicate implementation barriers or stale findings."
-                        ),
-                    })
+                    anomalies.append(
+                        {
+                            "signal": f"Direction '{d_id}' merge rate declining: {rates[0]:.2f} → {rates[1]:.2f} → {rates[2]:.2f}",
+                            "severity": "medium",
+                            "details": (
+                                f'Direction "{d_text}" (id: {d_id}) has seen a consistent decline in '
+                                f"merge rate over the last 3 cycles ({rates[0]:.2f} → {rates[1]:.2f} → {rates[2]:.2f}). "
+                                "May indicate implementation barriers or stale findings."
+                            ),
+                        }
+                    )
 
             # High failure rate in last 2 cycles (>50%)
             if len(history) >= 2:
@@ -480,15 +539,17 @@ async def _compute_research_anomalies(project_id, session: AsyncSession) -> list
                 total_failed = sum(e.get("tasks_failed", 0) for e in last2)
                 if total_created > 0 and total_failed / total_created > 0.5:
                     fail_pct = int(total_failed / total_created * 100)
-                    anomalies.append({
-                        "signal": f"Direction '{d_id}' has {fail_pct}% task failure rate in last 2 cycles",
-                        "severity": "high",
-                        "details": (
-                            f"Direction \"{d_text}\" (id: {d_id}) had {total_failed}/{total_created} tasks fail "
-                            f"in the last 2 research cycles ({fail_pct}% failure rate). "
-                            "The findings may be generating unimplementable tasks."
-                        ),
-                    })
+                    anomalies.append(
+                        {
+                            "signal": f"Direction '{d_id}' has {fail_pct}% task failure rate in last 2 cycles",
+                            "severity": "high",
+                            "details": (
+                                f'Direction "{d_text}" (id: {d_id}) had {total_failed}/{total_created} tasks fail '
+                                f"in the last 2 research cycles ({fail_pct}% failure rate). "
+                                "The findings may be generating unimplementable tasks."
+                            ),
+                        }
+                    )
 
     # --- Persist anomaly tracking ---
     proj_key = str(project_id)
@@ -508,7 +569,9 @@ async def _compute_research_anomalies(project_id, session: AsyncSession) -> list
         if signal.startswith("Direction '"):
             # Include direction ID to avoid key collisions across directions
             parts = signal.split("'")
-            anomaly_key = f"Direction_{parts[1]}" if len(parts) > 1 else signal.split()[0]
+            anomaly_key = (
+                f"Direction_{parts[1]}" if len(parts) > 1 else signal.split()[0]
+            )
         else:
             parts = signal.split()
             anomaly_key = parts[0] if parts else signal
@@ -580,7 +643,9 @@ async def _compute_research_anomalies(project_id, session: AsyncSession) -> list
         await _shared_state.persist_anomaly_snapshot(proj_key, proj_anomalies, session)
     except Exception:
         logger.warning(
-            "[ANOMALY_PERSIST] Failed to persist anomaly snapshot for %s", proj_key, exc_info=True,
+            "[ANOMALY_PERSIST] Failed to persist anomaly snapshot for %s",
+            proj_key,
+            exc_info=True,
         )
 
     return anomalies
@@ -595,7 +660,9 @@ async def _compute_research_anomalies(project_id, session: AsyncSession) -> list
 # code regressions tend to be direction-specific rather than infra-wide, so
 # aggressive pipeline-level throttling is less appropriate than for infra
 # failures.
-_ACTIONABLE_FAILURE_CLASSES = frozenset({"PROVISION_FAILURE", "EXTERNAL_API", "CODE_ERROR"})
+_ACTIONABLE_FAILURE_CLASSES = frozenset(
+    {"PROVISION_FAILURE", "EXTERNAL_API", "CODE_ERROR"}
+)
 _INFRA_FAILURE_CLASSES = frozenset({"PROVISION_FAILURE", "EXTERNAL_API"})
 
 # Minimum occurrence_count in persistent_anomalies to trigger adjustments
@@ -623,6 +690,7 @@ def _compute_adjusted_max_vms(pre_max_vms: int, triggers) -> int:
     if set(triggers) & _INFRA_FAILURE_CLASSES:
         return max(2, pre_max_vms // 2)
     return max(2, int(pre_max_vms * _CODE_ERROR_REDUCTION_RETAINED_FRACTION))
+
 
 # Fast-recovery: rolling window (hours) and minimum completions required
 _FAST_RECOVERY_WINDOW_HOURS = 2
@@ -684,11 +752,9 @@ def _apply_anomaly_adjustments() -> bool:
     # Detect re-entry shortly after a forced restoration so the log line
     # reflects the context (same anomaly coming back, timer restarts).
     forced_restored_at = _parse_adjustments_ts(adjustments.get("forced_restored_at"))
-    is_reentry = (
-        forced_restored_at is not None
-        and (_utcnow() - forced_restored_at)
-        < timedelta(minutes=_FORCED_RESTORATION_REENTRY_WINDOW_MINUTES)
-    )
+    is_reentry = forced_restored_at is not None and (
+        _utcnow() - forced_restored_at
+    ) < timedelta(minutes=_FORCED_RESTORATION_REENTRY_WINDOW_MINUTES)
 
     # Store pre-adjustment values for restoration
     adjustments["pre_adjustment_max_vms"] = rc["max_concurrent_vms"]
@@ -963,8 +1029,7 @@ def _check_fast_recovery() -> bool:
 
     cutoff = (_utcnow() - timedelta(hours=_FAST_RECOVERY_WINDOW_HOURS)).isoformat()
     recent_results = [
-        r for r in _shared_state.deploy_monitoring["task_results"]
-        if r[0] >= cutoff
+        r for r in _shared_state.deploy_monitoring["task_results"] if r[0] >= cutoff
     ]
 
     # Need a meaningful sample to avoid restoring during an idle lull.
@@ -980,6 +1045,7 @@ def _check_fast_recovery() -> bool:
             _HEALTH_HISTORY_SIZE,
             get_recovery_history_snapshot,
         )
+
         history = get_recovery_history_snapshot()
         if len(history) < _HEALTH_HISTORY_SIZE or not all(history):
             return False
@@ -989,7 +1055,8 @@ def _check_fast_recovery() -> bool:
     # a tiny fraction of recent results (one intermittent failure shouldn't pin
     # the throttle for hours). Genuine ongoing issues exceed either bound.
     triggering_failures = sum(
-        1 for r in recent_results
+        1
+        for r in recent_results
         if r[1] == "failure" and len(r) > 2 and r[2] in trigger_anomalies
     )
     if triggering_failures > _FAST_RECOVERY_MAX_TOLERATED_FAILURES:
@@ -1003,9 +1070,11 @@ def _check_fast_recovery() -> bool:
     if "PROVISION_FAILURE" in trigger_anomalies:
         window_cutoff_dt = _utcnow() - timedelta(hours=_FAST_RECOVERY_WINDOW_HOURS)
         recent_provision_events = sum(
-            1 for e in _shared_state.deploy_monitoring["pipeline_events"]
+            1
+            for e in _shared_state.deploy_monitoring["pipeline_events"]
             if e.get("type") == "provision_timeout_pre_claim"
-            and e.get("ts") and e["ts"] >= window_cutoff_dt
+            and e.get("ts")
+            and e["ts"] >= window_cutoff_dt
         )
         if recent_provision_events > 0:
             return False
@@ -1013,7 +1082,9 @@ def _check_fast_recovery() -> bool:
     return True
 
 
-async def seed_task_results_from_db(session: AsyncSession, hours: int = _FAST_RECOVERY_WINDOW_HOURS) -> int:
+async def seed_task_results_from_db(
+    session: AsyncSession, hours: int = _FAST_RECOVERY_WINDOW_HOURS
+) -> int:
     """Backfill deploy_monitoring['task_results'] from recently completed tasks.
 
     The fast-recovery window relies on an in-memory deque that empties on pod
@@ -1040,7 +1111,9 @@ async def seed_task_results_from_db(session: AsyncSession, hours: int = _FAST_RE
         failure_class = "" if success else classify_failure(task)
         task_type = task.first_payload.get("type", "")
         ts_iso = task.vm_stopped_at.isoformat()
-        deque_ref.append((ts_iso, "success" if success else "failure", failure_class, task_type))
+        deque_ref.append(
+            (ts_iso, "success" if success else "failure", failure_class, task_type)
+        )
         seeded += 1
     return seeded
 
@@ -1064,8 +1137,12 @@ async def check_anomaly_actions() -> dict:
         return {
             "action": "forced_restored",
             "max_concurrent_vms": _shared_state.runtime_config["max_concurrent_vms"],
-            "failure_gate_threshold": _shared_state.anomaly_adjustments["failure_gate_threshold"],
-            "forced_restoration_count": _shared_state.anomaly_adjustments["forced_restoration_count"],
+            "failure_gate_threshold": _shared_state.anomaly_adjustments[
+                "failure_gate_threshold"
+            ],
+            "forced_restoration_count": _shared_state.anomaly_adjustments[
+                "forced_restoration_count"
+            ],
         }
 
     was_active = _shared_state.anomaly_adjustments["active"]
@@ -1075,9 +1152,13 @@ async def check_anomaly_actions() -> dict:
             "action": "adjusted",
             "is_new": not was_active,
             "max_concurrent_vms": _shared_state.runtime_config["max_concurrent_vms"],
-            "failure_gate_threshold": _shared_state.anomaly_adjustments["failure_gate_threshold"],
+            "failure_gate_threshold": _shared_state.anomaly_adjustments[
+                "failure_gate_threshold"
+            ],
             "trigger_anomalies": _shared_state.anomaly_adjustments["trigger_anomalies"],
-            "pre_adjustment_max_vms": _shared_state.anomaly_adjustments["pre_adjustment_max_vms"],
+            "pre_adjustment_max_vms": _shared_state.anomaly_adjustments[
+                "pre_adjustment_max_vms"
+            ],
         }
 
     restored = _check_anomaly_restoration()
@@ -1085,7 +1166,9 @@ async def check_anomaly_actions() -> dict:
         return {
             "action": "restored",
             "max_concurrent_vms": _shared_state.runtime_config["max_concurrent_vms"],
-            "failure_gate_threshold": _shared_state.anomaly_adjustments["failure_gate_threshold"],
+            "failure_gate_threshold": _shared_state.anomaly_adjustments[
+                "failure_gate_threshold"
+            ],
         }
 
     return {"action": "none"}
@@ -1160,22 +1243,32 @@ _PROACTIVE_INVESTIGATION_SYSTEM_CAP = 2
 async def _count_active_proactive_investigations(session: AsyncSession) -> int:
     """Count in-flight proactive-pattern investigations system-wide."""
     active_statuses = (
-        TaskStatus.QUEUED, TaskStatus.PROVISIONING,
-        TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING,
+        TaskStatus.QUEUED,
+        TaskStatus.PROVISIONING,
+        TaskStatus.IN_PROGRESS,
+        TaskStatus.EVALUATING,
     )
     # Phase E (M-P5): use JSONB containment so ``ix_task_context_gin`` is
     # usable. The previous ``.as_string().in_(...)`` text-cast bypassed the
     # GIN index and forced a sequential scan of all active tasks each call.
-    rows = (await session.execute(
-        select(Task.id).where(
-            Task.status.in_(active_statuses),
-            Task.payloads[0]["type"].as_string() == "investigate",
-            or_(
-                Task.context.op("@>")(cast({"diagnosis_trigger": "proactive_pattern_detection"}, JSONB)),
-                Task.context.op("@>")(cast({"diagnosis_trigger": "proactive_intra_direction"}, JSONB)),
-            ),
+    rows = (
+        await session.execute(
+            select(Task.id).where(
+                Task.status.in_(active_statuses),
+                Task.payloads[0]["type"].as_string() == "investigate",
+                or_(
+                    Task.context.op("@>")(
+                        cast(
+                            {"diagnosis_trigger": "proactive_pattern_detection"}, JSONB
+                        )
+                    ),
+                    Task.context.op("@>")(
+                        cast({"diagnosis_trigger": "proactive_intra_direction"}, JSONB)
+                    ),
+                ),
+            )
         )
-    )).all()
+    ).all()
     return len(rows)
 
 
@@ -1230,7 +1323,10 @@ async def _spawn_proactive_fingerprint_investigations(session: AsyncSession) -> 
             primary_direction = affected[0]
             try:
                 if await _recent_investigation_exists(
-                    pid, primary_direction, session, error_fingerprint=fingerprint,
+                    pid,
+                    primary_direction,
+                    session,
+                    error_fingerprint=fingerprint,
                 ):
                     entry["proactive_investigation_spawned"] = True
                     entry["proactive_investigation_spawned_at"] = _utcnow().isoformat()
@@ -1238,7 +1334,8 @@ async def _spawn_proactive_fingerprint_investigations(session: AsyncSession) -> 
             except Exception:
                 logger.exception(
                     "[ANOMALY_SWEEP] proactive dedup check failed for %s/%s",
-                    proj_key, anomaly_key,
+                    proj_key,
+                    anomaly_key,
                 )
                 continue
 
@@ -1255,14 +1352,18 @@ async def _spawn_proactive_fingerprint_investigations(session: AsyncSession) -> 
                 "and recommend a fix. Produce the structured diagnosis JSON report."
             )
             payload = validate_internal_payload(
-                {"type": "investigate", "prompt": prompt, "base_branch": "main",
-                 "recent_changes": recent_changes or {}},
+                {
+                    "type": "investigate",
+                    "prompt": prompt,
+                    "base_branch": "main",
+                    "recent_changes": recent_changes or {},
+                },
                 "anomaly_detection:proactive_pattern_investigation",
             )
             new_task = Task(
                 project_id=pid,
                 title=f"Proactive investigation: fingerprint {fingerprint} "
-                      f"spans {len(affected)} directions",
+                f"spans {len(affected)} directions",
                 description=(
                     f"Auto-spawned from cross-direction pattern "
                     f"({failure_count} failures across {len(affected)} directions)"
@@ -1284,20 +1385,26 @@ async def _spawn_proactive_fingerprint_investigations(session: AsyncSession) -> 
                 created_by="ORCHESTRATOR",
             )
             session.add(new_task)
-            session.add(TaskHistory(
-                task_id=new_task.id, action="SPAWNED",
-                details={
-                    "spawned_by": "PROACTIVE_PATTERN_DETECTION",
-                    "fingerprint": fingerprint,
-                    "affected_directions": list(affected),
-                },
-            ))
+            session.add(
+                TaskHistory(
+                    task_id=new_task.id,
+                    action="SPAWNED",
+                    details={
+                        "spawned_by": "PROACTIVE_PATTERN_DETECTION",
+                        "fingerprint": fingerprint,
+                        "affected_directions": list(affected),
+                    },
+                )
+            )
             entry["proactive_investigation_spawned"] = True
             entry["proactive_investigation_spawned_at"] = _utcnow().isoformat()
             logger.info(
                 "[ANOMALY_SWEEP] Spawned proactive investigation for fingerprint "
                 "%s (project %s, %d directions, %d failures)",
-                fingerprint, proj_key, len(affected), failure_count,
+                fingerprint,
+                proj_key,
+                len(affected),
+                failure_count,
             )
             spawned += 1
             per_project_spawned += 1
@@ -1356,7 +1463,10 @@ async def _spawn_proactive_intra_direction_investigations(session: AsyncSession)
                 continue
             try:
                 if await _recent_investigation_exists(
-                    pid, direction_id, session, error_fingerprint=fingerprint,
+                    pid,
+                    direction_id,
+                    session,
+                    error_fingerprint=fingerprint,
                 ):
                     entry["proactive_investigation_spawned"] = True
                     entry["proactive_investigation_spawned_at"] = _utcnow().isoformat()
@@ -1364,7 +1474,8 @@ async def _spawn_proactive_intra_direction_investigations(session: AsyncSession)
             except Exception:
                 logger.exception(
                     "[ANOMALY_SWEEP] proactive intra-direction dedup check failed for %s/%s",
-                    proj_key, anomaly_key,
+                    proj_key,
+                    anomaly_key,
                 )
                 continue
 
@@ -1381,14 +1492,18 @@ async def _spawn_proactive_intra_direction_investigations(session: AsyncSession)
                 "JSON report."
             )
             payload = validate_internal_payload(
-                {"type": "investigate", "prompt": prompt, "base_branch": "main",
-                 "recent_changes": recent_changes or {}},
+                {
+                    "type": "investigate",
+                    "prompt": prompt,
+                    "base_branch": "main",
+                    "recent_changes": recent_changes or {},
+                },
                 "anomaly_detection:proactive_intra_direction_investigation",
             )
             new_task = Task(
                 project_id=pid,
                 title=f"Proactive investigation: fingerprint {fingerprint} "
-                      f"recurring in direction {direction_id}",
+                f"recurring in direction {direction_id}",
                 description=(
                     f"Auto-spawned from intra-direction pattern "
                     f"({failure_count} failures in direction {direction_id})"
@@ -1409,20 +1524,26 @@ async def _spawn_proactive_intra_direction_investigations(session: AsyncSession)
                 created_by="ORCHESTRATOR",
             )
             session.add(new_task)
-            session.add(TaskHistory(
-                task_id=new_task.id, action="SPAWNED",
-                details={
-                    "spawned_by": "PROACTIVE_INTRA_DIRECTION",
-                    "fingerprint": fingerprint,
-                    "direction_id": direction_id,
-                },
-            ))
+            session.add(
+                TaskHistory(
+                    task_id=new_task.id,
+                    action="SPAWNED",
+                    details={
+                        "spawned_by": "PROACTIVE_INTRA_DIRECTION",
+                        "fingerprint": fingerprint,
+                        "direction_id": direction_id,
+                    },
+                )
+            )
             entry["proactive_investigation_spawned"] = True
             entry["proactive_investigation_spawned_at"] = _utcnow().isoformat()
             logger.info(
                 "[ANOMALY_SWEEP] Spawned proactive intra-direction investigation "
                 "for fingerprint %s (project %s, direction %s, %d failures)",
-                fingerprint, proj_key, direction_id, failure_count,
+                fingerprint,
+                proj_key,
+                direction_id,
+                failure_count,
             )
             spawned += 1
             per_project_spawned += 1
@@ -1458,6 +1579,7 @@ async def anomaly_maintenance_sweep() -> dict:
     if needs_session:
         try:
             from app.database import AsyncSessionLocal  # noqa: PLC0415
+
             async with AsyncSessionLocal() as session:
                 if _shared_state.get_held_directions():
                     try:
@@ -1467,13 +1589,17 @@ async def anomaly_maintenance_sweep() -> dict:
                             "[ANOMALY_SWEEP] held-direction investigation pass failed"
                         )
                 try:
-                    proactive_spawned = await _spawn_proactive_fingerprint_investigations(session)
+                    proactive_spawned = (
+                        await _spawn_proactive_fingerprint_investigations(session)
+                    )
                 except Exception:
                     logger.exception(
                         "[ANOMALY_SWEEP] proactive fingerprint investigation pass failed"
                     )
                 try:
-                    proactive_spawned += await _spawn_proactive_intra_direction_investigations(session)
+                    proactive_spawned += (
+                        await _spawn_proactive_intra_direction_investigations(session)
+                    )
                 except Exception:
                     logger.exception(
                         "[ANOMALY_SWEEP] proactive intra-direction investigation pass failed"
@@ -1484,7 +1610,10 @@ async def anomaly_maintenance_sweep() -> dict:
         logger.info(
             "[ANOMALY_SWEEP] expired=%d action=%s spawned_investigations=%d "
             "proactive_investigations_spawned=%d",
-            expired, action["action"], spawned, proactive_spawned,
+            expired,
+            action["action"],
+            spawned,
+            proactive_spawned,
         )
     return {
         "expired": expired,
@@ -1513,7 +1642,11 @@ async def _check_anomaly_proposals(project, session):
         return
 
     now_iso = _utcnow().isoformat()
-    for anomaly_key, info in sorted(proj_anomalies.items(), key=lambda x: x[1].get("occurrence_count", 0), reverse=True):
+    for anomaly_key, info in sorted(
+        proj_anomalies.items(),
+        key=lambda x: x[1].get("occurrence_count", 0),
+        reverse=True,
+    ):
         if info["occurrence_count"] < 3:
             continue
 
@@ -1524,10 +1657,14 @@ async def _check_anomaly_proposals(project, session):
             proposal_text = f"Investigate {anomaly_key} anomaly — {details}"[:500]
         else:
             # Failure class anomaly (e.g. CODE_ERROR, PROVISION_FAILURE)
-            proposal_text = f"Investigate and reduce {anomaly_key} task failures — {details}"[:500]
+            proposal_text = (
+                f"Investigate and reduce {anomaly_key} task failures — {details}"[:500]
+            )
 
         if _is_direction_duplicate(proposal_text, proj_directions, rejected_proposals):
-            logger.info(f"[ANOMALY] Skipping proposal for {anomaly_key} — overlaps with existing direction")
+            logger.info(
+                f"[ANOMALY] Skipping proposal for {anomaly_key} — overlaps with existing direction"
+            )
             continue
 
         new_direction = {
@@ -1548,7 +1685,9 @@ async def _check_anomaly_proposals(project, session):
         project.directions = proj_directions
         flag_modified(project, "directions")
         session.add(project)
-        logger.info(f"[ANOMALY] Created direction proposal for persistent anomaly: {anomaly_key}")
+        logger.info(
+            f"[ANOMALY] Created direction proposal for persistent anomaly: {anomaly_key}"
+        )
 
         # Reset occurrence count so we don't re-propose until it recurs
         info["occurrence_count"] = 0
@@ -1560,15 +1699,24 @@ async def _check_anomaly_proposals(project, session):
 async def _expire_stale_proposals(session) -> int:
     """Expire direction proposals older than 30 days across all projects."""
     cutoff = (_utcnow() - timedelta(days=30)).isoformat()
-    projects = (await session.execute(
-        select(Project).where(Project.autonomous_enabled.is_(True))
-    )).scalars().all()
+    projects = (
+        (
+            await session.execute(
+                select(Project).where(Project.autonomous_enabled.is_(True))
+            )
+        )
+        .scalars()
+        .all()
+    )
     total_expired = 0
     for project in projects:
         dirs = list(project.directions or [])
         expired_count = 0
         for d in dirs:
-            if d.get("status") == "proposed" and (d.get("proposed_at") or d.get("added_at", "")) < cutoff:
+            if (
+                d.get("status") == "proposed"
+                and (d.get("proposed_at") or d.get("added_at", "")) < cutoff
+            ):
                 d["status"] = "expired"
                 d["expired_at"] = _utcnow().isoformat()
                 expired_count += 1
@@ -1577,7 +1725,9 @@ async def _expire_stale_proposals(session) -> int:
             flag_modified(project, "directions")
             session.add(project)
             total_expired += expired_count
-            logger.info(f"[DIRECTIONS] Expired {expired_count} stale proposals for project {project.id}")
+            logger.info(
+                f"[DIRECTIONS] Expired {expired_count} stale proposals for project {project.id}"
+            )
     if total_expired:
         await session.commit()
     return total_expired

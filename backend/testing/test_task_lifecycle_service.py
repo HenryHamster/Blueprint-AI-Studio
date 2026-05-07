@@ -24,10 +24,9 @@ from app.task_lifecycle_service.transitions import (
 )
 
 
-USE_POSTGRES = (
-    os.getenv("USE_TEST_POSTGRES", "").lower() == "true"
-    and os.getenv("DATABASE_URL", "").startswith("postgresql")
-)
+USE_POSTGRES = os.getenv("USE_TEST_POSTGRES", "").lower() == "true" and os.getenv(
+    "DATABASE_URL", ""
+).startswith("postgresql")
 
 
 def test_context_patch_preserves_unknown_fields_and_does_not_mutate_input():
@@ -87,7 +86,9 @@ def test_transition_helpers_match_current_status_semantics():
 
 
 @pytest.mark.asyncio
-async def test_create_task_accepts_open_payload_context_and_extra_model_fields(db_session):
+async def test_create_task_accepts_open_payload_context_and_extra_model_fields(
+    db_session,
+):
     project = Project(name="lifecycle create", user_id="test-user")
     db_session.add(project)
     await db_session.commit()

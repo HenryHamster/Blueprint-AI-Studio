@@ -9,6 +9,7 @@ Covers:
 - _compute_first_attempt_succeeded: attempt_count threshold and status check
 - _ensure_branch: retry/backoff, token refresh, exists-verification, terminal failure
 """
+
 import json
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -54,6 +55,7 @@ from testing.factories import make_project, make_task
 
 # ── _compute_first_attempt_succeeded ────────────────────────────────────────
 
+
 class TestComputeFirstAttemptSucceeded:
     def test_attempt_zero_completed(self):
         assert _compute_first_attempt_succeeded(0, TaskStatus.COMPLETED) is True
@@ -83,6 +85,7 @@ class TestComputeFirstAttemptSucceeded:
 
 # ── _parse_plan_output ───────────────────────────────────────────────────────
 
+
 class TestParsePlanOutput:
     def _make_plan(self, subtasks):
         return json.dumps({"subtasks": subtasks})
@@ -94,10 +97,12 @@ class TestParsePlanOutput:
         assert result["subtasks"][0]["title"] == "Task A"
 
     def test_multiple_subtasks(self):
-        plan = self._make_plan([
-            {"title": "Task A", "prompt": "Do A"},
-            {"title": "Task B", "prompt": "Do B", "depends_on_indices": [0]},
-        ])
+        plan = self._make_plan(
+            [
+                {"title": "Task A", "prompt": "Do A"},
+                {"title": "Task B", "prompt": "Do B", "depends_on_indices": [0]},
+            ]
+        )
         result = _parse_plan_output(plan)
         assert result is not None
         assert len(result["subtasks"]) == 2
@@ -105,31 +110,43 @@ class TestParsePlanOutput:
 
     def test_embedded_in_text(self):
         """JSON embedded in surrounding log text should still be extracted."""
-        text = "Some preamble\n" + self._make_plan([{"title": "A", "prompt": "p"}]) + "\nTrailing text"
+        text = (
+            "Some preamble\n"
+            + self._make_plan([{"title": "A", "prompt": "p"}])
+            + "\nTrailing text"
+        )
         result = _parse_plan_output(text)
         assert result is not None
         assert result["subtasks"][0]["title"] == "A"
 
     def test_braces_in_string_values(self):
         """Braces inside JSON string values (e.g. code snippets) must not break extraction."""
-        plan = json.dumps({
-            "subtasks": [{
-                "title": "Fix",
-                "prompt": "Run this: func() { return {a: 1}; }",
-            }]
-        })
+        plan = json.dumps(
+            {
+                "subtasks": [
+                    {
+                        "title": "Fix",
+                        "prompt": "Run this: func() { return {a: 1}; }",
+                    }
+                ]
+            }
+        )
         result = _parse_plan_output(plan)
         assert result is not None
         assert "func()" in result["subtasks"][0]["prompt"]
 
     def test_escaped_characters_in_strings(self):
         """Escaped backslashes and quotes in string values should be handled correctly."""
-        plan = json.dumps({
-            "subtasks": [{
-                "title": "Escape test",
-                "prompt": 'Use \\"double quotes\\" and backslash: \\\\',
-            }]
-        })
+        plan = json.dumps(
+            {
+                "subtasks": [
+                    {
+                        "title": "Escape test",
+                        "prompt": 'Use \\"double quotes\\" and backslash: \\\\',
+                    }
+                ]
+            }
+        )
         result = _parse_plan_output(plan)
         assert result is not None
         assert result["subtasks"][0]["title"] == "Escape test"
@@ -161,10 +178,12 @@ class TestParsePlanOutput:
     def test_nested_code_block_with_braces(self):
         """Code blocks containing braces nested inside subtask prompts."""
         plan_dict = {
-            "subtasks": [{
-                "title": "Add function",
-                "prompt": "Add this:\n```python\ndef foo():\n    return {'key': {'nested': True}}\n```",
-            }]
+            "subtasks": [
+                {
+                    "title": "Add function",
+                    "prompt": "Add this:\n```python\ndef foo():\n    return {'key': {'nested': True}}\n```",
+                }
+            ]
         }
         text = json.dumps(plan_dict)
         result = _parse_plan_output(text)
@@ -189,6 +208,7 @@ class TestParsePlanOutput:
 
 
 # ── _extract_json_array ──────────────────────────────────────────────────────
+
 
 class TestExtractJsonArray:
     def test_valid_array_with_required_key(self):
@@ -267,6 +287,7 @@ class TestExtractJsonArray:
 
 
 # ── _inject_file_overlap_deps ────────────────────────────────────────────────
+
 
 class TestInjectFileOverlapDeps:
     def test_no_shared_files_no_deps_added(self):
@@ -357,7 +378,9 @@ class TestInjectFileOverlapDeps:
             {"title": "B", "related_files": ["shared.py"]},
         ]
         # Save original deps
-        original_deps = {i: list(st.get("depends_on_indices", [])) for i, st in enumerate(subtasks)}
+        original_deps = {
+            i: list(st.get("depends_on_indices", [])) for i, st in enumerate(subtasks)
+        }
         _inject_file_overlap_deps(subtasks)
         # After injection, the plan should be cyclic
         assert _validate_plan_dependencies(subtasks) is False
@@ -372,6 +395,7 @@ class TestInjectFileOverlapDeps:
 
 
 # ── _log_file_overlaps ───────────────────────────────────────────────────────
+
 
 class TestLogFileOverlaps:
     def test_no_shared_files(self):
@@ -464,6 +488,7 @@ class TestLogFileOverlaps:
 
 # ── _ensure_branch ───────────────────────────────────────────────────────────
 
+
 @pytest.fixture
 def _patch_ensure_branch_deps(mocker):
     """Patch asyncio.sleep and failure-alert plumbing for _ensure_branch tests."""
@@ -474,7 +499,9 @@ def _patch_ensure_branch_deps(mocker):
 
 class TestEnsureBranch:
     @pytest.mark.asyncio
-    async def test_success_first_attempt(self, db_session, mocker, _patch_ensure_branch_deps):
+    async def test_success_first_attempt(
+        self, db_session, mocker, _patch_ensure_branch_deps
+    ):
         project = make_project()
         db_session.add(project)
         await db_session.commit()
@@ -558,7 +585,9 @@ class TestEnsureBranch:
         assert relocked.status != TaskStatus.FAILED
 
     @pytest.mark.asyncio
-    async def test_force_refresh_on_retry(self, db_session, mocker, _patch_ensure_branch_deps):
+    async def test_force_refresh_on_retry(
+        self, db_session, mocker, _patch_ensure_branch_deps
+    ):
         """On retry attempts (attempt > 0), token fetch uses force_refresh=True."""
         project = make_project()
         db_session.add(project)
@@ -713,6 +742,7 @@ class TestEnsureBranch:
 
 # ── _record_remediation_outcome ──────────────────────────────────────────────
 
+
 class TestRecordRemediationOutcome:
     @pytest.mark.asyncio
     async def test_skips_non_remediation_tasks(self, db_session):
@@ -725,7 +755,9 @@ class TestRecordRemediationOutcome:
         db_session.add(task)
         await db_session.commit()
 
-        updated = await _record_remediation_outcome(task, merged=True, session=db_session)
+        updated = await _record_remediation_outcome(
+            task, merged=True, session=db_session
+        )
         assert updated is False
         assert "remediation_attempts" not in project.directions[0]
 
@@ -748,7 +780,9 @@ class TestRecordRemediationOutcome:
         await db_session.commit()
         await db_session.refresh(task)
 
-        updated = await _record_remediation_outcome(task, merged=True, session=db_session)
+        updated = await _record_remediation_outcome(
+            task, merged=True, session=db_session
+        )
         await db_session.commit()
         await db_session.refresh(project)
 
@@ -764,12 +798,16 @@ class TestRecordRemediationOutcome:
     @pytest.mark.asyncio
     async def test_increments_attempts_on_repeat_failure(self, db_session):
         """Repeated failed remediations accumulate attempts and flip the result."""
-        project = make_project(directions=[{
-            "id": "dir-1",
-            "status": "active",
-            "remediation_attempts": 2,
-            "last_remediation_result": "merged",
-        }])
+        project = make_project(
+            directions=[
+                {
+                    "id": "dir-1",
+                    "status": "active",
+                    "remediation_attempts": 2,
+                    "last_remediation_result": "merged",
+                }
+            ]
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -780,7 +818,9 @@ class TestRecordRemediationOutcome:
         db_session.add(task)
         await db_session.commit()
 
-        updated = await _record_remediation_outcome(task, merged=False, session=db_session)
+        updated = await _record_remediation_outcome(
+            task, merged=False, session=db_session
+        )
         await db_session.commit()
         await db_session.refresh(project)
 
@@ -809,7 +849,9 @@ class TestRecordRemediationOutcome:
         db_session.add(task)
         await db_session.commit()
 
-        updated = await _record_remediation_outcome(task, merged=True, session=db_session)
+        updated = await _record_remediation_outcome(
+            task, merged=True, session=db_session
+        )
         assert updated is False
         assert "remediation_attempts" not in project.directions[0]
         orphan = (task.context or {}).get("orphan_remediation_outcome")
@@ -821,12 +863,16 @@ class TestRecordRemediationOutcome:
     @pytest.mark.asyncio
     async def test_increments_when_fingerprint_matches(self, db_session):
         """Same fingerprint as prior remediation increments attempts."""
-        project = make_project(directions=[{
-            "id": "dir-1",
-            "status": "active",
-            "remediation_attempts": 2,
-            "last_remediation_fingerprint": "fp-same",
-        }])
+        project = make_project(
+            directions=[
+                {
+                    "id": "dir-1",
+                    "status": "active",
+                    "remediation_attempts": 2,
+                    "last_remediation_fingerprint": "fp-same",
+                }
+            ]
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -850,12 +896,16 @@ class TestRecordRemediationOutcome:
     @pytest.mark.asyncio
     async def test_resets_when_fingerprint_differs(self, db_session):
         """Different fingerprint means a new root cause — counter resets to 1."""
-        project = make_project(directions=[{
-            "id": "dir-1",
-            "status": "active",
-            "remediation_attempts": 2,
-            "last_remediation_fingerprint": "fp-old",
-        }])
+        project = make_project(
+            directions=[
+                {
+                    "id": "dir-1",
+                    "status": "active",
+                    "remediation_attempts": 2,
+                    "last_remediation_fingerprint": "fp-old",
+                }
+            ]
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -881,12 +931,16 @@ class TestRecordRemediationOutcome:
     @pytest.mark.asyncio
     async def test_increments_when_no_fingerprint_available(self, db_session):
         """Missing fingerprint on context falls back to conservative increment."""
-        project = make_project(directions=[{
-            "id": "dir-1",
-            "status": "active",
-            "remediation_attempts": 1,
-            "last_remediation_fingerprint": "fp-prior",
-        }])
+        project = make_project(
+            directions=[
+                {
+                    "id": "dir-1",
+                    "status": "active",
+                    "remediation_attempts": 1,
+                    "last_remediation_fingerprint": "fp-prior",
+                }
+            ]
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -940,14 +994,18 @@ class TestRecordRemediationOutcome:
     @pytest.mark.asyncio
     async def test_merge_clears_prior_failure_details(self, db_session):
         """A merged remediation must clear stale failure class/summary from prior failures."""
-        project = make_project(directions=[{
-            "id": "dir-1",
-            "status": "active",
-            "remediation_attempts": 1,
-            "last_remediation_result": "failed",
-            "last_remediation_failure_class": "CODE_ERROR",
-            "last_remediation_error_summary": "previous error output",
-        }])
+        project = make_project(
+            directions=[
+                {
+                    "id": "dir-1",
+                    "status": "active",
+                    "remediation_attempts": 1,
+                    "last_remediation_result": "failed",
+                    "last_remediation_failure_class": "CODE_ERROR",
+                    "last_remediation_error_summary": "previous error output",
+                }
+            ]
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -984,7 +1042,13 @@ class TestRecordRemediationOutcome:
                 "diagnosis_fingerprint": "fp-hist",
                 "failure_category": "CODE_ERROR",
             },
-            payloads=[{"type": "create", "prompt": "apply guard clause", "base_branch": "main"}],
+            payloads=[
+                {
+                    "type": "create",
+                    "prompt": "apply guard clause",
+                    "base_branch": "main",
+                }
+            ],
         )
         db_session.add(task)
         await db_session.commit()
@@ -1009,20 +1073,33 @@ class TestRecordRemediationOutcome:
     async def test_history_capped_at_max_entries(self, db_session):
         """Appending beyond the cap drops the oldest entry (FIFO)."""
         from app.task_completion import _REMEDIATION_HISTORY_MAX
+
         existing = [
-            {"task_id": f"prev-{i}", "result": "failed", "timestamp": f"2020-01-0{i+1}T00:00:00"}
+            {
+                "task_id": f"prev-{i}",
+                "result": "failed",
+                "timestamp": f"2020-01-0{i + 1}T00:00:00",
+            }
             for i in range(_REMEDIATION_HISTORY_MAX)
         ]
-        project = make_project(directions=[{
-            "id": "dir-1", "status": "active", "remediation_history": list(existing),
-        }])
+        project = make_project(
+            directions=[
+                {
+                    "id": "dir-1",
+                    "status": "active",
+                    "remediation_history": list(existing),
+                }
+            ]
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
         task = make_task(
             project_id=project.id,
             context={"diagnosis_task_id": "diag-1", "direction_id": "dir-1"},
-            payloads=[{"type": "create", "prompt": "newest fix", "base_branch": "main"}],
+            payloads=[
+                {"type": "create", "prompt": "newest fix", "base_branch": "main"}
+            ],
         )
         db_session.add(task)
         await db_session.commit()
@@ -1097,6 +1174,7 @@ class TestRemediationSuccessPropagation:
 
     def _paused_sibling(self, direction_id: str, fingerprint: str, **overrides):
         from app.time_utils import _utcnow as _now
+
         sibling = {
             "id": direction_id,
             "status": "paused",
@@ -1108,11 +1186,15 @@ class TestRemediationSuccessPropagation:
         return sibling
 
     @pytest.mark.asyncio
-    async def test_injects_note_into_sibling_with_matching_fingerprint(self, db_session):
-        project = make_project(directions=[
-            {"id": "dir-1", "status": "active"},
-            self._paused_sibling("dir-2", "fp-shared"),
-        ])
+    async def test_injects_note_into_sibling_with_matching_fingerprint(
+        self, db_session
+    ):
+        project = make_project(
+            directions=[
+                {"id": "dir-1", "status": "active"},
+                self._paused_sibling("dir-2", "fp-shared"),
+            ]
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -1146,10 +1228,12 @@ class TestRemediationSuccessPropagation:
 
     @pytest.mark.asyncio
     async def test_noop_when_no_siblings_share_fingerprint(self, db_session):
-        project = make_project(directions=[
-            {"id": "dir-1", "status": "active"},
-            self._paused_sibling("dir-2", "fp-other"),
-        ])
+        project = make_project(
+            directions=[
+                {"id": "dir-1", "status": "active"},
+                self._paused_sibling("dir-2", "fp-other"),
+            ]
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -1173,16 +1257,22 @@ class TestRemediationSuccessPropagation:
 
     @pytest.mark.asyncio
     async def test_note_content_includes_remediation_context(self, db_session):
-        project = make_project(directions=[
-            {"id": "dir-1", "status": "active"},
-            self._paused_sibling("dir-2", "fp-shared"),
-        ])
+        project = make_project(
+            directions=[
+                {"id": "dir-1", "status": "active"},
+                self._paused_sibling("dir-2", "fp-shared"),
+            ]
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
         task = make_task(
             project_id=project.id,
-            payloads=[{"prompt": "Pin the pydantic version in requirements.txt to fix startup."}],
+            payloads=[
+                {
+                    "prompt": "Pin the pydantic version in requirements.txt to fix startup."
+                }
+            ],
             context={
                 "diagnosis_task_id": "diag-1",
                 "direction_id": "dir-1",
@@ -1209,10 +1299,12 @@ class TestRemediationSuccessPropagation:
     @pytest.mark.asyncio
     async def test_does_not_propagate_success_on_failed_remediation(self, db_session):
         """Failed remediation should not emit a success note (failure note is a separate source)."""
-        project = make_project(directions=[
-            {"id": "dir-1", "status": "active"},
-            self._paused_sibling("dir-2", "fp-shared"),
-        ])
+        project = make_project(
+            directions=[
+                {"id": "dir-1", "status": "active"},
+                self._paused_sibling("dir-2", "fp-shared"),
+            ]
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -1249,10 +1341,12 @@ class TestRemediationSuccessPropagation:
             needs_manual_intervention=True,
             escalation_notification_pending=True,
         )
-        project = make_project(directions=[
-            {"id": "dir-1", "status": "active"},
-            sibling_seed,
-        ])
+        project = make_project(
+            directions=[
+                {"id": "dir-1", "status": "active"},
+                sibling_seed,
+            ]
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -1288,12 +1382,16 @@ class TestRemediationSuccessPropagation:
         assert sibling["cross_direction_remediation_source"] == "dir-1"
 
     @pytest.mark.asyncio
-    async def test_does_not_unpause_sibling_with_different_fingerprint(self, db_session):
+    async def test_does_not_unpause_sibling_with_different_fingerprint(
+        self, db_session
+    ):
         """Exact-fingerprint-match guard: siblings with a different fingerprint stay paused."""
-        project = make_project(directions=[
-            {"id": "dir-1", "status": "active"},
-            self._paused_sibling("dir-2", "fp-other"),
-        ])
+        project = make_project(
+            directions=[
+                {"id": "dir-1", "status": "active"},
+                self._paused_sibling("dir-2", "fp-other"),
+            ]
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -1326,6 +1424,7 @@ class TestRemediationFailurePropagation:
 
     def _paused_sibling(self, direction_id: str, fingerprint: str, **overrides):
         from app.time_utils import _utcnow as _now
+
         sibling = {
             "id": direction_id,
             "status": "paused",
@@ -1337,11 +1436,15 @@ class TestRemediationFailurePropagation:
         return sibling
 
     @pytest.mark.asyncio
-    async def test_injects_failure_note_into_sibling_with_matching_fingerprint(self, db_session):
-        project = make_project(directions=[
-            {"id": "dir-1", "status": "active"},
-            self._paused_sibling("dir-2", "fp-shared"),
-        ])
+    async def test_injects_failure_note_into_sibling_with_matching_fingerprint(
+        self, db_session
+    ):
+        project = make_project(
+            directions=[
+                {"id": "dir-1", "status": "active"},
+                self._paused_sibling("dir-2", "fp-shared"),
+            ]
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -1378,10 +1481,12 @@ class TestRemediationFailurePropagation:
 
     @pytest.mark.asyncio
     async def test_failure_noop_when_no_siblings_share_fingerprint(self, db_session):
-        project = make_project(directions=[
-            {"id": "dir-1", "status": "active"},
-            self._paused_sibling("dir-2", "fp-other"),
-        ])
+        project = make_project(
+            directions=[
+                {"id": "dir-1", "status": "active"},
+                self._paused_sibling("dir-2", "fp-other"),
+            ]
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -1408,10 +1513,13 @@ class TestRemediationFailurePropagation:
     @pytest.mark.asyncio
     async def test_failure_note_respects_max_length(self, db_session):
         from app.strategic_constants import STRATEGIC_RATIONALE_MAX
-        project = make_project(directions=[
-            {"id": "dir-1", "status": "active"},
-            self._paused_sibling("dir-2", "fp-shared"),
-        ])
+
+        project = make_project(
+            directions=[
+                {"id": "dir-1", "status": "active"},
+                self._paused_sibling("dir-2", "fp-shared"),
+            ]
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -1440,6 +1548,7 @@ class TestRemediationFailurePropagation:
 
 # ── _record_remediation_if_terminal ─────────────────────────────────────────
 
+
 class TestRecordRemediationIfTerminal:
     """Wrapper that filters by terminal status + diagnosis context, then delegates."""
 
@@ -1458,7 +1567,12 @@ class TestRecordRemediationIfTerminal:
         db_session.add(task)
         await db_session.commit()
 
-        for status in (TaskStatus.IN_PROGRESS, TaskStatus.QUEUED, TaskStatus.EVALUATING, TaskStatus.PROVISIONING):
+        for status in (
+            TaskStatus.IN_PROGRESS,
+            TaskStatus.QUEUED,
+            TaskStatus.EVALUATING,
+            TaskStatus.PROVISIONING,
+        ):
             await _record_remediation_if_terminal(task, status, db_session)
         await db_session.refresh(project)
         assert "remediation_attempts" not in project.directions[0]
@@ -1619,8 +1733,12 @@ class TestRecordRemediationIfTerminal:
         assert boom.await_count == 1
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("task_type", ["create", "refactor", "docs", "qa", "deps", "migrate", "fix"])
-    async def test_completed_pr_creating_type_does_not_record(self, db_session, task_type):
+    @pytest.mark.parametrize(
+        "task_type", ["create", "refactor", "docs", "qa", "deps", "migrate", "fix"]
+    )
+    async def test_completed_pr_creating_type_does_not_record(
+        self, db_session, task_type
+    ):
         """Tasks that produce a PR must not record 'merged' on their own COMPLETED —
         the review pipeline drives the real outcome."""
         project = make_project(directions=[{"id": "dir-1", "status": "active"}])
@@ -1687,15 +1805,21 @@ class TestRecordRemediationIfTerminal:
 
 # ── follow-up investigation on remediation failure ──────────────────────────
 
+
 class TestFollowupInvestigationOnFailure:
     """_maybe_spawn_followup_investigation spawns a new investigate task when a
     diagnosis-spawned remediation fails, subject to dedup + cap guards."""
 
     @staticmethod
-    def _make_remediation_task(project_id, *, direction_id="dir-1",
-                               fingerprint="fp-A", prompt="apply the fix",
-                               status=TaskStatus.FAILED,
-                               latest_status_message="ImportError: boom"):
+    def _make_remediation_task(
+        project_id,
+        *,
+        direction_id="dir-1",
+        fingerprint="fp-A",
+        prompt="apply the fix",
+        status=TaskStatus.FAILED,
+        latest_status_message="ImportError: boom",
+    ):
         return make_task(
             project_id=project_id,
             status=status,
@@ -1712,10 +1836,16 @@ class TestFollowupInvestigationOnFailure:
     @pytest.mark.asyncio
     async def test_follow_up_spawned_on_first_failure(self, db_session):
         """Failed remediation spawns an investigate task and updates direction state."""
-        project = make_project(directions=[{
-            "id": "dir-1", "status": "active", "text": "demo direction",
-            "diagnosis_summary": "race on record_direction_result",
-        }])
+        project = make_project(
+            directions=[
+                {
+                    "id": "dir-1",
+                    "status": "active",
+                    "text": "demo direction",
+                    "diagnosis_summary": "race on record_direction_result",
+                }
+            ]
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -1734,22 +1864,32 @@ class TestFollowupInvestigationOnFailure:
         assert len(fp_entry) == 1
         # Entry is a parseable ISO timestamp
         from datetime import datetime as _dt
+
         _dt.fromisoformat(fp_entry[0])
         assert d["diagnosis_in_progress"] is True
         assert "diagnosis_started_at" in d
 
         from sqlmodel import select as _select
         from app.models import Task as TaskModel
-        spawned = (await db_session.execute(
-            _select(TaskModel).where(
-                TaskModel.project_id == project.id,
-                TaskModel.id != task.id,
+
+        spawned = (
+            (
+                await db_session.execute(
+                    _select(TaskModel).where(
+                        TaskModel.project_id == project.id,
+                        TaskModel.id != task.id,
+                    )
+                )
             )
-        )).scalars().all()
+            .scalars()
+            .all()
+        )
         assert len(spawned) == 1
         spawned_task = spawned[0]
         assert spawned_task.payloads[0]["type"] == "investigate"
-        assert spawned_task.context["diagnosis_trigger"] == "remediation_failure_followup"
+        assert (
+            spawned_task.context["diagnosis_trigger"] == "remediation_failure_followup"
+        )
         assert spawned_task.context["direction_id"] == "dir-1"
         assert spawned_task.context["diagnosis_fingerprint"] == "fp-A"
         assert spawned_task.context["failure_fingerprints"] == ["fp-A"]
@@ -1814,11 +1954,19 @@ class TestFollowupInvestigationOnFailure:
     async def test_follow_up_skipped_when_cap_reached(self, db_session):
         """Per-fingerprint cap blocks a third follow-up for the same fingerprint."""
         from app.time_utils import _utcnow
+
         recent_ts = [_utcnow().isoformat(), _utcnow().isoformat()]
-        project = make_project(directions=[{
-            "id": "dir-1", "status": "active",
-            "followup_investigation_attempts_by_fingerprint": {"fp-A": list(recent_ts)},
-        }])
+        project = make_project(
+            directions=[
+                {
+                    "id": "dir-1",
+                    "status": "active",
+                    "followup_investigation_attempts_by_fingerprint": {
+                        "fp-A": list(recent_ts)
+                    },
+                }
+            ]
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -1832,15 +1980,23 @@ class TestFollowupInvestigationOnFailure:
         await db_session.refresh(project)
 
         d = project.directions[0]
-        assert d["followup_investigation_attempts_by_fingerprint"] == {"fp-A": recent_ts}
+        assert d["followup_investigation_attempts_by_fingerprint"] == {
+            "fp-A": recent_ts
+        }
         assert d.get("diagnosis_in_progress") is not True
 
     @pytest.mark.asyncio
     async def test_follow_up_skipped_when_diagnosis_in_progress(self, db_session):
         """Do not spawn when an investigation is already open for the direction."""
-        project = make_project(directions=[{
-            "id": "dir-1", "status": "active", "diagnosis_in_progress": True,
-        }])
+        project = make_project(
+            directions=[
+                {
+                    "id": "dir-1",
+                    "status": "active",
+                    "diagnosis_in_progress": True,
+                }
+            ]
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -1859,11 +2015,16 @@ class TestFollowupInvestigationOnFailure:
     @pytest.mark.asyncio
     async def test_follow_up_prompt_includes_enriched_context(self, db_session):
         """Spawned investigate prompt carries summary, failed approach, class, error."""
-        project = make_project(directions=[{
-            "id": "dir-1", "status": "active",
-            "text": "fix rollup reliability",
-            "diagnosis_summary": "queue drains lock dict without ownership check",
-        }])
+        project = make_project(
+            directions=[
+                {
+                    "id": "dir-1",
+                    "status": "active",
+                    "text": "fix rollup reliability",
+                    "diagnosis_summary": "queue drains lock dict without ownership check",
+                }
+            ]
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -1881,12 +2042,19 @@ class TestFollowupInvestigationOnFailure:
 
         from sqlmodel import select as _select
         from app.models import Task as TaskModel
-        spawned = (await db_session.execute(
-            _select(TaskModel).where(
-                TaskModel.project_id == project.id,
-                TaskModel.id != task.id,
+
+        spawned = (
+            (
+                await db_session.execute(
+                    _select(TaskModel).where(
+                        TaskModel.project_id == project.id,
+                        TaskModel.id != task.id,
+                    )
+                )
             )
-        )).scalars().first()
+            .scalars()
+            .first()
+        )
         assert spawned is not None
         prompt_text = spawned.payloads[0]["prompt"]
         assert "queue drains lock dict without ownership check" in prompt_text
@@ -1899,9 +2067,15 @@ class TestFollowupInvestigationOnFailure:
         """Parent's trigger_failure_class becomes last_failure_class on the spawned
         follow-up, so _spawn_investigation_remediation will set trigger_failure_class
         correctly on the next remediation."""
-        project = make_project(directions=[{
-            "id": "dir-1", "status": "active", "text": "demo",
-        }])
+        project = make_project(
+            directions=[
+                {
+                    "id": "dir-1",
+                    "status": "active",
+                    "text": "demo",
+                }
+            ]
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -1927,12 +2101,19 @@ class TestFollowupInvestigationOnFailure:
 
         from sqlmodel import select as _select
         from app.models import Task as TaskModel
-        spawned = (await db_session.execute(
-            _select(TaskModel).where(
-                TaskModel.project_id == project.id,
-                TaskModel.id != task.id,
+
+        spawned = (
+            (
+                await db_session.execute(
+                    _select(TaskModel).where(
+                        TaskModel.project_id == project.id,
+                        TaskModel.id != task.id,
+                    )
+                )
             )
-        )).scalars().first()
+            .scalars()
+            .first()
+        )
         assert spawned is not None
         assert spawned.context["last_failure_class"] == "CODE_ERROR"
         assert spawned.context["failure_taxonomy"] == {"kind": "import"}
@@ -1940,12 +2121,17 @@ class TestFollowupInvestigationOnFailure:
         # Verify the downstream hop: a remediation spawned from this follow-up
         # investigation carries trigger_failure_class set from last_failure_class.
         from app.task_completion import _spawn_investigation_remediation
+
         remediation = await _spawn_investigation_remediation(
             task=spawned,
             direction_id="dir-1",
-            summary="s", root_cause="rc", recommended_fix="rf",
-            severity="medium", confidence="high",
-            affected_paths=["a.py"], remediation_attempts=0,
+            summary="s",
+            root_cause="rc",
+            recommended_fix="rf",
+            severity="medium",
+            confidence="high",
+            affected_paths=["a.py"],
+            remediation_attempts=0,
             session=db_session,
         )
         assert remediation is not None
@@ -1961,9 +2147,15 @@ class TestFollowupInvestigationOnFailure:
         """When parent has only error_fingerprint (no diagnosis_fingerprint), that
         value is propagated onto the spawned remediation so follow-up logic can
         still key off a stable fingerprint."""
-        project = make_project(directions=[{
-            "id": "dir-1", "status": "active", "text": "demo",
-        }])
+        project = make_project(
+            directions=[
+                {
+                    "id": "dir-1",
+                    "status": "active",
+                    "text": "demo",
+                }
+            ]
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -1978,12 +2170,17 @@ class TestFollowupInvestigationOnFailure:
         await db_session.refresh(parent)
 
         from app.task_completion import _spawn_investigation_remediation
+
         remediation = await _spawn_investigation_remediation(
             task=parent,
             direction_id="dir-1",
-            summary="s", root_cause="rc", recommended_fix="rf",
-            severity="medium", confidence="high",
-            affected_paths=["a.py"], remediation_attempts=0,
+            summary="s",
+            root_cause="rc",
+            recommended_fix="rf",
+            severity="medium",
+            confidence="high",
+            affected_paths=["a.py"],
+            remediation_attempts=0,
             session=db_session,
         )
         assert remediation is not None
@@ -1997,9 +2194,15 @@ class TestFollowupInvestigationOnFailure:
     async def test_remediation_fingerprint_from_failure_fingerprints(self, db_session):
         """When parent has only failure_fingerprints list, the first element seeds
         both error_fingerprint and diagnosis_fingerprint on the remediation."""
-        project = make_project(directions=[{
-            "id": "dir-1", "status": "active", "text": "demo",
-        }])
+        project = make_project(
+            directions=[
+                {
+                    "id": "dir-1",
+                    "status": "active",
+                    "text": "demo",
+                }
+            ]
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -2014,12 +2217,17 @@ class TestFollowupInvestigationOnFailure:
         await db_session.refresh(parent)
 
         from app.task_completion import _spawn_investigation_remediation
+
         remediation = await _spawn_investigation_remediation(
             task=parent,
             direction_id="dir-1",
-            summary="s", root_cause="rc", recommended_fix="rf",
-            severity="medium", confidence="high",
-            affected_paths=["a.py"], remediation_attempts=0,
+            summary="s",
+            root_cause="rc",
+            recommended_fix="rf",
+            severity="medium",
+            confidence="high",
+            affected_paths=["a.py"],
+            remediation_attempts=0,
             session=db_session,
         )
         assert remediation is not None
@@ -2030,9 +2238,15 @@ class TestFollowupInvestigationOnFailure:
     async def test_remediation_payload_includes_effort_from_scope(self, db_session):
         """Spawned remediation payload carries an effort derived from scope so the
         agent CLI receives the calibrated --effort flag (small→low, large→high)."""
-        project = make_project(directions=[{
-            "id": "dir-1", "status": "active", "text": "demo",
-        }])
+        project = make_project(
+            directions=[
+                {
+                    "id": "dir-1",
+                    "status": "active",
+                    "text": "demo",
+                }
+            ]
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -2049,19 +2263,28 @@ class TestFollowupInvestigationOnFailure:
         from app.task_completion import _spawn_investigation_remediation
 
         small = await _spawn_investigation_remediation(
-            task=parent, direction_id="dir-1",
-            summary="s", root_cause="rc", recommended_fix="rf",
-            severity="medium", confidence="high",
-            affected_paths=["a.py"], remediation_attempts=0,
+            task=parent,
+            direction_id="dir-1",
+            summary="s",
+            root_cause="rc",
+            recommended_fix="rf",
+            severity="medium",
+            confidence="high",
+            affected_paths=["a.py"],
+            remediation_attempts=0,
             session=db_session,
         )
         assert small is not None
         assert small.first_payload.get("effort") == "low"
 
         large = await _spawn_investigation_remediation(
-            task=parent, direction_id="dir-1",
-            summary="s", root_cause="rc", recommended_fix="rf",
-            severity="medium", confidence="high",
+            task=parent,
+            direction_id="dir-1",
+            summary="s",
+            root_cause="rc",
+            recommended_fix="rf",
+            severity="medium",
+            confidence="high",
             affected_paths=[f"f{i}.py" for i in range(6)],
             remediation_attempts=0,
             session=db_session,
@@ -2090,11 +2313,16 @@ class TestFollowupInvestigationOnFailure:
                 "timestamp": "2026-04-12T00:00:00",
             },
         ]
-        project = make_project(directions=[{
-            "id": "dir-1", "status": "active",
-            "text": "rollup reliability",
-            "remediation_history": list(prior_history),
-        }])
+        project = make_project(
+            directions=[
+                {
+                    "id": "dir-1",
+                    "status": "active",
+                    "text": "rollup reliability",
+                    "remediation_history": list(prior_history),
+                }
+            ]
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -2112,12 +2340,19 @@ class TestFollowupInvestigationOnFailure:
 
         from sqlmodel import select as _select
         from app.models import Task as TaskModel
-        spawned = (await db_session.execute(
-            _select(TaskModel).where(
-                TaskModel.project_id == project.id,
-                TaskModel.id != task.id,
+
+        spawned = (
+            (
+                await db_session.execute(
+                    _select(TaskModel).where(
+                        TaskModel.project_id == project.id,
+                        TaskModel.id != task.id,
+                    )
+                )
             )
-        )).scalars().first()
+            .scalars()
+            .first()
+        )
         assert spawned is not None
         prompt_text = spawned.payloads[0]["prompt"]
         assert "Earlier remediation attempts" in prompt_text
@@ -2152,9 +2387,16 @@ class TestFollowupInvestigationOnFailure:
 
         from sqlmodel import select as _select
         from app.models import Task as TaskModel
-        all_tasks = (await db_session.execute(
-            _select(TaskModel).where(TaskModel.project_id == project.id)
-        )).scalars().all()
+
+        all_tasks = (
+            (
+                await db_session.execute(
+                    _select(TaskModel).where(TaskModel.project_id == project.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
         assert len(all_tasks) == 1
 
     @pytest.mark.asyncio
@@ -2190,11 +2432,21 @@ class TestFollowupInvestigationOnFailure:
         from datetime import timedelta
         from app.time_utils import _utcnow
         from app.task_completion import _FOLLOWUP_INVESTIGATION_DECAY_DAYS
-        stale = (_utcnow() - timedelta(days=_FOLLOWUP_INVESTIGATION_DECAY_DAYS + 1)).isoformat()
-        project = make_project(directions=[{
-            "id": "dir-1", "status": "active",
-            "followup_investigation_attempts_by_fingerprint": {"fp-A": [stale, stale]},
-        }])
+
+        stale = (
+            _utcnow() - timedelta(days=_FOLLOWUP_INVESTIGATION_DECAY_DAYS + 1)
+        ).isoformat()
+        project = make_project(
+            directions=[
+                {
+                    "id": "dir-1",
+                    "status": "active",
+                    "followup_investigation_attempts_by_fingerprint": {
+                        "fp-A": [stale, stale]
+                    },
+                }
+            ]
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -2220,11 +2472,21 @@ class TestFollowupInvestigationOnFailure:
         from datetime import timedelta
         from app.time_utils import _utcnow
         from app.task_completion import _FOLLOWUP_INVESTIGATION_DECAY_DAYS
-        recent = (_utcnow() - timedelta(days=_FOLLOWUP_INVESTIGATION_DECAY_DAYS - 1)).isoformat()
-        project = make_project(directions=[{
-            "id": "dir-1", "status": "active",
-            "followup_investigation_attempts_by_fingerprint": {"fp-A": [recent, recent]},
-        }])
+
+        recent = (
+            _utcnow() - timedelta(days=_FOLLOWUP_INVESTIGATION_DECAY_DAYS - 1)
+        ).isoformat()
+        project = make_project(
+            directions=[
+                {
+                    "id": "dir-1",
+                    "status": "active",
+                    "followup_investigation_attempts_by_fingerprint": {
+                        "fp-A": [recent, recent]
+                    },
+                }
+            ]
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -2238,20 +2500,32 @@ class TestFollowupInvestigationOnFailure:
         await db_session.refresh(project)
 
         d = project.directions[0]
-        assert d["followup_investigation_attempts_by_fingerprint"] == {"fp-A": [recent, recent]}
+        assert d["followup_investigation_attempts_by_fingerprint"] == {
+            "fp-A": [recent, recent]
+        }
         assert d.get("diagnosis_in_progress") is not True
 
     @pytest.mark.asyncio
-    async def test_follow_up_skipped_when_cap_reached_across_other_directions(self, db_session):
+    async def test_follow_up_skipped_when_cap_reached_across_other_directions(
+        self, db_session
+    ):
         """Cross-direction: if siblings already hit the project-wide cap for this
         fingerprint, a new direction does not get its own per-direction quota."""
         from app.time_utils import _utcnow
+
         recent = _utcnow().isoformat()
-        project = make_project(directions=[
-            {"id": "dir-other", "status": "active",
-             "followup_investigation_attempts_by_fingerprint": {"fp-A": [recent, recent]}},
-            {"id": "dir-1", "status": "active", "text": "fresh direction"},
-        ])
+        project = make_project(
+            directions=[
+                {
+                    "id": "dir-other",
+                    "status": "active",
+                    "followup_investigation_attempts_by_fingerprint": {
+                        "fp-A": [recent, recent]
+                    },
+                },
+                {"id": "dir-1", "status": "active", "text": "fresh direction"},
+            ]
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -2271,10 +2545,15 @@ class TestFollowupInvestigationOnFailure:
     @pytest.mark.asyncio
     async def test_follow_up_legacy_int_entry_treated_as_expired(self, db_session):
         """Pre-decay int entries (e.g. 2) no longer permanently block recovery."""
-        project = make_project(directions=[{
-            "id": "dir-1", "status": "active",
-            "followup_investigation_attempts_by_fingerprint": {"fp-A": 2},
-        }])
+        project = make_project(
+            directions=[
+                {
+                    "id": "dir-1",
+                    "status": "active",
+                    "followup_investigation_attempts_by_fingerprint": {"fp-A": 2},
+                }
+            ]
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -2296,21 +2575,38 @@ class TestFollowupInvestigationOnFailure:
     async def test_cap_exhausted_all_failed_escalates(self, db_session, mocker):
         """Cap hit with all prior remediations failed flags needs_manual_intervention + posts."""
         from app.time_utils import _utcnow
+
         post_mock = mocker.patch(
             "app.notification_dispatch.post_remediation_escalation_message",
             new_callable=AsyncMock,
         )
         recent_ts = [_utcnow().isoformat(), _utcnow().isoformat()]
-        project = make_project(directions=[{
-            "id": "dir-1", "status": "active", "text": "rollup reliability",
-            "followup_investigation_attempts_by_fingerprint": {"fp-A": list(recent_ts)},
-            "remediation_history": [
-                {"task_id": "old-1", "result": "failed", "fingerprint": "fp-A",
-                 "timestamp": "2026-04-10T00:00:00"},
-                {"task_id": "old-2", "result": "failed", "fingerprint": "fp-A",
-                 "timestamp": "2026-04-12T00:00:00"},
-            ],
-        }])
+        project = make_project(
+            directions=[
+                {
+                    "id": "dir-1",
+                    "status": "active",
+                    "text": "rollup reliability",
+                    "followup_investigation_attempts_by_fingerprint": {
+                        "fp-A": list(recent_ts)
+                    },
+                    "remediation_history": [
+                        {
+                            "task_id": "old-1",
+                            "result": "failed",
+                            "fingerprint": "fp-A",
+                            "timestamp": "2026-04-10T00:00:00",
+                        },
+                        {
+                            "task_id": "old-2",
+                            "result": "failed",
+                            "fingerprint": "fp-A",
+                            "timestamp": "2026-04-12T00:00:00",
+                        },
+                    ],
+                }
+            ]
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -2329,28 +2625,48 @@ class TestFollowupInvestigationOnFailure:
         call_kwargs = post_mock.await_args.kwargs
         assert call_kwargs["direction_text"] == "rollup reliability"
         # Cap state unchanged; no follow-up spawned
-        assert d["followup_investigation_attempts_by_fingerprint"] == {"fp-A": recent_ts}
+        assert d["followup_investigation_attempts_by_fingerprint"] == {
+            "fp-A": recent_ts
+        }
         assert d.get("diagnosis_in_progress") is not True
 
     @pytest.mark.asyncio
-    async def test_cap_exhausted_with_prior_merged_does_not_escalate(self, db_session, mocker):
+    async def test_cap_exhausted_with_prior_merged_does_not_escalate(
+        self, db_session, mocker
+    ):
         """A prior merged remediation on this fingerprint indicates partial success — no escalation."""
         from app.time_utils import _utcnow
+
         post_mock = mocker.patch(
             "app.notification_dispatch.post_remediation_escalation_message",
             new_callable=AsyncMock,
         )
         recent_ts = [_utcnow().isoformat(), _utcnow().isoformat()]
-        project = make_project(directions=[{
-            "id": "dir-1", "status": "active",
-            "followup_investigation_attempts_by_fingerprint": {"fp-A": list(recent_ts)},
-            "remediation_history": [
-                {"task_id": "old-1", "result": "merged", "fingerprint": "fp-A",
-                 "timestamp": "2026-04-10T00:00:00"},
-                {"task_id": "old-2", "result": "failed", "fingerprint": "fp-A",
-                 "timestamp": "2026-04-12T00:00:00"},
-            ],
-        }])
+        project = make_project(
+            directions=[
+                {
+                    "id": "dir-1",
+                    "status": "active",
+                    "followup_investigation_attempts_by_fingerprint": {
+                        "fp-A": list(recent_ts)
+                    },
+                    "remediation_history": [
+                        {
+                            "task_id": "old-1",
+                            "result": "merged",
+                            "fingerprint": "fp-A",
+                            "timestamp": "2026-04-10T00:00:00",
+                        },
+                        {
+                            "task_id": "old-2",
+                            "result": "failed",
+                            "fingerprint": "fp-A",
+                            "timestamp": "2026-04-12T00:00:00",
+                        },
+                    ],
+                }
+            ]
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -2368,23 +2684,37 @@ class TestFollowupInvestigationOnFailure:
         assert post_mock.await_count == 0
 
     @pytest.mark.asyncio
-    async def test_cap_exhausted_idempotent_when_already_flagged(self, db_session, mocker):
+    async def test_cap_exhausted_idempotent_when_already_flagged(
+        self, db_session, mocker
+    ):
         """When needs_manual_intervention is already set, do not re-post the escalation."""
         from app.time_utils import _utcnow
+
         post_mock = mocker.patch(
             "app.notification_dispatch.post_remediation_escalation_message",
             new_callable=AsyncMock,
         )
         recent_ts = [_utcnow().isoformat(), _utcnow().isoformat()]
-        project = make_project(directions=[{
-            "id": "dir-1", "status": "active",
-            "needs_manual_intervention": True,
-            "followup_investigation_attempts_by_fingerprint": {"fp-A": list(recent_ts)},
-            "remediation_history": [
-                {"task_id": "old-1", "result": "failed", "fingerprint": "fp-A",
-                 "timestamp": "2026-04-10T00:00:00"},
-            ],
-        }])
+        project = make_project(
+            directions=[
+                {
+                    "id": "dir-1",
+                    "status": "active",
+                    "needs_manual_intervention": True,
+                    "followup_investigation_attempts_by_fingerprint": {
+                        "fp-A": list(recent_ts)
+                    },
+                    "remediation_history": [
+                        {
+                            "task_id": "old-1",
+                            "result": "failed",
+                            "fingerprint": "fp-A",
+                            "timestamp": "2026-04-10T00:00:00",
+                        },
+                    ],
+                }
+            ]
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -2400,23 +2730,38 @@ class TestFollowupInvestigationOnFailure:
         assert post_mock.await_count == 0
 
     @pytest.mark.asyncio
-    async def test_cap_exhausted_notification_failure_stamps_retry(self, db_session, mocker):
+    async def test_cap_exhausted_notification_failure_stamps_retry(
+        self, db_session, mocker
+    ):
         """When the escalation notification raises, stamp retry flags for the lifecycle retry loop."""
         from app.time_utils import _utcnow
+
         mocker.patch(
             "app.notification_dispatch.post_remediation_escalation_message",
             new_callable=AsyncMock,
             side_effect=RuntimeError("slack down"),
         )
         recent_ts = [_utcnow().isoformat(), _utcnow().isoformat()]
-        project = make_project(directions=[{
-            "id": "dir-1", "status": "active", "text": "rollup reliability",
-            "followup_investigation_attempts_by_fingerprint": {"fp-A": list(recent_ts)},
-            "remediation_history": [
-                {"task_id": "old-1", "result": "failed", "fingerprint": "fp-A",
-                 "timestamp": "2026-04-10T00:00:00"},
-            ],
-        }])
+        project = make_project(
+            directions=[
+                {
+                    "id": "dir-1",
+                    "status": "active",
+                    "text": "rollup reliability",
+                    "followup_investigation_attempts_by_fingerprint": {
+                        "fp-A": list(recent_ts)
+                    },
+                    "remediation_history": [
+                        {
+                            "task_id": "old-1",
+                            "result": "failed",
+                            "fingerprint": "fp-A",
+                            "timestamp": "2026-04-10T00:00:00",
+                        },
+                    ],
+                }
+            ]
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -2438,23 +2783,28 @@ class TestFollowupInvestigationOnFailure:
     async def test_follow_up_skipped_by_cross_direction_fingerprint(self, db_session):
         """A recent investigate task on a sibling direction sharing the same
         fingerprint blocks a new follow-up and records a dedup note."""
-        project = make_project(directions=[
-            {"id": "dir-1", "status": "active"},
-            {"id": "dir-2", "status": "paused"},
-        ])
+        project = make_project(
+            directions=[
+                {"id": "dir-1", "status": "active"},
+                {"id": "dir-2", "status": "paused"},
+            ]
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
         # Sibling direction already has an open investigate with same fingerprint
         sibling_inv = make_task(
             project_id=project.id,
-            payloads=[{"type": "investigate", "prompt": "sibling", "base_branch": "main"}],
+            payloads=[
+                {"type": "investigate", "prompt": "sibling", "base_branch": "main"}
+            ],
             context={"direction_id": "dir-2", "diagnosis_fingerprint": "fp-A"},
         )
         db_session.add(sibling_inv)
         await db_session.commit()
-        task = self._make_remediation_task(project.id, direction_id="dir-1",
-                                           fingerprint="fp-A")
+        task = self._make_remediation_task(
+            project.id, direction_id="dir-1", fingerprint="fp-A"
+        )
         db_session.add(task)
         await db_session.commit()
         await db_session.refresh(task)
@@ -2469,14 +2819,17 @@ class TestFollowupInvestigationOnFailure:
         notes = d.get("notes") or []
         assert any(n.get("source") == "followup_dedup" for n in notes)
         assert any(
-            n.get("shared_investigation_task_id") == str(sibling_inv.id)
-            for n in notes
+            n.get("shared_investigation_task_id") == str(sibling_inv.id) for n in notes
         )
 
     @staticmethod
-    def _make_regression_remediation_task(project_id, *, direction_id="dir-1",
-                                          fingerprint="fp-A",
-                                          regression_class="sr_catch_rate:correctness"):
+    def _make_regression_remediation_task(
+        project_id,
+        *,
+        direction_id="dir-1",
+        fingerprint="fp-A",
+        regression_class="sr_catch_rate:correctness",
+    ):
         return make_task(
             project_id=project_id,
             status=TaskStatus.FAILED,
@@ -2487,7 +2840,13 @@ class TestFollowupInvestigationOnFailure:
                 "diagnosis_fingerprint": fingerprint,
                 "regression_class": regression_class,
             },
-            payloads=[{"type": "create", "prompt": "apply regression fix", "base_branch": "main"}],
+            payloads=[
+                {
+                    "type": "create",
+                    "prompt": "apply regression fix",
+                    "base_branch": "main",
+                }
+            ],
         )
 
     @pytest.mark.asyncio
@@ -2495,10 +2854,16 @@ class TestFollowupInvestigationOnFailure:
         """When RegressionRemediationCase.attempts == 1, prompt has no PRIOR ATTEMPT CONTEXT block."""
         from app.models import RegressionCaseStatus, RegressionRemediationCase
 
-        project = make_project(directions=[{
-            "id": "dir-1", "status": "active", "text": "sr catch rate fix",
-            "diagnosis_summary": "SR catch rate dropped",
-        }])
+        project = make_project(
+            directions=[
+                {
+                    "id": "dir-1",
+                    "status": "active",
+                    "text": "sr catch rate fix",
+                    "diagnosis_summary": "SR catch rate dropped",
+                }
+            ]
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -2523,12 +2888,19 @@ class TestFollowupInvestigationOnFailure:
 
         from sqlmodel import select as _select
         from app.models import Task as TaskModel
-        spawned = (await db_session.execute(
-            _select(TaskModel).where(
-                TaskModel.project_id == project.id,
-                TaskModel.id != task.id,
+
+        spawned = (
+            (
+                await db_session.execute(
+                    _select(TaskModel).where(
+                        TaskModel.project_id == project.id,
+                        TaskModel.id != task.id,
+                    )
+                )
             )
-        )).scalars().all()
+            .scalars()
+            .all()
+        )
         assert len(spawned) == 1
         prompt = spawned[0].payloads[0]["prompt"]
         assert "PRIOR ATTEMPT CONTEXT" not in prompt
@@ -2539,10 +2911,16 @@ class TestFollowupInvestigationOnFailure:
         """When RegressionRemediationCase.attempts >= 2, prompt includes prior PR + signal."""
         from app.models import RegressionCaseStatus, RegressionRemediationCase
 
-        project = make_project(directions=[{
-            "id": "dir-1", "status": "active", "text": "sr catch rate fix",
-            "diagnosis_summary": "SR catch rate dropped",
-        }])
+        project = make_project(
+            directions=[
+                {
+                    "id": "dir-1",
+                    "status": "active",
+                    "text": "sr catch rate fix",
+                    "diagnosis_summary": "SR catch rate dropped",
+                }
+            ]
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -2568,12 +2946,19 @@ class TestFollowupInvestigationOnFailure:
 
         from sqlmodel import select as _select
         from app.models import Task as TaskModel
-        spawned = (await db_session.execute(
-            _select(TaskModel).where(
-                TaskModel.project_id == project.id,
-                TaskModel.id != task.id,
+
+        spawned = (
+            (
+                await db_session.execute(
+                    _select(TaskModel).where(
+                        TaskModel.project_id == project.id,
+                        TaskModel.id != task.id,
+                    )
+                )
             )
-        )).scalars().all()
+            .scalars()
+            .all()
+        )
         assert len(spawned) == 1
         prompt = spawned[0].payloads[0]["prompt"]
         assert "PRIOR ATTEMPT CONTEXT" in prompt
@@ -2586,9 +2971,15 @@ class TestFollowupInvestigationOnFailure:
         """When attempts >= 2 but no prior PR, no PR-number line is leaked into prompt."""
         from app.models import RegressionCaseStatus, RegressionRemediationCase
 
-        project = make_project(directions=[{
-            "id": "dir-1", "status": "active", "text": "sr catch rate fix",
-        }])
+        project = make_project(
+            directions=[
+                {
+                    "id": "dir-1",
+                    "status": "active",
+                    "text": "sr catch rate fix",
+                }
+            ]
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -2613,12 +3004,19 @@ class TestFollowupInvestigationOnFailure:
 
         from sqlmodel import select as _select
         from app.models import Task as TaskModel
-        spawned = (await db_session.execute(
-            _select(TaskModel).where(
-                TaskModel.project_id == project.id,
-                TaskModel.id != task.id,
+
+        spawned = (
+            (
+                await db_session.execute(
+                    _select(TaskModel).where(
+                        TaskModel.project_id == project.id,
+                        TaskModel.id != task.id,
+                    )
+                )
             )
-        )).scalars().all()
+            .scalars()
+            .all()
+        )
         assert len(spawned) == 1
         prompt = spawned[0].payloads[0]["prompt"]
         assert "PRIOR ATTEMPT CONTEXT" in prompt
@@ -2637,6 +3035,7 @@ class TestUnlinkedRemediationSiblingPropagation:
 
     def _paused_sibling(self, direction_id: str, fingerprint: str, **overrides):
         from app.time_utils import _utcnow as _now
+
         sibling = {
             "id": direction_id,
             "status": "paused",
@@ -2649,15 +3048,19 @@ class TestUnlinkedRemediationSiblingPropagation:
 
     @pytest.mark.asyncio
     async def test_merged_unlinked_remediation_unpauses_sibling(self, db_session):
-        project = make_project(directions=[
-            self._paused_sibling("dir-2", "fp-shared", paused_reason="CODE_ERROR"),
-        ])
+        project = make_project(
+            directions=[
+                self._paused_sibling("dir-2", "fp-shared", paused_reason="CODE_ERROR"),
+            ]
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
         task = make_task(
             project_id=project.id,
-            payloads=[{"type": "create", "prompt": "Pin pydantic", "base_branch": "main"}],
+            payloads=[
+                {"type": "create", "prompt": "Pin pydantic", "base_branch": "main"}
+            ],
             context={
                 "auto_remediation": True,
                 "_previous_error_fingerprint": "fp-shared",
@@ -2667,7 +3070,9 @@ class TestUnlinkedRemediationSiblingPropagation:
         await db_session.commit()
         await db_session.refresh(task)
 
-        recorded = await _record_project_remediation_outcome(task, merged=True, session=db_session)
+        recorded = await _record_project_remediation_outcome(
+            task, merged=True, session=db_session
+        )
         await db_session.commit()
         await db_session.refresh(project)
         assert recorded
@@ -2688,9 +3093,11 @@ class TestUnlinkedRemediationSiblingPropagation:
 
     @pytest.mark.asyncio
     async def test_failed_unlinked_remediation_notes_sibling(self, db_session):
-        project = make_project(directions=[
-            self._paused_sibling("dir-2", "fp-shared"),
-        ])
+        project = make_project(
+            directions=[
+                self._paused_sibling("dir-2", "fp-shared"),
+            ]
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -2721,10 +3128,14 @@ class TestUnlinkedRemediationSiblingPropagation:
         assert "Do not repeat" in note["text"]
 
     @pytest.mark.asyncio
-    async def test_unlinked_remediation_without_fingerprint_does_not_propagate(self, db_session):
-        project = make_project(directions=[
-            self._paused_sibling("dir-2", "fp-shared"),
-        ])
+    async def test_unlinked_remediation_without_fingerprint_does_not_propagate(
+        self, db_session
+    ):
+        project = make_project(
+            directions=[
+                self._paused_sibling("dir-2", "fp-shared"),
+            ]
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -2746,10 +3157,14 @@ class TestUnlinkedRemediationSiblingPropagation:
         assert not sibling.get("notes")
 
     @pytest.mark.asyncio
-    async def test_unlinked_remediation_with_mismatched_fingerprint_leaves_sibling(self, db_session):
-        project = make_project(directions=[
-            self._paused_sibling("dir-2", "fp-other"),
-        ])
+    async def test_unlinked_remediation_with_mismatched_fingerprint_leaves_sibling(
+        self, db_session
+    ):
+        project = make_project(
+            directions=[
+                self._paused_sibling("dir-2", "fp-other"),
+            ]
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -2775,6 +3190,7 @@ class TestUnlinkedRemediationSiblingPropagation:
 
 
 # ── _handle_investigation_completion ────────────────────────────────────────
+
 
 class TestIsStructuralDiagnosis:
     def test_detects_scope_too_broad(self):
@@ -2816,16 +3232,25 @@ class TestHandleInvestigationCompletion:
     def _payload(self, logs=""):
         from types import SimpleNamespace
         from app.models import ArtifactType
-        return SimpleNamespace(logs=logs, artifact_type=ArtifactType.INVESTIGATION_REPORT)
+
+        return SimpleNamespace(
+            logs=logs, artifact_type=ArtifactType.INVESTIGATION_REPORT
+        )
 
     def _report(self, **overrides) -> str:
         base = {
             "summary": "Tasks fail due to missing lock in _record_direction_result",
             "root_cause": "Concurrent writers race on the direction dict, causing one writer's update to overwrite the other. The bug is in shared_state.record_direction_result which reads, mutates, and writes without a lock.",
             "affected_files": [
-                {"path": "backend/app/shared_state.py", "issue": "missing lock around direction dict write"},
+                {
+                    "path": "backend/app/shared_state.py",
+                    "issue": "missing lock around direction dict write",
+                },
                 {"path": "backend/app/shared_state.py", "issue": "dup path"},
-                {"path": "backend/app/autonomous_research.py", "issue": "calls the unsafe function"},
+                {
+                    "path": "backend/app/autonomous_research.py",
+                    "issue": "calls the unsafe function",
+                },
             ],
             "recommended_fix": "Wrap record_direction_result body in the existing asyncio.Lock held for per-project state. Add a targeted regression test that exercises concurrent calls.",
             "severity": "high",
@@ -2861,7 +3286,9 @@ class TestHandleInvestigationCompletion:
         db_session.add(task)
         await db_session.commit()
 
-        await _handle_investigation_completion(task, self._payload(self._report()), db_session)
+        await _handle_investigation_completion(
+            task, self._payload(self._report()), db_session
+        )
         await db_session.commit()
         await db_session.refresh(task)
 
@@ -2879,7 +3306,9 @@ class TestHandleInvestigationCompletion:
         db_session.add(task)
         await db_session.commit()
 
-        await _handle_investigation_completion(task, self._payload(self._report()), db_session)
+        await _handle_investigation_completion(
+            task, self._payload(self._report()), db_session
+        )
         await db_session.commit()
         await db_session.refresh(project)
 
@@ -2903,7 +3332,9 @@ class TestHandleInvestigationCompletion:
         db_session.add(task)
         await db_session.commit()
 
-        await _handle_investigation_completion(task, self._payload(self._report()), db_session)
+        await _handle_investigation_completion(
+            task, self._payload(self._report()), db_session
+        )
         await db_session.commit()
         await db_session.refresh(project)
 
@@ -2923,12 +3354,15 @@ class TestHandleInvestigationCompletion:
         await db_session.commit()
         await db_session.refresh(task)
 
-        await _handle_investigation_completion(task, self._payload(self._report()), db_session)
+        await _handle_investigation_completion(
+            task, self._payload(self._report()), db_session
+        )
         await db_session.commit()
         await db_session.refresh(project)
 
         from sqlmodel import select as _select
         from app.models import Task as _Task
+
         result = await db_session.execute(
             _select(_Task).where(_Task.parent_task_id == task.id)
         )
@@ -3004,6 +3438,7 @@ class TestHandleInvestigationCompletion:
 
         from sqlmodel import select as _select
         from app.models import Task as _Task
+
         result = await db_session.execute(
             _select(_Task).where(_Task.parent_task_id == task.id)
         )
@@ -3029,12 +3464,15 @@ class TestHandleInvestigationCompletion:
             root_cause="The direction scope is too broad — it conflates two unrelated concerns.",
             recommended_fix="Split the direction into two narrower directions.",
         )
-        await _handle_investigation_completion(task, self._payload(structural_report), db_session)
+        await _handle_investigation_completion(
+            task, self._payload(structural_report), db_session
+        )
         await db_session.commit()
         await db_session.refresh(project)
 
         from sqlmodel import select as _select
         from app.models import Task as _Task
+
         result = await db_session.execute(
             _select(_Task).where(_Task.parent_task_id == task.id)
         )
@@ -3048,10 +3486,13 @@ class TestHandleInvestigationCompletion:
         assert "remediation_task_id" not in d
 
     @pytest.mark.asyncio
-    async def test_low_confidence_spawns_followup_investigation(self, db_session, mocker):
+    async def test_low_confidence_spawns_followup_investigation(
+        self, db_session, mocker
+    ):
         """Low-confidence diagnosis spawns a follow-up investigate task, not a remediation."""
         project = await self._setup(
-            db_session, mocker,
+            db_session,
+            mocker,
             direction_overrides={"error_fingerprint": "fp-low"},
         )
         task = make_task(
@@ -3070,18 +3511,31 @@ class TestHandleInvestigationCompletion:
 
         from sqlmodel import select as _select
         from app.models import Task as _Task
+
         # No remediation create-task child
-        children = (await db_session.execute(
-            _select(_Task).where(_Task.parent_task_id == task.id)
-        )).scalars().all()
+        children = (
+            (
+                await db_session.execute(
+                    _select(_Task).where(_Task.parent_task_id == task.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
         assert children == []
         # But a follow-up investigate task exists (sibling, not child)
-        siblings = (await db_session.execute(
-            _select(_Task).where(
-                _Task.project_id == project.id,
-                _Task.id != task.id,
+        siblings = (
+            (
+                await db_session.execute(
+                    _select(_Task).where(
+                        _Task.project_id == project.id,
+                        _Task.id != task.id,
+                    )
+                )
             )
-        )).scalars().all()
+            .scalars()
+            .all()
+        )
         assert len(siblings) == 1
         followup = siblings[0]
         assert followup.payloads[0]["type"] == "investigate"
@@ -3102,15 +3556,21 @@ class TestHandleInvestigationCompletion:
         assert isinstance(fp_entry, list) and len(fp_entry) == 1
 
     @pytest.mark.asyncio
-    async def test_low_confidence_followup_respects_fingerprint_cap(self, db_session, mocker):
+    async def test_low_confidence_followup_respects_fingerprint_cap(
+        self, db_session, mocker
+    ):
         """Cap on prior follow-up attempts blocks spawning on low confidence."""
         from app.time_utils import _utcnow
+
         recent = [_utcnow().isoformat(), _utcnow().isoformat()]
         project = await self._setup(
-            db_session, mocker,
+            db_session,
+            mocker,
             direction_overrides={
                 "error_fingerprint": "fp-low",
-                "followup_investigation_attempts_by_fingerprint": {"fp-low": list(recent)},
+                "followup_investigation_attempts_by_fingerprint": {
+                    "fp-low": list(recent)
+                },
             },
         )
         task = make_task(
@@ -3129,19 +3589,28 @@ class TestHandleInvestigationCompletion:
 
         from sqlmodel import select as _select
         from app.models import Task as _Task
-        siblings = (await db_session.execute(
-            _select(_Task).where(
-                _Task.project_id == project.id,
-                _Task.id != task.id,
+
+        siblings = (
+            (
+                await db_session.execute(
+                    _select(_Task).where(
+                        _Task.project_id == project.id,
+                        _Task.id != task.id,
+                    )
+                )
             )
-        )).scalars().all()
+            .scalars()
+            .all()
+        )
         assert siblings == []
         d = project.directions[0]
         assert d["followup_investigation_attempts_by_fingerprint"] == {"fp-low": recent}
         assert "diagnosis_in_progress" not in d
 
     @pytest.mark.asyncio
-    async def test_malformed_json_falls_back_gracefully(self, db_session, mocker, caplog):
+    async def test_malformed_json_falls_back_gracefully(
+        self, db_session, mocker, caplog
+    ):
         project = await self._setup(db_session, mocker)
         task = make_task(
             project_id=project.id,
@@ -3152,14 +3621,18 @@ class TestHandleInvestigationCompletion:
 
         bad_logs = "this is not json at all"
         with caplog.at_level("ERROR", logger="app.task_completion"):
-            await _handle_investigation_completion(task, self._payload(bad_logs), db_session)
+            await _handle_investigation_completion(
+                task, self._payload(bad_logs), db_session
+            )
         await db_session.commit()
         await db_session.refresh(task)
         await db_session.refresh(project)
 
         assert task.status == TaskStatus.FAILED
         assert task.plan_output == {"raw": bad_logs}
-        assert (task.context or {}).get("failure_detail") == "investigation_report_unparseable"
+        assert (task.context or {}).get(
+            "failure_detail"
+        ) == "investigation_report_unparseable"
         assert task.latest_status_message
         d = project.directions[0]
         assert "diagnosis_in_progress" not in d
@@ -3181,7 +3654,9 @@ class TestHandleInvestigationCompletion:
         db_session.add(task)
         await db_session.commit()
 
-        await _handle_investigation_completion(task, self._payload(self._report()), db_session)
+        await _handle_investigation_completion(
+            task, self._payload(self._report()), db_session
+        )
         await db_session.commit()
         await db_session.refresh(task)
 
@@ -3191,7 +3666,9 @@ class TestHandleInvestigationCompletion:
     @pytest.mark.asyncio
     async def test_empty_logs_completes_without_raising(self, db_session, mocker):
         mocker.patch("app.task_completion.broadcast_to_project", new_callable=AsyncMock)
-        project = make_project(directions=[{"id": "d-1", "diagnosis_in_progress": True}])
+        project = make_project(
+            directions=[{"id": "d-1", "diagnosis_in_progress": True}]
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -3206,16 +3683,22 @@ class TestHandleInvestigationCompletion:
 
         assert task.status == TaskStatus.FAILED
         assert task.plan_output == {}
-        assert (task.context or {}).get("failure_detail") == "investigation_report_unparseable"
+        assert (task.context or {}).get(
+            "failure_detail"
+        ) == "investigation_report_unparseable"
         assert "diagnosis_in_progress" not in project.directions[0]
 
     @pytest.mark.asyncio
     async def test_stamps_outcome_remediation_spawned(self, db_session, mocker):
         project = await self._setup(db_session, mocker)
-        task = make_task(project_id=project.id, context={"direction_id": "dir-invest-1"})
+        task = make_task(
+            project_id=project.id, context={"direction_id": "dir-invest-1"}
+        )
         db_session.add(task)
         await db_session.commit()
-        await _handle_investigation_completion(task, self._payload(self._report()), db_session)
+        await _handle_investigation_completion(
+            task, self._payload(self._report()), db_session
+        )
         await db_session.commit()
         await db_session.refresh(project)
         d = project.directions[0]
@@ -3225,14 +3708,18 @@ class TestHandleInvestigationCompletion:
     @pytest.mark.asyncio
     async def test_stamps_outcome_structural(self, db_session, mocker):
         project = await self._setup(db_session, mocker)
-        task = make_task(project_id=project.id, context={"direction_id": "dir-invest-1"})
+        task = make_task(
+            project_id=project.id, context={"direction_id": "dir-invest-1"}
+        )
         db_session.add(task)
         await db_session.commit()
         structural_report = self._report(
             root_cause="The direction scope is too broad — it conflates two unrelated concerns.",
             recommended_fix="Split the direction into two narrower directions.",
         )
-        await _handle_investigation_completion(task, self._payload(structural_report), db_session)
+        await _handle_investigation_completion(
+            task, self._payload(structural_report), db_session
+        )
         await db_session.commit()
         await db_session.refresh(project)
         d = project.directions[0]
@@ -3242,11 +3729,15 @@ class TestHandleInvestigationCompletion:
     @pytest.mark.asyncio
     async def test_stamps_outcome_no_actionable_fix(self, db_session, mocker):
         project = await self._setup(db_session, mocker)
-        task = make_task(project_id=project.id, context={"direction_id": "dir-invest-1"})
+        task = make_task(
+            project_id=project.id, context={"direction_id": "dir-invest-1"}
+        )
         db_session.add(task)
         await db_session.commit()
         await _handle_investigation_completion(
-            task, self._payload(self._report(recommended_fix="", confidence="high")), db_session
+            task,
+            self._payload(self._report(recommended_fix="", confidence="high")),
+            db_session,
         )
         await db_session.commit()
         await db_session.refresh(project)
@@ -3255,9 +3746,12 @@ class TestHandleInvestigationCompletion:
         assert d["last_diagnosis_task_id"] == str(task.id)
 
     @pytest.mark.asyncio
-    async def test_stamps_outcome_low_confidence_followup_spawned(self, db_session, mocker):
+    async def test_stamps_outcome_low_confidence_followup_spawned(
+        self, db_session, mocker
+    ):
         project = await self._setup(
-            db_session, mocker,
+            db_session,
+            mocker,
             direction_overrides={"error_fingerprint": "fp-low"},
         )
         task = make_task(
@@ -3276,14 +3770,20 @@ class TestHandleInvestigationCompletion:
         assert d["last_diagnosis_task_id"] == str(task.id)
 
     @pytest.mark.asyncio
-    async def test_stamps_outcome_low_confidence_when_followup_capped(self, db_session, mocker):
+    async def test_stamps_outcome_low_confidence_when_followup_capped(
+        self, db_session, mocker
+    ):
         from app.time_utils import _utcnow
+
         recent = [_utcnow().isoformat(), _utcnow().isoformat()]
         project = await self._setup(
-            db_session, mocker,
+            db_session,
+            mocker,
             direction_overrides={
                 "error_fingerprint": "fp-low",
-                "followup_investigation_attempts_by_fingerprint": {"fp-low": list(recent)},
+                "followup_investigation_attempts_by_fingerprint": {
+                    "fp-low": list(recent)
+                },
             },
         )
         task = make_task(
@@ -3304,10 +3804,14 @@ class TestHandleInvestigationCompletion:
     @pytest.mark.asyncio
     async def test_stamps_outcome_report_unparseable(self, db_session, mocker):
         project = await self._setup(db_session, mocker)
-        task = make_task(project_id=project.id, context={"direction_id": "dir-invest-1"})
+        task = make_task(
+            project_id=project.id, context={"direction_id": "dir-invest-1"}
+        )
         db_session.add(task)
         await db_session.commit()
-        await _handle_investigation_completion(task, self._payload("not json"), db_session)
+        await _handle_investigation_completion(
+            task, self._payload("not json"), db_session
+        )
         await db_session.commit()
         await db_session.refresh(project)
         d = project.directions[0]
@@ -3316,6 +3820,7 @@ class TestHandleInvestigationCompletion:
 
 
 # ── _clear_direction_diagnosis_flag ─────────────────────────────────────────
+
 
 class TestClearDirectionDiagnosisFlag:
     def _direction(self, **overrides):
@@ -3406,7 +3911,9 @@ class TestClearDirectionDiagnosisFlag:
         await db_session.commit()
         await db_session.refresh(project)
 
-        assert len(project.directions[0]["diagnosis_summary"]) == STRATEGIC_RATIONALE_MAX
+        assert (
+            len(project.directions[0]["diagnosis_summary"]) == STRATEGIC_RATIONALE_MAX
+        )
 
     @pytest.mark.asyncio
     async def test_none_summary_omits_key(self, db_session):
@@ -3429,6 +3936,7 @@ class TestClearDirectionDiagnosisFlag:
 
 
 # ── _calculate_remediation_scope ────────────────────────────────────────────
+
 
 class TestCalculateRemediationScope:
     def test_small_when_few_paths_and_low_severity(self):
@@ -3492,13 +4000,18 @@ class TestRemediationScopeInPayload:
     def _payload(self, logs=""):
         from types import SimpleNamespace
         from app.models import ArtifactType
-        return SimpleNamespace(logs=logs, artifact_type=ArtifactType.INVESTIGATION_REPORT)
+
+        return SimpleNamespace(
+            logs=logs, artifact_type=ArtifactType.INVESTIGATION_REPORT
+        )
 
     def _report(self, **overrides) -> str:
         base = {
             "summary": "Missing lock causing race condition",
             "root_cause": "Concurrent writers race on a shared dict without a lock.",
-            "affected_files": [{"path": "backend/app/shared_state.py", "issue": "missing lock"}],
+            "affected_files": [
+                {"path": "backend/app/shared_state.py", "issue": "missing lock"}
+            ],
             "recommended_fix": "Wrap the mutation in the existing asyncio.Lock.",
             "severity": "medium",
             "confidence": "high",
@@ -3525,6 +4038,7 @@ class TestRemediationScopeInPayload:
     async def _spawned_child(self, db_session, parent_task_id):
         from sqlmodel import select as _select
         from app.models import Task as _Task
+
         result = await db_session.execute(
             _select(_Task).where(_Task.parent_task_id == parent_task_id)
         )
@@ -3538,7 +4052,9 @@ class TestRemediationScopeInPayload:
         await db_session.commit()
         await db_session.refresh(task)
 
-        await _handle_investigation_completion(task, self._payload(self._report()), db_session)
+        await _handle_investigation_completion(
+            task, self._payload(self._report()), db_session
+        )
         await db_session.commit()
         child = await self._spawned_child(db_session, task.id)
         assert child is not None
@@ -3554,7 +4070,9 @@ class TestRemediationScopeInPayload:
 
         affected = [{"path": f"backend/app/mod_{i}.py"} for i in range(6)]
         await _handle_investigation_completion(
-            task, self._payload(self._report(affected_files=affected)), db_session,
+            task,
+            self._payload(self._report(affected_files=affected)),
+            db_session,
         )
         await db_session.commit()
         child = await self._spawned_child(db_session, task.id)
@@ -3572,7 +4090,9 @@ class TestRemediationScopeInPayload:
 
         affected = [{"path": f"backend/app/mod_{i}.py"} for i in range(5)]
         await _handle_investigation_completion(
-            task, self._payload(self._report(affected_files=affected)), db_session,
+            task,
+            self._payload(self._report(affected_files=affected)),
+            db_session,
         )
         await db_session.commit()
         child = await self._spawned_child(db_session, task.id)
@@ -3583,14 +4103,18 @@ class TestRemediationScopeInPayload:
     async def test_first_retry_keeps_small_scope(self, db_session, mocker):
         """First retry (attempts=1) still uses small — conservative escalation."""
         project = await self._setup(
-            db_session, mocker, direction_overrides={"remediation_attempts": 1},
+            db_session,
+            mocker,
+            direction_overrides={"remediation_attempts": 1},
         )
         task = make_task(project_id=project.id, context={"direction_id": "dir-scope-1"})
         db_session.add(task)
         await db_session.commit()
         await db_session.refresh(task)
 
-        await _handle_investigation_completion(task, self._payload(self._report()), db_session)
+        await _handle_investigation_completion(
+            task, self._payload(self._report()), db_session
+        )
         await db_session.commit()
         child = await self._spawned_child(db_session, task.id)
         assert child is not None
@@ -3600,14 +4124,18 @@ class TestRemediationScopeInPayload:
     async def test_second_retry_escalates_scope_to_large(self, db_session, mocker):
         """Second retry (attempts>=2) escalates small to large for plan decomposition."""
         project = await self._setup(
-            db_session, mocker, direction_overrides={"remediation_attempts": 2},
+            db_session,
+            mocker,
+            direction_overrides={"remediation_attempts": 2},
         )
         task = make_task(project_id=project.id, context={"direction_id": "dir-scope-1"})
         db_session.add(task)
         await db_session.commit()
         await db_session.refresh(task)
 
-        await _handle_investigation_completion(task, self._payload(self._report()), db_session)
+        await _handle_investigation_completion(
+            task, self._payload(self._report()), db_session
+        )
         await db_session.commit()
         child = await self._spawned_child(db_session, task.id)
         assert child is not None
@@ -3616,15 +4144,21 @@ class TestRemediationScopeInPayload:
 
 # ── _handle_investigation_terminal_failure ──────────────────────────────────
 
+
 class TestHandleInvestigationTerminalFailure:
     """Clears diagnosis_in_progress on investigate-task FAILED/CANCELLED and
     optionally re-spawns investigation when the failure was infra-related."""
 
     @staticmethod
-    def _make_investigation_task(project_id, *, direction_id="dir-1",
-                                 fingerprint="fp-A", status=TaskStatus.FAILED,
-                                 latest_status_message="VM failed to start: quota exceeded",
-                                 extra_context=None):
+    def _make_investigation_task(
+        project_id,
+        *,
+        direction_id="dir-1",
+        fingerprint="fp-A",
+        status=TaskStatus.FAILED,
+        latest_status_message="VM failed to start: quota exceeded",
+        extra_context=None,
+    ):
         ctx = {
             "direction_id": direction_id,
             "diagnosis_trigger": "auto_pause_diagnosis",
@@ -3638,18 +4172,28 @@ class TestHandleInvestigationTerminalFailure:
             status=status,
             latest_status_message=latest_status_message,
             context=ctx,
-            payloads=[{"type": "investigate", "prompt": "diagnose", "base_branch": "main"}],
+            payloads=[
+                {"type": "investigate", "prompt": "diagnose", "base_branch": "main"}
+            ],
         )
 
     @pytest.mark.asyncio
-    async def test_infra_failure_clears_flag_and_spawns_reinvestigation(self, db_session):
+    async def test_infra_failure_clears_flag_and_spawns_reinvestigation(
+        self, db_session
+    ):
         """VM crash on an investigation clears diagnosis flag AND spawns a re-investigation."""
-        project = make_project(directions=[{
-            "id": "dir-1", "status": "paused", "text": "fix rollup reliability",
-            "diagnosis_in_progress": True,
-            "diagnosis_started_at": "2026-04-17T00:00:00",
-            "diagnosis_task_id": "some-prior-id",
-        }])
+        project = make_project(
+            directions=[
+                {
+                    "id": "dir-1",
+                    "status": "paused",
+                    "text": "fix rollup reliability",
+                    "diagnosis_in_progress": True,
+                    "diagnosis_started_at": "2026-04-17T00:00:00",
+                    "diagnosis_task_id": "some-prior-id",
+                }
+            ]
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -3658,7 +4202,9 @@ class TestHandleInvestigationTerminalFailure:
         await db_session.commit()
         await db_session.refresh(task)
 
-        await _handle_investigation_terminal_failure(task, TaskStatus.FAILED, db_session)
+        await _handle_investigation_terminal_failure(
+            task, TaskStatus.FAILED, db_session
+        )
         await db_session.commit()
         await db_session.refresh(project)
 
@@ -3676,12 +4222,19 @@ class TestHandleInvestigationTerminalFailure:
 
         from sqlmodel import select as _select
         from app.models import Task as _Task
-        siblings = (await db_session.execute(
-            _select(_Task).where(
-                _Task.project_id == project.id,
-                _Task.id != task.id,
+
+        siblings = (
+            (
+                await db_session.execute(
+                    _select(_Task).where(
+                        _Task.project_id == project.id,
+                        _Task.id != task.id,
+                    )
+                )
             )
-        )).scalars().all()
+            .scalars()
+            .all()
+        )
         assert len(siblings) == 1
         followup = siblings[0]
         assert followup.payloads[0]["type"] == "investigate"
@@ -3695,11 +4248,16 @@ class TestHandleInvestigationTerminalFailure:
     @pytest.mark.asyncio
     async def test_cancelled_clears_flag_no_respawn(self, db_session):
         """CANCELLED status clears the flag but never spawns a re-investigation."""
-        project = make_project(directions=[{
-            "id": "dir-1", "status": "paused",
-            "diagnosis_in_progress": True,
-            "diagnosis_started_at": "2026-04-17T00:00:00",
-        }])
+        project = make_project(
+            directions=[
+                {
+                    "id": "dir-1",
+                    "status": "paused",
+                    "diagnosis_in_progress": True,
+                    "diagnosis_started_at": "2026-04-17T00:00:00",
+                }
+            ]
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -3712,7 +4270,9 @@ class TestHandleInvestigationTerminalFailure:
         await db_session.commit()
         await db_session.refresh(task)
 
-        await _handle_investigation_terminal_failure(task, TaskStatus.CANCELLED, db_session)
+        await _handle_investigation_terminal_failure(
+            task, TaskStatus.CANCELLED, db_session
+        )
         await db_session.commit()
         await db_session.refresh(project)
 
@@ -3725,21 +4285,33 @@ class TestHandleInvestigationTerminalFailure:
 
         from sqlmodel import select as _select
         from app.models import Task as _Task
-        siblings = (await db_session.execute(
-            _select(_Task).where(
-                _Task.project_id == project.id,
-                _Task.id != task.id,
+
+        siblings = (
+            (
+                await db_session.execute(
+                    _select(_Task).where(
+                        _Task.project_id == project.id,
+                        _Task.id != task.id,
+                    )
+                )
             )
-        )).scalars().all()
+            .scalars()
+            .all()
+        )
         assert siblings == []
 
     @pytest.mark.asyncio
     async def test_code_error_clears_flag_no_respawn(self, db_session):
         """CODE_ERROR investigation failure clears the flag but does not re-spawn."""
-        project = make_project(directions=[{
-            "id": "dir-1", "status": "paused",
-            "diagnosis_in_progress": True,
-        }])
+        project = make_project(
+            directions=[
+                {
+                    "id": "dir-1",
+                    "status": "paused",
+                    "diagnosis_in_progress": True,
+                }
+            ]
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -3753,7 +4325,9 @@ class TestHandleInvestigationTerminalFailure:
         await db_session.commit()
         await db_session.refresh(task)
 
-        await _handle_investigation_terminal_failure(task, TaskStatus.FAILED, db_session)
+        await _handle_investigation_terminal_failure(
+            task, TaskStatus.FAILED, db_session
+        )
         await db_session.commit()
         await db_session.refresh(project)
 
@@ -3764,21 +4338,33 @@ class TestHandleInvestigationTerminalFailure:
 
         from sqlmodel import select as _select
         from app.models import Task as _Task
-        siblings = (await db_session.execute(
-            _select(_Task).where(
-                _Task.project_id == project.id,
-                _Task.id != task.id,
+
+        siblings = (
+            (
+                await db_session.execute(
+                    _select(_Task).where(
+                        _Task.project_id == project.id,
+                        _Task.id != task.id,
+                    )
+                )
             )
-        )).scalars().all()
+            .scalars()
+            .all()
+        )
         assert siblings == []
 
     @pytest.mark.asyncio
     async def test_salvages_partial_diagnosis_on_failure(self, db_session):
         """A failed investigate task with partial plan_output stamps partial_* on direction."""
-        project = make_project(directions=[{
-            "id": "dir-1", "status": "paused",
-            "diagnosis_in_progress": True,
-        }])
+        project = make_project(
+            directions=[
+                {
+                    "id": "dir-1",
+                    "status": "paused",
+                    "diagnosis_in_progress": True,
+                }
+            ]
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -3792,7 +4378,9 @@ class TestHandleInvestigationTerminalFailure:
         await db_session.commit()
         await db_session.refresh(task)
 
-        await _handle_investigation_terminal_failure(task, TaskStatus.FAILED, db_session)
+        await _handle_investigation_terminal_failure(
+            task, TaskStatus.FAILED, db_session
+        )
         await db_session.commit()
         await db_session.refresh(project)
 
@@ -3805,10 +4393,16 @@ class TestHandleInvestigationTerminalFailure:
     @pytest.mark.asyncio
     async def test_code_error_with_partial_root_cause_respawns(self, db_session):
         """CODE_ERROR crash is not normally retried, but partial root_cause unlocks re-spawn."""
-        project = make_project(directions=[{
-            "id": "dir-1", "status": "paused", "text": "rollup",
-            "diagnosis_in_progress": True,
-        }])
+        project = make_project(
+            directions=[
+                {
+                    "id": "dir-1",
+                    "status": "paused",
+                    "text": "rollup",
+                    "diagnosis_in_progress": True,
+                }
+            ]
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -3826,15 +4420,26 @@ class TestHandleInvestigationTerminalFailure:
         await db_session.commit()
         await db_session.refresh(task)
 
-        await _handle_investigation_terminal_failure(task, TaskStatus.FAILED, db_session)
+        await _handle_investigation_terminal_failure(
+            task, TaskStatus.FAILED, db_session
+        )
         await db_session.commit()
         await db_session.refresh(project)
 
         from sqlmodel import select as _select
         from app.models import Task as _Task
-        siblings = (await db_session.execute(
-            _select(_Task).where(_Task.project_id == project.id, _Task.id != task.id)
-        )).scalars().all()
+
+        siblings = (
+            (
+                await db_session.execute(
+                    _select(_Task).where(
+                        _Task.project_id == project.id, _Task.id != task.id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
         assert len(siblings) == 1
         followup = siblings[0]
         assert followup.context["diagnosis_trigger"] == "investigation_failure_followup"
@@ -3845,6 +4450,7 @@ class TestHandleInvestigationTerminalFailure:
     def test_extract_partial_diagnosis_returns_none_when_empty(self):
         class _T:
             plan_output = None
+
         assert _extract_partial_diagnosis(_T()) is None
         _T.plan_output = {"summary": "", "root_cause": "", "affected_files": []}
         assert _extract_partial_diagnosis(_T()) is None
@@ -3852,11 +4458,16 @@ class TestHandleInvestigationTerminalFailure:
     @pytest.mark.asyncio
     async def test_non_investigate_task_is_noop(self, db_session):
         """A failing create/plan/etc task does not clear a direction diagnosis flag."""
-        project = make_project(directions=[{
-            "id": "dir-1", "status": "paused",
-            "diagnosis_in_progress": True,
-            "diagnosis_started_at": "2026-04-17T00:00:00",
-        }])
+        project = make_project(
+            directions=[
+                {
+                    "id": "dir-1",
+                    "status": "paused",
+                    "diagnosis_in_progress": True,
+                    "diagnosis_started_at": "2026-04-17T00:00:00",
+                }
+            ]
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -3870,7 +4481,9 @@ class TestHandleInvestigationTerminalFailure:
         await db_session.commit()
         await db_session.refresh(task)
 
-        await _handle_investigation_terminal_failure(task, TaskStatus.FAILED, db_session)
+        await _handle_investigation_terminal_failure(
+            task, TaskStatus.FAILED, db_session
+        )
         await db_session.commit()
         await db_session.refresh(project)
 
@@ -3882,10 +4495,15 @@ class TestHandleInvestigationTerminalFailure:
     @pytest.mark.asyncio
     async def test_completed_status_is_noop(self, db_session):
         """COMPLETED is handled by _handle_investigation_completion, not this path."""
-        project = make_project(directions=[{
-            "id": "dir-1", "status": "paused",
-            "diagnosis_in_progress": True,
-        }])
+        project = make_project(
+            directions=[
+                {
+                    "id": "dir-1",
+                    "status": "paused",
+                    "diagnosis_in_progress": True,
+                }
+            ]
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -3894,7 +4512,9 @@ class TestHandleInvestigationTerminalFailure:
         await db_session.commit()
         await db_session.refresh(task)
 
-        await _handle_investigation_terminal_failure(task, TaskStatus.COMPLETED, db_session)
+        await _handle_investigation_terminal_failure(
+            task, TaskStatus.COMPLETED, db_session
+        )
         await db_session.commit()
         await db_session.refresh(project)
 
@@ -3906,12 +4526,20 @@ class TestHandleInvestigationTerminalFailure:
     async def test_respawn_skipped_when_cap_reached(self, db_session):
         """Per-fingerprint cap blocks re-investigation but still clears the flag."""
         from app.time_utils import _utcnow
+
         recent = [_utcnow().isoformat(), _utcnow().isoformat()]
-        project = make_project(directions=[{
-            "id": "dir-1", "status": "paused",
-            "diagnosis_in_progress": True,
-            "followup_investigation_attempts_by_fingerprint": {"fp-A": list(recent)},
-        }])
+        project = make_project(
+            directions=[
+                {
+                    "id": "dir-1",
+                    "status": "paused",
+                    "diagnosis_in_progress": True,
+                    "followup_investigation_attempts_by_fingerprint": {
+                        "fp-A": list(recent)
+                    },
+                }
+            ]
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -3920,7 +4548,9 @@ class TestHandleInvestigationTerminalFailure:
         await db_session.commit()
         await db_session.refresh(task)
 
-        await _handle_investigation_terminal_failure(task, TaskStatus.FAILED, db_session)
+        await _handle_investigation_terminal_failure(
+            task, TaskStatus.FAILED, db_session
+        )
         await db_session.commit()
         await db_session.refresh(project)
 
@@ -3933,21 +4563,33 @@ class TestHandleInvestigationTerminalFailure:
 
         from sqlmodel import select as _select
         from app.models import Task as _Task
-        siblings = (await db_session.execute(
-            _select(_Task).where(
-                _Task.project_id == project.id,
-                _Task.id != task.id,
+
+        siblings = (
+            (
+                await db_session.execute(
+                    _select(_Task).where(
+                        _Task.project_id == project.id,
+                        _Task.id != task.id,
+                    )
+                )
             )
-        )).scalars().all()
+            .scalars()
+            .all()
+        )
         assert siblings == []
 
     @pytest.mark.asyncio
     async def test_respawn_skipped_when_recent_investigate_exists(self, db_session):
         """24h dedup: flag still cleared, but no re-investigation spawned."""
-        project = make_project(directions=[{
-            "id": "dir-1", "status": "paused",
-            "diagnosis_in_progress": True,
-        }])
+        project = make_project(
+            directions=[
+                {
+                    "id": "dir-1",
+                    "status": "paused",
+                    "diagnosis_in_progress": True,
+                }
+            ]
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -3964,7 +4606,9 @@ class TestHandleInvestigationTerminalFailure:
         await db_session.commit()
         await db_session.refresh(task)
 
-        await _handle_investigation_terminal_failure(task, TaskStatus.FAILED, db_session)
+        await _handle_investigation_terminal_failure(
+            task, TaskStatus.FAILED, db_session
+        )
         await db_session.commit()
         await db_session.refresh(project)
 
@@ -3975,12 +4619,19 @@ class TestHandleInvestigationTerminalFailure:
 
         from sqlmodel import select as _select
         from app.models import Task as _Task
-        all_investigate = (await db_session.execute(
-            _select(_Task).where(
-                _Task.project_id == project.id,
-                _Task.id != task.id,
+
+        all_investigate = (
+            (
+                await db_session.execute(
+                    _select(_Task).where(
+                        _Task.project_id == project.id,
+                        _Task.id != task.id,
+                    )
+                )
             )
-        )).scalars().all()
+            .scalars()
+            .all()
+        )
         # Only the pre-existing sibling remains — no new task spawned
         assert len(all_investigate) == 1
         assert all_investigate[0].id == sibling.id
@@ -4002,14 +4653,22 @@ class TestHandleInvestigationTerminalFailure:
         await db_session.commit()
 
         # Must not raise
-        await _handle_investigation_terminal_failure(task, TaskStatus.FAILED, db_session)
+        await _handle_investigation_terminal_failure(
+            task, TaskStatus.FAILED, db_session
+        )
 
     @pytest.mark.asyncio
     async def test_swallows_inner_exception(self, db_session, mocker):
         """Errors from helpers must not propagate (mirrors _record_remediation_if_terminal)."""
-        project = make_project(directions=[{
-            "id": "dir-1", "status": "paused", "diagnosis_in_progress": True,
-        }])
+        project = make_project(
+            directions=[
+                {
+                    "id": "dir-1",
+                    "status": "paused",
+                    "diagnosis_in_progress": True,
+                }
+            ]
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -4023,31 +4682,41 @@ class TestHandleInvestigationTerminalFailure:
             side_effect=RuntimeError("db blew up"),
         )
         # Should swallow the exception and still return
-        await _handle_investigation_terminal_failure(task, TaskStatus.FAILED, db_session)
+        await _handle_investigation_terminal_failure(
+            task, TaskStatus.FAILED, db_session
+        )
         assert boom.await_count == 1
 
     @pytest.mark.asyncio
-    async def test_reinvestigation_skipped_by_cross_direction_fingerprint(self, db_session):
+    async def test_reinvestigation_skipped_by_cross_direction_fingerprint(
+        self, db_session
+    ):
         """Sibling direction with a recent investigate sharing the fingerprint
         blocks the reinvestigation spawn and records a dedup note."""
-        project = make_project(directions=[
-            {"id": "dir-1", "status": "paused", "text": "primary"},
-            {"id": "dir-2", "status": "paused", "text": "sibling"},
-        ])
+        project = make_project(
+            directions=[
+                {"id": "dir-1", "status": "paused", "text": "primary"},
+                {"id": "dir-2", "status": "paused", "text": "sibling"},
+            ]
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
 
         sibling_inv = make_task(
             project_id=project.id,
-            payloads=[{"type": "investigate", "prompt": "sibling", "base_branch": "main"}],
+            payloads=[
+                {"type": "investigate", "prompt": "sibling", "base_branch": "main"}
+            ],
             context={"direction_id": "dir-2", "diagnosis_fingerprint": "fp-A"},
         )
         db_session.add(sibling_inv)
         await db_session.commit()
 
         failed_inv = self._make_investigation_task(
-            project.id, direction_id="dir-1", fingerprint="fp-A",
+            project.id,
+            direction_id="dir-1",
+            fingerprint="fp-A",
         )
         db_session.add(failed_inv)
         await db_session.commit()
@@ -4066,32 +4735,46 @@ class TestHandleInvestigationTerminalFailure:
         notes = target.get("notes") or []
         assert any(n.get("source") == "followup_dedup" for n in notes)
         assert any(
-            n.get("shared_investigation_task_id") == str(sibling_inv.id)
-            for n in notes
+            n.get("shared_investigation_task_id") == str(sibling_inv.id) for n in notes
         )
 
     @pytest.mark.asyncio
     async def test_reinvestigation_cap_exhausted_escalates(self, db_session, mocker):
         """Cap hit on investigation-failure path flags needs_manual_intervention + posts."""
         from app.time_utils import _utcnow
+
         post_mock = mocker.patch(
             "app.notification_dispatch.post_remediation_escalation_message",
             new_callable=AsyncMock,
         )
         recent_ts = [_utcnow().isoformat(), _utcnow().isoformat()]
-        project = make_project(directions=[{
-            "id": "dir-1", "status": "paused", "text": "rollup reliability",
-            "followup_investigation_attempts_by_fingerprint": {"fp-A": list(recent_ts)},
-            "remediation_history": [
-                {"task_id": "old-1", "result": "failed", "fingerprint": "fp-A",
-                 "timestamp": "2026-04-10T00:00:00"},
-            ],
-        }])
+        project = make_project(
+            directions=[
+                {
+                    "id": "dir-1",
+                    "status": "paused",
+                    "text": "rollup reliability",
+                    "followup_investigation_attempts_by_fingerprint": {
+                        "fp-A": list(recent_ts)
+                    },
+                    "remediation_history": [
+                        {
+                            "task_id": "old-1",
+                            "result": "failed",
+                            "fingerprint": "fp-A",
+                            "timestamp": "2026-04-10T00:00:00",
+                        },
+                    ],
+                }
+            ]
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
         failed_inv = self._make_investigation_task(
-            project.id, direction_id="dir-1", fingerprint="fp-A",
+            project.id,
+            direction_id="dir-1",
+            fingerprint="fp-A",
         )
         db_session.add(failed_inv)
         await db_session.commit()
@@ -4111,16 +4794,26 @@ class TestHandleInvestigationTerminalFailure:
         d = project.directions[0]
         assert d.get("needs_manual_intervention") is True
         assert post_mock.await_count == 1
-        assert d["followup_investigation_attempts_by_fingerprint"] == {"fp-A": recent_ts}
+        assert d["followup_investigation_attempts_by_fingerprint"] == {
+            "fp-A": recent_ts
+        }
 
     @pytest.mark.asyncio
-    async def test_partial_remediation_spawned_when_infra_and_actionable(self, db_session):
+    async def test_partial_remediation_spawned_when_infra_and_actionable(
+        self, db_session
+    ):
         """Infra-failed investigate with partial root_cause + files spawns a
         remediation (not a reinvestigation) tagged diagnosis_source='partial'."""
-        project = make_project(directions=[{
-            "id": "dir-1", "status": "paused", "text": "rollup",
-            "diagnosis_in_progress": True,
-        }])
+        project = make_project(
+            directions=[
+                {
+                    "id": "dir-1",
+                    "status": "paused",
+                    "text": "rollup",
+                    "diagnosis_in_progress": True,
+                }
+            ]
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -4134,15 +4827,26 @@ class TestHandleInvestigationTerminalFailure:
         await db_session.commit()
         await db_session.refresh(task)
 
-        await _handle_investigation_terminal_failure(task, TaskStatus.FAILED, db_session)
+        await _handle_investigation_terminal_failure(
+            task, TaskStatus.FAILED, db_session
+        )
         await db_session.commit()
         await db_session.refresh(project)
 
         from sqlmodel import select as _select
         from app.models import Task as _Task
-        siblings = (await db_session.execute(
-            _select(_Task).where(_Task.project_id == project.id, _Task.id != task.id)
-        )).scalars().all()
+
+        siblings = (
+            (
+                await db_session.execute(
+                    _select(_Task).where(
+                        _Task.project_id == project.id, _Task.id != task.id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
         assert len(siblings) == 1
         rem = siblings[0]
         assert rem.payloads[0]["type"] == "create"
@@ -4160,10 +4864,16 @@ class TestHandleInvestigationTerminalFailure:
     @pytest.mark.asyncio
     async def test_partial_remediation_skipped_when_no_root_cause(self, db_session):
         """Partial without root_cause falls back to reinvestigation."""
-        project = make_project(directions=[{
-            "id": "dir-1", "status": "paused", "text": "rollup",
-            "diagnosis_in_progress": True,
-        }])
+        project = make_project(
+            directions=[
+                {
+                    "id": "dir-1",
+                    "status": "paused",
+                    "text": "rollup",
+                    "diagnosis_in_progress": True,
+                }
+            ]
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -4177,15 +4887,26 @@ class TestHandleInvestigationTerminalFailure:
         await db_session.commit()
         await db_session.refresh(task)
 
-        await _handle_investigation_terminal_failure(task, TaskStatus.FAILED, db_session)
+        await _handle_investigation_terminal_failure(
+            task, TaskStatus.FAILED, db_session
+        )
         await db_session.commit()
         await db_session.refresh(project)
 
         from sqlmodel import select as _select
         from app.models import Task as _Task
-        siblings = (await db_session.execute(
-            _select(_Task).where(_Task.project_id == project.id, _Task.id != task.id)
-        )).scalars().all()
+
+        siblings = (
+            (
+                await db_session.execute(
+                    _select(_Task).where(
+                        _Task.project_id == project.id, _Task.id != task.id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
         # Reinvestigation spawned, not a create remediation
         assert len(siblings) == 1
         assert siblings[0].payloads[0]["type"] == "investigate"
@@ -4196,10 +4917,16 @@ class TestHandleInvestigationTerminalFailure:
     @pytest.mark.asyncio
     async def test_partial_remediation_skipped_when_no_files(self, db_session):
         """Partial with root_cause but no affected_files falls back to reinvestigation."""
-        project = make_project(directions=[{
-            "id": "dir-1", "status": "paused", "text": "rollup",
-            "diagnosis_in_progress": True,
-        }])
+        project = make_project(
+            directions=[
+                {
+                    "id": "dir-1",
+                    "status": "paused",
+                    "text": "rollup",
+                    "diagnosis_in_progress": True,
+                }
+            ]
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -4213,15 +4940,26 @@ class TestHandleInvestigationTerminalFailure:
         await db_session.commit()
         await db_session.refresh(task)
 
-        await _handle_investigation_terminal_failure(task, TaskStatus.FAILED, db_session)
+        await _handle_investigation_terminal_failure(
+            task, TaskStatus.FAILED, db_session
+        )
         await db_session.commit()
         await db_session.refresh(project)
 
         from sqlmodel import select as _select
         from app.models import Task as _Task
-        siblings = (await db_session.execute(
-            _select(_Task).where(_Task.project_id == project.id, _Task.id != task.id)
-        )).scalars().all()
+
+        siblings = (
+            (
+                await db_session.execute(
+                    _select(_Task).where(
+                        _Task.project_id == project.id, _Task.id != task.id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
         assert len(siblings) == 1
         assert siblings[0].payloads[0]["type"] == "investigate"
 
@@ -4230,10 +4968,16 @@ class TestHandleInvestigationTerminalFailure:
         """CODE_ERROR with actionable partial still falls through to reinvestigation,
         not partial-remediation (we don't trust partial output from broken agents
         enough to ship code changes without re-verifying)."""
-        project = make_project(directions=[{
-            "id": "dir-1", "status": "paused", "text": "rollup",
-            "diagnosis_in_progress": True,
-        }])
+        project = make_project(
+            directions=[
+                {
+                    "id": "dir-1",
+                    "status": "paused",
+                    "text": "rollup",
+                    "diagnosis_in_progress": True,
+                }
+            ]
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -4251,21 +4995,33 @@ class TestHandleInvestigationTerminalFailure:
         await db_session.commit()
         await db_session.refresh(task)
 
-        await _handle_investigation_terminal_failure(task, TaskStatus.FAILED, db_session)
+        await _handle_investigation_terminal_failure(
+            task, TaskStatus.FAILED, db_session
+        )
         await db_session.commit()
         await db_session.refresh(project)
 
         from sqlmodel import select as _select
         from app.models import Task as _Task
-        siblings = (await db_session.execute(
-            _select(_Task).where(_Task.project_id == project.id, _Task.id != task.id)
-        )).scalars().all()
+
+        siblings = (
+            (
+                await db_session.execute(
+                    _select(_Task).where(
+                        _Task.project_id == project.id, _Task.id != task.id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
         assert len(siblings) == 1
         # Reinvestigation (not a create remediation) — partial path should not fire on non-infra
         assert siblings[0].payloads[0]["type"] == "investigate"
 
 
 # ── _handle_plan_completion — scope-aware subtask effort ──────────────────────
+
 
 class TestPlanSubtaskScopeAwareEffort:
     """Plan subtasks inherit effort from parent, but with a scope-aware floor."""
@@ -4282,7 +5038,14 @@ class TestPlanSubtaskScopeAwareEffort:
         await db_session.refresh(project)
         task = make_task(
             project_id=project.id,
-            payloads=[{"type": "plan", "prompt": "plan it", "base_branch": "main", "effort": parent_effort}],
+            payloads=[
+                {
+                    "type": "plan",
+                    "prompt": "plan it",
+                    "base_branch": "main",
+                    "effort": parent_effort,
+                }
+            ],
             status=TaskStatus.IN_PROGRESS,
         )
         db_session.add(task)
@@ -4302,42 +5065,64 @@ class TestPlanSubtaskScopeAwareEffort:
     async def _child_tasks(self, db_session, parent_task):
         from sqlmodel import select as _select
         from app.models import Task as _Task
+
         result = await db_session.execute(
             _select(_Task).where(_Task.parent_task_id == parent_task.id)
         )
         return result.scalars().all()
 
     @pytest.mark.asyncio
-    async def test_large_scope_subtask_raises_effort_above_parent(self, db_session, mocker):
+    async def test_large_scope_subtask_raises_effort_above_parent(
+        self, db_session, mocker
+    ):
         """Large-scope subtask under medium-effort parent is floored up to 'high'."""
         task = await self._setup_plan_task(db_session, mocker, parent_effort="medium")
-        logs = self._plan_logs([
-            {"title": "Sweeping refactor", "prompt": "Do big thing", "scope": "large"},
-        ])
+        logs = self._plan_logs(
+            [
+                {
+                    "title": "Sweeping refactor",
+                    "prompt": "Do big thing",
+                    "scope": "large",
+                },
+            ]
+        )
         await _handle_plan_completion(task, logs, db_session)
         children = await self._child_tasks(db_session, task)
         assert len(children) == 1
         assert children[0].payloads[0]["effort"] == "high"
 
     @pytest.mark.asyncio
-    async def test_small_scope_subtask_keeps_parent_effort_when_higher(self, db_session, mocker):
+    async def test_small_scope_subtask_keeps_parent_effort_when_higher(
+        self, db_session, mocker
+    ):
         """Small-scope subtask under medium-effort parent keeps 'medium' (parent floor wins)."""
         task = await self._setup_plan_task(db_session, mocker, parent_effort="medium")
-        logs = self._plan_logs([
-            {"title": "Small tweak", "prompt": "Narrow fix", "scope": "small"},
-        ])
+        logs = self._plan_logs(
+            [
+                {"title": "Small tweak", "prompt": "Narrow fix", "scope": "small"},
+            ]
+        )
         await _handle_plan_completion(task, logs, db_session)
         children = await self._child_tasks(db_session, task)
         assert len(children) == 1
         assert children[0].payloads[0]["effort"] == "medium"
 
     @pytest.mark.asyncio
-    async def test_explicit_subtask_effort_max_beats_scope_floor(self, db_session, mocker):
+    async def test_explicit_subtask_effort_max_beats_scope_floor(
+        self, db_session, mocker
+    ):
         """Subtask-specified effort wins when it ranks higher than the scope floor."""
         task = await self._setup_plan_task(db_session, mocker, parent_effort="medium")
-        logs = self._plan_logs([
-            {"title": "Critical tiny change", "prompt": "p", "scope": "small", "effort": "max"},
-        ])
+        logs = self._plan_logs(
+            [
+                {
+                    "title": "Critical tiny change",
+                    "prompt": "p",
+                    "scope": "small",
+                    "effort": "max",
+                },
+            ]
+        )
         await _handle_plan_completion(task, logs, db_session)
         children = await self._child_tasks(db_session, task)
         assert len(children) == 1
@@ -4345,6 +5130,7 @@ class TestPlanSubtaskScopeAwareEffort:
 
 
 # ── _record_regression_signal_if_matching ──────────────────────────────────
+
 
 class TestRecordRegressionSignalIfMatching:
     """Regression signals flag directions where the post-merge monitoring
@@ -4358,11 +5144,13 @@ class TestRecordRegressionSignalIfMatching:
         direction. Computed from the task itself so the test stores the same
         value the function under test will recompute."""
         from app.anomaly_detection import _task_error_fingerprint
+
         return _task_error_fingerprint(task)
 
     @pytest.mark.asyncio
     async def test_matching_fingerprint_sets_signal(self, db_session):
         from datetime import datetime, timedelta
+
         err = "Segmentation fault in foo.py at bar"
         task = make_task(
             project_id=None,  # set after project insert
@@ -4370,12 +5158,18 @@ class TestRecordRegressionSignalIfMatching:
             latest_status_message=err,
         )
         fp = self._task_fp(task)
-        project = make_project(directions=[{
-            "id": "dir-1",
-            "status": "active",
-            "remediation_monitor_started_at": (datetime.utcnow() - timedelta(hours=1)).isoformat(),
-            "last_remediation_fingerprint": fp,
-        }])
+        project = make_project(
+            directions=[
+                {
+                    "id": "dir-1",
+                    "status": "active",
+                    "remediation_monitor_started_at": (
+                        datetime.utcnow() - timedelta(hours=1)
+                    ).isoformat(),
+                    "last_remediation_fingerprint": fp,
+                }
+            ]
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -4394,12 +5188,19 @@ class TestRecordRegressionSignalIfMatching:
     @pytest.mark.asyncio
     async def test_different_fingerprint_no_signal(self, db_session):
         from datetime import datetime, timedelta
-        project = make_project(directions=[{
-            "id": "dir-1",
-            "status": "active",
-            "remediation_monitor_started_at": (datetime.utcnow() - timedelta(hours=1)).isoformat(),
-            "last_remediation_fingerprint": "fp-other",
-        }])
+
+        project = make_project(
+            directions=[
+                {
+                    "id": "dir-1",
+                    "status": "active",
+                    "remediation_monitor_started_at": (
+                        datetime.utcnow() - timedelta(hours=1)
+                    ).isoformat(),
+                    "last_remediation_fingerprint": "fp-other",
+                }
+            ]
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -4427,11 +5228,15 @@ class TestRecordRegressionSignalIfMatching:
             context={"direction_id": "dir-1"},
             latest_status_message=err,
         )
-        project = make_project(directions=[{
-            "id": "dir-1",
-            "status": "active",
-            "last_remediation_fingerprint": self._task_fp(task),
-        }])
+        project = make_project(
+            directions=[
+                {
+                    "id": "dir-1",
+                    "status": "active",
+                    "last_remediation_fingerprint": self._task_fp(task),
+                }
+            ]
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -4448,14 +5253,21 @@ class TestRecordRegressionSignalIfMatching:
         """Follow-up investigation spawned after a failed remediation surfaces
         the regression signal so the agent avoids repeating the prior approach."""
         from datetime import datetime, timedelta
-        project = make_project(directions=[{
-            "id": "dir-1",
-            "status": "active",
-            "last_remediation_fingerprint": "fp-x",
-            "remediation_monitor_started_at": (datetime.utcnow() - timedelta(hours=1)).isoformat(),
-            "remediation_regression_signal": True,
-            "remediation_regression_count": 2,
-        }])
+
+        project = make_project(
+            directions=[
+                {
+                    "id": "dir-1",
+                    "status": "active",
+                    "last_remediation_fingerprint": "fp-x",
+                    "remediation_monitor_started_at": (
+                        datetime.utcnow() - timedelta(hours=1)
+                    ).isoformat(),
+                    "remediation_regression_signal": True,
+                    "remediation_regression_count": 2,
+                }
+            ]
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -4483,7 +5295,9 @@ class TestEscalateExhaustedFollowupsAlert:
     """Followup-cap escalation must create an Alert and stamp pending on notify failure."""
 
     @pytest.mark.asyncio
-    async def test_notification_failure_creates_alert_and_sets_pending(self, db_session, mocker):
+    async def test_notification_failure_creates_alert_and_sets_pending(
+        self, db_session, mocker
+    ):
         mocker.patch(
             "app.notification_dispatch.post_remediation_escalation_message",
             new_callable=AsyncMock,
@@ -4518,9 +5332,15 @@ class TestEscalateExhaustedFollowupsAlert:
         assert d.get("escalation_notification_pending") is True
         assert d.get("escalation_notification_retries") == 0
 
-        alerts = (await db_session.execute(
-            _sa_select(Alert).where(Alert.project_id == project.id)
-        )).scalars().all()
+        alerts = (
+            (
+                await db_session.execute(
+                    _sa_select(Alert).where(Alert.project_id == project.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
         matching = [a for a in alerts if "Follow-up escalation" in a.title]
         assert len(matching) == 1
         a = matching[0]
@@ -4561,13 +5381,20 @@ class TestEscalateExhaustedFollowupsAlert:
         d = project.directions[0]
         assert d.get("needs_manual_intervention") is True
         assert "escalation_notification_pending" not in d
-        alerts = (await db_session.execute(
-            _sa_select(Alert).where(Alert.project_id == project.id)
-        )).scalars().all()
+        alerts = (
+            (
+                await db_session.execute(
+                    _sa_select(Alert).where(Alert.project_id == project.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
         assert not any("Follow-up escalation" in a.title for a in alerts)
 
 
 # ── build_blueprint_pr_footer ────────────────────────────────────────────────
+
 
 class TestBuildBlueprintPrFooter:
     """Pure-function tests for the PR-body metadata footer builder."""
@@ -4655,7 +5482,9 @@ class TestBuildBlueprintPrFooter:
     def test_all_fields_combined(self):
         task = self._task_with_timing(1800.0, spot=False)
         task.context = {"direction_id": "d-xyz"}
-        footer = build_blueprint_pr_footer(task, iteration_count=2, direction_title="My Direction")
+        footer = build_blueprint_pr_footer(
+            task, iteration_count=2, direction_title="My Direction"
+        )
         assert "$" in footer
         assert "2 iterations" in footer
         assert "My Direction" in footer
@@ -4711,6 +5540,7 @@ class TestBuildBlueprintPrMergeSummaryComment:
 
 # ── patch_pr_body_with_blueprint_meta ────────────────────────────────────────
 
+
 class TestPatchPrBodyWithBlueprintMeta:
     """Tests for the async GitHub PR body patcher."""
 
@@ -4736,7 +5566,9 @@ class TestPatchPrBodyWithBlueprintMeta:
             mock_client.__aenter__ = AsyncMock(return_value=mock_client)
             mock_client.__aexit__ = AsyncMock(return_value=False)
             mock_client_cls.return_value = mock_client
-            await patch_pr_body_with_blueprint_meta("tok", "owner", "repo", 1, "<!-- blueprint:meta -->\n*$0.05*")
+            await patch_pr_body_with_blueprint_meta(
+                "tok", "owner", "repo", 1, "<!-- blueprint:meta -->\n*$0.05*"
+            )
 
         assert patched_body is not None
         assert "<!-- blueprint:meta -->" in patched_body
@@ -4765,7 +5597,9 @@ class TestPatchPrBodyWithBlueprintMeta:
             mock_client.__aenter__ = AsyncMock(return_value=mock_client)
             mock_client.__aexit__ = AsyncMock(return_value=False)
             mock_client_cls.return_value = mock_client
-            await patch_pr_body_with_blueprint_meta("tok", "owner", "repo", 1, "<!-- blueprint:meta -->\n*new content*")
+            await patch_pr_body_with_blueprint_meta(
+                "tok", "owner", "repo", 1, "<!-- blueprint:meta -->\n*new content*"
+            )
 
         assert patched_body is not None
         assert "new content" in patched_body
@@ -4792,12 +5626,15 @@ class TestPatchPrBodyWithBlueprintMeta:
             mock_client.__aenter__ = AsyncMock(return_value=mock_client)
             mock_client.__aexit__ = AsyncMock(return_value=False)
             mock_client_cls.return_value = mock_client
-            await patch_pr_body_with_blueprint_meta("tok", "owner", "repo", 1, "<!-- blueprint:meta -->\n*x*")
+            await patch_pr_body_with_blueprint_meta(
+                "tok", "owner", "repo", 1, "<!-- blueprint:meta -->\n*x*"
+            )
 
         assert not patch_called
 
 
 # ── _handle_self_audit_completion / auto-clear direction mode ─────────────────
+
 
 class TestHandleSelfAuditCompletion:
     """Tests for _handle_self_audit_completion focusing on the direction-mode
@@ -4806,35 +5643,51 @@ class TestHandleSelfAuditCompletion:
     _SHIP_RECOVERY_THRESHOLD consecutive assessments."""
 
     def _findings(self, system_id="sys-1", mode="ship", score=90):
-        return json.dumps({"findings": [{
-            "system_id": system_id,
-            "recommended_mode": mode,
-            "score": score,
-            "components": {
-                "test_coverage": 90,
-                "friction_density": 10,
-                "claim_consistency": 90,
-                "failure_mix": 10,
-            },
-            "top_issues": [],
-            "evidence": [],
-        }]})
+        return json.dumps(
+            {
+                "findings": [
+                    {
+                        "system_id": system_id,
+                        "recommended_mode": mode,
+                        "score": score,
+                        "components": {
+                            "test_coverage": 90,
+                            "friction_density": 10,
+                            "claim_consistency": 90,
+                            "failure_mix": 10,
+                        },
+                        "top_issues": [],
+                        "evidence": [],
+                    }
+                ]
+            }
+        )
 
     async def _run(self, db_session, mocker, task, logs):
         from app.task_completion import _handle_self_audit_completion
+
         mocker.patch("app.task_completion.broadcast_to_project", new_callable=AsyncMock)
         await _handle_self_audit_completion(task, logs, db_session)
 
     @pytest.mark.asyncio
-    async def test_audit_mode_clears_after_threshold_ship_assessments(self, db_session, mocker):
+    async def test_audit_mode_clears_after_threshold_ship_assessments(
+        self, db_session, mocker
+    ):
         """Direction in 'audit' (auto-set) clears after 2 consecutive 'ship' assessments."""
-        from app.models import RECOMMENDED_MODE_META_KEY, RECOMMENDED_MODE_SOURCE_SELF_AUDIT
+        from app.models import (
+            RECOMMENDED_MODE_META_KEY,
+            RECOMMENDED_MODE_SOURCE_SELF_AUDIT,
+        )
+
         direction = {
             "id": "dir-1",
             "system_id": "sys-1",
             "status": "active",
             "recommended_mode": "audit",
-            RECOMMENDED_MODE_META_KEY: {"source": RECOMMENDED_MODE_SOURCE_SELF_AUDIT, "mode": "audit"},
+            RECOMMENDED_MODE_META_KEY: {
+                "source": RECOMMENDED_MODE_SOURCE_SELF_AUDIT,
+                "mode": "audit",
+            },
         }
         project = make_project(directions=[direction])
         db_session.add(project)
@@ -4848,7 +5701,9 @@ class TestHandleSelfAuditCompletion:
         await db_session.refresh(task1)
         await self._run(db_session, mocker, task1, self._findings(mode="ship"))
         await db_session.refresh(project)
-        assert project.directions[0]["recommended_mode"] == "audit", "should not clear after 1 ship"
+        assert project.directions[0]["recommended_mode"] == "audit", (
+            "should not clear after 1 ship"
+        )
 
         # Second ship assessment — threshold met, mode clears.
         task2 = make_task(project_id=project.id)
@@ -4858,20 +5713,30 @@ class TestHandleSelfAuditCompletion:
         await self._run(db_session, mocker, task2, self._findings(mode="ship"))
         await db_session.refresh(project)
         d = project.directions[0]
-        assert d["recommended_mode"] is None, "audit mode should be auto-cleared after 2 ship assessments"
+        assert d["recommended_mode"] is None, (
+            "audit mode should be auto-cleared after 2 ship assessments"
+        )
         meta = d.get(RECOMMENDED_MODE_META_KEY, {})
         assert "cleared_reason" in meta, "clear metadata should record reason"
 
     @pytest.mark.asyncio
     async def test_strategic_set_mode_is_not_cleared(self, db_session, mocker):
         """Directions whose mode was set by the strategic agent are left untouched."""
-        from app.models import RECOMMENDED_MODE_META_KEY, RECOMMENDED_MODE_SOURCE_STRATEGIC, SystemMaturity
+        from app.models import (
+            RECOMMENDED_MODE_META_KEY,
+            RECOMMENDED_MODE_SOURCE_STRATEGIC,
+            SystemMaturity,
+        )
+
         direction = {
             "id": "dir-2",
             "system_id": "sys-2",
             "status": "active",
             "recommended_mode": "audit",
-            RECOMMENDED_MODE_META_KEY: {"source": RECOMMENDED_MODE_SOURCE_STRATEGIC, "mode": "audit"},
+            RECOMMENDED_MODE_META_KEY: {
+                "source": RECOMMENDED_MODE_SOURCE_STRATEGIC,
+                "mode": "audit",
+            },
         }
         project = make_project(directions=[direction])
         db_session.add(project)
@@ -4879,36 +5744,49 @@ class TestHandleSelfAuditCompletion:
         await db_session.refresh(project)
 
         # Seed SystemMaturity with 1 prior ship so next ship hits threshold=2.
-        db_session.add(SystemMaturity(
-            project_id=project.id,
-            system_id="sys-2",
-            score=90,
-            components={"_consecutive_ship_count": 1},
-            recommended_mode="ship",
-            top_issues=[],
-            evidence=[],
-        ))
+        db_session.add(
+            SystemMaturity(
+                project_id=project.id,
+                system_id="sys-2",
+                score=90,
+                components={"_consecutive_ship_count": 1},
+                recommended_mode="ship",
+                top_issues=[],
+                evidence=[],
+            )
+        )
         await db_session.commit()
 
         task = make_task(project_id=project.id)
         db_session.add(task)
         await db_session.commit()
         await db_session.refresh(task)
-        await self._run(db_session, mocker, task, self._findings(system_id="sys-2", mode="ship"))
+        await self._run(
+            db_session, mocker, task, self._findings(system_id="sys-2", mode="ship")
+        )
         await db_session.refresh(project)
-        assert project.directions[0]["recommended_mode"] == "audit", \
+        assert project.directions[0]["recommended_mode"] == "audit", (
             "strategic-set mode must not be auto-cleared"
+        )
 
     @pytest.mark.asyncio
     async def test_fundamentals_mode_clears_after_threshold(self, db_session, mocker):
         """'fundamentals' mode (auto-set) also clears after threshold ship assessments."""
-        from app.models import SystemMaturity, RECOMMENDED_MODE_META_KEY, RECOMMENDED_MODE_SOURCE_SELF_AUDIT
+        from app.models import (
+            SystemMaturity,
+            RECOMMENDED_MODE_META_KEY,
+            RECOMMENDED_MODE_SOURCE_SELF_AUDIT,
+        )
+
         direction = {
             "id": "dir-3",
             "system_id": "sys-3",
             "status": "active",
             "recommended_mode": "fundamentals",
-            RECOMMENDED_MODE_META_KEY: {"source": RECOMMENDED_MODE_SOURCE_SELF_AUDIT, "mode": "fundamentals"},
+            RECOMMENDED_MODE_META_KEY: {
+                "source": RECOMMENDED_MODE_SOURCE_SELF_AUDIT,
+                "mode": "fundamentals",
+            },
         }
         project = make_project(directions=[direction])
         db_session.add(project)
@@ -4916,45 +5794,53 @@ class TestHandleSelfAuditCompletion:
         await db_session.refresh(project)
 
         # Seed 1 prior ship so the next ship hits threshold.
-        db_session.add(SystemMaturity(
-            project_id=project.id,
-            system_id="sys-3",
-            score=90,
-            components={"_consecutive_ship_count": 1},
-            recommended_mode="ship",
-            top_issues=[],
-            evidence=[],
-        ))
+        db_session.add(
+            SystemMaturity(
+                project_id=project.id,
+                system_id="sys-3",
+                score=90,
+                components={"_consecutive_ship_count": 1},
+                recommended_mode="ship",
+                top_issues=[],
+                evidence=[],
+            )
+        )
         await db_session.commit()
 
         task = make_task(project_id=project.id)
         db_session.add(task)
         await db_session.commit()
         await db_session.refresh(task)
-        await self._run(db_session, mocker, task, self._findings(system_id="sys-3", mode="ship"))
+        await self._run(
+            db_session, mocker, task, self._findings(system_id="sys-3", mode="ship")
+        )
         await db_session.refresh(project)
-        assert project.directions[0]["recommended_mode"] is None, \
+        assert project.directions[0]["recommended_mode"] is None, (
             "fundamentals mode should clear after threshold ship assessments"
+        )
 
     @pytest.mark.asyncio
     async def test_non_ship_mode_resets_consecutive_count(self, db_session, mocker):
         """A non-ship audit finding resets the consecutive ship counter."""
         from app.models import SystemMaturity
+
         project = make_project(directions=[])
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
 
         # Seed with 1 consecutive ship.
-        db_session.add(SystemMaturity(
-            project_id=project.id,
-            system_id="sys-4",
-            score=90,
-            components={"_consecutive_ship_count": 1},
-            recommended_mode="ship",
-            top_issues=[],
-            evidence=[],
-        ))
+        db_session.add(
+            SystemMaturity(
+                project_id=project.id,
+                system_id="sys-4",
+                score=90,
+                components={"_consecutive_ship_count": 1},
+                recommended_mode="ship",
+                top_issues=[],
+                evidence=[],
+            )
+        )
         await db_session.commit()
 
         task = make_task(project_id=project.id)
@@ -4962,25 +5848,39 @@ class TestHandleSelfAuditCompletion:
         await db_session.commit()
         await db_session.refresh(task)
         # Incoming mode is "audit" — not ship, so counter resets.
-        await self._run(db_session, mocker, task, self._findings(system_id="sys-4", mode="audit"))
+        await self._run(
+            db_session, mocker, task, self._findings(system_id="sys-4", mode="audit")
+        )
 
         from sqlmodel import select as _sel
-        sm = (await db_session.execute(
-            _sel(SystemMaturity).where(SystemMaturity.system_id == "sys-4")
-        )).scalars().first()
+
+        sm = (
+            (
+                await db_session.execute(
+                    _sel(SystemMaturity).where(SystemMaturity.system_id == "sys-4")
+                )
+            )
+            .scalars()
+            .first()
+        )
         assert sm is not None
-        assert sm.components.get("_consecutive_ship_count", -1) == 0, \
+        assert sm.components.get("_consecutive_ship_count", -1) == 0, (
             "consecutive ship count should reset on non-ship finding"
+        )
 
 
 # ── confirm_applied_playbook_entries ────────────────────────────────────────
+
 
 class TestConfirmAppliedPlaybookEntries:
     @pytest.mark.asyncio
     async def test_no_op_when_no_entry_ids(self, db_session):
         """Returns early without DB write when playbook_applied_entry_ids is absent."""
         from app.task_completion import confirm_applied_playbook_entries
-        project = make_project(design_doc={"playbook/tip-a": {"content": "x", "confirmed_count": 0}})
+
+        project = make_project(
+            design_doc={"playbook/tip-a": {"content": "x", "confirmed_count": 0}}
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -4996,10 +5896,13 @@ class TestConfirmAppliedPlaybookEntries:
     async def test_increments_confirmed_count_and_stamps_timestamp(self, db_session):
         """Increments confirmed_count and sets last_confirmed_at for matching entries."""
         from app.task_completion import confirm_applied_playbook_entries
-        project = make_project(design_doc={
-            "playbook/tip-a": {"content": "a", "confirmed_count": 2},
-            "playbook/tip-b": {"content": "b", "confirmed_count": 0},
-        })
+
+        project = make_project(
+            design_doc={
+                "playbook/tip-a": {"content": "a", "confirmed_count": 2},
+                "playbook/tip-b": {"content": "b", "confirmed_count": 0},
+            }
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -5023,9 +5926,12 @@ class TestConfirmAppliedPlaybookEntries:
     async def test_normalizes_missing_prefix(self, db_session):
         """Entry IDs without 'playbook/' prefix are auto-prefixed before lookup."""
         from app.task_completion import confirm_applied_playbook_entries
-        project = make_project(design_doc={
-            "playbook/tip-x": {"content": "x", "confirmed_count": 1},
-        })
+
+        project = make_project(
+            design_doc={
+                "playbook/tip-x": {"content": "x", "confirmed_count": 1},
+            }
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -5046,9 +5952,12 @@ class TestConfirmAppliedPlaybookEntries:
     async def test_skips_unknown_entry_ids(self, db_session):
         """Entry IDs not present in design_doc are silently skipped."""
         from app.task_completion import confirm_applied_playbook_entries
-        project = make_project(design_doc={
-            "playbook/real": {"content": "r", "confirmed_count": 0},
-        })
+
+        project = make_project(
+            design_doc={
+                "playbook/real": {"content": "r", "confirmed_count": 0},
+            }
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -5069,6 +5978,7 @@ class TestConfirmAppliedPlaybookEntries:
     async def test_no_op_when_project_has_no_design_doc(self, db_session):
         """Returns early without error when project.design_doc is None."""
         from app.task_completion import confirm_applied_playbook_entries
+
         project = make_project(design_doc=None)
         db_session.add(project)
         await db_session.commit()

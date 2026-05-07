@@ -1,4 +1,5 @@
 """Open-ended JSONB context patching for task lifecycle writes."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -41,7 +42,9 @@ def apply_context_patch(
         if current is None:
             current = 0
         if not isinstance(current, int | float):
-            raise TypeError(f"context key {key!r} cannot be incremented from {type(current).__name__}")
+            raise TypeError(
+                f"context key {key!r} cannot be incremented from {type(current).__name__}"
+            )
         next_context[key] = current + delta
 
     for key, values in patch.append_unique.items():

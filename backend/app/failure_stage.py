@@ -6,9 +6,20 @@ several lifecycle/reaper paths.
 """
 
 _TRANSIENT_SCAN_ERROR_PATTERNS = (
-    "timeout", "timed out", "connection", "network", "unreachable",
-    "503", "502", "504", "service unavailable", "temporary", "dns",
-    "ssl", "eof occurred", "reset by peer",
+    "timeout",
+    "timed out",
+    "connection",
+    "network",
+    "unreachable",
+    "503",
+    "502",
+    "504",
+    "service unavailable",
+    "temporary",
+    "dns",
+    "ssl",
+    "eof occurred",
+    "reset by peer",
 )
 
 
@@ -32,28 +43,55 @@ def _derive_failure_stage(failure_class: str, status_message: str) -> "str | Non
     # Migration-specific keywords — kept aligned with _MIGRATION_PATTERNS in
     # failure_classification.py. Checked before 'integration' because
     # 'undefinedcolumnerror' would otherwise match the import-error bank.
-    if any(kw in msg for kw in (
-        "revisionerror", "can't locate revision", "cant locate revision",
-        "multiple head revisions", "only a single head supported",
-        "multiple heads are present", "undefinedcolumn", "undefinedcolumnerror",
-        "schema version mismatch", "expected_schema_revision",
-        "alembic.util.exc.commanderror", "alembic",
-    )):
+    if any(
+        kw in msg
+        for kw in (
+            "revisionerror",
+            "can't locate revision",
+            "cant locate revision",
+            "multiple head revisions",
+            "only a single head supported",
+            "multiple heads are present",
+            "undefinedcolumn",
+            "undefinedcolumnerror",
+            "schema version mismatch",
+            "expected_schema_revision",
+            "alembic.util.exc.commanderror",
+            "alembic",
+        )
+    ):
         return "migration"
-    if any(kw in msg for kw in (
-        "importerror", "import error", "cannot import", "no module named",
-        "module not found", "has no attribute", "no exported member",
-        "is not exported", "cannot find name", "does not exist on type",
-        "is not assignable to", "undefined export", "missing export",
-    )):
+    if any(
+        kw in msg
+        for kw in (
+            "importerror",
+            "import error",
+            "cannot import",
+            "no module named",
+            "module not found",
+            "has no attribute",
+            "no exported member",
+            "is not exported",
+            "cannot find name",
+            "does not exist on type",
+            "is not assignable to",
+            "undefined export",
+            "missing export",
+        )
+    ):
         return "integration"
     if any(kw in msg for kw in ("lint", "ruff", "eslint", "tsc", "type error")):
         return "lint"
     if any(kw in msg for kw in ("build", "compile", "webpack", "bundle")):
         return "build"
-    if any(kw in msg for kw in ("merge conflict", "mergeable", "dirty", "behind", "blocked")):
+    if any(
+        kw in msg
+        for kw in ("merge conflict", "mergeable", "dirty", "behind", "blocked")
+    ):
         return "merge"
-    if any(kw in msg for kw in ("review", "rejected", "dismissed", "changes requested")):
+    if any(
+        kw in msg for kw in ("review", "rejected", "dismissed", "changes requested")
+    ):
         return "review"
     if any(kw in msg for kw in ("pull request", "create pr", "pr creation")):
         return "pr_creation"

@@ -1,4 +1,5 @@
 """Unit tests for direction_mode.maybe_auto_clear_mode."""
+
 from app.direction_mode import (
     _AUTO_CLEAR_CONSECUTIVE_THRESHOLD,
     _HEALTHY_CONSECUTIVE_KEY,
@@ -25,13 +26,18 @@ class TestMaybeAutoClearMode:
         assert "recommended_mode" in d  # untouched
 
     def test_no_op_when_not_in_audit_or_fundamentals(self):
-        d = {"recommended_mode": "pause", _RECOMMENDED_MODE_META_KEY: {"source": "self_audit"}}
+        d = {
+            "recommended_mode": "pause",
+            _RECOMMENDED_MODE_META_KEY: {"source": "self_audit"},
+        }
         assert maybe_auto_clear_mode(d, "ship") is False
 
     def test_clears_after_consecutive_threshold_self_audit(self):
         d = _audit_direction(source="self_audit")
         for i in range(_AUTO_CLEAR_CONSECUTIVE_THRESHOLD - 1):
-            assert maybe_auto_clear_mode(d, "ship") is False, f"should not clear on tick {i+1}"
+            assert maybe_auto_clear_mode(d, "ship") is False, (
+                f"should not clear on tick {i + 1}"
+            )
         assert maybe_auto_clear_mode(d, "ship") is True
         assert "recommended_mode" not in d
         assert d.get("_mode_auto_cleared_from") == "audit"

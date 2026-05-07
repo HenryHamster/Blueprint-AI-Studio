@@ -11,7 +11,10 @@ from app.task_lifecycle_service.commands import (
     TransitionTaskCommand,
 )
 from app.task_lifecycle_service.context_patch import ContextPatch, apply_context_patch
-from app.task_lifecycle_service.service import InvalidTaskTransition, TaskLifecycleService
+from app.task_lifecycle_service.service import (
+    InvalidTaskTransition,
+    TaskLifecycleService,
+)
 from app.task_lifecycle_service.transitions import (
     ACTIVE_STATUSES,
     TERMINAL_STATUSES,

@@ -9,6 +9,7 @@ line-count guardrail. Contains:
 - `predict_spawn_success`: in-memory P(success) prediction used to gate spawns.
 - `SCOPE_FILE_BUDGETS`: per-scope file-count budgets surfaced to research agents.
 """
+
 import logging
 import os
 from datetime import timedelta
@@ -64,14 +65,16 @@ def _active_task_budget_for_design_cap(design_cap: int) -> int:
 
 
 async def _count_project_active_tasks(session: AsyncSession, project_id: Any) -> int:
-    row = (await session.execute(
-        select(func.count())
-        .select_from(Task)
-        .where(
-            Task.project_id == project_id,
-            Task.status.in_(_ACTIVE_SPAWN_HEALTH_STATUSES),
+    row = (
+        await session.execute(
+            select(func.count())
+            .select_from(Task)
+            .where(
+                Task.project_id == project_id,
+                Task.status.in_(_ACTIVE_SPAWN_HEALTH_STATUSES),
+            )
         )
-    )).one()
+    ).one()
     return int(row[0] or 0)
 
 
@@ -114,7 +117,9 @@ def _assess_spawn_health(
     if not os.getenv("ANTHROPIC_API_KEY"):
         create_model = _runtime_config.get("task_type_models", {}).get("create")
         all_accounts = list(_account_by_id.values())
-        if all_accounts and not any(_account_available_for_model(a, create_model) for a in all_accounts):
+        if all_accounts and not any(
+            _account_available_for_model(a, create_model) for a in all_accounts
+        ):
             return True, "no accounts available"
 
     if active_task_count is not None and active_task_budget is not None:
@@ -133,7 +138,10 @@ def _assess_spawn_health(
     if len(recent_results) >= 10:
         failures = sum(1 for entry in recent_results if entry[1] == "failure")
         if failures / len(recent_results) > 0.5:
-            return True, f"high failure rate ({failures}/{len(recent_results)} recent tasks failed)"
+            return (
+                True,
+                f"high failure rate ({failures}/{len(recent_results)} recent tasks failed)",
+            )
 
     return False, None
 
@@ -165,7 +173,9 @@ def _maybe_cold_start_upgrade_medium(
         "[RESEARCH] Cold-start upgrade scope medium→large(decompose) for direction '%s' "
         "(pipeline baseline medium %.0f%% < %.0f%%, small %.0f%% healthy)",
         direction.get("title", direction.get("id", "?")),
-        medium_rate * 100, threshold * 100, small_rate * 100,
+        medium_rate * 100,
+        threshold * 100,
+        small_rate * 100,
     )
     return "large", "medium"
 
@@ -176,15 +186,19 @@ def _poor_decomp_history(direction: dict, label: str = "") -> bool:
     """
     ws, total = 0.0, 0
     for entry in direction.get("research_history", [])[-3:]:
-        for dq in (entry.get("decomposition_quality") or []):
+        for dq in entry.get("decomposition_quality") or []:
             r = dq.get("subtask_merge_rate")
             if isinstance(r, (int, float)):
                 w = dq.get("subtask_count") or 1
                 ws, total = ws + float(r) * w, total + w
     if total < 3 or ws / total >= 0.3:
         return False
-    logger.info("[RESEARCH] Suppressing medium→large upgrade%s (avg %.0f%% < 30%% over %d subtasks)",
-                f" for '{label}'" if label else "", (ws / total) * 100, total)
+    logger.info(
+        "[RESEARCH] Suppressing medium→large upgrade%s (avg %.0f%% < 30%% over %d subtasks)",
+        f" for '{label}'" if label else "",
+        (ws / total) * 100,
+        total,
+    )
     return True
 
 
@@ -193,17 +207,27 @@ def _aggregate_scope_breakdown(history_entries: list[dict]) -> dict[str, dict]:
     agg: dict[str, dict] = {}
     for entry in history_entries:
         for scope, stats in (entry.get("scope_breakdown") or {}).items():
-            bucket = agg.setdefault(scope, {
-                "created": 0, "merged": 0, "merged_cross_module": 0,
-                "failed": 0,
-                "failed_infra": 0, "failed_scope_overflow": 0,
-                "failed_analysis_overflow": 0,
-                "failure_stages": {},
-            })
+            bucket = agg.setdefault(
+                scope,
+                {
+                    "created": 0,
+                    "merged": 0,
+                    "merged_cross_module": 0,
+                    "failed": 0,
+                    "failed_infra": 0,
+                    "failed_scope_overflow": 0,
+                    "failed_analysis_overflow": 0,
+                    "failure_stages": {},
+                },
+            )
             for key in (
-                "created", "merged", "merged_cross_module",
-                "failed", "failed_infra",
-                "failed_scope_overflow", "failed_analysis_overflow",
+                "created",
+                "merged",
+                "merged_cross_module",
+                "failed",
+                "failed_infra",
+                "failed_scope_overflow",
+                "failed_analysis_overflow",
             ):
                 bucket[key] = bucket.get(key, 0) + stats.get(key, 0)
             stage_bucket = bucket["failure_stages"]
@@ -220,7 +244,9 @@ def _effective_scope_denominator(stats: dict) -> int:
     strategic_spawning._window_counts). SCOPE_OVERFLOW stays in the denominator
     (scope-quality signal); only non-overflow infra fails are excluded.
     """
-    infra_excl_overflow = stats.get("failed_infra", 0) - stats.get("failed_scope_overflow", 0)
+    infra_excl_overflow = stats.get("failed_infra", 0) - stats.get(
+        "failed_scope_overflow", 0
+    )
     return stats.get("merged", 0) + stats.get("failed", 0) - infra_excl_overflow
 
 
@@ -233,7 +259,8 @@ def _get_failure_coaching_suffix(direction_id: str, design_doc: dict) -> str | N
     dfa = (design_doc or {}).get("direction_first_attempt_feedback") or {}
     entry = dfa.get(str(direction_id)) or {}
     cat_counts = {
-        k: v for k, v in entry.items()
+        k: v
+        for k, v in entry.items()
         if k not in ("total", "last_updated") and isinstance(v, (int, float)) and v > 0
     }
     total = sum(cat_counts.values())
@@ -244,7 +271,10 @@ def _get_failure_coaching_suffix(direction_id: str, design_doc: dict) -> str | N
         return None
     logger.info(
         "[RESEARCH] Direction %s: dominant failure category '%s' (%d/%d first-attempt rejections) — injecting coaching",
-        direction_id, top_cat, int(top_count), int(total),
+        direction_id,
+        top_cat,
+        int(top_count),
+        int(total),
     )
     return (
         f"Note: this direction has recurring first-attempt rejections in the '{top_cat}' category "
@@ -282,7 +312,10 @@ def _feedback_scope_override(
             logger.info(
                 "[RESEARCH] Downgrading scope %s→%s for direction '%s' "
                 "(failure feedback: %d scope_related first-attempt rejections)",
-                proposed_scope, smaller, label, int(sc_count),
+                proposed_scope,
+                smaller,
+                label,
+                int(sc_count),
             )
             return smaller, proposed_scope
     # Success-pattern evidence: retain scope on strong global history OR
@@ -295,7 +328,11 @@ def _feedback_scope_override(
             logger.info(
                 "[RESEARCH] Retaining scope %s for direction '%s' "
                 "(success-pattern: %d %s/%s confirmed successes)",
-                proposed_scope, label, int(cnt), task_type, proposed_scope,
+                proposed_scope,
+                label,
+                int(cnt),
+                task_type,
+                proposed_scope,
             )
             return proposed_scope, None
         # Direction-affinity: 2+ local successes for this specific direction
@@ -308,7 +345,11 @@ def _feedback_scope_override(
                 logger.info(
                     "[RESEARCH] Retaining scope %s for direction '%s' "
                     "(direction-affinity: %d local %s/%s successes)",
-                    proposed_scope, label, int(dir_cnt), task_type, proposed_scope,
+                    proposed_scope,
+                    label,
+                    int(dir_cnt),
+                    task_type,
+                    proposed_scope,
                 )
                 return proposed_scope, None
     return None
@@ -347,12 +388,15 @@ def _calibrate_scope(
     elif project is not None:
         # Fallback: aggregate scope_breakdown across all directions in the project
         proj_entries = [
-            entry for d in (project.directions or [])
+            entry
+            for d in (project.directions or [])
             for entry in (d.get("research_history") or [])
         ]
         proj_agg = _aggregate_scope_breakdown(proj_entries)
         if sum(v["created"] for v in proj_agg.values()) < 3:
-            _ov = _feedback_scope_override(proposed_scope, idx, direction, project, task_type)
+            _ov = _feedback_scope_override(
+                proposed_scope, idx, direction, project, task_type
+            )
             if _ov is not None:
                 return _ov
             return _maybe_cold_start_upgrade_medium(proposed_scope, direction)
@@ -389,10 +433,13 @@ def _calibrate_scope(
             logger.info(
                 "[RESEARCH] Upgrading scope %s→%s for direction '%s' "
                 "(%s overflow rate %.0f%% >= 30%%, %d/%d tasks overflowed)",
-                proposed_scope, larger,
+                proposed_scope,
+                larger,
                 direction.get("title", direction.get("id", "?")),
-                source, overflow_rate * 100,
-                overflow, proposed_stats["created"],
+                source,
+                overflow_rate * 100,
+                overflow,
+                proposed_stats["created"],
             )
             return larger, proposed_scope
 
@@ -408,10 +455,13 @@ def _calibrate_scope(
                 logger.info(
                     "[RESEARCH] Upgrading scope %s→%s for direction '%s' "
                     "(%s analysis_overflow rate %.0f%% >= 50%%, %d/%d tasks)",
-                    proposed_scope, larger,
+                    proposed_scope,
+                    larger,
                     direction.get("title", direction.get("id", "?")),
-                    source, analysis_rate * 100,
-                    analysis_overflow, proposed_stats["created"],
+                    source,
+                    analysis_rate * 100,
+                    analysis_overflow,
+                    proposed_stats["created"],
                 )
                 return larger, proposed_scope
 
@@ -433,16 +483,22 @@ def _calibrate_scope(
             # would just generate more failing decompositions. Fall through to
             # the downgrade loop so the task routes to the healthy small scope
             # rather than being stuck at a failing medium scope.
-            if _poor_decomp_history(direction, direction.get("title", direction.get("id", "?"))):
+            if _poor_decomp_history(
+                direction, direction.get("title", direction.get("id", "?"))
+            ):
                 pass  # fall through to downgrade loop below
             else:
                 larger = _SCOPE_ORDER[idx + 1]
                 logger.info(
                     "[RESEARCH] Upgrading scope %s→%s(decompose) for direction '%s' "
                     "(%s medium rate %.0f%% < %.0f%%, small rate %.0f%% healthy)",
-                    proposed_scope, larger,
+                    proposed_scope,
+                    larger,
                     direction.get("title", direction.get("id", "?")),
-                    source, rate * 100, threshold * 100, small_rate * 100,
+                    source,
+                    rate * 100,
+                    threshold * 100,
+                    small_rate * 100,
                 )
                 return larger, proposed_scope
 
@@ -453,9 +509,12 @@ def _calibrate_scope(
             logger.info(
                 "[RESEARCH] Downgrading scope %s→%s for direction '%s' "
                 "(%s merge rate %.0f%% < %.0f%%)",
-                proposed_scope, smaller_scope,
+                proposed_scope,
+                smaller_scope,
                 direction.get("title", direction.get("id", "?")),
-                source, rate * 100, threshold * 100,
+                source,
+                rate * 100,
+                threshold * 100,
             )
             return smaller_scope, proposed_scope
 
@@ -526,7 +585,8 @@ def predict_spawn_success(
     # create/plan/refactor tasks map to small/medium/large scopes respectively)
     if project is not None:
         proj_entries = [
-            entry for d in (project.directions or [])
+            entry
+            for d in (project.directions or [])
             for entry in (d.get("research_history") or [])
         ]
         proj_scope_stats = _aggregate_scope_breakdown(proj_entries).get(scope)
@@ -571,7 +631,7 @@ def predict_spawn_success(
     if scope == "large":
         decomp_rates: list[float] = []
         for entry in history3:
-            for dq in (entry.get("decomposition_quality") or []):
+            for dq in entry.get("decomposition_quality") or []:
                 rate = dq.get("subtask_merge_rate")
                 if isinstance(rate, (int, float)):
                     decomp_rates.append(float(rate))
@@ -851,7 +911,8 @@ def predict_spawn_success(
         dfa = design_doc.get("direction_first_attempt_feedback") or {}
         entry = dfa.get(str(direction_id)) or {}
         cat_counts = [
-            v for k, v in entry.items()
+            v
+            for k, v in entry.items()
             if k not in ("total", "last_updated") and isinstance(v, (int, float))
         ]
         total = sum(cat_counts)
@@ -867,7 +928,9 @@ def predict_spawn_success(
     if not signals:
         return 0.5  # insufficient data — neutral
 
-    return min(1.0, max(0.0, sum(s * w for s, w in zip(signals, weights)) / sum(weights)))
+    return min(
+        1.0, max(0.0, sum(s * w for s, w in zip(signals, weights)) / sum(weights))
+    )
 
 
 def _compute_scope_budget_utilization(
@@ -880,10 +943,13 @@ def _compute_scope_budget_utilization(
     crosses ``SCOPE_PRESSURE_WARN_THRESHOLD``.
     """
     from app.review_pipeline import _is_test_file  # noqa: PLC0415
+
     if not changed_files:
         return None
     budget_info = SCOPE_FILE_BUDGETS.get(scope) or {}
-    budget = budget_info.get("production_files_max") or budget_info.get("total_files_max")
+    budget = budget_info.get("production_files_max") or budget_info.get(
+        "total_files_max"
+    )
     if not budget:
         return None
     non_test_count = sum(1 for f in changed_files if not _is_test_file(f))
@@ -901,10 +967,13 @@ def _compute_scope_overflow_warning(
 ) -> dict | None:
     """Return machine-readable scope-overflow warning details, if triggered."""
     from app.review_pipeline import _is_test_file  # noqa: PLC0415
+
     if not changed_files:
         return None
     budget_info = SCOPE_FILE_BUDGETS.get(scope) or {}
-    threshold = budget_info.get("production_files_max") or budget_info.get("total_files_max")
+    threshold = budget_info.get("production_files_max") or budget_info.get(
+        "total_files_max"
+    )
     if not threshold:
         return None
     non_test_count = sum(1 for f in changed_files if not _is_test_file(f))
@@ -954,7 +1023,8 @@ def check_scope_budget_mismatch(
         )
         logger.info(
             "[RESEARCH] pre-spawn budget gate: medium→large (%d related_files > %d)",
-            n, MEDIUM_ANALYSIS_PLAN_FILE_LIMIT,
+            n,
+            MEDIUM_ANALYSIS_PLAN_FILE_LIMIT,
         )
         return "large", "medium", warning, False
 
@@ -966,7 +1036,8 @@ def check_scope_budget_mismatch(
         logger.info(
             "[RESEARCH] pre-spawn budget gate: large scope with %d related_files > %d "
             "— marking requires_approval=True",
-            n, _large_limit,
+            n,
+            _large_limit,
         )
         return scope, None, warning, True
 

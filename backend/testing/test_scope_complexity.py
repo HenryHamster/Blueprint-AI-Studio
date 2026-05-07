@@ -7,6 +7,7 @@ Scoring is multiplicative: each dimension contributes a factor in
 [0.5, 1.0], and the composite is the product. Moderate values across
 dimensions should not cascade below the 0.45 escalation threshold.
 """
+
 from unittest.mock import patch
 
 from app.scope_complexity import _composite_complexity_score
@@ -126,7 +127,9 @@ class TestCochangeFactor:
         with patch(
             "app.scope_complexity._cluster_files_by_cochange", return_value=None
         ) as m:
-            _score(["pkg/sub/a.py"], cochange_index={"pkg/sub/a.py": {"pkg/sub/b.py": 1}})
+            _score(
+                ["pkg/sub/a.py"], cochange_index={"pkg/sub/a.py": {"pkg/sub/b.py": 1}}
+            )
             assert m.call_count == 0
 
     def test_no_cochange_call_when_index_empty(self):
@@ -154,7 +157,8 @@ class TestNeighborFactor:
     def test_unlisted_neighbors_at_ratio_one(self):
         # 1 listed file with 1 unlisted neighbor (ratio=1.0) → f = 1 - 0.5/3 ≈ 0.833
         with patch(
-            "app.scope_complexity._cluster_files_by_cochange", return_value=None,
+            "app.scope_complexity._cluster_files_by_cochange",
+            return_value=None,
         ):
             s, meta = _score(
                 ["a.py"],
@@ -166,7 +170,8 @@ class TestNeighborFactor:
 
     def test_neighbor_factor_floors_at_half(self):
         with patch(
-            "app.scope_complexity._cluster_files_by_cochange", return_value=None,
+            "app.scope_complexity._cluster_files_by_cochange",
+            return_value=None,
         ):
             s, meta = _score(
                 ["a.py"],
@@ -178,7 +183,8 @@ class TestNeighborFactor:
 
     def test_low_affinity_partners_ignored(self):
         with patch(
-            "app.scope_complexity._cluster_files_by_cochange", return_value=None,
+            "app.scope_complexity._cluster_files_by_cochange",
+            return_value=None,
         ):
             s, meta = _score(
                 ["a.py"],
@@ -201,9 +207,7 @@ class TestCrossModuleFactor:
         assert meta["modules"] == 2
 
     def test_three_modules(self):
-        s, meta = _score(
-            ["backend/app/a.py", "admin-ui/src/b.ts", "agent/src/c.ts"]
-        )
+        s, meta = _score(["backend/app/a.py", "admin-ui/src/b.ts", "agent/src/c.ts"])
         # f_files = 1 - 0.0625 = 0.9375; f_modules = 1 - 0.125*2 = 0.75
         assert abs(s - (0.9375 * 0.75)) < 1e-9
         assert meta["modules"] == 3
@@ -310,20 +314,26 @@ class TestPredictSpawnSuccessCrossModuleBoost:
     def _direction(self, merged: int, cross_merged: int, scope: str = "small") -> dict:
         return {
             "research_history": [
-                {"scope_breakdown": {scope: {
-                    "created": merged,
-                    "merged": merged,
-                    "merged_cross_module": cross_merged,
-                }}},
+                {
+                    "scope_breakdown": {
+                        scope: {
+                            "created": merged,
+                            "merged": merged,
+                            "merged_cross_module": cross_merged,
+                        }
+                    }
+                },
             ],
         }
 
     def _disable_pipeline_rates(self, monkeypatch):
         from app.shared_state import runtime_config
+
         monkeypatch.setitem(runtime_config, "pipeline_scope_merge_rates", {})
 
     def test_boost_activates_for_high_cross_module_rate(self, monkeypatch):
         from app.spawn_calibration import predict_spawn_success
+
         self._disable_pipeline_rates(monkeypatch)
         # 3 merged, all cross-module (rate=1.0); finding spans 2 top-level dirs.
         direction = self._direction(merged=3, cross_merged=3)
@@ -339,6 +349,7 @@ class TestPredictSpawnSuccessCrossModuleBoost:
 
     def test_no_boost_when_cross_rate_low(self, monkeypatch):
         from app.spawn_calibration import predict_spawn_success
+
         self._disable_pipeline_rates(monkeypatch)
         # 4 merged, only 1 cross-module (rate=0.25 < 0.5 threshold).
         direction = self._direction(merged=4, cross_merged=1)
@@ -349,6 +360,7 @@ class TestPredictSpawnSuccessCrossModuleBoost:
 
     def test_no_boost_with_insufficient_merged_data(self, monkeypatch):
         from app.spawn_calibration import predict_spawn_success
+
         self._disable_pipeline_rates(monkeypatch)
         # Only 1 merged task — below 2-merge minimum to avoid noisy boosts.
         direction = self._direction(merged=1, cross_merged=1)
@@ -359,6 +371,7 @@ class TestPredictSpawnSuccessCrossModuleBoost:
 
     def test_no_boost_for_single_directory_finding(self, monkeypatch):
         from app.spawn_calibration import predict_spawn_success
+
         self._disable_pipeline_rates(monkeypatch)
         direction = self._direction(merged=3, cross_merged=3)
         related = ["backend/app/x.py", "backend/testing/y.py"]  # both 'backend'

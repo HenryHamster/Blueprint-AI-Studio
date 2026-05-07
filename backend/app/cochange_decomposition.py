@@ -3,6 +3,7 @@
 Extracted from ``app.research_completion`` to keep that module focused on the
 research completion handler itself (file-size guardrail).
 """
+
 import logging
 from typing import Callable
 
@@ -191,9 +192,8 @@ def auto_decompose_findings_by_cochange(
     intact.
     """
     from app.research_completion import SCOPE_FILE_BUDGETS  # noqa: PLC0415
-    small_budget = (
-        SCOPE_FILE_BUDGETS.get("small", {}).get("total_files_max") or 6
-    )
+
+    small_budget = SCOPE_FILE_BUDGETS.get("small", {}).get("total_files_max") or 6
     expanded: list[tuple[int, dict, str]] = []
     for orig_i, finding, fhash in deduplicated:
         f_scope = finding.get("scope", DEFAULT_TASK_SCOPE)
@@ -202,11 +202,7 @@ def auto_decompose_findings_by_cochange(
             finding.get("scope_calibrated_from")
             or (task_context or {}).get("scope_calibrated_from")
         )
-        if (
-            f_scope == "medium"
-            and len(f_files) >= 2
-            and not f_already_calibrated
-        ):
+        if f_scope == "medium" and len(f_files) >= 2 and not f_already_calibrated:
             f_clusters: list[list[str]] | None = None
             cluster_source = ""
             if len(f_files) >= 3:
@@ -223,7 +219,7 @@ def auto_decompose_findings_by_cochange(
                     f_clusters = cluster_files_by_subdir(f_files)
                     cluster_source = "subdir"
             if f_clusters and len(f_clusters) >= 2:
-                f_title = finding.get("title", f"Research finding #{orig_i+1}")
+                f_title = finding.get("title", f"Research finding #{orig_i + 1}")
                 if all(len(c) > small_budget for c in f_clusters):
                     subdir_split = split_oversized_clusters_by_subdir(
                         f_clusters, small_budget
@@ -236,14 +232,19 @@ def auto_decompose_findings_by_cochange(
                             "[RESEARCH] Skipping co-change decomposition for "
                             "'%s': all %d clusters exceed small-scope budget "
                             "(%d files) and sub-dir split produced no fit",
-                            f_title, len(f_clusters), small_budget,
+                            f_title,
+                            len(f_clusters),
+                            small_budget,
                         )
                         expanded.append((orig_i, finding, fhash))
                         continue
                 logger.info(
                     "[RESEARCH] Auto-decomposing medium finding '%s' into %d "
                     "sub-findings via %s clustering: %s",
-                    f_title, len(f_clusters), cluster_source, f_clusters,
+                    f_title,
+                    len(f_clusters),
+                    cluster_source,
+                    f_clusters,
                 )
                 for ci, cluster in enumerate(f_clusters):
                     sub = dict(finding)
@@ -253,9 +254,7 @@ def auto_decompose_findings_by_cochange(
                         sub["scope"] = "small"
                         sub["scope_calibrated_from"] = "medium"
                     sub["related_files"] = cluster
-                    sub["title"] = (
-                        f"{f_title} (cluster {ci + 1}/{len(f_clusters)})"
-                    )
+                    sub["title"] = f"{f_title} (cluster {ci + 1}/{len(f_clusters)})"
                     sub["auto_decomposed"] = True
                     file_lines = "\n".join(f"- {p}" for p in cluster)
                     other_count = len(f_clusters) - 1
@@ -279,9 +278,7 @@ def auto_decompose_findings_by_cochange(
                         sub["description"] = preamble + sub["description"]
                     else:
                         sub["prompt"] = preamble
-                    sub_hash = finding_hash_fn(
-                        sub["title"], sub.get("description", "")
-                    )
+                    sub_hash = finding_hash_fn(sub["title"], sub.get("description", ""))
                     expanded.append((orig_i, sub, sub_hash))
                 continue
         expanded.append((orig_i, finding, fhash))

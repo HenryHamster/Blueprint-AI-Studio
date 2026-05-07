@@ -1,4 +1,5 @@
 """Unit tests for app.finding_deduplication — pure dedup helpers."""
+
 import hashlib
 import uuid
 from datetime import datetime, timedelta
@@ -453,8 +454,16 @@ def test_deduplicate_findings_evidence_overlap_identical_sources_and_claims():
         "priority": "medium",
         "direction_id": "dir-1",
         "sources": [
-            {"type": "file", "ref": "backend/app/cache.py", "excerpt": "different part"},
-            {"type": "file", "ref": "backend/app/models.py:200", "excerpt": "different part"},
+            {
+                "type": "file",
+                "ref": "backend/app/cache.py",
+                "excerpt": "different part",
+            },
+            {
+                "type": "file",
+                "ref": "backend/app/models.py:200",
+                "excerpt": "different part",
+            },
         ],
         "claims": ["caching improves performance by 10x"],
     }
@@ -627,8 +636,14 @@ def test_deduplicate_findings_evidence_overlap_normalizes_refs():
         "description": "desc",
         "priority": "high",
         "sources": [
-            {"type": "file", "ref": "backend/app/cache.py:999"},  # Different line number, same file
-            {"type": "file", "ref": "backend/app/models.py:50"},   # Different line number, same file
+            {
+                "type": "file",
+                "ref": "backend/app/cache.py:999",
+            },  # Different line number, same file
+            {
+                "type": "file",
+                "ref": "backend/app/models.py:50",
+            },  # Different line number, same file
         ],
         "claims": ["bug needs fixing"],
     }
@@ -677,6 +692,7 @@ def test_deduplicate_findings_evidence_overlap_records_reason():
 
 # --- Direct unit tests for source-ref helper functions ---
 
+
 def test_normalize_source_ref_formats():
     assert _normalize_source_ref("backend/app/foo.py") == "backend/app/foo.py"
     assert _normalize_source_ref("backend/app/foo.py:42") == "backend/app/foo.py"
@@ -711,13 +727,21 @@ def test_jaccard_overlap_boundary_values():
 
 
 def test_extract_normalized_claims_deduplicates_and_lowercases():
-    claims = ["Performance Improved by 10x", "performance improved by 10x", "Another claim"]
+    claims = [
+        "Performance Improved by 10x",
+        "performance improved by 10x",
+        "Another claim",
+    ]
     result = _extract_normalized_claims(claims)
     assert result == {"performance improved by 10x", "another claim"}
 
 
 def test_check_evidence_overlap_empty_guard():
     # No sources → no overlap regardless of claims
-    assert _check_evidence_overlap([], ["claim A"], [("t", [{"ref": "foo.py"}], ["claim A"])]) == (False, "")
+    assert _check_evidence_overlap(
+        [], ["claim A"], [("t", [{"ref": "foo.py"}], ["claim A"])]
+    ) == (False, "")
     # No claims → no overlap
-    assert _check_evidence_overlap([{"ref": "foo.py"}], [], [("t", [{"ref": "foo.py"}], ["claim A"])]) == (False, "")
+    assert _check_evidence_overlap(
+        [{"ref": "foo.py"}], [], [("t", [{"ref": "foo.py"}], ["claim A"])]
+    ) == (False, "")

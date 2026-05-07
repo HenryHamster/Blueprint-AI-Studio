@@ -1,4 +1,5 @@
 """Tests for CI auto-remediation (auto_remediation.py + webhook extension in github.py)."""
+
 import hashlib
 import hmac
 import json
@@ -116,9 +117,12 @@ def _build_check_run_webhook_payload(
 
 def _sign_webhook_payload(payload_bytes: bytes) -> str:
     """Generate the x-hub-signature-256 header value."""
-    return "sha256=" + hmac.new(
-        _TEST_WEBHOOK_SECRET.encode(), payload_bytes, hashlib.sha256
-    ).hexdigest()
+    return (
+        "sha256="
+        + hmac.new(
+            _TEST_WEBHOOK_SECRET.encode(), payload_bytes, hashlib.sha256
+        ).hexdigest()
+    )
 
 
 async def _count_auto_tasks(session: AsyncSession, project_id: uuid.UUID) -> int:
@@ -126,12 +130,16 @@ async def _count_auto_tasks(session: AsyncSession, project_id: uuid.UUID) -> int
 
     Audit W1: auto_remediation is now a column (was JSONB context key).
     """
-    return (await session.execute(
-        select(func.count()).select_from(Task).where(
-            Task.project_id == project_id,
-            Task.auto_remediation.is_(True),
+    return (
+        await session.execute(
+            select(func.count())
+            .select_from(Task)
+            .where(
+                Task.project_id == project_id,
+                Task.auto_remediation.is_(True),
+            )
         )
-    )).scalar() or 0
+    ).scalar() or 0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -144,10 +152,21 @@ async def test_happy_path_spawns_task(db_session: AsyncSession):
     """Basic success: a CI failure on main spawns a fix task."""
     project = await _create_project(db_session)
 
-    with patch("app.auto_remediation._extract_ci_context", new_callable=AsyncMock) as mock_ctx, \
-         patch("app.auto_remediation.post_auto_fix_spawned_message", new_callable=AsyncMock) as mock_msg, \
-         patch("app.main._send_webhook_notification", new_callable=AsyncMock):
-        mock_ctx.return_value = (["CI / tests"], "AssertionError: 1 != 2", "test", {"failing_tests": [], "error_locations": [], "error_messages": []})
+    with (
+        patch(
+            "app.auto_remediation._extract_ci_context", new_callable=AsyncMock
+        ) as mock_ctx,
+        patch(
+            "app.auto_remediation.post_auto_fix_spawned_message", new_callable=AsyncMock
+        ) as mock_msg,
+        patch("app.main._send_webhook_notification", new_callable=AsyncMock),
+    ):
+        mock_ctx.return_value = (
+            ["CI / tests"],
+            "AssertionError: 1 != 2",
+            "test",
+            {"failing_tests": [], "error_locations": [], "error_messages": []},
+        )
 
         await _handle_main_branch_ci_failure_inner(
             owner="acme",
@@ -162,7 +181,7 @@ async def test_happy_path_spawns_task(db_session: AsyncSession):
     assert await _count_auto_tasks(db_session, project.id) == 1
 
     # Verify the created task
-    tasks = (await session_tasks(db_session, project.id))
+    tasks = await session_tasks(db_session, project.id)
     task = tasks[0]
     assert task.status == TaskStatus.QUEUED
     assert task.created_by == "SYSTEM_AUTO_REMEDIATION"
@@ -190,13 +209,26 @@ async def test_task_context_includes_error_fingerprint(db_session: AsyncSession)
     project = await _create_project(db_session)
     error_summary = "AssertionError: expected 1 but got 2 in test_foo"
 
-    with patch("app.auto_remediation._extract_ci_context", new_callable=AsyncMock) as mock_ctx, \
-         patch("app.auto_remediation.post_auto_fix_spawned_message", new_callable=AsyncMock), \
-         patch("app.main._send_webhook_notification", new_callable=AsyncMock):
-        mock_ctx.return_value = (["CI / tests"], error_summary, "test", {"failing_tests": [], "error_locations": [], "error_messages": []})
+    with (
+        patch(
+            "app.auto_remediation._extract_ci_context", new_callable=AsyncMock
+        ) as mock_ctx,
+        patch(
+            "app.auto_remediation.post_auto_fix_spawned_message", new_callable=AsyncMock
+        ),
+        patch("app.main._send_webhook_notification", new_callable=AsyncMock),
+    ):
+        mock_ctx.return_value = (
+            ["CI / tests"],
+            error_summary,
+            "test",
+            {"failing_tests": [], "error_locations": [], "error_messages": []},
+        )
 
         await _handle_main_branch_ci_failure_inner(
-            owner="acme", repo="webapp", head_sha="deadbeef",
+            owner="acme",
+            repo="webapp",
+            head_sha="deadbeef",
             head_branch="main",
             project_id=project.id,
             config=_default_config(),
@@ -207,7 +239,9 @@ async def test_task_context_includes_error_fingerprint(db_session: AsyncSession)
     assert len(tasks) == 1
     # Audit W1: previous_error_fingerprint is now a column (was JSONB key).
     # Fingerprint is stage-aware: "AssertionError ... test_foo" → stage="test".
-    assert tasks[0].previous_error_fingerprint == _error_fingerprint(error_summary, "test")
+    assert tasks[0].previous_error_fingerprint == _error_fingerprint(
+        error_summary, "test"
+    )
 
 
 async def session_tasks(session: AsyncSession, project_id: uuid.UUID) -> list[Task]:
@@ -227,14 +261,27 @@ async def test_rate_limit_rejects_third_spawn(db_session: AsyncSession):
     project = await _create_project(db_session)
 
     # Create 2 recent auto-remediation tasks (within the last hour)
-    await _create_auto_remediation_task(db_session, project.id, sha="sha1", status=TaskStatus.COMPLETED)
-    await _create_auto_remediation_task(db_session, project.id, sha="sha2", status=TaskStatus.COMPLETED)
+    await _create_auto_remediation_task(
+        db_session, project.id, sha="sha1", status=TaskStatus.COMPLETED
+    )
+    await _create_auto_remediation_task(
+        db_session, project.id, sha="sha2", status=TaskStatus.COMPLETED
+    )
     await db_session.flush()
 
-    with patch("app.auto_remediation._extract_ci_context", new_callable=AsyncMock) as mock_ctx:
-        mock_ctx.return_value = (["CI"], "error", "test", {"failing_tests": [], "error_locations": [], "error_messages": []})
+    with patch(
+        "app.auto_remediation._extract_ci_context", new_callable=AsyncMock
+    ) as mock_ctx:
+        mock_ctx.return_value = (
+            ["CI"],
+            "error",
+            "test",
+            {"failing_tests": [], "error_locations": [], "error_messages": []},
+        )
         await _handle_main_branch_ci_failure_inner(
-            owner="acme", repo="webapp", head_sha="sha3",
+            owner="acme",
+            repo="webapp",
+            head_sha="sha3",
             head_branch="main",
             project_id=project.id,
             config=_default_config(max_per_hour=2),
@@ -252,14 +299,26 @@ async def test_duplicate_sha_rejected(db_session: AsyncSession):
 
     # Existing active task for this SHA
     await _create_auto_remediation_task(
-        db_session, project.id, sha="deadbeef", status=TaskStatus.IN_PROGRESS,
+        db_session,
+        project.id,
+        sha="deadbeef",
+        status=TaskStatus.IN_PROGRESS,
     )
     await db_session.flush()
 
-    with patch("app.auto_remediation._extract_ci_context", new_callable=AsyncMock) as mock_ctx:
-        mock_ctx.return_value = (["CI"], "error", "test", {"failing_tests": [], "error_locations": [], "error_messages": []})
+    with patch(
+        "app.auto_remediation._extract_ci_context", new_callable=AsyncMock
+    ) as mock_ctx:
+        mock_ctx.return_value = (
+            ["CI"],
+            "error",
+            "test",
+            {"failing_tests": [], "error_locations": [], "error_messages": []},
+        )
         await _handle_main_branch_ci_failure_inner(
-            owner="acme", repo="webapp", head_sha="deadbeef",
+            owner="acme",
+            repo="webapp",
+            head_sha="deadbeef",
             head_branch="main",
             project_id=project.id,
             config=_default_config(),
@@ -277,17 +336,32 @@ async def test_concurrent_limit_blocks_spawn(db_session: AsyncSession):
 
     # Two active auto-remediation tasks
     await _create_auto_remediation_task(
-        db_session, project.id, sha="sha1", status=TaskStatus.IN_PROGRESS,
+        db_session,
+        project.id,
+        sha="sha1",
+        status=TaskStatus.IN_PROGRESS,
     )
     await _create_auto_remediation_task(
-        db_session, project.id, sha="sha2", status=TaskStatus.QUEUED,
+        db_session,
+        project.id,
+        sha="sha2",
+        status=TaskStatus.QUEUED,
     )
     await db_session.flush()
 
-    with patch("app.auto_remediation._extract_ci_context", new_callable=AsyncMock) as mock_ctx:
-        mock_ctx.return_value = (["CI"], "error", "test", {"failing_tests": [], "error_locations": [], "error_messages": []})
+    with patch(
+        "app.auto_remediation._extract_ci_context", new_callable=AsyncMock
+    ) as mock_ctx:
+        mock_ctx.return_value = (
+            ["CI"],
+            "error",
+            "test",
+            {"failing_tests": [], "error_locations": [], "error_messages": []},
+        )
         await _handle_main_branch_ci_failure_inner(
-            owner="acme", repo="webapp", head_sha="sha3",
+            owner="acme",
+            repo="webapp",
+            head_sha="sha3",
             head_branch="main",
             project_id=project.id,
             config=_default_config(max_concurrent=2),
@@ -304,14 +378,26 @@ async def test_different_sha_same_branch_blocked(db_session: AsyncSession):
     project = await _create_project(db_session)
 
     await _create_auto_remediation_task(
-        db_session, project.id, sha="sha_old", status=TaskStatus.IN_PROGRESS,
+        db_session,
+        project.id,
+        sha="sha_old",
+        status=TaskStatus.IN_PROGRESS,
     )
     await db_session.flush()
 
-    with patch("app.auto_remediation._extract_ci_context", new_callable=AsyncMock) as mock_ctx:
-        mock_ctx.return_value = (["CI / build"], "SyntaxError", "build", {"failing_tests": [], "error_locations": [], "error_messages": []})
+    with patch(
+        "app.auto_remediation._extract_ci_context", new_callable=AsyncMock
+    ) as mock_ctx:
+        mock_ctx.return_value = (
+            ["CI / build"],
+            "SyntaxError",
+            "build",
+            {"failing_tests": [], "error_locations": [], "error_messages": []},
+        )
         await _handle_main_branch_ci_failure_inner(
-            owner="acme", repo="webapp", head_sha="sha_new",
+            owner="acme",
+            repo="webapp",
+            head_sha="sha_new",
             head_branch="main",
             project_id=project.id,
             config=_default_config(),
@@ -328,12 +414,16 @@ async def test_different_sha_same_branch_blocked(db_session: AsyncSession):
 
 
 @pytest.mark.asyncio
-async def test_non_protected_branch_ignored(client: AsyncClient, db_session: AsyncSession):
+async def test_non_protected_branch_ignored(
+    client: AsyncClient, db_session: AsyncSession
+):
     """CI failure on a non-whitelisted branch is ignored at the webhook level."""
     project = await _create_project(db_session)
     await db_session.commit()
 
-    payload_dict = _build_check_run_webhook_payload(head_branch="feature/xyz", conclusion="failure")
+    payload_dict = _build_check_run_webhook_payload(
+        head_branch="feature/xyz", conclusion="failure"
+    )
     payload_bytes = json.dumps(payload_dict).encode()
     signature = _sign_webhook_payload(payload_bytes)
 
@@ -361,7 +451,9 @@ async def test_check_run_success_ignored(client: AsyncClient, db_session: AsyncS
     await _create_project(db_session)
     await db_session.commit()
 
-    payload_dict = _build_check_run_webhook_payload(head_branch="main", conclusion="success")
+    payload_dict = _build_check_run_webhook_payload(
+        head_branch="main", conclusion="success"
+    )
     payload_bytes = json.dumps(payload_dict).encode()
     signature = _sign_webhook_payload(payload_bytes)
 
@@ -388,19 +480,38 @@ async def test_completed_tasks_dont_count_concurrent(db_session: AsyncSession):
 
     # Create 2 completed tasks — these should NOT block new spawns
     await _create_auto_remediation_task(
-        db_session, project.id, sha="sha1", status=TaskStatus.COMPLETED,
+        db_session,
+        project.id,
+        sha="sha1",
+        status=TaskStatus.COMPLETED,
     )
     await _create_auto_remediation_task(
-        db_session, project.id, sha="sha2", status=TaskStatus.FAILED,
+        db_session,
+        project.id,
+        sha="sha2",
+        status=TaskStatus.FAILED,
     )
     await db_session.flush()
 
-    with patch("app.auto_remediation._extract_ci_context", new_callable=AsyncMock) as mock_ctx, \
-         patch("app.auto_remediation.post_auto_fix_spawned_message", new_callable=AsyncMock), \
-         patch("app.main._send_webhook_notification", new_callable=AsyncMock):
-        mock_ctx.return_value = (["CI"], "error", "test", {"failing_tests": [], "error_locations": [], "error_messages": []})
+    with (
+        patch(
+            "app.auto_remediation._extract_ci_context", new_callable=AsyncMock
+        ) as mock_ctx,
+        patch(
+            "app.auto_remediation.post_auto_fix_spawned_message", new_callable=AsyncMock
+        ),
+        patch("app.main._send_webhook_notification", new_callable=AsyncMock),
+    ):
+        mock_ctx.return_value = (
+            ["CI"],
+            "error",
+            "test",
+            {"failing_tests": [], "error_locations": [], "error_messages": []},
+        )
         await _handle_main_branch_ci_failure_inner(
-            owner="acme", repo="webapp", head_sha="sha3",
+            owner="acme",
+            repo="webapp",
+            head_sha="sha3",
             head_branch="main",
             project_id=project.id,
             config=_default_config(max_concurrent=2, max_per_hour=10),
@@ -429,13 +540,23 @@ async def test_extract_ci_context_test_failure():
         "failed_logs": "FAILED tests/test_main.py::test_foo - AssertionError: 1 != 2\n2 failed",
     }
 
-    with patch("app.auto_remediation.get_check_runs_cached", new_callable=AsyncMock) as mock_runs, \
-         patch("app.auto_remediation.get_repo_installation_token", new_callable=AsyncMock) as mock_token:
+    with (
+        patch(
+            "app.auto_remediation.get_check_runs_cached", new_callable=AsyncMock
+        ) as mock_runs,
+        patch(
+            "app.auto_remediation.get_repo_installation_token", new_callable=AsyncMock
+        ) as mock_token,
+    ):
         mock_token.return_value = "ghp_test_token"
         mock_runs.return_value = mock_ci_result
 
         failed_checks, error_summary, failure_type, signals = await _extract_ci_context(
-            "acme", "webapp", "deadbeef", uuid.uuid4(), AsyncMock(),
+            "acme",
+            "webapp",
+            "deadbeef",
+            uuid.uuid4(),
+            AsyncMock(),
         )
 
     assert failed_checks == ["CI / tests"]
@@ -456,13 +577,28 @@ async def test_extract_ci_context_build_failure():
         "failed_logs": "ImportError: No module named 'missing_dep'\nBuild failed.",
     }
 
-    with patch("app.auto_remediation.get_check_runs_cached", new_callable=AsyncMock) as mock_runs, \
-         patch("app.auto_remediation.get_repo_installation_token", new_callable=AsyncMock) as mock_token:
+    with (
+        patch(
+            "app.auto_remediation.get_check_runs_cached", new_callable=AsyncMock
+        ) as mock_runs,
+        patch(
+            "app.auto_remediation.get_repo_installation_token", new_callable=AsyncMock
+        ) as mock_token,
+    ):
         mock_token.return_value = "ghp_test_token"
         mock_runs.return_value = mock_ci_result
 
-        failed_checks, _error_summary, failure_type, _signals = await _extract_ci_context(
-            "acme", "webapp", "deadbeef", uuid.uuid4(), AsyncMock(),
+        (
+            failed_checks,
+            _error_summary,
+            failure_type,
+            _signals,
+        ) = await _extract_ci_context(
+            "acme",
+            "webapp",
+            "deadbeef",
+            uuid.uuid4(),
+            AsyncMock(),
         )
 
     assert failed_checks == ["CI / build"]
@@ -481,13 +617,23 @@ async def test_extract_ci_context_migration_failure():
         "failed_logs": "alembic.util.exc.CommandError: Can't locate revision identified by 'abc123'\nFAILED",
     }
 
-    with patch("app.auto_remediation.get_check_runs_cached", new_callable=AsyncMock) as mock_runs, \
-         patch("app.auto_remediation.get_repo_installation_token", new_callable=AsyncMock) as mock_token:
+    with (
+        patch(
+            "app.auto_remediation.get_check_runs_cached", new_callable=AsyncMock
+        ) as mock_runs,
+        patch(
+            "app.auto_remediation.get_repo_installation_token", new_callable=AsyncMock
+        ) as mock_token,
+    ):
         mock_token.return_value = "ghp_test_token"
         mock_runs.return_value = mock_ci_result
 
         _failed, _summary, failure_type, _signals = await _extract_ci_context(
-            "acme", "webapp", "deadbeef", uuid.uuid4(), AsyncMock(),
+            "acme",
+            "webapp",
+            "deadbeef",
+            uuid.uuid4(),
+            AsyncMock(),
         )
 
     assert failure_type == "migration"
@@ -499,17 +645,29 @@ async def test_extract_ci_context_migration_undefined_column():
     mock_ci_result = {
         "status": "completed",
         "conclusion": "failure",
-        "details": [{"name": "CI / tests", "status": "completed", "conclusion": "failure"}],
-        "failed_logs": "psycopg2.errors.UndefinedColumn: column \"foo\" does not exist\nImportError ignored",
+        "details": [
+            {"name": "CI / tests", "status": "completed", "conclusion": "failure"}
+        ],
+        "failed_logs": 'psycopg2.errors.UndefinedColumn: column "foo" does not exist\nImportError ignored',
     }
 
-    with patch("app.auto_remediation.get_check_runs_cached", new_callable=AsyncMock) as mock_runs, \
-         patch("app.auto_remediation.get_repo_installation_token", new_callable=AsyncMock) as mock_token:
+    with (
+        patch(
+            "app.auto_remediation.get_check_runs_cached", new_callable=AsyncMock
+        ) as mock_runs,
+        patch(
+            "app.auto_remediation.get_repo_installation_token", new_callable=AsyncMock
+        ) as mock_token,
+    ):
         mock_token.return_value = "ghp_test_token"
         mock_runs.return_value = mock_ci_result
 
         _failed, _summary, failure_type, _signals = await _extract_ci_context(
-            "acme", "webapp", "deadbeef", uuid.uuid4(), AsyncMock(),
+            "acme",
+            "webapp",
+            "deadbeef",
+            uuid.uuid4(),
+            AsyncMock(),
         )
 
     assert failure_type == "migration"
@@ -572,11 +730,17 @@ def test_build_remediation_prompt_migration_extracts_multiple_heads():
 @pytest.mark.asyncio
 async def test_extract_ci_context_no_token():
     """When no GitHub token is available, returns empty defaults."""
-    with patch("app.auto_remediation.get_repo_installation_token", new_callable=AsyncMock) as mock_token:
+    with patch(
+        "app.auto_remediation.get_repo_installation_token", new_callable=AsyncMock
+    ) as mock_token:
         mock_token.return_value = None
 
         failed_checks, error_summary, failure_type, signals = await _extract_ci_context(
-            "acme", "webapp", "deadbeef", uuid.uuid4(), AsyncMock(),
+            "acme",
+            "webapp",
+            "deadbeef",
+            uuid.uuid4(),
+            AsyncMock(),
         )
 
     assert failed_checks == []
@@ -598,13 +762,23 @@ async def test_extract_ci_context_skips_failed_check_without_name():
         "failed_logs": "src/App.tsx:12:5 error: lint failed",
     }
 
-    with patch("app.auto_remediation.get_check_runs_cached", new_callable=AsyncMock) as mock_runs, \
-         patch("app.auto_remediation.get_repo_installation_token", new_callable=AsyncMock) as mock_token:
+    with (
+        patch(
+            "app.auto_remediation.get_check_runs_cached", new_callable=AsyncMock
+        ) as mock_runs,
+        patch(
+            "app.auto_remediation.get_repo_installation_token", new_callable=AsyncMock
+        ) as mock_token,
+    ):
         mock_token.return_value = "ghp_test_token"
         mock_runs.return_value = mock_ci_result
 
         failed_checks, error_summary, failure_type, signals = await _extract_ci_context(
-            "acme", "webapp", "deadbeef", uuid.uuid4(), AsyncMock(),
+            "acme",
+            "webapp",
+            "deadbeef",
+            uuid.uuid4(),
+            AsyncMock(),
         )
 
     assert failed_checks == ["CI / lint"]
@@ -619,7 +793,7 @@ def test_extract_structured_signals_pytest():
         "collected 5 items\n"
         "FAILED tests/test_auth.py::test_login - AssertionError: 401 != 200\n"
         "FAILED tests/test_auth.py::test_logout - KeyError: 'session'\n"
-        'Traceback (most recent call last):\n'
+        "Traceback (most recent call last):\n"
         '  File "backend/app/auth.py", line 142, in login\n'
         '    raise AssertionError("bad creds")\n'
         "AssertionError: bad creds\n"
@@ -720,10 +894,19 @@ async def test_suspended_branch_is_blocked(db_session: AsyncSession):
     """A branch in suspended_branches is rejected before any other guard."""
     project = await _create_project(db_session)
 
-    with patch("app.auto_remediation._extract_ci_context", new_callable=AsyncMock) as mock_ctx:
-        mock_ctx.return_value = (["CI"], "error", "test", {"failing_tests": [], "error_locations": [], "error_messages": []})
+    with patch(
+        "app.auto_remediation._extract_ci_context", new_callable=AsyncMock
+    ) as mock_ctx:
+        mock_ctx.return_value = (
+            ["CI"],
+            "error",
+            "test",
+            {"failing_tests": [], "error_locations": [], "error_messages": []},
+        )
         await _handle_main_branch_ci_failure_inner(
-            owner="acme", repo="webapp", head_sha="deadbeef",
+            owner="acme",
+            repo="webapp",
+            head_sha="deadbeef",
             head_branch="main",
             project_id=project.id,
             config=_default_config(suspended_branches=["main"]),
@@ -741,12 +924,23 @@ async def test_skip_when_no_ci_context(db_session: AsyncSession):
     """No task is spawned when CI context extraction returns no useful information."""
     project = await _create_project(db_session)
 
-    with patch("app.auto_remediation._extract_ci_context", new_callable=AsyncMock) as mock_ctx, \
-         patch("app.main._send_webhook_notification", new_callable=AsyncMock):
+    with (
+        patch(
+            "app.auto_remediation._extract_ci_context", new_callable=AsyncMock
+        ) as mock_ctx,
+        patch("app.main._send_webhook_notification", new_callable=AsyncMock),
+    ):
         # Return the "no useful context" sentinel values
-        mock_ctx.return_value = ([], "", "unknown", {"failing_tests": [], "error_locations": [], "error_messages": []})
+        mock_ctx.return_value = (
+            [],
+            "",
+            "unknown",
+            {"failing_tests": [], "error_locations": [], "error_messages": []},
+        )
         await _handle_main_branch_ci_failure_inner(
-            owner="acme", repo="webapp", head_sha="deadbeef",
+            owner="acme",
+            repo="webapp",
+            head_sha="deadbeef",
             head_branch="main",
             project_id=project.id,
             config=_default_config(),
@@ -775,12 +969,25 @@ async def test_suspended_branch_auto_recovers_after_cooldown(db_session: AsyncSe
         },
     )
 
-    with patch("app.auto_remediation._extract_ci_context", new_callable=AsyncMock) as mock_ctx, \
-         patch("app.auto_remediation.post_auto_fix_spawned_message", new_callable=AsyncMock), \
-         patch("app.main._send_webhook_notification", new_callable=AsyncMock):
-        mock_ctx.return_value = (["CI / tests"], "error", "test", {"failing_tests": [], "error_locations": [], "error_messages": []})
+    with (
+        patch(
+            "app.auto_remediation._extract_ci_context", new_callable=AsyncMock
+        ) as mock_ctx,
+        patch(
+            "app.auto_remediation.post_auto_fix_spawned_message", new_callable=AsyncMock
+        ),
+        patch("app.main._send_webhook_notification", new_callable=AsyncMock),
+    ):
+        mock_ctx.return_value = (
+            ["CI / tests"],
+            "error",
+            "test",
+            {"failing_tests": [], "error_locations": [], "error_messages": []},
+        )
         await _handle_main_branch_ci_failure_inner(
-            owner="acme", repo="webapp", head_sha="deadbeef",
+            owner="acme",
+            repo="webapp",
+            head_sha="deadbeef",
             head_branch="main",
             project_id=project.id,
             config=(project.design_doc or {}).get("_auto_remediation", {}),
@@ -791,7 +998,9 @@ async def test_suspended_branch_auto_recovers_after_cooldown(db_session: AsyncSe
     assert await _count_auto_tasks(db_session, project.id) == 1
     ar = (project.design_doc or {}).get("_auto_remediation", {})
     assert "main" not in ar.get("suspended_branches", [])
-    assert ar.get("suspension_metadata", {}).get("main", {}).get("recovery_attempts") == 1
+    assert (
+        ar.get("suspension_metadata", {}).get("main", {}).get("recovery_attempts") == 1
+    )
 
 
 @pytest.mark.asyncio
@@ -811,10 +1020,19 @@ async def test_suspended_branch_within_cooldown_stays_blocked(db_session: AsyncS
         },
     )
 
-    with patch("app.auto_remediation._extract_ci_context", new_callable=AsyncMock) as mock_ctx:
-        mock_ctx.return_value = (["CI"], "error", "test", {"failing_tests": [], "error_locations": [], "error_messages": []})
+    with patch(
+        "app.auto_remediation._extract_ci_context", new_callable=AsyncMock
+    ) as mock_ctx:
+        mock_ctx.return_value = (
+            ["CI"],
+            "error",
+            "test",
+            {"failing_tests": [], "error_locations": [], "error_messages": []},
+        )
         await _handle_main_branch_ci_failure_inner(
-            owner="acme", repo="webapp", head_sha="deadbeef",
+            owner="acme",
+            repo="webapp",
+            head_sha="deadbeef",
             head_branch="main",
             project_id=project.id,
             config=(project.design_doc or {}).get("_auto_remediation", {}),
@@ -826,9 +1044,12 @@ async def test_suspended_branch_within_cooldown_stays_blocked(db_session: AsyncS
 
 
 @pytest.mark.asyncio
-async def test_suspended_branch_permanently_blocked_after_max_attempts(db_session: AsyncSession):
+async def test_suspended_branch_permanently_blocked_after_max_attempts(
+    db_session: AsyncSession,
+):
     """After MAX_AUTO_RECOVERY_ATTEMPTS, branch stays suspended even past cooldown."""
     from app.auto_remediation import MAX_AUTO_RECOVERY_ATTEMPTS
+
     suspended_at = (_utcnow() - timedelta(days=365)).isoformat()
     project = await _create_project(
         db_session,
@@ -846,11 +1067,24 @@ async def test_suspended_branch_permanently_blocked_after_max_attempts(db_sessio
         },
     )
 
-    with patch("app.auto_remediation._extract_ci_context", new_callable=AsyncMock) as mock_ctx, \
-         patch("app.main._send_webhook_notification", new_callable=AsyncMock) as mock_webhook:
-        mock_ctx.return_value = (["CI"], "error", "test", {"failing_tests": [], "error_locations": [], "error_messages": []})
+    with (
+        patch(
+            "app.auto_remediation._extract_ci_context", new_callable=AsyncMock
+        ) as mock_ctx,
+        patch(
+            "app.main._send_webhook_notification", new_callable=AsyncMock
+        ) as mock_webhook,
+    ):
+        mock_ctx.return_value = (
+            ["CI"],
+            "error",
+            "test",
+            {"failing_tests": [], "error_locations": [], "error_messages": []},
+        )
         await _handle_main_branch_ci_failure_inner(
-            owner="acme", repo="webapp", head_sha="deadbeef",
+            owner="acme",
+            repo="webapp",
+            head_sha="deadbeef",
             head_branch="main",
             project_id=project.id,
             config=(project.design_doc or {}).get("_auto_remediation", {}),
@@ -871,12 +1105,25 @@ async def test_non_suspended_branch_spawns_normally(db_session: AsyncSession):
     """A branch not in suspended_branches proceeds normally."""
     project = await _create_project(db_session)
 
-    with patch("app.auto_remediation._extract_ci_context", new_callable=AsyncMock) as mock_ctx, \
-         patch("app.auto_remediation.post_auto_fix_spawned_message", new_callable=AsyncMock), \
-         patch("app.main._send_webhook_notification", new_callable=AsyncMock):
-        mock_ctx.return_value = (["CI / tests"], "error", "test", {"failing_tests": [], "error_locations": [], "error_messages": []})
+    with (
+        patch(
+            "app.auto_remediation._extract_ci_context", new_callable=AsyncMock
+        ) as mock_ctx,
+        patch(
+            "app.auto_remediation.post_auto_fix_spawned_message", new_callable=AsyncMock
+        ),
+        patch("app.main._send_webhook_notification", new_callable=AsyncMock),
+    ):
+        mock_ctx.return_value = (
+            ["CI / tests"],
+            "error",
+            "test",
+            {"failing_tests": [], "error_locations": [], "error_messages": []},
+        )
         await _handle_main_branch_ci_failure_inner(
-            owner="acme", repo="webapp", head_sha="deadbeef",
+            owner="acme",
+            repo="webapp",
+            head_sha="deadbeef",
             head_branch="main",
             project_id=project.id,
             config=_default_config(suspended_branches=["develop"]),
@@ -891,6 +1138,7 @@ async def test_per_fingerprint_cap_blocks_repeat_spawn(db_session: AsyncSession)
     """Three failed auto-remediations sharing a fingerprint block a fourth spawn."""
     from app.anomaly_detection import _error_fingerprint
     from app.failure_stage import _derive_failure_stage
+
     project = await _create_project(db_session)
     err = "AssertionError: boom"
     # Production stamps the stage-aware fingerprint at auto_remediation.py
@@ -915,12 +1163,25 @@ async def test_per_fingerprint_cap_blocks_repeat_spawn(db_session: AsyncSession)
         db_session.add(t)
     await db_session.flush()
 
-    with patch("app.auto_remediation._extract_ci_context", new_callable=AsyncMock) as mock_ctx, \
-         patch("app.auto_remediation.post_auto_fix_spawned_message", new_callable=AsyncMock), \
-         patch("app.main._send_webhook_notification", new_callable=AsyncMock):
-        mock_ctx.return_value = (["CI / tests"], err, "test", {"failing_tests": [], "error_locations": [], "error_messages": []})
+    with (
+        patch(
+            "app.auto_remediation._extract_ci_context", new_callable=AsyncMock
+        ) as mock_ctx,
+        patch(
+            "app.auto_remediation.post_auto_fix_spawned_message", new_callable=AsyncMock
+        ),
+        patch("app.main._send_webhook_notification", new_callable=AsyncMock),
+    ):
+        mock_ctx.return_value = (
+            ["CI / tests"],
+            err,
+            "test",
+            {"failing_tests": [], "error_locations": [], "error_messages": []},
+        )
         await _handle_main_branch_ci_failure_inner(
-            owner="acme", repo="webapp", head_sha="deadbeef",
+            owner="acme",
+            repo="webapp",
+            head_sha="deadbeef",
             head_branch="main",
             project_id=project.id,
             config=_default_config(),
@@ -934,14 +1195,27 @@ async def test_per_fingerprint_cap_blocks_repeat_spawn(db_session: AsyncSession)
 
 
 @pytest.mark.asyncio
-async def test_full_ci_remediation_cycle_spawn_to_trackable_outcome(db_session: AsyncSession):
+async def test_full_ci_remediation_cycle_spawn_to_trackable_outcome(
+    db_session: AsyncSession,
+):
     """End-to-end: CI failure spawns task → task completes → outcome is trackable by trigger class."""
     project = await _create_project(db_session)
 
-    with patch("app.auto_remediation._extract_ci_context", new_callable=AsyncMock) as mock_ctx, \
-         patch("app.auto_remediation.post_auto_fix_spawned_message", new_callable=AsyncMock), \
-         patch("app.main._send_webhook_notification", new_callable=AsyncMock):
-        mock_ctx.return_value = (["CI / tests"], "AssertionError: boom", "test", {"failing_tests": [], "error_locations": [], "error_messages": []})
+    with (
+        patch(
+            "app.auto_remediation._extract_ci_context", new_callable=AsyncMock
+        ) as mock_ctx,
+        patch(
+            "app.auto_remediation.post_auto_fix_spawned_message", new_callable=AsyncMock
+        ),
+        patch("app.main._send_webhook_notification", new_callable=AsyncMock),
+    ):
+        mock_ctx.return_value = (
+            ["CI / tests"],
+            "AssertionError: boom",
+            "test",
+            {"failing_tests": [], "error_locations": [], "error_messages": []},
+        )
         await _handle_main_branch_ci_failure_inner(
             owner="acme",
             repo="webapp",
@@ -952,7 +1226,7 @@ async def test_full_ci_remediation_cycle_spawn_to_trackable_outcome(db_session: 
             session=db_session,
         )
 
-    spawned = (await session_tasks(db_session, project.id))
+    spawned = await session_tasks(db_session, project.id)
     assert len(spawned) == 1
     task = spawned[0]
 
@@ -988,7 +1262,9 @@ async def test_full_ci_remediation_cycle_spawn_to_trackable_outcome(db_session: 
 
 
 @pytest.mark.asyncio
-async def test_remediation_spawn_to_feedback_clears_escalation_state(db_session: AsyncSession):
+async def test_remediation_spawn_to_feedback_clears_escalation_state(
+    db_session: AsyncSession,
+):
     """End-to-end: spawn → merged feedback clears per-branch failure counts and suspension."""
     from sqlalchemy.orm.attributes import flag_modified
     from app.notification_dispatch import post_auto_fix_result_message
@@ -1011,10 +1287,21 @@ async def test_remediation_spawn_to_feedback_clears_escalation_state(db_session:
     flag_modified(project, "design_doc")
     await db_session.flush()
 
-    with patch("app.auto_remediation._extract_ci_context", new_callable=AsyncMock) as mock_ctx, \
-         patch("app.auto_remediation.post_auto_fix_spawned_message", new_callable=AsyncMock), \
-         patch("app.main._send_webhook_notification", new_callable=AsyncMock):
-        mock_ctx.return_value = (["CI / tests"], "AssertionError: boom", "test", {"failing_tests": [], "error_locations": [], "error_messages": []})
+    with (
+        patch(
+            "app.auto_remediation._extract_ci_context", new_callable=AsyncMock
+        ) as mock_ctx,
+        patch(
+            "app.auto_remediation.post_auto_fix_spawned_message", new_callable=AsyncMock
+        ),
+        patch("app.main._send_webhook_notification", new_callable=AsyncMock),
+    ):
+        mock_ctx.return_value = (
+            ["CI / tests"],
+            "AssertionError: boom",
+            "test",
+            {"failing_tests": [], "error_locations": [], "error_messages": []},
+        )
         await _handle_main_branch_ci_failure_inner(
             owner="acme",
             repo="webapp",
@@ -1051,7 +1338,9 @@ async def test_remediation_spawn_to_feedback_clears_escalation_state(db_session:
 
 
 @pytest.mark.asyncio
-async def test_merged_preserves_recovery_attempts_for_future_backoff(db_session: AsyncSession):
+async def test_merged_preserves_recovery_attempts_for_future_backoff(
+    db_session: AsyncSession,
+):
     """Merging an auto-fix must not reset recovery_attempts; the next suspension
     cycle needs the prior attempt count so exponential backoff escalates."""
     from app.notification_dispatch import post_auto_fix_result_message
@@ -1070,30 +1359,51 @@ async def test_merged_preserves_recovery_attempts_for_future_backoff(db_session:
     )
 
     await post_auto_fix_result_message(
-        db_session, project.id, branch="main", result="merged", pr_number=77,
+        db_session,
+        project.id,
+        branch="main",
+        result="merged",
+        pr_number=77,
     )
     ar = (project.design_doc or {}).get("_auto_remediation", {})
     assert "main" not in ar.get("branch_failure_counts", {})
     assert "main" not in ar.get("suspended_branches", [])
     # recovery_attempts must persist across the merge.
-    assert ar.get("suspension_metadata", {}).get("main", {}).get("recovery_attempts") == 1
+    assert (
+        ar.get("suspension_metadata", {}).get("main", {}).get("recovery_attempts") == 1
+    )
 
     # Same error recurs — three failures re-suspend the branch.
-    with patch("app.notification_dispatch.post_auto_fix_escalation_message", new_callable=AsyncMock), \
-         patch("app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock):
+    with (
+        patch(
+            "app.notification_dispatch.post_auto_fix_escalation_message",
+            new_callable=AsyncMock,
+        ),
+        patch(
+            "app.notification_dispatch.dispatch_external_notification",
+            new_callable=AsyncMock,
+        ),
+    ):
         for _ in range(3):
             await post_auto_fix_result_message(
-                db_session, project.id, branch="main", result="failed",
+                db_session,
+                project.id,
+                branch="main",
+                result="failed",
             )
 
     ar = (project.design_doc or {}).get("_auto_remediation", {})
     assert "main" in ar.get("suspended_branches", [])
     # Re-suspension carries the prior recovery_attempts forward (not reset to 0).
-    assert ar.get("suspension_metadata", {}).get("main", {}).get("recovery_attempts") == 1
+    assert (
+        ar.get("suspension_metadata", {}).get("main", {}).get("recovery_attempts") == 1
+    )
 
 
 @pytest.mark.asyncio
-async def test_pipeline_exhaustion_propagates_to_auto_remediation_branch(db_session: AsyncSession):
+async def test_pipeline_exhaustion_propagates_to_auto_remediation_branch(
+    db_session: AsyncSession,
+):
     """When a review/fix task fails permanently on an auto-remediation PR, the
     original create task's auto_remediation context drives post_auto_fix_result_message
     with result='failed' so the branch's failure counter advances toward suspension."""
@@ -1119,24 +1429,31 @@ async def test_pipeline_exhaustion_propagates_to_auto_remediation_branch(db_sess
 
     review = Task(
         project_id=project.id,
-        payloads=[{
-            "type": "review",
-            "pr_number": 9999,
-            "branch": "blueprint/auto-fix",
-            "original_task_id": str(original.id),
-        }],
-        context={"review_loop": {"original_task_id": str(original.id), "pr_number": 9999}},
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 9999,
+                "branch": "blueprint/auto-fix",
+                "original_task_id": str(original.id),
+            }
+        ],
+        context={
+            "review_loop": {"original_task_id": str(original.id), "pr_number": 9999}
+        },
         status=TaskStatus.FAILED,
     )
     db_session.add(review)
     await db_session.flush()
 
-    with patch(
-        "app.notification_dispatch.post_auto_fix_result_message",
-        new_callable=AsyncMock,
-    ) as mock_post, patch(
-        "app.routers.agent_status._check_and_trigger_rollup",
-        new_callable=AsyncMock,
+    with (
+        patch(
+            "app.notification_dispatch.post_auto_fix_result_message",
+            new_callable=AsyncMock,
+        ) as mock_post,
+        patch(
+            "app.routers.agent_status._check_and_trigger_rollup",
+            new_callable=AsyncMock,
+        ),
     ):
         await _propagate_pipeline_failure_to_original(review, db_session)
         assert mock_post.await_count == 1
@@ -1150,7 +1467,9 @@ async def test_pipeline_exhaustion_propagates_to_auto_remediation_branch(db_sess
 
 
 @pytest.mark.asyncio
-async def test_pipeline_exhaustion_skips_non_remediation_tasks(db_session: AsyncSession):
+async def test_pipeline_exhaustion_skips_non_remediation_tasks(
+    db_session: AsyncSession,
+):
     """Non-auto-remediation originals still get cancelled, but no auto-fix failure message is posted."""
     from app.routers.agent_status import _propagate_pipeline_failure_to_original
 
@@ -1168,24 +1487,31 @@ async def test_pipeline_exhaustion_skips_non_remediation_tasks(db_session: Async
 
     review = Task(
         project_id=project.id,
-        payloads=[{
-            "type": "review",
-            "pr_number": 42,
-            "branch": "blueprint/task-x",
-            "original_task_id": str(original.id),
-        }],
-        context={"review_loop": {"original_task_id": str(original.id), "pr_number": 42}},
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 42,
+                "branch": "blueprint/task-x",
+                "original_task_id": str(original.id),
+            }
+        ],
+        context={
+            "review_loop": {"original_task_id": str(original.id), "pr_number": 42}
+        },
         status=TaskStatus.FAILED,
     )
     db_session.add(review)
     await db_session.flush()
 
-    with patch(
-        "app.notification_dispatch.post_auto_fix_result_message",
-        new_callable=AsyncMock,
-    ) as mock_post, patch(
-        "app.routers.agent_status._check_and_trigger_rollup",
-        new_callable=AsyncMock,
+    with (
+        patch(
+            "app.notification_dispatch.post_auto_fix_result_message",
+            new_callable=AsyncMock,
+        ) as mock_post,
+        patch(
+            "app.routers.agent_status._check_and_trigger_rollup",
+            new_callable=AsyncMock,
+        ),
     ):
         await _propagate_pipeline_failure_to_original(review, db_session)
         mock_post.assert_not_awaited()
@@ -1195,7 +1521,9 @@ async def test_pipeline_exhaustion_skips_non_remediation_tasks(db_session: Async
 
 
 @pytest.mark.asyncio
-async def test_find_matching_prior_investigation_matches_on_file_path(db_session: AsyncSession):
+async def test_find_matching_prior_investigation_matches_on_file_path(
+    db_session: AsyncSession,
+):
     """A recent completed investigate task whose affected file appears in the error summary matches."""
     project = await _create_project(db_session)
     inv = Task(
@@ -1222,20 +1550,33 @@ async def test_find_matching_prior_investigation_matches_on_file_path(db_session
 
 
 @pytest.mark.asyncio
-async def test_find_matching_prior_investigation_no_match_returns_none(db_session: AsyncSession):
+async def test_find_matching_prior_investigation_no_match_returns_none(
+    db_session: AsyncSession,
+):
     """Empty error summary or no matching investigation returns None."""
     project = await _create_project(db_session)
-    assert await _find_matching_prior_investigation(
-        project_id=project.id, error_summary="", session=db_session,
-    ) is None
-    assert await _find_matching_prior_investigation(
-        project_id=project.id, error_summary="unrelated failure xyz",
-        session=db_session,
-    ) is None
+    assert (
+        await _find_matching_prior_investigation(
+            project_id=project.id,
+            error_summary="",
+            session=db_session,
+        )
+        is None
+    )
+    assert (
+        await _find_matching_prior_investigation(
+            project_id=project.id,
+            error_summary="unrelated failure xyz",
+            session=db_session,
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio
-async def test_prior_investigation_propagates_diagnosis_context(db_session: AsyncSession):
+async def test_prior_investigation_propagates_diagnosis_context(
+    db_session: AsyncSession,
+):
     """When a prior investigation matches, the spawned task carries diagnosis_task_id+direction_id."""
     direction_id = str(uuid.uuid4())
     project = await _create_project(
@@ -1258,14 +1599,29 @@ async def test_prior_investigation_propagates_diagnosis_context(db_session: Asyn
     db_session.add(inv)
     await db_session.flush()
 
-    with patch("app.auto_remediation._extract_ci_context", new_callable=AsyncMock) as mock_ctx, \
-         patch("app.auto_remediation.post_auto_fix_spawned_message", new_callable=AsyncMock), \
-         patch("app.main._send_webhook_notification", new_callable=AsyncMock):
-        mock_ctx.return_value = (["CI"], "FAILED backend/app/auth.py::test_session token mismatch", "test", {"failing_tests": [], "error_locations": [], "error_messages": []})
+    with (
+        patch(
+            "app.auto_remediation._extract_ci_context", new_callable=AsyncMock
+        ) as mock_ctx,
+        patch(
+            "app.auto_remediation.post_auto_fix_spawned_message", new_callable=AsyncMock
+        ),
+        patch("app.main._send_webhook_notification", new_callable=AsyncMock),
+    ):
+        mock_ctx.return_value = (
+            ["CI"],
+            "FAILED backend/app/auth.py::test_session token mismatch",
+            "test",
+            {"failing_tests": [], "error_locations": [], "error_messages": []},
+        )
         await _handle_main_branch_ci_failure_inner(
-            owner="acme", repo="webapp", head_sha="deadbeef",
-            head_branch="main", project_id=project.id,
-            config=_default_config(), session=db_session,
+            owner="acme",
+            repo="webapp",
+            head_sha="deadbeef",
+            head_branch="main",
+            project_id=project.id,
+            config=_default_config(),
+            session=db_session,
         )
 
     tasks = await session_tasks(db_session, project.id)
@@ -1278,7 +1634,9 @@ async def test_prior_investigation_propagates_diagnosis_context(db_session: Asyn
 
 
 @pytest.mark.asyncio
-async def test_remediation_outcome_recorded_when_auto_remediation_merges(db_session: AsyncSession):
+async def test_remediation_outcome_recorded_when_auto_remediation_merges(
+    db_session: AsyncSession,
+):
     """An auto-remediation task carrying diagnosis context updates direction state on merge."""
     from app.task_completion import _record_remediation_outcome
 
@@ -1313,7 +1671,9 @@ async def test_remediation_outcome_recorded_when_auto_remediation_merges(db_sess
 
 
 @pytest.mark.asyncio
-async def test_remediation_outcome_recorded_for_fingerprint_matched_merge(db_session: AsyncSession):
+async def test_remediation_outcome_recorded_for_fingerprint_matched_merge(
+    db_session: AsyncSession,
+):
     """Fingerprint-matched auto-remediation (direction_id set, no diagnosis_task_id) stamps merge outcome."""
     from app.task_completion import _record_remediation_outcome
 
@@ -1356,7 +1716,9 @@ async def test_remediation_outcome_recorded_for_fingerprint_matched_merge(db_ses
 
 
 @pytest.mark.asyncio
-async def test_find_recent_merged_remediation_matches_branch_and_fingerprint(db_session: AsyncSession):
+async def test_find_recent_merged_remediation_matches_branch_and_fingerprint(
+    db_session: AsyncSession,
+):
     """A recent completed auto-remediation task with matching branch+fingerprint is found."""
     project = await _create_project(db_session)
     # Audit W1: auto_remediation + previous_error_fingerprint are columns.
@@ -1375,26 +1737,44 @@ async def test_find_recent_merged_remediation_matches_branch_and_fingerprint(db_
     await db_session.flush()
 
     match = await _find_recent_merged_remediation(
-        project_id=project.id, branch="main", fingerprint="fp-xyz", session=db_session,
+        project_id=project.id,
+        branch="main",
+        fingerprint="fp-xyz",
+        session=db_session,
     )
     assert match is not None and match.id == prior.id
 
     # Different branch → no match
-    assert await _find_recent_merged_remediation(
-        project_id=project.id, branch="other", fingerprint="fp-xyz", session=db_session,
-    ) is None
+    assert (
+        await _find_recent_merged_remediation(
+            project_id=project.id,
+            branch="other",
+            fingerprint="fp-xyz",
+            session=db_session,
+        )
+        is None
+    )
     # Different fingerprint → no match
-    assert await _find_recent_merged_remediation(
-        project_id=project.id, branch="main", fingerprint="fp-other", session=db_session,
-    ) is None
+    assert (
+        await _find_recent_merged_remediation(
+            project_id=project.id,
+            branch="main",
+            fingerprint="fp-other",
+            session=db_session,
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio
-async def test_regression_detection_injects_context_and_prompt(db_session: AsyncSession):
+async def test_regression_detection_injects_context_and_prompt(
+    db_session: AsyncSession,
+):
     """When a prior remediation merged for same branch+fingerprint, spawned task gets regression context."""
     project = await _create_project(db_session)
     from app.anomaly_detection import _error_fingerprint
     from app.failure_stage import _derive_failure_stage
+
     err = "AssertionError: boom specific pattern"
     # Mirror production: prior remediation tasks persist the stage-aware
     # fingerprint, so the regression probe must match that exact form.
@@ -1415,14 +1795,28 @@ async def test_regression_detection_injects_context_and_prompt(db_session: Async
     db_session.add(prior)
     await db_session.flush()
 
-    with patch("app.auto_remediation._extract_ci_context", new_callable=AsyncMock) as mock_ctx, \
-         patch("app.auto_remediation.post_auto_fix_spawned_message", new_callable=AsyncMock), \
-         patch("app.main._send_webhook_notification", new_callable=AsyncMock):
-        mock_ctx.return_value = (["CI / tests"], err, "test", {"failing_tests": [], "error_locations": [], "error_messages": []})
+    with (
+        patch(
+            "app.auto_remediation._extract_ci_context", new_callable=AsyncMock
+        ) as mock_ctx,
+        patch(
+            "app.auto_remediation.post_auto_fix_spawned_message", new_callable=AsyncMock
+        ),
+        patch("app.main._send_webhook_notification", new_callable=AsyncMock),
+    ):
+        mock_ctx.return_value = (
+            ["CI / tests"],
+            err,
+            "test",
+            {"failing_tests": [], "error_locations": [], "error_messages": []},
+        )
         await _handle_main_branch_ci_failure_inner(
-            owner="acme", repo="webapp",
-            head_sha="feedface", head_branch="main",
-            project_id=project.id, config=_default_config(),
+            owner="acme",
+            repo="webapp",
+            head_sha="feedface",
+            head_branch="main",
+            project_id=project.id,
+            config=_default_config(),
             session=db_session,
         )
 
@@ -1435,7 +1829,9 @@ async def test_regression_detection_injects_context_and_prompt(db_session: Async
 
 
 @pytest.mark.asyncio
-async def test_regression_task_failure_suspends_at_threshold_one(db_session: AsyncSession):
+async def test_regression_task_failure_suspends_at_threshold_one(
+    db_session: AsyncSession,
+):
     """A failing task flagged as regression triggers suspension after a single failure."""
     from app.notification_dispatch import post_auto_fix_result_message
 
@@ -1452,10 +1848,22 @@ async def test_regression_task_failure_suspends_at_threshold_one(db_session: Asy
     db_session.add(task)
     await db_session.flush()
 
-    with patch("app.notification_dispatch.post_auto_fix_escalation_message", new_callable=AsyncMock) as mock_esc, \
-         patch("app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock):
+    with (
+        patch(
+            "app.notification_dispatch.post_auto_fix_escalation_message",
+            new_callable=AsyncMock,
+        ) as mock_esc,
+        patch(
+            "app.notification_dispatch.dispatch_external_notification",
+            new_callable=AsyncMock,
+        ),
+    ):
         await post_auto_fix_result_message(
-            db_session, project.id, branch="main", result="failed", task_id=task.id,
+            db_session,
+            project.id,
+            branch="main",
+            result="failed",
+            task_id=task.id,
         )
 
     mock_esc.assert_awaited_once()
@@ -1489,13 +1897,17 @@ async def test_find_direction_by_fingerprint_prefers_active(db_session: AsyncSes
     )
 
     result = await _find_direction_by_fingerprint(
-        project_id=project.id, fingerprint=fp, session=db_session,
+        project_id=project.id,
+        fingerprint=fp,
+        session=db_session,
     )
     assert result == active_id
 
 
 @pytest.mark.asyncio
-async def test_find_direction_by_fingerprint_prefers_most_recent_active(db_session: AsyncSession):
+async def test_find_direction_by_fingerprint_prefers_most_recent_active(
+    db_session: AsyncSession,
+):
     """Among active matches, prefer the one with the most recent last_remediation_at."""
     fp = "fp-abc"
     older_id = str(uuid.uuid4())
@@ -1518,6 +1930,8 @@ async def test_find_direction_by_fingerprint_prefers_most_recent_active(db_sessi
         ],
     )
     result = await _find_direction_by_fingerprint(
-        project_id=project.id, fingerprint=fp, session=db_session,
+        project_id=project.id,
+        fingerprint=fp,
+        session=db_session,
     )
     assert result == newer_id

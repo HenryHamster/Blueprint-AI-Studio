@@ -1,5 +1,4 @@
 """Unit tests for the _fix_loop_summary helper in backend/app/admin.py."""
-import pytest
 
 from app.admin import _fix_loop_summary
 
@@ -19,6 +18,7 @@ def _attempt(exit_reason: str, iteration: int = 1) -> dict:
 
 
 # --- None / omit cases -------------------------------------------------------
+
 
 def test_no_history_returns_none():
     assert _fix_loop_summary(None) is None
@@ -53,6 +53,7 @@ def test_multiple_loops_all_healthy_returns_none():
 
 
 # --- flagged cases -----------------------------------------------------------
+
 
 def test_divergence_oscillation_is_flagged():
     history = {"lint": [_attempt("divergence_oscillation", 1)]}
@@ -149,4 +150,9 @@ def test_summary_fields_are_compact():
     result = _fix_loop_summary(history)
     assert result is not None
     entry = result[0]
-    assert set(entry.keys()) == {"loop", "iterations", "last_exit_reason", "non_success"}
+    assert set(entry.keys()) == {
+        "loop",
+        "iterations",
+        "last_exit_reason",
+        "non_success",
+    }

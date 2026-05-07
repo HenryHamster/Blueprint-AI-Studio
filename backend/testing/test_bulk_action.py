@@ -12,6 +12,7 @@ mid-delete races with the FK-cascade delete. After the fix, the handler
 acquires ``lock_project_or_429`` so concurrent writers either complete
 before us or get 429 Retry-After.
 """
+
 import asyncio
 import uuid
 from unittest.mock import AsyncMock
@@ -41,9 +42,7 @@ async def _make_project_with_member(db_session, owner_id=TEST_USER_ID):
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
-    db_session.add(
-        ProjectMember(project_id=project.id, user_id=owner_id, role="owner")
-    )
+    db_session.add(ProjectMember(project_id=project.id, user_id=owner_id, role="owner"))
     await db_session.commit()
     return project
 
@@ -156,8 +155,11 @@ async def test_bulk_retry_does_not_block_concurrent_session_during_requeue(
         await sleep_started.wait()
         from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession
         from sqlmodel import select
+
         factory = async_sessionmaker(
-            db_session.bind, class_=AsyncSession, expire_on_commit=False,
+            db_session.bind,
+            class_=AsyncSession,
+            expire_on_commit=False,
         )
         async with factory() as fresh:
             result = await fresh.execute(

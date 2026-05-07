@@ -8,6 +8,7 @@ past its memory limit. Caching responses for a short window lets concurrent
 callers share the same compute; per-instance in-memory is enough because
 each Cloud Run container does its own pile-up.
 """
+
 from __future__ import annotations
 
 import asyncio

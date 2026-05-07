@@ -15,26 +15,88 @@ logger = logging.getLogger(__name__)
 
 _RAW_PATTERNS: List[Dict[str, Any]] = [
     # ── 1. Direct instruction overrides ──────────────────────────────────
-    {"pattern": r"ignore\s+(all\s+)?previous\s+(instructions|prompts|rules|context)", "severity": "high", "cat": "instruction_override"},
-    {"pattern": r"disregard\s+(all\s+)?(above|previous|prior|earlier|preceding)", "severity": "high", "cat": "instruction_override"},
-    {"pattern": r"forget\s+(everything|all|your)\s+(previous\s+)?(instructions|rules|context|training)", "severity": "high", "cat": "instruction_override"},
-    {"pattern": r"override\s+(your|the|all|any)\s+(instructions|rules|guidelines|constraints|safeguards)", "severity": "high", "cat": "instruction_override"},
-    {"pattern": r"do\s+not\s+follow\s+(your|the|any|previous)\s+(instructions|rules|guidelines)", "severity": "high", "cat": "instruction_override"},
-    {"pattern": r"stop\s+being\s+(a|an)\s+(ai|assistant|language\s+model|helpful)", "severity": "high", "cat": "instruction_override"},
-    {"pattern": r"(from|starting)\s+now\s+(on\s+)?(you|your)\s+(are|will|must|should)", "severity": "high", "cat": "instruction_override"},
-    {"pattern": r"new\s+(system\s+)?(prompt|instructions|rules|persona|role|directive)", "severity": "medium", "cat": "instruction_override"},
-    {"pattern": r"(here|these)\s+are\s+your\s+new\s+(instructions|rules|directives)", "severity": "high", "cat": "instruction_override"},
-    {"pattern": r"act\s+as\s+(if|though)\s+you\s+(have\s+)?(no|don.t\s+have)\s+(restrictions|rules|guidelines)", "severity": "high", "cat": "instruction_override"},
-
+    {
+        "pattern": r"ignore\s+(all\s+)?previous\s+(instructions|prompts|rules|context)",
+        "severity": "high",
+        "cat": "instruction_override",
+    },
+    {
+        "pattern": r"disregard\s+(all\s+)?(above|previous|prior|earlier|preceding)",
+        "severity": "high",
+        "cat": "instruction_override",
+    },
+    {
+        "pattern": r"forget\s+(everything|all|your)\s+(previous\s+)?(instructions|rules|context|training)",
+        "severity": "high",
+        "cat": "instruction_override",
+    },
+    {
+        "pattern": r"override\s+(your|the|all|any)\s+(instructions|rules|guidelines|constraints|safeguards)",
+        "severity": "high",
+        "cat": "instruction_override",
+    },
+    {
+        "pattern": r"do\s+not\s+follow\s+(your|the|any|previous)\s+(instructions|rules|guidelines)",
+        "severity": "high",
+        "cat": "instruction_override",
+    },
+    {
+        "pattern": r"stop\s+being\s+(a|an)\s+(ai|assistant|language\s+model|helpful)",
+        "severity": "high",
+        "cat": "instruction_override",
+    },
+    {
+        "pattern": r"(from|starting)\s+now\s+(on\s+)?(you|your)\s+(are|will|must|should)",
+        "severity": "high",
+        "cat": "instruction_override",
+    },
+    {
+        "pattern": r"new\s+(system\s+)?(prompt|instructions|rules|persona|role|directive)",
+        "severity": "medium",
+        "cat": "instruction_override",
+    },
+    {
+        "pattern": r"(here|these)\s+are\s+your\s+new\s+(instructions|rules|directives)",
+        "severity": "high",
+        "cat": "instruction_override",
+    },
+    {
+        "pattern": r"act\s+as\s+(if|though)\s+you\s+(have\s+)?(no|don.t\s+have)\s+(restrictions|rules|guidelines)",
+        "severity": "high",
+        "cat": "instruction_override",
+    },
     # ── 2. Role reassignment / persona injection ─────────────────────────
-    {"pattern": r"you\s+are\s+now\s+(a|an|the|my)\s+", "severity": "high", "cat": "role_injection"},
-    {"pattern": r"pretend\s+(you\s+are|to\s+be|you.re)\s+", "severity": "high", "cat": "role_injection"},
+    {
+        "pattern": r"you\s+are\s+now\s+(a|an|the|my)\s+",
+        "severity": "high",
+        "cat": "role_injection",
+    },
+    {
+        "pattern": r"pretend\s+(you\s+are|to\s+be|you.re)\s+",
+        "severity": "high",
+        "cat": "role_injection",
+    },
     {"pattern": r"roleplay\s+as\s+", "severity": "high", "cat": "role_injection"},
-    {"pattern": r"switch\s+(to|into)\s+(a\s+)?(.+?)\s+(mode|persona|role|character)", "severity": "high", "cat": "role_injection"},
-    {"pattern": r"you.re\s+(actually|really|secretly)\s+(a|an|not)\s+", "severity": "high", "cat": "role_injection"},
-    {"pattern": r"enter\s+(developer|admin|god|debug|unrestricted|jailbreak)\s+mode", "severity": "high", "cat": "role_injection"},
-    {"pattern": r"enable\s+(developer|admin|god|debug|unrestricted|DAN)\s+mode", "severity": "high", "cat": "role_injection"},
-
+    {
+        "pattern": r"switch\s+(to|into)\s+(a\s+)?(.+?)\s+(mode|persona|role|character)",
+        "severity": "high",
+        "cat": "role_injection",
+    },
+    {
+        "pattern": r"you.re\s+(actually|really|secretly)\s+(a|an|not)\s+",
+        "severity": "high",
+        "cat": "role_injection",
+    },
+    {
+        "pattern": r"enter\s+(developer|admin|god|debug|unrestricted|jailbreak)\s+mode",
+        "severity": "high",
+        "cat": "role_injection",
+    },
+    {
+        "pattern": r"enable\s+(developer|admin|god|debug|unrestricted|DAN)\s+mode",
+        "severity": "high",
+        "cat": "role_injection",
+    },
     # ── 3. Prompt/system boundary markers ────────────────────────────────
     {"pattern": r"<\|endoftext\|>", "severity": "high", "cat": "boundary_marker"},
     {"pattern": r"<\|im_start\|>", "severity": "high", "cat": "boundary_marker"},
@@ -48,7 +110,6 @@ _RAW_PATTERNS: List[Dict[str, Any]] = [
     {"pattern": r"<</SYS>>", "severity": "high", "cat": "boundary_marker"},
     {"pattern": r"<\|eot_id\|>", "severity": "high", "cat": "boundary_marker"},
     {"pattern": r"<\|start_header_id\|>", "severity": "high", "cat": "boundary_marker"},
-
     # Anthropic-specific XML injection
     {"pattern": r"<system>", "severity": "high", "cat": "boundary_marker"},
     {"pattern": r"</system>", "severity": "high", "cat": "boundary_marker"},
@@ -57,71 +118,162 @@ _RAW_PATTERNS: List[Dict[str, Any]] = [
     {"pattern": r"</?assistant>", "severity": "high", "cat": "boundary_marker"},
     {"pattern": r"<antThinking>", "severity": "high", "cat": "boundary_marker"},
     {"pattern": r"</?artifacts?>", "severity": "medium", "cat": "boundary_marker"},
-
     # Conversation turn markers (in code files — not natural)
     {"pattern": r"^Human:", "severity": "medium", "cat": "turn_marker"},
     {"pattern": r"^Assistant:", "severity": "medium", "cat": "turn_marker"},
-    {"pattern": r"^###\s*(System|Instruction|Human|User|Assistant)\s*(Message|Prompt)?:", "severity": "medium", "cat": "turn_marker"},
-    {"pattern": r"^(SYSTEM|USER|ASSISTANT)\s*:", "severity": "medium", "cat": "turn_marker"},
-
+    {
+        "pattern": r"^###\s*(System|Instruction|Human|User|Assistant)\s*(Message|Prompt)?:",
+        "severity": "medium",
+        "cat": "turn_marker",
+    },
+    {
+        "pattern": r"^(SYSTEM|USER|ASSISTANT)\s*:",
+        "severity": "medium",
+        "cat": "turn_marker",
+    },
     # ── 4. Prompt leaking / exfiltration ─────────────────────────────────
-    {"pattern": r"(output|print|show|display|reveal|repeat|echo|give\s+me)\s+.{0,30}(system\s+)?(prompt|instructions|rules|context|directives)", "severity": "medium", "cat": "prompt_leak"},
-    {"pattern": r"what\s+(are|is|were)\s+your\s+.{0,20}(system\s+)?(prompt|instructions|rules|directives)", "severity": "medium", "cat": "prompt_leak"},
-    {"pattern": r"(send|post|upload|transmit|exfiltrate)\s+.{0,40}(to|at|via)\s+(https?://|ftp://|wss?://)", "severity": "high", "cat": "exfiltration"},
-    {"pattern": r"curl\s+.{0,60}(https?://|ftp://)\S+\s+.{0,40}(-d|--data|--upload)", "severity": "high", "cat": "exfiltration"},
-
+    {
+        "pattern": r"(output|print|show|display|reveal|repeat|echo|give\s+me)\s+.{0,30}(system\s+)?(prompt|instructions|rules|context|directives)",
+        "severity": "medium",
+        "cat": "prompt_leak",
+    },
+    {
+        "pattern": r"what\s+(are|is|were)\s+your\s+.{0,20}(system\s+)?(prompt|instructions|rules|directives)",
+        "severity": "medium",
+        "cat": "prompt_leak",
+    },
+    {
+        "pattern": r"(send|post|upload|transmit|exfiltrate)\s+.{0,40}(to|at|via)\s+(https?://|ftp://|wss?://)",
+        "severity": "high",
+        "cat": "exfiltration",
+    },
+    {
+        "pattern": r"curl\s+.{0,60}(https?://|ftp://)\S+\s+.{0,40}(-d|--data|--upload)",
+        "severity": "high",
+        "cat": "exfiltration",
+    },
     # ── 5. Tool/function manipulation ────────────────────────────────────
-    {"pattern": r"call\s+the\s+(tool|function|api)\s+with\s+(these|the\s+following)\s+parameters", "severity": "high", "cat": "tool_manipulation"},
-    {"pattern": r"(execute|run|invoke)\s+(the\s+)?(bash|shell|terminal|exec)\s+(tool|command)\s+with", "severity": "high", "cat": "tool_manipulation"},
-    {"pattern": r"use\s+tool_use\s+to\s+", "severity": "high", "cat": "tool_manipulation"},
-
+    {
+        "pattern": r"call\s+the\s+(tool|function|api)\s+with\s+(these|the\s+following)\s+parameters",
+        "severity": "high",
+        "cat": "tool_manipulation",
+    },
+    {
+        "pattern": r"(execute|run|invoke)\s+(the\s+)?(bash|shell|terminal|exec)\s+(tool|command)\s+with",
+        "severity": "high",
+        "cat": "tool_manipulation",
+    },
+    {
+        "pattern": r"use\s+tool_use\s+to\s+",
+        "severity": "high",
+        "cat": "tool_manipulation",
+    },
     # ── 6. Unicode / encoding attacks ────────────────────────────────────
     # Bidi overrides can visually hide malicious code
-    {"pattern": r"[\u202a-\u202e\u2066-\u2069]", "severity": "high", "cat": "unicode_attack"},
+    {
+        "pattern": r"[\u202a-\u202e\u2066-\u2069]",
+        "severity": "high",
+        "cat": "unicode_attack",
+    },
     # Zero-width chars used to smuggle invisible text
-    {"pattern": r"[\u200b-\u200f\u2028-\u2029\u2060-\u206f\ufeff]", "severity": "medium", "cat": "unicode_attack"},
+    {
+        "pattern": r"[\u200b-\u200f\u2028-\u2029\u2060-\u206f\ufeff]",
+        "severity": "medium",
+        "cat": "unicode_attack",
+    },
     # Homoglyph attacks (Cyrillic/Greek lookalikes in otherwise ASCII code)
-    {"pattern": r"[\u0400-\u04ff\u0370-\u03ff]", "severity": "medium", "cat": "homoglyph"},
-
+    {
+        "pattern": r"[\u0400-\u04ff\u0370-\u03ff]",
+        "severity": "medium",
+        "cat": "homoglyph",
+    },
     # ── 7. Encoded payloads ──────────────────────────────────────────────
     # Long base64 blobs in comments (potential hidden instructions)
-    {"pattern": r"(?:#|//|/\*|\*|--)\s*[A-Za-z0-9+/=]{100,}", "severity": "medium", "cat": "encoded_payload"},
+    {
+        "pattern": r"(?:#|//|/\*|\*|--)\s*[A-Za-z0-9+/=]{100,}",
+        "severity": "medium",
+        "cat": "encoded_payload",
+    },
     # Hex-encoded strings in comments
-    {"pattern": r"(?:#|//|/\*|\*|--)\s*(?:\\x[0-9a-fA-F]{2}){20,}", "severity": "medium", "cat": "encoded_payload"},
-
+    {
+        "pattern": r"(?:#|//|/\*|\*|--)\s*(?:\\x[0-9a-fA-F]{2}){20,}",
+        "severity": "medium",
+        "cat": "encoded_payload",
+    },
     # ── 8. HTML/Markdown injection in code files ─────────────────────────
-    {"pattern": r"<!--[\s\S]*?(?:ignore|disregard|override|instruction|system|prompt|inject)[\s\S]*?-->", "severity": "medium", "cat": "html_injection"},
+    {
+        "pattern": r"<!--[\s\S]*?(?:ignore|disregard|override|instruction|system|prompt|inject)[\s\S]*?-->",
+        "severity": "medium",
+        "cat": "html_injection",
+    },
     # Hidden text via HTML (zero-size, white text, etc.)
-    {"pattern": r"<(?:span|div|p)\s+style\s*=\s*[\"'][^\"']*(?:display\s*:\s*none|font-size\s*:\s*0|color\s*:\s*(?:white|#fff))", "severity": "high", "cat": "html_injection"},
-
+    {
+        "pattern": r"<(?:span|div|p)\s+style\s*=\s*[\"'][^\"']*(?:display\s*:\s*none|font-size\s*:\s*0|color\s*:\s*(?:white|#fff))",
+        "severity": "high",
+        "cat": "html_injection",
+    },
     # ── 9. Multi-language injection ──────────────────────────────────────
-    {"pattern": r"ignor(?:ar|ez|ieren)\s+(?:todas?\s+las?\s+)?(?:instrucciones|instructions|Anweisungen)", "severity": "high", "cat": "multilang_injection"},
-    {"pattern": r"(?:oubliez|vergessen\s+Sie)\s+(?:toutes?\s+les?\s+|alle\s+)?(?:instructions|r[eè]gles|Anweisungen)", "severity": "high", "cat": "multilang_injection"},
-
+    {
+        "pattern": r"ignor(?:ar|ez|ieren)\s+(?:todas?\s+las?\s+)?(?:instrucciones|instructions|Anweisungen)",
+        "severity": "high",
+        "cat": "multilang_injection",
+    },
+    {
+        "pattern": r"(?:oubliez|vergessen\s+Sie)\s+(?:toutes?\s+les?\s+|alle\s+)?(?:instructions|r[eè]gles|Anweisungen)",
+        "severity": "high",
+        "cat": "multilang_injection",
+    },
 ]
 
 # Compile patterns once at module load
 INJECTION_PATTERNS: List[Dict[str, Any]] = []
 for p in _RAW_PATTERNS:
     try:
-        INJECTION_PATTERNS.append({
-            "compiled": re.compile(p["pattern"], re.IGNORECASE),
-            "severity": p["severity"],
-            "category": p["cat"],
-            "description": p["pattern"][:80],
-        })
+        INJECTION_PATTERNS.append(
+            {
+                "compiled": re.compile(p["pattern"], re.IGNORECASE),
+                "severity": p["severity"],
+                "category": p["cat"],
+                "description": p["pattern"][:80],
+            }
+        )
     except re.error:
         pass  # Skip malformed patterns
 
 # File extensions where natural language is expected (higher false-positive threshold)
 DOCS_EXTENSIONS = {".md", ".txt", ".rst", ".adoc", ".html", ".htm"}
 # File extensions to never scan (binary)
-BINARY_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".ico", ".woff", ".woff2",
-                     ".ttf", ".eot", ".pdf", ".zip", ".tar", ".gz", ".bin", ".exe",
-                     ".dll", ".so", ".dylib", ".pyc", ".class"}
+BINARY_EXTENSIONS = {
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".ico",
+    ".woff",
+    ".woff2",
+    ".ttf",
+    ".eot",
+    ".pdf",
+    ".zip",
+    ".tar",
+    ".gz",
+    ".bin",
+    ".exe",
+    ".dll",
+    ".so",
+    ".dylib",
+    ".pyc",
+    ".class",
+}
 # Auto-generated lock files — huge, full of hashes, never contain injections
-SKIP_FILENAMES = {"package-lock.json", "yarn.lock", "pnpm-lock.yaml",
-                  "Cargo.lock", "poetry.lock", "composer.lock"}
+SKIP_FILENAMES = {
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "Cargo.lock",
+    "poetry.lock",
+    "composer.lock",
+}
 # Test files that contain injection patterns by definition (they test the scanner)
 SKIP_PATHS_CONTAINING = {"test_security", "testing/test_security"}
 
@@ -147,9 +299,9 @@ def _normalize_for_fuzzy(text: str) -> str:
     t = text.lower()
     t = t.translate(_LEET_MAP)
     # Collapse separators between characters: "i.g.n.o.r.e" → "ignore"
-    t = re.sub(r'(?<=\w)[._\-\s]+(?=\w)', '', t)
+    t = re.sub(r"(?<=\w)[._\-\s]+(?=\w)", "", t)
     # Remove null bytes, backslashes used for evasion
-    t = t.replace('\\x00', '').replace('\\0', '').replace('\x00', '')
+    t = t.replace("\\x00", "").replace("\\0", "").replace("\x00", "")
     return t
 
 
@@ -185,19 +337,23 @@ def _fuzzy_scan(text: str, source: str) -> List[Dict[str, str]]:
 
         # Sliding window over normalized text
         for i in range(len(normalized) - phrase_len + max_dist + 1):
-            window = normalized[i:i + phrase_len + max_dist]
+            window = normalized[i : i + phrase_len + max_dist]
             if not window:
                 continue
             dist = _levenshtein(window[:phrase_len], norm_phrase)
             if dist <= max_dist:
-                findings.append({
-                    "source": source,
-                    "source_type": "code",
-                    "category": f"evasion:{category}",
-                    "severity": severity,
-                    "matched_text": text[i:i + phrase_len + max_dist].strip()[:200],
-                    "context": text.strip()[:300],
-                })
+                findings.append(
+                    {
+                        "source": source,
+                        "source_type": "code",
+                        "category": f"evasion:{category}",
+                        "severity": severity,
+                        "matched_text": text[i : i + phrase_len + max_dist].strip()[
+                            :200
+                        ],
+                        "context": text.strip()[:300],
+                    }
+                )
                 break  # One match per phrase per line is enough
 
     return findings
@@ -210,7 +366,9 @@ def _get_extension(path: str) -> str:
     return ""
 
 
-def _scan_text(text: str, source: str, source_type: str = "code") -> List[Dict[str, str]]:
+def _scan_text(
+    text: str, source: str, source_type: str = "code"
+) -> List[Dict[str, str]]:
     """
     Scan a text string against all injection patterns.
     source: identifier for where the text came from (file path, "commit_message", etc.)
@@ -229,14 +387,16 @@ def _scan_text(text: str, source: str, source_type: str = "code") -> List[Dict[s
             if source_type == "docs" and pattern_def["severity"] != "high":
                 continue
 
-            findings.append({
-                "source": source,
-                "source_type": source_type,
-                "category": pattern_def["category"],
-                "severity": pattern_def["severity"],
-                "matched_text": match.group()[:200],
-                "context": text.strip()[:300],
-            })
+            findings.append(
+                {
+                    "source": source,
+                    "source_type": source_type,
+                    "category": pattern_def["category"],
+                    "severity": pattern_def["severity"],
+                    "matched_text": match.group()[:200],
+                    "context": text.strip()[:300],
+                }
+            )
     return findings
 
 
@@ -247,7 +407,7 @@ def _check_base64_hidden_text(text: str, source: str) -> List[Dict[str, str]]:
     """
     findings = []
     # Find base64 blobs in comments (at least 40 chars to avoid false positives)
-    b64_pattern = re.compile(r'(?:#|//|/\*|\*|--)\s*([A-Za-z0-9+/]{40,}={0,2})')
+    b64_pattern = re.compile(r"(?:#|//|/\*|\*|--)\s*([A-Za-z0-9+/]{40,}={0,2})")
     for match in b64_pattern.finditer(text):
         try:
             decoded = base64.b64decode(match.group(1)).decode("utf-8", errors="ignore")
@@ -277,18 +437,23 @@ def scan_diff_text(diff_text: str) -> List[Dict[str, str]]:
             current_file = parts[-1] if len(parts) > 1 else ""
             # Scan the file PATH itself for injection
             if current_file:
-                path_findings = _scan_text(current_file, f"filename:{current_file}", "metadata")
+                path_findings = _scan_text(
+                    current_file, f"filename:{current_file}", "metadata"
+                )
                 findings.extend(path_findings)
 
         elif line.startswith("+++"):
             current_file = line[6:] if line.startswith("+++ b/") else current_file
 
-        elif (line.startswith("+") and not line.startswith("+++")) or \
-             (line.startswith("-") and not line.startswith("---")):
+        elif (line.startswith("+") and not line.startswith("+++")) or (
+            line.startswith("-") and not line.startswith("---")
+        ):
             # Scan both added AND deleted lines — deletions of security patterns are suspicious
             is_deletion = line.startswith("-")
             # Skip auto-generated lock files and security test files
-            basename = current_file.rsplit("/", 1)[-1] if "/" in current_file else current_file
+            basename = (
+                current_file.rsplit("/", 1)[-1] if "/" in current_file else current_file
+            )
             if basename in SKIP_FILENAMES:
                 continue
             if any(skip in current_file for skip in SKIP_PATHS_CONTAINING):
@@ -375,7 +540,9 @@ def evaluate_findings(findings: List[Dict[str, str]]) -> Dict[str, Any]:
     high_categories = sorted({f["category"] for f in high})
 
     has_encoded_injection = any(f["category"] == "encoded_injection" for f in findings)
-    medium_escalation = len(medium) >= 20  # sustained medium signals suggest coordinated evasion
+    medium_escalation = (
+        len(medium) >= 20
+    )  # sustained medium signals suggest coordinated evasion
     blocked = has_encoded_injection or len(high) >= 5 or medium_escalation
 
     if blocked:
@@ -410,7 +577,9 @@ def evaluate_findings(findings: List[Dict[str, str]]) -> Dict[str, Any]:
     }
 
 
-def format_findings_report(findings: List[Dict[str, str]], evaluation: Dict[str, Any], context: str = "") -> str:
+def format_findings_report(
+    findings: List[Dict[str, str]], evaluation: Dict[str, Any], context: str = ""
+) -> str:
     """
     Format findings into a markdown report for PR comments and logs.
     Always shows every finding with its location, even when not blocking.
@@ -422,13 +591,21 @@ def format_findings_report(findings: List[Dict[str, str]], evaluation: Dict[str,
 
     lines = []
     if evaluation["blocked"]:
-        lines.append(f"**Blueprint Security Scan**{ctx} — **BLOCKED**: {evaluation['reason']}")
+        lines.append(
+            f"**Blueprint Security Scan**{ctx} — **BLOCKED**: {evaluation['reason']}"
+        )
         lines.append("")
-        lines.append("> This PR requires manual approval before the pipeline can proceed.")
+        lines.append(
+            "> This PR requires manual approval before the pipeline can proceed."
+        )
     else:
-        lines.append(f"**Blueprint Security Scan**{ctx} — Passed with {len(findings)} finding(s)")
+        lines.append(
+            f"**Blueprint Security Scan**{ctx} — Passed with {len(findings)} finding(s)"
+        )
         lines.append("")
-        lines.append("> Below blocking threshold. Isolated matches are common in normal code.")
+        lines.append(
+            "> Below blocking threshold. Isolated matches are common in normal code."
+        )
 
     lines.append("")
     lines.append("| # | Severity | Category | Source | Matched |")
@@ -442,7 +619,9 @@ def format_findings_report(findings: List[Dict[str, str]], evaluation: Dict[str,
         lines.append(f"| {i} | {sev} | {cat} | `{src}` | `{matched}` |")
 
     lines.append("")
-    lines.append("*Blocking threshold: 5+ high-severity, 20+ medium-severity, or any encoded injection.*")
+    lines.append(
+        "*Blocking threshold: 5+ high-severity, 20+ medium-severity, or any encoded injection.*"
+    )
 
     return "\n".join(lines)
 
@@ -459,7 +638,9 @@ _SCAN_CACHE_MAX = 200
 _scan_cache: Dict[Tuple[str, str, str], Tuple[Dict[str, Any], float]] = {}
 
 
-async def scan_pr_for_injection(gh_token: str, owner: str, repo: str, pr_number: int) -> Dict[str, Any]:
+async def scan_pr_for_injection(
+    gh_token: str, owner: str, repo: str, pr_number: int
+) -> Dict[str, Any]:
     """
     Comprehensive PR security scan. Fetches and scans:
       1. PR diff (added lines + file names)
@@ -468,7 +649,11 @@ async def scan_pr_for_injection(gh_token: str, owner: str, repo: str, pr_number:
 
     Returns {"clean": bool, "blocked": bool, "findings": [...], "report": str, "summary": str, "scanned": [...]}
     """
-    from app.github import get_pull_request_diff, get_pull_request, get_pull_request_commits
+    from app.github import (
+        get_pull_request_diff,
+        get_pull_request,
+        get_pull_request_commits,
+    )
     import time as _time
 
     # Cheap pre-check: look up the PR once to get head_sha, then check cache.
@@ -486,7 +671,10 @@ async def scan_pr_for_injection(gh_token: str, owner: str, repo: str, pr_number:
         cached = _scan_cache.get((owner, repo, head_sha))
         if cached is not None and (_time.time() - cached[1]) < _SCAN_CACHE_TTL_S:
             import app.shared_state as _ss  # noqa: PLC0415
-            _ss.github_cache_hits["scan_pr"] = _ss.github_cache_hits.get("scan_pr", 0) + 1
+
+            _ss.github_cache_hits["scan_pr"] = (
+                _ss.github_cache_hits.get("scan_pr", 0) + 1
+            )
             logger.debug(
                 f"[SECURITY] Using cached scan for {owner}/{repo}@{head_sha[:8]} "
                 f"(PR #{pr_number})"

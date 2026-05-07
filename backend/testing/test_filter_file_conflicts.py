@@ -3,6 +3,7 @@
 Mirrors the test pattern in test_direction_health.TestFilterHeldDirections
 for the sibling filter function in the same module.
 """
+
 import uuid
 import pytest
 from unittest.mock import AsyncMock, MagicMock
@@ -136,7 +137,9 @@ class TestFilterFileConflicts:
     async def test_shared_test_files_not_deferred(self):
         pid = uuid.uuid4()
         c = _queued(pid, ["backend/testing/test_foo.py", "backend/testing/test_bar.py"])
-        ip = _in_progress(pid, ["backend/testing/test_foo.py", "backend/testing/test_bar.py"])
+        ip = _in_progress(
+            pid, ["backend/testing/test_foo.py", "backend/testing/test_bar.py"]
+        )
         session = MagicMock()
         broadcast_fn = AsyncMock()
 

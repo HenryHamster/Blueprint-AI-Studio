@@ -13,6 +13,7 @@ Two things are checked per entry:
 These tests pin the pattern contract — any future trim of patterns that
 regresses real-traffic matches will break here loudly.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -25,96 +26,126 @@ from app.providers.registry import get_provider
 OPENAI_CASES = [
     # ── OpenAI API key (sk-) ──────────────────────────────────────────────
     (
-        LLMProviderName.OPENAI, LLMAuthMode.API_KEY,
+        LLMProviderName.OPENAI,
+        LLMAuthMode.API_KEY,
         "You've exceeded the rate limit, please slow down and try again after 60.616292 seconds.",
-        "rate_limit", 60,
+        "rate_limit",
+        60,
     ),
     (
-        LLMProviderName.OPENAI, LLMAuthMode.API_KEY,
+        LLMProviderName.OPENAI,
+        LLMAuthMode.API_KEY,
         "Rate limit reached for o4-mini in organization org-xxx on tokens per min (TPM): "
         "Limit 200000, Used 162960, Requested 42288. Please try again in 1.574s.",
-        "rate_limit", 1,
+        "rate_limit",
+        1,
     ),
     (
-        LLMProviderName.OPENAI, LLMAuthMode.API_KEY,
+        LLMProviderName.OPENAI,
+        LLMAuthMode.API_KEY,
         "You exceeded your current quota, please check your plan and billing details.",
-        "quota_exhausted", None,
+        "quota_exhausted",
+        None,
     ),
     (
-        LLMProviderName.OPENAI, LLMAuthMode.API_KEY,
+        LLMProviderName.OPENAI,
+        LLMAuthMode.API_KEY,
         '{"error":{"message":"...","type":"insufficient_quota","code":"insufficient_quota"}}',
-        "quota_exhausted", None,
+        "quota_exhausted",
+        None,
     ),
     # ── OpenAI ChatGPT / Codex OAuth ─────────────────────────────────────
     (
-        LLMProviderName.OPENAI, LLMAuthMode.OAUTH,
+        LLMProviderName.OPENAI,
+        LLMAuthMode.OAUTH,
         "You're out of Codex messages  Your rate limit resets on 2:49 PM. "
         "To continue using Codex, add credits or upgrade to Pro today.",
-        "quota_exhausted", None,
+        "quota_exhausted",
+        None,
     ),
     (
-        LLMProviderName.OPENAI, LLMAuthMode.OAUTH,
+        LLMProviderName.OPENAI,
+        LLMAuthMode.OAUTH,
         "■ You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage "
         "to purchase more credits or try again at Apr 17th, 2026 6:10 AM.",
-        "rate_limit", None,
+        "rate_limit",
+        None,
     ),
     (
-        LLMProviderName.OPENAI, LLMAuthMode.OAUTH,
+        LLMProviderName.OPENAI,
+        LLMAuthMode.OAUTH,
         "⚠ Insufficient quota: You exceeded your current quota, please check your plan and billing details. "
         "Manage or purchase credits at https://platform.openai.com/account/billing.",
-        "quota_exhausted", None,
+        "quota_exhausted",
+        None,
     ),
     (
-        LLMProviderName.OPENAI, LLMAuthMode.OAUTH,
+        LLMProviderName.OPENAI,
+        LLMAuthMode.OAUTH,
         "ERROR: exceeded retry limit, last status: 429 Too Many Requests",
-        "rate_limit", None,
+        "rate_limit",
+        None,
     ),
 ]
 
 GEMINI_CASES = [
     # ── Gemini API key ────────────────────────────────────────────────────
     (
-        LLMProviderName.GEMINI, LLMAuthMode.API_KEY,
+        LLMProviderName.GEMINI,
+        LLMAuthMode.API_KEY,
         "You exceeded your current quota, please check your plan and billing details. "
         "Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_input_token_count, "
         "limit: 250000, model: gemini-2.5-flash. Please retry in 39.844676573s.",
-        "quota_exhausted", 39,
+        "quota_exhausted",
+        39,
     ),
     (
-        LLMProviderName.GEMINI, LLMAuthMode.API_KEY,
+        LLMProviderName.GEMINI,
+        LLMAuthMode.API_KEY,
         '✕ [API Error: {"error":{"code":429,"status":"Too Many Requests"}}] '
         "Please wait and try again later. To increase your limits, request a quota increase "
         "through AI Studio, or switch to another /auth method",
-        "rate_limit", None,
+        "rate_limit",
+        None,
     ),
     (
-        LLMProviderName.GEMINI, LLMAuthMode.API_KEY,
+        LLMProviderName.GEMINI,
+        LLMAuthMode.API_KEY,
         "Quota exceeded for quota metric 'Gemini 2.5 Pro Requests' and limit "
         "'Gemini 2.5 Pro Requests per day per user per tier' of service 'cloudcode-pa.googleapis.com'.",
-        "rate_limit", None,
+        "rate_limit",
+        None,
     ),
     (
-        LLMProviderName.GEMINI, LLMAuthMode.API_KEY,
+        LLMProviderName.GEMINI,
+        LLMAuthMode.API_KEY,
         "Possible quota limitations in place or slow response times detected. "
         "Switching to the gemini-2.5-flash model for the rest of this session.",
-        "rate_limit", None,
+        "rate_limit",
+        None,
     ),
     (
-        LLMProviderName.GEMINI, LLMAuthMode.API_KEY,
+        LLMProviderName.GEMINI,
+        LLMAuthMode.API_KEY,
         "Resource has been exhausted (e.g. check quota)",
-        "rate_limit", None,
+        "rate_limit",
+        None,
     ),
     # ── Gemini service account (Vertex AI) ───────────────────────────────
     (
-        LLMProviderName.GEMINI, LLMAuthMode.SERVICE_ACCOUNT,
+        LLMProviderName.GEMINI,
+        LLMAuthMode.SERVICE_ACCOUNT,
         "Resource exhausted. Please try again later. "
         "Please refer to https://cloud.google.com/vertex-ai/generative-ai/docs/error-code-429 for more details.",
-        "rate_limit", None,
+        "rate_limit",
+        None,
     ),
     (
-        LLMProviderName.GEMINI, LLMAuthMode.SERVICE_ACCOUNT,
+        LLMProviderName.GEMINI,
+        LLMAuthMode.SERVICE_ACCOUNT,
         "Quota exceeded for metric: aiplatform.googleapis.com/generate_content_requests",
-        "rate_limit", None,
+        "rate_limit",
+        None,
     ),
 ]
 
@@ -128,7 +159,9 @@ def test_classify_rate_limit_signal_verbatim(
 ):
     p = get_provider(provider)
     signal = p.classify_rate_limit_signal(auth_mode, text)
-    assert signal is not None, f"No match for {provider.value}/{auth_mode.value}: {text[:80]!r}"
+    assert signal is not None, (
+        f"No match for {provider.value}/{auth_mode.value}: {text[:80]!r}"
+    )
     assert signal.kind == expected_kind, (
         f"Expected kind={expected_kind} for {provider.value}/{auth_mode.value}: "
         f"{text[:80]!r}; got {signal.kind} (matched={signal.matched_pattern!r})"
@@ -143,14 +176,22 @@ def test_classify_rate_limit_signal_verbatim(
     "provider,auth_mode,text",
     [
         # Generic errors must NOT match any provider's rate-limit classifier.
-        (LLMProviderName.OPENAI, LLMAuthMode.API_KEY, "AssertionError: expected 3, got 4"),
+        (
+            LLMProviderName.OPENAI,
+            LLMAuthMode.API_KEY,
+            "AssertionError: expected 3, got 4",
+        ),
         (LLMProviderName.OPENAI, LLMAuthMode.OAUTH, "ECONNREFUSED connecting to api"),
         (LLMProviderName.GEMINI, LLMAuthMode.API_KEY, "Could not resolve hostname"),
         (LLMProviderName.GEMINI, LLMAuthMode.SERVICE_ACCOUNT, "401 unauthorized"),
         # Anthropic 529 overload is NOT a rate limit.
         (LLMProviderName.OPENAI, LLMAuthMode.OAUTH, "Error: Overloaded"),
         # GCP disk quota is NOT a rate limit (it's a provision failure).
-        (LLMProviderName.GEMINI, LLMAuthMode.SERVICE_ACCOUNT, "disk quota exceeded on /var"),
+        (
+            LLMProviderName.GEMINI,
+            LLMAuthMode.SERVICE_ACCOUNT,
+            "disk quota exceeded on /var",
+        ),
     ],
 )
 def test_classify_rate_limit_signal_no_false_positives(provider, auth_mode, text):

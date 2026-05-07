@@ -1,4 +1,5 @@
 """Tests for the GET /api/admin/provider-cost-summary endpoint."""
+
 import uuid
 from datetime import timedelta
 
@@ -21,7 +22,9 @@ class TestProviderCostSummary:
         assert body["window_hours"] == 24
 
     @pytest.mark.asyncio
-    async def test_aggregates_cost_and_success_by_account(self, client: AsyncClient, db_session):
+    async def test_aggregates_cost_and_success_by_account(
+        self, client: AsyncClient, db_session
+    ):
         project = make_project()
         db_session.add(project)
         await db_session.flush()
@@ -76,9 +79,7 @@ class TestProviderCostSummary:
         assert row["merged_count"] == 1
         assert row["success_rate"] == pytest.approx(0.5, abs=0.001)
 
-        expected_cost = round(
-            3600 * ON_DEMAND_RATE + 3600 * SPOT_RATE, 2
-        )
+        expected_cost = round(3600 * ON_DEMAND_RATE + 3600 * SPOT_RATE, 2)
         assert row["total_cost_usd"] == pytest.approx(expected_cost, abs=0.01)
         assert row["cost_per_merged_pr"] == pytest.approx(expected_cost, abs=0.01)
 
@@ -131,20 +132,28 @@ class TestProviderCostSummary:
         db_session.add(acct)
 
         ctx = {"llm_account_id": str(acct_id)}
-        t_a = make_task(project_id=project_a.id, status=TaskStatus.COMPLETED, context=ctx)
-        t_b = make_task(project_id=project_b.id, status=TaskStatus.COMPLETED, context=ctx)
+        t_a = make_task(
+            project_id=project_a.id, status=TaskStatus.COMPLETED, context=ctx
+        )
+        t_b = make_task(
+            project_id=project_b.id, status=TaskStatus.COMPLETED, context=ctx
+        )
         db_session.add(t_a)
         db_session.add(t_b)
         await db_session.commit()
 
-        resp = await client.get(f"/api/admin/provider-cost-summary?project_id={project_a.id}")
+        resp = await client.get(
+            f"/api/admin/provider-cost-summary?project_id={project_a.id}"
+        )
         assert resp.status_code == 200
         rows = resp.json()["rows"]
         assert len(rows) == 1
         assert rows[0]["total_tasks"] == 1
 
     @pytest.mark.asyncio
-    async def test_no_merged_pr_cost_per_merge_is_null(self, client: AsyncClient, db_session):
+    async def test_no_merged_pr_cost_per_merge_is_null(
+        self, client: AsyncClient, db_session
+    ):
         project = make_project()
         db_session.add(project)
         await db_session.flush()
@@ -174,7 +183,9 @@ class TestProviderCostSummary:
         assert row["merged_count"] == 0
 
     @pytest.mark.asyncio
-    async def test_unknown_account_grouped_as_untracked(self, client: AsyncClient, db_session):
+    async def test_unknown_account_grouped_as_untracked(
+        self, client: AsyncClient, db_session
+    ):
         project = make_project()
         db_session.add(project)
         await db_session.flush()
@@ -196,16 +207,26 @@ class TestProviderCostSummary:
         assert rows[0]["provider"] == "unknown"
 
     @pytest.mark.asyncio
-    async def test_rows_sorted_by_spend_descending(self, client: AsyncClient, db_session):
+    async def test_rows_sorted_by_spend_descending(
+        self, client: AsyncClient, db_session
+    ):
         project = make_project()
         db_session.add(project)
         await db_session.flush()
 
         acct_cheap = MaxPlanAccount(
-            id=uuid.uuid4(), user_id="u", name="Cheap", provider=LLMProviderName.ANTHROPIC, auth_mode=LLMAuthMode.OAUTH
+            id=uuid.uuid4(),
+            user_id="u",
+            name="Cheap",
+            provider=LLMProviderName.ANTHROPIC,
+            auth_mode=LLMAuthMode.OAUTH,
         )
         acct_expensive = MaxPlanAccount(
-            id=uuid.uuid4(), user_id="u", name="Expensive", provider=LLMProviderName.ANTHROPIC, auth_mode=LLMAuthMode.OAUTH
+            id=uuid.uuid4(),
+            user_id="u",
+            name="Expensive",
+            provider=LLMProviderName.ANTHROPIC,
+            auth_mode=LLMAuthMode.OAUTH,
         )
         db_session.add(acct_cheap)
         db_session.add(acct_expensive)

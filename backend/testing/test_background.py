@@ -21,6 +21,7 @@ from app.orchestrator import _check_candidate_task_deps
 # contention when both the fixture session and the reaper session are open
 # concurrently on the same in-memory SQLite connection.
 
+
 @pytest_asyncio.fixture()
 async def reaper_db(mocker):
     """Isolated test DB for reaper tests — avoids StaticPool contention."""
@@ -33,8 +34,11 @@ async def reaper_db(mocker):
         await conn.run_sync(SQLModel.metadata.create_all)
 
     ReaperSession = sessionmaker(
-        bind=reaper_engine, class_=AsyncSession,
-        autocommit=False, autoflush=False, expire_on_commit=False,
+        bind=reaper_engine,
+        class_=AsyncSession,
+        autocommit=False,
+        autoflush=False,
+        expire_on_commit=False,
     )
     mocker.patch("app.reaper.AsyncSessionLocal", ReaperSession)
 
@@ -44,6 +48,7 @@ async def reaper_db(mocker):
     async with reaper_engine.begin() as conn:
         await conn.run_sync(SQLModel.metadata.drop_all)
     await reaper_engine.dispose()
+
 
 @pytest.mark.asyncio
 async def test_reaper_evaluating_sweep_queries_updated_at(reaper_db, mocker):
@@ -61,6 +66,7 @@ async def test_reaper_evaluating_sweep_queries_updated_at(reaper_db, mocker):
 
     class StopLoopException(Exception):
         pass
+
     mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))
 
     project = Project(name="Evaluating Sweep Test", user_id="user1")
@@ -112,6 +118,7 @@ async def test_reaper_service(reaper_db, mocker):
 
     class StopLoopException(Exception):
         pass
+
     mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))
 
     project = Project(name="Reaper Test", user_id="user1")
@@ -125,7 +132,7 @@ async def test_reaper_service(reaper_db, mocker):
         vm_instance_id="orphan-vm",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=3,  # Exhausted retries → reaper should mark FAILED
-        created_at=datetime.now(timezone.utc) - timedelta(hours=2)
+        created_at=datetime.now(timezone.utc) - timedelta(hours=2),
     )
     reaper_db.add(task)
     await reaper_db.commit()
@@ -140,6 +147,7 @@ async def test_reaper_service(reaper_db, mocker):
     assert task.status == TaskStatus.FAILED
     mock_delete.assert_called_once_with("orphan-vm")
 
+
 @pytest.mark.asyncio
 async def test_reaper_retry_path(reaper_db, mocker):
     """
@@ -150,6 +158,7 @@ async def test_reaper_retry_path(reaper_db, mocker):
 
     class StopLoopException(Exception):
         pass
+
     mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))
 
     project = Project(name="Reaper Retry Test", user_id="user1")
@@ -189,6 +198,7 @@ async def test_reaper_retry_preserves_analysis_artifacts(reaper_db, mocker):
 
     class StopLoopException(Exception):
         pass
+
     mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))
 
     project = Project(name="Reaper Artifact Test", user_id="user1")
@@ -224,8 +234,13 @@ async def test_reaper_retry_preserves_analysis_artifacts(reaper_db, mocker):
     assert task.status == TaskStatus.QUEUED
     ctx = task.context or {}
     assert ctx.get("_previous_diff_summary") == original_ctx["_pr_diff_summary"]
-    assert ctx.get("_previous_test_failure_summary") == original_ctx["_test_failure_summary"]
-    assert ctx.get("_previous_self_review_outcome") == original_ctx["_self_review_outcome"]
+    assert (
+        ctx.get("_previous_test_failure_summary")
+        == original_ctx["_test_failure_summary"]
+    )
+    assert (
+        ctx.get("_previous_self_review_outcome") == original_ctx["_self_review_outcome"]
+    )
     assert ctx.get("_previous_analysis_plan") == original_ctx["_analysis_plan"]
 
 
@@ -241,6 +256,7 @@ async def test_reaper_terminal_failure(reaper_db, mocker):
 
     class StopLoopException(Exception):
         pass
+
     mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))
 
     project = Project(name="Reaper Terminal Test", user_id="user1")
@@ -284,6 +300,7 @@ async def test_reaper_persists_failure_category_on_terminal_fail(reaper_db, mock
 
     class StopLoopException(Exception):
         pass
+
     mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))
 
     project = Project(name="Reaper Category Test", user_id="user1")
@@ -323,6 +340,7 @@ async def test_reaper_five_minute_heartbeat_threshold(reaper_db, mocker):
 
     class StopLoopException(Exception):
         pass
+
     mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))
 
     project = Project(name="Reaper Threshold Test", user_id="user1")
@@ -363,6 +381,7 @@ async def test_reaper_parent_task_reevaluation(reaper_db, mocker):
 
     class StopLoopException(Exception):
         pass
+
     mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))
 
     project = Project(name="Reaper Parent Test", user_id="user1")
@@ -412,8 +431,11 @@ async def cleanup_db(mocker):
         await conn.run_sync(SQLModel.metadata.create_all)
 
     Session = sessionmaker(
-        bind=engine, class_=AsyncSession,
-        autocommit=False, autoflush=False, expire_on_commit=False,
+        bind=engine,
+        class_=AsyncSession,
+        autocommit=False,
+        autoflush=False,
+        expire_on_commit=False,
     )
     mocker.patch("app.services.AsyncSessionLocal", Session)
 
@@ -433,7 +455,9 @@ def _uuid_with_prefix(hex8: str) -> uuid.UUID:
 @pytest.mark.asyncio
 async def test_stale_branch_cleanup_preserves_active_task_branch(cleanup_db, mocker):
     """Branches owned by active (non-terminal) tasks must not be deleted."""
-    project = Project(name="Cleanup Test", user_id="user1", github_owner="org", github_repo="repo")
+    project = Project(
+        name="Cleanup Test", user_id="user1", github_owner="org", github_repo="repo"
+    )
     cleanup_db.add(project)
     await cleanup_db.commit()
     await cleanup_db.refresh(project)
@@ -449,9 +473,12 @@ async def test_stale_branch_cleanup_preserves_active_task_branch(cleanup_db, moc
     await cleanup_db.commit()
 
     mocker.patch("app.services._get_project_github_token", return_value="tok")
-    mocker.patch("app.github.list_branches", return_value=[
-        {"name": "blueprint/task-abc12345", "sha": "sha1"},
-    ])
+    mocker.patch(
+        "app.github.list_branches",
+        return_value=[
+            {"name": "blueprint/task-abc12345", "sha": "sha1"},
+        ],
+    )
     mock_delete = mocker.patch("app.github.delete_branch", return_value=True)
 
     await _run_stale_branch_cleanup()
@@ -463,7 +490,9 @@ async def test_stale_branch_cleanup_preserves_active_task_branch(cleanup_db, moc
 @pytest.mark.asyncio
 async def test_stale_branch_cleanup_deletes_orphaned_branch(cleanup_db, mocker):
     """Branches whose owning task is TERMINAL and HEAD commit is stale should be deleted."""
-    project = Project(name="Cleanup Test 2", user_id="user2", github_owner="org", github_repo="repo")
+    project = Project(
+        name="Cleanup Test 2", user_id="user2", github_owner="org", github_repo="repo"
+    )
     cleanup_db.add(project)
     await cleanup_db.commit()
     await cleanup_db.refresh(project)
@@ -478,9 +507,12 @@ async def test_stale_branch_cleanup_deletes_orphaned_branch(cleanup_db, mocker):
     await cleanup_db.commit()
 
     mocker.patch("app.services._get_project_github_token", return_value="tok")
-    mocker.patch("app.github.list_branches", return_value=[
-        {"name": "blueprint/task-deadbeef", "sha": "sha2"},
-    ])
+    mocker.patch(
+        "app.github.list_branches",
+        return_value=[
+            {"name": "blueprint/task-deadbeef", "sha": "sha2"},
+        ],
+    )
     # HEAD commit 10 days old — well past the 2-day stale threshold.
     mocker.patch(
         "app.github.get_commit_date",
@@ -496,17 +528,22 @@ async def test_stale_branch_cleanup_deletes_orphaned_branch(cleanup_db, mocker):
 @pytest.mark.asyncio
 async def test_stale_branch_cleanup_spares_protected_branches(cleanup_db, mocker):
     """Protected branches (main, master, develop) must never be deleted."""
-    project = Project(name="Cleanup Test 3", user_id="user3", github_owner="org", github_repo="repo")
+    project = Project(
+        name="Cleanup Test 3", user_id="user3", github_owner="org", github_repo="repo"
+    )
     cleanup_db.add(project)
     await cleanup_db.commit()
     await cleanup_db.refresh(project)
 
     mocker.patch("app.services._get_project_github_token", return_value="tok")
-    mocker.patch("app.github.list_branches", return_value=[
-        {"name": "main", "sha": "sha3"},
-        {"name": "master", "sha": "sha4"},
-        {"name": "develop", "sha": "sha5"},
-    ])
+    mocker.patch(
+        "app.github.list_branches",
+        return_value=[
+            {"name": "main", "sha": "sha3"},
+            {"name": "master", "sha": "sha4"},
+            {"name": "develop", "sha": "sha5"},
+        ],
+    )
     mock_delete = mocker.patch("app.github.delete_branch", return_value=True)
 
     await _run_stale_branch_cleanup()
@@ -515,11 +552,15 @@ async def test_stale_branch_cleanup_spares_protected_branches(cleanup_db, mocker
 
 
 @pytest.mark.asyncio
-async def test_stale_branch_cleanup_skips_active_task_with_old_updated_at(cleanup_db, mocker):
+async def test_stale_branch_cleanup_skips_active_task_with_old_updated_at(
+    cleanup_db, mocker
+):
     """A task that's still IN_PROGRESS must not have its branch deleted, even if
     the row's updated_at is ancient (which can happen when a long-running task
     predates the cleanup threshold). Gate 5 catches this."""
-    project = Project(name="Cleanup Test 4", user_id="user4", github_owner="org", github_repo="repo")
+    project = Project(
+        name="Cleanup Test 4", user_id="user4", github_owner="org", github_repo="repo"
+    )
     cleanup_db.add(project)
     await cleanup_db.commit()
     await cleanup_db.refresh(project)
@@ -540,9 +581,12 @@ async def test_stale_branch_cleanup_skips_active_task_with_old_updated_at(cleanu
     await cleanup_db.commit()
 
     mocker.patch("app.services._get_project_github_token", return_value="tok")
-    mocker.patch("app.github.list_branches", return_value=[
-        {"name": "blueprint/task-cafef00d", "sha": "sha4"},
-    ])
+    mocker.patch(
+        "app.github.list_branches",
+        return_value=[
+            {"name": "blueprint/task-cafef00d", "sha": "sha4"},
+        ],
+    )
     mock_delete = mocker.patch("app.github.delete_branch", return_value=True)
 
     await _run_stale_branch_cleanup()
@@ -551,18 +595,25 @@ async def test_stale_branch_cleanup_skips_active_task_with_old_updated_at(cleanu
 
 
 @pytest.mark.asyncio
-async def test_stale_branch_cleanup_skips_branch_with_no_matching_task(cleanup_db, mocker):
+async def test_stale_branch_cleanup_skips_branch_with_no_matching_task(
+    cleanup_db, mocker
+):
     """If a branch's short_id doesn't resolve to any task in the DB, skip it —
     we only delete what we can attribute. Gate 4."""
-    project = Project(name="Cleanup Test 5", user_id="user5", github_owner="org", github_repo="repo")
+    project = Project(
+        name="Cleanup Test 5", user_id="user5", github_owner="org", github_repo="repo"
+    )
     cleanup_db.add(project)
     await cleanup_db.commit()
     await cleanup_db.refresh(project)
 
     mocker.patch("app.services._get_project_github_token", return_value="tok")
-    mocker.patch("app.github.list_branches", return_value=[
-        {"name": "blueprint/task-ffffffff", "sha": "sha5"},  # no task owns this
-    ])
+    mocker.patch(
+        "app.github.list_branches",
+        return_value=[
+            {"name": "blueprint/task-ffffffff", "sha": "sha5"},  # no task owns this
+        ],
+    )
     mock_delete = mocker.patch("app.github.delete_branch", return_value=True)
 
     await _run_stale_branch_cleanup()
@@ -571,11 +622,15 @@ async def test_stale_branch_cleanup_skips_branch_with_no_matching_task(cleanup_d
 
 
 @pytest.mark.asyncio
-async def test_stale_branch_cleanup_skips_terminal_task_with_open_pr(cleanup_db, mocker):
+async def test_stale_branch_cleanup_skips_terminal_task_with_open_pr(
+    cleanup_db, mocker
+):
     """COMPLETED task with a PR reference but NO closure marker (pr_merged /
     pr_rejected / pr_closed_unmerged) must keep its branch — the PR may still
     be awaiting review and deleting the branch auto-closes it. Gate 5.5."""
-    project = Project(name="Cleanup PR Test", user_id="userpr", github_owner="org", github_repo="repo")
+    project = Project(
+        name="Cleanup PR Test", user_id="userpr", github_owner="org", github_repo="repo"
+    )
     cleanup_db.add(project)
     await cleanup_db.commit()
     await cleanup_db.refresh(project)
@@ -586,15 +641,23 @@ async def test_stale_branch_cleanup_skips_terminal_task_with_open_pr(cleanup_db,
         payloads=[{"type": "create"}],
         status=TaskStatus.COMPLETED,
         # PR reference present, no closure flag — PR may still be open.
-        context={"review_loop": {"pr_number": 42, "pr_url": "https://github.com/org/repo/pull/42"}},
+        context={
+            "review_loop": {
+                "pr_number": 42,
+                "pr_url": "https://github.com/org/repo/pull/42",
+            }
+        },
     )
     cleanup_db.add(task)
     await cleanup_db.commit()
 
     mocker.patch("app.services._get_project_github_token", return_value="tok")
-    mocker.patch("app.github.list_branches", return_value=[
-        {"name": "blueprint/task-beef0001", "sha": "shapr"},
-    ])
+    mocker.patch(
+        "app.github.list_branches",
+        return_value=[
+            {"name": "blueprint/task-beef0001", "sha": "shapr"},
+        ],
+    )
     # Commit is well past the stale threshold — only Gate 5.5 should hold.
     mocker.patch(
         "app.github.get_commit_date",
@@ -608,11 +671,18 @@ async def test_stale_branch_cleanup_skips_terminal_task_with_open_pr(cleanup_db,
 
 
 @pytest.mark.asyncio
-async def test_stale_branch_cleanup_deletes_terminal_task_with_merged_pr(cleanup_db, mocker):
+async def test_stale_branch_cleanup_deletes_terminal_task_with_merged_pr(
+    cleanup_db, mocker
+):
     """COMPLETED task whose PR merged (pr_merged=True) is safe to clean up
     once stale. Confirms Gate 5.5 doesn't over-block when a closure marker
     is present."""
-    project = Project(name="Cleanup Merged PR Test", user_id="usermerged", github_owner="org", github_repo="repo")
+    project = Project(
+        name="Cleanup Merged PR Test",
+        user_id="usermerged",
+        github_owner="org",
+        github_repo="repo",
+    )
     cleanup_db.add(project)
     await cleanup_db.commit()
     await cleanup_db.refresh(project)
@@ -631,9 +701,12 @@ async def test_stale_branch_cleanup_deletes_terminal_task_with_merged_pr(cleanup
     await cleanup_db.commit()
 
     mocker.patch("app.services._get_project_github_token", return_value="tok")
-    mocker.patch("app.github.list_branches", return_value=[
-        {"name": "blueprint/task-beef0002", "sha": "shamerged"},
-    ])
+    mocker.patch(
+        "app.github.list_branches",
+        return_value=[
+            {"name": "blueprint/task-beef0002", "sha": "shamerged"},
+        ],
+    )
     mocker.patch(
         "app.github.get_commit_date",
         return_value=datetime.utcnow() - timedelta(days=10),
@@ -649,7 +722,9 @@ async def test_stale_branch_cleanup_deletes_terminal_task_with_merged_pr(cleanup
 async def test_stale_branch_cleanup_skips_recent_terminal_task(cleanup_db, mocker):
     """Terminal task whose branch HEAD commit is fresher than the stale
     threshold (2d) should keep its branch. Gate 6."""
-    project = Project(name="Cleanup Test 6", user_id="user6", github_owner="org", github_repo="repo")
+    project = Project(
+        name="Cleanup Test 6", user_id="user6", github_owner="org", github_repo="repo"
+    )
     cleanup_db.add(project)
     await cleanup_db.commit()
     await cleanup_db.refresh(project)
@@ -664,9 +739,12 @@ async def test_stale_branch_cleanup_skips_recent_terminal_task(cleanup_db, mocke
     await cleanup_db.commit()
 
     mocker.patch("app.services._get_project_github_token", return_value="tok")
-    mocker.patch("app.github.list_branches", return_value=[
-        {"name": "blueprint/task-12345678", "sha": "sha6"},
-    ])
+    mocker.patch(
+        "app.github.list_branches",
+        return_value=[
+            {"name": "blueprint/task-12345678", "sha": "sha6"},
+        ],
+    )
     # HEAD commit 12 hours old — well inside the 2-day stale buffer.
     mocker.patch(
         "app.github.get_commit_date",
@@ -689,6 +767,7 @@ async def test_broadcast_to_project():
 
     class FakeWebSocket:
         """Minimal mock that records sent JSON messages."""
+
         async def send_json(self, data):
             sent_messages.append(data)
 
@@ -696,6 +775,7 @@ async def test_broadcast_to_project():
         def client(self):
             class _Client:
                 host = "127.0.0.1"
+
             return _Client()
 
     ws = FakeWebSocket()
@@ -714,6 +794,7 @@ async def test_broadcast_to_project():
 
 # ── _requeue_parent_task retry guidance ────────────────────────────────────
 
+
 @pytest_asyncio.fixture()
 async def requeue_db(mocker):
     """Isolated in-memory DB for _requeue_parent_task tests."""
@@ -726,8 +807,11 @@ async def requeue_db(mocker):
         await conn.run_sync(SQLModel.metadata.create_all)
 
     Session = sessionmaker(
-        bind=engine, class_=AsyncSession,
-        autocommit=False, autoflush=False, expire_on_commit=False,
+        bind=engine,
+        class_=AsyncSession,
+        autocommit=False,
+        autoflush=False,
+        expire_on_commit=False,
     )
 
     async with Session() as session:
@@ -738,7 +822,9 @@ async def requeue_db(mocker):
     await engine.dispose()
 
 
-async def _make_parent_child(session, child_payloads, child_context=None, child_status_message=None):
+async def _make_parent_child(
+    session, child_payloads, child_context=None, child_status_message=None
+):
     """Helper: create a parent+child pair, commit, return (parent, child)."""
     project = Project(name="Requeue Test", user_id="user1")
     session.add(project)
@@ -783,9 +869,17 @@ async def test_requeue_agent_timeout_injects_scope_guidance(requeue_db, mocker):
 
     await _requeue_parent_task(parent, requeue_db)
 
-    clones = (await requeue_db.execute(
-        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
-    )).scalars().all()
+    clones = (
+        (
+            await requeue_db.execute(
+                select(Task).where(
+                    Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
     assert len(clones) == 1
     suffix = (clones[0].payloads or [{}])[0].get("prompt_suffix", "")
     assert "TIMED OUT" in suffix
@@ -793,7 +887,9 @@ async def test_requeue_agent_timeout_injects_scope_guidance(requeue_db, mocker):
 
 
 @pytest.mark.asyncio
-async def test_requeue_code_error_test_failure_injects_test_guidance(requeue_db, mocker):
+async def test_requeue_code_error_test_failure_injects_test_guidance(
+    requeue_db, mocker
+):
     """CODE_ERROR with test keywords in status message injects test-fixing guidance."""
     mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
 
@@ -805,9 +901,17 @@ async def test_requeue_code_error_test_failure_injects_test_guidance(requeue_db,
 
     await _requeue_parent_task(parent, requeue_db)
 
-    clones = (await requeue_db.execute(
-        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
-    )).scalars().all()
+    clones = (
+        (
+            await requeue_db.execute(
+                select(Task).where(
+                    Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
     assert len(clones) == 1
     suffix = (clones[0].payloads or [{}])[0].get("prompt_suffix", "")
     assert "RETRY GUIDANCE" in suffix
@@ -815,7 +919,9 @@ async def test_requeue_code_error_test_failure_injects_test_guidance(requeue_db,
 
 
 @pytest.mark.asyncio
-async def test_requeue_code_error_lint_failure_injects_lint_guidance(requeue_db, mocker):
+async def test_requeue_code_error_lint_failure_injects_lint_guidance(
+    requeue_db, mocker
+):
     """CODE_ERROR with lint keywords injects lint-fixing guidance."""
     mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
 
@@ -827,9 +933,17 @@ async def test_requeue_code_error_lint_failure_injects_lint_guidance(requeue_db,
 
     await _requeue_parent_task(parent, requeue_db)
 
-    clones = (await requeue_db.execute(
-        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
-    )).scalars().all()
+    clones = (
+        (
+            await requeue_db.execute(
+                select(Task).where(
+                    Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
     assert len(clones) == 1
     suffix = (clones[0].payloads or [{}])[0].get("prompt_suffix", "")
     assert "RETRY GUIDANCE" in suffix
@@ -850,9 +964,17 @@ async def test_requeue_large_scope_second_timeout_downgrades_scope(requeue_db, m
 
     await _requeue_parent_task(parent, requeue_db)
 
-    clones = (await requeue_db.execute(
-        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
-    )).scalars().all()
+    clones = (
+        (
+            await requeue_db.execute(
+                select(Task).where(
+                    Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
     assert len(clones) == 1
     clone_ctx = clones[0].context or {}
     assert clone_ctx.get("scope") == "medium"
@@ -873,9 +995,17 @@ async def test_requeue_large_scope_first_timeout_no_scope_downgrade(requeue_db, 
 
     await _requeue_parent_task(parent, requeue_db)
 
-    clones = (await requeue_db.execute(
-        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
-    )).scalars().all()
+    clones = (
+        (
+            await requeue_db.execute(
+                select(Task).where(
+                    Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
     assert len(clones) == 1
     clone_ctx = clones[0].context or {}
     # scope should not be changed to medium on first timeout
@@ -896,9 +1026,17 @@ async def test_requeue_rate_limit_no_scope_guidance(requeue_db, mocker):
 
     await _requeue_parent_task(parent, requeue_db)
 
-    clones = (await requeue_db.execute(
-        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
-    )).scalars().all()
+    clones = (
+        (
+            await requeue_db.execute(
+                select(Task).where(
+                    Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
     assert len(clones) == 1
     # RATE_LIMIT gets retry-strategy guidance (backoff/Retry-After) but NOT
     # the scope-reduction language reserved for AGENT_TIMEOUT — a rate limit
@@ -923,9 +1061,17 @@ async def test_requeue_sets_retry_context_fields(requeue_db, mocker):
 
     await _requeue_parent_task(parent, requeue_db)
 
-    clones = (await requeue_db.execute(
-        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
-    )).scalars().all()
+    clones = (
+        (
+            await requeue_db.execute(
+                select(Task).where(
+                    Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
     assert len(clones) == 1
     clone_ctx = clones[0].context or {}
 
@@ -947,7 +1093,14 @@ async def test_requeue_propagates_pr_artifacts_to_retry_context(requeue_db, mock
 
     parent, _child = await _make_parent_child(
         requeue_db,
-        child_payloads=[{"type": "fix", "prompt": "fix the bug", "pr_number": 42, "branch": "fix/bug"}],
+        child_payloads=[
+            {
+                "type": "fix",
+                "prompt": "fix the bug",
+                "pr_number": 42,
+                "branch": "fix/bug",
+            }
+        ],
         child_context={
             "_attempt_number": 1,
             "_pr_url": pr_url,
@@ -958,9 +1111,17 @@ async def test_requeue_propagates_pr_artifacts_to_retry_context(requeue_db, mock
 
     await _requeue_parent_task(parent, requeue_db)
 
-    clones = (await requeue_db.execute(
-        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
-    )).scalars().all()
+    clones = (
+        (
+            await requeue_db.execute(
+                select(Task).where(
+                    Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
     assert len(clones) == 1
     clone_ctx = clones[0].context or {}
 
@@ -971,7 +1132,9 @@ async def test_requeue_propagates_pr_artifacts_to_retry_context(requeue_db, mock
 
 
 @pytest.mark.asyncio
-async def test_requeue_propagates_file_change_details_to_retry_context(requeue_db, mocker):
+async def test_requeue_propagates_file_change_details_to_retry_context(
+    requeue_db, mocker
+):
     """clone_ctx contains _previous_file_change_details from the failed child's context."""
     mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
 
@@ -992,9 +1155,17 @@ async def test_requeue_propagates_file_change_details_to_retry_context(requeue_d
 
     await _requeue_parent_task(parent, requeue_db)
 
-    clones = (await requeue_db.execute(
-        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
-    )).scalars().all()
+    clones = (
+        (
+            await requeue_db.execute(
+                select(Task).where(
+                    Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
     assert len(clones) == 1
     clone_ctx = clones[0].context or {}
 
@@ -1015,9 +1186,17 @@ async def test_requeue_no_pr_artifacts_when_child_has_none(requeue_db, mocker):
 
     await _requeue_parent_task(parent, requeue_db)
 
-    clones = (await requeue_db.execute(
-        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
-    )).scalars().all()
+    clones = (
+        (
+            await requeue_db.execute(
+                select(Task).where(
+                    Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
     assert len(clones) == 1
     clone_ctx = clones[0].context or {}
 
@@ -1033,11 +1212,27 @@ async def test_requeue_propagates_enriched_step_context(requeue_db, mocker):
     mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
 
     diff_summary = [
-        {"file": "backend/app/models.py", "additions": 45, "deletions": 12, "change_type": "modified"},
-        {"file": "backend/testing/test_models.py", "additions": 30, "deletions": 0, "change_type": "added"},
+        {
+            "file": "backend/app/models.py",
+            "additions": 45,
+            "deletions": 12,
+            "change_type": "modified",
+        },
+        {
+            "file": "backend/testing/test_models.py",
+            "additions": 30,
+            "deletions": 0,
+            "change_type": "added",
+        },
     ]
-    test_failure_summary = "FAILED testing/test_models.py::test_create - AssertionError: expected 1 got 2"
-    self_review_outcome = {"issues_found": False, "fixes_applied": False, "categories": []}
+    test_failure_summary = (
+        "FAILED testing/test_models.py::test_create - AssertionError: expected 1 got 2"
+    )
+    self_review_outcome = {
+        "issues_found": False,
+        "fixes_applied": False,
+        "categories": [],
+    }
 
     parent, _child = await _make_parent_child(
         requeue_db,
@@ -1053,9 +1248,17 @@ async def test_requeue_propagates_enriched_step_context(requeue_db, mocker):
 
     await _requeue_parent_task(parent, requeue_db)
 
-    clones = (await requeue_db.execute(
-        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
-    )).scalars().all()
+    clones = (
+        (
+            await requeue_db.execute(
+                select(Task).where(
+                    Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
     assert len(clones) == 1
     clone_ctx = clones[0].context or {}
 
@@ -1078,9 +1281,17 @@ async def test_requeue_omits_enriched_step_context_when_absent(requeue_db, mocke
 
     await _requeue_parent_task(parent, requeue_db)
 
-    clones = (await requeue_db.execute(
-        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
-    )).scalars().all()
+    clones = (
+        (
+            await requeue_db.execute(
+                select(Task).where(
+                    Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
     assert len(clones) == 1
     clone_ctx = clones[0].context or {}
 
@@ -1176,7 +1387,9 @@ async def test_requeue_count_limit_boundary_succeeds(requeue_db, mocker):
 @pytest.mark.asyncio
 async def test_requeue_count_limit_at_limit_fails_permanently(requeue_db, mocker):
     """Parent with _requeue_count=3 (at MAX_PARENT_REQUEUES) is set to FAILED and alert fired."""
-    mock_alert = mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mock_alert = mocker.patch(
+        "app.main._maybe_create_failure_alert", new_callable=AsyncMock
+    )
 
     parent, _child = await _make_parent_child(
         requeue_db,
@@ -1197,9 +1410,17 @@ async def test_requeue_count_limit_at_limit_fails_permanently(requeue_db, mocker
     assert "3" in parent.latest_status_message
     mock_alert.assert_called_once()
     # No clones should have been created
-    clones = (await requeue_db.execute(
-        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
-    )).scalars().all()
+    clones = (
+        (
+            await requeue_db.execute(
+                select(Task).where(
+                    Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
     assert len(clones) == 0
 
 
@@ -1221,9 +1442,17 @@ async def test_requeue_cancelled_parent_returns_zero(requeue_db, mocker):
     result = await _requeue_parent_task(parent, requeue_db)
 
     assert result == 0
-    clones = (await requeue_db.execute(
-        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
-    )).scalars().all()
+    clones = (
+        (
+            await requeue_db.execute(
+                select(Task).where(
+                    Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
     assert len(clones) == 0
 
 
@@ -1238,18 +1467,38 @@ async def test_requeue_dependency_remapping(requeue_db, mocker):
     parent, children = await _make_parent_with_children(
         requeue_db,
         [
-            {"payloads": [{"type": "create", "prompt": "task A"}], "status": TaskStatus.FAILED, "status_message": "ruff lint error"},
-            {"payloads": [{"type": "create", "prompt": "task B"}], "status": TaskStatus.FAILED, "status_message": "ruff lint error", "depends_on_indices": [0, 2]},
-            {"payloads": [{"type": "create", "prompt": "task C"}], "status": TaskStatus.COMPLETED},
+            {
+                "payloads": [{"type": "create", "prompt": "task A"}],
+                "status": TaskStatus.FAILED,
+                "status_message": "ruff lint error",
+            },
+            {
+                "payloads": [{"type": "create", "prompt": "task B"}],
+                "status": TaskStatus.FAILED,
+                "status_message": "ruff lint error",
+                "depends_on_indices": [0, 2],
+            },
+            {
+                "payloads": [{"type": "create", "prompt": "task C"}],
+                "status": TaskStatus.COMPLETED,
+            },
         ],
     )
     child_a, child_b, child_c = children
 
     await _requeue_parent_task(parent, requeue_db)
 
-    clones = (await requeue_db.execute(
-        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
-    )).scalars().all()
+    clones = (
+        (
+            await requeue_db.execute(
+                select(Task).where(
+                    Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
     assert len(clones) == 2
 
     clones_by_prompt = {c.payloads[0]["prompt"]: c for c in clones}
@@ -1272,16 +1521,34 @@ async def test_requeue_cycle_detection_clears_all_depends_on(requeue_db, mocker)
     parent, _children = await _make_parent_with_children(
         requeue_db,
         [
-            {"payloads": [{"type": "create", "prompt": "task A"}], "status": TaskStatus.FAILED, "status_message": "ruff lint error", "depends_on_indices": [1]},
-            {"payloads": [{"type": "create", "prompt": "task B"}], "status": TaskStatus.FAILED, "status_message": "ruff lint error", "depends_on_indices": [0]},
+            {
+                "payloads": [{"type": "create", "prompt": "task A"}],
+                "status": TaskStatus.FAILED,
+                "status_message": "ruff lint error",
+                "depends_on_indices": [1],
+            },
+            {
+                "payloads": [{"type": "create", "prompt": "task B"}],
+                "status": TaskStatus.FAILED,
+                "status_message": "ruff lint error",
+                "depends_on_indices": [0],
+            },
         ],
     )
 
     await _requeue_parent_task(parent, requeue_db)
 
-    clones = (await requeue_db.execute(
-        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
-    )).scalars().all()
+    clones = (
+        (
+            await requeue_db.execute(
+                select(Task).where(
+                    Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
     assert len(clones) == 2
     # All depends_on must be cleared due to cycle detection
     for clone in clones:
@@ -1302,9 +1569,17 @@ async def test_requeue_strips_max_plan_account_id(requeue_db, mocker):
 
     await _requeue_parent_task(parent, requeue_db)
 
-    clones = (await requeue_db.execute(
-        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
-    )).scalars().all()
+    clones = (
+        (
+            await requeue_db.execute(
+                select(Task).where(
+                    Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
     assert len(clones) == 1
     clone_ctx = clones[0].context or {}
     assert "max_plan_account_id" not in clone_ctx
@@ -1333,9 +1608,17 @@ async def test_requeue_clone_strips_provision_state(requeue_db, mocker):
 
     await _requeue_parent_task(parent, requeue_db)
 
-    clones = (await requeue_db.execute(
-        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
-    )).scalars().all()
+    clones = (
+        (
+            await requeue_db.execute(
+                select(Task).where(
+                    Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
     assert len(clones) == 1
     clone_ctx = clones[0].context or {}
     assert "provision_failures" not in clone_ctx
@@ -1354,7 +1637,9 @@ async def test_requeue_refreshes_base_branch_from_plan_branch(requeue_db, mocker
 
     parent, _child = await _make_parent_child(
         requeue_db,
-        child_payloads=[{"type": "create", "prompt": "task", "base_branch": "old-deleted-branch"}],
+        child_payloads=[
+            {"type": "create", "prompt": "task", "base_branch": "old-deleted-branch"}
+        ],
         child_status_message="ruff lint error",
     )
     parent.context = {"plan_branch": "plan/abc123"}
@@ -1364,9 +1649,17 @@ async def test_requeue_refreshes_base_branch_from_plan_branch(requeue_db, mocker
 
     await _requeue_parent_task(parent, requeue_db)
 
-    clones = (await requeue_db.execute(
-        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
-    )).scalars().all()
+    clones = (
+        (
+            await requeue_db.execute(
+                select(Task).where(
+                    Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
     assert len(clones) == 1
     assert clones[0].payloads[0].get("base_branch") == "plan/abc123"
 
@@ -1378,7 +1671,9 @@ async def test_requeue_refreshes_base_branch_from_research_branch(requeue_db, mo
 
     parent, _child = await _make_parent_child(
         requeue_db,
-        child_payloads=[{"type": "create", "prompt": "task", "base_branch": "stale-branch"}],
+        child_payloads=[
+            {"type": "create", "prompt": "task", "base_branch": "stale-branch"}
+        ],
         child_status_message="ruff lint error",
     )
     parent.context = {"research_branch": "research/xyz456"}
@@ -1388,9 +1683,17 @@ async def test_requeue_refreshes_base_branch_from_research_branch(requeue_db, mo
 
     await _requeue_parent_task(parent, requeue_db)
 
-    clones = (await requeue_db.execute(
-        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
-    )).scalars().all()
+    clones = (
+        (
+            await requeue_db.execute(
+                select(Task).where(
+                    Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
     assert len(clones) == 1
     assert clones[0].payloads[0].get("base_branch") == "research/xyz456"
 
@@ -1403,7 +1706,9 @@ def _common_reaper_mocks(mocker):
     mocker.patch("app.main.delete_agent_vm", return_value=True)
     mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
     mocker.patch("app.routers.agent_status.record_task_result")
-    mocker.patch("app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock)
+    mocker.patch(
+        "app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock
+    )
     mocker.patch("app.max_plan_pool.release_max_plan_account", new_callable=AsyncMock)
 
 
@@ -1416,7 +1721,9 @@ async def test_reaper_infra_provision_failure_no_retry_budget_burn(reaper_db, mo
     """Infra-wide provision failures (e.g. quota exhausted) must NOT increment
     provision_failures — only provision_failures_infra — and must requeue the task."""
     _common_reaper_mocks(mocker)
-    mocker.patch("app.reaper.get_provision_error", return_value="quota exceeded for region")
+    mocker.patch(
+        "app.reaper.get_provision_error", return_value="quota exceeded for region"
+    )
     mocker.patch("app.reaper.any_zone_available", return_value=True)
     mocker.patch("app.reaper.soonest_zone_recovery", return_value=None)
     mocker.patch("app.reaper.record_zone_failure")
@@ -1462,7 +1769,10 @@ async def test_reaper_account_provision_failure_burns_retry_budget(reaper_db, mo
     provision_failures and requeue while retries remain."""
     _common_reaper_mocks(mocker)
     # Non-infra error — does NOT match INFRA_PROVISION_PATTERNS
-    mocker.patch("app.reaper.get_provision_error", return_value="vm startup error: agent never claimed")
+    mocker.patch(
+        "app.reaper.get_provision_error",
+        return_value="vm startup error: agent never claimed",
+    )
     mocker.patch("app.reaper.any_zone_available", return_value=True)
     mocker.patch("app.reaper.record_zone_failure")
     mocker.patch("asyncio.to_thread", new_callable=AsyncMock, return_value=None)
@@ -1551,12 +1861,18 @@ async def test_reaper_infra_provision_failure_with_zone_recovery(reaper_db, mock
 
 
 @pytest.mark.asyncio
-async def test_reaper_rate_limit_requeue_without_burning_retry_budget(reaper_db, mocker):
+async def test_reaper_rate_limit_requeue_without_burning_retry_budget(
+    reaper_db, mocker
+):
     """Rate-limited tasks are requeued immediately without incrementing attempt_count,
     the account is blacklisted, and disable_account_model is called."""
     _common_reaper_mocks(mocker)
-    mock_disable = mocker.patch("app.max_plan_pool.disable_account_model", new_callable=AsyncMock)
-    mocker.patch("app.max_plan_pool._extract_task_model", return_value="claude-sonnet-4-6")
+    mock_disable = mocker.patch(
+        "app.max_plan_pool.disable_account_model", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.max_plan_pool._extract_task_model", return_value="claude-sonnet-4-6"
+    )
     mocker.patch("asyncio.sleep", side_effect=_StopLoop("Stop"))
 
     project = Project(name="Rate Limit Test", user_id="user1")
@@ -1603,13 +1919,17 @@ async def test_reaper_rate_limit_requeue_without_burning_retry_budget(reaper_db,
     # through; on a generic Anthropic rate-limit message the signal resolves
     # to the baseline (no retry hint, plain rate_limit kind).
     mock_disable.assert_called_once_with(
-        "rl-acct-123", "claude-sonnet-4-6",
-        retry_after_seconds=None, kind="rate_limit",
+        "rl-acct-123",
+        "claude-sonnet-4-6",
+        retry_after_seconds=None,
+        kind="rate_limit",
     )
 
 
 @pytest.mark.asyncio
-async def test_reaper_rate_limit_disable_account_model_failure_handled_gracefully(reaper_db, mocker):
+async def test_reaper_rate_limit_disable_account_model_failure_handled_gracefully(
+    reaper_db, mocker
+):
     """If disable_account_model raises on both attempts, the reaper still requeues the task,
     the account is blacklisted at the task level, and the error is logged at ERROR level."""
     _common_reaper_mocks(mocker)
@@ -1618,7 +1938,9 @@ async def test_reaper_rate_limit_disable_account_model_failure_handled_gracefull
         new_callable=AsyncMock,
         side_effect=RuntimeError("pool unavailable"),
     )
-    mocker.patch("app.max_plan_pool._extract_task_model", return_value="claude-sonnet-4-6")
+    mocker.patch(
+        "app.max_plan_pool._extract_task_model", return_value="claude-sonnet-4-6"
+    )
 
     # Allow the 1-second retry sleep through; raise _StopLoop on the next loop sleep
     sleep_calls = []
@@ -1668,7 +1990,9 @@ async def test_reaper_rate_limit_disable_account_model_failure_handled_gracefull
 
 
 @pytest.mark.asyncio
-async def test_reaper_rate_limit_disable_account_model_retry_succeeds(reaper_db, mocker):
+async def test_reaper_rate_limit_disable_account_model_retry_succeeds(
+    reaper_db, mocker
+):
     """If disable_account_model fails on first attempt but succeeds on retry, task is still requeued."""
     _common_reaper_mocks(mocker)
     call_count = 0
@@ -1687,7 +2011,9 @@ async def test_reaper_rate_limit_disable_account_model_retry_succeeds(reaper_db,
         new_callable=AsyncMock,
         side_effect=_disable_side_effect,
     )
-    mocker.patch("app.max_plan_pool._extract_task_model", return_value="claude-sonnet-4-6")
+    mocker.patch(
+        "app.max_plan_pool._extract_task_model", return_value="claude-sonnet-4-6"
+    )
 
     sleep_calls = []
 
@@ -1764,7 +2090,9 @@ def _make_sqlite_compat_asl(real_asl, project_id, blocked_id_str):
                     class _FakeScalars:
                         def all(self_2):
                             return matching
+
                     return _FakeScalars()
+
             return _FakeResult()
 
         def add(self, obj):
@@ -1833,6 +2161,7 @@ async def test_reaper_unblocks_dependent_tasks_on_terminal_failure(reaper_db, mo
     # SQLite does not support the JSONB @> operator used in the dep-unblocking
     # query.  Patch AsyncSessionLocal so the dep_session uses Python-level filtering.
     import app.reaper as _reaper_mod
+
     compat_asl = _make_sqlite_compat_asl(
         _reaper_mod.AsyncSessionLocal,
         project.id,
@@ -1889,6 +2218,7 @@ async def test_reaper_dep_unblocking_error_does_not_crash_reaper(reaper_db, mock
             pass
 
     import app.reaper as _reaper_mod
+
     _real_asl = _reaper_mod.AsyncSessionLocal
     _dep_call_count = 0
 
@@ -1924,7 +2254,9 @@ def clear_reaper_skip_counts():
 
 
 @pytest.mark.asyncio
-async def test_reaper_force_lock_failure_clears_tracking_state(reaper_db, mocker, clear_reaper_skip_counts):
+async def test_reaper_force_lock_failure_clears_tracking_state(
+    reaper_db, mocker, clear_reaper_skip_counts
+):
     """When a force-lock attempt fails (e.g. lock_timeout), the skip-count entry for
     that task ID must be cleared so the reaper retries on the next cycle rather than
     re-attempting the force-lock endlessly."""
@@ -1963,7 +2295,9 @@ async def test_reaper_force_lock_failure_clears_tracking_state(reaper_db, mocker
 
 
 @pytest.mark.asyncio
-async def test_reaper_force_lock_threshold_is_five(reaper_db, mocker, clear_reaper_skip_counts):
+async def test_reaper_force_lock_threshold_is_five(
+    reaper_db, mocker, clear_reaper_skip_counts
+):
     """Tasks with skip count < 5 must NOT trigger a force-lock attempt; only at 5+
     does the force-lock execute. Verify by checking that count=4 entries survive
     a reaper cycle as part of normal skip-count tracking (not prematurely cleared)."""
@@ -2031,9 +2365,17 @@ async def test_requeue_stores_replaced_by_task_id(requeue_db, mocker):
     await _requeue_parent_task(parent, requeue_db)
 
     await requeue_db.refresh(child)
-    clone = (await requeue_db.execute(
-        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
-    )).scalars().first()
+    clone = (
+        (
+            await requeue_db.execute(
+                select(Task).where(
+                    Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
 
     assert clone is not None
     assert child.status == TaskStatus.CANCELLED
@@ -2113,7 +2455,9 @@ async def test_check_deps_remap_to_clone(requeue_db, mocker):
     # COMPLETED clone — this will cause 'eligible' result
     clone = Task(
         project_id=project.id,
-        payloads=[{"type": "fix", "prompt": "clone", "pr_number": 1, "branch": "fix/1"}],
+        payloads=[
+            {"type": "fix", "prompt": "clone", "pr_number": 1, "branch": "fix/1"}
+        ],
         status=TaskStatus.COMPLETED,
     )
     requeue_db.add(clone)
@@ -2122,7 +2466,9 @@ async def test_check_deps_remap_to_clone(requeue_db, mocker):
 
     cancelled_child = Task(
         project_id=project.id,
-        payloads=[{"type": "fix", "prompt": "original", "pr_number": 1, "branch": "fix/1"}],
+        payloads=[
+            {"type": "fix", "prompt": "original", "pr_number": 1, "branch": "fix/1"}
+        ],
         status=TaskStatus.CANCELLED,
         latest_status_message="Parent requeued — replaced by retry",
         context={"_replaced_by_task_id": str(clone.id)},
@@ -2238,6 +2584,7 @@ async def test_check_deps_failed_dep_triggers_cascade(requeue_db, mocker):
 # Diagnostic observability — compute.py helpers
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 def test_capture_serial_for_vm_logs_on_failure(caplog, mocker):
     """
     _capture_serial_for_vm must not swallow exceptions silently — it is the
@@ -2278,6 +2625,7 @@ def test_provision_gcp_script_has_settle_window_before_success_heartbeat():
     service-start block and the success-heartbeat curl.
     """
     import inspect
+
     # The bash startup script body was moved out of compute._provision_gcp
     # into compute_startup_script.build_agent_startup_script (commit 55156451).
     # Read source from the new home.
@@ -2319,15 +2667,19 @@ def test_provision_gcp_script_has_settle_window_before_success_heartbeat():
 # Tests for the all-children-failed EVALUATING parent rescue (Step 4 in reaper)
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_reaper_rescues_evaluating_parent_all_children_failed(reaper_db, mocker):
     """EVALUATING parent whose children ALL failed and requeue limit exhausted is set to FAILED."""
     mocker.patch("app.main.delete_agent_vm", return_value=True)
     mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
-    mocker.patch("app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock)
+    mocker.patch(
+        "app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock
+    )
 
     class StopLoopException(Exception):
         pass
+
     mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))
 
     project = Project(name="All-Failed Rescue Test", user_id="user1")
@@ -2378,10 +2730,13 @@ async def test_reaper_does_not_rescue_parent_with_running_children(reaper_db, mo
     """EVALUATING parent with at least one still-running child must NOT be rescued prematurely."""
     mocker.patch("app.main.delete_agent_vm", return_value=True)
     mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
-    mocker.patch("app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock)
+    mocker.patch(
+        "app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock
+    )
 
     class StopLoopException(Exception):
         pass
+
     mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))
 
     project = Project(name="Running Child Test", user_id="user1")
@@ -2429,10 +2784,13 @@ async def test_reaper_failure_message_includes_failure_classes(reaper_db, mocker
     """Rescued parent failure message includes each child's failure_category."""
     mocker.patch("app.main.delete_agent_vm", return_value=True)
     mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
-    mocker.patch("app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock)
+    mocker.patch(
+        "app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock
+    )
 
     class StopLoopException(Exception):
         pass
+
     mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))
 
     project = Project(name="Failure Class Msg Test", user_id="user1")
@@ -2477,13 +2835,16 @@ async def test_reaper_parent_rescue_calls_requeue_before_failing(reaper_db, mock
     instead of being immediately set to FAILED when the requeue budget is not exhausted."""
     mocker.patch("app.main.delete_agent_vm", return_value=True)
     mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
-    mocker.patch("app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock)
+    mocker.patch(
+        "app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock
+    )
     mock_requeue = mocker.patch(
         "app.task_lifecycle._requeue_parent_task", new_callable=AsyncMock
     )
 
     class StopLoopException(Exception):
         pass
+
     mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))
 
     project = Project(name="Requeue Rescue Test", user_id="user1")
@@ -2536,13 +2897,17 @@ def _common_infra_recovery_mocks(mocker):
     """Mocks needed for infra-recovery sweep tests (no active/orphaned tasks)."""
     mocker.patch("app.main.delete_agent_vm", return_value=True)
     mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
-    mocker.patch("app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock)
+    mocker.patch(
+        "app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock
+    )
     mocker.patch("app.max_plan_pool.release_max_plan_account", new_callable=AsyncMock)
     mocker.patch("asyncio.sleep", side_effect=_StopLoop("Stop"))
 
 
 @pytest.mark.asyncio
-async def test_infra_recovery_resurrects_provision_failure_when_zone_available(reaper_db, mocker):
+async def test_infra_recovery_resurrects_provision_failure_when_zone_available(
+    reaper_db, mocker
+):
     """A PROVISION_FAILURE task is reset to QUEUED when at least one zone is available."""
     _common_infra_recovery_mocks(mocker)
     mocker.patch("app.reaper.any_zone_available", return_value=True)
@@ -2592,7 +2957,9 @@ async def test_infra_recovery_resurrects_provision_failure_when_zone_available(r
 
 
 @pytest.mark.asyncio
-async def test_infra_recovery_does_not_resurrect_when_no_zone_available(reaper_db, mocker):
+async def test_infra_recovery_does_not_resurrect_when_no_zone_available(
+    reaper_db, mocker
+):
     """A PROVISION_FAILURE task stays FAILED when no zone is available."""
     _common_infra_recovery_mocks(mocker)
     mocker.patch("app.reaper.any_zone_available", return_value=False)
@@ -2664,7 +3031,9 @@ async def test_infra_recovery_caps_at_one_resurrection_per_task(reaper_db, mocke
 
 
 @pytest.mark.asyncio
-async def test_infra_recovery_resurrects_agent_timeout_when_zone_available(reaper_db, mocker):
+async def test_infra_recovery_resurrects_agent_timeout_when_zone_available(
+    reaper_db, mocker
+):
     """An AGENT_TIMEOUT task (OOM/crash/heartbeat timeout) is reset to QUEUED when a zone is available."""
     _common_infra_recovery_mocks(mocker)
     mocker.patch("app.reaper.any_zone_available", return_value=True)
@@ -2702,7 +3071,9 @@ async def test_infra_recovery_resurrects_agent_timeout_when_zone_available(reape
 
 
 @pytest.mark.asyncio
-async def test_infra_recovery_skips_agent_timeout_when_no_zone_available(reaper_db, mocker):
+async def test_infra_recovery_skips_agent_timeout_when_no_zone_available(
+    reaper_db, mocker
+):
     """An AGENT_TIMEOUT task is not resurrected when no zone is available."""
     _common_infra_recovery_mocks(mocker)
     mocker.patch("app.reaper.any_zone_available", return_value=False)
@@ -2802,7 +3173,9 @@ async def test_infra_recovery_does_not_resurrect_code_error_tasks(reaper_db, moc
 
 
 @pytest.mark.asyncio
-async def test_infra_recovery_resurrects_external_api_when_deps_healthy(reaper_db, mocker):
+async def test_infra_recovery_resurrects_external_api_when_deps_healthy(
+    reaper_db, mocker
+):
     """An EXTERNAL_API task is resurrected when both github_api and dispatch_api are healthy."""
     _common_infra_recovery_mocks(mocker)
     mocker.patch("app.reaper.any_zone_available", return_value=True)
@@ -2842,7 +3215,9 @@ async def test_infra_recovery_resurrects_external_api_when_deps_healthy(reaper_d
 
 
 @pytest.mark.asyncio
-async def test_infra_recovery_clears_api_failure_retries_on_external_api_resurrection(reaper_db, mocker):
+async def test_infra_recovery_clears_api_failure_retries_on_external_api_resurrection(
+    reaper_db, mocker
+):
     """
     When the reaper resurrects an EXTERNAL_API task, it must clear _api_failure_retries.
     Without this, a task that exhausted its retry budget before failing would have
@@ -2894,7 +3269,9 @@ async def test_infra_recovery_clears_api_failure_retries_on_external_api_resurre
 
 
 @pytest.mark.asyncio
-async def test_infra_recovery_does_not_resurrect_external_api_when_deps_unhealthy(reaper_db, mocker):
+async def test_infra_recovery_does_not_resurrect_external_api_when_deps_unhealthy(
+    reaper_db, mocker
+):
     """An EXTERNAL_API task stays FAILED when dependencies are not yet healthy."""
     _common_infra_recovery_mocks(mocker)
     mocker.patch("app.reaper.any_zone_available", return_value=True)
@@ -2931,11 +3308,18 @@ async def test_infra_recovery_does_not_resurrect_external_api_when_deps_unhealth
 
 
 @pytest.mark.asyncio
-async def test_infra_recovery_resurrects_rate_limit_when_account_available(reaper_db, mocker):
+async def test_infra_recovery_resurrects_rate_limit_when_account_available(
+    reaper_db, mocker
+):
     """A RATE_LIMIT task is resurrected when a non-blacklisted account is available."""
     _common_infra_recovery_mocks(mocker)
-    mocker.patch("app.max_plan_pool._extract_task_model", return_value="claude-sonnet-4-6")
-    mocker.patch("app.max_plan_pool._all_accounts", return_value=[{"id": "acct-1"}, {"id": "acct-2"}])
+    mocker.patch(
+        "app.max_plan_pool._extract_task_model", return_value="claude-sonnet-4-6"
+    )
+    mocker.patch(
+        "app.max_plan_pool._all_accounts",
+        return_value=[{"id": "acct-1"}, {"id": "acct-2"}],
+    )
     mocker.patch("app.max_plan_pool._account_available_for_model", return_value=True)
 
     project = Project(name="Rate Limit Recovery Test", user_id="user1")
@@ -2981,10 +3365,14 @@ async def test_infra_recovery_resurrects_rate_limit_when_account_available(reape
 
 
 @pytest.mark.asyncio
-async def test_infra_recovery_does_not_resurrect_rate_limit_when_all_accounts_blacklisted(reaper_db, mocker):
+async def test_infra_recovery_does_not_resurrect_rate_limit_when_all_accounts_blacklisted(
+    reaper_db, mocker
+):
     """A RATE_LIMIT task stays FAILED when all available accounts are still blacklisted."""
     _common_infra_recovery_mocks(mocker)
-    mocker.patch("app.max_plan_pool._extract_task_model", return_value="claude-sonnet-4-6")
+    mocker.patch(
+        "app.max_plan_pool._extract_task_model", return_value="claude-sonnet-4-6"
+    )
     # Only one account exists and it's in the blacklist
     mocker.patch("app.max_plan_pool._all_accounts", return_value=[{"id": "acct-1"}])
     # account_available_for_model returns True but the account is blacklisted — any() is False
@@ -3031,20 +3419,27 @@ async def test_reaper_queued_age_alert_fired(reaper_db, mocker):
 
     class StopLoopException(Exception):
         pass
+
     mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))
-    mocker.patch("app.shared_state.runtime_config", {
-        "max_concurrent_vms": 8,
-        "max_retries": 3,
-        "max_provision_retries": 3,
-        "queued_age_alert_hours": 2,
-    })
+    mocker.patch(
+        "app.shared_state.runtime_config",
+        {
+            "max_concurrent_vms": 8,
+            "max_retries": 3,
+            "max_provision_retries": 3,
+            "queued_age_alert_hours": 2,
+        },
+    )
     # Override the reaper module's reference to runtime_config
-    mocker.patch("app.reaper._runtime_config", {
-        "max_concurrent_vms": 8,
-        "max_retries": 3,
-        "max_provision_retries": 3,
-        "queued_age_alert_hours": 2,
-    })
+    mocker.patch(
+        "app.reaper._runtime_config",
+        {
+            "max_concurrent_vms": 8,
+            "max_retries": 3,
+            "max_provision_retries": 3,
+            "queued_age_alert_hours": 2,
+        },
+    )
 
     project = Project(name="Queued Age Alert Test", user_id="user1")
     reaper_db.add(project)
@@ -3072,9 +3467,12 @@ async def test_reaper_queued_age_alert_fired(reaper_db, mocker):
     assert stale_task.context.get("queued_age_alert_fired") is True
 
     from sqlmodel import select as _select
-    alerts = (await reaper_db.execute(
-        _select(Alert).where(Alert.task_id == stale_task.id)
-    )).scalars().all()
+
+    alerts = (
+        (await reaper_db.execute(_select(Alert).where(Alert.task_id == stale_task.id)))
+        .scalars()
+        .all()
+    )
     assert len(alerts) == 1
     assert str(alerts[0].severity) in ("INFO", "AlertSeverity.INFO")
     assert "stalled in queue" in alerts[0].title
@@ -3093,13 +3491,17 @@ async def test_reaper_queued_age_alert_not_repeated(reaper_db, mocker):
 
     class StopLoopException(Exception):
         pass
+
     mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))
-    mocker.patch("app.reaper._runtime_config", {
-        "max_concurrent_vms": 8,
-        "max_retries": 3,
-        "max_provision_retries": 3,
-        "queued_age_alert_hours": 2,
-    })
+    mocker.patch(
+        "app.reaper._runtime_config",
+        {
+            "max_concurrent_vms": 8,
+            "max_retries": 3,
+            "max_provision_retries": 3,
+            "queued_age_alert_hours": 2,
+        },
+    )
 
     project = Project(name="Queued Age No Repeat Test", user_id="user1")
     reaper_db.add(project)
@@ -3124,10 +3526,15 @@ async def test_reaper_queued_age_alert_not_repeated(reaper_db, mocker):
         pass
 
     from sqlmodel import select as _select
-    alerts = (await reaper_db.execute(
-        _select(Alert).where(Alert.task_id == stale_task.id)
-    )).scalars().all()
-    assert len(alerts) == 0, "Alert should not be re-fired when queued_age_alert_fired is already True"
+
+    alerts = (
+        (await reaper_db.execute(_select(Alert).where(Alert.task_id == stale_task.id)))
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 0, (
+        "Alert should not be re-fired when queued_age_alert_fired is already True"
+    )
 
 
 @pytest.mark.asyncio
@@ -3141,13 +3548,17 @@ async def test_reaper_queued_age_alert_includes_requires_approval(reaper_db, moc
 
     class StopLoopException(Exception):
         pass
+
     mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))
-    mocker.patch("app.reaper._runtime_config", {
-        "max_concurrent_vms": 8,
-        "max_retries": 3,
-        "max_provision_retries": 3,
-        "queued_age_alert_hours": 2,
-    })
+    mocker.patch(
+        "app.reaper._runtime_config",
+        {
+            "max_concurrent_vms": 8,
+            "max_retries": 3,
+            "max_provision_retries": 3,
+            "queued_age_alert_hours": 2,
+        },
+    )
 
     project = Project(name="Approval Skip Test", user_id="user1")
     reaper_db.add(project)
@@ -3171,10 +3582,19 @@ async def test_reaper_queued_age_alert_includes_requires_approval(reaper_db, moc
         pass
 
     from sqlmodel import select as _select
-    alerts = (await reaper_db.execute(
-        _select(Alert).where(Alert.task_id == approval_task.id)
-    )).scalars().all()
-    assert len(alerts) == 1, "Approval-pending tasks should now surface via queued age alerts"
+
+    alerts = (
+        (
+            await reaper_db.execute(
+                _select(Alert).where(Alert.task_id == approval_task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1, (
+        "Approval-pending tasks should now surface via queued age alerts"
+    )
     assert "awaiting operator approval" in alerts[0].message
 
 
@@ -3189,13 +3609,17 @@ async def test_reaper_queued_age_alert_retry_after_cause(reaper_db, mocker):
 
     class StopLoopException(Exception):
         pass
+
     mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))
-    mocker.patch("app.reaper._runtime_config", {
-        "max_concurrent_vms": 8,
-        "max_retries": 3,
-        "max_provision_retries": 3,
-        "queued_age_alert_hours": 2,
-    })
+    mocker.patch(
+        "app.reaper._runtime_config",
+        {
+            "max_concurrent_vms": 8,
+            "max_retries": 3,
+            "max_provision_retries": 3,
+            "queued_age_alert_hours": 2,
+        },
+    )
 
     project = Project(name="Retry After Cause Test", user_id="user1")
     reaper_db.add(project)
@@ -3224,9 +3648,12 @@ async def test_reaper_queued_age_alert_retry_after_cause(reaper_db, mocker):
         pass
 
     from sqlmodel import select as _select
-    alerts = (await reaper_db.execute(
-        _select(Alert).where(Alert.task_id == stale_task.id)
-    )).scalars().all()
+
+    alerts = (
+        (await reaper_db.execute(_select(Alert).where(Alert.task_id == stale_task.id)))
+        .scalars()
+        .all()
+    )
     assert len(alerts) == 1
     assert "rate-limit retry delay" in alerts[0].message
     assert "reset 4 times" in alerts[0].message
@@ -3243,13 +3670,17 @@ async def test_reaper_queued_age_alert_escalates(reaper_db, mocker):
 
     class StopLoopException(Exception):
         pass
+
     mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))
-    mocker.patch("app.reaper._runtime_config", {
-        "max_concurrent_vms": 8,
-        "max_retries": 3,
-        "max_provision_retries": 3,
-        "queued_age_alert_hours": 2,
-    })
+    mocker.patch(
+        "app.reaper._runtime_config",
+        {
+            "max_concurrent_vms": 8,
+            "max_retries": 3,
+            "max_provision_retries": 3,
+            "queued_age_alert_hours": 2,
+        },
+    )
 
     project = Project(name="Escalation Test", user_id="user1")
     reaper_db.add(project)
@@ -3278,9 +3709,12 @@ async def test_reaper_queued_age_alert_escalates(reaper_db, mocker):
     assert stale_task.context.get("queued_age_alert_tier") == 2
 
     from sqlmodel import select as _select
-    alerts = (await reaper_db.execute(
-        _select(Alert).where(Alert.task_id == stale_task.id)
-    )).scalars().all()
+
+    alerts = (
+        (await reaper_db.execute(_select(Alert).where(Alert.task_id == stale_task.id)))
+        .scalars()
+        .all()
+    )
     assert len(alerts) == 1
     assert str(alerts[0].severity) in ("WARNING", "AlertSeverity.WARNING")
     assert "tier 2" in alerts[0].message
@@ -3341,10 +3775,10 @@ async def test_reaper_backoff_on_consecutive_errors(reaper_db, mocker):
         pass
 
     assert len(sleep_calls) == 4, f"Expected 4 sleep calls, got {sleep_calls}"
-    assert sleep_calls[0] == 120   # error 1: counter=1
-    assert sleep_calls[1] == 240   # error 2: counter=2
-    assert sleep_calls[2] == 300   # error 3: counter=3 → capped
-    assert sleep_calls[3] == 60    # success: counter reset to 0
+    assert sleep_calls[0] == 120  # error 1: counter=1
+    assert sleep_calls[1] == 240  # error 2: counter=2
+    assert sleep_calls[2] == 300  # error 3: counter=3 → capped
+    assert sleep_calls[3] == 60  # success: counter reset to 0
 
 
 @pytest.mark.asyncio
@@ -3356,7 +3790,9 @@ async def test_reaper_clears_far_future_retry_after(reaper_db, mocker):
     """
     mocker.patch("app.main.delete_agent_vm", return_value=True)
     mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
-    mocker.patch("app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock)
+    mocker.patch(
+        "app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock
+    )
     mocker.patch("asyncio.sleep", side_effect=_StopLoop("Stop"))
 
     project = Project(name="Retry-After Sweep Test", user_id="user1")
@@ -3432,13 +3868,19 @@ def test_clear_retry_after_state_resets_counter():
 
 def test_set_retry_after_clamps_to_30_minutes():
     """set_retry_after must cap delays at RETRY_AFTER_MAX_MINUTES."""
-    from app.time_utils import set_retry_after, RETRY_AFTER_MAX_MINUTES, parse_retry_after
+    from app.time_utils import (
+        set_retry_after,
+        RETRY_AFTER_MAX_MINUTES,
+        parse_retry_after,
+    )
 
     ctx = {}
     set_retry_after(ctx, 9999)
     dt = parse_retry_after(ctx["retry_after"])
     assert dt is not None
-    assert dt <= datetime.utcnow() + timedelta(minutes=RETRY_AFTER_MAX_MINUTES) + timedelta(seconds=5)
+    assert dt <= datetime.utcnow() + timedelta(
+        minutes=RETRY_AFTER_MAX_MINUTES
+    ) + timedelta(seconds=5)
 
     ctx2 = {}
     set_retry_after(ctx2, -100)
