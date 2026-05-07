@@ -73,7 +73,7 @@ class PostCommitLocked(Exception):
     """
 
 
-from app.failure_stage import (  # noqa: E402, F401 — re-exported for legacy callers/tests
+from app.failure_stage import (  # noqa: E402, F401, RUF100
     _TRANSIENT_SCAN_ERROR_PATTERNS,
     _derive_failure_stage,
     _is_transient_scan_error,
@@ -415,19 +415,60 @@ def _build_retry_prompt_suffix(
         # build-stage retry guidance. Short-circuit with a bespoke prompt
         # before any keyword-based routing fires.
         if agent_raw == "incomplete":
+            # Branch on the previous attempt's provider: each agent CLI has a
+            # different file-edit tool. Codex emitting a unified diff in its
+            # final assistant message instead of calling apply_patch is the
+            # primary observed failure mode here (3e1a042b incident).
+            prev_provider = (ctx.get("_previous_provider") or "").lower()
+            if prev_provider == "openai":
+                tool_guidance = (
+                    "  - Codex applies edits via the `apply_patch` tool. Your previous\n"
+                    "    attempt printed a unified diff to stdout instead of calling\n"
+                    "    apply_patch — printed text is NOT applied. Every file change\n"
+                    "    must go through apply_patch; do NOT emit a diff in your final\n"
+                    "    assistant message.\n"
+                )
+            elif prev_provider == "gemini":
+                tool_guidance = (
+                    "  - Gemini applies edits via its file-write tool calls. Your\n"
+                    "    previous attempt printed a diff to stdout instead of\n"
+                    "    invoking the edit tool — printed text is NOT applied.\n"
+                )
+            else:
+                tool_guidance = (
+                    "  - Use the file editing tools (Edit/Write/apply_patch) to\n"
+                    "    actually apply changes to the working tree — do not just\n"
+                    "    print a patch\n"
+                )
             extra_guidance = (
                 "RETRY GUIDANCE: Your previous attempt printed a diff to stdout but never\n"
                 "applied any edits or shipped a PR. A unified diff printed as text does\n"
                 "NOT modify the repository. The wrapper observed zero file changes and\n"
                 "no ./done/./fail/./pr call, so it failed the task as 'incomplete'.\n"
                 "You MUST:\n"
-                "  - Use the file editing tools (Edit/Write/apply_patch) to actually\n"
-                "    apply changes to the working tree — do not just print a patch\n"
-                "  - Run the build/tests if the task requires verification\n"
+                + tool_guidance
+                + "  - Run the build/tests if the task requires verification\n"
                 "  - Open a PR via ./pr and call ./done to ship — OR call\n"
                 '    ./fail "<reason>" if the task fundamentally cannot be completed\n'
                 "Do NOT print a unified diff to stdout and exit.\n"
             )
+            # Escape hatch: if this provider has now produced "incomplete" twice
+            # in a row, it's likely a tool-layer mismatch the prompt won't fix.
+            # Hint at ./fail so the orchestrator can surface the failure cleanly
+            # rather than burning the full retry budget on the same wall.
+            history = ctx.get("_failure_class_history") or []
+            recent = [h for h in history[-2:] if isinstance(h, dict)]
+            if (
+                len(recent) >= 2
+                and prev_provider
+                and ctx.get("_previous_failure_stage") in (None, "", "incomplete")
+            ):
+                extra_guidance += (
+                    "\nIf your tool layer is consistently failing to apply edits "
+                    "(third attempt with the same provider), exit with "
+                    '`./fail "tool-call layer not producing applied edits — needs '
+                    'provider switch"` so the orchestrator can escalate.\n'
+                )
         else:
             stage_guidance = CODE_ERROR_STAGE_GUIDANCE.get(
                 ctx.get("_previous_failure_stage") or ""
@@ -924,6 +965,18 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
         }
         clone_ctx = {k: v for k, v in child_ctx.items() if k not in _ctx_keys_to_strip}
 
+        # Preserve the prior attempt's provider/model under a non-stripped key
+        # so retry guidance can branch on what actually failed (e.g. emit
+        # apply_patch wording for Codex, Edit/Write wording for Claude). The
+        # canonical llm_provider/llm_model fields are stripped above so the
+        # retry can re-select; _previous_provider survives for diagnostic use.
+        prev_provider = child_ctx.get("llm_provider")
+        prev_model = child_ctx.get("llm_model")
+        if prev_provider:
+            clone_ctx["_previous_provider"] = prev_provider
+        if prev_model:
+            clone_ctx["_previous_model"] = prev_model
+
         # RATE_LIMIT: propagate the quarantine so the clone can't re-select the
         # same account before its cooldown elapses. agent_status.py already put
         # the failed account in child_ctx["blacklisted_accounts"] — re-applying
@@ -1072,8 +1125,22 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
                 clone_ctx["_scope_reduced"] = True
                 clone_ctx["scope_calibrated_from"] = f"{task_scope}:{_override_reason}"
             if extra_guidance:
+                # Replace any prior RETRY GUIDANCE block in existing_suffix so
+                # successive retries don't accumulate stacked guidance. Visible
+                # in 3e1a042b's payload: two stacked "RETRY GUIDANCE:" blocks
+                # plus duplicated AGENT_TIMEOUT heartbeat warnings, bloating
+                # the prompt across attempts. Strip from "RETRY GUIDANCE:" up
+                # to the first blank line (the conventional block terminator
+                # used by _build_retry_prompt_suffix).
+                stripped_suffix = re.sub(
+                    r"(?:^|\n)RETRY GUIDANCE:.*?(?:\n\n|\Z)",
+                    "\n",
+                    existing_suffix,
+                    count=1,
+                    flags=re.DOTALL,
+                ).lstrip()
                 new_payloads[0]["prompt_suffix"] = extra_guidance + (
-                    "\n" + existing_suffix if existing_suffix else ""
+                    "\n" + stripped_suffix if stripped_suffix else ""
                 )
 
         new_payloads = [
@@ -1815,7 +1882,7 @@ async def _process_post_commit(
         # row, get None from skip_locked, and return 409. Multiple skipped
         # heartbeats over 5+ minutes would let the reaper false-orphan the
         # task. Commit here flushes all pending state mutations from sections
-        # 1–4 above (dependent unblocking, failure recording, investigation
+        # 1–4 above (dependent unblocking, failure recording, investigation  # noqa: RUF003
         # spawns) and releases the lock; the rest of post-commit processing
         # operates on the already-loaded task object without re-locking.
         if session.dirty or session.new:
@@ -3280,8 +3347,8 @@ async def _process_post_commit(
                                                             "branch": _ar_branch,
                                                             "pr_number": pr_number,
                                                         }
-                                                    asyncio.ensure_future(
-                                                        dispatch_external_notification(  # noqa: RUF006 — fire-and-forget webhook dispatch from background flow
+                                                    asyncio.ensure_future(  # noqa: RUF006
+                                                        dispatch_external_notification(  # noqa: RUF006, RUF100
                                                             orig.project_id,
                                                             _wh_event,
                                                             _wh_payload,
@@ -3792,7 +3859,7 @@ async def _process_post_commit(
                         session.add(task)
                         await session.commit()
                         if original_task_id:
-                            try:
+                            try:  # noqa: SIM105
                                 await broadcast_to_project(
                                     str(task.project_id),
                                     "task_updated",
@@ -3801,7 +3868,7 @@ async def _process_post_commit(
                                         "status": TaskStatus.COMPLETED,
                                     },
                                 )
-                            except Exception:
+                            except Exception:  # noqa: S110
                                 pass
                         return {"status": "accepted"}
 

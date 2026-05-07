@@ -3032,7 +3032,7 @@ export function getProviderRunner(provider: ProviderName = PROVIDER, authMode: A
         if (authMode === 'oauth') return baseEnv.CODEX_HOME ? [] : ['CODEX_HOME'];
         return (baseEnv.OPENAI_API_KEY || baseEnv.CODEX_API_KEY) ? [] : ['OPENAI_API_KEY or CODEX_API_KEY'];
       },
-      buildRunCommand: (_prompt, model) => {
+      buildRunCommand: (_prompt, model, effort) => {
         // --skip-git-repo-check: some task types run outside a git checkout
         //   (standalone agentic handlers); without this flag Codex refuses
         //   to start.
@@ -3059,7 +3059,7 @@ export function getProviderRunner(provider: ProviderName = PROVIDER, authMode: A
           args,
           env: baseEnv,
           outputMode: 'text',
-          timeoutMs: claudeTimeoutForEffort(undefined),
+          timeoutMs: claudeTimeoutForEffort(effort),
           promptInput: 'stdin',
           displayName: 'OpenAI Codex',
         };
@@ -3086,7 +3086,7 @@ export function getProviderRunner(provider: ProviderName = PROVIDER, authMode: A
         if (authMode === 'service_account') return baseEnv.GOOGLE_APPLICATION_CREDENTIALS ? [] : ['GOOGLE_APPLICATION_CREDENTIALS'];
         return baseEnv.GEMINI_API_KEY ? [] : ['GEMINI_API_KEY'];
       },
-      buildRunCommand: (_prompt, model) => {
+      buildRunCommand: (_prompt, model, effort) => {
         // --approval-mode and -o are baseline flags the backend translation
         // won't emit; keep them here. Settings-bag translation carries -m
         // (alias if thinking/temp are configured, else raw model) plus any
@@ -3117,7 +3117,7 @@ export function getProviderRunner(provider: ProviderName = PROVIDER, authMode: A
           args,
           env: geminiEnv,
           outputMode: 'text',
-          timeoutMs: claudeTimeoutForEffort(undefined),
+          timeoutMs: claudeTimeoutForEffort(effort),
           promptInput: 'stdin',
           displayName: 'Gemini CLI',
         };

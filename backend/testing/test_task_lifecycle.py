@@ -2203,9 +2203,9 @@ async def test_approve_branch_does_not_propagate_warm_target(tl_db, mocker):
         verdict_json='{"verdict": "APPROVE", "issues": []}',
     )
 
-    try:
+    try:  # noqa: SIM105
         await _process_post_commit(review_task.id, payload, _session_factory=factory)
-    except Exception:
+    except Exception:  # noqa: S110
         # The harness may fail later in the APPROVE path on environment-specific
         # mocks (e.g. broadcasting); we just need _spawn_pipeline_task to have
         # been invoked with suppress_warm_handoff=True before that.
@@ -2958,6 +2958,62 @@ class TestBuildRetryPromptSuffix:
         # Generic test/lint hint should not appear.
         assert "Fix the specific failing tests" not in guidance
         assert "Fix lint/type errors first" not in guidance
+
+    def test_code_error_incomplete_codex_gets_apply_patch_guidance(self):
+        """When the previous attempt ran on Codex (openai), the retry guidance
+        names apply_patch — not the Claude-specific Edit/Write tools.
+        Regression guard for incident 2026-05-07 task 3e1a042b."""
+        guidance, _ = _build_retry_prompt_suffix(
+            "CODE_ERROR",
+            "+ some diff body",
+            attempt=2,
+            task_scope="medium",
+            ctx={
+                "agent_failure_category_raw": "incomplete",
+                "_previous_provider": "openai",
+            },
+        )
+        assert "apply_patch" in guidance
+        assert "Codex" in guidance
+        # Claude-only tool names must NOT leak into Codex guidance.
+        assert "Edit/Write/apply_patch" not in guidance
+
+    def test_code_error_incomplete_claude_default_keeps_existing_wording(self):
+        """No previous-provider context (or anthropic) keeps the original
+        Edit/Write/apply_patch wording intact."""
+        guidance, _ = _build_retry_prompt_suffix(
+            "CODE_ERROR",
+            "+ some diff body",
+            attempt=2,
+            task_scope="medium",
+            ctx={
+                "agent_failure_category_raw": "incomplete",
+                "_previous_provider": "anthropic",
+            },
+        )
+        assert "Edit/Write/apply_patch" in guidance
+        assert "Codex" not in guidance
+
+    def test_code_error_incomplete_repeat_provider_appends_escape_hatch(self):
+        """Two prior incomplete failures from the same provider trigger an
+        explicit ./fail escape-hatch hint so the orchestrator can escalate
+        instead of burning the full retry budget on a tool-layer mismatch."""
+        guidance, _ = _build_retry_prompt_suffix(
+            "CODE_ERROR",
+            "+ some diff body",
+            attempt=3,
+            task_scope="medium",
+            ctx={
+                "agent_failure_category_raw": "incomplete",
+                "_previous_provider": "openai",
+                "_failure_class_history": [
+                    {"at": "2026-05-07T14:00:00", "class": "CODE_ERROR"},
+                    {"at": "2026-05-07T14:30:00", "class": "CODE_ERROR"},
+                ],
+            },
+        )
+        assert "needs provider switch" in guidance
+        assert "./fail" in guidance
 
     def test_code_error_attempt_one_no_scope_override(self):
         _, override = _build_retry_prompt_suffix(
