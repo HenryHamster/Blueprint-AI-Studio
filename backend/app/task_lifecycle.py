@@ -1125,22 +1125,26 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
                 clone_ctx["_scope_reduced"] = True
                 clone_ctx["scope_calibrated_from"] = f"{task_scope}:{_override_reason}"
             if extra_guidance:
-                # Replace any prior RETRY GUIDANCE block in existing_suffix so
-                # successive retries don't accumulate stacked guidance. Visible
-                # in 3e1a042b's payload: two stacked "RETRY GUIDANCE:" blocks
-                # plus duplicated AGENT_TIMEOUT heartbeat warnings, bloating
-                # the prompt across attempts. Strip from "RETRY GUIDANCE:" up
-                # to the first blank line (the conventional block terminator
-                # used by _build_retry_prompt_suffix).
-                stripped_suffix = re.sub(
-                    r"(?:^|\n)RETRY GUIDANCE:.*?(?:\n\n|\Z)",
-                    "\n",
-                    existing_suffix,
-                    count=1,
-                    flags=re.DOTALL,
-                ).lstrip()
+                # Pin the spawn-time suffix in ctx and replace the
+                # auto-generated portion on every retry. Earlier dedup only
+                # matched "RETRY GUIDANCE:" headers and missed the AGENT_TIMEOUT
+                # "IMPORTANT: The previous attempt TIMED OUT…" form, causing
+                # observed stacking (291914e6 had the timeout block twice).
+                # On first retry we snapshot existing_suffix with all known
+                # auto-generated leading blocks stripped; subsequent retries
+                # carry the snapshot forward verbatim instead of re-stripping.
+                if "_original_prompt_suffix" in clone_ctx:
+                    carry = clone_ctx.get("_original_prompt_suffix") or ""
+                else:
+                    carry = re.sub(
+                        r"(?:^|\n)(?:RETRY GUIDANCE:|IMPORTANT: The previous attempt TIMED OUT|NOTE: The previous attempt was CANCELLED|WARNING: The same tests are failing).*?(?:\n\n|\Z)",
+                        "\n",
+                        existing_suffix,
+                        flags=re.DOTALL,
+                    ).strip()
+                    clone_ctx["_original_prompt_suffix"] = carry
                 new_payloads[0]["prompt_suffix"] = extra_guidance + (
-                    "\n" + stripped_suffix if stripped_suffix else ""
+                    "\n" + carry if carry else ""
                 )
 
         new_payloads = [

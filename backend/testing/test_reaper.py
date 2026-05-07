@@ -52,7 +52,7 @@ def test_heartbeat_stale_cutoff_respects_runtime_config_override():
         }
 
         class _T:
-            context = {"scope": "large"}
+            context = {"scope": "large"}  # noqa: RUF012
             first_payload = None
 
         now = datetime(2026, 1, 1, 12, 0, 0)
@@ -72,7 +72,7 @@ def test_heartbeat_stale_cutoff_effort_floor_extends_small_scope_max_effort():
     """Effort floor (max=720s) extends small-scope cutoff (300s) when effort is higher."""
 
     class _T:
-        context = {"scope": "small", "effort": "max"}
+        context = {"scope": "small", "effort": "max"}  # noqa: RUF012
         first_payload = None
 
     now = datetime(2026, 1, 1, 12, 0, 0)
@@ -83,7 +83,7 @@ def test_heartbeat_stale_cutoff_effort_floor_does_not_weaken_large_scope():
     """Large-scope threshold (900s) wins over low-effort floor (300s)."""
 
     class _T:
-        context = {"scope": "large", "effort": "low"}
+        context = {"scope": "large", "effort": "low"}  # noqa: RUF012
         first_payload = None
 
     now = datetime(2026, 1, 1, 12, 0, 0)
@@ -94,7 +94,7 @@ def test_heartbeat_stale_cutoff_large_scope_default_is_900s():
     """Large-scope default threshold is 900s (15 minutes) for analysis-heavy tasks."""
 
     class _T:
-        context = {"scope": "large"}
+        context = {"scope": "large"}  # noqa: RUF012
         first_payload = None
 
     now = datetime(2026, 1, 1, 12, 0, 0)
@@ -105,7 +105,7 @@ def test_heartbeat_stale_cutoff_effort_from_task_type_fallback():
     """Effort falls back to the Anthropic settings bag when not explicit in context."""
 
     class _T:
-        context = {"scope": "small", "type": "strategic_review"}
+        context = {"scope": "small", "type": "strategic_review"}  # noqa: RUF012
         first_payload = None
 
     # Isolate from other tests that may have mutated runtime_config via PATCH.
@@ -137,7 +137,7 @@ def test_heartbeat_stale_cutoff_unknown_effort_uses_scope_threshold():
     """Unknown effort string falls back to scope-only behavior."""
 
     class _T:
-        context = {"scope": "small", "effort": "unknown_effort_xyz"}
+        context = {"scope": "small", "effort": "unknown_effort_xyz"}  # noqa: RUF012
         first_payload = None
 
     now = datetime(2026, 1, 1, 12, 0, 0)
@@ -151,7 +151,7 @@ def test_progress_stale_cutoff_small_scope_default_is_480s():
     """Small-scope default progress-stale threshold is 480s (8 minutes)."""
 
     class _T:
-        context = {"scope": "small"}
+        context = {"scope": "small"}  # noqa: RUF012
         first_payload = None
 
     now = datetime(2026, 1, 1, 12, 0, 0)
@@ -162,7 +162,7 @@ def test_progress_stale_cutoff_medium_scope_default_is_720s():
     """Medium-scope default progress-stale threshold is 720s (12 minutes)."""
 
     class _T:
-        context = {"scope": "medium"}
+        context = {"scope": "medium"}  # noqa: RUF012
         first_payload = None
 
     now = datetime(2026, 1, 1, 12, 0, 0)
@@ -173,7 +173,7 @@ def test_progress_stale_cutoff_large_scope_default_is_1080s():
     """Large-scope default progress-stale threshold is 1080s (18 minutes)."""
 
     class _T:
-        context = {"scope": "large"}
+        context = {"scope": "large"}  # noqa: RUF012
         first_payload = None
 
     now = datetime(2026, 1, 1, 12, 0, 0)
@@ -191,7 +191,7 @@ def test_progress_stale_cutoff_respects_runtime_config_override():
         }
 
         class _T:
-            context = {"scope": "medium"}
+            context = {"scope": "medium"}  # noqa: RUF012
             first_payload = None
 
         now = datetime(2026, 1, 1, 12, 0, 0)
@@ -207,7 +207,7 @@ def test_progress_stale_cutoff_unknown_scope_falls_back_to_small():
     """Unknown scope string falls back to the small-scope threshold (480s)."""
 
     class _T:
-        context = {"scope": "unknown_scope_xyz"}
+        context = {"scope": "unknown_scope_xyz"}  # noqa: RUF012
         first_payload = None
 
     now = datetime(2026, 1, 1, 12, 0, 0)
@@ -218,8 +218,8 @@ def test_progress_stale_cutoff_reads_scope_from_payload():
     """Scope falls back to first_payload when context has no scope key."""
 
     class _T:
-        context = {}
-        first_payload = {"scope": "large"}
+        context = {}  # noqa: RUF012
+        first_payload = {"scope": "large"}  # noqa: RUF012
 
     now = datetime(2026, 1, 1, 12, 0, 0)
     assert _progress_stale_cutoff(_T(), now) == now - timedelta(seconds=1080)
@@ -289,7 +289,7 @@ async def _make_project(db: AsyncSession) -> Project:
 
 
 async def _run_reaper_once():
-    try:
+    try:  # noqa: SIM105
         await reaper_service()
     except _StopLoop:
         pass
@@ -485,6 +485,68 @@ async def test_in_progress_no_heartbeat_started_6min_reaped(
     await reaper_db.refresh(t)
 
     assert t.status == TaskStatus.QUEUED
+
+
+@pytest.mark.asyncio
+async def test_in_progress_no_tool_use_past_progress_stale_reaped(
+    reaper_db, stop_after_one_cycle, reaper_side_effects
+):
+    """Heartbeat fresh + last_tool_use_at NULL + started_at >8min (small) → agent_stalled.
+
+    Codex-stuck-in-text-mode pattern: agent process alive (heartbeats keep
+    flowing) but never invokes any tool. Without this branch the only catch
+    is the heartbeat-stall reaper after the upstream stream finally crashes.
+    """
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix", "scope": "small"}],
+        vm_instance_id="vm-no-tool",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        started_at=datetime.utcnow() - timedelta(minutes=10),
+        last_heartbeat=datetime.utcnow() - timedelta(seconds=30),
+        last_tool_use_at=None,
+        context={"scope": "small"},
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    assert t.status == TaskStatus.QUEUED
+    assert t.attempt_count == 1
+
+
+@pytest.mark.asyncio
+async def test_in_progress_no_tool_use_within_progress_stale_not_reaped(
+    reaper_db, stop_after_one_cycle, reaper_side_effects
+):
+    """Heartbeat fresh + last_tool_use_at NULL + started_at <8min → not reaped.
+
+    The watchdog must not fire during normal startup latency: agents
+    routinely take 1-2 min before their first tool call.
+    """
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix", "scope": "small"}],
+        vm_instance_id="vm-warmup",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        started_at=datetime.utcnow() - timedelta(minutes=3),
+        last_heartbeat=datetime.utcnow() - timedelta(seconds=10),
+        last_tool_use_at=None,
+        context={"scope": "small"},
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    assert t.status == TaskStatus.IN_PROGRESS
 
 
 @pytest.mark.asyncio
@@ -1652,7 +1714,7 @@ async def test_step6_tier1_info_alert_fires_past_threshold(
     reaper_db, stop_after_one_cycle, reaper_side_effects
 ):
     """QUEUED task older than 1× threshold (2h) → tier-1 INFO alert with correct
-    title/message, and tier persisted in task.context."""
+    title/message, and tier persisted in task.context."""  # noqa: RUF002
     project = await _make_project(reaper_db)
     t = Task(
         project_id=project.id,
@@ -1686,7 +1748,7 @@ async def test_step6_tier2_warning_skips_tier1_when_age_exceeds_3x(
     reaper_db, stop_after_one_cycle, reaper_side_effects
 ):
     """A task older than 3× threshold (6h) goes straight to tier-2 WARNING
-    without first firing a tier-1 INFO alert."""
+    without first firing a tier-1 INFO alert."""  # noqa: RUF002
     project = await _make_project(reaper_db)
     t = Task(
         project_id=project.id,

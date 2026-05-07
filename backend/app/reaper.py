@@ -357,7 +357,7 @@ async def _sweep_orphan_direction_holds(session) -> int:
     shouldn't hold tasks — and archived directions that disappear entirely
     definitely shouldn't. Returns the number of holds cleared.
     """
-    from app.shared_state import (  # noqa: PLC0415
+    from app.shared_state import (
         direction_failure_streaks,
         clear_direction_hold,
     )
@@ -394,9 +394,9 @@ async def _sweep_stale_residual_cases(session) -> int:
     transition to RESOLVED when the remediation has been stale for the
     configured window and no new failures carried that fingerprint in-window.
     """
-    from app.models import ResidualRemediationCase, ResidualCaseStatus  # noqa: PLC0415
-    from app.failure_classification import _mark_residual_case_closed  # noqa: PLC0415
-    from app.notification_dispatch import post_event_message  # noqa: PLC0415
+    from app.models import ResidualRemediationCase, ResidualCaseStatus
+    from app.failure_classification import _mark_residual_case_closed
+    from app.notification_dispatch import post_event_message
 
     now = _utcnow()
     active_hours = int(_runtime_config.get("residual_active_auto_close_hours", 72))
@@ -498,12 +498,12 @@ async def _run_regression_scan_and_notify(session) -> int:
 
     Returns the number of newly-fired quarantine events.
     """
-    from app.max_plan_pool import scan_account_model_regressions  # noqa: PLC0415
-    from app.notification_dispatch import (  # noqa: PLC0415
+    from app.max_plan_pool import scan_account_model_regressions
+    from app.notification_dispatch import (
         dispatch_external_notification,
         post_account_model_regression_message,
     )
-    from app.models import ProjectMember  # noqa: PLC0415
+    from app.models import ProjectMember
 
     fired = await scan_account_model_regressions(session)
     if not fired:
@@ -570,8 +570,8 @@ async def _run_regression_scan_and_notify(session) -> int:
                 logger.exception(
                     f"[REAPER] post_account_model_regression_message failed for project {pid}"
                 )
-            asyncio.ensure_future(
-                dispatch_external_notification(  # noqa: RUF006
+            asyncio.ensure_future(  # noqa: RUF006
+                dispatch_external_notification(
                     pid,
                     "account_model_regression_quarantined",
                     payload,
@@ -596,21 +596,21 @@ async def reaper_service():
     Marks them as FAILED and issues a delete command to GCP if they haven't sent a heartbeat in 5 minutes.
     """
     # Deferred imports to avoid circular dependency with app.main
-    from app.max_plan_pool import (  # noqa: PLC0415
+    from app.max_plan_pool import (
         clear_task_llm_runtime_context,
         disable_account_model,
         get_task_llm_account_id,
         _extract_task_model,
         release_max_plan_account,
     )
-    from app.main import (  # noqa: PLC0415
+    from app.main import (
         _ensure_vm_deleted,
         _maybe_create_failure_alert,
     )
-    from app.routers.agent_status import record_task_result  # noqa: PLC0415
-    from app.broadcast import broadcast_to_project  # noqa: PLC0415
-    from app.task_lifecycle import _requeue_parent_task  # noqa: PLC0415
-    from app.rollup_management import _check_and_trigger_rollup  # noqa: PLC0415
+    from app.routers.agent_status import record_task_result
+    from app.broadcast import broadcast_to_project
+    from app.task_lifecycle import _requeue_parent_task
+    from app.rollup_management import _check_and_trigger_rollup
 
     consecutive_errors = 0
     while True:
@@ -767,6 +767,20 @@ async def reaper_service():
                             # the scope-aware progress threshold. Indicates a hung LLM
                             # call, a spinning retry loop, or a wedged tool invocation.
                             orphaned_ids.append(task.id)
+                        elif (
+                            task.last_heartbeat
+                            and task.last_heartbeat >= hb_cutoff
+                            and task.last_tool_use_at is None
+                            and task.started_at
+                            and task.started_at
+                            < _progress_stale_cutoff(task, now)
+                        ):
+                            # Stalled-but-heartbeating with zero tool calls ever
+                            # (Codex text-mode pattern, 2026-05-07): agent emits
+                            # heartbeats but never invokes apply_patch / Edit /
+                            # Write. Use started_at as the clock since
+                            # last_tool_use_at is NULL.
+                            orphaned_ids.append(task.id)
                     elif task.created_at < ten_minutes_ago:
                         orphaned_ids.append(task.id)
 
@@ -848,7 +862,7 @@ async def reaper_service():
                                 logger.warning(
                                     f"[REAPER] Force-locked persistently skipped task {t.id}"
                                 )
-                        except Exception as e:
+                        except Exception as e:  # noqa: BLE001
                             logger.warning(
                                 f"[REAPER] Force-lock failed (lock timeout?): {e}"
                             )
@@ -858,7 +872,7 @@ async def reaper_service():
 
                     # Clean stale entries from skip counts
                     orphaned_id_set = set(orphaned_ids)
-                    for tid in list(_reaper_skip_counts.keys()):  # noqa: PERF101 — deletes from dict during iteration
+                    for tid in list(_reaper_skip_counts.keys()):
                         if tid not in orphaned_id_set:
                             del _reaper_skip_counts[tid]
 
@@ -873,9 +887,9 @@ async def reaper_service():
                         has_pr = t.id in tasks_with_pr
                         hb_cutoff = _heartbeat_stale_cutoff(t, now, has_open_pr=has_pr)
                         if t.status == TaskStatus.PROVISIONING:
-                            if t.started_at and t.started_at < fifteen_minutes_ago:
+                            if t.started_at and t.started_at < fifteen_minutes_ago:  # noqa: SIM114
                                 verified.append(t)
-                            elif t.last_heartbeat and t.last_heartbeat < hb_cutoff:
+                            elif t.last_heartbeat and t.last_heartbeat < hb_cutoff:  # noqa: SIM114
                                 verified.append(t)
                             elif (
                                 t.vm_provisioned_at
@@ -884,15 +898,15 @@ async def reaper_service():
                             ):
                                 verified.append(t)
                         elif t.status == TaskStatus.IN_PROGRESS:
-                            if t.last_heartbeat and t.last_heartbeat < hb_cutoff:
+                            if t.last_heartbeat and t.last_heartbeat < hb_cutoff:  # noqa: SIM114
                                 verified.append(t)
-                            elif (
+                            elif (  # noqa: SIM114
                                 t.last_heartbeat is None
                                 and t.started_at
                                 and t.started_at < hb_cutoff
                             ):
                                 verified.append(t)
-                            elif (
+                            elif (  # noqa: SIM114
                                 t.last_heartbeat is None
                                 and t.started_at is None
                                 and t.created_at < ten_minutes_ago
@@ -904,6 +918,21 @@ async def reaper_service():
                                 and t.last_tool_use_at is not None
                                 and t.last_tool_use_at < _progress_stale_cutoff(t, now)
                             ):
+                                verified.append(t)
+                            elif (
+                                t.last_heartbeat
+                                and t.last_heartbeat >= hb_cutoff
+                                and t.last_tool_use_at is None
+                                and t.started_at
+                                and t.started_at < _progress_stale_cutoff(t, now)
+                            ):
+                                # Codex-stuck-in-text-mode pattern (c60170b3,
+                                # 291914e6, f5c8a36f, 897a742e on 2026-05-07):
+                                # heartbeats keep flowing while the agent never
+                                # invokes any tool. Without this branch the
+                                # heartbeat-stall reaper only fires after the
+                                # upstream stream finally crashes, wasting 5+
+                                # min per attempt × 3 attempts × N retries.  # noqa: RUF003
                                 verified.append(t)
                         elif t.created_at < ten_minutes_ago:
                             verified.append(t)
@@ -1001,6 +1030,24 @@ async def reaper_service():
                         reap_reason = (
                             f"Agent stalled — heartbeat fresh but no tool calls for {age}s "
                             f"(last_tool_use_at={fresh_task.last_tool_use_at.isoformat()})"
+                        )
+                        reap_reason_code = "agent_stalled"
+                    elif (
+                        fresh_task.last_heartbeat
+                        and fresh_task.last_tool_use_at is None
+                        and fresh_task.started_at
+                        and fresh_task.started_at
+                        < _progress_stale_cutoff(fresh_task, now)
+                        and fresh_task.last_heartbeat
+                        >= _heartbeat_stale_cutoff(fresh_task, now)
+                    ):
+                        # Stalled-but-heartbeating with zero tool calls ever
+                        # (Codex text-mode pattern). Same classification as
+                        # last_tool_use_at-stale; uses started_at as the clock.
+                        age = int((now - fresh_task.started_at).total_seconds())
+                        reap_reason = (
+                            f"Agent stalled — heartbeat fresh but no tool call has occurred in {age}s "
+                            f"since started ({fresh_task.started_at.isoformat()})"
                         )
                         reap_reason_code = "agent_stalled"
                     elif fresh_task.last_heartbeat:
@@ -1161,7 +1208,7 @@ async def reaper_service():
                                         f"in {prov_zone_for_status} — vm_status={io_vm_status}, treating "
                                         f"as preemption (skipping attempt_count++)"
                                     )
-                            except Exception as e:
+                            except Exception as e:  # noqa: BLE001
                                 logger.debug(
                                     f"[REAPER] get_vm_status failed for {fresh_task.vm_instance_id}: {e}"
                                 )
@@ -1202,7 +1249,7 @@ async def reaper_service():
                                 await disable_account_model(
                                     rl_acct_id, rl_model, **_reaper_kwargs_io
                                 )
-                            except Exception as _disable_err:
+                            except Exception as _disable_err:  # noqa: BLE001
                                 logger.warning(
                                     f"[REAPER] disable_account_model failed for {rl_acct_id}/{rl_model}: "
                                     f"{_disable_err}; retrying in 1s"
@@ -1212,8 +1259,8 @@ async def reaper_service():
                                     await disable_account_model(
                                         rl_acct_id, rl_model, **_reaper_kwargs_io
                                     )
-                                except Exception as _disable_err2:
-                                    logger.error(
+                                except Exception as _disable_err2:  # noqa: BLE001
+                                    logger.error(  # noqa: TRY400
                                         f"[REAPER] disable_account_model retry also failed for "
                                         f"{rl_acct_id}/{rl_model}: {_disable_err2}. "
                                         "Account remains active in pool — tight re-selection loop risk."
@@ -1266,8 +1313,8 @@ async def reaper_service():
                     io_gh_pr_merged: bool = False
                     if _has_pr_artifact and _pr_num:
                         try:
-                            from app.routers.agent import get_github_token_for_task  # noqa: PLC0415
-                            from app.github import get_pull_request  # noqa: PLC0415
+                            from app.routers.agent import get_github_token_for_task
+                            from app.github import get_pull_request
 
                             (
                                 _gh_token,
@@ -1279,7 +1326,7 @@ async def reaper_service():
                             )
                             io_gh_pr_state = _pr_data.get("state")
                             io_gh_pr_merged = bool(_pr_data.get("merged"))
-                        except Exception as _gh_exc:
+                        except Exception as _gh_exc:  # noqa: BLE001
                             # GH API unreachable: fall back to "open" — handing off
                             # to review pipeline is the safer default.
                             logger.warning(
@@ -1652,7 +1699,7 @@ async def reaper_service():
                         # Spawn the review task that _process_post_commit would
                         # have spawned if the agent had reported COMPLETED.
                         try:
-                            from app.review_pipeline import _spawn_pipeline_task  # noqa: PLC0415
+                            from app.review_pipeline import _spawn_pipeline_task
 
                             _short_id = str(task.id).replace("-", "")[:8]
                             _task_type = (task.first_payload or {}).get(
@@ -1696,7 +1743,7 @@ async def reaper_service():
                                 original_prompt=_original_prompt,
                                 original_task_id=str(task.id),
                             )
-                        except Exception as _spawn_exc:
+                        except Exception as _spawn_exc:  # noqa: BLE001
                             # Review spawn is best-effort from the reaper — if it
                             # fails, reaper Step 3 (stale EVALUATING sweep) will
                             # retry within 15 min, and the 6h hard timeout still
@@ -1768,9 +1815,9 @@ async def reaper_service():
                                 from app.anomaly_detection import (
                                     _error_fingerprint,
                                     _is_recurring_failure_class,
-                                )  # noqa: PLC0415
-                                from app.task_lifecycle import _derive_failure_stage  # noqa: PLC0415
-                                import app.shared_state as _anomaly_state  # noqa: PLC0415
+                                )
+                                from app.task_lifecycle import _derive_failure_stage
+                                import app.shared_state as _anomaly_state
 
                                 _reap_failure_class = (
                                     "PROVISION_FAILURE"
@@ -1825,8 +1872,8 @@ async def reaper_service():
                                 try:
                                     from app.task_lifecycle import (
                                         _build_retry_prompt_suffix,
-                                    )  # noqa: PLC0415
-                                    from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
+                                    )
+                                    from sqlalchemy.orm.attributes import flag_modified
 
                                     _task_scope = (
                                         reaper_ctx.get("scope")
@@ -2002,7 +2049,7 @@ async def reaper_service():
                         extra_logs = " ".join(filter(None, extra_log_parts))
                         from app.failure_classification import (
                             classify_failure_with_confidence,
-                        )  # noqa: PLC0415
+                        )
 
                         classification = classify_failure_with_confidence(
                             task, logs=extra_logs or None
@@ -2041,7 +2088,7 @@ async def reaper_service():
                     for parent in _deferred_parent_requeues:
                         try:
                             await _requeue_parent_task(parent, session)
-                        except Exception as e:
+                        except Exception as e:  # noqa: PERF203 — per-attempt try in deferred-requeue loop
                             logger.error(
                                 f"[REAPER] Deferred parent requeue failed for {parent.id}: {e}",
                                 exc_info=True,
@@ -2095,7 +2142,7 @@ async def reaper_service():
                                         logger.info(
                                             f"[PIPELINE] Cleared terminal dependency {task.id} from {count} waiting tasks"
                                         )
-                            except Exception as e:
+                            except Exception as e:  # noqa: BLE001
                                 logger.warning(
                                     f"[PIPELINE] Failed to unblock dependents of {task.id}: {e}",
                                     exc_info=True,
@@ -2132,8 +2179,8 @@ async def reaper_service():
                             )
                             continue
                         try:
-                            from app.routers.agent import get_github_token_for_task  # noqa: PLC0415
-                            from app.github import close_pull_request, create_pr_comment  # noqa: PLC0415
+                            from app.routers.agent import get_github_token_for_task
+                            from app.github import close_pull_request, create_pr_comment
 
                             gh_token, owner, repo = await get_github_token_for_task(
                                 task.id, session
@@ -2152,7 +2199,7 @@ async def reaper_service():
                                     f"{reason[:400]}\n\n"
                                     f"Closing so sibling rollups aren't blocked waiting for this branch.",
                                 )
-                            except Exception as ce:
+                            except Exception as ce:  # noqa: BLE001
                                 logger.warning(
                                     f"[PIPELINE] Failed to comment on dead PR #{pr_number}: {ce}"
                                 )
@@ -2171,7 +2218,7 @@ async def reaper_service():
                                 logger.warning(
                                     f"[PIPELINE] close_pull_request returned False for PR #{pr_number}"
                                 )
-                        except Exception as e:
+                        except Exception as e:  # noqa: BLE001
                             logger.warning(
                                 f"[PIPELINE] Failed to close PR for failed fix task {task.id}: {e}",
                                 exc_info=True,
@@ -2262,7 +2309,7 @@ async def reaper_service():
                         if child:
                             try:
                                 await _check_and_trigger_rollup(child, session)
-                            except Exception as e:
+                            except Exception as e:  # noqa: BLE001
                                 logger.warning(
                                     f"[REAPER] Evaluating sweep rollup failed for parent {parent.id}: {e}",
                                     exc_info=True,
@@ -2271,7 +2318,7 @@ async def reaper_service():
                         logger.info(
                             f"[REAPER] Swept {len(evaluating_parents)} stale EVALUATING parents"
                         )
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001
                     logger.warning(
                         f"[REAPER] Evaluating parent sweep error: {e}", exc_info=True
                     )
@@ -2350,7 +2397,7 @@ async def reaper_service():
                     from app.max_plan_pool import (
                         _all_accounts,
                         _account_available_for_model,
-                    )  # noqa: PLC0415
+                    )
 
                     _infra_lookback = now - timedelta(hours=2)
                     # Exclude just-reaped tasks so Step 2 failures aren't immediately
@@ -2495,7 +2542,7 @@ async def reaper_service():
 
                         # INFO alert so the user knows recovery happened.
                         try:
-                            from app.models import Alert, AlertSeverity  # noqa: PLC0415
+                            from app.models import Alert, AlertSeverity
 
                             _task_type_label = (_t.first_payload or {}).get(
                                 "type", "unknown"
@@ -2521,7 +2568,7 @@ async def reaper_service():
                                     "title": _res_alert.title,
                                 },
                             )
-                        except Exception as _alert_err:
+                        except Exception as _alert_err:  # noqa: BLE001
                             logger.warning(
                                 f"[REAPER] Resurrection alert failed for {_t.id}: {_alert_err}"
                             )
@@ -2546,11 +2593,11 @@ async def reaper_service():
                     from app.max_plan_pool import (
                         _all_accounts,
                         _account_available_for_model,
-                    )  # noqa: PLC0415
+                    )
                     from app.shared_state import (
                         direction_failure_streaks,
                         clear_direction_hold,
-                    )  # noqa: PLC0415
+                    )
 
                     _cleared_holds = 0
                     for _did, _streak in list(direction_failure_streaks.items()):
@@ -2618,7 +2665,7 @@ async def reaper_service():
                 # over an instance's lifetime. On Cloud Run instances that
                 # stay up for days this contributes to 4GB OOMs.
                 try:
-                    from app.shared_state import sweep_stale_in_memory_state  # noqa: PLC0415
+                    from app.shared_state import sweep_stale_in_memory_state
 
                     _mem_pruned = sweep_stale_in_memory_state()
                     if any(_mem_pruned.values()):
@@ -2700,11 +2747,11 @@ async def reaper_service():
                     )
 
                 # Step 6: QUEUED task age alerts — escalate through 3 tiers (INFO/WARNING/ERROR
-                # at 1×/3×/6× the threshold) so long-stalled tasks re-alert instead of going silent.
+                # at 1×/3×/6× the threshold) so long-stalled tasks re-alert instead of going silent.  # noqa: RUF003
                 try:
-                    from app.models import Alert, AlertSeverity  # noqa: PLC0415
-                    from app.broadcast import broadcast_to_project as _bcast  # noqa: PLC0415
-                    import app.shared_state as _shared_state  # noqa: PLC0415
+                    from app.models import Alert, AlertSeverity
+                    from app.broadcast import broadcast_to_project as _bcast
+                    import app.shared_state as _shared_state
 
                     _queued_threshold_hours = _runtime_config.get(
                         "queued_age_alert_hours", 2
@@ -2803,7 +2850,7 @@ async def reaper_service():
                                 from app.max_plan_pool import (
                                     describe_pool_blockage,
                                     _extract_task_model,
-                                )  # noqa: PLC0415
+                                )
 
                                 _likely_cause = describe_pool_blockage(
                                     _extract_task_model(_qt)
@@ -2838,7 +2885,7 @@ async def reaper_service():
                                     "title": _alert.title,
                                 },
                             )
-                        except Exception as _bcast_err:
+                        except Exception as _bcast_err:  # noqa: BLE001
                             logger.warning(
                                 f"[REAPER] Queued age alert broadcast failed for {_qt.id}: {_bcast_err}"
                             )
@@ -2867,9 +2914,9 @@ async def reaper_service():
                 # task termination and post-commit). Mark them stalled so the
                 # strategic agent can see the failure on the next run.
                 try:
-                    from app import strategic_cycle  # noqa: PLC0415
-                    from app.models import Alert, AlertSeverity  # noqa: PLC0415
-                    from app.broadcast import broadcast_to_project as _bcast  # noqa: PLC0415
+                    from app import strategic_cycle
+                    from app.models import Alert, AlertSeverity
+                    from app.broadcast import broadcast_to_project as _bcast
 
                     stalled = await strategic_cycle.find_stalled(session)
                     for c in stalled:

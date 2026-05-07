@@ -1326,6 +1326,89 @@ async def test_requeue_external_api_injects_api_guidance(tl_db, mocker):
 
 
 @pytest.mark.asyncio
+async def test_requeue_agent_timeout_does_not_stack_suffix_on_repeat_retry(
+    tl_db, mocker
+):
+    """Repeat AGENT_TIMEOUT retry should not duplicate the timeout suffix block.
+
+    Regression for 291914e6 / f5c8a36f / 897a742e (2026-05-07): the original
+    dedup regex only matched 'RETRY GUIDANCE:' headers and missed the
+    'IMPORTANT: The previous attempt TIMED OUT' header used by AGENT_TIMEOUT.
+    Each retry stacked another copy. Fix tracks _original_prompt_suffix in
+    ctx and replaces the auto-generated portion entirely on each retry.
+    """
+    mocker.patch("app.playbook_learning._maybe_auto_playbook", new_callable=AsyncMock)
+    mocker.patch("app.task_lifecycle.classify_failure", return_value="AGENT_TIMEOUT")
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(session, project.id, status=TaskStatus.EVALUATING)
+
+    failed_child = await _make_task(
+        session,
+        project.id,
+        task_type="create",
+        status=TaskStatus.FAILED,
+        parent_task_id=parent.id,
+        context={"_attempt_number": 2},
+        latest_status_message="Agent timed out (heartbeat lost)",
+    )
+    # Simulate a payload that already carries the timeout suffix from the
+    # previous retry (legacy stacking regression). The original spawn-time
+    # suffix is a small note we want preserved.
+    failed_child.payloads = [
+        {
+            "type": "create",
+            "prompt": "do create",
+            "prompt_suffix": (
+                "IMPORTANT: The previous attempt TIMED OUT — the agent stopped sending heartbeats. Keep operations smaller:\n"
+                "- Break long-running steps into shorter units that emit progress frequently\n"
+                "- Avoid single commands that block for minutes; prefer batched/iterative work\n"
+                "- Commit partial progress early so a later heartbeat loss doesn't erase it\n"
+                "- Reduce scope to fit comfortably within the heartbeat window\n"
+                "\n"
+                "ORIGINAL_NOTE: spawn-time guidance preserved across retries.\n"
+            ),
+        }
+    ]
+    from sqlalchemy.orm.attributes import flag_modified
+
+    flag_modified(failed_child, "payloads")
+    session.add(failed_child)
+    await session.commit()
+
+    await _requeue_parent_task(parent, session)
+
+    clone = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    assert clone is not None
+    prompt_suffix = clone.payloads[0].get("prompt_suffix", "") or ""
+
+    # Timeout block must appear EXACTLY ONCE (not stacked).
+    occurrences = prompt_suffix.count("IMPORTANT: The previous attempt TIMED OUT")
+    assert occurrences == 1, (
+        f"Timeout suffix stacked {occurrences} times — dedup regression. "
+        f"Suffix:\n{prompt_suffix}"
+    )
+    # Original spawn-time note must be preserved.
+    assert "ORIGINAL_NOTE: spawn-time guidance preserved" in prompt_suffix
+    # And the dedup snapshot is now stamped in clone ctx for future retries.
+    assert "_original_prompt_suffix" in (clone.context or {})
+    assert (
+        "IMPORTANT: The previous attempt TIMED OUT"
+        not in clone.context["_original_prompt_suffix"]
+    )
+
+
+@pytest.mark.asyncio
 async def test_requeue_rate_limit_injects_rate_limit_guidance(tl_db, mocker):
     """RATE_LIMIT failure inserts rate-limit retry guidance into prompt_suffix."""
     mocker.patch("app.playbook_learning._maybe_auto_playbook", new_callable=AsyncMock)
