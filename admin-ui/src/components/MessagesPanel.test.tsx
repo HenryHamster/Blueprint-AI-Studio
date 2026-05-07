@@ -140,8 +140,9 @@ describe('classifySignalLevel', () => {
     expect(classifySignalLevel({ ...base, context: { event_type: 'cycle_summary' } })).toBe('routine');
   });
 
-  test('NOTE with account_model_regression_quarantined is routine', () => {
-    expect(classifySignalLevel({ ...base, context: { event_type: 'account_model_regression_quarantined' } })).toBe('routine');
+  test('NOTE with account_model_regression_quarantined is high-signal', () => {
+    // System took account out of rotation due to regression — operator needs to see this immediately
+    expect(classifySignalLevel({ ...base, context: { event_type: 'account_model_regression_quarantined' } })).toBe('high');
   });
 
   test('NOTE with account_model_regression_recovered is routine', () => {
@@ -180,8 +181,9 @@ describe('classifySignalLevel', () => {
     expect(classifySignalLevel({ ...base, context: { event_type: 'review_feedback' } })).toBe('routine');
   });
 
-  test('NOTE with feedback_acknowledgment is routine', () => {
-    expect(classifySignalLevel({ ...base, context: { event_type: 'feedback_acknowledgment' } })).toBe('routine');
+  test('NOTE with feedback_acknowledgment is high-signal', () => {
+    // User filed FEEDBACK explicitly asking something; system's resolution reply should surface prominently
+    expect(classifySignalLevel({ ...base, context: { event_type: 'feedback_acknowledgment' } })).toBe('high');
   });
 
   test('NOTE with unknown event_type is routine (fail-safe)', () => {
@@ -750,5 +752,100 @@ describe('MessagesPanel persistence', () => {
     await act(async () => { root!.unmount(); }); root = null; await renderPanel(); expect(host!.textContent).toContain('test content');
     localStorage.removeItem(key); await act(async () => { root!.unmount(); }); root = null; await renderPanel(); expect(JSON.parse(localStorage.getItem(key) || '{}')).toMatchObject({ routineExpanded: false, showResolved: false });
     localStorage.setItem(key, '}{'); await act(async () => { root!.unmount(); }); root = null; await expect(renderPanel()).resolves.toBeUndefined(); expect(JSON.parse(localStorage.getItem(key) || '{}')).toMatchObject({ routineExpanded: false, showResolved: false });
+  });
+});
+
+describe('MessagesPanel feedback acknowledgment reply context', () => {
+  let root: Root | null = null;
+  let host: HTMLDivElement | null = null;
+
+  afterEach(() => {
+    const r = root;
+    if (r) act(() => r.unmount());
+    root = null;
+    host?.remove();
+    host = null;
+    vi.clearAllMocks();
+  });
+
+  async function renderPanel(messages: ReturnType<typeof makeMsg>[]) {
+    (apiFetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      new Response(JSON.stringify({ messages }), { status: 200 }),
+    );
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <MessagesPanel
+          selectedProjectId="proj-1"
+          onClose={() => {}}
+          addToast={() => {}}
+          onMessageCountChange={() => {}}
+        />,
+      );
+    });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 50)); });
+    return host as HTMLDivElement;
+  }
+
+  test('renders reply context label and original feedback excerpt for feedback_acknowledgment NOTE', async () => {
+    const feedback = makeMsg({
+      id: 'feedback-1',
+      message_type: 'FEEDBACK',
+      from_type: 'user',
+      content: 'How do we handle edge case X in the validation logic?',
+    });
+    const ack = makeMsg({
+      id: 'ack-1',
+      message_type: 'NOTE',
+      from_type: 'system',
+      content: 'We added a new validation step to handle that case.',
+      context: { event_type: 'feedback_acknowledgment', reply_to: 'feedback-1' },
+    });
+    const el = await renderPanel([feedback, ack]);
+    const text = el.textContent ?? '';
+
+    // Reply context label should appear
+    expect(text).toContain('In reply to your feedback:');
+    // Original feedback excerpt should appear
+    expect(text).toContain('How do we handle edge case X');
+    // Acknowledgment content should appear
+    expect(text).toContain('We added a new validation step');
+  });
+
+  test('gracefully handles missing reply_to reference (original feedback not in list)', async () => {
+    const ack = makeMsg({
+      id: 'ack-1',
+      message_type: 'NOTE',
+      from_type: 'system',
+      content: 'This is a reply to a feedback that was already resolved.',
+      context: { event_type: 'feedback_acknowledgment', reply_to: 'feedback-missing' },
+    });
+    const el = await renderPanel([ack]);
+    const text = el.textContent ?? '';
+
+    // Acknowledgment content should still render
+    expect(text).toContain('This is a reply to a feedback');
+    // Reply context label should NOT appear when reference is missing
+    expect(text).not.toContain('In reply to your feedback:');
+  });
+
+  test('does not show reply context for regular NOTE messages without feedback_acknowledgment event_type', async () => {
+    // Use a high-signal NOTE event_type so the bubble actually renders (routine NOTEs
+    // are placed inside the collapsed routine-ops group where bubble content is hidden).
+    const regularNote = makeMsg({
+      id: 'note-1',
+      message_type: 'NOTE',
+      from_type: 'system',
+      content: 'A regular note without reply context',
+      context: { event_type: 'failure_alert' },
+    });
+    const el = await renderPanel([regularNote]);
+    const text = el.textContent ?? '';
+
+    expect(text).toContain('A regular note without reply context');
+    expect(text).not.toContain('In reply to your feedback:');
   });
 });

@@ -1,5 +1,6 @@
 export const HIGH_SIGNAL_NOTE_EVENTS = new Set([
   'failure_alert', 'rollback_recommended', 'fix_loop_divergence_regressed',
+  'feedback_acknowledgment', 'account_model_regression_quarantined',
 ]);
 
 export const ROUTINE_EVENT_LABELS: Record<string, string> = {

@@ -538,11 +538,19 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
     }
   }
 
-  function renderBubble(msg: ProjectMessage, faded = false, readOnly = false) {
+  function renderBubble(msg: ProjectMessage, faded = false, readOnly = false, allMessages: ProjectMessage[] = []) {
     const config = TYPE_CONFIG[msg.message_type] || TYPE_CONFIG.NOTE;
     const Icon = config.icon;
     const userMsg = isUserMessage(msg);
     const isResolving = resolvingId === msg.id;
+
+    // Look up original FEEDBACK for feedback_acknowledgment NOTEs
+    let replyContextMsg: ProjectMessage | null = null;
+    if (msg.message_type === 'NOTE' &&
+        msg.context.event_type === 'feedback_acknowledgment' &&
+        typeof msg.context.reply_to === 'string') {
+      replyContextMsg = allMessages.find(m => m.id === msg.context.reply_to) || null;
+    }
 
     return (
       <div key={msg.id} className={`flex ${userMsg ? 'justify-end' : 'justify-start'} ${faded ? 'opacity-75' : ''}`}>
@@ -560,6 +568,13 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
                 {formatFromType(msg)} · {formatAge(msg.created_at)}
               </span>
             </div>
+            {/* Reply context for feedback acknowledgment */}
+            {replyContextMsg && (
+              <div className="mb-1.5 px-2 py-1 border-l-2 border-neutral-700/50 rounded-r bg-neutral-800/30">
+                <p className="text-[11px] text-neutral-500 mb-0.5">In reply to your feedback:</p>
+                <p className="text-[11px] text-neutral-400 truncate">{replyContextMsg.content}</p>
+              </div>
+            )}
             {/* Reply quote (if this message is a reply) */}
             {typeof msg.context.reply_preview === 'string' && (
               <div className="mb-1.5 px-2 py-1 border-l-2 border-neutral-700/50 rounded-r bg-neutral-800/30">
@@ -773,12 +788,12 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
                   <AlertTriangle className="w-3 h-3" />
                   <span>Pinned · Blockers</span>
                 </div>
-                {pinnedBlockers.map(msg => renderBubble(msg))}
+                {pinnedBlockers.map(msg => renderBubble(msg, false, false, messages))}
                 {otherHighSignal.length > 0 && <div className="border-t border-neutral-800/60" />}
               </>
             )}
             {/* Other high-signal open messages */}
-            {otherHighSignal.map(msg => renderBubble(msg))}
+            {otherHighSignal.map(msg => renderBubble(msg, false, false, messages))}
 
             {/* Routine ops group — collapsed by default */}
             {routineOpen.length > 0 && (
@@ -794,7 +809,7 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
                 {routineExpanded && (
                   <div className="space-y-3 p-3 border-t border-neutral-800/40">
                     {groupRoutineMessages(routineOpen).map(row => {
-                      if (row.kind === 'single') return renderBubble(row.msg);
+                      if (row.kind === 'single') return renderBubble(row.msg, false, false, messages);
                       const isGroupExpanded = expandedGroupKeys.has(row.key);
                       return (
                         <div key={row.key} className="border border-neutral-800/40 rounded-xl overflow-hidden">
@@ -821,7 +836,7 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
                           </div>
                           {isGroupExpanded && (
                             <div className="space-y-2 p-2 border-t border-neutral-800/40">
-                              {row.msgs.map(msg => renderBubble(msg, false, true))}
+                              {row.msgs.map(msg => renderBubble(msg, false, true, messages))}
                             </div>
                           )}
                         </div>
@@ -833,7 +848,7 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
             )}
 
             {/* Resolved messages (faded) */}
-            {visibleResolved.map(msg => renderBubble(msg, true))}
+            {visibleResolved.map(msg => renderBubble(msg, true, false, messages))}
 
             {/* Resolved toggle + clear */}
             {hiddenResolvedCount > 0 && (
