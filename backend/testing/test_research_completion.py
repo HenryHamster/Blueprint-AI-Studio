@@ -1,6 +1,9 @@
-"""Unit tests for research_completion.py pre-spawn scope-budget gate, low_actionability decay, grade normalization, and source ref validation."""
+"""Unit tests for research_completion.py pre-spawn scope-budget gate, low_actionability decay, grade normalization, source ref validation, and findings index."""
 
 import logging
+import uuid
+from datetime import timedelta
+from unittest.mock import AsyncMock, MagicMock
 
 from app.spawn_calibration import (
     MEDIUM_ANALYSIS_PLAN_FILE_LIMIT,
@@ -582,3 +585,164 @@ class TestCollectStaleRefs:
         ]
         stale = collect_stale_refs(validated)
         assert stale == ["a.py", "b.py"]
+
+
+class TestQueryFindingsIndex:
+    """query_findings_index: structured findings view for strategic cycle and admin."""
+
+    def _make_task(self, direction_id, plan_output, days_ago=1):
+        from app.time_utils import _utcnow
+
+        task = MagicMock()
+        task.id = uuid.uuid4()
+        task.context = {"direction_id": direction_id}
+        task.created_at = _utcnow() - timedelta(days=days_ago)
+        task.plan_output = plan_output
+        return task
+
+    def _mock_session(self, tasks):
+        mock_result = MagicMock()
+        mock_result.scalars.return_value.all.return_value = tasks
+        session = AsyncMock()
+        session.execute.return_value = mock_result
+        return session
+
+    def test_returns_all_findings_no_filter(self):
+        import asyncio
+        from app.research_completion import query_findings_index
+
+        t1 = self._make_task(
+            "d-1",
+            [
+                {
+                    "title": "F1",
+                    "description": "D1",
+                    "actionability_grade": "HIGH",
+                    "claims": ["c1"],
+                    "sources": [],
+                }
+            ],
+        )
+        t2 = self._make_task(
+            "d-2",
+            [
+                {
+                    "title": "F2",
+                    "description": "D2",
+                    "actionability_grade": "MEDIUM",
+                    "claims": [],
+                    "sources": [],
+                }
+            ],
+        )
+        session = self._mock_session([t1, t2])
+
+        rows = asyncio.get_event_loop().run_until_complete(
+            query_findings_index(session, "proj-1")
+        )
+        assert len(rows) == 2
+        titles = {r["finding_title"] for r in rows}
+        assert titles == {"F1", "F2"}
+
+    def test_filters_by_direction_id(self):
+        import asyncio
+        from app.research_completion import query_findings_index
+
+        t1 = self._make_task(
+            "d-1",
+            [
+                {
+                    "title": "F1",
+                    "description": "D1",
+                    "actionability_grade": "HIGH",
+                    "claims": [],
+                    "sources": [],
+                }
+            ],
+        )
+        t2 = self._make_task(
+            "d-2",
+            [
+                {
+                    "title": "F2",
+                    "description": "D2",
+                    "actionability_grade": "LOW",
+                    "claims": [],
+                    "sources": [],
+                }
+            ],
+        )
+        session = self._mock_session([t1, t2])
+
+        rows = asyncio.get_event_loop().run_until_complete(
+            query_findings_index(session, "proj-1", direction_id="d-1")
+        )
+        assert len(rows) == 1
+        assert rows[0]["finding_title"] == "F1"
+        assert rows[0]["direction_id"] == "d-1"
+
+    def test_row_shape_includes_claims_and_sources(self):
+        import asyncio
+        from app.research_completion import query_findings_index
+
+        claims = ["claim A", "claim B"]
+        sources = [{"type": "file", "ref": "backend/app/foo.py"}]
+        t = self._make_task(
+            "d-1",
+            [
+                {
+                    "title": "T",
+                    "description": "Desc",
+                    "actionability_grade": "HIGH",
+                    "claims": claims,
+                    "sources": sources,
+                }
+            ],
+        )
+        session = self._mock_session([t])
+
+        rows = asyncio.get_event_loop().run_until_complete(
+            query_findings_index(session, "proj-1")
+        )
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["claims"] == claims
+        assert row["sources"] == sources
+        assert row["actionability_grade"] == "HIGH"
+        assert "task_id" in row
+        assert "completed_at" in row
+        assert "finding_index" in row
+
+    def test_respects_limit(self):
+        import asyncio
+        from app.research_completion import query_findings_index
+
+        findings = [
+            {
+                "title": f"F{i}",
+                "description": "x",
+                "actionability_grade": "MEDIUM",
+                "claims": [],
+                "sources": [],
+            }
+            for i in range(10)
+        ]
+        t = self._make_task("d-1", findings)
+        session = self._mock_session([t])
+
+        rows = asyncio.get_event_loop().run_until_complete(
+            query_findings_index(session, "proj-1", limit=3)
+        )
+        assert len(rows) == 3
+
+    def test_skips_non_list_plan_output(self):
+        import asyncio
+        from app.research_completion import query_findings_index
+
+        t = self._make_task("d-1", {"not": "a list"})
+        session = self._mock_session([t])
+
+        rows = asyncio.get_event_loop().run_until_complete(
+            query_findings_index(session, "proj-1")
+        )
+        assert rows == []

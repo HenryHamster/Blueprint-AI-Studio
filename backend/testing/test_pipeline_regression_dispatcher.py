@@ -2938,6 +2938,230 @@ async def test_closed_case_with_recent_history_uses_recurrence_prompt(db_session
 
 
 @pytest.mark.asyncio
+async def test_recurrence_prompt_layers_targeted_absent_renders_pending(db_session):
+    """fix-log entries without layers_targeted render 'classification pending' and no mismatch block."""
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+
+    project = make_project(
+        design_doc=_design_doc_with_sr_regression(category="correctness"),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    merged_at = (_utcnow() - timedelta(hours=3)).isoformat()
+    prior_task = await _seed_dispatcher_spawn_history(
+        db_session,
+        project.id,
+        regression_class="sr_catch_rate",
+        created_at=_utcnow() - timedelta(hours=7),
+        pr_number=9001,
+    )
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate",
+        status=RegressionCaseStatus.MERGED,
+        hit_count=1,
+        attempts=0,
+        last_remediation_task_id=prior_task.id,
+        last_remediation_pr_number=9001,
+        last_remediation_result="merged",
+        signal_snapshot_at_spawn={
+            "prior_rate": 0.80,
+            "current_rate": 0.50,
+            "signal_name": "sr_catch_rate",
+            "captured_at": merged_at,
+        },
+        signal_snapshot_at_merge={"captured_at": merged_at},
+        fingerprint_to_fix_log=[
+            {
+                "fingerprint": "sr_catch_rate",
+                "fix_pr_number": 9001,
+                "merged_at": merged_at,
+            }
+        ],
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    await run_recovery_once(db_session, project.id)
+    await db_session.refresh(case)
+    assert case.status == RegressionCaseStatus.ACTIVE
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 1
+
+    task = (
+        (
+            await db_session.execute(
+                select(Task)
+                .where(Task.project_id == project.id)
+                .order_by(Task.created_at.desc())
+            )
+        )
+        .scalars()
+        .first()
+    )
+    prompt = (task.first_payload or {}).get("prompt", "")
+    assert "RECURRENCE META-INVESTIGATION" in prompt
+    assert "layers: classification pending" in prompt
+    assert "SYMPTOM-MISMATCH RECURRENCE" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_recurrence_prompt_layers_targeted_overlap_no_mismatch(db_session):
+    """When prior layers overlap with current obs layers, no mismatch block is emitted."""
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+
+    project = make_project(
+        design_doc=_design_doc_with_sr_regression(category="correctness"),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    merged_at = (_utcnow() - timedelta(hours=3)).isoformat()
+    prior_task = await _seed_dispatcher_spawn_history(
+        db_session,
+        project.id,
+        regression_class="sr_catch_rate",
+        created_at=_utcnow() - timedelta(hours=7),
+        pr_number=9100,
+    )
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate",
+        status=RegressionCaseStatus.MERGED,
+        hit_count=1,
+        attempts=0,
+        last_remediation_task_id=prior_task.id,
+        last_remediation_pr_number=9100,
+        last_remediation_result="merged",
+        signal_snapshot_at_spawn={
+            "prior_rate": 0.80,
+            "current_rate": 0.50,
+            "signal_name": "sr_catch_rate",
+            "captured_at": merged_at,
+        },
+        signal_snapshot_at_merge={"captured_at": merged_at},
+        fingerprint_to_fix_log=[
+            {
+                "fingerprint": "sr_catch_rate",
+                "fix_pr_number": 9100,
+                "merged_at": merged_at,
+                "layers_targeted": ["REVIEWER_PASS"],
+            }
+        ],
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    await run_recovery_once(db_session, project.id)
+    await db_session.refresh(case)
+    assert case.status == RegressionCaseStatus.ACTIVE
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 1
+
+    task = (
+        (
+            await db_session.execute(
+                select(Task)
+                .where(Task.project_id == project.id)
+                .order_by(Task.created_at.desc())
+            )
+        )
+        .scalars()
+        .first()
+    )
+    prompt = (task.first_payload or {}).get("prompt", "")
+    assert "RECURRENCE META-INVESTIGATION" in prompt
+    assert "layers: REVIEWER_PASS" in prompt
+    assert "SYMPTOM-MISMATCH RECURRENCE" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_recurrence_prompt_layers_targeted_disjoint_emits_mismatch_block(
+    db_session,
+):
+    """When prior layers and current obs layers are disjoint, the SYMPTOM-MISMATCH block fires."""
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+
+    project = make_project(
+        design_doc=_design_doc_with_sr_regression(category="correctness"),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    merged_at = (_utcnow() - timedelta(hours=3)).isoformat()
+    prior_task = await _seed_dispatcher_spawn_history(
+        db_session,
+        project.id,
+        regression_class="sr_catch_rate",
+        created_at=_utcnow() - timedelta(hours=7),
+        pr_number=9200,
+    )
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate",
+        status=RegressionCaseStatus.MERGED,
+        hit_count=1,
+        attempts=0,
+        last_remediation_task_id=prior_task.id,
+        last_remediation_pr_number=9200,
+        last_remediation_result="merged",
+        signal_snapshot_at_spawn={
+            "prior_rate": 0.80,
+            "current_rate": 0.50,
+            "signal_name": "sr_catch_rate",
+            "captured_at": merged_at,
+        },
+        signal_snapshot_at_merge={"captured_at": merged_at},
+        fingerprint_to_fix_log=[
+            {
+                "fingerprint": "sr_catch_rate",
+                "fix_pr_number": 9200,
+                "merged_at": merged_at,
+                "layers_targeted": ["CI_WORKFLOW"],
+            }
+        ],
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    await run_recovery_once(db_session, project.id)
+    await db_session.refresh(case)
+    assert case.status == RegressionCaseStatus.ACTIVE
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 1
+
+    task = (
+        (
+            await db_session.execute(
+                select(Task)
+                .where(Task.project_id == project.id)
+                .order_by(Task.created_at.desc())
+            )
+        )
+        .scalars()
+        .first()
+    )
+    prompt = (task.first_payload or {}).get("prompt", "")
+    assert "RECURRENCE META-INVESTIGATION" in prompt
+    assert "SYMPTOM-MISMATCH RECURRENCE" in prompt
+    # Names both sets
+    assert "CI_WORKFLOW" in prompt
+    assert "REVIEWER_PASS" in prompt
+    # Calls out the un-defended layers explicitly
+    assert "Difference (un-defended layers): REVIEWER_PASS" in prompt
+    assert "Start your layer reasoning from the un-defended layers" in prompt
+    # Per-attempt layer annotation reflects the prior layers
+    assert "layers: CI_WORKFLOW" in prompt
+
+
+@pytest.mark.asyncio
 async def test_third_attempt_prompt_enriched(db_session):
     """attempts==2: spawned prompt includes prior-attempt context with PR and post-merge value."""
     from app.models import RegressionCaseStatus, RegressionRemediationCase
@@ -5391,6 +5615,122 @@ async def test_cross_layer_idempotent_repeated_fingerprint(db_session):
     assert f"fresh-fp-{_LAYER_SYMPTOM_BOUND + 4}" in fps
 
 
+@pytest.mark.asyncio
+async def test_cross_layer_with_recurrence_blends_prompts(db_session):
+    """When regression recurs on new layers → both recurrence and cross-layer blocks in prompt."""
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+    from app.regression_layer_classifier import (
+        LAYER_AGENT_VM,
+        LAYER_CI_WORKFLOW,
+    )
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    fingerprint = "PROVISION_FAILURE"
+    regression_class = f"anomaly:{fingerprint}"
+    now = _utcnow()
+    merged_at = (now - timedelta(hours=3)).isoformat()
+
+    # Prior spawn with successful remediation.
+    prior_task = await _seed_dispatcher_spawn_history(
+        db_session,
+        project.id,
+        regression_class=regression_class,
+        created_at=now - timedelta(hours=7),
+        pr_number=4321,
+    )
+
+    # Case with symptoms on AGENT_VM and prior fix history.
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class=regression_class,
+        status=RegressionCaseStatus.ACTIVE,
+        signal_snapshot_at_spawn={"signal_name": "persistent_anomaly"},
+        last_seen_at=now - timedelta(hours=2),
+        hit_count=1,
+        signal_first_crossed_at=now - timedelta(hours=2),
+        signal_first_seen_at=now - timedelta(hours=2),
+        attempts=1,
+        last_remediation_task_id=prior_task.id,
+        last_remediation_pr_number=4321,
+        last_remediation_result="failed",
+        signal_snapshot_at_merge={"captured_at": merged_at},
+        fingerprint_to_fix_log=[
+            {
+                "fingerprint": "agentvm-fp-1",
+                "fix_pr_number": 4321,
+                "merged_at": merged_at,
+            }
+        ],
+        symptoms_by_layer={
+            LAYER_AGENT_VM: [
+                {
+                    "fingerprint": "agentvm-fp-1",
+                    "observed_at": (now - timedelta(hours=2)).isoformat(),
+                    "sample": "error while loading shared libraries: libatk-1.0.so.0",
+                }
+            ]
+        },
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    # New observation on CI_WORKFLOW layer → triggers cross-layer detection.
+    _seed_anomaly(
+        project.id,
+        fingerprint,
+        message="no jobs ran for changed files; workflow not triggered",
+    )
+    try:
+        spawned = await run_once(db_session, project.id)
+        assert spawned == 1
+
+        task = (
+            (
+                await db_session.execute(
+                    select(Task)
+                    .where(Task.project_id == project.id)
+                    .order_by(Task.created_at.desc())
+                )
+            )
+            .scalars()
+            .first()
+        )
+        assert task is not None
+        ctx = task.context or {}
+        assert ctx.get("cross_layer") is True
+        assert ctx.get("recurrence_count") == 1
+
+        payload = task.first_payload or {}
+        prompt = payload.get("prompt") or ""
+
+        # Both blocks must be present.
+        assert "RECURRENCE META-INVESTIGATION" in prompt
+        assert "CROSS-LAYER REGRESSION DETECTED" in prompt
+
+        # Verify recurrence appears before cross-layer.
+        recurrence_idx = prompt.find("RECURRENCE META-INVESTIGATION")
+        cross_layer_idx = prompt.find("CROSS-LAYER REGRESSION DETECTED")
+        assert recurrence_idx < cross_layer_idx
+        assert recurrence_idx != -1
+        assert cross_layer_idx != -1
+
+        # Both layer names should appear in prompt.
+        assert LAYER_AGENT_VM in prompt
+        assert LAYER_CI_WORKFLOW in prompt
+
+        # Recurrence details should be present.
+        assert "4321" in prompt
+        assert "Enumerate ALL FIVE canonical layers explicitly:" in prompt
+    finally:
+        import app.shared_state as _ss
+
+        _ss.persistent_anomalies.pop(str(project.id), None)
+
+
 # ---------------------------------------------------------------------------
 # Watchdog alarm tests
 # ---------------------------------------------------------------------------
@@ -6340,3 +6680,377 @@ async def test_telemetry_stale_recovery_closes_when_signal_refreshed(db_session)
 
     await db_session.refresh(case)
     assert case.status == RegressionCaseStatus.CLOSED
+
+
+# ---------------------------------------------------------------------------
+# Layer-defense ledger tests
+# ---------------------------------------------------------------------------
+
+
+def test_build_layer_defense_ledger_empty_fix_log_returns_empty_string():
+    """Empty fix log produces no block."""
+    from app.pipeline_regression_dispatcher import _build_layer_defense_ledger
+
+    assert _build_layer_defense_ledger([]) == ""
+
+
+def test_build_layer_defense_ledger_groups_by_layer_with_hold_duration():
+    """Entries with layers_targeted and both timestamps produce per-layer stats."""
+    from app.pipeline_regression_dispatcher import (
+        _build_layer_defense_ledger,
+        _LAYER_DEFENSE_LEDGER_LOOKBACK_DAYS,
+    )
+    from app.time_utils import _utcnow
+
+    now = _utcnow()
+    merged_at = (now - timedelta(days=10)).isoformat()
+    recovered_at = (now - timedelta(days=8)).isoformat()  # held 2 days
+
+    fix_log = [
+        {
+            "fingerprint": "fp1",
+            "fix_pr_number": 100,
+            "merged_at": merged_at,
+            "recovered_at": recovered_at,
+            "layers_targeted": ["BASELINE_GATE"],
+        },
+        {
+            "fingerprint": "fp2",
+            "fix_pr_number": 101,
+            "merged_at": merged_at,
+            "recovered_at": recovered_at,
+            "layers_targeted": ["BASELINE_GATE"],
+        },
+    ]
+    block = _build_layer_defense_ledger(fix_log)
+    assert "RECENT DEFENSE ACTIVITY BY LAYER" in block
+    # All five canonical layers appear
+    for layer in (
+        "CI_WORKFLOW",
+        "AGENT_VM",
+        "AGENT_VERB",
+        "BASELINE_GATE",
+        "REVIEWER_PASS",
+    ):
+        assert layer in block
+    # BASELINE_GATE has 2 defenses
+    assert "BASELINE_GATE: 2 defense(s) added" in block
+    # Avg hold should be ~2.0d (both held 2d)
+    assert "avg hold 2.0d before re-trip" in block
+    # Layers with no activity show the "no defenses" phrasing
+    assert (
+        f"CI_WORKFLOW: no defenses added here in the last {_LAYER_DEFENSE_LEDGER_LOOKBACK_DAYS} days"
+        in block
+    )
+    assert (
+        f"AGENT_VM: no defenses added here in the last {_LAYER_DEFENSE_LEDGER_LOOKBACK_DAYS} days"
+        in block
+    )
+
+
+def test_build_layer_defense_ledger_entries_outside_lookback_excluded():
+    """Entries with merged_at older than the lookback window are not counted."""
+    from app.pipeline_regression_dispatcher import (
+        _build_layer_defense_ledger,
+        _LAYER_DEFENSE_LEDGER_LOOKBACK_DAYS,
+    )
+    from app.time_utils import _utcnow
+
+    now = _utcnow()
+    # Older than 90 days
+    old_merged = (
+        now - timedelta(days=_LAYER_DEFENSE_LEDGER_LOOKBACK_DAYS + 5)
+    ).isoformat()
+    old_recovered = (
+        now - timedelta(days=_LAYER_DEFENSE_LEDGER_LOOKBACK_DAYS + 3)
+    ).isoformat()
+
+    fix_log = [
+        {
+            "fingerprint": "fp_old",
+            "merged_at": old_merged,
+            "recovered_at": old_recovered,
+            "layers_targeted": ["BASELINE_GATE"],
+        },
+    ]
+    block = _build_layer_defense_ledger(fix_log)
+    # Block is rendered (non-empty fix_log)
+    assert "RECENT DEFENSE ACTIVITY BY LAYER" in block
+    # But BASELINE_GATE shows no activity (entry was excluded)
+    assert (
+        f"BASELINE_GATE: no defenses added here in the last {_LAYER_DEFENSE_LEDGER_LOOKBACK_DAYS} days"
+        in block
+    )
+    assert "defense(s) added" not in block
+
+
+def test_build_layer_defense_ledger_still_holding_and_retripped():
+    """Still-holding and re-tripped-within-48h entries are categorised correctly."""
+    from app.pipeline_regression_dispatcher import _build_layer_defense_ledger
+    from app.time_utils import _utcnow
+
+    now = _utcnow()
+    # Still holding (no recovered_at) - 30 days old → held >7d
+    merged_still = (now - timedelta(days=30)).isoformat()
+    # Re-tripped within 48h
+    merged_fast = (now - timedelta(days=5)).isoformat()
+    recovered_fast = (now - timedelta(days=4, hours=23)).isoformat()  # ~1h hold < 48h
+
+    fix_log = [
+        {
+            "fingerprint": "fp_still",
+            "merged_at": merged_still,
+            "layers_targeted": ["CI_WORKFLOW"],
+        },
+        {
+            "fingerprint": "fp_fast",
+            "merged_at": merged_fast,
+            "recovered_at": recovered_fast,
+            "layers_targeted": ["CI_WORKFLOW"],
+        },
+    ]
+    block = _build_layer_defense_ledger(fix_log)
+    assert "CI_WORKFLOW: 2 defense(s) added" in block
+    assert "1 still holding" in block
+    assert "retripped <48h (fragile)" in block
+    # still_holding entry > 7d old → contributes to held_gt_7d
+    assert "held >7d" in block
+
+
+def test_format_recurrence_meta_prompt_includes_layer_defense_block():
+    """_format_recurrence_meta_prompt appends layer_defense_block when non-empty."""
+    from types import SimpleNamespace
+    from app.pipeline_regression_dispatcher import _format_recurrence_meta_prompt
+
+    case = SimpleNamespace(
+        _recurrence_attempts=[],
+        _recurrence_count=1,
+        _recurrence_held_text="2 days",
+        _recurrence_obs_layers=[],
+        fingerprint_to_fix_log=[],
+    )
+    block = "RECENT DEFENSE ACTIVITY BY LAYER (last 90 days)\n  BASELINE_GATE: 1 defense(s) added"
+    result = _format_recurrence_meta_prompt(
+        case, "base prompt", layer_defense_block=block
+    )
+    assert "RECURRENCE META-INVESTIGATION" in result
+    assert "RECENT DEFENSE ACTIVITY BY LAYER" in result
+    assert "base prompt" in result
+
+
+def test_format_cross_layer_prompt_includes_layer_defense_block():
+    """_format_cross_layer_prompt appends layer_defense_block when non-empty."""
+    from app.pipeline_regression_dispatcher import _format_cross_layer_prompt
+
+    block = "RECENT DEFENSE ACTIVITY BY LAYER (last 90 days)\n  AGENT_VM: no defenses added here"
+    result = _format_cross_layer_prompt(
+        signal_name="fix_loop_divergence",
+        regression_class="fix_loop_divergence:fp1",
+        layers_evidence=[
+            {"layer": "CI_WORKFLOW", "fingerprint": "fp1", "sample": "some error"},
+            {"layer": "AGENT_VM", "fingerprint": "fp2", "sample": "other error"},
+        ],
+        base_lines="base prompt",
+        layer_defense_block=block,
+    )
+    assert "CROSS-LAYER REGRESSION DETECTED" in result
+    assert "RECENT DEFENSE ACTIVITY BY LAYER" in result
+    assert "base prompt" in result
+
+
+def test_format_theme_layer_meta_prompt_includes_layer_defense_block():
+    """_format_theme_layer_meta_prompt appends layer_defense_block when non-empty."""
+    from app.pipeline_regression_dispatcher import _format_theme_layer_meta_prompt
+
+    block = "RECENT DEFENSE ACTIVITY BY LAYER (last 90 days)\n  REVIEWER_PASS: 3 defense(s) added"
+    result = _format_theme_layer_meta_prompt("base prompt", layer_defense_block=block)
+    assert "META-INVESTIGATION — SR BLIND-SPOT THEME" in result
+    assert "RECENT DEFENSE ACTIVITY BY LAYER" in result
+    assert "base prompt" in result
+
+
+@pytest.mark.asyncio
+async def test_recurrence_spawn_prompt_has_ledger_block(db_session):
+    """Re-armed cases include RECENT DEFENSE ACTIVITY BY LAYER in the spawned prompt."""
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+
+    project = make_project(
+        design_doc=_design_doc_with_sr_regression(category="correctness"),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    merged_at = (now - timedelta(hours=3)).isoformat()
+    recovered_at = (now - timedelta(hours=2, minutes=30)).isoformat()
+    prior_task = await _seed_dispatcher_spawn_history(
+        db_session,
+        project.id,
+        regression_class="sr_catch_rate",
+        created_at=now - timedelta(hours=7),
+        pr_number=9900,
+    )
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate",
+        status=RegressionCaseStatus.MERGED,
+        hit_count=1,
+        attempts=0,
+        last_remediation_task_id=prior_task.id,
+        last_remediation_pr_number=9900,
+        last_remediation_result="merged",
+        signal_snapshot_at_spawn={
+            "prior_rate": 0.80,
+            "current_rate": 0.50,
+            "signal_name": "sr_catch_rate",
+            "captured_at": merged_at,
+        },
+        signal_snapshot_at_merge={"captured_at": merged_at},
+        fingerprint_to_fix_log=[
+            {
+                "fingerprint": "sr_catch_rate",
+                "fix_pr_number": 9900,
+                "merged_at": merged_at,
+                "recovered_at": recovered_at,
+                "layers_targeted": ["BASELINE_GATE"],
+            }
+        ],
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    await run_recovery_once(db_session, project.id)
+    await db_session.refresh(case)
+    assert case.status == RegressionCaseStatus.ACTIVE
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 1
+
+    task = (
+        (
+            await db_session.execute(
+                select(Task)
+                .where(Task.project_id == project.id)
+                .order_by(Task.created_at.desc())
+            )
+        )
+        .scalars()
+        .first()
+    )
+    prompt = (task.first_payload or {}).get("prompt", "")
+    assert "RECURRENCE META-INVESTIGATION" in prompt
+    assert "RECENT DEFENSE ACTIVITY BY LAYER" in prompt
+    assert "BASELINE_GATE" in prompt
+
+
+@pytest.mark.asyncio
+async def test_theme_spawn_prompt_has_ledger_block(db_session):
+    """SR blind-spot theme spawns include RECENT DEFENSE ACTIVITY BY LAYER in the prompt."""
+    from app.pipeline_regression_dispatcher import _SR_BLIND_SPOT_THEME_FLOOR
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+    from app.time_utils import _utcnow as _ts_now
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _ts_now()
+    theme_text = "missing null guard in processing loop"
+    for _ in range(_SR_BLIND_SPOT_THEME_FLOOR):
+        sro = {
+            "verdict": "pass",
+            "check_results": {"correctness": {"passed": True}},
+            "blind_spots": [theme_text],
+            "reviewer_findings": [],
+        }
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create", "prompt": "x", "base_branch": "main"}],
+                context={"_self_review_outcome": sro},
+                created_at=now - timedelta(days=3),
+            )
+        )
+
+    # Seed a resolved case with a layers_targeted fix-log entry so the ledger has content
+    existing_case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="fix_loop_divergence:some_fp",
+        status=RegressionCaseStatus.CLOSED,
+        hit_count=1,
+        fingerprint_to_fix_log=[
+            {
+                "fingerprint": "some_fp",
+                "fix_pr_number": 5555,
+                "merged_at": (now - timedelta(days=5)).isoformat(),
+                "recovered_at": (now - timedelta(days=3)).isoformat(),
+                "layers_targeted": ["AGENT_VERB"],
+            }
+        ],
+    )
+    db_session.add(existing_case)
+    await db_session.commit()
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 1
+
+    all_tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    task = _get_investigate_task(all_tasks)
+    assert task is not None
+    prompt = (task.first_payload or {}).get("prompt", "")
+    assert "META-INVESTIGATION" in prompt
+    assert "RECENT DEFENSE ACTIVITY BY LAYER" in prompt
+    assert "AGENT_VERB" in prompt
+
+
+@pytest.mark.asyncio
+async def test_ledger_computed_once_per_run_once(db_session, monkeypatch):
+    """_build_layer_defense_ledger is called at most once per project per run_once call."""
+    import app.pipeline_regression_dispatcher as mod
+
+    # Two SR category regressions so run_once calls _maybe_spawn twice for the same project.
+    project = make_project(
+        design_doc={
+            "sr_catch_rate_trends": {
+                "categories": {
+                    "correctness": {
+                        "current_hit_rate": 0.50,
+                        "previous_hit_rate": 0.80,
+                        "current_human_count": 12,
+                        "trend": "decreasing",
+                    },
+                    "error-handling": {
+                        "current_hit_rate": 0.45,
+                        "previous_hit_rate": 0.85,
+                        "current_human_count": 15,
+                        "trend": "decreasing",
+                    },
+                },
+            },
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    call_count = [0]
+    original_fn = mod._build_layer_defense_ledger
+
+    def counting_wrapper(all_fix_logs, **kwargs):
+        call_count[0] += 1
+        return original_fn(all_fix_logs, **kwargs)
+
+    monkeypatch.setattr(mod, "_build_layer_defense_ledger", counting_wrapper)
+
+    spawned = await run_once(db_session, project.id)
+    # At least one spawn happened (may be 1 or 2 depending on budget/cooldowns)
+    assert spawned >= 1
+    # The ledger was computed only once for this project despite multiple _maybe_spawn calls
+    assert call_count[0] == 1

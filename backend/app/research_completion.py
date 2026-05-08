@@ -639,6 +639,69 @@ async def lookup_findings_by_source_ref(
     return matches
 
 
+async def query_findings_index(
+    session: AsyncSession,
+    project_id: Any,
+    direction_id: Optional[str] = None,
+    limit: int = 50,
+    days: int = 30,
+) -> List[Dict[str, Any]]:
+    """Return structured findings rows for the strategic cycle and admin display.
+
+    Scans plan_output of completed research tasks for the project, optionally
+    filtered to a single direction.  Each returned dict has:
+      task_id, direction_id, completed_at (ISO), finding_title,
+      finding_description, actionability_grade, claims (list), sources (list),
+      finding_index — ready for prompt embedding or JSON serialisation.
+
+    Bounded by ``days`` recency and ``limit`` total rows so prompt budgets are
+    predictable.  Ordered newest-task-first, then by finding_index within task.
+    """
+    since = _utcnow() - timedelta(days=days)
+    stmt = (
+        select(Task)
+        .where(
+            Task.project_id == project_id,
+            Task.plan_output.isnot(None),
+            Task.created_at >= since,
+        )
+        .order_by(Task.created_at.desc())
+        .limit(500)
+    )
+    tasks = (await session.execute(stmt)).scalars().all()
+
+    rows: List[Dict[str, Any]] = []
+    for task in tasks:
+        ctx = task.context or {}
+        task_dir = ctx.get("direction_id")
+        if direction_id is not None and task_dir != direction_id:
+            continue
+        plan = task.plan_output
+        if not isinstance(plan, list):
+            continue
+        for idx, finding in enumerate(plan):
+            if not isinstance(finding, dict):
+                continue
+            rows.append(
+                {
+                    "task_id": str(task.id),
+                    "direction_id": task_dir,
+                    "completed_at": task.created_at.isoformat()
+                    if task.created_at
+                    else None,
+                    "finding_index": idx,
+                    "finding_title": finding.get("title", ""),
+                    "finding_description": finding.get("description", ""),
+                    "actionability_grade": finding.get("actionability_grade", "MEDIUM"),
+                    "claims": finding.get("claims") or [],
+                    "sources": finding.get("sources") or [],
+                }
+            )
+            if len(rows) >= limit:
+                return rows
+    return rows
+
+
 async def _handle_research_completion(task: Task, logs: str, session: AsyncSession):
     """Parse research findings and create tasks from them."""
     # Increment _research_spawn_count on completion (variable name is legacy;

@@ -3378,3 +3378,53 @@ class TestBuildOutcomeEvaluationEvidence:
         ev = result["directions"][0].get("evidence")
         assert ev is not None
         assert len(ev) <= 5
+
+
+class TestFormatFindingsForPrompt:
+    """format_findings_for_prompt: compact prompt block from query_findings_index rows."""
+
+    def _row(self, title, grade="MEDIUM", desc="", claims=None, sources=None):
+        return {
+            "finding_title": title,
+            "finding_description": desc,
+            "actionability_grade": grade,
+            "claims": claims or [],
+            "sources": sources or [],
+        }
+
+    def test_empty_rows_returns_empty_string(self):
+        from app.strategic_completion import format_findings_for_prompt
+
+        assert format_findings_for_prompt([]) == ""
+
+    def test_single_row_no_claims_no_sources(self):
+        from app.strategic_completion import format_findings_for_prompt
+
+        row = self._row("Title A", grade="HIGH", desc="Some description")
+        result = format_findings_for_prompt([row])
+        assert "[HIGH] Title A: Some description" in result
+        assert "claims" not in result
+        assert "sources" not in result
+
+    def test_row_with_claims_and_sources(self):
+        from app.strategic_completion import format_findings_for_prompt
+
+        row = self._row(
+            "Title B",
+            grade="HIGH",
+            desc="Desc",
+            claims=["claim X", "claim Y"],
+            sources=[{"type": "file", "ref": "backend/app/foo.py"}],
+        )
+        result = format_findings_for_prompt([row])
+        assert "claim X" in result
+        assert "backend/app/foo.py" in result
+
+    def test_max_rows_respected(self):
+        from app.strategic_completion import format_findings_for_prompt
+
+        rows = [self._row(f"T{i}") for i in range(20)]
+        result = format_findings_for_prompt(rows, max_rows=5)
+        assert result.count("\n") == 4  # 5 lines = 4 newlines
+        assert "T0" in result
+        assert "T5" not in result

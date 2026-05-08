@@ -94,6 +94,10 @@ _FIX_LOOP_DIVERGENCE_FINGERPRINT_WINDOW_DAYS = 7
 # in the self-review prompt rather than a one-off observation from a single task.
 _SR_BLIND_SPOT_THEME_FLOOR = 5
 
+# Lookback window for the project-wide layer-defense ledger injected into meta-investigation
+# prompts. Covers ~3 months of defense activity across all regression classes for the project.
+_LAYER_DEFENSE_LEDGER_LOOKBACK_DAYS = 90
+
 # Strategic-cycle stall threshold: how many hours without a completed
 # strategic_review or design_doc_update before we flag the engine as stalled.
 _STRATEGIC_CYCLE_STALL_HOURS = 8
@@ -176,6 +180,14 @@ _last_cycle_monotonic: dict[str, float] = {}
 # at entry, before any guard, so cooldown/dedup/cap rejections are counted.
 _cycle_signals_tripped_var: contextvars.ContextVar[list] = contextvars.ContextVar(
     "_cycle_signals_tripped",
+    default=None,
+)
+
+# Per-run cache for the project-wide layer-defense ledger block. Keyed by str(project_id).
+# Populated by run_once() so the ledger DB query fires at most once per project per tick.
+# Default None means caching is disabled (e.g. when called from run_recovery_once).
+_cycle_layer_ledger_var: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "_cycle_layer_ledger",
     default=None,
 )
 
@@ -546,6 +558,11 @@ def _extract_recurrence_cycles(
         has_fix = entry.get("fix_pr_number") is not None
         has_recovery = entry.get("recovered_at") is not None
         if has_fix:
+            layers_present = "layers_targeted" in entry
+            raw_layers = entry.get("layers_targeted") if layers_present else None
+            layers_list = (
+                [str(x) for x in raw_layers] if isinstance(raw_layers, list) else []
+            )
             cycles.append(
                 {
                     "fix_pr_number": entry.get("fix_pr_number"),
@@ -555,6 +572,8 @@ def _extract_recurrence_cycles(
                     or case.updated_at
                     or case.created_at,
                     "recovered_at": None,
+                    "layers_targeted_present": layers_present,
+                    "layers_targeted": layers_list,
                 }
             )
             continue
@@ -568,6 +587,8 @@ def _extract_recurrence_cycles(
                     "fix_pr_number": None,
                     "merged_at": merged_fallback or recovered_at or case.updated_at,
                     "recovered_at": recovered_at,
+                    "layers_targeted_present": False,
+                    "layers_targeted": [],
                 }
             )
     if not cycles and (
@@ -580,29 +601,159 @@ def _extract_recurrence_cycles(
                 "fix_pr_number": case.last_remediation_pr_number,
                 "merged_at": merged_fallback or case.updated_at or case.created_at,
                 "recovered_at": None,
+                "layers_targeted_present": False,
+                "layers_targeted": [],
             }
         )
     return cycles
 
 
+def _build_layer_defense_ledger(
+    all_fix_logs: list[dict[str, Any]],
+    lookback_days: int = _LAYER_DEFENSE_LEDGER_LOOKBACK_DAYS,
+) -> str:
+    """Build a RECENT DEFENSE ACTIVITY BY LAYER block for meta-investigation prompts.
+
+    Aggregates fingerprint_to_fix_log entries from all RegressionRemediationCase rows
+    for a project, filters to merged_at within lookback_days, and computes per-layer
+    statistics. All five canonical layers always appear. Returns empty string when
+    all_fix_logs is empty.
+    """
+    if not all_fix_logs:
+        return ""
+
+    now = _utcnow()
+    cutoff = now - timedelta(days=lookback_days)
+
+    layer_stats: dict[str, dict[str, Any]] = {
+        layer: {
+            "fix_count": 0,
+            "hold_days": [],  # hold durations for re-tripped entries (days)
+            "still_holding_ages": [],  # age in days for still-holding entries
+            "retripped_within_48h": 0,
+            "held_gt_7d": 0,
+        }
+        for layer in _CANONICAL_RECURRENCE_LAYERS
+    }
+
+    for entry in all_fix_logs:
+        if not isinstance(entry, dict):
+            continue
+        merged_dt = _parse_dispatcher_dt(entry.get("merged_at"))
+        if merged_dt is None or merged_dt < cutoff:
+            continue
+        layers_targeted = entry.get("layers_targeted") or []
+        if not layers_targeted:
+            continue
+        recovered_dt = _parse_dispatcher_dt(entry.get("recovered_at"))
+        age_days = (now - merged_dt).total_seconds() / 86400.0
+
+        for layer in layers_targeted:
+            if layer not in layer_stats:
+                continue
+            s = layer_stats[layer]
+            s["fix_count"] += 1
+            if recovered_dt is not None:
+                hold = (recovered_dt - merged_dt).total_seconds() / 86400.0
+                s["hold_days"].append(hold)
+                if hold < 2.0:
+                    s["retripped_within_48h"] += 1
+                if hold > 7.0:
+                    s["held_gt_7d"] += 1
+            else:
+                s["still_holding_ages"].append(age_days)
+                if age_days > 7.0:
+                    s["held_gt_7d"] += 1
+
+    lines: list[str] = [
+        "",
+        f"RECENT DEFENSE ACTIVITY BY LAYER (last {lookback_days} days)",
+    ]
+    for layer in _CANONICAL_RECURRENCE_LAYERS:
+        s = layer_stats[layer]
+        if s["fix_count"] == 0:
+            lines.append(
+                f"  {layer}: no defenses added here in the last {lookback_days} days"
+            )
+        else:
+            parts = [f"  {layer}: {s['fix_count']} defense(s) added"]
+            hold_days_list = s["hold_days"]
+            if hold_days_list:
+                avg_hold = sum(hold_days_list) / len(hold_days_list)
+                parts.append(f"avg hold {avg_hold:.1f}d before re-trip")
+            if s["still_holding_ages"]:
+                parts.append(f"{len(s['still_holding_ages'])} still holding")
+            if s["held_gt_7d"] > 0:
+                parts.append(f"{s['held_gt_7d']} held >7d")
+            if s["retripped_within_48h"] > 0:
+                parts.append(f"{s['retripped_within_48h']} retripped <48h (fragile)")
+            lines.append("; ".join(parts))
+    return "\n".join(lines)
+
+
 def _format_recurrence_meta_prompt(
     case: RegressionRemediationCase,
     base_lines: str,
+    layer_defense_block: str = "",
 ) -> str:
     attempts = getattr(case, "_recurrence_attempts", []) or []
     recurrence_count = getattr(case, "_recurrence_count", len(attempts)) or len(
         attempts
     )
     held_text = getattr(case, "_recurrence_held_text", "unknown")
-    lines = [
-        "RECURRENCE META-INVESTIGATION",
-        (
-            f"This regression class has recurred {recurrence_count} time(s) after "
-            "prior remediation."
-        ),
-        f"Most recent prior fix held for {held_text} before the signal re-tripped.",
-        "Prior remediation attempts:",
-    ]
+    obs_layers = list(getattr(case, "_recurrence_obs_layers", []) or [])
+
+    def _format_attempt_layers(attempt: dict[str, Any]) -> str:
+        if not attempt.get("layers_targeted_present"):
+            return "layers: classification pending"
+        layers = attempt.get("layers_targeted") or []
+        if not layers:
+            return "layers: none of the canonical layers"
+        return f"layers: {', '.join(layers)}"
+
+    prior_layers_union: set[str] = set()
+    for attempt in attempts:
+        if attempt.get("layers_targeted_present"):
+            prior_layers_union.update(attempt.get("layers_targeted") or [])
+    obs_layers_set = set(obs_layers)
+    mismatch = (
+        bool(prior_layers_union)
+        and bool(obs_layers_set)
+        and prior_layers_union.isdisjoint(obs_layers_set)
+    )
+
+    lines: list[str] = []
+    if mismatch:
+        undefended = sorted(obs_layers_set - prior_layers_union)
+        lines.extend(
+            [
+                "SYMPTOM-MISMATCH RECURRENCE",
+                (
+                    "Prior fixes targeted layers ["
+                    f"{', '.join(sorted(prior_layers_union))}] but the current "
+                    f"observation classifies as [{', '.join(sorted(obs_layers_set))}]."
+                ),
+                (f"Difference (un-defended layers): {', '.join(undefended)}."),
+                (
+                    "Start your layer reasoning from the un-defended layers above; "
+                    "the previously-targeted layers have not prevented this re-trip."
+                ),
+                "",
+            ]
+        )
+    lines.extend(
+        [
+            "RECURRENCE META-INVESTIGATION",
+            (
+                f"This regression class has recurred {recurrence_count} time(s) after "
+                "prior remediation."
+            ),
+            f"Most recent prior fix held for {held_text} before the signal re-tripped.",
+        ]
+    )
+    obs_text = ", ".join(obs_layers) if obs_layers else "classification pending"
+    lines.append(f"Current observation layers: {obs_text}")
+    lines.append("Prior remediation attempts:")
     if attempts:
         for idx, attempt in enumerate(attempts, start=1):
             task_id = attempt.get("task_id") or "unknown"
@@ -615,6 +766,7 @@ def _format_recurrence_meta_prompt(
                 f"PR #{pr_number}" if pr_number is not None else "PR unknown",
                 f"merged {merged_at}",
                 f"held {held_for} before re-trip",
+                _format_attempt_layers(attempt),
             ]
             if recovered_at is not None:
                 parts.insert(3, f"recovered {recovered_at}")
@@ -634,10 +786,14 @@ def _format_recurrence_meta_prompt(
     )
     lines.append("")
     lines.append(base_lines)
+    if layer_defense_block:
+        lines.append(layer_defense_block)
     return "\n".join(lines)
 
 
-def _format_theme_layer_meta_prompt(base_lines: str) -> str:
+def _format_theme_layer_meta_prompt(
+    base_lines: str, layer_defense_block: str = ""
+) -> str:
     """Prepend the canonical layer-enumeration block for SR blind-spot theme regressions.
 
     Themes only fire after _SR_BLIND_SPOT_THEME_FLOOR (5+) occurrences, so the
@@ -661,6 +817,8 @@ def _format_theme_layer_meta_prompt(base_lines: str) -> str:
         "",
         base_lines,
     ]
+    if layer_defense_block:
+        lines.append(layer_defense_block)
     return "\n".join(lines)
 
 
@@ -1330,6 +1488,7 @@ def _format_cross_layer_prompt(
     regression_class: str,
     layers_evidence: list[dict[str, Any]],
     base_lines: str,
+    layer_defense_block: str = "",
 ) -> str:
     """Build the cross-layer investigate prompt enumerating per-layer evidence."""
     layer_count = len(layers_evidence)
@@ -1363,6 +1522,8 @@ def _format_cross_layer_prompt(
     )
     header.append("")
     header.append(base_lines)
+    if layer_defense_block:
+        header.append(layer_defense_block)
     return "\n".join(header)
 
 
@@ -1645,6 +1806,8 @@ async def _load_recurrence_prompt_context(
                 "fix_pr_number": case.last_remediation_pr_number,
                 "merged_at": merged_anchor or case.updated_at or case.created_at,
                 "recovered_at": None,
+                "layers_targeted_present": False,
+                "layers_targeted": [],
             }
         ]
 
@@ -1685,6 +1848,8 @@ async def _load_recurrence_prompt_context(
                     recovered_at.isoformat() if recovered_at is not None else None
                 ),
                 "held_for": _format_dispatcher_duration(held_for),
+                "layers_targeted_present": bool(cycle.get("layers_targeted_present")),
+                "layers_targeted": list(cycle.get("layers_targeted") or []),
             }
         )
 
@@ -1868,6 +2033,34 @@ async def _maybe_spawn(
             extras=extras,
         )
     )
+    # Compute (or retrieve from per-run cache) the project-wide layer-defense ledger.
+    # The cache is keyed by str(project_id) inside the ContextVar dict set by run_once();
+    # a None dict means caching is disabled (e.g. run_recovery_once), so we compute
+    # fresh but still use the result.
+    _ledger_cache = _cycle_layer_ledger_var.get()
+    _pid_key = str(project_id)
+    if _ledger_cache is not None and _pid_key in _ledger_cache:
+        _layer_defense_block = _ledger_cache[_pid_key]
+    else:
+        _all_cases = (
+            (
+                await session.execute(
+                    select(RegressionRemediationCase).where(
+                        RegressionRemediationCase.project_id == project_id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        _all_fix_logs: list[dict[str, Any]] = []
+        for _c in _all_cases:
+            if _c.fingerprint_to_fix_log:
+                _all_fix_logs.extend(_c.fingerprint_to_fix_log)
+        _layer_defense_block = _build_layer_defense_ledger(_all_fix_logs)
+        if _ledger_cache is not None:
+            _ledger_cache[_pid_key] = _layer_defense_block
+
     if is_cross_layer:
         layers_evidence = _representative_per_layer(
             merged_symptoms, distinct_layers, now=now
@@ -1877,13 +2070,14 @@ async def _maybe_spawn(
             regression_class=regression_class,
             layers_evidence=layers_evidence,
             base_lines=base_prompt,
+            layer_defense_block=_layer_defense_block,
         )
     else:
         prompt = base_prompt
         layers_evidence = []
 
     recurrence_context = None
-    if not is_cross_layer and existing_case is not None:
+    if existing_case is not None:
         recurrence_context = await _load_recurrence_prompt_context(
             session,
             existing_case,
@@ -1905,19 +2099,33 @@ async def _maybe_spawn(
                 "_recurrence_held_text",
                 recurrence_context["held_text"],
             )
-            prompt = _format_recurrence_meta_prompt(existing_case, base_prompt)
+            object.__setattr__(
+                existing_case,
+                "_recurrence_obs_layers",
+                list(obs_layers or []),
+            )
+            if is_cross_layer:
+                prompt = _format_recurrence_meta_prompt(
+                    existing_case, prompt, layer_defense_block=_layer_defense_block
+                )
+            else:
+                prompt = _format_recurrence_meta_prompt(
+                    existing_case, base_prompt, layer_defense_block=_layer_defense_block
+                )
 
     # SR blind-spot theme regressions already represent 5+ recurrences of the same
     # pattern; force the layer-enumeration meta block on every first dispatch so the
     # agent enumerates all five canonical layers rather than doing single-symptom triage.
-    # Recurrence meta (above) already includes layer enumeration; cross-layer (above)
-    # takes precedence; this only fires when neither of those paths ran.
+    # Recurrence meta (above) already includes layer enumeration; cross-layer and
+    # recurrence may both fire together; this only fires when neither path ran.
     if (
         not is_cross_layer
         and recurrence_context is None
         and regression_class.startswith("sr_blind_spot:theme:")
     ):
-        prompt = _format_theme_layer_meta_prompt(base_prompt)
+        prompt = _format_theme_layer_meta_prompt(
+            base_prompt, layer_defense_block=_layer_defense_block
+        )
 
     if (
         recurrence_context is None
@@ -3529,6 +3737,8 @@ async def run_once(session: AsyncSession, project_id: uuid.UUID) -> int:
     _token = _cycle_rejections_var.set(_rj)
     _st_counter: list = [0]
     _st_token = _cycle_signals_tripped_var.set(_st_counter)
+    _ledger_cache_init: dict = {}
+    _ledger_token = _cycle_layer_ledger_var.set(_ledger_cache_init)
     _spawned = 0
     try:
         # Force a full SELECT rather than session.get(): a caller that left a
@@ -3649,6 +3859,7 @@ async def run_once(session: AsyncSession, project_id: uuid.UUID) -> int:
     finally:
         _cycle_rejections_var.reset(_token)
         _cycle_signals_tripped_var.reset(_st_token)
+        _cycle_layer_ledger_var.reset(_ledger_token)
         # Persist the cycle record to the durable table.  Use a fresh
         # session-scope INSERT in its own commit so a write error here cannot
         # mask the spawn commits already flushed above.  Matches the prior

@@ -355,6 +355,44 @@ def _extract_cycle_reasoning(task: Task) -> str:
     return msg.strip()[:_CYCLE_REASONING_MAX]
 
 
+_FINDINGS_PROMPT_MAX_ROWS = 10
+_FINDINGS_DESCRIPTION_MAX = 120
+_FINDINGS_CLAIM_MAX = 3
+_FINDINGS_SOURCE_MAX = 2
+
+
+def format_findings_for_prompt(
+    rows: list, max_rows: int = _FINDINGS_PROMPT_MAX_ROWS
+) -> str:
+    """Format query_findings_index rows as a compact prompt block.
+
+    Returns a newline-separated string with one finding per line: grade, title,
+    truncated description, top claims, and source refs.  Empty string when rows
+    is empty.  Suitable for embedding in a strategic synthesis prompt.
+    """
+    if not rows:
+        return ""
+    lines: list[str] = []
+    for r in rows[:max_rows]:
+        grade = r.get("actionability_grade") or "MEDIUM"
+        title = r.get("finding_title") or ""
+        desc = (r.get("finding_description") or "")[:_FINDINGS_DESCRIPTION_MAX]
+        claims = [str(c) for c in (r.get("claims") or [])[:_FINDINGS_CLAIM_MAX]]
+        sources = r.get("sources") or []
+        refs = [
+            s.get("ref", "")
+            for s in sources[:_FINDINGS_SOURCE_MAX]
+            if isinstance(s, dict) and s.get("ref")
+        ]
+        line = f"[{grade}] {title}: {desc}"
+        if claims:
+            line += f" | claims: {'; '.join(claims)}"
+        if refs:
+            line += f" | sources: {', '.join(refs)}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def _check_direction_health(direction: dict) -> str | None:
     """Return a pause reason if this direction should be auto-paused, else None."""
     history = direction.get("research_history") or []
@@ -839,6 +877,22 @@ async def _handle_strategic_completion(
             }
             if _retirement_critiques is not None:
                 _extra["retirement_critiques"] = _retirement_critiques
+            try:
+                from app.research_completion import query_findings_index  # noqa: PLC0415
+
+                _finding_rows = await query_findings_index(
+                    session, project.id, limit=20, days=30
+                )
+                if _finding_rows:
+                    _extra["recent_research_findings"] = _finding_rows
+                    _extra["recent_research_findings_prompt"] = (
+                        format_findings_for_prompt(_finding_rows)
+                    )
+            except Exception:
+                logger.warning(
+                    f"[STRATEGIC] Task {task.id}: failed to fetch findings index (non-fatal)",
+                    exc_info=True,
+                )
             await strategic_cycle.mark_phase2_completed(
                 session,
                 cycle_id,

@@ -5,6 +5,7 @@ from app.strategic_analysis import (
     _compute_prediction_calibration_factor as _real_compute_prediction_calibration_factor,
     _compute_prediction_calibration,
     _build_retired_directions_summary,
+    _index_findings_by_direction,
     _RETIRED_MAX_COUNT,
     _RETIRED_PER_ENTRY_CHAR_CAP,
 )
@@ -2056,3 +2057,70 @@ def test_failed_approaches_included():
     entry = result[0]
     if "failed_approaches" in entry:
         assert len(entry["failed_approaches"]) > 0
+
+
+# ---------------------------------------------------------------------------
+# _index_findings_by_direction
+# ---------------------------------------------------------------------------
+
+
+def test_index_findings_groups_by_direction():
+    rows = [
+        {"direction_id": "d-1", "finding_title": "F1"},
+        {"direction_id": "d-1", "finding_title": "F2"},
+        {"direction_id": "d-2", "finding_title": "F3"},
+    ]
+    idx = _index_findings_by_direction(rows)
+    assert set(idx.keys()) == {"d-1", "d-2"}
+    assert len(idx["d-1"]) == 2
+    assert len(idx["d-2"]) == 1
+
+
+def test_index_findings_no_direction_id_goes_to_unlinked():
+    rows = [{"direction_id": None, "finding_title": "X"}]
+    idx = _index_findings_by_direction(rows)
+    assert "_unlinked" in idx
+    assert "X" == idx["_unlinked"][0]["finding_title"]
+
+
+def test_build_outcome_evaluation_injects_recent_findings():
+    directions = [
+        {
+            "id": "d-1",
+            "status": "active",
+            "research_history": [
+                {"timestamp": "2026-01-01T00:00:00", "prs_merged": 1, "tasks_failed": 0}
+            ],
+        }
+    ]
+    project = _make_project(directions=directions)
+    findings_rows = [
+        {
+            "direction_id": "d-1",
+            "finding_title": "T1",
+            "claims": ["c1"],
+            "sources": [],
+            "actionability_grade": "HIGH",
+        }
+    ]
+    fbd = _index_findings_by_direction(findings_rows)
+    result = _real_build_outcome_evaluation(project, [], findings_by_direction=fbd)
+    d_out = result["directions"][0]
+    assert "recent_findings" in d_out
+    assert d_out["recent_findings"][0]["finding_title"] == "T1"
+
+
+def test_build_outcome_evaluation_no_findings_by_direction_unchanged():
+    directions = [
+        {
+            "id": "d-1",
+            "status": "active",
+            "research_history": [
+                {"timestamp": "2026-01-01T00:00:00", "prs_merged": 1, "tasks_failed": 0}
+            ],
+        }
+    ]
+    project = _make_project(directions=directions)
+    result = _real_build_outcome_evaluation(project, [])
+    d_out = result["directions"][0]
+    assert "recent_findings" not in d_out

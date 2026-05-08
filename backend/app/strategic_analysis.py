@@ -159,7 +159,26 @@ def _build_retired_directions_summary(
     return results
 
 
-def _build_outcome_evaluation(project, cycle_history: list | None = None) -> dict:
+def _index_findings_by_direction(findings_rows: list) -> dict:
+    """Group query_findings_index rows by direction_id for O(1) per-direction lookup.
+
+    Returns {direction_id: [row, ...]} suitable for passing to
+    _build_outcome_evaluation as findings_by_direction.  Rows with no
+    direction_id are keyed under "_unlinked" and are never injected into a
+    direction outcome.
+    """
+    by_dir: dict = {}
+    for row in findings_rows:
+        did = row.get("direction_id") or "_unlinked"
+        by_dir.setdefault(did, []).append(row)
+    return by_dir
+
+
+def _build_outcome_evaluation(
+    project,
+    cycle_history: list | None = None,
+    findings_by_direction: dict | None = None,
+) -> dict:
     """Build a planned-vs-actual assessment for the strategic agent.
 
     Compares what the vision predicted against what directions actually produced.
@@ -303,6 +322,10 @@ def _build_outcome_evaluation(project, cycle_history: list | None = None) -> dic
             filtered = filter_direction_evidence(ctx, raw_evidence)
             if filtered:
                 outcome["evidence"] = filtered
+        if findings_by_direction is not None:
+            live_rows = findings_by_direction.get(d.get("id") or "", [])
+            if live_rows:
+                outcome["recent_findings"] = live_rows[:5]
         # Include lifetime totals for context
         lifetime_cycles = len(history) + (agg.get("total_cycles") or 0)
         lifetime_merged = sum(h.get("prs_merged", 0) for h in history) + (

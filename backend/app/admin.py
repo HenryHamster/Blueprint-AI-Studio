@@ -2570,6 +2570,31 @@ async def trigger_rollup(
     }
 
 
+@router.get("/projects/{project_id}/findings")
+async def get_project_findings(
+    project_id: uuid.UUID,
+    direction_id: Optional[str] = Query(None),
+    limit: int = Query(50, ge=1, le=200),
+    days: int = Query(30, ge=1, le=365),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return structured research findings for a project, with claims and sources.
+
+    Optional direction_id filter scopes results to a single direction.
+    Ordered newest-task-first; bounded by days recency and limit total rows.
+    """
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "viewer"
+    )
+    from app.research_completion import query_findings_index
+
+    rows = await query_findings_index(
+        session, project_id, direction_id=direction_id, limit=limit, days=days
+    )
+    return {"findings": rows, "count": len(rows)}
+
+
 # --- Deployment State & Health ---
 
 
