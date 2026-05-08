@@ -3,7 +3,7 @@ import { X, MessageSquare, Send, Check, AlertTriangle, HelpCircle, Bug, StickyNo
 import { auth } from '../firebase';
 import { apiFetch, API_BASE_URL } from '../api';
 import { parseTimestamp } from '../utils/time';
-import { routineSummary, effectiveSignal, loadEventPrefs, EVENT_PREFS_KEY, type EventPref, groupRoutineMessages } from './MessagesPanel.utils';
+import { routineSummary, effectiveSignal, loadEventPrefs, EVENT_PREFS_KEY, type EventPref, groupRoutineMessages, outcomeBreakdown, isFailingGroup, getToastSeverity, type RoutineRow } from './MessagesPanel.utils';
 
 interface ProjectMessage {
   id: string;
@@ -221,12 +221,16 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
   // Track seen messages to detect new arrivals and avoid initial-load toast spam
   const seenMessageIdsRef = useRef<Set<string>>(new Set());
   const hasInitiallyLoadedRef = useRef(false);
+  const seenPromotedGroupKeysRef = useRef<Set<string>>(new Set());
+  const eventPrefsRef = useRef(eventPrefs);
+  eventPrefsRef.current = eventPrefs;
 
   // Reset toast suppression state when switching projects so that the next
   // fetch is treated as an initial load for the new project (avoids a flood
   // of toasts for project B's pre-existing open BLOCKER/BUG/FEEDBACK items).
   useEffect(() => {
     seenMessageIdsRef.current = new Set();
+    seenPromotedGroupKeysRef.current = new Set();
     hasInitiallyLoadedRef.current = false;
   }, [selectedProjectId]);
 
@@ -259,6 +263,15 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
   // In importance mode, pin BLOCKERs at the top with a visual divider
   const pinnedBlockers = sortMode === 'importance' ? highSignalOpen.filter(m => m.message_type === 'BLOCKER') : [];
   const otherHighSignal = sortMode === 'importance' ? highSignalOpen.filter(m => m.message_type !== 'BLOCKER') : highSignalOpen;
+
+  // Failing routine groups auto-promoted above the routine ops section
+  const allRoutineRows = groupRoutineMessages(routineOpen);
+  const promotedGroups = allRoutineRows.filter(
+    (r): r is RoutineRow<ProjectMessage> & { kind: 'group' } =>
+      r.kind === 'group' && isFailingGroup(r.msgs) && eventPrefs[r.event_type] !== 'mute',
+  );
+  const promotedKeys = new Set(promotedGroups.map(r => r.key));
+  const remainingRoutineRows = allRoutineRows.filter(r => r.kind === 'single' || !promotedKeys.has(r.key));
 
   const allEventTypes = [...new Set([
     ...Object.keys(eventPrefs),
@@ -297,21 +310,33 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
 
       // Detect new high-signal messages for toast alerts
       if (hasInitiallyLoadedRef.current) {
-        const highSignalTypes = new Set(['BLOCKER', 'BUG_REPORT', 'FEEDBACK']);
         const newHighSignal = msgs.filter(m =>
           m.status === 'open' &&
-          highSignalTypes.has(m.message_type) &&
+          effectiveSignal(m, eventPrefs) === 'high' &&
           !seenMessageIdsRef.current.has(m.id)
         );
 
         if (newHighSignal.length > 0) {
           const summary = newHighSignal.length === 1
-            ? `New ${newHighSignal[0].message_type === 'BLOCKER' ? 'BLOCKER' : newHighSignal[0].message_type === 'BUG_REPORT' ? 'BUG' : 'FEEDBACK'}: ${newHighSignal[0].content.slice(0, 80)}`
-            : `${newHighSignal.length} new high-signal messages (${newHighSignal.filter(m => m.message_type === 'BLOCKER').length} BLOCKERs, ${newHighSignal.filter(m => m.message_type === 'BUG_REPORT').length} BUGs, ${newHighSignal.filter(m => m.message_type === 'FEEDBACK').length} FEEDBACKs)`;
+            ? `New ${newHighSignal[0].message_type === 'BLOCKER' ? 'BLOCKER' : newHighSignal[0].message_type === 'BUG_REPORT' ? 'BUG' : newHighSignal[0].message_type === 'FEEDBACK' ? 'FEEDBACK' : 'high-signal message'}: ${newHighSignal[0].content.slice(0, 80)}`
+            : `${newHighSignal.length} new high-signal messages`;
 
-          // Determine toast type based on presence of BLOCKERs or BUG_REPORTs
-          const hasCritical = newHighSignal.some(m => m.message_type === 'BLOCKER' || m.message_type === 'BUG_REPORT');
-          addToastRef.current(summary, hasCritical ? 'error' : 'info');
+          // Use the highest severity among the new messages
+          const toastSeverity = newHighSignal.some(m => getToastSeverity(m) === 'error') ? 'error' : 'info';
+          addToastRef.current(summary, toastSeverity);
+        }
+      }
+
+      // Detect + toast for newly promoted failing routine groups
+      const wasLoaded = hasInitiallyLoadedRef.current;
+      const routineMsgs = msgs.filter(m => m.status === 'open' && effectiveSignal(m, eventPrefsRef.current) === 'routine');
+      for (const row of groupRoutineMessages(routineMsgs)) {
+        if (row.kind === 'group' && isFailingGroup(row.msgs) && eventPrefsRef.current[row.event_type] !== 'mute') {
+          if (wasLoaded && !seenPromotedGroupKeysRef.current.has(row.key)) {
+            const bd = outcomeBreakdown(row.msgs);
+            addToastRef.current(`Failing group: ${row.msgs.length} ${row.label} ${bd}`, 'error');
+          }
+          seenPromotedGroupKeysRef.current.add(row.key);
         }
       }
 
@@ -331,7 +356,7 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
     } finally {
       setLoading(false);
     }
-  }, [selectedProjectId, onMessageCountChange]);
+  }, [selectedProjectId, onMessageCountChange, eventPrefs]);
 
   useEffect(() => {
     fetchMessages();
@@ -795,6 +820,35 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
             {/* Other high-signal open messages */}
             {otherHighSignal.map(msg => renderBubble(msg, false, false, messages))}
 
+            {/* Auto-promoted failing routine groups */}
+            {promotedGroups.map(row => {
+              const bd = outcomeBreakdown(row.msgs);
+              const isGroupExpanded = expandedGroupKeys.has(row.key);
+              return (
+                <div key={row.key} className="border border-red-800/50 rounded-xl overflow-hidden bg-red-950/20">
+                  <div className="flex items-center gap-2 px-4 py-2.5 bg-red-950/30 min-h-[44px]">
+                    <button
+                      onClick={() => setExpandedGroupKeys(prev => { const next = new Set(prev); if (next.has(row.key)) next.delete(row.key); else next.add(row.key); return next; })}
+                      className="flex-1 flex items-center gap-2 text-left"
+                    >
+                      <AlertTriangle className="w-3.5 h-3.5 text-red-400 shrink-0" />
+                      <span className="text-xs text-red-300 font-medium">{row.msgs.length} {row.label}</span>
+                      {bd && <span className="text-xs text-red-400">{bd}</span>}
+                    </button>
+                    {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
+                    <button onClick={() => handleResolveGroup(row.msgs)} title="Resolve all" className="text-emerald-500/70 hover:text-emerald-400 p-1 rounded transition-colors">
+                      <Check className="w-3 h-3" />
+                    </button>
+                  </div>
+                  {isGroupExpanded && (
+                    <div className="space-y-2 p-2 border-t border-red-900/40">
+                      {row.msgs.map(msg => renderBubble(msg, false, true, messages))}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+
             {/* Routine ops group — collapsed by default */}
             {routineOpen.length > 0 && (
               <div className="border border-neutral-800/50 rounded-xl overflow-hidden">
@@ -808,9 +862,10 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
                 </button>
                 {routineExpanded && (
                   <div className="space-y-3 p-3 border-t border-neutral-800/40">
-                    {groupRoutineMessages(routineOpen).map(row => {
+                    {remainingRoutineRows.map(row => {
                       if (row.kind === 'single') return renderBubble(row.msg, false, false, messages);
                       const isGroupExpanded = expandedGroupKeys.has(row.key);
+                      const bd = outcomeBreakdown(row.msgs);
                       return (
                         <div key={row.key} className="border border-neutral-800/40 rounded-xl overflow-hidden">
                           <div className="flex items-center gap-2 px-3 py-2 bg-neutral-900/30">
@@ -823,7 +878,7 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
                               className="flex-1 flex items-center gap-2 text-left"
                             >
                               <ChevronDown className={`w-3 h-3 text-neutral-600 shrink-0 transition-transform ${isGroupExpanded ? 'rotate-180' : ''}`} />
-                              <span className="text-xs text-neutral-500 font-medium">{row.msgs.length} {row.label}</span>
+                              <span className="text-xs text-neutral-500 font-medium">{row.msgs.length} {row.label}{bd ? ` ${bd}` : ''}</span>
                             </button>
                             {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                             <button

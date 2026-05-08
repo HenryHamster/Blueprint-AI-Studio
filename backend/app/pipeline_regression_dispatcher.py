@@ -224,6 +224,11 @@ async def _run_signal_staleness_watchdog(
             _shared_state.deploy_monitoring.get("signal_last_computed_at"),
             _SIGNAL_STALENESS_WINDOWS["deploy_health"],
         ),
+        (
+            "sr_blind_spot",
+            doc.get("sr_blind_spot_signal_last_computed_at"),
+            _SIGNAL_STALENESS_WINDOWS["sr_blind_spot"],
+        ),
     ]
     created = 0
     for signal_name, raw_ts, threshold in specs:
@@ -883,6 +888,27 @@ async def _current_signal_value_for_class(
             "magnitude": float(n),
             "tripped": tripped,
             "extras": [f"Persistent anomaly '{anomaly_key}' seen {n}x."],
+        }
+
+    if regression_class.startswith("telemetry_stale:"):
+        signal = regression_class[len("telemetry_stale:") :]
+        doc = project_design_doc or {}
+        now = _utcnow()
+        raw_ts, threshold = _get_staleness_raw_ts(signal, doc, project_id)
+        computed_at = _parse_iso_timestamp(raw_ts)
+        if computed_at is None:
+            return None
+        age = now - computed_at
+        return {
+            "signal_name": "telemetry_stale",
+            "prior_rate": None,
+            "current_rate": None,
+            "sample_size": 0,
+            "magnitude": round(age.total_seconds() / 3600, 2),
+            "tripped": age > threshold,
+            "extras": [
+                f"Signal '{signal}' last computed {round(age.total_seconds() / 3600, 1)}h ago."
+            ],
         }
 
     if regression_class.startswith("background_service_crash:"):
@@ -2327,6 +2353,111 @@ async def _evaluate_sr_blind_spot_signal(
     return spawned
 
 
+def _get_staleness_raw_ts(
+    signal_name: str,
+    doc: dict,
+    project_id: uuid.UUID,
+) -> tuple[Any, timedelta]:
+    """Return (raw_timestamp_str, freshness_threshold) for a staleness-monitored signal."""
+    if signal_name == "sr_catch_rate":
+        raw = (doc.get("sr_catch_rate_trends") or {}).get(
+            "signal_last_computed_at"
+        ) or (doc.get("sr_catch_rate_trends") or {}).get("computed_at")
+    elif signal_name == "fix_loop_divergence":
+        raw = doc.get("fix_loop_divergence_signal_last_computed_at") or doc.get(
+            "fix_loop_divergence_detected_at"
+        )
+    elif signal_name == "persistent_anomaly":
+        raw = (_shared_state.persistent_anomalies.get(str(project_id)) or {}).get(
+            "signal_last_computed_at"
+        )
+    elif signal_name == "deploy_health":
+        raw = _shared_state.deploy_monitoring.get("signal_last_computed_at")
+    elif signal_name == "sr_blind_spot":
+        raw = doc.get("sr_blind_spot_signal_last_computed_at")
+    else:
+        raw = None
+    return raw, _SIGNAL_STALENESS_WINDOWS.get(signal_name, timedelta(hours=48))
+
+
+_TELEMETRY_STALENESS_SIGNALS: list[tuple[str, str]] = [
+    ("sr_catch_rate", "playbook_learning.compute_sr_catch_rate_trends"),
+    (
+        "fix_loop_divergence",
+        "fix_loop_telemetry (computed alongside task fix-loop history)",
+    ),
+    ("persistent_anomaly", "anomaly_detection (updated on task completion)"),
+    ("deploy_health", "deploy_health (updated on deploy events)"),
+    (
+        "sr_blind_spot",
+        "sr_blind_spots.compute_sr_blind_spot_themes (call on task completion)",
+    ),
+]
+
+
+async def _evaluate_telemetry_staleness_signal(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    project_design_doc: dict | None,
+    spawn_budget_left: int,
+) -> int:
+    """Spawn investigate tasks for pipeline signals that have stopped computing.
+
+    Treats each stale signal as its own regression_class so dedup, cooldown,
+    and MTTD/MTTR dashboards work identically to other regression classes.
+    The existing WARNING Alerts from _run_signal_staleness_watchdog still fire
+    — this adds an autonomous investigation, not a replacement.
+    """
+    if spawn_budget_left <= 0:
+        return 0
+    doc = project_design_doc or {}
+    now = _utcnow()
+    spawned = 0
+    for signal, source_module in _TELEMETRY_STALENESS_SIGNALS:
+        if spawned >= spawn_budget_left:
+            break
+        raw_ts, threshold = _get_staleness_raw_ts(signal, doc, project_id)
+        computed_at = _parse_iso_timestamp(raw_ts)
+        if computed_at is None or (now - computed_at) <= threshold:
+            continue
+        age = now - computed_at
+        regression_class = f"telemetry_stale:{signal}"
+        prompt = "\n".join(
+            [
+                f"Telemetry staleness: signal '{signal}' has not refreshed in {round(age.total_seconds() / 3600, 1)}h.",
+                f"Last computed: {computed_at.isoformat()} (freshness window: {round(threshold.total_seconds() / 3600, 1)}h).",
+                f"This signal is computed by: {source_module}.",
+                "",
+                "Diagnose why this signal stopped computing and ship a fix.",
+                "Produce the structured diagnosis JSON ({summary, root_cause, recommended_fix, severity, confidence, affected_files}).",
+                "Do NOT prescribe a fix — let the investigate→fix chain produce the remediation.",
+            ]
+        )
+        spawn = await _maybe_spawn(
+            session,
+            project_id,
+            signal_name="telemetry_stale",
+            regression_class=regression_class,
+            prior_rate=None,
+            current_rate=None,
+            sample_size=0,
+            magnitude=round(age.total_seconds() / 3600, 2),
+            extras=[
+                f"Signal '{signal}' last computed {round(age.total_seconds() / 3600, 1)}h ago."
+            ],
+            title_hint=f"telemetry staleness: {signal}",
+            prompt_override=prompt,
+            extra_snapshot_fields={
+                "signal_last_computed_at": computed_at.isoformat(),
+                "age_hours": round(age.total_seconds() / 3600, 1),
+                "source_module": source_module,
+            },
+        )
+        if spawn is not None:
+            spawned += 1
+    return spawned
+
+
 def _format_strategic_stall_prompt(
     *,
     stall_hours: int,
@@ -3348,6 +3479,12 @@ async def run_once(session: AsyncSession, project_id: uuid.UUID) -> int:
         _spawned += await _evaluate_strategic_cycle_stall_signal(
             session,
             project_id,
+            spawn_budget - _spawned,
+        )
+        _spawned += await _evaluate_telemetry_staleness_signal(
+            session,
+            project_id,
+            project.design_doc,
             spawn_budget - _spawned,
         )
 

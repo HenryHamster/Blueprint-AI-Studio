@@ -126,7 +126,8 @@ function deriveMissRate(c: SrCategoryTrend): number | null {
   return null;
 }
 
-function trendColorClass(t: SrCategoryTrend['trend']): string {
+// eslint-disable-next-line react-refresh/only-export-components
+export function trendColorClass(t: SrCategoryTrend['trend']): string {
   if (t === 'decreasing') return 'text-red-400';
   if (t === 'increasing') return 'text-emerald-400';
   return 'text-neutral-500';
@@ -139,7 +140,8 @@ function calculateMissRateDelta(c: SrCategoryTrend): number | null {
   return currentMiss - previousMiss;
 }
 
-function deltaColorClass(delta: number): string {
+// eslint-disable-next-line react-refresh/only-export-components
+export function deltaColorClass(delta: number): string {
   if (delta > 0.005) return 'text-red-400'; // regression
   if (delta < -0.005) return 'text-emerald-400'; // improvement
   return 'text-neutral-500'; // stable
@@ -151,14 +153,16 @@ function fpRateColorClass(fp: number): string {
   return 'text-neutral-500';
 }
 
-function formatDelta(delta: number): string {
+// eslint-disable-next-line react-refresh/only-export-components
+export function formatDelta(delta: number): string {
   const pp = Math.round(delta * 100);
   if (pp > 0) return `+${pp}pp`;
   if (pp < 0) return `−${Math.abs(pp)}pp`;
   return '±0pp';
 }
 
-function trendStroke(t: SrCategoryTrend['trend'], versionChanged?: boolean | null): string {
+// eslint-disable-next-line react-refresh/only-export-components
+export function trendStroke(t: SrCategoryTrend['trend'], versionChanged?: boolean | null): string {
   if (versionChanged) return '#f59e0b'; // amber — attribution break mid-window
   if (t === 'decreasing') return '#f87171';
   if (t === 'increasing') return '#34d399';
@@ -176,7 +180,7 @@ function isBelowFloor(c: SrCategoryTrend, floorHitRate = FLOOR_HIT_RATE, minWind
 
 // SR `trend` `decreasing` = hit-rate falling = miss-rate rising = regression (red).
 // `increasing` hit-rate = miss-rate dropping (green). `stable` is neutral.
-function TrendIcon({ trend }: { trend: SrCategoryTrend['trend'] }) {
+export function TrendIcon({ trend }: { trend: SrCategoryTrend['trend'] }) {
   const color = trendColorClass(trend);
   if (trend === 'decreasing') {
     return <TrendingUp className={`w-3 h-3 ${color}`} aria-label="miss-rate increasing" />;
@@ -189,7 +193,7 @@ function TrendIcon({ trend }: { trend: SrCategoryTrend['trend'] }) {
 
 // Renders miss-rate (= 1 - hit-rate) so up = worse, matching the "miss-rate
 // trending up = regression" framing in surrounding cards.
-function MissRateSparkline({
+export function MissRateSparkline({
   history,
   width,
   height,

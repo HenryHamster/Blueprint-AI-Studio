@@ -9039,6 +9039,31 @@ async def test_sr_blind_spots_aggregates_themes(client: AsyncClient, db_session)
     assert body["total_distinct_themes"] == 2
 
 
+@pytest.mark.asyncio
+async def test_compute_sr_blind_spot_themes_stamps_design_doc(db_session):
+    """compute_sr_blind_spot_themes stamps sr_blind_spot_signal_last_computed_at."""
+    from app.sr_blind_spots import compute_sr_blind_spot_themes
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    assert (project.design_doc or {}).get(
+        "sr_blind_spot_signal_last_computed_at"
+    ) is None
+
+    fixed_now = _utcnow().replace(microsecond=0)
+    await compute_sr_blind_spot_themes(db_session, project.id, now=fixed_now)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    assert (
+        project.design_doc["sr_blind_spot_signal_last_computed_at"]
+        == fixed_now.isoformat()
+    )
+
+
 # ---------------------------------------------------------------------------
 # aggregate_sr_regression_risk_test_signal (synchronous helper)
 # ---------------------------------------------------------------------------

@@ -3,7 +3,7 @@ import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { render, waitFor } from '@testing-library/react';
 import { MessagesPanel } from './MessagesPanel';
-import { classifySignalLevel, effectiveSignal, loadEventPrefs, EVENT_PREFS_KEY, groupRoutineMessages } from './MessagesPanel.utils';
+import { classifySignalLevel, effectiveSignal, loadEventPrefs, EVENT_PREFS_KEY, groupRoutineMessages, outcomeBreakdown, isFailingGroup, getToastSeverity } from './MessagesPanel.utils';
 
 vi.mock('../firebase', () => ({
   auth: { currentUser: { email: 'test-user@example.com' } },
@@ -199,6 +199,61 @@ describe('classifySignalLevel', () => {
   });
 });
 
+// ── outcomeBreakdown unit tests ───────────────────────────────────────────────
+
+describe('outcomeBreakdown', () => {
+  function m(result?: string) { return { context: result ? { result } : {} }; }
+
+  test('returns empty string when no result fields present', () => {
+    expect(outcomeBreakdown([m(), m()])).toBe('');
+  });
+
+  test('shows failed count when only failures present', () => {
+    expect(outcomeBreakdown([m('failed'), m('failed'), m('failed')])).toBe('· 3 failed');
+  });
+
+  test('shows merged count when only merges present', () => {
+    expect(outcomeBreakdown([m('merged'), m('merged')])).toBe('· 2 merged');
+  });
+
+  test('shows mixed breakdown', () => {
+    const msgs = [m('failed'), m('failed'), m('merged'), m('review_needed')];
+    expect(outcomeBreakdown(msgs)).toBe('· 2 failed, 1 merged, 1 review');
+  });
+
+  test('silently degrades when result is absent on all messages', () => {
+    expect(outcomeBreakdown([{ context: { event_type: 'pr_merged' } }])).toBe('');
+  });
+});
+
+// ── isFailingGroup unit tests ─────────────────────────────────────────────────
+
+describe('isFailingGroup', () => {
+  function m(result?: string) { return { context: result ? { result } : {} }; }
+
+  test('returns false when fewer than 3 failures', () => {
+    expect(isFailingGroup([m('failed'), m('failed'), m('merged')])).toBe(false);
+  });
+
+  test('returns false when 3+ failures but rate < 50%', () => {
+    // 3 failed out of 7 = 43% < 50%
+    expect(isFailingGroup([m('failed'), m('failed'), m('failed'), m('merged'), m('merged'), m('merged'), m('merged')])).toBe(false);
+  });
+
+  test('returns true when 3+ failures AND rate >= 50%', () => {
+    // 3 failed out of 4 = 75%
+    expect(isFailingGroup([m('failed'), m('failed'), m('failed'), m('merged')])).toBe(true);
+  });
+
+  test('returns true when all 3 are failed (100%)', () => {
+    expect(isFailingGroup([m('failed'), m('failed'), m('failed')])).toBe(true);
+  });
+
+  test('returns false for empty array', () => {
+    expect(isFailingGroup([])).toBe(false);
+  });
+});
+
 // ── Component rendering tests ─────────────────────────────────────────────────
 
 function makeMsg(overrides: Partial<{
@@ -318,6 +373,60 @@ describe('MessagesPanel grouping', () => {
     const el = await renderPanel([blocker]);
     // Pin label still appears (there are blockers)
     expect(el.textContent).toContain('Pinned');
+  });
+
+  test('auto-promoted failing group renders above routine ops section', async () => {
+    // 4 failed auto_fix_result messages — qualifies for promotion (>=3 failed, 100% rate)
+    const failedMsgs = Array.from({ length: 4 }, (_, i) =>
+      makeMsg({ id: `af${i}`, from_type: 'system', context: { event_type: 'auto_fix_result', result: 'failed' } }),
+    );
+    const el = await renderPanel(failedMsgs);
+    const text = el.textContent ?? '';
+    // Promoted group banner should appear
+    expect(text).toContain('4 auto-fix results');
+    expect(text).toContain('4 failed');
+    // No separate routine ops section (all promoted, none remaining in routine)
+    expect(text).not.toContain('routine ops');
+  });
+
+  test('routine group with mixed outcomes stays in routine ops section', async () => {
+    // 2 failed, 1 merged — below promotion threshold (needs >=3 failed)
+    const msgs = [
+      makeMsg({ id: 'af1', from_type: 'system', context: { event_type: 'auto_fix_result', result: 'failed' } }),
+      makeMsg({ id: 'af2', from_type: 'system', context: { event_type: 'auto_fix_result', result: 'failed' } }),
+      makeMsg({ id: 'af3', from_type: 'system', context: { event_type: 'auto_fix_result', result: 'merged' } }),
+    ];
+    const el = await renderPanel(msgs);
+    // Stays inside routine ops group (not promoted)
+    expect(el.textContent).toContain('routine ops');
+    expect(el.textContent).not.toContain('auto-fix results'); // label only visible when expanded
+  });
+
+  test('muted event_type suppresses auto-promotion', async () => {
+    const key = 'messages_panel_event_prefs';
+    localStorage.setItem(key, JSON.stringify({ auto_fix_result: 'mute' }));
+    const failedMsgs = Array.from({ length: 4 }, (_, i) =>
+      makeMsg({ id: `af${i}`, from_type: 'system', context: { event_type: 'auto_fix_result', result: 'failed' } }),
+    );
+    const el = await renderPanel(failedMsgs);
+    // Muted messages are hidden entirely — no promotion banner, no routine group
+    expect(el.textContent).not.toContain('auto-fix results');
+    expect(el.textContent).not.toContain('routine ops');
+    localStorage.removeItem(key);
+  });
+
+  test('outcome breakdown appears in group label inside routine ops', async () => {
+    const msgs = [
+      makeMsg({ id: 'af1', from_type: 'system', context: { event_type: 'auto_fix_result', result: 'failed' } }),
+      makeMsg({ id: 'af2', from_type: 'system', context: { event_type: 'auto_fix_result', result: 'failed' } }),
+      makeMsg({ id: 'af3', from_type: 'system', context: { event_type: 'auto_fix_result', result: 'merged' } }),
+    ];
+    const el = await renderPanel(msgs);
+    // Expand the routine ops group
+    const btn = [...el.querySelectorAll('button')].find(b => b.textContent?.includes('routine ops'));
+    await act(async () => { (btn as HTMLButtonElement)?.click(); });
+    // Group chip label inside expanded section should show breakdown
+    expect(el.textContent).toContain('· 2 failed');
   });
 
   test('sort toggle button is present in header', async () => {
@@ -522,7 +631,7 @@ describe('MessagesPanel toast notifications', () => {
     expect(mockAddToast).not.toHaveBeenCalled();
   });
 
-  test('does not fire toast for NOTE messages on initial load', async () => {
+  test('does not fire toast for routine NOTE messages on initial load', async () => {
     const mockAddToast = vi.fn();
     const note = {
       id: 'msg-1',
@@ -531,7 +640,7 @@ describe('MessagesPanel toast notifications', () => {
       from_type: 'system',
       from_task_id: null,
       content: 'Routine operation completed',
-      context: {},
+      context: { event_type: 'pr_merged' },
       status: 'open',
       resolution: null,
       resolved_at: null,
@@ -555,8 +664,227 @@ describe('MessagesPanel toast notifications', () => {
       expect(apiFetch).toHaveBeenCalled();
     });
 
-    // NOTE messages are not in highSignalTypes — no toast fires
+    // Routine NOTE messages do not fire toast
     expect(mockAddToast).not.toHaveBeenCalled();
+  });
+
+  test('fires toast when new high-signal NOTE (failure_alert) arrives on subsequent poll', async () => {
+    vi.useFakeTimers();
+    try {
+      const mockAddToast = vi.fn();
+      const failureAlert = {
+        id: 'msg-1',
+        project_id: 'proj-1',
+        message_type: 'NOTE',
+        from_type: 'system',
+        from_task_id: null,
+        content: 'Pipeline failure detected',
+        context: { event_type: 'failure_alert' },
+        status: 'open',
+        resolution: null,
+        resolved_at: null,
+        created_at: '2026-05-06T10:00:00Z',
+      };
+
+      // First fetch returns empty (initial load — should NOT toast).
+      vi.mocked(apiFetch).mockResolvedValueOnce(
+        new Response(JSON.stringify({ messages: [] }), { status: 200 })
+      );
+      // Second fetch (poll) returns the failure_alert — toast SHOULD fire with 'error'.
+      vi.mocked(apiFetch).mockResolvedValueOnce(
+        new Response(JSON.stringify({ messages: [failureAlert] }), { status: 200 })
+      );
+
+      render(
+        <MessagesPanel
+          selectedProjectId="proj-1"
+          onClose={() => {}}
+          addToast={mockAddToast}
+          onMessageCountChange={() => {}}
+        />
+      );
+
+      // Initial load completes — no toast yet.
+      await vi.waitFor(() => {
+        expect(apiFetch).toHaveBeenCalledTimes(1);
+      });
+      expect(mockAddToast).not.toHaveBeenCalled();
+
+      // Advance the 30s polling interval to trigger the second fetch.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000);
+      });
+
+      await vi.waitFor(() => {
+        expect(apiFetch).toHaveBeenCalledTimes(2);
+      });
+      await vi.waitFor(() => {
+        expect(mockAddToast).toHaveBeenCalledTimes(1);
+      });
+      const [summary, severity] = mockAddToast.mock.calls[0];
+      expect(summary).toContain('high-signal message');
+      expect(summary).toContain('Pipeline failure detected');
+      expect(severity).toBe('error');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test('does not fire toast for muted high-signal NOTE event_type', async () => {
+    vi.useFakeTimers();
+    try {
+      const mockAddToast = vi.fn();
+      const failureAlert = {
+        id: 'msg-1',
+        project_id: 'proj-1',
+        message_type: 'NOTE',
+        from_type: 'system',
+        from_task_id: null,
+        content: 'Pipeline failure detected',
+        context: { event_type: 'failure_alert' },
+        status: 'open',
+        resolution: null,
+        resolved_at: null,
+        created_at: '2026-05-06T10:00:00Z',
+      };
+
+      // Set event pref to mute failure_alert
+      localStorage.setItem(EVENT_PREFS_KEY, JSON.stringify({ failure_alert: 'mute' }));
+
+      // Initial load empty
+      vi.mocked(apiFetch).mockResolvedValueOnce(
+        new Response(JSON.stringify({ messages: [] }), { status: 200 })
+      );
+      // Poll returns the muted failure_alert — no toast should fire
+      vi.mocked(apiFetch).mockResolvedValueOnce(
+        new Response(JSON.stringify({ messages: [failureAlert] }), { status: 200 })
+      );
+
+      render(
+        <MessagesPanel
+          selectedProjectId="proj-1"
+          onClose={() => {}}
+          addToast={mockAddToast}
+          onMessageCountChange={() => {}}
+        />
+      );
+
+      await vi.waitFor(() => {
+        expect(apiFetch).toHaveBeenCalledTimes(1);
+      });
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000);
+      });
+
+      await vi.waitFor(() => {
+        expect(apiFetch).toHaveBeenCalledTimes(2);
+      });
+
+      // Even though failure_alert is high-signal, the mute pref prevents the toast
+      expect(mockAddToast).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+      localStorage.removeItem(EVENT_PREFS_KEY);
+    }
+  });
+
+  test('fires toast with info severity for high-signal FEEDBACK', async () => {
+    vi.useFakeTimers();
+    try {
+      const mockAddToast = vi.fn();
+      const feedback = {
+        id: 'msg-1',
+        project_id: 'proj-1',
+        message_type: 'FEEDBACK',
+        from_type: 'user',
+        from_task_id: null,
+        content: 'Consider adding validation',
+        context: {},
+        status: 'open',
+        resolution: null,
+        resolved_at: null,
+        created_at: '2026-05-06T10:00:00Z',
+      };
+
+      vi.mocked(apiFetch).mockResolvedValueOnce(
+        new Response(JSON.stringify({ messages: [] }), { status: 200 })
+      );
+      vi.mocked(apiFetch).mockResolvedValueOnce(
+        new Response(JSON.stringify({ messages: [feedback] }), { status: 200 })
+      );
+
+      render(
+        <MessagesPanel
+          selectedProjectId="proj-1"
+          onClose={() => {}}
+          addToast={mockAddToast}
+          onMessageCountChange={() => {}}
+        />
+      );
+
+      await vi.waitFor(() => {
+        expect(apiFetch).toHaveBeenCalledTimes(1);
+      });
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000);
+      });
+
+      await vi.waitFor(() => {
+        expect(mockAddToast).toHaveBeenCalledTimes(1);
+      });
+      const [, severity] = mockAddToast.mock.calls[0];
+      expect(severity).toBe('info');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+// ── getToastSeverity unit tests ────────────────────────────────────────────────
+
+describe('getToastSeverity', () => {
+  const base = { message_type: 'NOTE', from_type: 'system', context: {} };
+
+  test('BLOCKER returns error', () => {
+    expect(getToastSeverity({ ...base, message_type: 'BLOCKER' })).toBe('error');
+  });
+
+  test('BUG_REPORT returns error', () => {
+    expect(getToastSeverity({ ...base, message_type: 'BUG_REPORT' })).toBe('error');
+  });
+
+  test('FEEDBACK returns info', () => {
+    expect(getToastSeverity({ ...base, message_type: 'FEEDBACK' })).toBe('info');
+  });
+
+  test('NOTE with failure_alert returns error', () => {
+    expect(getToastSeverity({ ...base, context: { event_type: 'failure_alert' } })).toBe('error');
+  });
+
+  test('NOTE with rollback_recommended returns error', () => {
+    expect(getToastSeverity({ ...base, context: { event_type: 'rollback_recommended' } })).toBe('error');
+  });
+
+  test('NOTE with fix_loop_divergence_regressed returns error', () => {
+    expect(getToastSeverity({ ...base, context: { event_type: 'fix_loop_divergence_regressed' } })).toBe('error');
+  });
+
+  test('NOTE with account_model_regression_quarantined returns error', () => {
+    expect(getToastSeverity({ ...base, context: { event_type: 'account_model_regression_quarantined' } })).toBe('error');
+  });
+
+  test('NOTE with feedback_acknowledgment returns info', () => {
+    expect(getToastSeverity({ ...base, context: { event_type: 'feedback_acknowledgment' } })).toBe('info');
+  });
+
+  test('NOTE with routine event_type returns info', () => {
+    expect(getToastSeverity({ ...base, context: { event_type: 'pr_merged' } })).toBe('info');
+  });
+
+  test('NOTE with no event_type returns info', () => {
+    expect(getToastSeverity({ ...base, context: {} })).toBe('info');
   });
 });
 

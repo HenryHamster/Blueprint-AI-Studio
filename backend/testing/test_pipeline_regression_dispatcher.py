@@ -5648,3 +5648,154 @@ def test_regression_case_summary_emits_layer_coverage_field():
     assert by_class_entry["layer_coverage"]["combinations"] == [
         {"layers": ["REVIEWER_PASS"], "count": 1}
     ]
+
+
+# ---------------------------------------------------------------------------
+# Telemetry-staleness autonomous investigation tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_telemetry_stale_spawns_investigation_for_stale_sr_catch_rate(db_session):
+    """sr_catch_rate stale beyond 48h threshold → spawns investigate with telemetry_stale:sr_catch_rate class."""
+    from app.models import RegressionRemediationCase
+    from app.time_utils import _utcnow
+
+    now = _utcnow()
+    stale_ts = (now - timedelta(hours=50)).isoformat()
+    project = make_project(
+        design_doc={
+            "sr_catch_rate_trends": {"signal_last_computed_at": stale_ts},
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned >= 1
+
+    case = (
+        (
+            await db_session.execute(
+                select(RegressionRemediationCase).where(
+                    RegressionRemediationCase.project_id == project.id,
+                    RegressionRemediationCase.regression_class
+                    == "telemetry_stale:sr_catch_rate",
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    assert case is not None
+    assert case.signal_first_seen_at is not None
+
+    all_tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    task = _get_investigate_task(all_tasks)
+    assert task is not None
+    payload = task.first_payload or {}
+    assert payload.get("type") == "investigate"
+    ctx = task.context or {}
+    assert ctx["regression_class"] == "telemetry_stale:sr_catch_rate"
+    assert ctx["signal_name"] == "telemetry_stale"
+    prompt = payload.get("prompt", "")
+    assert "sr_catch_rate" in prompt
+    assert "playbook_learning" in prompt
+
+
+@pytest.mark.asyncio
+async def test_telemetry_stale_no_spawn_when_signal_fresh(db_session):
+    """sr_catch_rate within 48h freshness window → no investigate spawned."""
+    from app.time_utils import _utcnow
+
+    now = _utcnow()
+    fresh_ts = (now - timedelta(hours=24)).isoformat()
+    project = make_project(
+        design_doc={
+            "sr_catch_rate_trends": {"signal_last_computed_at": fresh_ts},
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await run_once(db_session, project.id)
+    all_tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    investigate_tasks = [
+        t
+        for t in all_tasks
+        if (t.first_payload or {}).get("type") == "investigate"
+        and (t.context or {}).get("regression_class", "").startswith("telemetry_stale:")
+    ]
+    assert len(investigate_tasks) == 0
+
+
+@pytest.mark.asyncio
+async def test_telemetry_stale_dedup_inflight_blocks_second_spawn(db_session):
+    """A second run_once with a telemetry_stale case in-flight does not spawn a duplicate."""
+    from app.time_utils import _utcnow
+
+    now = _utcnow()
+    stale_ts = (now - timedelta(hours=50)).isoformat()
+    project = make_project(
+        design_doc={
+            "sr_catch_rate_trends": {"signal_last_computed_at": stale_ts},
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    first = await run_once(db_session, project.id)
+    assert first >= 1
+
+    await run_once(db_session, project.id)
+    all_tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    stale_tasks = [
+        t
+        for t in all_tasks
+        if (t.context or {}).get("regression_class") == "telemetry_stale:sr_catch_rate"
+    ]
+    assert len(stale_tasks) == 1
+
+
+@pytest.mark.asyncio
+async def test_telemetry_stale_recovery_closes_when_signal_refreshed(db_session):
+    """Recovery scan closes telemetry_stale case once the signal is within its freshness window."""
+    from app.models import RegressionCaseStatus
+    from app.time_utils import _utcnow
+
+    now = _utcnow()
+    fresh_ts = (now - timedelta(hours=24)).isoformat()
+    project = make_project(
+        design_doc={
+            "sr_catch_rate_trends": {"signal_last_computed_at": fresh_ts},
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    case = _merged_case(project.id, regression_class="telemetry_stale:sr_catch_rate")
+    db_session.add(case)
+    await db_session.commit()
+    await db_session.refresh(case)
+
+    changed = await run_recovery_once(db_session, project.id)
+    assert changed >= 1
+
+    await db_session.refresh(case)
+    assert case.status == RegressionCaseStatus.CLOSED

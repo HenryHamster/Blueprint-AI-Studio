@@ -30,7 +30,7 @@ import { DriftSignalsCard } from './DriftSignalsCard';
 import { PoolAccountHealthPanel, type AccountHealthEntry } from './PoolAccountHealthPanel';
 import { SystemMaturityCard, type SystemMaturityRow } from './SystemMaturityCard';
 import { DirectionPortfolioSection, type DirectionProgress } from './DirectionPortfolioSection';
-import { SrTrendBreakdown, SrMissedRetrospective, SrReviewerDisagreementsPanel, EdgesTrendBreakdown, type SrTrendData, type SrMissedTask, type SrReviewerDisagreementsData, type EdgesTrend } from './SrTrendBreakdown'; // EdgesTrend used in DigestData
+import { SrTrendBreakdown, SrMissedRetrospective, SrReviewerDisagreementsPanel, EdgesTrendBreakdown, TrendIcon, MissRateSparkline, deltaColorClass, formatDelta, trendStroke, type SrTrendData, type SrMissedTask, type SrReviewerDisagreementsData, type EdgesTrend } from './SrTrendBreakdown'; // EdgesTrend used in DigestData
 import { TAXONOMY_COLORS, TAXONOMY_LABELS, TAXONOMY_ORDER } from './dashboardConstants';
 import { ManualInterventionPanel, AutoRecoveredPanel, AnomalyTrackerPanel } from './PipelineRegressionsPanel';
 import { RecentlyResolvedRegressionsPanel } from './RecentlyResolvedRegressionsPanel';
@@ -300,6 +300,9 @@ export interface DirectionSrEntry {
   overall_catch_rate: number | null;
   categories: Record<string, DirectionSrCategoryStats>;
   worst_category: string | null;
+  previous_miss_rate?: number | null;
+  trend?: 'increasing' | 'decreasing' | 'stable';
+  rate_history?: number[];
 }
 
 interface DirectionSrBreakdownData {
@@ -1367,6 +1370,13 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
                 {directionSrBreakdown.directions.map(d => {
                   const rate = d.overall_catch_rate;
                   const rateColor = rate == null ? 'text-neutral-500' : rate >= 0.7 ? 'text-emerald-400' : rate >= 0.4 ? 'text-amber-400' : 'text-red-400';
+                  const trend = d.trend ?? 'stable';
+                  const currentMiss = rate != null ? 1 - rate : null;
+                  const previousMiss = d.previous_miss_rate;
+                  const delta = currentMiss != null && previousMiss != null ? currentMiss - previousMiss : null;
+                  const sparklineStroke = trendStroke(trend);
+                  const rateHistory = d.rate_history ?? [];
+                  const hasSparkline = rateHistory.length >= 2;
                   return (
                     <div
                       key={d.direction_id}
@@ -1379,6 +1389,21 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
                         >
                           {rate != null ? `${Math.round(rate * 100)}%` : '–'}
                         </span>
+                        {hasSparkline && (
+                          <MissRateSparkline
+                            history={rateHistory}
+                            width={36}
+                            height={12}
+                            stroke={sparklineStroke}
+                            title="catch-rate history (5 most recent samples)"
+                          />
+                        )}
+                        <TrendIcon trend={trend} />
+                        {delta != null && (
+                          <span className={`font-mono tabular-nums text-xs ${deltaColorClass(delta)}`} title="miss-rate cycle-over-cycle change">
+                            {formatDelta(delta)}
+                          </span>
+                        )}
                         <span
                           className="text-[10px] text-neutral-300 truncate flex-1"
                           title={d.direction_text}

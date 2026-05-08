@@ -97,6 +97,34 @@ async def _scan_blind_spot_counts(
     return theme_counts
 
 
+async def compute_sr_blind_spot_themes(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    days: int = 14,
+    now: datetime | None = None,
+) -> None:
+    """Background variant of blind-spot aggregation that stamps the design-doc
+    staleness key consumed by the pipeline-regression dispatcher's
+    telemetry-staleness watchdog.
+
+    Call on task completion alongside compute_sr_catch_rate_trends so the
+    dispatcher can detect when this job stops running and spawn an
+    investigation automatically.
+    """
+    from app.models import Project
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project = await session.get(Project, project_id)
+    if project is None:
+        return
+    doc = dict(project.design_doc or {})
+    stamp_sr_blind_spot_computed_at(doc, now=now)
+    project.design_doc = doc
+    flag_modified(project, "design_doc")
+    session.add(project)
+
+
 async def aggregate_sr_blind_spot_themes(
     session: AsyncSession,
     project_id: uuid.UUID,

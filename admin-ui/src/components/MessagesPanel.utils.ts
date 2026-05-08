@@ -78,12 +78,42 @@ export function groupRoutineMessages<T extends { id: string; context: Record<str
   return rows;
 }
 
+export function outcomeBreakdown(msgs: { context: Record<string, unknown> }[]): string {
+  const failed = msgs.filter(m => m.context.result === 'failed').length;
+  const merged = msgs.filter(m => m.context.result === 'merged').length;
+  const reviewNeeded = msgs.filter(m => m.context.result === 'review_needed').length;
+  if (failed === 0 && merged === 0 && reviewNeeded === 0) return '';
+  const parts: string[] = [];
+  if (failed > 0) parts.push(`${failed} failed`);
+  if (merged > 0) parts.push(`${merged} merged`);
+  if (reviewNeeded > 0) parts.push(`${reviewNeeded} review`);
+  return `· ${parts.join(', ')}`;
+}
+
+export function isFailingGroup(msgs: { context: Record<string, unknown> }[]): boolean {
+  const failed = msgs.filter(m => m.context.result === 'failed').length;
+  return failed >= 3 && failed / msgs.length >= 0.5;
+}
+
 export function routineSummary(msgs: { message_type: string; context: Record<string, unknown> }[]): string {
-  const counts: Record<string, number> = {};
+  const groups: Record<string, { label: string; group: typeof msgs }> = {};
   for (const m of msgs) {
-    const et = m.context.event_type as string | undefined;
+    const et = (m.context.event_type as string | undefined) ?? '';
+    const key = et || '__unknown__';
     const label = et ? (ROUTINE_EVENT_LABELS[et] ?? et.replace(/_/g, ' ')) : 'notes';
-    counts[label] = (counts[label] ?? 0) + 1;
+    if (!groups[key]) groups[key] = { label, group: [] };
+    groups[key].group.push(m);
   }
-  return Object.entries(counts).slice(0, 4).map(([l, c]) => `${c} ${l}`).join(', ');
+  return Object.values(groups).slice(0, 4).map(({ label, group }) => {
+    const bd = outcomeBreakdown(group);
+    return `${group.length} ${label}${bd ? ' ' + bd : ''}`;
+  }).join(', ');
+}
+
+export function getToastSeverity(msg: { message_type: string; from_type: string; context: Record<string, unknown> }): 'error' | 'info' {
+  const et = msg.context.event_type as string | undefined;
+  const criticalNoteEvents = new Set(['failure_alert', 'rollback_recommended', 'fix_loop_divergence_regressed', 'account_model_regression_quarantined']);
+  if (msg.message_type === 'BLOCKER' || msg.message_type === 'BUG_REPORT') return 'error';
+  if (et && criticalNoteEvents.has(et)) return 'error';
+  return 'info';
 }
