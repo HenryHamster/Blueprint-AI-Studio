@@ -34,7 +34,6 @@ build {
       "# Resilient apt-get update: retry with fallback mirrors if GPG/signature errors occur",
       "sudo apt-get update || (sudo sed -i 's|http://archive.ubuntu.com|http://us.archive.ubuntu.com|g' /etc/apt/sources.list && sudo apt-get update) || (sudo sed -i 's|http://us.archive.ubuntu.com|http://mirrors.edge.kernel.org|g' /etc/apt/sources.list && sudo apt-get update)",
       "sudo apt-get install -y curl git wget gnupg",
-      "sudo apt-get install -y libatk1.0-0 libatk-bridge2.0-0 libcairo2 libcups2 libdbus-1-3 libdrm2 libexpat1 libfontconfig1 libgbm1 libglib2.0-0 libgtk-3-0 libnss3 libpango-1.0-0 libpangocairo-1.0-0 libx11-6 libx11-xcb1 libxcb1 libxcomposite1 libxdamage1 libxext6 libxfixes3 libxkbcommon0 libxrandr2 libxshmfence1 libasound2 libxss1 libxtst6 fonts-liberation",
       "curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -",
       "sudo apt-get install -y nodejs docker.io",
       "sudo systemctl enable docker",
@@ -45,15 +44,6 @@ build {
       "sudo npm install -g @anthropic-ai/claude-code @openai/codex @google/gemini-cli",
       "sudo apt-get install -y python3-pip",
       "sudo pip3 install ruff",
-      "# Playwright Chromium system libs — required for admin-ui viewport",
-      "# tests run by ./check (vitest browser-mode + chromium). Without these",
-      "# the agent VM fails the gate on libatk-1.0.so.0 missing on every fix",
-      "# task that touches admin-ui/, which historically burned 12 review-fix",
-      "# iterations on PR #3884 before being recognized as an infra blocker.",
-      "# Match the deps Playwright's `install --with-deps chromium` would pull",
-      "# on Ubuntu 22.04 — pinned explicitly so Packer doesn't depend on a",
-      "# Playwright install at build time.",
-      "sudo apt-get install -y libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 libcairo2 libasound2",
       "git config --global user.email 'blueprint-agent@automated.dev'",
       "git config --global user.name 'Blueprint Agent'",
       "sudo mkdir -p /opt/agent /tmp/workspace",
@@ -124,11 +114,15 @@ build {
 
   provisioner "shell" {
     inline = [
-      "# Prefetch Playwright Chromium binary to the agent user's cache (idempotent).",
-      "# Failures are non-fatal so a transient download error doesn't sink the build,",
-      "# but emit a serial-output marker (PACKER_CHROMIUM_PREFETCH_FAILED) the orchestrator",
-      "# can grep for — silent || true masked broken images on prior runs.",
-      "sudo -u agent bash -c '/opt/agent/node_modules/.bin/playwright install chromium' || { echo 'PACKER_CHROMIUM_PREFETCH_FAILED: chromium prefetch failed; agent will fall back to runtime install'; true; }"
+      "# Prefetch Playwright Chromium browser + system libs (--with-deps).",
+      "# Using Playwright's canonical dep list (which it maintains upstream)",
+      "# instead of pinning a manual apt list — manual lists rot when upstream",
+      "# package names change (t64 transition, package renames, etc.). The",
+      "# agent user has passwordless sudo, so --with-deps' internal apt-get",
+      "# install runs cleanly. Failures are non-fatal so a transient download",
+      "# error doesn't sink the build, but emit a serial-output marker the",
+      "# orchestrator can grep for — silent || true masked broken images before.",
+      "sudo -u agent bash -c '/opt/agent/node_modules/.bin/playwright install --with-deps chromium' || { echo 'PACKER_CHROMIUM_PREFETCH_FAILED: chromium prefetch failed; agent will fall back to runtime install'; true; }"
     ]
   }
 }
