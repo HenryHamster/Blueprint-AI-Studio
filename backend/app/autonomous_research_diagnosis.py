@@ -117,6 +117,7 @@ async def _spawn_direction_diagnosis(
     direction: dict,
     pause_reason: str,
     session: AsyncSession,
+    retry_context: dict | None = None,
 ) -> bool:
     """Spawn a diagnosis research task for a freshly auto-paused direction.
 
@@ -124,6 +125,10 @@ async def _spawn_direction_diagnosis(
     the direction's recent error signatures, failure classifications, and playbook
     entries to produce targeted fix findings that address the root cause before the
     direction's 48h cooldown elapses.
+
+    When ``retry_context`` is supplied, the task is a re-spawn after a prior
+    diagnosis stalled (reaped/timed-out). The payload carries the retry metadata
+    so the agent takes a different investigation angle.
 
     Returns True if a new diagnosis task was created, False if skipped (already an
     active diagnosis task for this direction, or the spawn couldn't be completed).
@@ -285,6 +290,7 @@ async def _spawn_direction_diagnosis(
         **({"model": research_model} if research_model else {}),
         **({"effort": research_effort} if research_effort else {}),
         **({"prompt_suffix": research_suffix} if research_suffix else {}),
+        **({"retry_context": retry_context} if retry_context else {}),
     }
     if project.build_config:
         research_payload["build_config"] = project.build_config
@@ -293,16 +299,34 @@ async def _spawn_direction_diagnosis(
     )
 
     direction_text = (direction.get("text") or "direction")[:160]
+    retry_attempt = retry_context.get("retry_attempt") if retry_context else None
+    title_prefix = (
+        f"Diagnosis (retry {retry_attempt})" if retry_attempt else "Diagnosis"
+    )
+    task_context: dict = {
+        "diagnosis_for_direction": did,
+        "direction_id": did,
+        "pause_reason": pause_reason,
+    }
+    if retry_context:
+        task_context["diagnosis_retry"] = True
+        task_context["diagnosis_retry_attempt"] = retry_attempt
+        if retry_context.get("prior_task_id"):
+            task_context["prior_diagnosis_task_id"] = retry_context["prior_task_id"]
     new_task = Task(
         project_id=project.id,
-        title=f"Diagnosis: {direction_text}",
-        description=f"Auto-paused diagnosis for direction: {direction_text}",
+        title=f"{title_prefix}: {direction_text}",
+        description=(
+            f"Auto-paused diagnosis for direction: {direction_text}"
+            + (
+                f" (retry {retry_attempt}: prior task {retry_context.get('prior_task_id')} "
+                f"timed out)"
+                if retry_context
+                else ""
+            )
+        )[:500],
         payloads=[research_payload],
-        context={
-            "diagnosis_for_direction": did,
-            "direction_id": did,
-            "pause_reason": pause_reason,
-        },
+        context=task_context,
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
         status=TaskStatus.QUEUED,
         created_by="ORCHESTRATOR",
@@ -315,12 +339,15 @@ async def _spawn_direction_diagnosis(
             "spawned_by": "AUTONOMOUS_LOOP",
             "trigger": "direction_auto_pause_diagnosis",
             "pause_reason": pause_reason,
+            **({"retry_attempt": retry_attempt} if retry_attempt else {}),
         },
     )
     session.add(history)
     logger.info(
         f"[DIAGNOSIS] Spawned diagnosis research {new_task.id} for direction {did}: "
-        f"{pause_reason} ({len(failed_signatures)} failed task signatures)"
+        f"{pause_reason} ({len(failed_signatures)} failed task signatures"
+        + (f", retry {retry_attempt}" if retry_attempt else "")
+        + ")"
     )
     return True
 

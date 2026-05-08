@@ -388,9 +388,8 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
   const muteActive = isMuteWindowActive(muteWindow);
   const highSignalOpen = [...openMessages.filter(m => effectiveSignal(m, eventPrefs) === 'high' && matchesSearch(m))]
     .sort(sortMode === 'importance' ? bySeverity : byTimeDesc);
-  const routineOpen = muteActive
-    ? []
-    : [...openMessages.filter(m => effectiveSignal(m, eventPrefs) === 'routine' && matchesSearch(m))].sort(byTimeDesc);
+  // Always compute routine messages; mute only filters them from the non-promoted routine section
+  const routineOpen = [...openMessages.filter(m => effectiveSignal(m, eventPrefs) === 'routine' && matchesSearch(m))].sort(byTimeDesc);
 
   // In importance mode, pin BLOCKERs at the top with a visual divider
   const pinnedBlockers = sortMode === 'importance' ? highSignalOpen.filter(m => m.message_type === 'BLOCKER') : [];
@@ -403,7 +402,10 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
       r.kind === 'group' && isFailingGroup(r.msgs) && eventPrefs[r.event_type] !== 'mute',
   );
   const promotedKeys = new Set(promotedGroups.map(r => r.key));
-  const remainingRoutineRows = allRoutineRows.filter(r => r.kind === 'single' || !promotedKeys.has(r.key));
+  // When mute is active, filter out routine messages from the remaining section, but keep promoted groups
+  const remainingRoutineRows = muteActive
+    ? allRoutineRows.filter(r => promotedKeys.has((r as RoutineRow<ProjectMessage> & { key?: string }).key ?? ''))
+    : allRoutineRows.filter(r => r.kind === 'single' || !promotedKeys.has(r.key));
 
   // Auto-expand groups that have search matches
   const groupsWithMatches = new Set(
@@ -1452,6 +1454,11 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
                   <span className="text-xs text-neutral-500 font-medium shrink-0">{routineOpen.length} routine ops</span>
                   <span className="text-[11px] text-neutral-600 truncate">{routineSummary(routineOpen)}</span>
                 </button>
+                {muteActive && (
+                  <div className="px-4 py-2 bg-amber-950/30 border-t border-amber-800/30 text-[11px] text-amber-400">
+                    🔕 Mute active, but failing groups still surface
+                  </div>
+                )}
                 {routineExpanded && (
                   <div className="space-y-3 p-3 border-t border-neutral-800/40">
                     {(() => {

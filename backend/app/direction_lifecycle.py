@@ -33,6 +33,10 @@ _REMEDIATION_MONITOR_EXPIRY_DAYS = 7
 # Investigations typically finish in minutes; 4h is a safety ceiling to recover from reaped/timed-out tasks.
 _DIAGNOSIS_STALE_HOURS = 4
 
+# Max re-spawns after a stalled diagnosis, per pause event. After this many stalls the direction
+# escalates to an operator alert instead of silently clearing flags.
+_DIAGNOSIS_STALL_MAX_RETRIES = 2
+
 # Recent failed tasks to scan when computing the dominant error fingerprint
 _FINGERPRINT_SAMPLE_SIZE = 10
 # Min matching failures required for a fingerprint to count as "dominant" for the direction
@@ -440,6 +444,8 @@ async def _spawn_direction_diagnosis(
     session.add(new_task)
     direction["diagnosis_in_progress"] = True
     direction["diagnosis_started_at"] = _utcnow().isoformat()
+    direction["diagnosis_task_id"] = str(new_task.id)
+    direction["diagnosis_pause_reason"] = pause_reason
     logger.info(
         f"[DIAGNOSIS] Spawned investigate task {new_task.id} for auto-paused "
         f"direction {direction_id} ({pause_reason[:60]})"
@@ -706,6 +712,7 @@ async def _process_direction_lifecycle(
                 except (ValueError, TypeError):
                     is_stale = True
             if is_stale:
+                prior_task_id = d.get("diagnosis_task_id")
                 logger.warning(
                     f"[DIAGNOSIS] Clearing stale diagnosis flags for direction {did} "
                     f"(started_at={started_at})"
@@ -715,6 +722,61 @@ async def _process_direction_lifecycle(
                 d.pop("diagnosis_task_id", None)
                 d["diagnosis_completed_at"] = _utcnow().isoformat()
                 directions_modified = True
+                retry_count = d.get("diagnosis_stall_retry_count", 0)
+                if retry_count < _DIAGNOSIS_STALL_MAX_RETRIES:
+                    stall_reason = (
+                        d.get("diagnosis_pause_reason")
+                        or "code failure auto-pause (prior investigation timed out)"
+                    )
+                    retry_ctx = {
+                        "is_retry": True,
+                        "retry_attempt": retry_count + 1,
+                        "prior_task_id": prior_task_id,
+                        "prior_started_at": started_at,
+                        "why_cleared": (
+                            "prior diagnosis task timed out or was reaped without "
+                            "producing a finding"
+                        ),
+                    }
+                    try:
+                        from app.autonomous_research import (
+                            _spawn_direction_diagnosis as _spawn_diagnosis_research,
+                        )
+
+                        if await _spawn_diagnosis_research(
+                            project, d, stall_reason, session, retry_context=retry_ctx
+                        ):
+                            d["diagnosis_stall_retry_count"] = retry_count + 1
+                            d["diagnosis_spawned_at"] = _utcnow().isoformat()
+                            logger.info(
+                                f"[DIAGNOSIS] Re-spawned stalled diagnosis for {did} "
+                                f"(retry {retry_count + 1}/{_DIAGNOSIS_STALL_MAX_RETRIES})"
+                            )
+                    except Exception as _retry_exc:
+                        logger.warning(
+                            f"[DIAGNOSIS] Failed to re-spawn stalled diagnosis for {did}: "
+                            f"{_retry_exc}"
+                        )
+                else:
+                    from app.models import Alert, AlertSeverity
+
+                    session.add(
+                        Alert(
+                            project_id=project.id,
+                            severity=AlertSeverity.WARNING,
+                            title="Direction diagnosis stall: max retries exceeded",
+                            message=(
+                                f"Direction '{(d.get('text') or '')[:80]}' ({did}) had "
+                                f"{retry_count} diagnosis attempts time out without "
+                                f"producing a finding. Manual investigation required."
+                            ),
+                        )
+                    )
+                    logger.warning(
+                        f"[DIAGNOSIS] Max diagnosis stall retries "
+                        f"({_DIAGNOSIS_STALL_MAX_RETRIES}) exceeded for {did}; "
+                        f"escalating to operator alert"
+                    )
         # If a remediation monitor has expired while the direction stayed active,
         # the fix held — drop the monitor and clear any lingering manual-intervention
         # alert so the UI stops showing a permanent red banner after recovery.
@@ -854,6 +916,9 @@ async def _process_direction_lifecycle(
             d["paused_at"] = _utcnow().isoformat()
             d["auto_paused"] = True
             d["auto_pause_count"] = d.get("auto_pause_count", 0) + 1
+            d.pop(
+                "diagnosis_stall_retry_count", None
+            )  # Reset retries for this pause event
             # Only code-failure pauses (Rules 3/4) count toward auto-retirement.
             # Infrastructure-driven pauses (saturation, unproductive) shouldn't
             # permanently retire an otherwise healthy direction.

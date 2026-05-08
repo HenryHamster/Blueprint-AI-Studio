@@ -5,6 +5,7 @@ import {
   type EventPref,
   eventPrefsKey,
   groupRoutineMessages,
+  isFailingGroup,
   ESCALATION_EVENT_TYPES,
   ESCALATION_BADGE_LABELS,
   HIGH_SIGNAL_NOTE_EVENTS,
@@ -602,5 +603,48 @@ describe('Saved Views storage', () => {
 
   it('cap constant is 10', () => {
     expect(SAVED_VIEWS_CAP).toBe(10);
+  });
+});
+
+describe('Failing group detection (mute escape hatch)', () => {
+  test('group of 5 routine messages with 3 failed (60% failure rate) is identified as failing', () => {
+    const msgs = [
+      { id: 'msg1', context: { result: 'failed' } },
+      { id: 'msg2', context: { result: 'failed' } },
+      { id: 'msg3', context: { result: 'failed' } },
+      { id: 'msg4', context: { result: 'merged' } },
+      { id: 'msg5', context: { result: 'merged' } },
+    ];
+    expect(isFailingGroup(msgs)).toBe(true);
+  });
+
+  test('group of 5 with exactly 3 failed still qualifies as failing', () => {
+    const msgs = [
+      { id: 'm1', context: { result: 'failed' } },
+      { id: 'm2', context: { result: 'failed' } },
+      { id: 'm3', context: { result: 'failed' } },
+      { id: 'm4', context: { result: 'review_needed' } },
+      { id: 'm5', context: { result: 'review_needed' } },
+    ];
+    expect(isFailingGroup(msgs)).toBe(true);
+  });
+
+  test('group below 50% failure rate is not failing', () => {
+    const msgs = [
+      { id: 'msg1', context: { result: 'failed' } },
+      { id: 'msg2', context: { result: 'failed' } },
+      { id: 'msg3', context: { result: 'merged' } },
+      { id: 'msg4', context: { result: 'merged' } },
+      { id: 'msg5', context: { result: 'merged' } },
+    ];
+    expect(isFailingGroup(msgs)).toBe(false);
+  });
+
+  test('group with less than 3 failed does not qualify even if >=50%', () => {
+    const msgs = [
+      { id: 'msg1', context: { result: 'failed' } },
+      { id: 'msg2', context: { result: 'merged' } },
+    ];
+    expect(isFailingGroup(msgs)).toBe(false);
   });
 });

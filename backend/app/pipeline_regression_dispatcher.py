@@ -99,6 +99,15 @@ _SR_BLIND_SPOT_THEME_FLOOR = 5
 # prompts. Covers ~3 months of defense activity across all regression classes for the project.
 _LAYER_DEFENSE_LEDGER_LOOKBACK_DAYS = 90
 
+# Layer-concentration meta-signal thresholds.
+# A canonical layer trips the signal when it absorbs fixes across at least
+# _LAYER_CONCENTRATION_MIN_DISTINCT_CASES distinct regression cases AND the
+# defenses are fragile: avg hold < _LAYER_CONCENTRATION_FRAGILE_AVG_HOLD_DAYS
+# OR re-trip count >= _LAYER_CONCENTRATION_FRAGILE_RETRIPS.
+_LAYER_CONCENTRATION_MIN_DISTINCT_CASES = 3
+_LAYER_CONCENTRATION_FRAGILE_AVG_HOLD_DAYS = 7.0
+_LAYER_CONCENTRATION_FRAGILE_RETRIPS = 2
+
 # Strategic-cycle stall threshold: how many hours without a completed
 # strategic_review or design_doc_update before we flag the engine as stalled.
 _STRATEGIC_CYCLE_STALL_HOURS = 8
@@ -681,28 +690,25 @@ def compute_layer_defense_density(
     return result
 
 
-def _build_layer_defense_ledger(
+def _compute_layer_fragility_stats(
     all_fix_logs: list[dict[str, Any]],
     lookback_days: int = _LAYER_DEFENSE_LEDGER_LOOKBACK_DAYS,
-) -> str:
-    """Build a RECENT DEFENSE ACTIVITY BY LAYER block for meta-investigation prompts.
+) -> dict[str, dict[str, Any]]:
+    """Return per-layer fragility stats from fix-log entries within the lookback window.
 
-    Aggregates fingerprint_to_fix_log entries from all RegressionRemediationCase rows
-    for a project, filters to merged_at within lookback_days, and computes per-layer
-    statistics. All five canonical layers always appear. Returns empty string when
-    all_fix_logs is empty.
+    Each canonical layer entry contains: fix_count, avg_hold_days (float|None),
+    still_holding_count, held_gt_7d_count, retripped_within_48h_count.
+    avg_hold_days is None when no re-tripped entries exist (i.e. all defenses
+    are still holding or no fixes recorded).
     """
-    if not all_fix_logs:
-        return ""
-
     now = _utcnow()
     cutoff = now - timedelta(days=lookback_days)
 
     layer_stats: dict[str, dict[str, Any]] = {
         layer: {
             "fix_count": 0,
-            "hold_days": [],  # hold durations for re-tripped entries (days)
-            "still_holding_ages": [],  # age in days for still-holding entries
+            "hold_days": [],
+            "still_holding_ages": [],
             "retripped_within_48h": 0,
             "held_gt_7d": 0,
         }
@@ -738,28 +744,61 @@ def _build_layer_defense_ledger(
                 if age_days > 7.0:
                     s["held_gt_7d"] += 1
 
+    result: dict[str, dict[str, Any]] = {}
+    for layer in _CANONICAL_RECURRENCE_LAYERS:
+        s = layer_stats[layer]
+        hold_days_list = s["hold_days"]
+        result[layer] = {
+            "fix_count": s["fix_count"],
+            "avg_hold_days": sum(hold_days_list) / len(hold_days_list)
+            if hold_days_list
+            else None,
+            "still_holding_count": len(s["still_holding_ages"]),
+            "held_gt_7d_count": s["held_gt_7d"],
+            "retripped_within_48h_count": s["retripped_within_48h"],
+        }
+    return result
+
+
+def _build_layer_defense_ledger(
+    all_fix_logs: list[dict[str, Any]],
+    lookback_days: int = _LAYER_DEFENSE_LEDGER_LOOKBACK_DAYS,
+) -> str:
+    """Build a RECENT DEFENSE ACTIVITY BY LAYER block for meta-investigation prompts.
+
+    Aggregates fingerprint_to_fix_log entries from all RegressionRemediationCase rows
+    for a project, filters to merged_at within lookback_days, and computes per-layer
+    statistics. All five canonical layers always appear. Returns empty string when
+    all_fix_logs is empty.
+    """
+    if not all_fix_logs:
+        return ""
+
+    stats = _compute_layer_fragility_stats(all_fix_logs, lookback_days)
+
     lines: list[str] = [
         "",
         f"RECENT DEFENSE ACTIVITY BY LAYER (last {lookback_days} days)",
     ]
     for layer in _CANONICAL_RECURRENCE_LAYERS:
-        s = layer_stats[layer]
+        s = stats[layer]
         if s["fix_count"] == 0:
             lines.append(
                 f"  {layer}: no defenses added here in the last {lookback_days} days"
             )
         else:
             parts = [f"  {layer}: {s['fix_count']} defense(s) added"]
-            hold_days_list = s["hold_days"]
-            if hold_days_list:
-                avg_hold = sum(hold_days_list) / len(hold_days_list)
+            avg_hold = s["avg_hold_days"]
+            if avg_hold is not None:
                 parts.append(f"avg hold {avg_hold:.1f}d before re-trip")
-            if s["still_holding_ages"]:
-                parts.append(f"{len(s['still_holding_ages'])} still holding")
-            if s["held_gt_7d"] > 0:
-                parts.append(f"{s['held_gt_7d']} held >7d")
-            if s["retripped_within_48h"] > 0:
-                parts.append(f"{s['retripped_within_48h']} retripped <48h (fragile)")
+            if s["still_holding_count"] > 0:
+                parts.append(f"{s['still_holding_count']} still holding")
+            if s["held_gt_7d_count"] > 0:
+                parts.append(f"{s['held_gt_7d_count']} held >7d")
+            if s["retripped_within_48h_count"] > 0:
+                parts.append(
+                    f"{s['retripped_within_48h_count']} retripped <48h (fragile)"
+                )
             lines.append("; ".join(parts))
     return "\n".join(lines)
 
@@ -1618,6 +1657,96 @@ def _format_cross_layer_prompt(
     return "\n".join(header)
 
 
+def _format_layer_concentration_prompt(
+    *,
+    layer: str,
+    sample_case_ids: list[str],
+    all_fix_logs_with_case_ids: list[tuple[str, dict[str, Any]]],
+    layer_defense_block: str = "",
+) -> str:
+    """Build the layer-concentration meta-investigation prompt."""
+    lines = [
+        f"LAYER-CONCENTRATION META-INVESTIGATION (layer_concentration:{layer})",
+        (
+            f"The {layer} infrastructure layer is the recurrent failure mode across "
+            "multiple distinct regression classes. This is a cross-case meta-signal, "
+            "not a single-case regression — the pattern spans independent regression "
+            f"cases, each receiving fixes that target {layer}."
+        ),
+        "",
+        f"CONTRIBUTING CASES (up to 5 most recent for {layer})",
+    ]
+
+    for case_id in sample_case_ids:
+        case_entries = [
+            e
+            for cid, e in all_fix_logs_with_case_ids
+            if cid == case_id and layer in (e.get("layers_targeted") or [])
+        ]
+        lines.append(f"\n  Case {case_id}:")
+        if not case_entries:
+            lines.append("    (no matching fix-log entries)")
+            continue
+        for e in case_entries[:3]:
+            merged = e.get("merged_at") or "unknown"
+            recovered = e.get("recovered_at")
+            merged_short = merged[:10] if len(merged) >= 10 else merged
+            if recovered:
+                recovered_short = recovered[:10] if len(recovered) >= 10 else recovered
+                merged_dt = _parse_dispatcher_dt(merged)
+                recovered_dt = _parse_dispatcher_dt(recovered)
+                if merged_dt and recovered_dt:
+                    hold_days = (recovered_dt - merged_dt).total_seconds() / 86400.0
+                    lines.append(
+                        f"    merged={merged_short} recovered={recovered_short} "
+                        f"hold={hold_days:.1f}d (re-tripped)"
+                    )
+                else:
+                    lines.append(
+                        f"    merged={merged_short} recovered={recovered_short}"
+                    )
+            else:
+                merged_dt = _parse_dispatcher_dt(merged)
+                if merged_dt:
+                    age_days = (_utcnow() - merged_dt).total_seconds() / 86400.0
+                    lines.append(
+                        f"    merged={merged_short} still holding (age={age_days:.1f}d)"
+                    )
+                else:
+                    lines.append(f"    merged={merged_short} still holding")
+
+    lines += [
+        "",
+        "STRUCTURAL QUESTIONS TO INVESTIGATE",
+        (
+            f"  1. Is the {layer} layer's defense pattern structurally insufficient "
+            "(architectural / categorical), rather than individual fixes being wrong? "
+            "If every fix targets this layer but the regression recurs, the layer may "
+            "have a systemic gap that point-fixes cannot close."
+        ),
+        (
+            f"  2. Should additional defenses be added at OTHER layers to compensate "
+            f"for {layer}'s fragility? E.g. if {layer} is chronically fragile, "
+            "hardening adjacent layers (pre-flight checks, gate policies) may provide "
+            "defense-in-depth that reduces blast radius when this layer fails."
+        ),
+        "",
+        "Produce the structured diagnosis JSON "
+        "({summary, root_cause, recommended_fix, severity, confidence, affected_files}). "
+        "Do NOT prescribe a fix — let the investigate→fix chain produce the remediation.",
+        "",
+        "Note: .github/workflows/ files cannot be modified by the agent. "
+        "If the recommended fix would touch workflow YAML, treat it as a "
+        "finding/note in the diagnosis report rather than a direct edit.",
+    ]
+
+    if layer_defense_block:
+        lines.append("")
+        lines.append(layer_defense_block)
+
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # Path-based layer classification (for fix-log layers_targeted backfill)
 # ---------------------------------------------------------------------------
@@ -1626,6 +1755,23 @@ def _format_cross_layer_prompt(
 # runs every 60s and each call hits the GitHub API once per case; capping
 # prevents a multi-hundred-case backlog from saturating the API budget.
 _LAYER_BACKFILL_PER_TICK = 5
+
+# Cap for the per-entry ``unmatched_paths`` list written by
+# ``_backfill_layers_targeted_once`` when classification yields ``[]``. Bounds
+# the JSON column on noisy PRs so a single 200-file refactor cannot bloat the
+# row.
+_UNMATCHED_PATHS_PER_ENTRY_CAP = 20
+
+# Path-classifier coverage signal thresholds. The signal trips when the share
+# of recently-merged fix-log entries that classified to ``[]`` exceeds the
+# rate over a minimum sample. Both are module-level so tests can monkeypatch.
+_PATH_CLASSIFIER_COVERAGE_MIN_SAMPLE = 5
+_PATH_CLASSIFIER_COVERAGE_RATE_THRESHOLD = 0.20
+# Top-N most-frequent unmatched paths to surface in the alert message.
+_PATH_CLASSIFIER_COVERAGE_TOP_PATHS = 10
+# Stable Alert title used for dedup so a recurring stale-classifier condition
+# does not pile up duplicate alerts each cycle.
+_PATH_CLASSIFIER_COVERAGE_ALERT_TITLE = "Path-layer classifier coverage stale"
 
 
 def _classify_layers_from_paths(paths: list[str]) -> list[str]:
@@ -1822,7 +1968,19 @@ async def _backfill_layers_targeted_once(
                 )
                 continue
             paths = [str(f.get("filename") or "") for f in files if isinstance(f, dict)]
-            entry["layers_targeted"] = _classify_layers_from_paths(paths)
+            classified = _classify_layers_from_paths(paths)
+            entry["layers_targeted"] = classified
+            # When the path classifier returned [] but at least one path was
+            # supplied, persist the unmatched paths so the coverage-staleness
+            # signal can name them. Cap the list so a 200-file refactor cannot
+            # bloat the JSON column. When classification is non-empty, do NOT
+            # write unmatched_paths — by definition every path that didn't
+            # match a rule is irrelevant to the matched layers.
+            non_empty_paths = [p for p in paths if p]
+            if not classified and non_empty_paths:
+                entry["unmatched_paths"] = non_empty_paths[
+                    :_UNMATCHED_PATHS_PER_ENTRY_CAP
+                ]
             log_changed = True
             mutated += 1
         if log_changed:
@@ -1833,6 +1991,164 @@ async def _backfill_layers_targeted_once(
     if mutated:
         await session.commit()
     return mutated
+
+
+def compute_unclassified_fix_coverage(
+    cases: list[RegressionRemediationCase],
+    *,
+    lookback_days: int = _LAYER_DEFENSE_LEDGER_LOOKBACK_DAYS,
+) -> dict[str, Any]:
+    """Aggregate path-classifier coverage across recent fix-log entries.
+
+    Walks ``RegressionRemediationCase.fingerprint_to_fix_log`` entries within
+    the same ``merged_at`` lookback window used by ``compute_layer_defense_density``
+    and ``_build_layer_defense_ledger``. Counts entries where classification
+    was attempted (``layers_targeted`` present OR ``unmatched_paths`` present)
+    toward ``total_qualifying_entries``; among those, counts entries where
+    ``layers_targeted`` is the empty list (or absent) toward
+    ``entries_with_empty_layers``.
+
+    Pre-classification entries (neither key present) are NOT counted in
+    either numerator or denominator — the coverage signal only fires once
+    backfill has actually run.
+
+    Returns a dict with:
+      * ``total_qualifying_entries`` (int)
+      * ``entries_with_empty_layers`` (int)
+      * ``unclassified_fix_rate`` (float; 0.0 when total < min sample)
+      * ``top_unmatched_paths`` (list of (path, count) tuples, most-frequent
+        first, capped at ``_PATH_CLASSIFIER_COVERAGE_TOP_PATHS``)
+    """
+    now = _utcnow()
+    cutoff = now - timedelta(days=lookback_days)
+
+    total_qualifying = 0
+    empty_layers = 0
+    path_freq: dict[str, int] = {}
+
+    for case in cases or []:
+        log = case.fingerprint_to_fix_log or []
+        for entry in log:
+            if not isinstance(entry, dict):
+                continue
+            merged_dt = _parse_dispatcher_dt(entry.get("merged_at"))
+            if merged_dt is None or merged_dt < cutoff:
+                continue
+            has_layers = "layers_targeted" in entry
+            has_unmatched = "unmatched_paths" in entry
+            if not (has_layers or has_unmatched):
+                continue
+            total_qualifying += 1
+            layers = entry.get("layers_targeted")
+            is_empty_layers = (has_layers and not layers) or (
+                not has_layers and has_unmatched
+            )
+            if is_empty_layers:
+                empty_layers += 1
+                for raw_path in entry.get("unmatched_paths") or []:
+                    if not raw_path or not isinstance(raw_path, str):
+                        continue
+                    path_freq[raw_path] = path_freq.get(raw_path, 0) + 1
+
+    rate = 0.0
+    if total_qualifying >= _PATH_CLASSIFIER_COVERAGE_MIN_SAMPLE:
+        rate = empty_layers / total_qualifying
+
+    top_paths = sorted(path_freq.items(), key=lambda kv: (-kv[1], kv[0]))[
+        :_PATH_CLASSIFIER_COVERAGE_TOP_PATHS
+    ]
+
+    return {
+        "total_qualifying_entries": total_qualifying,
+        "entries_with_empty_layers": empty_layers,
+        "unclassified_fix_rate": rate,
+        "top_unmatched_paths": top_paths,
+    }
+
+
+async def _evaluate_path_classifier_coverage(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> None:
+    """Open a project-scoped Alert when path-classifier coverage is stale.
+
+    Non-spawning observation step — never spawns investigate tasks or consumes
+    spawn budget. Wrapped by callers in try/except so a transient failure here
+    cannot break the rest of the recovery scan.
+
+    Trips when both:
+      * ``total_qualifying_entries >= _PATH_CLASSIFIER_COVERAGE_MIN_SAMPLE``
+      * ``unclassified_fix_rate >= _PATH_CLASSIFIER_COVERAGE_RATE_THRESHOLD``
+
+    Dedup mirrors ``_emit_signal_staleness_alerts`` — skip insertion when an
+    open Alert with the same project_id, no task_id, WARNING severity, and
+    matching title already exists.
+    """
+    cases = (
+        (
+            await session.execute(
+                select(RegressionRemediationCase).where(
+                    RegressionRemediationCase.project_id == project_id,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    coverage = compute_unclassified_fix_coverage(list(cases))
+
+    total = coverage["total_qualifying_entries"]
+    empty = coverage["entries_with_empty_layers"]
+    rate = coverage["unclassified_fix_rate"]
+    top_paths: list[tuple[str, int]] = coverage["top_unmatched_paths"]
+
+    if total < _PATH_CLASSIFIER_COVERAGE_MIN_SAMPLE:
+        return
+    if rate < _PATH_CLASSIFIER_COVERAGE_RATE_THRESHOLD:
+        return
+
+    title = _PATH_CLASSIFIER_COVERAGE_ALERT_TITLE
+    existing = (
+        (
+            await session.execute(
+                select(Alert).where(
+                    Alert.project_id == project_id,
+                    Alert.task_id.is_(None),
+                    Alert.severity == AlertSeverity.WARNING,
+                    Alert.dismissed_at.is_(None),
+                    Alert.title == title,
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if existing is not None:
+        return
+
+    path_lines = (
+        "\n".join(f"  - {path} ({count}×)" for path, count in top_paths)
+        or "  (no unmatched paths recorded yet)"
+    )
+    message = (
+        f"Path-based layer classifier returned [] for {empty}/{total} "
+        f"({rate:.0%}) of recently-merged fix-log entries — the canonical "
+        f"layer rules in _classify_layers_from_paths are stale relative to "
+        f"where the autonomous loop is shipping fixes. Most-frequent "
+        f"unmatched paths:\n{path_lines}\n"
+        f"Update _classify_layers_from_paths or extend the canonical layer "
+        f"list to cover these paths."
+    )
+    session.add(
+        Alert(
+            project_id=project_id,
+            severity=AlertSeverity.WARNING,
+            title=title,
+            message=message[:1000],
+        )
+    )
+    await session.commit()
 
 
 async def _get_remediation_case(
@@ -2785,6 +3101,98 @@ async def _evaluate_sr_blind_spot_signal(
     return spawned
 
 
+async def _evaluate_layer_concentration_signal(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    spawn_budget_left: int,
+) -> int:
+    """Escalate when a single canonical layer absorbs fragile fixes across many cases.
+
+    Trips when, for a canonical layer:
+    - At least _LAYER_CONCENTRATION_MIN_DISTINCT_CASES distinct regression cases
+      contributed a fix targeting that layer in the lookback window, AND
+    - The layer is fragile: avg hold days < _LAYER_CONCENTRATION_FRAGILE_AVG_HOLD_DAYS
+      OR re-trip count >= _LAYER_CONCENTRATION_FRAGILE_RETRIPS.
+
+    Uses regression_class="layer_concentration:<LAYER>" so each layer has its own
+    dedup/cooldown slot via the existing _maybe_spawn gates.
+    """
+    if spawn_budget_left <= 0:
+        return 0
+
+    all_cases = (
+        (
+            await session.execute(
+                select(RegressionRemediationCase).where(
+                    RegressionRemediationCase.project_id == project_id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not all_cases:
+        return 0
+
+    all_fix_logs_with_case_ids: list[tuple[str, dict[str, Any]]] = [
+        (str(c.id), entry)
+        for c in all_cases
+        for entry in (c.fingerprint_to_fix_log or [])
+        if isinstance(entry, dict)
+    ]
+    if not all_fix_logs_with_case_ids:
+        return 0
+
+    all_fix_logs = [entry for _, entry in all_fix_logs_with_case_ids]
+
+    density = compute_layer_defense_density(all_fix_logs_with_case_ids)
+    fragility = _compute_layer_fragility_stats(all_fix_logs)
+    layer_defense_block = _build_layer_defense_ledger(all_fix_logs)
+
+    spawned = 0
+    for density_row in density:
+        if spawned >= spawn_budget_left:
+            break
+        layer = density_row["layer"]
+        sample_case_ids = density_row["sample_case_ids"]
+        if len(sample_case_ids) < _LAYER_CONCENTRATION_MIN_DISTINCT_CASES:
+            continue
+
+        frag = fragility[layer]
+        avg_hold = frag["avg_hold_days"]
+        retrips = frag["retripped_within_48h_count"]
+        is_fragile = (
+            avg_hold is not None
+            and avg_hold < _LAYER_CONCENTRATION_FRAGILE_AVG_HOLD_DAYS
+        ) or retrips >= _LAYER_CONCENTRATION_FRAGILE_RETRIPS
+        if not is_fragile:
+            continue
+
+        fix_count = density_row["fix_count"]
+        prompt = _format_layer_concentration_prompt(
+            layer=layer,
+            sample_case_ids=sample_case_ids,
+            all_fix_logs_with_case_ids=all_fix_logs_with_case_ids,
+            layer_defense_block=layer_defense_block,
+        )
+        spawn = await _maybe_spawn(
+            session,
+            project_id,
+            signal_name="layer_concentration",
+            regression_class=f"layer_concentration:{layer}",
+            prior_rate=None,
+            current_rate=None,
+            sample_size=fix_count,
+            magnitude=float(fix_count),
+            title_hint=f"Layer concentration: {layer} ({len(sample_case_ids)} cases)",
+            prompt_override=prompt,
+        )
+        if spawn is not None:
+            spawned += 1
+
+    return spawned
+
+
 def _get_staleness_raw_ts(
     signal_name: str,
     doc: dict,
@@ -3113,6 +3521,20 @@ async def run_recovery_once(session: AsyncSession, project_id: uuid.UUID) -> int
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "[REGRESSION_DISPATCHER] layers_targeted backfill raised for project=%s: %s",
+            project_id,
+            exc,
+        )
+
+    # Non-spawning observation: open a WARNING alert when the path-based
+    # layer classifier is increasingly returning [] across recently-merged
+    # fix-log entries. Wrapped in try/except so a transient failure here
+    # cannot break the rest of the recovery scan.
+    try:
+        await _evaluate_path_classifier_coverage(session, project_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[REGRESSION_DISPATCHER] path-classifier coverage evaluation raised "
+            "for project=%s: %s",
             project_id,
             exc,
         )
@@ -4127,6 +4549,11 @@ async def run_once(session: AsyncSession, project_id: uuid.UUID) -> int:
             spawn_budget - _spawned,
         )
         _spawned += await _evaluate_sr_blind_spot_signal(
+            session,
+            project_id,
+            spawn_budget - _spawned,
+        )
+        _spawned += await _evaluate_layer_concentration_signal(
             session,
             project_id,
             spawn_budget - _spawned,

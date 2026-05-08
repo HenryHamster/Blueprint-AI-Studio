@@ -1386,6 +1386,248 @@ async def test_stale_diagnosis_clears_all_three_fields(db_session):
     assert "diagnosis_completed_at" in d
 
 
+@pytest.mark.asyncio
+async def test_stale_diagnosis_respawns_research_task(db_session):
+    """Stale diagnosis with retry_count=0 triggers re-spawn; counter increments to 1."""
+    stale_iso = (datetime.utcnow() - timedelta(hours=5)).isoformat()
+    prior_task_id = "task-prior-stale-001"
+    direction = {
+        "id": "d-stale-respawn-1",
+        "text": "Direction with stalled diagnosis",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": [],
+        "diagnosis_in_progress": True,
+        "diagnosis_started_at": stale_iso,
+        "diagnosis_task_id": prior_task_id,
+        "diagnosis_pause_reason": "High code failure rate: >70% of spawned tasks failed...",
+    }
+    project = Project(
+        name="Stale Respawn First",
+        user_id="u-stale-r1",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "t"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    _ss.circuit_breakers.pop(str(project.id), None)
+
+    await _process_direction_lifecycle(
+        project,
+        db_session,
+        cooldown_minutes=240.0,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
+    )
+    await db_session.refresh(project)
+
+    d = project.directions[0]
+    assert "diagnosis_in_progress" not in d
+    assert "diagnosis_started_at" not in d
+    assert "diagnosis_task_id" not in d
+    assert "diagnosis_completed_at" in d
+    assert d.get("diagnosis_stall_retry_count") == 1
+
+    tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    research_tasks = [t for t in tasks if t.first_payload.get("type") == "research"]
+    assert len(research_tasks) == 1
+    t = research_tasks[0]
+    assert t.context.get("diagnosis_for_direction") == "d-stale-respawn-1"
+    assert t.context.get("diagnosis_retry") is True
+    assert t.context.get("diagnosis_retry_attempt") == 1
+    assert t.context.get("prior_diagnosis_task_id") == prior_task_id
+
+
+@pytest.mark.asyncio
+async def test_stale_diagnosis_second_stall_still_respawns(db_session):
+    """Stale diagnosis with retry_count=1 re-spawns (count → 2, attempt=2 in task context)."""
+    stale_iso = (datetime.utcnow() - timedelta(hours=5)).isoformat()
+    direction = {
+        "id": "d-stale-respawn-2",
+        "text": "Direction with two stalled diagnoses",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": [],
+        "diagnosis_in_progress": True,
+        "diagnosis_started_at": stale_iso,
+        "diagnosis_task_id": "task-prior-stale-002",
+        "diagnosis_pause_reason": "High code failure rate: ...",
+        "diagnosis_stall_retry_count": 1,
+    }
+    project = Project(
+        name="Stale Respawn Second",
+        user_id="u-stale-r2",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "t"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    _ss.circuit_breakers.pop(str(project.id), None)
+
+    await _process_direction_lifecycle(
+        project,
+        db_session,
+        cooldown_minutes=240.0,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
+    )
+    await db_session.refresh(project)
+
+    d = project.directions[0]
+    assert "diagnosis_in_progress" not in d
+    assert d.get("diagnosis_stall_retry_count") == 2
+
+    tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    research_tasks = [t for t in tasks if t.first_payload.get("type") == "research"]
+    assert len(research_tasks) == 1
+    assert research_tasks[0].context.get("diagnosis_retry_attempt") == 2
+
+
+@pytest.mark.asyncio
+async def test_stale_diagnosis_max_retries_creates_alert(db_session):
+    """At max retries, stale diagnosis clears flags and creates a WARNING Alert without spawning a task."""
+    stale_iso = (datetime.utcnow() - timedelta(hours=5)).isoformat()
+    direction = {
+        "id": "d-stale-max-retry",
+        "text": "Direction that exhausted stall retries",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": [],
+        "diagnosis_in_progress": True,
+        "diagnosis_started_at": stale_iso,
+        "diagnosis_task_id": "task-prior-stale-max",
+        "diagnosis_stall_retry_count": 2,  # == _DIAGNOSIS_STALL_MAX_RETRIES
+    }
+    project = Project(
+        name="Stale Max Retry Alert",
+        user_id="u-stale-max",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "t"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    _ss.circuit_breakers.pop(str(project.id), None)
+
+    await _process_direction_lifecycle(
+        project,
+        db_session,
+        cooldown_minutes=240.0,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
+    )
+    await db_session.refresh(project)
+
+    d = project.directions[0]
+    assert "diagnosis_in_progress" not in d
+    assert "diagnosis_completed_at" in d
+
+    tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    research_tasks = [t for t in tasks if t.first_payload.get("type") == "research"]
+    assert len(research_tasks) == 0, "no re-spawn once max retries exceeded"
+
+    alerts = (
+        (await db_session.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+    a = alerts[0]
+    assert a.severity == AlertSeverity.WARNING
+    assert "diagnosis stall" in a.title.lower()
+    assert "d-stale-max-retry" in a.message
+    assert "manual" in a.message.lower()
+
+
+@pytest.mark.asyncio
+async def test_stale_diagnosis_retry_count_reset_on_new_pause(db_session, mocker):
+    """A new pause event clears diagnosis_stall_retry_count so the fresh pause gets full retry budget."""
+    mocker.patch(
+        "app.notification_dispatch.post_direction_milestone_message",
+        new_callable=AsyncMock,
+    )
+    direction = {
+        "id": "d-reset-stall-count",
+        "text": "Direction that gets re-paused after prior stalls",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "auto_pause_count": 1,
+        "code_failure_pause_count": 1,
+        "research_history": [
+            {
+                "tasks_created": 4,
+                "tasks_failed": 4,
+                "tasks_failed_infra": 0,
+                "prs_merged": 0,
+            },
+            {
+                "tasks_created": 4,
+                "tasks_failed": 4,
+                "tasks_failed_infra": 0,
+                "prs_merged": 0,
+            },
+            {
+                "tasks_created": 4,
+                "tasks_failed": 4,
+                "tasks_failed_infra": 0,
+                "prs_merged": 0,
+            },
+        ],
+        "diagnosis_stall_retry_count": 1,
+    }
+    project = Project(
+        name="Reset Stall Count",
+        user_id="u-reset-stall",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "t"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    _ss.circuit_breakers.pop(str(project.id), None)
+
+    await _process_direction_lifecycle(
+        project,
+        db_session,
+        cooldown_minutes=240.0,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
+    )
+    await db_session.refresh(project)
+
+    d = project.directions[0]
+    assert d["status"] == "paused", "unhealthy history should trigger auto-pause"
+    assert "diagnosis_stall_retry_count" not in d, (
+        "retry count must be cleared on new pause so the fresh pause gets full retry budget"
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # _compute_direction_error_fingerprint
 # ─────────────────────────────────────────────────────────────────────────────
