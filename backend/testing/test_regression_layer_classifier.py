@@ -7,6 +7,7 @@ from app.regression_layer_classifier import (
     LAYER_BASELINE_GATE,
     LAYER_CI_WORKFLOW,
     LAYER_REVIEWER_PASS,
+    build_layer_meta_block,
     classify_layers,
 )
 
@@ -232,3 +233,41 @@ class TestReturnType:
     def test_stage_none_is_fine(self):
         result = classify_layers("CODE_ERROR", "some message", stage=None)
         assert isinstance(result, list)
+
+
+# ---------------------------------------------------------------------------
+# build_layer_meta_block
+# ---------------------------------------------------------------------------
+
+
+class TestBuildLayerMetaBlock:
+    def test_all_layers_appear(self):
+        block = build_layer_meta_block()
+        for layer in ALL_LAYERS:
+            assert layer in block
+
+    def test_all_untargeted_when_none_supplied(self):
+        block = build_layer_meta_block()
+        assert block.count("UNTARGETED") == len(ALL_LAYERS)
+
+    def test_targeted_marker_for_supplied_layer(self):
+        block = build_layer_meta_block(targeted_layers=frozenset([LAYER_AGENT_VM]))
+        assert "AGENT_VM [targeted]" in block
+
+    def test_untargeted_marker_for_remaining_layers(self):
+        block = build_layer_meta_block(targeted_layers=frozenset([LAYER_CI_WORKFLOW]))
+        assert block.count("UNTARGETED") == len(ALL_LAYERS) - 1
+
+    def test_returns_string(self):
+        assert isinstance(build_layer_meta_block(), str)
+
+    def test_descriptions_included(self):
+        block = build_layer_meta_block()
+        assert ".github/workflows" in block
+
+    def test_at_least_two_layer_names_in_meta_investigation_context(self):
+        block = build_layer_meta_block(
+            targeted_layers=frozenset([LAYER_CI_WORKFLOW, LAYER_AGENT_VM])
+        )
+        layer_mentions = [layer for layer in ALL_LAYERS if layer in block]
+        assert len(layer_mentions) >= 2

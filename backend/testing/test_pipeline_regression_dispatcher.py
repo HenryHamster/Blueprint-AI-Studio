@@ -2937,6 +2937,59 @@ async def test_auto_close_higher_is_better_degradation_is_marginal(db_session):
     assert alerts[0].severity == AlertSeverity.WARNING
 
 
+@pytest.mark.asyncio
+async def test_recovery_cycle_record_tracks_marginal_and_confirmed_counts(db_session):
+    """Recovery cycle records persist marginal and confirmed recovery counts."""
+    from app.models import RegressionCaseStatus
+    from app.pipeline_regression_dispatcher import get_dispatcher_cycle_records
+
+    project = make_project(design_doc=_design_doc_no_sr_regression())
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Create two cases: one marginal, one confirmed
+    marginal_case = await _make_stale_case(
+        db_session,
+        project.id,
+        status=RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION,
+        hours_stale=72,
+        regression_class="sr_catch_rate:correctness",
+    )
+    marginal_case.signal_snapshot_at_merge = {"current_rate": 0.78}
+    marginal_case.signal_healthy_since_at = _utcnow() - timedelta(hours=30)
+    db_session.add(marginal_case)
+
+    confirmed_case = await _make_stale_case(
+        db_session,
+        project.id,
+        status=RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION,
+        hours_stale=72,
+        regression_class="fix_loop_divergence",
+    )
+    confirmed_case.signal_snapshot_at_merge = {"current_rate": 100}
+    confirmed_case.signal_healthy_since_at = _utcnow() - timedelta(hours=30)
+    db_session.add(confirmed_case)
+    await db_session.commit()
+
+    # Run watchdog to close both cases
+    closed = await run_watchdog_once(db_session, project.id)
+    assert closed == 2
+
+    # Verify cycle record has the correct counts
+    cycles = await get_dispatcher_cycle_records(db_session, project_id=str(project.id))
+    recovery_cycles = [
+        c
+        for c in cycles
+        if c.get("marginal_recoveries_count", 0) > 0
+        or c.get("confirmed_recoveries_count", 0) > 0
+    ]
+    assert len(recovery_cycles) >= 1
+    latest = recovery_cycles[-1]
+    assert latest["marginal_recoveries_count"] == 1
+    assert latest["confirmed_recoveries_count"] == 1
+
+
 # ---------------------------------------------------------------------------
 # Deploy-monitoring gate tests
 # ---------------------------------------------------------------------------
@@ -3328,12 +3381,14 @@ async def test_closed_case_with_recent_history_uses_recurrence_prompt(db_session
     await db_session.commit()
     await db_session.refresh(project)
 
-    merged_at = (_utcnow() - timedelta(days=1)).isoformat()
+    # Merge 7 days ago, recovered 3 days ago → 4-day hold (above the 2-day fragile floor).
+    merged_at = (_utcnow() - timedelta(days=7)).isoformat()
+    recovered_at = (_utcnow() - timedelta(days=3)).isoformat()
     await _seed_dispatcher_spawn_history(
         db_session,
         project.id,
         regression_class="sr_catch_rate",
-        created_at=_utcnow() - timedelta(days=1, minutes=5),
+        created_at=_utcnow() - timedelta(days=7, minutes=5),
         pr_number=5678,
     )
     case = RegressionRemediationCase(
@@ -3351,7 +3406,7 @@ async def test_closed_case_with_recent_history_uses_recurrence_prompt(db_session
             },
             {
                 "fingerprint": "sr_catch_rate",
-                "recovered_at": (_utcnow() - timedelta(hours=12)).isoformat(),
+                "recovered_at": recovered_at,
             },
         ],
     )
@@ -3600,6 +3655,133 @@ async def test_recurrence_prompt_layers_targeted_disjoint_emits_mismatch_block(
     assert "Start your layer reasoning from the un-defended layers" in prompt
     # Per-attempt layer annotation reflects the prior layers
     assert "layers: CI_WORKFLOW" in prompt
+
+
+@pytest.mark.asyncio
+async def test_fragile_recurrence_meta_on_third_recurrence(db_session):
+    """Third recurrence on a single case produces fragile-recurrence meta-investigation prompt."""
+    from app.models import (
+        Alert,
+        AlertSeverity,
+        RegressionCaseStatus,
+        RegressionRemediationCase,
+    )
+    from app.pipeline_regression_dispatcher import (
+        ESCALATION_REASON_FRAGILE_RECURRENCE_META,
+    )
+
+    project = make_project(
+        design_doc=_design_doc_with_sr_regression(category="correctness"),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    merged_at = (_utcnow() - timedelta(hours=3)).isoformat()
+    # Seed three prior spawned tasks so _load_recurrence_prompt_context returns 3 cycles.
+    for i in range(3):
+        await _seed_dispatcher_spawn_history(
+            db_session,
+            project.id,
+            regression_class="sr_catch_rate",
+            created_at=_utcnow() - timedelta(hours=7 + i),
+            pr_number=4400 + i,
+        )
+
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate",
+        status=RegressionCaseStatus.MERGED,
+        hit_count=3,
+        attempts=0,
+        last_remediation_pr_number=4402,
+        last_remediation_result="merged",
+        signal_snapshot_at_spawn={
+            "prior_rate": 0.80,
+            "current_rate": 0.50,
+            "signal_name": "sr_catch_rate",
+            "captured_at": merged_at,
+        },
+        signal_snapshot_at_merge={"captured_at": merged_at},
+        fingerprint_to_fix_log=[
+            {
+                "fingerprint": "sr_catch_rate",
+                "fix_pr_number": 4400,
+                "merged_at": merged_at,
+            },
+            {
+                "fingerprint": "sr_catch_rate",
+                "fix_pr_number": 4401,
+                "merged_at": merged_at,
+            },
+            {
+                "fingerprint": "sr_catch_rate",
+                "fix_pr_number": 4402,
+                "merged_at": merged_at,
+            },
+        ],
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    await run_recovery_once(db_session, project.id)
+    await db_session.refresh(case)
+    assert case.status == RegressionCaseStatus.ACTIVE
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 1
+
+    task = (
+        (
+            await db_session.execute(
+                select(Task)
+                .where(Task.project_id == project.id)
+                .order_by(Task.created_at.desc())
+            )
+        )
+        .scalars()
+        .first()
+    )
+    prompt = (task.first_payload or {}).get("prompt", "")
+
+    # Must use the fragile-recurrence meta-investigation framing.
+    assert "FRAGILE-RECURRENCE META-INVESTIGATION" in prompt
+    assert "meta-investigation" in prompt.lower()
+
+    # Must reference at least 2 distinct canonical layer classes.
+    layer_mentions = [
+        layer
+        for layer in (
+            "CI_WORKFLOW",
+            "AGENT_VM",
+            "AGENT_VERB",
+            "BASELINE_GATE",
+            "REVIEWER_PASS",
+        )
+        if layer in prompt
+    ]
+    assert len(layer_mentions) >= 2, (
+        f"Expected >=2 layer classes, got: {layer_mentions}"
+    )
+
+    # Case escalation reason must be set.
+    await db_session.refresh(case)
+    assert case.escalation_reason == ESCALATION_REASON_FRAGILE_RECURRENCE_META
+
+    # Alert level must be INFO (not WARNING — expected, not anomalous behavior).
+    alert = (
+        (
+            await db_session.execute(
+                select(Alert)
+                .where(Alert.project_id == project.id)
+                .order_by(Alert.created_at.desc())
+            )
+        )
+        .scalars()
+        .first()
+    )
+    assert alert is not None
+    assert alert.severity == AlertSeverity.INFO
 
 
 @pytest.mark.asyncio
@@ -5562,8 +5744,11 @@ async def test_signal_healthy_since_persists_across_worker_restart(db_session):
 
     # Tick 2 (different worker would read the same row): auto-close fires
     # because the persisted timestamp puts us past the 24h window.
-    closed = await _auto_close_recovered_manual_intervention(db_session, project.id)
-    assert closed == 1
+    marginal_closed, confirmed_closed = await _auto_close_recovered_manual_intervention(
+        db_session, project.id
+    )
+    # No signal_snapshot_at_merge → not classified marginal → confirmed close.
+    assert (marginal_closed, confirmed_closed) == (0, 1)
     await db_session.refresh(case)
     assert case.status == RegressionCaseStatus.CLOSED
     # Cleared on close — never carries forward into a re-escalation.
@@ -11108,3 +11293,183 @@ async def test_agent_vm_resource_code_level_subtypes_excluded(
 
     spawned = await run_once(db_session, project.id)
     assert spawned == 0
+
+
+# ---------------------------------------------------------------------------
+# Marginal-recovery follow-up investigation spawning
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_marginal_followup_spawns_investigate_task(db_session):
+    """Marginal recovery spawns exactly one follow-up investigate task.
+
+    The task prompt must include the pre-fix and post-fix values; the WARNING
+    alert must remain the only alert (no double-fire); and the fix log must
+    carry a marginal_followup_spawned entry.
+    """
+    from app.models import Alert, AlertSeverity, RegressionCaseStatus
+    from app.pipeline_regression_dispatcher import (
+        _auto_close_recovered_manual_intervention,
+    )
+
+    project = make_project(design_doc=_design_doc_no_sr_regression())
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    case = await _make_stale_case(
+        db_session,
+        project.id,
+        status=RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION,
+        hours_stale=72,
+        regression_class="sr_catch_rate:correctness",
+    )
+    case.signal_snapshot_at_merge = {"current_rate": 0.78}
+    case.signal_healthy_since_at = _utcnow() - timedelta(hours=30)
+    db_session.add(case)
+    await db_session.commit()
+
+    marginal_closed, confirmed_closed = await _auto_close_recovered_manual_intervention(
+        db_session, project.id
+    )
+    assert (marginal_closed, confirmed_closed) == (1, 0)
+
+    await db_session.refresh(case)
+    assert case.status == RegressionCaseStatus.CLOSED
+    assert case.last_remediation_result == "recovered_marginal"
+
+    # Exactly one WARNING alert — no double-fire.
+    alerts = (
+        (await db_session.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.WARNING
+
+    # Exactly one follow-up investigate task spawned.
+    tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    followup_tasks = [
+        t for t in tasks if (t.context or {}).get("signal_name") == "marginal_followup"
+    ]
+    assert len(followup_tasks) == 1
+    ft = followup_tasks[0]
+    prompt = ft.first_payload.get("prompt", "")
+    assert "0.78" in prompt
+    assert "0.8" in prompt
+
+    # Fix log carries marginal_followup_spawned entry.
+    log_entries = case.fingerprint_to_fix_log or []
+    followup_entries = [
+        e
+        for e in log_entries
+        if isinstance(e, dict) and e.get("type") == "marginal_followup_spawned"
+    ]
+    assert len(followup_entries) == 1
+    assert followup_entries[0].get("spawned_at") is not None
+    assert followup_entries[0].get("task_id") == str(ft.id)
+
+
+@pytest.mark.asyncio
+async def test_marginal_followup_cooldown_blocks_repeat_spawn(db_session):
+    """A second marginal closure within the cooldown window does NOT spawn another follow-up."""
+    from app.models import RegressionCaseStatus
+    from app.pipeline_regression_dispatcher import (
+        _auto_close_recovered_manual_intervention,
+    )
+    from app.shared_state import runtime_config
+
+    project = make_project(design_doc=_design_doc_no_sr_regression())
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    case = await _make_stale_case(
+        db_session,
+        project.id,
+        status=RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION,
+        hours_stale=72,
+        regression_class="sr_catch_rate:correctness",
+    )
+    case.signal_snapshot_at_merge = {"current_rate": 0.78}
+    case.signal_healthy_since_at = _utcnow() - timedelta(hours=30)
+    # Pre-seed the durable cooldown anchor (1h ago → within 72h cooldown).
+    case.marginal_followup_spawned_at = _utcnow() - timedelta(hours=1)
+    db_session.add(case)
+    await db_session.commit()
+
+    orig = runtime_config.get("regression_marginal_followup_cooldown_hours")
+    runtime_config["regression_marginal_followup_cooldown_hours"] = 72
+    try:
+        (
+            marginal_closed,
+            confirmed_closed,
+        ) = await _auto_close_recovered_manual_intervention(db_session, project.id)
+    finally:
+        if orig is None:
+            runtime_config.pop("regression_marginal_followup_cooldown_hours", None)
+        else:
+            runtime_config["regression_marginal_followup_cooldown_hours"] = orig
+
+    assert (marginal_closed, confirmed_closed) == (1, 0)
+    tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    followup_tasks = [
+        t for t in tasks if (t.context or {}).get("signal_name") == "marginal_followup"
+    ]
+    assert len(followup_tasks) == 0, "cooldown should have blocked the follow-up spawn"
+
+
+@pytest.mark.asyncio
+async def test_marginal_followup_disabled_by_config(db_session):
+    """Setting regression_marginal_followup_enabled=False suppresses follow-up spawn."""
+    from app.models import RegressionCaseStatus
+    from app.pipeline_regression_dispatcher import (
+        _auto_close_recovered_manual_intervention,
+    )
+    from app.shared_state import runtime_config
+
+    project = make_project(design_doc=_design_doc_no_sr_regression())
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    case = await _make_stale_case(
+        db_session,
+        project.id,
+        status=RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION,
+        hours_stale=72,
+        regression_class="sr_catch_rate:correctness",
+    )
+    case.signal_snapshot_at_merge = {"current_rate": 0.78}
+    case.signal_healthy_since_at = _utcnow() - timedelta(hours=30)
+    db_session.add(case)
+    await db_session.commit()
+
+    runtime_config["regression_marginal_followup_enabled"] = False
+    try:
+        (
+            marginal_closed,
+            confirmed_closed,
+        ) = await _auto_close_recovered_manual_intervention(db_session, project.id)
+    finally:
+        runtime_config.pop("regression_marginal_followup_enabled", None)
+
+    assert (marginal_closed, confirmed_closed) == (1, 0)
+    tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    followup_tasks = [
+        t for t in tasks if (t.context or {}).get("signal_name") == "marginal_followup"
+    ]
+    assert len(followup_tasks) == 0, "disabled config should suppress follow-up spawn"

@@ -24,7 +24,7 @@
     "reaper.py": 3200,
     "review_pipeline.py": 2350,
     "deploy_health.py": 1250,
-    "regression_layer_classifier.py": 250
+    "regression_layer_classifier.py": 330
   },
   "frontend": {
     "useAppState.ts": 3000,

@@ -57,6 +57,7 @@ ESCALATION_REASON_ESCALATED_CROSS_LAYER = "escalated_cross_layer"
 ESCALATION_REASON_ESCALATED_LAYER_CONCENTRATION = "escalated_layer_concentration"
 ESCALATION_REASON_ESCALATED_CROSS_CASE_FINGERPRINT = "escalated_cross_case_fingerprint"
 ESCALATION_REASON_ESCALATED_RECURRENCE = "escalated_recurrence"
+ESCALATION_REASON_FRAGILE_RECURRENCE_META = "fragile_recurrence_meta"
 
 # Cooldown between consecutive spawns for the SAME regression_class. Mirrors
 # the self_audit_dispatch cooldown pattern — keeps a noisy regression from
@@ -114,6 +115,12 @@ _VIEWPORT_REGRESSION_WINDOW_DAYS = 7
 # is noise suppression matching _ANOMALY_DISPATCH_MIN_OCCURRENCES.
 _AGENT_VM_RESOURCE_MIN_FAILURES = 3
 _AGENT_VM_RESOURCE_WINDOW_HOURS = 24
+
+# Fragile-recurrence meta-investigation thresholds.
+# A case is "fragile" if it has recurred >= this many times OR any prior fix cycle
+# held < _FRAGILE_RECURRENCE_SHORT_HOLD_DAYS before the signal re-tripped.
+_FRAGILE_RECURRENCE_MIN_COUNT = 3
+_FRAGILE_RECURRENCE_SHORT_HOLD_DAYS = 2.0
 
 # SR blind-spot theme occurrence floor. A blind_spot theme must appear at least
 # this many times across the 14d window before it is considered a structural gap
@@ -245,6 +252,12 @@ _cycle_layer_ledger_var: contextvars.ContextVar[dict | None] = contextvars.Conte
     default=None,
 )
 
+# Context vars for tracking recovery counts in watchdog cycles.
+_recovery_counts_var: contextvars.ContextVar[dict] = contextvars.ContextVar(
+    "_recovery_counts",
+    default=None,
+)
+
 
 def _parse_iso_timestamp(raw: Any) -> datetime | None:
     if not isinstance(raw, str) or not raw.strip():
@@ -373,6 +386,8 @@ async def get_dispatcher_cycle_records(
             "spawns_emitted": r.spawns_emitted or 0,
             "rejections_by_reason": dict(r.rejections_by_reason or {}),
             "mttd_p50_sec": r.mttd_p50_sec,
+            "marginal_recoveries_count": r.marginal_recoveries_count or 0,
+            "confirmed_recoveries_count": r.confirmed_recoveries_count or 0,
         }
         for r in rows
     ]
@@ -1035,6 +1050,80 @@ def _format_recurrence_meta_prompt(
         ]
     )
     lines.append("")
+    lines.append(base_lines)
+    if layer_defense_block:
+        lines.append(layer_defense_block)
+    return "\n".join(lines)
+
+
+def _is_fragile_recurrence(
+    case: RegressionRemediationCase,
+    recurrence_count: int,
+    now: datetime,
+) -> bool:
+    """Return True if the case is chronically fragile."""
+    if recurrence_count >= _FRAGILE_RECURRENCE_MIN_COUNT:
+        return True
+    # Only completed cycles (recovered_at set) count as "held" — an in-progress
+    # cycle has no confirmed hold duration yet.
+    for cycle in _extract_recurrence_cycles(case):
+        merged_at = cycle.get("merged_at")
+        recovered_at = cycle.get("recovered_at")
+        if merged_at is None or recovered_at is None:
+            continue
+        hold_days = (recovered_at - merged_at).total_seconds() / 86400
+        if hold_days < _FRAGILE_RECURRENCE_SHORT_HOLD_DAYS:
+            return True
+    return False
+
+
+def _format_fragile_recurrence_meta_prompt(
+    case: RegressionRemediationCase,
+    base_lines: str,
+    layer_defense_block: str = "",
+) -> str:
+    """Build the fragile-recurrence cross-layer meta-investigation prompt."""
+    attempts = getattr(case, "_recurrence_attempts", []) or []
+    recurrence_count = getattr(case, "_recurrence_count", len(attempts)) or len(
+        attempts
+    )
+
+    all_targeted: set[str] = set()
+    for attempt in attempts:
+        if attempt.get("layers_targeted_present"):
+            all_targeted.update(attempt.get("layers_targeted") or [])
+
+    untargeted = [
+        layer for layer in _CANONICAL_RECURRENCE_LAYERS if layer not in all_targeted
+    ]
+
+    lines: list[str] = [
+        "FRAGILE-RECURRENCE META-INVESTIGATION",
+        (
+            f"This regression class has re-tripped {recurrence_count} time(s) and is "
+            "classified as chronically fragile (recurrence_count >= "
+            f"{_FRAGILE_RECURRENCE_MIN_COUNT} OR a prior fix held < "
+            f"{_FRAGILE_RECURRENCE_SHORT_HOLD_DAYS:.0f} days)."
+        ),
+        (
+            "Single-layer fixes have not held. This meta-investigation must enumerate "
+            "ALL canonical layers and propose a defense in at least one untargeted layer."
+        ),
+        "",
+        f"Canonical defense layers: {', '.join(_CANONICAL_RECURRENCE_LAYERS)}",
+        (
+            f"Layers already targeted by prior fixes: "
+            f"{', '.join(sorted(all_targeted)) if all_targeted else 'none recorded'}"
+        ),
+        (
+            f"Untargeted layers (start here): "
+            f"{', '.join(untargeted) if untargeted else 'all layers have been targeted — look for cross-layer interactions'}"
+        ),
+        "",
+        "For each untargeted layer answer: what defense should be added to prevent re-trip?",
+        "For each targeted layer answer: why did the prior fix fail to hold?",
+        "",
+    ]
     lines.append(base_lines)
     if layer_defense_block:
         lines.append(layer_defense_block)
@@ -2804,6 +2893,7 @@ async def _maybe_spawn(
         layers_evidence = []
 
     recurrence_context = None
+    _fragile_recurrence = False
     if existing_case is not None:
         recurrence_context = await _load_recurrence_prompt_context(
             session,
@@ -2831,7 +2921,26 @@ async def _maybe_spawn(
                 "_recurrence_obs_layers",
                 list(obs_layers or []),
             )
-            if is_cross_layer:
+            # Upgrade to fragile-recurrence meta when the case is chronically fragile
+            # and no higher-priority meta-signal (layer_concentration, cross_case_fingerprint,
+            # cross_layer) is already handling it. Guard against re-escalating within the
+            # same ACTIVE cycle.
+            _fragile_recurrence = (
+                signal_name not in ("layer_concentration", "cross_case_fingerprint")
+                and not is_cross_layer
+                and existing_case.escalation_reason
+                != ESCALATION_REASON_FRAGILE_RECURRENCE_META
+                and _is_fragile_recurrence(
+                    existing_case,
+                    recurrence_context["recurrence_count"],
+                    now,
+                )
+            )
+            if _fragile_recurrence:
+                prompt = _format_fragile_recurrence_meta_prompt(
+                    existing_case, base_prompt, layer_defense_block=_layer_defense_block
+                )
+            elif is_cross_layer:
                 prompt = _format_recurrence_meta_prompt(
                     existing_case, prompt, layer_defense_block=_layer_defense_block
                 )
@@ -2874,6 +2983,8 @@ async def _maybe_spawn(
         case_escalation_reason = ESCALATION_REASON_ESCALATED_CROSS_CASE_FINGERPRINT
     elif is_cross_layer:
         case_escalation_reason = ESCALATION_REASON_ESCALATED_CROSS_LAYER
+    elif _fragile_recurrence:
+        case_escalation_reason = ESCALATION_REASON_FRAGILE_RECURRENCE_META
     elif recurrence_context is not None:
         case_escalation_reason = ESCALATION_REASON_ESCALATED_RECURRENCE
     else:
@@ -4773,6 +4884,89 @@ async def _spawn_auto_escalation_meta_investigate(
     return new_task
 
 
+async def _persist_recovery_cycle_record(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    cycle_started_at: datetime,
+    marginal_closed: int,
+    confirmed_closed: int,
+) -> None:
+    """Persist a recovery cycle record with marginal/confirmed recovery counts."""
+    from app.models import DispatcherCycleRecord  # noqa: PLC0415
+
+    try:
+        session.add(
+            DispatcherCycleRecord(
+                project_id=project_id,
+                cycle_started_at=cycle_started_at,
+                cycle_finished_at=_utcnow(),
+                signals_evaluated=0,
+                signals_tripped=0,
+                spawns_emitted=0,
+                rejections_by_reason={},
+                marginal_recoveries_count=marginal_closed,
+                confirmed_recoveries_count=confirmed_closed,
+            )
+        )
+        await session.commit()
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "[REGRESSION_WATCHDOG] recovery-cycle-record write failed",
+            exc_info=True,
+        )
+        try:
+            await session.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+async def _check_marginal_recovery_rate_threshold(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> None:
+    """Check if marginal recovery rate exceeds threshold for >=2 consecutive cycles.
+
+    If both the last 2 recovery cycles have marginal_rate > threshold (default 0.30),
+    emit a WARNING alert.
+    """
+    threshold = float(
+        _runtime_config.get("marginal_recovery_rate_threshold", 0.30) or 0.30
+    )
+    records = await get_dispatcher_cycle_records(
+        session,
+        project_id=str(project_id),
+        limit=2,
+    )
+    if len(records) < 2:
+        return
+
+    rates = []
+    for rec in records[-2:]:
+        marginal = rec.get("marginal_recoveries_count", 0)
+        confirmed = rec.get("confirmed_recoveries_count", 0)
+        total = marginal + confirmed
+        if total > 0:
+            rates.append(marginal / total)
+        else:
+            rates.append(0.0)
+
+    if len(rates) == 2 and all(r > threshold for r in rates):
+        session.add(
+            Alert(
+                project_id=project_id,
+                severity=AlertSeverity.WARNING,
+                title="High marginal recovery rate threshold exceeded"[:200],
+                message=(
+                    f"Marginal recovery rate exceeded {threshold:.0%} "
+                    f"for {len(rates)} consecutive cycles. "
+                    f"Rates: {[f'{r:.1%}' for r in rates]}. "
+                    f"May indicate fixes that do not fully address root causes."
+                )[:1000],
+            )
+        )
+        await session.commit()
+
+
 async def run_watchdog_once(session: AsyncSession, project_id: uuid.UUID) -> int:
     """Escalate stale ACTIVE/MERGED cases and auto-close recovered NMI cases.
 
@@ -4786,117 +4980,135 @@ async def run_watchdog_once(session: AsyncSession, project_id: uuid.UUID) -> int
 
     Returns the total number of cases mutated this tick (escalated + auto-closed).
     """
-    now = _utcnow()
-    rows = (
-        (
-            await session.execute(
-                select(RegressionRemediationCase).where(
-                    RegressionRemediationCase.project_id == project_id,
-                    RegressionRemediationCase.status.in_(
-                        [
-                            RegressionCaseStatus.ACTIVE,
-                            RegressionCaseStatus.MERGED,
-                        ]
-                    ),
+    cycle_started_at = _utcnow()
+    _recovery_counts = {"marginal": 0, "confirmed": 0}
+    _token = _recovery_counts_var.set(_recovery_counts)
+    mutated = 0
+    marginal_closed = 0
+    confirmed_closed = 0
+    try:
+        now = _utcnow()
+        rows = (
+            (
+                await session.execute(
+                    select(RegressionRemediationCase).where(
+                        RegressionRemediationCase.project_id == project_id,
+                        RegressionRemediationCase.status.in_(
+                            [
+                                RegressionCaseStatus.ACTIVE,
+                                RegressionCaseStatus.MERGED,
+                            ]
+                        ),
+                    )
                 )
             )
+            .scalars()
+            .all()
         )
-        .scalars()
-        .all()
-    )
 
-    mutated = 0
-    for case in rows:
-        updated = case.updated_at
-        if updated.tzinfo is not None:
-            updated = updated.replace(tzinfo=None)
+        for case in rows:
+            updated = case.updated_at
+            if updated.tzinfo is not None:
+                updated = updated.replace(tzinfo=None)
 
-        if case.status == RegressionCaseStatus.ACTIVE:
-            threshold = _WATCHDOG_ACTIVE_STALE_THRESHOLD
-            reason = "ACTIVE case stale — investigation may have finished with low confidence and no remediation was spawned"
-            escalation_reason = ESCALATION_REASON_STALE_ACTIVE
-        else:  # MERGED
-            threshold = _WATCHDOG_MERGED_STALE_THRESHOLD
-            reason = "MERGED case stale — recovery scan could not evaluate it (signal_snapshot_at_merge may be empty)"
-            escalation_reason = ESCALATION_REASON_STALE_MERGED
+            if case.status == RegressionCaseStatus.ACTIVE:
+                threshold = _WATCHDOG_ACTIVE_STALE_THRESHOLD
+                reason = "ACTIVE case stale — investigation may have finished with low confidence and no remediation was spawned"
+                escalation_reason = ESCALATION_REASON_STALE_ACTIVE
+            else:  # MERGED
+                threshold = _WATCHDOG_MERGED_STALE_THRESHOLD
+                reason = "MERGED case stale — recovery scan could not evaluate it (signal_snapshot_at_merge may be empty)"
+                escalation_reason = ESCALATION_REASON_STALE_MERGED
 
-        if now < updated + threshold:
-            continue
-
-        # ACTIVE-stale auto-escalation: if the original investigation child is
-        # still running and we have not yet auto-escalated this case, give the
-        # autonomous loop ONE more attempt — spawn a meta-investigate task
-        # focused on the remediation BLOCKER (merge conflicts, reviewer/CI
-        # disagreement, leader-death cascade) and let the 24h window restart
-        # from the auto-escalation moment. `auto_escalation_count` is the
-        # cooldown gate (capped at 1 — the next stale tick goes straight to
-        # NMI). We scope the meta task with `signal_name=auto_escalation_meta_investigate`
-        # so the existing _last_spawn_for_class cooldown — keyed on
-        # (spawned_by, regression_class) — does not block the meta-investigate;
-        # `_in_flight_for_class` likewise dedups on regression_class, but here
-        # we deliberately want a peer task running alongside the original
-        # investigation, so we bypass _maybe_spawn entirely and emit the
-        # task/history/alert inline.
-        if (
-            case.status == RegressionCaseStatus.ACTIVE
-            and (case.auto_escalation_count or 0) == 0
-        ):
-            child_alive = await _has_active_remediation_child(session, case)
-            if child_alive:
-                meta_task = await _spawn_auto_escalation_meta_investigate(
-                    session, project_id, case
-                )
-                case.auto_escalation_count = (case.auto_escalation_count or 0) + 1
-                case.last_remediation_task_id = meta_task.id
-                case.updated_at = now
-                session.add(case)
-                logger.info(
-                    "[REGRESSION_WATCHDOG] auto-escalate project=%s class=%s "
-                    "meta_task=%s (one-shot, count=1)",
-                    project_id,
-                    case.regression_class,
-                    meta_task.id,
-                )
-                mutated += 1
+            if now < updated + threshold:
                 continue
 
-        logger.warning(
-            "[REGRESSION_WATCHDOG] stale-%s project=%s class=%s updated_at=%s "
-            "threshold_hours=%s — escalating to NEEDS_MANUAL_INTERVENTION",
-            case.status,
-            project_id,
-            case.regression_class,
-            updated.isoformat(),
-            threshold.total_seconds() / 3600,
-        )
-        case.status = RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION
-        case.needs_manual_intervention_at = now
-        case.escalation_reason = escalation_reason
-        session.add(case)
-        session.add(
-            Alert(
-                project_id=project_id,
-                severity=AlertSeverity.WARNING,
-                title=f"Regression case stalled: {case.regression_class}"[:200],
-                message=(
-                    f"{reason}. Case last updated {updated.isoformat()}; "
-                    f"staleness threshold {threshold}. Manual review required."
-                )[:1000],
+            # ACTIVE-stale auto-escalation: if the original investigation child is
+            # still running and we have not yet auto-escalated this case, give the
+            # autonomous loop ONE more attempt — spawn a meta-investigate task
+            # focused on the remediation BLOCKER (merge conflicts, reviewer/CI
+            # disagreement, leader-death cascade) and let the 24h window restart
+            # from the auto-escalation moment. `auto_escalation_count` is the
+            # cooldown gate (capped at 1 — the next stale tick goes straight to
+            # NMI). We scope the meta task with `signal_name=auto_escalation_meta_investigate`
+            # so the existing _last_spawn_for_class cooldown — keyed on
+            # (spawned_by, regression_class) — does not block the meta-investigate;
+            # `_in_flight_for_class` likewise dedups on regression_class, but here
+            # we deliberately want a peer task running alongside the original
+            # investigation, so we bypass _maybe_spawn entirely and emit the
+            # task/history/alert inline.
+            if (
+                case.status == RegressionCaseStatus.ACTIVE
+                and (case.auto_escalation_count or 0) == 0
+            ):
+                child_alive = await _has_active_remediation_child(session, case)
+                if child_alive:
+                    meta_task = await _spawn_auto_escalation_meta_investigate(
+                        session, project_id, case
+                    )
+                    case.auto_escalation_count = (case.auto_escalation_count or 0) + 1
+                    case.last_remediation_task_id = meta_task.id
+                    case.updated_at = now
+                    session.add(case)
+                    logger.info(
+                        "[REGRESSION_WATCHDOG] auto-escalate project=%s class=%s "
+                        "meta_task=%s (one-shot, count=1)",
+                        project_id,
+                        case.regression_class,
+                        meta_task.id,
+                    )
+                    mutated += 1
+                    continue
+
+            logger.warning(
+                "[REGRESSION_WATCHDOG] stale-%s project=%s class=%s updated_at=%s "
+                "threshold_hours=%s — escalating to NEEDS_MANUAL_INTERVENTION",
+                case.status,
+                project_id,
+                case.regression_class,
+                updated.isoformat(),
+                threshold.total_seconds() / 3600,
             )
-        )
-        mutated += 1
+            case.status = RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION
+            case.needs_manual_intervention_at = now
+            case.escalation_reason = escalation_reason
+            session.add(case)
+            session.add(
+                Alert(
+                    project_id=project_id,
+                    severity=AlertSeverity.WARNING,
+                    title=f"Regression case stalled: {case.regression_class}"[:200],
+                    message=(
+                        f"{reason}. Case last updated {updated.isoformat()}; "
+                        f"staleness threshold {threshold}. Manual review required."
+                    )[:1000],
+                )
+            )
+            mutated += 1
 
-    if mutated:
-        await session.commit()
+        if mutated:
+            await session.commit()
 
-    auto_closed = await _auto_close_recovered_manual_intervention(session, project_id)
-    return mutated + auto_closed
+        (
+            marginal_closed,
+            confirmed_closed,
+        ) = await _auto_close_recovered_manual_intervention(session, project_id)
+        _recovery_counts["marginal"] = marginal_closed
+        _recovery_counts["confirmed"] = confirmed_closed
+        return mutated + marginal_closed + confirmed_closed
+    finally:
+        _recovery_counts_var.reset(_token)
+        if marginal_closed or confirmed_closed:
+            await _persist_recovery_cycle_record(
+                session, project_id, cycle_started_at, marginal_closed, confirmed_closed
+            )
+            await _check_marginal_recovery_rate_threshold(session, project_id)
 
 
 async def _auto_close_recovered_manual_intervention(
     session: AsyncSession,
     project_id: uuid.UUID,
-) -> int:
+) -> tuple[int, int]:
     """Auto-close NEEDS_MANUAL_INTERVENTION cases whose signal has recovered.
 
     Re-evaluates each case's underlying signal via ``_current_signal_value_for_class``
@@ -4912,12 +5124,14 @@ async def _auto_close_recovered_manual_intervention(
     ``with_for_update(skip_locked=True)`` and the status is re-checked under the
     lock so the operator ``Clear`` button (which transitions back to ACTIVE) can't
     race against this auto-close pass into a double-write.
+
+    Returns: tuple of (marginal_recoveries_count, confirmed_recoveries_count)
     """
     from app.models import Project
 
     project = await session.get(Project, project_id)
     if project is None:
-        return 0
+        return 0, 0
     design_doc = project.design_doc
 
     candidate_rows = (
@@ -4933,14 +5147,15 @@ async def _auto_close_recovered_manual_intervention(
         )
     ).all()
     if not candidate_rows:
-        return 0
+        return 0, 0
 
     window_hours = int(
         _runtime_config.get("regression_recovered_unattended_window_hours", 24) or 24
     )
     window = timedelta(hours=window_hours)
     now = _utcnow()
-    auto_closed = 0
+    marginal_closed = 0
+    confirmed_closed = 0
     mutated_rows = 0
     for case_id, _candidate_class in candidate_rows:
         locked = (
@@ -5090,6 +5305,113 @@ async def _auto_close_recovered_manual_intervention(
                 message=alert_message,
             )
         )
+        # Spawn follow-up investigation for marginal recoveries so the
+        # autonomous loop diagnoses inadequate fixes proactively.
+        if marginal and bool(
+            _runtime_config.get("regression_marginal_followup_enabled", True)
+        ):
+            followup_cooldown_hours = int(
+                _runtime_config.get("regression_marginal_followup_cooldown_hours", 72)
+                or 72
+            )
+            # Cooldown anchor lives on the row column so it survives any future
+            # fix-log restructuring and is index-friendly. Strip tz for the
+            # comparison since the column is stored as naive UTC.
+            last_followup_at = locked.marginal_followup_spawned_at
+            if last_followup_at is not None and last_followup_at.tzinfo is not None:
+                last_followup_at = last_followup_at.replace(tzinfo=None)
+            if last_followup_at is None or now - last_followup_at >= timedelta(
+                hours=followup_cooldown_hours
+            ):
+                # Build layer-history summary from prior spawn log entries.
+                _seen_layers: list[str] = []
+                for _e in locked.fingerprint_to_fix_log or []:
+                    if isinstance(_e, dict):
+                        for _layer in _e.get("spawn_layers_enumerated") or []:
+                            if _layer not in _seen_layers:
+                                _seen_layers.append(_layer)
+                _layer_block = (
+                    f"\n\nLayer history: {', '.join(_seen_layers)}"
+                    if _seen_layers
+                    else ""
+                )
+                _followup_prompt = (
+                    f"Prior fix for regression class '{locked.regression_class}' "
+                    f"was closed as MARGINAL recovery: pre-fix signal={pre_value}, "
+                    f"post-fix signal={post_value}. The improvement was insufficient "
+                    f"(< 10% relative AND < 5% absolute).{_layer_block}\n\n"
+                    "Diagnose why the prior fix was insufficient — examine the "
+                    "fix-log entries and propose either (a) a stronger remediation "
+                    "in the same layer, or (b) a defense in a different layer."
+                )
+                _followup_payload = validate_internal_payload(
+                    {
+                        "type": "investigate",
+                        "prompt": _followup_prompt,
+                        "base_branch": "main",
+                        "effort": "low",
+                    },
+                    "pipeline_regression_dispatcher:marginal_followup",
+                )
+                _followup_task = Task(
+                    project_id=project_id,
+                    title=(f"Marginal-recovery follow-up: {locked.regression_class}")[
+                        :200
+                    ],
+                    description=(
+                        "Auto-spawned: prior fix closed as marginal recovery — "
+                        "investigate why the prior remediation was insufficient."
+                    )[:500],
+                    payloads=[_followup_payload],
+                    context={
+                        "spawned_by": "pipeline_regression_dispatcher_marginal_followup",
+                        "regression_class": locked.regression_class,
+                        "signal_name": "marginal_followup",
+                        "pre_fix_value": pre_value,
+                        "post_fix_value": post_value,
+                        "remediation_case_id": str(locked.id),
+                    },
+                    vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+                    status=TaskStatus.QUEUED,
+                    created_by="ORCHESTRATOR",
+                )
+                session.add(_followup_task)
+                await session.flush()
+                session.add(
+                    TaskHistory(
+                        task_id=_followup_task.id,
+                        action="SPAWNED",
+                        details={
+                            "spawned_by": "PIPELINE_REGRESSION_DISPATCHER_MARGINAL_FOLLOWUP",
+                            "regression_class": locked.regression_class,
+                            "signal_name": "marginal_followup",
+                        },
+                    )
+                )
+                # Persist cooldown anchor on the column (durable across fix-log
+                # restructuring) and append a fix-log audit entry for history.
+                locked.marginal_followup_spawned_at = now
+                locked.fingerprint_to_fix_log = list(
+                    locked.fingerprint_to_fix_log or []
+                ) + [
+                    {
+                        "type": "marginal_followup_spawned",
+                        "spawned_at": now.isoformat(),
+                        "task_id": str(_followup_task.id),
+                        "pre_value": pre_value,
+                        "post_value": post_value,
+                    }
+                ]
+                session.add(locked)
+                logger.info(
+                    "[REGRESSION_WATCHDOG] marginal-followup-spawned project=%s "
+                    "class=%s task_id=%s pre_value=%s post_value=%s",
+                    project_id,
+                    locked.regression_class,
+                    _followup_task.id,
+                    pre_value,
+                    post_value,
+                )
         logger.info(
             "[REGRESSION_WATCHDOG] auto-recovered project=%s class=%s "
             "window_hours=%d pre_value=%s post_value=%s reason=%s",
@@ -5100,11 +5422,14 @@ async def _auto_close_recovered_manual_intervention(
             post_value,
             close_reason,
         )
-        auto_closed += 1
+        if marginal:
+            marginal_closed += 1
+        else:
+            confirmed_closed += 1
 
-    if auto_closed or mutated_rows:
+    if marginal_closed or confirmed_closed or mutated_rows:
         await session.commit()
-    return auto_closed
+    return marginal_closed, confirmed_closed
 
 
 async def _any_signal_would_trip(

@@ -1599,6 +1599,15 @@ class RegressionRemediationCase(SQLModel, table=True):
         default=None,
         sa_column=Column(Text, nullable=True),
     )
+    # Timestamp when the most recent marginal-recovery follow-up investigate task
+    # was spawned for this case. Used as a durable cooldown anchor: the dispatcher
+    # skips spawning a new follow-up if now − marginal_followup_spawned_at is
+    # within the configured cooldown window (default 72 h). Null for cases that
+    # have never had a marginal follow-up or pre-date this column.
+    marginal_followup_spawned_at: Optional[datetime] = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
     created_at: datetime = Field(
         default_factory=_utcnow,
         sa_column=Column(NaiveUTCDateTime, nullable=False),
@@ -1955,3 +1964,11 @@ class DispatcherCycleRecord(SQLModel, table=True):
         sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
     )
     mttd_p50_sec: Optional[float] = Field(default=None)
+    marginal_recoveries_count: int = Field(
+        default=0,
+        sa_column=Column(Integer, nullable=False, server_default=text("0")),
+    )
+    confirmed_recoveries_count: int = Field(
+        default=0,
+        sa_column=Column(Integer, nullable=False, server_default=text("0")),
+    )

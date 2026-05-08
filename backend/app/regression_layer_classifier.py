@@ -150,6 +150,47 @@ _REVIEWER_PASS_STAGE_KEYWORDS: list[str] = [
 ]
 
 # ---------------------------------------------------------------------------
+# Layer descriptions (used by meta-investigation prompt builders)
+# ---------------------------------------------------------------------------
+
+LAYER_DESCRIPTIONS: dict[str, str] = {
+    LAYER_CI_WORKFLOW: ".github/workflows/*.yml — triggers, path filters, job definitions",
+    LAYER_AGENT_VM: "infra/packer/agent.pkr.hcl — system libs, runtimes, sudoers",
+    LAYER_AGENT_VERB: "agent/src/handlers/ — gate scope enforcement, handler invocations",
+    LAYER_BASELINE_GATE: "lint/typecheck baselines, scope rules, module size limits",
+    LAYER_REVIEWER_PASS: "fresh-reviewer pass, build-gate disagreement detection",
+}
+
+# Stable display order for meta-investigation prompts.
+_LAYER_DISPLAY_ORDER: tuple[str, ...] = (
+    LAYER_CI_WORKFLOW,
+    LAYER_AGENT_VM,
+    LAYER_AGENT_VERB,
+    LAYER_BASELINE_GATE,
+    LAYER_REVIEWER_PASS,
+)
+
+
+def build_layer_meta_block(
+    targeted_layers: frozenset[str] | set[str] | None = None,
+) -> str:
+    """Return a formatted layer-catalog block for meta-investigation prompts.
+
+    Lists every canonical layer with its description and marks each as
+    'targeted' (already defended) or 'UNTARGETED' (candidate for next defense).
+    Callers should embed this block in the investigation prompt so investigators
+    know which layers to prioritise.
+    """
+    targeted = frozenset(targeted_layers or [])
+    lines: list[str] = ["Canonical defense layers:"]
+    for layer in _LAYER_DISPLAY_ORDER:
+        status = "targeted" if layer in targeted else "UNTARGETED"
+        desc = LAYER_DESCRIPTIONS.get(layer, "")
+        lines.append(f"  {layer} [{status}]: {desc}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
