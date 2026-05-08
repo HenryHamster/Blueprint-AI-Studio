@@ -1,9 +1,9 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { X, MessageSquare, Send, Check, AlertTriangle, HelpCircle, Bug, StickyNote, ChevronDown, PlusCircle, Trash2, CheckSquare, ArrowDown, Reply, Settings } from 'lucide-react';
+import { X, MessageSquare, Send, Check, AlertTriangle, HelpCircle, Bug, StickyNote, ChevronDown, PlusCircle, Trash2, CheckSquare, ArrowDown, Reply, Settings, ChevronUp } from 'lucide-react';
 import { auth } from '../firebase';
 import { apiFetch, API_BASE_URL } from '../api';
 import { parseTimestamp } from '../utils/time';
-import { routineSummary, effectiveSignal, loadEventPrefs, EVENT_PREFS_KEY, type EventPref, groupRoutineMessages, outcomeBreakdown, isFailingGroup, getToastSeverity, type RoutineRow } from './MessagesPanel.utils';
+import { routineSummary, effectiveSignal, loadEventPrefs, saveEventPrefs, type EventPref, groupRoutineMessages, outcomeBreakdown, isFailingGroup, getToastSeverity, type RoutineRow, loadLastSeen, saveLastSeen, formatTimestamp, insertTimeDividers, type MessageWithDivider } from './MessagesPanel.utils';
 
 interface ProjectMessage {
   id: string;
@@ -19,11 +19,21 @@ interface ProjectMessage {
   created_at: string | null;
 }
 
+interface WebhookStats {
+  total_dispatched: number;
+  total_delivered: number;
+  total_failed: number;
+  last_failure_reason: string;
+  last_failure_at: string | null;
+  retry_queue_depth: number;
+}
+
 interface MessagesPanelProps {
   selectedProjectId: string | null;
   onClose: () => void;
   addToast: (message: string, type: 'success' | 'error' | 'info') => void;
   onMessageCountChange?: (count: number) => void;
+  onOpenTask?: (taskId: string) => void;
 }
 
 type MessagesPanelPrefs = { version: 1; routineExpanded: boolean; showResolved: boolean };
@@ -177,7 +187,7 @@ function ContextBadges({ context, fromType }: { context: Record<string, unknown>
 }
 
 
-export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageCountChange }: MessagesPanelProps) {
+export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageCountChange, onOpenTask }: MessagesPanelProps) {
   const [messages, setMessages] = useState<ProjectMessage[]>([]);
   const [loading, setLoading] = useState(true);
   // Compose
@@ -209,10 +219,30 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
   const [routineExpanded, setRoutineExpanded] = useState(() => loadMessagesPanelPrefs(auth.currentUser?.email).routineExpanded);
   // Track which grouped-chip event_type keys are expanded
   const [expandedGroupKeys, setExpandedGroupKeys] = useState<Set<string>>(new Set());
-  // Per-event-type mute/surface preferences
-  const [eventPrefs, setEventPrefs] = useState<Record<string, EventPref>>(loadEventPrefs);
+  // Per-event-type mute/surface preferences (scoped to project)
+  const [eventPrefs, setEventPrefs] = useState<Record<string, EventPref>>(() =>
+    loadEventPrefs(auth.currentUser?.email, selectedProjectId),
+  );
   const [showPrefsPanel, setShowPrefsPanel] = useState(false);
   const [sortMode, setSortMode] = useState<'importance' | 'recent'>('importance');
+  const [searchQuery, setSearchQuery] = useState('');
+  const [webhookStats, setWebhookStats] = useState<WebhookStats | null>(null);
+  const [showWebhookDetail, setShowWebhookDetail] = useState(false);
+
+  // Last-seen tracking: dividerTime is the threshold; when operator scrolls past or timeout fires, we persist it
+  const [dividerTime, setDividerTime] = useState<number | null>(null);
+  const dividerTimeRef = useRef<number | null>(null);
+  const dividerDismissedRef = useRef(false);
+
+  const dismissDivider = useCallback(() => {
+    if (!dividerDismissedRef.current && selectedProjectId) {
+      const now = Date.now();
+      setDividerTime(now);
+      dividerTimeRef.current = now;
+      saveLastSeen(auth.currentUser?.email, selectedProjectId, now);
+      dividerDismissedRef.current = true;
+    }
+  }, [selectedProjectId]);
 
   // Stable ref for addToast
   const addToastRef = useRef(addToast);
@@ -228,10 +258,17 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
   // Reset toast suppression state when switching projects so that the next
   // fetch is treated as an initial load for the new project (avoids a flood
   // of toasts for project B's pre-existing open BLOCKER/BUG/FEEDBACK items).
+  // Also reload event prefs and initialize divider time for new project.
   useEffect(() => {
     seenMessageIdsRef.current = new Set();
     seenPromotedGroupKeysRef.current = new Set();
     hasInitiallyLoadedRef.current = false;
+    setEventPrefs(loadEventPrefs(auth.currentUser?.email, selectedProjectId));
+    setWebhookStats(null);
+    const lastSeen = loadLastSeen(auth.currentUser?.email, selectedProjectId);
+    setDividerTime(lastSeen);
+    dividerTimeRef.current = lastSeen;
+    dividerDismissedRef.current = false;
   }, [selectedProjectId]);
 
   const byTime = (a: ProjectMessage, b: ProjectMessage) => {
@@ -241,6 +278,21 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
   };
 
   const byTimeDesc = (a: ProjectMessage, b: ProjectMessage) => -byTime(a, b);
+
+  const matchesSearch = (msg: ProjectMessage): boolean => {
+    if (!searchQuery.trim()) return true;
+    const q = searchQuery.toLowerCase();
+    if (msg.content.toLowerCase().includes(q)) return true;
+    if (msg.resolution?.toLowerCase().includes(q)) return true;
+    if (formatFromType(msg).toLowerCase().includes(q)) return true;
+    const et = msg.context.event_type as string | undefined;
+    if (et?.toLowerCase().includes(q)) return true;
+    const at = msg.context.annotation_type as string | undefined;
+    if (at?.toLowerCase().includes(q)) return true;
+    const src = msg.context.source as string | undefined;
+    if (src?.toLowerCase().includes(q)) return true;
+    return false;
+  };
 
   const SEVERITY_RANK: Record<string, number> = { BLOCKER: 0, BUG_REPORT: 1, FEEDBACK: 2, NOTE: 3 };
   const bySeverity = (a: ProjectMessage, b: ProjectMessage) => {
@@ -252,12 +304,21 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
 
   const openMessages = messages.filter(m => m.status === 'open');
   const resolvedMessages = messages.filter(m => m.status === 'resolved');
-  const openFeedbackMessages = openMessages.filter(m => m.message_type === 'FEEDBACK');
+  const openFeedbackMessages = openMessages.filter(m => m.message_type === 'FEEDBACK' && matchesSearch(m));
 
-  // Split open messages by signal level, respecting per-event-type prefs
-  const highSignalOpen = [...openMessages.filter(m => effectiveSignal(m, eventPrefs) === 'high')]
+  // Count new high-signal messages (created after divider time)
+  const newHighSignalCount = dividerTime
+    ? openMessages.filter(m =>
+        m.created_at &&
+        effectiveSignal(m, eventPrefs) === 'high' &&
+        parseTimestamp(m.created_at).getTime() > dividerTime
+      ).length
+    : 0;
+
+  // Split open messages by signal level, respecting per-event-type prefs, then filter by search
+  const highSignalOpen = [...openMessages.filter(m => effectiveSignal(m, eventPrefs) === 'high' && matchesSearch(m))]
     .sort(sortMode === 'importance' ? bySeverity : byTimeDesc);
-  const routineOpen = [...openMessages.filter(m => effectiveSignal(m, eventPrefs) === 'routine')]
+  const routineOpen = [...openMessages.filter(m => effectiveSignal(m, eventPrefs) === 'routine' && matchesSearch(m))]
     .sort(byTimeDesc);
 
   // In importance mode, pin BLOCKERs at the top with a visual divider
@@ -273,6 +334,14 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
   const promotedKeys = new Set(promotedGroups.map(r => r.key));
   const remainingRoutineRows = allRoutineRows.filter(r => r.kind === 'single' || !promotedKeys.has(r.key));
 
+  // Auto-expand groups that have search matches
+  const groupsWithMatches = new Set(
+    allRoutineRows
+      .filter((r): r is RoutineRow<ProjectMessage> & { kind: 'group' } => r.kind === 'group' && r.msgs.length > 0)
+      .map(r => r.key)
+  );
+  const autoExpandedKeys = searchQuery.trim() ? groupsWithMatches : new Set();
+
   const allEventTypes = [...new Set([
     ...Object.keys(eventPrefs),
     ...openMessages.flatMap(m => { const et = m.context.event_type as string | undefined; return et ? [et] : []; }),
@@ -284,7 +353,7 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
       const next = pref === 'routine'
         ? Object.fromEntries(Object.entries(prev).filter(([k]) => k !== et)) as Record<string, EventPref>
         : { ...prev, [et]: pref };
-      localStorage.setItem(EVENT_PREFS_KEY, JSON.stringify(next));
+      saveEventPrefs(auth.currentUser?.email, selectedProjectId, next);
       return next;
     });
   }
@@ -293,11 +362,11 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
     saveMessagesPanelPrefs(auth.currentUser?.email, { version: 1, routineExpanded, showResolved });
   }, [routineExpanded, showResolved]);
 
-  // Resolved: show last 5 by default, toggle to show all
+  // Resolved: show last 5 by default, toggle to show all, filtered by search
   const RECENT_RESOLVED = 5;
-  const sortedResolved = [...resolvedMessages].sort(byTime);
+  const sortedResolved = [...resolvedMessages.filter(m => matchesSearch(m))].sort(byTime);
   const visibleResolved = showResolved ? sortedResolved : sortedResolved.slice(-RECENT_RESOLVED);
-  const hiddenResolvedCount = showResolved ? 0 : Math.max(0, resolvedMessages.length - RECENT_RESOLVED);
+  const hiddenResolvedCount = showResolved ? 0 : Math.max(0, sortedResolved.length - RECENT_RESOLVED);
 
   const fetchMessages = useCallback(async () => {
     if (!selectedProjectId) { setLoading(false); return; }
@@ -351,6 +420,11 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
       });
       const openCount = msgs.filter(m => m.status === 'open' && (m.from_type || '').toLowerCase() !== 'user').length;
       onMessageCountChange?.(openCount);
+      // Fetch webhook delivery stats (non-critical — errors are silently ignored)
+      try {
+        const statsRes = await apiFetch(`${API_BASE_URL}/api/admin/notification-dispatch/stats?project_id=${selectedProjectId}`);
+        if (statsRes.ok) setWebhookStats(await statsRes.json());
+      } catch { /* ignore */ }
     } catch {
       addToastRef.current('Failed to load messages', 'error');
     } finally {
@@ -397,6 +471,31 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
     el.addEventListener('scroll', onScroll, { passive: true });
     return () => el.removeEventListener('scroll', onScroll);
   }, []);
+
+  // Auto-dismiss divider after 5 seconds of panel being visible
+  useEffect(() => {
+    if (!dividerTime || dividerDismissedRef.current) return;
+    const timer = setTimeout(dismissDivider, 5000);
+    return () => clearTimeout(timer);
+  }, [dividerTime, selectedProjectId, dismissDivider]);
+
+  // Scroll-based divider dismissal: detect when user scrolls past the divider
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el || !dividerTime || dividerDismissedRef.current) return;
+    function onScroll() {
+      if (!el) return;
+      const dividerEl = document.querySelector('[data-divider-marker]');
+      if (!dividerEl) return;
+      const dividerRect = dividerEl.getBoundingClientRect();
+      // If divider is above the viewport, dismiss it
+      if (dividerRect.bottom < 0) {
+        dismissDivider();
+      }
+    }
+    el.addEventListener('scroll', onScroll, { passive: true });
+    return () => el.removeEventListener('scroll', onScroll);
+  }, [dividerTime, selectedProjectId, dismissDivider]);
 
   function scrollToBottom() {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' });
@@ -590,7 +689,17 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
               <Icon className={`w-3.5 h-3.5 shrink-0 ${config.color}`} />
               <span className={`text-[11px] font-semibold ${config.color}`}>{config.label}</span>
               <span className="text-[11px] text-neutral-600">
-                {formatFromType(msg)} · {formatAge(msg.created_at)}
+                {formatFromType(msg)}
+                {msg.from_task_id && onOpenTask && (
+                  <button
+                    onClick={() => onOpenTask(msg.from_task_id!)}
+                    className="text-blue-400 hover:text-blue-300 transition-colors ml-1"
+                    title={`Open task ${msg.from_task_id}`}
+                  >
+                    ({msg.from_task_id.slice(0, 8)})
+                  </button>
+                )}
+                <span> · {formatAge(msg.created_at)}</span>
               </span>
             </div>
             {/* Reply context for feedback acknowledgment */}
@@ -707,27 +816,63 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
   return (
     <div className="flex-1 overflow-hidden flex flex-col min-h-0">
       {/* Header */}
-      <div className="px-4 md:px-6 py-3 border-b border-neutral-800 flex items-center justify-between shrink-0">
-        <div className="flex items-center gap-2">
-          <MessageSquare className="w-4 h-4 text-neutral-400" />
-          <h2 className="text-sm font-semibold text-neutral-100">Messages</h2>
-          {highSignalOpen.length > 0 && (
-            <span className="bg-amber-500/20 text-amber-400 border border-amber-500/40 text-xs font-semibold px-2 py-0.5 rounded-full">
-              {highSignalOpen.length} high
-            </span>
-          )}
-          {openMessages.length > 0 && (
-            <span className="bg-blue-500/20 text-blue-400 border border-blue-500/40 text-xs font-semibold px-2 py-0.5 rounded-full">
-              {openMessages.length}
-            </span>
-          )}
-          {mutedCount > 0 && (
-            <button onClick={() => setShowPrefsPanel(true)} className="text-[11px] text-neutral-600 hover:text-neutral-400 transition-colors">
-              {mutedCount} muted
-            </button>
-          )}
-        </div>
-        <div className="flex items-center gap-1">
+      <div className="px-4 md:px-6 py-3 border-b border-neutral-800 flex flex-col gap-2 shrink-0">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <MessageSquare className="w-4 h-4 text-neutral-400" />
+            <h2 className="text-sm font-semibold text-neutral-100">Messages</h2>
+            {newHighSignalCount > 0 && (
+              <span className="bg-blue-600/30 text-blue-300 border border-blue-500/50 text-xs font-semibold px-2 py-0.5 rounded-full animate-pulse">
+                {newHighSignalCount} new
+              </span>
+            )}
+            {highSignalOpen.length > 0 && (
+              <span className="bg-amber-500/20 text-amber-400 border border-amber-500/40 text-xs font-semibold px-2 py-0.5 rounded-full">
+                {highSignalOpen.length} high
+              </span>
+            )}
+            {openMessages.length > 0 && (
+              <span className="bg-blue-500/20 text-blue-400 border border-blue-500/40 text-xs font-semibold px-2 py-0.5 rounded-full">
+                {openMessages.length}
+              </span>
+            )}
+            {mutedCount > 0 && (
+              <button onClick={() => setShowPrefsPanel(true)} className="text-[11px] text-neutral-600 hover:text-neutral-400 transition-colors">
+                {mutedCount} muted
+              </button>
+            )}
+            {webhookStats && webhookStats.total_dispatched > 0 && (
+              <div className="relative">
+                {/* eslint-disable-next-line viewport/min-touch-target -- badge-row in dense header; same pattern as other header chips */}
+                <button
+                  onClick={() => setShowWebhookDetail(v => !v)}
+                  title="Webhook delivery health"
+                  className={`text-[11px] px-2 py-0.5 rounded-full border font-semibold transition-colors ${
+                    webhookStats.total_failed > 0
+                      ? 'bg-amber-500/20 text-amber-400 border-amber-500/40'
+                      : 'bg-emerald-500/20 text-emerald-400 border-emerald-500/40'
+                  }`}
+                >
+                  {webhookStats.total_failed > 0 ? `${webhookStats.total_failed} webhook err` : 'webhooks ok'}
+                </button>
+                {showWebhookDetail && (
+                  <>
+                    <div className="fixed inset-0 z-40" onClick={() => setShowWebhookDetail(false)} />
+                    <div className="absolute left-0 top-full mt-1 z-50 w-52 bg-neutral-900 border border-neutral-700 rounded-xl shadow-xl p-3 space-y-1 text-[11px]">
+                      <p className="text-neutral-300 font-medium mb-1.5">Webhook delivery</p>
+                      <div className="flex justify-between text-neutral-400"><span>Delivered</span><span className="text-emerald-400">{webhookStats.total_delivered}</span></div>
+                      <div className="flex justify-between text-neutral-400"><span>Failed</span><span className={webhookStats.total_failed > 0 ? 'text-amber-400' : 'text-neutral-500'}>{webhookStats.total_failed}</span></div>
+                      <div className="flex justify-between text-neutral-400"><span>Retry queue</span><span>{webhookStats.retry_queue_depth}</span></div>
+                      {webhookStats.last_failure_reason && (
+                        <p className="mt-1 text-neutral-600 truncate" title={webhookStats.last_failure_reason}>Last err: {webhookStats.last_failure_reason.slice(0, 40)}</p>
+                      )}
+                    </div>
+                  </>
+                )}
+              </div>
+            )}
+          </div>
+          <div className="flex items-center gap-1">
           <button
             onClick={() => setSortMode(m => m === 'importance' ? 'recent' : 'importance')}
             title="Toggle sort order"
@@ -763,7 +908,7 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
                   <div className="flex items-center justify-between">
                     <span className="text-xs font-medium text-neutral-300">Event visibility</span>
                     {Object.keys(eventPrefs).length > 0 && (
-                      <button onClick={() => { setEventPrefs({}); localStorage.removeItem(EVENT_PREFS_KEY); }} className="text-[10px] text-neutral-500 hover:text-red-400 transition-colors">Reset all</button>
+                      <button onClick={() => { setEventPrefs({}); saveEventPrefs(auth.currentUser?.email, selectedProjectId, {}); }} className="text-[10px] text-neutral-500 hover:text-red-400 transition-colors">Reset all</button>
                     )}
                   </div>
                   {allEventTypes.length === 0 ? (
@@ -791,7 +936,15 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
           <button onClick={onClose} className="bg-neutral-800 hover:bg-neutral-700 text-neutral-400 p-2 rounded-lg text-xs transition-colors border border-neutral-700 min-h-[44px] min-w-[44px] md:min-h-[36px] md:min-w-[36px] flex items-center justify-center">
             <X className="w-4 h-4" />
           </button>
+          </div>
         </div>
+        <input
+          type="text"
+          value={searchQuery}
+          onChange={e => setSearchQuery(e.target.value)}
+          placeholder="Search messages..."
+          className="w-full bg-neutral-900/50 border border-neutral-800/50 text-neutral-100 rounded-lg px-3 py-2 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-700 placeholder-neutral-600"
+        />
       </div>
 
       {/* Messages list — chat-style scroll area */}
@@ -804,6 +957,12 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
             <p className="text-sm">No messages yet</p>
             <p className="text-xs mt-1 opacity-70">Send feedback, report bugs, or ask questions</p>
           </div>
+        ) : searchQuery.trim() && highSignalOpen.length === 0 && routineOpen.length === 0 && visibleResolved.length === 0 ? (
+          <div className="flex flex-col items-center justify-center py-16 text-neutral-500">
+            <MessageSquare className="w-8 h-8 mb-3 opacity-40" />
+            <p className="text-sm">No matches for "{searchQuery}"</p>
+            <p className="text-xs mt-1 opacity-70">Try a different search term</p>
+          </div>
         ) : (
           <>
             {/* Pinned BLOCKERs (importance mode only) */}
@@ -813,17 +972,49 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
                   <AlertTriangle className="w-3 h-3" />
                   <span>Pinned · Blockers</span>
                 </div>
-                {pinnedBlockers.map(msg => renderBubble(msg, false, false, messages))}
+                {insertTimeDividers(pinnedBlockers).map((item, idx) =>
+                  item.kind === 'divider' ? (
+                    <div key={`divider-pinned-${idx}`} className="flex items-center gap-1.5 text-[11px] text-neutral-600 font-semibold uppercase tracking-wide px-1 mt-2">
+                      <div className="flex-1 border-t border-neutral-800/60" />
+                      <span className="shrink-0">{item.label}</span>
+                      <div className="flex-1 border-t border-neutral-800/60" />
+                    </div>
+                  ) : (
+                    renderBubble(item.msg, false, false, messages)
+                  )
+                )}
                 {otherHighSignal.length > 0 && <div className="border-t border-neutral-800/60" />}
               </>
             )}
+
+            {/* Divider: show before first new message if divider time is set and not dismissed */}
+            {dividerTime && newHighSignalCount > 0 && !dividerDismissedRef.current && (
+              <div data-divider-marker className="flex items-center gap-2 px-2 py-3 text-[11px] text-blue-300/70">
+                <div className="flex-1 border-t border-blue-500/40" />
+                <span className="whitespace-nowrap font-medium flex items-center gap-1">
+                  <ChevronUp className="w-3 h-3" />
+                  NEW since {formatTimestamp(dividerTime)}
+                </span>
+                <div className="flex-1 border-t border-blue-500/40" />
+              </div>
+            )}
             {/* Other high-signal open messages */}
-            {otherHighSignal.map(msg => renderBubble(msg, false, false, messages))}
+            {insertTimeDividers(otherHighSignal).map((item, idx) =>
+              item.kind === 'divider' ? (
+                <div key={`divider-high-${idx}`} className="flex items-center gap-1.5 text-[11px] text-neutral-600 font-semibold uppercase tracking-wide px-1 mt-2">
+                  <div className="flex-1 border-t border-neutral-800/60" />
+                  <span className="shrink-0">{item.label}</span>
+                  <div className="flex-1 border-t border-neutral-800/60" />
+                </div>
+              ) : (
+                renderBubble(item.msg, false, false, messages)
+              )
+            )}
 
             {/* Auto-promoted failing routine groups */}
             {promotedGroups.map(row => {
               const bd = outcomeBreakdown(row.msgs);
-              const isGroupExpanded = expandedGroupKeys.has(row.key);
+              const isGroupExpanded = expandedGroupKeys.has(row.key) || autoExpandedKeys.has(row.key);
               return (
                 <div key={row.key} className="border border-red-800/50 rounded-xl overflow-hidden bg-red-950/20">
                   <div className="flex items-center gap-2 px-4 py-2.5 bg-red-950/30 min-h-[44px]">
@@ -862,48 +1053,113 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
                 </button>
                 {routineExpanded && (
                   <div className="space-y-3 p-3 border-t border-neutral-800/40">
-                    {remainingRoutineRows.map(row => {
-                      if (row.kind === 'single') return renderBubble(row.msg, false, false, messages);
-                      const isGroupExpanded = expandedGroupKeys.has(row.key);
-                      const bd = outcomeBreakdown(row.msgs);
-                      return (
-                        <div key={row.key} className="border border-neutral-800/40 rounded-xl overflow-hidden">
-                          <div className="flex items-center gap-2 px-3 py-2 bg-neutral-900/30">
-                            <button
-                              onClick={() => setExpandedGroupKeys(prev => {
-                                const next = new Set(prev);
-                                if (next.has(row.key)) next.delete(row.key); else next.add(row.key);
-                                return next;
-                              })}
-                              className="flex-1 flex items-center gap-2 text-left"
-                            >
-                              <ChevronDown className={`w-3 h-3 text-neutral-600 shrink-0 transition-transform ${isGroupExpanded ? 'rotate-180' : ''}`} />
-                              <span className="text-xs text-neutral-500 font-medium">{row.msgs.length} {row.label}{bd ? ` ${bd}` : ''}</span>
-                            </button>
-                            {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
-                            <button
-                              onClick={() => handleResolveGroup(row.msgs)}
-                              title="Resolve all"
-                              className="text-emerald-500/70 hover:text-emerald-400 p-1 rounded transition-colors"
-                            >
-                              <Check className="w-3 h-3" />
-                            </button>
-                          </div>
-                          {isGroupExpanded && (
-                            <div className="space-y-2 p-2 border-t border-neutral-800/40">
-                              {row.msgs.map(msg => renderBubble(msg, false, true, messages))}
+                    {(() => {
+                      // Get first message date for each row (for single: the message, for group: first in group)
+                      const rowsWithDate = remainingRoutineRows.map(row => {
+                        const msg = row.kind === 'single' ? row.msg : row.msgs[0];
+                        return { row, firstMsg: msg };
+                      });
+
+                      // Create divider list for all messages in order
+                      const allMsgs = rowsWithDate.map(r => r.firstMsg);
+                      const msgWithDividers = insertTimeDividers(allMsgs);
+
+                      // Build a set of message IDs that have a divider before them
+                      const msgsWithDividerBefore = new Set<string>();
+                      msgWithDividers.forEach((item, idx) => {
+                        if (item.kind === 'message' && idx > 0 && msgWithDividers[idx - 1]?.kind === 'divider') {
+                          msgsWithDividerBefore.add(item.msg.id);
+                        }
+                      });
+
+                      // Also build a map of message ID to divider label
+                      const dividerLabels = new Map<string, string>();
+                      msgWithDividers.forEach((item, idx) => {
+                        if (item.kind === 'divider' && idx + 1 < msgWithDividers.length && msgWithDividers[idx + 1]?.kind === 'message') {
+                          dividerLabels.set((msgWithDividers[idx + 1] as MessageWithDivider<ProjectMessage> & { kind: 'message' }).msg.id, item.label);
+                        }
+                      });
+
+                      return rowsWithDate.map(({ row, firstMsg }) => {
+                        const hasDividerBefore = msgsWithDividerBefore.has(firstMsg.id);
+                        const dividerLabel = dividerLabels.get(firstMsg.id);
+
+                        if (row.kind === 'group') {
+                          const isGroupExpanded = expandedGroupKeys.has(row.key) || autoExpandedKeys.has(row.key);
+                          const bd = outcomeBreakdown(row.msgs);
+                          return (
+                            <div key={row.key}>
+                              {hasDividerBefore && dividerLabel && (
+                                <div className="flex items-center gap-1.5 text-[11px] text-neutral-600 font-semibold uppercase tracking-wide px-1 mt-2 mb-2">
+                                  <div className="flex-1 border-t border-neutral-800/60" />
+                                  <span className="shrink-0">{dividerLabel}</span>
+                                  <div className="flex-1 border-t border-neutral-800/60" />
+                                </div>
+                              )}
+                              <div className="border border-neutral-800/40 rounded-xl overflow-hidden">
+                                <div className="flex items-center gap-2 px-3 py-2 bg-neutral-900/30">
+                                  <button
+                                    onClick={() => setExpandedGroupKeys(prev => {
+                                      const next = new Set(prev);
+                                      if (next.has(row.key)) next.delete(row.key); else next.add(row.key);
+                                      return next;
+                                    })}
+                                    className="flex-1 flex items-center gap-2 text-left"
+                                  >
+                                    <ChevronDown className={`w-3 h-3 text-neutral-600 shrink-0 transition-transform ${isGroupExpanded ? 'rotate-180' : ''}`} />
+                                    <span className="text-xs text-neutral-500 font-medium">{row.msgs.length} {row.label}{bd ? ` ${bd}` : ''}</span>
+                                  </button>
+                                  {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
+                                  <button
+                                    onClick={() => handleResolveGroup(row.msgs)}
+                                    title="Resolve all"
+                                    className="text-emerald-500/70 hover:text-emerald-400 p-1 rounded transition-colors"
+                                  >
+                                    <Check className="w-3 h-3" />
+                                  </button>
+                                </div>
+                                {isGroupExpanded && (
+                                  <div className="space-y-2 p-2 border-t border-neutral-800/40">
+                                    {row.msgs.map(msg => renderBubble(msg, false, true, messages))}
+                                  </div>
+                                )}
+                              </div>
                             </div>
-                          )}
-                        </div>
-                      );
-                    })}
+                          );
+                        }
+
+                        // Single message
+                        return (
+                          <div key={`single-${row.msg.id}`}>
+                            {hasDividerBefore && dividerLabel && (
+                              <div className="flex items-center gap-1.5 text-[11px] text-neutral-600 font-semibold uppercase tracking-wide px-1 mt-2 mb-2">
+                                <div className="flex-1 border-t border-neutral-800/60" />
+                                <span className="shrink-0">{dividerLabel}</span>
+                                <div className="flex-1 border-t border-neutral-800/60" />
+                              </div>
+                            )}
+                            {renderBubble(row.msg, false, false, messages)}
+                          </div>
+                        );
+                      });
+                    })()}
                   </div>
                 )}
               </div>
             )}
 
             {/* Resolved messages (faded) */}
-            {visibleResolved.map(msg => renderBubble(msg, true, false, messages))}
+            {insertTimeDividers(visibleResolved).map((item, idx) =>
+              item.kind === 'divider' ? (
+                <div key={`divider-resolved-${idx}`} className="flex items-center gap-1.5 text-[11px] text-neutral-600 font-semibold uppercase tracking-wide px-1 mt-2">
+                  <div className="flex-1 border-t border-neutral-800/60" />
+                  <span className="shrink-0">{item.label}</span>
+                  <div className="flex-1 border-t border-neutral-800/60" />
+                </div>
+              ) : (
+                renderBubble(item.msg, true, false, messages)
+              )
+            )}
 
             {/* Resolved toggle + clear */}
             {hiddenResolvedCount > 0 && (

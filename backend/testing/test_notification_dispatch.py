@@ -71,6 +71,7 @@ def _reset_stats():
     nd.last_failure_reason = ""
     nd._retry_queue.clear()
     nd._last_dispatch_time.clear()
+    nd._per_project_stats.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +188,65 @@ async def test_dispatch_enqueues_retry_on_network_error():
     stats = get_notification_stats()
     assert stats["total_dispatched"] == 1
     assert stats["retry_queue_depth"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Per-project stats
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_notification_stats_per_project():
+    _reset_stats()
+    pid = uuid.uuid4()
+    other_pid = uuid.uuid4()
+    with (
+        patch("app.shared_state.runtime_config", _make_runtime_config()),
+        patch(
+            "app.notification_dispatch._attempt_delivery",
+            new=AsyncMock(return_value=200),
+        ),
+        patch("app.notification_dispatch._drain_retry_queue", new=AsyncMock()),
+    ):
+        await dispatch_external_notification(pid, "test_event", {"k": "v"})
+        await dispatch_external_notification(pid, "test_event", {"k": "v2"})
+        await dispatch_external_notification(other_pid, "test_event", {"k": "v3"})
+
+    pstats = get_notification_stats(project_id=pid)
+    assert pstats["total_dispatched"] == 2
+    assert pstats["total_delivered"] == 2
+    assert pstats["total_failed"] == 0
+    assert pstats["retry_queue_depth"] == 0
+
+    other_stats = get_notification_stats(project_id=other_pid)
+    assert other_stats["total_dispatched"] == 1
+
+    global_stats = get_notification_stats()
+    assert global_stats["total_dispatched"] == 3
+
+
+@pytest.mark.asyncio
+async def test_get_notification_stats_per_project_failure():
+    _reset_stats()
+    pid = uuid.uuid4()
+    with (
+        patch("app.shared_state.runtime_config", _make_runtime_config()),
+        patch(
+            "app.notification_dispatch._attempt_delivery",
+            new=AsyncMock(return_value=401),
+        ),
+        patch("app.notification_dispatch._drain_retry_queue", new=AsyncMock()),
+    ):
+        await dispatch_external_notification(pid, "test_event", {})
+
+    pstats = get_notification_stats(project_id=pid)
+    assert pstats["total_failed"] == 1
+    assert "401" in pstats["last_failure_reason"]
+    assert pstats["last_failure_at"] is not None
+
+    unknown_stats = get_notification_stats(project_id=uuid.uuid4())
+    assert unknown_stats["total_dispatched"] == 0
+    assert unknown_stats["last_failure_at"] is None
 
 
 # ---------------------------------------------------------------------------

@@ -24,8 +24,42 @@ export type EventPref = 'mute' | 'routine' | 'surfaced';
 
 export const EVENT_PREFS_KEY = 'messages_panel_event_prefs';
 
-export function loadEventPrefs(): Record<string, EventPref> {
-  try { return JSON.parse(localStorage.getItem(EVENT_PREFS_KEY) ?? '{}'); } catch { return {}; }
+// Legacy global key for migration only
+const LEGACY_EVENT_PREFS_KEY = 'messages_panel_event_prefs';
+
+export function eventPrefsKey(userId: string | undefined, projectId: string | undefined): string {
+  return `messages_panel_event_prefs:${userId || 'anonymous'}:${projectId || 'default'}`;
+}
+
+export function loadEventPrefs(userId?: string | null, projectId?: string | null): Record<string, EventPref> {
+  try {
+    const key = eventPrefsKey(userId || undefined, projectId || undefined);
+    const stored = localStorage.getItem(key);
+    if (stored) return JSON.parse(stored);
+
+    // Migration: if no project-scoped key exists, try legacy global key
+    const legacy = localStorage.getItem(LEGACY_EVENT_PREFS_KEY);
+    if (legacy) return JSON.parse(legacy);
+
+    return {};
+  } catch {
+    return {};
+  }
+}
+
+export function saveEventPrefs(
+  userId: string | undefined | null,
+  projectId: string | undefined | null,
+  prefs: Record<string, EventPref>,
+): void {
+  try {
+    const key = eventPrefsKey(userId || undefined, projectId || undefined);
+    if (Object.keys(prefs).length === 0) {
+      localStorage.removeItem(key);
+    } else {
+      localStorage.setItem(key, JSON.stringify(prefs));
+    }
+  } catch { /* ignore */ }
 }
 
 export function effectiveSignal(
@@ -116,4 +150,82 @@ export function getToastSeverity(msg: { message_type: string; from_type: string;
   if (msg.message_type === 'BLOCKER' || msg.message_type === 'BUG_REPORT') return 'error';
   if (et && criticalNoteEvents.has(et)) return 'error';
   return 'info';
+}
+
+export function lastSeenKey(userId: string | null | undefined, projectId: string | null | undefined): string {
+  return `messages_panel_last_seen:${userId || 'anonymous'}:${projectId || 'none'}`;
+}
+
+export function loadLastSeen(userId: string | null | undefined, projectId: string | null | undefined): number | null {
+  try {
+    const raw = localStorage.getItem(lastSeenKey(userId, projectId));
+    if (!raw) return null;
+    const val = parseInt(raw, 10);
+    return !isNaN(val) && val > 0 ? val : null;
+  } catch {
+    return null;
+  }
+}
+
+export function saveLastSeen(userId: string | null | undefined, projectId: string | null | undefined, timestamp: number): void {
+  try {
+    localStorage.setItem(lastSeenKey(userId, projectId), String(timestamp));
+  } catch { /* ignore */ }
+}
+
+export function formatTimestamp(timestamp: number): string {
+  const now = new Date();
+  const diffMs = now.getTime() - timestamp;
+  const diffMins = Math.floor(diffMs / 60000);
+
+  if (diffMins < 1) return 'just now';
+  if (diffMins < 60) return `${diffMins}m ago`;
+  const hours = Math.floor(diffMins / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  if (days === 1) return 'yesterday';
+  return `${days}d ago`;
+}
+
+export type MessageWithDivider<T> =
+  | { kind: 'divider'; label: string }
+  | { kind: 'message'; msg: T };
+
+function getMessageDateString(msg: { created_at: string | null }): string {
+  if (!msg.created_at) return '';
+  const date = new Date(msg.created_at);
+  const today = new Date();
+  const yesterday = new Date(today);
+  yesterday.setDate(yesterday.getDate() - 1);
+
+  const normalize = (d: Date) => new Date(d.getFullYear(), d.getMonth(), d.getDate()).toISOString();
+  const msgDateStr = normalize(date);
+  const todayStr = normalize(today);
+  const yesterdayStr = normalize(yesterday);
+
+  if (msgDateStr === todayStr) return 'Today';
+  if (msgDateStr === yesterdayStr) return 'Yesterday';
+
+  const dayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  const monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  const day = dayNames[date.getDay()];
+  const month = monthNames[date.getMonth()];
+  const dayNum = date.getDate();
+  return `${day} ${month} ${dayNum}`;
+}
+
+export function insertTimeDividers<T extends { created_at: string | null }>(msgs: T[]): MessageWithDivider<T>[] {
+  const result: MessageWithDivider<T>[] = [];
+  let lastDateStr = '';
+
+  for (const msg of msgs) {
+    const dateStr = getMessageDateString(msg);
+    if (dateStr && dateStr !== lastDateStr) {
+      result.push({ kind: 'divider', label: dateStr });
+      lastDateStr = dateStr;
+    }
+    result.push({ kind: 'message', msg });
+  }
+
+  return result;
 }

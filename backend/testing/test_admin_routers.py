@@ -757,6 +757,44 @@ class TestAlerts:
         assert len(resp.json()) == 1
 
 
+class TestNotificationDispatchStats:
+    @pytest.mark.asyncio
+    async def test_stats_returns_zeros_for_new_project(
+        self, client: AsyncClient, db_session
+    ):
+        """Newly created project returns zeroed delivery stats."""
+        project = await _make_project(db_session)
+        resp = await client.get(
+            f"/api/admin/notification-dispatch/stats?project_id={project.id}"
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["total_dispatched"] == 0
+        assert body["total_delivered"] == 0
+        assert body["total_failed"] == 0
+        assert body["retry_queue_depth"] == 0
+
+    @pytest.mark.asyncio
+    async def test_stats_requires_project_access(self, client: AsyncClient, db_session):
+        """Missing project membership → 404."""
+        other_project = Project(name="Other", user_id="other-user")
+        db_session.add(other_project)
+        await db_session.commit()
+        await db_session.refresh(other_project)
+        resp = await client.get(
+            f"/api/admin/notification-dispatch/stats?project_id={other_project.id}"
+        )
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_stats_invalid_project_id(self, client: AsyncClient, db_session):
+        """Invalid UUID → 400."""
+        resp = await client.get(
+            "/api/admin/notification-dispatch/stats?project_id=not-a-uuid"
+        )
+        assert resp.status_code == 400
+
+
 class TestMessages:
     @pytest.mark.asyncio
     async def test_list_messages_empty(self, client: AsyncClient, db_session):

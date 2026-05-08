@@ -19,6 +19,7 @@ from app.auth import get_current_user
 from app.shared_state import limiter
 from app.admin import _get_user_project, _get_user_project_with_role, _user_project_ids
 from app.task_locking import lock_project_or_429
+from app import notification_dispatch as _nd
 
 logger = logging.getLogger(__name__)
 
@@ -230,6 +231,24 @@ async def dismiss_all_alerts(
     result = await session.execute(stmt)
     await session.commit()
     return {"dismissed_count": result.rowcount}
+
+
+# ── Notification Dispatch Stats Endpoint ─────────────────────────────────────
+
+
+@router.get("/notification-dispatch/stats")
+async def get_notification_dispatch_stats(
+    project_id: str = Query(...),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return webhook delivery stats for the project (success/failure counts, retry queue depth)."""
+    try:
+        pid = uuid.UUID(project_id)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid project_id format")
+    await _get_user_project_with_role(pid, current_user["user_id"], session, "member")
+    return _nd.get_notification_stats(project_id=pid)
 
 
 # ── Project Message Endpoints ─────────────────────────────────────────────────

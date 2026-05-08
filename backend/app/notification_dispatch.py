@@ -42,6 +42,9 @@ total_delivered: int = 0
 total_failed: int = 0
 last_failure_reason: str = ""
 
+# Per-project delivery stats: str(project_id) -> {dispatched, delivered, failed, last_failure_reason, last_failure_at}
+_per_project_stats: dict[str, dict] = {}
+
 # HTTP status codes that indicate a permanent failure — don't retry these
 _PERMANENT_FAILURE_CODES: frozenset[int] = frozenset({401, 403, 404})
 
@@ -63,8 +66,41 @@ class _RetryEntry:
 _retry_queue: collections.deque[_RetryEntry] = collections.deque(maxlen=50)
 
 
-def get_notification_stats() -> dict:
-    """Return current delivery stats and retry queue depth."""
+def _record_project_stat(project_id: Any, outcome: str, reason: str = "") -> None:
+    """Update per-project delivery counters. outcome: 'dispatched'|'delivered'|'failed'."""
+    pid = str(project_id)
+    if pid not in _per_project_stats:
+        _per_project_stats[pid] = {
+            "dispatched": 0,
+            "delivered": 0,
+            "failed": 0,
+            "last_failure_reason": "",
+            "last_failure_at": None,
+        }
+    ps = _per_project_stats[pid]
+    ps[outcome] = ps.get(outcome, 0) + 1
+    if outcome == "failed":
+        ps["last_failure_reason"] = reason
+        ps["last_failure_at"] = datetime.now(timezone.utc).isoformat()
+
+
+def get_notification_stats(project_id: Any = None) -> dict:
+    """Return current delivery stats and retry queue depth.
+
+    If project_id is provided, returns stats scoped to that project.
+    """
+    if project_id is not None:
+        pid = str(project_id)
+        ps = _per_project_stats.get(pid, {})
+        queue_depth = sum(1 for e in _retry_queue if str(e.project_id) == pid)
+        return {
+            "total_dispatched": ps.get("dispatched", 0),
+            "total_delivered": ps.get("delivered", 0),
+            "total_failed": ps.get("failed", 0),
+            "last_failure_reason": ps.get("last_failure_reason", ""),
+            "last_failure_at": ps.get("last_failure_at"),
+            "retry_queue_depth": queue_depth,
+        }
     return {
         "total_dispatched": total_dispatched,
         "total_delivered": total_delivered,
@@ -107,6 +143,7 @@ async def _drain_retry_queue(webhook_url: str) -> None:
             status = await _attempt_delivery(webhook_url, entry.body)
             if 200 <= status < 300:
                 total_delivered += 1
+                _record_project_stat(entry.project_id, "delivered")
                 logger.info(
                     f"[NOTIFY] Retry succeeded for {entry.event_type} "
                     f"(attempt {entry.attempts + 1})"
@@ -114,6 +151,7 @@ async def _drain_retry_queue(webhook_url: str) -> None:
             elif status in _PERMANENT_FAILURE_CODES:
                 total_failed += 1
                 last_failure_reason = f"permanent {status}"
+                _record_project_stat(entry.project_id, "failed", f"permanent {status}")
                 logger.warning(
                     f"[NOTIFY] Retry permanently failed for {entry.event_type}: {status}"
                 )
@@ -134,6 +172,7 @@ async def _drain_retry_queue(webhook_url: str) -> None:
             else:
                 total_failed += 1
                 last_failure_reason = f"max retries exceeded (last status: {status})"
+                _record_project_stat(entry.project_id, "failed", last_failure_reason)
                 logger.warning(
                     f"[NOTIFY] Exhausted retries for {entry.event_type} after "
                     f"{entry.attempts + 1} attempts"
@@ -155,6 +194,7 @@ async def _drain_retry_queue(webhook_url: str) -> None:
             else:
                 total_failed += 1
                 last_failure_reason = str(exc)
+                _record_project_stat(entry.project_id, "failed", str(exc))
                 logger.warning(
                     f"[NOTIFY] Exhausted retries for {entry.event_type}: {exc}"
                 )
@@ -232,14 +272,17 @@ async def dispatch_external_notification(
         }
 
         total_dispatched += 1
+        _record_project_stat(project_id, "dispatched")
 
         try:
             status = await _attempt_delivery(webhook_url, body)
             if 200 <= status < 300:
                 total_delivered += 1
+                _record_project_stat(project_id, "delivered")
             elif status in _PERMANENT_FAILURE_CODES:
                 total_failed += 1
                 last_failure_reason = f"permanent {status}"
+                _record_project_stat(project_id, "failed", f"permanent {status}")
                 logger.warning(
                     f"[NOTIFY] External webhook {event_type} returned {status} (permanent)"
                 )

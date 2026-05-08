@@ -1176,4 +1176,74 @@ describe('MessagesPanel feedback acknowledgment reply context', () => {
     expect(text).toContain('A regular note without reply context');
     expect(text).not.toContain('In reply to your feedback:');
   });
+
+  test('renders clickable task slug when onOpenTask is provided', async () => {
+    const mockOpenTask = vi.fn();
+    const agentMsg = makeMsg({
+      id: 'agent-1',
+      message_type: 'BLOCKER',
+      from_type: 'agent',
+      from_task_id: 'abcd1234-efgh-5678-ijkl-9012mnopqrst',
+      content: 'Agent message with task ref',
+    });
+    vi.mocked(apiFetch).mockResolvedValueOnce(
+      new Response(JSON.stringify({ messages: [agentMsg] }), { status: 200 })
+    );
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <MessagesPanel
+          selectedProjectId="proj-1"
+          onClose={() => {}}
+          addToast={() => {}}
+          onMessageCountChange={() => {}}
+          onOpenTask={mockOpenTask}
+        />,
+      );
+    });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 50)); });
+
+    // Click the task slug
+    const slug = host!.querySelector('button[title*="Open task"]');
+    expect(slug).toBeTruthy();
+    await act(async () => { (slug as HTMLButtonElement).click(); });
+
+    // onOpenTask should have been called with the full task ID
+    expect(mockOpenTask).toHaveBeenCalledWith('abcd1234-efgh-5678-ijkl-9012mnopqrst');
+  });
+
+  test('does not render clickable task slug when onOpenTask is not provided', async () => {
+    const agentMsg = makeMsg({
+      id: 'agent-1',
+      message_type: 'BLOCKER',
+      from_type: 'agent',
+      from_task_id: 'abcd1234-efgh-5678-ijkl-9012mnopqrst',
+      content: 'Agent message with task ref',
+    });
+    vi.mocked(apiFetch).mockResolvedValueOnce(
+      new Response(JSON.stringify({ messages: [agentMsg] }), { status: 200 })
+    );
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <MessagesPanel
+          selectedProjectId="proj-1"
+          onClose={() => {}}
+          addToast={() => {}}
+          onMessageCountChange={() => {}}
+        />,
+      );
+    });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 50)); });
+
+    // Task slug button should not be present
+    const slug = host!.querySelector('button[title*="Open task"]');
+    expect(slug).toBeFalsy();
+  });
 });

@@ -594,6 +594,7 @@ export default function App() {
           onClose={() => s.setShowMessages(false)}
           addToast={s.addToast}
           onMessageCountChange={handleMessageCountChange}
+          onOpenTask={handleViewTask}
         />
       ) : s.showArchive ? (
         <ArchiveView
