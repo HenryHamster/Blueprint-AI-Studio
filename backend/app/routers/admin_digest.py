@@ -49,8 +49,15 @@ from app.direction_outcomes import synthesize_prompt_quality_patterns
 from app.retry_budget import failure_class_history_classes
 from app import strategic_cycle as _strategic_cycle
 from app.strategic_analysis import _compute_prediction_calibration
-from app.playbook_learning import _categorize_review_issues
+from app.playbook_learning import (
+    _MIN_DIRECTION_SR_SAMPLE,
+    _categorize_review_issues,
+    compute_direction_sr_breakdown_for_endpoint,
+    compute_sr_quality_by_fingerprint,
+    resolve_sr_miss_human_truth,
+)
 from app.sr_blind_spots import (
+    _REVIEWER_ORIGINS,
     aggregate_sr_blind_spot_envelope,
     aggregate_sr_reviewer_disagreements,
     is_skipped_sr_outcome as _is_skipped_sr_outcome_shared,
@@ -115,8 +122,23 @@ def _task_prompt_fingerprint(task: Task) -> str:
     return "unknown"
 
 
-def _serialize_sr_catch_rate_trends(sr_trends: Dict[str, Any]) -> Dict[str, Any]:
+def _author_sr_failed_categories(check_results: Dict[str, Any]) -> set[str]:
+    """Return categories the author self-review actually failed.
+
+    Reviewer-stamped check_results entries are intentionally excluded so
+    reviewer rescues are not misattributed as author catches.
+    """
     return {
+        category
+        for category, result in (check_results or {}).items()
+        if isinstance(result, dict)
+        and not result.get("passed", True)
+        and result.get("origin") not in _REVIEWER_ORIGINS
+    }
+
+
+def _serialize_sr_catch_rate_trends(sr_trends: Dict[str, Any]) -> Dict[str, Any]:
+    serialized = {
         "computed_at": sr_trends.get("computed_at"),
         "signal_last_computed_at": sr_trends.get("signal_last_computed_at")
         or sr_trends.get("computed_at"),
@@ -124,6 +146,9 @@ def _serialize_sr_catch_rate_trends(sr_trends: Dict[str, Any]) -> Dict[str, Any]
         "by_task_type": sr_trends.get("by_task_type") or {},
         "by_fix_iteration": sr_trends.get("by_fix_iteration") or {},
     }
+    for key, value in sr_trends.items():
+        serialized.setdefault(key, value)
+    return serialized
 
 
 def _compute_sr_skip_rate(terminal_tasks: List[Task]) -> "Dict[str, Any] | None":
@@ -188,7 +213,7 @@ def _compute_sr_prediction_accuracy(
         ctx = t.context or {}
         check_results = ctx.get("_self_review_outcome", {}).get("check_results") or {}
         human_cats = set(ctx.get("_first_attempt_rejection_categories") or {})
-        sr_failed = {c for c, r in check_results.items() if not r.get("passed", True)}
+        sr_failed = _author_sr_failed_categories(check_results)
         total_human += len(human_cats)
         total_overlap += len(human_cats & sr_failed)
         total_missed += len(human_cats - sr_failed)
@@ -280,9 +305,7 @@ def _compute_fresh_reviewer_effectiveness(
         findings = ctx.get("_self_review_outcome", {}).get("reviewer_findings") or []
         human_cats = set(ctx.get("_first_attempt_rejection_categories") or {})
         check_results = ctx.get("_self_review_outcome", {}).get("check_results") or {}
-        agent_failed = {
-            c for c, r in check_results.items() if not r.get("passed", True)
-        }
+        agent_failed = _author_sr_failed_categories(check_results)
         for finding in findings:
             cat = finding.get("category") if isinstance(finding, dict) else None
             if not cat:
@@ -6760,6 +6783,8 @@ async def list_sr_missed_retrospectives(
     or check changes can target them.
     """
     cutoff = datetime.utcnow() - timedelta(days=days)
+    page_start = page * page_size
+    page_end = page_start + page_size
 
     stmt = (
         select(Task)
@@ -6779,32 +6804,39 @@ async def list_sr_missed_retrospectives(
             )
         )
         .order_by(Task.created_at.desc())
-        .limit(2000)
     )
-    result = await session.execute(stmt)
-    all_tasks = result.scalars().all()
 
-    # Filter to tasks that have both SR check results and human rejection categories
-    missed_tasks = []
-    for t in all_tasks:
+    page_items = []
+    total_matched = 0
+    task_stream = await session.stream(stmt)
+    async for t in task_stream.scalars():
         ctx = t.context or {}
         sr_outcome = ctx.get("_self_review_outcome") or {}
         check_results = sr_outcome.get("check_results") or {}
         if not check_results:
             continue
-        human_cats = set(ctx.get("_first_attempt_rejection_categories") or [])
+        human_cats = resolve_sr_miss_human_truth(ctx)
         if not human_cats:
             continue
-        sr_failed = {c for c, r in check_results.items() if not r.get("passed", True)}
+        sr_failed = _author_sr_failed_categories(check_results)
         missed = human_cats - sr_failed
         if not missed:
             continue
+        t_type = (t.first_payload or {}).get("type")
+        if category and category not in missed:
+            continue
+        if task_type and t_type != task_type:
+            continue
+
+        current_index = total_matched
+        total_matched += 1
+        if current_index < page_start or current_index >= page_end:
+            continue
+
         caught = human_cats & sr_failed
         sr_check_results, reviewer_findings = _sr_miss_drilldown(sr_outcome, missed)
-        t_type = (t.first_payload or {}).get("type")
-        missed_tasks.append(
+        page_items.append(
             {
-                "_task": t,
                 "task_id": str(t.id),
                 "title": t.title or "",
                 "task_type": t_type,
@@ -6816,15 +6848,6 @@ async def list_sr_missed_retrospectives(
                 "reviewer_findings": reviewer_findings,
             }
         )
-
-    # Apply optional filters
-    if category:
-        missed_tasks = [m for m in missed_tasks if category in m["missed_categories"]]
-    if task_type:
-        missed_tasks = [m for m in missed_tasks if m["task_type"] == task_type]
-
-    total = len(missed_tasks)
-    page_items = missed_tasks[page * page_size : (page + 1) * page_size]
 
     # Batch-fetch PR artifacts for items on this page
     page_task_ids = [uuid.UUID(m["task_id"]) for m in page_items]
@@ -6855,7 +6878,7 @@ async def list_sr_missed_retrospectives(
             }
         )
 
-    return {"items": items, "total": total}
+    return {"items": items, "total": total_matched}
 
 
 @router.get("/projects/{project_id}/sr-alert-drilldown")
@@ -7162,9 +7185,10 @@ async def get_prompt_fingerprint_analytics(
     the lookback window by `Task.prompt_fingerprint` (with an `"unknown"`
     fallback for older rows that pre-date the column) and reports per-bucket
     sample size, first-attempt success rate, SR skip rate, rejection-category
-    counts, and delta vs. the project mean success rate. Buckets below
-    `min_sample_size` are excluded so a single-task fingerprint cannot dominate
-    the view.
+    counts, delta vs. the project mean success rate, and additive SR-quality
+    fields. Buckets below `min_sample_size` are excluded so a single-task
+    fingerprint cannot dominate the view; SR-quality fields apply the same gate
+    independently using `sr_sample_size`.
     """
     await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "viewer"
@@ -7199,6 +7223,10 @@ async def get_prompt_fingerprint_analytics(
         ttype = (t.first_payload or {}).get("type")
         if ttype in _SR_CODE_CHANGE_TYPES:
             code_change_tasks.append(t)
+    sr_quality_by_fp = compute_sr_quality_by_fingerprint(
+        code_change_tasks,
+        min_sample_size=min_sample_size,
+    )
 
     buckets: Dict[str, Dict[str, Any]] = defaultdict(
         lambda: {
@@ -7284,6 +7312,7 @@ async def get_prompt_fingerprint_analytics(
                 "sr_skip_rate": sr_skip_rate,
                 "rejection_category_counts": dict(b["rejection_category_counts"]),
                 "delta_vs_project_mean": delta,
+                **sr_quality_by_fp.get(fp, {}),
             }
         )
 
@@ -7327,9 +7356,6 @@ async def list_sr_reviewer_disagreements(
     }
 
 
-_MIN_DIRECTION_SR_SAMPLE = 3
-
-
 @router.get("/projects/{project_id}/direction-sr-breakdown")
 async def get_direction_sr_breakdown(
     project_id: uuid.UUID,
@@ -7339,8 +7365,25 @@ async def get_direction_sr_breakdown(
 ) -> Dict[str, Any]:
     """Per-direction SR catch-rate breakdown.
 
-    Only directions with >= 3 qualifying tasks (both SR check_results and
-    human rejection categories present) are included.
+    Delegates to the canonical ``compute_sr_catch_rate_by_direction`` model
+    (severity-aware ``_categorize_review_issues``, sr_alone/reviewer_save
+    origin tracking, ``_finalize_examples`` deduped/sensitive-stripped/capped
+    examples, all-iterations human-truth set). Only directions with at least
+    ``_MIN_DIRECTION_SR_SAMPLE`` qualifying tasks (both SR ``check_results``
+    and ``_first_attempt_rejection_categories`` present) are included.
+
+    Per-direction shape::
+
+        {
+          "direction_id": str,
+          "direction_text": str,
+          "sample_size": int,
+          "overall_catch_rate": float | None,
+          "categories": {
+            "<cat>": {"hit_rate", "miss_rate", "sample_count", "examples"?}
+          },
+          "worst_category": str | None
+        }
     """
     cutoff = datetime.utcnow() - timedelta(days=days)
     stmt = (
@@ -7358,17 +7401,6 @@ async def get_direction_sr_breakdown(
     )
     all_tasks = (await session.execute(stmt)).scalars().all()
 
-    dir_tasks: Dict[str, list] = {}
-    for t in all_tasks:
-        ctx = t.context or {}
-        if "_self_review_outcome" not in ctx or not ctx.get(
-            "_first_attempt_rejection_categories"
-        ):
-            continue
-        did = str(ctx.get("direction_id") or "")
-        if did:
-            dir_tasks.setdefault(did, []).append(t)
-
     dir_text: Dict[str, str] = {}
     stored_by_dir: Dict[str, Any] = {}
     project = await session.get(Project, project_id)
@@ -7380,71 +7412,9 @@ async def get_direction_sr_breakdown(
         stored_trends = (project.design_doc or {}).get("sr_catch_rate_trends") or {}
         stored_by_dir = stored_trends.get("by_direction") or {}
 
-    directions_out = []
-    for did, tasks in dir_tasks.items():
-        if len(tasks) < _MIN_DIRECTION_SR_SAMPLE:
-            continue
-        cat_stats: Dict[str, Dict] = {}
-        for t in tasks:
-            ctx = t.context or {}
-            human_cats = set(ctx.get("_first_attempt_rejection_categories") or [])
-            check_results = ctx["_self_review_outcome"].get("check_results") or {}
-            sr_failed = {
-                c for c, r in check_results.items() if not r.get("passed", True)
-            }
-            rev_hist = (ctx.get("review_loop") or {}).get("review_history") or []
-            rev_cats = _categorize_review_issues(rev_hist) if rev_hist else {}
-            for cat in human_cats:
-                s = cat_stats.setdefault(
-                    cat, {"hit_count": 0, "human_count": 0, "miss_examples": []}
-                )
-                s["human_count"] += 1
-                if cat in sr_failed:
-                    s["hit_count"] += 1
-                else:
-                    for issue in rev_cats.get(cat, []):
-                        if len(s["miss_examples"]) < 3:
-                            s["miss_examples"].append(
-                                {"desc": issue["desc"], "severity": issue["severity"]}
-                            )
-        total_human = sum(s["human_count"] for s in cat_stats.values())
-        total_hit = sum(s["hit_count"] for s in cat_stats.values())
-        cats_out: Dict[str, Any] = {}
-        worst_cat: Optional[str] = None
-        worst_miss = -1.0
-        for cat, s in cat_stats.items():
-            miss_rate = (
-                round(1 - s["hit_count"] / s["human_count"], 3)
-                if s["human_count"]
-                else None
-            )
-            cats_out[cat] = {
-                "human_count": s["human_count"],
-                "hit_count": s["hit_count"],
-                "miss_rate": miss_rate,
-                "miss_examples": s["miss_examples"],
-            }
-            if miss_rate is not None and miss_rate > worst_miss:
-                worst_miss = miss_rate
-                worst_cat = cat
-        stored_dir = stored_by_dir.get(did) or {}
-        directions_out.append(
-            {
-                "direction_id": did,
-                "direction_text": dir_text.get(did, ""),
-                "sample_size": len(tasks),
-                "overall_catch_rate": round(total_hit / total_human, 3)
-                if total_human
-                else None,
-                "categories": cats_out,
-                "worst_category": worst_cat,
-                "previous_miss_rate": stored_dir.get("previous_miss_rate"),
-                "trend": stored_dir.get("trend", "stable"),
-                "rate_history": stored_dir.get("rate_history") or [],
-            }
-        )
-
-    directions_out.sort(key=lambda x: x.get("overall_catch_rate") or 1.0)
+    directions_out = compute_direction_sr_breakdown_for_endpoint(
+        all_tasks, dir_text, existing_by_direction=stored_by_dir
+    )
     return {"directions": directions_out, "min_sample": _MIN_DIRECTION_SR_SAMPLE}
 
 
@@ -7481,45 +7451,46 @@ async def get_sr_recent_misses(
             )
         )
         .order_by(Task.created_at.desc())
-        .limit(2000)
     )
-    all_tasks = (await session.execute(stmt)).scalars().all()
 
     rows = []
     matched_task_ids: list[uuid.UUID] = []
-    for t in all_tasks:
+    total_matched = 0
+    task_stream = await session.stream(stmt)
+    async for t in task_stream.scalars():
         ctx = t.context or {}
         sr_outcome = ctx.get("_self_review_outcome")
-        human_cats_raw = ctx.get("_first_attempt_rejection_categories")
-        if not sr_outcome or not human_cats_raw:
+        if not sr_outcome:
             continue
-        human_cats = set(human_cats_raw)
+        human_cats = resolve_sr_miss_human_truth(ctx)
+        if not human_cats:
+            continue
         check_results = sr_outcome.get("check_results") or {}
-        sr_failed = {c for c, r in check_results.items() if not r.get("passed", True)}
+        sr_failed = _author_sr_failed_categories(check_results)
         missed = human_cats - sr_failed
         if not missed:
             continue
         if category and category not in missed:
             continue
-        sr_check_results, reviewer_findings = _sr_miss_drilldown(sr_outcome, missed)
-        fp = t.first_payload or {}
-        rows.append(
-            {
-                "task_id": str(t.id),
-                "title": t.title,
-                "scope": ctx.get("scope"),
-                "task_type": fp.get("type") or ctx.get("type"),
-                "created_at": t.created_at.isoformat() if t.created_at else None,
-                "missed_categories": sorted(missed),
-                "caught_categories": sorted(human_cats & sr_failed),
-                "sr_check_results": sr_check_results,
-                "reviewer_findings": reviewer_findings,
-                "pr_url": None,
-            }
-        )
-        matched_task_ids.append(t.id)
-        if len(rows) >= limit:
-            break
+        total_matched += 1
+        if len(rows) < limit:
+            sr_check_results, reviewer_findings = _sr_miss_drilldown(sr_outcome, missed)
+            fp = t.first_payload or {}
+            rows.append(
+                {
+                    "task_id": str(t.id),
+                    "title": t.title,
+                    "scope": ctx.get("scope"),
+                    "task_type": fp.get("type") or ctx.get("type"),
+                    "created_at": t.created_at.isoformat() if t.created_at else None,
+                    "missed_categories": sorted(missed),
+                    "caught_categories": sorted(human_cats & sr_failed),
+                    "sr_check_results": sr_check_results,
+                    "reviewer_findings": reviewer_findings,
+                    "pr_url": None,
+                }
+            )
+            matched_task_ids.append(t.id)
 
     if matched_task_ids:
         art_stmt = select(Artifact.task_id, Artifact.pr_url).where(
@@ -7532,7 +7503,7 @@ async def get_sr_recent_misses(
         for row in rows:
             row["pr_url"] = pr_map.get(row["task_id"])
 
-    return {"misses": rows, "total": len(rows)}
+    return {"misses": rows, "total": total_matched}
 
 
 @router.get("/projects/{project_id}/findings-by-source")

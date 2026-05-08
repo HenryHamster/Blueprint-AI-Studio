@@ -125,21 +125,26 @@ function heuristicRegressionRisk(diff: string): { passed: boolean; issue: string
   return { passed: false, issue: `${tag} ${signals.join('; ')}` };
 }
 
-/** Inject a heuristic regression_risk entry when no baseline file exists. */
+/** Inject a heuristic regression_risk entry when no baseline file exists.
+ *  Always returns an object (never null) so the backend can track prompt_version
+ *  for every completed task, even when Claude didn't write the SR file. */
 export function augmentSelfReview(
   selfReview: Record<string, unknown> | null,
   taskId: string,
   baseCommit: string,
-): Record<string, unknown> | null {
-  if (!selfReview) return null;
-  if (fs.existsSync(`/tmp/test_baseline_${taskId}.json`)) return selfReview;
-  const checkResults = (selfReview.check_results ?? {}) as Record<string, unknown>;
-  if ('regression_risk' in checkResults) return selfReview;
+): Record<string, unknown> {
+  // Ensure prompt_version is always stamped so compute_sr_catch_rate_trends can
+  // bucket by prompt regime even when Claude skipped the self-review step.
+  const sr: Record<string, unknown> = selfReview ?? { verdict: 'unknown', check_results: {}, prompt_version: SELF_REVIEW_PROMPT_VERSION };
+  if (!('prompt_version' in sr)) sr.prompt_version = SELF_REVIEW_PROMPT_VERSION;
+  if (fs.existsSync(`/tmp/test_baseline_${taskId}.json`)) return sr;
+  const checkResults = (sr.check_results ?? {}) as Record<string, unknown>;
+  if ('regression_risk' in checkResults) return sr;
   try {
     const diff = git(['diff', `${baseCommit}..HEAD`]);
-    selfReview.check_results = { ...checkResults, regression_risk: heuristicRegressionRisk(diff) };
+    sr.check_results = { ...checkResults, regression_risk: heuristicRegressionRisk(diff) };
   } catch { /* git unavailable — leave check_results unchanged */ }
-  return selfReview;
+  return sr;
 }
 
 /** Write a fix-task self-review context file before Claude runs.
@@ -317,7 +322,7 @@ export async function runCodeChangeTask(opts: CodeChangeTaskOpts): Promise<void>
         pr_url: prUrl,
         logs: 'Task completed. Claude opened PR but did not call ./done — wrapper finalised.',
         ...(changedFiles.length > 0 ? { changed_files: changedFiles } : {}),
-        ...(selfReview ? { self_review_outcome: selfReview } : {}),
+        self_review_outcome: selfReview,
       });
       return;
     }

@@ -4326,8 +4326,10 @@ async def test_compute_sr_catch_rate_trends_includes_by_direction_when_above_sam
     entry = result["by_direction"][direction_id]
     assert entry["sample_count"] == 4
     assert "regression_risk" in entry["categories"]
-    # All missed → miss_rate 1.0
+    # All missed → miss_rate 1.0 → overall_catch_rate 0.0
     assert entry["categories"]["regression_risk"]["miss_rate"] == 1.0
+    assert entry["miss_rate"] == 1.0
+    assert entry["overall_catch_rate"] == 0.0
 
 
 @pytest.mark.asyncio
@@ -6925,9 +6927,66 @@ async def test_sr_skip_rate_omitted_below_min_sample(db_session: AsyncSession):
 
     result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
 
-    # Overall result may be None (below _MIN_SR_SAMPLE) or skip fields may be absent
+    # sr_skip_rate is always present in the result dict; it is None when sample is too small.
     if result is not None:
-        assert "sr_skip_rate" not in result
+        assert "sr_skip_rate" in result
+        assert result["sr_skip_rate"] is None
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_all_fields_always_present(
+    db_session: AsyncSession,
+):
+    """All canonical fields are always present in the result dict with safe defaults."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    # Enough tasks for compute to return a result (>=5 per window)
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+    assert result is not None
+
+    required_keys = [
+        "computed_at",
+        "bucket_mode",
+        "current_cycle_id",
+        "previous_cycle_id",
+        "categories",
+        "by_task_type",
+        "by_severity",
+        "edges_considered_stats",
+        "sr_skip_rate",
+        "sr_skip_reason_distribution",
+        "by_direction",
+        "execution_evidence_miss_rates",
+    ]
+    for key in required_keys:
+        assert key in result, f"missing required key: {key}"
+
+    assert isinstance(result["sr_skip_reason_distribution"], dict)
+    assert isinstance(result["by_direction"], dict)
+    assert isinstance(result["execution_evidence_miss_rates"], dict)
 
 
 @pytest.mark.asyncio
@@ -7479,6 +7538,51 @@ def _make_fp_task(
     return task
 
 
+def _make_fp_quality_task(
+    project_id,
+    *,
+    prompt_fingerprint: str,
+    sr_failed_cats: list[str] | None = None,
+    reviewer_cats: list[str] | None = None,
+    human_cats: list[str] | None = None,
+    review_history: list[dict] | None = None,
+    skipped: bool = False,
+) -> Task:
+    if skipped:
+        sro = {
+            "verdict": "unknown",
+            "fixes_applied": False,
+            "check_results": {},
+            "blind_spots": [],
+        }
+    else:
+        sro = {
+            "verdict": "pass",
+            "fixes_applied": False,
+            "check_results": {
+                cat: {"passed": False, "issue": "x"} for cat in (sr_failed_cats or [])
+            },
+            "blind_spots": [],
+            "reviewer_findings": [
+                {"category": cat, "severity": "HIGH", "description": "found"}
+                for cat in (reviewer_cats or [])
+            ],
+        }
+    context = {"_self_review_outcome": sro}
+    if human_cats is not None:
+        context["_first_attempt_rejection_categories"] = human_cats
+    if review_history is not None:
+        context["review_loop"] = {"review_history": review_history}
+    return Task(
+        project_id=project_id,
+        title="FP quality task",
+        payloads=[{"type": "create", "prompt": "do something"}],
+        prompt_fingerprint=prompt_fingerprint,
+        status=TaskStatus.COMPLETED,
+        context=context,
+    )
+
+
 def test_compute_cat_fp_stats_fp_and_tp_counts():
     """SR-flagged categories caught by reviewer count as TP; missed by reviewer count as FP."""
     from app.playbook_learning import _compute_cat_fp_stats
@@ -7571,6 +7675,384 @@ def test_compute_cat_fp_stats_false_positive_rate_formula():
     assert tp == 1
     fpr = round(fp / (fp + tp), 3)
     assert fpr == 0.667
+
+
+def test_compute_sr_quality_by_fingerprint_groups_metrics_and_gates_low_sr_samples():
+    from app.playbook_learning import compute_sr_quality_by_fingerprint
+
+    project_id = uuid.uuid4()
+    review_history = [
+        {
+            "iteration": 0,
+            "issues": [{"description": "missing unit tests", "severity": "MAJOR"}],
+        }
+    ]
+    results = compute_sr_quality_by_fingerprint(
+        [
+            _make_fp_quality_task(
+                project_id,
+                prompt_fingerprint="fp-a",
+                sr_failed_cats=["correctness"],
+                human_cats=["correctness"],
+            ),
+            _make_fp_quality_task(
+                project_id,
+                prompt_fingerprint="fp-a",
+                sr_failed_cats=["test-coverage"],
+                review_history=review_history,
+            ),
+            _make_fp_quality_task(
+                project_id,
+                prompt_fingerprint="fp-a",
+                sr_failed_cats=["architecture"],
+                reviewer_cats=["architecture"],
+            ),
+            _make_fp_quality_task(
+                project_id,
+                prompt_fingerprint="fp-a",
+                sr_failed_cats=["performance"],
+            ),
+            _make_fp_quality_task(
+                project_id,
+                prompt_fingerprint="fp-a",
+                reviewer_cats=["security"],
+                human_cats=["security"],
+            ),
+            _make_fp_quality_task(
+                project_id,
+                prompt_fingerprint="fp-a",
+                skipped=True,
+            ),
+            _make_fp_quality_task(
+                project_id,
+                prompt_fingerprint="fp-b",
+                sr_failed_cats=["correctness"],
+                human_cats=["correctness"],
+            ),
+        ],
+        min_sample_size=2,
+        top_disagreement_categories=3,
+    )
+
+    assert set(results) == {"fp-a", "fp-b"}
+
+    a = results["fp-a"]
+    assert a["sr_sample_size"] == 5
+    assert a["sr_catch_sample_size"] == 4
+    assert a["sr_catch_rate"] == 0.75
+    assert a["reviewer_rescue_sample_size"] == 1
+    assert a["reviewer_rescue_rate"] == 1.0
+    assert a["sr_false_positive_sample_size"] == 4
+    assert a["sr_false_positive_rate"] == 0.25
+    fp_by_cat = {
+        entry["category"]: (entry["fp_count"], entry["tp_count"])
+        for entry in a["sr_false_positive_rate_by_category"]
+    }
+    assert fp_by_cat["architecture"] == (0, 1)
+    assert fp_by_cat["correctness"] == (0, 1)
+    assert fp_by_cat["performance"] == (1, 0)
+    assert fp_by_cat["test-coverage"] == (0, 1)
+    disagreements = {
+        entry["category"]: (
+            entry["reviewer_overrode_sr_count"],
+            entry["sr_overrode_reviewer_count"],
+        )
+        for entry in a["sr_reviewer_disagreement_top_categories"]
+    }
+    assert disagreements == {
+        "correctness": (0, 1),
+        "performance": (0, 1),
+        "security": (1, 0),
+    }
+    assert a["sr_catch_rate_delta_vs_project_mean"] == -0.05
+
+    b = results["fp-b"]
+    assert b["sr_sample_size"] == 1
+    assert b["sr_catch_rate"] is None
+    assert b["reviewer_rescue_rate"] is None
+    assert b["sr_false_positive_rate"] is None
+    assert b["sr_false_positive_rate_by_category"] == []
+    assert b["sr_reviewer_disagreement_top_categories"] == []
+
+
+@pytest.mark.parametrize(
+    "origin",
+    ["reviewer", "reviewer_disagreement", "reviewer_recovery_after_incomplete_sr"],
+)
+def test_compute_sr_quality_by_fingerprint_excludes_reviewer_origin(origin):
+    """Reviewer-stamped passed=False entries must not inflate sr_catch_rate.
+
+    The category was actually missed by the author SR, so it must surface as a
+    reviewer rescue (miss) — not as an author catch.
+    """
+    from app.playbook_learning import compute_sr_quality_by_fingerprint
+
+    project_id = uuid.uuid4()
+    sro = {
+        "verdict": "pass",
+        "fixes_applied": False,
+        "check_results": {
+            "correctness": {"passed": False, "issue": "x", "origin": origin},
+        },
+        "blind_spots": [],
+        "reviewer_findings": [
+            {"category": "correctness", "severity": "HIGH", "description": "found"}
+        ],
+    }
+    task = Task(
+        project_id=project_id,
+        title="reviewer-rescue fp task",
+        payloads=[{"type": "create", "prompt": "do something"}],
+        prompt_fingerprint="fp-rescue",
+        status=TaskStatus.COMPLETED,
+        context={"_self_review_outcome": sro},
+    )
+
+    results = compute_sr_quality_by_fingerprint([task], min_sample_size=1)
+
+    bucket = results["fp-rescue"]
+    # Reviewer flagged correctness, author SR did NOT (origin-stamped entries
+    # are excluded) — so this is a reviewer rescue, not an author catch.
+    assert bucket["sr_catch_rate"] == 0.0
+    assert bucket["reviewer_rescue_rate"] == 1.0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests for reviewer-origin attribution (PR #4193 follow-up).
+# Reviewer-stamped check_results entries (origin in _REVIEWER_ORIGINS) must NOT
+# be attributed to the author SR — i.e. they must still count as "agent missed"
+# for `cat_added_value`, must NOT contribute to TP/FP in `_compute_cat_fp_stats`
+# or `_stats_for_tasks`, and must still surface as misses in the SR drilldown.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "origin",
+    ["reviewer", "reviewer_disagreement", "reviewer_recovery_after_incomplete_sr"],
+)
+def test_compute_cat_fp_stats_excludes_reviewer_origin_from_sr_failed(origin):
+    """A reviewer-stamped failure must NOT count toward the author SR's TP/FP totals."""
+    from app.playbook_learning import _compute_cat_fp_stats
+
+    project_id = uuid.uuid4()
+    # SR check_results says correctness:passed=False, BUT origin is reviewer-stamped
+    # → this is a reviewer rescue, not an author catch. Must not appear in cat_fp.
+    sro = {
+        "check_results": {
+            "correctness": {"passed": False, "issue": "x", "origin": origin},
+        },
+        "reviewer_findings": [
+            {"category": "correctness", "severity": "HIGH", "description": "found"}
+        ],
+    }
+    task = Task(
+        project_id=project_id,
+        title="reviewer-rescue task",
+        payloads=[{"type": "create", "prompt": "do something"}],
+        status=TaskStatus.COMPLETED,
+        context={"_self_review_outcome": sro},
+    )
+
+    cat_fp, type_cat_fp = _compute_cat_fp_stats([task])
+
+    # Reviewer-stamped failure must not be attributed to the author SR.
+    assert cat_fp == {}
+    assert type_cat_fp == {}
+
+
+def test_compute_cat_fp_stats_legacy_no_origin_still_counts():
+    """Control: a passed=False entry with no `origin` is a genuine author catch."""
+    from app.playbook_learning import _compute_cat_fp_stats
+
+    project_id = uuid.uuid4()
+    task = _make_fp_task(
+        project_id, sr_failed_cats=["correctness"], reviewer_cats=["correctness"]
+    )
+
+    cat_fp, _ = _compute_cat_fp_stats([task])
+
+    assert cat_fp["correctness"]["tp"] == 1
+    assert cat_fp["correctness"].get("fp", 0) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "origin",
+    ["reviewer", "reviewer_disagreement", "reviewer_recovery_after_incomplete_sr"],
+)
+async def test_compute_fresh_reviewer_trend_added_value_excludes_reviewer_origin(
+    db_session: AsyncSession, origin
+):
+    """A reviewer-stamped passed=False must not silently absorb the rescue.
+
+    When the author SR's check_results entry was stamped by the reviewer
+    (origin in _REVIEWER_ORIGINS), the category was actually missed by the
+    author SR — so it must still count toward `cat_added_value`.
+    """
+    from app.playbook_learning import compute_fresh_reviewer_trend
+
+    project = await _make_project(db_session)
+    tasks: list[Task] = []
+
+    # Current window: 5 tasks, all reviewer-stamped on `correctness`.
+    # Pre-fix: agent_failed would include `correctness` and added_value=0.
+    # Post-fix: reviewer-origin excluded → added_value=5.
+    for _ in range(5):
+        check_results = {
+            "correctness": {"passed": False, "issue": "x", "origin": origin}
+        }
+        ctx = {
+            "_self_review_outcome": {
+                "check_results": check_results,
+                "reviewer_findings": [{"category": "correctness"}],
+            },
+            "_first_attempt_rejection_categories": ["correctness"],
+            "_first_attempt_succeeded": True,
+        }
+        t = Task(
+            project_id=project.id,
+            title="reviewer-rescue current",
+            payloads=[{"type": "create", "prompt": "do something"}],
+            status=TaskStatus.COMPLETED,
+            context=ctx,
+        )
+        t.created_at = _utcnow() - timedelta(days=2)
+        db_session.add(t)
+        tasks.append(t)
+
+    # Previous window: 5 tasks where author SR genuinely caught `correctness`
+    # (no origin field) → added_value=0 in previous bucket.
+    for _ in range(5):
+        t = _make_fr_task(
+            project.id,
+            age_days=20,
+            reviewer_findings=[{"category": "correctness"}],
+            human_cats=["correctness"],
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_fresh_reviewer_trend(project.id, db_session, tasks)
+
+    assert result is not None
+    av = result["added_value"]["correctness"]
+    assert av["current"] == 5, (
+        f"reviewer-origin '{origin}' should still count as added_value (got {av['current']})"
+    )
+    assert av["previous"] == 0
+
+
+def test_stats_for_tasks_reviewer_origin_excluded_from_sr_failed_count():
+    """Reviewer-stamped failures must NOT inflate sr_failed_count / fp_count
+    in `_stats_for_tasks`. The reviewer rescue is not a thing the author SR
+    flagged, so it must not appear in the precision/false-positive metrics.
+    """
+    from app.playbook_learning import _stats_for_tasks
+
+    project_id = uuid.uuid4()
+    # Author SR genuinely flagged `correctness` (no origin) — TP since human
+    # confirmed it.
+    author_task = _make_sr_task(
+        project_id,
+        age_days=1,
+        human_cats={"correctness": 1},
+        sr_failed_cats=["correctness"],
+    )
+    # Reviewer-stamped failure on `security` with no human confirmation. Pre-fix
+    # this would be counted as a SR false positive; post-fix it's excluded from
+    # sr_failed_count entirely because the author SR didn't actually flag it.
+    reviewer_task = _make_sr_task(
+        project_id,
+        age_days=1,
+        human_cats={"correctness": 1},
+        sr_failed_cats=["security"],
+        check_result_overrides={"security": {"origin": "reviewer_disagreement"}},
+    )
+
+    _count, cat_stats, _type_cat, _all_iter, _sev = _stats_for_tasks(
+        [author_task, reviewer_task]
+    )
+
+    # `correctness` is a genuine author catch — should appear with a TP.
+    correctness = cat_stats.get("correctness", {})
+    assert correctness.get("sr_failed_count", 0) == 1
+    assert correctness.get("fp_count", 0) == 0
+    # `security` was reviewer-stamped only — must not surface as a SR failure
+    # at all in the FP/sr_failed counters.
+    if "security" in cat_stats:
+        assert cat_stats["security"].get("sr_failed_count", 0) == 0
+        assert cat_stats["security"].get("fp_count", 0) == 0
+
+
+def test_stats_for_tasks_reviewer_origin_keeps_combined_hit_count():
+    """Reviewer-stamped passed=False must still feed `reviewer_save_hit_count`.
+
+    The combined `hit_count` (and the origin-based split) is intentionally
+    inclusive of reviewer rescues — only the FP/precision side excludes them.
+    Locks in the invariant that the fix did not regress the split metrics.
+    """
+    from app.playbook_learning import _stats_for_tasks
+
+    project_id = uuid.uuid4()
+    # Reviewer-stamped passed=False on `correctness`, human also flagged it →
+    # this is a reviewer-save TP.
+    task = _make_sr_task(
+        project_id,
+        age_days=1,
+        human_cats={"correctness": 1},
+        sr_failed_cats=["correctness"],
+        check_result_overrides={"correctness": {"origin": "reviewer"}},
+    )
+
+    _count, cat_stats, _type_cat, _all_iter, _sev = _stats_for_tasks([task])
+
+    cat = cat_stats.get("correctness") or {}
+    assert cat.get("hit_count", 0) == 1
+    assert cat.get("reviewer_save_hit_count", 0) == 1
+    assert cat.get("sr_alone_hit_count", 0) == 0
+
+
+def test_get_sr_alert_drilldown_tasks_reviewer_rescue_still_a_miss():
+    """A reviewer-rescued category must surface as `missed_in_target` in the drilldown."""
+    from app.playbook_learning import get_sr_alert_drilldown_tasks
+
+    project_id = uuid.uuid4()
+    # Task has `correctness` stamped by the reviewer (passed=False with origin)
+    # plus a human rejection on `correctness` → SR did NOT catch it.
+    ctx = {
+        "_self_review_outcome": {
+            "check_results": {
+                "correctness": {
+                    "passed": False,
+                    "issue": "x",
+                    "origin": "reviewer_disagreement",
+                },
+            },
+            "verdict": "fail",
+        },
+        "_first_attempt_rejection_categories": ["correctness"],
+    }
+    task = Task(
+        project_id=project_id,
+        title="reviewer-rescue drilldown",
+        payloads=[{"type": "create", "prompt": "do something"}],
+        status=TaskStatus.COMPLETED,
+        context=ctx,
+    )
+    task.created_at = _utcnow() - timedelta(days=1)
+
+    rows = get_sr_alert_drilldown_tasks(
+        all_tasks=[task],
+        design_doc={},
+        categories=["correctness"],
+        alert_type="trends",
+    )
+
+    assert len(rows) == 1
+    assert "correctness" in rows[0]["missed_categories"]
+    assert "correctness" not in rows[0]["caught_categories"]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -8238,3 +8720,72 @@ async def test_compute_sr_regression_risk_test_signal_trends_cycle_bucketing(
     assert result["current"]["sr_passed_with_signal"] == 5
     assert result["previous"]["sr_passed_with_signal"] == 0
     assert result["trend"] == "regressing"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests for resolve_sr_miss_human_truth — three-tier precedence
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_resolve_sr_miss_human_truth_prefers_all_iterations():
+    """_all_iterations_rejection_categories wins over review_history and first-attempt."""
+    from app.playbook_learning import resolve_sr_miss_human_truth
+
+    ctx = {
+        "_all_iterations_rejection_categories": {"architecture": 1, "correctness": 2},
+        "_first_attempt_rejection_categories": {"correctness": 1},
+        "review_loop": {
+            "review_history": [
+                {
+                    "iteration": 1,
+                    "issues": [
+                        {"description": "security hole", "severity": "CRITICAL"}
+                    ],
+                }
+            ]
+        },
+    }
+    result = resolve_sr_miss_human_truth(ctx)
+    assert result == {"architecture", "correctness"}
+
+
+def test_resolve_sr_miss_human_truth_falls_back_to_review_history():
+    """When _all_iterations absent, keyword-categorised review_history is used."""
+    from app.playbook_learning import resolve_sr_miss_human_truth
+
+    ctx = {
+        "_first_attempt_rejection_categories": {"correctness": 1},
+        "review_loop": {
+            "review_history": [
+                {
+                    "iteration": 2,
+                    "issues": [
+                        {
+                            "description": "regressed previously passing test",
+                            "severity": "MAJOR",
+                        }
+                    ],
+                }
+            ]
+        },
+    }
+    result = resolve_sr_miss_human_truth(ctx)
+    assert "regression_risk" in result
+
+
+def test_resolve_sr_miss_human_truth_falls_back_to_first_attempt():
+    """When neither _all_iterations nor review_history exist, uses first-attempt."""
+    from app.playbook_learning import resolve_sr_miss_human_truth
+
+    ctx = {
+        "_first_attempt_rejection_categories": {"security": 1, "performance": 1},
+    }
+    result = resolve_sr_miss_human_truth(ctx)
+    assert result == {"security", "performance"}
+
+
+def test_resolve_sr_miss_human_truth_empty_ctx():
+    """Returns empty set when no human-truth sources are present."""
+    from app.playbook_learning import resolve_sr_miss_human_truth
+
+    assert resolve_sr_miss_human_truth({}) == set()

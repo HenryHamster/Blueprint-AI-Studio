@@ -2567,6 +2567,29 @@ describe('buildRetryContext', () => {
     expect(result).toContain('test-coverage (reviewer found 1 issue)');
   });
 
+  it('treats reviewer-origin failures as SR-missed even when check_results marked them failed', () => {
+    const task = {
+      context: {
+        _attempt_number: 2,
+        _previous_failure_class: 'CODE_ERROR',
+        _previous_error: 'error',
+        _previous_self_review_outcome: {
+          verdict: 'fail',
+          fixes_applied: false,
+          check_results: {
+            correctness: { passed: false, origin: 'reviewer' },
+          },
+        },
+        _first_attempt_rejection_categories: {
+          correctness: 2,
+        },
+      },
+    };
+    const result = buildRetryContext(task);
+    expect(result).toContain('missed these categories');
+    expect(result).toContain('correctness (reviewer found 2 issues)');
+  });
+
   it('uses existing wording when SR correctly identified all reviewer categories', () => {
     const task = {
       context: {
@@ -4390,6 +4413,38 @@ describe('formatSelfReviewCalibrationSection', () => {
   it('returns empty string when categories are empty', () => {
     const source = { categories: {} };
     expect(formatSelfReviewCalibrationSection(source)).toBe('');
+  });
+
+  it('prepends mixed-version caveat when mixed_prompt_versions is true', () => {
+    const source = {
+      categories: { regression_risk: { miss_rate: 0.6, below_floor: true } },
+      mixed_prompt_versions: true,
+    };
+    const result = formatSelfReviewCalibrationSection(source);
+    expect(result).toContain('## Self-review calibration');
+    expect(result).toContain('spans multiple SR prompt versions');
+    expect(result).toContain('regression_risk');
+  });
+
+  it('omits mixed-version caveat when mixed_prompt_versions is false', () => {
+    const source = {
+      categories: { regression_risk: { miss_rate: 0.6, below_floor: true } },
+      mixed_prompt_versions: false,
+    };
+    const result = formatSelfReviewCalibrationSection(source);
+    expect(result).toContain('## Self-review calibration');
+    expect(result).not.toContain('spans multiple SR prompt versions');
+  });
+
+  it('does not suppress calibration when mixed_prompt_versions is true (unlike prompt_version_changed)', () => {
+    const source = {
+      categories: { regression_risk: { miss_rate: 0.6, below_floor: true } },
+      mixed_prompt_versions: true,
+      prompt_version_changed: false,
+    };
+    const result = formatSelfReviewCalibrationSection(source);
+    expect(result).not.toBe('');
+    expect(result).toContain('regression_risk');
   });
 });
 

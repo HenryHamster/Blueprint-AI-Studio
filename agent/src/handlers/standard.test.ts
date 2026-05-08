@@ -2490,6 +2490,33 @@ describe('runFreshReviewerPass origin stamp for incompleteSrRecovery', () => {
     expect(checkResults.correctness.origin).toBe('reviewer');
     expect(capturedRx2.reviewer_recovery_origin).toBeUndefined();
   });
+
+  it('stamps origin: reviewer_disagreement when reviewer overrides an author-passed entry', async () => {
+    const idx = await import('../index.js');
+    vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
+    vi.mocked(idx.runClaudeCode).mockResolvedValue({
+      exitCode: 0,
+      allOutput: '',
+      lastResultText: '{"reviewer_findings":[{"category":"correctness","severity":"HIGH","description":"logic bug"}]}',
+    });
+    // Author explicitly attested correctness: passed
+    vi.mocked(fsModule.readFileSync).mockReturnValue(
+      JSON.stringify({ verdict: 'pass', check_results: { correctness: { passed: true, issue: 'looks fine' } } }),
+    );
+
+    let captured: Record<string, unknown> | null = null;
+    vi.mocked(fsModule.writeFileSync).mockImplementation((_p: unknown, data: unknown) => {
+      captured = JSON.parse(data as string) as Record<string, unknown>;
+    });
+
+    await runFreshReviewerPass('rx3', 'Title', 'Desc', [], null, { value: '' });
+
+    expect(captured).not.toBeNull();
+    const json = captured as unknown as Record<string, unknown>;
+    const checkResults = json.check_results as Record<string, Record<string, unknown>>;
+    expect(checkResults.correctness.passed).toBe(false);
+    expect(checkResults.correctness.origin).toBe('reviewer_disagreement');
+  });
 });
 
 // ── origin field tagging (agent self-review + fresh-reviewer) ───────────────────

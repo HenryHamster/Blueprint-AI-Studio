@@ -8966,6 +8966,56 @@ async def test_digest_fresh_reviewer_effectiveness_per_category_hit_rate(
     assert fre["reviewer_finding_added_value"].get("correctness", 0) == 3
 
 
+@pytest.mark.asyncio
+async def test_digest_fresh_reviewer_effectiveness_excludes_reviewer_origin_catches(
+    client: AsyncClient, db_session
+):
+    """Reviewer-stamped passed=False entries still count as reviewer added value."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    for _ in range(3):
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create"}],
+                context={
+                    "_first_attempt_succeeded": False,
+                    "_first_attempt_rejection_categories": ["correctness"],
+                    "_self_review_outcome": {
+                        "verdict": "fail",
+                        "check_results": {
+                            "correctness": {
+                                "passed": False,
+                                "origin": "reviewer_disagreement",
+                            }
+                        },
+                        "blind_spots": [],
+                        "reviewer_findings": [
+                            {
+                                "category": "correctness",
+                                "severity": "CRITICAL",
+                                "description": "caught by reviewer",
+                            }
+                        ],
+                    },
+                },
+            )
+        )
+    await db_session.commit()
+
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    fre = response.json()["fresh_reviewer_effectiveness"]
+    assert fre["fresh_reviewer_sample_size"] == 3
+    assert fre["prediction_sample_size"] == 3
+    assert fre["per_category_hit_rate"]["correctness"] == 1.0
+    assert fre["reviewer_finding_added_value"].get("correctness", 0) == 3
+
+
 # ---------------------------------------------------------------------------
 # SR blind-spots aggregation endpoint
 # ---------------------------------------------------------------------------
@@ -9501,15 +9551,19 @@ async def test_prompt_fingerprint_analytics_groups_by_fingerprint(
 
     a = by_fp["aaaaaaaaaaaa"]
     assert a["sample_size"] == 3
+    assert a["sr_sample_size"] == 3
     assert a["first_attempt_measured"] == 3
     assert a["first_attempt_success_rate"] == round(2 / 3, 3)
     assert a["sr_skip_rate"] == 0.0
+    assert a["sr_catch_rate"] == 0.0
     assert a["rejection_category_counts"] == {"correctness": 1}
 
     b = by_fp["bbbbbbbbbbbb"]
     assert b["sample_size"] == 3
+    assert b["sr_sample_size"] == 2
     assert b["first_attempt_success_rate"] == 0.0
     assert b["sr_skip_rate"] == round(1 / 3, 3)
+    assert b["sr_catch_rate"] is None
     assert b["rejection_category_counts"] == {"correctness": 3, "performance": 3}
 
     # Project mean = 2/6 successes = 0.333; A above, B below.
@@ -9674,6 +9728,137 @@ async def test_prompt_fingerprint_analytics_filters_below_min_sample_size(
     assert [f["fingerprint"] for f in fps] == ["aaaaaaaaaaaa"]
     # Project mean still includes the singleton — sample_size counts all 4.
     assert response.json()["sample_size"] == 4
+
+
+@pytest.mark.asyncio
+async def test_prompt_fingerprint_analytics_sr_quality_fields_gate_on_sr_sample_size(
+    client: AsyncClient, db_session
+):
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(make_membership(project.id))
+
+    db_session.add_all(
+        [
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create"}],
+                prompt_fingerprint="aaaaaaaaaaaa",
+                context={
+                    "_self_review_outcome": {
+                        "verdict": "pass",
+                        "fixes_applied": False,
+                        "check_results": {
+                            "correctness": {"passed": False, "issue": "x"}
+                        },
+                        "blind_spots": [],
+                    },
+                    "_first_attempt_rejection_categories": ["correctness"],
+                },
+            ),
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create"}],
+                prompt_fingerprint="aaaaaaaaaaaa",
+                context={
+                    "_self_review_outcome": {
+                        "verdict": "pass",
+                        "fixes_applied": False,
+                        "check_results": {},
+                        "blind_spots": [],
+                        "reviewer_findings": [
+                            {
+                                "category": "security",
+                                "severity": "HIGH",
+                                "description": "found",
+                            }
+                        ],
+                    },
+                    "_first_attempt_rejection_categories": ["security"],
+                },
+            ),
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create"}],
+                prompt_fingerprint="aaaaaaaaaaaa",
+                context={
+                    "_self_review_outcome": _sr_skipped_envelope_unknown_verdict()
+                },
+            ),
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "fix"}],
+                prompt_fingerprint="bbbbbbbbbbbb",
+                context={
+                    "_self_review_outcome": {
+                        "verdict": "pass",
+                        "fixes_applied": False,
+                        "check_results": {
+                            "correctness": {"passed": False, "issue": "x"}
+                        },
+                        "blind_spots": [],
+                    },
+                    "_first_attempt_rejection_categories": ["correctness"],
+                },
+            ),
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "fix"}],
+                prompt_fingerprint="bbbbbbbbbbbb",
+                context={
+                    "_self_review_outcome": _sr_skipped_envelope_unknown_verdict()
+                },
+            ),
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "fix"}],
+                prompt_fingerprint="bbbbbbbbbbbb",
+                context={
+                    "_self_review_outcome": _sr_skipped_envelope_unknown_verdict()
+                },
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/prompt-fingerprint-analytics?min_sample_size=2"
+    )
+    assert response.status_code == 200
+    by_fp = {fp["fingerprint"]: fp for fp in response.json()["fingerprints"]}
+
+    a = by_fp["aaaaaaaaaaaa"]
+    assert a["sample_size"] == 3
+    assert a["sr_sample_size"] == 2
+    assert a["sr_catch_sample_size"] == 2
+    assert a["sr_catch_rate"] == 0.5
+    assert a["reviewer_rescue_sample_size"] == 1
+    assert a["reviewer_rescue_rate"] == 1.0
+    assert a["sr_false_positive_rate"] == 0.0
+    disagreements = {
+        entry["category"]: (
+            entry["reviewer_overrode_sr_count"],
+            entry["sr_overrode_reviewer_count"],
+        )
+        for entry in a["sr_reviewer_disagreement_top_categories"]
+    }
+    assert disagreements == {"correctness": (0, 1), "security": (1, 0)}
+
+    b = by_fp["bbbbbbbbbbbb"]
+    assert b["sample_size"] == 3
+    assert b["sr_sample_size"] == 1
+    assert b["sr_catch_rate"] is None
+    assert b["reviewer_rescue_rate"] is None
+    assert b["sr_false_positive_rate"] is None
+    assert b["sr_false_positive_rate_by_category"] == []
 
 
 @pytest.mark.asyncio
@@ -10044,6 +10229,114 @@ async def test_pipeline_regressions_surface_signal_staleness(
     assert "last computed" in stale["signal_staleness:sr_catch_rate"]["details"]
 
 
+@pytest.mark.asyncio
+async def test_digest_sr_trends_full_fidelity_passthrough(
+    client: AsyncClient, db_session
+):
+    """Digest passes all canonical SR trend fields unchanged (full-fidelity contract)."""
+    project = make_project()
+    project.design_doc = {
+        "sr_catch_rate_trends": {
+            "computed_at": "2026-05-01T00:00:00",
+            "bucket_mode": "cycle",
+            "current_cycle_id": "cycle-1",
+            "previous_cycle_id": "cycle-0",
+            "categories": {
+                "correctness": {
+                    "current_hit_rate": 0.8,
+                    "miss_rate": 0.2,
+                    "trend": "improving",
+                    "fp_count": 1,
+                    "tp_count": 4,
+                    "false_positive_rate": 0.2,
+                }
+            },
+            "by_task_type": {"create": {"correctness": {"hit_count": 3}}},
+            "by_severity": {
+                "high": {
+                    "current_miss_rate": 0.1,
+                    "current_hit_rate": 0.9,
+                    "trend": "stable",
+                }
+            },
+            "sr_skip_rate": 0.05,
+            "sr_skip_reason_distribution": {"legacy_unknown": 2},
+            "by_direction": {"dir-abc": {"correctness": {"hit_count": 2}}},
+            "execution_evidence_miss_rates": {
+                "test-coverage": {"miss_rate": 0.3, "miss_count": 3, "sample_count": 10}
+            },
+            "edges_considered_stats": {"total": 50, "with_sr": 40},
+        }
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    trends = response.json().get("self_review_prediction_accuracy_trends")
+    assert trends is not None
+
+    assert trends["bucket_mode"] == "cycle"
+    assert trends["current_cycle_id"] == "cycle-1"
+    assert trends["previous_cycle_id"] == "cycle-0"
+    assert trends["sr_skip_rate"] == 0.05
+    assert trends["sr_skip_reason_distribution"] == {"legacy_unknown": 2}
+    assert "dir-abc" in trends["by_direction"]
+    assert "test-coverage" in trends["execution_evidence_miss_rates"]
+    assert trends["edges_considered_stats"] == {"total": 50, "with_sr": 40}
+    assert trends["by_severity"]["high"]["trend"] == "stable"
+    assert trends["computed_at"] == "2026-05-01T00:00:00"
+    assert trends["categories"]["correctness"]["fp_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_digest_sr_trends_empty_optional_fields_present(
+    client: AsyncClient, db_session
+):
+    """Digest returns sr trend keys with empty defaults when optional fields are absent."""
+    project = make_project()
+    project.design_doc = {
+        "sr_catch_rate_trends": {
+            "computed_at": "2026-05-01T00:00:00",
+            "bucket_mode": "calendar",
+            "current_cycle_id": None,
+            "previous_cycle_id": None,
+            "categories": {},
+            "by_task_type": {},
+            "by_severity": {},
+            "sr_skip_rate": None,
+            "sr_skip_reason_distribution": {},
+            "by_direction": {},
+            "execution_evidence_miss_rates": {},
+            "edges_considered_stats": {},
+        }
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    trends = response.json().get("self_review_prediction_accuracy_trends")
+    assert trends is not None
+
+    for key in (
+        "bucket_mode",
+        "current_cycle_id",
+        "previous_cycle_id",
+        "sr_skip_rate",
+        "sr_skip_reason_distribution",
+        "by_direction",
+        "execution_evidence_miss_rates",
+        "edges_considered_stats",
+    ):
+        assert key in trends, f"missing key: {key}"
+    assert trends["sr_skip_rate"] is None
+    assert trends["by_direction"] == {}
+    assert trends["execution_evidence_miss_rates"] == {}
+
+
 # ---------------------------------------------------------------------------
 # Per-direction SR breakdown endpoint
 # ---------------------------------------------------------------------------
@@ -10105,9 +10398,11 @@ async def test_direction_sr_breakdown_basic(client: AsyncClient, db_session):
     assert entry["direction_id"] == "d-aaa"
     assert entry["sample_size"] == 3
     assert entry["worst_category"] == "correctness"
+    assert entry["overall_catch_rate"] == round(2 / 3, 3)
     cat = entry["categories"]["correctness"]
-    assert cat["human_count"] == 3
-    assert cat["hit_count"] == 2
+    assert cat["sample_count"] == 3
+    assert cat["hit_rate"] == round(2 / 3, 3)
+    assert cat["miss_rate"] == round(1 / 3, 3)
 
 
 @pytest.mark.asyncio
@@ -10142,6 +10437,254 @@ async def test_direction_sr_breakdown_excludes_insufficient_sample(
     )
     assert response.status_code == 200
     assert response.json()["directions"] == []
+
+
+@pytest.mark.asyncio
+async def test_direction_sr_breakdown_examples_finalized(
+    client: AsyncClient, db_session
+):
+    """Miss examples flow through ``_finalize_examples`` (severity-sorted,
+    deduped, capped). Old inline aggregation appended raw issues until cap=3
+    and would have included the duplicate; the canonical path dedupes."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # 3 qualifying tasks, all misses on "correctness". Each task has a
+    # review_history with the same MAJOR description plus one CRITICAL
+    # description. Old code would have produced a list with duplicates;
+    # finalized output dedupes by cleaned text and surfaces CRITICAL first.
+    rev_hist = [
+        {
+            "iteration": 0,
+            "issues": [
+                {"description": "off-by-one in the loop", "severity": "MAJOR"},
+                {
+                    "description": "race condition under concurrent calls",
+                    "severity": "CRITICAL",
+                },
+            ],
+        }
+    ]
+    for _ in range(3):
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create"}],
+                context={
+                    "direction_id": "d-fin",
+                    "_first_attempt_rejection_categories": ["correctness"],
+                    "_self_review_outcome": {
+                        "check_results": {"correctness": {"passed": True}}
+                    },
+                    "review_loop": {"review_history": rev_hist},
+                },
+            )
+        )
+    await db_session.commit()
+
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/direction-sr-breakdown"
+    )
+    assert response.status_code == 200
+    cat = response.json()["directions"][0]["categories"]["correctness"]
+    examples = cat.get("examples") or []
+    # Deduped: each unique description appears once even though 3 tasks
+    # contributed it.
+    descs = [ex["desc"] for ex in examples]
+    assert len(descs) == len(set(descs))
+    # CRITICAL is sorted before MAJOR.
+    assert examples[0]["severity"] == "CRITICAL"
+
+
+@pytest.mark.asyncio
+async def test_direction_sr_breakdown_categories_sorted_worst_first(
+    client: AsyncClient, db_session
+):
+    """Category dict is ordered worst-first by miss_rate, and worst_category
+    matches the first key — proving the endpoint pulls ordering from the
+    canonical sort rather than inferring from raw iteration order."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # 3 tasks: correctness hit rate 1.0 (0 miss), error-handling hit rate 0.0
+    # (3 miss). error-handling should come first.
+    for _ in range(3):
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create"}],
+                context={
+                    "direction_id": "d-sort",
+                    "_first_attempt_rejection_categories": [
+                        "correctness",
+                        "error-handling",
+                    ],
+                    "_self_review_outcome": {
+                        "check_results": {
+                            "correctness": {"passed": False},
+                            "error-handling": {"passed": True},
+                        }
+                    },
+                },
+            )
+        )
+    await db_session.commit()
+
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/direction-sr-breakdown"
+    )
+    assert response.status_code == 200
+    entry = response.json()["directions"][0]
+    cats = entry["categories"]
+    first_key = next(iter(cats))
+    assert first_key == "error-handling"
+    assert entry["worst_category"] == "error-handling"
+    assert cats["error-handling"]["miss_rate"] == 1.0
+    assert cats["correctness"]["miss_rate"] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# SR missed retrospectives endpoint
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_sr_missed_retrospectives_all_iterations_miss(
+    client: AsyncClient, db_session
+):
+    """Late-iteration categories in the paginated backlog use all-iterations truth."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="Late iter backlog task",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            context={
+                "_first_attempt_rejection_categories": {"correctness": 1},
+                "_all_iterations_rejection_categories": {
+                    "correctness": 1,
+                    "architecture": 1,
+                },
+                "_self_review_outcome": {
+                    "verdict": "pass",
+                    "fixes_applied": False,
+                    "check_results": {
+                        "correctness": {"passed": False},
+                        "architecture": {"passed": True},
+                    },
+                    "blind_spots": [],
+                },
+            },
+        )
+    )
+    await db_session.commit()
+
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/sr-missed-retrospectives"
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] == 1
+    row = body["items"][0]
+    assert "architecture" in row["missed_categories"]
+    assert "correctness" in row["caught_categories"]
+
+
+@pytest.mark.asyncio
+async def test_sr_missed_retrospectives_reviewer_origin_still_counts_as_miss(
+    client: AsyncClient, db_session
+):
+    """Paginated backlog treats reviewer rescues as misses, not catches."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="Reviewer rescue backlog",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            context={
+                "_first_attempt_rejection_categories": {"correctness": 1},
+                "_self_review_outcome": {
+                    "verdict": "fail",
+                    "fixes_applied": False,
+                    "check_results": {
+                        "correctness": {
+                            "passed": False,
+                            "origin": "reviewer_recovery_after_incomplete_sr",
+                        }
+                    },
+                    "blind_spots": [],
+                },
+            },
+        )
+    )
+    await db_session.commit()
+
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/sr-missed-retrospectives"
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] == 1
+    row = body["items"][0]
+    assert "correctness" in row["missed_categories"]
+    assert "correctness" not in row["caught_categories"]
+
+
+@pytest.mark.asyncio
+async def test_sr_missed_retrospectives_total_not_capped_at_page_size(
+    client: AsyncClient, db_session
+):
+    """Backlog total counts all matching tasks, not just the returned page."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add_all(
+        [
+            make_task(
+                project_id=project.id,
+                title=f"Backlog task {i}",
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create"}],
+                context={
+                    "_first_attempt_rejection_categories": {"correctness": 1},
+                    "_self_review_outcome": {
+                        "verdict": "pass",
+                        "fixes_applied": False,
+                        "check_results": {"correctness": {"passed": True}},
+                        "blind_spots": [],
+                    },
+                },
+            )
+            for i in range(205)
+        ]
+    )
+    await db_session.commit()
+
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/sr-missed-retrospectives?page_size=3"
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] == 205
+    assert len(body["items"]) == 3
 
 
 # ---------------------------------------------------------------------------
@@ -10270,6 +10813,56 @@ async def test_sr_recent_misses_includes_drilldown_fields(
             "description": long_desc[:400],
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_sr_recent_misses_reviewer_origin_still_counts_as_miss(
+    client: AsyncClient, db_session
+):
+    """Reviewer-stamped passed=False does not count as an author catch."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="Reviewer rescue",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            context={
+                "_first_attempt_rejection_categories": ["correctness"],
+                "_self_review_outcome": {
+                    "verdict": "fail",
+                    "check_results": {
+                        "correctness": {
+                            "passed": False,
+                            "issue": "reviewer found it",
+                            "origin": "reviewer",
+                        }
+                    },
+                    "blind_spots": [],
+                    "reviewer_findings": [
+                        {
+                            "category": "correctness",
+                            "severity": "HIGH",
+                            "description": "reviewer rescue",
+                        }
+                    ],
+                },
+            },
+        )
+    )
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/projects/{project.id}/sr-recent-misses")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] == 1
+    row = body["misses"][0]
+    assert "correctness" in row["missed_categories"]
+    assert "correctness" not in row["caught_categories"]
 
 
 @pytest.mark.asyncio
@@ -10429,7 +11022,7 @@ async def test_sr_recent_misses_limit_param(client: AsyncClient, db_session):
     )
     assert response.status_code == 200
     body = response.json()
-    assert body["total"] == 3
+    assert body["total"] == 5
     assert len(body["misses"]) == 3
 
 
@@ -10475,6 +11068,163 @@ async def test_sr_recent_misses_project_isolation(client: AsyncClient, db_sessio
     assert response.status_code == 200
     body = response.json()
     assert body["total"] == 1
+
+
+@pytest.mark.asyncio
+async def test_sr_recent_misses_all_iterations_miss(client: AsyncClient, db_session):
+    """A category only in _all_iterations_rejection_categories (not first-attempt) is detected."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Late-iteration category "architecture" is absent from first-attempt but present
+    # in _all_iterations_rejection_categories.  SR passed it → miss.
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="Late iter task",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            context={
+                "_first_attempt_rejection_categories": {"correctness": 1},
+                "_all_iterations_rejection_categories": {
+                    "correctness": 1,
+                    "architecture": 1,
+                },
+                "_self_review_outcome": {
+                    "verdict": "pass",
+                    "fixes_applied": False,
+                    "check_results": {
+                        "correctness": {"passed": False},
+                        "architecture": {"passed": True},
+                    },
+                    "blind_spots": [],
+                },
+            },
+        )
+    )
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/projects/{project.id}/sr-recent-misses")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] == 1
+    row = body["misses"][0]
+    assert "architecture" in row["missed_categories"]
+    assert "correctness" in row["caught_categories"]
+
+
+@pytest.mark.asyncio
+async def test_sr_recent_misses_total_before_limit(client: AsyncClient, db_session):
+    """total reflects all matching tasks, not just the capped page."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    for i in range(7):
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                title=f"Task {i}",
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create"}],
+                context={
+                    "_first_attempt_rejection_categories": {"correctness": 1},
+                    "_self_review_outcome": {
+                        "verdict": "pass",
+                        "fixes_applied": False,
+                        "check_results": {"correctness": {"passed": True}},
+                        "blind_spots": [],
+                    },
+                },
+            )
+        )
+    await db_session.commit()
+
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/sr-recent-misses?limit=3"
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] == 7
+    assert len(body["misses"]) == 3
+
+
+@pytest.mark.asyncio
+async def test_sr_recent_misses_total_not_capped_at_scan_limit(
+    client: AsyncClient, db_session
+):
+    """total keeps counting beyond the old 2000-row scan cap."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add_all(
+        [
+            make_task(
+                project_id=project.id,
+                title=f"Task {i}",
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create"}],
+                context={
+                    "_first_attempt_rejection_categories": {"correctness": 1},
+                    "_self_review_outcome": {
+                        "verdict": "pass",
+                        "fixes_applied": False,
+                        "check_results": {"correctness": {"passed": True}},
+                        "blind_spots": [],
+                    },
+                },
+            )
+            for i in range(2005)
+        ]
+    )
+    await db_session.commit()
+
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/sr-recent-misses?limit=3"
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] == 2005
+    assert len(body["misses"]) == 3
+
+
+@pytest.mark.asyncio
+async def test_sr_recent_misses_fallback_first_attempt(client: AsyncClient, db_session):
+    """When no _all_iterations and no review_history, _first_attempt_rejection_categories is used."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="Old task",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "fix"}],
+            context={
+                "_first_attempt_rejection_categories": {"security": 1},
+                "_self_review_outcome": {
+                    "verdict": "pass",
+                    "fixes_applied": False,
+                    "check_results": {"security": {"passed": True}},
+                    "blind_spots": [],
+                },
+            },
+        )
+    )
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/projects/{project.id}/sr-recent-misses")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] == 1
+    assert "security" in body["misses"][0]["missed_categories"]
 
 
 # ── POST /regression-cases/{regression_class}/clear-manual-intervention ─────

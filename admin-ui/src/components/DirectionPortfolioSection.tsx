@@ -166,8 +166,8 @@ function CalibrationChip({ factor, note, sampleCount }: { factor: number | null 
 
 interface DirectionSrCatStat {
   miss_rate: number | null;
-  human_count: number;
-  miss_examples: Array<{ desc: string; severity: string }>;
+  sample_count: number;
+  examples?: Array<{ desc: string; severity: string }>;
 }
 
 interface DirectionSrEntry {
@@ -219,7 +219,7 @@ function DirectionSrPill({ entry }: { entry: DirectionSrEntry }) {
           {Object.entries(entry.categories).sort(([, a], [, b]) => (b.miss_rate ?? 0) - (a.miss_rate ?? 0)).map(([cat, s]) => (
             <div key={cat} className="text-neutral-400">
               <span className="text-neutral-300">{cat}</span>{' '}{s.miss_rate != null ? `${Math.round(s.miss_rate * 100)}%` : '–'} miss
-              {s.miss_examples.map((ex, i) => <div key={i} className="pl-1.5 text-neutral-500 line-clamp-1">{ex.desc}</div>)}
+              {(s.examples ?? []).map((ex, i) => <div key={i} className="pl-1.5 text-neutral-500 line-clamp-1">{ex.desc}</div>)}
             </div>
           ))}
         </div>

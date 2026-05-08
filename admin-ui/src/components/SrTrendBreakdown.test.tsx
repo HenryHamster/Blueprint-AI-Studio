@@ -385,8 +385,8 @@ describe('DirectionSrBreakdownPanel', () => {
       overall_catch_rate: 0.4,
       worst_category: 'correctness',
       categories: {
-        style: { human_count: 2, hit_count: 1, miss_rate: 0.5, miss_examples: [] },
-        correctness: { human_count: 3, hit_count: 1, miss_rate: 0.67, miss_examples: [] },
+        style: { sample_count: 2, hit_rate: 0.5, miss_rate: 0.5 },
+        correctness: { sample_count: 3, hit_rate: 0.33, miss_rate: 0.67 },
       },
     }];
     render(<DirectionSrBreakdownPanel entries={entries} />);
@@ -403,8 +403,8 @@ describe('DirectionSrBreakdownPanel', () => {
       worst_category: 'correctness',
       categories: {
         correctness: {
-          human_count: 3, hit_count: 1, miss_rate: 0.67,
-          miss_examples: [{ desc: 'null check missed', severity: 'CRITICAL' }],
+          sample_count: 3, hit_rate: 0.33, miss_rate: 0.67,
+          examples: [{ desc: 'null check missed', severity: 'CRITICAL' }],
         },
       },
     }];

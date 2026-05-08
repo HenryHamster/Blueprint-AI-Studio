@@ -1666,6 +1666,11 @@ type SRCatchRateSource = {
   by_task_type?: Record<string, Record<string, { miss_rate?: number; weighted_miss_rate?: number; current_hit_rate?: number; hit_rate?: number; below_floor?: boolean }>>;
   for_task_type?: Record<string, { miss_rate?: number; weighted_miss_rate?: number; current_hit_rate?: number; hit_rate?: number; below_floor?: boolean }>;
   prompt_version_changed?: boolean;
+  // True when the measurement window spans multiple SR prompt versions. The
+  // calibration surface is still surfaced (unlike prompt_version_changed which
+  // fully suppresses it) but a caveat is prepended so the agent knows the
+  // percentages may conflate regimes and should not be treated as a clean signal.
+  mixed_prompt_versions?: boolean;
 };
 
 export function formatSelfReviewCalibrationSection(source: SRCatchRateSource | undefined, taskType = ''): string {
@@ -1678,7 +1683,10 @@ export function formatSelfReviewCalibrationSection(source: SRCatchRateSource | u
     .sort((a, b) => (b.data.weighted_miss_rate ?? b.miss) - (a.data.weighted_miss_rate ?? a.miss))
     .slice(0, 2);
   if (rows.length === 0) return '';
-  return `## Self-review calibration\nHistorical pattern for this task type:\n${rows.map(({ category, miss }) => `- Historical pattern: ${category} is missing ${Math.round(miss * 100)}% of issues a reviewer catches on this project. Scrutinize this category extra carefully.`).join('\n')}\n\n`;
+  const caveat = source.mixed_prompt_versions
+    ? '> Note: this calibration window spans multiple SR prompt versions — percentages may conflate regimes and are directional only.\n'
+    : '';
+  return `## Self-review calibration\n${caveat}Historical pattern for this task type:\n${rows.map(({ category, miss }) => `- Historical pattern: ${category} is missing ${Math.round(miss * 100)}% of issues a reviewer catches on this project. Scrutinize this category extra carefully.`).join('\n')}\n\n`;
 }
 
 // Task-type-specific self-review focus blocks. Each block overlays the generic
@@ -2972,10 +2980,11 @@ export function buildRetryContext(task: Record<string, unknown>): string {
 
     if (!isSoftFallback && Object.keys(firstAttemptRejectionCategories).length > 0) {
       for (const [category, count] of Object.entries(firstAttemptRejectionCategories)) {
-        // SR missed this category if it's absent from check_results or marked as passed
+        // SR missed this category if it was reviewer-originated, absent from
+        // check_results, or marked as passed.
         if (category in checkResults) {
           const srResult = checkResults[category];
-          if (srResult.passed) {
+          if (srResult.origin === 'reviewer' || srResult.passed) {
             srMissedCategories.push([category, count]);
           }
         } else {

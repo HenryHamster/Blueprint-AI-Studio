@@ -371,7 +371,13 @@ If no issues found: {"reviewer_findings": [], "reviewer_edges_considered": []}`;
     const existing = checkResultsLookup[f.category];
     if (!existing || existing.passed === true) {
       const entry: Record<string, unknown> = { passed: false, issue: `[reviewer] ${f.description}` };
-      entry.origin = incompleteSrRecovery ? 'reviewer_recovery_after_incomplete_sr' : 'reviewer';
+      if (incompleteSrRecovery) {
+        entry.origin = 'reviewer_recovery_after_incomplete_sr';
+      } else if (existing?.passed === true) {
+        entry.origin = 'reviewer_disagreement';
+      } else {
+        entry.origin = 'reviewer';
+      }
       checkResults[f.category] = entry;
     }
   }

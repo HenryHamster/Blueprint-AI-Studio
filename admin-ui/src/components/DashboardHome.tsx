@@ -11,7 +11,7 @@ import {
   Search,
 } from 'lucide-react';
 import { ResponsiveContainer, AreaChart, Area } from 'recharts';
-import { apiFetch } from '../api';
+import { apiFetch, type PromptFingerprintAnalyticsResponse } from '../api';
 import { timeAgo, formatDurationSec, parseTimestamp } from '../utils/time';
 import { isSafeUrl } from './TaskCard';
 import { RecentErrorsWidget } from './RecentErrorsWidget';
@@ -30,7 +30,7 @@ import { DriftSignalsCard } from './DriftSignalsCard';
 import { PoolAccountHealthPanel, type AccountHealthEntry } from './PoolAccountHealthPanel';
 import { SystemMaturityCard, type SystemMaturityRow } from './SystemMaturityCard';
 import { DirectionPortfolioSection, type DirectionProgress } from './DirectionPortfolioSection';
-import { SrTrendBreakdown, SrMissedRetrospective, SrReviewerDisagreementsPanel, EdgesTrendBreakdown, TrendIcon, MissRateSparkline, deltaColorClass, formatDelta, trendStroke, type SrTrendData, type SrMissedTask, type SrReviewerDisagreementsData, type EdgesTrend } from './SrTrendBreakdown'; // EdgesTrend used in DigestData
+import { SrTrendBreakdown, SrMissedRetrospective, SrReviewerDisagreementsPanel, EdgesTrendBreakdown, DirectionSrBreakdownPanel, type SrTrendData, type SrMissedTask, type SrReviewerDisagreementsData, type EdgesTrend, type DirectionSrEntry } from './SrTrendBreakdown'; // EdgesTrend used in DigestData
 import { TAXONOMY_COLORS, TAXONOMY_LABELS, TAXONOMY_ORDER } from './dashboardConstants';
 import { ManualInterventionPanel, AutoRecoveredPanel, AnomalyTrackerPanel } from './PipelineRegressionsPanel';
 import { RecentlyResolvedRegressionsPanel } from './RecentlyResolvedRegressionsPanel';
@@ -285,25 +285,9 @@ interface DigestData {
 interface SrFixIterationBucket { hit_rate?: number | null; miss_rate?: number | null; sample_count?: number | null; }
 type SrTrendWithFixIterations = SrTrendData & { by_fix_iteration?: Record<string, SrFixIterationBucket> | null; fix_iteration_breakdown?: Record<string, SrFixIterationBucket> | null; iteration_breakdown?: Record<string, SrFixIterationBucket> | null; };
 
-// Per-direction SR catch-rate breakdown types (endpoint: GET /projects/{id}/direction-sr-breakdown)
-interface DirectionSrCategoryStats {
-  human_count: number;
-  hit_count: number;
-  miss_rate: number | null;
-  miss_examples?: string[];
-}
-
-export interface DirectionSrEntry {
-  direction_id: string;
-  direction_text: string;
-  sample_size: number;
-  overall_catch_rate: number | null;
-  categories: Record<string, DirectionSrCategoryStats>;
-  worst_category: string | null;
-  previous_miss_rate?: number | null;
-  trend?: 'increasing' | 'decreasing' | 'stable';
-  rate_history?: number[];
-}
+// Per-direction SR catch-rate breakdown (endpoint: GET /projects/{id}/direction-sr-breakdown)
+// DirectionSrEntry is re-exported from SrTrendBreakdown (canonical model)
+export type { DirectionSrEntry };
 
 interface DirectionSrBreakdownData {
   directions: DirectionSrEntry[];
@@ -660,8 +644,10 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
   const [taskDurationStats, setTaskDurationStats] = useState<TaskDurationStats | null>(null);
   const [blindSpots, setBlindSpots] = useState<BlindSpotsData | null>(null);
   const [srRecentMisses, setSrRecentMisses] = useState<SrMissedTask[] | null>(null);
+  const [srRecentMissesTotal, setSrRecentMissesTotal] = useState<number>(0);
   const [srReviewerDisagreements, setSrReviewerDisagreements] = useState<SrReviewerDisagreementsData | null>(null);
   const [directionSrBreakdown, setDirectionSrBreakdown] = useState<DirectionSrBreakdownData | null>(null);
+  const [fingerprintAnalytics, setFingerprintAnalytics] = useState<PromptFingerprintAnalyticsResponse | null>(null);
   const [srTrendDrilldownOpen, setSrTrendDrilldownOpen] = useState(false);
   const [srTrendDrilldownRows, setSrTrendDrilldownRows] = useState<{ task_id: string; title: string; missed_categories: string[]; sr_verdict: string | null }[]>([]);
   const [srTrendDrilldownLoading, setSrTrendDrilldownLoading] = useState(false);
@@ -790,6 +776,7 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
             if (res.ok) {
               const data = await res.json();
               setSrRecentMisses(data.misses ?? []);
+              setSrRecentMissesTotal(data.total ?? (data.misses ?? []).length);
             }
           } catch { /* silent */ }
         })(),
@@ -797,6 +784,12 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
           try {
             const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(selectedProjectId)}/direction-sr-breakdown`);
             if (res.ok) setDirectionSrBreakdown(await res.json());
+          } catch { /* silent */ }
+        })(),
+        (async () => {
+          try {
+            const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(selectedProjectId)}/prompt-fingerprint-analytics`);
+            if (res.ok) setFingerprintAnalytics(await res.json());
           } catch { /* silent */ }
         })(),
       );
@@ -1312,7 +1305,7 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
             <section>
               <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-2">
                 Recent SR Misses
-                <span className="ml-1 text-neutral-600 font-normal normal-case tracking-normal">· {srRecentMisses.length} task{srRecentMisses.length !== 1 ? 's' : ''}</span>
+                <span className="ml-1 text-neutral-600 font-normal normal-case tracking-normal">· {srRecentMissesTotal} task{srRecentMissesTotal !== 1 ? 's' : ''}</span>
               </p>
               <SrMissedRetrospective
                 tasks={srRecentMisses}
@@ -1366,67 +1359,48 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
                   · {directionSrBreakdown.directions.length} direction{directionSrBreakdown.directions.length !== 1 ? 's' : ''} · worst-first
                 </span>
               </p>
-              <div className="flex flex-col gap-1.5">
-                {directionSrBreakdown.directions.map(d => {
-                  const rate = d.overall_catch_rate;
-                  const rateColor = rate == null ? 'text-neutral-500' : rate >= 0.7 ? 'text-emerald-400' : rate >= 0.4 ? 'text-amber-400' : 'text-red-400';
-                  const trend = d.trend ?? 'stable';
-                  const currentMiss = rate != null ? 1 - rate : null;
-                  const previousMiss = d.previous_miss_rate;
-                  const delta = currentMiss != null && previousMiss != null ? currentMiss - previousMiss : null;
-                  const sparklineStroke = trendStroke(trend);
-                  const rateHistory = d.rate_history ?? [];
-                  const hasSparkline = rateHistory.length >= 2;
+              <DirectionSrBreakdownPanel
+                entries={directionSrBreakdown.directions}
+                onDirectionClick={onDirectionClick}
+              />
+            </section>
+          )}
+
+          {/* Prompt Fingerprint SR Quality */}
+          {!loading && fingerprintAnalytics && fingerprintAnalytics.fingerprints.length > 0 && (
+            <section data-testid="prompt-fingerprint-sr-quality">
+              <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-2">
+                Prompt Fingerprint SR Quality
+                <span className="ml-1 text-neutral-600 font-normal normal-case tracking-normal">
+                  · {fingerprintAnalytics.fingerprints.length} regime{fingerprintAnalytics.fingerprints.length !== 1 ? 's' : ''} · {fingerprintAnalytics.window_days}d
+                </span>
+              </p>
+              <div className="flex flex-col gap-1">
+                {fingerprintAnalytics.fingerprints.map((fp) => {
+                  const catchRate = fp.sr_catch_rate;
+                  const catchColor = catchRate == null ? 'text-neutral-500' : catchRate >= 0.7 ? 'text-emerald-400' : catchRate >= 0.4 ? 'text-amber-400' : 'text-red-400';
+                  const delta = fp.sr_catch_rate_delta_vs_project_mean;
+                  const deltaColor = delta == null ? '' : delta >= 0 ? 'text-emerald-400' : 'text-red-400';
                   return (
-                    <div
-                      key={d.direction_id}
-                      className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2"
-                    >
-                      <div className="flex items-baseline gap-2 mb-1">
-                        <span
-                          className={`font-mono font-bold tabular-nums text-sm ${rateColor}`}
-                          title="overall SR catch rate for this direction"
-                        >
-                          {rate != null ? `${Math.round(rate * 100)}%` : '–'}
-                        </span>
-                        {hasSparkline && (
-                          <MissRateSparkline
-                            history={rateHistory}
-                            width={36}
-                            height={12}
-                            stroke={sparklineStroke}
-                            title="catch-rate history (5 most recent samples)"
-                          />
-                        )}
-                        <TrendIcon trend={trend} />
-                        {delta != null && (
-                          <span className={`font-mono tabular-nums text-xs ${deltaColorClass(delta)}`} title="miss-rate cycle-over-cycle change">
-                            {formatDelta(delta)}
-                          </span>
-                        )}
-                        <span
-                          className="text-[10px] text-neutral-300 truncate flex-1"
-                          title={d.direction_text}
-                          onClick={() => onDirectionClick?.(d.direction_id)}
-                          role={onDirectionClick ? 'button' : undefined}
-                          style={onDirectionClick ? { cursor: 'pointer' } : undefined}
-                        >
-                          {d.direction_text || d.direction_id}
-                        </span>
-                        <span className="text-[9px] text-neutral-600 shrink-0">n={d.sample_size}</span>
+                    <div key={fp.fingerprint} className="bg-neutral-900/50 border border-neutral-800/50 rounded px-2 py-1.5 text-[11px]">
+                      <div className="flex items-center gap-2 mb-0.5">
+                        <span className="font-mono text-neutral-400 text-[10px]">{fp.fingerprint.slice(0, 12)}…</span>
+                        <span className="text-neutral-600 text-[10px]">n={fp.sample_size}</span>
                       </div>
-                      {d.worst_category && d.categories[d.worst_category] && (() => {
-                        const worst = d.categories[d.worst_category];
-                        if (!worst) return null;
-                        return (
-                          <p className="text-[9px] text-neutral-500">
-                            worst: <span className="text-orange-400 font-mono">{d.worst_category}</span>
-                            {worst.miss_rate != null && (
-                              <span className="ml-1 font-mono text-orange-400">{Math.round(worst.miss_rate * 100)}% miss</span>
-                            )}
-                          </p>
-                        );
-                      })()}
+                      <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-[10px] text-neutral-500">
+                        <span>catch <span className={`font-semibold ${catchColor}`}>{catchRate != null ? `${Math.round(catchRate * 100)}%` : '--'}</span>{' '}<span className="text-neutral-600">n={fp.sr_catch_sample_size}</span>{delta != null && <span className={`ml-1 ${deltaColor}`}>({delta >= 0 ? '+' : ''}{Math.round(delta * 100)}pp)</span>}</span>
+                        <span>rescue <span className="font-semibold text-neutral-300">{fp.reviewer_rescue_rate != null ? `${Math.round(fp.reviewer_rescue_rate * 100)}%` : '--'}</span>{' '}<span className="text-neutral-600">n={fp.reviewer_rescue_sample_size}</span></span>
+                        {fp.sr_false_positive_rate != null && <span>FP <span className="font-semibold text-neutral-300">{Math.round(fp.sr_false_positive_rate * 100)}%</span>{' '}<span className="text-neutral-600">n={fp.sr_false_positive_sample_size}</span></span>}
+                      </div>
+                      {fp.sr_reviewer_disagreement_top_categories.length > 0 && (
+                        <div className="flex flex-wrap gap-1 mt-1">
+                          {fp.sr_reviewer_disagreement_top_categories.slice(0, 3).map((d) => (
+                            <span key={d.category} className="text-[9px] px-1 py-0.5 rounded bg-neutral-800/60 text-neutral-400 border border-neutral-700/40">
+                              {d.category}
+                            </span>
+                          ))}
+                        </div>
+                      )}
                     </div>
                   );
                 })}

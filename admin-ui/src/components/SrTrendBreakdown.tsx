@@ -92,6 +92,12 @@ export interface SrSeverityBucket {
   trend?: 'improving' | 'stable' | 'regressing';
 }
 
+export interface ExecutionEvidenceMissRate {
+  miss_rate?: number | null;
+  miss_count?: number | null;
+  sample_count?: number | null;
+}
+
 export interface SrTrendData {
   computed_at?: string | null;
   bucket_mode?: 'cycle' | 'calendar' | null;
@@ -99,11 +105,19 @@ export interface SrTrendData {
   previous_cycle_id?: string | null;
   /** Short version stamp of the SR prompt active in the current window (e.g. "a1b2c3"). */
   prompt_version?: string | null;
+  /** True when the current measurement window contains tasks from multiple SR prompt regimes — within-window attribution is unreliable. */
+  mixed_prompt_versions?: boolean | null;
+  /** True when the current window's prompt version differs from the previous window's — cycle-over-cycle delta may reflect guidance change, not genuine catch-rate change. */
+  prompt_version_changed?: boolean | null;
   categories?: Record<string, SrCategoryTrend> | null;
   by_task_type?: Record<string, Record<string, SrTaskTypeCategoryStats>> | null;
+  by_fix_iteration?: Record<string, Record<string, SrTaskTypeCategoryStats>> | null;
   sr_skip_rate?: number | null;
   sr_skip_reason_distribution?: Record<string, number> | null;
   by_severity?: Record<string, SrSeverityBucket> | null;
+  by_direction?: Record<string, Record<string, DirectionSrCatStat>> | null;
+  execution_evidence_miss_rates?: Record<string, ExecutionEvidenceMissRate> | null;
+  edges_considered_stats?: Record<string, number> | null;
 }
 
 const SKIP_RATE_AMBER_THRESHOLD = 0.25;
@@ -570,10 +584,18 @@ export function EdgesTrendBreakdown({ trend }: { trend: EdgesTrend | null | unde
 }
 
 export interface DirectionSrCatStat {
-  human_count: number;
-  hit_count: number;
+  sample_count: number;
+  hit_rate?: number | null;
   miss_rate: number | null;
-  miss_examples: Array<{ desc: string; severity: string }>;
+  all_iterations_miss_rate?: number | null;
+  weighted_miss_rate?: number | null;
+  false_positive_rate?: number | null;
+  precision?: number | null;
+  sr_alone_hit_count?: number | null;
+  reviewer_save_hit_count?: number | null;
+  sr_alone_hit_rate?: number | null;
+  reviewer_save_rate?: number | null;
+  examples?: Array<{ desc: string; severity: string }>;
 }
 
 export interface DirectionSrEntry {
@@ -582,6 +604,9 @@ export interface DirectionSrEntry {
   sample_size: number;
   overall_catch_rate: number | null;
   worst_category: string | null;
+  prompt_version?: string | null;
+  mixed_prompt_versions?: boolean | null;
+  prompt_version_changed?: boolean | null;
   categories: Record<string, DirectionSrCatStat>;
 }
 
@@ -624,6 +649,12 @@ export function DirectionSrBreakdownPanel({
               >
                 {d.direction_text || d.direction_id}
               </span>
+              {d.mixed_prompt_versions && (
+                <span className="text-[9px] text-amber-400 font-mono shrink-0" title="Tasks from multiple SR prompt versions — attribution unreliable">mixed v</span>
+              )}
+              {!d.mixed_prompt_versions && d.prompt_version && (
+                <span className="text-[9px] text-amber-600 font-mono shrink-0" title="SR prompt version for this window">{`v=${d.prompt_version.slice(0, 7)}`}</span>
+              )}
               <span className="text-[9px] text-neutral-600 shrink-0">n={d.sample_size}</span>
             </div>
             {cats.length > 0 && (
@@ -635,11 +666,24 @@ export function DirectionSrBreakdownPanel({
                       {s.miss_rate != null && (
                         <span className="font-mono text-orange-400">{Math.round(s.miss_rate * 100)}% miss</span>
                       )}
-                      <span className="text-neutral-600 ml-auto">n={s.human_count}</span>
+                      {s.all_iterations_miss_rate != null && (
+                        <span className="font-mono text-sky-600" title="all-iterations miss rate">{`all:${Math.round(s.all_iterations_miss_rate * 100)}%`}</span>
+                      )}
+                      {s.false_positive_rate != null && (
+                        <span className={`font-mono ${fpRateColorClass(s.false_positive_rate)}`} title="false-positive rate">{`fp:${Math.round(s.false_positive_rate * 100)}%`}</span>
+                      )}
+                      <span className="text-neutral-600 ml-auto">n={s.sample_count}</span>
                     </div>
-                    {s.miss_examples.length > 0 && (
+                    {(s.sr_alone_hit_rate != null || s.reviewer_save_rate != null) && (
+                      <div className="flex items-center gap-1 text-[9px] text-neutral-500 font-mono ml-3 mt-0.5">
+                        <span>SR-alone {s.sr_alone_hit_rate != null ? `${Math.round(s.sr_alone_hit_rate * 100)}%` : '–'}</span>
+                        <span className="text-neutral-700">·</span>
+                        <span>reviewer-save {s.reviewer_save_rate != null ? `${Math.round(s.reviewer_save_rate * 100)}%` : '–'}</span>
+                      </div>
+                    )}
+                    {(s.examples ?? []).length > 0 && (
                       <ExampleList
-                        examples={s.miss_examples.map(e => ({
+                        examples={(s.examples ?? []).map(e => ({
                           severity: e.severity as SrMissExample['severity'],
                           desc: e.desc,
                         }))}
@@ -940,6 +984,24 @@ export function SrTrendBreakdown({ trends, variant, onCategoryClick }: SrTrendBr
           )}
           {promptVersionLabel && (
             <span className="text-[9px] text-amber-600 font-mono" title="SR prompt version for this window">{promptVersionLabel}</span>
+          )}
+          {trends?.mixed_prompt_versions && (
+            <span
+              data-testid="mixed-prompt-versions-badge"
+              className="text-[9px] text-amber-400 font-mono ml-auto"
+              title="This window contains tasks from multiple SR prompt regimes — attribution is unreliable"
+            >
+              mixed versions
+            </span>
+          )}
+          {!trends?.mixed_prompt_versions && trends?.prompt_version_changed && (
+            <span
+              data-testid="prompt-version-changed-badge"
+              className="text-[9px] text-amber-600 font-mono ml-auto"
+              title="SR prompt version changed since the previous window — cycle-over-cycle delta may reflect guidance change, not genuine catch-rate shift"
+            >
+              version changed
+            </span>
           )}
         </div>
         {skipRate != null && (

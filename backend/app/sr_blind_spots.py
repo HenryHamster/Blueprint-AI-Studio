@@ -557,6 +557,15 @@ def aggregate_sr_scope_drift_vs_expansion(
     }
 
 
+_REVIEWER_ORIGINS = frozenset(
+    (
+        "reviewer",
+        "reviewer_disagreement",
+        "reviewer_recovery_after_incomplete_sr",
+    )
+)
+
+
 def _count_reviewer_disagreement_directions(tasks) -> Dict[tuple, Dict[str, int]]:
     counts: Dict[tuple, Dict[str, int]] = defaultdict(
         lambda: {"miss": 0, "tp": 0, "fp": 0}
@@ -569,22 +578,43 @@ def _count_reviewer_disagreement_directions(tasks) -> Dict[tuple, Dict[str, int]
         sro = ctx.get("_self_review_outcome")
         if not sro or is_skipped_sr_outcome(sro):
             continue
-        reviewer_findings = sro.get("reviewer_findings") or []
         check_results = sro.get("check_results") or {}
+        reviewer_findings = sro.get("reviewer_findings") or []
         reviewer_cats = {
             finding.get("category")
             for finding in reviewer_findings
             if isinstance(finding, dict) and finding.get("category")
         }
+
+        # Use structured origin to identify reviewer-rescued categories.
+        # Fall back to the absent/passed heuristic for pre-origin outcomes.
+        origin_rescued = {
+            cat
+            for cat, result in check_results.items()
+            if isinstance(result, dict) and result.get("origin") in _REVIEWER_ORIGINS
+        }
+        if origin_rescued:
+            missed_cats = origin_rescued
+        else:
+            missed_cats = {
+                cat
+                for cat in reviewer_cats
+                if check_results.get(cat) is None
+                or (check_results.get(cat) or {}).get("passed", True)
+            }
+
+        # Author-flagged failures: exclude reviewer-rescued entries so they
+        # don't double-count as TP/FP when origin_rescued is present.
         sr_failed = {
             cat
             for cat, result in check_results.items()
-            if not result.get("passed", True)
+            if isinstance(result, dict)
+            and not result.get("passed", True)
+            and result.get("origin") not in _REVIEWER_ORIGINS
         }
-        for cat in reviewer_cats:
-            cr = check_results.get(cat)
-            if cr is None or cr.get("passed", True):
-                counts[(cat, task_type)]["miss"] += 1
+
+        for cat in missed_cats:
+            counts[(cat, task_type)]["miss"] += 1
         for cat in sr_failed:
             bucket = counts[(cat, task_type)]
             if cat in reviewer_cats:

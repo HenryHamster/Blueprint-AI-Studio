@@ -135,6 +135,7 @@ function setupApiMocks({
   accountHealth,
   systemMaturity,
   directionSrBreakdown,
+  promptFingerprintAnalytics,
 }: {
   digest?: unknown;
   diagnostics?: unknown;
@@ -144,6 +145,7 @@ function setupApiMocks({
   accountHealth?: unknown;
   systemMaturity?: unknown;
   directionSrBreakdown?: unknown;
+  promptFingerprintAnalytics?: unknown;
 }) {
   apiFetchMock.mockImplementation((url: string) => {
     if (url.includes('/api/admin/digest')) return Promise.resolve(jsonResponse(digest ?? {}));
@@ -154,6 +156,7 @@ function setupApiMocks({
     if (url.includes('/api/admin/max-plan-accounts/health')) return Promise.resolve(jsonResponse(accountHealth ?? { accounts: [] }));
     if (url.includes('/system-maturity')) return Promise.resolve(jsonResponse(systemMaturity ?? []));
     if (url.includes('/direction-sr-breakdown')) return Promise.resolve(directionSrBreakdown ? jsonResponse(directionSrBreakdown) : notFoundResponse());
+    if (url.includes('/prompt-fingerprint-analytics')) return Promise.resolve(promptFingerprintAnalytics ? jsonResponse(promptFingerprintAnalytics) : notFoundResponse());
     // Unmatched endpoints (sr-blind-spots, sr-reviewer-disagreements,
     // sr-recent-misses, regression-cases, task-duration-stats, etc.) return 404 so the
     // component leaves the corresponding state slot at its initial null/[] sentinel rather
@@ -973,6 +976,68 @@ describe('DashboardHome', () => {
       await screen.findByText('SR Approval Lift');
       expect(screen.queryByText('SR Self-Fix Path')).not.toBeInTheDocument();
     });
+  });
+
+  it('renders prompt fingerprint SR quality section when data is available', async () => {
+    setupApiMocks({
+      digest: { failed_count: 0, pending_approval_count: 0, completed_count: 0, failure_groups: [], direction_progress: [], recent_completions: [] },
+      diagnostics: makeDiagnostics(),
+      promptFingerprintAnalytics: {
+        project_id: 'proj1',
+        window_days: 30,
+        sample_size: 150,
+        project_first_attempt_success_rate: 0.88,
+        project_sr_skip_rate: 0.05,
+        fingerprints: [
+          {
+            fingerprint: 'abc123def456xyz789',
+            sample_size: 80,
+            first_attempt_measured: 70,
+            first_attempt_success_rate: 0.9,
+            sr_skip_rate: 0.04,
+            rejection_category_counts: {},
+            delta_vs_project_mean: 0.02,
+            sr_sample_size: 65,
+            sr_catch_rate: 0.72,
+            sr_catch_sample_size: 40,
+            reviewer_rescue_rate: 0.15,
+            reviewer_rescue_sample_size: 30,
+            sr_false_positive_rate: 0.08,
+            sr_false_positive_sample_size: 25,
+            sr_false_positive_rate_by_category: [],
+            sr_reviewer_disagreement_top_categories: [
+              { category: 'correctness', sample_size: 20, reviewer_overrode_sr_count: 3, sr_overrode_reviewer_count: 1 },
+            ],
+            sr_catch_rate_delta_vs_project_mean: 0.05,
+          },
+        ],
+      },
+    });
+
+    render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+
+    expect(await screen.findByTestId('prompt-fingerprint-sr-quality')).toBeInTheDocument();
+    expect(screen.getByText('Prompt Fingerprint SR Quality')).toBeInTheDocument();
+    // catch rate 72%
+    expect(screen.getByText(/72%/)).toBeInTheDocument();
+    // delta +5pp
+    expect(screen.getByText(/\(\+5pp\)/)).toBeInTheDocument();
+    // rescue rate 15%
+    expect(screen.getByText(/15%/)).toBeInTheDocument();
+    // disagreement category badge
+    expect(screen.getByText('correctness')).toBeInTheDocument();
+  });
+
+  it('does not render prompt fingerprint SR quality section when no data', async () => {
+    setupApiMocks({
+      digest: { failed_count: 0, pending_approval_count: 0, completed_count: 0, failure_groups: [], direction_progress: [], recent_completions: [] },
+      diagnostics: makeDiagnostics(),
+    });
+
+    render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+
+    await screen.findByText('All systems healthy');
+    expect(screen.queryByTestId('prompt-fingerprint-sr-quality')).not.toBeInTheDocument();
   });
 
   it('renders fix-iteration SR breakdown buckets when by_fix_iteration data is present', async () => {

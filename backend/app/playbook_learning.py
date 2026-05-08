@@ -41,6 +41,7 @@ from app.models import (
     TaskStatus,
     _utcnow,
 )
+from app.sr_blind_spots import _REVIEWER_ORIGINS
 
 # In-app Alert row title prefixes for SR catch-rate alerts. The router that
 # powers AlertsBanner returns Alert rows verbatim; we use these prefixes both
@@ -1099,6 +1100,25 @@ def _categorize_review_issues(
     if cached is not None:
         return cached
     return _categorize_review_issues_keyword(review_history)
+
+
+def resolve_sr_miss_human_truth(ctx: dict) -> set[str]:
+    """Return the best available set of human-flagged review categories for a task.
+
+    Uses the same three-tier precedence as ``_stats_for_tasks``:
+    1. ``_all_iterations_rejection_categories`` (persisted across all review rounds)
+    2. Keyword-categorised ``review_loop.review_history`` (covers late-iteration issues)
+    3. ``_first_attempt_rejection_categories`` (backward-compatible fallback)
+
+    Returns an empty set when none of the sources are present.
+    """
+    stored_all_iter = ctx.get("_all_iterations_rejection_categories") or {}
+    if stored_all_iter:
+        return set(stored_all_iter.keys())
+    rev_hist = (ctx.get("review_loop") or {}).get("review_history") or []
+    if rev_hist:
+        return set(_categorize_review_issues_keyword(rev_hist).keys())
+    return set(ctx.get("_first_attempt_rejection_categories") or {})
 
 
 _VALID_CATEGORIES = set(_REVIEW_CATEGORIES.keys()) | {"other"}
@@ -2528,7 +2548,18 @@ def _stats_for_tasks(
         if "_self_review_outcome" not in ctx:
             continue
         check_results = ctx["_self_review_outcome"].get("check_results") or {}
+        # Combined view (author SR + reviewer save) — feeds hit/origin-split
+        # counters below where _origin_bucket separates `sr_alone` vs
+        # `reviewer_save`, so reviewer-stamped entries must remain present.
         sr_failed = {c for c, r in check_results.items() if not r.get("passed", True)}
+        # Author-only view — used for FP/sr_failed_count attribution. A
+        # reviewer-stamped failure does not represent something the author SR
+        # caught, so it must not inflate the precision/false-positive metrics.
+        sr_failed_author = {
+            c
+            for c in sr_failed
+            if (check_results.get(c) or {}).get("origin") not in _REVIEWER_ORIGINS
+        }
         rev_hist = (ctx.get("review_loop") or {}).get("review_history") or []
         cat_weights: dict[str, int] = {}
         rev_cats: dict[str, list[dict]] = {}
@@ -2542,8 +2573,10 @@ def _stats_for_tasks(
         # any human reviewer across all review iterations (first rejection OR later).
         # Runs for every task (even those with no first-attempt rejection) because
         # those are exactly the cases where SR may have flagged a false positive.
+        # Uses the author-only view so reviewer-stamped overrides are not
+        # falsely attributed to the author SR's precision.
         all_human_flagged = set(rev_cats.keys()) | human_cats
-        for cat in sr_failed:
+        for cat in sr_failed_author:
             if cat not in cat_stats:
                 cat_stats[cat] = {
                     "hit_count": 0,
@@ -2804,9 +2837,15 @@ def compute_sr_catch_rate_by_direction(
                 if total_samples
                 else None
             )
+            overall_catch_rate = (
+                round(1 - weighted_miss_rate, 3)
+                if weighted_miss_rate is not None
+                else None
+            )
             entry: dict[str, Any] = {
                 "sample_count": count,
                 "miss_rate": weighted_miss_rate,
+                "overall_catch_rate": overall_catch_rate,
                 "categories": categories,
             }
             if existing_by_direction is not None:
@@ -2837,6 +2876,41 @@ def compute_sr_catch_rate_by_direction(
     )
 
 
+def compute_direction_sr_breakdown_for_endpoint(
+    all_tasks: list,
+    direction_text_map: dict[str, str],
+    *,
+    existing_by_direction: Optional[dict] = None,
+) -> list[dict[str, Any]]:
+    """Endpoint-shaped per-direction SR breakdown.
+
+    Wraps :func:`compute_sr_catch_rate_by_direction` and decorates each entry
+    with ``direction_text`` (looked up from *direction_text_map*), exposes
+    ``sample_size`` (alias of canonical ``sample_count``), and adds
+    ``worst_category`` derived from the canonical worst-first ordering of
+    categories. Returned list preserves canonical worst-first direction
+    ordering.
+    """
+    canonical = compute_sr_catch_rate_by_direction(
+        all_tasks, existing_by_direction=existing_by_direction
+    )
+    out: list[dict[str, Any]] = []
+    for direction_id, entry in canonical.items():
+        categories = entry.get("categories") or {}
+        worst_category = next(iter(categories), None)
+        out.append(
+            {
+                "direction_id": direction_id,
+                "direction_text": direction_text_map.get(direction_id, ""),
+                "sample_size": entry["sample_count"],
+                "overall_catch_rate": entry.get("overall_catch_rate"),
+                "categories": categories,
+                "worst_category": worst_category,
+            }
+        )
+    return out
+
+
 def _compute_cat_fp_stats(
     tasks: list,
 ) -> tuple[dict[str, dict[str, int]], dict[str, dict[str, dict[str, int]]]]:
@@ -2858,7 +2932,15 @@ def _compute_cat_fp_stats(
         if not sro:
             continue
         check_results = sro.get("check_results") or {}
-        sr_failed = {c for c, r in check_results.items() if not r.get("passed", True)}
+        # Author SR failures only — exclude reviewer-stamped overrides so a
+        # reviewer rescue is never attributed to the author SR as a TP/FP.
+        sr_failed = {
+            c
+            for c, r in check_results.items()
+            if isinstance(r, dict)
+            and not r.get("passed", True)
+            and r.get("origin") not in _REVIEWER_ORIGINS
+        }
         if not sr_failed:
             continue
         reviewer_cats = {
@@ -2884,6 +2966,188 @@ def _compute_cat_fp_stats(
                 bucket["fp"] += 1
                 tbucket["fp"] += 1
     return cat_fp, type_cat_fp
+
+
+def _task_prompt_fingerprint(task: Task) -> str:
+    """Resolve the task's prompt fingerprint with legacy context fallback."""
+    if isinstance(task.prompt_fingerprint, str) and task.prompt_fingerprint:
+        return task.prompt_fingerprint
+    ctx = task.context or {}
+    legacy = ctx.get("prompt_fingerprint")
+    if isinstance(legacy, str) and legacy:
+        return legacy
+    return "unknown"
+
+
+def compute_sr_quality_by_fingerprint(
+    tasks: list,
+    *,
+    min_sample_size: int = 3,
+    top_disagreement_categories: int = 3,
+) -> dict[str, dict[str, Any]]:
+    """Compute additive SR-quality metrics for prompt fingerprint analytics."""
+    from app.sr_blind_spots import is_skipped_sr_outcome  # noqa: PLC0415
+
+    buckets: dict[str, dict[str, Any]] = {}
+    project_catch_hits = 0
+    project_catch_total = 0
+    for task in tasks:
+        if (task.first_payload or {}).get("type") not in _SR_CODE_CHANGE_TYPES:
+            continue
+        fp = _task_prompt_fingerprint(task)
+        bucket = buckets.setdefault(
+            fp,
+            {
+                "tasks": [],
+                "sr_sample_size": 0,
+                "catch_hits": 0,
+                "catch_total": 0,
+                "reviewer_rescues": 0,
+                "reviewer_rescue_total": 0,
+                "disagreements": {},
+            },
+        )
+        bucket["tasks"].append(task)
+        ctx = task.context or {}
+        sro = ctx.get("_self_review_outcome")
+        if not sro or is_skipped_sr_outcome(sro):
+            continue
+        bucket["sr_sample_size"] += 1
+        check_results = sro.get("check_results") or {}
+        sr_failed = {
+            cat
+            for cat, result in check_results.items()
+            if isinstance(result, dict)
+            and not result.get("passed", True)
+            and result.get("origin") not in _REVIEWER_ORIGINS
+        }
+        reviewer_cats = {
+            finding.get("category")
+            for finding in (sro.get("reviewer_findings") or [])
+            if isinstance(finding, dict) and finding.get("category")
+        }
+        rev_hist = (ctx.get("review_loop") or {}).get("review_history") or []
+        confirmed = (
+            reviewer_cats
+            | set(ctx.get("_first_attempt_rejection_categories") or {})
+            | set(_categorize_review_issues(rev_hist).keys())
+        )
+        hits = len(confirmed & sr_failed)
+        misses = confirmed - sr_failed
+        bucket["catch_hits"] += hits
+        bucket["catch_total"] += len(confirmed)
+        bucket["reviewer_rescue_total"] += len(misses)
+        bucket["reviewer_rescues"] += len(misses & reviewer_cats)
+        project_catch_hits += hits
+        project_catch_total += len(confirmed)
+        for cat in reviewer_cats - sr_failed:
+            entry = bucket["disagreements"].setdefault(
+                cat, {"reviewer_overrode_sr_count": 0, "sr_overrode_reviewer_count": 0}
+            )
+            entry["reviewer_overrode_sr_count"] += 1
+        for cat in sr_failed - reviewer_cats:
+            entry = bucket["disagreements"].setdefault(
+                cat, {"reviewer_overrode_sr_count": 0, "sr_overrode_reviewer_count": 0}
+            )
+            entry["sr_overrode_reviewer_count"] += 1
+
+    project_catch_rate = (
+        round(project_catch_hits / project_catch_total, 3)
+        if project_catch_total
+        else None
+    )
+    results: dict[str, dict[str, Any]] = {}
+    for fp, bucket in buckets.items():
+        result: dict[str, Any] = {"sr_sample_size": bucket["sr_sample_size"]}
+        if bucket["sr_sample_size"] < min_sample_size:
+            result.update(
+                {
+                    "sr_catch_rate": None,
+                    "sr_catch_sample_size": bucket["catch_total"],
+                    "reviewer_rescue_rate": None,
+                    "reviewer_rescue_sample_size": bucket["reviewer_rescue_total"],
+                    "sr_false_positive_rate": None,
+                    "sr_false_positive_sample_size": 0,
+                    "sr_false_positive_rate_by_category": [],
+                    "sr_reviewer_disagreement_top_categories": [],
+                    "sr_catch_rate_delta_vs_project_mean": None,
+                }
+            )
+            results[fp] = result
+            continue
+        cat_fp_stats, _ = _compute_cat_fp_stats(bucket["tasks"])
+        fp_total = sum(stats.get("fp", 0) for stats in cat_fp_stats.values())
+        tp_total = sum(stats.get("tp", 0) for stats in cat_fp_stats.values())
+        catch_rate = (
+            round(bucket["catch_hits"] / bucket["catch_total"], 3)
+            if bucket["catch_total"]
+            else None
+        )
+        result.update(
+            {
+                "sr_catch_rate": catch_rate,
+                "sr_catch_sample_size": bucket["catch_total"],
+                "reviewer_rescue_rate": (
+                    round(
+                        bucket["reviewer_rescues"] / bucket["reviewer_rescue_total"], 3
+                    )
+                    if bucket["reviewer_rescue_total"]
+                    else None
+                ),
+                "reviewer_rescue_sample_size": bucket["reviewer_rescue_total"],
+                "sr_false_positive_rate": (
+                    round(fp_total / (fp_total + tp_total), 3)
+                    if (fp_total + tp_total)
+                    else None
+                ),
+                "sr_false_positive_sample_size": fp_total + tp_total,
+                "sr_false_positive_rate_by_category": [
+                    {
+                        "category": cat,
+                        "sample_size": stats.get("fp", 0) + stats.get("tp", 0),
+                        "false_positive_rate": round(
+                            stats.get("fp", 0)
+                            / (stats.get("fp", 0) + stats.get("tp", 0)),
+                            3,
+                        ),
+                        "fp_count": stats.get("fp", 0),
+                        "tp_count": stats.get("tp", 0),
+                    }
+                    for cat, stats in sorted(
+                        cat_fp_stats.items(),
+                        key=lambda item: (
+                            -(item[1].get("fp", 0) + item[1].get("tp", 0)),
+                            item[0],
+                        ),
+                    )
+                ],
+                "sr_reviewer_disagreement_top_categories": [
+                    {
+                        "category": cat,
+                        "sample_size": counts["reviewer_overrode_sr_count"]
+                        + counts["sr_overrode_reviewer_count"],
+                        **counts,
+                    }
+                    for cat, counts in sorted(
+                        bucket["disagreements"].items(),
+                        key=lambda item: (
+                            -(
+                                item[1]["reviewer_overrode_sr_count"]
+                                + item[1]["sr_overrode_reviewer_count"]
+                            ),
+                            item[0],
+                        ),
+                    )[:top_disagreement_categories]
+                ],
+                "sr_catch_rate_delta_vs_project_mean": (
+                    round(catch_rate - project_catch_rate, 3)
+                    if catch_rate is not None and project_catch_rate is not None
+                    else None
+                ),
+            }
+        )
+        results[fp] = result
+    return results
 
 
 def _compute_reasoning_engagement(
@@ -2932,6 +3196,18 @@ def _compute_reasoning_engagement(
     return result
 
 
+def _collect_prompt_versions(tasks: list) -> dict:
+    """Return a Counter of prompt_version values seen in _self_review_outcome."""
+    from collections import Counter  # noqa: PLC0415
+
+    c: Counter = Counter()
+    for t in tasks:
+        pv = (t.context or {}).get("_self_review_outcome", {}).get("prompt_version")
+        if pv is not None:
+            c[str(pv)] += 1
+    return c
+
+
 async def compute_sr_catch_rate_trends(
     project_id: uuid.UUID,
     session: AsyncSession,
@@ -2968,6 +3244,7 @@ async def compute_sr_catch_rate_trends(
     previous_stats: dict[str, dict] = {}
     current_type_stats: dict[str, dict[str, dict]] = {}
     current_window_tasks: list = []
+    previous_window_tasks: list = []
     current_all_iter_stats: dict[str, dict] = {}
     previous_all_iter_stats: dict[str, dict] = {}
     current_sev_stats: dict[str, dict] = {}
@@ -3007,6 +3284,7 @@ async def compute_sr_catch_rate_trends(
                 previous_stats = p_stats
                 current_type_stats = c_type_stats
                 current_window_tasks = task_by_cycle.get(c_cycle.id, [])
+                previous_window_tasks = task_by_cycle.get(p_cycle.id, [])
                 current_all_iter_stats = c_all_iter
                 previous_all_iter_stats = p_all_iter
                 current_sev_stats = c_sev
@@ -3043,6 +3321,7 @@ async def compute_sr_catch_rate_trends(
             previous_sev_stats,
         ) = _stats_for_tasks(cal_previous)
         current_window_tasks = cal_current
+        previous_window_tasks = cal_previous
 
     if current_count < _MIN_SR_SAMPLE or previous_count < _MIN_SR_SAMPLE:
         return None
@@ -3328,6 +3607,18 @@ async def compute_sr_catch_rate_trends(
         }
 
     edges_stats = _compute_edges_stats(all_tasks)
+
+    # Prompt-version awareness: detect mixed-regime windows so the agent can
+    # caveat calibration surfaces and avoid mistaking prompt rollouts for regressions.
+    pv_counter = _collect_prompt_versions(current_window_tasks)
+    pv_counter_prev = _collect_prompt_versions(previous_window_tasks)
+    current_prompt_version: Optional[str] = (
+        pv_counter.most_common(1)[0][0] if pv_counter else None
+    )
+    prev_prompt_version: Optional[str] = (
+        pv_counter_prev.most_common(1)[0][0] if pv_counter_prev else None
+    )
+
     result: dict[str, Any] = {
         "computed_at": now.isoformat(),
         "signal_last_computed_at": now.isoformat(),
@@ -3338,7 +3629,19 @@ async def compute_sr_catch_rate_trends(
         "by_task_type": by_task_type,
         "by_severity": by_severity,
         "edges_considered_stats": edges_stats,
+        "sr_skip_rate": sr_skip_rate,
+        "sr_skip_reason_distribution": sr_skip_dist if sr_skip_dist is not None else {},
     }
+    if current_prompt_version is not None:
+        result["prompt_version"] = current_prompt_version
+    if len(pv_counter) > 1:
+        result["mixed_prompt_versions"] = True
+    if (
+        current_prompt_version is not None
+        and prev_prompt_version is not None
+        and current_prompt_version != prev_prompt_version
+    ):
+        result["prompt_version_changed"] = True
     if sr_skip_rate is not None:
         result["sr_skip_rate"] = sr_skip_rate
         result["sr_skip_reason_distribution"] = sr_skip_dist
@@ -3348,12 +3651,10 @@ async def compute_sr_catch_rate_trends(
         existing_by_direction=existing.get("by_direction") or {},
         is_new_window=is_new_window,
     )
-    if by_direction:
-        result["by_direction"] = by_direction
+    result["by_direction"] = by_direction or {}
 
     exec_evidence = _compute_execution_evidence_miss_rates(current_window_tasks)
-    if exec_evidence:
-        result["execution_evidence_miss_rates"] = exec_evidence
+    result["execution_evidence_miss_rates"] = exec_evidence or {}
 
     doc["sr_catch_rate_trends"] = result
     project.design_doc = doc
@@ -3974,8 +4275,15 @@ async def compute_fresh_reviewer_trend(
             check_results = (
                 ctx.get("_self_review_outcome", {}).get("check_results") or {}
             )
+            # Author SR failures only — a reviewer-stamped override means the
+            # author SR did NOT catch the category, so it must still count
+            # toward `cat_added_value` when the human confirms the rescue.
             agent_failed = {
-                c for c, r in check_results.items() if not r.get("passed", True)
+                c
+                for c, r in check_results.items()
+                if isinstance(r, dict)
+                and not r.get("passed", True)
+                and r.get("origin") not in _REVIEWER_ORIGINS
             }
             for finding in findings:
                 cat = finding.get("category") if isinstance(finding, dict) else None
@@ -4690,7 +4998,16 @@ def get_sr_alert_drilldown_tasks(
         if "_self_review_outcome" not in ctx:
             continue
         check_results = ctx["_self_review_outcome"].get("check_results") or {}
-        sr_failed = {c for c, r in check_results.items() if not r.get("passed", True)}
+        # Author SR failures only — a reviewer-rescued category should still
+        # surface in the drilldown as `missed_in_target` because the SR itself
+        # did not catch it.
+        sr_failed = {
+            c
+            for c, r in check_results.items()
+            if isinstance(r, dict)
+            and not r.get("passed", True)
+            and r.get("origin") not in _REVIEWER_ORIGINS
+        }
         human_cats = set(ctx.get("_first_attempt_rejection_categories") or [])
         missed_in_target = (human_cats & target_cats) - sr_failed
         if not missed_in_target:

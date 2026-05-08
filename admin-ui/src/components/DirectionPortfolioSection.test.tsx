@@ -137,7 +137,7 @@ describe('DirectionPortfolioSection', () => {
           overall_catch_rate: 0.6,
           worst_category: 'correctness',
           categories: {
-            correctness: { miss_rate: 0.4, human_count: 5, miss_examples: [{ desc: 'missed a bug', severity: 'HIGH' }] },
+            correctness: { miss_rate: 0.4, sample_count: 5, examples: [{ desc: 'missed a bug', severity: 'HIGH' }] },
           },
         }],
       }),

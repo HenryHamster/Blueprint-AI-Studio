@@ -211,6 +211,7 @@ export interface SrRecentMiss {
   title: string;
   scope: string | null;
   task_type: string | null;
+  created_at?: string | null;
   missed_categories: string[];
   caught_categories: string[];
   pr_url: string | null;
@@ -239,10 +240,14 @@ export async function fetchSrRecentMisses(
 }
 
 export interface DirectionSrCatStat {
-  human_count: number;
-  hit_count: number;
+  sample_count: number;
+  hit_rate?: number | null;
   miss_rate: number | null;
-  miss_examples: Array<{ desc: string; severity: string }>;
+  examples?: Array<{ desc: string; severity: string }>;
+  sr_alone_hit_count?: number | null;
+  reviewer_save_hit_count?: number | null;
+  sr_alone_hit_rate?: number | null;
+  reviewer_save_rate?: number | null;
 }
 
 export interface DirectionSrEntry {
@@ -353,6 +358,65 @@ export interface SrFixIterationBucket {
 }
 
 export type SrFixIterationBreakdown = Record<string, SrFixIterationBucket>;
+
+export interface SrFalsePositiveCategoryStat {
+  category: string;
+  sample_size: number;
+  false_positive_rate: number;
+  fp_count: number;
+  tp_count: number;
+}
+
+export interface SrReviewerDisagreementCategory {
+  category: string;
+  sample_size: number;
+  reviewer_overrode_sr_count: number;
+  sr_overrode_reviewer_count: number;
+}
+
+export interface PromptFingerprintEntry {
+  fingerprint: string;
+  sample_size: number;
+  first_attempt_measured: number;
+  first_attempt_success_rate: number | null;
+  sr_skip_rate: number | null;
+  rejection_category_counts: Record<string, number>;
+  delta_vs_project_mean: number | null;
+  sr_sample_size: number;
+  sr_catch_rate: number | null;
+  sr_catch_sample_size: number;
+  reviewer_rescue_rate: number | null;
+  reviewer_rescue_sample_size: number;
+  sr_false_positive_rate: number | null;
+  sr_false_positive_sample_size: number;
+  sr_false_positive_rate_by_category: SrFalsePositiveCategoryStat[];
+  sr_reviewer_disagreement_top_categories: SrReviewerDisagreementCategory[];
+  sr_catch_rate_delta_vs_project_mean: number | null;
+}
+
+export interface PromptFingerprintAnalyticsResponse {
+  project_id: string;
+  window_days: number;
+  sample_size: number;
+  project_first_attempt_success_rate: number | null;
+  project_sr_skip_rate: number | null;
+  fingerprints: PromptFingerprintEntry[];
+}
+
+export async function fetchPromptFingerprintAnalytics(
+  projectId: string,
+  params?: { days?: number; min_sample_size?: number; top_n?: number },
+): Promise<PromptFingerprintAnalyticsResponse> {
+  const searchParams = new URLSearchParams();
+  if (params?.days !== undefined) searchParams.set('days', String(params.days));
+  if (params?.min_sample_size !== undefined) searchParams.set('min_sample_size', String(params.min_sample_size));
+  if (params?.top_n !== undefined) searchParams.set('top_n', String(params.top_n));
+  const query = searchParams.toString();
+  const url = `/api/admin/projects/${encodeURIComponent(projectId)}/prompt-fingerprint-analytics${query ? `?${query}` : ''}`;
+  const res = await apiFetch(url);
+  if (!res.ok) throw new Error(`Failed to fetch prompt fingerprint analytics: ${res.status}`);
+  return res.json();
+}
 
 export interface RegressionClassKpiRow {
   regression_class: string;
