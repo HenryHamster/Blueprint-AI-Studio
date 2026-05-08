@@ -139,6 +139,8 @@ async def _scan_blind_spot_counts(
     result = await session.execute(stmt)
     all_tasks = result.scalars().all()
 
+    from app.regression_layer_classifier import classify_layers  # noqa: PLC0415
+
     theme_data: Dict[str, dict] = {}
     for t in all_tasks:
         ctx = t.context or {}
@@ -152,12 +154,22 @@ async def _scan_blind_spot_counts(
                 continue
             theme = " ".join(entry.lower().split()[:6])
             if theme not in theme_data:
-                theme_data[theme] = {"count": 0, "examples": []}
+                theme_data[theme] = {
+                    "count": 0,
+                    "examples": [],
+                    "layer_distribution": defaultdict(int),
+                }
             theme_data[theme]["count"] += 1
             if len(theme_data[theme]["examples"]) < _BLIND_SPOT_EXAMPLES_PER_THEME:
                 theme_data[theme]["examples"].append(
                     {"text": entry, "task_id": task_id, "task_type": task_type}
                 )
+            for layer in classify_layers("SR_BLIND_SPOT", entry, None):
+                theme_data[theme]["layer_distribution"][layer] += 1
+
+    for d in theme_data.values():
+        d["layer_distribution"] = dict(d["layer_distribution"])
+
     return theme_data
 
 
@@ -206,7 +218,13 @@ async def aggregate_sr_blind_spot_themes(
     theme_data = await _scan_blind_spot_counts(session, project_id, days=days)
     top = sorted(theme_data.items(), key=lambda x: -x[1]["count"])[:limit]
     return [
-        {"theme": t, "count": d["count"], "examples": d["examples"]} for t, d in top
+        {
+            "theme": t,
+            "count": d["count"],
+            "examples": d["examples"],
+            "layer_distribution": d["layer_distribution"],
+        }
+        for t, d in top
     ]
 
 
@@ -320,7 +338,13 @@ async def aggregate_sr_blind_spot_envelope(
         "window_days": days,
         "total_distinct_themes": len(theme_data),
         "themes": [
-            {"theme": t, "count": d["count"], "examples": d["examples"]} for t, d in top
+            {
+                "theme": t,
+                "count": d["count"],
+                "examples": d["examples"],
+                "layer_distribution": d["layer_distribution"],
+            }
+            for t, d in top
         ],
     }
 

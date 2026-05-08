@@ -11,6 +11,12 @@ import {
   CRITICAL_NOTE_EVENTS,
   classifySignalLevel,
   getToastSeverity,
+  loadMuteWindow,
+  saveMuteWindow,
+  clearMuteWindow,
+  isMuteWindowActive,
+  formatMuteCountdown,
+  muteWindowKey,
 } from './MessagesPanel.utils';
 
 describe('MessagesPanel.utils - Event Preferences', () => {
@@ -218,6 +224,72 @@ describe('escalation event invariants', () => {
     expect(classifySignalLevel({ ...base, context: { event_type: 'failure_alert' } })).toBe('high');
     expect(classifySignalLevel({ ...base, context: { event_type: 'rollback_recommended' } })).toBe('high');
     expect(classifySignalLevel({ ...base, context: { event_type: 'pr_merged' } })).toBe('routine');
+  });
+});
+
+describe('MuteWindow persistence', () => {
+  beforeEach(() => { localStorage.clear(); });
+  afterEach(() => { localStorage.clear(); });
+
+  test('loadMuteWindow returns null when no key', () => {
+    expect(loadMuteWindow('user1', 'proj1')).toBeNull();
+  });
+
+  test('saveMuteWindow then loadMuteWindow round-trips', () => {
+    const expiresAt = Date.now() + 3600000;
+    saveMuteWindow('user1', 'proj1', { expiresAt });
+    const loaded = loadMuteWindow('user1', 'proj1');
+    expect(loaded).toEqual({ expiresAt });
+  });
+
+  test('loadMuteWindow returns null for expired window', () => {
+    saveMuteWindow('user1', 'proj1', { expiresAt: Date.now() - 1 });
+    expect(loadMuteWindow('user1', 'proj1')).toBeNull();
+  });
+
+  test('loadMuteWindow clears expired key from storage', () => {
+    const key = muteWindowKey('user1', 'proj1');
+    saveMuteWindow('user1', 'proj1', { expiresAt: Date.now() - 1 });
+    loadMuteWindow('user1', 'proj1');
+    expect(localStorage.getItem(key)).toBeNull();
+  });
+
+  test('clearMuteWindow removes the key', () => {
+    const key = muteWindowKey('user1', 'proj1');
+    saveMuteWindow('user1', 'proj1', { expiresAt: Date.now() + 3600000 });
+    expect(localStorage.getItem(key)).not.toBeNull();
+    clearMuteWindow('user1', 'proj1');
+    expect(localStorage.getItem(key)).toBeNull();
+  });
+
+  test('isMuteWindowActive returns true for future expiry', () => {
+    expect(isMuteWindowActive({ expiresAt: Date.now() + 3600000 })).toBe(true);
+  });
+
+  test('isMuteWindowActive returns false for past expiry', () => {
+    expect(isMuteWindowActive({ expiresAt: Date.now() - 1 })).toBe(false);
+  });
+
+  test('isMuteWindowActive returns false for null', () => {
+    expect(isMuteWindowActive(null)).toBe(false);
+  });
+
+  test('formatMuteCountdown renders Xm left', () => {
+    const expiresAt = Date.now() + 47 * 60000 + 500; // +500ms so ceil gives exactly 47
+    expect(formatMuteCountdown(expiresAt)).toBe('47m left');
+  });
+
+  test('formatMuteCountdown renders <1m left when less than a minute remains', () => {
+    expect(formatMuteCountdown(Date.now() + 30000)).toBe('<1m left');
+  });
+
+  test('two project IDs hold independent mute windows', () => {
+    const exp1 = Date.now() + 3600000;
+    const exp2 = Date.now() + 7200000;
+    saveMuteWindow('user1', 'proj1', { expiresAt: exp1 });
+    saveMuteWindow('user1', 'proj2', { expiresAt: exp2 });
+    expect(loadMuteWindow('user1', 'proj1')?.expiresAt).toBe(exp1);
+    expect(loadMuteWindow('user1', 'proj2')?.expiresAt).toBe(exp2);
   });
 });
 

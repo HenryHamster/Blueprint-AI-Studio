@@ -2436,6 +2436,46 @@ async def list_regression_cases(
     }
 
 
+@router.get("/regression-cases/layer-defense-density")
+async def regression_cases_layer_defense_density(
+    project_id: uuid.UUID = Query(..., description="Project to query (required)"),
+    days: int = Query(30, ge=1, le=365),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),  # noqa: ARG001
+):
+    """Per-canonical-layer defense activity over the last ``days`` days.
+
+    Loads every ``RegressionRemediationCase`` for the project, walks each
+    case's ``fingerprint_to_fix_log`` entries, and returns one row per
+    canonical infrastructure layer (CI_WORKFLOW, AGENT_VM, AGENT_VERB,
+    BASELINE_GATE, REVIEWER_PASS) — including layers with zero defenses —
+    so the UI can render a stable five-row table.
+    """
+    from app.pipeline_regression_dispatcher import compute_layer_defense_density
+
+    cases = (
+        (
+            await session.execute(
+                select(RegressionRemediationCase).where(
+                    RegressionRemediationCase.project_id == project_id,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    pairs: list[tuple[str, dict[str, Any]]] = []
+    for case in cases:
+        for entry in case.fingerprint_to_fix_log or []:
+            pairs.append((str(case.id), entry))
+    layers = compute_layer_defense_density(pairs, lookback_days=days)
+    return {
+        "days": days,
+        "generated_at": _utcnow().isoformat(),
+        "layers": layers,
+    }
+
+
 @router.post("/regression-cases/{regression_class}/clear-manual-intervention")
 async def clear_regression_manual_intervention(
     regression_class: str,
@@ -2783,14 +2823,21 @@ async def list_recently_closed_regression_cases(
     for c in rows:
         fix_pr_number = None
         recovered_at = None
+        merged_at = None
+        latest_merged_at = None
         hold_days_history = []
 
         if c.fingerprint_to_fix_log:
             for entry in c.fingerprint_to_fix_log:
                 if "fix_pr_number" in entry:
                     fix_pr_number = entry["fix_pr_number"]
+                if entry.get("merged_at"):
+                    latest_merged_at = entry["merged_at"]
                 if "recovered_at" in entry:
                     recovered_at = entry["recovered_at"]
+                    # Pair this recovery with the latest merge that preceded it,
+                    # mirroring _compute_regression_case_summary (lines 940–966).
+                    merged_at = latest_merged_at
 
         # Pair merged_at/recovered_at across separate fix-log entries
         # (production shape: mark_merged writes one entry, the recovery scan
@@ -2831,6 +2878,7 @@ async def list_recently_closed_regression_cases(
                 "id": str(c.id),
                 "regression_class": c.regression_class,
                 "fix_pr_number": fix_pr_number,
+                "merged_at": merged_at,
                 "recovered_at": recovered_at,
                 "recurrence_count": _regression_case_recurrence_count(c),
                 "first_seen_at": c.first_seen_at.isoformat()
@@ -2844,6 +2892,10 @@ async def list_recently_closed_regression_cases(
                 else None,
                 "time_to_detect_sec": c.time_to_detect_sec,
                 "time_to_recover_sec": time_to_recover_sec,
+                "investigate_spawned_at": c.investigate_spawned_at.isoformat()
+                if c.investigate_spawned_at
+                else None,
+                "time_to_investigate_sec": c.time_to_investigate_sec,
                 "hold_days_history": hold_days_history,
                 "is_fragile": is_fragile,
                 "layer_summary": _summarize_symptoms_by_layer(

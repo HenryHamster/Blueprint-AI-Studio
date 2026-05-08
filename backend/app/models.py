@@ -1558,6 +1558,13 @@ class RegressionRemediationCase(SQLModel, table=True):
         default_factory=dict,
         sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
     )
+    # Timestamp when the dispatcher first spawned an investigate Task for this case.
+    # Null for cases pre-dating this column. Never overwritten on re-spawns so
+    # operators always see the original detection-to-action latency.
+    investigate_spawned_at: Optional[datetime] = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
     created_at: datetime = Field(
         default_factory=_utcnow,
         sa_column=Column(NaiveUTCDateTime, nullable=False),
@@ -1598,6 +1605,18 @@ class RegressionRemediationCase(SQLModel, table=True):
         if anchor is None:
             return None
         return (self.first_seen_at - anchor).total_seconds()
+
+    @property
+    def time_to_investigate_sec(self) -> Optional[int]:
+        """Seconds between first_seen_at and the first investigate Task spawn.
+
+        Returns None when investigate_spawned_at is missing (legacy rows) or
+        when the delta is negative (clock skew guard). Integer seconds.
+        """
+        if self.investigate_spawned_at is None or self.first_seen_at is None:
+            return None
+        delta = int((self.investigate_spawned_at - self.first_seen_at).total_seconds())
+        return delta if delta >= 0 else None
 
     def mark_merged(
         self,

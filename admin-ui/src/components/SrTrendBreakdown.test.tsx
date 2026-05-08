@@ -731,6 +731,165 @@ describe('SrTrendBreakdown below_floor from backend', () => {
   });
 });
 
+describe('SrTrendBreakdown by_fix_iteration section', () => {
+  function makeIterTrends(byFixIteration: SrTrendData['by_fix_iteration']): SrTrendData {
+    return {
+      categories: { correctness: { miss_rate: 0.2, trend: 'stable' } },
+      by_fix_iteration: byFixIteration,
+    };
+  }
+
+  it('renders the by-fix-iteration section when by_fix_iteration has data', () => {
+    const trends = makeIterTrends({
+      '1': { correctness: { miss_rate: 0.2, sample_count: 10 } },
+    });
+    render(<SrTrendBreakdown trends={trends} variant="card" />);
+    expect(screen.getByTestId('sr-by-fix-iteration-section')).toBeInTheDocument();
+  });
+
+  it('does not render the section when by_fix_iteration is absent (backward compat)', () => {
+    const trends = makeIterTrends(undefined);
+    render(<SrTrendBreakdown trends={trends} variant="card" />);
+    expect(screen.queryByTestId('sr-by-fix-iteration-section')).not.toBeInTheDocument();
+  });
+
+  it('does not render the section when all buckets are empty', () => {
+    const trends = makeIterTrends({ '1': {}, '2': {} });
+    render(<SrTrendBreakdown trends={trends} variant="card" />);
+    expect(screen.queryByTestId('sr-by-fix-iteration-section')).not.toBeInTheDocument();
+  });
+
+  it('section is collapsed by default; toggle opens it', async () => {
+    const user = userEvent.setup();
+    const trends = makeIterTrends({
+      '1': { correctness: { miss_rate: 0.2, sample_count: 10 } },
+    });
+    render(<SrTrendBreakdown trends={trends} variant="card" />);
+    expect(screen.queryByText('iter 1')).not.toBeInTheDocument();
+
+    const toggle = screen.getByRole('button', { name: /by fix iteration/i });
+    expect(toggle).toHaveAttribute('aria-expanded', 'false');
+    await user.click(toggle);
+    expect(toggle).toHaveAttribute('aria-expanded', 'true');
+    expect(screen.getByText('iter 1')).toBeInTheDocument();
+  });
+
+  it('toggle closes section on second click', async () => {
+    const user = userEvent.setup();
+    const trends = makeIterTrends({
+      '1': { correctness: { miss_rate: 0.2, sample_count: 10 } },
+    });
+    render(<SrTrendBreakdown trends={trends} variant="card" />);
+    const toggle = screen.getByRole('button', { name: /by fix iteration/i });
+    await user.click(toggle);
+    expect(screen.getByText('iter 1')).toBeInTheDocument();
+    await user.click(toggle);
+    expect(screen.queryByText('iter 1')).not.toBeInTheDocument();
+  });
+
+  it('displays buckets in order 1 → 2 → 3+ when all present', async () => {
+    const user = userEvent.setup();
+    const trends = makeIterTrends({
+      '3+': { correctness: { miss_rate: 0.6, sample_count: 5 } },
+      '1': { correctness: { miss_rate: 0.2, sample_count: 20 } },
+      '2': { correctness: { miss_rate: 0.4, sample_count: 10 } },
+    });
+    render(<SrTrendBreakdown trends={trends} variant="card" />);
+    await user.click(screen.getByRole('button', { name: /by fix iteration/i }));
+    const iterLabels = screen.getAllByText(/^iter \d[+]?$/);
+    expect(iterLabels.map(el => el.textContent)).toEqual(['iter 1', 'iter 2', 'iter 3+']);
+  });
+
+  it('sorts categories by miss rate descending within a bucket', async () => {
+    const user = userEvent.setup();
+    const trends = makeIterTrends({
+      '1': {
+        correctness: { miss_rate: 0.1, sample_count: 10 },
+        'error-handling': { miss_rate: 0.5, sample_count: 10 },
+        'type-safety': { miss_rate: 0.3, sample_count: 10 },
+      },
+    });
+    const { container } = render(<SrTrendBreakdown trends={trends} variant="card" />);
+    await user.click(screen.getByRole('button', { name: /by fix iteration/i }));
+    const section = container.querySelector('[data-testid="sr-by-fix-iteration-section"]');
+    expect(section).not.toBeNull();
+    const catSpans = Array.from(section!.querySelectorAll('span.text-neutral-400'));
+    const texts = catSpans.map(el => el.textContent);
+    const errIdx = texts.indexOf('error-handling');
+    const typeIdx = texts.indexOf('type-safety');
+    const corrIdx = texts.indexOf('correctness');
+    expect(errIdx).toBeGreaterThanOrEqual(0);
+    expect(errIdx).toBeLessThan(typeIdx);
+    expect(typeIdx).toBeLessThan(corrIdx);
+  });
+
+  it('shows delta vs iter 1 for iter 2 when delta >= 5pp', async () => {
+    const user = userEvent.setup();
+    const trends = makeIterTrends({
+      '1': { correctness: { miss_rate: 0.2, sample_count: 20 } },
+      '2': { correctness: { miss_rate: 0.35, sample_count: 10 } },
+    });
+    render(<SrTrendBreakdown trends={trends} variant="card" />);
+    await user.click(screen.getByRole('button', { name: /by fix iteration/i }));
+    // iter 2 correctness is 35% vs iter 1's 20% → delta +15pp
+    const deltaEl = screen.getByTitle(/vs iter 1/i);
+    expect(deltaEl).toHaveTextContent('+15pp');
+    expect(deltaEl.className).toContain('text-red-400');
+  });
+
+  it('shows negative delta (green) when iter 2 miss rate improves vs iter 1', async () => {
+    const user = userEvent.setup();
+    const trends = makeIterTrends({
+      '1': { correctness: { miss_rate: 0.4, sample_count: 20 } },
+      '2': { correctness: { miss_rate: 0.2, sample_count: 10 } },
+    });
+    render(<SrTrendBreakdown trends={trends} variant="card" />);
+    await user.click(screen.getByRole('button', { name: /by fix iteration/i }));
+    const deltaEl = screen.getByTitle(/vs iter 1/i);
+    expect(deltaEl).toHaveTextContent('−20pp');
+    expect(deltaEl.className).toContain('text-emerald-400');
+  });
+
+  it('omits delta when difference is < 5pp', async () => {
+    const user = userEvent.setup();
+    const trends = makeIterTrends({
+      '1': { correctness: { miss_rate: 0.2, sample_count: 20 } },
+      '2': { correctness: { miss_rate: 0.23, sample_count: 10 } },
+    });
+    render(<SrTrendBreakdown trends={trends} variant="card" />);
+    await user.click(screen.getByRole('button', { name: /by fix iteration/i }));
+    expect(screen.queryByTitle(/vs iter 1/i)).not.toBeInTheDocument();
+  });
+
+  it('omits delta for iter 1 rows (no baseline to compare)', async () => {
+    const user = userEvent.setup();
+    const trends = makeIterTrends({
+      '1': { correctness: { miss_rate: 0.3, sample_count: 20 } },
+    });
+    render(<SrTrendBreakdown trends={trends} variant="card" />);
+    await user.click(screen.getByRole('button', { name: /by fix iteration/i }));
+    expect(screen.queryByTitle(/vs iter 1/i)).not.toBeInTheDocument();
+  });
+
+  it('renders examples button when examples are present in a bucket category', async () => {
+    const user = userEvent.setup();
+    const trends = makeIterTrends({
+      '2': {
+        correctness: {
+          miss_rate: 0.5,
+          sample_count: 5,
+          examples: [{ severity: 'CRITICAL', desc: 'null check missed in iter2' }],
+        },
+      },
+    });
+    render(<SrTrendBreakdown trends={trends} variant="card" />);
+    await user.click(screen.getByRole('button', { name: /by fix iteration/i }));
+    const exBtn = screen.getByTitle(/5 samples — click for examples/i);
+    await user.click(exBtn);
+    expect(screen.getByText('null check missed in iter2')).toBeInTheDocument();
+  });
+});
+
 describe('SrTrendBreakdown reasoning engagement', () => {
   it('displays reasoning engagement for regressing (decreasing) category', () => {
     const trends: SrTrendData = {

@@ -4,10 +4,21 @@ import { act } from 'react';
 import { RecentlyResolvedRegressionsPanel } from './RecentlyResolvedRegressionsPanel';
 import { expectNoOverflowAt } from '../test/viewport';
 
-// Mock '../api' so apiFetch returns a controlled cases payload (mirrors
-// the pattern in RecentlyResolvedRegressionsPanel.test.tsx).
+// Mock '../api' so apiFetch returns controlled payloads (mirrors the pattern
+// in RecentlyResolvedRegressionsPanel.test.tsx). Routes by URL suffix.
 vi.mock('../api', () => ({
-  apiFetch: vi.fn(async () => new Response(JSON.stringify({ cases: [] }), { status: 200 })),
+  apiFetch: vi.fn(async (url: string) => {
+    if (url.includes('layer-defense-density')) {
+      return new Response(JSON.stringify({ days: 30, layers: [
+        { layer: 'CI_WORKFLOW', fix_count: 8, last_fix_at: new Date(Date.now() - 86400000).toISOString(), sample_case_ids: [] },
+        { layer: 'AGENT_VM', fix_count: 0, last_fix_at: null, sample_case_ids: [] },
+        { layer: 'AGENT_VERB', fix_count: 3, last_fix_at: new Date(Date.now() - 3600000).toISOString(), sample_case_ids: [] },
+        { layer: 'BASELINE_GATE', fix_count: 1, last_fix_at: new Date(Date.now() - 7200000).toISOString(), sample_case_ids: [] },
+        { layer: 'REVIEWER_PASS', fix_count: 0, last_fix_at: null, sample_case_ids: [] },
+      ] }), { status: 200 });
+    }
+    return new Response(JSON.stringify({ cases: [] }), { status: 200 });
+  }),
   fetchCrossLayerCompliance: vi.fn(async () => ({
     total_classified: 0,
     compliant: 0,
@@ -80,6 +91,20 @@ describe('RecentlyResolvedRegressionsPanel — viewport regression', () => {
     (apiFetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
       new Response(JSON.stringify({ cases: populatedCases }), { status: 200 }),
     );
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(<RecentlyResolvedRegressionsPanel projectId="proj-1" />);
+      });
+      await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+    });
+  });
+
+  test('layer-defense-density section renders without horizontal overflow at 375px', async () => {
     await expectNoOverflowAt(375, async () => {
       host = document.createElement('div');
       host.style.padding = '12px';

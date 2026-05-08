@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import { AlertTriangle, CheckCircle, RotateCcw, Activity, ChevronDown, ChevronRight } from 'lucide-react';
+import { AlertTriangle, CheckCircle, RotateCcw, Activity, ChevronDown, ChevronRight, Shield } from 'lucide-react';
 import { ResponsiveContainer, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip } from 'recharts';
 import { apiFetch } from '../api';
 import { timeAgo, parseTimestamp } from '../utils/time';
@@ -641,6 +641,93 @@ export function RegressionRateTrendPanel({ projectId }: Props) {
           </span>
         </div>
       </div>
+    </section>
+  );
+}
+
+interface LayerDefenseEntry {
+  layer: string;
+  fix_count: number;
+  last_fix_at: string | null;
+  sample_case_ids: string[];
+}
+
+export function LayerDefenseDensityPanel({ projectId }: Props) {
+  const [data, setData] = useState<{ days: number; layers: LayerDefenseEntry[] } | null>(null);
+  const [loaded, setLoaded] = useState(false);
+  const [days, setDays] = useState(30);
+
+  useEffect(() => {
+    let cancelled = false;
+    apiFetch(`/api/admin/regression-cases/layer-defense-density?project_id=${encodeURIComponent(projectId)}&days=${days}`)
+      .then(async (res) => { if (!cancelled && res.ok) setData(await res.json()); })
+      .catch(() => {})
+      .finally(() => { if (!cancelled) setLoaded(true); });
+    return () => { cancelled = true; };
+  }, [projectId, days]);
+
+  if (!loaded) return null;
+
+  const maxCount = data ? Math.max(...data.layers.map(l => l.fix_count), 1) : 1;
+
+  return (
+    <section data-testid="layer-defense-density-panel" className="mb-4">
+      <div className="flex items-center justify-between mb-2">
+        <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest flex items-center gap-1.5">
+          <Shield className="w-3 h-3" />
+          Layer Defense Density
+        </h2>
+        <select
+          value={days}
+          onChange={(e) => setDays(Number(e.target.value))}
+          className="text-[10px] bg-neutral-800 border border-neutral-700 rounded px-1.5 py-0.5 text-neutral-400"
+        >
+          <option value={7}>7d</option>
+          <option value={30}>30d</option>
+          <option value={90}>90d</option>
+        </select>
+      </div>
+      {!data || data.layers.every(l => l.fix_count === 0) ? (
+        <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 text-neutral-500 text-xs">
+          No layer defenses recorded in the last {days} days
+        </div>
+      ) : (
+        <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg overflow-hidden">
+          <table className="w-full text-[10px]">
+            <thead>
+              <tr className="border-b border-neutral-800/50 text-neutral-500">
+                <th className="text-left px-3 py-1.5 font-medium">Layer</th>
+                <th className="text-right px-2 py-1.5 font-medium">Fixes</th>
+                <th className="px-3 py-1.5 font-medium w-24 hidden sm:table-cell">Coverage</th>
+                <th className="text-right px-3 py-1.5 font-medium">Last fix</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-neutral-800/30">
+              {(data?.layers ?? []).map((row) => (
+                <tr key={row.layer}>
+                  <td className="px-3 py-1.5 font-mono text-neutral-300 truncate max-w-[120px]">{row.layer}</td>
+                  <td className="px-2 py-1.5 text-right">
+                    <span className={row.fix_count === 0 ? 'text-neutral-600' : 'text-white font-medium'}>
+                      {row.fix_count}
+                    </span>
+                  </td>
+                  <td className="px-3 py-1.5 hidden sm:table-cell">
+                    <div className="h-1.5 bg-neutral-800 rounded-full overflow-hidden w-full">
+                      <div
+                        className="h-full rounded-full bg-blue-500/70"
+                        style={{ width: `${Math.round((row.fix_count / maxCount) * 100)}%` }}
+                      />
+                    </div>
+                  </td>
+                  <td className="px-3 py-1.5 text-right text-neutral-500">
+                    {row.last_fix_at ? timeAgo(row.last_fix_at) : <span className="text-neutral-700">—</span>}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
     </section>
   );
 }

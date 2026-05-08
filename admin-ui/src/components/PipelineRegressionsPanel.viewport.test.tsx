@@ -1,7 +1,7 @@
 import { afterEach, describe, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
-import { DispatcherHealthPanel, LayerCoverageHistogramPanel, ManualInterventionPanel, RegressionRateTrendPanel } from './PipelineRegressionsPanel';
+import { DispatcherHealthPanel, LayerCoverageHistogramPanel, ManualInterventionPanel, RegressionRateTrendPanel, LayerDefenseDensityPanel } from './PipelineRegressionsPanel';
 import { expectNoOverflowAt } from '../test/viewport';
 
 vi.mock('recharts', () => ({
@@ -46,6 +46,19 @@ vi.mock('../api', () => ({
         return { date: d.toISOString().slice(0, 10), opened: Math.floor(Math.random() * 5), closed: Math.floor(Math.random() * 4) };
       });
       return new Response(JSON.stringify({ project_id: 'project-123', days: 30, daily, by_class: {} }), { status: 200 });
+    }
+    if (url.includes('layer-defense-density')) {
+      return new Response(JSON.stringify({
+        days: 30,
+        generated_at: new Date().toISOString(),
+        layers: [
+          { layer: 'CI_WORKFLOW', fix_count: 8, last_fix_at: new Date(Date.now() - 86400_000).toISOString(), sample_case_ids: ['case-1', 'case-2'] },
+          { layer: 'AGENT_VM', fix_count: 0, last_fix_at: null, sample_case_ids: [] },
+          { layer: 'AGENT_VERB', fix_count: 3, last_fix_at: new Date(Date.now() - 172800_000).toISOString(), sample_case_ids: ['case-3'] },
+          { layer: 'BASELINE_GATE', fix_count: 1, last_fix_at: new Date(Date.now() - 604800_000).toISOString(), sample_case_ids: ['case-4'] },
+          { layer: 'REVIEWER_PASS', fix_count: 5, last_fix_at: new Date(Date.now() - 43200_000).toISOString(), sample_case_ids: ['case-5'] },
+        ],
+      }), { status: 200 });
     }
     if (url.includes('regression-cases') && !url.includes('manual-intervention') && !url.includes('auto-recovered') && !url.includes('trend')) {
       return new Response(JSON.stringify({
@@ -191,6 +204,46 @@ describe('RegressionRateTrendPanel — viewport regression', () => {
       document.body.appendChild(host);
       root = createRoot(host);
       await act(async () => { root?.render(<RegressionRateTrendPanel projectId="project-123" />); });
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 50)); });
+    });
+  });
+});
+
+describe('LayerDefenseDensityPanel — viewport regression', () => {
+  let root: Root | null = null;
+  let host: HTMLDivElement | null = null;
+  afterEach(() => { if (root) act(() => root?.unmount()); root = null; host?.remove(); host = null; });
+  test('renders populated state without overflow at 375px', async () => {
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      root = createRoot(host);
+      await act(async () => { root?.render(<LayerDefenseDensityPanel projectId="project-123" />); });
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 50)); });
+    });
+  });
+  test('renders empty state without overflow at 375px', async () => {
+    const { apiFetch } = await import('../api');
+    vi.mocked(apiFetch).mockResolvedValueOnce(
+      new Response(JSON.stringify({
+        days: 30,
+        generated_at: new Date().toISOString(),
+        layers: [
+          { layer: 'CI_WORKFLOW', fix_count: 0, last_fix_at: null, sample_case_ids: [] },
+          { layer: 'AGENT_VM', fix_count: 0, last_fix_at: null, sample_case_ids: [] },
+          { layer: 'AGENT_VERB', fix_count: 0, last_fix_at: null, sample_case_ids: [] },
+          { layer: 'BASELINE_GATE', fix_count: 0, last_fix_at: null, sample_case_ids: [] },
+          { layer: 'REVIEWER_PASS', fix_count: 0, last_fix_at: null, sample_case_ids: [] },
+        ],
+      }), { status: 200 })
+    );
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      root = createRoot(host);
+      await act(async () => { root?.render(<LayerDefenseDensityPanel projectId="project-123" />); });
       await act(async () => { await new Promise((resolve) => setTimeout(resolve, 50)); });
     });
   });

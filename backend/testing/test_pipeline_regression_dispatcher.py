@@ -605,6 +605,88 @@ async def test_sr_repeat_spawn_updates_existing_case(db_session):
 
 
 @pytest.mark.asyncio
+async def test_spawn_sets_investigate_spawned_at(db_session):
+    """First spawn populates investigate_spawned_at on the new RegressionRemediationCase."""
+    from app.models import RegressionRemediationCase
+
+    project = make_project(
+        design_doc=_design_doc_with_sr_regression(category="correctness"),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 1
+
+    case = (
+        (
+            await db_session.execute(
+                select(RegressionRemediationCase).where(
+                    RegressionRemediationCase.project_id == project.id,
+                    RegressionRemediationCase.regression_class == "sr_catch_rate",
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    assert case is not None
+    assert case.investigate_spawned_at is not None
+    assert case.time_to_investigate_sec is not None
+    assert case.time_to_investigate_sec >= 0
+
+
+@pytest.mark.asyncio
+async def test_repeat_spawn_preserves_investigate_spawned_at(db_session):
+    """A second spawn does NOT overwrite the original investigate_spawned_at."""
+    from app.models import RegressionRemediationCase
+
+    project = make_project(
+        design_doc=_design_doc_with_sr_regression(category="correctness"),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 1
+
+    case = (
+        (
+            await db_session.execute(
+                select(RegressionRemediationCase).where(
+                    RegressionRemediationCase.project_id == project.id,
+                    RegressionRemediationCase.regression_class == "sr_catch_rate",
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    assert case is not None
+    original_investigate_spawned_at = case.investigate_spawned_at
+    assert original_investigate_spawned_at is not None
+
+    # Expire cooldown and re-spawn.
+    task = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .first()
+    )
+    task.status = TaskStatus.COMPLETED
+    task.created_at = _utcnow() - _REGRESSION_COOLDOWN - timedelta(minutes=5)
+    db_session.add(task)
+    await db_session.commit()
+
+    spawned2 = await run_once(db_session, project.id)
+    assert spawned2 == 1
+
+    await db_session.refresh(case)
+    assert case.investigate_spawned_at == original_investigate_spawned_at
+
+
+@pytest.mark.asyncio
 async def test_manual_intervention_case_suppresses_spawn(db_session):
     """Existing case in NEEDS_MANUAL_INTERVENTION status prevents a new spawn."""
     from app.models import RegressionCaseStatus, RegressionRemediationCase
@@ -6874,6 +6956,143 @@ def test_build_layer_defense_ledger_still_holding_and_retripped():
     assert "retripped <48h (fragile)" in block
     # still_holding entry > 7d old → contributes to held_gt_7d
     assert "held >7d" in block
+
+
+def test_compute_layer_defense_density_empty_returns_zeroed_layers():
+    """Empty input yields one zero-row per canonical layer in canonical order."""
+    from app.pipeline_regression_dispatcher import (
+        _CANONICAL_RECURRENCE_LAYERS,
+        compute_layer_defense_density,
+    )
+
+    out = compute_layer_defense_density([])
+    assert [r["layer"] for r in out] == list(_CANONICAL_RECURRENCE_LAYERS)
+    for row in out:
+        assert row["fix_count"] == 0
+        assert row["last_fix_at"] is None
+        assert row["sample_case_ids"] == []
+
+
+def test_compute_layer_defense_density_canonical_order_with_partial_activity():
+    """All five layers appear in canonical order even when only some have entries."""
+    from app.pipeline_regression_dispatcher import (
+        _CANONICAL_RECURRENCE_LAYERS,
+        compute_layer_defense_density,
+    )
+    from app.time_utils import _utcnow
+
+    now = _utcnow()
+    pairs = [
+        (
+            "case-1",
+            {
+                "merged_at": (now - timedelta(days=1)).isoformat(),
+                "layers_targeted": ["BASELINE_GATE"],
+            },
+        ),
+    ]
+    out = compute_layer_defense_density(pairs)
+    assert [r["layer"] for r in out] == list(_CANONICAL_RECURRENCE_LAYERS)
+    by_layer = {r["layer"]: r for r in out}
+    assert by_layer["BASELINE_GATE"]["fix_count"] == 1
+    assert by_layer["BASELINE_GATE"]["sample_case_ids"] == ["case-1"]
+    assert by_layer["CI_WORKFLOW"]["fix_count"] == 0
+    assert by_layer["CI_WORKFLOW"]["last_fix_at"] is None
+    assert by_layer["CI_WORKFLOW"]["sample_case_ids"] == []
+
+
+def test_compute_layer_defense_density_filters_by_lookback():
+    """Entries with merged_at outside the lookback are excluded."""
+    from app.pipeline_regression_dispatcher import compute_layer_defense_density
+    from app.time_utils import _utcnow
+
+    now = _utcnow()
+    in_window = (now - timedelta(days=10)).isoformat()
+    out_window = (now - timedelta(days=400)).isoformat()
+    pairs = [
+        (
+            "case-recent",
+            {
+                "merged_at": in_window,
+                "layers_targeted": ["CI_WORKFLOW"],
+            },
+        ),
+        (
+            "case-old",
+            {
+                "merged_at": out_window,
+                "layers_targeted": ["CI_WORKFLOW"],
+            },
+        ),
+    ]
+    out = compute_layer_defense_density(pairs, lookback_days=90)
+    by_layer = {r["layer"]: r for r in out}
+    assert by_layer["CI_WORKFLOW"]["fix_count"] == 1
+    assert by_layer["CI_WORKFLOW"]["sample_case_ids"] == ["case-recent"]
+    # last_fix_at corresponds to the in-window entry only.
+    assert by_layer["CI_WORKFLOW"]["last_fix_at"] is not None
+    assert by_layer["CI_WORKFLOW"]["last_fix_at"].startswith(in_window[:10])
+
+
+def test_compute_layer_defense_density_sample_case_ids_distinct_recent_first_capped():
+    """sample_case_ids is most-recent-first, distinct, capped at 5."""
+    from app.pipeline_regression_dispatcher import compute_layer_defense_density
+    from app.time_utils import _utcnow
+
+    now = _utcnow()
+    pairs: list[tuple[str, dict]] = []
+    # 7 distinct case ids, each contributing one BASELINE_GATE entry.
+    # case-i has merged_at = now - i days; smaller i = more recent.
+    for i in range(1, 8):
+        pairs.append(
+            (
+                f"case-{i}",
+                {
+                    "merged_at": (now - timedelta(days=i)).isoformat(),
+                    "layers_targeted": ["BASELINE_GATE"],
+                },
+            )
+        )
+    # Add a duplicate-id entry for case-1 (older) — must not produce a duplicate id.
+    pairs.append(
+        (
+            "case-1",
+            {
+                "merged_at": (now - timedelta(days=20)).isoformat(),
+                "layers_targeted": ["BASELINE_GATE"],
+            },
+        )
+    )
+    out = compute_layer_defense_density(pairs)
+    by_layer = {r["layer"]: r for r in out}
+    samples = by_layer["BASELINE_GATE"]["sample_case_ids"]
+    assert len(samples) == 5
+    assert samples == ["case-1", "case-2", "case-3", "case-4", "case-5"]
+    assert len(set(samples)) == 5  # distinct
+
+
+def test_compute_layer_defense_density_multi_layer_entry_credits_each_layer():
+    """A single entry with two layers_targeted increments each layer's fix_count."""
+    from app.pipeline_regression_dispatcher import compute_layer_defense_density
+    from app.time_utils import _utcnow
+
+    now = _utcnow()
+    pairs = [
+        (
+            "case-multi",
+            {
+                "merged_at": (now - timedelta(days=2)).isoformat(),
+                "layers_targeted": ["CI_WORKFLOW", "REVIEWER_PASS"],
+            },
+        ),
+    ]
+    out = compute_layer_defense_density(pairs)
+    by_layer = {r["layer"]: r for r in out}
+    assert by_layer["CI_WORKFLOW"]["fix_count"] == 1
+    assert by_layer["REVIEWER_PASS"]["fix_count"] == 1
+    assert by_layer["CI_WORKFLOW"]["sample_case_ids"] == ["case-multi"]
+    assert by_layer["REVIEWER_PASS"]["sample_case_ids"] == ["case-multi"]
+    assert by_layer["BASELINE_GATE"]["fix_count"] == 0
 
 
 def test_format_recurrence_meta_prompt_includes_layer_defense_block():

@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import { CheckCircle, Minus } from 'lucide-react';
+import { CheckCircle, Minus, Shield } from 'lucide-react';
 import { apiFetch, fetchCrossLayerCompliance, type CrossLayerComplianceResponse } from '../api';
 import { timeAgo, formatDurationSec, parseTimestamp } from '../utils/time';
 import { LayersAffectedBadges, type LayerSummary } from './LayersAffectedBadges';
@@ -11,11 +11,19 @@ interface RecentlyClosedCase {
   recovered_at: string | null;
   first_seen_at: string | null;
   signal_first_crossed_at?: string | null;
+  investigate_spawned_at?: string | null;
+  merged_at?: string | null;
   time_to_recover_sec: number | null;
   recurrence_count?: number;
   layer_summary?: LayerSummary | null;
   hold_days_history?: number[];
   is_fragile?: boolean;
+}
+
+interface LayerDefenseEntry {
+  layer: string;
+  fix_count: number;
+  last_fix_at: string | null;
 }
 
 interface Props {
@@ -28,10 +36,26 @@ function formatTimeToDetect(firstSeenAt: string | null, signalFirstCrossedAt?: s
   return formatDurationSec(Math.max(0, seconds));
 }
 
+function formatTimeToInvestigate(firstSeenAt: string | null, investigateSpawnedAt?: string | null): string {
+  if (!firstSeenAt || !investigateSpawnedAt) return 'unknown';
+  const seconds = (parseTimestamp(investigateSpawnedAt).getTime() - parseTimestamp(firstSeenAt).getTime()) / 1000;
+  return formatDurationSec(Math.max(0, seconds));
+}
+
+function PhaseChip({ label, duration }: { label: string; duration: string }) {
+  return (
+    <span className="flex items-center gap-1">
+      <span className="text-neutral-600">{label}</span>
+      <span className={duration === 'unknown' ? 'text-neutral-700 italic' : 'text-neutral-400'}>{duration}</span>
+    </span>
+  );
+}
+
 export function RecentlyResolvedRegressionsPanel({ projectId }: Props) {
   const [cases, setCases] = useState<RecentlyClosedCase[]>([]);
   const [compliance, setCompliance] = useState<CrossLayerComplianceResponse | null>(null);
   const [loaded, setLoaded] = useState(false);
+  const [layerDensity, setLayerDensity] = useState<LayerDefenseEntry[] | null>(null);
 
   const fetchCases = useCallback(async () => {
     try {
@@ -65,6 +89,14 @@ export function RecentlyResolvedRegressionsPanel({ projectId }: Props) {
     }, 60_000);
     return () => clearInterval(id);
   }, [fetchCases, fetchCompliance]);
+
+  useEffect(() => {
+    let cancelled = false;
+    apiFetch(`/api/admin/regression-cases/layer-defense-density?project_id=${encodeURIComponent(projectId)}&days=30`)
+      .then(async (res) => { if (!cancelled && res.ok) { const d = await res.json(); setLayerDensity(d.layers ?? []); } })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [projectId]);
 
   if (!loaded) return null;
 
@@ -164,7 +196,7 @@ export function RecentlyResolvedRegressionsPanel({ projectId }: Props) {
                     )}
                     <LayersAffectedBadges summary={c.layer_summary} />
                   </div>
-                  <div className="mt-1.5 flex items-center gap-3 text-[10px] text-neutral-500">
+                  <div className="mt-1.5 flex flex-wrap items-center gap-3 text-[10px] text-neutral-500">
                     {c.time_to_recover_sec != null && (
                       <span>
                         <span className="text-neutral-400 font-medium">time-to-recover:</span>{' '}
@@ -175,16 +207,54 @@ export function RecentlyResolvedRegressionsPanel({ projectId }: Props) {
                       <span className="text-neutral-400 font-medium">time-to-detect:</span>{' '}
                       {formatTimeToDetect(c.first_seen_at, c.signal_first_crossed_at)}
                     </span>
+                    <span data-testid="time-to-investigate">
+                      <span className="text-neutral-400 font-medium">time-to-investigate:</span>{' '}
+                      {formatTimeToInvestigate(c.first_seen_at, c.investigate_spawned_at)}
+                    </span>
                     {c.recovered_at && (
                       <span>
                         recovered {timeAgo(c.recovered_at)}
                       </span>
                     )}
                   </div>
+                  <div className="mt-1 flex flex-wrap items-center gap-1 text-[9px]" data-testid="timeline-breakdown">
+                    <PhaseChip label="detect→" duration={formatTimeToDetect(c.first_seen_at, c.signal_first_crossed_at)} />
+                    <span className="text-neutral-800">·</span>
+                    <PhaseChip label="investigate→" duration={formatTimeToInvestigate(c.first_seen_at, c.investigate_spawned_at)} />
+                    <span className="text-neutral-800">·</span>
+                    <PhaseChip label="merge→" duration={c.merged_at && c.investigate_spawned_at ? formatDurationSec(Math.max(0, (parseTimestamp(c.merged_at).getTime() - parseTimestamp(c.investigate_spawned_at).getTime()) / 1000)) : 'unknown'} />
+                    <span className="text-neutral-800">·</span>
+                    <PhaseChip label="recover" duration={c.time_to_recover_sec != null ? formatDurationSec(c.time_to_recover_sec) : 'unknown'} />
+                  </div>
                 </div>
               </div>
             </div>
           ))}
+        </div>
+      )}
+      {layerDensity !== null && (
+        <div className="mt-4" data-testid="layer-defense-density-section">
+          <h3 className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest mb-1.5 flex items-center gap-1">
+            <Shield className="w-3 h-3" />
+            Layer Defense Density (30d)
+          </h3>
+          <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg overflow-hidden">
+            <table className="w-full text-[10px]">
+              <tbody className="divide-y divide-neutral-800/30">
+                {layerDensity.map((row) => (
+                  <tr key={row.layer}>
+                    <td className="px-3 py-1 font-mono text-neutral-400 truncate max-w-[120px]">{row.layer}</td>
+                    <td className="px-2 py-1 text-right">
+                      <span className={row.fix_count === 0 ? 'text-neutral-600' : 'text-white font-medium'}>{row.fix_count}</span>
+                    </td>
+                    <td className="px-3 py-1 text-right text-neutral-600">
+                      {row.last_fix_at ? timeAgo(row.last_fix_at) : '—'}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         </div>
       )}
     </section>

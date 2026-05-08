@@ -3627,6 +3627,55 @@ async def compute_sr_catch_rate_trends(
         if type_cats:
             by_task_type[ttype] = type_cats
 
+    # Per-fix-iteration breakdown — bucket current_window_tasks by the
+    # fix_iteration stamped on _self_review_outcome (1, 2, 3+) so operators
+    # can see which categories degrade across review-fix passes vs. which
+    # are weak from the start. Original tasks (no fix_iteration) bucket as "1".
+    def _fix_iter_bucket(t) -> str:
+        sro = (t.context or {}).get("_self_review_outcome") or {}
+        fi = sro.get("fix_iteration")
+        if fi is None:
+            fi_int = 1
+        else:
+            try:
+                fi_int = int(fi)
+            except (TypeError, ValueError):
+                fi_int = 1
+        if fi_int <= 1:
+            return "1"
+        if fi_int == 2:
+            return "2"
+        return "3+"
+
+    by_fix_iteration: dict[str, dict[str, Any]] = {}
+    fix_iter_buckets: dict[str, list] = {"1": [], "2": [], "3+": []}
+    for _t in current_window_tasks:
+        fix_iter_buckets[_fix_iter_bucket(_t)].append(_t)
+    for bucket_key in ("1", "2", "3+"):
+        bucket_tasks = fix_iter_buckets[bucket_key]
+        if not bucket_tasks:
+            continue
+        _, b_cat_stats, _, b_all_iter_stats, _, _ = _stats_for_tasks(bucket_tasks)
+        bucket_cats: dict[str, Any] = {}
+        for cat, stats in b_cat_stats.items():
+            if stats["human_count"] < _MIN_SR_SAMPLE:
+                continue
+            hit_rate = round(stats["hit_count"] / stats["human_count"], 3)
+            entry: dict[str, Any] = {
+                "miss_rate": round(1 - hit_rate, 3),
+                "sample_count": stats["human_count"],
+            }
+            ai = b_all_iter_stats.get(cat)
+            if ai and ai["human_count"] > 0:
+                ai_hit_rate = round(ai["hit_count"] / ai["human_count"], 3)
+                entry["all_iterations_miss_rate"] = round(1 - ai_hit_rate, 3)
+            ex = _finalize_examples(stats.get("miss_examples", []))
+            if ex:
+                entry["examples"] = ex
+            bucket_cats[cat] = entry
+        if bucket_cats:
+            by_fix_iteration[bucket_key] = bucket_cats
+
     # Compute per-scope category breakdown from current window only.
     # Cells with fewer than _MIN_SR_SAMPLE observations are omitted.
     by_scope: dict[str, dict[str, Any]] = {}
@@ -3733,6 +3782,7 @@ async def compute_sr_catch_rate_trends(
         "previous_cycle_id": previous_cycle_id,
         "categories": categories,
         "by_task_type": by_task_type,
+        "by_fix_iteration": by_fix_iteration,
         "by_scope": by_scope,
         "by_severity": by_severity,
         "edges_considered_stats": edges_stats,

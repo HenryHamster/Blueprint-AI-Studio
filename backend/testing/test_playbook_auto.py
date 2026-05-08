@@ -4250,6 +4250,170 @@ async def test_compute_sr_catch_rate_trends_persists_to_design_doc(
     assert "by_task_type" in stored
 
 
+def _make_sr_task_with_fix_iter(
+    project_id,
+    *,
+    age_days: float,
+    human_cats: dict,
+    sr_failed_cats: list,
+    fix_iteration: int | None = None,
+    task_type: str = "create",
+) -> Task:
+    sro: dict = {
+        "check_results": {
+            cat: {"passed": False, "issue": "x"} for cat in sr_failed_cats
+        }
+    }
+    if fix_iteration is not None:
+        sro["fix_iteration"] = fix_iteration
+    task = Task(
+        project_id=project_id,
+        title="SR fix-iter task",
+        payloads=[{"type": task_type, "prompt": "do something"}],
+        status=TaskStatus.COMPLETED,
+        context={
+            "_self_review_outcome": sro,
+            "_first_attempt_rejection_categories": human_cats,
+        },
+    )
+    task.created_at = _utcnow() - timedelta(days=age_days)
+    return task
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_by_fix_iteration_buckets(
+    db_session: AsyncSession,
+):
+    """by_fix_iteration buckets tasks by _self_review_outcome.fix_iteration into
+    '1' (None or <=1), '2', and '3+' (>=3). Buckets below _MIN_SR_SAMPLE are omitted."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks: list[Task] = []
+    # Bucket "1": 5 tasks all hit (fix_iteration absent ⇒ original/first pass)
+    for _ in range(5):
+        t = _make_sr_task_with_fix_iter(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+            fix_iteration=None,
+        )
+        db_session.add(t)
+        tasks.append(t)
+    # Bucket "2": 5 tasks with 2 hits, 3 misses on correctness
+    for _ in range(2):
+        t = _make_sr_task_with_fix_iter(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+            fix_iteration=2,
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(3):
+        t = _make_sr_task_with_fix_iter(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=[],
+            fix_iteration=2,
+        )
+        db_session.add(t)
+        tasks.append(t)
+    # Bucket "3+": 5 tasks all missed
+    for _ in range(5):
+        t = _make_sr_task_with_fix_iter(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=[],
+            fix_iteration=4,
+        )
+        db_session.add(t)
+        tasks.append(t)
+    # Previous window — meets _MIN_SR_SAMPLE so compute returns a result
+    for _ in range(5):
+        t = _make_sr_task_with_fix_iter(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+            fix_iteration=None,
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+    assert result is not None
+    by_iter = result.get("by_fix_iteration") or {}
+    assert set(by_iter.keys()) == {"1", "2", "3+"}
+    # Bucket "1": 0 misses → miss_rate 0
+    assert by_iter["1"]["correctness"]["miss_rate"] == 0.0
+    assert by_iter["1"]["correctness"]["sample_count"] == 5
+    # Bucket "2": 3 of 5 missed → miss_rate 0.6
+    assert by_iter["2"]["correctness"]["miss_rate"] == round(3 / 5, 3)
+    assert by_iter["2"]["correctness"]["sample_count"] == 5
+    # Bucket "3+": 5 of 5 missed → miss_rate 1.0
+    assert by_iter["3+"]["correctness"]["miss_rate"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_by_fix_iteration_omits_below_sample(
+    db_session: AsyncSession,
+):
+    """Buckets with fewer than _MIN_SR_SAMPLE qualifying observations per category
+    are omitted from by_fix_iteration."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks: list[Task] = []
+    # Bucket "1": 5 tasks (above floor)
+    for _ in range(5):
+        t = _make_sr_task_with_fix_iter(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+            fix_iteration=None,
+        )
+        db_session.add(t)
+        tasks.append(t)
+    # Bucket "2": only 2 tasks (below floor)
+    for _ in range(2):
+        t = _make_sr_task_with_fix_iter(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+            fix_iteration=2,
+        )
+        db_session.add(t)
+        tasks.append(t)
+    # Previous window — meets _MIN_SR_SAMPLE
+    for _ in range(5):
+        t = _make_sr_task_with_fix_iter(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+            fix_iteration=None,
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+    assert result is not None
+    by_iter = result.get("by_fix_iteration") or {}
+    assert "1" in by_iter
+    # Bucket "2" had only 2 samples for correctness — filtered out.
+    assert "2" not in by_iter
+    assert "3+" not in by_iter
+
+
 def _make_sr_task_with_direction(
     project_id,
     direction_id: str,
@@ -7220,6 +7384,7 @@ async def test_compute_sr_catch_rate_trends_all_fields_always_present(
         "previous_cycle_id",
         "categories",
         "by_task_type",
+        "by_fix_iteration",
         "by_scope",
         "by_severity",
         "edges_considered_stats",
@@ -9038,3 +9203,120 @@ def test_resolve_sr_miss_human_truth_empty_ctx():
     from app.playbook_learning import resolve_sr_miss_human_truth
 
     assert resolve_sr_miss_human_truth({}) == set()
+
+
+# ---------------------------------------------------------------------------
+# SR blind-spot layer distribution
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_blind_spot_layer_distribution_populated(db_session: AsyncSession):
+    """aggregate_sr_blind_spot_themes populates layer_distribution for classifiable text."""
+    from app.sr_blind_spots import aggregate_sr_blind_spot_themes
+
+    project = await _make_project(db_session)
+
+    # Text that triggers CI_WORKFLOW (matches "github actions.*fail" pattern)
+    ci_text = "github actions failed to trigger workflow due to path filter miss"
+    # Text that triggers AGENT_VERB (matches "scope too broad" pattern)
+    verb_text = "scope too broad — edited files outside declared scope in handler"
+
+    db_session.add(
+        Task(
+            project_id=project.id,
+            title="t1",
+            payloads=[{"type": "create"}],
+            status=TaskStatus.COMPLETED,
+            context={
+                "_self_review_outcome": {
+                    "verdict": "pass",
+                    "fixes_applied": False,
+                    "check_results": {},
+                    "blind_spots": [ci_text],
+                }
+            },
+        )
+    )
+    db_session.add(
+        Task(
+            project_id=project.id,
+            title="t2",
+            payloads=[{"type": "fix"}],
+            status=TaskStatus.COMPLETED,
+            context={
+                "_self_review_outcome": {
+                    "verdict": "pass",
+                    "fixes_applied": False,
+                    "check_results": {},
+                    "blind_spots": [verb_text],
+                }
+            },
+        )
+    )
+    await db_session.flush()
+
+    themes = await aggregate_sr_blind_spot_themes(
+        db_session, project.id, days=30, limit=10
+    )
+
+    assert len(themes) == 2
+    by_theme = {t["theme"]: t for t in themes}
+
+    ci_theme_key = " ".join(ci_text.lower().split()[:6])
+    verb_theme_key = " ".join(verb_text.lower().split()[:6])
+
+    ci_entry = by_theme[ci_theme_key]
+    assert "layer_distribution" in ci_entry
+    assert isinstance(ci_entry["layer_distribution"], dict)
+    assert ci_entry["layer_distribution"].get("CI_WORKFLOW", 0) >= 1
+
+    verb_entry = by_theme[verb_theme_key]
+    assert "layer_distribution" in verb_entry
+    assert isinstance(verb_entry["layer_distribution"], dict)
+    assert verb_entry["layer_distribution"].get("AGENT_VERB", 0) >= 1
+
+    # Counts must be positive ints; total per theme ≤ count × num_layers
+    for entry in themes:
+        dist = entry["layer_distribution"]
+        for layer_count in dist.values():
+            assert isinstance(layer_count, int) and layer_count > 0
+        total = sum(dist.values())
+        assert total <= entry["count"] * 5  # at most 5 layers per example
+
+
+@pytest.mark.asyncio
+async def test_blind_spot_layer_distribution_empty_for_unclassifiable(
+    db_session: AsyncSession,
+):
+    """aggregate_sr_blind_spot_themes returns empty layer_distribution when text matches no layer."""
+    from app.sr_blind_spots import aggregate_sr_blind_spot_themes
+
+    project = await _make_project(db_session)
+
+    db_session.add(
+        Task(
+            project_id=project.id,
+            title="t1",
+            payloads=[{"type": "create"}],
+            status=TaskStatus.COMPLETED,
+            context={
+                "_self_review_outcome": {
+                    "verdict": "pass",
+                    "fixes_applied": False,
+                    "check_results": {},
+                    "blind_spots": ["did not add extra comments to helpers"],
+                }
+            },
+        )
+    )
+    await db_session.flush()
+
+    themes = await aggregate_sr_blind_spot_themes(
+        db_session, project.id, days=30, limit=10
+    )
+
+    assert len(themes) == 1
+    dist = themes[0]["layer_distribution"]
+    assert isinstance(dist, dict)
+    # May be empty — unclassifiable text produces no layer tags

@@ -1,4 +1,4 @@
-import { afterEach, describe, test } from 'vitest';
+import { afterEach, describe, expect, test } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { SrTrendBreakdown, type SrTrendData } from './SrTrendBreakdown';
@@ -56,6 +56,21 @@ const sampleTrends: SrTrendData = {
   },
   sr_skip_rate: 0.08,
   sr_skip_reason_distribution: { no_diff: 4, trivial: 2 },
+  by_fix_iteration: {
+    '1': {
+      correctness: { miss_rate: 0.18, sample_count: 42, all_iterations_miss_rate: 0.21 },
+      'error-handling': { miss_rate: 0.22, sample_count: 33 },
+      'type-safety': { miss_rate: 0.55, sample_count: 28 },
+    },
+    '2': {
+      correctness: { miss_rate: 0.31, sample_count: 18 },
+      'error-handling': { miss_rate: 0.27, sample_count: 14 },
+    },
+    '3+': {
+      correctness: { miss_rate: 0.62, sample_count: 9, all_iterations_miss_rate: 0.7 },
+      'error-handling': { miss_rate: 0.55, sample_count: 6 },
+    },
+  },
 };
 
 describe('SrTrendBreakdown — viewport regression', () => {
@@ -87,6 +102,50 @@ describe('SrTrendBreakdown — viewport regression', () => {
         r.render(
           <SrTrendBreakdown trends={sampleTrends} variant="card" />,
         );
+      });
+    });
+  });
+
+  test('card variant: by-fix-iteration section toggles open and fits at 375px', async () => {
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <SrTrendBreakdown trends={sampleTrends} variant="card" />,
+        );
+      });
+      const section = host.querySelector('[data-testid="sr-by-fix-iteration-section"]');
+      expect(section).not.toBeNull();
+      const toggle = section!.querySelector('button[aria-expanded]') as HTMLButtonElement;
+      expect(toggle.getAttribute('aria-expanded')).toBe('false');
+      await act(async () => {
+        toggle.click();
+      });
+      expect(toggle.getAttribute('aria-expanded')).toBe('true');
+    });
+  });
+
+  test('card variant: by-fix-iteration open state fits at 1024px', async () => {
+    await expectNoOverflowAt(1024, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <SrTrendBreakdown trends={sampleTrends} variant="card" />,
+        );
+      });
+      const toggle = host.querySelector(
+        '[data-testid="sr-by-fix-iteration-section"] button[aria-expanded]',
+      ) as HTMLButtonElement;
+      await act(async () => {
+        toggle.click();
       });
     });
   });

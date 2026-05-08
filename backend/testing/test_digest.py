@@ -12374,6 +12374,137 @@ async def test_list_recently_closed_time_to_detect_computed_from_signal_first_cr
     assert c["time_to_recover_sec"] is None  # no recovered_at
 
 
+@pytest.mark.asyncio
+async def test_list_recently_closed_investigate_spawned_at_populated(
+    client: AsyncClient, db_session
+):
+    """investigate_spawned_at and time_to_investigate_sec are returned when column is set."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    first_seen = datetime(2026, 5, 5, 10, 0, 0)
+    investigate_spawned = datetime(2026, 5, 5, 10, 5, 0)  # 5 minutes later → 300s
+
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate:correctness",
+        status=RegressionCaseStatus.CLOSED,
+        first_seen_at=first_seen,
+        investigate_spawned_at=investigate_spawned,
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    response = await client.get(
+        "/api/admin/regression-cases/recently-closed",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 200
+    c = response.json()["cases"][0]
+    assert c["investigate_spawned_at"] is not None
+    assert c["time_to_investigate_sec"] == 300
+
+
+@pytest.mark.asyncio
+async def test_list_recently_closed_merged_at_paired_with_recovery(
+    client: AsyncClient, db_session
+):
+    """merged_at is returned, paired with the latest recovered_at in fingerprint_to_fix_log."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate:correctness",
+        status=RegressionCaseStatus.CLOSED,
+        first_seen_at=datetime(2026, 5, 1, 9, 0, 0),
+        fingerprint_to_fix_log=[
+            {
+                "fingerprint": "abc",
+                "merged_at": "2026-05-01T10:00:00+00:00",
+                "recovered_at": "2026-05-01T11:00:00+00:00",
+            },
+        ],
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    response = await client.get(
+        "/api/admin/regression-cases/recently-closed",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 200
+    c = response.json()["cases"][0]
+    assert c["merged_at"] == "2026-05-01T10:00:00+00:00"
+    assert c["recovered_at"] == "2026-05-01T11:00:00+00:00"
+
+
+@pytest.mark.asyncio
+async def test_list_recently_closed_merged_at_null_when_no_merge_logged(
+    client: AsyncClient, db_session
+):
+    """merged_at is null when fingerprint_to_fix_log has no merged_at entries."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate:correctness",
+        status=RegressionCaseStatus.CLOSED,
+        first_seen_at=datetime(2026, 5, 1, 9, 0, 0),
+        fingerprint_to_fix_log=[
+            {"fingerprint": "abc", "recovered_at": "2026-05-01T11:00:00+00:00"},
+        ],
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    response = await client.get(
+        "/api/admin/regression-cases/recently-closed",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 200
+    c = response.json()["cases"][0]
+    assert c["merged_at"] is None
+    assert c["recovered_at"] == "2026-05-01T11:00:00+00:00"
+
+
+@pytest.mark.asyncio
+async def test_list_recently_closed_investigate_spawned_at_null_for_legacy(
+    client: AsyncClient, db_session
+):
+    """investigate_spawned_at and time_to_investigate_sec are null for legacy rows."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="pipeline_success_rate",
+        status=RegressionCaseStatus.CLOSED,
+        first_seen_at=datetime(2026, 4, 1, 0, 0, 0),
+        investigate_spawned_at=None,
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    response = await client.get(
+        "/api/admin/regression-cases/recently-closed",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 200
+    c = response.json()["cases"][0]
+    assert c["investigate_spawned_at"] is None
+    assert c["time_to_investigate_sec"] is None
+
+
 # ---------------------------------------------------------------------------
 # /api/admin/projects/{project_id}/sr-alert-drilldown tests
 # ---------------------------------------------------------------------------
@@ -13376,6 +13507,176 @@ async def test_regression_case_trend_counts_opened_and_closed(
     )
     assert div_today["opened"] == 0
     assert div_today["closed"] == 1
+
+
+# ── GET /regression-cases/layer-defense-density ─────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_layer_defense_density_endpoint_returns_canonical_layers_with_counts(
+    client: AsyncClient, db_session
+):
+    """Endpoint returns all five canonical layers with correct counts and sample case ids."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    case_a = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="rc:a",
+        status=RegressionCaseStatus.ACTIVE,
+        fingerprint_to_fix_log=[
+            {
+                "fingerprint": "fp1",
+                "merged_at": (now - timedelta(days=2)).isoformat(),
+                "layers_targeted": ["BASELINE_GATE"],
+            },
+            {
+                "fingerprint": "fp2",
+                "merged_at": (now - timedelta(days=4)).isoformat(),
+                "layers_targeted": ["CI_WORKFLOW", "REVIEWER_PASS"],
+            },
+        ],
+    )
+    case_b = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="rc:b",
+        status=RegressionCaseStatus.ACTIVE,
+        fingerprint_to_fix_log=[
+            {
+                "fingerprint": "fp3",
+                "merged_at": (now - timedelta(days=1)).isoformat(),
+                "layers_targeted": ["BASELINE_GATE"],
+            },
+        ],
+    )
+    db_session.add_all([case_a, case_b])
+    await db_session.commit()
+    await db_session.refresh(case_a)
+    await db_session.refresh(case_b)
+
+    response = await client.get(
+        "/api/admin/regression-cases/layer-defense-density",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["days"] == 30
+    assert "generated_at" in body
+    layers = body["layers"]
+    assert [r["layer"] for r in layers] == [
+        "CI_WORKFLOW",
+        "AGENT_VM",
+        "AGENT_VERB",
+        "BASELINE_GATE",
+        "REVIEWER_PASS",
+    ]
+    by_layer = {r["layer"]: r for r in layers}
+    assert by_layer["BASELINE_GATE"]["fix_count"] == 2
+    assert by_layer["CI_WORKFLOW"]["fix_count"] == 1
+    assert by_layer["REVIEWER_PASS"]["fix_count"] == 1
+    assert by_layer["AGENT_VM"]["fix_count"] == 0
+    assert by_layer["AGENT_VM"]["last_fix_at"] is None
+    assert by_layer["AGENT_VM"]["sample_case_ids"] == []
+    # case_b's most-recent BASELINE_GATE entry leads case_a's older one.
+    assert by_layer["BASELINE_GATE"]["sample_case_ids"] == [
+        str(case_b.id),
+        str(case_a.id),
+    ]
+    assert by_layer["CI_WORKFLOW"]["sample_case_ids"] == [str(case_a.id)]
+
+
+@pytest.mark.asyncio
+async def test_layer_defense_density_endpoint_respects_days_param(
+    client: AsyncClient, db_session
+):
+    """A days=7 window excludes entries older than 7 days."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="rc:c",
+        status=RegressionCaseStatus.ACTIVE,
+        fingerprint_to_fix_log=[
+            {
+                "fingerprint": "recent",
+                "merged_at": (now - timedelta(days=2)).isoformat(),
+                "layers_targeted": ["CI_WORKFLOW"],
+            },
+            {
+                "fingerprint": "old",
+                "merged_at": (now - timedelta(days=20)).isoformat(),
+                "layers_targeted": ["CI_WORKFLOW"],
+            },
+        ],
+    )
+    db_session.add(case)
+    await db_session.commit()
+    await db_session.refresh(case)
+
+    response = await client.get(
+        "/api/admin/regression-cases/layer-defense-density",
+        params={"project_id": str(project.id), "days": 7},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["days"] == 7
+    by_layer = {r["layer"]: r for r in body["layers"]}
+    assert by_layer["CI_WORKFLOW"]["fix_count"] == 1
+    assert by_layer["CI_WORKFLOW"]["sample_case_ids"] == [str(case.id)]
+
+
+@pytest.mark.asyncio
+async def test_layer_defense_density_endpoint_no_cases_returns_zeroed_layers(
+    client: AsyncClient, db_session
+):
+    """Project with no regression cases returns five zero-row layers."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    response = await client.get(
+        "/api/admin/regression-cases/layer-defense-density",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    layers = body["layers"]
+    assert len(layers) == 5
+    for row in layers:
+        assert row["fix_count"] == 0
+        assert row["last_fix_at"] is None
+        assert row["sample_case_ids"] == []
+
+
+@pytest.mark.asyncio
+async def test_layer_defense_density_endpoint_validates_days_param(
+    client: AsyncClient, db_session
+):
+    """days param must be within the allowed range."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    response = await client.get(
+        "/api/admin/regression-cases/layer-defense-density",
+        params={"project_id": str(project.id), "days": 0},
+    )
+    assert response.status_code == 422
+
+    response = await client.get(
+        "/api/admin/regression-cases/layer-defense-density",
+        params={"project_id": str(project.id), "days": 1000},
+    )
+    assert response.status_code == 422
 
 
 # ── _compute_layer_coverage_by_class / _compute_symptom_layers_by_class ──────

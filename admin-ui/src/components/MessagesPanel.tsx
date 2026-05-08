@@ -1,9 +1,9 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { X, MessageSquare, Send, Check, AlertTriangle, HelpCircle, Bug, StickyNote, ChevronDown, PlusCircle, Trash2, CheckSquare, ArrowDown, Reply, Settings, ChevronUp } from 'lucide-react';
+import { X, MessageSquare, Send, Check, AlertTriangle, HelpCircle, Bug, StickyNote, ChevronDown, PlusCircle, Trash2, CheckSquare, ArrowDown, Reply, Settings, ChevronUp, BellOff } from 'lucide-react';
 import { auth } from '../firebase';
 import { apiFetch, API_BASE_URL } from '../api';
 import { parseTimestamp } from '../utils/time';
-import { routineSummary, effectiveSignal, loadEventPrefs, saveEventPrefs, type EventPref, groupRoutineMessages, outcomeBreakdown, isFailingGroup, getToastSeverity, type RoutineRow, loadLastSeen, saveLastSeen, formatTimestamp, insertTimeDividers, type MessageWithDivider, ESCALATION_BADGE_LABELS } from './MessagesPanel.utils';
+import { routineSummary, effectiveSignal, loadEventPrefs, saveEventPrefs, type EventPref, groupRoutineMessages, outcomeBreakdown, isFailingGroup, getToastSeverity, type RoutineRow, loadLastSeen, saveLastSeen, formatTimestamp, insertTimeDividers, type MessageWithDivider, ESCALATION_BADGE_LABELS, isCriticalSeverity, type MuteWindow, loadMuteWindow, saveMuteWindow, clearMuteWindow, isMuteWindowActive, formatMuteCountdown } from './MessagesPanel.utils';
 
 interface ProjectMessage {
   id: string;
@@ -36,7 +36,7 @@ interface MessagesPanelProps {
   onOpenTask?: (taskId: string) => void;
 }
 
-type MessagesPanelPrefs = { version: 1; routineExpanded: boolean; showResolved: boolean };
+type MessagesPanelPrefs = { version: 1; routineExpanded: boolean; showResolved: boolean; criticalOnly: boolean };
 
 function messagesPanelPrefsKey(userId?: string | null): string {
   return `messages_panel_prefs:${userId || 'anonymous'}`;
@@ -45,14 +45,14 @@ function messagesPanelPrefsKey(userId?: string | null): string {
 function loadMessagesPanelPrefs(userId?: string | null): MessagesPanelPrefs {
   try {
     const raw = localStorage.getItem(messagesPanelPrefsKey(userId));
-    if (!raw) return { version: 1, routineExpanded: false, showResolved: false };
+    if (!raw) return { version: 1, routineExpanded: false, showResolved: false, criticalOnly: false };
     const parsed = JSON.parse(raw) as Partial<MessagesPanelPrefs>;
-    if (parsed.version !== 1 || typeof parsed.routineExpanded !== 'boolean' || typeof parsed.showResolved !== 'boolean') {
-      return { version: 1, routineExpanded: false, showResolved: false };
+    if (parsed.version !== 1 || typeof parsed.routineExpanded !== 'boolean' || typeof parsed.showResolved !== 'boolean' || typeof parsed.criticalOnly !== 'boolean') {
+      return { version: 1, routineExpanded: false, showResolved: false, criticalOnly: false };
     }
     return parsed as MessagesPanelPrefs;
   } catch {
-    return { version: 1, routineExpanded: false, showResolved: false };
+    return { version: 1, routineExpanded: false, showResolved: false, criticalOnly: false };
   }
 }
 
@@ -220,6 +220,8 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
   const [showResolved, setShowResolved] = useState(() => loadMessagesPanelPrefs(auth.currentUser?.email).showResolved);
   // Routine ops group collapsed by default
   const [routineExpanded, setRoutineExpanded] = useState(() => loadMessagesPanelPrefs(auth.currentUser?.email).routineExpanded);
+  // Critical-only severity filter for incident triage
+  const [criticalOnly, setCriticalOnly] = useState(() => loadMessagesPanelPrefs(auth.currentUser?.email).criticalOnly);
   // Track which grouped-chip event_type keys are expanded
   const [expandedGroupKeys, setExpandedGroupKeys] = useState<Set<string>>(new Set());
   // Per-event-type mute/surface preferences (scoped to project)
@@ -231,6 +233,8 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
   const [searchQuery, setSearchQuery] = useState('');
   const [webhookStats, setWebhookStats] = useState<WebhookStats | null>(null);
   const [showWebhookDetail, setShowWebhookDetail] = useState(false);
+  const [muteWindow, setMuteWindow] = useState<MuteWindow | null>(() => loadMuteWindow(auth.currentUser?.email, selectedProjectId));
+  const [showMuteMenu, setShowMuteMenu] = useState(false);
 
   // Last-seen tracking: dividerTime is the threshold; when operator scrolls past or timeout fires, we persist it
   const [dividerTime, setDividerTime] = useState<number | null>(null);
@@ -268,6 +272,7 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
     hasInitiallyLoadedRef.current = false;
     setEventPrefs(loadEventPrefs(auth.currentUser?.email, selectedProjectId));
     setWebhookStats(null);
+    setMuteWindow(loadMuteWindow(auth.currentUser?.email, selectedProjectId));
     const lastSeen = loadLastSeen(auth.currentUser?.email, selectedProjectId);
     setDividerTime(lastSeen);
     dividerTimeRef.current = lastSeen;
@@ -305,7 +310,7 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
     return byTimeDesc(a, b);
   };
 
-  const openMessages = messages.filter(m => m.status === 'open');
+  const openMessages = messages.filter(m => m.status === 'open' && (!criticalOnly || isCriticalSeverity(m)));
   const resolvedMessages = messages.filter(m => m.status === 'resolved');
   const openFeedbackMessages = openMessages.filter(m => m.message_type === 'FEEDBACK' && matchesSearch(m));
 
@@ -319,10 +324,12 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
     : 0;
 
   // Split open messages by signal level, respecting per-event-type prefs, then filter by search
+  const muteActive = isMuteWindowActive(muteWindow);
   const highSignalOpen = [...openMessages.filter(m => effectiveSignal(m, eventPrefs) === 'high' && matchesSearch(m))]
     .sort(sortMode === 'importance' ? bySeverity : byTimeDesc);
-  const routineOpen = [...openMessages.filter(m => effectiveSignal(m, eventPrefs) === 'routine' && matchesSearch(m))]
-    .sort(byTimeDesc);
+  const routineOpen = muteActive
+    ? []
+    : [...openMessages.filter(m => effectiveSignal(m, eventPrefs) === 'routine' && matchesSearch(m))].sort(byTimeDesc);
 
   // In importance mode, pin BLOCKERs at the top with a visual divider
   const pinnedBlockers = sortMode === 'importance' ? highSignalOpen.filter(m => m.message_type === 'BLOCKER') : [];
@@ -362,8 +369,21 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
   }
 
   useEffect(() => {
-    saveMessagesPanelPrefs(auth.currentUser?.email, { version: 1, routineExpanded, showResolved });
-  }, [routineExpanded, showResolved]);
+    saveMessagesPanelPrefs(auth.currentUser?.email, { version: 1, routineExpanded, showResolved, criticalOnly });
+  }, [routineExpanded, showResolved, criticalOnly]);
+
+  // Auto-clear mute window when it expires
+  const muteExpiresAt = muteWindow?.expiresAt;
+  useEffect(() => {
+    if (!muteExpiresAt) return;
+    const interval = setInterval(() => {
+      if (Date.now() >= muteExpiresAt) {
+        clearMuteWindow(auth.currentUser?.email, selectedProjectId);
+        setMuteWindow(null);
+      }
+    }, 30_000);
+    return () => clearInterval(interval);
+  }, [muteExpiresAt, selectedProjectId]);
 
   // Resolved: show last 5 by default, toggle to show all, filtered by search
   const RECENT_RESOLVED = 5;
@@ -875,13 +895,24 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
               </div>
             )}
           </div>
-          <div className="flex items-center gap-1">
+          <div className="flex items-center gap-1 flex-wrap justify-end">
           <button
             onClick={() => setSortMode(m => m === 'importance' ? 'recent' : 'importance')}
             title="Toggle sort order"
             className="text-xs px-2 py-1 rounded-lg transition-colors border border-neutral-800/60 text-neutral-500 hover:text-neutral-300 min-h-[44px] min-w-[44px] md:min-h-[36px] md:min-w-auto flex items-center justify-center"
           >
             {sortMode === 'importance' ? 'Importance' : 'Recent'}
+          </button>
+          <button
+            onClick={() => setCriticalOnly(v => !v)}
+            title={criticalOnly ? 'Show all severities' : 'Critical only (BLOCKER, BUG, critical NOTEs)'}
+            className={`text-xs px-2 py-1 rounded-lg transition-colors border min-h-[44px] min-w-[44px] md:min-h-[36px] md:min-w-auto flex items-center justify-center ${
+              criticalOnly
+                ? 'text-amber-400 bg-amber-500/10 border-amber-500/30'
+                : 'text-neutral-500 hover:text-neutral-300 border-neutral-800/60'
+            }`}
+          >
+            <AlertTriangle className="w-3.5 h-3.5" />
           </button>
           {openFeedbackMessages.length > 1 && (
             <button
@@ -896,6 +927,53 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
               {selectMode ? 'Cancel' : 'Select'}
             </button>
           )}
+          <div className="relative">
+            <button
+              onClick={() => setShowMuteMenu(v => !v)}
+              title={muteActive && muteWindow ? `Muted · ${formatMuteCountdown(muteWindow.expiresAt)}` : 'Mute routine ops temporarily'}
+              className={`px-2 py-1 rounded-lg transition-colors border min-h-[44px] min-w-[44px] md:min-h-[36px] md:min-w-auto flex items-center justify-center text-xs font-semibold ${muteActive ? 'bg-amber-500/20 text-amber-400 border-amber-500/40' : 'text-neutral-500 hover:text-neutral-300 border-transparent'}`}
+            >
+              {muteActive && muteWindow ? `🔕 ${formatMuteCountdown(muteWindow.expiresAt)}` : <BellOff className="w-4 h-4" />}
+            </button>
+            {showMuteMenu && (
+              <>
+                <div className="fixed inset-0 z-40" onClick={() => setShowMuteMenu(false)} />
+                <div className="absolute right-0 top-full mt-1 z-50 w-44 bg-neutral-900 border border-neutral-700 rounded-xl shadow-xl p-2 space-y-0.5">
+                  {muteActive ? (
+                    <>
+                      <p className="text-[10px] text-neutral-500 px-2 py-1">Mute active</p>
+                      {([['Extend +1h', 3600000], ['Extend +4h', 14400000], ['Extend +8h', 28800000]] as [string, number][]).map(([label, ms]) => (
+                        <button key={label} onClick={() => {
+                          const updated = { expiresAt: (muteWindow!.expiresAt) + ms };
+                          saveMuteWindow(auth.currentUser?.email, selectedProjectId, updated);
+                          setMuteWindow(updated);
+                          setShowMuteMenu(false);
+                        }} className="w-full text-left text-xs px-2 py-2 rounded text-neutral-300 hover:bg-neutral-800 transition-colors min-h-[44px] md:min-h-auto flex items-center">{label}</button>
+                      ))}
+                      <div className="border-t border-neutral-800 my-1" />
+                      <button onClick={() => {
+                        clearMuteWindow(auth.currentUser?.email, selectedProjectId);
+                        setMuteWindow(null);
+                        setShowMuteMenu(false);
+                      }} className="w-full text-left text-xs px-2 py-2 rounded text-amber-400 hover:bg-amber-500/10 transition-colors min-h-[44px] md:min-h-auto flex items-center">End mute early</button>
+                    </>
+                  ) : (
+                    <>
+                      <p className="text-[10px] text-neutral-500 px-2 py-1">Mute routine ops for</p>
+                      {([['1 hour', 3600000], ['4 hours', 14400000], ['8 hours', 28800000]] as [string, number][]).map(([label, ms]) => (
+                        <button key={label} onClick={() => {
+                          const newWin = { expiresAt: Date.now() + ms };
+                          saveMuteWindow(auth.currentUser?.email, selectedProjectId, newWin);
+                          setMuteWindow(newWin);
+                          setShowMuteMenu(false);
+                        }} className="w-full text-left text-xs px-2 py-2 rounded text-neutral-300 hover:bg-neutral-800 transition-colors min-h-[44px] md:min-h-auto flex items-center">{label}</button>
+                      ))}
+                    </>
+                  )}
+                </div>
+              </>
+            )}
+          </div>
           <div className="relative">
             <button
               onClick={() => setShowPrefsPanel(v => !v)}

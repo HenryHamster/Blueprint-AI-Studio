@@ -608,6 +608,77 @@ def _extract_recurrence_cycles(
     return cycles
 
 
+def compute_layer_defense_density(
+    all_fix_logs_with_case_ids: list[tuple[str, dict[str, Any]]],
+    lookback_days: int = _LAYER_DEFENSE_LEDGER_LOOKBACK_DAYS,
+) -> list[dict[str, Any]]:
+    """Return per-canonical-layer defense activity over a lookback window.
+
+    Walks ``(case_id, fix_log_entry)`` pairs from
+    ``RegressionRemediationCase.fingerprint_to_fix_log``, applies the same
+    ``merged_at`` cutoff used by ``_build_layer_defense_ledger``, and returns
+    one entry per canonical layer in canonical order — including layers with
+    zero activity. Each entry has ``layer``, ``fix_count``, ``last_fix_at``
+    (ISO timestamp of the most recent qualifying ``merged_at`` for that layer,
+    or ``None``), and ``sample_case_ids`` (up to 5 distinct case ids whose fix
+    logs contributed an entry, ordered most-recent-first).
+    """
+    now = _utcnow()
+    cutoff = now - timedelta(days=lookback_days)
+
+    layer_state: dict[str, dict[str, Any]] = {
+        layer: {
+            "fix_count": 0,
+            "last_fix_at": None,  # datetime
+            "case_contribs": [],  # list[(merged_dt, case_id)] for sampling
+        }
+        for layer in _CANONICAL_RECURRENCE_LAYERS
+    }
+
+    for case_id, entry in all_fix_logs_with_case_ids:
+        if not isinstance(entry, dict):
+            continue
+        merged_dt = _parse_dispatcher_dt(entry.get("merged_at"))
+        if merged_dt is None or merged_dt < cutoff:
+            continue
+        layers_targeted = entry.get("layers_targeted") or []
+        if not layers_targeted:
+            continue
+        for layer in layers_targeted:
+            if layer not in layer_state:
+                continue
+            s = layer_state[layer]
+            s["fix_count"] += 1
+            if s["last_fix_at"] is None or merged_dt > s["last_fix_at"]:
+                s["last_fix_at"] = merged_dt
+            s["case_contribs"].append((merged_dt, str(case_id)))
+
+    result: list[dict[str, Any]] = []
+    for layer in _CANONICAL_RECURRENCE_LAYERS:
+        s = layer_state[layer]
+        contribs = sorted(s["case_contribs"], key=lambda p: p[0], reverse=True)
+        seen: set[str] = set()
+        sample_ids: list[str] = []
+        for _dt, cid in contribs:
+            if cid in seen:
+                continue
+            seen.add(cid)
+            sample_ids.append(cid)
+            if len(sample_ids) >= 5:
+                break
+        result.append(
+            {
+                "layer": layer,
+                "fix_count": s["fix_count"],
+                "last_fix_at": s["last_fix_at"].isoformat()
+                if s["last_fix_at"] is not None
+                else None,
+                "sample_case_ids": sample_ids,
+            }
+        )
+    return result
+
+
 def _build_layer_defense_ledger(
     all_fix_logs: list[dict[str, Any]],
     lookback_days: int = _LAYER_DEFENSE_LEDGER_LOOKBACK_DAYS,
@@ -2234,6 +2305,7 @@ async def _maybe_spawn(
                 signal_first_crossed_at=now,
                 signal_first_seen_at=signal_first_seen_at or now,
                 symptoms_by_layer=merged_symptoms,
+                investigate_spawned_at=now,
             )
         )
     else:
@@ -2256,6 +2328,10 @@ async def _maybe_spawn(
         # across cooldown-blocked ticks and worker restarts.
         if signal_first_seen_at is not None:
             existing_case.signal_first_seen_at = signal_first_seen_at
+        # Preserve the first investigate spawn timestamp — operators want the
+        # original detection-to-action latency, not the most recent re-spawn.
+        if existing_case.investigate_spawned_at is None:
+            existing_case.investigate_spawned_at = now
         # Reactivate so admin state matches the in-flight remediation. A
         # CLOSED case re-tripping is a fresh regression cycle; without this
         # the case would stay CLOSED while a new investigation runs.

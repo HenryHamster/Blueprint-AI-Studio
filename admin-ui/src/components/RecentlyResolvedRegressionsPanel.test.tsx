@@ -82,6 +82,31 @@ describe('RecentlyResolvedRegressionsPanel', () => {
     expect(screen.queryByTestId('cross-layer-badge')).toBeNull();
   });
 
+  it('shows time-to-investigate when investigate_spawned_at is present', async () => {
+    apiFetchMock.mockResolvedValueOnce(response([{ id: '6', regression_class: 'slow-spawn', fix_pr_number: null, recovered_at: null, first_seen_at: '2026-05-06T10:00:00', investigate_spawned_at: '2026-05-06T10:03:00', signal_first_crossed_at: null, time_to_recover_sec: null }]));
+    render(<RecentlyResolvedRegressionsPanel projectId="proj-1" />);
+    await screen.findByText('slow-spawn');
+    expect(screen.getByTestId('time-to-investigate')).toHaveTextContent('time-to-investigate: 3m');
+  });
+
+  it('shows unknown time-to-investigate for legacy rows without investigate_spawned_at', async () => {
+    apiFetchMock.mockResolvedValueOnce(response([{ id: '7', regression_class: 'legacy-case', fix_pr_number: null, recovered_at: null, first_seen_at: '2026-05-06T10:00:00', time_to_recover_sec: null }]));
+    render(<RecentlyResolvedRegressionsPanel projectId="proj-1" />);
+    await screen.findByText('legacy-case');
+    expect(screen.getByTestId('time-to-investigate')).toHaveTextContent('time-to-investigate: unknown');
+  });
+
+  it('renders timeline-breakdown row with all four phases', async () => {
+    apiFetchMock.mockResolvedValueOnce(response([{ id: '8', regression_class: 'full-timeline', fix_pr_number: 55, recovered_at: '2026-05-06T10:20:00', first_seen_at: '2026-05-06T10:05:00', signal_first_crossed_at: '2026-05-06T10:00:00', investigate_spawned_at: '2026-05-06T10:07:00', merged_at: '2026-05-06T10:15:00', time_to_recover_sec: 300 }]));
+    render(<RecentlyResolvedRegressionsPanel projectId="proj-1" />);
+    await screen.findByText('full-timeline');
+    const breakdown = screen.getByTestId('timeline-breakdown');
+    expect(breakdown).toHaveTextContent('detect→');
+    expect(breakdown).toHaveTextContent('investigate→');
+    expect(breakdown).toHaveTextContent('merge→');
+    expect(breakdown).toHaveTextContent('recover');
+  });
+
   it('renders no badges when layer_summary is omitted', async () => {
     apiFetchMock.mockResolvedValueOnce(response([
       {

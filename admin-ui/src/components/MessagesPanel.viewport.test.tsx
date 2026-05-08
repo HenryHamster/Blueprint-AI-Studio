@@ -208,6 +208,21 @@ describe('MessagesPanel — viewport regression', () => {
     }
   });
 
+  test('mute window countdown chip renders without overflow at 375px', async () => {
+    const expiresAt = Date.now() + 3600000;
+    localStorage.setItem('messages_panel_mute_window:anonymous:project-123', JSON.stringify({ expiresAt }));
+    const msgs = [makeMsg({ id: 'r1', context: { event_type: 'pr_merged' } })];
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await renderPanel(r, msgs);
+    });
+    localStorage.removeItem('messages_panel_mute_window:anonymous:project-123');
+  });
+
   test('search filters messages by content', async () => {
     const msgs = [
       makeMsg({ id: 'msg-1', content: 'migration schema error', message_type: 'FEEDBACK', status: 'open' }),

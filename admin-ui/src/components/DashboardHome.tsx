@@ -368,6 +368,7 @@ function FixIterationBreakdown({ trends }: { trends: SrTrendWithFixIterations | 
 interface BlindSpotTheme {
   theme: string;
   count: number;
+  layer_distribution?: Record<string, number>;
 }
 
 interface BlindSpotsData {
@@ -1324,16 +1325,32 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
                 SR Blind Spots
                 <span className="ml-1 text-neutral-600 font-normal normal-case tracking-normal">· {blindSpots.total_distinct_themes} themes · {blindSpots.window_days}d</span>
               </p>
-              <div className="flex flex-wrap gap-1.5">
+              <div className="flex flex-wrap gap-2">
                 {blindSpots.themes.slice(0, 8).map((t, i) => (
-                  <span
-                    key={i}
-                    className="inline-flex items-center gap-1.5 text-[10px] font-semibold px-2 py-0.5 rounded border bg-violet-500/10 text-violet-400 border-violet-500/20"
-                    title={t.theme}
-                  >
-                    <span className="truncate max-w-[160px]">{t.theme}</span>
-                    <span className="font-bold shrink-0">×{t.count}</span>
-                  </span>
+                  <div key={i} className="flex flex-col gap-0.5 min-w-0">
+                    <span
+                      className="inline-flex items-center gap-1.5 text-[10px] font-semibold px-2 py-0.5 rounded border bg-violet-500/10 text-violet-400 border-violet-500/20"
+                      title={t.theme}
+                    >
+                      <span className="truncate max-w-[160px]">{t.theme}</span>
+                      <span className="font-bold shrink-0">×{t.count}</span>
+                    </span>
+                    {t.layer_distribution && Object.keys(t.layer_distribution).length > 0 && (
+                      <div className="flex flex-wrap gap-1">
+                        {Object.entries(t.layer_distribution)
+                          .sort((a, b) => b[1] - a[1])
+                          .map(([layer, cnt]) => (
+                            <span
+                              key={layer}
+                              className="inline-flex items-center gap-0.5 text-[9px] px-1.5 py-0.5 rounded border bg-neutral-500/10 text-neutral-400 border-neutral-500/20 max-w-[140px]"
+                            >
+                              <span className="truncate">{layer}</span>
+                              <span className="shrink-0">×{cnt}</span>
+                            </span>
+                          ))}
+                      </div>
+                    )}
+                  </div>
                 ))}
               </div>
             </section>

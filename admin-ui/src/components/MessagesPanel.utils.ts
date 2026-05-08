@@ -269,6 +269,57 @@ export function saveLastSeen(userId: string | null | undefined, projectId: strin
   } catch { /* ignore */ }
 }
 
+// ── Time-window mute (hides routine ops for a chosen duration) ────────────────
+
+export type MuteWindow = { expiresAt: number };
+
+export function muteWindowKey(userId: string | undefined, projectId: string | undefined): string {
+  return `messages_panel_mute_window:${userId || 'anonymous'}:${projectId || 'default'}`;
+}
+
+export function loadMuteWindow(userId?: string | null, projectId?: string | null): MuteWindow | null {
+  try {
+    const key = muteWindowKey(userId || undefined, projectId || undefined);
+    const raw = localStorage.getItem(key);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as { expiresAt?: unknown };
+    if (typeof parsed.expiresAt !== 'number' || parsed.expiresAt <= Date.now()) {
+      localStorage.removeItem(key);
+      return null;
+    }
+    return { expiresAt: parsed.expiresAt };
+  } catch {
+    return null;
+  }
+}
+
+export function saveMuteWindow(
+  userId: string | undefined | null,
+  projectId: string | undefined | null,
+  muteWin: MuteWindow,
+): void {
+  try {
+    localStorage.setItem(muteWindowKey(userId || undefined, projectId || undefined), JSON.stringify(muteWin));
+  } catch { /* ignore */ }
+}
+
+export function clearMuteWindow(userId: string | undefined | null, projectId: string | undefined | null): void {
+  try {
+    localStorage.removeItem(muteWindowKey(userId || undefined, projectId || undefined));
+  } catch { /* ignore */ }
+}
+
+export function isMuteWindowActive(muteWin: MuteWindow | null): boolean {
+  return muteWin !== null && muteWin.expiresAt > Date.now();
+}
+
+export function formatMuteCountdown(expiresAt: number): string {
+  const msLeft = expiresAt - Date.now();
+  const minsLeft = Math.floor(msLeft / 60000);
+  if (minsLeft < 1) return '<1m left';
+  return `${minsLeft}m left`;
+}
+
 export function formatTimestamp(timestamp: number): string {
   const now = new Date();
   const diffMs = now.getTime() - timestamp;
@@ -324,4 +375,16 @@ export function insertTimeDividers<T extends { created_at: string | null }>(msgs
   }
 
   return result;
+}
+
+export function isCriticalSeverity(msg: {
+  message_type: string;
+  context: Record<string, unknown>;
+}): boolean {
+  if (msg.message_type === 'BLOCKER' || msg.message_type === 'BUG_REPORT') return true;
+  if (msg.message_type === 'NOTE') {
+    const et = msg.context.event_type as string | undefined;
+    if (et && CRITICAL_NOTE_EVENTS.has(et)) return true;
+  }
+  return false;
 }

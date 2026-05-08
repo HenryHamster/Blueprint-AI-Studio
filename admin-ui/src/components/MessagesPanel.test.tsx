@@ -3,7 +3,7 @@ import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { render, waitFor } from '@testing-library/react';
 import { MessagesPanel } from './MessagesPanel';
-import { classifySignalLevel, effectiveSignal, loadEventPrefs, EVENT_PREFS_KEY, groupRoutineMessages, outcomeBreakdown, isFailingGroup, getToastSeverity } from './MessagesPanel.utils';
+import { classifySignalLevel, effectiveSignal, loadEventPrefs, EVENT_PREFS_KEY, groupRoutineMessages, outcomeBreakdown, isFailingGroup, getToastSeverity, isCriticalSeverity } from './MessagesPanel.utils';
 
 vi.mock('../firebase', () => ({
   auth: { currentUser: { email: 'test-user@example.com' } },
@@ -952,6 +952,120 @@ describe('loadEventPrefs', () => {
   });
 });
 
+// ── Time-window mute component tests ─────────────────────────────────────────
+
+describe('MessagesPanel mute window', () => {
+  let root: Root | null = null;
+  let host: HTMLDivElement | null = null;
+
+  beforeEach(() => { localStorage.clear(); });
+
+  afterEach(() => {
+    const r = root;
+    if (r) act(() => r.unmount());
+    root = null;
+    host?.remove();
+    host = null;
+    localStorage.clear();
+    vi.clearAllMocks();
+  });
+
+  async function renderPanel(messages: ReturnType<typeof makeMsg>[]) {
+    (apiFetch as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Response(JSON.stringify({ messages }), { status: 200 }),
+    );
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <MessagesPanel selectedProjectId="proj-1" onClose={() => {}} addToast={() => {}} onMessageCountChange={() => {}} />,
+      );
+    });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 50)); });
+    return host as HTMLDivElement;
+  }
+
+  test('mute dropdown renders 1h/4h/8h options', async () => {
+    const el = await renderPanel([]);
+    const muteBtn = [...el.querySelectorAll('button')].find(b => b.title?.includes('Mute routine'));
+    expect(muteBtn).toBeTruthy();
+    await act(async () => { (muteBtn as HTMLButtonElement).click(); });
+    expect(el.textContent).toContain('1 hour');
+    expect(el.textContent).toContain('4 hours');
+    expect(el.textContent).toContain('8 hours');
+  });
+
+  test('selecting 1h hides routine ops section', async () => {
+    const msgs = [makeMsg({ id: 'r1', from_type: 'system', context: { event_type: 'pr_merged' } })];
+    const el = await renderPanel(msgs);
+    expect(el.textContent).toContain('routine ops');
+
+    const muteBtn = [...el.querySelectorAll('button')].find(b => b.title?.includes('Mute routine'));
+    await act(async () => { (muteBtn as HTMLButtonElement)?.click(); });
+    const oneHourBtn = [...el.querySelectorAll('button')].find(b => b.textContent?.trim() === '1 hour');
+    await act(async () => { (oneHourBtn as HTMLButtonElement)?.click(); });
+
+    expect(el.textContent).not.toContain('routine ops');
+  });
+
+  test('countdown chip shows amber styling when active', async () => {
+    const el = await renderPanel([]);
+    const muteBtn = [...el.querySelectorAll('button')].find(b => b.title?.includes('Mute routine'));
+    await act(async () => { (muteBtn as HTMLButtonElement)?.click(); });
+    const oneHourBtn = [...el.querySelectorAll('button')].find(b => b.textContent?.trim() === '1 hour');
+    await act(async () => { (oneHourBtn as HTMLButtonElement)?.click(); });
+
+    const chip = [...el.querySelectorAll('button')].find(b => b.textContent?.includes('left'));
+    expect(chip).toBeTruthy();
+    expect(chip?.className).toContain('amber');
+  });
+
+  test('clicking End mute early clears window and resurfaces routine', async () => {
+    const msgs = [makeMsg({ id: 'r1', from_type: 'system', context: { event_type: 'pr_merged' } })];
+    const el = await renderPanel(msgs);
+
+    const muteBtn = [...el.querySelectorAll('button')].find(b => b.title?.includes('Mute routine'));
+    await act(async () => { (muteBtn as HTMLButtonElement)?.click(); });
+    const oneHourBtn = [...el.querySelectorAll('button')].find(b => b.textContent?.trim() === '1 hour');
+    await act(async () => { (oneHourBtn as HTMLButtonElement)?.click(); });
+    expect(el.textContent).not.toContain('routine ops');
+
+    const chip = [...el.querySelectorAll('button')].find(b => b.textContent?.includes('left'));
+    await act(async () => { (chip as HTMLButtonElement)?.click(); });
+    const endBtn = [...el.querySelectorAll('button')].find(b => b.textContent?.includes('End mute'));
+    await act(async () => { (endBtn as HTMLButtonElement)?.click(); });
+
+    expect(el.textContent).toContain('routine ops');
+  });
+
+  test('BLOCKERs remain visible while mute is active', async () => {
+    const msgs = [
+      makeMsg({ id: 'b1', message_type: 'BLOCKER', from_type: 'agent', content: 'critical blocker' }),
+      makeMsg({ id: 'r1', from_type: 'system', context: { event_type: 'pr_merged' }, content: 'routine msg' }),
+    ];
+    const el = await renderPanel(msgs);
+
+    const muteBtn = [...el.querySelectorAll('button')].find(b => b.title?.includes('Mute routine'));
+    await act(async () => { (muteBtn as HTMLButtonElement)?.click(); });
+    const oneHourBtn = [...el.querySelectorAll('button')].find(b => b.textContent?.trim() === '1 hour');
+    await act(async () => { (oneHourBtn as HTMLButtonElement)?.click(); });
+
+    expect(el.textContent).toContain('critical blocker');
+    expect(el.textContent).not.toContain('routine ops');
+  });
+
+  test('mute window persists across re-renders via localStorage', async () => {
+    const expiresAt = Date.now() + 3600000;
+    localStorage.setItem('messages_panel_mute_window:test-user@example.com:proj-1', JSON.stringify({ expiresAt }));
+    const msgs = [makeMsg({ id: 'r1', from_type: 'system', context: { event_type: 'pr_merged' } })];
+    const el = await renderPanel(msgs);
+    // Routine ops hidden because mute was loaded from localStorage on mount
+    expect(el.textContent).not.toContain('routine ops');
+  });
+});
+
 // ── Per-event-type mute/surface component integration tests ───────────────────
 
 describe('MessagesPanel per-event-type prefs', () => {
@@ -1080,6 +1194,257 @@ describe('MessagesPanel persistence', () => {
     await act(async () => { root!.unmount(); }); root = null; await renderPanel(); expect(host!.textContent).toContain('test content');
     localStorage.removeItem(key); await act(async () => { root!.unmount(); }); root = null; await renderPanel(); expect(JSON.parse(localStorage.getItem(key) || '{}')).toMatchObject({ routineExpanded: false, showResolved: false });
     localStorage.setItem(key, '}{'); await act(async () => { root!.unmount(); }); root = null; await expect(renderPanel()).resolves.toBeUndefined(); expect(JSON.parse(localStorage.getItem(key) || '{}')).toMatchObject({ routineExpanded: false, showResolved: false });
+  });
+});
+
+describe('isCriticalSeverity', () => {
+  test('returns true for BLOCKER', () => {
+    expect(isCriticalSeverity({ message_type: 'BLOCKER', context: {} })).toBe(true);
+  });
+
+  test('returns true for BUG_REPORT', () => {
+    expect(isCriticalSeverity({ message_type: 'BUG_REPORT', context: {} })).toBe(true);
+  });
+
+  test('returns false for FEEDBACK', () => {
+    expect(isCriticalSeverity({ message_type: 'FEEDBACK', context: {} })).toBe(false);
+  });
+
+  test('returns false for QUESTION', () => {
+    expect(isCriticalSeverity({ message_type: 'QUESTION', context: {} })).toBe(false);
+  });
+
+  test('returns true for NOTE with failure_alert event_type', () => {
+    expect(isCriticalSeverity({ message_type: 'NOTE', context: { event_type: 'failure_alert' } })).toBe(true);
+  });
+
+  test('returns true for NOTE with rollback_recommended event_type', () => {
+    expect(isCriticalSeverity({ message_type: 'NOTE', context: { event_type: 'rollback_recommended' } })).toBe(true);
+  });
+
+  test('returns true for NOTE with fix_loop_divergence_regressed event_type', () => {
+    expect(isCriticalSeverity({ message_type: 'NOTE', context: { event_type: 'fix_loop_divergence_regressed' } })).toBe(true);
+  });
+
+  test('returns true for NOTE with account_model_regression_quarantined event_type', () => {
+    expect(isCriticalSeverity({ message_type: 'NOTE', context: { event_type: 'account_model_regression_quarantined' } })).toBe(true);
+  });
+
+  test('returns true for NOTE with auto_fix_escalated event_type', () => {
+    expect(isCriticalSeverity({ message_type: 'NOTE', context: { event_type: 'auto_fix_escalated' } })).toBe(true);
+  });
+
+  test('returns false for NOTE with pr_merged event_type', () => {
+    expect(isCriticalSeverity({ message_type: 'NOTE', context: { event_type: 'pr_merged' } })).toBe(false);
+  });
+
+  test('returns false for NOTE with no event_type', () => {
+    expect(isCriticalSeverity({ message_type: 'NOTE', context: {} })).toBe(false);
+  });
+});
+
+describe('MessagesPanel critical-only severity filter', () => {
+  let root: Root | null = null;
+  let host: HTMLDivElement | null = null;
+  const key = 'messages_panel_prefs:test-user@example.com';
+
+  beforeEach(() => localStorage.removeItem(key));
+
+  afterEach(() => {
+    const r = root;
+    if (r) act(() => r.unmount());
+    root = null;
+    host?.remove();
+    host = null;
+    localStorage.removeItem(key);
+    vi.clearAllMocks();
+  });
+
+  async function renderPanel(messages: ReturnType<typeof makeMsg>[]) {
+    (apiFetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      new Response(JSON.stringify({ messages }), { status: 200 }),
+    );
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <MessagesPanel
+          selectedProjectId="proj-1"
+          onClose={() => {}}
+          addToast={() => {}}
+          onMessageCountChange={() => {}}
+        />,
+      );
+    });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 50)); });
+    return host as HTMLDivElement;
+  }
+
+  test('severity filter button is present in header', async () => {
+    const blocker = makeMsg({ id: 'b1', message_type: 'BLOCKER', from_type: 'agent' });
+    const el = await renderPanel([blocker]);
+    const btn = [...el.querySelectorAll('button')].find(b => b.title?.includes('Critical only'));
+    expect(btn).toBeTruthy();
+  });
+
+  test('critical-only filter hides FEEDBACK when active', async () => {
+    const blocker = makeMsg({ id: 'b1', message_type: 'BLOCKER', from_type: 'agent', content: 'blocker msg' });
+    const feedback = makeMsg({ id: 'f1', message_type: 'FEEDBACK', from_type: 'user', content: 'feedback msg' });
+    const el = await renderPanel([blocker, feedback]);
+
+    // Both should be visible initially
+    expect(el.textContent).toContain('blocker msg');
+    expect(el.textContent).toContain('feedback msg');
+
+    // Toggle critical-only filter
+    const filterBtn = [...el.querySelectorAll('button')].find(b => b.title?.includes('Critical only'));
+    await act(async () => { (filterBtn as HTMLButtonElement).click(); });
+
+    // Only blocker should be visible
+    expect(el.textContent).toContain('blocker msg');
+    expect(el.textContent).not.toContain('feedback msg');
+  });
+
+  test('critical-only filter hides QUESTION when active', async () => {
+    const bug = makeMsg({ id: 'b1', message_type: 'BUG_REPORT', from_type: 'agent', content: 'bug msg' });
+    const question = makeMsg({ id: 'q1', message_type: 'QUESTION', from_type: 'user', content: 'question msg' });
+    const el = await renderPanel([bug, question]);
+
+    // Toggle critical-only
+    const filterBtn = [...el.querySelectorAll('button')].find(b => b.title?.includes('Critical only'));
+    await act(async () => { (filterBtn as HTMLButtonElement).click(); });
+
+    expect(el.textContent).toContain('bug msg');
+    expect(el.textContent).not.toContain('question msg');
+  });
+
+  test('critical-only filter shows critical NOTEs (failure_alert)', async () => {
+    const failureAlert = makeMsg({
+      id: 'fa1',
+      message_type: 'NOTE',
+      from_type: 'system',
+      context: { event_type: 'failure_alert' },
+      content: 'failure alert msg',
+    });
+    const feedback = makeMsg({ id: 'f1', message_type: 'FEEDBACK', from_type: 'user', content: 'feedback msg' });
+    const el = await renderPanel([failureAlert, feedback]);
+
+    // Toggle critical-only
+    const filterBtn = [...el.querySelectorAll('button')].find(b => b.title?.includes('Critical only'));
+    await act(async () => { (filterBtn as HTMLButtonElement).click(); });
+
+    expect(el.textContent).toContain('failure alert msg');
+    expect(el.textContent).not.toContain('feedback msg');
+  });
+
+  test('critical-only filter hides routine NOTEs (pr_merged)', async () => {
+    const blocker = makeMsg({ id: 'b1', message_type: 'BLOCKER', from_type: 'agent', content: 'blocker msg' });
+    const prMerged = makeMsg({
+      id: 'pm1',
+      message_type: 'NOTE',
+      from_type: 'system',
+      context: { event_type: 'pr_merged' },
+      content: 'pr merged msg',
+    });
+    const el = await renderPanel([blocker, prMerged]);
+
+    // Initially both visible
+    expect(el.textContent).toContain('blocker msg');
+    // prMerged is in routine ops (collapsed)
+    expect(el.textContent).toContain('routine ops');
+
+    // Toggle critical-only
+    const filterBtn = [...el.querySelectorAll('button')].find(b => b.title?.includes('Critical only'));
+    await act(async () => { (filterBtn as HTMLButtonElement).click(); });
+
+    expect(el.textContent).toContain('blocker msg');
+    // Routine ops section should be gone
+    expect(el.textContent).not.toContain('routine ops');
+  });
+
+  test('critical-only filter persists across reloads', async () => {
+    const blocker = makeMsg({ id: 'b1', message_type: 'BLOCKER', from_type: 'agent' });
+    const feedback = makeMsg({ id: 'f1', message_type: 'FEEDBACK', from_type: 'user', content: 'feedback' });
+    const el = await renderPanel([blocker, feedback]);
+
+    // Activate critical-only
+    const filterBtn = [...el.querySelectorAll('button')].find(b => b.title?.includes('Critical only'));
+    await act(async () => { (filterBtn as HTMLButtonElement).click(); });
+
+    // Verify saved in localStorage
+    const prefs = JSON.parse(localStorage.getItem(key) || '{}');
+    expect(prefs.criticalOnly).toBe(true);
+
+    // Unmount and remount
+    await act(async () => { root!.unmount(); });
+    root = null;
+    host?.remove();
+    host = null;
+    (apiFetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      new Response(JSON.stringify({ messages: [blocker, feedback] }), { status: 200 }),
+    );
+
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    root = createRoot(host);
+    await act(async () => {
+      root!.render(
+        <MessagesPanel
+          selectedProjectId="proj-1"
+          onClose={() => {}}
+          addToast={() => {}}
+          onMessageCountChange={() => {}}
+        />,
+      );
+    });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 50)); });
+
+    // Critical-only should still be active
+    expect(host!.textContent).toContain('Blocker');
+    expect(host!.textContent).not.toContain('feedback');
+  });
+
+  test('critical-only filter works with search', async () => {
+    const blocker = makeMsg({ id: 'b1', message_type: 'BLOCKER', from_type: 'agent', content: 'system down' });
+    const feedback = makeMsg({ id: 'f1', message_type: 'FEEDBACK', from_type: 'user', content: 'system down too' });
+    const el = await renderPanel([blocker, feedback]);
+
+    // Activate critical-only
+    const filterBtn = [...el.querySelectorAll('button')].find(b => b.title?.includes('Critical only'));
+    await act(async () => { (filterBtn as HTMLButtonElement).click(); });
+
+    // Search for "system down"
+    const searchInput = el.querySelector('input[placeholder*="Search"]') as HTMLInputElement;
+    await act(async () => {
+      searchInput.value = 'system down';
+      searchInput.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+
+    // Only blocker matches (feedback is filtered by critical-only)
+    const text = el.textContent || '';
+    expect(text).toContain('system down');
+    const matches = [...el.querySelectorAll('[class*="bubble"]')];
+    expect(matches.length).toBeGreaterThanOrEqual(1);
+  });
+
+  test('button appearance changes when critical-only is active', async () => {
+    const blocker = makeMsg({ id: 'b1', message_type: 'BLOCKER', from_type: 'agent' });
+    const el = await renderPanel([blocker]);
+
+    const filterBtn = [...el.querySelectorAll('button')].find(b => b.title?.includes('Critical only')) as HTMLButtonElement;
+    expect(filterBtn).toBeTruthy();
+
+    // Initially not active (neutral colors)
+    expect(filterBtn.className).toContain('text-neutral');
+
+    // Click to activate
+    await act(async () => { filterBtn.click(); });
+
+    // Should now have amber/alert colors
+    expect(filterBtn.className).toContain('text-amber');
+    expect(filterBtn.className).toContain('amber-500');
   });
 });
 

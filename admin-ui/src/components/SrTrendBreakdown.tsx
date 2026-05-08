@@ -318,6 +318,92 @@ function ByTaskTypeSection({ byTaskType }: { byTaskType: Record<string, Record<s
   );
 }
 
+const FIX_ITER_ORDER = ['1', '2', '3+'] as const;
+
+function ByFixIterationRow({
+  bucket,
+  cats,
+  baselineCats,
+}: {
+  bucket: string;
+  cats: Record<string, SrTaskTypeCategoryStats>;
+  baselineCats: Record<string, SrTaskTypeCategoryStats> | null;
+}) {
+  const [openCat, setOpenCat] = useState<string | null>(null);
+  const sorted = Object.entries(cats).sort(([, a], [, b]) => b.miss_rate - a.miss_rate);
+  const openExamples = openCat ? cats[openCat]?.examples ?? [] : [];
+  return (
+    <div className="text-[10px] mb-0.5">
+      <div className="flex items-start gap-1">
+        <span className="text-neutral-400 w-12 shrink-0 font-medium" title={`Fix iteration ${bucket}`}>{`iter ${bucket}`}</span>
+        <span className="text-neutral-500 flex flex-wrap gap-x-1.5 gap-y-0">
+          {sorted.map(([cat, stats]) => {
+            const hasExamples = (stats.examples?.length ?? 0) > 0;
+            const isOpen = openCat === cat;
+            const baseline = baselineCats?.[cat]?.miss_rate;
+            const delta = baseline != null ? stats.miss_rate - baseline : null;
+            const inner = (
+              <>
+                <span className="text-neutral-400">{cat}</span>{' '}
+                <span className="font-mono text-orange-400">{Math.round(stats.miss_rate * 100)}%</span>
+                {delta != null && Math.abs(delta) >= 0.05 && (
+                  <span
+                    className={`font-mono tabular-nums text-[9px] ml-0.5 ${deltaColorClass(delta)}`}
+                    title={`vs iter 1: ${formatDelta(delta)}`}
+                  >
+                    {formatDelta(delta)}
+                  </span>
+                )}
+              </>
+            );
+            return hasExamples ? (
+              <button
+                key={cat}
+                type="button"
+                onClick={() => setOpenCat(isOpen ? null : cat)}
+                aria-expanded={isOpen}
+                title={`${stats.sample_count} samples — click for examples`}
+                className={`hover:text-neutral-300 ${isOpen ? 'underline' : ''}`}
+              >{inner}</button>
+            ) : (
+              <span key={cat} title={`${stats.sample_count} samples`}>{inner}</span>
+            );
+          })}
+        </span>
+      </div>
+      {openCat && openExamples.length > 0 && <ExampleList examples={openExamples} indent />}
+    </div>
+  );
+}
+
+function ByFixIterationSection({ byFixIteration }: { byFixIteration: Record<string, Record<string, SrTaskTypeCategoryStats>> }) {
+  const [open, setOpen] = useState(false);
+  const buckets = FIX_ITER_ORDER.filter(b => byFixIteration[b] && Object.keys(byFixIteration[b]).length > 0);
+  if (buckets.length === 0) return null;
+  const baseline = byFixIteration['1'] ?? null;
+  return (
+    <div className="mt-1.5 pt-1.5 border-t border-neutral-800/60" data-testid="sr-by-fix-iteration-section">
+      <button
+        type="button"
+        onClick={() => setOpen(o => !o)}
+        aria-expanded={open}
+        className="flex items-center gap-1 text-[9px] text-neutral-500 uppercase tracking-wide mb-1 hover:text-neutral-300"
+      >
+        {open ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
+        By Fix Iteration
+      </button>
+      {open && buckets.map(bucket => (
+        <ByFixIterationRow
+          key={bucket}
+          bucket={bucket}
+          cats={byFixIteration[bucket]}
+          baselineCats={bucket === '1' ? null : baseline}
+        />
+      ))}
+    </div>
+  );
+}
+
 const SCOPE_ORDER: readonly string[] = ['small', 'medium', 'large'];
 
 function ByScopeSection({ byScope }: { byScope: Record<string, Record<string, SrTaskTypeCategoryStats>> }) {
@@ -1064,6 +1150,9 @@ export function SrTrendBreakdown({ trends, variant, onCategoryClick }: SrTrendBr
         )}
         {trends?.by_task_type && Object.keys(trends.by_task_type).length > 0 && (
           <ByTaskTypeSection byTaskType={trends.by_task_type} />
+        )}
+        {trends?.by_fix_iteration && Object.keys(trends.by_fix_iteration).length > 0 && (
+          <ByFixIterationSection byFixIteration={trends.by_fix_iteration} />
         )}
       </div>
     );
