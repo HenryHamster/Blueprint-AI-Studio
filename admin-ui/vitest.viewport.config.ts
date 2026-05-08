@@ -25,6 +25,9 @@ export default defineConfig({
       headless: true,
       provider: playwright(),
       instances: [{ browser: 'chromium' }],
+      // Capture on failure so CI can upload the PNGs as artifacts —
+      // overflow regressions are visual and a stack trace alone often
+      // doesn't make the failure mode obvious.
       screenshotFailures: true,
     },
   },

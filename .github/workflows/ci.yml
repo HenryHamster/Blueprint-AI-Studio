@@ -108,6 +108,23 @@ jobs:
           VITE_FIREBASE_PROJECT_ID: ci-placeholder
         run: npm run test:viewport
 
+      # Failure screenshots are visual regressions; the stack trace alone
+      # rarely makes the issue diagnosable. screenshotFailures=true in
+      # vitest.viewport.config.ts writes PNGs into vitest's default browser
+      # output dir(s); we glob the likely locations and let the action
+      # ignore missing paths so a passing run doesn't fail this step.
+      - name: Upload viewport failure screenshots
+        if: steps.viewport.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: viewport-failure-screenshots
+          path: |
+            admin-ui/**/__screenshots__/**/*.png
+            admin-ui/.vitest/**/*.png
+            admin-ui/test-results/**/*.png
+          if-no-files-found: ignore
+          retention-days: 7
+
       - name: Save result for baseline (main only)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: |

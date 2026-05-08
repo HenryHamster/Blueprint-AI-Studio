@@ -22,7 +22,7 @@ from app.models import (
 )
 from app.auth import get_current_user
 from app.admin import _get_user_project, _get_user_project_with_role
-from app.payload_schemas import validate_internal_payload
+from app.payload_schemas import pack_under_budget, validate_internal_payload
 from app.task_locking import lock_project_or_429
 
 logger = logging.getLogger(__name__)
@@ -729,6 +729,16 @@ async def trigger_strategic_cycle(
 
     design_doc_for_agent = _agent_view_design_doc(project.design_doc)
 
+    # Use the same pack_under_budget schemas as the autonomous path so manual
+    # triggers can't generate payloads that pass schema validation (256KB cap)
+    # but exceed the DB chk_task_payloads_size constraint (200KB on payloads
+    # column). Strategic payloads grow with design_doc + directions_summary +
+    # conversation_thread and reliably overflow without packing.
+    from app.strategic_spawning import (  # noqa: PLC0415
+        _DESIGN_DOC_UPDATE_SCHEMA,
+        _STRATEGIC_REVIEW_SCHEMA,
+    )
+
     if phase == "design_doc":
         # Fetch open messages
         open_msgs_result = await session.execute(
@@ -761,17 +771,22 @@ async def trigger_strategic_cycle(
             or _runtime_config.get("task_type_efforts", {}).get("research")
             or None
         )
-        payload = {
-            "type": "design_doc_update",
-            "design_doc": design_doc_for_agent,
-            "proposed_changes": (project.design_doc or {}).get("proposed_changes", []),
-            "project_name": project.name,
-            "vision": project.vision or {},
-            "open_messages": open_msgs,
-            "base_branch": "main",
-            **({"model": doc_model} if doc_model else {}),
-            **({"effort": doc_effort} if doc_effort else {}),
-        }
+        payload = pack_under_budget(
+            {
+                "type": "design_doc_update",
+                "design_doc": design_doc_for_agent,
+                "proposed_changes": (project.design_doc or {}).get(
+                    "proposed_changes", []
+                ),
+                "project_name": project.name,
+                "vision": project.vision or {},
+                "open_messages": open_msgs,
+                "base_branch": "main",
+                **({"model": doc_model} if doc_model else {}),
+                **({"effort": doc_effort} if doc_effort else {}),
+            },
+            _DESIGN_DOC_UPDATE_SCHEMA,
+        )
         title = f"Architecture review: {project.name}"
     elif phase == "strategic_review":
         # Build direction stats — include both active and proposed so the
@@ -850,20 +865,23 @@ async def trigger_strategic_cycle(
             or _runtime_config.get("task_type_efforts", {}).get("research")
             or None
         )
-        payload = {
-            "type": "strategic_review",
-            "research_mode": "strategic",
-            "design_doc": design_doc_for_agent,
-            "vision": project.vision or {},
-            "directions_summary": direction_stats,
-            "outcome_evaluation": _build_outcome_evaluation(project),
-            "project_name": project.name,
-            "open_messages": open_msgs,
-            "conversation_thread": conversation_thread,
-            "base_branch": "main",
-            **({"model": review_model} if review_model else {}),
-            **({"effort": review_effort} if review_effort else {}),
-        }
+        payload = pack_under_budget(
+            {
+                "type": "strategic_review",
+                "research_mode": "strategic",
+                "design_doc": design_doc_for_agent,
+                "vision": project.vision or {},
+                "directions_summary": direction_stats,
+                "outcome_evaluation": _build_outcome_evaluation(project),
+                "project_name": project.name,
+                "open_messages": open_msgs,
+                "conversation_thread": conversation_thread,
+                "base_branch": "main",
+                **({"model": review_model} if review_model else {}),
+                **({"effort": review_effort} if review_effort else {}),
+            },
+            _STRATEGIC_REVIEW_SCHEMA,
+        )
         title = f"Strategic review: {project.name}"
     else:
         raise HTTPException(
