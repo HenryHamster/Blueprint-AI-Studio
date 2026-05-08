@@ -9281,3 +9281,217 @@ def test_claim_sr_recent_miss_examples_fixture_parity():
         f"Backend: {backend_copy}\nAgent:   {agent_copy}\n"
         "Both must be updated together."
     )
+
+
+@pytest.mark.asyncio
+async def test_claim_sr_recent_miss_examples_global_unchanged_without_direction_id(
+    client: AsyncClient, db_session
+):
+    """(a) Global ranking is unchanged when the task has no direction_id."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    design_doc = {
+        "sr_catch_rate_trends": {
+            "categories": {
+                "correctness": {
+                    "miss_rate": 0.50,
+                    "weighted_miss_rate": 0.55,
+                    "examples": [
+                        {"severity": "CRITICAL", "desc": "Global correctness issue"}
+                    ],
+                },
+                "security": {
+                    "miss_rate": 0.40,
+                    "weighted_miss_rate": 0.42,
+                    "examples": [
+                        {"severity": "MAJOR", "desc": "Global security issue"}
+                    ],
+                },
+            },
+            "by_direction": {
+                "dir-xyz": {
+                    "categories": {
+                        "scope-drift": {
+                            "miss_rate": 0.80,
+                            "examples": [
+                                {"severity": "MINOR", "desc": "Direction-only example"}
+                            ],
+                        }
+                    }
+                }
+            },
+        }
+    }
+    project = Project(
+        name="SR Miss Examples No Direction",
+        user_id="test-user-123",
+        design_doc=design_doc,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    flag_modified(project, "design_doc")
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "No direction task"}],
+        vm_instance_id="agent-vm-no-dir-1",
+        # no direction_id in context
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-no-dir-1")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    miss_ex = resp.json().get("project_context", {}).get("sr_recent_miss_examples", {})
+    # Global categories served — direction-only category NOT present
+    assert "correctness" in miss_ex
+    assert "security" in miss_ex
+    assert "scope-drift" not in miss_ex
+
+
+@pytest.mark.asyncio
+async def test_claim_sr_recent_miss_examples_prefers_direction_examples(
+    client: AsyncClient, db_session
+):
+    """(b) Per-direction examples are preferred over global when the task has direction_id."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    direction_id = "dir-abc"
+    design_doc = {
+        "sr_catch_rate_trends": {
+            "categories": {
+                "correctness": {
+                    "miss_rate": 0.50,
+                    "weighted_miss_rate": 0.55,
+                    "examples": [
+                        {"severity": "CRITICAL", "desc": "Global correctness example"}
+                    ],
+                },
+            },
+            "by_direction": {
+                direction_id: {
+                    "categories": {
+                        "scope-drift": {
+                            "miss_rate": 0.80,
+                            "examples": [
+                                {
+                                    "severity": "MAJOR",
+                                    "desc": "Direction scope-drift example",
+                                }
+                            ],
+                        },
+                        "architecture": {
+                            "miss_rate": 0.60,
+                            "examples": [
+                                {
+                                    "severity": "MINOR",
+                                    "desc": "Direction architecture example",
+                                }
+                            ],
+                        },
+                    }
+                }
+            },
+        }
+    }
+    project = Project(
+        name="SR Miss Examples With Direction",
+        user_id="test-user-123",
+        design_doc=design_doc,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    flag_modified(project, "design_doc")
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "Direction-scoped task"}],
+        vm_instance_id="agent-vm-dir-pref-1",
+        context={"direction_id": direction_id},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-dir-pref-1")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    miss_ex = resp.json().get("project_context", {}).get("sr_recent_miss_examples", {})
+    # Direction-specific categories present; global-only category NOT present
+    assert "scope-drift" in miss_ex
+    assert "architecture" in miss_ex
+    assert "correctness" not in miss_ex
+    # scope-drift ranked first (miss_rate 0.80 > 0.60)
+    assert list(miss_ex.keys())[0] == "scope-drift"
+    assert "Direction scope-drift example" in miss_ex["scope-drift"][0]["desc"]
+
+
+@pytest.mark.asyncio
+async def test_claim_sr_recent_miss_examples_falls_back_to_global_when_direction_empty(
+    client: AsyncClient, db_session
+):
+    """(c) Falls back to global examples when the direction has no qualifying examples."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    direction_id = "dir-no-examples"
+    design_doc = {
+        "sr_catch_rate_trends": {
+            "categories": {
+                "correctness": {
+                    "miss_rate": 0.50,
+                    "weighted_miss_rate": 0.55,
+                    "examples": [
+                        {"severity": "CRITICAL", "desc": "Global fallback example"}
+                    ],
+                },
+            },
+            "by_direction": {
+                direction_id: {
+                    "categories": {
+                        # Categories exist but none have examples
+                        "scope-drift": {"miss_rate": 0.80},
+                        "architecture": {"miss_rate": 0.60, "examples": []},
+                    }
+                }
+            },
+        }
+    }
+    project = Project(
+        name="SR Miss Examples Direction Empty",
+        user_id="test-user-123",
+        design_doc=design_doc,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    flag_modified(project, "design_doc")
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "Fallback direction task"}],
+        vm_instance_id="agent-vm-dir-fallback-1",
+        context={"direction_id": direction_id},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-dir-fallback-1")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    miss_ex = resp.json().get("project_context", {}).get("sr_recent_miss_examples", {})
+    # Global fallback: correctness present; direction categories (no examples) absent
+    assert "correctness" in miss_ex
+    assert "Global fallback example" in miss_ex["correctness"][0]["desc"]
+    assert "scope-drift" not in miss_ex
+    assert "architecture" not in miss_ex

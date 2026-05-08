@@ -2254,6 +2254,100 @@ class TestViewportRegressionDigest:
         assert by_class["viewport_regression:AlertsBanner@375"]["cases_opened"] == 1
 
 
+class TestSrCatchRateTrendsDirectionExamples:
+    """Admin digest exposes by_direction examples in the shape needed for SR-prompt injection."""
+
+    @pytest.mark.asyncio
+    async def test_digest_passes_through_direction_examples(
+        self, client: AsyncClient, db_session
+    ):
+        """(a/b) by_direction categories with examples are serialized correctly by the digest."""
+        from sqlalchemy.orm.attributes import flag_modified
+
+        project = await _make_project(db_session)
+        project.design_doc = {
+            "sr_catch_rate_trends": {
+                "computed_at": "2026-05-01T00:00:00",
+                "categories": {
+                    "correctness": {
+                        "miss_rate": 0.5,
+                        "examples": [{"severity": "MAJOR", "desc": "Global issue"}],
+                    }
+                },
+                "by_direction": {
+                    "dir-x": {
+                        "categories": {
+                            "security": {
+                                "miss_rate": 0.9,
+                                "examples": [
+                                    {
+                                        "severity": "CRITICAL",
+                                        "desc": "Direction X security miss",
+                                    }
+                                ],
+                            }
+                        }
+                    }
+                },
+            }
+        }
+        flag_modified(project, "design_doc")
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/digest?project_id={project.id}")
+        assert resp.status_code == 200
+        trends = resp.json().get("self_review_prediction_accuracy_trends")
+        assert trends is not None
+
+        by_dir = trends.get("by_direction", {})
+        assert "dir-x" in by_dir
+        dir_cats = by_dir["dir-x"].get("categories", {})
+        assert "security" in dir_cats
+        examples = dir_cats["security"].get("examples", [])
+        assert len(examples) >= 1
+        assert examples[0]["severity"] == "CRITICAL"
+        assert examples[0]["desc"] == "Direction X security miss"
+
+    @pytest.mark.asyncio
+    async def test_digest_direction_without_examples_does_not_mask_global(
+        self, client: AsyncClient, db_session
+    ):
+        """(c) by_direction entry with no examples is passed through; global categories still present."""
+        from sqlalchemy.orm.attributes import flag_modified
+
+        project = await _make_project(db_session)
+        project.design_doc = {
+            "sr_catch_rate_trends": {
+                "computed_at": "2026-05-01T00:00:00",
+                "categories": {
+                    "correctness": {
+                        "miss_rate": 0.5,
+                        "examples": [{"severity": "MAJOR", "desc": "Global fallback"}],
+                    }
+                },
+                "by_direction": {
+                    "dir-empty": {"categories": {"scope-drift": {"miss_rate": 0.7}}}
+                },
+            }
+        }
+        flag_modified(project, "design_doc")
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/digest?project_id={project.id}")
+        assert resp.status_code == 200
+        trends = resp.json().get("self_review_prediction_accuracy_trends")
+        assert trends is not None
+
+        assert "correctness" in trends.get("categories", {})
+        by_dir = trends.get("by_direction", {})
+        assert "dir-empty" in by_dir
+        dir_cats = by_dir["dir-empty"].get("categories", {})
+        assert "scope-drift" in dir_cats
+        assert "examples" not in dir_cats["scope-drift"]
+
+
 # ---------------------------------------------------------------------------
 # Viewport debt endpoint tests
 # ---------------------------------------------------------------------------

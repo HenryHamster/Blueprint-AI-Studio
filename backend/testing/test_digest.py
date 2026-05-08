@@ -8838,6 +8838,92 @@ async def test_digest_self_review_skip_rate_by_task_type_breakdown(
 
 
 # ---------------------------------------------------------------------------
+# SR disallowed blind-spot rate metric
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_digest_sr_disallowed_blind_spot_rate_below_min_sample(
+    client: AsyncClient, db_session
+):
+    """Fewer than 5 code-change tasks → sr_disallowed_blind_spot_rate is None."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    for _ in range(4):
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create"}],
+                context={
+                    "_self_review_outcome": {
+                        **_sr_valid_outcome(),
+                        "_filtered_blind_spots_count": 1,
+                    }
+                },
+            )
+        )
+    await db_session.commit()
+
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    assert response.json()["sr_disallowed_blind_spot_rate"] is None
+
+
+@pytest.mark.asyncio
+async def test_digest_sr_disallowed_blind_spot_rate_basic(
+    client: AsyncClient, db_session
+):
+    """Tasks with _filtered_blind_spots_count > 0 produce a correct violation rate."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # 2 violators + 3 clean = 5 code-change tasks → rate = 0.4
+    for _ in range(2):
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create"}],
+                context={
+                    "_self_review_outcome": {
+                        **_sr_valid_outcome(),
+                        "_filtered_blind_spots_count": 2,
+                    }
+                },
+            )
+        )
+    for _ in range(3):
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "fix"}],
+                context={
+                    "_self_review_outcome": {
+                        **_sr_valid_outcome(),
+                        "_filtered_blind_spots_count": 0,
+                    }
+                },
+            )
+        )
+    await db_session.commit()
+
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    rate = response.json()["sr_disallowed_blind_spot_rate"]
+    assert rate is not None
+    assert rate["violation_count"] == 2
+    assert rate["sample_size"] == 5
+    assert rate["overall_rate"] == 0.4
+
+
+# ---------------------------------------------------------------------------
 # Fresh-reviewer effectiveness metric
 # ---------------------------------------------------------------------------
 

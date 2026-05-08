@@ -2982,6 +2982,73 @@ def compute_direction_sr_breakdown_for_endpoint(
     return out
 
 
+def select_sr_miss_examples_for_injection(
+    sr_catch_rate_trends: dict,
+    direction_id: Optional[str] = None,
+    *,
+    max_cats: int = 3,
+    max_examples_per_cat: int = 3,
+    max_total_chars: int = 1200,
+) -> dict[str, list[dict]]:
+    """Select miss examples for agent SR-prompt injection.
+
+    When *direction_id* is provided and the per-direction snapshot in
+    ``by_direction`` contains at least one category with non-empty examples,
+    those direction-scoped categories are used as candidates.  Falls back to
+    the global top categories when the direction has no qualifying examples.
+
+    Returns ``{category: [{severity, desc}, ...]}`` bounded by *max_cats*,
+    *max_examples_per_cat*, and *max_total_chars*.
+    """
+    global_cats = sr_catch_rate_trends.get("categories") or {}
+    if not isinstance(global_cats, dict):
+        return {}
+
+    candidate_cats: dict = global_cats
+    if direction_id:
+        dir_entry = (sr_catch_rate_trends.get("by_direction") or {}).get(
+            str(direction_id)
+        ) or {}
+        dir_cats = dir_entry.get("categories")
+        if isinstance(dir_cats, dict) and any(
+            isinstance(v, dict)
+            and isinstance(v.get("examples"), list)
+            and v["examples"]
+            for v in dir_cats.values()
+        ):
+            candidate_cats = dir_cats
+
+    ranked = sorted(
+        [
+            (cat, data)
+            for cat, data in candidate_cats.items()
+            if isinstance(data, dict)
+            and isinstance(data.get("examples"), list)
+            and data["examples"]
+        ],
+        key=lambda x: x[1].get("weighted_miss_rate") or x[1].get("miss_rate") or 0.0,
+        reverse=True,
+    )[:max_cats]
+
+    result: dict[str, list[dict]] = {}
+    total_chars = 0
+    for cat, data in ranked:
+        cat_exs: list[dict] = []
+        for ex in data["examples"][:max_examples_per_cat]:
+            desc = (str(ex.get("desc") or ""))[:200]
+            if not desc:
+                continue
+            if total_chars + len(desc) > max_total_chars:
+                break
+            total_chars += len(desc)
+            cat_exs.append({"severity": ex.get("severity", "MINOR"), "desc": desc})
+        if cat_exs:
+            result[cat] = cat_exs
+        if total_chars >= max_total_chars:
+            break
+    return result
+
+
 def _compute_cat_fp_stats(
     tasks: list,
 ) -> tuple[
@@ -5352,7 +5419,7 @@ async def compute_sr_reviewer_disagreements(
 
     Returns the result dict, or ``None`` when no disagreements are found.
     """
-    from app.sr_blind_spots import count_reviewer_disagreements_in_tasks  # noqa: PLC0415
+    from app.sr_blind_spots import _count_reviewer_disagreement_directions  # noqa: PLC0415
 
     now = _utcnow()
     cutoff = now - timedelta(days=window_days)
@@ -5368,14 +5435,23 @@ async def compute_sr_reviewer_disagreements(
         if t.status == TaskStatus.COMPLETED
         and (not t.created_at or _naive(t.created_at) >= cutoff_naive)
     ]
-    disagreement_counts = count_reviewer_disagreements_in_tasks(eligible)
+    direction_counts = _count_reviewer_disagreement_directions(eligible)
 
-    if not disagreement_counts:
+    if not any(bucket["miss"] > 0 for bucket in direction_counts.values()):
         return None
 
-    top = sorted(disagreement_counts.items(), key=lambda x: -x[1])[:limit]
+    top = sorted(
+        [(k, v) for k, v in direction_counts.items() if v["miss"] > 0],
+        key=lambda x: -x[1]["miss"],
+    )[:limit]
     entries = [
-        {"category": cat, "task_type": ttype, "count": cnt} for (cat, ttype), cnt in top
+        {
+            "category": cat,
+            "task_type": ttype,
+            "count": bucket["miss"],
+            "examples": bucket["examples"],
+        }
+        for (cat, ttype), bucket in top
     ]
     result: dict[str, Any] = {
         "computed_at": now.isoformat(),

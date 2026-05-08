@@ -28,7 +28,16 @@ interface SelfReviewOutcome {
   check_results?: Record<string, SelfReviewCheckResult>;
   blind_spots?: string[];
   skip_reason?: string;
+  _filtered_blind_spots_count?: number;
 }
+
+// Human-readable labels for disallowed blind-spot categories.
+// Cross-reference: backend/app/sr_blind_spots.py DISALLOWED_BLIND_SPOT_EXAMPLES
+const DISALLOWED_BLIND_SPOT_LABELS = [
+  'full backend test suite',
+  'docker pytest',
+  'viewport tests',
+];
 
 interface SrBadgeState {
   label: string;
@@ -153,6 +162,24 @@ function SrBadge({ task, onClick }: { task: Task; onClick?: () => void }) {
       className={`inline-flex items-center text-[10px] font-medium border px-1.5 py-0.5 rounded ${colorClass}`}
     >
       {state.label}
+    </span>
+  );
+}
+
+function SrDisallowedBadge({ task }: { task: Task }) {
+  const ctx = task.context as Record<string, unknown> | undefined;
+  const outcome = ctx?._self_review_outcome as SelfReviewOutcome | undefined;
+  const count = outcome?._filtered_blind_spots_count ?? 0;
+  if (count === 0) return null;
+
+  const tooltip = `Agent emitted ${count} disallowed blind-spot pattern${count !== 1 ? 's' : ''} (filtered before aggregation)\nDisallowed categories: ${DISALLOWED_BLIND_SPOT_LABELS.join(', ')}`;
+  return (
+    <span
+      title={tooltip}
+      className="inline-flex items-center gap-0.5 text-[10px] font-medium border px-1.5 py-0.5 rounded bg-amber-500/10 border-amber-500/20 text-amber-400"
+    >
+      <AlertTriangle className="w-3 h-3 shrink-0" />
+      {count} disallowed
     </span>
   );
 }
@@ -754,6 +781,9 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
         )}
         {(isTerminal || task.status === 'EVALUATING') && (
           <SrBadge task={task} onClick={onOpenSelfReview} />
+        )}
+        {(isTerminal || task.status === 'EVALUATING') && (
+          <SrDisallowedBadge task={task} />
         )}
       </div>
 

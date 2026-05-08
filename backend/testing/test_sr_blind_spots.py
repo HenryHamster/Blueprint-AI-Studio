@@ -308,3 +308,132 @@ def test_false_attestation_non_code_change_tasks_excluded():
         for _ in range(5)
     ]
     assert aggregate_sr_false_attestation_rates(tasks, min_sample=1) is None
+
+
+# ---------------------------------------------------------------------------
+# Unit: _count_reviewer_disagreement_directions — examples capture
+# ---------------------------------------------------------------------------
+
+
+def _make_disagreement_task(
+    project_id,
+    *,
+    task_type: str = "create",
+    check_results: dict | None = None,
+    reviewer_findings: list | None = None,
+):
+    """Build a task for reviewer-disagreement example-capture tests."""
+    return make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": task_type, "prompt": "x"}],
+        context={
+            "_self_review_outcome": {
+                "check_results": check_results or {},
+                "reviewer_findings": reviewer_findings or [],
+            }
+        },
+    )
+
+
+def test_disagreement_directions_captures_verbatim_examples():
+    """Missed reviewer findings are stored as {severity, description} examples."""
+    from app.sr_blind_spots import _count_reviewer_disagreement_directions
+
+    pid = uuid.uuid4()
+    task = _make_disagreement_task(
+        pid,
+        reviewer_findings=[
+            {
+                "category": "correctness",
+                "severity": "HIGH",
+                "description": "Missing null check on return value",
+            }
+        ],
+    )
+    counts = _count_reviewer_disagreement_directions([task])
+    bucket = counts[("correctness", "create")]
+    assert bucket["miss"] == 1
+    assert len(bucket["examples"]) == 1
+    ex = bucket["examples"][0]
+    assert ex["severity"] == "HIGH"
+    assert ex["description"] == "Missing null check on return value"
+
+
+def test_disagreement_directions_truncates_long_descriptions():
+    """Descriptions longer than _REVIEWER_EXAMPLE_CHAR_CAP are truncated."""
+    from app.sr_blind_spots import (
+        _REVIEWER_EXAMPLE_CHAR_CAP,
+        _count_reviewer_disagreement_directions,
+    )
+
+    pid = uuid.uuid4()
+    long_desc = "x" * (_REVIEWER_EXAMPLE_CHAR_CAP + 50)
+    task = _make_disagreement_task(
+        pid,
+        reviewer_findings=[
+            {"category": "correctness", "severity": "HIGH", "description": long_desc}
+        ],
+    )
+    counts = _count_reviewer_disagreement_directions([task])
+    stored = counts[("correctness", "create")]["examples"][0]["description"]
+    assert len(stored) == _REVIEWER_EXAMPLE_CHAR_CAP
+
+
+def test_disagreement_directions_caps_examples_per_bucket():
+    """At most _REVIEWER_EXAMPLE_CAP examples are stored per (category, task_type) bucket."""
+    from app.sr_blind_spots import (
+        _REVIEWER_EXAMPLE_CAP,
+        _count_reviewer_disagreement_directions,
+    )
+
+    pid = uuid.uuid4()
+    tasks = [
+        _make_disagreement_task(
+            pid,
+            reviewer_findings=[
+                {
+                    "category": "correctness",
+                    "severity": "MEDIUM",
+                    "description": f"Issue {i}",
+                }
+            ],
+        )
+        for i in range(_REVIEWER_EXAMPLE_CAP + 2)
+    ]
+    counts = _count_reviewer_disagreement_directions(tasks)
+    bucket = counts[("correctness", "create")]
+    assert bucket["miss"] == _REVIEWER_EXAMPLE_CAP + 2
+    assert len(bucket["examples"]) == _REVIEWER_EXAMPLE_CAP
+
+
+def test_disagreement_directions_no_example_when_description_empty():
+    """A reviewer finding with empty description is counted as a miss but adds no example."""
+    from app.sr_blind_spots import _count_reviewer_disagreement_directions
+
+    pid = uuid.uuid4()
+    task = _make_disagreement_task(
+        pid,
+        reviewer_findings=[
+            {"category": "correctness", "severity": "HIGH", "description": ""}
+        ],
+    )
+    counts = _count_reviewer_disagreement_directions([task])
+    bucket = counts[("correctness", "create")]
+    assert bucket["miss"] == 1
+    assert bucket["examples"] == []
+
+
+def test_disagreement_directions_defaults_severity_to_low():
+    """A finding without a recognised severity value is stored with severity='LOW'."""
+    from app.sr_blind_spots import _count_reviewer_disagreement_directions
+
+    pid = uuid.uuid4()
+    task = _make_disagreement_task(
+        pid,
+        reviewer_findings=[
+            {"category": "correctness", "description": "Some issue without severity"}
+        ],
+    )
+    counts = _count_reviewer_disagreement_directions([task])
+    assert counts[("correctness", "create")]["examples"][0]["severity"] == "LOW"

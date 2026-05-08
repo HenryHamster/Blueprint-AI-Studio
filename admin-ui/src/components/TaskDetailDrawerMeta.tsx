@@ -437,7 +437,15 @@ interface SelfReviewOutcome {
   reviewer_findings?: ReviewerFinding[];
   edges_considered?: EdgeConsidered[];
   fix_iteration?: number;
+  _filtered_blind_spots_count?: number;
 }
+
+// Cross-reference: backend/app/sr_blind_spots.py DISALLOWED_BLIND_SPOT_EXAMPLES
+const DISALLOWED_BLIND_SPOT_LABELS = [
+  'full backend test suite',
+  'docker pytest',
+  'viewport tests',
+];
 
 function getSeverityColor(severity: string): string {
   switch (severity) {
@@ -625,6 +633,16 @@ function SelfReviewPanel({ task }: { task: Task }) {
                       </li>
                     ))}
                   </ul>
+                </div>
+              )}
+              {(outcome._filtered_blind_spots_count ?? 0) > 0 && (
+                <div className="bg-amber-950/20 border border-amber-800/30 rounded px-2.5 py-2">
+                  <p className="text-xs text-amber-400">
+                    Agent emitted {outcome._filtered_blind_spots_count} disallowed blind-spot pattern{outcome._filtered_blind_spots_count !== 1 ? 's' : ''} — filtered before aggregation
+                  </p>
+                  <p className="text-[10px] text-amber-500/70 mt-0.5">
+                    Disallowed categories: {DISALLOWED_BLIND_SPOT_LABELS.join(', ')}
+                  </p>
                 </div>
               )}
 

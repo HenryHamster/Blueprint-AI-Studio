@@ -200,6 +200,55 @@ def _compute_sr_skip_rate(terminal_tasks: List[Task]) -> "Dict[str, Any] | None"
     }
 
 
+def _compute_sr_disallowed_blind_spot_rate(
+    terminal_tasks: List[Task],
+) -> "Dict[str, Any] | None":
+    """Share of code-change tasks where the agent emitted at least one disallowed
+    blind-spot phrase (captured as ``_filtered_blind_spots_count > 0`` by
+    ``filter_disallowed_blind_spots``). Returns None when sample size < 5.
+    """
+    code_change_tasks: List[Task] = []
+    for t in terminal_tasks:
+        ttype = (t.first_payload or {}).get("type")
+        if ttype in _SR_CODE_CHANGE_TYPES:
+            code_change_tasks.append(t)
+
+    if len(code_change_tasks) < 5:
+        return None
+
+    violation_count = 0
+    by_type: Dict[str, Dict[str, int]] = {}
+    for t in code_change_tasks:
+        ttype = (t.first_payload or {}).get("type")
+        ctx = t.context or {}
+        sro = ctx.get("_self_review_outcome") or {}
+        has_violation = (sro.get("_filtered_blind_spots_count") or 0) > 0
+        bucket = by_type.setdefault(ttype, {"violations": 0, "total": 0})
+        bucket["total"] += 1
+        if has_violation:
+            violation_count += 1
+            bucket["violations"] += 1
+
+    by_task_type: Dict[str, Dict[str, Any]] = {}
+    for ttype, counts in by_type.items():
+        total = counts["total"]
+        if total < 5:
+            continue
+        by_task_type[ttype] = {
+            "rate": round(counts["violations"] / total, 3),
+            "violation_count": counts["violations"],
+            "sample_size": total,
+        }
+
+    sample_size = len(code_change_tasks)
+    return {
+        "overall_rate": round(violation_count / sample_size, 3),
+        "violation_count": violation_count,
+        "sample_size": sample_size,
+        "by_task_type": by_task_type,
+    }
+
+
 def _compute_sr_prediction_accuracy(
     tasks_with_both: List[Task],
 ) -> "Dict[str, Any] | None":
@@ -6292,6 +6341,9 @@ async def _compute_digest(
 
     _review_quality = _compute_review_quality_metrics(completed_tasks + failed_tasks)
     _self_review_skip_rate = _compute_sr_skip_rate(completed_tasks + failed_tasks)
+    _sr_disallowed_blind_spot_rate = _compute_sr_disallowed_blind_spot_rate(
+        completed_tasks + failed_tasks
+    )
     _first_attempt_success_rate = _compute_first_attempt_breakdowns(
         completed_tasks + failed_tasks,
         prev_terminal_tasks=prev_completed_tasks + prev_failed_tasks,
@@ -6355,6 +6407,7 @@ async def _compute_digest(
         "self_review_prediction_accuracy_trends": self_review_prediction_accuracy_trends,
         "sr_regression_risk_test_signal_trends": sr_regression_risk_test_signal_trends,
         "self_review_skip_rate": _self_review_skip_rate,
+        "sr_disallowed_blind_spot_rate": _sr_disallowed_blind_spot_rate,
         "review_accuracy": _review_quality["review_accuracy"],
         "fresh_reviewer_effectiveness": _review_quality["fresh_reviewer_effectiveness"],
         "fresh_reviewer_trend": fresh_reviewer_trend,

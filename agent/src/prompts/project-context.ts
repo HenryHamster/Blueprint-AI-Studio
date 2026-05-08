@@ -603,8 +603,9 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
   }
 
   // Build SR vs fresh-reviewer disagreement calibration block — only if budget allows.
-  // Shape: ctx.sr_reviewer_disagreements = { disagreements: [{category, task_type, count}], window_days: number }
-  type SRReviewerDisagreementEntry = { category: string; task_type: string; count: number };
+  // Shape: ctx.sr_reviewer_disagreements = { disagreements: [{category, task_type, count, examples?}], window_days: number }
+  type SRReviewerDisagreementExample = { severity: string; description: string };
+  type SRReviewerDisagreementEntry = { category: string; task_type: string; count: number; examples?: SRReviewerDisagreementExample[] };
   const srReviewerDisagreementsData = ctx.sr_reviewer_disagreements as {
     disagreements?: SRReviewerDisagreementEntry[];
     window_days?: number;
@@ -619,19 +620,32 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
     const ordered = [...forCurrentType, ...forOtherTypes].slice(0, 8);
     if (ordered.length > 0) {
       const typeScope = taskType ? ` — especially in ${taskType} tasks` : '';
-      const candidateLines: string[] = [
-        '### SR vs Fresh-Reviewer Disagreements',
-        `Categories where self-review passed but the fresh reviewer caught issues (last ${windowDays} days)${typeScope}. Apply extra scrutiny here:`,
-      ];
-      for (const entry of ordered) {
-        const typeSuffix = taskType && entry.task_type !== taskType ? ` (${entry.task_type} tasks)` : '';
-        candidateLines.push(`- **${entry.category}**: ${entry.count} disagreement${entry.count === 1 ? '' : 's'}${typeSuffix}`);
-      }
-      candidateLines.push('');
-      const candidate = candidateLines.join('\n');
-      if (candidate.length <= budget) {
-        srReviewerDisagreementLines = candidateLines;
-        budget -= candidate.length;
+      const buildDisagreementLines = (withExamples: boolean): string[] => {
+        const lines: string[] = [
+          '### SR vs Fresh-Reviewer Disagreements',
+          `Categories where self-review passed but the fresh reviewer caught issues (last ${windowDays} days)${typeScope}. Apply extra scrutiny here:`,
+        ];
+        for (const entry of ordered) {
+          const typeSuffix = taskType && entry.task_type !== taskType ? ` (${entry.task_type} tasks)` : '';
+          lines.push(`- **${entry.category}**: ${entry.count} disagreement${entry.count === 1 ? '' : 's'}${typeSuffix}`);
+          if (withExamples && entry.examples && entry.examples.length > 0) {
+            for (const ex of entry.examples.slice(0, 3)) {
+              const desc = ex.description.slice(0, 200);
+              lines.push(`  - [${ex.severity}] ${desc}`);
+            }
+          }
+        }
+        lines.push('');
+        return lines;
+      };
+      for (const withExamples of [true, false]) {
+        const candidateLines = buildDisagreementLines(withExamples);
+        const candidate = candidateLines.join('\n');
+        if (candidate.length <= budget) {
+          srReviewerDisagreementLines = candidateLines;
+          budget -= candidate.length;
+          break;
+        }
       }
     }
   }

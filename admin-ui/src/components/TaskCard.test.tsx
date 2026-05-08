@@ -210,3 +210,50 @@ describe('TaskCard SR badge', () => {
     expect(screen.queryByText('SR skipped')).toBeNull();
   });
 });
+
+describe('TaskCard SrDisallowedBadge', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('renders disallowed badge when _filtered_blind_spots_count > 0', () => {
+    const task = makeTask({
+      context: {
+        _self_review_outcome: {
+          verdict: 'pass',
+          check_results: { correctness: { passed: true } },
+          _filtered_blind_spots_count: 2,
+        },
+      },
+    });
+    render(<TaskCard task={task} {...baseProps} />);
+    expect(screen.getByText('2 disallowed')).toBeTruthy();
+  });
+
+  it('renders no disallowed badge when _filtered_blind_spots_count is 0', () => {
+    const task = makeTask({
+      context: {
+        _self_review_outcome: {
+          verdict: 'pass',
+          check_results: { correctness: { passed: true } },
+          _filtered_blind_spots_count: 0,
+        },
+      },
+    });
+    render(<TaskCard task={task} {...baseProps} />);
+    expect(screen.queryByText(/disallowed/)).toBeNull();
+  });
+
+  it('renders no disallowed badge when _filtered_blind_spots_count is absent', () => {
+    const task = makeTask({
+      context: {
+        _self_review_outcome: {
+          verdict: 'pass',
+          check_results: { correctness: { passed: true } },
+        },
+      },
+    });
+    render(<TaskCard task={task} {...baseProps} />);
+    expect(screen.queryByText(/disallowed/)).toBeNull();
+  });
+});

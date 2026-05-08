@@ -263,6 +263,12 @@ interface DigestData {
     sample_size: number;
     by_task_type: Record<string, { rate: number; skipped_count: number; sample_size: number }>;
   } | null;
+  sr_disallowed_blind_spot_rate?: {
+    overall_rate: number;
+    violation_count: number;
+    sample_size: number;
+    by_task_type: Record<string, { rate: number; violation_count: number; sample_size: number }>;
+  } | null;
   fresh_reviewer_effectiveness?: {
     fresh_reviewer_sample_size: number;
     fresh_reviewer_first_attempt_approval_rate: number | null;
@@ -1082,7 +1088,7 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
           })()}
 
           {/* Section 1d3: Review Quality */}
-          {!loading && (digest?.review_accuracy != null || digest?.self_review_effectiveness != null || digest?.self_review_prediction_accuracy != null || digest?.self_review_prediction_accuracy_trends != null || digest?.self_review_skip_rate != null || digest?.fresh_reviewer_effectiveness != null || digest?.sr_false_attestation_trends != null) && (
+          {!loading && (digest?.review_accuracy != null || digest?.self_review_effectiveness != null || digest?.self_review_prediction_accuracy != null || digest?.self_review_prediction_accuracy_trends != null || digest?.self_review_skip_rate != null || digest?.sr_disallowed_blind_spot_rate != null || digest?.fresh_reviewer_effectiveness != null || digest?.sr_false_attestation_trends != null) && (
             <section>
               <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-2">Review Quality</p>
               <div className="flex flex-wrap gap-3">
@@ -1244,6 +1250,33 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
                         {Math.round(rate * 100)}%
                       </p>
                       <p className="text-[9px] text-neutral-600 mt-0.5">n={skip.sample_size}</p>
+                    </div>
+                  );
+                })()}
+                {digest?.sr_disallowed_blind_spot_rate != null && (() => {
+                  const dbs = digest.sr_disallowed_blind_spot_rate!;
+                  const rate = dbs.overall_rate;
+                  const color = rate <= 0.05 ? 'text-emerald-400' : rate <= 0.15 ? 'text-amber-400' : 'text-red-400';
+                  const byTypeEntries = Object.entries(dbs.by_task_type ?? {});
+                  // Cross-reference: backend/app/sr_blind_spots.py DISALLOWED_BLIND_SPOT_EXAMPLES
+                  const categoryLabels = 'full backend test suite, docker pytest, viewport tests';
+                  const tooltip = [
+                    `Disallowed patterns: ${categoryLabels}`,
+                    ...(byTypeEntries.length
+                      ? byTypeEntries.map(([t, b]) => `${t}: ${Math.round(b.rate * 100)}% (n=${b.sample_size})`)
+                      : []),
+                  ].join('\n');
+                  return (
+                    <div
+                      className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[110px]"
+                      title={tooltip}
+                      data-testid="sr-disallowed-blind-spot-tile"
+                    >
+                      <p className="text-[9px] text-neutral-500 uppercase tracking-wide mb-0.5">SR Disallowed</p>
+                      <p className={`text-xl font-bold font-mono ${color}`}>
+                        {Math.round(rate * 100)}%
+                      </p>
+                      <p className="text-[9px] text-neutral-600 mt-0.5">n={dbs.sample_size}</p>
                     </div>
                   );
                 })()}

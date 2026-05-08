@@ -601,6 +601,9 @@ _REVIEWER_ORIGINS = frozenset(
 
 _SEVERITY_LEVELS = ("CRITICAL", "HIGH", "MEDIUM", "LOW")
 
+_REVIEWER_EXAMPLE_CAP = 3
+_REVIEWER_EXAMPLE_CHAR_CAP = 200
+
 
 def _max_severity(sev_counts: Dict[str, int]) -> str | None:
     for s in _SEVERITY_LEVELS:
@@ -616,6 +619,7 @@ def _count_reviewer_disagreement_directions(tasks) -> Dict[tuple, dict]:
             "tp": 0,
             "fp": 0,
             "severity": {s: 0 for s in _SEVERITY_LEVELS},
+            "examples": [],
         }
     )
     for t in tasks:
@@ -663,17 +667,28 @@ def _count_reviewer_disagreement_directions(tasks) -> Dict[tuple, dict]:
 
         for cat in missed_cats:
             counts[(cat, task_type)]["miss"] += 1
-            sev = next(
+            matching_finding = next(
                 (
-                    f.get("severity")
+                    f
                     for f in reviewer_findings
-                    if isinstance(f, dict)
-                    and f.get("category") == cat
-                    and f.get("severity") in _SEVERITY_LEVELS
+                    if isinstance(f, dict) and f.get("category") == cat
                 ),
-                "LOW",
+                None,
+            )
+            sev = (
+                matching_finding.get("severity")
+                if matching_finding
+                and matching_finding.get("severity") in _SEVERITY_LEVELS
+                else "LOW"
             )
             counts[(cat, task_type)]["severity"][sev] += 1
+            bucket_examples = counts[(cat, task_type)]["examples"]
+            if len(bucket_examples) < _REVIEWER_EXAMPLE_CAP and matching_finding:
+                desc = (matching_finding.get("description") or "")[
+                    :_REVIEWER_EXAMPLE_CHAR_CAP
+                ]
+                if desc:
+                    bucket_examples.append({"severity": sev, "description": desc})
         for cat in sr_failed:
             bucket = counts[(cat, task_type)]
             if cat in reviewer_cats:
@@ -938,6 +953,7 @@ async def aggregate_sr_reviewer_disagreements(
             )
             if (bucket["fp"] + bucket["tp"]) > 0
             else None,
+            "examples": bucket["examples"],
         }
         for (cat, ttype), bucket in top
     ]

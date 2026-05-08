@@ -1550,6 +1550,44 @@ async def claim_task(
                     "[AGENT] Failed to compute sr_catch_rate_trends (non-critical)"
                 )
             try:
+                from app.playbook_learning import compute_sr_false_attestation_trends
+
+                await compute_sr_false_attestation_trends(
+                    project_id=task.project_id,
+                    session=session,
+                    all_tasks=list(high_iter_rows),
+                )
+            except Exception:
+                logger.exception(
+                    "[AGENT] Failed to compute sr_false_attestation_trends (non-critical)"
+                )
+            try:
+                from app.playbook_learning import (
+                    compute_sr_regression_risk_test_signal_trends,
+                )
+
+                await compute_sr_regression_risk_test_signal_trends(
+                    project_id=task.project_id,
+                    session=session,
+                    all_tasks=list(high_iter_rows),
+                )
+            except Exception:
+                logger.exception(
+                    "[AGENT] Failed to compute sr_regression_risk_test_signal_trends (non-critical)"
+                )
+            try:
+                from app.playbook_learning import compute_fresh_reviewer_trend
+
+                await compute_fresh_reviewer_trend(
+                    project_id=task.project_id,
+                    session=session,
+                    all_tasks=list(high_iter_rows),
+                )
+            except Exception:
+                logger.exception(
+                    "[AGENT] Failed to compute fresh_reviewer_trend (non-critical)"
+                )
+            try:
                 from app.playbook_learning import compute_edges_trend
 
                 await compute_edges_trend(
@@ -2442,6 +2480,46 @@ async def claim_task(
                         "[AGENT] Failed to compute research sr_catch_rate_trends (non-critical)"
                     )
                 try:
+                    from app.playbook_learning import (
+                        compute_sr_false_attestation_trends,
+                    )
+
+                    await compute_sr_false_attestation_trends(
+                        project_id=task.project_id,
+                        session=session,
+                        all_tasks=list(high_iter_rows),
+                    )
+                except Exception:
+                    logger.exception(
+                        "[AGENT] Failed to compute research sr_false_attestation_trends (non-critical)"
+                    )
+                try:
+                    from app.playbook_learning import (
+                        compute_sr_regression_risk_test_signal_trends,
+                    )
+
+                    await compute_sr_regression_risk_test_signal_trends(
+                        project_id=task.project_id,
+                        session=session,
+                        all_tasks=list(high_iter_rows),
+                    )
+                except Exception:
+                    logger.exception(
+                        "[AGENT] Failed to compute research sr_regression_risk_test_signal_trends (non-critical)"
+                    )
+                try:
+                    from app.playbook_learning import compute_fresh_reviewer_trend
+
+                    await compute_fresh_reviewer_trend(
+                        project_id=task.project_id,
+                        session=session,
+                        all_tasks=list(high_iter_rows),
+                    )
+                except Exception:
+                    logger.exception(
+                        "[AGENT] Failed to compute research fresh_reviewer_trend (non-critical)"
+                    )
+                try:
                     from app.playbook_learning import compute_edges_trend
 
                     await compute_edges_trend(
@@ -2776,16 +2854,36 @@ async def claim_task(
     # specific "this exact thing slipped past last time" examples to act on.
     # Shape: project_context.sr_recent_miss_examples = {cat: [{severity, desc}, ...]}
     # Bounded: top 3 categories by weighted_miss_rate, ≤3 examples each, ≤1200 chars total.
+    # When the task has a direction_id, prefer per-direction examples; fall back to global
+    # when the direction has no qualifying data in by_direction.
     if task_type in ("create", "fix", "refactor", "migrate") and project_for_playbook:
         try:
             _miss_trends = (project_for_playbook.design_doc or {}).get(
                 "sr_catch_rate_trends"
             )
             if _miss_trends and isinstance(_miss_trends.get("categories"), dict):
+                # Resolve candidate categories: prefer direction-scoped when available.
+                _direction_id = (task.context or {}).get("direction_id")
+                _candidate_cats: dict | None = None
+                if _direction_id:
+                    _dir_entry = (_miss_trends.get("by_direction") or {}).get(
+                        str(_direction_id)
+                    ) or {}
+                    _dir_cats = _dir_entry.get("categories")
+                    if isinstance(_dir_cats, dict) and any(
+                        isinstance(v, dict)
+                        and isinstance(v.get("examples"), list)
+                        and v["examples"]
+                        for v in _dir_cats.values()
+                    ):
+                        _candidate_cats = _dir_cats
+                if _candidate_cats is None:
+                    _candidate_cats = _miss_trends["categories"]
+
                 _ranked = sorted(
                     [
                         (cat, data)
-                        for cat, data in _miss_trends["categories"].items()
+                        for cat, data in _candidate_cats.items()
                         if isinstance(data, dict)
                         and isinstance(data.get("examples"), list)
                         and data["examples"]

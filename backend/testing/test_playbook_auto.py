@@ -4918,6 +4918,100 @@ async def test_compute_sr_catch_rate_trends_by_direction_stores_direction_text(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Tests for select_sr_miss_examples_for_injection
+# ─────────────────────────────────────────────────────────────────────────────
+
+_SAMPLE_TRENDS: dict = {
+    "categories": {
+        "correctness": {
+            "weighted_miss_rate": 0.8,
+            "examples": [{"severity": "MAJOR", "desc": "Global correctness issue"}],
+        },
+        "error-handling": {
+            "weighted_miss_rate": 0.5,
+            "examples": [{"severity": "MINOR", "desc": "Global error handling gap"}],
+        },
+    },
+    "by_direction": {
+        "dir-x": {
+            "categories": {
+                "security": {
+                    "miss_rate": 0.9,
+                    "examples": [
+                        {"severity": "CRITICAL", "desc": "Direction X security miss"}
+                    ],
+                },
+            }
+        },
+        "dir-empty": {
+            "categories": {
+                "correctness": {
+                    "miss_rate": 0.7,
+                    # no examples key → direction has no qualifying examples
+                },
+            }
+        },
+    },
+}
+
+
+def test_select_sr_miss_examples_global_when_no_direction_id():
+    """When direction_id is None, global categories are used."""
+    from app.playbook_learning import select_sr_miss_examples_for_injection
+
+    result = select_sr_miss_examples_for_injection(_SAMPLE_TRENDS, direction_id=None)
+    # Should include global categories ranked by weighted_miss_rate
+    assert "correctness" in result
+    assert any("Global correctness issue" in ex["desc"] for ex in result["correctness"])
+    # Global ranking preserved: correctness (0.8) before error-handling (0.5)
+    keys = list(result.keys())
+    assert keys.index("correctness") < keys.index("error-handling")
+
+
+def test_select_sr_miss_examples_prefers_direction_when_examples_present():
+    """When direction_id is provided and has examples, those are preferred over global."""
+    from app.playbook_learning import select_sr_miss_examples_for_injection
+
+    result = select_sr_miss_examples_for_injection(_SAMPLE_TRENDS, direction_id="dir-x")
+    # Direction-scoped category should be present
+    assert "security" in result
+    assert any("Direction X security miss" in ex["desc"] for ex in result["security"])
+    # Global-only category must not appear (direction slice was used instead)
+    assert "correctness" not in result
+    assert "error-handling" not in result
+
+
+def test_select_sr_miss_examples_falls_back_to_global_when_direction_has_no_examples():
+    """When the direction has no categories with examples, fall back to global."""
+    from app.playbook_learning import select_sr_miss_examples_for_injection
+
+    result = select_sr_miss_examples_for_injection(
+        _SAMPLE_TRENDS, direction_id="dir-empty"
+    )
+    # dir-empty has no examples, so global categories are used
+    assert "correctness" in result
+    assert "security" not in result
+
+
+def test_select_sr_miss_examples_falls_back_to_global_for_unknown_direction():
+    """When direction_id is not found in by_direction, fall back to global."""
+    from app.playbook_learning import select_sr_miss_examples_for_injection
+
+    result = select_sr_miss_examples_for_injection(
+        _SAMPLE_TRENDS, direction_id="dir-unknown"
+    )
+    assert "correctness" in result
+
+
+def test_select_sr_miss_examples_empty_trends_returns_empty():
+    """When sr_catch_rate_trends has no categories, return empty dict."""
+    from app.playbook_learning import select_sr_miss_examples_for_injection
+
+    assert select_sr_miss_examples_for_injection({}) == {}
+    assert select_sr_miss_examples_for_injection({"categories": {}}) == {}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Tests for reasoning engagement in compute_sr_catch_rate_trends
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -8786,6 +8880,12 @@ async def test_compute_sr_reviewer_disagreements_counts_disagreements(
     assert entries[0]["category"] == "correctness"
     assert entries[0]["task_type"] == "fix"
     assert entries[0]["count"] == 3
+    # Examples should be included — capped at 3 per bucket by sr_blind_spots
+    assert "examples" in entries[0]
+    assert len(entries[0]["examples"]) >= 1
+    ex = entries[0]["examples"][0]
+    assert ex["severity"] == "HIGH"
+    assert "bug" in ex["description"]
 
 
 @pytest.mark.asyncio
