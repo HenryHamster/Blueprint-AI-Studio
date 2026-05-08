@@ -244,6 +244,35 @@ function getRegressingCategories(
 }
 
 /**
+ * Augments check_results entries with fp_rate_hint when a category has reliable
+ * false-positive rate data (fp_rate >= 50% and sample_size >= 10). The hint is used
+ * by sr-pr-section.js to annotate findings when rendered in the PR body.
+ */
+function augmentCheckResultsWithFpRateHints(
+  checkResults: Record<string, Record<string, unknown>>,
+  projectContext: Record<string, unknown> | undefined,
+): void {
+  const srCatchRate = projectContext?.self_review_catch_rate as {
+    categories?: Record<string, SRCatchRateCategory>;
+  } | null | undefined;
+  const categories = srCatchRate?.categories;
+  if (!categories) return;
+
+  for (const [category, entry] of Object.entries(checkResults)) {
+    // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
+    const categoryData = categories[category];
+    // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
+    if (!categoryData) continue;
+    const fpRate = categoryData.false_positive_rate ?? 0;
+    const sampleSize = categoryData.sr_flag_sample_size ?? 0;
+    if (fpRate >= 0.5 && sampleSize >= 10) {
+      const fpPercent = Math.round(fpRate * 100);
+      entry.fp_rate_hint = `(FP rate ${fpPercent}% in this project, n=${sampleSize})`;
+    }
+  }
+}
+
+/**
  * Runs a second read-only Claude session to review the current diff as an
  * adversarial reviewer. Findings are merged into /tmp/self_review_<taskId>.json:
  * reviewer-flagged categories override passing self-attestations, and findings
@@ -438,6 +467,35 @@ If no issues found: {"reviewer_findings": [], "reviewer_edges_considered": []}`;
     if (engagementGaps.length > 0) {
       sr.engagement_gaps = engagementGaps;
       sendLog(ws, `[FreshReview] Engagement gaps (regressing categories without SR reasoning): ${engagementGaps.join(', ')}.\n`);
+    }
+  }
+
+  // Augment check_results with FP-rate hints for categories with reliable false-positive data.
+  const checkResultsForHints = sr.check_results as Record<string, Record<string, unknown>> | undefined;
+  if (checkResultsForHints) {
+    augmentCheckResultsWithFpRateHints(checkResultsForHints, projectContext);
+  }
+
+  // Also augment reviewer_findings with FP-rate hints for rendering in sr-pr-section.js.
+  const srCatchRate = projectContext?.self_review_catch_rate as {
+    categories?: Record<string, SRCatchRateCategory>;
+  } | null | undefined;
+  const fpRateCategories = srCatchRate?.categories ?? {};
+  const reviewerFindings = sr.reviewer_findings as Array<Record<string, unknown>> | undefined;
+  if (Array.isArray(reviewerFindings)) {
+    for (const finding of reviewerFindings) {
+      const cat = finding.category as string | undefined;
+      if (!cat) continue;
+      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
+      const categoryData = fpRateCategories[cat];
+      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
+      if (!categoryData) continue;
+      const fpRate = categoryData.false_positive_rate ?? 0;
+      const sampleSize = categoryData.sr_flag_sample_size ?? 0;
+      if (fpRate >= 0.5 && sampleSize >= 10) {
+        const fpPercent = Math.round(fpRate * 100);
+        finding.fp_rate_hint = `(FP rate ${fpPercent}% in this project, n=${sampleSize})`;
+      }
     }
   }
 

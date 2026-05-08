@@ -1385,6 +1385,8 @@ class TestEdgesConsideredInvariants:
             "unhandled_edge_flagged_rate",
             "correctness_rejection_rate_with_edges",
             "correctness_rejection_rate_without_edges",
+            "correctness_rejection_rate_with_unhandled_flag",
+            "correctness_rejection_rate_with_all_handled",
             "author_avg_edges_per_task",
             "reviewer_avg_edges_per_task",
             "tasks_with_reviewer_edges_count",
@@ -1554,3 +1556,193 @@ class TestEdgesConsideredInvariants:
         assert result["author_avg_edges_per_task"] == 1.0
         assert result["reviewer_avg_edges_per_task"] is None
         assert result["tasks_with_reviewer_edges_count"] == 0
+
+    def test_author_unhandled_flag_partitioning(self):
+        """Tasks with author-origin edges are partitioned into two sub-buckets:
+        those where ≥1 author edge is handled=False (unhandled-flag bucket) and
+        those where all author edges are handled=True (all-handled bucket).
+        Only author-origin edges drive the split; reviewer edges are excluded.
+        """
+        from unittest.mock import MagicMock
+        from app.routers.admin_digest import _compute_edges_considered_metrics
+
+        def _make_task(edges, rejected_cats=None):
+            t = MagicMock()
+            t.first_payload = {"type": "create"}
+            ctx = {"_self_review_outcome": {"edges_considered": edges}}
+            if rejected_cats is not None:
+                ctx["_first_attempt_rejection_categories"] = rejected_cats
+            ctx["_first_attempt_succeeded"] = True
+            t.context = ctx
+            return t
+
+        # task A: author flags one unhandled edge → lands in unhandled-flag bucket
+        # task B: author marks all edges handled → lands in all-handled bucket
+        # task C: author marks all edges handled → lands in all-handled bucket
+        # Reviewer edge on task A must NOT affect which bucket it lands in.
+        tasks = [
+            _make_task(
+                [
+                    {"case": "edge1", "handled": False, "origin": "author"},
+                    {"case": "edge2", "handled": True, "origin": "reviewer"},
+                ],
+                rejected_cats=["correctness"],
+            ),
+            _make_task(
+                [{"case": "edge3", "handled": True, "origin": "author"}],
+                rejected_cats=[],
+            ),
+            _make_task(
+                [{"case": "edge4", "handled": True}],  # no origin → author
+                rejected_cats=[],
+            ),
+        ]
+        result = _compute_edges_considered_metrics(tasks)
+        assert result is not None
+
+        # unhandled-flag bucket: 1 task (task A), 1 rejected → rate = 1.0
+        assert result["correctness_rejection_rate_with_unhandled_flag"] == 1.0, (
+            "unhandled-flag bucket must compute rejection rate only for tasks where "
+            "≥1 author-origin edge is handled=False"
+        )
+        # all-handled bucket: 2 tasks (B, C), 0 rejected → rate = 0.0
+        assert result["correctness_rejection_rate_with_all_handled"] == 0.0, (
+            "all-handled bucket must compute rejection rate only for tasks where "
+            "all author-origin edges are handled=True"
+        )
+
+    def test_author_unhandled_flag_sample_size_guard(self):
+        """Sub-buckets below the sample threshold must return None — the same
+        guard that applies to the with/without-edges partition."""
+        from unittest.mock import MagicMock
+        from app.routers.admin_digest import _compute_edges_considered_metrics
+
+        def _make_task(edges):
+            t = MagicMock()
+            t.first_payload = {"type": "create"}
+            t.context = {"_self_review_outcome": {"edges_considered": edges}}
+            return t
+
+        # All three tasks have all-handled author edges → unhandled-flag bucket is empty
+        tasks = [
+            _make_task([{"case": "c1", "handled": True}]),
+            _make_task([{"case": "c2", "handled": True}]),
+            _make_task([{"case": "c3", "handled": True}]),
+        ]
+        result = _compute_edges_considered_metrics(tasks)
+        assert result is not None
+        # Empty sub-bucket: no tasks with rejection data → _rejection_rate returns None
+        assert result["correctness_rejection_rate_with_unhandled_flag"] is None, (
+            "correctness_rejection_rate_with_unhandled_flag must be None when the "
+            "unhandled-flag sub-bucket is empty (no tasks qualify)"
+        )
+
+
+# ── Reviewer-Disagreement Severity Invariants ─────────────────────────────────
+
+
+class TestReviewerDisagreementSeverityInvariants:
+    """Contract tests for severity-stratified reviewer-disagreement tallying.
+
+    Guards against the severity_breakdown / max_severity fields being dropped
+    from the aggregate_sr_reviewer_disagreements return shape, and ensures
+    _max_severity respects CRITICAL > HIGH > MEDIUM > LOW precedence.
+    """
+
+    def test_max_severity_precedence(self):
+        """_max_severity must return the highest-ranked level with a nonzero count."""
+        from app.sr_blind_spots import _max_severity
+
+        assert (
+            _max_severity({"CRITICAL": 1, "HIGH": 2, "MEDIUM": 0, "LOW": 0})
+            == "CRITICAL"
+        )
+        assert (
+            _max_severity({"CRITICAL": 0, "HIGH": 3, "MEDIUM": 1, "LOW": 0}) == "HIGH"
+        )
+        assert (
+            _max_severity({"CRITICAL": 0, "HIGH": 0, "MEDIUM": 2, "LOW": 0}) == "MEDIUM"
+        )
+        assert _max_severity({"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 5}) == "LOW"
+        assert _max_severity({"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}) is None
+
+    def test_count_directions_accumulates_severity(self):
+        """_count_reviewer_disagreement_directions must tally severity per bucket."""
+        from unittest.mock import MagicMock
+        from app.sr_blind_spots import (
+            _count_reviewer_disagreement_directions,
+            _SEVERITY_LEVELS,
+        )
+
+        def _make_task(findings):
+            t = MagicMock()
+            t.first_payload = {"type": "create"}
+            t.context = {
+                "_self_review_outcome": {
+                    "check_results": {},
+                    "reviewer_findings": findings,
+                }
+            }
+            return t
+
+        tasks = [
+            _make_task([{"category": "correctness", "severity": "CRITICAL"}]),
+            _make_task([{"category": "correctness", "severity": "HIGH"}]),
+            _make_task([{"category": "correctness", "severity": "HIGH"}]),
+        ]
+        result = _count_reviewer_disagreement_directions(tasks)
+        bucket = result[("correctness", "create")]
+        assert set(bucket["severity"].keys()) == set(_SEVERITY_LEVELS), (
+            "severity dict must contain all four levels: CRITICAL, HIGH, MEDIUM, LOW"
+        )
+        assert bucket["severity"]["CRITICAL"] == 1
+        assert bucket["severity"]["HIGH"] == 2
+        assert bucket["severity"]["MEDIUM"] == 0
+        assert bucket["severity"]["LOW"] == 0
+
+    def test_aggregate_return_shape_includes_severity_fields(self):
+        """aggregate_sr_reviewer_disagreements items must expose severity_breakdown and max_severity.
+
+        If this fails: either field was dropped from the return dict — update the
+        frontend reader (SrReviewerDisagreementsPanel) and this test together to avoid
+        contract drift.
+        """
+        import asyncio
+        import uuid
+        from unittest.mock import AsyncMock, MagicMock
+        from app.sr_blind_spots import aggregate_sr_reviewer_disagreements
+
+        def _make_task(findings):
+            t = MagicMock()
+            t.first_payload = {"type": "create"}
+            t.context = {
+                "_self_review_outcome": {
+                    "check_results": {},
+                    "reviewer_findings": findings,
+                }
+            }
+            return t
+
+        tasks = [_make_task([{"category": "correctness", "severity": "CRITICAL"}])]
+        scalars_mock = MagicMock()
+        scalars_mock.all.return_value = tasks
+        result_mock = MagicMock()
+        result_mock.scalars.return_value = scalars_mock
+        session = AsyncMock()
+        session.execute = AsyncMock(return_value=result_mock)
+
+        items = asyncio.run(
+            aggregate_sr_reviewer_disagreements(
+                session, uuid.uuid4(), days=14, limit=10
+            )
+        )
+        assert items, "Expected at least one result"
+        item = items[0]
+        assert "severity_breakdown" in item, (
+            "severity_breakdown missing — frontend SrReviewerDisagreementsPanel depends on it"
+        )
+        assert "max_severity" in item, (
+            "max_severity missing — frontend badge color-coding depends on it"
+        )
+        assert isinstance(item["severity_breakdown"], dict)
+        assert item["max_severity"] == "CRITICAL"

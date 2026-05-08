@@ -591,10 +591,24 @@ _REVIEWER_ORIGINS = frozenset(
     )
 )
 
+_SEVERITY_LEVELS = ("CRITICAL", "HIGH", "MEDIUM", "LOW")
 
-def _count_reviewer_disagreement_directions(tasks) -> Dict[tuple, Dict[str, int]]:
-    counts: Dict[tuple, Dict[str, int]] = defaultdict(
-        lambda: {"miss": 0, "tp": 0, "fp": 0}
+
+def _max_severity(sev_counts: Dict[str, int]) -> str | None:
+    for s in _SEVERITY_LEVELS:
+        if sev_counts.get(s, 0) > 0:
+            return s
+    return None
+
+
+def _count_reviewer_disagreement_directions(tasks) -> Dict[tuple, dict]:
+    counts: Dict[tuple, dict] = defaultdict(
+        lambda: {
+            "miss": 0,
+            "tp": 0,
+            "fp": 0,
+            "severity": {s: 0 for s in _SEVERITY_LEVELS},
+        }
     )
     for t in tasks:
         task_type = (t.first_payload or {}).get("type", "")
@@ -641,6 +655,17 @@ def _count_reviewer_disagreement_directions(tasks) -> Dict[tuple, Dict[str, int]
 
         for cat in missed_cats:
             counts[(cat, task_type)]["miss"] += 1
+            sev = next(
+                (
+                    f.get("severity")
+                    for f in reviewer_findings
+                    if isinstance(f, dict)
+                    and f.get("category") == cat
+                    and f.get("severity") in _SEVERITY_LEVELS
+                ),
+                "LOW",
+            )
+            counts[(cat, task_type)]["severity"][sev] += 1
         for cat in sr_failed:
             bucket = counts[(cat, task_type)]
             if cat in reviewer_cats:
@@ -896,6 +921,8 @@ async def aggregate_sr_reviewer_disagreements(
             "category": cat,
             "task_type": ttype,
             "count": bucket["miss"],
+            "severity_breakdown": dict(bucket["severity"]),
+            "max_severity": _max_severity(bucket["severity"]),
             "false_positive_count": bucket["fp"],
             "true_positive_count": bucket["tp"],
             "false_positive_rate": round(

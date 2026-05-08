@@ -439,6 +439,8 @@ def _compute_edges_considered_metrics(
 
     tasks_with_edges: List[Task] = []
     tasks_without_edges: List[Task] = []
+    tasks_with_unhandled_flag: List[Task] = []
+    tasks_with_all_handled: List[Task] = []
     total_edges = 0
     unhandled_flagged = 0
     total_author_edges = 0
@@ -457,6 +459,10 @@ def _compute_edges_considered_metrics(
         total_reviewer_edges += len(reviewer_e)
         if author_e:
             n_with_author += 1
+            if any(not e.get("handled", True) for e in author_e):
+                tasks_with_unhandled_flag.append(t)
+            else:
+                tasks_with_all_handled.append(t)
         if reviewer_e:
             n_with_reviewer += 1
             if _reviewer_caught_author_miss(author_e, reviewer_e):
@@ -500,6 +506,12 @@ def _compute_edges_considered_metrics(
         "correctness_rejection_rate_with_edges": _rejection_rate(tasks_with_edges),
         "correctness_rejection_rate_without_edges": _rejection_rate(
             tasks_without_edges
+        ),
+        "correctness_rejection_rate_with_unhandled_flag": _rejection_rate(
+            tasks_with_unhandled_flag
+        ),
+        "correctness_rejection_rate_with_all_handled": _rejection_rate(
+            tasks_with_all_handled
         ),
         "author_avg_edges_per_task": round(total_author_edges / n_with_author, 2)
         if n_with_author

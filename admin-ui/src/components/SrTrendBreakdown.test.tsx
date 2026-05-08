@@ -7,10 +7,12 @@ import {
   DirectionSrBreakdownPanel,
   EdgesTrendBreakdown,
   SrScopeDriftVsExpansionCard,
+  SrReviewerDisagreementsPanel,
   type SrTrendData,
   type DirectionSrEntry,
   type EdgesTrend,
   type SrScopeDriftVsExpansion,
+  type SrReviewerDisagreementsData,
 } from './SrTrendBreakdown';
 
 function makeTrends(): SrTrendData {
@@ -562,6 +564,68 @@ describe('EdgesTrendBreakdown', () => {
     expect(screen.getByText('correctness rej w/wo')).toBeTruthy();
     expect(container.querySelector('[title*="positive = edges correlate"]')).toBeNull();
   });
+
+  it('renders rej w/unhandled-flag vs all-handled row when both sub-bucket fields are present', () => {
+    render(<EdgesTrendBreakdown trend={makeEdgesTrend({
+      rate_history: [],
+      current: {
+        sample_size: 20,
+        tasks_with_edges_rate: 0.7,
+        correctness_rejection_rate_with_unhandled_flag: 0.40,
+        correctness_rejection_rate_with_all_handled: 0.15,
+      },
+    })} />);
+    expect(screen.getByText('rej w/unhandled-flag vs all-handled')).toBeTruthy();
+    expect(screen.getByText('40%')).toBeTruthy();
+    expect(screen.getByText('15%')).toBeTruthy();
+  });
+
+  it('shows positive gap colored emerald when unhandled-flag rejection is higher (informative signal)', () => {
+    const { container } = render(<EdgesTrendBreakdown trend={makeEdgesTrend({
+      current: {
+        sample_size: 20,
+        tasks_with_edges_rate: 0.7,
+        correctness_rejection_rate_with_unhandled_flag: 0.45,
+        correctness_rejection_rate_with_all_handled: 0.10,
+      },
+    })} />);
+    const gap = container.querySelector('[title*="positive = author\'s unhandled-flag signal is informative"]');
+    expect(gap).not.toBeNull();
+    expect(gap?.textContent).toBe('Δ+35pp');
+    expect(gap?.className).toContain('text-emerald-400');
+  });
+
+  it('shows negative gap colored red when all-handled rejection is higher (non-informative signal)', () => {
+    const { container } = render(<EdgesTrendBreakdown trend={makeEdgesTrend({
+      current: {
+        sample_size: 20,
+        tasks_with_edges_rate: 0.7,
+        correctness_rejection_rate_with_unhandled_flag: 0.10,
+        correctness_rejection_rate_with_all_handled: 0.35,
+      },
+    })} />);
+    const gap = container.querySelector('[title*="positive = author\'s unhandled-flag signal is informative"]');
+    expect(gap).not.toBeNull();
+    expect(gap?.textContent).toBe('Δ−25pp');
+    expect(gap?.className).toContain('text-red-400');
+  });
+
+  it('does not render rej w/unhandled-flag row when both sub-bucket fields are absent', () => {
+    render(<EdgesTrendBreakdown trend={makeEdgesTrend()} />);
+    expect(screen.queryByText('rej w/unhandled-flag vs all-handled')).toBeNull();
+  });
+
+  it('omits the gap when only one of the unhandled/all-handled sub-bucket rates is present', () => {
+    const { container } = render(<EdgesTrendBreakdown trend={makeEdgesTrend({
+      current: {
+        sample_size: 10,
+        tasks_with_edges_rate: 0.7,
+        correctness_rejection_rate_with_unhandled_flag: 0.30,
+      },
+    })} />);
+    expect(screen.getByText('rej w/unhandled-flag vs all-handled')).toBeTruthy();
+    expect(container.querySelector('[title*="positive = author\'s unhandled-flag signal is informative"]')).toBeNull();
+  });
 });
 
 describe('SrTrendBreakdown execution-evidence categories', () => {
@@ -1057,6 +1121,121 @@ describe('SrTrendBreakdown reasoning engagement', () => {
     render(<SrTrendBreakdown trends={trends} variant="inline" />);
     const engEl = screen.getByTitle(/Reasoning engagement/i);
     expect(engEl).toHaveTextContent('eng:50%');
+  });
+});
+
+describe('SrReviewerDisagreementsPanel severity stratification', () => {
+  function makeData(disagreements: SrReviewerDisagreementsData['disagreements']): SrReviewerDisagreementsData {
+    return { window_days: 7, total_entries: disagreements.length, disagreements };
+  }
+
+  it('returns null when disagreements array is empty', () => {
+    const { container } = render(<SrReviewerDisagreementsPanel data={makeData([])} />);
+    expect(container.firstChild).toBeNull();
+  });
+
+  it('applies red styling for CRITICAL max_severity badge', () => {
+    const { container } = render(
+      <SrReviewerDisagreementsPanel data={makeData([
+        { category: 'correctness', task_type: 'create', count: 5, max_severity: 'CRITICAL', severity_breakdown: { CRITICAL: 5 } },
+      ])} />,
+    );
+    const badge = container.querySelector('[data-testid="sr-reviewer-disagreements"] span:first-child');
+    expect(badge?.className).toContain('text-red-400');
+  });
+
+  it('applies orange styling for HIGH max_severity badge', () => {
+    const { container } = render(
+      <SrReviewerDisagreementsPanel data={makeData([
+        { category: 'correctness', task_type: 'create', count: 3, max_severity: 'HIGH', severity_breakdown: { HIGH: 3 } },
+      ])} />,
+    );
+    const badge = container.querySelector('[data-testid="sr-reviewer-disagreements"] span:first-child');
+    expect(badge?.className).toContain('text-orange-400');
+  });
+
+  it('applies amber styling for MEDIUM max_severity badge', () => {
+    const { container } = render(
+      <SrReviewerDisagreementsPanel data={makeData([
+        { category: 'style-conventions', task_type: 'fix', count: 2, max_severity: 'MEDIUM', severity_breakdown: { MEDIUM: 2 } },
+      ])} />,
+    );
+    const badge = container.querySelector('[data-testid="sr-reviewer-disagreements"] span:first-child');
+    expect(badge?.className).toContain('text-amber-400');
+  });
+
+  it('shows severity detail counts inline for CRITICAL badge', () => {
+    render(
+      <SrReviewerDisagreementsPanel data={makeData([
+        { category: 'correctness', task_type: 'create', count: 8, max_severity: 'CRITICAL', severity_breakdown: { CRITICAL: 3, HIGH: 5 } },
+      ])} />,
+    );
+    expect(screen.getByText(/3 CRITICAL/)).toBeInTheDocument();
+    expect(screen.getByText(/5 HIGH/)).toBeInTheDocument();
+  });
+
+  it('shows severity detail counts inline for HIGH badge', () => {
+    render(
+      <SrReviewerDisagreementsPanel data={makeData([
+        { category: 'error-handling', task_type: 'fix', count: 4, max_severity: 'HIGH', severity_breakdown: { HIGH: 4 } },
+      ])} />,
+    );
+    expect(screen.getByText(/4 HIGH/)).toBeInTheDocument();
+  });
+
+  it('does not show severity detail counts for MEDIUM badge', () => {
+    render(
+      <SrReviewerDisagreementsPanel data={makeData([
+        { category: 'style-conventions', task_type: 'fix', count: 2, max_severity: 'MEDIUM', severity_breakdown: { MEDIUM: 2 } },
+      ])} />,
+    );
+    expect(screen.queryByText(/MEDIUM/)).not.toBeInTheDocument();
+  });
+
+  it('does not show severity detail counts for LOW badge', () => {
+    render(
+      <SrReviewerDisagreementsPanel data={makeData([
+        { category: 'documentation', task_type: 'create', count: 1, max_severity: 'LOW', severity_breakdown: { LOW: 1 } },
+      ])} />,
+    );
+    expect(screen.queryByText(/LOW/)).not.toBeInTheDocument();
+  });
+
+  it('backward compat: renders badge without severity_breakdown (old data shape)', () => {
+    render(
+      <SrReviewerDisagreementsPanel data={makeData([
+        { category: 'correctness', task_type: 'create', count: 12 },
+      ])} />,
+    );
+    expect(screen.getByText('×12')).toBeInTheDocument();
+    expect(screen.getByText('correctness')).toBeInTheDocument();
+  });
+
+  it('sorts CRITICAL badges before HIGH, HIGH before MEDIUM, then by count descending', () => {
+    const { container } = render(
+      <SrReviewerDisagreementsPanel data={makeData([
+        { category: 'performance', task_type: 'fix', count: 10, max_severity: 'MEDIUM' },
+        { category: 'correctness', task_type: 'create', count: 3, max_severity: 'CRITICAL', severity_breakdown: { CRITICAL: 3 } },
+        { category: 'error-handling', task_type: 'fix', count: 7, max_severity: 'HIGH', severity_breakdown: { HIGH: 7 } },
+        { category: 'security', task_type: 'create', count: 2, max_severity: 'CRITICAL', severity_breakdown: { CRITICAL: 2 } },
+      ])} />,
+    );
+    const badges = container.querySelectorAll('[data-testid="sr-reviewer-disagreements"] > span');
+    // First two should be CRITICAL (count 3 before 2), third HIGH, fourth MEDIUM
+    expect(badges[0].textContent).toContain('correctness');
+    expect(badges[1].textContent).toContain('security');
+    expect(badges[2].textContent).toContain('error-handling');
+    expect(badges[3].textContent).toContain('performance');
+  });
+
+  it('title attribute encodes max_severity when present', () => {
+    const { container } = render(
+      <SrReviewerDisagreementsPanel data={makeData([
+        { category: 'correctness', task_type: 'create', count: 5, max_severity: 'CRITICAL', severity_breakdown: { CRITICAL: 5 } },
+      ])} />,
+    );
+    const badge = container.querySelector('[title*="max: CRITICAL"]');
+    expect(badge).not.toBeNull();
   });
 });
 

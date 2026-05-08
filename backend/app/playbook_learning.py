@@ -2453,6 +2453,8 @@ def _compute_edges_stats(tasks: list) -> Optional[dict[str, Any]]:
 
     with_edges: list = []
     without_edges: list = []
+    with_unhandled_flag: list = []
+    with_all_handled: list = []
     total_edges = 0
     unhandled_flagged = 0
     total_author_edges = 0
@@ -2471,6 +2473,10 @@ def _compute_edges_stats(tasks: list) -> Optional[dict[str, Any]]:
         total_reviewer_edges += len(reviewer_e)
         if author_e:
             n_with_author += 1
+            if any(not e.get("handled", True) for e in author_e):
+                with_unhandled_flag.append(t)
+            else:
+                with_all_handled.append(t)
         if reviewer_e:
             n_with_reviewer += 1
             if _reviewer_caught_author_miss(author_e, reviewer_e):
@@ -2510,6 +2516,12 @@ def _compute_edges_stats(tasks: list) -> Optional[dict[str, Any]]:
         else None,
         "correctness_rejection_rate_with_edges": _rejection_rate(with_edges),
         "correctness_rejection_rate_without_edges": _rejection_rate(without_edges),
+        "correctness_rejection_rate_with_unhandled_flag": _rejection_rate(
+            with_unhandled_flag
+        ),
+        "correctness_rejection_rate_with_all_handled": _rejection_rate(
+            with_all_handled
+        ),
         "author_avg_edges_per_task": round(total_author_edges / n_with_author, 2)
         if n_with_author
         else None,

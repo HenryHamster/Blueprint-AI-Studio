@@ -653,6 +653,8 @@ export interface EdgesTrendStats {
   unhandled_edge_flagged_rate?: number | null;
   correctness_rejection_rate_with_edges?: number | null;
   correctness_rejection_rate_without_edges?: number | null;
+  correctness_rejection_rate_with_unhandled_flag?: number | null;
+  correctness_rejection_rate_with_all_handled?: number | null;
 }
 
 export interface EdgesTrend {
@@ -726,6 +728,36 @@ export function EdgesTrendBreakdown({ trend }: { trend: EdgesTrend | null | unde
               <span
                 className={`font-mono tabular-nums text-[9px] ${deltaColorClass(-gap)}`}
                 title="gap = without-edges minus with-edges; positive = edges correlate with fewer correctness rejections"
+              >
+                {`Δ${formatDelta(gap)}`}
+              </span>
+            )}
+          </div>
+        );
+      })()}
+      {(curr.correctness_rejection_rate_with_unhandled_flag != null || curr.correctness_rejection_rate_with_all_handled != null) && (() => {
+        const rUnhandled = curr.correctness_rejection_rate_with_unhandled_flag;
+        const rAllHandled = curr.correctness_rejection_rate_with_all_handled;
+        const gap = rUnhandled != null && rAllHandled != null ? rUnhandled - rAllHandled : null;
+        return (
+          <div className="flex items-center gap-2 text-[10px]">
+            <span
+              className="text-neutral-400 flex-1"
+              title="Higher rate-with-unhandled-flag than rate-with-all-handled means the agent's honesty about unhandled edges is informative — reviewers consistently catch issues the author flagged."
+            >
+              rej w/unhandled-flag vs all-handled
+            </span>
+            <span className="font-mono tabular-nums text-neutral-300" title="correctness rejection rate when ≥1 author-origin edge was flagged unhandled">
+              {rUnhandled != null ? `${Math.round(rUnhandled * 100)}%` : '–'}
+            </span>
+            <span className="text-neutral-600 text-[9px]">/</span>
+            <span className="font-mono tabular-nums text-neutral-300" title="correctness rejection rate when all author-origin edges were marked handled">
+              {rAllHandled != null ? `${Math.round(rAllHandled * 100)}%` : '–'}
+            </span>
+            {gap != null && (
+              <span
+                className={`font-mono tabular-nums text-[9px] ${deltaColorClass(-gap)}`}
+                title="gap = with-unhandled-flag minus with-all-handled; positive = author's unhandled-flag signal is informative"
               >
                 {`Δ${formatDelta(gap)}`}
               </span>
@@ -1344,6 +1376,8 @@ export interface SrReviewerDisagreement {
   category: string;
   task_type: string;
   count: number;
+  severity_breakdown?: Record<string, number> | null;
+  max_severity?: string | null;
 }
 
 export interface SrReviewerDisagreementsData {
@@ -1352,21 +1386,52 @@ export interface SrReviewerDisagreementsData {
   disagreements: SrReviewerDisagreement[];
 }
 
+const _DISAGREEMENT_SEV_ORDER: Record<string, number> = { CRITICAL: 0, HIGH: 1, MEDIUM: 2, LOW: 3 };
+
+function disagreementBadgeClass(maxSev?: string | null): string {
+  if (maxSev === 'CRITICAL') return 'bg-red-500/10 text-red-400 border-red-500/20';
+  if (maxSev === 'HIGH') return 'bg-orange-500/10 text-orange-400 border-orange-500/20';
+  if (maxSev === 'MEDIUM') return 'bg-amber-500/10 text-amber-400 border-amber-500/20';
+  return 'bg-orange-500/10 text-orange-400 border-orange-500/20';
+}
+
+function sortDisagreements(items: SrReviewerDisagreement[]): SrReviewerDisagreement[] {
+  return [...items].sort((a, b) => {
+    const sa = _DISAGREEMENT_SEV_ORDER[a.max_severity ?? ''] ?? 4;
+    const sb = _DISAGREEMENT_SEV_ORDER[b.max_severity ?? ''] ?? 4;
+    return sa !== sb ? sa - sb : b.count - a.count;
+  });
+}
+
 export function SrReviewerDisagreementsPanel({ data }: { data: SrReviewerDisagreementsData }) {
   if (!data.disagreements.length) return null;
+  const sorted = sortDisagreements(data.disagreements);
   return (
     <div data-testid="sr-reviewer-disagreements" className="flex flex-wrap gap-1.5">
-      {data.disagreements.slice(0, 8).map((d, i) => (
-        <span
-          key={i}
-          title={`${d.count} task${d.count !== 1 ? 's' : ''} where self-review passed ${d.category} but reviewer flagged it`}
-          className="inline-flex items-center gap-1.5 text-[10px] font-semibold px-2 py-0.5 rounded border bg-orange-500/10 text-orange-400 border-orange-500/20"
-        >
-          <span className="truncate max-w-[120px]">{d.category}</span>
-          {d.task_type && <span className="text-orange-600 font-normal">{d.task_type}</span>}
-          <span className="font-bold shrink-0">×{d.count}</span>
-        </span>
-      ))}
+      {sorted.slice(0, 8).map((d, i) => {
+        const sev = d.max_severity;
+        const breakdown = d.severity_breakdown;
+        const showSevDetail = (sev === 'CRITICAL' || sev === 'HIGH') && breakdown;
+        const sevDetail = showSevDetail && breakdown
+          ? (['CRITICAL', 'HIGH'] as const)
+              .filter(s => (breakdown[s] ?? 0) > 0)
+              .map(s => `${breakdown[s]} ${s}`)
+              .join(', ')
+          : null;
+        return (
+          <span
+            key={i}
+            title={`${d.count} task${d.count !== 1 ? 's' : ''} where self-review passed ${d.category} but reviewer flagged it${sev ? ` (max: ${sev})` : ''}`}
+            className={`inline-flex items-center gap-1.5 text-[10px] font-semibold px-2 py-0.5 rounded border ${disagreementBadgeClass(sev)}`}
+          >
+            <span className="truncate max-w-[120px]">{d.category}</span>
+            {d.task_type && <span className="opacity-60 font-normal">·</span>}
+            {d.task_type && <span className="opacity-70 font-normal">{d.task_type}</span>}
+            <span className="font-bold shrink-0">×{d.count}</span>
+            {sevDetail && <span className="font-normal opacity-80">({sevDetail})</span>}
+          </span>
+        );
+      })}
     </div>
   );
 }
