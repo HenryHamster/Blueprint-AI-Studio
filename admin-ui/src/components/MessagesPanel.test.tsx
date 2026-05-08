@@ -140,9 +140,9 @@ describe('classifySignalLevel', () => {
     expect(classifySignalLevel({ ...base, context: { event_type: 'cycle_summary' } })).toBe('routine');
   });
 
-  test('NOTE with account_model_regression_quarantined is high-signal', () => {
-    // System took account out of rotation due to regression — operator needs to see this immediately
-    expect(classifySignalLevel({ ...base, context: { event_type: 'account_model_regression_quarantined' } })).toBe('high');
+  test('NOTE with account_model_regression_quarantined is routine (single event)', () => {
+    // Single quarantine is routine; ≥3 quarantines with ≥50% failed rate auto-promote to high-signal via isFailingGroup
+    expect(classifySignalLevel({ ...base, context: { event_type: 'account_model_regression_quarantined' } })).toBe('routine');
   });
 
   test('NOTE with account_model_regression_recovered is routine', () => {
@@ -181,9 +181,10 @@ describe('classifySignalLevel', () => {
     expect(classifySignalLevel({ ...base, context: { event_type: 'review_feedback' } })).toBe('routine');
   });
 
-  test('NOTE with feedback_acknowledgment is high-signal', () => {
-    // User filed FEEDBACK explicitly asking something; system's resolution reply should surface prominently
-    expect(classifySignalLevel({ ...base, context: { event_type: 'feedback_acknowledgment' } })).toBe('high');
+  test('NOTE with feedback_acknowledgment is routine', () => {
+    // Demoted from high-signal — flood of system acks was crowding the panel; reply context
+    // is still rendered when the routine ops group is expanded.
+    expect(classifySignalLevel({ ...base, context: { event_type: 'feedback_acknowledgment' } })).toBe('routine');
   });
 
   test('NOTE with unknown event_type is routine (fail-safe)', () => {
@@ -196,6 +197,21 @@ describe('classifySignalLevel', () => {
 
   test('QUESTION is routine (not in high-signal list)', () => {
     expect(classifySignalLevel({ ...base, message_type: 'QUESTION' })).toBe('routine');
+  });
+
+  test('failing group of ≥3 account_model_regression_quarantined (≥50% failed) would be promoted via isFailingGroup', () => {
+    // Single quarantine is routine, but a cluster of quarantines with high failure rate
+    // should be promoted to high-signal. Verify isFailingGroup contract is available for that behavior.
+    const failingGroup = [
+      { context: { result: 'failed', event_type: 'account_model_regression_quarantined' } },
+      { context: { result: 'failed', event_type: 'account_model_regression_quarantined' } },
+      { context: { result: 'failed', event_type: 'account_model_regression_quarantined' } },
+      { context: { result: 'merged', event_type: 'account_model_regression_quarantined' } },
+    ];
+    // Verify isFailingGroup detects this cluster as failing (3 failed out of 4 = 75%)
+    expect(isFailingGroup(failingGroup)).toBe(true);
+    // Individual message would be routine
+    expect(classifySignalLevel({ ...base, context: { event_type: 'account_model_regression_quarantined' } })).toBe('routine');
   });
 });
 
@@ -871,8 +887,8 @@ describe('getToastSeverity', () => {
     expect(getToastSeverity({ ...base, context: { event_type: 'fix_loop_divergence_regressed' } })).toBe('error');
   });
 
-  test('NOTE with account_model_regression_quarantined returns error', () => {
-    expect(getToastSeverity({ ...base, context: { event_type: 'account_model_regression_quarantined' } })).toBe('error');
+  test('NOTE with account_model_regression_quarantined returns info', () => {
+    expect(getToastSeverity({ ...base, context: { event_type: 'account_model_regression_quarantined' } })).toBe('info');
   });
 
   test('NOTE with feedback_acknowledgment returns info', () => {
@@ -922,6 +938,41 @@ describe('effectiveSignal', () => {
   test('message with no event_type in context ignores prefs', () => {
     const noEtMsg = { ...base, context: {} };
     expect(effectiveSignal(noEtMsg, { pr_merged: 'mute' })).toBe('routine');
+  });
+
+  test('routine pref demotes failure_alert from high-signal to routine', () => {
+    const failureMsg = { ...base, context: { event_type: 'failure_alert' } };
+    expect(effectiveSignal(failureMsg, { failure_alert: 'routine' })).toBe('routine');
+  });
+
+  test('routine pref demotes account_model_regression_quarantined from high to routine', () => {
+    const quarantineMsg = { ...base, context: { event_type: 'account_model_regression_quarantined' } };
+    expect(effectiveSignal(quarantineMsg, { account_model_regression_quarantined: 'routine' })).toBe('routine');
+  });
+
+  test('routine pref demotes auto_fix_escalated from high to routine', () => {
+    const escalatedMsg = { ...base, context: { event_type: 'auto_fix_escalated' } };
+    expect(effectiveSignal(escalatedMsg, { auto_fix_escalated: 'routine' })).toBe('routine');
+  });
+
+  test('routine pref demotes remediation_escalated from high to routine', () => {
+    const remediationMsg = { ...base, context: { event_type: 'remediation_escalated' } };
+    expect(effectiveSignal(remediationMsg, { remediation_escalated: 'routine' })).toBe('routine');
+  });
+
+  test('routine pref demotes residual_fix_escalated from high to routine', () => {
+    const residualMsg = { ...base, context: { event_type: 'residual_fix_escalated' } };
+    expect(effectiveSignal(residualMsg, { residual_fix_escalated: 'routine' })).toBe('routine');
+  });
+
+  test('routine pref demotes residual_fix_audit_deferred from high to routine', () => {
+    const auditMsg = { ...base, context: { event_type: 'residual_fix_audit_deferred' } };
+    expect(effectiveSignal(auditMsg, { residual_fix_audit_deferred: 'routine' })).toBe('routine');
+  });
+
+  test('high-signal message with no pref stays high by default', () => {
+    const failureMsg = { ...base, context: { event_type: 'failure_alert' } };
+    expect(effectiveSignal(failureMsg, {})).toBe('high');
   });
 });
 
@@ -1154,6 +1205,123 @@ describe('MessagesPanel per-event-type prefs', () => {
   });
 });
 
+describe('MessagesPanel event type volume in prefs popover', () => {
+  let root: Root | null = null;
+  let host: HTMLDivElement | null = null;
+
+  afterEach(() => {
+    const r = root;
+    if (r) act(() => r.unmount());
+    root = null;
+    host?.remove();
+    host = null;
+    vi.clearAllMocks();
+  });
+
+  async function renderPanel(messages: ReturnType<typeof makeMsg>[]) {
+    (apiFetch as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Response(JSON.stringify({ messages }), { status: 200 }),
+    );
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <MessagesPanel
+          selectedProjectId="proj-1"
+          onClose={() => {}}
+          addToast={() => {}}
+          onMessageCountChange={() => {}}
+        />,
+      );
+    });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 100)); });
+    return host as HTMLDivElement;
+  }
+
+  test('renders event type count in prefs popover', async () => {
+    const msgs = [
+      makeMsg({ id: 'm1', from_type: 'system', context: { event_type: 'pr_merged' } }),
+      makeMsg({ id: 'm2', from_type: 'system', context: { event_type: 'pr_merged' } }),
+      makeMsg({ id: 'm3', from_type: 'system', context: { event_type: 'auto_fix_spawned' } }),
+    ];
+    const el = await renderPanel(msgs);
+
+    // Open the prefs popover
+    const settingsBtn = [...el.querySelectorAll('button')].find(b => b.title?.includes('Event type visibility'));
+    expect(settingsBtn).toBeTruthy();
+    await act(async () => { (settingsBtn as HTMLButtonElement).click(); });
+
+    const popover = el.querySelector('[class*="bg-neutral-900"][class*="border-neutral-700"][class*="rounded-xl"]');
+    expect(popover).toBeTruthy();
+    const popoverText = popover?.textContent ?? '';
+    // Popover should list event types with spaces (pr merged, auto fix spawned)
+    expect(popoverText).toContain('pr merged');
+    expect(popoverText).toContain('auto fix spawned');
+  });
+
+  test('sorts event types by 24h volume descending in prefs popover', async () => {
+    const msgs = [
+      ...Array.from({ length: 5 }, (_, i) => makeMsg({ id: `m${i}`, from_type: 'system', context: { event_type: 'pr_merged' } })),
+      ...Array.from({ length: 2 }, (_, i) => makeMsg({ id: `a${i}`, from_type: 'system', context: { event_type: 'auto_fix_spawned' } })),
+    ];
+    const el = await renderPanel(msgs);
+
+    // Open the prefs popover
+    const settingsBtn = [...el.querySelectorAll('button')].find(b => b.title?.includes('Event type visibility'));
+    await act(async () => { (settingsBtn as HTMLButtonElement).click(); });
+
+    // pr merged (5 events) should appear before auto fix spawned (2 events) when sorted by count
+    const popover = el.querySelector('[class*="bg-neutral-900"][class*="border-neutral-700"][class*="rounded-xl"]');
+    const popoverText = popover?.textContent ?? '';
+    const prMergedIdx = popoverText.indexOf('pr merged');
+    const autoFixIdx = popoverText.indexOf('auto fix spawned');
+    expect(prMergedIdx).toBeLessThan(autoFixIdx);
+    expect(prMergedIdx).toBeGreaterThanOrEqual(0);
+  });
+
+  test('highlights high-volume events (10+) with amber styling', async () => {
+    const msgs = Array.from({ length: 12 }, (_, i) =>
+      makeMsg({ id: `m${i}`, from_type: 'system', context: { event_type: 'pr_merged' } }),
+    );
+    const el = await renderPanel(msgs);
+
+    // Open the prefs popover
+    const settingsBtn = [...el.querySelectorAll('button')].find(b => b.title?.includes('Event type visibility'));
+    await act(async () => { (settingsBtn as HTMLButtonElement).click(); });
+
+    // Find the count badge - it's the span within the popover row that shows "12"
+    const popover = el.querySelector('[class*="bg-neutral-900"][class*="border-neutral-700"][class*="rounded-xl"]');
+    const countBadges = popover?.querySelectorAll('span');
+    const countBadge = countBadges && [...countBadges].find(s => s.textContent?.trim() === '12');
+    expect(countBadge).toBeTruthy();
+    // Check for orange/amber styling
+    expect(countBadge?.className).toContain('orange');
+  });
+
+  test('excludes messages older than 24 hours from volume count', async () => {
+    const now = new Date();
+    const yesterday = new Date(now.getTime() - 48 * 60 * 60 * 1000); // 48 hours ago
+    const msgs = [
+      makeMsg({ id: 'm1', from_type: 'system', context: { event_type: 'pr_merged' }, created_at: now.toISOString() }),
+      makeMsg({ id: 'm2', from_type: 'system', context: { event_type: 'pr_merged' }, created_at: yesterday.toISOString() }),
+    ];
+    const el = await renderPanel(msgs);
+
+    // Open the prefs popover
+    const settingsBtn = [...el.querySelectorAll('button')].find(b => b.title?.includes('Event type visibility'));
+    await act(async () => { (settingsBtn as HTMLButtonElement).click(); });
+
+    const popover = el.querySelector('[class*="bg-neutral-900"][class*="border-neutral-700"][class*="rounded-xl"]');
+    // Should only count the recent one (1), not both (2)
+    // Check that the popover contains the count 1 for pr merged
+    const countBadges = popover?.querySelectorAll('span');
+    const countBadge = countBadges && [...countBadges].find(s => s.textContent?.trim() === '1');
+    expect(countBadge).toBeTruthy();
+  });
+});
+
 describe('MessagesPanel persistence', () => {
   let root: Root | null = null;
   let host: HTMLDivElement | null = null;
@@ -1226,8 +1394,9 @@ describe('isCriticalSeverity', () => {
     expect(isCriticalSeverity({ message_type: 'NOTE', context: { event_type: 'fix_loop_divergence_regressed' } })).toBe(true);
   });
 
-  test('returns true for NOTE with account_model_regression_quarantined event_type', () => {
-    expect(isCriticalSeverity({ message_type: 'NOTE', context: { event_type: 'account_model_regression_quarantined' } })).toBe(true);
+  test('returns false for NOTE with account_model_regression_quarantined event_type', () => {
+    // Single quarantine is not critical; clusters of quarantines with high failure rate are promoted via isFailingGroup
+    expect(isCriticalSeverity({ message_type: 'NOTE', context: { event_type: 'account_model_regression_quarantined' } })).toBe(false);
   });
 
   test('returns true for NOTE with auto_fix_escalated event_type', () => {
@@ -1498,8 +1667,15 @@ describe('MessagesPanel feedback acknowledgment reply context', () => {
       context: { event_type: 'feedback_acknowledgment', reply_to: 'feedback-1' },
     });
     const el = await renderPanel([feedback, ack]);
-    const text = el.textContent ?? '';
 
+    // feedback_acknowledgment is now classified routine, so the bubble lives inside the
+    // collapsed routine-ops group. Expand it so the reply context becomes visible.
+    const routineToggle = [...el.querySelectorAll('button')]
+      .find(b => /routine ops/.test(b.textContent ?? ''));
+    expect(routineToggle).toBeTruthy();
+    await act(async () => { (routineToggle as HTMLButtonElement).click(); });
+
+    const text = el.textContent ?? '';
     // Reply context label should appear
     expect(text).toContain('In reply to your feedback:');
     // Original feedback excerpt should appear
@@ -1517,8 +1693,14 @@ describe('MessagesPanel feedback acknowledgment reply context', () => {
       context: { event_type: 'feedback_acknowledgment', reply_to: 'feedback-missing' },
     });
     const el = await renderPanel([ack]);
-    const text = el.textContent ?? '';
 
+    // feedback_acknowledgment is now routine — expand the routine ops group to reveal the bubble.
+    const routineToggle = [...el.querySelectorAll('button')]
+      .find(b => /routine ops/.test(b.textContent ?? ''));
+    expect(routineToggle).toBeTruthy();
+    await act(async () => { (routineToggle as HTMLButtonElement).click(); });
+
+    const text = el.textContent ?? '';
     // Acknowledgment content should still render
     expect(text).toContain('This is a reply to a feedback');
     // Reply context label should NOT appear when reference is missing

@@ -225,11 +225,21 @@ describe('escalation event invariants', () => {
     }
   });
 
+  test('feedback_acknowledgment fires info toast (not error)', () => {
+    const base = { from_type: 'system', message_type: 'NOTE' as const, context: { event_type: 'feedback_acknowledgment' } };
+    expect(getToastSeverity(base)).toBe('info');
+  });
+
   test('regression: existing high-signal NOTE events still classify correctly', () => {
     const base = { from_type: 'system', message_type: 'NOTE' as const };
     expect(classifySignalLevel({ ...base, context: { event_type: 'failure_alert' } })).toBe('high');
     expect(classifySignalLevel({ ...base, context: { event_type: 'rollback_recommended' } })).toBe('high');
     expect(classifySignalLevel({ ...base, context: { event_type: 'pr_merged' } })).toBe('routine');
+  });
+
+  test('feedback_acknowledgment classifies as routine (not high-signal)', () => {
+    const base = { from_type: 'system', message_type: 'NOTE' as const };
+    expect(classifySignalLevel({ ...base, context: { event_type: 'feedback_acknowledgment' } })).toBe('routine');
   });
 });
 

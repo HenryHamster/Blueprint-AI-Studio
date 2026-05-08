@@ -21,13 +21,11 @@ export const ESCALATION_BADGE_LABELS: Readonly<Record<string, string>> = {
 
 export const HIGH_SIGNAL_NOTE_EVENTS: ReadonlySet<string> = new Set([
   'failure_alert', 'rollback_recommended', 'fix_loop_divergence_regressed',
-  'feedback_acknowledgment', 'account_model_regression_quarantined',
   ...ESCALATION_EVENT_TYPES,
 ]);
 
 export const CRITICAL_NOTE_EVENTS: ReadonlySet<string> = new Set([
   'failure_alert', 'rollback_recommended', 'fix_loop_divergence_regressed',
-  'account_model_regression_quarantined',
   ...ESCALATION_EVENT_TYPES,
 ]);
 
@@ -183,6 +181,7 @@ export function effectiveSignal(
   const et = msg.context.event_type as string | undefined;
   const pref = et ? prefs[et] : undefined;
   if (pref === 'mute') return 'mute';
+  if (pref === 'routine') return 'routine';
   if (pref === 'surfaced') return 'high';
   return classifySignalLevel(msg);
 }

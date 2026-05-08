@@ -415,10 +415,40 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
   );
   const autoExpandedKeys = searchQuery.trim() ? groupsWithMatches : new Set();
 
-  const allEventTypes = [...new Set([
-    ...Object.keys(eventPrefs),
-    ...openMessages.flatMap(m => { const et = m.context.event_type as string | undefined; return et ? [et] : []; }),
-  ])];
+  // Calculate 24-hour volume for each event type and memoize event types
+  const { eventType24hVolume, sortedEventTypes } = useMemo(() => {
+    const now = Date.now();
+    const twentyFourHoursMs = 24 * 60 * 60 * 1000;
+    const counts = new Map<string, number>();
+    for (const msg of messages) {
+      const et = msg.context.event_type as string | undefined;
+      if (!et) continue;
+      if (msg.created_at) {
+        const msgTime = parseTimestamp(msg.created_at).getTime();
+        if (now - msgTime <= twentyFourHoursMs) {
+          counts.set(et, (counts.get(et) ?? 0) + 1);
+        }
+      }
+    }
+
+    // Source from open messages without coupling to criticalOnly — the popover is for
+    // managing prefs across all event types, so toggling criticalOnly should not hide
+    // event types whose only currently-open messages are non-critical.
+    const allEts = [...new Set([
+      ...Object.keys(eventPrefs),
+      ...messages.filter(m => m.status === 'open')
+        .flatMap(m => { const et = m.context.event_type as string | undefined; return et ? [et] : []; }),
+    ])];
+
+    const sorted = [...allEts].sort((a, b) => {
+      const countA = counts.get(a) ?? 0;
+      const countB = counts.get(b) ?? 0;
+      return countB - countA;
+    });
+
+    return { eventType24hVolume: counts, sortedEventTypes: sorted };
+  }, [messages, eventPrefs]);
+
   const mutedCount = Object.values(eventPrefs).filter(v => v === 'mute').length;
 
   function updatePref(et: string, pref: EventPref) {
@@ -1167,13 +1197,26 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
                       <button onClick={() => { setEventPrefs({}); saveEventPrefs(auth.currentUser?.email, selectedProjectId, {}); }} className="text-[10px] text-neutral-500 hover:text-red-400 transition-colors">Reset all</button>
                     )}
                   </div>
-                  {allEventTypes.length === 0 ? (
+                  {sortedEventTypes.length === 0 ? (
                     <p className="text-[11px] text-neutral-600 py-1">No events loaded</p>
-                  ) : allEventTypes.map(et => {
+                  ) : sortedEventTypes.map(et => {
                     const pref = eventPrefs[et] ?? 'routine';
+                    const count = eventType24hVolume.get(et) ?? 0;
+                    const isHighVolume = count >= 10;
                     return (
                       <div key={et} className="flex items-center gap-1.5">
-                        <span className="text-[11px] text-neutral-400 truncate flex-1">{et.replace(/_/g, ' ')}</span>
+                        <div className="flex items-center gap-1 flex-1 min-w-0">
+                          <span className="text-[11px] text-neutral-400 truncate">{et.replace(/_/g, ' ')}</span>
+                          {count > 0 && (
+                            <span className={`text-[10px] shrink-0 px-1.5 py-0.5 rounded-full font-medium ${
+                              isHighVolume
+                                ? 'bg-orange-500/20 text-orange-400 border border-orange-500/30'
+                                : 'bg-neutral-800 text-neutral-500'
+                            }`}>
+                              {count}
+                            </span>
+                          )}
+                        </div>
                         {(['surfaced', 'routine', 'mute'] as EventPref[]).map(p => (
                           // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
                           <button key={p} onClick={() => updatePref(et, p)}
