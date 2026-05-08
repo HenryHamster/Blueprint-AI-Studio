@@ -2343,10 +2343,17 @@ async def clear_regression_manual_intervention(
     }
 
 
-@router.post("/regression-cases/{regression_class}/close")
+@router.post("/regression-cases/close")
 async def close_regression_case(
-    regression_class: str,
-    project_id: uuid.UUID,
+    regression_class: str = Query(
+        ...,
+        description=(
+            "Full regression_class string. Passed as a query parameter (not a "
+            "path segment) because regression_class values may contain slashes "
+            "or other URL-reserved characters."
+        ),
+    ),
+    project_id: uuid.UUID = Query(...),
     reason: str | None = Query(
         None, description="Optional human-readable reason for the close"
     ),
@@ -2360,9 +2367,11 @@ async def close_regression_case(
     auto-recover via run_recovery_once, which only handles MERGED→CLOSED).
 
     Idempotent: returns 200 with status=CLOSED if the case was already CLOSED.
-    Returns 404 if no row exists for (project_id, regression_class). The
-    process-local first_tripped / healthy_since markers are dropped so a
-    re-spawn (if the signal trips again) starts from a clean slate.
+    Returns 404 if no row exists for (project_id, regression_class).
+
+    regression_class is a query parameter rather than a path segment so values
+    containing slashes (e.g. ``sr_blind_spot:theme:agent/src/prompt.ts ...``)
+    don't fragment FastAPI's path routing.
     """
     result = await session.execute(
         select(RegressionRemediationCase).where(

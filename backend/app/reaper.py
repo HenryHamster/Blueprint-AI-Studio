@@ -213,15 +213,41 @@ _PROGRESS_STALE_DEFAULTS = {
     "large": 1080,  # 18 min
 }
 
+# Task types where the agent legitimately spends 5-20 min reasoning before
+# emitting a tool call (b2410541 incident: Claude Opus on strategic_review
+# was reaped after 484s while in the middle of pass-1 thinking — actual
+# attempt completed cleanly in 19 min once given a budget). These types
+# get a flat longer cutoff regardless of nominal scope.
+_THINKING_HEAVY_TASK_TYPES = frozenset(
+    {
+        "strategic_review",
+        "design_doc_update",
+        "research",
+        "investigate",
+        "plan",
+    }
+)
+_THINKING_HEAVY_PROGRESS_STALE_SECONDS = 1500  # 25 min
+
 
 def _progress_stale_cutoff(task, now: datetime) -> datetime:
     """Return cutoff time for meaningful-progress (last_tool_use_at) staleness.
 
     Only fires when last_heartbeat IS fresh (agent alive but wedged). Uses
     longer thresholds than heartbeat-stale to tolerate normal LLM latency.
+    Thinking-heavy task types override scope-based defaults — reasoning
+    models on strategic/research work spend long stretches between tool
+    calls (8-min cutoff misclassifies normal Opus reasoning as stalled).
     """
     ctx = task.context or {}
     payload = task.first_payload or {}
+    task_type = payload.get("type") or ""
+    if task_type in _THINKING_HEAVY_TASK_TYPES:
+        thinking_override = _runtime_config.get(
+            "progress_stale_seconds_thinking_heavy",
+            _THINKING_HEAVY_PROGRESS_STALE_SECONDS,
+        )
+        return now - timedelta(seconds=thinking_override)
     scope = ctx.get("scope") or payload.get("scope")
     thresholds = _runtime_config.get(
         "progress_stale_seconds_by_scope", _PROGRESS_STALE_DEFAULTS

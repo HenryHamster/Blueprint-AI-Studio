@@ -158,6 +158,55 @@ def test_progress_stale_cutoff_small_scope_default_is_480s():
     assert _progress_stale_cutoff(_T(), now) == now - timedelta(seconds=480)
 
 
+def test_progress_stale_cutoff_strategic_review_uses_thinking_heavy_budget():
+    """strategic_review gets the 1500s thinking-heavy budget regardless of scope.
+
+    Regression for b2410541 (2026-05-08): Claude Opus on strategic_review
+    was reaped at 484s with the small-scope 480s cutoff while still in
+    legitimate pass-1 reasoning. Actual completion took 19 min — the
+    480s budget is structurally incompatible with reasoning-model thinking.
+    """
+
+    class _T:
+        context = {"scope": "small"}  # noqa: RUF012
+        first_payload = {"type": "strategic_review"}  # noqa: RUF012
+        payloads = [{"type": "strategic_review"}]  # noqa: RUF012
+
+    now = datetime(2026, 1, 1, 12, 0, 0)
+    assert _progress_stale_cutoff(_T(), now) == now - timedelta(seconds=1500)
+
+
+def test_progress_stale_cutoff_research_design_doc_investigate_plan_thinking_heavy():
+    """All thinking-heavy types (research, design_doc_update, investigate, plan)
+    use the 1500s budget."""
+    now = datetime(2026, 1, 1, 12, 0, 0)
+    for ttype in ("research", "design_doc_update", "investigate", "plan"):
+
+        class _T:
+            context = {"scope": "small"}  # noqa: RUF012
+            first_payload = {"type": ttype}  # noqa: RUF012
+            payloads = [{"type": ttype}]  # noqa: RUF012
+
+        assert _progress_stale_cutoff(_T(), now) == now - timedelta(seconds=1500), (
+            f"{ttype} should use thinking-heavy 1500s cutoff"
+        )
+
+
+def test_progress_stale_cutoff_fix_review_create_use_scope_default():
+    """Tool-cadence task types (fix, review, create) keep scope-based budgets."""
+    now = datetime(2026, 1, 1, 12, 0, 0)
+    for ttype in ("fix", "review", "create"):
+
+        class _T:
+            context = {"scope": "small"}  # noqa: RUF012
+            first_payload = {"type": ttype}  # noqa: RUF012
+            payloads = [{"type": ttype}]  # noqa: RUF012
+
+        assert _progress_stale_cutoff(_T(), now) == now - timedelta(seconds=480), (
+            f"{ttype} should use small-scope 480s cutoff, not thinking-heavy"
+        )
+
+
 def test_progress_stale_cutoff_medium_scope_default_is_720s():
     """Medium-scope default progress-stale threshold is 720s (12 minutes)."""
 

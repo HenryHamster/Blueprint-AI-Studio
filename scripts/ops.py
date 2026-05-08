@@ -1077,6 +1077,14 @@ def cmd_regression_cases(args):
     pid = get_project_id()
 
     # Mutations.
+    def _build_close_path(cls: str, reason: str | None) -> str:
+        # regression_class is a query param so slashes / quotes don't
+        # fragment FastAPI's path routing.
+        p = f"/api/admin/regression-cases/close?project_id={pid}&regression_class={quote(cls, safe='')}"
+        if reason:
+            p += f"&reason={quote(reason, safe='')}"
+        return p
+
     if args and args[0] == '--close' and len(args) > 1:
         cls = args[1]
         reason = None
@@ -1084,11 +1092,8 @@ def cmd_regression_cases(args):
             if a == '--reason' and i + 3 < len(args):
                 reason = args[i + 3]
                 break
-        path = f"/api/admin/regression-cases/{quote(cls, safe='')}/close?project_id={pid}"
-        if reason:
-            path += f"&reason={quote(reason, safe='')}"
         try:
-            result = api("POST", path)
+            result = api("POST", _build_close_path(cls, reason))
             print(f"Closed: {result.get('regression_class', '')[:120]} → {result.get('prior_status')} → {result.get('status')}")
         except Exception as e:
             print(f"Error closing {cls!r}: {e}")
@@ -1113,11 +1118,8 @@ def cmd_regression_cases(args):
         print(f"Closing {len(matches)} case(s) matching prefix {prefix!r}:")
         for c in matches:
             cls = c["regression_class"]
-            close_path = f"/api/admin/regression-cases/{quote(cls, safe='')}/close?project_id={pid}"
-            if reason:
-                close_path += f"&reason={quote(reason, safe='')}"
             try:
-                r = api("POST", close_path)
+                r = api("POST", _build_close_path(cls, reason))
                 print(f"  {r.get('prior_status'):28} → {r.get('status'):8}  {cls[:80]}")
             except Exception as e:
                 print(f"  ERROR  {cls[:80]}: {e}")

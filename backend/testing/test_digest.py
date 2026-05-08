@@ -10431,8 +10431,12 @@ async def test_close_regression_case_transitions_active_to_closed(
     await db_session.commit()
 
     response = await client.post(
-        f"/api/admin/regression-cases/{regression_class}/close",
-        params={"project_id": str(project.id), "reason": "gated at source"},
+        "/api/admin/regression-cases/close",
+        params={
+            "regression_class": regression_class,
+            "project_id": str(project.id),
+            "reason": "gated at source",
+        },
     )
     assert response.status_code == 200
     data = response.json()
@@ -10475,8 +10479,11 @@ async def test_close_regression_case_idempotent_on_already_closed(
     await db_session.commit()
 
     response = await client.post(
-        f"/api/admin/regression-cases/{regression_class}/close",
-        params={"project_id": str(project.id)},
+        "/api/admin/regression-cases/close",
+        params={
+            "regression_class": regression_class,
+            "project_id": str(project.id),
+        },
     )
     assert response.status_code == 200
     data = response.json()
@@ -10500,10 +10507,55 @@ async def test_close_regression_case_404_when_missing(
     await db_session.refresh(project)
 
     response = await client.post(
-        "/api/admin/regression-cases/no_such_class/close",
-        params={"project_id": str(project.id)},
+        "/api/admin/regression-cases/close",
+        params={
+            "regression_class": "no_such_class",
+            "project_id": str(project.id),
+        },
     )
     assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_close_regression_case_handles_slashes_and_quotes_in_class(
+    client: AsyncClient, db_session
+):
+    """regression_class is a query parameter, so values with slashes / quotes
+    don't fragment FastAPI's path routing. Concrete observation 2026-05-08:
+    one ACTIVE case had class
+    'sr_blind_spot:theme:agent/src/prompt.test.ts now expects ordering of \\'install'
+    and a path-based endpoint 404'd because URL-decoded slashes split the path."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    regression_class = (
+        "sr_blind_spot:theme:agent/src/prompt.test.ts now expects ordering of 'install"
+    )
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class=regression_class,
+        status=RegressionCaseStatus.ACTIVE,
+        attempts=0,
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    response = await client.post(
+        "/api/admin/regression-cases/close",
+        params={
+            "regression_class": regression_class,
+            "project_id": str(project.id),
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["regression_class"] == regression_class
+    assert data["status"] == "CLOSED"
+
+    await db_session.refresh(case)
+    assert case.status == RegressionCaseStatus.CLOSED
 
 
 @pytest.mark.asyncio
@@ -10534,8 +10586,11 @@ async def test_close_regression_case_clears_durable_recovery_clock(
     await db_session.commit()
 
     response = await client.post(
-        f"/api/admin/regression-cases/{regression_class}/close",
-        params={"project_id": str(project.id)},
+        "/api/admin/regression-cases/close",
+        params={
+            "regression_class": regression_class,
+            "project_id": str(project.id),
+        },
     )
     assert response.status_code == 200
 
