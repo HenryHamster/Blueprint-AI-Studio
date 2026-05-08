@@ -1537,6 +1537,19 @@ class RegressionRemediationCase(SQLModel, table=True):
         default=None,
         sa_column=Column(String, nullable=True),
     )
+    # Durable recovery clock for the auto-close path on
+    # NEEDS_MANUAL_INTERVENTION cases. The watchdog sets this when the
+    # underlying signal first reads healthy and uses the difference between
+    # now and this timestamp to enforce the
+    # ``regression_recovered_unattended_window_hours`` stable window before
+    # auto-closing the case. Reset to NULL when the signal trips again, on
+    # case re-arm/closure, and when the operator presses Clear — mirroring
+    # the .pop() semantics of the deprecated process-local
+    # ``_signal_healthy_since`` dict.
+    signal_healthy_since_at: Optional[datetime] = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
     # Per-layer symptom log: {layer_name: [{fingerprint, observed_at, sample}]}.
     # Written by the dispatcher when classify_layers() matches; bounded to 10
     # entries per layer so the column doesn't grow unboundedly.
@@ -1804,3 +1817,63 @@ class AnomalyFingerprintState(SQLModel, table=True):
         default_factory=_utcnow,
         sa_column=Column(NaiveUTCDateTime, nullable=False, onupdate=_utcnow),
     )
+
+
+class DispatcherCycleRecord(SQLModel, table=True):
+    """Durable record of a single pipeline_regression_dispatcher cycle.
+
+    Replaces the process-local ``_dispatcher_cycle_records`` deque so cycle
+    throughput, signal-trip counts, and rejection-by-reason aggregates survive
+    worker restarts and remain consistent across multi-worker deployments.
+
+    Retention is bounded to ~30 days by a periodic prune call inside
+    ``run_once`` (see ``_prune_old_dispatcher_cycle_records``).  Older rows
+    are deleted opportunistically rather than via a server-side TTL trigger
+    so behavior is identical on Postgres and the SQLite test fixture.
+    """
+
+    __tablename__ = "dispatchercyclerecord"
+    __table_args__ = (
+        Index(
+            "ix_dispatchercyclerecord_project_started",
+            "project_id",
+            "cycle_started_at",
+        ),
+    )
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    # ON DELETE CASCADE: cycle records are per-project telemetry with no
+    # value once the project is gone, and the postgres conftest cleanup
+    # path uses straight DELETE FROM project (no per-table sweep), so the
+    # FK must cascade or teardown fails.
+    project_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("project.id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        ),
+    )
+    cycle_started_at: datetime = Field(
+        sa_column=Column(NaiveUTCDateTime, nullable=False),
+    )
+    cycle_finished_at: datetime = Field(
+        sa_column=Column(NaiveUTCDateTime, nullable=False),
+    )
+    signals_evaluated: int = Field(
+        default=0,
+        sa_column=Column(Integer, nullable=False, server_default=text("0")),
+    )
+    signals_tripped: int = Field(
+        default=0,
+        sa_column=Column(Integer, nullable=False, server_default=text("0")),
+    )
+    spawns_emitted: int = Field(
+        default=0,
+        sa_column=Column(Integer, nullable=False, server_default=text("0")),
+    )
+    rejections_by_reason: Dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
+    )
+    mttd_p50_sec: Optional[float] = Field(default=None)

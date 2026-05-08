@@ -6163,7 +6163,10 @@ async def test_agent_status_pr_artifact_stores_enriched_context(
     await db_session.refresh(task)
     ctx = task.context or {}
     assert ctx.get("_pr_diff_summary") == diff_summary
-    assert ctx.get("_self_review_outcome") == self_review_outcome
+    stored_sro = ctx.get("_self_review_outcome") or {}
+    for k, v in self_review_outcome.items():
+        assert stored_sro[k] == v
+    assert stored_sro["_filtered_blind_spots_count"] == 0
     assert ctx.get("_test_failure_summary") == test_failure_summary
     assert ctx.get("_pr_url") == "https://github.com/foo/bar/pull/10"
 

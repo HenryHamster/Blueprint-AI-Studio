@@ -42,7 +42,7 @@ from app.models import (
 )
 from app.auth import get_current_user, require_admin
 from app.admin import _get_user_project_with_role
-from app.shared_state import runtime_config as _runtime_config, get_dispatcher_cycles
+from app.shared_state import runtime_config as _runtime_config
 from app.routers.admin_analytics import _derive_completed_at, ON_DEMAND_RATE, SPOT_RATE
 from app.direction_metrics import _compute_direction_quality_score
 from app.direction_outcomes import synthesize_prompt_quality_patterns
@@ -2325,20 +2325,15 @@ async def clear_regression_manual_intervention(
         )
     case.status = RegressionCaseStatus.ACTIVE
     case.needs_manual_intervention_at = None
+    # Reset the durable recovery clock so a re-escalated case does not pick
+    # up a stale healthy_since and auto-close on the first tick, bypassing
+    # the stable window.  The case row's signal_first_seen_at /
+    # signal_first_crossed_at columns are intentionally preserved so MTTD on
+    # any future spawn reflects the original detection latency.
+    case.signal_healthy_since_at = None
     case.updated_at = _utcnow()
     session.add(case)
     await session.commit()
-    # Drop process-local markers so a re-escalated case does not pick up a
-    # stale healthy_since (which would let it auto-close on the first tick,
-    # bypassing the stable window) or a stale first-tripped (which would
-    # mis-report time_to_detect_sec on the next escalation).
-    from app.pipeline_regression_dispatcher import (  # noqa: PLC0415
-        _signal_first_tripped,
-        _signal_healthy_since,
-    )
-
-    _signal_healthy_since.pop((str(project_id), regression_class), None)
-    _signal_first_tripped.pop((str(project_id), regression_class), None)
     return {
         "id": str(case.id),
         "regression_class": regression_class,
@@ -2703,6 +2698,85 @@ async def get_regression_class_kpis(
         "window_hours": window_hours,
         "class_count": len(classes),
         "classes": classes,
+    }
+
+
+@router.get("/regression-cases/trend")
+async def get_regression_case_trend(
+    project_id: uuid.UUID = Query(..., description="Project to query (required)"),
+    days: int = Query(30, ge=7, le=90, description="Rolling window in days"),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),  # noqa: ARG001
+) -> Dict[str, Any]:
+    """Daily opened-vs-closed trend for regression cases over the last N days.
+
+    opened: cases whose first_seen_at falls in the day bucket.
+    closed: cases whose updated_at falls in the day bucket AND status is CLOSED or MERGED.
+    Returns one entry per day plus a per-class breakdown for sparkline rendering.
+    """
+    cutoff = _utcnow() - timedelta(days=days)
+    rows = (
+        (
+            await session.execute(
+                select(RegressionRemediationCase).where(
+                    RegressionRemediationCase.project_id == project_id,
+                    or_(
+                        RegressionRemediationCase.first_seen_at >= cutoff,
+                        RegressionRemediationCase.updated_at >= cutoff,
+                    ),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    now = _utcnow()
+    # Pre-fill all day buckets so the frontend gets a contiguous series.
+    buckets: Dict[str, Dict[str, Any]] = {
+        (now - timedelta(days=days - 1 - d)).strftime("%Y-%m-%d"): {
+            "date": (now - timedelta(days=days - 1 - d)).strftime("%Y-%m-%d"),
+            "opened": 0,
+            "closed": 0,
+        }
+        for d in range(days)
+    }
+    by_class: Dict[str, Dict[str, Dict[str, int]]] = {}
+
+    closed_statuses = {RegressionCaseStatus.CLOSED, RegressionCaseStatus.MERGED}
+    for case in rows:
+        cls = case.regression_class
+        if case.first_seen_at:
+            day = _to_naive_utc(case.first_seen_at).strftime("%Y-%m-%d")
+            if day in buckets:
+                buckets[day]["opened"] += 1
+                by_class.setdefault(cls, {}).setdefault(
+                    day, {"opened": 0, "closed": 0}
+                )["opened"] += 1
+        if case.updated_at and case.status in closed_statuses:
+            day = _to_naive_utc(case.updated_at).strftime("%Y-%m-%d")
+            if day in buckets:
+                buckets[day]["closed"] += 1
+                by_class.setdefault(cls, {}).setdefault(
+                    day, {"opened": 0, "closed": 0}
+                )["closed"] += 1
+
+    daily = sorted(buckets.values(), key=lambda b: b["date"])
+    class_trends = {
+        cls: [
+            {
+                "date": b["date"],
+                **by_class[cls].get(b["date"], {"opened": 0, "closed": 0}),
+            }
+            for b in daily
+        ]
+        for cls in sorted(by_class)
+    }
+    return {
+        "project_id": str(project_id),
+        "days": days,
+        "daily": daily,
+        "by_class": class_trends,
     }
 
 
@@ -7467,11 +7541,28 @@ async def get_regression_dispatcher_health(
     """Dispatcher health and throughput summary for the last N hours.
 
     Returns aggregate cycle counts, per-hour spawn sparkline, and per-class
-    last-spawn/cooldown info derived from the in-memory cycle ring buffer and
-    the RegressionRemediationCase table. Works at all viewport widths.
+    last-spawn/cooldown info derived from the durable
+    ``DispatcherCycleRecord`` table and the ``RegressionRemediationCase``
+    table.  Works at all viewport widths and returns zero / empty arrays on
+    a cold start (empty table) — never raises — so the UI shows 'no data'
+    rather than crashing.
     """
+    from app.pipeline_regression_dispatcher import (  # noqa: PLC0415
+        get_dispatcher_cycle_records,
+    )
+
     pid_str = str(project_id) if project_id else None
-    cycles = get_dispatcher_cycles(project_id=pid_str, window_hours=window_hours)
+    # ``window_hours`` is bounded to 168 above; pull a large enough page that
+    # the aggregates and sparkline both cover the full window.  Default tick
+    # interval is 60s → 168h * 60 = ~10080 rows worst case; we cap at 11000
+    # to cover the last week at 1-minute resolution without truncation.  The
+    # (project_id, cycle_started_at) index makes this read cheap.
+    cycles = await get_dispatcher_cycle_records(
+        session,
+        project_id=pid_str,
+        limit=11000,
+        window_hours=window_hours,
+    )
 
     # Aggregate totals
     total_cycles = len(cycles)

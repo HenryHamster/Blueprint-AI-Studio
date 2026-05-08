@@ -1653,6 +1653,14 @@ export function formatPlaybook(
 // for frontend operations like `.slice(...)`.
 export const SELF_REVIEW_PROMPT_VERSION = "5";
 
+// Human-readable examples of disallowed blind_spot entries — mirrored in
+// backend/app/sr_blind_spots.py DISALLOWED_BLIND_SPOT_EXAMPLES for contract-test parity.
+export const DISALLOWED_BLIND_SPOT_EXAMPLES: readonly string[] = [
+  "did not run the full backend test suite",
+  "did not run docker pytest",
+  "did not run viewport tests",
+] as const;
+
 type SRCatchRateSource = {
   categories?: Record<string, { miss_rate?: number; weighted_miss_rate?: number; current_hit_rate?: number; hit_rate?: number; below_floor?: boolean }>;
   by_task_type?: Record<string, Record<string, { miss_rate?: number; weighted_miss_rate?: number; current_hit_rate?: number; hit_rate?: number; below_floor?: boolean }>>;

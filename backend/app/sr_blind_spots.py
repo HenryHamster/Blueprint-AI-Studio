@@ -14,6 +14,7 @@ optimization could mirror the ``sr_catch_rate_trends`` cache pattern in
 
 from __future__ import annotations
 
+import re
 import uuid
 from collections import defaultdict
 from datetime import datetime, timedelta
@@ -26,6 +27,60 @@ from sqlmodel import select
 from app.models import Task, TaskStatus
 
 _SR_SKIP_BLIND_SPOT_MARKERS = ("self-review skipped", "self-review JSON parsing failed")
+
+# Patterns matching blind_spot entries that agents must NOT emit (per prompt.ts:2057).
+# Lenient matching covers wording variants: didn't/skipped/did not execute +
+# full/entire/whole + backend/docker/viewport/playwright + pytest/test suite/tests.
+DISALLOWED_BLIND_SPOT_PATTERNS: List[re.Pattern] = [
+    re.compile(
+        r"(did\s+not\s+run|didn.t\s+run|skipped|did\s+not\s+execute)\s+"
+        r"(the\s+)?(full|entire|whole)\s+"
+        r"(backend|docker|viewport|playwright)\s+"
+        r"(test\s+suite|pytest|tests?)",
+        re.IGNORECASE,
+    ),
+    # Shorter variant without "full/entire/whole": "did not run docker pytest"
+    re.compile(
+        r"(did\s+not\s+run|didn.t\s+run|skipped|did\s+not\s+execute)\s+"
+        r"(docker|viewport|playwright)\s+"
+        r"(pytest|tests?)",
+        re.IGNORECASE,
+    ),
+]
+
+# Human-readable examples from the prompt — used by contract tests to verify parity.
+DISALLOWED_BLIND_SPOT_EXAMPLES: List[str] = [
+    "did not run the full backend test suite",
+    "did not run docker pytest",
+    "did not run viewport tests",
+]
+
+
+def is_disallowed_blind_spot(entry: str) -> bool:
+    """Return True when *entry* matches any disallowed blind_spot pattern."""
+    return any(p.search(entry) for p in DISALLOWED_BLIND_SPOT_PATTERNS)
+
+
+def filter_disallowed_blind_spots(sro: Dict[str, Any]) -> Dict[str, Any]:
+    """Drop disallowed blind_spot entries from *sro* in-place and record the count.
+
+    Mutates *sro* directly and returns it.  The count of dropped entries is
+    stored under ``_filtered_blind_spots_count`` for diagnostics (so operators
+    can see compliance failures without those entries polluting the theme
+    aggregator or the dispatcher).  A zero count is still written so callers
+    can distinguish "filter ran" from "filter never ran".
+    """
+    blind_spots = sro.get("blind_spots") or []
+    kept = [
+        e
+        for e in blind_spots
+        if not (isinstance(e, str) and is_disallowed_blind_spot(e))
+    ]
+    dropped = len(blind_spots) - len(kept)
+    sro["blind_spots"] = kept
+    sro["_filtered_blind_spots_count"] = dropped
+    return sro
+
 
 _TASK_SCAN_CAP = 2000
 

@@ -382,6 +382,30 @@ export async function fetchRegressionClassKpis(
   return res.json();
 }
 
+export interface RegressionTrendBucket {
+  date: string;
+  opened: number;
+  closed: number;
+}
+
+export interface RegressionRateTrendResponse {
+  project_id: string;
+  days: number;
+  daily: RegressionTrendBucket[];
+  by_class: Record<string, RegressionTrendBucket[]>;
+}
+
+export async function fetchRegressionRateTrend(
+  projectId: string,
+  windowDays = 30,
+): Promise<RegressionRateTrendResponse> {
+  const res = await apiFetch(
+    `/api/admin/regression-cases/trend?project_id=${encodeURIComponent(projectId)}&days=${windowDays}`,
+  );
+  if (!res.ok) throw new Error(`Failed to fetch regression rate trend: ${res.status}`);
+  return res.json();
+}
+
 export async function onboardProject(
   owner: string,
   repo: string,

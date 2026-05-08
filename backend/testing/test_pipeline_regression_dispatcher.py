@@ -18,7 +18,7 @@ from types import SimpleNamespace
 import pytest
 from sqlmodel import select
 
-from app.models import Task, TaskStatus
+from app.models import DispatcherCycleRecord, Task, TaskStatus
 from app.pipeline_regression_dispatcher import (
     _REGRESSION_COOLDOWN,
     _WATCHDOG_ACTIVE_STALE_THRESHOLD,
@@ -1815,9 +1815,6 @@ async def test_watchdog_does_not_re_escalate_needs_manual_intervention(db_sessio
     emitted — matching the prior contract for this case.
     """
     from app.models import Alert, RegressionCaseStatus
-    from app.pipeline_regression_dispatcher import _signal_healthy_since
-
-    _signal_healthy_since.clear()
 
     project = make_project(design_doc={})
     db_session.add(project)
@@ -2152,9 +2149,6 @@ def _design_doc_no_sr_regression(*, category: str = "correctness") -> dict:
 async def test_watchdog_no_auto_close_when_signal_still_tripping(db_session):
     """NMI case is left untouched when the signal is still tripping (1)."""
     from app.models import Alert, RegressionCaseStatus
-    from app.pipeline_regression_dispatcher import _signal_healthy_since
-
-    _signal_healthy_since.clear()
 
     project = make_project(
         design_doc=_design_doc_with_sr_regression(category="correctness"),
@@ -2174,8 +2168,9 @@ async def test_watchdog_no_auto_close_when_signal_still_tripping(db_session):
     # Pre-populate healthy_since at 30h ago so a falsely-healthy read would
     # auto-close. The signal IS still tripping per the design-doc above, so
     # the dispatcher must drop the marker and skip.
-    key = (str(project.id), "sr_catch_rate:correctness")
-    _signal_healthy_since[key] = _utcnow() - timedelta(hours=30)
+    case.signal_healthy_since_at = _utcnow() - timedelta(hours=30)
+    db_session.add(case)
+    await db_session.commit()
 
     escalated = await run_watchdog_once(db_session, project.id)
     assert escalated == 0
@@ -2183,8 +2178,8 @@ async def test_watchdog_no_auto_close_when_signal_still_tripping(db_session):
     await db_session.refresh(case)
     assert case.status == RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION
     assert case.last_remediation_result != "recovered_unattended"
-    # Marker dropped because signal would trip today.
-    assert key not in _signal_healthy_since
+    # Marker dropped on the case row because signal would trip today.
+    assert case.signal_healthy_since_at is None
 
     alerts = (
         (await db_session.execute(select(Alert).where(Alert.project_id == project.id)))
@@ -2198,9 +2193,6 @@ async def test_watchdog_no_auto_close_when_signal_still_tripping(db_session):
 async def test_watchdog_no_auto_close_within_window(db_session):
     """NMI case stays open when healthy_since is younger than the window (2)."""
     from app.models import Alert, RegressionCaseStatus
-    from app.pipeline_regression_dispatcher import _signal_healthy_since
-
-    _signal_healthy_since.clear()
 
     project = make_project(design_doc=_design_doc_no_sr_regression())
     db_session.add(project)
@@ -2215,8 +2207,10 @@ async def test_watchdog_no_auto_close_within_window(db_session):
         regression_class="sr_catch_rate:correctness",
     )
 
-    key = (str(project.id), "sr_catch_rate:correctness")
-    _signal_healthy_since[key] = _utcnow() - timedelta(hours=12)
+    seeded_healthy_at = _utcnow() - timedelta(hours=12)
+    case.signal_healthy_since_at = seeded_healthy_at
+    db_session.add(case)
+    await db_session.commit()
 
     escalated = await run_watchdog_once(db_session, project.id)
     assert escalated == 0
@@ -2224,8 +2218,10 @@ async def test_watchdog_no_auto_close_within_window(db_session):
     await db_session.refresh(case)
     assert case.status == RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION
     assert case.last_remediation_result != "recovered_unattended"
-    # Marker preserved — signal is healthy, just not long enough yet.
-    assert key in _signal_healthy_since
+    # Marker preserved on the case row — signal is healthy, just not long
+    # enough yet — so the timer must persist verbatim across ticks (and
+    # across worker restarts in production).
+    assert case.signal_healthy_since_at is not None
 
     alerts = (
         (await db_session.execute(select(Alert).where(Alert.project_id == project.id)))
@@ -2239,13 +2235,6 @@ async def test_watchdog_no_auto_close_within_window(db_session):
 async def test_watchdog_auto_closes_after_window(db_session):
     """NMI case auto-closes once healthy_since exceeds the 24h window (3)."""
     from app.models import Alert, AlertSeverity, RegressionCaseStatus
-    from app.pipeline_regression_dispatcher import (
-        _signal_first_tripped,
-        _signal_healthy_since,
-    )
-
-    _signal_healthy_since.clear()
-    _signal_first_tripped.clear()
 
     project = make_project(design_doc=_design_doc_no_sr_regression())
     db_session.add(project)
@@ -2260,10 +2249,9 @@ async def test_watchdog_auto_closes_after_window(db_session):
         regression_class="sr_catch_rate:correctness",
     )
 
-    key = (str(project.id), "sr_catch_rate:correctness")
-    _signal_healthy_since[key] = _utcnow() - timedelta(hours=30)
-    # Ensure first_tripped marker is also cleared on close.
-    _signal_first_tripped[key] = _utcnow() - timedelta(hours=72)
+    case.signal_healthy_since_at = _utcnow() - timedelta(hours=30)
+    db_session.add(case)
+    await db_session.commit()
 
     closed = await run_watchdog_once(db_session, project.id)
     assert closed == 1
@@ -2278,9 +2266,9 @@ async def test_watchdog_auto_closes_after_window(db_session):
         for e in log_entries
     )
 
-    # Both process-local markers cleared on close.
-    assert key not in _signal_healthy_since
-    assert key not in _signal_first_tripped
+    # Recovery clock cleared on close so the column never carries a stale
+    # value into a future re-escalation.
+    assert case.signal_healthy_since_at is None
 
     alerts = (
         (await db_session.execute(select(Alert).where(Alert.project_id == project.id)))
@@ -2302,9 +2290,6 @@ async def test_watchdog_auto_close_race_with_operator_clear(db_session):
     causes the watchdog to skip — no double-write, no alert, no log entry.
     """
     from app.models import Alert, RegressionCaseStatus, RegressionRemediationCase
-    from app.pipeline_regression_dispatcher import _signal_healthy_since
-
-    _signal_healthy_since.clear()
 
     project = make_project(design_doc=_design_doc_no_sr_regression())
     db_session.add(project)
@@ -2318,8 +2303,7 @@ async def test_watchdog_auto_close_race_with_operator_clear(db_session):
         hours_stale=72,
         regression_class="sr_catch_rate:correctness",
     )
-    key = (str(project.id), "sr_catch_rate:correctness")
-    _signal_healthy_since[key] = _utcnow() - timedelta(hours=30)
+    case.signal_healthy_since_at = _utcnow() - timedelta(hours=30)
 
     # Operator clears the case before the watchdog runs — the lock SELECT's
     # status filter must reject the row even though the candidate scan would
@@ -2359,10 +2343,7 @@ async def test_watchdog_auto_close_race_with_operator_clear(db_session):
 async def test_watchdog_auto_close_window_runtime_config_override(db_session):
     """runtime_config['regression_recovered_unattended_window_hours'] takes effect (5)."""
     from app.models import RegressionCaseStatus
-    from app.pipeline_regression_dispatcher import _signal_healthy_since
     from app.shared_state import runtime_config
-
-    _signal_healthy_since.clear()
 
     project = make_project(design_doc=_design_doc_no_sr_regression())
     db_session.add(project)
@@ -2376,9 +2357,10 @@ async def test_watchdog_auto_close_window_runtime_config_override(db_session):
         hours_stale=72,
         regression_class="sr_catch_rate:correctness",
     )
-    key = (str(project.id), "sr_catch_rate:correctness")
     # 90 minutes — under the 24h default but over the override.
-    _signal_healthy_since[key] = _utcnow() - timedelta(minutes=90)
+    case.signal_healthy_since_at = _utcnow() - timedelta(minutes=90)
+    db_session.add(case)
+    await db_session.commit()
 
     original = runtime_config.get("regression_recovered_unattended_window_hours")
     runtime_config["regression_recovered_unattended_window_hours"] = 1
@@ -2407,14 +2389,7 @@ async def test_operator_clear_drops_healthy_since_marker(db_session):
     lifecycles.
     """
     from app.models import Alert, RegressionCaseStatus, RegressionRemediationCase
-    from app.pipeline_regression_dispatcher import (
-        _signal_first_tripped,
-        _signal_healthy_since,
-    )
     from app.routers.admin_digest import clear_regression_manual_intervention
-
-    _signal_healthy_since.clear()
-    _signal_first_tripped.clear()
 
     project = make_project(design_doc=_design_doc_no_sr_regression())
     db_session.add(project)
@@ -2429,25 +2404,25 @@ async def test_operator_clear_drops_healthy_since_marker(db_session):
         hours_stale=72,
         regression_class=regression_class,
     )
-    key = (str(project.id), regression_class)
     # Stale healthy_since from a prior NMI lifecycle — would cause an
     # immediate auto-close on a re-escalation if not cleared by the operator
     # clear path.
-    _signal_healthy_since[key] = _utcnow() - timedelta(hours=30)
-    _signal_first_tripped[key] = _utcnow() - timedelta(hours=72)
+    case.signal_healthy_since_at = _utcnow() - timedelta(hours=30)
+    db_session.add(case)
+    await db_session.commit()
 
-    # Operator clears via the admin endpoint.
+    # Operator clears via the admin endpoint — this must NULL out
+    # signal_healthy_since_at on the case row.
     await clear_regression_manual_intervention(
         regression_class=regression_class,
         project_id=project.id,
         session=db_session,
         current_user={},
     )
-    assert key not in _signal_healthy_since
-    assert key not in _signal_first_tripped
+    await db_session.refresh(case)
+    assert case.signal_healthy_since_at is None
 
     # Re-escalate the case back to NMI (e.g. another stale-active tick).
-    await db_session.refresh(case)
     case.status = RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION
     case.needs_manual_intervention_at = _utcnow()
     db_session.add(case)
@@ -2493,9 +2468,6 @@ async def test_watchdog_no_auto_close_when_signal_unevaluable(db_session):
     retire the escalation after the stable window.
     """
     from app.models import RegressionCaseStatus, RegressionRemediationCase
-    from app.pipeline_regression_dispatcher import _signal_healthy_since
-
-    _signal_healthy_since.clear()
 
     # Empty design_doc → _current_signal_value_for_class returns None for
     # sr_catch_rate:correctness (no prior/current rate data available).
@@ -2511,13 +2483,9 @@ async def test_watchdog_no_auto_close_when_signal_unevaluable(db_session):
         hours_stale=72,
         regression_class="sr_catch_rate:correctness",
     )
-    key = (str(project.id), "sr_catch_rate:correctness")
 
     closed = await run_watchdog_once(db_session, project.id)
     assert closed == 0
-    # Critically: no marker should have been set, so a subsequent tick 30h
-    # later would also not auto-close.
-    assert key not in _signal_healthy_since
 
     refreshed = (
         await db_session.execute(
@@ -2526,6 +2494,9 @@ async def test_watchdog_no_auto_close_when_signal_unevaluable(db_session):
             )
         )
     ).scalar_one()
+    # Critically: no marker should have been set, so a subsequent tick 30h
+    # later would also not auto-close.
+    assert refreshed.signal_healthy_since_at is None
     assert refreshed.status == RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION
 
 
@@ -3368,6 +3339,98 @@ async def test_sr_blind_spot_theme_below_floor_no_spawn(db_session):
 
 
 @pytest.mark.asyncio
+async def test_sr_blind_spot_disallowed_theme_does_not_spawn(db_session):
+    """Disallowed blind_spot theme at/above floor does not spawn an investigation.
+
+    Verifies the dispatcher's is_disallowed_blind_spot gate: even when a
+    forbidden theme (e.g. 'did not run docker pytest') meets _SR_BLIND_SPOT_THEME_FLOOR,
+    no sr_blind_spot:theme:* task is spawned.
+    """
+    from app.pipeline_regression_dispatcher import _SR_BLIND_SPOT_THEME_FLOOR
+    from app.time_utils import _utcnow as _ts_now
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _ts_now()
+    # Use a disallowed theme text that matches DISALLOWED_BLIND_SPOT_PATTERNS.
+    disallowed_theme = "did not run docker pytest"
+    for _ in range(_SR_BLIND_SPOT_THEME_FLOOR):
+        sro = {
+            "verdict": "pass",
+            "check_results": {"correctness": {"passed": True}},
+            "blind_spots": [disallowed_theme],
+            "reviewer_findings": [],
+        }
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create", "prompt": "x", "base_branch": "main"}],
+                context={"_self_review_outcome": sro},
+                created_at=now - timedelta(days=3),
+            )
+        )
+    await db_session.commit()
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 0, (
+        "Dispatcher must not spawn an investigation for a disallowed blind_spot theme"
+    )
+
+
+@pytest.mark.asyncio
+async def test_sr_blind_spot_ingestion_filter_prevents_theme_spawn(db_session):
+    """After ingestion filter, disallowed blind_spots are absent → theme aggregator
+    has zero count → no spawn.
+
+    Simulates what happens when filter_disallowed_blind_spots is applied at write
+    time: the stored _self_review_outcome.blind_spots is empty, so the theme
+    aggregator never accumulates the disallowed theme above the floor.
+    """
+    from app.pipeline_regression_dispatcher import _SR_BLIND_SPOT_THEME_FLOOR
+    from app.sr_blind_spots import filter_disallowed_blind_spots
+    from app.time_utils import _utcnow as _ts_now
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _ts_now()
+    for _ in range(_SR_BLIND_SPOT_THEME_FLOOR):
+        raw_sro = {
+            "verdict": "pass",
+            "check_results": {"correctness": {"passed": True}},
+            # Disallowed entry that the ingestion filter would remove.
+            "blind_spots": ["did not run the full backend test suite"],
+            "reviewer_findings": [],
+        }
+        # Apply the same filter used at ingestion (agent_status.py).
+        filtered_sro = filter_disallowed_blind_spots(dict(raw_sro))
+        assert filtered_sro["blind_spots"] == [], (
+            "Filter must remove the disallowed entry"
+        )
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create", "prompt": "x", "base_branch": "main"}],
+                context={"_self_review_outcome": filtered_sro},
+                created_at=now - timedelta(days=3),
+            )
+        )
+    await db_session.commit()
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 0, (
+        "Ingestion-filtered blind_spots must not accumulate into a spawnable theme"
+    )
+
+
+@pytest.mark.asyncio
 async def test_sr_blind_spot_dedup_inflight_blocks_second_spawn(db_session):
     """Second run_once with an in-flight sr_blind_spot investigation → no duplicate spawn."""
     from app.playbook_learning import _MIN_SR_SAMPLE
@@ -3628,7 +3691,6 @@ async def test_signal_first_seen_at_uses_anomaly_first_seen(db_session):
 async def test_mttd_non_zero_across_ticks(db_session):
     """signal_first_seen_at persists across ticks so MTTD is non-zero on re-spawn."""
     from app.models import RegressionCaseStatus, RegressionRemediationCase
-    from app.pipeline_regression_dispatcher import _signal_first_tripped
 
     project = make_project(design_doc=_design_doc_with_sr_regression())
     db_session.add(project)
@@ -3636,14 +3698,11 @@ async def test_mttd_non_zero_across_ticks(db_session):
     await db_session.refresh(project)
 
     await run_once(db_session, project.id)
-    key = (str(project.id), "sr_catch_rate")
-    assert key in _signal_first_tripped
 
-    # Backdate tracker to simulate signal tripping 3 hours before spawn.
-    _signal_first_tripped[key] = _signal_first_tripped[key] - timedelta(hours=3)
-    earlier = _signal_first_tripped[key]
-
-    # Expire cooldown and close case so run_once can re-spawn.
+    # The case row is now the durable source of truth for the first-trip
+    # time. Backdate it to simulate the signal having tripped 3h before
+    # the first spawn — a worker restart between trip and spawn would
+    # produce the same row state.
     case = (
         (
             await db_session.execute(
@@ -3655,6 +3714,11 @@ async def test_mttd_non_zero_across_ticks(db_session):
         .scalars()
         .first()
     )
+    assert case is not None
+    assert case.signal_first_seen_at is not None
+    earlier = case.signal_first_seen_at - timedelta(hours=3)
+    case.signal_first_seen_at = earlier
+    case.signal_first_crossed_at = earlier
     case.status = RegressionCaseStatus.CLOSED
     prior_task = (
         (await db_session.execute(select(Task).where(Task.project_id == project.id)))
@@ -3695,9 +3759,8 @@ async def test_mttd_non_zero_across_ticks(db_session):
 
 @pytest.mark.asyncio
 async def test_mttd_tracker_cleared_on_recovery(db_session):
-    """run_recovery_once clears _signal_first_tripped when a case is closed."""
+    """run_recovery_once clears the case's signal_healthy_since_at on close."""
     from app.models import RegressionCaseStatus, RegressionRemediationCase
-    from app.pipeline_regression_dispatcher import _signal_first_tripped
 
     project = make_project(design_doc=_design_doc_with_sr_regression())
     db_session.add(project)
@@ -3705,8 +3768,6 @@ async def test_mttd_tracker_cleared_on_recovery(db_session):
     await db_session.refresh(project)
 
     await run_once(db_session, project.id)
-    key = (str(project.id), "sr_catch_rate")
-    assert key in _signal_first_tripped
 
     # Remove regression so signal reads as recovered.
     project.design_doc = {}
@@ -3721,6 +3782,10 @@ async def test_mttd_tracker_cleared_on_recovery(db_session):
         .scalars()
         .first()
     )
+    # Seed a stale healthy_since timestamp on the case row — the recovery
+    # close path must NULL it out so a re-escalation cannot inherit a stale
+    # auto-close clock from a prior lifecycle.
+    case.signal_healthy_since_at = _utcnow() - timedelta(hours=30)
     case.status = RegressionCaseStatus.MERGED
     case.signal_snapshot_at_merge = {
         "captured_at": (_utcnow() - timedelta(hours=1)).isoformat()
@@ -3729,8 +3794,11 @@ async def test_mttd_tracker_cleared_on_recovery(db_session):
     await db_session.refresh(project)
 
     await run_recovery_once(db_session, project.id)
-    assert key not in _signal_first_tripped, (
-        "tracker must be cleared when signal recovers"
+
+    await db_session.refresh(case)
+    assert case.status == RegressionCaseStatus.CLOSED
+    assert case.signal_healthy_since_at is None, (
+        "recovery clock must be cleared when signal recovers"
     )
 
 
@@ -4274,7 +4342,7 @@ async def test_strategic_stall_respects_cooldown(db_session):
 
 @pytest.mark.asyncio
 async def test_cycle_record_emitted_on_tick(db_session):
-    """run_once() emits a cycle record into the ring buffer on every call."""
+    """run_once() emits a cycle record into the durable table on every call."""
     project = make_project(
         design_doc=_design_doc_with_sr_regression(category="correctness"),
     )
@@ -4285,7 +4353,7 @@ async def test_cycle_record_emitted_on_tick(db_session):
     spawned = await run_once(db_session, project.id)
     assert spawned == 1
 
-    records = get_dispatcher_cycle_records(project_id=str(project.id))
+    records = await get_dispatcher_cycle_records(db_session, project_id=str(project.id))
     assert len(records) >= 1
     rec = records[-1]
     assert rec["project_id"] == str(project.id)
@@ -4315,11 +4383,156 @@ async def test_rejection_reason_dedup_attributed(db_session):
     second = await run_once(db_session, project.id)
     assert second == 0
 
-    records = get_dispatcher_cycle_records(project_id=str(project.id))
+    records = await get_dispatcher_cycle_records(db_session, project_id=str(project.id))
     last_rec = records[-1]
     rj = last_rec["rejections_by_reason"]
     assert rj["dedup"] >= 1, "dedup rejection not recorded"
     assert rj["cooldown"] == 0, "rejection wrongly attributed to cooldown"
+
+
+@pytest.mark.asyncio
+async def test_cycle_record_survives_fresh_session(db_session):
+    """Cycle records written in one session are visible from a fresh session.
+
+    Demonstrates the durable-storage requirement of this PR: a worker that
+    crashes mid-cycle must not lose throughput history that the admin
+    health endpoint and the zero-spawn-streak watchdog depend on.
+
+    The fresh-session check only runs on the Postgres test backend; the
+    SQLite in-memory test fixture re-creates schema per-test in an isolated
+    connection so a cross-session read cannot demonstrate durability.  The
+    same-session path is exercised on both backends so the test is not a
+    no-op on SQLite — it still confirms the row was written.
+    """
+    from testing.conftest import TestingSessionLocal, USE_POSTGRES
+
+    project = make_project(
+        design_doc=_design_doc_with_sr_regression(category="correctness"),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 1
+
+    # Same-session readback (works on both SQLite and Postgres).
+    same_session_rows = (
+        (
+            await db_session.execute(
+                select(DispatcherCycleRecord).where(
+                    DispatcherCycleRecord.project_id == project.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(same_session_rows) >= 1
+    assert any(r.spawns_emitted == 1 for r in same_session_rows)
+
+    if USE_POSTGRES:
+        # Cross-session readback on a real DB — proves the cycle record
+        # actually committed and is visible to a worker that did not write it.
+        async with TestingSessionLocal() as fresh:
+            rows = (
+                (
+                    await fresh.execute(
+                        select(DispatcherCycleRecord).where(
+                            DispatcherCycleRecord.project_id == project.id
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            assert len(rows) >= 1
+            assert any(r.spawns_emitted == 1 for r in rows)
+
+
+@pytest.mark.asyncio
+async def test_health_endpoint_returns_no_data_on_empty_db(db_session):
+    """Admin health endpoint returns zeros / empty arrays on a cold start.
+
+    No DispatcherCycleRecord rows + no RegressionRemediationCase rows must
+    not raise — the UI displays 'no data' rather than crashing.
+    """
+    from app.routers.admin_digest import get_regression_dispatcher_health
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    data = await get_regression_dispatcher_health(
+        project_id=project.id,
+        window_hours=24,
+        session=db_session,
+        current_user={},
+    )
+    agg = data["aggregate"]
+    assert agg["cycles"] == 0
+    assert agg["spawns"] == 0
+    assert agg["signals_tripped"] == 0
+    assert agg["signals_evaluated"] == 0
+    assert agg["rejections"]["cooldown"] == 0
+    assert agg["rejections"]["dedup"] == 0
+    assert agg["rejections"]["system_cap"] == 0
+    assert agg["rejections"]["manual_intervention_suppressed"] == 0
+    assert data["per_class"] == []
+    assert len(data["spawns_sparkline"]) == 24
+
+
+@pytest.mark.asyncio
+async def test_signal_healthy_since_persists_across_worker_restart(db_session):
+    """signal_healthy_since_at is preserved across simulated worker restart.
+
+    Two ``_auto_close_recovered_manual_intervention`` ticks: between them
+    we mutate the case row to simulate a worker restart that loses any
+    process-local state. The unattended-window check must still use the
+    persisted timestamp on the second tick instead of resetting to ``now``.
+    """
+    from app.models import RegressionCaseStatus
+    from app.pipeline_regression_dispatcher import (
+        _auto_close_recovered_manual_intervention,
+    )
+
+    project = make_project(design_doc=_design_doc_no_sr_regression())
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    case = await _make_stale_case(
+        db_session,
+        project.id,
+        status=RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION,
+        hours_stale=72,
+        regression_class="sr_catch_rate:correctness",
+    )
+
+    # Tick 1: signal is healthy — populates case.signal_healthy_since_at.
+    await _auto_close_recovered_manual_intervention(db_session, project.id)
+    await db_session.refresh(case)
+    assert case.signal_healthy_since_at is not None
+    first_seen = case.signal_healthy_since_at
+
+    # Backdate 30h to simulate the window having elapsed BETWEEN ticks
+    # while the worker was down.  A fresh worker reading the column must
+    # see the original timestamp, not its own ``now``.
+    backdated = _utcnow() - timedelta(hours=30)
+    case.signal_healthy_since_at = backdated
+    db_session.add(case)
+    await db_session.commit()
+
+    # Tick 2 (different worker would read the same row): auto-close fires
+    # because the persisted timestamp puts us past the 24h window.
+    closed = await _auto_close_recovered_manual_intervention(db_session, project.id)
+    assert closed == 1
+    await db_session.refresh(case)
+    assert case.status == RegressionCaseStatus.CLOSED
+    # Cleared on close — never carries forward into a re-escalation.
+    assert case.signal_healthy_since_at is None
+    assert first_seen != backdated  # sanity: backdating actually mutated it
 
 
 # ---------------------------------------------------------------------------
@@ -5073,7 +5286,6 @@ async def test_staleness_alarm_no_false_positive_on_first_boot(db_session):
 @pytest.mark.asyncio
 async def test_zero_spawn_streak_alarm_fires(db_session):
     """Zero-spawn streak alert opens after K consecutive suppressed cycles."""
-    import app.pipeline_regression_dispatcher as _disp
     from app.models import Alert, AlertSeverity
     from app.pipeline_regression_dispatcher import (
         _DISPATCHER_ZERO_SPAWN_STREAK_K,
@@ -5085,19 +5297,22 @@ async def test_zero_spawn_streak_alarm_fires(db_session):
     await db_session.commit()
     await db_session.refresh(project)
 
-    pid_str = str(project.id)
-    # Inject K cycle records: all have signals_tripped>0 and spawns_emitted==0.
-    for _ in range(_DISPATCHER_ZERO_SPAWN_STREAK_K):
-        _disp._dispatcher_cycle_records.append(
-            {
-                "project_id": pid_str,
-                "cycle_started_at": _utcnow().isoformat(),
-                "cycle_finished_at": _utcnow().isoformat(),
-                "spawns_emitted": 0,
-                "signals_tripped": 1,
-                "rejections_by_reason": {"cooldown": 1},
-            }
+    # Insert K cycle rows: all have signals_tripped>0 and spawns_emitted==0.
+    # Stagger cycle_started_at by 1s so the watchdog's ``order_by(desc)`` read
+    # returns them deterministically.
+    base = _utcnow()
+    for i in range(_DISPATCHER_ZERO_SPAWN_STREAK_K):
+        db_session.add(
+            DispatcherCycleRecord(
+                project_id=project.id,
+                cycle_started_at=base + timedelta(seconds=i),
+                cycle_finished_at=base + timedelta(seconds=i),
+                spawns_emitted=0,
+                signals_tripped=1,
+                rejections_by_reason={"cooldown": 1},
+            )
         )
+    await db_session.commit()
 
     await run_dispatcher_watchdog_alarms(db_session, [project.id])
 
@@ -5121,7 +5336,6 @@ async def test_zero_spawn_streak_alarm_fires(db_session):
 @pytest.mark.asyncio
 async def test_zero_spawn_streak_alarm_auto_resolves(db_session):
     """Zero-spawn streak alert is dismissed when a spawn succeeds."""
-    import app.pipeline_regression_dispatcher as _disp
     from app.models import Alert
     from app.pipeline_regression_dispatcher import (
         _DISPATCHER_ZERO_SPAWN_STREAK_K,
@@ -5144,21 +5358,21 @@ async def test_zero_spawn_streak_alarm_auto_resolves(db_session):
     )
     await db_session.commit()
 
-    pid_str = str(project.id)
-    # Inject K-1 suppressed + 1 successful spawn → streak broken.
+    # Insert K-1 suppressed + 1 successful spawn → streak broken.
+    base = _utcnow()
     for i in range(_DISPATCHER_ZERO_SPAWN_STREAK_K):
-        _disp._dispatcher_cycle_records.append(
-            {
-                "project_id": pid_str,
-                "cycle_started_at": _utcnow().isoformat(),
-                "cycle_finished_at": _utcnow().isoformat(),
-                "spawns_emitted": 1 if i == _DISPATCHER_ZERO_SPAWN_STREAK_K - 1 else 0,
-                "signals_tripped": 1,
-                "rejections_by_reason": {
-                    "cooldown": 0 if i == _DISPATCHER_ZERO_SPAWN_STREAK_K - 1 else 1
-                },
-            }
+        is_success = i == _DISPATCHER_ZERO_SPAWN_STREAK_K - 1
+        db_session.add(
+            DispatcherCycleRecord(
+                project_id=project.id,
+                cycle_started_at=base + timedelta(seconds=i),
+                cycle_finished_at=base + timedelta(seconds=i),
+                spawns_emitted=1 if is_success else 0,
+                signals_tripped=1,
+                rejections_by_reason={"cooldown": 0 if is_success else 1},
+            )
         )
+    await db_session.commit()
 
     await run_dispatcher_watchdog_alarms(db_session, [project.id])
 
@@ -5648,6 +5862,106 @@ def test_regression_case_summary_emits_layer_coverage_field():
     assert by_class_entry["layer_coverage"]["combinations"] == [
         {"layers": ["REVIEWER_PASS"], "count": 1}
     ]
+
+
+@pytest.mark.asyncio
+async def test_sr_blind_spot_theme_disallowed_no_spawn(db_session):
+    """Disallowed theme at count >= floor → no investigate spawned; disallowed_theme rejection incremented."""
+    from app.pipeline_regression_dispatcher import get_dispatcher_cycle_records
+    from app.time_utils import _utcnow as _ts_now
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _ts_now()
+    # "did not run full backend pytest" matches DISALLOWED_BLIND_SPOT_PATTERNS (6 tokens, pattern hits)
+    disallowed_text = "did not run full backend pytest"
+    for _ in range(7):  # well above the floor of 5
+        sro = {
+            "verdict": "pass",
+            "check_results": {"correctness": {"passed": True}},
+            "blind_spots": [disallowed_text],
+            "reviewer_findings": [],
+        }
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create", "prompt": "x", "base_branch": "main"}],
+                context={"_self_review_outcome": sro},
+                created_at=now - timedelta(days=3),
+            )
+        )
+    await db_session.commit()
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 0
+
+    all_tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    investigate_tasks = [
+        t for t in all_tasks if (t.first_payload or {}).get("type") == "investigate"
+    ]
+    assert investigate_tasks == [], (
+        "no investigate task should be spawned for disallowed theme"
+    )
+
+    records = await get_dispatcher_cycle_records(db_session, project_id=str(project.id))
+    assert records, "cycle record must exist"
+    last_record = records[-1]
+    assert last_record["rejections_by_reason"].get("disallowed_theme", 0) >= 1
+
+
+@pytest.mark.asyncio
+async def test_sr_blind_spot_theme_allowed_spawns(db_session):
+    """Allowed theme at count >= floor → investigate task is spawned normally."""
+    from app.pipeline_regression_dispatcher import _SR_BLIND_SPOT_THEME_FLOOR
+    from app.time_utils import _utcnow as _ts_now
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _ts_now()
+    allowed_text = "unsure whether retry path handles concurrent calls"
+    for _ in range(_SR_BLIND_SPOT_THEME_FLOOR):
+        sro = {
+            "verdict": "pass",
+            "check_results": {"correctness": {"passed": True}},
+            "blind_spots": [allowed_text],
+            "reviewer_findings": [],
+        }
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create", "prompt": "x", "base_branch": "main"}],
+                context={"_self_review_outcome": sro},
+                created_at=now - timedelta(days=3),
+            )
+        )
+    await db_session.commit()
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 1
+
+    all_tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    investigate_tasks = [
+        t for t in all_tasks if (t.first_payload or {}).get("type") == "investigate"
+    ]
+    assert len(investigate_tasks) == 1
+    ctx = investigate_tasks[0].context or {}
+    assert ctx["regression_class"].startswith("sr_blind_spot:theme:")
 
 
 # ---------------------------------------------------------------------------

@@ -38,6 +38,7 @@ from app.shared_state import runtime_config as _runtime_config
 import app.orchestrator as _orch
 from app.broadcast import broadcast_to_project
 from app.routers.agent import verify_agent_token
+from app.sr_blind_spots import filter_disallowed_blind_spots
 from app.max_plan_pool import (
     _max_plan_pool_lock,
     apply_task_llm_runtime_context,
@@ -1072,7 +1073,9 @@ async def update_agent_status(
                     if payload.diff_summary:
                         ctx["_pr_diff_summary"] = payload.diff_summary[:50]
                     if payload.self_review_outcome:
-                        ctx["_self_review_outcome"] = payload.self_review_outcome
+                        ctx["_self_review_outcome"] = filter_disallowed_blind_spots(
+                            dict(payload.self_review_outcome)
+                        )
                     if payload.test_failure_summary:
                         ctx["_test_failure_summary"] = payload.test_failure_summary[
                             :5000

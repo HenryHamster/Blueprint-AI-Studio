@@ -11376,9 +11376,14 @@ async def test_regression_dispatcher_health_empty(client: AsyncClient, db_sessio
 async def test_regression_dispatcher_health_with_cycle_and_case(
     client: AsyncClient, db_session
 ):
-    """Cycle records aggregate correctly; open case appears in per_class."""
-    import app.shared_state as _ss
-    from app.shared_state import record_dispatcher_cycle
+    """Cycle records aggregate correctly; open case appears in per_class.
+
+    Cycle records are now persisted in the durable ``DispatcherCycleRecord``
+    table (see migration 0087); the legacy in-memory
+    ``shared_state.dispatcher_cycle_log`` is no longer the source of truth
+    for this endpoint.
+    """
+    from app.models import DispatcherCycleRecord
 
     project = make_project()
     db_session.add(project)
@@ -11391,30 +11396,25 @@ async def test_regression_dispatcher_health_with_cycle_and_case(
         status=RegressionCaseStatus.ACTIVE,
     )
     db_session.add(case)
+    now = _utcnow()
+    db_session.add(
+        DispatcherCycleRecord(
+            project_id=project.id,
+            cycle_started_at=now - timedelta(minutes=5),
+            cycle_finished_at=now - timedelta(minutes=4),
+            signals_evaluated=3,
+            signals_tripped=1,
+            spawns_emitted=1,
+            rejections_by_reason={"cooldown": 0, "dedup": 1},
+            mttd_p50_sec=120.0,
+        )
+    )
     await db_session.commit()
 
-    saved = list(_ss.dispatcher_cycle_log)
-    _ss.dispatcher_cycle_log.clear()
-    now = _utcnow()
-    record_dispatcher_cycle(
-        project_id=str(project.id),
-        cycle_started_at=now - timedelta(minutes=5),
-        cycle_finished_at=now - timedelta(minutes=4),
-        signals_evaluated=3,
-        signals_tripped=1,
-        spawns_emitted=1,
-        rejections_by_reason={"cooldown": 0, "dedup": 1},
-        mttd_p50_sec=120.0,
+    response = await client.get(
+        "/api/admin/regression-dispatcher/health",
+        params={"project_id": str(project.id), "window_hours": 24},
     )
-    try:
-        response = await client.get(
-            "/api/admin/regression-dispatcher/health",
-            params={"project_id": str(project.id), "window_hours": 24},
-        )
-    finally:
-        _ss.dispatcher_cycle_log.clear()
-        for rec in saved:
-            _ss.dispatcher_cycle_log.append(rec)
 
     assert response.status_code == 200
     data = response.json()
@@ -11994,3 +11994,82 @@ async def test_list_regression_cases_layer_summary_empty_for_default_case(
         "cross_layer": False,
         "window_hours": 48,
     }
+
+
+# ── GET /regression-cases/trend ──────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_regression_case_trend_empty(client: AsyncClient, db_session):
+    """Returns contiguous daily buckets with zeros when no cases exist."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    response = await client.get(
+        "/api/admin/regression-cases/trend",
+        params={"project_id": str(project.id), "days": 7},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["days"] == 7
+    assert len(body["daily"]) == 7
+    assert all(b["opened"] == 0 and b["closed"] == 0 for b in body["daily"])
+    assert body["by_class"] == {}
+
+
+@pytest.mark.asyncio
+async def test_regression_case_trend_counts_opened_and_closed(
+    client: AsyncClient, db_session
+):
+    """Cases opened today appear in today's bucket; CLOSED cases appear in closed bucket."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    # An ACTIVE case opened today (opened += 1).
+    opened_case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="fix_loop_stall",
+        status=RegressionCaseStatus.ACTIVE,
+        first_seen_at=now,
+        updated_at=now,
+    )
+    # A CLOSED case (different class) updated today (closed += 1).
+    closed_case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="fix_loop_divergence",
+        status=RegressionCaseStatus.CLOSED,
+        first_seen_at=now - timedelta(days=5),
+        updated_at=now,
+    )
+    db_session.add(opened_case)
+    db_session.add(closed_case)
+    await db_session.commit()
+
+    response = await client.get(
+        "/api/admin/regression-cases/trend",
+        params={"project_id": str(project.id), "days": 7},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    today = now.strftime("%Y-%m-%d")
+    today_bucket = next(b for b in body["daily"] if b["date"] == today)
+    assert today_bucket["opened"] == 1
+    assert today_bucket["closed"] == 1
+    # Per-class breakdown present for both classes.
+    assert "fix_loop_stall" in body["by_class"]
+    assert "fix_loop_divergence" in body["by_class"]
+    stall_today = next(
+        b for b in body["by_class"]["fix_loop_stall"] if b["date"] == today
+    )
+    assert stall_today["opened"] == 1
+    assert stall_today["closed"] == 0
+    div_today = next(
+        b for b in body["by_class"]["fix_loop_divergence"] if b["date"] == today
+    )
+    assert div_today["opened"] == 0
+    assert div_today["closed"] == 1

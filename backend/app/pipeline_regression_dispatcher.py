@@ -19,7 +19,6 @@ import contextvars
 import logging
 import time
 import uuid
-from collections import deque
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -123,16 +122,19 @@ _CANONICAL_RECURRENCE_LAYERS = (
     "REVIEWER_PASS",
 )
 
-# Bounded ring buffer of the last 1000 dispatcher cycle records (all projects).
-# Each record is a plain dict written by run_once(). Read by the health endpoint.
-#
-# NOTE: this buffer is process-local. It is safe today because the orchestrator
-# runs as a single FastAPI worker; a sibling /api/admin/regression-dispatcher/health
-# endpoint shares this module's address space. If the orchestrator is ever
-# scaled to multiple workers, the health endpoint would see only the buffer of
-# the worker that handled its request — at that point the records should be
-# persisted (e.g. to a bounded DB table) instead of an in-memory deque.
-_dispatcher_cycle_records: deque = deque(maxlen=1000)
+# Cycle records moved to durable storage: see ``DispatcherCycleRecord`` in
+# ``backend/app/models.py``. ``run_once()`` inserts one row per tick; the
+# admin /api/admin/regression-dispatcher/health endpoint and
+# ``run_dispatcher_watchdog_alarms`` query the table.  This survives worker
+# restarts and is consistent across multi-worker deployments — both blind
+# spots of the prior process-local deque.
+
+# Retention window for DispatcherCycleRecord rows. Older rows are pruned
+# opportunistically inside ``run_once()`` so the table doesn't grow
+# unboundedly (the prior deque was bounded at 1000 records, ~17h at a
+# 60s tick).  30d roughly matches the existing admin window-hours upper
+# bound (168h) plus headroom for retroactive analysis.
+_DISPATCHER_CYCLE_TTL = timedelta(days=30)
 
 # ContextVar lets run_once() accumulate rejection counts inside _maybe_spawn()
 # without threading a mutable dict through every evaluate helper signature.
@@ -143,19 +145,18 @@ _cycle_rejections_var: contextvars.ContextVar[dict | None] = contextvars.Context
     default=None,
 )
 
-# Per-(project_id, regression_class) timestamp when the signal FIRST crossed
-# threshold in this process. Preserved across cooldown-blocked ticks so
-# time_to_detect_sec reflects true MTTD. Cleared by run_recovery_once when a
-# case closes (signal recovered). Anomaly class uses entry["first_seen"] instead.
-_signal_first_tripped: dict[tuple[str, str], datetime] = {}
-
-# Per-(project_id, regression_class) timestamp when an escalated
-# NEEDS_MANUAL_INTERVENTION case's underlying signal first stopped tripping
-# during the watchdog's auto-close pass. Used to enforce the
-# regression_recovered_unattended_window_hours stable window before closing.
-# Held in process memory rather than fingerprint_to_fix_log so a stale entry
-# from a prior case lifecycle cannot let a re-opened case bypass the window.
-_signal_healthy_since: dict[tuple[str, str], datetime] = {}
+# The earliest "signal first tripped" time is now sourced from the
+# ``RegressionRemediationCase.signal_first_seen_at`` /
+# ``signal_first_crossed_at`` columns — the dispatcher writes both on
+# spawn and reads them on subsequent ticks.  No process-local cache:
+# when no case row exists yet, the trip is by definition ``now`` (first
+# observation), so persisting it across cooldown-blocked ticks would
+# require a second durable write that adds no value for the first-spawn
+# MTTD edge case.
+#
+# The "signal healthy since" recovery clock is now stored on
+# ``RegressionRemediationCase.signal_healthy_since_at`` (durable, per-case)
+# and read/written inside ``_auto_close_recovered_manual_intervention``.
 
 _SIGNAL_STALENESS_WINDOWS = {
     "sr_catch_rate": timedelta(hours=48),
@@ -269,23 +270,78 @@ async def _run_signal_staleness_watchdog(
     return created
 
 
-def get_dispatcher_cycle_records(
+async def get_dispatcher_cycle_records(
+    session: AsyncSession,
     project_id: str | None = None,
     limit: int = 100,
+    window_hours: int | None = None,
 ) -> list[dict]:
-    """Return recent cycle records from the in-memory ring buffer.
+    """Return recent dispatcher cycle records from the durable table.
 
-    Optionally filter to a single project.  Results are ordered oldest-first.
+    Reads from ``DispatcherCycleRecord``.  Optionally filters to one project
+    and/or a trailing window.  Results are returned oldest-first (matching
+    the deque-iteration order callers historically relied on).
 
-    NOTE: the underlying buffer is process-local — see the comment on
-    _dispatcher_cycle_records. This is fine today (single-worker orchestrator)
-    but a multi-worker deployment would need a persistent backing store so the
-    health endpoint sees a consistent view across workers.
+    On an empty table, returns ``[]`` — never raises — so the health
+    endpoint can render 'no data' on cold start.
     """
-    records = list(_dispatcher_cycle_records)
+    from app.models import DispatcherCycleRecord  # noqa: PLC0415
+
+    stmt = select(DispatcherCycleRecord)
     if project_id is not None:
-        records = [r for r in records if r["project_id"] == project_id]
-    return records[-limit:]
+        stmt = stmt.where(DispatcherCycleRecord.project_id == uuid.UUID(project_id))
+    if window_hours is not None:
+        cutoff = _utcnow() - timedelta(hours=window_hours)
+        stmt = stmt.where(DispatcherCycleRecord.cycle_started_at >= cutoff)
+    stmt = stmt.order_by(DispatcherCycleRecord.cycle_started_at.desc()).limit(limit)
+    rows = (await session.execute(stmt)).scalars().all()
+    # Return oldest-first to mirror the prior deque semantics.
+    rows = list(reversed(rows))
+    return [
+        {
+            "project_id": str(r.project_id),
+            "cycle_started_at": r.cycle_started_at.isoformat(),
+            "cycle_finished_at": r.cycle_finished_at.isoformat(),
+            "signals_evaluated": r.signals_evaluated or 0,
+            "signals_tripped": r.signals_tripped or 0,
+            "spawns_emitted": r.spawns_emitted or 0,
+            "rejections_by_reason": dict(r.rejections_by_reason or {}),
+            "mttd_p50_sec": r.mttd_p50_sec,
+        }
+        for r in rows
+    ]
+
+
+async def _prune_old_dispatcher_cycle_records(session: AsyncSession) -> int:
+    """Delete DispatcherCycleRecord rows older than the retention window.
+
+    Called opportunistically inside ``run_once``; failures are swallowed so
+    a prune error cannot mask a successful spawn commit.  Returns the count
+    of rows deleted (0 when nothing matches).
+    """
+    from sqlalchemy import delete as sql_delete  # noqa: PLC0415
+    from app.models import DispatcherCycleRecord  # noqa: PLC0415
+
+    cutoff = _utcnow() - _DISPATCHER_CYCLE_TTL
+    try:
+        result = await session.execute(
+            sql_delete(DispatcherCycleRecord).where(
+                DispatcherCycleRecord.cycle_started_at < cutoff
+            )
+        )
+        deleted = result.rowcount or 0
+        if deleted:
+            await session.commit()
+        return int(deleted)
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "[REGRESSION_DISPATCHER] cycle-record prune failed", exc_info=True
+        )
+        try:
+            await session.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        return 0
 
 
 async def _last_spawn_for_class(
@@ -1714,9 +1770,21 @@ async def _maybe_spawn(
 
     # Derive signal_first_seen_at for MTTD across all non-anomaly classes.
     # Anomaly class passes signal_first_seen_at explicitly from entry["first_seen"].
-    _trip_key = (str(project_id), regression_class)
+    # The case row's signal_first_seen_at / signal_first_crossed_at columns are
+    # the durable source of truth across cooldown-blocked ticks and worker
+    # restarts.  When no case exists yet (first observation), use ``now`` —
+    # the trip is by definition right now from this dispatcher's perspective.
     if signal_first_seen_at is None:
-        signal_first_seen_at = _signal_first_tripped.setdefault(_trip_key, now)
+        if existing_case is not None and (
+            existing_case.signal_first_seen_at is not None
+            or existing_case.signal_first_crossed_at is not None
+        ):
+            signal_first_seen_at = (
+                existing_case.signal_first_seen_at
+                or existing_case.signal_first_crossed_at
+            )
+        else:
+            signal_first_seen_at = now
 
     # ---- Cross-layer regression accumulation ----------------------------------
     # Classify this observation into layer tags and merge into the case's
@@ -1935,10 +2003,10 @@ async def _maybe_spawn(
             or existing_case.signal_first_crossed_at is None
         ):
             existing_case.signal_first_crossed_at = now
-        # Propagate the earliest-tracked trip time to the case so MTTD
-        # reflects the true detection latency on re-spawn. _signal_first_tripped
-        # is the source of truth across cooldown-blocked ticks; the case row
-        # should mirror it whenever a re-spawn fires.
+        # Propagate the earliest-tracked trip time to the case row so MTTD
+        # reflects the true detection latency on re-spawn. The case row's
+        # ``signal_first_seen_at`` is itself the durable source of truth
+        # across cooldown-blocked ticks and worker restarts.
         if signal_first_seen_at is not None:
             existing_case.signal_first_seen_at = signal_first_seen_at
         # Reactivate so admin state matches the in-flight remediation. A
@@ -2156,6 +2224,7 @@ async def _probe_sr_blind_spot_any_trip(
     from app.sr_blind_spots import (
         _count_reviewer_disagreement_directions,
         aggregate_sr_blind_spot_themes,
+        is_disallowed_blind_spot,
     )
     from app.models import Task as TaskModel
 
@@ -2199,7 +2268,11 @@ async def _probe_sr_blind_spot_any_trip(
         session, project_id, days=14, limit=10
     )
     for theme_entry in themes:
-        if theme_entry["count"] >= _SR_BLIND_SPOT_THEME_FLOOR:
+        if theme_entry[
+            "count"
+        ] >= _SR_BLIND_SPOT_THEME_FLOOR and not is_disallowed_blind_spot(
+            theme_entry["theme"]
+        ):
             return True
     return False
 
@@ -2222,6 +2295,7 @@ async def _evaluate_sr_blind_spot_signal(
     from app.sr_blind_spots import (
         _count_reviewer_disagreement_directions,
         aggregate_sr_blind_spot_themes,
+        is_disallowed_blind_spot,
     )
     from app.models import Task as TaskModel
 
@@ -2332,6 +2406,16 @@ async def _evaluate_sr_blind_spot_signal(
         if count < _SR_BLIND_SPOT_THEME_FLOOR:
             break  # sorted descending — subsequent entries also below floor
         theme = theme_entry["theme"]
+        if is_disallowed_blind_spot(theme):
+            _rj_inner = _cycle_rejections_var.get()
+            if _rj_inner is not None:
+                _rj_inner["disallowed_theme"] = _rj_inner.get("disallowed_theme", 0) + 1
+            logger.info(
+                "[REGRESSION_DISPATCHER] disallowed-theme skip project=%s theme=%r",
+                project_id,
+                theme,
+            )
+            continue
         regression_class = f"sr_blind_spot:theme:{theme}"
         spawn = await _maybe_spawn(
             session,
@@ -2635,7 +2719,10 @@ async def run_recovery_once(session: AsyncSession, project_id: uuid.UUID) -> int
             continue
         if not state["tripped"]:
             case.mark_closed()
-            _signal_first_tripped.pop((str(project_id), case.regression_class), None)
+            # Reset the recovery clock so a future re-escalation does not
+            # pick up a stale healthy_since on the same row (mirrors the
+            # prior process-local ``_signal_healthy_since.pop`` semantics).
+            case.signal_healthy_since_at = None
             case.fingerprint_to_fix_log = list(case.fingerprint_to_fix_log or []) + [
                 {
                     "fingerprint": case.regression_class,
@@ -2662,6 +2749,10 @@ async def run_recovery_once(session: AsyncSession, project_id: uuid.UUID) -> int
                     )
                     continue
             case.re_arm()
+            # Re-armed cases start a fresh recovery clock — do not let a
+            # stale healthy_since from a prior lifecycle short-circuit the
+            # auto-close stable window after a future escalation.
+            case.signal_healthy_since_at = None
         session.add(case)
         changed += 1
     if changed:
@@ -3007,10 +3098,13 @@ async def _auto_close_recovered_manual_intervention(
     """Auto-close NEEDS_MANUAL_INTERVENTION cases whose signal has recovered.
 
     Re-evaluates each case's underlying signal via ``_current_signal_value_for_class``
-    and tracks the first-healthy moment in process-local ``_signal_healthy_since``.
-    Once the case has been continuously healthy for the configured stable window,
-    transitions the case to CLOSED with ``last_remediation_result =
-    'recovered_unattended'`` and emits a single INFO Alert.
+    and persists the first-healthy moment on
+    ``RegressionRemediationCase.signal_healthy_since_at``.  Once the case has
+    been continuously healthy for the configured stable window, transitions
+    to CLOSED with ``last_remediation_result = 'recovered_unattended'`` and
+    emits a single INFO Alert.  The stable window therefore survives worker
+    restarts — a worker that drops mid-window does not let the next worker
+    reset the clock.
 
     Race protection: each candidate row is re-acquired with
     ``with_for_update(skip_locked=True)`` and the status is re-checked under the
@@ -3045,8 +3139,8 @@ async def _auto_close_recovered_manual_intervention(
     window = timedelta(hours=window_hours)
     now = _utcnow()
     auto_closed = 0
-    for case_id, candidate_class in candidate_rows:
-        key = (str(project_id), candidate_class)
+    mutated_rows = 0
+    for case_id, _candidate_class in candidate_rows:
         locked = (
             await session.execute(
                 select(RegressionRemediationCase)
@@ -3059,12 +3153,10 @@ async def _auto_close_recovered_manual_intervention(
             )
         ).scalar_one_or_none()
         # Row is held by a peer (operator clear, parallel watchdog) or its
-        # status changed between the candidate scan and the lock. Either way
-        # the right behavior is to skip — no double-write. Drop the
-        # healthy_since marker so a re-escalated case does not pick up a
-        # stale value and bypass the stable window on a future tick.
+        # status changed between the candidate scan and the lock. Skip;
+        # no marker mutation needed because the column lives on the row
+        # whose status will dictate the next-tick behavior.
         if locked is None:
-            _signal_healthy_since.pop(key, None)
             continue
 
         state = await _current_signal_value_for_class(
@@ -3076,10 +3168,21 @@ async def _auto_close_recovered_manual_intervention(
         if state is None:
             continue
         if state.get("tripped"):
-            _signal_healthy_since.pop(key, None)
+            # Signal tripped again — reset the recovery clock so any future
+            # healthy run starts the stable-window timer from scratch.
+            if locked.signal_healthy_since_at is not None:
+                locked.signal_healthy_since_at = None
+                session.add(locked)
+                mutated_rows += 1
             continue
 
-        first_healthy = _signal_healthy_since.setdefault(key, now)
+        if locked.signal_healthy_since_at is None:
+            locked.signal_healthy_since_at = now
+            session.add(locked)
+            mutated_rows += 1
+            first_healthy = now
+        else:
+            first_healthy = locked.signal_healthy_since_at
         if now - first_healthy < window:
             continue
 
@@ -3094,8 +3197,9 @@ async def _auto_close_recovered_manual_intervention(
                 "reason": CLOSE_REASON_RECOVERED_UNATTENDED,
             }
         ]
-        _signal_first_tripped.pop(key, None)
-        _signal_healthy_since.pop(key, None)
+        # Cleared on close so the column never carries a stale value across
+        # case lifecycles — mirrors the prior process-local ``.pop()`` calls.
+        locked.signal_healthy_since_at = None
         session.add(locked)
         session.add(
             Alert(
@@ -3119,7 +3223,7 @@ async def _auto_close_recovered_manual_intervention(
         )
         auto_closed += 1
 
-    if auto_closed:
+    if auto_closed or mutated_rows:
         await session.commit()
     return auto_closed
 
@@ -3302,7 +3406,6 @@ async def run_dispatcher_watchdog_alarms(
     fires even when run_once hangs or raises on the subsequent tick.
     """
     now_mono = time.monotonic()
-    all_records = list(_dispatcher_cycle_records)
 
     for pid in project_ids:
         pid_str = str(pid)
@@ -3329,8 +3432,15 @@ async def run_dispatcher_watchdog_alarms(
         # No baseline yet → don't alert; clock starts from first completed cycle.
 
         # --- Alarm 2: zero-spawn streak (MEDIUM / WARNING) ---
-        project_records = [r for r in all_records if r["project_id"] == pid_str]
-        recent = project_records[-_DISPATCHER_ZERO_SPAWN_STREAK_K:]
+        # Read the most recent K cycle rows from the durable table so the
+        # streak detection survives worker restarts. The query takes the
+        # newest K and we evaluate the streak in any order — the "streak
+        # broken" predicate is order-independent.
+        recent = await get_dispatcher_cycle_records(
+            session,
+            project_id=pid_str,
+            limit=_DISPATCHER_ZERO_SPAWN_STREAK_K,
+        )
         if len(recent) >= _DISPATCHER_ZERO_SPAWN_STREAK_K:
             streak_broken = any(
                 r["spawns_emitted"] > 0 or r.get("signals_tripped", 0) == 0
@@ -3370,6 +3480,7 @@ async def run_once(session: AsyncSession, project_id: uuid.UUID) -> int:
         "cooldown": 0,
         "system_cap": 0,
         "manual_intervention_suppressed": 0,
+        "disallowed_theme": 0,
     }
     _token = _cycle_rejections_var.set(_rj)
     _st_counter: list = [0]
@@ -3494,14 +3605,36 @@ async def run_once(session: AsyncSession, project_id: uuid.UUID) -> int:
     finally:
         _cycle_rejections_var.reset(_token)
         _cycle_signals_tripped_var.reset(_st_token)
-        _dispatcher_cycle_records.append(
-            {
-                "project_id": str(project_id),
-                "cycle_started_at": cycle_started_at.isoformat(),
-                "cycle_finished_at": _utcnow().isoformat(),
-                "spawns_emitted": _spawned,
-                "signals_tripped": _st_counter[0],
-                "rejections_by_reason": dict(_rj),
-            }
-        )
+        # Persist the cycle record to the durable table.  Use a fresh
+        # session-scope INSERT in its own commit so a write error here cannot
+        # mask the spawn commits already flushed above.  Matches the prior
+        # ``finally``-block semantics: the record is written even when
+        # run_once short-circuits early (deploy-monitoring defer, project not
+        # found, exception inside an evaluator).
+        from app.models import DispatcherCycleRecord  # noqa: PLC0415
+
+        try:
+            session.add(
+                DispatcherCycleRecord(
+                    project_id=project_id,
+                    cycle_started_at=cycle_started_at,
+                    cycle_finished_at=_utcnow(),
+                    signals_evaluated=0,
+                    signals_tripped=_st_counter[0],
+                    spawns_emitted=_spawned,
+                    rejections_by_reason=dict(_rj),
+                )
+            )
+            await session.commit()
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "[REGRESSION_DISPATCHER] cycle-record write failed", exc_info=True
+            )
+            try:
+                await session.rollback()
+            except Exception:  # noqa: BLE001
+                pass
+        # Periodic prune so DispatcherCycleRecord doesn't grow unboundedly.
+        # Cheap when the index hits no expired rows; failures are swallowed.
+        await _prune_old_dispatcher_cycle_records(session)
         _last_cycle_monotonic[str(project_id)] = time.monotonic()

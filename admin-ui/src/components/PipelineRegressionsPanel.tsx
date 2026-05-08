@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { AlertTriangle, CheckCircle, RotateCcw, Activity, ChevronDown, ChevronRight } from 'lucide-react';
+import { ResponsiveContainer, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip } from 'recharts';
 import { apiFetch } from '../api';
 import { timeAgo, parseTimestamp } from '../utils/time';
 import { LayersAffectedBadges, type LayerSummary } from './LayersAffectedBadges';
@@ -531,6 +532,58 @@ export function AnomalyTrackerPanel({ projectId }: Props) {
           )}
         </div>
       )}
+    </section>
+  );
+}
+
+interface TrendBucket {
+  date: string;
+  opened: number;
+  closed: number;
+}
+
+export function RegressionRateTrendPanel({ projectId }: Props) {
+  const [data, setData] = useState<{ daily: TrendBucket[] } | null>(null);
+  const [loaded, setLoaded] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    apiFetch(`/api/admin/regression-cases/trend?project_id=${encodeURIComponent(projectId)}&days=30`)
+      .then(async (res) => { if (!cancelled && res.ok) setData(await res.json()); })
+      .catch(() => {})
+      .finally(() => { if (!cancelled) setLoaded(true); });
+    return () => { cancelled = true; };
+  }, [projectId]);
+
+  if (!loaded || !data || data.daily.length === 0) return null;
+
+  return (
+    <section data-testid="regression-rate-trend-panel" className="mb-4">
+      <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">
+        Regression Trend (30d)
+      </h2>
+      <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3">
+        <ResponsiveContainer width="100%" height={120}>
+          <LineChart data={data.daily} margin={{ top: 4, right: 4, left: -28, bottom: 0 }}>
+            <CartesianGrid strokeDasharray="3 3" stroke="#262626" />
+            <XAxis dataKey="date" tick={{ fontSize: 9, fill: '#737373' }} tickFormatter={(v: string) => v.slice(5)} />
+            <YAxis tick={{ fontSize: 9, fill: '#737373' }} allowDecimals={false} width={32} />
+            <Tooltip contentStyle={{ background: '#171717', border: '1px solid #404040', fontSize: 10 }} />
+            <Line type="monotone" dataKey="opened" stroke="#f87171" dot={false} strokeWidth={1.5} name="Opened" />
+            <Line type="monotone" dataKey="closed" stroke="#34d399" dot={false} strokeWidth={1.5} name="Closed" />
+          </LineChart>
+        </ResponsiveContainer>
+        <div className="flex items-center gap-3 mt-1 text-[10px] text-neutral-500">
+          <span className="flex items-center gap-1.5">
+            <span className="inline-block w-3 h-0.5 bg-red-400 rounded-full" />
+            Opened
+          </span>
+          <span className="flex items-center gap-1.5">
+            <span className="inline-block w-3 h-0.5 bg-emerald-400 rounded-full" />
+            Closed
+          </span>
+        </div>
+      </div>
     </section>
   );
 }
