@@ -10507,30 +10507,28 @@ async def test_close_regression_case_404_when_missing(
 
 
 @pytest.mark.asyncio
-async def test_close_regression_case_drops_process_local_markers(
+async def test_close_regression_case_clears_durable_recovery_clock(
     client: AsyncClient, db_session
 ):
-    """Process-local first_tripped / healthy_since markers are cleared on close."""
-    from app.pipeline_regression_dispatcher import (
-        _signal_first_tripped,
-        _signal_healthy_since,
-    )
-
+    """signal_healthy_since_at is cleared on close so a future re-escalation does
+    not auto-close on its first tick from a stale value. signal_first_seen_at and
+    signal_first_crossed_at are preserved so MTTD on a future spawn reflects the
+    original detection latency."""
     project = make_project()
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
 
     regression_class = "sr_blind_spot:theme:operator_close_marker_test"
-    key = (str(project.id), regression_class)
-    _signal_first_tripped[key] = _utcnow()
-    _signal_healthy_since[key] = _utcnow()
-
+    first_seen = _utcnow()
     case = RegressionRemediationCase(
         project_id=project.id,
         regression_class=regression_class,
         status=RegressionCaseStatus.ACTIVE,
         attempts=0,
+        signal_first_seen_at=first_seen,
+        signal_first_crossed_at=first_seen,
+        signal_healthy_since_at=_utcnow(),
     )
     db_session.add(case)
     await db_session.commit()
@@ -10540,8 +10538,12 @@ async def test_close_regression_case_drops_process_local_markers(
         params={"project_id": str(project.id)},
     )
     assert response.status_code == 200
-    assert key not in _signal_first_tripped
-    assert key not in _signal_healthy_since
+
+    await db_session.refresh(case)
+    assert case.signal_healthy_since_at is None
+    # Detection-latency signals preserved.
+    assert case.signal_first_seen_at == first_seen
+    assert case.signal_first_crossed_at == first_seen
 
 
 @pytest.mark.asyncio

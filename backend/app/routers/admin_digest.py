@@ -2381,6 +2381,12 @@ async def close_regression_case(
         case.status = RegressionCaseStatus.CLOSED
         case.last_remediation_result = "operator_closed"
         case.needs_manual_intervention_at = None
+        # Drop the durable recovery clock so a future re-escalation on the same
+        # row does not pick up a stale healthy_since and auto-close on the first
+        # tick, bypassing the stable window. signal_first_seen_at /
+        # signal_first_crossed_at are intentionally preserved so a future spawn
+        # reflects the original detection latency.
+        case.signal_healthy_since_at = None
         case.updated_at = _utcnow()
         case.fingerprint_to_fix_log = list(case.fingerprint_to_fix_log or []) + [
             {
@@ -2393,13 +2399,6 @@ async def close_regression_case(
         session.add(case)
         await session.commit()
 
-    from app.pipeline_regression_dispatcher import (  # noqa: PLC0415
-        _signal_first_tripped,
-        _signal_healthy_since,
-    )
-
-    _signal_healthy_since.pop((str(project_id), regression_class), None)
-    _signal_first_tripped.pop((str(project_id), regression_class), None)
     return {
         "id": str(case.id),
         "regression_class": regression_class,
