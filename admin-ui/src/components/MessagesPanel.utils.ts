@@ -90,6 +90,92 @@ export function saveEventPrefs(
   } catch { /* ignore */ }
 }
 
+// ── Saved Views (operator filter combos) ────────────────────────────────────
+// Persists to localStorage under a per-user-per-project key so each operator's
+// named views travel with their account but stay isolated per project. Schema
+// is versioned: load() coerces missing fields to defaults and ignores unknown
+// fields so future panel state (e.g. dateRange) can join SavedView additively.
+
+export const SAVED_VIEWS_CAP = 10;
+
+export type SavedView = {
+  id: string;
+  name: string;
+  description?: string;
+  query: string;
+  prefs: Record<string, EventPref>;
+  sort: 'importance' | 'recent';
+  showResolved: boolean;
+  routineExpanded: boolean;
+  createdAt: number;
+};
+
+export type SavedViewsFile = { version: 1; views: SavedView[] };
+
+export function savedViewsKey(userId?: string | null, projectId?: string | null): string {
+  return `messages_saved_views:${userId || 'anonymous'}:${projectId || 'default'}`;
+}
+
+function sanitizeSavedView(raw: unknown): SavedView | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const r = raw as Record<string, unknown>;
+  const id = typeof r.id === 'string' && r.id ? r.id : null;
+  const name = typeof r.name === 'string' && r.name ? r.name : null;
+  if (!id || !name) return null;
+  const prefsRaw = r.prefs && typeof r.prefs === 'object' ? r.prefs as Record<string, unknown> : {};
+  const prefs: Record<string, EventPref> = {};
+  for (const [k, v] of Object.entries(prefsRaw)) {
+    if (v === 'mute' || v === 'routine' || v === 'surfaced') prefs[k] = v;
+  }
+  return {
+    id,
+    name,
+    description: typeof r.description === 'string' ? r.description : undefined,
+    query: typeof r.query === 'string' ? r.query : '',
+    prefs,
+    sort: r.sort === 'recent' ? 'recent' : 'importance',
+    showResolved: r.showResolved === true,
+    routineExpanded: r.routineExpanded === true,
+    createdAt: typeof r.createdAt === 'number' ? r.createdAt : Date.now(),
+  };
+}
+
+export function loadSavedViews(userId?: string | null, projectId?: string | null): SavedView[] {
+  try {
+    const raw = localStorage.getItem(savedViewsKey(userId, projectId));
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    // Tolerate both wrapped {version, views} and bare arrays from any
+    // earlier ad-hoc shape — pick views[] if present, else treat parsed as the array.
+    const arr: unknown = Array.isArray(parsed) ? parsed : (parsed && typeof parsed === 'object' ? (parsed as { views?: unknown }).views : null);
+    if (!Array.isArray(arr)) return [];
+    const out: SavedView[] = [];
+    for (const item of arr) {
+      const v = sanitizeSavedView(item);
+      if (v) out.push(v);
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+export function saveSavedViews(
+  userId: string | undefined | null,
+  projectId: string | undefined | null,
+  views: SavedView[],
+): void {
+  try {
+    const key = savedViewsKey(userId, projectId);
+    if (!views || views.length === 0) {
+      localStorage.removeItem(key);
+      return;
+    }
+    const file: SavedViewsFile = { version: 1, views };
+    localStorage.setItem(key, JSON.stringify(file));
+  } catch { /* ignore */ }
+}
+
 export function effectiveSignal(
   msg: { message_type: string; from_type: string; context: Record<string, unknown> },
   prefs: Record<string, EventPref>,

@@ -48,6 +48,8 @@ from app.sr_blind_spots import _REVIEWER_ORIGINS
 # to format new rows and to find/dismiss prior matching rows on clear-transition.
 _SR_REGRESSION_ALERT_TITLE_PREFIX = "Self-review catch-rate regression"
 _SR_FLOOR_ALERT_TITLE_PREFIX = "Self-review catch-rate below floor"
+_SR_QUADRANT_ALERT_TITLE_PREFIX = "Self-review precision/recall shift"
+_PASS_ENGAGEMENT_THINNING_ALERT_TITLE_PREFIX = "PASS reasoning thinning"
 # Cap how many regressing categories/severities we name in an Alert title
 # before truncating; the full breakdown lives in `Alert.message`.
 _SR_ALERT_TITLE_MAX_PARTS = 5
@@ -2055,6 +2057,8 @@ _MIN_REVIEW_SAMPLE = 10
 # Rate-of-change threshold below which a category is considered "stable" vs
 # "decreasing" / "increasing".  A 5pp shift is distinguishable from noise.
 _TREND_DELTA_THRESHOLD = 0.05
+# Threshold for precision/recall quadrant classification (5pp absolute change).
+_PRECISION_RECALL_QUADRANT_THRESHOLD = 0.05
 _SR_SEVERITY_DELTA_THRESHOLDS: dict[str, float] = {
     "CRITICAL": 0.03,
     "MAJOR": 0.05,
@@ -2065,6 +2069,11 @@ _SR_SEVERITY_DELTA_THRESHOLDS: dict[str, float] = {
 # threshold for at least _FLOOR_MIN_CONSECUTIVE_WINDOWS measurement windows.
 _SR_FLOOR_THRESHOLD = 0.50
 _FLOOR_MIN_CONSECUTIVE_WINDOWS = 2
+
+# PASS reasoning thinning alert: fire when a non-regressing category has
+# engagement below this threshold with at least _SR_ENGAGEMENT_MIN_PASSES passes.
+_SR_ENGAGEMENT_THRESHOLD = 0.5
+_SR_ENGAGEMENT_MIN_PASSES = 10
 
 
 async def compute_review_effectiveness(
@@ -3204,9 +3213,9 @@ def compute_sr_quality_by_fingerprint(
 
 def _compute_reasoning_engagement(
     tasks: list,
-    regressing_cats: set[str],
+    cats: set[str],
 ) -> dict[str, dict[str, Any]]:
-    """For each regressing category, compute the fraction of passed entries
+    """For each category in *cats*, compute the fraction of passed entries
     that include a non-trivial reasoning string.
 
     A reasoning is 'non-trivial' when it is a non-empty string of more than
@@ -3218,7 +3227,7 @@ def _compute_reasoning_engagement(
     from app.sr_blind_spots import is_skipped_sr_outcome  # noqa: PLC0415
 
     stats: dict[str, dict[str, int]] = {
-        cat: {"with_reasoning": 0, "total_passes": 0} for cat in regressing_cats
+        cat: {"with_reasoning": 0, "total_passes": 0} for cat in cats
     }
     for t in tasks:
         ctx = t.context or {}
@@ -3226,7 +3235,7 @@ def _compute_reasoning_engagement(
         if not sro or is_skipped_sr_outcome(sro):
             continue
         check_results = sro.get("check_results") or {}
-        for cat in regressing_cats:
+        for cat in cats:
             entry = check_results.get(cat)
             if not isinstance(entry, dict) or not entry.get("passed", True):
                 continue
@@ -3258,6 +3267,123 @@ def _collect_prompt_versions(tasks: list) -> dict:
         if pv is not None:
             c[str(pv)] += 1
     return c
+
+
+def _percentile(values: list, p: float) -> float:
+    """Compute p-th percentile (0–100) of a list using linear interpolation."""
+    sv = sorted(values)
+    n = len(sv)
+    if n == 1:
+        return float(sv[0])
+    idx = (p / 100.0) * (n - 1)
+    lo = int(idx)
+    hi = lo + 1
+    if hi >= n:
+        return float(sv[-1])
+    frac = idx - lo
+    return sv[lo] + frac * (sv[hi] - sv[lo])
+
+
+def _compute_miss_latency_stats(tasks: list) -> dict:
+    """Return per-category time-to-detect latency stats for SR misses.
+
+    An SR miss is a category where check_results[cat].passed == True but the
+    same category appears in _first_attempt_rejection_categories.  Latency =
+    rejection timestamp − SR completion timestamp.
+
+    Skips samples where both timestamps fall back to the same value (task.updated_at),
+    because the latency would be 0 and not a real signal.
+    """
+
+    def _parse_iso(s: object) -> Optional[datetime]:
+        if not s:
+            return None
+        try:
+            dt = datetime.fromisoformat(str(s))
+            return dt.replace(tzinfo=None) if dt.tzinfo else dt
+        except (ValueError, TypeError):
+            return None
+
+    def _updated_naive(t: object) -> Optional[datetime]:
+        ua = getattr(t, "updated_at", None)
+        if ua is None:
+            return None
+        return ua.replace(tzinfo=None) if ua.tzinfo else ua  # type: ignore[return-value]
+
+    _LONE_CHECKER_P95_THRESHOLD = 7 * 86400  # 7 days in seconds
+
+    # per category: list of latency seconds
+    latencies: dict[str, list[float]] = {}
+
+    for task in tasks:
+        ctx = task.context or {}
+        sr_outcome = ctx.get("_self_review_outcome") or {}
+        check_results = sr_outcome.get("check_results") or {}
+        rejection_cats = ctx.get("_first_attempt_rejection_categories") or {}
+
+        if not check_results or not rejection_cats:
+            continue
+
+        missed_cats = [
+            cat
+            for cat, cr in check_results.items()
+            if isinstance(cr, dict)
+            and cr.get("passed") is True
+            and cat in rejection_cats
+        ]
+        if not missed_cats:
+            continue
+
+        # Resolve SR timestamp
+        sr_ts: Optional[datetime] = None
+        for field in ("completed_at", "computed_at", "stamped_at"):
+            sr_ts = _parse_iso(sr_outcome.get(field))
+            if sr_ts is not None:
+                break
+        sr_fallback = sr_ts is None
+        if sr_ts is None:
+            sr_ts = _updated_naive(task)
+
+        # Resolve rejection timestamp
+        rej_ts: Optional[datetime] = None
+        for field in (
+            "_first_attempt_rejection_at",
+            "_first_attempt_rejection_categories_at",
+        ):
+            rej_ts = _parse_iso(ctx.get(field))
+            if rej_ts is not None:
+                break
+        rej_fallback = rej_ts is None
+        if rej_ts is None:
+            rej_ts = _updated_naive(task)
+
+        # Skip if both timestamps came from the same fallback — no real signal
+        if sr_fallback and rej_fallback:
+            continue
+
+        if sr_ts is None or rej_ts is None:
+            continue
+
+        latency = (rej_ts - sr_ts).total_seconds()
+        if latency <= 0:
+            continue
+
+        for cat in missed_cats:
+            latencies.setdefault(cat, []).append(latency)
+
+    result: dict[str, dict] = {}
+    for cat, lats in latencies.items():
+        n = len(lats)
+        p50 = int(_percentile(lats, 50))
+        p95 = int(_percentile(lats, 95))
+        result[cat] = {
+            "time_to_miss_detect_p50_sec": p50,
+            "time_to_miss_detect_p95_sec": p95,
+            "time_to_miss_detect_sample_count": n,
+            "time_to_miss_detect_lone_checker": n >= 2
+            and p95 > _LONE_CHECKER_P95_THRESHOLD,
+        }
+    return result
 
 
 async def compute_sr_catch_rate_trends(
@@ -3483,6 +3609,43 @@ async def compute_sr_catch_rate_trends(
         all_iter_miss_rate = (
             round(1 - all_iter_hit_rate, 3) if all_iter_hit_rate is not None else None
         )
+
+        # Precision/recall quadrant: compare current vs previous window deltas.
+        previous_precision = (
+            round((prev_sr_failed - prev_fp) / prev_sr_failed, 3)
+            if prev_sr_failed > 0
+            else None
+        )
+        recall_delta: Optional[float] = (
+            round(current_hit_rate - previous_hit_rate, 3)
+            if current_hit_rate is not None and previous_hit_rate is not None
+            else None
+        )
+        precision_delta: Optional[float] = (
+            round(precision - previous_precision, 3)
+            if precision is not None and previous_precision is not None
+            else None
+        )
+        precision_recall_quadrant: Optional[str] = None
+        if recall_delta is not None and precision_delta is not None:
+            _q = _PRECISION_RECALL_QUADRANT_THRESHOLD
+            p_up = precision_delta >= _q
+            p_down = precision_delta <= -_q
+            r_up = recall_delta >= _q
+            r_down = recall_delta <= -_q
+            if p_up and r_up:
+                precision_recall_quadrant = "healthy"
+            elif p_up and r_down:
+                precision_recall_quadrant = "conservative_shift"
+            elif p_down and r_up:
+                precision_recall_quadrant = "noisy_shift"
+            elif p_down and r_down:
+                precision_recall_quadrant = "both_declining"
+            elif not p_up and not p_down and not r_up and not r_down:
+                precision_recall_quadrant = "flat"
+            else:
+                precision_recall_quadrant = "mixed"
+
         categories[cat] = {
             "current_hit_rate": current_hit_rate,
             "previous_hit_rate": previous_hit_rate,
@@ -3501,6 +3664,9 @@ async def compute_sr_catch_rate_trends(
             "precision": precision,
             "all_iterations_catch_rate": all_iter_hit_rate,
             "all_iterations_miss_rate": all_iter_miss_rate,
+            "precision_recall_quadrant": precision_recall_quadrant,
+            "precision_delta": precision_delta,
+            "recall_delta": recall_delta,
         }
 
     # Attach miss examples to top-_EXAMPLE_MAX_CATS categories by weighted_miss_rate.
@@ -3554,20 +3720,19 @@ async def compute_sr_catch_rate_trends(
             r < _floor_thresh for r in history[-_floor_min_win:]
         )
 
-    # Attach reasoning engagement rate for regressing categories.
-    # Regressing = trend=="decreasing" OR below_floor; engagement = share of
-    # passed entries that include a non-trivial reasoning string (>10 chars).
+    # Attach reasoning engagement rate for all categories (not just regressing ones).
+    # Regressing = trend=="decreasing" OR below_floor.
     regressing_cats = {
         cat
         for cat, data in categories.items()
         if data.get("trend") == "decreasing" or data.get("below_floor")
     }
-    if regressing_cats:
-        eng = _compute_reasoning_engagement(current_window_tasks, regressing_cats)
-        for cat, cat_eng in eng.items():
-            categories[cat]["reasoning_engagement_rate"] = cat_eng["engagement_rate"]
-            categories[cat]["reasoning_engagement_with"] = cat_eng["with_reasoning"]
-            categories[cat]["reasoning_engagement_total"] = cat_eng["total_passes"]
+    all_cats = set(categories.keys())
+    eng = _compute_reasoning_engagement(current_window_tasks, all_cats)
+    for cat, cat_eng in eng.items():
+        categories[cat]["reasoning_engagement_rate"] = cat_eng["engagement_rate"]
+        categories[cat]["reasoning_engagement_with"] = cat_eng["with_reasoning"]
+        categories[cat]["reasoning_engagement_total"] = cat_eng["total_passes"]
 
     # Attach false-positive stats: SR flagged but reviewer didn't independently flag.
     cat_fp_stats, type_cat_fp_stats, scope_cat_fp_stats = _compute_cat_fp_stats(
@@ -3581,6 +3746,19 @@ async def compute_sr_catch_rate_trends(
         data["tp_count"] = tp
         data["false_positive_rate"] = (
             round(fp / (fp + tp), 3) if (fp + tp) > 0 else None
+        )
+
+    # Attach time-to-miss-detect latency stats per category.
+    miss_latency = _compute_miss_latency_stats(current_window_tasks)
+    for cat, data in categories.items():
+        stats = miss_latency.get(cat) or {}
+        data["time_to_miss_detect_p50_sec"] = stats.get("time_to_miss_detect_p50_sec")
+        data["time_to_miss_detect_p95_sec"] = stats.get("time_to_miss_detect_p95_sec")
+        data["time_to_miss_detect_sample_count"] = stats.get(
+            "time_to_miss_detect_sample_count", 0
+        )
+        data["time_to_miss_detect_lone_checker"] = stats.get(
+            "time_to_miss_detect_lone_checker", False
         )
 
     # Compute per-task-type category breakdown from current window only.
@@ -4224,6 +4402,332 @@ async def compute_sr_catch_rate_trends(
     except Exception:
         logger.exception(
             "[SR_CATCH_RATE_TRENDS] floor notification failed, suppressing"
+        )
+
+    # Quadrant alert: fire when a category is classified as conservative_shift or
+    # noisy_shift.  both_declining is intentionally excluded (covered by regression
+    # alert); healthy/mixed/flat are silent.
+    try:
+        import asyncio
+        from app.notification_dispatch import (
+            post_failure_alert_message,
+            dispatch_external_notification,
+        )
+
+        quadrant_alertable = {
+            cat: data
+            for cat, data in categories.items()
+            if data.get("precision_recall_quadrant")
+            in ("conservative_shift", "noisy_shift")
+        }
+
+        if quadrant_alertable:
+            quadrant_alert_state: dict = dict(doc.get("sr_quadrant_alert") or {})
+            q_alerted_cats: list = list(quadrant_alert_state.get("categories") or [])
+            current_quadrant_cats = sorted(quadrant_alertable.keys())
+
+            q_already_alerted = False
+            if use_cycle_mode:
+                q_already_alerted = (
+                    quadrant_alert_state.get("cycle_id") == current_cycle_id
+                    and q_alerted_cats == current_quadrant_cats
+                )
+            else:
+                q_alert_at: Optional[str] = quadrant_alert_state.get("computed_at")
+                if q_alert_at:
+                    try:
+                        last_q_dt = datetime.fromisoformat(q_alert_at)
+                        if (
+                            now - last_q_dt
+                        ).days < 14 and q_alerted_cats == current_quadrant_cats:
+                            q_already_alerted = True
+                    except (ValueError, TypeError):
+                        pass
+
+            if not q_already_alerted:
+                lines = ["SR precision/recall shift detected:"]
+                for cat in current_quadrant_cats:
+                    data = quadrant_alertable[cat]
+                    quadrant = data.get("precision_recall_quadrant")
+                    pdelta = data.get("precision_delta")
+                    rdelta = data.get("recall_delta")
+                    p_str = f"{pdelta:+.0%}" if pdelta is not None else "N/A"
+                    r_str = f"{rdelta:+.0%}" if rdelta is not None else "N/A"
+                    lines.append(
+                        f"  • {cat} [{quadrant}]: precision {p_str} / recall {r_str}"
+                    )
+                description = "\n".join(lines)
+
+                await post_failure_alert_message(session, project_id, description)
+
+                new_quadrant_title = _format_sr_alert_title(
+                    _SR_QUADRANT_ALERT_TITLE_PREFIX, current_quadrant_cats
+                )
+                existing_q_alerts = (
+                    (
+                        await session.execute(
+                            select(Alert).where(
+                                Alert.project_id == project_id,
+                                Alert.task_id.is_(None),
+                                Alert.severity == AlertSeverity.WARNING,
+                                Alert.dismissed_at.is_(None),
+                                Alert.title.like(f"{_SR_QUADRANT_ALERT_TITLE_PREFIX}%"),
+                            )
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                if not any(a.title == new_quadrant_title for a in existing_q_alerts):
+                    for a in existing_q_alerts:
+                        a.dismissed_at = now
+                        session.add(a)
+                    session.add(
+                        Alert(
+                            project_id=project_id,
+                            severity=AlertSeverity.WARNING,
+                            title=new_quadrant_title,
+                            message=description,
+                        )
+                    )
+
+                q_payload: dict[str, Any] = {
+                    "project_id": str(project_id),
+                    "computed_at": result["computed_at"],
+                    "quadrant_categories": [
+                        {
+                            "category": cat,
+                            "quadrant": quadrant_alertable[cat].get(
+                                "precision_recall_quadrant"
+                            ),
+                            "precision_delta": quadrant_alertable[cat].get(
+                                "precision_delta"
+                            ),
+                            "recall_delta": quadrant_alertable[cat].get("recall_delta"),
+                        }
+                        for cat in current_quadrant_cats
+                    ],
+                }
+                asyncio.ensure_future(
+                    dispatch_external_notification(
+                        project_id,
+                        event_type="sr_precision_recall_shift",
+                        payload=q_payload,
+                    )
+                )
+
+                doc["sr_quadrant_alert"] = {
+                    "computed_at": result["computed_at"],
+                    "cycle_id": current_cycle_id,
+                    "categories": current_quadrant_cats,
+                }
+                project.design_doc = doc
+                flag_modified(project, "design_doc")
+                session.add(project)
+
+                logger.info(
+                    "[SR_CATCH_RATE_TRENDS] project=%s quadrant_alert categories=%s",
+                    project_id,
+                    current_quadrant_cats,
+                )
+        elif doc.get("sr_quadrant_alert"):
+            # Clear transition: no longer alertable this cycle.
+            stale_q_alerts = (
+                (
+                    await session.execute(
+                        select(Alert).where(
+                            Alert.project_id == project_id,
+                            Alert.task_id.is_(None),
+                            Alert.severity == AlertSeverity.WARNING,
+                            Alert.dismissed_at.is_(None),
+                            Alert.title.like(f"{_SR_QUADRANT_ALERT_TITLE_PREFIX}%"),
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            for a in stale_q_alerts:
+                a.dismissed_at = now
+                session.add(a)
+            doc.pop("sr_quadrant_alert", None)
+            project.design_doc = doc
+            flag_modified(project, "design_doc")
+            session.add(project)
+    except Exception:
+        logger.exception(
+            "[SR_CATCH_RATE_TRENDS] quadrant notification failed, suppressing"
+        )
+
+    # PASS reasoning thinning alert: fire when a non-regressing category has
+    # engagement below threshold with enough PASS samples.  Suppressed for
+    # categories already covered by a regression or floor alert this cycle.
+    try:
+        import asyncio
+        from app.notification_dispatch import (
+            post_failure_alert_message,
+            dispatch_external_notification,
+        )
+
+        eng_threshold: float = float(
+            (doc.get("sr_engagement_threshold") or _SR_ENGAGEMENT_THRESHOLD)
+        )
+        eng_min_passes: int = int(
+            (doc.get("sr_engagement_min_passes") or _SR_ENGAGEMENT_MIN_PASSES)
+        )
+
+        thinning_cats = {
+            cat: data
+            for cat, data in categories.items()
+            if (
+                cat not in regressing_cats
+                and data.get("reasoning_engagement_rate") is not None
+                and data["reasoning_engagement_rate"] < eng_threshold
+                and (data.get("reasoning_engagement_total") or 0) >= eng_min_passes
+            )
+        }
+
+        if thinning_cats:
+            eng_alert_state: dict = dict(doc.get("sr_pass_engagement_alert") or {})
+            eng_alerted_cats: list = list(eng_alert_state.get("categories") or [])
+            current_thinning_cats = sorted(thinning_cats.keys())
+
+            eng_already_alerted = False
+            if use_cycle_mode:
+                eng_already_alerted = (
+                    eng_alert_state.get("cycle_id") == current_cycle_id
+                    and eng_alerted_cats == current_thinning_cats
+                )
+            else:
+                eng_alert_at: Optional[str] = eng_alert_state.get("computed_at")
+                if eng_alert_at:
+                    try:
+                        last_eng_dt = datetime.fromisoformat(eng_alert_at)
+                        if (
+                            now - last_eng_dt
+                        ).days < 14 and eng_alerted_cats == current_thinning_cats:
+                            eng_already_alerted = True
+                    except (ValueError, TypeError):
+                        pass
+
+            if not eng_already_alerted:
+                lines = [
+                    f"PASS reasoning thinning (engagement < {eng_threshold:.0%}, may regress soon):"
+                ]
+                for cat in current_thinning_cats:
+                    data = thinning_cats[cat]
+                    rate = data.get("reasoning_engagement_rate")
+                    total = data.get("reasoning_engagement_total", 0)
+                    with_r = data.get("reasoning_engagement_with", 0)
+                    rate_str = f"{rate:.0%}" if rate is not None else "N/A"
+                    lines.append(
+                        f"  • {cat}: {with_r}/{total} PASSes with reasoning ({rate_str})"
+                    )
+                description = "\n".join(lines)
+
+                await post_failure_alert_message(session, project_id, description)
+
+                new_eng_title = _format_sr_alert_title(
+                    _PASS_ENGAGEMENT_THINNING_ALERT_TITLE_PREFIX, current_thinning_cats
+                )
+                existing_eng_alerts = (
+                    (
+                        await session.execute(
+                            select(Alert).where(
+                                Alert.project_id == project_id,
+                                Alert.task_id.is_(None),
+                                Alert.severity == AlertSeverity.WARNING,
+                                Alert.dismissed_at.is_(None),
+                                Alert.title.like(
+                                    f"{_PASS_ENGAGEMENT_THINNING_ALERT_TITLE_PREFIX}%"
+                                ),
+                            )
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                if not any(a.title == new_eng_title for a in existing_eng_alerts):
+                    for a in existing_eng_alerts:
+                        a.dismissed_at = now
+                        session.add(a)
+                    session.add(
+                        Alert(
+                            project_id=project_id,
+                            severity=AlertSeverity.WARNING,
+                            title=new_eng_title,
+                            message=description,
+                        )
+                    )
+
+                thinning_payload: dict[str, Any] = {
+                    "project_id": str(project_id),
+                    "computed_at": result["computed_at"],
+                    "eng_threshold": eng_threshold,
+                    "thinning_categories": [
+                        {
+                            "category": cat,
+                            "engagement_rate": thinning_cats[cat].get(
+                                "reasoning_engagement_rate"
+                            ),
+                            "total_passes": thinning_cats[cat].get(
+                                "reasoning_engagement_total", 0
+                            ),
+                        }
+                        for cat in current_thinning_cats
+                    ],
+                }
+                asyncio.ensure_future(
+                    dispatch_external_notification(
+                        project_id,
+                        event_type="sr_pass_reasoning_thinning",
+                        payload=thinning_payload,
+                    )
+                )
+
+                doc["sr_pass_engagement_alert"] = {
+                    "computed_at": result["computed_at"],
+                    "cycle_id": current_cycle_id,
+                    "categories": current_thinning_cats,
+                }
+                project.design_doc = doc
+                flag_modified(project, "design_doc")
+                session.add(project)
+
+                logger.info(
+                    "[SR_CATCH_RATE_TRENDS] project=%s engagement_thinning_alert categories=%s",
+                    project_id,
+                    current_thinning_cats,
+                )
+        elif doc.get("sr_pass_engagement_alert"):
+            # Clear transition: previously firing, no longer firing this cycle.
+            stale_eng_alerts = (
+                (
+                    await session.execute(
+                        select(Alert).where(
+                            Alert.project_id == project_id,
+                            Alert.task_id.is_(None),
+                            Alert.severity == AlertSeverity.WARNING,
+                            Alert.dismissed_at.is_(None),
+                            Alert.title.like(
+                                f"{_PASS_ENGAGEMENT_THINNING_ALERT_TITLE_PREFIX}%"
+                            ),
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            for a in stale_eng_alerts:
+                a.dismissed_at = now
+                session.add(a)
+            doc.pop("sr_pass_engagement_alert", None)
+            project.design_doc = doc
+            flag_modified(project, "design_doc")
+            session.add(project)
+    except Exception:
+        logger.exception(
+            "[SR_CATCH_RATE_TRENDS] engagement thinning notification failed, suppressing"
         )
 
     await session.flush()

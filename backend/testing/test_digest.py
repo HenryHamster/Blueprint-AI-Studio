@@ -6581,7 +6581,7 @@ async def test_residual_fingerprints_case_status_branches(
     client: AsyncClient, db_session
 ):
     """Each lifecycle status is surfaced in the corresponding cluster entry."""
-    from app.anomaly_detection import _error_fingerprint  # noqa: PLC0415
+    from app.anomaly_detection import _error_fingerprint
 
     project = make_project()
     db_session.add(project)
@@ -6664,7 +6664,7 @@ async def test_residual_fingerprints_case_status_project_scoped(
     client: AsyncClient, db_session
 ):
     """Case rows from a different project do not pollute the response."""
-    from app.anomaly_detection import _error_fingerprint  # noqa: PLC0415
+    from app.anomaly_detection import _error_fingerprint
 
     project_a = make_project()
     project_b = make_project()
@@ -6707,7 +6707,7 @@ async def test_residual_fingerprints_includes_audit_deferral_fields(
     client: AsyncClient, db_session
 ):
     """audit_defer_count and audit_deferred_system_id are included when a case exists."""
-    from app.anomaly_detection import _error_fingerprint  # noqa: PLC0415
+    from app.anomaly_detection import _error_fingerprint
 
     project = make_project()
     db_session.add(project)
@@ -13977,3 +13977,160 @@ async def test_cross_layer_compliance_most_recent_layer_only_failure_mode(
     assert body["total_classified"] == 1
     assert body["non_compliant"] == 1
     assert body["failure_modes"]["most_recent_layer_only"] == 1
+
+
+# ── recurrence_by_bucket in cross-layer-compliance ──────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_cross_layer_recurrence_no_retrip(client: AsyncClient, db_session):
+    """Compliant fix with no subsequent fix → retripped_count=0, recurrence_rate=0."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    case = _make_cross_layer_case(
+        project.id,
+        "sr_catch_rate",
+        [_cross_layer_entry(layers_targeted=["CI_WORKFLOW", "AGENT_VM"], days_ago=5)],
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    response = await client.get(
+        "/api/admin/regression-cases/cross-layer-compliance",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    rb = body["recurrence_by_bucket"]
+    assert rb["compliant"]["merged_count"] == 1
+    assert rb["compliant"]["retripped_count"] == 0
+    assert rb["compliant"]["recurrence_rate"] == 0.0
+    assert rb["compliant"]["median_hold_days"] is None
+
+
+@pytest.mark.asyncio
+async def test_cross_layer_recurrence_retripped_within_window(
+    client: AsyncClient, db_session
+):
+    """Compliant fix followed by another fix within 14 days → retripped_count=1."""
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    first_fix = {
+        "fingerprint": "sr_catch_rate",
+        "fix_pr_number": 101,
+        "merged_at": (now - timedelta(days=10)).isoformat(),
+        "spawn_was_cross_layer": True,
+        "spawn_layers_enumerated": ["CI_WORKFLOW", "AGENT_VM"],
+        "layers_targeted": ["CI_WORKFLOW", "AGENT_VM"],
+    }
+    # Re-trip fix 8 days after first fix
+    second_fix = {
+        "fingerprint": "sr_catch_rate",
+        "fix_pr_number": 102,
+        "merged_at": (now - timedelta(days=2)).isoformat(),
+        "spawn_was_cross_layer": True,
+        "spawn_layers_enumerated": ["CI_WORKFLOW", "AGENT_VM"],
+        "layers_targeted": ["CI_WORKFLOW", "AGENT_VM"],
+    }
+    case = _make_cross_layer_case(project.id, "sr_catch_rate", [first_fix, second_fix])
+    db_session.add(case)
+    await db_session.commit()
+
+    response = await client.get(
+        "/api/admin/regression-cases/cross-layer-compliance",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    rb = body["recurrence_by_bucket"]
+    assert rb["compliant"]["merged_count"] == 2
+    assert rb["compliant"]["retripped_count"] == 1
+    assert rb["compliant"]["recurrence_rate"] == 0.5
+    assert rb["compliant"]["median_hold_days"] is not None
+    assert rb["compliant"]["median_hold_days"] > 0
+
+
+@pytest.mark.asyncio
+async def test_cross_layer_recurrence_doc_test_only_bucket(
+    client: AsyncClient, db_session
+):
+    """Non-compliant doc_test_only fix tracked separately from compliant bucket."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    case = _make_cross_layer_case(
+        project.id,
+        "sr_catch_rate",
+        [_cross_layer_entry(layers_targeted=[], days_ago=3)],
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    response = await client.get(
+        "/api/admin/regression-cases/cross-layer-compliance",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    rb = body["recurrence_by_bucket"]
+    assert rb["doc_test_only"]["merged_count"] == 1
+    assert rb["doc_test_only"]["retripped_count"] == 0
+    assert rb["compliant"]["merged_count"] == 0
+    assert rb["compliant"]["recurrence_rate"] is None
+
+
+@pytest.mark.asyncio
+async def test_cross_layer_compliance_new_additive_fields(
+    client: AsyncClient, db_session
+):
+    """New additive fields are returned without changing existing awaiting_backfill_count."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    # One entry that is awaiting backfill and older than 24h (over threshold)
+    old_awaiting_entry = _cross_layer_entry(layers_targeted=None, days_ago=3)
+    # One entry that is awaiting backfill but recent (within 24h threshold)
+    recent_awaiting_entry = {
+        "fingerprint": "test_class",
+        "fix_pr_number": 101,
+        "merged_at": (now - timedelta(hours=2)).isoformat(),
+        "spawn_was_cross_layer": True,
+        "spawn_layers_enumerated": ["CI_WORKFLOW", "AGENT_VM"],
+        # no layers_targeted
+    }
+    case = _make_cross_layer_case(
+        project.id, "sr_catch_rate", [old_awaiting_entry, recent_awaiting_entry]
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    response = await client.get(
+        "/api/admin/regression-cases/cross-layer-compliance",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 200
+    body = response.json()
+
+    # Existing field is unchanged
+    assert body["awaiting_backfill_count"] == 2
+
+    # New additive fields
+    assert body["awaiting_backfill_over_threshold_count"] == 1
+    assert body["awaiting_backfill_oldest_merged_at"] is not None
+    # Oldest merged_at should reflect the 3-days-ago entry
+    oldest_dt = datetime.fromisoformat(body["awaiting_backfill_oldest_merged_at"])
+    expected_oldest = now - timedelta(days=3)
+    assert abs((oldest_dt - expected_oldest).total_seconds()) < 5

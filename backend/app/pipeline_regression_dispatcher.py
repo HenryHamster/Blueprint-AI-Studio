@@ -32,6 +32,7 @@ from app.deploy_health import (
 from app.models import (
     Alert,
     AlertSeverity,
+    CLOSE_REASON_RECOVERED_MARGINAL,
     CLOSE_REASON_RECOVERED_UNATTENDED,
     DeploymentState,
     ESCALATION_REASON_STALE_ACTIVE,
@@ -45,7 +46,7 @@ from app.models import (
 from app.payload_schemas import validate_internal_payload
 import app.shared_state as _shared_state
 from app.shared_state import runtime_config as _runtime_config
-from app.time_utils import _utcnow
+from app.time_utils import _to_naive_utc, _utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +111,7 @@ _DISPATCHER_STALENESS_THRESHOLD_SECONDS = 300  # 5 min; cycle interval is 60s
 _DISPATCHER_ZERO_SPAWN_STREAK_K = 10  # ≈10 min of suppressed spawns
 _STALENESS_ALERT_TITLE_PREFIX = "Dispatcher cycle staleness:"
 _ZERO_SPAWN_ALERT_TITLE_PREFIX = "Dispatcher zero-spawn streak:"
+_CROSS_LAYER_BACKFILL_ALERT_TITLE_PREFIX = "Cross-layer backfill lag:"
 
 _ACTIVE_INVESTIGATE_STATUSES = (
     TaskStatus.QUEUED,
@@ -920,6 +922,24 @@ def _format_bundle_signal_lines(signals: list[dict]) -> str:
         "chain produce the remediation."
     )
     return "\n".join(lines)
+
+
+def _signal_higher_is_better(regression_class: str) -> bool:
+    """Return True when a HIGHER ``current_rate`` is the recovery direction.
+
+    Mirrors the ``tripped`` formulas in ``_current_signal_value_for_class``:
+    sr_catch_rate trips on ``prior - curr`` (a hit-rate dropping is regression),
+    and pipeline_success_rate is a success-percentage. All other classes
+    (divergence, blind-spot miss-rate, anomaly counts, telemetry-stale age,
+    crash recency) are lower-is-better.
+    """
+    if regression_class == "sr_catch_rate" or regression_class.startswith(
+        "sr_catch_rate:"
+    ):
+        return True
+    if regression_class == "pipeline_success_rate":
+        return True
+    return False
 
 
 async def _current_signal_value_for_class(
@@ -3515,39 +3535,116 @@ async def _auto_close_recovered_manual_intervention(
             continue
 
         post_value = state.get("current_rate")
+
+        # Determine if the recovery is marginal by comparing the pre-fix signal
+        # value (stored at merge time) with the current post-fix value. The
+        # polarity (which direction is "improvement") depends on the signal:
+        # sr_catch_rate and pipeline_success_rate are higher-is-better;
+        # divergence/blind-spot/anomaly counts are lower-is-better.
+        pre_value = (locked.signal_snapshot_at_merge or {}).get("current_rate")
+        close_reason = CLOSE_REASON_RECOVERED_UNATTENDED
+        alert_severity = AlertSeverity.INFO
+        marginal = False
+        if isinstance(pre_value, (int, float)) and isinstance(post_value, (int, float)):
+            higher_is_better = _signal_higher_is_better(locked.regression_class)
+            improvement = (
+                post_value - pre_value if higher_is_better else pre_value - post_value
+            )
+            # Reference magnitude for the relative-improvement ratio is the
+            # pre-fix value's distance from the "best" end of the scale. For
+            # higher-is-better signals like a hit-rate, recovering from 0.40
+            # toward 1.0 has a 0.60 headroom — using pre_value (0.40) as the
+            # denominator would overstate the relative improvement.
+            if higher_is_better:
+                reference = max(1.0 - pre_value, 0.0)
+            else:
+                reference = pre_value if pre_value > 0 else 0.0
+            rel_floor = float(
+                _runtime_config.get(
+                    "regression_recovered_marginal_relative_floor", 0.10
+                )
+                or 0.10
+            )
+            abs_floor = float(
+                _runtime_config.get(
+                    "regression_recovered_marginal_absolute_floor", 0.05
+                )
+                or 0.05
+            )
+            if improvement <= 0:
+                # Signal did not improve (or got worse) despite not tripping.
+                marginal = True
+            else:
+                rel_improvement = (
+                    improvement / reference if reference > 0 else float("inf")
+                )
+                if rel_improvement < rel_floor and improvement < abs_floor:
+                    marginal = True
+            if marginal:
+                close_reason = CLOSE_REASON_RECOVERED_MARGINAL
+                alert_severity = AlertSeverity.WARNING
+        elif pre_value is not None or post_value is not None:
+            # Snapshot exists but does not carry numeric metrics we can compare
+            # — operators should be able to see this in logs (otherwise it is
+            # indistinguishable from a confirmed clean recovery).
+            logger.info(
+                "[REGRESSION_WATCHDOG] snapshot-missing project=%s class=%s "
+                "pre_value=%r post_value=%r — falling back to %s without "
+                "magnitude check",
+                project_id,
+                locked.regression_class,
+                pre_value,
+                post_value,
+                CLOSE_REASON_RECOVERED_UNATTENDED,
+            )
+
         locked.mark_closed()
-        locked.last_remediation_result = CLOSE_REASON_RECOVERED_UNATTENDED
+        locked.last_remediation_result = close_reason
         locked.fingerprint_to_fix_log = list(locked.fingerprint_to_fix_log or []) + [
             {
                 "fingerprint": locked.regression_class,
                 "recovered_at": now.isoformat(),
                 "post_recovery_value": post_value,
-                "reason": CLOSE_REASON_RECOVERED_UNATTENDED,
+                "reason": close_reason,
             }
         ]
         # Cleared on close so the column never carries a stale value across
         # case lifecycles — mirrors the prior process-local ``.pop()`` calls.
         locked.signal_healthy_since_at = None
         session.add(locked)
+        if marginal:
+            alert_title = f"Regression marginal recovery: {locked.regression_class}"[
+                :200
+            ]
+            alert_message = (
+                f"NEEDS_MANUAL_INTERVENTION case for '{locked.regression_class}' "
+                f"auto-closed with marginal improvement: pre-fix={pre_value}, "
+                f"post-fix={post_value}. Signal likely to re-trip."
+            )[:1000]
+        else:
+            alert_title = f"Regression auto-recovered: {locked.regression_class}"[:200]
+            alert_message = (
+                f"NEEDS_MANUAL_INTERVENTION case for '{locked.regression_class}' "
+                f"auto-closed: underlying signal stayed below threshold for "
+                f"{window_hours}h without operator action."
+            )[:1000]
         session.add(
             Alert(
                 project_id=project_id,
-                severity=AlertSeverity.INFO,
-                title=f"Regression auto-recovered: {locked.regression_class}"[:200],
-                message=(
-                    f"NEEDS_MANUAL_INTERVENTION case for '{locked.regression_class}' "
-                    f"auto-closed: underlying signal stayed below threshold for "
-                    f"{window_hours}h without operator action."
-                )[:1000],
+                severity=alert_severity,
+                title=alert_title,
+                message=alert_message,
             )
         )
         logger.info(
             "[REGRESSION_WATCHDOG] auto-recovered project=%s class=%s "
-            "window_hours=%d post_value=%s",
+            "window_hours=%d pre_value=%s post_value=%s reason=%s",
             project_id,
             locked.regression_class,
             window_hours,
+            pre_value,
             post_value,
+            close_reason,
         )
         auto_closed += 1
 
@@ -3724,6 +3821,121 @@ async def _resolve_watchdog_alert(
         await session.commit()
 
 
+async def _check_cross_layer_backfill_lag(
+    session: AsyncSession,
+    project_ids: list[uuid.UUID],
+) -> None:
+    """Emit an INFO alert when cross-layer fix-log entries sit unbackfilled too long.
+
+    Reads three runtime-config knobs:
+      cross_layer_backfill_alert_threshold_hours (int, default 24)
+      cross_layer_backfill_alert_dedupe_hours    (int, default 24)
+      cross_layer_backfill_alert_disabled_projects (list[str] of project IDs)
+    """
+    threshold_hours = int(
+        _runtime_config.get("cross_layer_backfill_alert_threshold_hours", 24) or 24
+    )
+    dedupe_hours = int(
+        _runtime_config.get("cross_layer_backfill_alert_dedupe_hours", 24) or 24
+    )
+    disabled_projects = list(
+        _runtime_config.get("cross_layer_backfill_alert_disabled_projects", []) or []
+    )
+
+    now = _utcnow()
+    threshold_dt = now - timedelta(hours=threshold_hours)
+
+    for pid in project_ids:
+        if str(pid) in disabled_projects:
+            continue
+
+        cases = (
+            (
+                await session.execute(
+                    select(RegressionRemediationCase).where(
+                        RegressionRemediationCase.project_id == pid
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+        stale_count = 0
+        oldest_merged_at: datetime | None = None
+
+        for case in cases:
+            for entry in case.fingerprint_to_fix_log or []:
+                if not isinstance(entry, dict):
+                    continue
+                if not entry.get("spawn_was_cross_layer"):
+                    continue
+                if "layers_targeted" in entry:
+                    continue
+                merged_at_raw = entry.get("merged_at")
+                if not merged_at_raw:
+                    continue
+                try:
+                    merged_dt = _to_naive_utc(
+                        datetime.fromisoformat(
+                            str(merged_at_raw).replace("Z", "+00:00")
+                        )
+                    )
+                except (ValueError, TypeError):
+                    continue
+                if merged_dt >= threshold_dt:
+                    continue
+                stale_count += 1
+                if oldest_merged_at is None or merged_dt < oldest_merged_at:
+                    oldest_merged_at = merged_dt
+
+        if stale_count > 0:
+            # Check dedupe: dismiss stale open alert if outside window, then re-emit.
+            dedupe_cutoff = now - timedelta(hours=dedupe_hours)
+            open_alert = (
+                (
+                    await session.execute(
+                        select(Alert).where(
+                            Alert.project_id == pid,
+                            Alert.title.like(
+                                _CROSS_LAYER_BACKFILL_ALERT_TITLE_PREFIX + "%"
+                            ),
+                            Alert.dismissed_at.is_(None),
+                        )
+                    )
+                )
+                .scalars()
+                .first()
+            )
+            if open_alert is not None:
+                if open_alert.created_at >= dedupe_cutoff:
+                    # Within dedupe window — skip to avoid duplicate
+                    continue
+                # Outside dedupe window: dismiss the stale one, emit fresh
+                open_alert.dismissed_at = now
+                await session.commit()
+
+            oldest_str = (
+                oldest_merged_at.date().isoformat() if oldest_merged_at else "unknown"
+            )
+            await _ensure_watchdog_alert_open(
+                session,
+                pid,
+                _CROSS_LAYER_BACKFILL_ALERT_TITLE_PREFIX,
+                f"{_CROSS_LAYER_BACKFILL_ALERT_TITLE_PREFIX} {stale_count} entries unbackfilled",
+                (
+                    f"{stale_count} cross-layer fix-log entries unbackfilled for "
+                    f">{threshold_hours}h, oldest merged_at={oldest_str}; "
+                    "compliance_rate may be biased"
+                ),
+                AlertSeverity.INFO,
+            )
+        else:
+            await _resolve_watchdog_alert(
+                session, pid, _CROSS_LAYER_BACKFILL_ALERT_TITLE_PREFIX
+            )
+
+
 async def run_dispatcher_watchdog_alarms(
     session: AsyncSession,
     project_ids: list[uuid.UUID],
@@ -3733,6 +3945,8 @@ async def run_dispatcher_watchdog_alarms(
     Must be called BEFORE the per-project run_once loop so the staleness alarm
     fires even when run_once hangs or raises on the subsequent tick.
     """
+    await _check_cross_layer_backfill_lag(session, project_ids)
+
     now_mono = time.monotonic()
 
     for pid in project_ids:

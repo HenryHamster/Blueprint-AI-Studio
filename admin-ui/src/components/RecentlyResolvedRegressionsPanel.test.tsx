@@ -236,6 +236,108 @@ describe('RecentlyResolvedRegressionsPanel', () => {
     expect(fragileChip).not.toHaveAttribute('title');
   });
 
+  it('renders recurrence-by-bucket breakdown when recurrence_by_bucket is present', async () => {
+    apiFetchMock.mockResolvedValueOnce(response([]));
+    fetchComplianceMock.mockResolvedValueOnce({
+      total_classified: 10,
+      compliant: 8,
+      non_compliant: 2,
+      awaiting_backfill_count: 0,
+      compliance_rate: 0.8,
+      failure_modes: { doc_test_only: 1, most_recent_layer_only: 1 },
+      by_class: {},
+      recurrence_by_bucket: {
+        compliant: { merged_count: 8, retripped_count: 1, recurrence_rate: 0.125, median_hold_days: 7.5 },
+        most_recent_layer_only: { merged_count: 1, retripped_count: 1, recurrence_rate: 1.0, median_hold_days: 2.0 },
+      },
+    });
+    render(<RecentlyResolvedRegressionsPanel projectId="proj-1" />);
+    await screen.findByTestId('recurrence-by-bucket');
+    expect(screen.getByText('Recurrence by compliance bucket')).toBeInTheDocument();
+    expect(screen.getByText('compliant')).toBeInTheDocument();
+    expect(screen.getByText('1/8')).toBeInTheDocument();
+    expect(screen.getByText('13%')).toBeInTheDocument();
+    expect(screen.getByText(/7\.5d median/)).toBeInTheDocument();
+    expect(screen.getByText('recent-only')).toBeInTheDocument();
+    expect(screen.getByText('1/1')).toBeInTheDocument();
+    expect(screen.getByText('100%')).toBeInTheDocument();
+    expect(screen.getByText(/2d median/)).toBeInTheDocument();
+  });
+
+  it('does not render recurrence breakdown when recurrence_by_bucket is absent', async () => {
+    apiFetchMock.mockResolvedValueOnce(response([]));
+    fetchComplianceMock.mockResolvedValueOnce({
+      total_classified: 10,
+      compliant: 8,
+      non_compliant: 2,
+      awaiting_backfill_count: 0,
+      compliance_rate: 0.8,
+      failure_modes: { doc_test_only: 1, most_recent_layer_only: 1 },
+      by_class: {},
+    });
+    render(<RecentlyResolvedRegressionsPanel projectId="proj-1" />);
+    await screen.findByText('Cross-layer Compliance');
+    expect(screen.queryByTestId('recurrence-by-bucket')).toBeNull();
+  });
+
+  it('renders marginal chip when last_remediation_result is recovered_marginal', async () => {
+    apiFetchMock.mockResolvedValueOnce(response([
+      {
+        id: '10',
+        regression_class: 'marginal-fix',
+        fix_pr_number: 104,
+        recovered_at: '2026-05-06T10:15:00',
+        first_seen_at: '2026-05-06T10:10:00',
+        signal_first_crossed_at: '2026-05-06T10:05:00',
+        time_to_recover_sec: 300,
+        last_remediation_result: 'recovered_marginal',
+      },
+    ]));
+    render(<RecentlyResolvedRegressionsPanel projectId="proj-1" />);
+    await screen.findByText('marginal-fix');
+    const chip = screen.getByTestId('marginal-chip');
+    expect(chip).toHaveTextContent('marginal');
+    expect(chip).toHaveAttribute('title', 'Marginal improvement — signal may re-trip on noise');
+  });
+
+  it('does not render marginal chip when last_remediation_result is recovered_unattended', async () => {
+    apiFetchMock.mockResolvedValueOnce(response([
+      {
+        id: '11',
+        regression_class: 'clean-fix',
+        fix_pr_number: 105,
+        recovered_at: '2026-05-06T10:15:00',
+        first_seen_at: '2026-05-06T10:10:00',
+        signal_first_crossed_at: '2026-05-06T10:05:00',
+        time_to_recover_sec: 300,
+        last_remediation_result: 'recovered_unattended',
+      },
+    ]));
+    render(<RecentlyResolvedRegressionsPanel projectId="proj-1" />);
+    await screen.findByText('clean-fix');
+    expect(screen.queryByTestId('marginal-chip')).toBeNull();
+  });
+
+  it('shows marginal count in compliance section when marginal cases are present', async () => {
+    apiFetchMock.mockResolvedValueOnce(response([
+      { id: '12', regression_class: 'marginal-a', fix_pr_number: null, recovered_at: null, first_seen_at: null, time_to_recover_sec: null, last_remediation_result: 'recovered_marginal' },
+      { id: '13', regression_class: 'marginal-b', fix_pr_number: null, recovered_at: null, first_seen_at: null, time_to_recover_sec: null, last_remediation_result: 'recovered_marginal' },
+    ]));
+    fetchComplianceMock.mockResolvedValueOnce({
+      total_classified: 5,
+      compliant: 4,
+      non_compliant: 1,
+      awaiting_backfill_count: 0,
+      compliance_rate: 0.8,
+      failure_modes: { doc_test_only: 0, most_recent_layer_only: 1 },
+      by_class: {},
+    });
+    render(<RecentlyResolvedRegressionsPanel projectId="proj-1" />);
+    await screen.findByText('Cross-layer Compliance');
+    const countEl = screen.getByTestId('marginal-count');
+    expect(countEl).toHaveTextContent('2 marginal recovery (signal may re-trip)');
+  });
+
   it('renders both recurrence and fragile chips when applicable', async () => {
     apiFetchMock.mockResolvedValueOnce(response([
       {

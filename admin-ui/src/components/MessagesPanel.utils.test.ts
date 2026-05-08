@@ -11,6 +11,11 @@ import {
   CRITICAL_NOTE_EVENTS,
   classifySignalLevel,
   getToastSeverity,
+  loadSavedViews,
+  saveSavedViews,
+  savedViewsKey,
+  SAVED_VIEWS_CAP,
+  type SavedView,
   loadMuteWindow,
   saveMuteWindow,
   clearMuteWindow,
@@ -470,5 +475,132 @@ describe('MessagesPanel.utils - Time-window grouping', () => {
     // All rendered as singles due to <3 threshold
     const singles = rows.filter(r => r.kind === 'single');
     expect(singles.length).toBe(4);
+  });
+});
+
+// ── Saved Views ─────────────────────────────────────────────────────────────
+
+describe('Saved Views storage', () => {
+  beforeEach(() => { localStorage.clear(); });
+  afterEach(() => { localStorage.clear(); });
+
+  function makeView(overrides: Partial<SavedView> = {}): SavedView {
+    return {
+      id: 'view_1',
+      name: 'Unresolved blockers',
+      query: 'blocker',
+      prefs: { pr_merged: 'mute' } as Record<string, EventPref>,
+      sort: 'importance',
+      showResolved: false,
+      routineExpanded: false,
+      createdAt: 1700000000000,
+      ...overrides,
+    };
+  }
+
+  it('savedViewsKey scopes per user and project', () => {
+    expect(savedViewsKey('alice', 'proj-A')).toBe('messages_saved_views:alice:proj-A');
+    expect(savedViewsKey(undefined, undefined)).toBe('messages_saved_views:anonymous:default');
+    expect(savedViewsKey(null, null)).toBe('messages_saved_views:anonymous:default');
+  });
+
+  it('round-trips a saved view', () => {
+    const v = makeView({ description: 'top priority' });
+    saveSavedViews('u1', 'p1', [v]);
+    const loaded = loadSavedViews('u1', 'p1');
+    expect(loaded).toEqual([v]);
+  });
+
+  it('loads empty array when key is missing', () => {
+    expect(loadSavedViews('u1', 'p1')).toEqual([]);
+  });
+
+  it('returns empty array for corrupt JSON', () => {
+    localStorage.setItem(savedViewsKey('u1', 'p1'), 'not json {');
+    expect(loadSavedViews('u1', 'p1')).toEqual([]);
+  });
+
+  it('saving an empty array removes the key', () => {
+    saveSavedViews('u1', 'p1', [makeView()]);
+    expect(localStorage.getItem(savedViewsKey('u1', 'p1'))).not.toBeNull();
+    saveSavedViews('u1', 'p1', []);
+    expect(localStorage.getItem(savedViewsKey('u1', 'p1'))).toBeNull();
+  });
+
+  it('tolerates missing optional description on load', () => {
+    saveSavedViews('u1', 'p1', [makeView({ description: undefined })]);
+    const loaded = loadSavedViews('u1', 'p1');
+    expect(loaded).toHaveLength(1);
+    expect(loaded[0].description).toBeUndefined();
+    expect(loaded[0].name).toBe('Unresolved blockers');
+  });
+
+  it('coerces missing/invalid fields to defaults on load', () => {
+    // Write a manually-corrupted file with missing/invalid fields
+    const file = {
+      version: 1,
+      views: [
+        { id: 'v1', name: 'A' }, // missing query/prefs/sort/etc — should default
+        { id: 'v2', name: 'B', sort: 'nonsense', prefs: { x: 'mute', y: 'invalid' } },
+        { name: 'no-id' }, // dropped
+        { id: 'no-name' }, // dropped
+      ],
+    };
+    localStorage.setItem(savedViewsKey('u1', 'p1'), JSON.stringify(file));
+    const loaded = loadSavedViews('u1', 'p1');
+    expect(loaded).toHaveLength(2);
+    expect(loaded[0].id).toBe('v1');
+    expect(loaded[0].query).toBe('');
+    expect(loaded[0].prefs).toEqual({});
+    expect(loaded[0].sort).toBe('importance');
+    expect(loaded[0].showResolved).toBe(false);
+    expect(loaded[0].routineExpanded).toBe(false);
+    expect(loaded[1].id).toBe('v2');
+    expect(loaded[1].sort).toBe('importance'); // 'nonsense' -> default
+    expect(loaded[1].prefs).toEqual({ x: 'mute' }); // 'invalid' EventPref dropped
+  });
+
+  it('ignores unknown fields on load (forward-compatible)', () => {
+    const file = {
+      version: 1,
+      views: [
+        {
+          id: 'v1', name: 'A', query: '', prefs: {}, sort: 'importance',
+          showResolved: false, routineExpanded: false, createdAt: 1,
+          // future fields the current code does not know about:
+          dateRange: { from: '2026-01-01', to: '2026-01-02' },
+          muteUntil: 1234567890,
+        },
+      ],
+    };
+    localStorage.setItem(savedViewsKey('u1', 'p1'), JSON.stringify(file));
+    const loaded = loadSavedViews('u1', 'p1');
+    expect(loaded).toHaveLength(1);
+    expect(loaded[0].id).toBe('v1');
+    expect((loaded[0] as unknown as { dateRange?: unknown }).dateRange).toBeUndefined();
+  });
+
+  it('persists views as a {version, views} envelope', () => {
+    saveSavedViews('u1', 'p1', [makeView()]);
+    const raw = localStorage.getItem(savedViewsKey('u1', 'p1'));
+    expect(raw).not.toBeNull();
+    const parsed = JSON.parse(raw!);
+    expect(parsed.version).toBe(1);
+    expect(Array.isArray(parsed.views)).toBe(true);
+  });
+
+  it('per-user-per-project isolation', () => {
+    const a = makeView({ id: 'a', name: 'A' });
+    const b = makeView({ id: 'b', name: 'B' });
+    saveSavedViews('alice', 'proj-A', [a]);
+    saveSavedViews('alice', 'proj-B', [b]);
+    saveSavedViews('bob', 'proj-A', []);
+    expect(loadSavedViews('alice', 'proj-A')).toEqual([a]);
+    expect(loadSavedViews('alice', 'proj-B')).toEqual([b]);
+    expect(loadSavedViews('bob', 'proj-A')).toEqual([]);
+  });
+
+  it('cap constant is 10', () => {
+    expect(SAVED_VIEWS_CAP).toBe(10);
   });
 });

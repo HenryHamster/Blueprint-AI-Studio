@@ -1439,6 +1439,10 @@ REGRESSION_ESCALATION_REASONS: frozenset[str] = frozenset(
 # recovery) and "merged" (PR merged) so the recently-closed admin views can
 # render the right badge.
 CLOSE_REASON_RECOVERED_UNATTENDED = "recovered_unattended"
+# Stored in last_remediation_result when auto-close detects that the signal
+# recovered but the improvement is below both relative and absolute floors —
+# the fix nudged the metric just enough to not trip but is likely to re-trip.
+CLOSE_REASON_RECOVERED_MARGINAL = "recovered_marginal"
 
 
 class RegressionRemediationCase(SQLModel, table=True):

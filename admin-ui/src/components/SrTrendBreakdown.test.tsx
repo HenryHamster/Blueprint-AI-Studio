@@ -925,7 +925,7 @@ describe('SrTrendBreakdown reasoning engagement', () => {
     expect(engEl).toHaveTextContent('eng:80%');
   });
 
-  it('does not show engagement for stable category even if engagement data is present', () => {
+  it('shows engagement for stable category when engagement data is present', () => {
     const trends: SrTrendData = {
       categories: {
         correctness: {
@@ -938,10 +938,11 @@ describe('SrTrendBreakdown reasoning engagement', () => {
       },
     };
     render(<SrTrendBreakdown trends={trends} variant="card" />);
-    expect(screen.queryByTitle(/Reasoning engagement/i)).not.toBeInTheDocument();
+    const engEl = screen.getByTitle(/Reasoning engagement/i);
+    expect(engEl).toHaveTextContent('eng:70%');
   });
 
-  it('does not show engagement for increasing category', () => {
+  it('shows engagement for increasing category when engagement data is present', () => {
     const trends: SrTrendData = {
       categories: {
         correctness: {
@@ -954,7 +955,91 @@ describe('SrTrendBreakdown reasoning engagement', () => {
       },
     };
     render(<SrTrendBreakdown trends={trends} variant="card" />);
+    const engEl = screen.getByTitle(/Reasoning engagement/i);
+    expect(engEl).toHaveTextContent('eng:90%');
+  });
+
+  it('omits the engagement chip when total_passes is 0', () => {
+    const trends: SrTrendData = {
+      categories: {
+        correctness: {
+          miss_rate: 0.2,
+          trend: 'stable',
+          reasoning_engagement_rate: null,
+          reasoning_engagement_with: 0,
+          reasoning_engagement_total: 0,
+        },
+      },
+    };
+    render(<SrTrendBreakdown trends={trends} variant="card" />);
     expect(screen.queryByTitle(/Reasoning engagement/i)).not.toBeInTheDocument();
+    expect(screen.queryByTitle(/Reasoning thinning/i)).not.toBeInTheDocument();
+  });
+
+  it('omits the engagement chip when engagement fields are absent', () => {
+    const trends: SrTrendData = {
+      categories: {
+        correctness: { miss_rate: 0.2, trend: 'stable' },
+      },
+    };
+    render(<SrTrendBreakdown trends={trends} variant="card" />);
+    expect(screen.queryByTitle(/Reasoning/i)).not.toBeInTheDocument();
+  });
+
+  it('shows amber thinning cue when rate < 0.5 AND total >= 10', () => {
+    const trends: SrTrendData = {
+      categories: {
+        correctness: {
+          miss_rate: 0.2,
+          trend: 'stable',
+          reasoning_engagement_rate: 0.3,
+          reasoning_engagement_with: 3,
+          reasoning_engagement_total: 10,
+        },
+      },
+    };
+    render(<SrTrendBreakdown trends={trends} variant="card" />);
+    const engEl = screen.getByTitle(/Reasoning thinning/i);
+    expect(engEl).toHaveTextContent('eng:30%');
+    expect(engEl.className).toContain('amber');
+  });
+
+  it('shows cyan (non-thinning) cue when rate >= 0.5', () => {
+    const trends: SrTrendData = {
+      categories: {
+        correctness: {
+          miss_rate: 0.2,
+          trend: 'stable',
+          reasoning_engagement_rate: 0.6,
+          reasoning_engagement_with: 6,
+          reasoning_engagement_total: 10,
+        },
+      },
+    };
+    render(<SrTrendBreakdown trends={trends} variant="card" />);
+    const engEl = screen.getByTitle(/Reasoning engagement/i);
+    expect(engEl).toHaveTextContent('eng:60%');
+    expect(engEl.className).not.toContain('amber');
+    expect(engEl.className).toContain('cyan');
+  });
+
+  it('does NOT show thinning cue when rate < 0.5 but total < 10 (insufficient sample)', () => {
+    const trends: SrTrendData = {
+      categories: {
+        correctness: {
+          miss_rate: 0.2,
+          trend: 'stable',
+          reasoning_engagement_rate: 0.2,
+          reasoning_engagement_with: 1,
+          reasoning_engagement_total: 5,
+        },
+      },
+    };
+    render(<SrTrendBreakdown trends={trends} variant="card" />);
+    // chip should still show (total > 0) but NOT amber (insufficient sample)
+    const engEl = screen.getByTitle(/Reasoning engagement/i);
+    expect(engEl).toHaveTextContent('eng:20%');
+    expect(engEl.className).not.toContain('amber');
   });
 
   it('displays engagement in inline variant for regressing category', () => {

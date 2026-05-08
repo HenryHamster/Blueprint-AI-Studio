@@ -3874,22 +3874,38 @@ def _make_sr_task(
     sr_failed_cats: list,
     task_type: str = "create",
     check_result_overrides: dict[str, dict] | None = None,
+    sr_completed_at: datetime | None = None,
+    rejection_at: datetime | None = None,
+    sr_passed_cats_with_reasoning: dict[str, str] | None = None,
 ) -> Task:
-    """Build a Task with both _self_review_outcome.check_results and _first_attempt_rejection_categories."""
+    """Build a Task with both _self_review_outcome.check_results and _first_attempt_rejection_categories.
+
+    sr_passed_cats_with_reasoning: optional {cat: reasoning_string} to add
+    explicit PASS entries to check_results (for engagement tracking tests).
+    """
     check_results = {cat: {"passed": False, "issue": "x"} for cat in sr_failed_cats}
+    if sr_passed_cats_with_reasoning:
+        for cat, reasoning in sr_passed_cats_with_reasoning.items():
+            check_results[cat] = {"passed": True, "reasoning": reasoning}
     if check_result_overrides:
         for cat, overrides in check_result_overrides.items():
             if cat in check_results:
                 check_results[cat].update(overrides)
+    sr_outcome: dict = {"check_results": check_results}
+    if sr_completed_at is not None:
+        sr_outcome["completed_at"] = sr_completed_at.isoformat()
+    ctx: dict = {
+        "_self_review_outcome": sr_outcome,
+        "_first_attempt_rejection_categories": human_cats,
+    }
+    if rejection_at is not None:
+        ctx["_first_attempt_rejection_at"] = rejection_at.isoformat()
     task = Task(
         project_id=project_id,
         title="SR task",
         payloads=[{"type": task_type, "prompt": "do something"}],
         status=TaskStatus.COMPLETED,
-        context={
-            "_self_review_outcome": {"check_results": check_results},
-            "_first_attempt_rejection_categories": human_cats,
-        },
+        context=ctx,
     )
     task.created_at = _utcnow() - timedelta(days=age_days)
     return task
@@ -4784,6 +4800,484 @@ async def test_compute_sr_catch_rate_trends_by_direction_rate_history_capped(
     assert len(entry["rate_history"]) == 5
     # The oldest entry (0.5) should have been dropped
     assert 0.5 not in entry["rate_history"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests for reasoning engagement in compute_sr_catch_rate_trends
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _make_sr_task_with_pass_reasoning(
+    project_id,
+    *,
+    age_days: float,
+    human_cats: dict,
+    pass_cats_with_reasoning: dict[str, str],
+) -> "Task":
+    """Build a Task with PASS check_results entries that include reasoning text.
+
+    pass_cats_with_reasoning: {cat: reasoning_string}.  Categories not in the
+    dict are absent from check_results.  The task has no human rejections beyond
+    what's supplied in human_cats.
+    """
+    check_results = {
+        cat: {"passed": True, "reasoning": reasoning}
+        for cat, reasoning in pass_cats_with_reasoning.items()
+    }
+    task = Task(
+        project_id=project_id,
+        title="SR task with PASS reasoning",
+        payloads=[{"type": "create", "prompt": "do something"}],
+        status=TaskStatus.COMPLETED,
+        context={
+            "_self_review_outcome": {"check_results": check_results},
+            "_first_attempt_rejection_categories": human_cats,
+        },
+    )
+    task.created_at = _utcnow() - timedelta(days=age_days)
+    return task
+
+
+@pytest.mark.asyncio
+async def test_reasoning_engagement_populated_for_stable_categories(
+    db_session: AsyncSession,
+):
+    """Engagement fields are present on stable/increasing categories (not just decreasing)."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    # Current window (10 tasks): correctness appears in both windows with stable hit rate.
+    # 8 tasks: SR hits correctness (FAIL entry) + 2 tasks: SR passes with reasoning (PASS entry).
+    for _ in range(8):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(2):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=[],
+            sr_passed_cats_with_reasoning={"correctness": "substantial reasoning here"},
+        )
+        db_session.add(t)
+        tasks.append(t)
+    # Previous window (10 tasks): same hit rate → stable trend.
+    for _ in range(8):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(2):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=[],
+            sr_passed_cats_with_reasoning={"correctness": "x"},
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+    assert result is not None
+    cat = result["categories"].get("correctness")
+    assert cat is not None, "correctness category should be present"
+    assert cat["trend"] == "stable", "should be stable — same rate in both windows"
+    # Engagement fields must be populated even for stable categories.
+    assert "reasoning_engagement_rate" in cat
+    assert "reasoning_engagement_with" in cat
+    assert "reasoning_engagement_total" in cat
+    # 2 current-window tasks had PASS entries for correctness; 2 with substantial reasoning.
+    assert cat["reasoning_engagement_total"] == 2
+    assert cat["reasoning_engagement_with"] == 2
+    assert cat["reasoning_engagement_rate"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_pass_reasoning_thinning_alert_fires_for_non_regressing_category(
+    db_session: AsyncSession,
+):
+    """A non-regressing category with low engagement and >= min-passes triggers thinning Alert."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+    from app.models import Alert, AlertSeverity
+
+    project = await _make_project(db_session)
+    tasks = []
+    # Current window: correctness hit rate = 10/20 = 0.5 (exactly at floor, NOT below).
+    # 10 hit tasks + 10 explicit PASS entries with no substantial reasoning.
+    for _ in range(10):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(10):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=[],
+            sr_passed_cats_with_reasoning={
+                "correctness": "x"
+            },  # ≤ 10 chars → no engagement
+        )
+        db_session.add(t)
+        tasks.append(t)
+    # Previous window: same structure so trend = stable.
+    for _ in range(10):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(10):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=[],
+            sr_passed_cats_with_reasoning={"correctness": "x"},
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+    await db_session.flush()
+
+    alerts = (
+        (
+            await db_session.execute(
+                _sql_select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.severity == AlertSeverity.WARNING,
+                    Alert.title.like("PASS reasoning thinning%"),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+    assert "correctness" in alerts[0].title
+
+
+@pytest.mark.asyncio
+async def test_pass_reasoning_thinning_alert_suppressed_below_min_passes(
+    db_session: AsyncSession,
+):
+    """Alert is NOT fired when total PASS count is below min-passes threshold."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+    from app.models import Alert, AlertSeverity
+
+    project = await _make_project(db_session)
+    tasks = []
+    # Current window: 8 hits + 3 PASS entries (below min_passes=10).
+    for _ in range(8):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(3):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=[],
+            sr_passed_cats_with_reasoning={"correctness": "x"},
+        )
+        db_session.add(t)
+        tasks.append(t)
+    # Previous window: same structure.
+    for _ in range(8):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(3):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=[],
+            sr_passed_cats_with_reasoning={"correctness": "x"},
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+    await db_session.flush()
+
+    alerts = (
+        (
+            await db_session.execute(
+                _sql_select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.severity == AlertSeverity.WARNING,
+                    Alert.title.like("PASS reasoning thinning%"),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 0, "no alert when passes < min_passes"
+
+
+@pytest.mark.asyncio
+async def test_pass_reasoning_thinning_alert_suppressed_for_regressing_category(
+    db_session: AsyncSession,
+):
+    """Alert is NOT fired for categories already covered by a regression alert."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+    from app.models import Alert, AlertSeverity
+
+    project = await _make_project(db_session)
+    tasks = []
+    # correctness is regressing: 3/10 hit in current, 5/5 in previous.
+    for _ in range(3):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(7):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=[],
+            sr_passed_cats_with_reasoning={
+                "correctness": "x"
+            },  # explicit PASS, no reasoning
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+    await db_session.flush()
+
+    thinning_alerts = (
+        (
+            await db_session.execute(
+                _sql_select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.severity == AlertSeverity.WARNING,
+                    Alert.title.like("PASS reasoning thinning%"),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(thinning_alerts) == 0, (
+        "thinning alert suppressed for regressing category"
+    )
+
+
+@pytest.mark.asyncio
+async def test_pass_reasoning_thinning_alert_honors_design_doc_overrides(
+    db_session: AsyncSession,
+):
+    """sr_engagement_threshold and sr_engagement_min_passes overrides from design_doc are honored."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+    from app.models import Alert, AlertSeverity
+
+    project = await _make_project(db_session)
+    # Override: threshold=1.0 (always fire if any PASS lacks reasoning), min_passes=3.
+    project.design_doc = {
+        "sr_engagement_threshold": 1.0,
+        "sr_engagement_min_passes": 3,
+    }
+    tasks = []
+    # Current window: 7 hits + 3 PASS entries (1 with reasoning, 2 without).
+    # Engagement = 1/3 = 0.33 < 1.0, total_passes=3 >= 3 → alert fires.
+    for _ in range(7):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    t = _make_sr_task(
+        project.id,
+        age_days=2,
+        human_cats={"correctness": 1},
+        sr_failed_cats=[],
+        sr_passed_cats_with_reasoning={
+            "correctness": "this is a substantial reasoning"
+        },
+    )
+    db_session.add(t)
+    tasks.append(t)
+    for _ in range(2):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=[],
+            sr_passed_cats_with_reasoning={"correctness": "x"},  # short → not counted
+        )
+        db_session.add(t)
+        tasks.append(t)
+    # Previous window: same structure (stable trend).
+    for _ in range(7):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(3):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=[],
+            sr_passed_cats_with_reasoning={"correctness": "x"},
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+    await db_session.flush()
+
+    alerts = (
+        (
+            await db_session.execute(
+                _sql_select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.severity == AlertSeverity.WARNING,
+                    Alert.title.like("PASS reasoning thinning%"),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1, (
+        "alert fires because engagement (0.33) < threshold (1.0) with 3 passes"
+    )
+
+
+@pytest.mark.asyncio
+async def test_pass_reasoning_thinning_alert_deduplicates_within_cycle(
+    db_session: AsyncSession,
+):
+    """Calling compute_sr_catch_rate_trends twice with the same thinning state does not create duplicate Alerts."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+    from app.models import Alert, AlertSeverity
+
+    project = await _make_project(db_session)
+    tasks = []
+    # Same structure as the fires test: hit rate=0.5, 10 PASS entries with no reasoning.
+    for _ in range(10):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(10):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=[],
+            sr_passed_cats_with_reasoning={"correctness": "x"},
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(10):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(10):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=[],
+            sr_passed_cats_with_reasoning={"correctness": "x"},
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    # First call.
+    await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+    await db_session.flush()
+    # Second call — same data, same cycle.
+    await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+    await db_session.flush()
+
+    alerts = (
+        (
+            await db_session.execute(
+                _sql_select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.severity == AlertSeverity.WARNING,
+                    Alert.title.like("PASS reasoning thinning%"),
+                    Alert.dismissed_at.is_(None),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1, "dedup: second call must not create a second Alert"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -9203,6 +9697,878 @@ def test_resolve_sr_miss_human_truth_empty_ctx():
     from app.playbook_learning import resolve_sr_miss_human_truth
 
     assert resolve_sr_miss_human_truth({}) == set()
+
+
+# ---------------------------------------------------------------------------
+# Precision/recall quadrant classification tests
+# ---------------------------------------------------------------------------
+
+# Helper: build a two-window task set where current window has the given
+# hit/fp rates and the previous window has different rates, producing known
+# precision/recall deltas.
+#
+# Recall == hit_rate (hit_count / human_count).
+# Precision == (sr_failed - fp) / sr_failed.
+#
+# We control fp via check_result_overrides: tasks where SR fails AND the human
+# flagged the same cat are TPs; tasks where SR fails but human did NOT flag are
+# FPs.  We approximate FP by using a separate category for the human_cats so
+# the fp-stats see it as an FP.
+#
+# For simplicity, we use 10 tasks per window so rates are round numbers.
+
+
+def _make_quadrant_tasks(
+    project_id,
+    db_session,
+    tasks: list,
+    *,
+    curr_hits: int,
+    curr_fp: int,
+    prev_hits: int,
+    prev_fp: int,
+    cat: str = "correctness",
+    n: int = 10,
+):
+    """Build current + previous window tasks controlling hit and FP counts.
+
+    actual sr_failed = hits + fp for each window.
+
+    For each window:
+    - ``hits`` tasks: human flagged cat + SR failed cat → TP hit
+    - ``n - hits`` tasks: human flagged cat, SR passed → miss
+    - ``fp`` tasks: SR failed cat but human flagged a different cat → FP
+
+    precision = hits / (hits + fp); recall (hit_rate) = hits / n
+    """
+    # Current window (age_days=2)
+    for _ in range(curr_hits):
+        t = _make_sr_task(
+            project_id,
+            age_days=2,
+            human_cats={cat: 1},
+            sr_failed_cats=[cat],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(n - curr_hits):
+        t = _make_sr_task(
+            project_id,
+            age_days=2,
+            human_cats={cat: 1},
+            sr_failed_cats=[],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(curr_fp):
+        t = _make_sr_task(
+            project_id,
+            age_days=2,
+            human_cats={"other-cat": 1},
+            sr_failed_cats=[cat],
+        )
+        db_session.add(t)
+        tasks.append(t)
+
+    # Previous window (age_days=20)
+    for _ in range(prev_hits):
+        t = _make_sr_task(
+            project_id,
+            age_days=20,
+            human_cats={cat: 1},
+            sr_failed_cats=[cat],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(n - prev_hits):
+        t = _make_sr_task(
+            project_id,
+            age_days=20,
+            human_cats={cat: 1},
+            sr_failed_cats=[],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(prev_fp):
+        t = _make_sr_task(
+            project_id,
+            age_days=20,
+            human_cats={"other-cat": 1},
+            sr_failed_cats=[cat],
+        )
+        db_session.add(t)
+        tasks.append(t)
+
+
+@pytest.mark.asyncio
+async def test_precision_recall_quadrant_conservative_shift(db_session: AsyncSession):
+    """Precision up + recall down → conservative_shift."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks: list = []
+    # Current: recall=6/10=0.6, sr_failed=8, fp=1 → precision=(8-1)/8=0.875
+    # Previous: recall=9/10=0.9, sr_failed=9, fp=4 → precision=(9-4)/9=0.556
+    # recall_delta = 0.6-0.9 = -0.3 (below -threshold)
+    # precision_delta = 0.875-0.556 = +0.319 (above +threshold)
+    _make_quadrant_tasks(
+        project.id,
+        db_session,
+        tasks,
+        curr_hits=6,
+        curr_fp=1,
+        prev_hits=9,
+        prev_fp=4,
+    )
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+    assert result is not None
+    cat = result["categories"]["correctness"]
+    assert cat["precision_recall_quadrant"] == "conservative_shift"
+    assert cat["recall_delta"] is not None and cat["recall_delta"] < -0.05
+    assert cat["precision_delta"] is not None and cat["precision_delta"] > 0.05
+
+
+@pytest.mark.asyncio
+async def test_precision_recall_quadrant_noisy_shift(db_session: AsyncSession):
+    """Precision down + recall up → noisy_shift."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks: list = []
+    # Current: recall=9/10=0.9, sr_failed=9, fp=4 → precision=(9-4)/9≈0.556
+    # Previous: recall=6/10=0.6, sr_failed=8, fp=1 → precision=(8-1)/8=0.875
+    # recall_delta = +0.3, precision_delta = -0.319
+    _make_quadrant_tasks(
+        project.id,
+        db_session,
+        tasks,
+        curr_hits=9,
+        curr_fp=4,
+        prev_hits=6,
+        prev_fp=1,
+    )
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+    assert result is not None
+    cat = result["categories"]["correctness"]
+    assert cat["precision_recall_quadrant"] == "noisy_shift"
+    assert cat["recall_delta"] is not None and cat["recall_delta"] > 0.05
+    assert cat["precision_delta"] is not None and cat["precision_delta"] < -0.05
+
+
+@pytest.mark.asyncio
+async def test_precision_recall_quadrant_both_declining(db_session: AsyncSession):
+    """Precision down + recall down → both_declining."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks: list = []
+    # Current: recall=4/10=0.4, sr_failed=6, fp=3 → precision=(6-3)/6=0.5
+    # Previous: recall=8/10=0.8, sr_failed=8, fp=1 → precision=(8-1)/8=0.875
+    # recall_delta = -0.4, precision_delta = -0.375
+    _make_quadrant_tasks(
+        project.id,
+        db_session,
+        tasks,
+        curr_hits=4,
+        curr_fp=3,
+        prev_hits=8,
+        prev_fp=1,
+    )
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+    assert result is not None
+    cat = result["categories"]["correctness"]
+    assert cat["precision_recall_quadrant"] == "both_declining"
+    assert cat["recall_delta"] is not None and cat["recall_delta"] < -0.05
+    assert cat["precision_delta"] is not None and cat["precision_delta"] < -0.05
+
+
+@pytest.mark.asyncio
+async def test_precision_recall_quadrant_healthy(db_session: AsyncSession):
+    """Precision up + recall up → healthy."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks: list = []
+    # Current: recall=9/10=0.9, sr_failed=9, fp=1 → precision=(9-1)/9≈0.889
+    # Previous: recall=4/10=0.4, sr_failed=6, fp=3 → precision=(6-3)/6=0.5
+    # recall_delta = +0.5, precision_delta = +0.389
+    _make_quadrant_tasks(
+        project.id,
+        db_session,
+        tasks,
+        curr_hits=9,
+        curr_fp=1,
+        prev_hits=4,
+        prev_fp=3,
+    )
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+    assert result is not None
+    cat = result["categories"]["correctness"]
+    assert cat["precision_recall_quadrant"] == "healthy"
+    assert cat["recall_delta"] is not None and cat["recall_delta"] > 0.05
+    assert cat["precision_delta"] is not None and cat["precision_delta"] > 0.05
+
+
+@pytest.mark.asyncio
+async def test_precision_recall_quadrant_flat(db_session: AsyncSession):
+    """Both deltas within threshold → flat."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks: list = []
+    # Current == previous: recall=7/10=0.7, sr_failed=7, fp=2 → precision=5/7≈0.714
+    # Both deltas = 0.0 → flat
+    _make_quadrant_tasks(
+        project.id,
+        db_session,
+        tasks,
+        curr_hits=7,
+        curr_fp=2,
+        prev_hits=7,
+        prev_fp=2,
+    )
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+    assert result is not None
+    cat = result["categories"]["correctness"]
+    assert cat["precision_recall_quadrant"] == "flat"
+
+
+@pytest.mark.asyncio
+async def test_precision_recall_quadrant_mixed(db_session: AsyncSession):
+    """One delta significant, other not → mixed."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks: list = []
+    # Current: recall=8/10=0.8, sr_failed=8, fp=1 → precision=7/8=0.875
+    # Previous: recall=7/10=0.7, sr_failed=8, fp=3 → precision=5/8=0.625
+    # recall_delta = +0.1 (above threshold)
+    # precision_delta = +0.25 (above threshold) → both up → actually healthy
+    # Let's adjust: prev_hits=7, but make precision barely below threshold for recall
+    # Actually let's set: curr_hits=7(recall=0.7), prev_hits=6(recall=0.6) delta=+0.1 (above 0.05)
+    # and curr_fp=2, prev_fp=2 with same sr_failed=7 → precision delta = 0 → mixed
+    _make_quadrant_tasks(
+        project.id,
+        db_session,
+        tasks,
+        curr_hits=7,
+        curr_fp=2,
+        prev_hits=6,
+        prev_fp=2,
+    )
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+    assert result is not None
+    cat = result["categories"]["correctness"]
+    # recall_delta = +0.1 (significant), precision_delta = 0.0 (not significant) → mixed
+    assert cat["precision_recall_quadrant"] == "mixed"
+
+
+@pytest.mark.asyncio
+async def test_precision_recall_quadrant_null_when_no_previous_precision(
+    db_session: AsyncSession,
+):
+    """When previous window has no SR failures (prev_sr_failed=0), quadrant is None."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks: list = []
+    # prev_hits=0, prev_fp=0 → actual prev_sr_failed = 0 → previous_precision=None
+    # precision_delta = None → quadrant = None
+    _make_quadrant_tasks(
+        project.id,
+        db_session,
+        tasks,
+        curr_hits=7,
+        curr_fp=2,
+        prev_hits=0,
+        prev_fp=0,
+    )
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+    assert result is not None
+    cat = result["categories"]["correctness"]
+    assert cat["precision_recall_quadrant"] is None
+    assert cat["precision_delta"] is None
+
+
+@pytest.mark.asyncio
+async def test_precision_recall_quadrant_alert_fires_for_conservative_shift(
+    db_session: AsyncSession,
+):
+    """conservative_shift triggers exactly one alert per cycle."""
+    from app.playbook_learning import (
+        compute_sr_catch_rate_trends,
+        _SR_QUADRANT_ALERT_TITLE_PREFIX,
+    )
+
+    project = await _make_project(db_session)
+    tasks: list = []
+    _make_quadrant_tasks(
+        project.id,
+        db_session,
+        tasks,
+        curr_hits=6,
+        curr_fp=1,
+        prev_hits=9,
+        prev_fp=4,
+    )
+    await db_session.flush()
+
+    with (
+        patch(
+            "app.notification_dispatch.post_failure_alert_message",
+            new_callable=AsyncMock,
+        ) as mock_post,
+        patch(
+            "app.notification_dispatch.dispatch_external_notification",
+            new_callable=AsyncMock,
+        ),
+        patch("asyncio.ensure_future", side_effect=lambda coro: coro.close() or None),
+    ):
+        result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    assert (
+        result["categories"]["correctness"]["precision_recall_quadrant"]
+        == "conservative_shift"
+    )
+    mock_post.assert_called()
+
+    # Verify Alert row was inserted
+    await db_session.commit()
+    alert_rows = (
+        (
+            await db_session.execute(
+                _sql_select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.dismissed_at.is_(None),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    q_rows = [
+        r for r in alert_rows if r.title.startswith(_SR_QUADRANT_ALERT_TITLE_PREFIX)
+    ]
+    assert len(q_rows) == 1
+    assert q_rows[0].severity == AlertSeverity.WARNING
+    assert "correctness" in q_rows[0].title
+
+
+@pytest.mark.asyncio
+async def test_precision_recall_quadrant_alert_fires_for_noisy_shift(
+    db_session: AsyncSession,
+):
+    """noisy_shift triggers an alert."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks: list = []
+    _make_quadrant_tasks(
+        project.id,
+        db_session,
+        tasks,
+        curr_hits=9,
+        curr_fp=4,
+        prev_hits=6,
+        prev_fp=1,
+    )
+    await db_session.flush()
+
+    with (
+        patch(
+            "app.notification_dispatch.post_failure_alert_message",
+            new_callable=AsyncMock,
+        ) as mock_post,
+        patch(
+            "app.notification_dispatch.dispatch_external_notification",
+            new_callable=AsyncMock,
+        ),
+        patch("asyncio.ensure_future", side_effect=lambda coro: coro.close() or None),
+    ):
+        result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    assert (
+        result["categories"]["correctness"]["precision_recall_quadrant"]
+        == "noisy_shift"
+    )
+    mock_post.assert_called()
+
+
+@pytest.mark.asyncio
+async def test_precision_recall_quadrant_no_alert_for_healthy(
+    db_session: AsyncSession,
+):
+    """healthy quadrant does NOT trigger an alert."""
+    from app.playbook_learning import (
+        compute_sr_catch_rate_trends,
+        _SR_QUADRANT_ALERT_TITLE_PREFIX,
+    )
+
+    project = await _make_project(db_session)
+    tasks: list = []
+    _make_quadrant_tasks(
+        project.id,
+        db_session,
+        tasks,
+        curr_hits=9,
+        curr_fp=1,
+        prev_hits=4,
+        prev_fp=3,
+    )
+    await db_session.flush()
+
+    with (
+        patch(
+            "app.notification_dispatch.post_failure_alert_message",
+            new_callable=AsyncMock,
+        ),
+        patch(
+            "app.notification_dispatch.dispatch_external_notification",
+            new_callable=AsyncMock,
+        ),
+        patch("asyncio.ensure_future", side_effect=lambda coro: coro.close() or None),
+    ):
+        result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    assert result["categories"]["correctness"]["precision_recall_quadrant"] == "healthy"
+
+    await db_session.commit()
+    alert_rows = (
+        (
+            await db_session.execute(
+                _sql_select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.dismissed_at.is_(None),
+                    Alert.title.like(f"{_SR_QUADRANT_ALERT_TITLE_PREFIX}%"),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alert_rows) == 0
+
+
+@pytest.mark.asyncio
+async def test_precision_recall_quadrant_no_alert_for_both_declining(
+    db_session: AsyncSession,
+):
+    """both_declining quadrant does NOT trigger a quadrant alert (covered by regression alert)."""
+    from app.playbook_learning import (
+        compute_sr_catch_rate_trends,
+        _SR_QUADRANT_ALERT_TITLE_PREFIX,
+    )
+
+    project = await _make_project(db_session)
+    tasks: list = []
+    _make_quadrant_tasks(
+        project.id,
+        db_session,
+        tasks,
+        curr_hits=4,
+        curr_fp=3,
+        prev_hits=8,
+        prev_fp=1,
+    )
+    await db_session.flush()
+
+    with (
+        patch(
+            "app.notification_dispatch.post_failure_alert_message",
+            new_callable=AsyncMock,
+        ),
+        patch(
+            "app.notification_dispatch.dispatch_external_notification",
+            new_callable=AsyncMock,
+        ),
+        patch("asyncio.ensure_future", side_effect=lambda coro: coro.close() or None),
+    ):
+        result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    assert (
+        result["categories"]["correctness"]["precision_recall_quadrant"]
+        == "both_declining"
+    )
+
+    await db_session.commit()
+    q_rows = (
+        (
+            await db_session.execute(
+                _sql_select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.dismissed_at.is_(None),
+                    Alert.title.like(f"{_SR_QUADRANT_ALERT_TITLE_PREFIX}%"),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(q_rows) == 0
+
+
+@pytest.mark.asyncio
+async def test_precision_recall_quadrant_alert_dedup_same_cycle(
+    db_session: AsyncSession,
+):
+    """Alert fires only once per cycle even when compute is called twice."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks: list = []
+    _make_quadrant_tasks(
+        project.id,
+        db_session,
+        tasks,
+        curr_hits=6,
+        curr_fp=1,
+        prev_hits=9,
+        prev_fp=4,
+    )
+    await db_session.flush()
+
+    with (
+        patch(
+            "app.notification_dispatch.post_failure_alert_message",
+            new_callable=AsyncMock,
+        ) as mock_post,
+        patch(
+            "app.notification_dispatch.dispatch_external_notification",
+            new_callable=AsyncMock,
+        ),
+        patch("asyncio.ensure_future", side_effect=lambda coro: coro.close() or None),
+    ):
+        await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+        await db_session.commit()
+        call_count_after_first = mock_post.call_count
+
+        await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    # Second call should not fire again for same window/cycle
+    assert mock_post.call_count == call_count_after_first
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests for _compute_miss_latency_stats
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _make_latency_task(
+    project_id,
+    *,
+    sr_completed_at: datetime,
+    rejection_at: datetime,
+    miss_cats: list[str],
+    age_days: float = 2,
+) -> Task:
+    """Build a Task where SR passed all miss_cats but reviewer rejected them."""
+    # SR marks all miss_cats as passed=True
+    check_results = {cat: {"passed": True, "issue": ""} for cat in miss_cats}
+    # human cats contains all miss_cats
+    human_cats = {cat: 1 for cat in miss_cats}
+    sr_outcome = {
+        "check_results": check_results,
+        "completed_at": sr_completed_at.isoformat(),
+    }
+    ctx = {
+        "_self_review_outcome": sr_outcome,
+        "_first_attempt_rejection_categories": human_cats,
+        "_first_attempt_rejection_at": rejection_at.isoformat(),
+    }
+    task = Task(
+        project_id=project_id,
+        title="latency task",
+        payloads=[{"type": "create", "prompt": "x"}],
+        status=TaskStatus.COMPLETED,
+        context=ctx,
+    )
+    task.created_at = _utcnow() - timedelta(days=age_days)
+    return task
+
+
+def test_compute_miss_latency_stats_p50_and_p95():
+    """p50 / p95 are computed correctly from multiple samples."""
+    from app.playbook_learning import _compute_miss_latency_stats
+
+    import uuid as _uuid
+
+    pid = _uuid.uuid4()
+    base = datetime(2026, 1, 1, 0, 0, 0)
+    # Latencies in seconds: 60, 120, 300, 600, 86400
+    latency_secs = [60, 120, 300, 600, 86400]
+    tasks = []
+    for lat in latency_secs:
+        sr_ts = base
+        rej_ts = base + timedelta(seconds=lat)
+        tasks.append(
+            _make_latency_task(
+                pid,
+                sr_completed_at=sr_ts,
+                rejection_at=rej_ts,
+                miss_cats=["test-coverage"],
+            )
+        )
+
+    result = _compute_miss_latency_stats(tasks)
+
+    assert "test-coverage" in result
+    cat = result["test-coverage"]
+    assert cat["time_to_miss_detect_sample_count"] == 5
+    # p50 of [60, 120, 300, 600, 86400] = 300
+    assert cat["time_to_miss_detect_p50_sec"] == 300
+    # p95 of 5 values: idx = 0.95*4 = 3.8 → interpolated between 600 and 86400
+    # Use ±1 tolerance for float→int truncation
+    assert abs(cat["time_to_miss_detect_p95_sec"] - 69240) <= 1
+
+
+def test_compute_miss_latency_stats_single_sample_lone_checker_false():
+    """With only one sample, lone_checker must be False regardless of latency."""
+    from app.playbook_learning import _compute_miss_latency_stats
+
+    import uuid as _uuid
+
+    pid = _uuid.uuid4()
+    base = datetime(2026, 1, 1, 0, 0, 0)
+    # Single miss with > 7-day latency
+    sr_ts = base
+    rej_ts = base + timedelta(days=10)
+    tasks = [
+        _make_latency_task(
+            pid, sr_completed_at=sr_ts, rejection_at=rej_ts, miss_cats=["correctness"]
+        )
+    ]
+
+    result = _compute_miss_latency_stats(tasks)
+
+    assert "correctness" in result
+    cat = result["correctness"]
+    assert cat["time_to_miss_detect_sample_count"] == 1
+    assert cat["time_to_miss_detect_lone_checker"] is False
+
+
+def test_compute_miss_latency_stats_no_misses_absent():
+    """A category with no misses should not appear in the result."""
+    from app.playbook_learning import _compute_miss_latency_stats
+
+    import uuid as _uuid
+
+    pid = _uuid.uuid4()
+    base = datetime(2026, 1, 1, 0, 0, 0)
+    # Task where SR also failed the category (not a miss — both SR and reviewer flagged)
+    check_results = {"test-coverage": {"passed": False, "issue": "x"}}
+    human_cats = {"test-coverage": 1}
+    ctx = {
+        "_self_review_outcome": {
+            "check_results": check_results,
+            "completed_at": base.isoformat(),
+        },
+        "_first_attempt_rejection_categories": human_cats,
+        "_first_attempt_rejection_at": (base + timedelta(hours=1)).isoformat(),
+    }
+    task = Task(
+        project_id=pid,
+        title="not a miss",
+        payloads=[{"type": "create", "prompt": "x"}],
+        status=TaskStatus.COMPLETED,
+        context=ctx,
+    )
+    result = _compute_miss_latency_stats([task])
+    assert "test-coverage" not in result
+
+
+def test_compute_miss_latency_stats_lone_checker_flag():
+    """lone_checker=True when sample_count >= 2 and p95 > 7 days."""
+    from app.playbook_learning import _compute_miss_latency_stats
+
+    import uuid as _uuid
+
+    pid = _uuid.uuid4()
+    base = datetime(2026, 1, 1, 0, 0, 0)
+    # Two misses each with 8-day latency → p95 = 8 days > 7 days
+    tasks = []
+    for _ in range(2):
+        sr_ts = base
+        rej_ts = base + timedelta(days=8)
+        tasks.append(
+            _make_latency_task(
+                pid, sr_completed_at=sr_ts, rejection_at=rej_ts, miss_cats=["security"]
+            )
+        )
+
+    result = _compute_miss_latency_stats(tasks)
+
+    assert result["security"]["time_to_miss_detect_lone_checker"] is True
+
+
+def test_compute_miss_latency_stats_lone_checker_false_when_fast():
+    """lone_checker=False when p95 is under 7 days even with multiple samples."""
+    from app.playbook_learning import _compute_miss_latency_stats
+
+    import uuid as _uuid
+
+    pid = _uuid.uuid4()
+    base = datetime(2026, 1, 1, 0, 0, 0)
+    # Two misses with 1-hour latency
+    tasks = []
+    for _ in range(2):
+        sr_ts = base
+        rej_ts = base + timedelta(hours=1)
+        tasks.append(
+            _make_latency_task(
+                pid,
+                sr_completed_at=sr_ts,
+                rejection_at=rej_ts,
+                miss_cats=["style-conventions"],
+            )
+        )
+
+    result = _compute_miss_latency_stats(tasks)
+
+    assert result["style-conventions"]["time_to_miss_detect_lone_checker"] is False
+
+
+def test_compute_miss_latency_stats_fallback_both_skipped():
+    """When SR and rejection both lack real timestamps, the sample is skipped."""
+    from app.playbook_learning import _compute_miss_latency_stats
+
+    import uuid as _uuid
+
+    pid = _uuid.uuid4()
+    # Build a task with no SR completed_at and no rejection_at in context
+    check_results = {"test-coverage": {"passed": True, "issue": ""}}
+    human_cats = {"test-coverage": 1}
+    ctx = {
+        "_self_review_outcome": {"check_results": check_results},  # no completed_at
+        "_first_attempt_rejection_categories": human_cats,  # no _first_attempt_rejection_at
+    }
+    task = Task(
+        project_id=pid,
+        title="no-ts task",
+        payloads=[{"type": "create", "prompt": "x"}],
+        status=TaskStatus.COMPLETED,
+        context=ctx,
+    )
+    # updated_at is None on this in-memory task — both fallbacks are None, so skipped
+    result = _compute_miss_latency_stats([task])
+    assert "test-coverage" not in result
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_miss_latency_fields_present(
+    db_session: AsyncSession,
+):
+    """compute_sr_catch_rate_trends attaches time_to_miss_detect fields to category entries."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    base = _utcnow()
+
+    # Current window (5 tasks): each has a miss on test-coverage with 2h latency
+    for _ in range(5):
+        sr_ts = base - timedelta(days=2, hours=2)
+        rej_ts = base - timedelta(days=2)
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"test-coverage": 1},
+            sr_failed_cats=[],
+            check_result_overrides={},
+            sr_completed_at=sr_ts,
+            rejection_at=rej_ts,
+        )
+        # Make test-coverage a miss (SR passed, reviewer rejected)
+        t.context = {
+            "_self_review_outcome": {
+                "check_results": {"test-coverage": {"passed": True, "issue": ""}},
+                "completed_at": sr_ts.isoformat(),
+            },
+            "_first_attempt_rejection_categories": {"test-coverage": 1},
+            "_first_attempt_rejection_at": rej_ts.isoformat(),
+        }
+        db_session.add(t)
+        tasks.append(t)
+
+    # Previous window (5 tasks): simple misses without latency timestamps
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"test-coverage": 1},
+            sr_failed_cats=["test-coverage"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    cat = result["categories"].get("test-coverage")
+    assert cat is not None
+    # Fields must be present (value may be None or int)
+    assert "time_to_miss_detect_sample_count" in cat
+    assert "time_to_miss_detect_lone_checker" in cat
+    assert "time_to_miss_detect_p50_sec" in cat
+    assert "time_to_miss_detect_p95_sec" in cat
+    # We have 5 samples with 2h latency → p50 = p95 = 7200
+    assert cat["time_to_miss_detect_sample_count"] == 5
+    assert cat["time_to_miss_detect_p50_sec"] == 7200
+    assert cat["time_to_miss_detect_lone_checker"] is False
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_zero_miss_category_has_zero_count(
+    db_session: AsyncSession,
+):
+    """A category with no latency samples gets time_to_miss_detect_sample_count == 0."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+
+    # 5 current + 5 previous tasks, SR also failed (not a miss — no passed=True in SR)
+    for age in [2, 20]:
+        for _ in range(5):
+            t = _make_sr_task(
+                project.id,
+                age_days=age,
+                human_cats={"correctness": 1},
+                sr_failed_cats=["correctness"],
+            )
+            db_session.add(t)
+            tasks.append(t)
+
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    cat = result["categories"].get("correctness")
+    assert cat is not None
+    assert cat["time_to_miss_detect_sample_count"] == 0
+    assert cat["time_to_miss_detect_p50_sec"] is None
+    assert cat["time_to_miss_detect_p95_sec"] is None
+    assert cat["time_to_miss_detect_lone_checker"] is False
 
 
 # ---------------------------------------------------------------------------

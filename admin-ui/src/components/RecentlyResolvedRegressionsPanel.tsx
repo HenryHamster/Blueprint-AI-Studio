@@ -4,6 +4,24 @@ import { apiFetch, fetchCrossLayerCompliance, type CrossLayerComplianceResponse 
 import { timeAgo, formatDurationSec, parseTimestamp } from '../utils/time';
 import { LayersAffectedBadges, type LayerSummary } from './LayersAffectedBadges';
 
+interface RecurrenceEntry {
+  merged_count: number;
+  retripped_count: number;
+  recurrence_rate: number | null;
+  median_hold_days: number | null;
+}
+
+type ComplianceWithRecurrence = CrossLayerComplianceResponse & {
+  recurrence_by_bucket?: Record<string, RecurrenceEntry>;
+};
+
+const BUCKET_LABEL: Record<string, string> = {
+  compliant: 'compliant',
+  doc_test_only: 'no-canonical',
+  most_recent_layer_only: 'recent-only',
+  awaiting_backfill: 'awaiting',
+};
+
 interface RecentlyClosedCase {
   id: string;
   regression_class: string;
@@ -18,6 +36,7 @@ interface RecentlyClosedCase {
   layer_summary?: LayerSummary | null;
   hold_days_history?: number[];
   is_fragile?: boolean;
+  last_remediation_result?: string | null;
 }
 
 interface LayerDefenseEntry {
@@ -53,7 +72,7 @@ function PhaseChip({ label, duration }: { label: string; duration: string }) {
 
 export function RecentlyResolvedRegressionsPanel({ projectId }: Props) {
   const [cases, setCases] = useState<RecentlyClosedCase[]>([]);
-  const [compliance, setCompliance] = useState<CrossLayerComplianceResponse | null>(null);
+  const [compliance, setCompliance] = useState<ComplianceWithRecurrence | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [layerDensity, setLayerDensity] = useState<LayerDefenseEntry[] | null>(null);
 
@@ -140,6 +159,38 @@ export function RecentlyResolvedRegressionsPanel({ projectId }: Props) {
             {compliance.awaiting_backfill_count} awaiting backfill
           </div>
         )}
+        {cases.filter(c => c.last_remediation_result === 'recovered_marginal').length > 0 && (
+          <div className="mt-1.5 text-[9px] text-amber-500" data-testid="marginal-count">
+            {cases.filter(c => c.last_remediation_result === 'recovered_marginal').length} marginal recovery (signal may re-trip)
+          </div>
+        )}
+        {compliance.recurrence_by_bucket && Object.keys(compliance.recurrence_by_bucket).length > 0 && (
+          <div className="mt-2 pt-2 border-t border-neutral-800/50" data-testid="recurrence-by-bucket">
+            <div className="text-[9px] font-semibold text-neutral-500 uppercase tracking-widest mb-1">
+              Recurrence by compliance bucket
+            </div>
+            <div className="space-y-0.5">
+              {Object.entries(compliance.recurrence_by_bucket)
+                .filter(([, v]) => v.merged_count > 0)
+                .map(([bucket, v]) => (
+                  <div key={bucket} className="flex items-center gap-2 text-[10px]">
+                    <span className="text-neutral-500 w-24 shrink-0">{BUCKET_LABEL[bucket] ?? bucket}</span>
+                    <span className="text-neutral-400">
+                      {v.retripped_count}/{v.merged_count}
+                    </span>
+                    {v.recurrence_rate != null && (
+                      <span className={v.recurrence_rate > 0.5 ? 'text-red-400' : v.recurrence_rate > 0.2 ? 'text-amber-400' : 'text-emerald-500'}>
+                        {Math.round(v.recurrence_rate * 100)}%
+                      </span>
+                    )}
+                    {v.median_hold_days != null && (
+                      <span className="text-neutral-600">· {v.median_hold_days}d median</span>
+                    )}
+                  </div>
+                ))}
+            </div>
+          </div>
+        )}
       </div>
     );
   };
@@ -165,7 +216,7 @@ export function RecentlyResolvedRegressionsPanel({ projectId }: Props) {
           {cases.map(c => (
             <div
               key={c.id}
-              className="bg-emerald-950/20 border border-emerald-900/40 border-l-2 border-l-emerald-500 rounded-lg px-3 py-2"
+              className={`rounded-lg px-3 py-2 border border-l-2 ${c.last_remediation_result === 'recovered_marginal' ? 'bg-amber-950/20 border-amber-900/40 border-l-amber-500' : 'bg-emerald-950/20 border-emerald-900/40 border-l-emerald-500'}`}
             >
               <div className="flex items-start justify-between gap-2">
                 <div className="min-w-0 flex-1">
@@ -192,6 +243,15 @@ export function RecentlyResolvedRegressionsPanel({ projectId }: Props) {
                         }
                       >
                         fragile
+                      </span>
+                    )}
+                    {c.last_remediation_result === 'recovered_marginal' && (
+                      <span
+                        className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 border border-amber-500/20"
+                        data-testid="marginal-chip"
+                        title="Marginal improvement — signal may re-trip on noise"
+                      >
+                        marginal
                       </span>
                     )}
                     <LayersAffectedBadges summary={c.layer_summary} />

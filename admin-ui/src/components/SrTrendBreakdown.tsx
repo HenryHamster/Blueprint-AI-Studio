@@ -31,6 +31,20 @@ export interface SrCategoryTrend {
   reasoning_engagement_with?: number | null;
   /** Total PASS verdicts (denominator for engagement rate). */
   reasoning_engagement_total?: number | null;
+  /** Precision/recall quadrant classification for this category. */
+  precision_recall_quadrant?: 'healthy' | 'conservative_shift' | 'noisy_shift' | 'both_declining' | 'mixed' | 'flat' | null;
+  /** Cycle-over-cycle change in precision (hits / sr_failed). */
+  precision_delta?: number | null;
+  /** Cycle-over-cycle change in recall (hit_rate). */
+  recall_delta?: number | null;
+  /** Median seconds between SR completion and reviewer rejection for misses in this category. */
+  time_to_miss_detect_p50_sec?: number | null;
+  /** 95th-percentile seconds between SR completion and reviewer rejection for misses. */
+  time_to_miss_detect_p95_sec?: number | null;
+  /** Number of miss samples used to compute the latency percentiles. */
+  time_to_miss_detect_sample_count?: number | null;
+  /** True when sample_count >= 2 AND p95 > 7 days — SR is effectively the sole checker. */
+  time_to_miss_detect_lone_checker?: boolean | null;
 }
 
 export interface SrTaskTypeCategoryStats {
@@ -176,6 +190,12 @@ export function formatDelta(delta: number): string {
   return '±0pp';
 }
 
+function formatLatencySec(sec: number): string {
+  if (sec < 3600) return `${Math.round(sec / 60)}m`;
+  if (sec < 172800) return `${Math.round(sec / 3600)}h`;
+  return `${Math.round(sec / 86400)}d`;
+}
+
 // eslint-disable-next-line react-refresh/only-export-components
 export function trendStroke(t: SrCategoryTrend['trend'], versionChanged?: boolean | null): string {
   if (versionChanged) return '#f59e0b'; // amber — attribution break mid-window
@@ -186,6 +206,8 @@ export function trendStroke(t: SrCategoryTrend['trend'], versionChanged?: boolea
 
 const FLOOR_HIT_RATE = 0.5; // 50% hit-rate floor — categories below this are flagged
 const FLOOR_MIN_WINDOWS = 2; // consecutive windows below floor required to flag
+const ENGAGEMENT_THINNING_THRESHOLD = 0.5; // mirrors backend _SR_ENGAGEMENT_THRESHOLD
+const ENGAGEMENT_THINNING_MIN_PASSES = 10; // mirrors backend _SR_ENGAGEMENT_MIN_PASSES
 
 function isBelowFloor(c: SrCategoryTrend, floorHitRate = FLOOR_HIT_RATE, minWindows = FLOOR_MIN_WINDOWS): boolean {
   const history = c.rate_history;
@@ -848,6 +870,16 @@ function CategoryRow({
   const deltaColor = delta != null ? deltaColorClass(delta) : '';
   // Use backend below_floor if provided; fall back to local derivation for backward compat
   const belowFloor = c.below_floor != null ? c.below_floor : isBelowFloor(c);
+  const quadrant = c.precision_recall_quadrant;
+  const quadrantBadge = (() => {
+    if (!quadrant || quadrant === 'healthy' || quadrant === 'mixed' || quadrant === 'flat') return null;
+    const label = quadrant === 'conservative_shift' ? 'conservative' : quadrant === 'noisy_shift' ? 'noisy' : 'declining';
+    const cls = quadrant === 'both_declining' ? 'text-red-400' : 'text-amber-500';
+    const pdStr = c.precision_delta != null ? formatDelta(c.precision_delta) : 'N/A';
+    const rdStr = c.recall_delta != null ? formatDelta(c.recall_delta) : 'N/A';
+    const tip = `precision ${pdStr} / recall ${rdStr}`;
+    return <span className={`font-mono text-[9px] ${cls}`} title={tip}>{label}</span>;
+  })();
   const examples = c.examples ?? [];
   const hasExamples = examples.length > 0;
   const clickable = !!onCategoryClick;
@@ -914,9 +946,27 @@ function CategoryRow({
             {`prec:${Math.round(prec * 100)}%`}
           </span>
         )}
-        {c.trend === 'decreasing' && c.reasoning_engagement_rate != null && (
-          <span className="font-mono tabular-nums text-cyan-500" title={`Reasoning engagement: ${c.reasoning_engagement_with}/${c.reasoning_engagement_total} PASS verdicts with substantial reasoning`}>
-            {`eng:${Math.round(c.reasoning_engagement_rate * 100)}%`}
+        {c.reasoning_engagement_rate != null && (c.reasoning_engagement_total ?? 0) > 0 && (() => {
+          const thinning = c.reasoning_engagement_rate < ENGAGEMENT_THINNING_THRESHOLD && (c.reasoning_engagement_total ?? 0) >= ENGAGEMENT_THINNING_MIN_PASSES;
+          return (
+            <span
+              className={`font-mono tabular-nums ${thinning ? 'text-amber-400' : 'text-cyan-500'}`}
+              title={thinning
+                ? `Reasoning thinning: only ${c.reasoning_engagement_with}/${c.reasoning_engagement_total} PASS verdicts include substantial reasoning — may regress soon`
+                : `Reasoning engagement: ${c.reasoning_engagement_with}/${c.reasoning_engagement_total} PASS verdicts with substantial reasoning`}
+            >
+              {`eng:${Math.round(c.reasoning_engagement_rate * 100)}%`}
+            </span>
+          );
+        })()}
+        {c.time_to_miss_detect_p50_sec != null && (
+          <span className="font-mono tabular-nums text-neutral-500" title={`Median time-to-detect SR miss: ${formatLatencySec(c.time_to_miss_detect_p50_sec)}`}>
+            {`t50:${formatLatencySec(c.time_to_miss_detect_p50_sec)}`}
+          </span>
+        )}
+        {c.time_to_miss_detect_p95_sec != null && (
+          <span className="font-mono tabular-nums text-neutral-500" title={`p95 time-to-detect SR miss: ${formatLatencySec(c.time_to_miss_detect_p95_sec)}`}>
+            {`t95:${formatLatencySec(c.time_to_miss_detect_p95_sec)}`}
           </span>
         )}
         <TrendIcon trend={c.trend} />
@@ -927,6 +977,16 @@ function CategoryRow({
             aria-label="below floor"
           >
             <AlertTriangle className="w-3 h-3 text-orange-400" />
+          </span>
+        )}
+        {quadrantBadge}
+        {c.time_to_miss_detect_lone_checker && (
+          <span
+            className="shrink-0"
+            title="SR is the lone checker for this category — p95 time-to-detect > 7 days"
+            aria-label="lone checker"
+          >
+            <AlertTriangle className="w-3 h-3 text-red-400" />
           </span>
         )}
         <MissRateSparkline
@@ -1004,9 +1064,27 @@ function CategoryRow({
           {`prec:${Math.round(prec * 100)}%`}
         </span>
       )}
-      {c.trend === 'decreasing' && c.reasoning_engagement_rate != null && (
-        <span className="font-mono text-cyan-500" title={`Reasoning engagement: ${c.reasoning_engagement_with}/${c.reasoning_engagement_total} PASS verdicts with substantial reasoning`}>
-          {`eng:${Math.round(c.reasoning_engagement_rate * 100)}%`}
+      {c.reasoning_engagement_rate != null && (c.reasoning_engagement_total ?? 0) > 0 && (() => {
+        const thinning = c.reasoning_engagement_rate < ENGAGEMENT_THINNING_THRESHOLD && (c.reasoning_engagement_total ?? 0) >= ENGAGEMENT_THINNING_MIN_PASSES;
+        return (
+          <span
+            className={`font-mono ${thinning ? 'text-amber-400' : 'text-cyan-500'}`}
+            title={thinning
+              ? `Reasoning thinning: only ${c.reasoning_engagement_with}/${c.reasoning_engagement_total} PASS verdicts include substantial reasoning — may regress soon`
+              : `Reasoning engagement: ${c.reasoning_engagement_with}/${c.reasoning_engagement_total} PASS verdicts with substantial reasoning`}
+          >
+            {`eng:${Math.round(c.reasoning_engagement_rate * 100)}%`}
+          </span>
+        );
+      })()}
+      {c.time_to_miss_detect_p50_sec != null && (
+        <span className="font-mono text-neutral-500" title={`Median time-to-detect SR miss: ${formatLatencySec(c.time_to_miss_detect_p50_sec)}`}>
+          {`t50:${formatLatencySec(c.time_to_miss_detect_p50_sec)}`}
+        </span>
+      )}
+      {c.time_to_miss_detect_p95_sec != null && (
+        <span className="font-mono text-neutral-500" title={`p95 time-to-detect SR miss: ${formatLatencySec(c.time_to_miss_detect_p95_sec)}`}>
+          {`t95:${formatLatencySec(c.time_to_miss_detect_p95_sec)}`}
         </span>
       )}
       <TrendIcon trend={c.trend} />
@@ -1017,6 +1095,16 @@ function CategoryRow({
           aria-label="below floor"
         >
           <AlertTriangle className="w-3 h-3 text-orange-400" />
+        </span>
+      )}
+      {quadrantBadge}
+      {c.time_to_miss_detect_lone_checker && (
+        <span
+          className="shrink-0"
+          title="SR is the lone checker for this category — p95 time-to-detect > 7 days"
+          aria-label="lone checker"
+        >
+          <AlertTriangle className="w-3 h-3 text-red-400" />
         </span>
       )}
       <MissRateSparkline

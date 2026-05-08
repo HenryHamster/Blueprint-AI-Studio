@@ -1,9 +1,40 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
-import { X, MessageSquare, Send, Check, AlertTriangle, HelpCircle, Bug, StickyNote, ChevronDown, PlusCircle, Trash2, CheckSquare, ArrowDown, Reply, Settings, ChevronUp, BellOff } from 'lucide-react';
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import { X, MessageSquare, Send, Check, AlertTriangle, HelpCircle, Bug, StickyNote, ChevronDown, PlusCircle, Trash2, CheckSquare, ArrowDown, Reply, Settings, ChevronUp, BellOff, Save, MoreVertical, Pencil } from 'lucide-react';
 import { auth } from '../firebase';
 import { apiFetch, API_BASE_URL } from '../api';
 import { parseTimestamp } from '../utils/time';
-import { routineSummary, effectiveSignal, loadEventPrefs, saveEventPrefs, type EventPref, groupRoutineMessages, outcomeBreakdown, isFailingGroup, getToastSeverity, type RoutineRow, loadLastSeen, saveLastSeen, formatTimestamp, insertTimeDividers, type MessageWithDivider, ESCALATION_BADGE_LABELS, isCriticalSeverity, type MuteWindow, loadMuteWindow, saveMuteWindow, clearMuteWindow, isMuteWindowActive, formatMuteCountdown } from './MessagesPanel.utils';
+import { routineSummary, effectiveSignal, loadEventPrefs, saveEventPrefs, type EventPref, groupRoutineMessages, outcomeBreakdown, isFailingGroup, getToastSeverity, type RoutineRow, loadLastSeen, saveLastSeen, formatTimestamp, insertTimeDividers, type MessageWithDivider, ESCALATION_BADGE_LABELS, isCriticalSeverity, type MuteWindow, loadMuteWindow, saveMuteWindow, clearMuteWindow, isMuteWindowActive, formatMuteCountdown, type SavedView, loadSavedViews, saveSavedViews, SAVED_VIEWS_CAP } from './MessagesPanel.utils';
+
+const DEFAULT_VIEW_ID = '__default__';
+
+function viewSummaryLine(query: string, prefs: Record<string, EventPref>, sort: 'importance' | 'recent', showResolved: boolean): string {
+  const parts: string[] = [];
+  parts.push(query.trim() ? `Search: ${query.trim().slice(0, 40)}` : 'No search');
+  const muted = Object.values(prefs).filter(v => v === 'mute').length;
+  const surfaced = Object.values(prefs).filter(v => v === 'surfaced').length;
+  if (muted > 0) parts.push(`${muted} muted`);
+  if (surfaced > 0) parts.push(`${surfaced} surfaced`);
+  parts.push(`sort: ${sort}`);
+  parts.push(showResolved ? 'resolved shown' : 'resolved hidden');
+  return parts.join(' · ');
+}
+
+function viewMatches(
+  view: { query: string; prefs: Record<string, EventPref>; sort: 'importance' | 'recent'; showResolved: boolean; routineExpanded: boolean },
+  state: { query: string; prefs: Record<string, EventPref>; sort: 'importance' | 'recent'; showResolved: boolean; routineExpanded: boolean },
+): boolean {
+  if (view.query !== state.query) return false;
+  if (view.sort !== state.sort) return false;
+  if (view.showResolved !== state.showResolved) return false;
+  if (view.routineExpanded !== state.routineExpanded) return false;
+  const aKeys = Object.keys(view.prefs);
+  const bKeys = Object.keys(state.prefs);
+  if (aKeys.length !== bKeys.length) return false;
+  for (const k of aKeys) {
+    if (view.prefs[k] !== state.prefs[k]) return false;
+  }
+  return true;
+}
 
 interface ProjectMessage {
   id: string;
@@ -236,6 +267,22 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
   const [muteWindow, setMuteWindow] = useState<MuteWindow | null>(() => loadMuteWindow(auth.currentUser?.email, selectedProjectId));
   const [showMuteMenu, setShowMuteMenu] = useState(false);
 
+  // Saved views — named filter combos persisted per-user-per-project. activeViewId
+  // tracks which tab is currently applied; when the operator mutates any underlying
+  // filter the active tab is rendered as "modified" but state is not auto-cleared.
+  const [savedViews, setSavedViews] = useState<SavedView[]>(() =>
+    loadSavedViews(auth.currentUser?.email, selectedProjectId),
+  );
+  const [activeViewId, setActiveViewId] = useState<string>(DEFAULT_VIEW_ID);
+  const [showSaveDialog, setShowSaveDialog] = useState(false);
+  const [saveDialogMode, setSaveDialogMode] = useState<'create' | 'rename'>('create');
+  const [saveDialogTargetId, setSaveDialogTargetId] = useState<string | null>(null);
+  const [saveDialogName, setSaveDialogName] = useState('');
+  const [saveDialogDescription, setSaveDialogDescription] = useState('');
+  const [saveDialogError, setSaveDialogError] = useState<string | null>(null);
+  const [openKebabId, setOpenKebabId] = useState<string | null>(null);
+  const kebabRef = useRef<HTMLDivElement>(null);
+
   // Last-seen tracking: dividerTime is the threshold; when operator scrolls past or timeout fires, we persist it
   const [dividerTime, setDividerTime] = useState<number | null>(null);
   const dividerTimeRef = useRef<number | null>(null);
@@ -277,7 +324,21 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
     setDividerTime(lastSeen);
     dividerTimeRef.current = lastSeen;
     dividerDismissedRef.current = false;
+    // Reload saved views for the new project — views never bleed across projects.
+    setSavedViews(loadSavedViews(auth.currentUser?.email, selectedProjectId));
+    setActiveViewId(DEFAULT_VIEW_ID);
+    setOpenKebabId(null);
   }, [selectedProjectId]);
+
+  // Close kebab menu on outside click — same pattern as MessageTypeDropdown.
+  useEffect(() => {
+    if (!openKebabId) return;
+    function handleClickOutside(e: MouseEvent) {
+      if (kebabRef.current && !kebabRef.current.contains(e.target as Node)) setOpenKebabId(null);
+    }
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, [openKebabId]);
 
   const byTime = (a: ProjectMessage, b: ProjectMessage) => {
     const ta = a.created_at ? parseTimestamp(a.created_at).getTime() : 0;
@@ -366,6 +427,118 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
       saveEventPrefs(auth.currentUser?.email, selectedProjectId, next);
       return next;
     });
+  }
+
+  const activeView = useMemo(
+    () => savedViews.find(v => v.id === activeViewId) ?? null,
+    [savedViews, activeViewId],
+  );
+
+  // Active tab is "modified" when current panel state diverges from its saved
+  // snapshot. For Default the baseline is the empty/initial state.
+  const activeTabModified = useMemo(() => {
+    const current = { query: searchQuery, prefs: eventPrefs, sort: sortMode, showResolved, routineExpanded };
+    if (activeViewId === DEFAULT_VIEW_ID) {
+      return !viewMatches(
+        { query: '', prefs: {}, sort: 'importance', showResolved: false, routineExpanded: false },
+        current,
+      );
+    }
+    if (!activeView) return false;
+    return !viewMatches(activeView, current);
+  }, [activeView, activeViewId, searchQuery, eventPrefs, sortMode, showResolved, routineExpanded]);
+
+  function applyView(viewId: string) {
+    setOpenKebabId(null);
+    if (viewId === DEFAULT_VIEW_ID) {
+      setActiveViewId(DEFAULT_VIEW_ID);
+      setSearchQuery('');
+      setEventPrefs({});
+      saveEventPrefs(auth.currentUser?.email, selectedProjectId, {});
+      setSortMode('importance');
+      setShowResolved(false);
+      setRoutineExpanded(false);
+      return;
+    }
+    const view = savedViews.find(v => v.id === viewId);
+    if (!view) return;
+    setActiveViewId(view.id);
+    setSearchQuery(view.query);
+    setEventPrefs(view.prefs);
+    saveEventPrefs(auth.currentUser?.email, selectedProjectId, view.prefs);
+    setSortMode(view.sort);
+    setShowResolved(view.showResolved);
+    setRoutineExpanded(view.routineExpanded);
+  }
+
+  function openSaveDialog() {
+    setSaveDialogMode('create');
+    setSaveDialogTargetId(null);
+    setSaveDialogName('');
+    setSaveDialogDescription('');
+    setSaveDialogError(null);
+    setShowSaveDialog(true);
+  }
+
+  function openRenameDialog(view: SavedView) {
+    setSaveDialogMode('rename');
+    setSaveDialogTargetId(view.id);
+    setSaveDialogName(view.name);
+    setSaveDialogDescription(view.description ?? '');
+    setSaveDialogError(null);
+    setShowSaveDialog(true);
+    setOpenKebabId(null);
+  }
+
+  function closeSaveDialog() {
+    setShowSaveDialog(false);
+    setSaveDialogError(null);
+  }
+
+  function commitSaveDialog() {
+    const name = saveDialogName.trim();
+    if (!name) {
+      setSaveDialogError('Name is required');
+      return;
+    }
+    if (saveDialogMode === 'create') {
+      if (savedViews.length >= SAVED_VIEWS_CAP) {
+        setSaveDialogError(`Cap reached (${SAVED_VIEWS_CAP}). Delete a view to add another.`);
+        return;
+      }
+      const view: SavedView = {
+        id: `view_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        name,
+        description: saveDialogDescription.trim() || undefined,
+        query: searchQuery,
+        prefs: eventPrefs,
+        sort: sortMode,
+        showResolved,
+        routineExpanded,
+        createdAt: Date.now(),
+      };
+      const next = [...savedViews, view];
+      setSavedViews(next);
+      saveSavedViews(auth.currentUser?.email, selectedProjectId, next);
+      setActiveViewId(view.id);
+    } else if (saveDialogTargetId) {
+      const next = savedViews.map(v =>
+        v.id === saveDialogTargetId
+          ? { ...v, name, description: saveDialogDescription.trim() || undefined }
+          : v,
+      );
+      setSavedViews(next);
+      saveSavedViews(auth.currentUser?.email, selectedProjectId, next);
+    }
+    closeSaveDialog();
+  }
+
+  function deleteView(viewId: string) {
+    const next = savedViews.filter(v => v.id !== viewId);
+    setSavedViews(next);
+    saveSavedViews(auth.currentUser?.email, selectedProjectId, next);
+    setOpenKebabId(null);
+    if (activeViewId === viewId) setActiveViewId(DEFAULT_VIEW_ID);
   }
 
   useEffect(() => {
@@ -1019,14 +1192,161 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
           </button>
           </div>
         </div>
-        <input
-          type="text"
-          value={searchQuery}
-          onChange={e => setSearchQuery(e.target.value)}
-          placeholder="Search messages..."
-          className="w-full bg-neutral-900/50 border border-neutral-800/50 text-neutral-100 rounded-lg px-3 py-2 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-700 placeholder-neutral-600"
-        />
+        <div className="flex items-center gap-2">
+          <input
+            type="text"
+            value={searchQuery}
+            onChange={e => setSearchQuery(e.target.value)}
+            placeholder="Search messages..."
+            className="flex-1 bg-neutral-900/50 border border-neutral-800/50 text-neutral-100 rounded-lg px-3 py-2 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-700 placeholder-neutral-600"
+          />
+          <button
+            onClick={openSaveDialog}
+            title="Save current filters as a view"
+            className="shrink-0 flex items-center justify-center gap-1 px-2.5 py-2 rounded-lg text-xs text-neutral-400 hover:text-neutral-200 border border-neutral-800/60 hover:border-neutral-700 transition-colors min-h-[44px] min-w-[44px] md:min-h-[36px] md:min-w-auto"
+          >
+            <Save className="w-3.5 h-3.5" />
+            <span className="hidden md:inline">Save view</span>
+          </button>
+        </div>
+        {/* Saved views tab strip */}
+        <div
+          className="flex items-center gap-1 overflow-x-auto -mx-1 px-1"
+          data-testid="saved-views-tab-strip"
+          data-viewport-allow-small-target
+        >
+          {(() => {
+            const tabs: { id: string; name: string; isDefault: boolean; view: SavedView | null }[] = [
+              { id: DEFAULT_VIEW_ID, name: 'Default', isDefault: true, view: null },
+              ...savedViews.map(v => ({ id: v.id, name: v.name, isDefault: false, view: v })),
+            ];
+            return tabs.map(tab => {
+              const isActive = activeViewId === tab.id;
+              const showModified = isActive && activeTabModified;
+              return (
+                <div key={tab.id} className="relative shrink-0 flex items-center">
+                  {/* eslint-disable-next-line viewport/min-touch-target -- compact tab; matches density of header chips */}
+                  <button
+                    onClick={() => applyView(tab.id)}
+                    title={tab.view?.description || tab.name}
+                    className={`flex items-center gap-1 px-2.5 py-1 rounded-md text-xs transition-colors border ${
+                      isActive
+                        ? 'bg-blue-500/15 text-blue-300 border-blue-500/40'
+                        : 'text-neutral-500 hover:text-neutral-300 border-transparent hover:border-neutral-800/60'
+                    }`}
+                  >
+                    <span>{tab.name}</span>
+                    {showModified && (
+                      <span title="Filters changed" className="w-1.5 h-1.5 rounded-full bg-amber-400" data-testid="view-modified-dot" />
+                    )}
+                  </button>
+                  {!tab.isDefault && tab.view && (
+                    <div ref={openKebabId === tab.id ? kebabRef : undefined} className="relative">
+                      {/* eslint-disable-next-line viewport/min-touch-target -- kebab in dense tab strip; matches existing chip density */}
+                      <button
+                        onClick={() => setOpenKebabId(prev => (prev === tab.id ? null : tab.id))}
+                        title="Manage view"
+                        aria-label={`Manage view ${tab.name}`}
+                        className="text-neutral-600 hover:text-neutral-300 p-1 rounded transition-colors"
+                      >
+                        <MoreVertical className="w-3.5 h-3.5" />
+                      </button>
+                      {openKebabId === tab.id && (
+                        <div className="absolute right-0 top-full mt-1 z-50 min-w-[120px] bg-neutral-900 border border-neutral-700 rounded-lg shadow-xl overflow-hidden">
+                          <button
+                            onClick={() => openRenameDialog(tab.view!)}
+                            className="w-full flex items-center gap-2 px-3 py-2 text-xs text-neutral-300 hover:bg-neutral-800 transition-colors min-h-[44px]"
+                          >
+                            <Pencil className="w-3 h-3" />
+                            Rename
+                          </button>
+                          <button
+                            onClick={() => deleteView(tab.id)}
+                            className="w-full flex items-center gap-2 px-3 py-2 text-xs text-red-400 hover:bg-red-500/10 transition-colors min-h-[44px]"
+                          >
+                            <Trash2 className="w-3 h-3" />
+                            Delete
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              );
+            });
+          })()}
+        </div>
       </div>
+
+      {/* Save view dialog */}
+      {showSaveDialog && (
+        <>
+          <div className="fixed inset-0 z-40 bg-black/50" onClick={closeSaveDialog} />
+          <div
+            role="dialog"
+            aria-label={saveDialogMode === 'rename' ? 'Rename saved view' : 'Save current filters as a view'}
+            className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 z-50 w-[min(420px,90vw)] bg-neutral-900 border border-neutral-700 rounded-xl shadow-2xl p-4 space-y-3"
+          >
+            <div className="flex items-center justify-between">
+              <h3 className="text-sm font-semibold text-neutral-100">
+                {saveDialogMode === 'rename' ? 'Rename view' : 'Save view'}
+              </h3>
+              {/* eslint-disable-next-line viewport/min-touch-target -- close button in dense modal header */}
+              <button onClick={closeSaveDialog} className="text-neutral-500 hover:text-neutral-300 p-1">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <label className="block text-xs text-neutral-400">
+              Name
+              <input
+                type="text"
+                value={saveDialogName}
+                onChange={e => { setSaveDialogName(e.target.value); setSaveDialogError(null); }}
+                onKeyDown={e => { if (e.key === 'Enter') commitSaveDialog(); if (e.key === 'Escape') closeSaveDialog(); }}
+                placeholder="e.g. Unresolved BLOCKERs"
+                className="mt-1 w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600 placeholder-neutral-600"
+                autoFocus
+              />
+            </label>
+            <label className="block text-xs text-neutral-400">
+              Description (optional)
+              <input
+                type="text"
+                value={saveDialogDescription}
+                onChange={e => setSaveDialogDescription(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter') commitSaveDialog(); if (e.key === 'Escape') closeSaveDialog(); }}
+                placeholder="What is this view for?"
+                className="mt-1 w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600 placeholder-neutral-600"
+              />
+            </label>
+            {saveDialogMode === 'create' && (
+              <div className="text-[11px] text-neutral-500 bg-neutral-950/50 border border-neutral-800/60 rounded-md px-3 py-2">
+                <span className="text-neutral-400">Saving:</span>{' '}
+                {viewSummaryLine(searchQuery, eventPrefs, sortMode, showResolved)}
+              </div>
+            )}
+            {saveDialogError && (
+              <div role="alert" className="text-[11px] text-red-400 bg-red-500/10 border border-red-500/30 rounded-md px-3 py-2">
+                {saveDialogError}
+              </div>
+            )}
+            <div className="flex items-center justify-end gap-2 pt-1">
+              <button
+                onClick={closeSaveDialog}
+                className="text-xs px-3 py-1.5 rounded-lg text-neutral-400 hover:text-neutral-200 border border-neutral-800 hover:border-neutral-700 transition-colors min-h-[36px]"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={commitSaveDialog}
+                className="text-xs px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white transition-colors min-h-[36px]"
+              >
+                {saveDialogMode === 'rename' ? 'Save' : 'Save view'}
+              </button>
+            </div>
+          </div>
+        </>
+      )}
 
       {/* Messages list — chat-style scroll area */}
       <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 md:px-6 py-4 space-y-3 relative">

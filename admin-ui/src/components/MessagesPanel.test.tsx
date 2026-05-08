@@ -1612,3 +1612,230 @@ describe('MessagesPanel feedback acknowledgment reply context', () => {
     expect(slug).toBeFalsy();
   });
 });
+
+// ── Saved views (operator filter combos) ─────────────────────────────────────
+
+describe('MessagesPanel saved views', () => {
+  let root: Root | null = null;
+  let host: HTMLDivElement | null = null;
+  const userId = 'test-user@example.com';
+
+  beforeEach(() => {
+    localStorage.clear();
+  });
+
+  afterEach(() => {
+    const r = root;
+    if (r) act(() => r.unmount());
+    root = null;
+    host?.remove();
+    host = null;
+    localStorage.clear();
+    vi.clearAllMocks();
+  });
+
+  async function renderForProject(projectId: string, messages: ReturnType<typeof makeMsg>[] = []) {
+    (apiFetch as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Response(JSON.stringify({ messages }), { status: 200 }),
+    );
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <MessagesPanel
+          selectedProjectId={projectId}
+          onClose={() => {}}
+          addToast={() => {}}
+          onMessageCountChange={() => {}}
+        />,
+      );
+    });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 50)); });
+    return host as HTMLDivElement;
+  }
+
+  async function rerenderForProject(projectId: string, messages: ReturnType<typeof makeMsg>[] = []) {
+    (apiFetch as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Response(JSON.stringify({ messages }), { status: 200 }),
+    );
+    await act(async () => {
+      root!.render(
+        <MessagesPanel
+          selectedProjectId={projectId}
+          onClose={() => {}}
+          addToast={() => {}}
+          onMessageCountChange={() => {}}
+        />,
+      );
+    });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 50)); });
+  }
+
+  function tabStrip(el: HTMLElement): HTMLElement {
+    const strip = el.querySelector('[data-testid="saved-views-tab-strip"]');
+    if (!strip) throw new Error('tab strip not found');
+    return strip as HTMLElement;
+  }
+
+  function tabButtons(el: HTMLElement): HTMLButtonElement[] {
+    return [...tabStrip(el).querySelectorAll('button')] as HTMLButtonElement[];
+  }
+
+  function tabByName(el: HTMLElement, name: string): HTMLButtonElement | null {
+    return tabButtons(el).find(b => b.textContent?.trim().startsWith(name)) ?? null;
+  }
+
+  test('Default tab is rendered and active by default', async () => {
+    const el = await renderForProject('proj-1');
+    const def = tabByName(el, 'Default');
+    expect(def).toBeTruthy();
+    expect(def!.className).toMatch(/blue-500/);
+  });
+
+  test('Save view dialog enforces non-empty name and 10-view cap', async () => {
+    // Pre-seed 10 views so creating an 11th is blocked.
+    const tenViews: SavedView[] = Array.from({ length: 10 }, (_, i) => ({
+      id: `v${i}`,
+      name: `View ${i}`,
+      query: '',
+      prefs: {},
+      sort: 'importance',
+      showResolved: false,
+      routineExpanded: false,
+      createdAt: Date.now() - i,
+    }));
+    localStorage.setItem(`messages_saved_views:${userId}:proj-1`, JSON.stringify({ version: 1, views: tenViews }));
+    const el = await renderForProject('proj-1');
+    const saveBtn = [...el.querySelectorAll('button')].find(b => b.title?.includes('Save current filters'));
+    expect(saveBtn).toBeTruthy();
+    await act(async () => { (saveBtn as HTMLButtonElement).click(); });
+    const nameInput = document.body.querySelector('input[placeholder*="Unresolved"]') as HTMLInputElement | null;
+    expect(nameInput).toBeTruthy();
+    await act(async () => {
+      nameInput!.focus();
+      const proto = Object.getPrototypeOf(nameInput);
+      Object.getOwnPropertyDescriptor(proto, 'value')?.set?.call(nameInput, 'Eleventh');
+      nameInput!.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    const submit = [...document.body.querySelectorAll('button')].find(b => b.textContent?.trim() === 'Save view' && b.className.includes('bg-blue-600'));
+    expect(submit).toBeTruthy();
+    await act(async () => { (submit as HTMLButtonElement).click(); });
+    const alert = document.body.querySelector('[role="alert"]');
+    expect(alert?.textContent).toMatch(/Cap reached/);
+    // Existing 10 views unchanged
+    const stored = JSON.parse(localStorage.getItem(`messages_saved_views:${userId}:proj-1`)!);
+    expect(stored.views).toHaveLength(10);
+  });
+
+  test('saving a view persists it and switching to Default resets state', async () => {
+    const el = await renderForProject('proj-1');
+    // Type into the search box
+    const searchInput = el.querySelector('input[placeholder="Search messages..."]') as HTMLInputElement;
+    expect(searchInput).toBeTruthy();
+    await act(async () => {
+      const proto = Object.getPrototypeOf(searchInput);
+      Object.getOwnPropertyDescriptor(proto, 'value')?.set?.call(searchInput, 'urgent');
+      searchInput.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    // Open save dialog
+    const openBtn = [...el.querySelectorAll('button')].find(b => b.title?.includes('Save current filters'));
+    await act(async () => { (openBtn as HTMLButtonElement).click(); });
+    // Fill name and submit
+    const nameInput = document.body.querySelector('input[placeholder*="Unresolved"]') as HTMLInputElement;
+    await act(async () => {
+      const proto = Object.getPrototypeOf(nameInput);
+      Object.getOwnPropertyDescriptor(proto, 'value')?.set?.call(nameInput, 'Urgent stuff');
+      nameInput.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    const submit = [...document.body.querySelectorAll('button')].find(b => b.textContent?.trim() === 'Save view' && b.className.includes('bg-blue-600'));
+    await act(async () => { (submit as HTMLButtonElement).click(); });
+    // Stored under per-project-per-user key
+    const stored = JSON.parse(localStorage.getItem(`messages_saved_views:${userId}:proj-1`)!);
+    expect(stored.views).toHaveLength(1);
+    expect(stored.views[0].name).toBe('Urgent stuff');
+    expect(stored.views[0].query).toBe('urgent');
+    // Tab strip shows the new tab
+    expect(tabByName(el, 'Urgent stuff')).toBeTruthy();
+    // Click Default tab — search should reset
+    const defaultTab = tabByName(el, 'Default');
+    await act(async () => { defaultTab!.click(); });
+    const searchAfter = el.querySelector('input[placeholder="Search messages..."]') as HTMLInputElement;
+    expect(searchAfter.value).toBe('');
+  });
+
+  test('applying a saved view updates query, sort, and showResolved together', async () => {
+    // Seed a view that flips multiple fields
+    const seeded: SavedView = {
+      id: 'v_complex',
+      name: 'Recent Resolved',
+      query: 'pr_merged',
+      prefs: { pr_merged: 'mute' },
+      sort: 'recent',
+      showResolved: true,
+      routineExpanded: true,
+      createdAt: Date.now(),
+    };
+    localStorage.setItem(`messages_saved_views:${userId}:proj-1`, JSON.stringify({ version: 1, views: [seeded] }));
+    const el = await renderForProject('proj-1');
+    const tab = tabByName(el, 'Recent Resolved');
+    expect(tab).toBeTruthy();
+    await act(async () => { tab!.click(); });
+    // Search updated
+    const searchInput = el.querySelector('input[placeholder="Search messages..."]') as HTMLInputElement;
+    expect(searchInput.value).toBe('pr_merged');
+    // Sort toggle text reflects 'recent' mode
+    const sortBtn = [...el.querySelectorAll('button')].find(b => b.textContent?.trim() === 'Recent' || b.textContent?.trim() === 'Importance');
+    expect(sortBtn?.textContent?.trim()).toBe('Recent');
+    // Event prefs persisted to project key
+    const prefsRaw = localStorage.getItem(`messages_panel_event_prefs:${userId}:proj-1`);
+    expect(prefsRaw).not.toBeNull();
+    expect(JSON.parse(prefsRaw!)).toEqual({ pr_merged: 'mute' });
+  });
+
+  test('deleting a view removes it from tab strip and storage', async () => {
+    const seeded: SavedView = {
+      id: 'v_kill',
+      name: 'Doomed',
+      query: '',
+      prefs: {},
+      sort: 'importance',
+      showResolved: false,
+      routineExpanded: false,
+      createdAt: Date.now(),
+    };
+    localStorage.setItem(`messages_saved_views:${userId}:proj-1`, JSON.stringify({ version: 1, views: [seeded] }));
+    const el = await renderForProject('proj-1');
+    expect(tabByName(el, 'Doomed')).toBeTruthy();
+    // Open kebab
+    const kebabBtn = [...el.querySelectorAll('button')].find(b => b.getAttribute('aria-label')?.includes('Doomed'));
+    expect(kebabBtn).toBeTruthy();
+    await act(async () => { (kebabBtn as HTMLButtonElement).click(); });
+    const deleteBtn = [...el.querySelectorAll('button')].find(b => b.textContent?.trim() === 'Delete');
+    expect(deleteBtn).toBeTruthy();
+    await act(async () => { (deleteBtn as HTMLButtonElement).click(); });
+    expect(tabByName(el, 'Doomed')).toBeFalsy();
+    expect(localStorage.getItem(`messages_saved_views:${userId}:proj-1`)).toBeNull();
+  });
+
+  test('per-project isolation: project A views do not bleed into project B', async () => {
+    const seeded: SavedView = {
+      id: 'v_a',
+      name: 'A-only',
+      query: 'a',
+      prefs: {},
+      sort: 'importance',
+      showResolved: false,
+      routineExpanded: false,
+      createdAt: Date.now(),
+    };
+    localStorage.setItem(`messages_saved_views:${userId}:proj-A`, JSON.stringify({ version: 1, views: [seeded] }));
+    const el = await renderForProject('proj-A');
+    expect(tabByName(el, 'A-only')).toBeTruthy();
+    await rerenderForProject('proj-B');
+    expect(tabByName(el, 'A-only')).toBeFalsy();
+    expect(tabByName(el, 'Default')).toBeTruthy();
+  });
+});
+

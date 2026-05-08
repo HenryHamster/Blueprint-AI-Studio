@@ -351,6 +351,48 @@ export async function fetchSrAlertDrilldown(
   return res.json();
 }
 
+export interface SrCategoryTrend {
+  current_hit_rate?: number | null;
+  previous_hit_rate?: number | null;
+  miss_rate?: number | null;
+  all_iterations_miss_rate?: number | null;
+  weighted_miss_rate?: number | null;
+  false_positive_rate?: number | null;
+  precision?: number | null;
+  sr_alone_hit_count?: number | null;
+  reviewer_save_hit_count?: number | null;
+  sr_alone_hit_rate?: number | null;
+  reviewer_save_rate?: number | null;
+  trend?: 'increasing' | 'decreasing' | 'stable';
+  rate_history?: number[];
+  prompt_version_changed?: boolean | null;
+  below_floor?: boolean | null;
+  reasoning_engagement_rate?: number | null;
+  reasoning_engagement_with?: number | null;
+  reasoning_engagement_total?: number | null;
+  /** Median wall-clock seconds from SR PASS stamp to reviewer/CI rejection for misses in this category. */
+  time_to_miss_detect_p50_sec?: number | null;
+  /** 95th-percentile seconds from SR PASS stamp to reviewer/CI rejection for misses in this category. */
+  time_to_miss_detect_p95_sec?: number | null;
+  /** Number of miss samples used to compute the latency percentiles. */
+  time_to_miss_detect_sample_count?: number | null;
+  /** True when sample_count >= 2 AND p95 > 7 days — SR is effectively the sole checker for this category. */
+  time_to_miss_detect_lone_checker?: boolean | null;
+  /** Precision from the previous window (hit_count / (hit_count + fp_count)), used to compute precision_delta. */
+  previous_precision?: number | null;
+  /**
+   * Quadrant classification from (precision_delta, recall_delta) across the previous-vs-current window.
+   * 'conservative_shift': precision improving, recall declining (SR flags less → misses more genuine issues).
+   * 'noisy_shift': precision declining, recall improving (SR flags more → more false positives).
+   * 'both_declining': both metrics worsening.
+   * 'healthy': both improving.
+   * 'mixed': below threshold for any directional assignment.
+   */
+  precision_recall_quadrant?: 'healthy' | 'conservative_shift' | 'noisy_shift' | 'both_declining' | 'mixed' | null;
+  /** True when the category enters conservative_shift or noisy_shift with both deltas exceeding the alert threshold. */
+  precision_recall_alert?: boolean | null;
+}
+
 export interface SrFixIterationBucket {
   hit_rate?: number | null;
   miss_rate?: number | null;
@@ -492,6 +534,13 @@ export interface CrossLayerComplianceByClass {
   compliance_rate: number | null;
 }
 
+export interface RecurrenceByBucketEntry {
+  merged_count: number;
+  retripped_count: number;
+  recurrence_rate: number | null;
+  median_hold_days: number | null;
+}
+
 export interface CrossLayerComplianceResponse {
   total_classified: number;
   compliant: number;
@@ -503,6 +552,7 @@ export interface CrossLayerComplianceResponse {
     most_recent_layer_only: number;
   };
   by_class: Record<string, CrossLayerComplianceByClass>;
+  recurrence_by_bucket?: Record<string, RecurrenceByBucketEntry>;
 }
 
 export async function fetchCrossLayerCompliance(

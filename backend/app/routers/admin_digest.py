@@ -843,6 +843,7 @@ def _compute_symptom_layers_by_class(
 def _compute_cross_layer_compliance(
     rows: List[RegressionRemediationCase],
     cutoff: datetime,
+    over_threshold_hours: int = 24,
 ) -> Dict[str, Any]:
     """Compliance metric for cross-layer-escalated regression remediations.
 
@@ -857,15 +858,49 @@ def _compute_cross_layer_compliance(
 
     ``cutoff`` is the oldest ``merged_at`` timestamp to include.
     Non-cross-layer entries are never counted in any bucket.
+
+    Also computes per-bucket recurrence: for each cross-layer fix, whether
+    the regression re-tripped (another fix merged within 14 days) so operators
+    can validate whether compliant fixes hold longer than non-compliant ones.
     """
     from app.regression_layer_classifier import ALL_LAYERS
 
+    _RE_TRIP_WINDOW = timedelta(days=14)
+
     total = compliant = doc_test_only = most_recent_layer_only = awaiting_backfill = 0
     non_compliant = 0
+    awaiting_over_threshold = 0
+    awaiting_oldest_merged_at: Optional[datetime] = None
     by_class: Dict[str, Dict[str, Any]] = {}
+    # bucket -> list of hold_days (None = no re-trip within 14 days)
+    bucket_records: Dict[str, List] = {
+        "compliant": [],
+        "doc_test_only": [],
+        "most_recent_layer_only": [],
+        "awaiting_backfill": [],
+    }
 
     for case in rows:
         cls_compliant = cls_non_compliant = cls_awaiting = 0
+
+        # Collect all fix merged timestamps for re-trip detection (any entry with a fix_pr_number)
+        all_fix_dts: List[datetime] = []
+        for e in case.fingerprint_to_fix_log or []:
+            if not isinstance(e, dict) or e.get("fix_pr_number") is None:
+                continue
+            raw = e.get("merged_at")
+            if not raw:
+                continue
+            try:
+                all_fix_dts.append(
+                    _to_naive_utc(
+                        datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+                    )
+                )
+            except (ValueError, TypeError):
+                pass
+        all_fix_dts.sort()
+
         for entry in case.fingerprint_to_fix_log or []:
             if not isinstance(entry, dict):
                 continue
@@ -886,25 +921,51 @@ def _compute_cross_layer_compliance(
             if "layers_targeted" not in entry:
                 awaiting_backfill += 1
                 cls_awaiting += 1
-                continue
-
-            raw_targeted = entry.get("layers_targeted") or []
-            targeted_canonical = {str(x) for x in raw_targeted if str(x) in ALL_LAYERS}
-            spawn_layers = list(entry.get("spawn_layers_enumerated") or [])
-
-            total += 1
-            if len(targeted_canonical) >= 2:
-                compliant += 1
-                cls_compliant += 1
+                bucket_name = "awaiting_backfill"
+                over_threshold_cutoff = _utcnow() - timedelta(
+                    hours=over_threshold_hours
+                )
+                if merged_dt < over_threshold_cutoff:
+                    awaiting_over_threshold += 1
+                if (
+                    awaiting_oldest_merged_at is None
+                    or merged_dt < awaiting_oldest_merged_at
+                ):
+                    awaiting_oldest_merged_at = merged_dt
             else:
-                non_compliant += 1
-                cls_non_compliant += 1
-                if not targeted_canonical:
-                    doc_test_only += 1
-                elif spawn_layers:
-                    most_recent = spawn_layers[-1]
-                    if targeted_canonical == {most_recent}:
+                raw_targeted = entry.get("layers_targeted") or []
+                targeted_canonical = {
+                    str(x) for x in raw_targeted if str(x) in ALL_LAYERS
+                }
+                spawn_layers = list(entry.get("spawn_layers_enumerated") or [])
+
+                total += 1
+                if len(targeted_canonical) >= 2:
+                    compliant += 1
+                    cls_compliant += 1
+                    bucket_name = "compliant"
+                else:
+                    non_compliant += 1
+                    cls_non_compliant += 1
+                    if not targeted_canonical:
+                        doc_test_only += 1
+                        bucket_name = "doc_test_only"
+                    elif spawn_layers and targeted_canonical == {spawn_layers[-1]}:
                         most_recent_layer_only += 1
+                        bucket_name = "most_recent_layer_only"
+                    else:
+                        bucket_name = "doc_test_only"
+
+            # Detect re-trip: earliest subsequent fix within 14 days
+            hold_days = None
+            for next_dt in all_fix_dts:
+                if next_dt <= merged_dt:
+                    continue
+                delta = next_dt - merged_dt
+                if delta <= _RE_TRIP_WINDOW:
+                    hold_days = delta.total_seconds() / 86400
+                break
+            bucket_records[bucket_name].append(hold_days)
 
         if cls_compliant + cls_non_compliant + cls_awaiting > 0:
             cls_total = cls_compliant + cls_non_compliant
@@ -917,17 +978,38 @@ def _compute_cross_layer_compliance(
                 ),
             }
 
+    recurrence_by_bucket: Dict[str, Any] = {}
+    for bname, records in bucket_records.items():
+        merged_count = len(records)
+        retripped = [hd for hd in records if hd is not None]
+        retripped_count = len(retripped)
+        recurrence_by_bucket[bname] = {
+            "merged_count": merged_count,
+            "retripped_count": retripped_count,
+            "recurrence_rate": round(retripped_count / merged_count, 4)
+            if merged_count > 0
+            else None,
+            "median_hold_days": round(statistics.median(retripped), 2)
+            if retripped
+            else None,
+        }
+
     return {
         "total_classified": total,
         "compliant": compliant,
         "non_compliant": non_compliant,
         "awaiting_backfill_count": awaiting_backfill,
+        "awaiting_backfill_oldest_merged_at": (
+            awaiting_oldest_merged_at.isoformat() if awaiting_oldest_merged_at else None
+        ),
+        "awaiting_backfill_over_threshold_count": awaiting_over_threshold,
         "compliance_rate": round(compliant / total, 4) if total > 0 else None,
         "failure_modes": {
             "doc_test_only": doc_test_only,
             "most_recent_layer_only": most_recent_layer_only,
         },
         "by_class": by_class,
+        "recurrence_by_bucket": recurrence_by_bucket,
     }
 
 

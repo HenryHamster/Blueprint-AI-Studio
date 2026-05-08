@@ -2583,6 +2583,261 @@ async def test_watchdog_no_auto_close_when_signal_unevaluable(db_session):
 
 
 # ---------------------------------------------------------------------------
+# Marginal-improvement auto-close tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_auto_close_clean_improvement_unattended(db_session):
+    """Large improvement on a higher-is-better signal (pre=0.40, post=0.80) →
+    recovered_unattended + INFO alert.
+
+    sr_catch_rate is higher-is-better — the fixture's design doc reports
+    current_hit_rate=0.80, so the watchdog reads post_value=0.80. Pre-fix
+    snapshot at 0.40 means a +0.40 absolute improvement, which clears both
+    floors comfortably.
+    """
+    from app.models import Alert, AlertSeverity, RegressionCaseStatus
+
+    project = make_project(design_doc=_design_doc_no_sr_regression())
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    case = await _make_stale_case(
+        db_session,
+        project.id,
+        status=RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION,
+        hours_stale=72,
+        regression_class="sr_catch_rate:correctness",
+    )
+    # Pre-fix snapshot: hit-rate was at 0.40 before the fix merged; design-doc
+    # current_hit_rate=0.80 means post_value=0.80. Improvement = +0.40.
+    case.signal_snapshot_at_merge = {"current_rate": 0.40}
+    case.signal_healthy_since_at = _utcnow() - timedelta(hours=30)
+    db_session.add(case)
+    await db_session.commit()
+
+    closed = await run_watchdog_once(db_session, project.id)
+    assert closed == 1
+
+    await db_session.refresh(case)
+    assert case.status == RegressionCaseStatus.CLOSED
+    assert case.last_remediation_result == "recovered_unattended"
+
+    log_entries = case.fingerprint_to_fix_log or []
+    assert any(
+        isinstance(e, dict) and e.get("reason") == "recovered_unattended"
+        for e in log_entries
+    )
+
+    alerts = (
+        (await db_session.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.INFO
+
+
+@pytest.mark.asyncio
+async def test_auto_close_marginal_improvement_emits_warn_alert(db_session):
+    """Tiny improvement on a higher-is-better signal (pre=0.78, post=0.80) →
+    recovered_marginal + WARNING alert.
+
+    sr_catch_rate is higher-is-better; design-doc current_hit_rate=0.80 so
+    post_value=0.80. Pre-fix snapshot=0.78 → improvement=0.02 which is below
+    the absolute floor (0.05) AND below the relative floor — relative is
+    measured against the headroom (1.0 - pre = 0.22), giving 0.02/0.22 ≈ 9%
+    < rel_floor(10%).
+    """
+    from app.models import Alert, AlertSeverity, RegressionCaseStatus
+
+    project = make_project(design_doc=_design_doc_no_sr_regression())
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    case = await _make_stale_case(
+        db_session,
+        project.id,
+        status=RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION,
+        hours_stale=72,
+        regression_class="sr_catch_rate:correctness",
+    )
+    # Pre-fix=0.78, post-fix=0.80 (from design-doc current_hit_rate). Improvement
+    # = 0.02 < abs_floor(0.05) AND relative = 0.02/0.22 ≈ 9% < rel_floor(10%).
+    case.signal_snapshot_at_merge = {"current_rate": 0.78}
+    case.signal_healthy_since_at = _utcnow() - timedelta(hours=30)
+    db_session.add(case)
+    await db_session.commit()
+
+    closed = await run_watchdog_once(db_session, project.id)
+    assert closed == 1
+
+    await db_session.refresh(case)
+    assert case.status == RegressionCaseStatus.CLOSED
+    assert case.last_remediation_result == "recovered_marginal"
+
+    log_entries = case.fingerprint_to_fix_log or []
+    assert any(
+        isinstance(e, dict) and e.get("reason") == "recovered_marginal"
+        for e in log_entries
+    )
+
+    assert case.signal_healthy_since_at is None
+
+    alerts = (
+        (await db_session.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+    warn_alert = alerts[0]
+    assert warn_alert.severity == AlertSeverity.WARNING
+    assert "marginal" in (warn_alert.title or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_auto_close_missing_snapshot_falls_back_to_clean(db_session):
+    """Missing signal_snapshot_at_merge → falls back to recovered_unattended + INFO."""
+    from app.models import Alert, AlertSeverity, RegressionCaseStatus
+
+    project = make_project(design_doc=_design_doc_no_sr_regression())
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    case = await _make_stale_case(
+        db_session,
+        project.id,
+        status=RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION,
+        hours_stale=72,
+        regression_class="sr_catch_rate:correctness",
+    )
+    # Snapshot is empty — no pre-fix value available.
+    case.signal_snapshot_at_merge = {}
+    case.signal_healthy_since_at = _utcnow() - timedelta(hours=30)
+    db_session.add(case)
+    await db_session.commit()
+
+    closed = await run_watchdog_once(db_session, project.id)
+    assert closed == 1
+
+    await db_session.refresh(case)
+    assert case.status == RegressionCaseStatus.CLOSED
+    assert case.last_remediation_result == "recovered_unattended"
+
+    alerts = (
+        (await db_session.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.INFO
+
+
+@pytest.mark.asyncio
+async def test_auto_close_marginal_runtime_config_override(db_session):
+    """Raising relative floor reclassifies a borderline-clean case as marginal."""
+    from app.models import Alert, AlertSeverity, RegressionCaseStatus
+    from app.shared_state import runtime_config
+
+    project = make_project(design_doc=_design_doc_no_sr_regression())
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    case = await _make_stale_case(
+        db_session,
+        project.id,
+        status=RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION,
+        hours_stale=72,
+        regression_class="sr_catch_rate:correctness",
+    )
+    # sr_catch_rate is higher-is-better; design-doc current_hit_rate=0.80 so
+    # post_value=0.80. Pre=0.50, improvement=0.30. Reference (headroom)=0.50,
+    # relative=60%. Defaults (rel=10%, abs=5%) → clean. Override (rel=0.80,
+    # abs=0.80) → 60% < 80% AND 0.30 < 0.80 → marginal.
+    case.signal_snapshot_at_merge = {"current_rate": 0.50}
+    case.signal_healthy_since_at = _utcnow() - timedelta(hours=30)
+    db_session.add(case)
+    await db_session.commit()
+
+    original_rel = runtime_config.get("regression_recovered_marginal_relative_floor")
+    original_abs = runtime_config.get("regression_recovered_marginal_absolute_floor")
+    runtime_config["regression_recovered_marginal_relative_floor"] = 0.80
+    runtime_config["regression_recovered_marginal_absolute_floor"] = 0.80
+    try:
+        closed = await run_watchdog_once(db_session, project.id)
+    finally:
+        for key, orig in [
+            ("regression_recovered_marginal_relative_floor", original_rel),
+            ("regression_recovered_marginal_absolute_floor", original_abs),
+        ]:
+            if orig is None:
+                runtime_config.pop(key, None)
+            else:
+                runtime_config[key] = orig
+
+    assert closed == 1
+    await db_session.refresh(case)
+    assert case.last_remediation_result == "recovered_marginal"
+
+    alerts = (
+        (await db_session.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.WARNING
+
+
+@pytest.mark.asyncio
+async def test_auto_close_higher_is_better_degradation_is_marginal(db_session):
+    """A drop on a higher-is-better signal must NOT be flagged as a clean recovery.
+
+    sr_catch_rate is higher-is-better. With pre=0.90 and post=0.80, the signal
+    actually got worse — improvement is negative. This test would fail under
+    the old hard-coded ``pre - post`` formula (which would treat 0.10 as a
+    clean improvement) and protects against re-introducing that bug.
+    """
+    from app.models import Alert, AlertSeverity, RegressionCaseStatus
+
+    project = make_project(design_doc=_design_doc_no_sr_regression())
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    case = await _make_stale_case(
+        db_session,
+        project.id,
+        status=RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION,
+        hours_stale=72,
+        regression_class="sr_catch_rate:correctness",
+    )
+    # post_value = 0.80 (design-doc), pre_value = 0.90 → degradation of 0.10.
+    case.signal_snapshot_at_merge = {"current_rate": 0.90}
+    case.signal_healthy_since_at = _utcnow() - timedelta(hours=30)
+    db_session.add(case)
+    await db_session.commit()
+
+    closed = await run_watchdog_once(db_session, project.id)
+    assert closed == 1
+
+    await db_session.refresh(case)
+    assert case.last_remediation_result == "recovered_marginal"
+
+    alerts = (
+        (await db_session.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.WARNING
+
+
+# ---------------------------------------------------------------------------
 # Deploy-monitoring gate tests
 # ---------------------------------------------------------------------------
 
@@ -7332,3 +7587,165 @@ async def test_ledger_computed_once_per_run_once(db_session, monkeypatch):
     assert spawned >= 1
     # The ledger was computed only once for this project despite multiple _maybe_spawn calls
     assert call_count[0] == 1
+
+
+# ---------------------------------------------------------------------------
+# Cross-layer backfill-lag watchdog tests
+# ---------------------------------------------------------------------------
+
+
+def _make_cross_layer_fix_log_case(
+    project_id,
+    *,
+    hours_ago: int,
+    has_layers_targeted: bool = False,
+    spawn_was_cross_layer: bool = True,
+):
+    from app.models import RegressionRemediationCase as RRC, RegressionCaseStatus
+
+    entry: dict = {
+        "fingerprint": "test_fp",
+        "fix_pr_number": 999,
+        "merged_at": (_utcnow() - timedelta(hours=hours_ago)).isoformat(),
+        "spawn_was_cross_layer": spawn_was_cross_layer,
+        "spawn_layers_enumerated": ["CI_WORKFLOW", "AGENT_VM"],
+    }
+    if has_layers_targeted:
+        entry["layers_targeted"] = ["CI_WORKFLOW", "AGENT_VM"]
+    return RRC(
+        project_id=project_id,
+        regression_class="sr_catch_rate:correctness",
+        status=RegressionCaseStatus.ACTIVE,
+        hit_count=1,
+        fingerprint_to_fix_log=[entry],
+    )
+
+
+@pytest.mark.asyncio
+async def test_cross_layer_backfill_lag_alert_fires_when_stale_entries_exist(
+    db_session,
+):
+    """Cross-layer entry older than threshold with no layers_targeted → INFO alert opened."""
+    from app.models import Alert
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    case = _make_cross_layer_fix_log_case(
+        project.id, hours_ago=48, has_layers_targeted=False
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    await run_dispatcher_watchdog_alarms(db_session, [project.id])
+
+    alerts = (
+        (await db_session.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    backfill_alerts = [
+        a for a in alerts if "Cross-layer backfill lag:" in (a.title or "")
+    ]
+    assert len(backfill_alerts) == 1
+    assert backfill_alerts[0].dismissed_at is None
+    assert backfill_alerts[0].severity == "INFO"
+    assert "1 cross-layer fix-log entries unbackfilled" in backfill_alerts[0].message
+
+
+@pytest.mark.asyncio
+async def test_cross_layer_backfill_lag_alert_resolves_when_entries_backfilled(
+    db_session,
+):
+    """All cross-layer entries have layers_targeted → existing alert is dismissed."""
+    from app.models import Alert, AlertSeverity
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Pre-create an open alert
+    alert = Alert(
+        project_id=project.id,
+        severity=AlertSeverity.INFO,
+        title="Cross-layer backfill lag: 1 entries unbackfilled",
+        message="old message",
+    )
+    db_session.add(alert)
+    await db_session.commit()
+    await db_session.refresh(alert)
+
+    # All entries are now backfilled
+    case = _make_cross_layer_fix_log_case(
+        project.id, hours_ago=48, has_layers_targeted=True
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    await run_dispatcher_watchdog_alarms(db_session, [project.id])
+
+    await db_session.refresh(alert)
+    assert alert.dismissed_at is not None
+
+
+@pytest.mark.asyncio
+async def test_cross_layer_backfill_lag_not_triggered_for_recent_entries(db_session):
+    """Entry missing layers_targeted but merged within threshold → no alert."""
+    from app.models import Alert
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Only 2 hours old — below the 24h default threshold
+    case = _make_cross_layer_fix_log_case(
+        project.id, hours_ago=2, has_layers_targeted=False
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    await run_dispatcher_watchdog_alarms(db_session, [project.id])
+
+    alerts = (
+        (await db_session.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    backfill_alerts = [
+        a for a in alerts if "Cross-layer backfill lag:" in (a.title or "")
+    ]
+    assert len(backfill_alerts) == 0
+
+
+@pytest.mark.asyncio
+async def test_cross_layer_backfill_lag_ignores_non_cross_layer_entries(db_session):
+    """Entries without spawn_was_cross_layer=True are not counted, no alert fires."""
+    from app.models import Alert
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # spawn_was_cross_layer=False — should be skipped regardless of age / backfill state
+    case = _make_cross_layer_fix_log_case(
+        project.id, hours_ago=72, has_layers_targeted=False, spawn_was_cross_layer=False
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    await run_dispatcher_watchdog_alarms(db_session, [project.id])
+
+    alerts = (
+        (await db_session.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    backfill_alerts = [
+        a for a in alerts if "Cross-layer backfill lag:" in (a.title or "")
+    ]
+    assert len(backfill_alerts) == 0
