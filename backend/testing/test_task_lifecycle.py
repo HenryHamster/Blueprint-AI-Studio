@@ -35,6 +35,7 @@ from app.task_lifecycle import (
     _extract_error_files,
     _build_scope_overflow_details,
     _build_retry_prompt_suffix,
+    merge_retry_prompt_suffix,
 )
 
 # SQLite JSONB compatibility — defensive, conftest.py also sets this
@@ -1323,6 +1324,54 @@ async def test_requeue_external_api_injects_api_guidance(tl_db, mocker):
     assert "GitHub API" in prompt_suffix
     assert "503" in prompt_suffix
     assert "backoff" in prompt_suffix.lower()
+
+
+def test_merge_retry_prompt_suffix_strips_all_known_auto_prefixes_on_first_call():
+    """First call snapshots `existing_suffix` with all known auto-blocks
+    stripped; the snapshot is what carries forward verbatim across retries.
+
+    Critical: covers the reaper-driven within-task retry path that was
+    blindly prepending — observed on 911b3ed3, two `IMPORTANT: …TIMED OUT`
+    blocks plus an old RETRY GUIDANCE block stacked from successive reaps.
+    """
+    ctx: dict = {}
+    polluted = (
+        "IMPORTANT: The previous attempt TIMED OUT — the agent stopped sending heartbeats. Keep operations smaller:\n"
+        "- step\n"
+        "\n"
+        "RETRY GUIDANCE: prior block\n"
+        "- detail\n"
+        "\n"
+        "ORIGINAL_NOTE: spawn-time note preserved.\n"
+    )
+    new_guidance = "RETRY GUIDANCE: fresh block\n- new detail\n"
+    out = merge_retry_prompt_suffix(new_guidance, polluted, ctx)
+    assert out.count("IMPORTANT: The previous attempt TIMED OUT") == 0
+    # New block appears exactly once.
+    assert out.count("RETRY GUIDANCE:") == 1
+    assert "ORIGINAL_NOTE: spawn-time note preserved" in out
+    # Snapshot persisted in ctx without any auto-block.
+    snap = ctx["_original_prompt_suffix"]
+    assert "IMPORTANT: The previous attempt TIMED OUT" not in snap
+    assert "RETRY GUIDANCE:" not in snap
+    assert "ORIGINAL_NOTE: spawn-time note preserved" in snap
+
+
+def test_merge_retry_prompt_suffix_carries_snapshot_forward_on_repeat():
+    """Subsequent calls reuse the snapshotted original; never re-strip."""
+    ctx = {"_original_prompt_suffix": "ORIGINAL_NOTE: kept verbatim."}
+    new_guidance = (
+        "IMPORTANT: The previous attempt TIMED OUT — heartbeats stopped.\n- step\n"
+    )
+    out = merge_retry_prompt_suffix(
+        new_guidance,
+        # An "existing" suffix that already has the prior block — should be
+        # ignored entirely because ctx already has the snapshot.
+        new_guidance + "\nORIGINAL_NOTE: kept verbatim.\n",
+        ctx,
+    )
+    assert out.count("IMPORTANT: The previous attempt TIMED OUT") == 1
+    assert "ORIGINAL_NOTE: kept verbatim" in out
 
 
 @pytest.mark.asyncio

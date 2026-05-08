@@ -275,6 +275,39 @@ def _record_parent_failure(parent: Task, failure_class: str) -> None:
         )
 
 
+_RETRY_SUFFIX_AUTO_PREFIXES = re.compile(
+    r"^(?:RETRY GUIDANCE:"
+    r"|IMPORTANT: The previous attempt TIMED OUT"
+    r"|NOTE: The previous attempt was CANCELLED"
+    r"|WARNING: The same tests are failing).*?(?=\n\n|\Z)",
+    flags=re.MULTILINE | re.DOTALL,
+)
+
+
+def merge_retry_prompt_suffix(
+    extra_guidance: str, existing_suffix: str, ctx: dict
+) -> str:
+    """Combine fresh retry guidance with carry-forward spawn-time suffix.
+
+    Stamps ctx['_original_prompt_suffix'] on first use (with all known
+    auto-generated leading blocks stripped from existing_suffix), then
+    carries that snapshot forward verbatim across retries. Without this,
+    each retry stacks another auto-block (observed on 911b3ed3 / 547a700d:
+    two `IMPORTANT: The previous attempt TIMED OUT` blocks in the payload
+    after a single reaper-driven retry).
+
+    Used by both _requeue_parent_task (parent-level requeue) and the
+    in-place reaper retry in reaper.py — keeping the dedup centralized
+    so a third caller can't drift again.
+    """
+    if "_original_prompt_suffix" in ctx:
+        carry = ctx.get("_original_prompt_suffix") or ""
+    else:
+        carry = _RETRY_SUFFIX_AUTO_PREFIXES.sub("\n", existing_suffix or "").strip()
+        ctx["_original_prompt_suffix"] = carry
+    return extra_guidance + ("\n" + carry if carry else "")
+
+
 def _build_retry_prompt_suffix(
     failure_class: "str | None",
     original_status_message: "str | None",
@@ -1125,26 +1158,8 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
                 clone_ctx["_scope_reduced"] = True
                 clone_ctx["scope_calibrated_from"] = f"{task_scope}:{_override_reason}"
             if extra_guidance:
-                # Pin the spawn-time suffix in ctx and replace the
-                # auto-generated portion on every retry. Earlier dedup only
-                # matched "RETRY GUIDANCE:" headers and missed the AGENT_TIMEOUT
-                # "IMPORTANT: The previous attempt TIMED OUT…" form, causing
-                # observed stacking (291914e6 had the timeout block twice).
-                # On first retry we snapshot existing_suffix with all known
-                # auto-generated leading blocks stripped; subsequent retries
-                # carry the snapshot forward verbatim instead of re-stripping.
-                if "_original_prompt_suffix" in clone_ctx:
-                    carry = clone_ctx.get("_original_prompt_suffix") or ""
-                else:
-                    carry = re.sub(
-                        r"(?:^|\n)(?:RETRY GUIDANCE:|IMPORTANT: The previous attempt TIMED OUT|NOTE: The previous attempt was CANCELLED|WARNING: The same tests are failing).*?(?:\n\n|\Z)",
-                        "\n",
-                        existing_suffix,
-                        flags=re.DOTALL,
-                    ).strip()
-                    clone_ctx["_original_prompt_suffix"] = carry
-                new_payloads[0]["prompt_suffix"] = extra_guidance + (
-                    "\n" + carry if carry else ""
+                new_payloads[0]["prompt_suffix"] = merge_retry_prompt_suffix(
+                    extra_guidance, existing_suffix, clone_ctx
                 )
 
         new_payloads = [

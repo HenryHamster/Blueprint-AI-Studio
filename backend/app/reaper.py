@@ -1872,6 +1872,7 @@ async def reaper_service():
                                 try:
                                     from app.task_lifecycle import (
                                         _build_retry_prompt_suffix,
+                                        merge_retry_prompt_suffix,
                                     )
                                     from sqlalchemy.orm.attributes import flag_modified
 
@@ -1904,10 +1905,12 @@ async def reaper_service():
                                             _existing_suffix = (
                                                 _p0.get("prompt_suffix", "") or ""
                                             )
-                                            _p0["prompt_suffix"] = _extra_guidance + (
-                                                "\n" + _existing_suffix
-                                                if _existing_suffix
-                                                else ""
+                                            _p0["prompt_suffix"] = (
+                                                merge_retry_prompt_suffix(
+                                                    _extra_guidance,
+                                                    _existing_suffix,
+                                                    reaper_ctx,
+                                                )
                                             )
                                             _new_payloads[0] = _p0
                                             task.payloads = _new_payloads
