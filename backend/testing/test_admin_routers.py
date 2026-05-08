@@ -2082,3 +2082,140 @@ class TestProjectSystemMaturity:
 
         resp = await client.get(f"/api/admin/projects/{project.id}/system-maturity")
         assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Viewport regression digest tests
+# ---------------------------------------------------------------------------
+
+
+class TestViewportRegressionDigest:
+    """Tests for viewport_regression:* cases appearing in /pipeline-regressions."""
+
+    @pytest.mark.asyncio
+    async def test_active_viewport_case_appears_in_pipeline_regressions(
+        self, client: AsyncClient, db_session
+    ):
+        """An active viewport_regression:Foo@375 case appears in /pipeline-regressions."""
+        from app.models import RegressionRemediationCase, RegressionCaseStatus
+
+        project = await _make_project(db_session)
+
+        case = RegressionRemediationCase(
+            project_id=project.id,
+            regression_class="viewport_regression:TaskDetailDrawerMeta@375",
+            signal_name="viewport_regression",
+            status=RegressionCaseStatus.ACTIVE,
+            first_seen_at=__import__("datetime").datetime.utcnow(),
+        )
+        db_session.add(case)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/pipeline-regressions?project_id={project.id}"
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        classes = [r["regression_class"] for r in data["regressions"]]
+        assert "viewport_regression:TaskDetailDrawerMeta@375" in classes
+
+        vp = next(
+            r
+            for r in data["regressions"]
+            if r["regression_class"] == "viewport_regression:TaskDetailDrawerMeta@375"
+        )
+        assert vp["severity"] == "warning"
+        assert vp["resolved"] is False
+
+    @pytest.mark.asyncio
+    async def test_closed_viewport_case_excluded_from_pipeline_regressions(
+        self, client: AsyncClient, db_session
+    ):
+        """A CLOSED viewport case does not appear in /pipeline-regressions active list."""
+        from app.models import RegressionRemediationCase, RegressionCaseStatus
+
+        project = await _make_project(db_session)
+
+        case = RegressionRemediationCase(
+            project_id=project.id,
+            regression_class="viewport_regression:SearchFilterBar@375",
+            signal_name="viewport_regression",
+            status=RegressionCaseStatus.CLOSED,
+            first_seen_at=__import__("datetime").datetime.utcnow(),
+        )
+        db_session.add(case)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/pipeline-regressions?project_id={project.id}"
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        classes = [r["regression_class"] for r in data["regressions"]]
+        assert "viewport_regression:SearchFilterBar@375" not in classes
+
+    @pytest.mark.asyncio
+    async def test_viewport_case_appears_in_regression_class_kpis(
+        self, client: AsyncClient, db_session
+    ):
+        """A viewport_regression case appears in /regression-class-kpis output."""
+        from app.models import RegressionRemediationCase, RegressionCaseStatus
+
+        project = await _make_project(db_session)
+
+        case = RegressionRemediationCase(
+            project_id=project.id,
+            regression_class="viewport_regression:Foo@375",
+            signal_name="viewport_regression",
+            status=RegressionCaseStatus.ACTIVE,
+            first_seen_at=__import__("datetime").datetime.utcnow(),
+        )
+        db_session.add(case)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/regression-class-kpis?project_id={project.id}&window_hours=168"
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        classes = [row["regression_class"] for row in data["classes"]]
+        assert "viewport_regression:Foo@375" in classes
+
+    @pytest.mark.asyncio
+    async def test_existing_classes_unaffected_by_viewport_case(
+        self, client: AsyncClient, db_session
+    ):
+        """Adding a viewport case does not change existing SR/fix-loop aggregation."""
+        from app.models import RegressionRemediationCase, RegressionCaseStatus
+
+        project = await _make_project(db_session)
+
+        existing_case = RegressionRemediationCase(
+            project_id=project.id,
+            regression_class="fix_loop_divergence:lint",
+            signal_name="fix_loop_divergence",
+            status=RegressionCaseStatus.ACTIVE,
+            first_seen_at=__import__("datetime").datetime.utcnow(),
+        )
+        viewport_case = RegressionRemediationCase(
+            project_id=project.id,
+            regression_class="viewport_regression:AlertsBanner@375",
+            signal_name="viewport_regression",
+            status=RegressionCaseStatus.ACTIVE,
+            first_seen_at=__import__("datetime").datetime.utcnow(),
+        )
+        db_session.add_all([existing_case, viewport_case])
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/regression-class-kpis?project_id={project.id}&window_hours=168"
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        by_class = {row["regression_class"]: row for row in data["classes"]}
+        # Both classes must be present
+        assert "fix_loop_divergence:lint" in by_class
+        assert "viewport_regression:AlertsBanner@375" in by_class
+        # The existing class' opened count must not be polluted
+        assert by_class["fix_loop_divergence:lint"]["cases_opened"] == 1
+        assert by_class["viewport_regression:AlertsBanner@375"]["cases_opened"] == 1

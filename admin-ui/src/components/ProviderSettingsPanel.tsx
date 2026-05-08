@@ -605,19 +605,19 @@ function PreviewFallbackBanner({
       {willFallback.length > 0 && (
         <div className="text-amber-200/80">
           <span className="text-amber-400">{willFallback.length}/{gemini.length}</span> account{willFallback.length === 1 ? '' : 's'} will fall back:{' '}
-          <span className="font-mono text-neutral-300">{nameList(willFallback)}</span>
+          <span className="font-mono text-neutral-300 break-all">{nameList(willFallback)}</span>
         </div>
       )}
       {willRun.length > 0 && (
         <div className="text-neutral-400">
           <span className="text-emerald-400">{willRun.length}/{gemini.length}</span> will run the preview model:{' '}
-          <span className="font-mono">{nameList(willRun)}</span>
+          <span className="font-mono break-all">{nameList(willRun)}</span>
         </div>
       )}
       {unknown.length > 0 && (
         <div className="text-neutral-500">
           <span className="text-neutral-400">{unknown.length}/{gemini.length}</span> not yet probed (click refresh on the account row to check):{' '}
-          <span className="font-mono">{nameList(unknown)}</span>
+          <span className="font-mono break-all">{nameList(unknown)}</span>
         </div>
       )}
     </div>

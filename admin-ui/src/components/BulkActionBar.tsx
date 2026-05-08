@@ -57,7 +57,7 @@ export function BulkActionBar({
               setConfirmDialog(null);
             },
           })}
-          className="px-3 py-1.5 rounded-lg text-xs font-medium bg-green-500/20 hover:bg-green-500/30 text-green-400 border border-green-500/40 transition-colors"
+          className="px-3 py-1.5 min-h-[44px] rounded-lg text-xs font-medium bg-green-500/20 hover:bg-green-500/30 text-green-400 border border-green-500/40 transition-colors"
         >
           Approve {approvableTasks.length}
         </button>
@@ -70,7 +70,7 @@ export function BulkActionBar({
             confirmLabel: `Cancel ${cancellableTasks.length}`,
             onConfirm: () => handleBulkCancel(cancellableTasks.map(t => t.id)),
           })}
-          className="px-3 py-1.5 rounded-lg text-xs font-medium bg-red-500/20 hover:bg-red-500/30 text-red-400 border border-red-500/40 transition-colors"
+          className="px-3 py-1.5 min-h-[44px] rounded-lg text-xs font-medium bg-red-500/20 hover:bg-red-500/30 text-red-400 border border-red-500/40 transition-colors"
         >
           Cancel {cancellableTasks.length}
         </button>
@@ -87,7 +87,7 @@ export function BulkActionBar({
               setConfirmDialog(null);
             },
           })}
-          className="px-3 py-1.5 rounded-lg text-xs font-medium bg-amber-500/20 hover:bg-amber-500/30 text-amber-400 border border-amber-500/40 transition-colors"
+          className="px-3 py-1.5 min-h-[44px] rounded-lg text-xs font-medium bg-amber-500/20 hover:bg-amber-500/30 text-amber-400 border border-amber-500/40 transition-colors"
         >
           Retry {failedTasks.length}
         </button>
@@ -103,16 +103,15 @@ export function BulkActionBar({
               toggleSelectionMode();
             },
           })}
-          className="px-3 py-1.5 rounded-lg text-xs font-medium bg-neutral-700 hover:bg-neutral-600 text-neutral-300 border border-neutral-600 transition-colors"
+          className="px-3 py-1.5 min-h-[44px] rounded-lg text-xs font-medium bg-neutral-700 hover:bg-neutral-600 text-neutral-300 border border-neutral-600 transition-colors"
         >
           Archive {terminalTasks.length}
         </button>
       )}
-      {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
       <button
         onClick={toggleSelectionMode}
         title="Exit selection mode"
-        className="ml-1 p-1.5 rounded-lg text-neutral-400 hover:text-neutral-200 hover:bg-neutral-700 transition-colors"
+        className="ml-1 min-h-[44px] min-w-[44px] flex items-center justify-center rounded-lg text-neutral-400 hover:text-neutral-200 hover:bg-neutral-700 transition-colors"
       >
         <X className="w-3.5 h-3.5" />
       </button>

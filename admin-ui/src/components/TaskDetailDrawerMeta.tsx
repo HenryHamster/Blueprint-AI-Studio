@@ -20,7 +20,7 @@ function CopyableId({ value }: { value: string }) {
   return (
     <button
       onClick={handleCopy}
-      className="inline-flex items-center gap-1.5 font-mono text-sm text-neutral-200 hover:text-white transition-colors group"
+      className="inline-flex items-center gap-1.5 font-mono text-sm text-neutral-200 hover:text-white transition-colors group min-h-[44px]"
     >
       <span>{value}</span>
       {copied ? (

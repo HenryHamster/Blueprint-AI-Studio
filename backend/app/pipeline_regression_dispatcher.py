@@ -94,6 +94,11 @@ _ANOMALY_DISPATCH_RECENCY_HOURS = 48
 _FIX_LOOP_DIVERGENCE_FINGERPRINT_MIN_TASKS = 3
 _FIX_LOOP_DIVERGENCE_FINGERPRINT_WINDOW_DAYS = 7
 
+# Viewport-regression signal thresholds. Viewport tests run less often than fix-loop
+# cycles, so the minimum failure count is lower. Same 7-day window as fingerprints.
+_VIEWPORT_REGRESSION_MIN_FAILURES = 2
+_VIEWPORT_REGRESSION_WINDOW_DAYS = 7
+
 # SR blind-spot theme occurrence floor. A blind_spot theme must appear at least
 # this many times across the 14d window before it is considered a structural gap
 # in the self-review prompt rather than a one-off observation from a single task.
@@ -1589,6 +1594,80 @@ async def _collect_fix_loop_divergence_fingerprints(
     return sorted(trips, key=lambda item: (-item["count"], item["fingerprint"]))
 
 
+async def _collect_viewport_failures(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> list[dict[str, Any]]:
+    """Collect recent VIEWPORT_REGRESSION task failures grouped by (component, width).
+
+    Calls classify_failure() to filter for viewport-test errors, then extracts
+    the component name (from .viewport.test.tsx file references in the message
+    or task title) and the viewport width (from expectNoOverflowAt/expectMinTouchTargetAt
+    error strings). Falls back to "unknown" / "0" when extraction fails.
+    """
+    import re
+    from app.failure_classification import VIEWPORT_REGRESSION, classify_failure
+    from app.models import Task as TaskModel
+
+    now = _utcnow()
+    cutoff = now - timedelta(days=_VIEWPORT_REGRESSION_WINDOW_DAYS)
+    rows = (
+        (
+            await session.execute(
+                select(TaskModel)
+                .where(
+                    TaskModel.project_id == project_id,
+                    TaskModel.status == TaskStatus.FAILED,
+                    TaskModel.updated_at >= cutoff,
+                )
+                .order_by(TaskModel.updated_at.desc())
+                .limit(200)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    _width_re = re.compile(
+        r"expect(?:NoOverflow|MinTouchTarget)At\((\d+)\)", re.IGNORECASE
+    )
+    _component_re = re.compile(r"(\w+)\.viewport\.test\.tsx", re.IGNORECASE)
+
+    grouped: dict[tuple[str, str], dict[str, Any]] = {}
+    for task in rows:
+        if classify_failure(task) != VIEWPORT_REGRESSION:
+            continue
+        msg = task.latest_status_message or ""
+        combined = msg + " " + (task.title or "")
+
+        width_m = _width_re.search(msg)
+        width = width_m.group(1) if width_m else "0"
+
+        comp_m = _component_re.search(combined)
+        component = comp_m.group(1) if comp_m else "unknown"
+
+        key = (component, width)
+        item = grouped.setdefault(key, {"tasks": set(), "samples": []})
+        item["tasks"].add(str(task.id))
+        if msg and len(item["samples"]) < 2:
+            item["samples"].append(msg[:240])
+
+    trips: list[dict[str, Any]] = []
+    for (component, width), item in grouped.items():
+        count = len(item["tasks"])
+        if count < _VIEWPORT_REGRESSION_MIN_FAILURES:
+            continue
+        trips.append(
+            {
+                "component": component,
+                "width": width,
+                "count": count,
+                "samples": item["samples"],
+            }
+        )
+    return sorted(trips, key=lambda x: (-x["count"], x["component"], x["width"]))
+
+
 # ---------------------------------------------------------------------------
 # Cross-layer regression detection
 # ---------------------------------------------------------------------------
@@ -1629,6 +1708,8 @@ def _derive_observation_for_layer_classify(
         stage = "lint"
     elif regression_class.startswith("background_service_crash"):
         stage = "provision"
+    elif regression_class.startswith("viewport_regression:"):
+        stage = "baseline"
     elif signal_name in ("sr_catch_rate", "sr_blind_spot", "sr_false_positive"):
         stage = "review"
     elif signal_name == "pipeline_success_rate":
@@ -3164,6 +3245,51 @@ async def _evaluate_fix_loop_divergence_fingerprint_signal(
     return spawned
 
 
+async def _evaluate_viewport_regression_signal(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    spawn_budget_left: int,
+) -> int:
+    """Trip viewport_regression:<Component>@<width> when ≥2 viewport-test failures recur."""
+    if spawn_budget_left <= 0:
+        return 0
+    trips = await _collect_viewport_failures(session, project_id)
+    spawned = 0
+    for trip in trips:
+        if spawned >= spawn_budget_left:
+            break
+        component = trip["component"]
+        width = trip["width"]
+        regression_class = f"viewport_regression:{component}@{width}"
+        prompt = _format_signal_lines(
+            signal_name="viewport_regression",
+            regression_class=regression_class,
+            prior_rate=None,
+            current_rate=None,
+            sample_size=trip["count"],
+            extras=[
+                f"Component: {component}",
+                f"Viewport width: {width}px",
+                *[f"Sample failure: {s}" for s in trip["samples"]],
+            ],
+        )
+        spawn = await _maybe_spawn(
+            session,
+            project_id,
+            signal_name="viewport_regression",
+            regression_class=regression_class,
+            prior_rate=None,
+            current_rate=None,
+            sample_size=trip["count"],
+            magnitude=float(trip["count"]),
+            title_hint=f"viewport regression: {component} at {width}px"[:80],
+            prompt_override=prompt,
+        )
+        if spawn is not None:
+            spawned += 1
+    return spawned
+
+
 async def _evaluate_pipeline_success_signal(
     session: AsyncSession,
     project_id: uuid.UUID,
@@ -4456,6 +4582,8 @@ async def _any_signal_would_trip(
         return True
     if await _probe_strategic_stall_any_trip(session, project_id):
         return True
+    if await _collect_viewport_failures(session, project_id):
+        return True
     return False
 
 
@@ -4903,6 +5031,11 @@ async def run_once(session: AsyncSession, project_id: uuid.UUID) -> int:
             session,
             project_id,
             project.design_doc,
+            spawn_budget - _spawned,
+        )
+        _spawned += await _evaluate_viewport_regression_signal(
+            session,
+            project_id,
             spawn_budget - _spawned,
         )
 

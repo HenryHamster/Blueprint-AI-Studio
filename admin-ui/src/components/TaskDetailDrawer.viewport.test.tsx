@@ -3,7 +3,7 @@ import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { TaskDetailDrawer } from './TaskDetailDrawer';
 import type { Task } from '../types/task';
-import { expectNoOverflowAt } from '../test/viewport';
+import { expectNoOverflowAt, expectMinTouchTargetAt } from '../test/viewport';
 
 // Stub firebase before any module that transitively imports it.
 // Browser-mode vitest validates ESM exports statically, so the mock must
@@ -74,7 +74,7 @@ describe('TaskDetailDrawer — viewport regression', () => {
   });
 
   test('header buttons meet 44px touch target at 375px', async () => {
-    await expectNoOverflowAt(375, async () => {
+    await expectMinTouchTargetAt(375, async () => {
       host = document.createElement('div');
       document.body.appendChild(host);
       const r = createRoot(host);
@@ -94,12 +94,29 @@ describe('TaskDetailDrawer — viewport regression', () => {
           />,
         );
       });
-      const buttons = document.querySelectorAll('[title="Fullscreen (f)"], [title*="Exit fullscreen"]') as NodeListOf<HTMLElement>;
-      buttons.forEach(btn => {
-        const rect = btn.getBoundingClientRect();
-        if (rect.height < 44 || rect.width < 44) {
-          throw new Error(`Header button ${btn.title} too small: ${rect.width}x${rect.height}px (need >=44px)`);
-        }
+    }, { selector: '[title="Fullscreen (f)"], [title*="Exit fullscreen"]' });
+  });
+
+  test('all drawer buttons meet 44px touch target at 375px', async () => {
+    await expectMinTouchTargetAt(375, async () => {
+      host = document.createElement('div');
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <TaskDetailDrawer
+            task={makeTask()}
+            logLines={[]}
+            onClose={() => {}}
+            onApprove={() => {}}
+            onRequestChanges={() => {}}
+            onCancel={() => {}}
+            onRetry={() => {}}
+            onEditPrompt={() => {}}
+            onDismiss={() => {}}
+          />,
+        );
       });
     });
   });

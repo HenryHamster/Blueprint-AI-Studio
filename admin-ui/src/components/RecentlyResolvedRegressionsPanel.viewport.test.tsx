@@ -2,7 +2,7 @@ import { afterEach, describe, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { RecentlyResolvedRegressionsPanel } from './RecentlyResolvedRegressionsPanel';
-import { expectNoOverflowAt } from '../test/viewport';
+import { expectNoOverflowAt, expectMinTouchTargetAt } from '../test/viewport';
 
 // Mock '../api' so apiFetch returns controlled payloads (mirrors the pattern
 // in RecentlyResolvedRegressionsPanel.test.tsx). Routes by URL suffix.
@@ -102,6 +102,24 @@ describe('RecentlyResolvedRegressionsPanel — viewport regression', () => {
       });
       await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
     });
+  });
+
+  test('interactive buttons meet 44px touch target at 375px', async () => {
+    const { apiFetch } = await import('../api');
+    (apiFetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      new Response(JSON.stringify({ cases: populatedCases }), { status: 200 }),
+    );
+    await expectMinTouchTargetAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(<RecentlyResolvedRegressionsPanel projectId="proj-1" />);
+      });
+      await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+    }, { waitMs: 50 });
   });
 
   test('layer-defense-density section renders without horizontal overflow at 375px', async () => {

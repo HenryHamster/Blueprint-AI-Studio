@@ -16,6 +16,30 @@ type ComplianceWithRecurrence = CrossLayerComplianceResponse & {
   recurrence_by_bucket?: Record<string, RecurrenceEntry>;
 };
 
+const CLASS_PREFIX_CHIPS: Record<string, string> = {
+  viewport_regression: 'bg-violet-900/60 text-violet-300 border-violet-700/50',
+  fix_loop_divergence: 'bg-amber-900/60 text-amber-300 border-amber-700/50',
+  sr_false_positive: 'bg-rose-900/60 text-rose-300 border-rose-700/50',
+  sr_catch_rate: 'bg-sky-900/60 text-sky-300 border-sky-700/50',
+};
+
+function RegressionClassLabel({ cls }: { cls: string }) {
+  const colon = cls.indexOf(':');
+  if (colon === -1) return <span className="font-mono text-emerald-300">{cls}</span>;
+  const prefix = cls.slice(0, colon);
+  const subkey = cls.slice(colon + 1);
+  const chipCls = CLASS_PREFIX_CHIPS[prefix];
+  if (!chipCls) return <span className="font-mono text-emerald-300">{cls}</span>;
+  return (
+    <span className="inline-flex items-center gap-1 min-w-0">
+      <span className={`inline-block text-[9px] font-semibold px-1 py-px rounded border ${chipCls} shrink-0`}>
+        {prefix.replace(/_/g, ' ')}
+      </span>
+      <span className="font-mono text-emerald-300 truncate">{subkey}</span>
+    </span>
+  );
+}
+
 const BUCKET_LABEL: Record<string, string> = {
   compliant: 'compliant',
   doc_test_only: 'no-canonical',
@@ -223,7 +247,7 @@ export function RecentlyResolvedRegressionsPanel({ projectId }: Props) {
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-2 flex-wrap">
                     <CheckCircle className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
-                    <span className="text-[10px] text-emerald-300 font-mono break-all">{c.regression_class}</span>
+                    <span className="text-[10px] break-all min-w-0"><RegressionClassLabel cls={c.regression_class} /></span>
                     {c.fix_pr_number != null && (
                       <span className="text-[10px] text-neutral-400">
                         PR #{c.fix_pr_number}

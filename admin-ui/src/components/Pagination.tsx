@@ -15,7 +15,7 @@ export function Pagination({ page, onPageChange, taskCount, serverTaskCount, lim
   const isLastPage = (page - 1) * limit + serverTaskCount >= totalTasks;
 
   return (
-    <div className="flex items-center justify-between px-6 py-2 border-t border-neutral-800 shrink-0">
+    <div className="flex flex-col md:flex-row md:items-center md:justify-between px-6 py-2 border-t border-neutral-800 shrink-0 gap-3 md:gap-0">
       <div className="flex items-center gap-3 text-xs text-neutral-500">
         <span>
           {taskCount > 0
@@ -43,14 +43,14 @@ export function Pagination({ page, onPageChange, taskCount, serverTaskCount, lim
           <button
             onClick={() => onPageChange(Math.max(1, page - 1))}
             disabled={page === 1}
-            className="px-3 py-1 text-xs font-medium rounded-md bg-neutral-800 text-neutral-300 hover:bg-neutral-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+            className="px-3 py-1.5 min-h-11 text-xs font-medium rounded-md bg-neutral-800 text-neutral-300 hover:bg-neutral-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center"
           >
             Previous
           </button>
           <button
             onClick={() => onPageChange(page + 1)}
             disabled={isLastPage}
-            className="px-3 py-1 text-xs font-medium rounded-md bg-neutral-800 text-neutral-300 hover:bg-neutral-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+            className="px-3 py-1.5 min-h-11 text-xs font-medium rounded-md bg-neutral-800 text-neutral-300 hover:bg-neutral-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center"
           >
             Next
           </button>

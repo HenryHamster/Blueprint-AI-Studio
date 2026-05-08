@@ -215,7 +215,7 @@ export function TaskDetailDrawer({
         <div className="flex items-center border-b border-neutral-800 shrink-0">
           <button
             onClick={() => setActiveTab('details')}
-            className={`px-4 py-2.5 text-sm font-medium transition-colors ${
+            className={`px-4 py-2.5 min-h-[44px] text-sm font-medium transition-colors ${
               activeTab === 'details'
                 ? 'text-neutral-100 border-b-2 border-blue-500'
                 : 'text-neutral-500 hover:text-neutral-300'
@@ -225,7 +225,7 @@ export function TaskDetailDrawer({
           </button>
           <button
             onClick={() => setActiveTab('logs')}
-            className={`px-4 py-2.5 text-sm font-medium transition-colors ${
+            className={`px-4 py-2.5 min-h-[44px] text-sm font-medium transition-colors ${
               activeTab === 'logs'
                 ? 'text-neutral-100 border-b-2 border-blue-500'
                 : 'text-neutral-500 hover:text-neutral-300'
@@ -361,7 +361,7 @@ export function TaskDetailDrawer({
             {showCancel && !confirmCancel && (
               <button
                 onClick={() => setConfirmCancel(true)}
-                className="px-4 py-2 rounded-lg bg-red-600/20 hover:bg-red-600/30 text-red-400 text-sm font-medium transition-colors border border-red-600/30"
+                className="px-4 py-2 min-h-[44px] rounded-lg bg-red-600/20 hover:bg-red-600/30 text-red-400 text-sm font-medium transition-colors border border-red-600/30"
               >
                 Cancel Task
               </button>

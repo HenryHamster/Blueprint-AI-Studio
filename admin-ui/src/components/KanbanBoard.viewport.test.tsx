@@ -3,7 +3,7 @@ import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { KanbanBoard, type KanbanColumn } from './KanbanBoard';
 import type { Task } from '../types/task';
-import { expectNoOverflowAt } from '../test/viewport';
+import { expectNoOverflowAt, expectMinTouchTargetAt } from '../test/viewport';
 
 vi.mock('../api', () => ({
   apiFetch: vi.fn(async () => new Response('{}', { status: 200 })),
@@ -121,13 +121,17 @@ describe('KanbanBoard — viewport regression', () => {
     });
   });
 
-  test('action toolbar buttons are touch-accessible (44px) at 375px mobile width', async () => {
+  test('action toolbar buttons meet 44px touch target at 375px mobile width', async () => {
     const tasks = [
       makeTask({ id: 't1', status: 'FAILED', requires_approval: false }),
       makeTask({ id: 't2', status: 'QUEUED', requires_approval: true }),
+      makeTask({ id: 't3', status: 'COMPLETED', title: 'feat: completed task alpha' }),
+      makeTask({ id: 't4', status: 'IN_PROGRESS', title: 'feat: in-progress task beta' }),
+      makeTask({ id: 't5', status: 'EVALUATING', title: 'feat: evaluating task gamma' }),
+      makeTask({ id: 't6', status: 'FAILED', title: 'fix: second failed task delta' }),
     ];
 
-    await expectNoOverflowAt(375, async () => {
+    await expectMinTouchTargetAt(375, async () => {
       host = document.createElement('div');
       document.body.appendChild(host);
       const r = createRoot(host);

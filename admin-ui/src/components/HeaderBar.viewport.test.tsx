@@ -2,7 +2,7 @@ import { afterEach, describe, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { HeaderBar } from './HeaderBar';
-import { expectNoOverflowAt } from '../test/viewport';
+import { expectNoOverflowAt, expectMinTouchTargetAt } from '../test/viewport';
 import type { UserLaunchableTaskType } from '../taskCapabilities';
 
 vi.mock('../api', () => ({
@@ -225,6 +225,23 @@ describe('HeaderBar — viewport regression', () => {
       root = r;
       await act(async () => { r.render(<HeaderBar {...makeProps()} />); });
       // Click the mobile menu hamburger button to open the dropdown
+      const hamburger = host.querySelector<HTMLButtonElement>('button[title="More options"]');
+      if (hamburger) {
+        await act(async () => { hamburger.click(); });
+      }
+    });
+  });
+
+  test('mobile menu buttons meet 44px touch target at 375px', async () => {
+    await expectMinTouchTargetAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      host.style.minHeight = '600px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => { r.render(<HeaderBar {...makeProps()} />); });
+      // Open the mobile menu to expose its buttons
       const hamburger = host.querySelector<HTMLButtonElement>('button[title="More options"]');
       if (hamburger) {
         await act(async () => { hamburger.click(); });

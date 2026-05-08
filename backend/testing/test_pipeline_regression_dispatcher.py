@@ -9399,3 +9399,202 @@ def test_compute_unclassified_fix_coverage_excludes_pre_classification_entries()
     coverage = compute_unclassified_fix_coverage([case])
     assert coverage["total_qualifying_entries"] == 2
     assert coverage["entries_with_empty_layers"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Viewport regression evaluator tests
+# ---------------------------------------------------------------------------
+
+
+def _make_viewport_task(
+    project_id,
+    *,
+    status_message: str,
+    title: str = "Test Task",
+    updated_at_offset_hours: int = 1,
+) -> "Task":
+    """Create a FAILED Task whose status_message triggers VIEWPORT_REGRESSION classification."""
+    now = _utcnow()
+    task = make_task(
+        project_id=project_id,
+        status=TaskStatus.FAILED,
+        title=title,
+        created_at=now - timedelta(hours=updated_at_offset_hours),
+        updated_at=now - timedelta(hours=updated_at_offset_hours),
+    )
+    task.latest_status_message = status_message
+    return task
+
+
+class TestViewportRegressionEvaluator:
+    """Tests for _collect_viewport_failures + _evaluate_viewport_regression_signal."""
+
+    @pytest.mark.asyncio
+    async def test_viewport_failure_trips_and_spawns(self, db_session):
+        """Two FAILED tasks with viewport errors on same component+width spawn a case."""
+        from app.models import RegressionRemediationCase
+        from app.pipeline_regression_dispatcher import (
+            _VIEWPORT_REGRESSION_MIN_FAILURES,
+            _collect_viewport_failures,
+            _evaluate_viewport_regression_signal,
+        )
+
+        assert _VIEWPORT_REGRESSION_MIN_FAILURES >= 2, "threshold sanity"
+
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        msg = (
+            "expectNoOverflowAt(375): 2 element(s) overflow at width=375px:\n"
+            "  <div> right=400px (limit 376px)\n"
+            "Found in MessagesPanel.viewport.test.tsx"
+        )
+        for _ in range(_VIEWPORT_REGRESSION_MIN_FAILURES):
+            db_session.add(_make_viewport_task(project.id, status_message=msg))
+        await db_session.commit()
+
+        trips = await _collect_viewport_failures(db_session, project.id)
+        assert len(trips) == 1
+        assert trips[0]["component"] == "MessagesPanel"
+        assert trips[0]["width"] == "375"
+        assert trips[0]["count"] >= _VIEWPORT_REGRESSION_MIN_FAILURES
+
+        spawned = await _evaluate_viewport_regression_signal(
+            db_session, project.id, spawn_budget_left=2
+        )
+        assert spawned == 1
+        await db_session.commit()
+
+        cases = (
+            (
+                await db_session.execute(
+                    select(RegressionRemediationCase).where(
+                        RegressionRemediationCase.project_id == project.id,
+                        RegressionRemediationCase.regression_class
+                        == "viewport_regression:MessagesPanel@375",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(cases) == 1
+
+    @pytest.mark.asyncio
+    async def test_below_threshold_does_not_spawn(self, db_session):
+        """A single viewport failure (below min) does not spawn."""
+        from app.pipeline_regression_dispatcher import (
+            _VIEWPORT_REGRESSION_MIN_FAILURES,
+            _collect_viewport_failures,
+        )
+
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        msg = (
+            "expectMinTouchTargetAt(375): 1 element(s) below 44px touch target\n"
+            "Found in AlertsBanner.viewport.test.tsx"
+        )
+        # Add one fewer than the minimum
+        for _ in range(_VIEWPORT_REGRESSION_MIN_FAILURES - 1):
+            db_session.add(_make_viewport_task(project.id, status_message=msg))
+        await db_session.commit()
+
+        trips = await _collect_viewport_failures(db_session, project.id)
+        assert len(trips) == 0
+
+    @pytest.mark.asyncio
+    async def test_unknown_component_fallback(self, db_session):
+        """When the file reference is absent, component falls back to 'unknown'."""
+        from app.pipeline_regression_dispatcher import (
+            _VIEWPORT_REGRESSION_MIN_FAILURES,
+            _collect_viewport_failures,
+        )
+
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        msg = "expectNoOverflowAt(375): document.documentElement.scrollWidth=400px > 376px"
+        for _ in range(_VIEWPORT_REGRESSION_MIN_FAILURES):
+            db_session.add(_make_viewport_task(project.id, status_message=msg))
+        await db_session.commit()
+
+        trips = await _collect_viewport_failures(db_session, project.id)
+        assert len(trips) == 1
+        assert trips[0]["component"] == "unknown"
+        assert trips[0]["width"] == "375"
+
+    @pytest.mark.asyncio
+    async def test_unknown_width_fallback(self, db_session):
+        """When width cannot be extracted, width falls back to '0'."""
+        from app.pipeline_regression_dispatcher import (
+            _VIEWPORT_REGRESSION_MIN_FAILURES,
+            _collect_viewport_failures,
+        )
+
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        msg = (
+            "expectnooverflowat( ): some viewport overflow detected\n"
+            "Found in TaskDetailDrawerMeta.viewport.test.tsx"
+        )
+        for _ in range(_VIEWPORT_REGRESSION_MIN_FAILURES):
+            db_session.add(_make_viewport_task(project.id, status_message=msg))
+        await db_session.commit()
+
+        trips = await _collect_viewport_failures(db_session, project.id)
+        assert len(trips) == 1
+        assert trips[0]["component"] == "TaskDetailDrawerMeta"
+        assert trips[0]["width"] == "0"
+
+    @pytest.mark.asyncio
+    async def test_dedup_same_component_width_updates_not_duplicates(self, db_session):
+        """A second run_once with the same viewport failure class updates the case, not duplicates."""
+        from app.models import RegressionRemediationCase
+        from app.pipeline_regression_dispatcher import run_once
+
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        msg = (
+            "expectNoOverflowAt(375): 1 element(s) overflow\n"
+            "Found in SearchFilterBar.viewport.test.tsx"
+        )
+        for _ in range(2):
+            db_session.add(_make_viewport_task(project.id, status_message=msg))
+        await db_session.commit()
+
+        first = await run_once(db_session, project.id)
+        assert first == 1
+        await db_session.commit()
+
+        # Second run: in-flight case should block re-spawn
+        second = await run_once(db_session, project.id)
+        assert second == 0
+
+        cases = (
+            (
+                await db_session.execute(
+                    select(RegressionRemediationCase).where(
+                        RegressionRemediationCase.project_id == project.id,
+                        RegressionRemediationCase.regression_class.like(
+                            "viewport_regression:%"
+                        ),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(cases) == 1

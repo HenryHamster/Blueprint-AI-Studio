@@ -3,7 +3,7 @@ import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { BulkActionBar } from './BulkActionBar';
 import type { Task } from '../types/task';
-import { expectNoOverflowAt } from '../test/viewport';
+import { expectNoOverflowAt, expectMinTouchTargetAt } from '../test/viewport';
 
 const createSampleTask = (id: string, status: string, title: string): Task => ({
   id,
@@ -98,6 +98,47 @@ describe('BulkActionBar — viewport regression', () => {
             cancellableTasks={[]}
             failedTasks={[]}
             terminalTasks={[]}
+            setConfirmDialog={() => {}}
+            handleBulkAction={() => {}}
+            handleBulkCancel={() => {}}
+            handleBulkArchiveColumn={() => {}}
+            toggleSelectionMode={() => {}}
+          />,
+        );
+      });
+    });
+  });
+
+  test('action buttons meet 44px touch target at 375px', async () => {
+    const approvableTasks = [
+      createSampleTask('task-1', 'EVALUATING', 'feat: add mobile-responsive layout'),
+      createSampleTask('task-2', 'EVALUATING', 'fix: resolve authentication timeout issue'),
+    ];
+    const cancellableTasks = [
+      createSampleTask('task-3', 'IN_PROGRESS', 'refactor: simplify component state management'),
+    ];
+    const failedTasks = [
+      createSampleTask('task-4', 'FAILED', 'test: add comprehensive integration tests'),
+    ];
+    const terminalTasks = [
+      createSampleTask('task-5', 'COMPLETED', 'chore: update dependencies to latest versions'),
+    ];
+
+    await expectMinTouchTargetAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+
+      await act(async () => {
+        r.render(
+          <BulkActionBar
+            selectedCount={approvableTasks.length + cancellableTasks.length + failedTasks.length + terminalTasks.length}
+            approvableTasks={approvableTasks}
+            cancellableTasks={cancellableTasks}
+            failedTasks={failedTasks}
+            terminalTasks={terminalTasks}
             setConfirmDialog={() => {}}
             handleBulkAction={() => {}}
             handleBulkCancel={() => {}}

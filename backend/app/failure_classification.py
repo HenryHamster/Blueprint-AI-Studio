@@ -137,6 +137,20 @@ BLOCKED_PRECONDITION = "BLOCKED_PRECONDITION"
 # separately from crash/OOM regressions. Lowercase to match the literal string
 # the reaper writes into failure_category context.
 AGENT_STALLED = "agent_stalled"
+# Viewport rendering regression — npm run test:viewport reported overflow or
+# touch-target violations (expectNoOverflowAt / expectMinTouchTargetAt).
+# Distinct from CODE_ERROR so the regression dispatcher and operator panels can
+# track mobile-rendering regressions separately from unit-test or build breaks.
+VIEWPORT_REGRESSION = "VIEWPORT_REGRESSION"
+
+
+# Substrings emitted by expectNoOverflowAt() / expectMinTouchTargetAt() in
+# admin-ui/src/test/viewport.ts. Kept narrow so only true viewport-suite
+# failures get this class rather than any test mentioning "viewport".
+_VIEWPORT_PATTERNS: tuple[str, ...] = (
+    "expectnooverflowat(",
+    "expectmintouchtargetat(",
+)
 
 
 # Substrings that uniquely identify migration-related failures. Kept narrow so
@@ -197,6 +211,7 @@ ALL_FAILURE_CLASSES: tuple[str, ...] = (
     EXTERNAL_API,
     PROVISION_FAILURE,
     MIGRATION_ERROR,
+    VIEWPORT_REGRESSION,
     AGENT_TIMEOUT,
     AGENT_STALLED,
     SCOPE_OVERFLOW,
@@ -495,6 +510,7 @@ _PROVISION_PHRASE_RE = re.compile(
 _SEVERITY: dict[str, int] = {
     MIGRATION_ERROR: 3,
     CODE_ERROR: 3,
+    VIEWPORT_REGRESSION: 3,
     AGENT_TIMEOUT: 2,
     AGENT_STALLED: 2,
     PROVISION_FAILURE: 1,
@@ -1342,15 +1358,18 @@ def _classify_failure_class(task: "Task", logs: str | None = None) -> str:
         agent_lower = agent_label.lower()
         if agent_lower in _AGENT_CATEGORY_TO_CLASS:
             mapped = _AGENT_CATEGORY_TO_CLASS[agent_lower]
-            if mapped == CODE_ERROR and agent_lower in _GENERIC_AGENT_CODE_LABELS:
+            if mapped == CODE_ERROR:
                 combined = (
                     (task.latest_status_message or "").lower()
                     + " "
                     + (logs or "").lower()
                 )
-                override = _text_provider_failure_override(task, combined)
-                if override:
-                    return override
+                if agent_lower in _GENERIC_AGENT_CODE_LABELS:
+                    override = _text_provider_failure_override(task, combined)
+                    if override:
+                        return override
+                if any(kw in combined for kw in _VIEWPORT_PATTERNS):
+                    return VIEWPORT_REGRESSION
             return mapped
         if agent_category in INFRA_CLASSES or agent_category == CODE_ERROR:
             return agent_category
@@ -1617,6 +1636,11 @@ def _classify_failure_class(task: "Task", logs: str | None = None) -> str:
     # "Superseded by fix on PR #N: ...". Same family as "cancelled:" above.
     if "superseded" in combined:
         return AGENT_TIMEOUT
+
+    # Viewport rendering regression — must be checked before the generic CODE_ERROR
+    # fallthrough so it doesn't dissolve into residual fingerprints.
+    if any(kw in combined for kw in _VIEWPORT_PATTERNS):
+        return VIEWPORT_REGRESSION
 
     # Default: code error — record fingerprint for residual-pattern analysis.
     # Pass `logs` so the fingerprint keys on the actual error signature

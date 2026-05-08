@@ -125,7 +125,7 @@ export function NewTaskModal({
             <GitBranch className="w-4 h-4 text-neutral-400" />
             Launch Claude Code Task
           </h2>
-          <button onClick={onClose} className="text-neutral-500 hover:text-neutral-300 transition-colors">
+          <button onClick={onClose} className="min-h-[44px] min-w-[44px] flex items-center justify-center -mr-2 text-neutral-500 hover:text-neutral-300 transition-colors">
             <X className="w-4 h-4" />
           </button>
         </div>
@@ -138,7 +138,7 @@ export function NewTaskModal({
                   <button
                     type="button"
                     onClick={() => { setUseManualRepo(m => !m); if (!useManualRepo) { setNewTaskRepo(''); setBranchOptions([]); } }}
-                    className="text-xs text-neutral-500 hover:text-neutral-300 transition-colors"
+                    className="min-h-[44px] sm:min-h-0 flex items-center text-xs text-neutral-500 hover:text-neutral-300 transition-colors"
                   >
                     {useManualRepo ? 'Use dropdown' : 'Type manually'}
                   </button>
@@ -181,7 +181,7 @@ export function NewTaskModal({
                   <button
                     type="button"
                     onClick={() => setUseManualBranch(m => !m)}
-                    className="text-xs text-neutral-500 hover:text-neutral-300 transition-colors"
+                    className="min-h-[44px] sm:min-h-0 flex items-center text-xs text-neutral-500 hover:text-neutral-300 transition-colors"
                   >
                     {useManualBranch ? 'Use dropdown' : 'Type manually'}
                   </button>
@@ -225,7 +225,7 @@ export function NewTaskModal({
                     key={opt.value}
                     type="button"
                     onClick={() => handleTaskTypeChange(opt.value)}
-                    className={`min-w-0 flex items-center gap-2 px-3 py-2 rounded-lg border text-xs font-medium transition-all ${
+                    className={`min-w-0 min-h-[44px] sm:min-h-0 flex items-center gap-2 px-3 py-2 rounded-lg border text-xs font-medium transition-all ${
                       newTaskType === opt.value
                         ? 'bg-white/5 border-neutral-600 text-neutral-100'
                         : 'bg-neutral-950 border-neutral-800 text-neutral-500 hover:border-neutral-700'
@@ -298,7 +298,7 @@ export function NewTaskModal({
             <button
               type="button"
               onClick={() => setAdvancedOpen(o => !o)}
-              className="flex items-center gap-1 text-[11px] font-semibold text-neutral-500 hover:text-neutral-300 uppercase tracking-wider transition-colors"
+              className="min-h-[44px] sm:min-h-0 flex items-center gap-1 text-[11px] font-semibold text-neutral-500 hover:text-neutral-300 uppercase tracking-wider transition-colors"
             >
               <ChevronDown className={`w-3 h-3 transition-transform ${advancedOpen ? 'rotate-180' : ''}`} />
               Advanced

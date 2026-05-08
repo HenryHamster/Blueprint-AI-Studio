@@ -2,7 +2,7 @@ import { afterEach, describe, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { NewProjectModal } from './NewProjectModal';
-import { expectNoOverflowAt } from '../test/viewport';
+import { expectNoOverflowAt, expectMinTouchTargetAt } from '../test/viewport';
 
 vi.mock('../api', () => ({
   apiFetch: vi.fn(async (url: string) => {
@@ -134,6 +134,27 @@ describe('NewProjectModal — viewport regression', () => {
           await new Promise<void>((resolve) => setTimeout(resolve, 50));
         });
       }
+    });
+  });
+
+  test('primary action buttons meet 44px touch target at 375px', async () => {
+    await expectMinTouchTargetAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <NewProjectModal
+            onClose={() => {}}
+            onSuccess={() => {}}
+          />,
+        );
+      });
+      await act(async () => {
+        await new Promise<void>((resolve) => setTimeout(resolve, 100));
+      });
     });
   });
 

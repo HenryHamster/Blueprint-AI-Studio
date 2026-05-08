@@ -930,7 +930,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
 
           <button
             onClick={(e) => { e.stopPropagation(); onViewLogs(task); }}
-            className="flex items-center gap-1 text-neutral-400 hover:text-neutral-200 transition-colors"
+            className="flex items-center justify-center gap-1 min-h-11 min-w-11 text-neutral-400 hover:text-neutral-200 transition-colors"
             title="View details"
           >
             <Terminal className="w-3 h-3" />
@@ -940,16 +940,15 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
 
       {task.requires_approval && !['FAILED', 'CANCELLED'].includes(task.status) ? (
         <div className={`flex flex-col gap-2 ${compact ? 'mt-2' : 'mt-4'}`}>
-          <button onClick={() => onApprove(task.id)} disabled={!!actionLoading} className={`w-full bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-400 border border-emerald-500/30 rounded-md font-semibold transition-colors flex items-center justify-center gap-2 ${compact ? 'py-1.5 text-xs' : 'py-2.5 text-sm'} ${actionLoading && actionLoading !== 'approve' ? 'opacity-50 pointer-events-none' : ''} ${actionLoading ? 'cursor-not-allowed' : ''}`}>
+          <button onClick={() => onApprove(task.id)} disabled={!!actionLoading} className={`w-full bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-400 border border-emerald-500/30 rounded-md font-semibold transition-colors flex items-center justify-center gap-2 min-h-[44px] ${compact ? 'py-1.5 text-xs' : 'py-2.5 text-sm'} ${actionLoading && actionLoading !== 'approve' ? 'opacity-50 pointer-events-none' : ''} ${actionLoading ? 'cursor-not-allowed' : ''}`}>
             {actionLoading === 'approve' ? <Activity className={compact ? 'w-3.5 h-3.5 animate-spin' : 'w-4 h-4 animate-spin'} /> : <CheckCircle className={compact ? 'w-3.5 h-3.5' : 'w-4 h-4'} />} Approve & Merge
           </button>
           {!showChangesForm ? (
             <div className="flex gap-2">
-              {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
-              <button onClick={() => setShowChangesForm(true)} className="flex-1 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 border border-neutral-700 py-2 rounded-md text-xs font-medium transition-colors flex items-center justify-center gap-1.5">
+              <button onClick={() => setShowChangesForm(true)} className="flex-1 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 border border-neutral-700 py-2 min-h-[44px] rounded-md text-xs font-medium transition-colors flex items-center justify-center gap-1.5">
                 <RotateCcw className="w-3.5 h-3.5" /> Request Changes
               </button>
-              <button onClick={() => handleDestructiveClick('cancel', () => onCancel(task.id))} disabled={!!actionLoading} className={`px-3 py-2 rounded-md text-xs font-medium transition-all duration-300 flex items-center justify-center gap-1 border ${confirmAction === 'cancel' ? 'bg-amber-500/20 text-amber-400 border-amber-500/40' : 'bg-neutral-800/50 hover:bg-neutral-700 text-neutral-500 border-neutral-700'}`}>
+              <button onClick={() => handleDestructiveClick('cancel', () => onCancel(task.id))} disabled={!!actionLoading} className={`px-3 py-2 min-h-[44px] rounded-md text-xs font-medium transition-all duration-300 flex items-center justify-center gap-1 border ${confirmAction === 'cancel' ? 'bg-amber-500/20 text-amber-400 border-amber-500/40' : 'bg-neutral-800/50 hover:bg-neutral-700 text-neutral-500 border-neutral-700'}`}>
                 {confirmAction === 'cancel' ? `Confirm (${confirmCountdown}s)` : 'Reject'}
               </button>
             </div>

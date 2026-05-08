@@ -7407,6 +7407,51 @@ async def get_pipeline_regressions(
             }
         )
 
+    # Viewport-regression cases — active RegressionRemediationCase rows whose
+    # regression_class starts with "viewport_regression:". Sourced from the durable
+    # table written by the pipeline_regression_dispatcher; no design_doc flags needed.
+    viewport_cutoff = now - timedelta(days=30)
+    viewport_rows = (
+        (
+            await session.execute(
+                select(RegressionRemediationCase)
+                .where(
+                    RegressionRemediationCase.project_id == project_id,
+                    RegressionRemediationCase.regression_class.like(
+                        "viewport_regression:%"
+                    ),
+                    RegressionRemediationCase.status.in_(
+                        [
+                            RegressionCaseStatus.ACTIVE,
+                            RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION,
+                        ]
+                    ),
+                    RegressionRemediationCase.first_seen_at >= viewport_cutoff,
+                )
+                .order_by(RegressionRemediationCase.first_seen_at.desc())
+                .limit(10)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for case in viewport_rows:
+        subkey = case.regression_class.split(":", 1)[-1]
+        regressions.append(
+            {
+                "signal_name": f"Viewport regression: {subkey}",
+                "regression_class": case.regression_class,
+                "detected_at": case.first_seen_at.isoformat()
+                if case.first_seen_at
+                else None,
+                "severity": "warning",
+                "current_rate": None,
+                "prior_rate": None,
+                "resolved": False,
+                "resolved_at": None,
+            }
+        )
+
     # Enrich each regression with the status of any spawned investigation task.
     # Includes both pipeline_regression_dispatcher tasks (SR/fix-loop classes) and
     # crash_investigation tasks spawned by lifecycle._spawn_crash_investigations.

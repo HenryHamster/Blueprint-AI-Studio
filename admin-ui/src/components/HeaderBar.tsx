@@ -598,28 +598,28 @@ export function HeaderBar(props: HeaderBarProps) {
             <div className="absolute right-0 top-full mt-2 w-56 bg-neutral-900 border border-neutral-700 rounded-lg shadow-2xl p-2 z-50">
               <button
                 onClick={() => { onSetViewMode('home'); setShowMobileMenu(false); }}
-                className={`w-full flex items-center gap-3 px-3 py-2.5 rounded text-sm transition-colors text-left ${viewMode === 'home' ? 'text-cyan-400 bg-cyan-500/10' : 'text-neutral-300 hover:bg-neutral-800'}`}
+                className={`w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left ${viewMode === 'home' ? 'text-cyan-400 bg-cyan-500/10' : 'text-neutral-300 hover:bg-neutral-800'}`}
               >
                 <LayoutDashboard className="w-4 h-4 shrink-0" />
                 <span>Dashboard</span>
               </button>
               <button
                 onClick={() => { onSetViewMode('kanban'); setShowMobileMenu(false); }}
-                className={`w-full flex items-center gap-3 px-3 py-2.5 rounded text-sm transition-colors text-left ${viewMode === 'kanban' ? 'text-cyan-400 bg-cyan-500/10' : 'text-neutral-300 hover:bg-neutral-800'}`}
+                className={`w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left ${viewMode === 'kanban' ? 'text-cyan-400 bg-cyan-500/10' : 'text-neutral-300 hover:bg-neutral-800'}`}
               >
                 <LayoutGrid className="w-4 h-4 shrink-0" />
                 <span>Kanban view</span>
               </button>
               <button
                 onClick={() => { onSetViewMode('pipeline'); setShowMobileMenu(false); }}
-                className={`w-full flex items-center gap-3 px-3 py-2.5 rounded text-sm transition-colors text-left ${viewMode === 'pipeline' ? 'text-cyan-400 bg-cyan-500/10' : 'text-neutral-300 hover:bg-neutral-800'}`}
+                className={`w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left ${viewMode === 'pipeline' ? 'text-cyan-400 bg-cyan-500/10' : 'text-neutral-300 hover:bg-neutral-800'}`}
               >
                 <Network className="w-4 h-4 shrink-0" />
                 <span>Pipeline view</span>
               </button>
               <button
                 onClick={() => { onToggleResearchBrowser(); setShowMobileMenu(false); }}
-                className={`w-full flex items-center gap-3 px-3 py-2.5 rounded text-sm transition-colors text-left ${showResearchBrowser ? 'text-cyan-400 bg-cyan-500/10' : 'text-neutral-300 hover:bg-neutral-800'}`}
+                className={`w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left ${showResearchBrowser ? 'text-cyan-400 bg-cyan-500/10' : 'text-neutral-300 hover:bg-neutral-800'}`}
               >
                 <Microscope className="w-4 h-4 shrink-0" />
                 <span>Research Browser</span>
@@ -631,7 +631,7 @@ export function HeaderBar(props: HeaderBarProps) {
               </button>
               <button
                 onClick={() => { onToggleArchive(); setShowMobileMenu(false); }}
-                className={`w-full flex items-center gap-3 px-3 py-2.5 rounded text-sm transition-colors text-left ${showArchive ? 'text-cyan-400 bg-cyan-500/10' : 'text-neutral-300 hover:bg-neutral-800'}`}
+                className={`w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left ${showArchive ? 'text-cyan-400 bg-cyan-500/10' : 'text-neutral-300 hover:bg-neutral-800'}`}
               >
                 <Archive className="w-4 h-4 shrink-0" />
                 <span>Archive</span>
@@ -639,7 +639,7 @@ export function HeaderBar(props: HeaderBarProps) {
               {/* Pipeline Diagnostics & Activity Feed removed */}
               <button
                 onClick={() => { onToggleMessages(); setShowMobileMenu(false); }}
-                className={`w-full flex items-center gap-3 px-3 py-2.5 rounded text-sm transition-colors text-left ${showMessages ? 'text-cyan-400 bg-cyan-500/10' : 'text-neutral-300 hover:bg-neutral-800'}`}
+                className={`w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left ${showMessages ? 'text-cyan-400 bg-cyan-500/10' : 'text-neutral-300 hover:bg-neutral-800'}`}
               >
                 <MessageSquare className="w-4 h-4 shrink-0" />
                 <span>Messages</span>
@@ -651,14 +651,14 @@ export function HeaderBar(props: HeaderBarProps) {
               </button>
               <button
                 onClick={() => { onShowDirections(); setShowMobileMenu(false); }}
-                className="w-full flex items-center gap-3 px-3 py-2.5 rounded text-sm transition-colors text-left text-neutral-300 hover:bg-neutral-800"
+                className="w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left text-neutral-300 hover:bg-neutral-800"
               >
                 <Compass className="w-4 h-4 shrink-0" />
                 <span>Directions</span>
               </button>
               <button
                 onClick={() => setShowMobileShortcuts(prev => !prev)}
-                className="w-full flex items-center gap-3 px-3 py-2.5 rounded text-sm transition-colors text-left text-neutral-300 hover:bg-neutral-800"
+                className="w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left text-neutral-300 hover:bg-neutral-800"
               >
                 <span className="w-4 h-4 flex items-center justify-center font-mono shrink-0">?</span>
                 <span>Keyboard Shortcuts</span>
@@ -693,7 +693,7 @@ export function HeaderBar(props: HeaderBarProps) {
               )}
               <button
                 onClick={() => { onToggleSettings(); setShowMobileMenu(false); }}
-                className="w-full flex items-center gap-3 px-3 py-2.5 rounded text-sm transition-colors text-left text-neutral-300 hover:bg-neutral-800"
+                className="w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left text-neutral-300 hover:bg-neutral-800"
               >
                 <Settings className="w-4 h-4 shrink-0" />
                 <span>Settings</span>

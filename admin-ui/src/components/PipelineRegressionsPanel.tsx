@@ -7,6 +7,40 @@ import { timeAgo, parseTimestamp, formatTimeToDetect, formatTimeToInvestigate } 
 import { LayersAffectedBadges, type LayerSummary } from './LayersAffectedBadges';
 import { PhaseChip } from './regressionPhaseChips';
 
+/** Prefix-to-chip color mapping for recognized composite regression classes. */
+const CLASS_PREFIX_CHIPS: Record<string, string> = {
+  viewport_regression: 'bg-violet-900/60 text-violet-300 border-violet-700/50',
+  fix_loop_divergence: 'bg-amber-900/60 text-amber-300 border-amber-700/50',
+  sr_false_positive: 'bg-rose-900/60 text-rose-300 border-rose-700/50',
+  sr_catch_rate: 'bg-sky-900/60 text-sky-300 border-sky-700/50',
+};
+
+/**
+ * Format a regression_class string for display. For recognized composite
+ * classes (prefix:subkey), renders a colored chip + subkey identifier.
+ * All other classes render as raw monospace text (unchanged behavior).
+ */
+function RegressionClassLabel({ cls }: { cls: string }) {
+  const colon = cls.indexOf(':');
+  if (colon === -1) {
+    return <span className="font-mono text-neutral-300">{cls}</span>;
+  }
+  const prefix = cls.slice(0, colon);
+  const subkey = cls.slice(colon + 1);
+  const chipCls = CLASS_PREFIX_CHIPS[prefix];
+  if (!chipCls) {
+    return <span className="font-mono text-neutral-300">{cls}</span>;
+  }
+  return (
+    <span className="inline-flex items-center gap-1 min-w-0">
+      <span className={`inline-block text-[9px] font-semibold px-1 py-px rounded border ${chipCls} shrink-0`}>
+        {prefix.replace(/_/g, ' ')}
+      </span>
+      <span className="font-mono text-neutral-300 truncate">{subkey}</span>
+    </span>
+  );
+}
+
 interface DispatcherCycleClass {
   regression_class: string;
   last_spawn_at: string | null;
@@ -63,7 +97,7 @@ export function DispatcherHealthPanel({ projectId }: Props) {
             <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg divide-y divide-neutral-800/50 overflow-hidden">
               {data.classes.map((c) => (
                 <div key={c.regression_class} className="px-3 py-1.5 flex flex-wrap items-center gap-x-3 gap-y-0.5">
-                  <span className="text-[10px] font-mono text-neutral-300 min-w-0 flex-1 truncate">{c.regression_class}</span>
+                  <span className="text-[10px] min-w-0 flex-1 overflow-hidden"><RegressionClassLabel cls={c.regression_class} /></span>
                   {c.last_spawn_at && (
                     <span className="text-[10px] text-neutral-500">spawn {timeAgo(c.last_spawn_at)}</span>
                   )}
@@ -134,7 +168,7 @@ export function ClassKpisPanel({ projectId, filterClass, onClassSelect }: Props)
                   onClick={() => onClassSelect?.(active ? null : row.regression_class)}
                   className={`transition-colors ${onClassSelect ? 'cursor-pointer' : ''} ${active ? 'bg-blue-950/30' : onClassSelect ? 'hover:bg-neutral-800/30' : ''}`}
                 >
-                  <td className="px-3 py-1.5 font-mono text-neutral-300 max-w-[160px] truncate">{row.regression_class}</td>
+                  <td className="px-3 py-1.5 max-w-[160px] overflow-hidden"><RegressionClassLabel cls={row.regression_class} /></td>
                   <td className="px-2 py-1.5 text-right text-white">{row.cases_opened}</td>
                   <td className="px-2 py-1.5 text-right text-emerald-400">{row.cases_closed}</td>
                   <td className="px-2 py-1.5 text-right text-neutral-400">{formatMttd(row.mean_time_to_detect_seconds)}</td>
@@ -389,8 +423,8 @@ export function ManualInterventionPanel({ projectId, filterClass }: Props) {
                     <span className="text-xs text-red-300 font-medium capitalize">
                       {c.signal_name}
                     </span>
-                    <span className="text-[10px] text-neutral-500 font-mono break-all min-w-0">
-                      {c.regression_class}
+                    <span className="text-[10px] break-all min-w-0">
+                      <RegressionClassLabel cls={c.regression_class} />
                     </span>
                     <span className="text-[10px] px-1.5 py-0.5 rounded bg-red-500/10 text-red-400 border border-red-500/20">
                       {c.attempts} attempt{c.attempts !== 1 ? 's' : ''}
@@ -476,11 +510,10 @@ export function ManualInterventionPanel({ projectId, filterClass }: Props) {
                     })()}
                   </div>
                 </div>
-                {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                 <button
                   onClick={() => handleClear(c.regression_class)}
                   disabled={clearing === c.regression_class}
-                  className="shrink-0 flex items-center gap-1.5 text-[10px] px-2 py-1 rounded border border-neutral-700 text-neutral-300 hover:text-white hover:border-neutral-500 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                  className="shrink-0 flex items-center gap-1.5 text-[10px] px-2 py-1 min-h-11 rounded border border-neutral-700 text-neutral-300 hover:text-white hover:border-neutral-500 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                   title="Clear manual intervention and re-arm autonomous remediation"
                 >
                   <RotateCcw className={`w-3 h-3 ${clearing === c.regression_class ? 'animate-spin' : ''}`} />
@@ -769,7 +802,7 @@ function MttaClassCard({ row }: { row: MttaClassRow }) {
   return (
     <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2 space-y-1.5">
       <div className="flex items-center gap-2 flex-wrap">
-        <span className="text-[10px] font-mono text-neutral-300 flex-1 min-w-0 truncate">{row.regression_class}</span>
+        <span className="text-[10px] flex-1 min-w-0 overflow-hidden"><RegressionClassLabel cls={row.regression_class} /></span>
         <span className="text-[10px] text-neutral-500">{row.sample_count} cases</span>
         {totalP50 > 0 && (
           <span className="text-[10px] text-neutral-400" title="Estimated p50 end-to-end auto-fix time">
@@ -930,7 +963,7 @@ export function AutoRecoveredPanel({ projectId }: Props) {
                   <span className="text-xs text-emerald-300 font-medium capitalize">
                     {c.signal_name}
                   </span>
-                  <span className="text-[10px] text-neutral-500 font-mono">{c.regression_class}</span>
+                  <span className="text-[10px] text-neutral-500"><RegressionClassLabel cls={c.regression_class} /></span>
                   <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
                     {c.attempts} attempt{c.attempts !== 1 ? 's' : ''}
                   </span>

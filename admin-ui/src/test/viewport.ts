@@ -1,5 +1,14 @@
 import { page } from 'vitest/browser';
 
+// Extract the *.viewport.test.tsx filename from the call stack so failures
+// embed the component reference that the backend regression classifier needs
+// (pattern: `(\w+)\.viewport\.test\.tsx`).
+function _callerTestFile(): string {
+  const stack = new Error().stack ?? '';
+  const m = stack.match(/(\w+\.viewport\.test\.tsx)/i);
+  return m ? m[1] : '';
+}
+
 /**
  * Options for `expectNoOverflowAt`.
  *
@@ -38,6 +47,7 @@ export async function expectNoOverflowAt(
   render: () => Promise<void> | void,
   options?: ExpectNoOverflowOptions,
 ): Promise<void> {
+  const callerFile = _callerTestFile();
   const tolerance = options?.tolerance ?? 1;
   const height = options?.height ?? 800;
   const waitMs = options?.waitMs ?? 0;
@@ -59,8 +69,9 @@ export async function expectNoOverflowAt(
   const docScrollWidth = document.documentElement.scrollWidth;
 
   if (docScrollWidth > limit) {
+    const fileTag = callerFile ? ` [${callerFile}]` : '';
     throw new Error(
-      `expectNoOverflowAt(${width}): document.documentElement.scrollWidth=${docScrollWidth}px > ${limit}px`,
+      `expectNoOverflowAt(${width})${fileTag}: document.documentElement.scrollWidth=${docScrollWidth}px > ${limit}px`,
     );
   }
 
@@ -87,8 +98,9 @@ export async function expectNoOverflowAt(
       .map((e) => `  <${e.tag}> right=${e.right}px (limit ${limit}px) — ${e.html}`)
       .join('\n');
     const more = overflowing.length > 5 ? `\n  ... and ${overflowing.length - 5} more` : '';
+    const fileTag = callerFile ? ` [${callerFile}]` : '';
     throw new Error(
-      `expectNoOverflowAt(${width}): ${overflowing.length} element(s) overflow at width=${width}px:\n${lines}${more}`,
+      `expectNoOverflowAt(${width})${fileTag}: ${overflowing.length} element(s) overflow at width=${width}px:\n${lines}${more}`,
     );
   }
 }
@@ -123,6 +135,7 @@ export async function expectMinTouchTargetAt(
   render: () => Promise<void> | void,
   options?: ExpectMinTouchTargetOptions,
 ): Promise<void> {
+  const callerFile = _callerTestFile();
   const selector = options?.selector ?? 'button';
   const minSize = options?.minSize ?? 44;
   const height = options?.height ?? 800;
@@ -163,8 +176,9 @@ export async function expectMinTouchTargetAt(
       .map((e) => `  <${e.tag}> ${e.width}×${e.height}px (min ${minSize}×${minSize}px) — ${e.html}`)
       .join('\n');
     const more = undersized.length > 5 ? `\n  ... and ${undersized.length - 5} more` : '';
+    const fileTag = callerFile ? ` [${callerFile}]` : '';
     throw new Error(
-      `expectMinTouchTargetAt(${width}): ${undersized.length} element(s) below ${minSize}px touch target:\n${lines}${more}`,
+      `expectMinTouchTargetAt(${width})${fileTag}: ${undersized.length} element(s) below ${minSize}px touch target:\n${lines}${more}`,
     );
   }
 }

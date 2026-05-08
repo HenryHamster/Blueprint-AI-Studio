@@ -1735,6 +1735,30 @@ export function isViewportBootstrapFailure(msg: string): boolean {
   return VIEWPORT_BOOTSTRAP_PATTERNS.some(re => re.test(msg));
 }
 
+/** Find screenshot files captured on viewport test failures. Returns relative paths within the cwd. */
+function findViewportScreenshots(cwd: string): string[] {
+  const screenshotDir = `${cwd}/.vitest`;
+  if (!fs.existsSync(screenshotDir)) return [];
+  const screenshots: string[] = [];
+  const walkDir = (dir: string, baseDir: string) => {
+    try {
+      const files = fs.readdirSync(dir);
+      for (const file of files) {
+        const fullPath = `${dir}/${file}`;
+        if (fs.statSync(fullPath).isDirectory()) {
+          walkDir(fullPath, baseDir);
+        } else if (file.endsWith('.png')) {
+          screenshots.push(fullPath.slice(baseDir.length + 1));
+        }
+      }
+    } catch {
+      // Ignore errors reading directories
+    }
+  };
+  walkDir(screenshotDir, cwd);
+  return screenshots;
+}
+
 /** Run `npm run test:viewport` locally; on a bootstrap failure retry inside the
  *  Playwright Docker image where all native deps are baked in. Real assertion
  *  failures (non-bootstrap errors) propagate immediately without Docker retry. */
@@ -1828,11 +1852,15 @@ export function runProjectLintChecks(changedPaths: string[], ws: WebSocket | nul
       sendHeartbeatSync(taskId, 'npm run test:viewport (admin-ui)...');
       runViewportSuiteWithFallback(`${WORKSPACE}/admin-ui`, adminUiEnv, FRONTEND_BUILD_TIMEOUT);
     } catch (err: unknown) {
+      const screenshotPaths = findViewportScreenshots(`${WORKSPACE}/admin-ui`);
+      const screenshotGuidance = screenshotPaths.length > 0
+        ? `\nViewport test screenshots:\n${screenshotPaths.map(p => `  admin-ui/${p}`).join('\n')}`
+        : '';
       if (err instanceof Error) {
-        err.message += viewportFailureGuidance;
+        err.message += viewportFailureGuidance + screenshotGuidance;
         throw err;
       }
-      throw new Error(`${String(err)}${viewportFailureGuidance}`);
+      throw new Error(`${String(err)}${viewportFailureGuidance}${screenshotGuidance}`);
     }
     sendHeartbeatSync(taskId, 'npm run build (admin-ui)...');
     execFileSync('npm', ['run', 'build'], { cwd: `${WORKSPACE}/admin-ui`, encoding: 'utf-8', timeout: FRONTEND_BUILD_TIMEOUT, env: adminUiEnv });

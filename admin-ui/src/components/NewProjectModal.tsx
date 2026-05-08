@@ -230,7 +230,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
             <Plus className="w-4 h-4 text-neutral-400" />
             {setupProject ? 'Project Setup' : 'New Project'}
           </h2>
-          <button onClick={onClose} className="text-neutral-500 hover:text-neutral-300 transition-colors">
+          <button onClick={onClose} className="min-h-[44px] min-w-[44px] flex items-center justify-center -mr-2 text-neutral-500 hover:text-neutral-300 transition-colors">
             <X className="w-4 h-4" />
           </button>
         </div>
@@ -300,7 +300,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
                               setRepoInput(r.full_name);
                               setRepoError('');
                             }}
-                            className={`w-full flex items-center justify-between px-3 py-2 text-left hover:bg-neutral-800 transition-colors border-b border-neutral-800/50 last:border-b-0 ${
+                            className={`w-full flex items-center justify-between px-3 py-2 min-h-[44px] text-left hover:bg-neutral-800 transition-colors border-b border-neutral-800/50 last:border-b-0 ${
                               repoInput === r.full_name ? 'bg-neutral-800' : ''
                             }`}
                           >
@@ -322,7 +322,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
                     <button
                       type="button"
                       onClick={() => { setUseManualRepo(true); setRepoInput(''); setRepoFilter(''); }}
-                      className="text-[10px] text-neutral-500 hover:text-neutral-300 underline transition-colors"
+                      className="min-h-[44px] flex items-center text-[10px] text-neutral-500 hover:text-neutral-300 underline transition-colors"
                     >
                       Enter manually
                     </button>
@@ -347,7 +347,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
                       <button
                         type="button"
                         onClick={() => { setUseManualRepo(false); setRepoInput(''); }}
-                        className="text-[10px] text-neutral-500 hover:text-neutral-300 underline transition-colors mt-1 block"
+                        className="min-h-[44px] flex items-center text-[10px] text-neutral-500 hover:text-neutral-300 underline transition-colors"
                       >
                         Pick from list
                       </button>
@@ -382,7 +382,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
                 <button
                   type="button"
                   onClick={onClose}
-                  className="px-4 py-1.5 text-xs text-neutral-400 font-medium hover:bg-neutral-800 rounded transition-colors"
+                  className="px-4 py-1.5 min-h-[44px] sm:min-h-0 text-xs text-neutral-400 font-medium hover:bg-neutral-800 rounded transition-colors"
                 >
                   Cancel
                 </button>
@@ -390,7 +390,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
                   type="button"
                   onClick={handleRepoNext}
                   disabled={!repoInput.trim()}
-                  className="px-4 py-1.5 bg-white text-neutral-950 text-xs font-semibold hover:bg-neutral-200 rounded transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                  className="px-4 py-1.5 min-h-[44px] sm:min-h-0 bg-white text-neutral-950 text-xs font-semibold hover:bg-neutral-200 rounded transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
                 >
                   Continue
                 </button>
@@ -430,7 +430,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
                   type="button"
                   onClick={() => setStep('repo')}
                   disabled={step === 'submitting'}
-                  className="px-4 py-1.5 text-xs text-neutral-400 font-medium hover:bg-neutral-800 rounded transition-colors disabled:opacity-40"
+                  className="px-4 py-1.5 min-h-[44px] sm:min-h-0 text-xs text-neutral-400 font-medium hover:bg-neutral-800 rounded transition-colors disabled:opacity-40"
                 >
                   Back
                 </button>
@@ -439,7 +439,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
                     type="button"
                     onClick={onClose}
                     disabled={step === 'submitting'}
-                    className="px-4 py-1.5 text-xs text-neutral-400 font-medium hover:bg-neutral-800 rounded transition-colors disabled:opacity-40"
+                    className="px-4 py-1.5 min-h-[44px] sm:min-h-0 text-xs text-neutral-400 font-medium hover:bg-neutral-800 rounded transition-colors disabled:opacity-40"
                   >
                     Cancel
                   </button>
@@ -447,7 +447,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
                     type="button"
                     onClick={handleCreate}
                     disabled={step === 'submitting'}
-                    className="px-4 py-1.5 bg-white text-neutral-950 text-xs font-semibold hover:bg-neutral-200 rounded transition-colors disabled:opacity-60 disabled:cursor-not-allowed flex items-center gap-1.5"
+                    className="px-4 py-1.5 min-h-[44px] sm:min-h-0 bg-white text-neutral-950 text-xs font-semibold hover:bg-neutral-200 rounded transition-colors disabled:opacity-60 disabled:cursor-not-allowed flex items-center gap-1.5"
                   >
                     {step === 'submitting' && (
                       <Loader2 className="animate-spin" style={{ width: 14, height: 14 }} />
@@ -627,7 +627,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
                 <button
                   type="button"
                   onClick={onClose}
-                  className="px-4 py-1.5 bg-white text-neutral-950 text-xs font-semibold hover:bg-neutral-200 rounded transition-colors"
+                  className="px-4 py-1.5 min-h-[44px] sm:min-h-0 bg-white text-neutral-950 text-xs font-semibold hover:bg-neutral-200 rounded transition-colors"
                 >
                   Done
                 </button>
