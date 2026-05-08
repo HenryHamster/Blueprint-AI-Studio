@@ -680,3 +680,138 @@ describe('SrScopeDriftVsExpansionCard', () => {
     expect(rateEl.className).toContain('text-emerald-400');
   });
 });
+
+describe('SrTrendBreakdown below_floor from backend', () => {
+  it('uses backend below_floor field instead of deriving from rate_history', () => {
+    const trends: SrTrendData = {
+      categories: {
+        correctness: {
+          current_hit_rate: 0.45,
+          previous_hit_rate: 0.5,
+          trend: 'decreasing',
+          rate_history: [0.45],  // only 1 window — not enough to trigger isBelowFloor logic (needs 2+)
+          below_floor: true,      // but backend says it's below floor
+        },
+      },
+    };
+    render(<SrTrendBreakdown trends={trends} variant="card" />);
+    const alertSpan = screen.getByLabelText(/below floor/i);
+    expect(alertSpan).toBeInTheDocument();
+  });
+
+  it('falls back to local derivation when backend below_floor is absent', () => {
+    const trends: SrTrendData = {
+      categories: {
+        correctness: {
+          current_hit_rate: 0.4,
+          trend: 'decreasing',
+          rate_history: [0.4, 0.45],  // 2 windows below 50% floor
+          // no below_floor field — should derive locally
+        },
+      },
+    };
+    render(<SrTrendBreakdown trends={trends} variant="card" />);
+    const alertSpan = screen.getByLabelText(/below floor/i);
+    expect(alertSpan).toBeInTheDocument();
+  });
+
+  it('does not show below-floor icon when backend sets below_floor: false despite history suggesting it', () => {
+    const trends: SrTrendData = {
+      categories: {
+        correctness: {
+          current_hit_rate: 0.4,
+          trend: 'decreasing',
+          rate_history: [0.4, 0.45],  // would trigger isBelowFloor
+          below_floor: false,           // but backend says no
+        },
+      },
+    };
+    render(<SrTrendBreakdown trends={trends} variant="card" />);
+    expect(screen.queryByLabelText(/below floor/i)).not.toBeInTheDocument();
+  });
+});
+
+describe('SrTrendBreakdown reasoning engagement', () => {
+  it('displays reasoning engagement for regressing (decreasing) category', () => {
+    const trends: SrTrendData = {
+      categories: {
+        correctness: {
+          miss_rate: 0.3,
+          trend: 'decreasing',
+          reasoning_engagement_rate: 0.4,
+          reasoning_engagement_with: 4,
+          reasoning_engagement_total: 10,
+        },
+      },
+    };
+    render(<SrTrendBreakdown trends={trends} variant="card" />);
+    const engEl = screen.getByTitle(/Reasoning engagement/i);
+    expect(engEl).toHaveTextContent('eng:40%');
+  });
+
+  it('shows high engagement (80%) for regressing category with strong reasoning', () => {
+    const trends: SrTrendData = {
+      categories: {
+        type_safety: {
+          miss_rate: 0.15,
+          trend: 'decreasing',
+          reasoning_engagement_rate: 0.8,
+          reasoning_engagement_with: 8,
+          reasoning_engagement_total: 10,
+        },
+      },
+    };
+    render(<SrTrendBreakdown trends={trends} variant="card" />);
+    const engEl = screen.getByTitle(/Reasoning engagement/i);
+    expect(engEl).toHaveTextContent('eng:80%');
+  });
+
+  it('does not show engagement for stable category even if engagement data is present', () => {
+    const trends: SrTrendData = {
+      categories: {
+        correctness: {
+          miss_rate: 0.2,
+          trend: 'stable',
+          reasoning_engagement_rate: 0.7,
+          reasoning_engagement_with: 7,
+          reasoning_engagement_total: 10,
+        },
+      },
+    };
+    render(<SrTrendBreakdown trends={trends} variant="card" />);
+    expect(screen.queryByTitle(/Reasoning engagement/i)).not.toBeInTheDocument();
+  });
+
+  it('does not show engagement for increasing category', () => {
+    const trends: SrTrendData = {
+      categories: {
+        correctness: {
+          miss_rate: 0.1,
+          trend: 'increasing',
+          reasoning_engagement_rate: 0.9,
+          reasoning_engagement_with: 9,
+          reasoning_engagement_total: 10,
+        },
+      },
+    };
+    render(<SrTrendBreakdown trends={trends} variant="card" />);
+    expect(screen.queryByTitle(/Reasoning engagement/i)).not.toBeInTheDocument();
+  });
+
+  it('displays engagement in inline variant for regressing category', () => {
+    const trends: SrTrendData = {
+      categories: {
+        correctness: {
+          miss_rate: 0.25,
+          trend: 'decreasing',
+          reasoning_engagement_rate: 0.5,
+          reasoning_engagement_with: 5,
+          reasoning_engagement_total: 10,
+        },
+      },
+    };
+    render(<SrTrendBreakdown trends={trends} variant="inline" />);
+    const engEl = screen.getByTitle(/Reasoning engagement/i);
+    expect(engEl).toHaveTextContent('eng:50%');
+  });
+});

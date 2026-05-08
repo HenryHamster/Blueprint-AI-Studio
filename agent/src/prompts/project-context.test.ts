@@ -1,5 +1,10 @@
 import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 import { formatProjectContext, formatSrCatchRateForSrPrompt } from './project-context.js';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
 describe('formatProjectContext — Self-Review False-Positive Calibration', () => {
   it('renders the FP calibration block when a category exceeds the FP threshold and has adequate sample size', () => {
@@ -147,6 +152,68 @@ describe('formatProjectContext — Self-Review False-Positive Calibration', () =
     expect(result).not.toContain('**cat-0**');
     expect(result).not.toContain('**cat-1**');
     expect(result).not.toContain('**cat-2**');
+  });
+});
+
+describe('formatProjectContext — SR Recent Miss Examples', () => {
+  it('renders section from sr_recent_miss_examples (backend contract)', () => {
+    // Shape mirrors what backend/app/routers/agent.py emits as
+    // response["project_context"]["sr_recent_miss_examples"].
+    const ctx = {
+      sr_recent_miss_examples: {
+        security: [{ severity: 'CRITICAL', desc: 'SQL injection via user input' }],
+        correctness: [{ severity: 'HIGH', desc: 'missed null check' }],
+      },
+    };
+    const result = formatProjectContext(ctx, 'create');
+    expect(result).toContain('## Concrete misses from the last cycle');
+    expect(result).toContain('**security:**');
+    expect(result).toContain('[CRITICAL] SQL injection via user input');
+    expect(result).toContain('**correctness:**');
+    expect(result).toContain('[HIGH] missed null check');
+  });
+
+  it('omits the section when sr_recent_miss_examples is absent or has no examples', () => {
+    expect(formatProjectContext({}, 'create')).not.toContain('Concrete misses from the last cycle');
+    expect(formatProjectContext({ sr_recent_miss_examples: {} }, 'create')).not.toContain(
+      'Concrete misses from the last cycle',
+    );
+    expect(
+      formatProjectContext({ sr_recent_miss_examples: { correctness: [] } }, 'create'),
+    ).not.toContain('Concrete misses from the last cycle');
+  });
+
+  it('renders the canonical contract fixture (cross-language contract with backend)', () => {
+    // Loads the same fixture that backend/testing/test_agent.py asserts the claim
+    // endpoint produces. If either side drifts from this shape, both tests must update.
+    const fixturePath = join(__dirname, '__fixtures__', 'sr_recent_miss_examples_contract.json');
+    const fixture = JSON.parse(readFileSync(fixturePath, 'utf8')) as {
+      sr_recent_miss_examples: Record<string, Array<{ severity: string; desc: string }>>;
+    };
+    const ctx = { sr_recent_miss_examples: fixture.sr_recent_miss_examples };
+    const result = formatProjectContext(ctx, 'create');
+    expect(result).toContain('## Concrete misses from the last cycle');
+    expect(result).toContain('**correctness:**');
+    expect(result).toContain('[CRITICAL] Off-by-one in loop boundary check');
+    expect(result).toContain('**security:**');
+    expect(result).toContain('[MAJOR] User input passed directly to SQL query');
+  });
+
+  it('does NOT render from the legacy sr_catch_rate_trends shape (no key/shape collision)', () => {
+    // Guards against contract regression — the trends doc shape must not be misread as miss examples.
+    const ctx = {
+      sr_catch_rate_trends: {
+        categories: {
+          security: {
+            miss_rate: 0.9,
+            examples: [{ severity: 'CRITICAL', desc: 'should not render' }],
+          },
+        },
+      },
+    };
+    const result = formatProjectContext(ctx, 'create');
+    expect(result).not.toContain('Concrete misses from the last cycle');
+    expect(result).not.toContain('should not render');
   });
 });
 

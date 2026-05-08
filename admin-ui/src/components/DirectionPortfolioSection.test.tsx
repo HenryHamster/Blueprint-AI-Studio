@@ -163,6 +163,47 @@ describe('DirectionPortfolioSection', () => {
     expect(apiFetchMock).toHaveBeenCalledWith('/api/admin/projects/proj-1/direction-sr-breakdown');
   });
 
+  it('renders trend arrow and delta when direction-sr-breakdown includes trend data', async () => {
+    apiFetchMock.mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve({
+        directions: [{
+          direction_id: 'dir-1',
+          sample_size: 12,
+          overall_catch_rate: 0.65,
+          worst_category: null,
+          categories: {},
+          trend: 'increasing',
+          previous_miss_rate: 0.25,
+          rate_history: [0.85, 0.75, 0.65],
+        }],
+      }),
+    });
+
+    await act(async () => {
+      render(
+        <DirectionPortfolioSection
+          directions={[makeDirection({ direction_id: 'dir-1' })]}
+          loading={false}
+          productPct={null}
+          totalDirPRs={2}
+          hasAttribution={false}
+          totalAutonomousPRs={null}
+          totalAssistedPRs={null}
+          selfSufficientCount={1}
+          projectId="proj-1"
+        />,
+      );
+    });
+
+    expect(screen.getByText(/SR: 65% catch/)).toBeInTheDocument();
+    // Backend trend = 'increasing' means miss-rate went UP (0.25 → 0.35), i.e. catch-rate DOWN (75% → 65%) — a regression.
+    // UI must render red ↓ with negative pp delta (65% - 75% = -10pp).
+    const trendEl = screen.getByText(/↓-10pp/);
+    expect(trendEl).toBeInTheDocument();
+    expect(trendEl).toHaveClass('text-red-400');
+  });
+
   it('does not render SR pill when no project id is provided', () => {
     render(
       <DirectionPortfolioSection

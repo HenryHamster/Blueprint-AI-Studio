@@ -7222,12 +7222,15 @@ async def get_direction_sr_breakdown(
             dir_tasks.setdefault(did, []).append(t)
 
     dir_text: Dict[str, str] = {}
+    stored_by_dir: Dict[str, Any] = {}
     project = await session.get(Project, project_id)
     if project:
         for d in (project.design_doc or {}).get("directions") or []:
             did = str(d.get("id") or d.get("direction_id") or "")
             if did:
                 dir_text[did] = d.get("text") or d.get("description") or ""
+        stored_trends = (project.design_doc or {}).get("sr_catch_rate_trends") or {}
+        stored_by_dir = stored_trends.get("by_direction") or {}
 
     directions_out = []
     for did, tasks in dir_tasks.items():
@@ -7276,6 +7279,7 @@ async def get_direction_sr_breakdown(
             if miss_rate is not None and miss_rate > worst_miss:
                 worst_miss = miss_rate
                 worst_cat = cat
+        stored_dir = stored_by_dir.get(did) or {}
         directions_out.append(
             {
                 "direction_id": did,
@@ -7286,6 +7290,9 @@ async def get_direction_sr_breakdown(
                 else None,
                 "categories": cats_out,
                 "worst_category": worst_cat,
+                "previous_miss_rate": stored_dir.get("previous_miss_rate"),
+                "trend": stored_dir.get("trend", "stable"),
+                "rate_history": stored_dir.get("rate_history") or [],
             }
         )
 

@@ -135,6 +135,58 @@ export function formatExecutionEvidenceForSrPrompt(): string {
   );
 }
 
+// Format concrete recent miss examples for injection into the agent's self-review prompt.
+// Consumes the backend-emitted shape (see backend/app/routers/agent.py
+// `response["project_context"]["sr_recent_miss_examples"]`):
+//   { [category]: [{ severity, desc }, ...], ... }
+// The backend already ranks categories by weighted_miss_rate and caps to top 3
+// categories / 3 examples each / ~1200 chars, so this formatter trusts that ordering
+// and only applies defensive safety caps. Returns '' when no examples are available.
+export function formatSrRecentMissExamplesForSrPrompt(
+  miss: Record<string, Array<{ desc: string; severity: string }>> | null | undefined,
+): string {
+  if (!miss || typeof miss !== 'object') return '';
+
+  const MAX_CATS = 3;
+  const MAX_EXAMPLES_PER_CAT = 3;
+  const MAX_DESC_CHARS = 200;
+  const MAX_TOTAL_CHARS = 1200;
+
+  const catsWithExamples = Object.entries(miss)
+    .filter(([, examples]) => Array.isArray(examples) && examples.length > 0)
+    .slice(0, MAX_CATS);
+
+  if (catsWithExamples.length === 0) return '';
+
+  const sections: string[] = [];
+  let totalChars = 0;
+
+  for (const [cat, examples] of catsWithExamples) {
+    if (totalChars >= MAX_TOTAL_CHARS) break;
+    const rows = examples
+      .slice(0, MAX_EXAMPLES_PER_CAT)
+      .map(ex => {
+        const desc = ex.desc.length > MAX_DESC_CHARS ? ex.desc.slice(0, MAX_DESC_CHARS) + '…' : ex.desc;
+        return `  - [${ex.severity}] ${desc}`;
+      })
+      .join('\n');
+    const section = `**${cat}:**\n${rows}`;
+    if (totalChars + section.length > MAX_TOTAL_CHARS) break;
+    sections.push(section);
+    totalChars += section.length;
+  }
+
+  if (sections.length === 0) return '';
+
+  return (
+    `## Concrete misses from the last cycle\n` +
+    `These are real reviewer findings the self-review missed for this project's worst-performing categories. ` +
+    `Apply heightened scrutiny when you see similar code patterns:\n\n` +
+    sections.join('\n\n') +
+    `\n\n`
+  );
+}
+
 // Format blind-spot themes for injection into the agent's own self-review prompt.
 // Unlike formatProjectBlindSpotSummary (which addresses a reviewer reading the diff),
 // this section is written TO the agent — framing themes as categories it has historically

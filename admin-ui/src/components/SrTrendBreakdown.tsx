@@ -23,6 +23,14 @@ export interface SrCategoryTrend {
   /** True when the SR prompt version changed within the rate_history window — attribution breaks here. */
   prompt_version_changed?: boolean | null;
   examples?: SrMissExample[];
+  /** Backend-computed flag: hit-rate stuck below floor for min_windows cycles. */
+  below_floor?: boolean | null;
+  /** Reasoning engagement: fraction of PASS verdicts with substantial reasoning text. */
+  reasoning_engagement_rate?: number | null;
+  /** Count of PASS verdicts with reasoning. */
+  reasoning_engagement_with?: number | null;
+  /** Total PASS verdicts (denominator for engagement rate). */
+  reasoning_engagement_total?: number | null;
 }
 
 export interface SrTaskTypeCategoryStats {
@@ -684,7 +692,8 @@ function CategoryRow({
   const color = trendColorClass(c.trend);
   const delta = calculateMissRateDelta(c);
   const deltaColor = delta != null ? deltaColorClass(delta) : '';
-  const belowFloor = isBelowFloor(c);
+  // Use backend below_floor if provided; fall back to local derivation for backward compat
+  const belowFloor = c.below_floor != null ? c.below_floor : isBelowFloor(c);
   const examples = c.examples ?? [];
   const hasExamples = examples.length > 0;
   const clickable = !!onCategoryClick;
@@ -749,6 +758,11 @@ function CategoryRow({
         {prec != null && (
           <span className="font-mono tabular-nums text-neutral-500" title="precision: hits / (hits + false-positives)">
             {`prec:${Math.round(prec * 100)}%`}
+          </span>
+        )}
+        {c.trend === 'decreasing' && c.reasoning_engagement_rate != null && (
+          <span className="font-mono tabular-nums text-cyan-500" title={`Reasoning engagement: ${c.reasoning_engagement_with}/${c.reasoning_engagement_total} PASS verdicts with substantial reasoning`}>
+            {`eng:${Math.round(c.reasoning_engagement_rate * 100)}%`}
           </span>
         )}
         <TrendIcon trend={c.trend} />
@@ -834,6 +848,11 @@ function CategoryRow({
       {prec != null && (
         <span className="font-mono text-neutral-500" title="precision: hits / (hits + false-positives)">
           {`prec:${Math.round(prec * 100)}%`}
+        </span>
+      )}
+      {c.trend === 'decreasing' && c.reasoning_engagement_rate != null && (
+        <span className="font-mono text-cyan-500" title={`Reasoning engagement: ${c.reasoning_engagement_with}/${c.reasoning_engagement_total} PASS verdicts with substantial reasoning`}>
+          {`eng:${Math.round(c.reasoning_engagement_rate * 100)}%`}
         </span>
       )}
       <TrendIcon trend={c.trend} />

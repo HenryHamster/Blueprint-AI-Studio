@@ -1,4 +1,6 @@
+import os
 import uuid
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
@@ -17,6 +19,45 @@ from app.models import (
     TaskStatus,
 )
 from app.auth import create_agent_token
+
+
+def _resolve_sr_recent_miss_examples_contract_fixture() -> Path:
+    """Locate the SR-recent-miss-examples contract fixture across local + Docker.
+
+    Search order:
+      1. ``SR_CONTRACT_FIXTURE`` env override (caller-supplied path).
+      2. ``backend/testing/__fixtures__/...`` (always present in the backend
+         Docker build context — the path that works in CI).
+      3. ``agent/src/prompts/__fixtures__/...`` resolved from the host
+         repo root (works in local dev outside Docker).
+
+    The two on-disk copies are kept byte-identical;
+    ``test_claim_sr_recent_miss_examples_fixture_parity`` asserts this when
+    both are reachable. The duplicate exists because the backend image's
+    build context (``./backend``) cannot reach ``agent/``.
+    """
+    candidates: list[Path] = []
+    env_override = os.getenv("SR_CONTRACT_FIXTURE")
+    if env_override:
+        candidates.append(Path(env_override))
+    candidates.append(
+        Path(__file__).parent / "__fixtures__" / "sr_recent_miss_examples_contract.json"
+    )
+    candidates.append(
+        Path(__file__).resolve().parents[2]
+        / "agent"
+        / "src"
+        / "prompts"
+        / "__fixtures__"
+        / "sr_recent_miss_examples_contract.json"
+    )
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    raise AssertionError(
+        "SR contract fixture not found in any candidate path: "
+        + ", ".join(str(c) for c in candidates)
+    )
 
 
 @pytest.mark.smoketest
@@ -8949,3 +8990,291 @@ async def test_claim_omits_self_review_catch_rate_for_direction_when_below_thres
     project_ctx = resp.json().get("project_context", {})
     assert "self_review_catch_rate_for_direction" not in project_ctx
     assert "self_review_catch_rate" in project_ctx
+
+
+@pytest.mark.asyncio
+async def test_claim_injects_sr_recent_miss_examples_for_create_task(
+    client: AsyncClient, db_session
+):
+    """Claim endpoint injects sr_recent_miss_examples from sr_catch_rate_trends.categories[cat].examples."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    design_doc = {
+        "sr_catch_rate_trends": {
+            "categories": {
+                "correctness": {
+                    "miss_rate": 0.40,
+                    "weighted_miss_rate": 0.45,
+                    "examples": [
+                        {
+                            "severity": "CRITICAL",
+                            "desc": "Off-by-one in loop boundary check",
+                        },
+                        {
+                            "severity": "MAJOR",
+                            "desc": "Null pointer not guarded before dereference",
+                        },
+                    ],
+                },
+                "security": {
+                    "miss_rate": 0.30,
+                    "weighted_miss_rate": 0.35,
+                    "examples": [
+                        {
+                            "severity": "MAJOR",
+                            "desc": "User input passed directly to SQL query",
+                        },
+                    ],
+                },
+                "style-conventions": {
+                    "miss_rate": 0.10,
+                    "weighted_miss_rate": 0.05,
+                    # No examples — should be excluded
+                },
+            }
+        }
+    }
+    project = Project(
+        name="SR Miss Examples Test",
+        user_id="test-user-123",
+        design_doc=design_doc,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    flag_modified(project, "design_doc")
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "Add new feature"}],
+        vm_instance_id="agent-vm-miss-ex-1",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-miss-ex-1")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    project_ctx = resp.json().get("project_context", {})
+    assert "sr_recent_miss_examples" in project_ctx, (
+        f"Expected sr_recent_miss_examples in project_context, got: {list(project_ctx.keys())}"
+    )
+    miss_ex = project_ctx["sr_recent_miss_examples"]
+    # correctness and security have examples; style-conventions does not
+    assert "correctness" in miss_ex
+    assert "security" in miss_ex
+    assert "style-conventions" not in miss_ex
+    # correctness ranked higher (weighted_miss_rate 0.45 > 0.35) → appears first
+    assert list(miss_ex.keys())[0] == "correctness"
+    # Examples carry severity and desc fields
+    assert miss_ex["correctness"][0]["severity"] == "CRITICAL"
+    assert "Off-by-one" in miss_ex["correctness"][0]["desc"]
+    assert miss_ex["security"][0]["severity"] == "MAJOR"
+
+
+@pytest.mark.asyncio
+async def test_claim_omits_sr_recent_miss_examples_when_no_examples(
+    client: AsyncClient, db_session
+):
+    """Field is absent when no category has examples populated."""
+    design_doc = {
+        "sr_catch_rate_trends": {
+            "categories": {
+                "correctness": {"miss_rate": 0.40, "weighted_miss_rate": 0.45},
+            }
+        }
+    }
+    project = Project(
+        name="SR Miss Examples Empty",
+        user_id="test-user-123",
+        design_doc=design_doc,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "Something"}],
+        vm_instance_id="agent-vm-miss-ex-2",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-miss-ex-2")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    project_ctx = resp.json().get("project_context", {})
+    assert "sr_recent_miss_examples" not in project_ctx
+
+
+@pytest.mark.asyncio
+async def test_claim_does_not_inject_sr_recent_miss_examples_for_review_task(
+    client: AsyncClient, db_session
+):
+    """Field is NOT injected for review task types."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    design_doc = {
+        "sr_catch_rate_trends": {
+            "categories": {
+                "correctness": {
+                    "miss_rate": 0.40,
+                    "weighted_miss_rate": 0.45,
+                    "examples": [{"severity": "CRITICAL", "desc": "Some issue"}],
+                }
+            }
+        }
+    }
+    project = Project(
+        name="SR Miss Examples Review",
+        user_id="test-user-123",
+        design_doc=design_doc,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    flag_modified(project, "design_doc")
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "review", "pr_number": 42, "branch": "fix/thing"}],
+        vm_instance_id="agent-vm-miss-ex-3",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-miss-ex-3")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    project_ctx = resp.json().get("project_context", {})
+    assert "sr_recent_miss_examples" not in project_ctx
+
+
+@pytest.mark.asyncio
+async def test_claim_sr_recent_miss_examples_matches_typescript_consumer_contract(
+    client: AsyncClient, db_session
+):
+    """Cross-language contract test.
+
+    The claim endpoint must emit response['project_context']['sr_recent_miss_examples']
+    in the exact shape that the TypeScript consumer
+    (agent/src/prompts/project-context.ts -> formatSrRecentMissExamplesForSrPrompt)
+    reads. The canonical shape lives in
+    agent/src/prompts/__fixtures__/sr_recent_miss_examples_contract.json and is
+    consumed by both this test and a parallel test in
+    agent/src/prompts/project-context.test.ts. If you change the producer or the
+    consumer, update the fixture so both sides agree.
+    """
+    import json
+
+    from sqlalchemy.orm.attributes import flag_modified
+
+    fixture_path = _resolve_sr_recent_miss_examples_contract_fixture()
+    fixture = json.loads(fixture_path.read_text())
+    expected_payload = fixture["sr_recent_miss_examples"]
+
+    # Build a design_doc whose sr_catch_rate_trends will, after the backend's
+    # ranking + cap pass, produce exactly the fixture's emitted payload.
+    categories: dict = {}
+    for idx, (cat, examples) in enumerate(expected_payload.items()):
+        # Higher weighted_miss_rate = ranked earlier; preserve fixture insertion order.
+        categories[cat] = {
+            "miss_rate": 0.5,
+            "weighted_miss_rate": 0.9 - (idx * 0.1),
+            "examples": list(examples),
+        }
+    design_doc = {"sr_catch_rate_trends": {"categories": categories}}
+
+    project = Project(
+        name="SR Recent Miss Examples Contract",
+        user_id="test-user-123",
+        design_doc=design_doc,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    flag_modified(project, "design_doc")
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "Add module"}],
+        vm_instance_id="agent-vm-contract-1",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-contract-1")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    project_ctx = resp.json().get("project_context", {})
+    assert "sr_recent_miss_examples" in project_ctx, (
+        "Producer regression: claim endpoint did not emit sr_recent_miss_examples. "
+        "TypeScript consumer (agent/src/prompts/project-context.ts) reads this exact key."
+    )
+    emitted = project_ctx["sr_recent_miss_examples"]
+
+    # Shape contract: top-level dict[str, list[dict]] with each item having
+    # severity (str) and desc (str) — exactly what the TS formatter destructures.
+    assert isinstance(emitted, dict), f"Expected dict, got {type(emitted).__name__}"
+    for cat, examples in emitted.items():
+        assert isinstance(cat, str)
+        assert isinstance(examples, list) and examples, (
+            f"category {cat!r} must have non-empty list"
+        )
+        for ex in examples:
+            assert isinstance(ex, dict)
+            assert isinstance(ex.get("severity"), str), f"missing severity in {ex!r}"
+            assert isinstance(ex.get("desc"), str), f"missing desc in {ex!r}"
+
+    # Value contract: emitted payload matches the fixture exactly.
+    assert emitted == expected_payload, (
+        "Emitted sr_recent_miss_examples diverged from contract fixture. "
+        "Update agent/src/prompts/__fixtures__/sr_recent_miss_examples_contract.json "
+        "AND agent/src/prompts/project-context.ts together if this is intentional."
+    )
+
+
+def test_claim_sr_recent_miss_examples_fixture_parity():
+    """The two on-disk copies of the contract fixture must stay byte-identical.
+
+    Backend Docker reads from ``backend/testing/__fixtures__/`` (in the
+    image), agent reads from ``agent/src/prompts/__fixtures__/`` (in the
+    repo). When both are reachable (local dev, outside Docker), assert
+    they match so drift is caught at PR time. When only one is reachable
+    (CI Docker build context = ``./backend``), this test no-ops — drift
+    will surface on whichever side runs locally next.
+    """
+    backend_copy = (
+        Path(__file__).parent / "__fixtures__" / "sr_recent_miss_examples_contract.json"
+    )
+    agent_copy = (
+        Path(__file__).resolve().parents[2]
+        / "agent"
+        / "src"
+        / "prompts"
+        / "__fixtures__"
+        / "sr_recent_miss_examples_contract.json"
+    )
+    if not (backend_copy.exists() and agent_copy.exists()):
+        pytest.skip(
+            "Only one of the two contract-fixture copies is reachable "
+            "(expected in Docker where agent/ is not mounted)."
+        )
+    assert backend_copy.read_text() == agent_copy.read_text(), (
+        "Contract fixture drift: backend and agent copies of "
+        "sr_recent_miss_examples_contract.json have diverged. "
+        f"Backend: {backend_copy}\nAgent:   {agent_copy}\n"
+        "Both must be updated together."
+    )

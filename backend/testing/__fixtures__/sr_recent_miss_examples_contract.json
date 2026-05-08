@@ -1,0 +1,12 @@
+{
+  "_doc": "Canonical shape of project_context.sr_recent_miss_examples. Producer: backend/app/routers/agent.py (response['project_context']['sr_recent_miss_examples']). Consumer: agent/src/prompts/project-context.ts -> formatSrRecentMissExamplesForSrPrompt. Contract tests on both sides load this file; if the shape diverges, both tests must be updated. A byte-identical copy is kept at backend/testing/__fixtures__/sr_recent_miss_examples_contract.json so the backend Docker test (which has no access to agent/) can read it; test_claim_sr_recent_miss_examples_fixture_parity asserts the two files match when both are reachable.",
+  "sr_recent_miss_examples": {
+    "correctness": [
+      { "severity": "CRITICAL", "desc": "Off-by-one in loop boundary check" },
+      { "severity": "MAJOR", "desc": "Null pointer not guarded before dereference" }
+    ],
+    "security": [
+      { "severity": "MAJOR", "desc": "User input passed directly to SQL query" }
+    ]
+  }
+}

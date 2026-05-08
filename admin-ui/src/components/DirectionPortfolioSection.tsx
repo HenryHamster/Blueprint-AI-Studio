@@ -176,6 +176,17 @@ interface DirectionSrEntry {
   overall_catch_rate: number | null;
   worst_category: string | null;
   categories: Record<string, DirectionSrCatStat>;
+  rate_history?: number[] | null;
+  previous_miss_rate?: number | null;
+  trend?: 'increasing' | 'decreasing' | 'stable' | null;
+}
+
+function CatchRateSparkline({ history, trend }: { history: number[]; trend?: string | null }) {
+  if (history.length < 2) return null;
+  const w = 28; const h = 10; const dx = w / (history.length - 1);
+  const pts = history.map((v, i) => `${(i * dx).toFixed(1)},${(h - Math.max(0, Math.min(1, v)) * h).toFixed(1)}`).join(' ');
+  const stroke = trend === 'increasing' ? '#f87171' : trend === 'decreasing' ? '#34d399' : '#737373';
+  return <svg width={w} height={h} viewBox={`0 0 ${w} ${h}`} className="inline-block align-middle ml-1" aria-hidden="true"><polyline fill="none" stroke={stroke} strokeWidth="1" points={pts} /></svg>;
 }
 
 function DirectionSrPill({ entry }: { entry: DirectionSrEntry }) {
@@ -186,9 +197,22 @@ function DirectionSrPill({ entry }: { entry: DirectionSrEntry }) {
   const worstCat = entry.worst_category;
   const worstMiss = worstCat ? entry.categories[worstCat]?.miss_rate : null;
   const label = `SR: ${catchPct}% catch${worstCat && worstMiss != null ? ` · ${worstCat} ${Math.round(worstMiss * 100)}% miss` : ''}`;
+  const trend = entry.trend;
+  const prevCatchPct = entry.previous_miss_rate != null ? Math.round((1 - entry.previous_miss_rate) * 100) : null;
+  const deltaPp = prevCatchPct != null ? catchPct - prevCatchPct : null;
+  const trendArrow = trend === 'increasing' ? '↓' : trend === 'decreasing' ? '↑' : null;
+  const trendColor = trend === 'increasing' ? 'text-red-400' : trend === 'decreasing' ? 'text-emerald-400' : null;
   return (
     <div className="mt-1 text-[9px]">
       <button type="button" className={`${catchColor} hover:underline cursor-pointer`} title={`SR catch rate (n=${entry.sample_size})`} onClick={e => { e.stopPropagation(); setOpen(v => !v); }}>{label}</button>
+      {trendArrow && trendColor && (
+        <span className={`ml-1 font-mono ${trendColor}`} title={prevCatchPct != null ? `Prev: ${prevCatchPct}%` : 'trend direction'}>
+          {trendArrow}{deltaPp != null ? `${deltaPp > 0 ? '+' : ''}${deltaPp}pp` : ''}
+        </span>
+      )}
+      {entry.rate_history && entry.rate_history.length >= 2 && (
+        <CatchRateSparkline history={entry.rate_history} trend={trend} />
+      )}
       {open && (
         // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
         <div className="mt-0.5 flex flex-col gap-0.5 pl-2 border-l border-neutral-800" onClick={e => e.stopPropagation()}>

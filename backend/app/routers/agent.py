@@ -2770,6 +2770,63 @@ async def claim_task(
                 "[AGENT] Failed to inject sr_blind_spot_themes (non-critical)"
             )
 
+    # Inject concrete recent miss examples for the worst-performing SR categories.
+    # Unlike sr_blind_spot_themes (aggregated keyword patterns), these are verbatim
+    # reviewer findings that SR missed in the most recent window — giving the agent
+    # specific "this exact thing slipped past last time" examples to act on.
+    # Shape: project_context.sr_recent_miss_examples = {cat: [{severity, desc}, ...]}
+    # Bounded: top 3 categories by weighted_miss_rate, ≤3 examples each, ≤1200 chars total.
+    if task_type in ("create", "fix", "refactor", "migrate") and project_for_playbook:
+        try:
+            _miss_trends = (project_for_playbook.design_doc or {}).get(
+                "sr_catch_rate_trends"
+            )
+            if _miss_trends and isinstance(_miss_trends.get("categories"), dict):
+                _ranked = sorted(
+                    [
+                        (cat, data)
+                        for cat, data in _miss_trends["categories"].items()
+                        if isinstance(data, dict)
+                        and isinstance(data.get("examples"), list)
+                        and data["examples"]
+                    ],
+                    key=lambda x: (
+                        x[1].get("weighted_miss_rate") or x[1].get("miss_rate") or 0.0
+                    ),
+                    reverse=True,
+                )[:3]
+                _miss_examples: dict = {}
+                _total_chars = 0
+                for _cat, _data in _ranked:
+                    _cat_exs = []
+                    for _ex in _data["examples"][:3]:
+                        _desc = (str(_ex.get("desc") or ""))[:200]
+                        if not _desc:
+                            continue
+                        if _total_chars + len(_desc) > 1200:
+                            break
+                        _total_chars += len(_desc)
+                        _cat_exs.append(
+                            {
+                                "severity": _ex.get("severity", "MINOR"),
+                                "desc": _desc,
+                            }
+                        )
+                    if _cat_exs:
+                        _miss_examples[_cat] = _cat_exs
+                    if _total_chars >= 1200:
+                        break
+                if _miss_examples:
+                    if "project_context" not in response:
+                        response["project_context"] = {}
+                    response["project_context"]["sr_recent_miss_examples"] = (
+                        _miss_examples
+                    )
+        except Exception:
+            logger.exception(
+                "[AGENT] Failed to inject sr_recent_miss_examples (non-critical)"
+            )
+
     # Inject scoped architecture context for create/fix/refactor tasks
     if task_type in ("create", "fix", "refactor") and project_for_playbook:
         design_doc = project_for_playbook.design_doc or {}

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { formatSrBlindSpotThemesForSrPrompt, formatExecutionEvidenceForSrPrompt } from './self-review.js';
+import { formatSrBlindSpotThemesForSrPrompt, formatExecutionEvidenceForSrPrompt, formatSrRecentMissExamplesForSrPrompt } from './self-review.js';
 
 describe('formatExecutionEvidenceForSrPrompt', () => {
   it('includes all three category names', () => {
@@ -27,6 +27,92 @@ describe('formatExecutionEvidenceForSrPrompt', () => {
 
   it('returns non-empty string unconditionally', () => {
     expect(formatExecutionEvidenceForSrPrompt().length).toBeGreaterThan(0);
+  });
+});
+
+describe('formatSrRecentMissExamplesForSrPrompt', () => {
+  it('returns empty string for null', () => {
+    expect(formatSrRecentMissExamplesForSrPrompt(null)).toBe('');
+  });
+
+  it('returns empty string for undefined', () => {
+    expect(formatSrRecentMissExamplesForSrPrompt(undefined)).toBe('');
+  });
+
+  it('returns empty string when input is empty', () => {
+    expect(formatSrRecentMissExamplesForSrPrompt({})).toBe('');
+  });
+
+  it('returns empty string when all categories have no examples', () => {
+    expect(formatSrRecentMissExamplesForSrPrompt({
+      correctness: [],
+      security: [],
+    })).toBe('');
+  });
+
+  it('renders section heading and category with examples', () => {
+    const result = formatSrRecentMissExamplesForSrPrompt({
+      correctness: [{ severity: 'HIGH', desc: 'missed null check in handler' }],
+    });
+    expect(result).toContain('## Concrete misses from the last cycle');
+    expect(result).toContain('**correctness:**');
+    expect(result).toContain('[HIGH] missed null check in handler');
+  });
+
+  it('instructs heightened scrutiny', () => {
+    const result = formatSrRecentMissExamplesForSrPrompt({
+      security: [{ severity: 'CRITICAL', desc: 'SQL injection via user input' }],
+    });
+    expect(result).toContain('heightened scrutiny');
+    expect(result).toContain('similar code patterns');
+  });
+
+  it('preserves backend-supplied category ordering and caps at 3', () => {
+    // Backend pre-ranks by weighted_miss_rate, so insertion order encodes priority.
+    const result = formatSrRecentMissExamplesForSrPrompt({
+      cat_high: [{ severity: 'HIGH', desc: 'high miss' }],
+      cat_med: [{ severity: 'MEDIUM', desc: 'med miss' }],
+      cat_low: [{ severity: 'LOW', desc: 'low miss' }],
+      cat_extra: [{ severity: 'LOW', desc: 'extra miss' }],
+    });
+    expect(result).toContain('**cat_high:**');
+    expect(result).toContain('**cat_med:**');
+    expect(result).toContain('**cat_low:**');
+    expect(result).not.toContain('**cat_extra:**');
+  });
+
+  it('caps examples per category at 3', () => {
+    const result = formatSrRecentMissExamplesForSrPrompt({
+      correctness: [
+        { severity: 'HIGH', desc: 'miss 1' },
+        { severity: 'HIGH', desc: 'miss 2' },
+        { severity: 'HIGH', desc: 'miss 3' },
+        { severity: 'HIGH', desc: 'miss 4' },
+      ],
+    });
+    expect(result).toContain('miss 1');
+    expect(result).toContain('miss 3');
+    expect(result).not.toContain('miss 4');
+  });
+
+  it('truncates long descriptions to 200 chars with ellipsis', () => {
+    const longDesc = 'x'.repeat(250);
+    const result = formatSrRecentMissExamplesForSrPrompt({
+      correctness: [{ severity: 'HIGH', desc: longDesc }],
+    });
+    expect(result).toContain('x'.repeat(200) + '…');
+    expect(result).not.toContain('x'.repeat(201));
+  });
+
+  it('renders multiple categories as separate sections', () => {
+    const result = formatSrRecentMissExamplesForSrPrompt({
+      security: [{ severity: 'CRITICAL', desc: 'injection' }],
+      correctness: [{ severity: 'HIGH', desc: 'off-by-one' }],
+    });
+    expect(result).toContain('**security:**');
+    expect(result).toContain('**correctness:**');
+    expect(result).toContain('[CRITICAL] injection');
+    expect(result).toContain('[HIGH] off-by-one');
   });
 });
 

@@ -2718,6 +2718,9 @@ def _compute_execution_evidence_miss_rates(
 
 def compute_sr_catch_rate_by_direction(
     all_tasks: list,
+    *,
+    existing_by_direction: Optional[dict] = None,
+    is_new_window: bool = True,
 ) -> dict[str, dict[str, Any]]:
     """Compute per-direction SR catch-rate breakdown.
 
@@ -2725,6 +2728,13 @@ def compute_sr_catch_rate_by_direction(
     at least :data:`_MIN_DIRECTION_SR_SAMPLE` qualifying tasks (both
     ``_self_review_outcome`` and ``_first_attempt_rejection_categories`` present),
     computes category-level miss rates and sample counts.
+
+    When *existing_by_direction* is provided (a previously persisted
+    ``by_direction`` snapshot), each entry is enriched with cycle-over-cycle
+    trend fields: ``previous_miss_rate``, ``trend`` ('increasing' | 'decreasing'
+    | 'stable'), and ``rate_history`` (list of recent miss_rates, capped at 5).
+    *is_new_window* controls whether the current measurement is appended to
+    ``rate_history`` (mirrors the per-category rate_history logic).
 
     Returns a dict keyed by direction_id::
 
@@ -2794,13 +2804,36 @@ def compute_sr_catch_rate_by_direction(
                 if total_samples
                 else None
             )
-            result[direction_id] = {
+            entry: dict[str, Any] = {
                 "sample_count": count,
                 "miss_rate": weighted_miss_rate,
                 "categories": categories,
             }
+            if existing_by_direction is not None:
+                prev_entry: dict = dict(existing_by_direction.get(direction_id) or {})
+                prev_miss_rate = prev_entry.get("miss_rate")
+                rate_history: list = list(prev_entry.get("rate_history") or [])
+                if (
+                    is_new_window or not rate_history
+                ) and weighted_miss_rate is not None:
+                    rate_history.append(weighted_miss_rate)
+                    rate_history = rate_history[-5:]
+                if prev_miss_rate is not None and weighted_miss_rate is not None:
+                    delta = weighted_miss_rate - prev_miss_rate
+                    if delta >= _TREND_DELTA_THRESHOLD:
+                        dir_trend = "increasing"
+                    elif delta <= -_TREND_DELTA_THRESHOLD:
+                        dir_trend = "decreasing"
+                    else:
+                        dir_trend = "stable"
+                else:
+                    dir_trend = "stable"
+                entry["previous_miss_rate"] = prev_miss_rate
+                entry["trend"] = dir_trend
+                entry["rate_history"] = rate_history
+            result[direction_id] = entry
     return dict(
-        sorted(result.items(), key=lambda item: (-item[1]["miss_rate"], item[0]))
+        sorted(result.items(), key=lambda item: (-(item[1]["miss_rate"] or 0), item[0]))
     )
 
 
@@ -3310,7 +3343,11 @@ async def compute_sr_catch_rate_trends(
         result["sr_skip_rate"] = sr_skip_rate
         result["sr_skip_reason_distribution"] = sr_skip_dist
 
-    by_direction = compute_sr_catch_rate_by_direction(all_tasks)
+    by_direction = compute_sr_catch_rate_by_direction(
+        all_tasks,
+        existing_by_direction=existing.get("by_direction") or {},
+        is_new_window=is_new_window,
+    )
     if by_direction:
         result["by_direction"] = by_direction
 

@@ -126,7 +126,7 @@ function heuristicRegressionRisk(diff: string): { passed: boolean; issue: string
 }
 
 /** Inject a heuristic regression_risk entry when no baseline file exists. */
-function augmentSelfReview(
+export function augmentSelfReview(
   selfReview: Record<string, unknown> | null,
   taskId: string,
   baseCommit: string,

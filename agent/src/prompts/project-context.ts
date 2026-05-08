@@ -1,6 +1,6 @@
 import { strVal } from '../prompt.js';
 import { MEDIUM_ANALYSIS_PLAN_FILE_LIMIT } from '../constants.js';
-import { formatProjectBlindSpotSummary } from './self-review.js';
+import { formatProjectBlindSpotSummary, formatSrRecentMissExamplesForSrPrompt } from './self-review.js';
 
 type SRCatData = {
   miss_rate: number;
@@ -653,6 +653,26 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
     }
   }
 
+  // Build SR recent miss examples block — concrete examples from the last cycle, placed after
+  // the themes section to deepen the signal from generic themes to specific instances.
+  // Reads `sr_recent_miss_examples` injected by backend agent.py (shape: {cat: [{severity, desc}]}).
+  const srRecentMissExamples = ctx.sr_recent_miss_examples as
+    | Record<string, Array<{ desc: string; severity: string }>>
+    | null
+    | undefined;
+  let srRecentMissLines: string[] = [];
+  if (srRecentMissExamples) {
+    const rendered = formatSrRecentMissExamplesForSrPrompt(srRecentMissExamples);
+    if (rendered) {
+      const candidateLines = rendered.split('\n');
+      const candidate = candidateLines.join('\n');
+      if (candidate.length <= budget) {
+        srRecentMissLines = candidateLines;
+        budget -= candidate.length;
+      }
+    }
+  }
+
   // Build per-module review feedback warnings — only if budget allows
   type ModuleFeedbackWarning = { file: string; top_categories: Record<string, number>; sample_size: number };
   const moduleFeedbackWarnings = ctx.module_feedback_warnings as ModuleFeedbackWarning[] | null | undefined;
@@ -714,6 +734,6 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
     footerLines.push('');
   }
 
-  const allLines = [...header, ...activeLines, ...lessonsLines, ...queuedLines, ...directionRecentLines, ...recentLines, ...healthLines, ...reviewIssueLines, ...srBlindSpotLines, ...srForDirectionLines, ...srFPCalibrationLines, ...srReviewerDisagreementLines, ...srBlindSpotThemesLines, ...moduleFeedbackLines, ...dirQualityLines, ...prLines, ...siblingLines, ...cochangeLines, ...footerLines];
+  const allLines = [...header, ...activeLines, ...lessonsLines, ...queuedLines, ...directionRecentLines, ...recentLines, ...healthLines, ...reviewIssueLines, ...srBlindSpotLines, ...srForDirectionLines, ...srFPCalibrationLines, ...srReviewerDisagreementLines, ...srBlindSpotThemesLines, ...srRecentMissLines, ...moduleFeedbackLines, ...dirQualityLines, ...prLines, ...siblingLines, ...cochangeLines, ...footerLines];
   return allLines.join('\n');
 }

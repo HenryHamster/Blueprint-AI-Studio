@@ -4378,6 +4378,248 @@ async def test_compute_sr_catch_rate_trends_by_direction_omits_below_sample_dire
     assert "d-low" not in by_direction
 
 
+def _make_direction_tasks(project_id, direction_id, count, age_days, miss_all=True):
+    """Create `count` SR tasks for a direction; if miss_all, human catches but SR misses."""
+    tasks = []
+    for _ in range(count):
+        sr_failed = [] if miss_all else ["regression_risk"]
+        t = _make_sr_task_with_direction(
+            project_id,
+            direction_id,
+            age_days=age_days,
+            human_cats={"regression_risk": 1},
+            sr_failed_cats=sr_failed,
+        )
+        tasks.append(t)
+    return tasks
+
+
+def _make_window_padding(project_id, age_days, n=5):
+    """Pad the overall SR sample so compute_sr_catch_rate_trends has enough tasks."""
+    tasks = []
+    for _ in range(n):
+        t = _make_sr_task(
+            project_id,
+            age_days=age_days,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        tasks.append(t)
+    return tasks
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_by_direction_trend_increasing(
+    db_session: AsyncSession,
+):
+    """When current miss_rate exceeds previous by >= _TREND_DELTA_THRESHOLD, trend=='increasing'."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    direction_id = "d-trend-increasing"
+
+    # Seed prior state: miss_rate was 0.0 (all caught)
+    project.design_doc = {
+        "sr_catch_rate_trends": {
+            "by_direction": {
+                direction_id: {
+                    "miss_rate": 0.0,
+                    "rate_history": [0.0],
+                }
+            }
+        }
+    }
+    await db_session.flush()
+
+    # Current window: all tasks missed (miss_rate → 1.0)
+    tasks = []
+    for t in _make_direction_tasks(
+        project.id, direction_id, 4, age_days=2, miss_all=True
+    ):
+        db_session.add(t)
+        tasks.append(t)
+    for t in _make_window_padding(project.id, age_days=2):
+        db_session.add(t)
+        tasks.append(t)
+    for t in _make_window_padding(project.id, age_days=20):
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+    assert result is not None
+    entry = result["by_direction"][direction_id]
+    assert entry["trend"] == "increasing"
+    assert entry["previous_miss_rate"] == 0.0
+    assert len(entry["rate_history"]) == 2
+    assert entry["rate_history"][0] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_by_direction_trend_decreasing(
+    db_session: AsyncSession,
+):
+    """When current miss_rate is lower than previous by >= _TREND_DELTA_THRESHOLD, trend=='decreasing'."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    direction_id = "d-trend-decreasing"
+
+    # Seed prior state: miss_rate was 1.0 (all missed)
+    project.design_doc = {
+        "sr_catch_rate_trends": {
+            "by_direction": {
+                direction_id: {
+                    "miss_rate": 1.0,
+                    "rate_history": [1.0],
+                }
+            }
+        }
+    }
+    await db_session.flush()
+
+    # Current window: all tasks caught (miss_rate → 0.0)
+    tasks = []
+    for t in _make_direction_tasks(
+        project.id, direction_id, 4, age_days=2, miss_all=False
+    ):
+        db_session.add(t)
+        tasks.append(t)
+    for t in _make_window_padding(project.id, age_days=2):
+        db_session.add(t)
+        tasks.append(t)
+    for t in _make_window_padding(project.id, age_days=20):
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+    assert result is not None
+    entry = result["by_direction"][direction_id]
+    assert entry["trend"] == "decreasing"
+    assert entry["previous_miss_rate"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_by_direction_trend_stable(
+    db_session: AsyncSession,
+):
+    """When current miss_rate delta is within ±_TREND_DELTA_THRESHOLD, trend=='stable'."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    direction_id = "d-trend-stable"
+
+    # Seed prior state: miss_rate was 1.0
+    project.design_doc = {
+        "sr_catch_rate_trends": {
+            "by_direction": {
+                direction_id: {
+                    "miss_rate": 1.0,
+                    "rate_history": [1.0],
+                }
+            }
+        }
+    }
+    await db_session.flush()
+
+    # Current window: all missed too (miss_rate → 1.0, delta == 0)
+    tasks = []
+    for t in _make_direction_tasks(
+        project.id, direction_id, 4, age_days=2, miss_all=True
+    ):
+        db_session.add(t)
+        tasks.append(t)
+    for t in _make_window_padding(project.id, age_days=2):
+        db_session.add(t)
+        tasks.append(t)
+    for t in _make_window_padding(project.id, age_days=20):
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+    assert result is not None
+    entry = result["by_direction"][direction_id]
+    assert entry["trend"] == "stable"
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_by_direction_no_previous(
+    db_session: AsyncSession,
+):
+    """First run (no prior history): previous_miss_rate=None, trend='stable', rate_history has one entry."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    direction_id = "d-trend-new"
+    tasks = []
+    for t in _make_direction_tasks(
+        project.id, direction_id, 4, age_days=2, miss_all=True
+    ):
+        db_session.add(t)
+        tasks.append(t)
+    for t in _make_window_padding(project.id, age_days=2):
+        db_session.add(t)
+        tasks.append(t)
+    for t in _make_window_padding(project.id, age_days=20):
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+    assert result is not None
+    entry = result["by_direction"][direction_id]
+    assert entry["previous_miss_rate"] is None
+    assert entry["trend"] == "stable"
+    assert len(entry["rate_history"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_by_direction_rate_history_capped(
+    db_session: AsyncSession,
+):
+    """rate_history is capped at 5 entries; oldest are dropped when new entries arrive."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    direction_id = "d-hist-cap"
+
+    # Seed prior state with 5 history entries (already at cap)
+    project.design_doc = {
+        "sr_catch_rate_trends": {
+            "by_direction": {
+                direction_id: {
+                    "miss_rate": 0.9,
+                    "rate_history": [0.5, 0.6, 0.7, 0.8, 0.9],
+                }
+            }
+        }
+    }
+    await db_session.flush()
+
+    tasks = []
+    for t in _make_direction_tasks(
+        project.id, direction_id, 4, age_days=2, miss_all=True
+    ):
+        db_session.add(t)
+        tasks.append(t)
+    for t in _make_window_padding(project.id, age_days=2):
+        db_session.add(t)
+        tasks.append(t)
+    for t in _make_window_padding(project.id, age_days=20):
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+    assert result is not None
+    entry = result["by_direction"][direction_id]
+    assert len(entry["rate_history"]) == 5
+    # The oldest entry (0.5) should have been dropped
+    assert 0.5 not in entry["rate_history"]
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Tests for _categorize_review_issues — scope-drift bucket
 # ─────────────────────────────────────────────────────────────────────────────
@@ -7942,6 +8184,7 @@ async def test_compute_sr_regression_risk_test_signal_trends_persists_to_design_
     )
     assert result is not None
 
+    await db_session.flush()
     await db_session.refresh(project)
     assert project.design_doc is not None
     persisted = project.design_doc.get("sr_regression_risk_test_signal_trends")
