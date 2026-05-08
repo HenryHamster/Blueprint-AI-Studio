@@ -51,6 +51,13 @@ from app.time_utils import _to_naive_utc, _utcnow
 
 logger = logging.getLogger(__name__)
 
+# Meta-investigation escalation reason constants (case-level audit trail).
+# Complement the four manual-intervention reasons defined in app.models.
+ESCALATION_REASON_ESCALATED_CROSS_LAYER = "escalated_cross_layer"
+ESCALATION_REASON_ESCALATED_LAYER_CONCENTRATION = "escalated_layer_concentration"
+ESCALATION_REASON_ESCALATED_CROSS_CASE_FINGERPRINT = "escalated_cross_case_fingerprint"
+ESCALATION_REASON_ESCALATED_RECURRENCE = "escalated_recurrence"
+
 # Cooldown between consecutive spawns for the SAME regression_class. Mirrors
 # the self_audit_dispatch cooldown pattern — keeps a noisy regression from
 # generating an investigate every cycle once the prior task terminates.
@@ -1614,6 +1621,19 @@ async def _collect_fix_loop_divergence_fingerprints(
     return sorted(trips, key=lambda item: (-item["count"], item["fingerprint"]))
 
 
+def _extract_failure_type(msg: str) -> str:
+    """Extract failure type from viewport test error message.
+
+    Returns 'overflow' for expectNoOverflowAt, 'touch_target' for expectMinTouchTargetAt,
+    or 'unknown' if neither is found.
+    """
+    if "expectNoOverflowAt" in msg:
+        return "overflow"
+    if "expectMinTouchTargetAt" in msg:
+        return "touch_target"
+    return "unknown"
+
+
 async def _collect_viewport_failures(
     session: AsyncSession,
     project_id: uuid.UUID,
@@ -1624,6 +1644,7 @@ async def _collect_viewport_failures(
     the component name (from .viewport.test.tsx file references in the message
     or task title) and the viewport width (from expectNoOverflowAt/expectMinTouchTargetAt
     error strings). Falls back to "unknown" / "0" when extraction fails.
+    Also classifies each failure as 'overflow', 'touch_target', or 'mixed'.
     """
     import re
     from app.failure_classification import VIEWPORT_REGRESSION, classify_failure
@@ -1667,8 +1688,11 @@ async def _collect_viewport_failures(
         component = comp_m.group(1) if comp_m else "unknown"
 
         key = (component, width)
-        item = grouped.setdefault(key, {"tasks": set(), "samples": []})
+        item = grouped.setdefault(
+            key, {"tasks": set(), "samples": [], "failure_types": set()}
+        )
         item["tasks"].add(str(task.id))
+        item["failure_types"].add(_extract_failure_type(msg))
         if msg and len(item["samples"]) < 2:
             item["samples"].append(msg[:240])
 
@@ -1677,12 +1701,21 @@ async def _collect_viewport_failures(
         count = len(item["tasks"])
         if count < _VIEWPORT_REGRESSION_MIN_FAILURES:
             continue
+        # Determine failure_type: 'overflow', 'touch_target', or 'mixed'
+        types = item["failure_types"] - {"unknown"}
+        if not types:
+            failure_type = "unknown"
+        elif len(types) == 1:
+            failure_type = types.pop()
+        else:
+            failure_type = "mixed"
         trips.append(
             {
                 "component": component,
                 "width": width,
                 "count": count,
                 "samples": item["samples"],
+                "failure_type": failure_type,
             }
         )
     return sorted(trips, key=lambda x: (-x["count"], x["component"], x["width"]))
@@ -2831,6 +2864,21 @@ async def _maybe_spawn(
         )
     if fast_tracking_failed_remediation:
         prompt += await _format_prior_failure_context(existing_case, session)
+
+    # Determine case-level escalation reason for operator visibility.
+    if signal_name == "layer_concentration":
+        case_escalation_reason: str | None = (
+            ESCALATION_REASON_ESCALATED_LAYER_CONCENTRATION
+        )
+    elif signal_name == "cross_case_fingerprint":
+        case_escalation_reason = ESCALATION_REASON_ESCALATED_CROSS_CASE_FINGERPRINT
+    elif is_cross_layer:
+        case_escalation_reason = ESCALATION_REASON_ESCALATED_CROSS_LAYER
+    elif recurrence_context is not None:
+        case_escalation_reason = ESCALATION_REASON_ESCALATED_RECURRENCE
+    else:
+        case_escalation_reason = None
+
     payload_dict: dict[str, Any] = {
         "type": "investigate",
         "prompt": prompt,
@@ -2883,15 +2931,18 @@ async def _maybe_spawn(
     )
     session.add(new_task)
     await session.flush()
+    _history_details: dict[str, Any] = {
+        "spawned_by": "PIPELINE_REGRESSION_DISPATCHER",
+        "regression_class": regression_class,
+        "signal_name": signal_name,
+    }
+    if case_escalation_reason is not None:
+        _history_details["escalation_reason"] = case_escalation_reason
     session.add(
         TaskHistory(
             task_id=new_task.id,
             action="SPAWNED",
-            details={
-                "spawned_by": "PIPELINE_REGRESSION_DISPATCHER",
-                "regression_class": regression_class,
-                "signal_name": signal_name,
-            },
+            details=_history_details,
         )
     )
     session.add(
@@ -2933,6 +2984,7 @@ async def _maybe_spawn(
                 signal_first_seen_at=signal_first_seen_at or now,
                 symptoms_by_layer=merged_symptoms,
                 investigate_spawned_at=now,
+                escalation_reason=case_escalation_reason,
             )
         )
     else:
@@ -2941,6 +2993,8 @@ async def _maybe_spawn(
         existing_case.last_seen_at = now
         existing_case.last_remediation_task_id = new_task.id
         existing_case.symptoms_by_layer = merged_symptoms
+        if case_escalation_reason is not None:
+            existing_case.escalation_reason = case_escalation_reason
         # A CLOSED case re-tripping starts a new regression cycle — reset
         # signal_first_crossed_at so time-to-detect reflects the new episode.
         # For still-ACTIVE cases, preserve the original crossing time.
@@ -3280,6 +3334,7 @@ async def _evaluate_viewport_regression_signal(
             break
         component = trip["component"]
         width = trip["width"]
+        failure_type = trip.get("failure_type", "unknown")
         regression_class = f"viewport_regression:{component}@{width}"
         prompt = _format_signal_lines(
             signal_name="viewport_regression",
@@ -3290,6 +3345,7 @@ async def _evaluate_viewport_regression_signal(
             extras=[
                 f"Component: {component}",
                 f"Viewport width: {width}px",
+                f"Failure type: {failure_type}",
                 *[f"Sample failure: {s}" for s in trip["samples"]],
             ],
         )

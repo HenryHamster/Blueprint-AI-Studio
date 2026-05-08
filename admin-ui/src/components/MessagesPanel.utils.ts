@@ -2,6 +2,15 @@
 // One source of truth: high-signal classification, error toast severity, and ContextBadges
 // all read from this set, so a new escalation type added here automatically gets surfaced
 // across all three behaviors. Keep in sync with notification_dispatch.py escalation emitters.
+//
+// EVENT TYPE INVARIANT: See backend/testing/event_type_snapshot.json for the canonical list
+// of all 21+ event_types emitted by the backend. The invariant test in
+// MessagesPanel.invariant.test.ts validates that every event_type appears in either
+// HIGH_SIGNAL_NOTE_EVENTS or ROUTINE_EVENT_LABELS below. When adding a new event_type:
+// 1. Update backend/testing/event_type_snapshot.json with (name, classification, source_fn)
+// 2. Update HIGH_SIGNAL_NOTE_EVENTS, ROUTINE_EVENT_LABELS, or ESCALATION_EVENT_TYPES below
+// 3. If escalation, add a badge label to ESCALATION_BADGE_LABELS
+// The invariant test will fail and tell you exactly what's missing.
 export const ESCALATION_EVENT_TYPES: ReadonlySet<string> = new Set([
   'auto_fix_escalated',
   'residual_fix_escalated',
@@ -200,9 +209,12 @@ export function classifySignalLevel(msg: {
   return 'routine';
 }
 
+export const STALE_ROUTINE_COLLAPSE_AGE_MS = 3600000; // 1 hour — stale routine notes collapse to a per-day digest
+
 export type RoutineRow<T> =
   | { kind: 'single'; msg: T }
-  | { kind: 'group'; key: string; event_type: string; label: string; msgs: T[] };
+  | { kind: 'group'; key: string; event_type: string; label: string; msgs: T[] }
+  | { kind: 'daily_digest'; day: string; count: number; breakdown: Record<string, number>; msgs: T[] };
 
 export function groupRoutineMessages<T extends { id: string; context: Record<string, unknown>; created_at?: string | null }>(
   msgs: T[],
@@ -472,4 +484,61 @@ export function isCriticalSeverity(msg: {
     if (et && CRITICAL_NOTE_EVENTS.has(et)) return true;
   }
   return false;
+}
+
+// Collapses stale routine rows (older than STALE_ROUTINE_COLLAPSE_AGE_MS) into per-day digest
+// entries. Failing groups and high-signal events are never collapsed.
+export function collapseStaleRoutineRows<T extends { id: string; context: Record<string, unknown>; created_at?: string | null }>(
+  rows: RoutineRow<T>[],
+  nowMs: number = Date.now(),
+): RoutineRow<T>[] {
+  const parseTs = (v: string | null | undefined): number => {
+    if (!v) return 0;
+    return new Date(v.endsWith('Z') || v.includes('+') ? v : v + 'Z').getTime();
+  };
+  const cutoffMs = nowMs - STALE_ROUTINE_COLLAPSE_AGE_MS;
+  const digestBuckets = new Map<string, { msgs: T[]; breakdown: Record<string, number> }>();
+  const digestFirstPos = new Map<string, number>();
+  const output: (RoutineRow<T> | string)[] = [];
+
+  for (const row of rows) {
+    const rowMsgs = row.kind === 'single' ? [row.msg] : row.msgs;
+    const lastTs = parseTs(rowMsgs[rowMsgs.length - 1].created_at);
+    const rowStale = lastTs > 0 && lastTs < cutoffMs;
+    const rowFailingGrp = row.kind === 'group' && isFailingGroup(row.msgs);
+    const rowHighSignal = rowMsgs.some(m => {
+      const et = m.context.event_type as string | undefined;
+      return et !== undefined && HIGH_SIGNAL_NOTE_EVENTS.has(et);
+    });
+
+    if (rowStale && !rowFailingGrp && !rowHighSignal) {
+      const day = getMessageDateString(rowMsgs[0] as { created_at: string | null });
+      if (!digestFirstPos.has(day)) {
+        digestFirstPos.set(day, output.length);
+        output.push(day);
+        digestBuckets.set(day, { msgs: [], breakdown: {} });
+      }
+      const bucket = digestBuckets.get(day)!;
+      for (const m of rowMsgs) {
+        bucket.msgs.push(m);
+        const et = (m.context.event_type as string | undefined) ?? '__unknown__';
+        bucket.breakdown[et] = (bucket.breakdown[et] || 0) + 1;
+      }
+    } else {
+      output.push(row);
+    }
+  }
+
+  return output.map(item => {
+    if (typeof item !== 'string') return item;
+    const b = digestBuckets.get(item)!;
+    return { kind: 'daily_digest' as const, day: item, count: b.msgs.length, breakdown: b.breakdown, msgs: b.msgs };
+  });
+}
+
+export function formatDailyDigestSummary(breakdown: Record<string, number>): string {
+  return Object.entries(breakdown)
+    .slice(0, 3)
+    .map(([et, cnt]) => `${cnt} ${ROUTINE_EVENT_LABELS[et] ?? et.replace(/_/g, ' ')}`)
+    .join(', ');
 }

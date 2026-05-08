@@ -405,7 +405,7 @@ export function TaskTypeBadge({ taskType, expanded }: { taskType?: TaskType; exp
       title={style.label}
     >
       <Icon className="w-3 h-3 shrink-0" />
-      <span className={`max-w-0 overflow-hidden group-hover/badge:max-w-[80px] transition-all duration-150 ${expanded ? 'max-w-[80px]' : ''}`}>
+      <span data-viewport-allow-truncation className={`max-w-0 overflow-hidden group-hover/badge:max-w-[80px] transition-all duration-150 ${expanded ? 'max-w-[80px]' : ''}`}>
         {style.label}
       </span>
     </span>
@@ -457,7 +457,7 @@ export function StatusBadge({ status }: { status: TaskStatus }) {
       title={cfg.label}
     >
       <Icon className={`w-3 h-3 shrink-0 ${cfg.spin ? 'animate-spin' : ''}`} />
-      <span className="max-w-0 overflow-hidden group-hover/status:max-w-[120px] transition-all duration-150">
+      <span data-viewport-allow-truncation className="max-w-0 overflow-hidden group-hover/status:max-w-[120px] transition-all duration-150">
         {cfg.label}
       </span>
     </span>

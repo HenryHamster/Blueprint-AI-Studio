@@ -3,7 +3,7 @@ import { X, MessageSquare, Send, Check, AlertTriangle, HelpCircle, Bug, StickyNo
 import { auth } from '../firebase';
 import { apiFetch, API_BASE_URL } from '../api';
 import { parseTimestamp } from '../utils/time';
-import { routineSummary, effectiveSignal, loadEventPrefs, saveEventPrefs, type EventPref, groupRoutineMessages, outcomeBreakdown, isFailingGroup, getToastSeverity, type RoutineRow, loadLastSeen, saveLastSeen, formatTimestamp, insertTimeDividers, type MessageWithDivider, ESCALATION_BADGE_LABELS, isCriticalSeverity, type MuteWindow, loadMuteWindow, saveMuteWindow, clearMuteWindow, isMuteWindowActive, formatMuteCountdown, type SavedView, loadSavedViews, saveSavedViews, SAVED_VIEWS_CAP } from './MessagesPanel.utils';
+import { routineSummary, effectiveSignal, loadEventPrefs, saveEventPrefs, type EventPref, groupRoutineMessages, collapseStaleRoutineRows, formatDailyDigestSummary, outcomeBreakdown, isFailingGroup, getToastSeverity, type RoutineRow, loadLastSeen, saveLastSeen, formatTimestamp, insertTimeDividers, type MessageWithDivider, ESCALATION_BADGE_LABELS, isCriticalSeverity, type MuteWindow, loadMuteWindow, saveMuteWindow, clearMuteWindow, isMuteWindowActive, formatMuteCountdown, type SavedView, loadSavedViews, saveSavedViews, SAVED_VIEWS_CAP } from './MessagesPanel.utils';
 
 const DEFAULT_VIEW_ID = '__default__';
 
@@ -396,7 +396,7 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
   const otherHighSignal = sortMode === 'importance' ? highSignalOpen.filter(m => m.message_type !== 'BLOCKER') : highSignalOpen;
 
   // Failing routine groups auto-promoted above the routine ops section
-  const allRoutineRows = groupRoutineMessages(routineOpen);
+  const allRoutineRows = collapseStaleRoutineRows(groupRoutineMessages(routineOpen));
   const promotedGroups = allRoutineRows.filter(
     (r): r is RoutineRow<ProjectMessage> & { kind: 'group' } =>
       r.kind === 'group' && isFailingGroup(r.msgs) && eventPrefs[r.event_type] !== 'mute',
@@ -405,7 +405,7 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
   // When mute is active, filter out routine messages from the remaining section, but keep promoted groups
   const remainingRoutineRows = muteActive
     ? allRoutineRows.filter(r => promotedKeys.has((r as RoutineRow<ProjectMessage> & { key?: string }).key ?? ''))
-    : allRoutineRows.filter(r => r.kind === 'single' || !promotedKeys.has(r.key));
+    : allRoutineRows.filter(r => r.kind !== 'group' || !promotedKeys.has(r.key));
 
   // Auto-expand groups that have search matches
   const groupsWithMatches = new Set(
@@ -1570,6 +1570,37 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
                                   </button>
                                 </div>
                                 {isGroupExpanded && (
+                                  <div className="space-y-2 p-2 border-t border-neutral-800/40">
+                                    {row.msgs.map(msg => renderBubble(msg, false, true, messages))}
+                                  </div>
+                                )}
+                              </div>
+                            </div>
+                          );
+                        }
+
+                        if (row.kind === 'daily_digest') {
+                          const digestKey = `digest-${row.day}`;
+                          const isExpanded = expandedGroupKeys.has(digestKey);
+                          const summary = formatDailyDigestSummary(row.breakdown);
+                          return (
+                            <div key={digestKey}>
+                              {hasDividerBefore && dividerLabel && (
+                                <div className="flex items-center gap-1.5 text-[11px] text-neutral-600 font-semibold uppercase tracking-wide px-1 mt-2 mb-2">
+                                  <div className="flex-1 border-t border-neutral-800/60" />
+                                  <span className="shrink-0">{dividerLabel}</span>
+                                  <div className="flex-1 border-t border-neutral-800/60" />
+                                </div>
+                              )}
+                              <div className="border border-neutral-800/40 rounded-xl overflow-hidden opacity-60">
+                                <button
+                                  onClick={() => setExpandedGroupKeys(prev => { const next = new Set(prev); if (next.has(digestKey)) next.delete(digestKey); else next.add(digestKey); return next; })}
+                                  className="w-full flex items-center gap-2 px-3 py-2 bg-neutral-900/30 text-left"
+                                >
+                                  <ChevronDown className={`w-3 h-3 text-neutral-600 shrink-0 transition-transform ${isExpanded ? 'rotate-180' : ''}`} />
+                                  <span className="text-xs text-neutral-500 font-medium">{row.count} stale routine{summary ? ` · ${summary}` : ''}</span>
+                                </button>
+                                {isExpanded && (
                                   <div className="space-y-2 p-2 border-t border-neutral-800/40">
                                     {row.msgs.map(msg => renderBubble(msg, false, true, messages))}
                                   </div>

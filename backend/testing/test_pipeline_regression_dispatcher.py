@@ -3311,6 +3311,10 @@ async def test_re_arm_spawn_uses_recurrence_meta_prompt(db_session):
     ):
         assert layer in prompt
 
+    # Case-level escalation_reason stamped for operator audit trail.
+    await db_session.refresh(case)
+    assert case.escalation_reason == "escalated_recurrence"
+
 
 @pytest.mark.asyncio
 async def test_closed_case_with_recent_history_uses_recurrence_prompt(db_session):
@@ -6011,6 +6015,10 @@ async def test_cross_layer_two_layers_escalates(db_session):
         layer_set = {e.get("layer") for e in layer_entries if isinstance(e, dict)}
         assert LAYER_AGENT_VM in layer_set
         assert LAYER_CI_WORKFLOW in layer_set
+
+        # Case-level escalation_reason stamped for operator audit trail.
+        await db_session.refresh(case)
+        assert case.escalation_reason == "escalated_cross_layer"
     finally:
         import app.shared_state as _ss
 
@@ -8919,6 +8927,23 @@ async def test_layer_concentration_fires_when_thresholds_met(db_session):
     )
     assert "STRUCTURAL QUESTIONS" in prompt
 
+    # Case-level escalation_reason stamped for operator audit trail.
+    lc_case = (
+        (
+            await db_session.execute(
+                select(RegressionRemediationCase).where(
+                    RegressionRemediationCase.project_id == project.id,
+                    RegressionRemediationCase.regression_class
+                    == "layer_concentration:CI_WORKFLOW",
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    assert lc_case is not None
+    assert lc_case.escalation_reason == "escalated_layer_concentration"
+
 
 @pytest.mark.asyncio
 async def test_layer_concentration_no_escalation_below_case_threshold(db_session):
@@ -9743,6 +9768,87 @@ class TestViewportRegressionEvaluator:
         )
         assert len(cases) == 1
 
+    @pytest.mark.asyncio
+    async def test_overflow_only_failure_type(self, db_session):
+        """Failures from expectNoOverflowAt classify as 'overflow'."""
+        from app.pipeline_regression_dispatcher import (
+            _VIEWPORT_REGRESSION_MIN_FAILURES,
+            _collect_viewport_failures,
+        )
+
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        msg = (
+            "expectNoOverflowAt(375): 2 element(s) overflow at width=375px\n"
+            "Found in MessagesPanel.viewport.test.tsx"
+        )
+        for _ in range(_VIEWPORT_REGRESSION_MIN_FAILURES):
+            db_session.add(_make_viewport_task(project.id, status_message=msg))
+        await db_session.commit()
+
+        trips = await _collect_viewport_failures(db_session, project.id)
+        assert len(trips) == 1
+        assert trips[0]["failure_type"] == "overflow"
+
+    @pytest.mark.asyncio
+    async def test_touch_target_only_failure_type(self, db_session):
+        """Failures from expectMinTouchTargetAt classify as 'touch_target'."""
+        from app.pipeline_regression_dispatcher import (
+            _VIEWPORT_REGRESSION_MIN_FAILURES,
+            _collect_viewport_failures,
+        )
+
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        msg = (
+            "expectMinTouchTargetAt(375): 1 element(s) below 44px touch target\n"
+            "Found in AlertsBanner.viewport.test.tsx"
+        )
+        for _ in range(_VIEWPORT_REGRESSION_MIN_FAILURES):
+            db_session.add(_make_viewport_task(project.id, status_message=msg))
+        await db_session.commit()
+
+        trips = await _collect_viewport_failures(db_session, project.id)
+        assert len(trips) == 1
+        assert trips[0]["failure_type"] == "touch_target"
+
+    @pytest.mark.asyncio
+    async def test_mixed_failure_types(self, db_session):
+        """When a (component, width) bucket has both overflow and touch_target failures, classify as 'mixed'."""
+        from app.pipeline_regression_dispatcher import (
+            _VIEWPORT_REGRESSION_MIN_FAILURES,
+            _collect_viewport_failures,
+        )
+
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        overflow_msg = (
+            "expectNoOverflowAt(375): 2 element(s) overflow\n"
+            "Found in TestComponent.viewport.test.tsx"
+        )
+        touch_target_msg = (
+            "expectMinTouchTargetAt(375): 1 element(s) below 44px\n"
+            "Found in TestComponent.viewport.test.tsx"
+        )
+        # Add at least _VIEWPORT_REGRESSION_MIN_FAILURES failures
+        for _ in range(_VIEWPORT_REGRESSION_MIN_FAILURES - 1):
+            db_session.add(_make_viewport_task(project.id, status_message=overflow_msg))
+        db_session.add(_make_viewport_task(project.id, status_message=touch_target_msg))
+        await db_session.commit()
+
+        trips = await _collect_viewport_failures(db_session, project.id)
+        assert len(trips) == 1
+        assert trips[0]["failure_type"] == "mixed"
+
 
 # ---------------------------------------------------------------------------
 # Reviewer SLA stall signal tests
@@ -10270,6 +10376,24 @@ async def test_cross_case_fingerprint_trips_when_distinct_classes_and_occurrence
     assert str(case_a.id) in prompt
     assert str(case_b.id) in prompt
     assert "is this one shared root symptom" in prompt.lower()
+
+    # Case-level escalation_reason stamped for operator audit trail.
+    from app.models import RegressionRemediationCase as _RRC
+
+    ccf_case = (
+        (
+            await db_session.execute(
+                select(_RRC).where(
+                    _RRC.project_id == project.id,
+                    _RRC.regression_class == ctx["regression_class"],
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    assert ccf_case is not None
+    assert ccf_case.escalation_reason == "escalated_cross_case_fingerprint"
 
 
 @pytest.mark.asyncio

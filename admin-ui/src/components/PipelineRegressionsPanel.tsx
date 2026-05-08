@@ -226,6 +226,10 @@ const ESCALATION_REASON_LABELS: Record<string, string> = {
   stale_active: 'Stale (watchdog)',
   stale_merged: 'Stale (watchdog)',
   recovered_unattended: 'Auto-recovered (24h healthy)',
+  escalated_cross_layer: 'Meta: cross-layer',
+  escalated_layer_concentration: 'Meta: layer concentration',
+  escalated_cross_case_fingerprint: 'Meta: cross-case fingerprint',
+  escalated_recurrence: 'Meta: recurrence',
 };
 
 interface ClassKpiRow {

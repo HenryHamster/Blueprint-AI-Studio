@@ -106,6 +106,94 @@ export async function expectNoOverflowAt(
 }
 
 /**
+ * Options for `expectNoTextTruncationAt`.
+ *
+ * - `selector`: CSS selector to find elements to check (default 'body *').
+ * - `height`: viewport height in px (default 800).
+ * - `waitMs`: extra milliseconds to pause after `render()` before asserting.
+ */
+export interface ExpectNoTextTruncationOptions {
+  selector?: string;
+  height?: number;
+  waitMs?: number;
+}
+
+/**
+ * Assert that no visible text-bearing element has its text silently clipped at
+ * `width` px without an ellipsis.
+ *
+ * After rendering at the target viewport width, every element that has text
+ * content is checked: if its `scrollWidth > clientWidth` (content is wider than
+ * the container) AND its computed `text-overflow` style is not `'ellipsis'`,
+ * the text is being silently clipped — a mobile readability bug.
+ *
+ * Authors can opt a node out by adding `data-viewport-allow-truncation` to it.
+ * Any descendant of an opted-out node is skipped as well.
+ *
+ * Intentional ellipsis via Tailwind `truncate` (which applies
+ * `text-overflow: ellipsis`) is automatically excluded — only silent clipping
+ * is flagged.
+ *
+ * On failure, the thrown Error names up to five offending elements with their
+ * tag, overflow amount in px, and a short outerHTML excerpt.
+ */
+export async function expectNoTextTruncationAt(
+  width: number,
+  render: () => Promise<void> | void,
+  options?: ExpectNoTextTruncationOptions,
+): Promise<void> {
+  const callerFile = _callerTestFile();
+  const selector = options?.selector ?? 'body *';
+  const height = options?.height ?? 800;
+  const waitMs = options?.waitMs ?? 0;
+
+  await page.viewport(width, height);
+  await render();
+
+  await new Promise<void>((resolve) => {
+    requestAnimationFrame(() => resolve());
+  });
+
+  if (waitMs > 0) {
+    await new Promise<void>((resolve) => setTimeout(resolve, waitMs));
+  }
+
+  const truncated: { tag: string; overflow: number; html: string }[] = [];
+  const all = document.querySelectorAll<HTMLElement>(selector);
+  for (const el of all) {
+    if (el.closest('[data-viewport-allow-truncation]')) continue;
+    // Skip hidden/zero-sized elements (display:none collapses to 0×0)
+    const rect = el.getBoundingClientRect();
+    if (rect.width === 0 && rect.height === 0) continue;
+    // Skip elements with no text content
+    if (!el.textContent?.trim()) continue;
+    // Skip elements where text-overflow is intentionally ellipsis (e.g. Tailwind `truncate`)
+    const style = window.getComputedStyle(el);
+    if (style.textOverflow === 'ellipsis') continue;
+    // scrollWidth > clientWidth means text content is wider than the visible container
+    if (el.scrollWidth > el.clientWidth) {
+      truncated.push({
+        tag: el.tagName.toLowerCase(),
+        overflow: el.scrollWidth - el.clientWidth,
+        html: el.outerHTML.slice(0, 160),
+      });
+    }
+  }
+
+  if (truncated.length > 0) {
+    const lines = truncated
+      .slice(0, 5)
+      .map((e) => `  <${e.tag}> overflow=${e.overflow}px — ${e.html}`)
+      .join('\n');
+    const more = truncated.length > 5 ? `\n  ... and ${truncated.length - 5} more` : '';
+    const fileTag = callerFile ? ` [${callerFile}]` : '';
+    throw new Error(
+      `expectNoTextTruncationAt(${width})${fileTag}: ${truncated.length} element(s) have text clipped without ellipsis at width=${width}px:\n${lines}${more}`,
+    );
+  }
+}
+
+/**
  * Options for `expectMinTouchTargetAt`.
  *
  * - `selector`: CSS selector to find buttons to check (default 'button').

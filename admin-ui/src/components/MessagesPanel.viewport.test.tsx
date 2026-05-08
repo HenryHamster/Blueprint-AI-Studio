@@ -2,7 +2,7 @@ import { afterEach, describe, test, vi, expect } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { MessagesPanel } from './MessagesPanel';
-import { expectNoOverflowAt, expectMinTouchTargetAt } from '../test/viewport';
+import { expectNoOverflowAt, expectMinTouchTargetAt, expectNoTextTruncationAt } from '../test/viewport';
 
 // React patches the input `value` setter on its prototype to track controlled-input
 // state. Assigning `input.value = 'x'` then dispatching an event won't trigger React's
@@ -125,6 +125,21 @@ describe('MessagesPanel — viewport regression', () => {
       root = r;
       await renderPanel(r, msgs);
     });
+  });
+
+  test('long message content does not silently clip text at 375px', async () => {
+    const msgs = [
+      makeMsg({ id: 'msg-1', content: 'PR #4219 fix(auth): handle token expiry edge case in refresh flow — production users affected', message_type: 'FEEDBACK', status: 'open' }),
+      makeMsg({ id: 'msg-2', content: 'account_model_regression_quarantined: model claude-opus-4-7 shows elevated error rate on direction portfolio tasks', message_type: 'NOTE', from_type: 'system', context: { event_type: 'account_model_regression_quarantined' } }),
+    ];
+    await expectNoTextTruncationAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await renderPanel(r, msgs);
+    }, { waitMs: 50 });
   });
 
   test('time dividers render without overflow when messages span days', async () => {

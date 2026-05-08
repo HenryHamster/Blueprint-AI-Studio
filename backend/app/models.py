@@ -1424,12 +1424,23 @@ ESCALATION_REASON_ATTEMPTS_EXHAUSTED = "attempts_exhausted"
 ESCALATION_REASON_INVESTIGATIONS_DIVERGED = "investigations_diverged"
 ESCALATION_REASON_STALE_ACTIVE = "stale_active"
 ESCALATION_REASON_STALE_MERGED = "stale_merged"
+# Meta-investigation escalation reasons — set when the dispatcher spawns a
+# cross-layer / concentration / fingerprint / recurrence investigation so
+# operators can distinguish these from manual-intervention triggers in the UI.
+ESCALATION_REASON_ESCALATED_CROSS_LAYER = "escalated_cross_layer"
+ESCALATION_REASON_ESCALATED_LAYER_CONCENTRATION = "escalated_layer_concentration"
+ESCALATION_REASON_ESCALATED_CROSS_CASE_FINGERPRINT = "escalated_cross_case_fingerprint"
+ESCALATION_REASON_ESCALATED_RECURRENCE = "escalated_recurrence"
 REGRESSION_ESCALATION_REASONS: frozenset[str] = frozenset(
     {
         ESCALATION_REASON_ATTEMPTS_EXHAUSTED,
         ESCALATION_REASON_INVESTIGATIONS_DIVERGED,
         ESCALATION_REASON_STALE_ACTIVE,
         ESCALATION_REASON_STALE_MERGED,
+        ESCALATION_REASON_ESCALATED_CROSS_LAYER,
+        ESCALATION_REASON_ESCALATED_LAYER_CONCENTRATION,
+        ESCALATION_REASON_ESCALATED_CROSS_CASE_FINGERPRINT,
+        ESCALATION_REASON_ESCALATED_RECURRENCE,
     }
 )
 

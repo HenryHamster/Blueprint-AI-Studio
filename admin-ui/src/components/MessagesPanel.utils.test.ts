@@ -5,6 +5,8 @@ import {
   type EventPref,
   eventPrefsKey,
   groupRoutineMessages,
+  collapseStaleRoutineRows,
+  STALE_ROUTINE_COLLAPSE_AGE_MS,
   isFailingGroup,
   ESCALATION_EVENT_TYPES,
   ESCALATION_BADGE_LABELS,
@@ -613,6 +615,48 @@ describe('Saved Views storage', () => {
 
   it('cap constant is 10', () => {
     expect(SAVED_VIEWS_CAP).toBe(10);
+  });
+});
+
+describe('Age-based routine collapse (collapseStaleRoutineRows)', () => {
+  const makeMsg = (id: string, et: string, msSinceEpoch: number) => ({
+    id,
+    context: { event_type: et },
+    created_at: new Date(msSinceEpoch).toISOString(),
+  });
+
+  it('(1) single stale routine message collapses into a daily_digest row', () => {
+    const msgTs = Date.now() - 4 * STALE_ROUTINE_COLLAPSE_AGE_MS;
+    const rows = groupRoutineMessages([makeMsg('m1', 'pr_merged', msgTs)]);
+    const collapsed = collapseStaleRoutineRows(rows);
+    expect(collapsed).toHaveLength(1);
+    expect(collapsed[0].kind).toBe('daily_digest');
+    expect(collapsed[0].count).toBe(1);
+    expect(collapsed[0].breakdown['pr_merged']).toBe(1);
+  });
+
+  it('(2) fresh burst of 3 routine messages within 30min stays as a 1h-window group', () => {
+    const base = Date.now() - 20 * 60000; // 20 min ago — well within 1h threshold
+    const msgs = [
+      makeMsg('m1', 'pr_merged', base),
+      makeMsg('m2', 'pr_merged', base + 10 * 60000),
+      makeMsg('m3', 'pr_merged', base + 20 * 60000),
+    ];
+    const rows = groupRoutineMessages(msgs);
+    expect(rows[0].kind).toBe('group'); // sanity: 1h-window grouping fired
+    const collapsed = collapseStaleRoutineRows(rows);
+    expect(collapsed).toHaveLength(1);
+    expect(collapsed[0].kind).toBe('group');
+    expect(collapsed[0].msgs).toHaveLength(3);
+  });
+
+  it('(3) high-signal event type older than threshold renders as single, not collapsed', () => {
+    const msgTs = Date.now() - 4 * STALE_ROUTINE_COLLAPSE_AGE_MS;
+    const rows = groupRoutineMessages([makeMsg('m1', 'failure_alert', msgTs)]);
+    const collapsed = collapseStaleRoutineRows(rows);
+    expect(collapsed).toHaveLength(1);
+    expect(collapsed[0].kind).toBe('single');
+    expect(collapsed[0].msg.id).toBe('m1');
   });
 });
 
