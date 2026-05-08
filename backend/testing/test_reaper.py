@@ -550,6 +550,45 @@ async def test_in_progress_no_tool_use_within_progress_stale_not_reaped(
 
 
 @pytest.mark.asyncio
+async def test_in_progress_stale_tool_use_but_fresh_attempt_not_reaped(
+    reaper_db, stop_after_one_cycle, reaper_side_effects
+):
+    """A retry whose last_tool_use_at is stale (carried forward from a prior
+    attempt) must NOT be reaped if the CURRENT attempt's started_at is recent.
+
+    Regression for 8c8cf973 (Architecture review on Claude Opus, 2026-05-08):
+    attempt 3 was reaped 22 seconds after starting because last_tool_use_at
+    was 11 minutes old from attempt 1. Three attempts burned in ~3 minutes
+    with each retry never getting a chance to actually run.
+    """
+    project = await _make_project(reaper_db)
+    now = datetime.utcnow()
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "design_doc_update", "scope": "small"}],
+        vm_instance_id="vm-fresh-retry",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=2,  # 3rd attempt
+        # Started 30s ago — well within any reasonable progress window.
+        started_at=now - timedelta(seconds=30),
+        last_heartbeat=now - timedelta(seconds=15),
+        # Tool use from a much earlier attempt — stale by 12+ minutes.
+        last_tool_use_at=now - timedelta(minutes=12),
+        context={"scope": "small", "llm_provider": "anthropic"},
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    assert t.status == TaskStatus.IN_PROGRESS, (
+        "Reaper killed a fresh attempt because tool_use_at was stale from "
+        "a prior attempt — cross-attempt stale-tool guard regression"
+    )
+
+
+@pytest.mark.asyncio
 async def test_in_progress_no_tool_use_codex_provider_not_reaped(
     reaper_db, stop_after_one_cycle, reaper_side_effects
 ):

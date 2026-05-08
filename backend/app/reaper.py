@@ -761,11 +761,24 @@ async def reaper_service():
                             and task.last_tool_use_at is not None
                             and task.last_tool_use_at
                             < _progress_stale_cutoff(task, now)
+                            and (
+                                task.started_at is None
+                                or task.started_at
+                                < _progress_stale_cutoff(task, now)
+                            )
                         ):
                             # Stalled-but-heartbeating: agent process is alive (fresh
                             # heartbeat) but has made no tool/LLM calls for longer than
                             # the scope-aware progress threshold. Indicates a hung LLM
                             # call, a spinning retry loop, or a wedged tool invocation.
+                            #
+                            # Cross-attempt stale-tool guard (8c8cf973 incident):
+                            # last_tool_use_at carries forward across retries — if
+                            # only this field is checked, every retry is born stale
+                            # and reaped within seconds (8c8cf973 attempt 3 reaped
+                            # 22s after starting because tool_use_at was 11min old
+                            # from attempt 1). The started_at check ensures the
+                            # current attempt has actually had time to call tools.
                             orphaned_ids.append(task.id)
                         elif (
                             task.last_heartbeat
@@ -914,7 +927,7 @@ async def reaper_service():
                                 and t.started_at < hb_cutoff
                             ):
                                 verified.append(t)
-                            elif (  # noqa: SIM114
+                            elif (
                                 t.last_heartbeat is None
                                 and t.started_at is None
                                 and t.created_at < ten_minutes_ago
@@ -925,7 +938,13 @@ async def reaper_service():
                                 and t.last_heartbeat >= hb_cutoff
                                 and t.last_tool_use_at is not None
                                 and t.last_tool_use_at < _progress_stale_cutoff(t, now)
+                                and (
+                                    t.started_at is None
+                                    or t.started_at < _progress_stale_cutoff(t, now)
+                                )
                             ):
+                                # Verification mirror; see step-1 cross-attempt
+                                # stale-tool guard (8c8cf973 incident).
                                 verified.append(t)
                             elif (
                                 t.last_heartbeat
@@ -1031,10 +1050,19 @@ async def reaper_service():
                         and fresh_task.last_tool_use_at is not None
                         and fresh_task.last_tool_use_at
                         < _progress_stale_cutoff(fresh_task, now)
+                        and (
+                            fresh_task.started_at is None
+                            or fresh_task.started_at
+                            < _progress_stale_cutoff(fresh_task, now)
+                        )
                         and fresh_task.last_heartbeat
                         >= _heartbeat_stale_cutoff(fresh_task, now)
                     ):
                         # Stalled-but-heartbeating: process alive, no tool progress.
+                        # The started_at clause guards against cross-attempt
+                        # stale-tool reaps — last_tool_use_at carries forward
+                        # across retries; without this, a fresh attempt can be
+                        # killed within seconds of starting (8c8cf973 incident).
                         age = int((now - fresh_task.last_tool_use_at).total_seconds())
                         reap_reason = (
                             f"Agent stalled — heartbeat fresh but no tool calls for {age}s "
