@@ -4716,12 +4716,42 @@ async def orchestrator_worker():
                             f"[CI] Error checking CI for task {ci_task_id}"
                         )
                         try:
+                            # Re-fetch ci_task fresh inside the recovery: if the
+                            # outer exception was a connection-class failure, the
+                            # session was rolled back and every loaded attribute
+                            # is expired — accessing ci_task.context / .id below
+                            # would lazy-load on a poisoned connection and crash
+                            # this handler too. ``_lock_task_for_mutation`` uses
+                            # ``populate_existing=True`` which gives us a live
+                            # row; a None return means another worker took the
+                            # task or the row is gone, in which case we have
+                            # nothing to mutate. (Production 2026-05-08:
+                            # orchestrator.py:4750 + models.py:700 cascade.)
+                            try:
+                                await session.rollback()
+                            except Exception:
+                                logger.debug(
+                                    "[CI] Pre-recovery rollback raised, continuing"
+                                )
+                            ci_task = await _lock_task_for_mutation(
+                                session,
+                                ci_task_id,
+                                reason="CI polling error recovery",
+                            )
+                            if ci_task is None:
+                                logger.warning(
+                                    f"[CI] Skipping error recovery for task {ci_task_id}: row not lockable"
+                                )
+                                continue
                             status_code = getattr(e, "status_code", None)
                             if status_code == 404:
                                 ci_task.status = TaskStatus.FAILED
                                 ci_task.latest_status_message = "CI polling failed: PR not found (404) — PR may have been deleted"
+                                _pr_num_404 = (ci_task.context or {}).get(
+                                    "review_loop", {}
+                                ).get("pr_number")
                                 logger.exception(
-                                    f"[CI] PR #{ci_task.context.get('review_loop', {}).get('pr_number')} returned 404 — marking task {ci_task.id} FAILED"
+                                    f"[CI] PR #{_pr_num_404} returned 404 — marking task {ci_task_id} FAILED"
                                 )
                                 await _maybe_create_failure_alert(
                                     ci_task,
@@ -4736,7 +4766,7 @@ async def orchestrator_worker():
                                 record_task_result(
                                     success=False,
                                     failure_class="EXTERNAL_API",
-                                    task_id=str(ci_task.id),
+                                    task_id=str(ci_task_id),
                                     task_type=(ci_task.first_payload).get("type", ""),
                                 )
                             else:
@@ -4747,13 +4777,13 @@ async def orchestrator_worker():
                             await session.commit()
                         except Exception:
                             logger.exception(
-                                f"[CI] Failed to update ci_task status after error for task {ci_task.id}"
+                                f"[CI] Failed to update ci_task status after error for task {ci_task_id}"
                             )
                             try:
                                 await session.rollback()
                             except Exception:
                                 logger.exception(
-                                    f"[CI] Rollback also failed for task {ci_task.id}"
+                                    f"[CI] Rollback also failed for task {ci_task_id}"
                                 )
 
                 # Post-commit recovery is handled by `_sweep_post_commit_pending`

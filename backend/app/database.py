@@ -1,3 +1,4 @@
+import contextlib
 import logging
 import os
 from typing import cast
@@ -187,8 +188,45 @@ engine = _LazyEngine()
 # Stable-identifier reads (primary keys, parent FKs) are always safe; only
 # mutable columns (status, context, payloads, updated_at) carry stale-read
 # risk. See docs/concurrency.md for the full discipline guide.
+class _SafeCloseAsyncSession(AsyncSession):
+    """AsyncSession that tolerates ``InterfaceError("connection is closed")``
+    on close.
+
+    Background services use ``async with AsyncSessionLocal() as session:``
+    directly. When the asyncpg socket dies mid-cycle (Cloud SQL idle
+    eviction, failover, Cloud Run cutover), the context manager's
+    ``__aexit__`` invokes ``rollback()`` on a dead connection and
+    raises — bubbling out as the actual production crash class.
+    The disconnect listener has already invalidated the pool entry,
+    so the bad connection won't be checked out again; swallowing the
+    cleanup-time error keeps the surrounding cycle alive.
+
+    Production 2026-05-08: services.py:44 + orchestrator.py:4750 +
+    reaper.py:2407 cascades all originated in this close-time path.
+    Subclassing here means *every* session — bare AsyncSessionLocal
+    callers, ``get_session`` request handlers, and ``closing_session``
+    callers — gets the same protection automatically.
+    """
+
+    async def close(self) -> None:
+        from sqlalchemy.exc import InterfaceError as SAInterfaceError
+
+        try:
+            await super().close()
+        except SAInterfaceError as e:
+            msg = str(e).lower()
+            if "connection is closed" in msg or "connection does not exist" in msg:
+                logger.debug(
+                    "[DB] Tolerating closed-connection during session close: %s", e
+                )
+                return
+            raise
+
+
 AsyncSessionLocal = async_sessionmaker(
-    cast(AsyncEngine, engine), class_=AsyncSession, expire_on_commit=False
+    cast(AsyncEngine, engine),
+    class_=_SafeCloseAsyncSession,
+    expire_on_commit=False,
 )
 
 
@@ -210,19 +248,49 @@ async def get_session() -> AsyncSession:  # type: ignore
     succeeded application-side. Suppressing the cleanup-time error keeps the
     response intact; the bad connection is gone from the pool either way.
     """
-    from sqlalchemy.exc import InterfaceError as SAInterfaceError
-
     session = AsyncSessionLocal()
     try:
         yield session
     finally:
-        try:
-            await session.close()
-        except SAInterfaceError as e:
-            msg = str(e).lower()
-            if "connection is closed" in msg or "connection does not exist" in msg:
-                logger.debug(
-                    "[DB] Tolerating closed-connection during session close: %s", e
-                )
-            else:
-                raise
+        await _safe_close(session)
+
+
+async def _safe_close(session: AsyncSession) -> None:
+    """Close a session, swallowing the asyncpg "connection is closed" rollback.
+
+    See ``get_session`` for the full rationale. Background services that use
+    ``async with AsyncSessionLocal() as session:`` directly bypass that
+    handler and crash with ``InterfaceError`` whenever Cloud SQL evicts an
+    idle connection between the last query and ``__aexit__``'s rollback.
+    """
+    from sqlalchemy.exc import InterfaceError as SAInterfaceError
+
+    try:
+        await session.close()
+    except SAInterfaceError as e:
+        msg = str(e).lower()
+        if "connection is closed" in msg or "connection does not exist" in msg:
+            logger.debug(
+                "[DB] Tolerating closed-connection during session close: %s", e
+            )
+        else:
+            raise
+
+
+@contextlib.asynccontextmanager
+async def closing_session():
+    """Async-cm replacement for ``async with AsyncSessionLocal() as session``.
+
+    Background services (reaper, orchestrator, gcp_cleanup, lifecycle, ...)
+    use the bare ``AsyncSessionLocal()`` context manager and crash on close
+    when the asyncpg socket has died mid-cycle (Cloud SQL idle eviction,
+    failover, Cloud Run cutover). Switching such call sites to this helper
+    routes the close through ``_safe_close`` and keeps the cycle alive — the
+    disconnect listener has already invalidated the pool entry, so the next
+    iteration gets a fresh connection.
+    """
+    session = AsyncSessionLocal()
+    try:
+        yield session
+    finally:
+        await _safe_close(session)

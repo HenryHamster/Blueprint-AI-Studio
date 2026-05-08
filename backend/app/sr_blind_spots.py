@@ -152,6 +152,14 @@ async def _scan_blind_spot_counts(
         for entry in sro.get("blind_spots") or []:
             if not isinstance(entry, str) or not entry.strip():
                 continue
+            # Apply disallow patterns to the *full* entry, not the 6-token
+            # theme. Patterns require a "(test suite|pytest|tests?)" suffix
+            # that the truncation drops (e.g. "did not run the full backend
+            # test suite" → "did not run the full backend"), so a per-theme
+            # check downstream in the dispatcher always missed and noisy
+            # intentional-skip themes still tripped the spawn floor.
+            if is_disallowed_blind_spot(entry):
+                continue
             theme = " ".join(entry.lower().split()[:6])
             if theme not in theme_data:
                 theme_data[theme] = {

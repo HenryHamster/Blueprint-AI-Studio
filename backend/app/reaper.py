@@ -2304,6 +2304,17 @@ async def reaper_service():
                 # listeners (models.py ~360) read status_log on every set; under
                 # async sessions a deferred-column fetch raises MissingGreenlet.
                 _children_by_parent: Dict[uuid.UUID, list] = {}
+                # Plain-tuple snapshot of (id, status, context) per child, captured
+                # at SELECT time. Step 4 iterates this rather than touching live
+                # ORM children: ``_check_and_trigger_rollup`` in Step 3 may commit
+                # or trigger a session rollback (via inner DB error), which under
+                # SQLAlchemy expires every loaded instance — a subsequent
+                # ``c.status`` read fires a sync lazy-load that can't acquire a
+                # connection if the underlying asyncpg socket is dead, crashing
+                # the entire reaper cycle. Snapshotting decouples Step 4 from
+                # session state. (Production 2026-05-08: 26x crashes at
+                # reaper.py:2407 over a 45 min Cloud SQL instability window.)
+                _children_snapshot_by_parent: Dict[uuid.UUID, list[tuple]] = {}
                 evaluating_parents = []
                 try:
                     stale_cutoff = now - timedelta(minutes=15)
@@ -2362,6 +2373,9 @@ async def reaper_service():
                             _children_by_parent.setdefault(
                                 _c.parent_task_id, []
                             ).append(_c)
+                            _children_snapshot_by_parent.setdefault(
+                                _c.parent_task_id, []
+                            ).append((_c.id, _c.status, _c.context or {}))
                     for parent in evaluating_parents:
                         # Find a completed child to use as the trigger for _check_and_trigger_rollup
                         child = next(
@@ -2392,7 +2406,9 @@ async def reaper_service():
                 # Step 4: Rescue EVALUATING parents whose children ALL terminated without
                 # any completing successfully.  These parents have no COMPLETED child to
                 # trigger _check_and_trigger_rollup, so they stay EVALUATING forever.
-                # Reuses _children_by_parent populated in Step 3.
+                # Iterates the plain-tuple snapshot from Step 3 — see the comment
+                # at ``_children_snapshot_by_parent`` for why we don't touch
+                # live ORM children here.
                 try:
                     _terminal = {
                         TaskStatus.COMPLETED,
@@ -2401,13 +2417,13 @@ async def reaper_service():
                     }
                     rescued = 0
                     for parent in evaluating_parents:
-                        children = _children_by_parent.get(parent.id, [])
-                        if not children:
+                        children_snap = _children_snapshot_by_parent.get(parent.id, [])
+                        if not children_snap:
                             continue
-                        if any(c.status not in _terminal for c in children):
+                        if any(status not in _terminal for _, status, _ in children_snap):
                             # At least one child still running — not safe to rescue yet.
                             continue
-                        if any(c.status == TaskStatus.COMPLETED for c in children):
+                        if any(status == TaskStatus.COMPLETED for _, status, _ in children_snap):
                             # Step 3 handles this; skip.
                             continue
                         # All children are terminal and none completed — attempt re-evaluation
@@ -2415,17 +2431,19 @@ async def reaper_service():
                         # guidance (up to MAX_PARENT_REQUEUES attempts).  If attempts are
                         # exhausted it marks the parent FAILED and fires a failure alert.
                         failed_children = [
-                            c for c in children if c.status == TaskStatus.FAILED
+                            (cid, ctx) for cid, status, ctx in children_snap
+                            if status == TaskStatus.FAILED
                         ]
                         cancelled_children = [
-                            c for c in children if c.status == TaskStatus.CANCELLED
+                            cid for cid, status, _ in children_snap
+                            if status == TaskStatus.CANCELLED
                         ]
                         # Build a diagnostic message including child failure classes.
                         parts = []
                         if failed_children:
                             classes = [
-                                (c.context or {}).get("failure_category") or "unknown"
-                                for c in failed_children
+                                (ctx or {}).get("failure_category") or "unknown"
+                                for _, ctx in failed_children
                             ]
                             class_summary = ", ".join(f"{cls}" for cls in classes)
                             parts.append(
@@ -2434,7 +2452,7 @@ async def reaper_service():
                         if cancelled_children:
                             parts.append(f"{len(cancelled_children)} cancelled")
                         diag = (
-                            "; ".join(parts) if parts else f"{len(children)} terminal"
+                            "; ".join(parts) if parts else f"{len(children_snap)} terminal"
                         )
                         parent.latest_status_message = (
                             f"All child tasks terminated without success: {diag}"

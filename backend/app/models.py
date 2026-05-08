@@ -697,7 +697,24 @@ class TaskHistory(SQLModel, table=True):
 def _on_status_message_set(target: Task, value, oldvalue, initiator):
     if value and value != oldvalue:
         entry = {"t": _utcnow().isoformat(), "msg": str(value)[:500]}
-        target.status_log = ((target.status_log or []) + [entry])[-90:]
+        try:
+            target.status_log = ((target.status_log or []) + [entry])[-90:]
+        except Exception as e:  # noqa: BLE001
+            # Reading target.status_log fires a sync lazy-load when the
+            # attribute is expired (most common cause: the session was
+            # rolled back by an upstream DB error, expiring every loaded
+            # instance). Under an async session that raises
+            # MissingGreenlet; if the underlying asyncpg connection is
+            # also dead it raises InterfaceError. Either way the
+            # status_log audit append is best-effort — the
+            # latest_status_message SET itself still persists via the
+            # outer assignment, so we swallow and skip the append rather
+            # than crashing the caller's whole transaction.
+            # Production 2026-05-08: orchestrator.py:4743 cascade.
+            logger.debug(
+                "[MODELS] _on_status_message_set: skipped status_log append (%s)",
+                e,
+            )
 
 
 # Callbacks invoked when a task reaches a terminal state.
@@ -732,7 +749,15 @@ def _on_status_set(target: Task, value, oldvalue, initiator):
             "t": _utcnow().isoformat(),
             "msg": f"Status changed: {oldvalue} → {value}",
         }
-        target.status_log = ((target.status_log or []) + [entry])[-90:]
+        try:
+            target.status_log = ((target.status_log or []) + [entry])[-90:]
+        except Exception as e:  # noqa: BLE001
+            # Best-effort audit append — see _on_status_message_set for
+            # the expired-attribute / dead-connection rationale.
+            logger.debug(
+                "[MODELS] _on_status_set: skipped status_log append (%s)",
+                e,
+            )
         task_id = str(target.id)
         # Notify JWT revocation when task reaches terminal state
         if value in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
@@ -1413,6 +1438,13 @@ class RegressionCaseStatus(str, Enum):
     MERGED = "MERGED"
     CLOSED = "CLOSED"
     NEEDS_MANUAL_INTERVENTION = "NEEDS_MANUAL_INTERVENTION"
+    # Investigation concluded the signal does not represent a real regression
+    # (intended behavior change, expected variance, statistical noise on a
+    # small sample, or a known-incomplete pipeline step). Spawning is
+    # suppressed until ``false_positive_until_at`` lapses, after which the
+    # next dispatcher tick re-arms the case to ACTIVE so a genuine recurrence
+    # of the same signal can still be diagnosed.
+    FALSE_POSITIVE = "FALSE_POSITIVE"
 
 
 # Distinguishes the path that drove a case into NEEDS_MANUAL_INTERVENTION so the
@@ -1565,6 +1597,22 @@ class RegressionRemediationCase(SQLModel, table=True):
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
+    # Suppression clock for FALSE_POSITIVE-status cases. When the investigate
+    # agent reports verdict=="not_a_regression" on a regression-dispatcher
+    # spawn, completion sets status=FALSE_POSITIVE and stamps this timestamp
+    # to now+TTL. The dispatcher silently skips spawn while this is in the
+    # future; once it lapses, the next tick re-arms to ACTIVE so genuine
+    # recurrence after expiry is still caught. NULL on every other status.
+    false_positive_until_at: Optional[datetime] = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+    # Free-form reason captured from the investigate report's verdict_reason
+    # so operators can audit auto-suppressions. Truncated to 500 chars.
+    false_positive_reason: Optional[str] = Field(
+        default=None,
+        sa_column=Column(String, nullable=True),
+    )
     # Per-layer symptom log: {layer_name: [{fingerprint, observed_at, sample}]}.
     # Written by the dispatcher when classify_layers() matches; bounded to 10
     # entries per layer so the column doesn't grow unboundedly.
@@ -1630,7 +1678,7 @@ class RegressionRemediationCase(SQLModel, table=True):
             "last_seen_at",
         ),
         CheckConstraint(
-            "status IN ('ACTIVE', 'REMEDIATING', 'MERGED', 'CLOSED', 'NEEDS_MANUAL_INTERVENTION')",
+            "status IN ('ACTIVE', 'REMEDIATING', 'MERGED', 'CLOSED', 'NEEDS_MANUAL_INTERVENTION', 'FALSE_POSITIVE')",
             name="ck_regressionremediationcase_status",
         ),
     )

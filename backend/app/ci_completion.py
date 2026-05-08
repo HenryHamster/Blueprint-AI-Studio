@@ -1175,6 +1175,8 @@ async def handle_ci_completion(
     from app.main import _maybe_create_failure_alert
     from app.broadcast import broadcast_to_project
 
+    ci_marked_failed = False
+
     # Serialize concurrent callers (webhook + poller) by locking the task row.
     # skip_locked: if another handler already holds the lock, exit — it will
     # handle the CI result.
@@ -1388,6 +1390,7 @@ async def handle_ci_completion(
             )
         else:
             task.status = TaskStatus.FAILED
+            ci_marked_failed = True
             task.latest_status_message = (
                 f"CI failed on PR #{ci_pr_number}, fix not spawned (pipeline limit)"
             )
@@ -1418,7 +1421,12 @@ async def handle_ci_completion(
                     project_id=str(task.project_id) if task.project_id else "",
                 )
 
-    if task.status == TaskStatus.FAILED:
+    # Tracked via local rather than ``task.status`` re-read: the failure-class
+    # block above invokes session-touching helpers that can leave ``task`` in
+    # an expired state (rollback after inner DB error → all attrs deferred,
+    # next read fires a sync lazy-load that crashes under async + bad conn).
+    # Production 2026-05-08: ci_completion.py:1421 cascade.
+    if ci_marked_failed:
         await _maybe_create_failure_alert(
             task,
             session,

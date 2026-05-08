@@ -666,8 +666,9 @@ ${userPrompt}${recentChangesSection}
 Instructions:
 1. Read relevant source files to understand the codebase and locate the root cause of the issue.
 2. DO NOT make any changes to any files — this is a read-only analysis.
-3. Identify the root cause, affected files, and a recommended fix.
-4. Write your diagnosis as a JSON object to /tmp/investigation_report_${taskId}.json with EXACTLY this schema:
+3. If the user prompt above frames this as a regression / signal trip / pipeline anomaly, FIRST triage whether what was observed is actually a real regression, or whether it is intended behavior, expected variance, or a known-incomplete pipeline step. When the prompt explicitly asks for a verdict, you MUST emit one.
+4. Otherwise, identify the root cause, affected files, and a recommended fix.
+5. Write your diagnosis as a JSON object to /tmp/investigation_report_${taskId}.json with EXACTLY this schema:
 
 {
   "summary": "Brief summary of the issue and findings",
@@ -677,8 +678,19 @@ Instructions:
   ],
   "recommended_fix": "Concrete description of what needs to be changed to fix the issue",
   "severity": "critical|high|medium|low",
-  "confidence": "high|medium|low"
+  "confidence": "high|medium|low",
+  "verdict": "real_regression|not_a_regression",
+  "verdict_reason": "One to three sentences citing concrete evidence (file paths, design doc passages, prior commit SHAs) that justify the verdict. Required when verdict='not_a_regression', optional otherwise."
 }
+
+verdict guidance (only meaningful for regression / signal-trip prompts; default 'real_regression' if the prompt isn't framed that way):
+- "real_regression": the observed behavior is a genuine bug, regression, or unintended degradation. Diagnose normally and populate root_cause / recommended_fix.
+- "not_a_regression": set this when ANY of the following apply, and leave recommended_fix empty (do NOT fabricate a fix):
+  * The observed behavior is intentional / by design (feature flag deliberately gating a step, recently merged change altered the baseline, design doc explicitly documents the behavior).
+  * Sample size is too small for the prior/current delta to be statistically meaningful.
+  * The 'regression' is just a known-incomplete pipeline step (e.g. the agent did not run the full backend test suite — that's documented design, not a bug).
+  * The signal observed transient infrastructure noise (one-off VM crash, flaky external dep) with no code-side root cause.
+  Your verdict_reason must cite concrete evidence — vague claims ("seems intentional") are rejected; the dispatcher will still suppress respawning for the TTL but operators will lose trust in the verdict.
 
 Confidence scoring criteria (be honest — low confidence triggers follow-up investigation, medium/high triggers an automated remediation task):
 - "high": You found the exact code location causing the failure with clear evidence — a specific function, wrong condition, missing check, or faulty expression directly explains the observed behavior. A fix can be written without further investigation.

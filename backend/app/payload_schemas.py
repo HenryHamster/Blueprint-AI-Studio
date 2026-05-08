@@ -24,12 +24,22 @@ from app.task_capabilities import ALL_TASK_TYPES, TaskType
 logger = logging.getLogger(__name__)
 
 
-# Hard upper bound on a serialized task payload. Above this, agent startup
-# stalls in ways that don't surface as explained failures — see the silent
-# pre-claim death investigation (task 595c235d). 256 KB is well above any
-# legitimate payload (normal design_doc_update is ~80 KB) while cutting off
-# runaway JSON state from bloating claim responses.
-_MAX_PAYLOAD_BYTES = 256 * 1024
+# Hard upper bound on a serialized task payload. Two constraints stack:
+#   1) Agent startup stalls when the claim response is bloated — see the
+#      silent pre-claim death investigation (task 595c235d).
+#   2) The DB enforces ``octet_length(payloads::text) < 200000`` via
+#      ``chk_task_payloads_size`` (alembic 0065). The list wrapper around
+#      a single payload adds 2 bytes (``[`` + ``]``), so any caller whose
+#      payload passes validation but whose value exceeds 199,997 bytes
+#      hits an opaque ``IntegrityError`` at DB insert. The validator and
+#      DB cap MUST stay aligned in the safe direction (validator <= DB),
+#      otherwise paths that skip ``pack_under_budget`` 500 silently —
+#      this regressed strategic-cycle in 2026-05-08 (task 7d6e... fix).
+# 190 KB is comfortably under the DB cap, well above any real payload
+# (design_doc_update is ~80 KB; pack_under_budget targets 120 KB), and
+# leaves ~5 KB of slack for the list-wrapper + UTF-8 multi-byte quirks.
+# When raising this, raise the DB constraint in a new migration first.
+_MAX_PAYLOAD_BYTES = 190 * 1024
 
 
 class PayloadTooLargeError(ValueError):

@@ -7269,8 +7269,18 @@ def test_regression_case_summary_emits_layer_coverage_field():
 
 @pytest.mark.asyncio
 async def test_sr_blind_spot_theme_disallowed_no_spawn(db_session):
-    """Disallowed theme at count >= floor → no investigate spawned; disallowed_theme rejection incremented."""
-    from app.pipeline_regression_dispatcher import get_dispatcher_cycle_records
+    """Disallowed theme at count >= floor → no investigate spawned.
+
+    The disallow filter now runs upstream in ``_scan_blind_spot_counts``
+    (sr_blind_spots.py) before themes ever reach the dispatcher, so the
+    dispatcher's per-theme ``is_disallowed_blind_spot`` defense-in-depth
+    check no longer increments the cycle-record ``disallowed_theme``
+    rejection counter for naturally-aggregated themes — the entries are
+    dropped before aggregation. The user-visible contract (no investigate
+    spawn for these themes) remains identical and is what this test
+    asserts.
+    """
+    from app.sr_blind_spots import aggregate_sr_blind_spot_themes
     from app.time_utils import _utcnow as _ts_now
 
     project = make_project(design_doc={})
@@ -7279,7 +7289,7 @@ async def test_sr_blind_spot_theme_disallowed_no_spawn(db_session):
     await db_session.refresh(project)
 
     now = _ts_now()
-    # "did not run full backend pytest" matches DISALLOWED_BLIND_SPOT_PATTERNS (6 tokens, pattern hits)
+    # "did not run full backend pytest" matches DISALLOWED_BLIND_SPOT_PATTERNS.
     disallowed_text = "did not run full backend pytest"
     for _ in range(7):  # well above the floor of 5
         sro = {
@@ -7299,6 +7309,13 @@ async def test_sr_blind_spot_theme_disallowed_no_spawn(db_session):
         )
     await db_session.commit()
 
+    # Confirm the upstream filter strips the disallowed entry — no theme
+    # row reaches the dispatcher loop.
+    themes = await aggregate_sr_blind_spot_themes(
+        db_session, project.id, days=14, limit=100
+    )
+    assert all(disallowed_text not in t["theme"] for t in themes)
+
     spawned = await run_once(db_session, project.id)
     assert spawned == 0
 
@@ -7313,11 +7330,6 @@ async def test_sr_blind_spot_theme_disallowed_no_spawn(db_session):
     assert investigate_tasks == [], (
         "no investigate task should be spawned for disallowed theme"
     )
-
-    records = await get_dispatcher_cycle_records(db_session, project_id=str(project.id))
-    assert records, "cycle record must exist"
-    last_record = records[-1]
-    assert last_record["rejections_by_reason"].get("disallowed_theme", 0) >= 1
 
 
 @pytest.mark.asyncio
@@ -11710,3 +11722,149 @@ async def test_marginal_followup_disabled_by_config(db_session):
         t for t in tasks if (t.context or {}).get("signal_name") == "marginal_followup"
     ]
     assert len(followup_tasks) == 0, "disabled config should suppress follow-up spawn"
+
+
+# ---------------------------------------------------------------------------
+# FALSE_POSITIVE suppression tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_false_positive_status_suppresses_spawn_within_ttl(db_session):
+    """A FALSE_POSITIVE case with future suppression timestamp blocks new spawns."""
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+    from app.pipeline_regression_dispatcher import _REGRESSION_FALSE_POSITIVE_TTL
+
+    project = make_project(
+        design_doc=_design_doc_with_sr_regression(category="correctness"),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate",
+        status=RegressionCaseStatus.FALSE_POSITIVE,
+        false_positive_until_at=now + _REGRESSION_FALSE_POSITIVE_TTL - timedelta(hours=1),
+        false_positive_reason="documented design — partial backend test run",
+        hit_count=1,
+    )
+    db_session.add(case)
+    await db_session.commit()
+    await db_session.refresh(case)
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 0
+
+    rows = (
+        (
+            await db_session.execute(
+                select(Task).where(
+                    Task.project_id == project.id,
+                    Task.context["regression_class"].as_string() == "sr_catch_rate",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert rows == []
+
+    await db_session.refresh(case)
+    # Status untouched; suppression still in effect.
+    assert case.status == RegressionCaseStatus.FALSE_POSITIVE
+
+
+@pytest.mark.asyncio
+async def test_false_positive_rearms_after_ttl_expires(db_session):
+    """Once false_positive_until_at lapses, the dispatcher re-arms to CLOSED and spawns."""
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+
+    project = make_project(
+        design_doc=_design_doc_with_sr_regression(category="correctness"),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate",
+        status=RegressionCaseStatus.FALSE_POSITIVE,
+        false_positive_until_at=now - timedelta(minutes=5),
+        false_positive_reason="(stale)",
+        hit_count=1,
+    )
+    db_session.add(case)
+    await db_session.commit()
+    await db_session.refresh(case)
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 1
+
+    await db_session.refresh(case)
+    # Re-arm clears the suppression clock and records a fresh spawn (case
+    # is reactivated to ACTIVE inside the existing-case spawn branch).
+    assert case.status == RegressionCaseStatus.ACTIVE
+    assert case.false_positive_until_at is None
+
+
+@pytest.mark.asyncio
+async def test_false_positive_with_null_until_does_not_suppress(db_session):
+    """Defensive: a malformed FALSE_POSITIVE row without a TTL still re-arms."""
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+
+    project = make_project(
+        design_doc=_design_doc_with_sr_regression(category="correctness"),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate",
+        status=RegressionCaseStatus.FALSE_POSITIVE,
+        false_positive_until_at=None,
+        hit_count=1,
+    )
+    db_session.add(case)
+    await db_session.commit()
+    await db_session.refresh(case)
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 1
+
+    await db_session.refresh(case)
+    assert case.status == RegressionCaseStatus.ACTIVE
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_prompt_documents_verdict_triage(db_session):
+    """Dispatcher prompt instructs the agent to set verdict=not_a_regression
+    when the trip is intentional behavior or known-incomplete pipeline step."""
+    project = make_project(
+        design_doc=_design_doc_with_sr_regression(category="correctness"),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 1
+
+    new_task = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .first()
+    )
+    prompt = (new_task.first_payload or {}).get("prompt", "")
+    # The triage instructions and false-positive triggers must reach the agent.
+    assert "verdict" in prompt
+    assert "not_a_regression" in prompt
+    assert "intentional" in prompt or "intended" in prompt
+    assert "known-incomplete pipeline step" in prompt
+    assert "verdict_reason" in prompt

@@ -64,6 +64,13 @@ ESCALATION_REASON_FRAGILE_RECURRENCE_META = "fragile_recurrence_meta"
 # generating an investigate every cycle once the prior task terminates.
 _REGRESSION_COOLDOWN = timedelta(hours=6)
 
+# Suppression window when an investigation reports verdict=="not_a_regression"
+# on a pipeline-regression spawn. Long enough that intentional behavior +
+# small-sample noise stops re-spawning every cooldown lapse, short enough that
+# a genuine new occurrence of the same signal class is still caught within a
+# week. The dispatcher silently re-arms the case to ACTIVE when this lapses.
+_REGRESSION_FALSE_POSITIVE_TTL = timedelta(days=7)
+
 # Per-cycle system-wide concurrency budget. A noisy regression cannot starve
 # the rest of the pipeline by occupying every research slot.
 _REGRESSION_DISPATCHER_SYSTEM_CAP = 2
@@ -544,11 +551,29 @@ def _format_signal_lines(
     if extras:
         lines.extend(extras)
     lines.append(
-        "\nDiagnose the underlying root cause of this regression and produce "
-        "the structured diagnosis JSON report ({summary, root_cause, "
-        "recommended_fix, severity, confidence, affected_files}). "
-        "Do NOT prescribe a fix — let the investigate→fix chain produce the "
-        "remediation."
+        "\nFIRST: triage whether this signal actually represents a regression. "
+        "Set `verdict` to 'not_a_regression' (not 'real_regression') when ANY "
+        "of these apply:\n"
+        "  - The behavior the signal observed is intentional / by design "
+        "(e.g. a pipeline step that is intentionally skipped under known "
+        "conditions, a feature flag deliberately gating a step, a recently "
+        "merged change that altered the expected baseline).\n"
+        "  - The sample size is too small for the prior/current delta to be "
+        "statistically meaningful (random variance, not a real shift).\n"
+        "  - The 'regression' is just a known-incomplete pipeline step (e.g. "
+        "the agent did not run the full backend test suite — that is the "
+        "documented design, not a bug).\n"
+        "  - The signal is observing transient infrastructure noise (one-off "
+        "VM crash, flaky external dep) with no code-side root cause.\n"
+        "When verdict='not_a_regression', populate `verdict_reason` with one "
+        "to three sentences citing concrete evidence (file paths, design "
+        "doc passages, prior commit SHAs, etc.). Leave recommended_fix "
+        "empty in that case — DO NOT fabricate a fix to satisfy the schema.\n"
+        "\nOTHERWISE (verdict='real_regression'), diagnose the underlying "
+        "root cause and produce the structured diagnosis JSON report "
+        "({summary, root_cause, recommended_fix, severity, confidence, "
+        "affected_files, verdict, verdict_reason}). Do NOT prescribe a fix "
+        "yourself — let the investigate→fix chain produce the remediation."
     )
     return "\n".join(lines)
 
@@ -2861,6 +2886,10 @@ async def _maybe_spawn(
         return None
 
     existing_case = await _get_remediation_case(session, project_id, regression_class)
+    # Compute ``now`` up-front so the FALSE_POSITIVE check below has access
+    # to it; the original code only assigned ``now`` after the cooldown
+    # gate. Subsequent gates reuse the same value.
+    now = _utcnow()
     if (
         existing_case is not None
         and existing_case.status == RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION
@@ -2877,6 +2906,46 @@ async def _maybe_spawn(
             existing_case.id,
         )
         return None
+    # FALSE_POSITIVE: investigation already concluded the signal does not
+    # represent a real regression. Silently suppress until the TTL lapses,
+    # then re-arm to ACTIVE so the next genuine occurrence of the same
+    # signal class can still be investigated.
+    if (
+        existing_case is not None
+        and existing_case.status == RegressionCaseStatus.FALSE_POSITIVE
+    ):
+        suppressed_until = existing_case.false_positive_until_at
+        if suppressed_until is not None and now < suppressed_until:
+            if _rj is not None:
+                _rj["false_positive_suppressed"] = (
+                    _rj.get("false_positive_suppressed", 0) + 1
+                )
+            logger.info(
+                "[REGRESSION_DISPATCHER] false-positive-suppressed project=%s "
+                "class=%s case_id=%s suppressed_until=%s",
+                project_id,
+                regression_class,
+                existing_case.id,
+                suppressed_until.isoformat(),
+            )
+            return None
+        # TTL lapsed (or was never stamped) — re-arm so the existing-case
+        # branch below treats this as a normal re-spawn. The case row is
+        # mutated in-place; the spawn helper will reset signal_first_crossed_at
+        # for a CLOSED-style fresh-cycle. We mirror CLOSED here so MTTD
+        # reflects the new episode rather than the original false-positive
+        # detection time.
+        existing_case.status = RegressionCaseStatus.CLOSED
+        existing_case.false_positive_until_at = None
+        existing_case.signal_first_crossed_at = None
+        session.add(existing_case)
+        logger.info(
+            "[REGRESSION_DISPATCHER] false-positive-rearm project=%s class=%s "
+            "case_id=%s",
+            project_id,
+            regression_class,
+            existing_case.id,
+        )
     if (
         existing_case is not None
         and existing_case.status == RegressionCaseStatus.MERGED
@@ -2895,7 +2964,6 @@ async def _maybe_spawn(
         return None
 
     last_spawn = await _last_spawn_for_class(session, project_id, regression_class)
-    now = _utcnow()
     fast_tracking_failed_remediation = (
         existing_case is not None
         and bool(getattr(existing_case, "fast_track_next_spawn", False))
@@ -5963,6 +6031,7 @@ async def run_once(session: AsyncSession, project_id: uuid.UUID) -> int:
         "cooldown": 0,
         "system_cap": 0,
         "manual_intervention_suppressed": 0,
+        "false_positive_suppressed": 0,
         "disallowed_theme": 0,
     }
     _token = _cycle_rejections_var.set(_rj)

@@ -2931,6 +2931,102 @@ async def _maybe_escalate_diagnosis_divergence(
     return True
 
 
+async def _mark_regression_case_false_positive(
+    *,
+    task: Task,
+    verdict_reason: str,
+    session: AsyncSession,
+) -> None:
+    """Transition the linked RegressionRemediationCase to FALSE_POSITIVE.
+
+    Triggered from ``_handle_investigation_completion`` when an investigate
+    task spawned by the pipeline-regression dispatcher reports
+    ``verdict == "not_a_regression"``. Stamps the suppression clock so the
+    dispatcher silently skips re-spawning the same regression class for the
+    TTL window (see ``_REGRESSION_FALSE_POSITIVE_TTL`` in
+    ``pipeline_regression_dispatcher``). After the TTL lapses the dispatcher
+    re-arms the case to ACTIVE so a genuine recurrence is still caught.
+
+    No-ops (without raising) when the matching case row cannot be found —
+    the dispatcher rebuilds case rows on next spawn anyway, so a missing row
+    just means the suppression won't survive past the next true trip.
+    """
+    from app.models import (  # noqa: PLC0415
+        Alert,
+        AlertSeverity,
+        RegressionCaseStatus,
+        RegressionRemediationCase,
+    )
+    from app.pipeline_regression_dispatcher import (  # noqa: PLC0415
+        _REGRESSION_FALSE_POSITIVE_TTL,
+    )
+
+    ctx = task.context or {}
+    regression_class = ctx.get("regression_class")
+    if not regression_class:
+        logger.warning(
+            "[INVESTIGATION_FALSE_POSITIVE] task=%s missing regression_class in "
+            "context — cannot mark case suppressed",
+            task.id,
+        )
+        return
+    case_row = (
+        await session.execute(
+            select(RegressionRemediationCase).where(
+                RegressionRemediationCase.project_id == task.project_id,
+                RegressionRemediationCase.regression_class == regression_class,
+            )
+        )
+    ).scalar_one_or_none()
+    if case_row is None:
+        logger.warning(
+            "[INVESTIGATION_FALSE_POSITIVE] task=%s class=%s no matching case "
+            "row — verdict recorded on task only",
+            task.id,
+            regression_class,
+        )
+        return
+
+    now = _utcnow()
+    suppressed_until = now + _REGRESSION_FALSE_POSITIVE_TTL
+    reason = (verdict_reason or "")[:500]
+    case_row.status = RegressionCaseStatus.FALSE_POSITIVE
+    case_row.false_positive_until_at = suppressed_until
+    case_row.false_positive_reason = reason
+    case_row.last_seen_at = now
+    case_row.last_remediation_result = "false_positive"
+    # Clear any in-flight signal-recovery clock — the case is no longer
+    # awaiting a fix, so the watchdog must not auto-close it via the
+    # recovered-unattended path.
+    case_row.signal_healthy_since_at = None
+    session.add(case_row)
+    session.add(
+        Alert(
+            project_id=task.project_id,
+            severity=AlertSeverity.INFO,
+            title=(
+                f"Regression case marked FALSE_POSITIVE: {regression_class}"
+            )[:200],
+            message=(
+                f"Investigation {task.id} concluded the signal is not a real "
+                f"regression. Suppressing dispatcher spawns for class "
+                f"{regression_class} until {suppressed_until.isoformat()}. "
+                f"Reason: {reason or '(none provided)'}"
+            )[:1000],
+        )
+    )
+    logger.info(
+        "[INVESTIGATION_FALSE_POSITIVE] project=%s class=%s task=%s case_id=%s "
+        "suppressed_until=%s reason=%r",
+        task.project_id,
+        regression_class,
+        task.id,
+        case_row.id,
+        suppressed_until.isoformat(),
+        reason[:200],
+    )
+
+
 async def _handle_investigation_completion(
     task: Task, payload, session: AsyncSession
 ) -> None:
@@ -3040,6 +3136,8 @@ async def _handle_investigation_completion(
         )
         confidence = "medium"
     severity = str(report.get("severity") or "").lower()
+    verdict = str(report.get("verdict") or "real_regression").strip().lower()
+    verdict_reason = str(report.get("verdict_reason") or "").strip()
     raw_affected = report.get("affected_files") or []
     affected_paths: List[str] = []
     for entry in raw_affected if isinstance(raw_affected, list) else []:
@@ -3062,6 +3160,26 @@ async def _handle_investigation_completion(
         direction = next(
             (d for d in directions_list if d.get("id") == direction_id), None
         )
+
+    # Pipeline-regression false-positive short-circuit. When the agent
+    # concluded the tripped signal isn't actually a regression (intended
+    # behavior, statistical noise, known-incomplete pipeline step), mark the
+    # RegressionRemediationCase as FALSE_POSITIVE so the dispatcher
+    # suppresses re-spawning the same class for the TTL window. We MUST run
+    # this before the remediation-spawn branches below, otherwise a verdict
+    # disagreement would still spawn a fix and undo the suppression.
+    spawned_by = (task.context or {}).get("spawned_by")
+    if (
+        verdict == "not_a_regression"
+        and spawned_by == "pipeline_regression_dispatcher"
+    ):
+        await _mark_regression_case_false_positive(
+            task=task,
+            verdict_reason=verdict_reason or summary or "(no reason provided)",
+            session=session,
+        )
+        session.add(task)
+        return
 
     structural = _is_structural_diagnosis(root_cause, recommended_fix)
     spawn_remediation = (

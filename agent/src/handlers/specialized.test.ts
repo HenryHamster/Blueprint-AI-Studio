@@ -1085,6 +1085,22 @@ describe('specialized handler task-specific content contracts', () => {
       // Read-only constraint
       expect(p).toContain('Do NOT modify any files');
     });
+
+    it('prompt documents real-vs-false regression verdict triage', async () => {
+      await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+      const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+      // Verdict field with both enum values
+      expect(p).toContain('"verdict"');
+      expect(p).toContain('real_regression');
+      expect(p).toContain('not_a_regression');
+      // verdict_reason explanation
+      expect(p).toContain('verdict_reason');
+      // Common false-positive triggers explicitly enumerated
+      expect(p).toContain('intentional');
+      expect(p).toContain('known-incomplete pipeline step');
+      // Don't fabricate fixes when not_a_regression
+      expect(p).toContain('do NOT fabricate a fix');
+    });
   });
 
   // ── handleSelfAudit contract ────────────────────────────────────────────
