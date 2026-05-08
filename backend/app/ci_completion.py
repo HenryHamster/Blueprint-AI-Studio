@@ -134,7 +134,7 @@ async def _post_merge_summary(
     review_loop: dict,
 ) -> None:
     """Post a one-time structured merge summary on a Blueprint-generated PR. Best-effort."""
-    from app.github import create_pr_comment  # noqa: PLC0415
+    from app.github import create_pr_comment
 
     ctx = task.context or {}
     payload = task.first_payload or {}
@@ -425,7 +425,7 @@ async def _attempt_merge_with_retry_and_escalation(
         # 'behind' path: call update_branch (GitHub write) BEFORE re-acquiring
         # the lock. The result is consumed in the lock-held block below.
         if _recheck_err is None and _ms == "behind":
-            from app.github import update_branch  # noqa: PLC0415
+            from app.github import update_branch
 
             try:
                 _upd = await update_branch(gh_token, owner, repo, ci_pr_number)
@@ -479,7 +479,7 @@ async def _attempt_merge_with_retry_and_escalation(
         return True
 
     if _in_progress:
-        from app import pause_clock  # noqa: PLC0415 — local import to avoid cycle
+        from app import pause_clock
 
         ci_loop["ci_poll_interval"] = 10
         ci_loop["ci_last_polled"] = _utcnow().isoformat()
@@ -534,7 +534,7 @@ async def _attempt_merge_with_retry_and_escalation(
         # This is not a merge infrastructure failure — defer back to CI polling
         # without burning the merge retry budget.
         if _ms == "unstable":
-            from app import pause_clock  # noqa: PLC0415 — local import to avoid cycle
+            from app import pause_clock
 
             ci_loop["ci_passed"] = False
             ci_loop["ci_poll_interval"] = 30
@@ -558,7 +558,7 @@ async def _attempt_merge_with_retry_and_escalation(
         # called in the unlocked window above; ``_upd`` holds the result.
         if _ms == "behind":
             assert _upd is not None  # set in unlocked block when _ms == "behind"
-            from app import pause_clock  # noqa: PLC0415 — local import to avoid cycle
+            from app import pause_clock
 
             ci_loop["ci_passed"] = False
             ci_loop["ci_poll_interval"] = 30
@@ -594,8 +594,8 @@ async def _attempt_merge_with_retry_and_escalation(
                 )
                 return False
             # update_branch failures exceeded dynamic threshold — escalate to fix task with rebase.
-            from app.review_pipeline import _spawn_pipeline_task  # noqa: PLC0415
-            from app.rollup_state import _is_rollup_parent_awaiting_merge  # noqa: PLC0415
+            from app.review_pipeline import _spawn_pipeline_task
+            from app.rollup_state import _is_rollup_parent_awaiting_merge
 
             # Phase F3 (H5): push the per-PR filter into SQL using
             # cast(..., Integer) so the ``ix_task_payloads_pr_number`` partial
@@ -715,8 +715,8 @@ async def _attempt_merge_with_retry_and_escalation(
         # Cannot be resolved by retrying — spawn a fix task with rebase instructions,
         # mirroring the CI-failure spawn path below.
         if merge_result.get("conflict") or _ms == "dirty":
-            from app.review_pipeline import _spawn_pipeline_task  # noqa: PLC0415
-            from app.rollup_state import _is_rollup_parent_awaiting_merge  # noqa: PLC0415
+            from app.review_pipeline import _spawn_pipeline_task
+            from app.rollup_state import _is_rollup_parent_awaiting_merge
 
             # Dedup guard: if a fix task for this PR is already active, don't spawn another.
             # Mirrors the CI-failure path in handle_ci_completion to prevent duplicate fixes
@@ -877,7 +877,7 @@ async def _attempt_merge_with_retry_and_escalation(
             # pause retries (they won't succeed until the shared cause clears)
             # and raise a single alert surfacing the shared pattern. Resumes
             # automatically once the window ages out stale occurrences.
-            from app.shared_state import (  # noqa: PLC0415
+            from app.shared_state import (
                 record_merge_error_occurrence,
                 MERGE_PATTERN_MIN_PRS,
             )
@@ -1096,9 +1096,9 @@ async def _attempt_merge_with_retry_and_escalation(
                 from app.failure_classification import (
                     classify_failure,
                     persist_failure_category,
-                )  # noqa: PLC0415
-                from app.routers.agent_status import record_task_result  # noqa: PLC0415
-                from app.shared_state import record_direction_result  # noqa: PLC0415
+                )
+                from app.routers.agent_status import record_task_result
+                from app.shared_state import record_direction_result
 
                 _fc = classify_failure(task)
                 persist_failure_category(task, _fc)
@@ -1119,7 +1119,7 @@ async def _attempt_merge_with_retry_and_escalation(
                         project_id=str(task.project_id) if task.project_id else "",
                     )
                 if _early_exit and task.project_id:
-                    from app.broadcast import broadcast_to_project  # noqa: PLC0415
+                    from app.broadcast import broadcast_to_project
 
                     await broadcast_to_project(
                         str(task.project_id),
@@ -1310,6 +1310,24 @@ async def handle_ci_completion(
             return True
 
         ci_errors = ci_result.get("failed_logs", "CI checks failed")
+        # Pre-extract pytest failure tokens (FAILED testing/path::test_name)
+        # so the agent's prompt has a clean list up front instead of having
+        # to scan ~2KB of noisy log tail. ci_errors is also kept verbatim
+        # below for stack-trace context.
+        failing_tests = sorted(
+            set(
+                re.findall(
+                    r"^FAILED\s+(\S+::\S+)", ci_errors or "", flags=re.MULTILINE
+                )
+            )
+        )[:25]
+        failing_tests_block = (
+            "\nFailing tests (extracted from CI summary — fix these):\n"
+            + "\n".join(f"  - {t}" for t in failing_tests)
+            + "\n"
+            if failing_tests
+            else ""
+        )
         await create_pr_comment(
             gh_token,
             owner,
@@ -1325,10 +1343,13 @@ async def handle_ci_completion(
             f"  2. Inspect the failing checks via the GitHub API "
             f'(`curl -H "Authorization: Bearer $GITHUB_TOKEN" '
             f"https://api.github.com/repos/{owner}/{repo}/commits/$(git rev-parse HEAD)/check-runs`) "
-            f"to confirm which checks are still failing on the latest head.\n\n"
+            f"to confirm which checks are still failing on the latest head.\n"
+            f"{failing_tests_block}\n"
             f"CI errors captured at spawn time:\n{ci_errors[:2000]}\n\n"
             f"Focus: fix the build/lint/test errors — the code review is already approved, "
-            f"don't re-architect unrelated code.\n\n"
+            f"don't re-architect unrelated code. If a failing test was already broken on `main` "
+            f"(unrelated to this PR's diff), repairing it is still in scope — fix it as part of "
+            f"this PR rather than skipping or `./blocked`-ing.\n\n"
             f"Before declaring done: ensure (a) `git rebase origin/{ci_base}` succeeds cleanly with no "
             f"remaining conflict markers, (b) local lint/type/test suites pass on the changed files, "
             f"and (c) every fix is committed."
@@ -1376,9 +1397,9 @@ async def handle_ci_completion(
             from app.failure_classification import (
                 classify_failure,
                 persist_failure_category,
-            )  # noqa: PLC0415
-            from app.routers.agent_status import record_task_result  # noqa: PLC0415
-            from app.shared_state import record_direction_result  # noqa: PLC0415
+            )
+            from app.routers.agent_status import record_task_result
+            from app.shared_state import record_direction_result
 
             _fc = classify_failure(task)
             persist_failure_category(task, _fc)

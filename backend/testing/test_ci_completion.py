@@ -1070,7 +1070,7 @@ async def test_merge_failure_hard_cap_marks_failed(db_session, mocker):
     assert "hard-capped" in alert_mock.call_args[0][2].lower()
     # Merge hard-cap must classify as EXTERNAL_API (infra), not CODE_ERROR —
     # the phrase "merge failed" in the status message is a keyword match.
-    from app.failure_classification import classify_failure  # noqa: PLC0415
+    from app.failure_classification import classify_failure
 
     assert classify_failure(task) == "EXTERNAL_API"
 
@@ -2136,3 +2136,75 @@ async def test_suppress_warm_handoff_ci_failure(db_session, mocker):
         "ci_failure spawn (ci_completion.py:804) must pass "
         "suppress_warm_handoff=True — Phase 2d post-APPROVE chain end"
     )
+
+
+@pytest.mark.asyncio
+async def test_ci_failure_spawn_extracts_failing_test_names_into_prompt(
+    db_session, mocker
+):
+    """Failing test names from pytest's "FAILED <path>::<name>" lines should
+    appear as a structured list at the top of the fix-PR prompt.
+
+    Without this, agents had to scan ~2KB of CI log noise to find what to fix.
+    Regression for the 2026-05-07 rollup-loop where 3 fix-tasks burnt out
+    chasing tests that were already broken on main.
+    """
+    from app.ci_completion import handle_ci_completion
+
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+    fake_fix = type("FT", (), {"id": uuid.uuid4()})()
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        return_value=(fake_fix, True),
+    )
+
+    project = Project(name="CI failing-tests prompt", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    ci_result = {
+        "status": "completed",
+        "conclusion": "failure",
+        "failed_logs": (
+            "============================= test session starts ==============================\n"
+            "FAILED testing/test_pack_under_budget.py::test_meta_preserved\n"
+            "FAILED testing/test_anomaly_detection.py::test_proactive_fingerprint_spawns\n"
+            "FAILED testing/test_invariants.py::TestSize::test_lifecycle\n"
+            "5 errors, 3 failed in 12.5s\n"
+        ),
+    }
+    await handle_ci_completion(
+        task=task,
+        ci_result=ci_result,
+        gh_token="fake-token",
+        owner="owner",
+        repo="repo",
+        session=db_session,
+        source="poll",
+    )
+
+    spawn_mock.assert_called_once()
+    fix_prompt = spawn_mock.call_args.kwargs.get("fix_prompt") or ""
+    assert "Failing tests (extracted from CI summary" in fix_prompt
+    assert (
+        "testing/test_pack_under_budget.py::test_meta_preserved" in fix_prompt
+    )
+    assert (
+        "testing/test_anomaly_detection.py::test_proactive_fingerprint_spawns"
+        in fix_prompt
+    )
+    assert "testing/test_invariants.py::TestSize::test_lifecycle" in fix_prompt
+    # The extracted-list block must come BEFORE the verbatim CI errors dump,
+    # so the agent reads the structured list first.
+    assert fix_prompt.index("Failing tests (extracted") < fix_prompt.index(
+        "CI errors captured"
+    )
+    # And the broken-on-main fix-as-part-of-PR guidance should be there.
+    assert "broken on `main`" in fix_prompt
