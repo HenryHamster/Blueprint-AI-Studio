@@ -111,7 +111,7 @@ async def test_rising_failure_count_produces_high_severity_anomaly():
         )
         for i in range(5)
     ]
-    # 2 CODE_ERROR failures in prior 48h (48–96h ago)
+    # 2 CODE_ERROR failures in prior 48h (48–96h ago)  # noqa: RUF003
     prior = [
         make_task(
             project_id=project_id,
@@ -651,9 +651,28 @@ async def test_cross_direction_below_count_threshold_no_anomaly():
 # Proactive fingerprint investigation spawning
 # ─────────────────────────────────────────────────────────────────────────────
 
-import app.shared_state as _shared_state  # noqa: E402
-from app.anomaly_detection import _spawn_proactive_fingerprint_investigations  # noqa: E402
-from app.models import Task as _TaskModel  # noqa: E402
+import app.shared_state as _shared_state
+from app.anomaly_detection import _spawn_proactive_fingerprint_investigations
+from app.models import Task as _TaskModel
+
+
+@pytest.fixture(autouse=True)
+def _stub_recent_changes_for_proactive(monkeypatch):
+    """Stub _get_recent_changes_context to {} for all proactive-spawn tests.
+
+    Production reads DeploymentState.deployed_at.isoformat() for the payload's
+    recent_changes block. The fake AsyncMock session in this module returns a
+    MagicMock for that chain, which then leaks into the payload as a non-string
+    and trips fail-closed validate_internal_payload (introduced in 6fe0b544).
+    """
+
+    async def _empty_recent_changes(*args, **kwargs):
+        return {}
+
+    monkeypatch.setattr(
+        "app.autonomous_research_diagnosis._get_recent_changes_context",
+        _empty_recent_changes,
+    )
 
 
 def _make_proactive_session(active_proactive_count: int = 0):
@@ -891,7 +910,7 @@ async def test_proactive_fingerprint_system_concurrent_cap(monkeypatch):
 # Intra-direction fingerprint detection + proactive spawning
 # ─────────────────────────────────────────────────────────────────────────────
 
-from app.anomaly_detection import (  # noqa: E402
+from app.anomaly_detection import (
     _spawn_proactive_intra_direction_investigations,
 )
 
