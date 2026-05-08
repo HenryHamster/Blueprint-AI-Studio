@@ -3777,3 +3777,125 @@ async def test_auto_merge_dirty_spawns_fix_with_prompt(tl_db, mocker):
     assert "rebase" in fix_prompt.lower(), "fix_prompt must contain rebase guidance"
     assert "77" in fix_prompt, "fix_prompt must reference the PR number"
     assert "research/cycle-1" in fix_prompt, "fix_prompt must reference the base branch"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# _close_loop_regression_case_on_failure — failure summary capture
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_close_loop_failure_captures_last_failure_summary(tl_db):
+    """_close_loop_regression_case_on_failure populates last_failure_summary from task.latest_status_message."""
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+    from app.task_lifecycle import _close_loop_regression_case_on_failure
+
+    session, _ = tl_db
+    project = await _make_project(session)
+
+    investigate_task = await _make_task(
+        session,
+        project.id,
+        task_type="investigate",
+        status=TaskStatus.FAILED,
+        context={"regression_class": "sr_catch_rate"},
+        latest_status_message="Reviewer rejected: missing test for null-payload edge case.",
+    )
+
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate",
+        status=RegressionCaseStatus.ACTIVE,
+        attempts=1,
+        hit_count=1,
+        last_remediation_task_id=investigate_task.id,
+    )
+    session.add(case)
+    await session.commit()
+    await session.refresh(case)
+
+    await _close_loop_regression_case_on_failure(investigate_task, session)
+    await session.commit()
+    await session.refresh(case)
+
+    assert (
+        case.last_failure_summary
+        == "Reviewer rejected: missing test for null-payload edge case."
+    )
+    assert case.fast_track_next_spawn is True
+    assert case.status == RegressionCaseStatus.ACTIVE
+    assert case.attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_close_loop_failure_truncates_long_status_message(tl_db):
+    """last_failure_summary is truncated to 500 chars."""
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+    from app.task_lifecycle import _close_loop_regression_case_on_failure
+
+    session, _ = tl_db
+    project = await _make_project(session)
+
+    long_msg = "x" * 600
+    task = await _make_task(
+        session,
+        project.id,
+        task_type="fix",
+        status=TaskStatus.FAILED,
+        context={"regression_class": "fix_loop_divergence"},
+        latest_status_message=long_msg,
+    )
+
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="fix_loop_divergence",
+        status=RegressionCaseStatus.ACTIVE,
+        attempts=0,
+        hit_count=1,
+    )
+    session.add(case)
+    await session.commit()
+    await session.refresh(case)
+
+    await _close_loop_regression_case_on_failure(task, session)
+    await session.commit()
+    await session.refresh(case)
+
+    assert len(case.last_failure_summary) == 500
+    assert case.last_failure_summary == long_msg[:500]
+
+
+@pytest.mark.asyncio
+async def test_close_loop_failure_no_status_message_leaves_summary_none(tl_db):
+    """When task has no latest_status_message, last_failure_summary stays None."""
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+    from app.task_lifecycle import _close_loop_regression_case_on_failure
+
+    session, _ = tl_db
+    project = await _make_project(session)
+
+    task = await _make_task(
+        session,
+        project.id,
+        task_type="fix",
+        status=TaskStatus.FAILED,
+        context={"regression_class": "pipeline_success_rate"},
+    )
+
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="pipeline_success_rate",
+        status=RegressionCaseStatus.ACTIVE,
+        attempts=0,
+        hit_count=1,
+    )
+    session.add(case)
+    await session.commit()
+    await session.refresh(case)
+
+    await _close_loop_regression_case_on_failure(task, session)
+    await session.commit()
+    await session.refresh(case)
+
+    assert case.last_failure_summary is None
+    assert case.fast_track_next_spawn is True

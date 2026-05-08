@@ -24,6 +24,7 @@ from app.pipeline_regression_dispatcher import (
     _WATCHDOG_ACTIVE_STALE_THRESHOLD,
     _WATCHDOG_MERGED_STALE_THRESHOLD,
     get_dispatcher_cycle_records,
+    get_regression_mtta_data,
     run_dispatcher_watchdog_alarms,
     run_once,
     run_recovery_once,
@@ -234,6 +235,105 @@ async def test_threshold_gating_no_trends_block(db_session):
 
     spawned = await run_once(db_session, project.id)
     assert spawned == 0
+
+
+@pytest.mark.asyncio
+async def test_per_direction_sr_catch_rate_spawns_when_project_wide_healthy(db_session):
+    """Per-direction regression spawns a direction-scoped investigation when project-wide is stable."""
+    # Project-wide correctness is stable (no regression).
+    # Direction "dir-test1" has correctness hit_rate well below the project-wide baseline.
+    design_doc = {
+        "sr_catch_rate_trends": {
+            "categories": {
+                "correctness": {
+                    "current_hit_rate": 0.80,
+                    "previous_hit_rate": 0.82,  # delta=0.02, below threshold
+                    "current_human_count": 20,
+                    "trend": "stable",
+                },
+            },
+            "by_direction": {
+                "dir-test1": {
+                    "sample_count": 5,
+                    "miss_rate": 0.40,
+                    "categories": {
+                        "correctness": {
+                            "hit_rate": 0.60,  # baseline(0.82) - 0.60 = 0.22 >= threshold
+                            "miss_rate": 0.40,
+                            "sample_count": 5,
+                        }
+                    },
+                }
+            },
+        }
+    }
+    project = make_project(design_doc=design_doc)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 1
+
+    task = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .first()
+    )
+    assert task is not None
+    ctx = task.context or {}
+    assert ctx["regression_class"] == "sr_catch_rate:correctness:dir-test1"
+    assert ctx["direction_id"] == "dir-test1"
+    payload = task.first_payload or {}
+    assert "dir-test1" in payload.get("prompt", "")
+
+
+@pytest.mark.asyncio
+async def test_per_direction_sr_does_not_double_spawn_when_project_wide_trips(
+    db_session,
+):
+    """When project-wide category trips, per-direction signal for same category is suppressed."""
+    design_doc = {
+        "sr_catch_rate_trends": {
+            "categories": {
+                "correctness": {
+                    "current_hit_rate": 0.50,
+                    "previous_hit_rate": 0.80,  # delta=0.30, project-wide trips
+                    "current_human_count": 12,
+                    "trend": "decreasing",
+                },
+            },
+            "by_direction": {
+                "dir-test2": {
+                    "sample_count": 5,
+                    "miss_rate": 0.50,
+                    "categories": {
+                        "correctness": {
+                            "hit_rate": 0.50,
+                            "miss_rate": 0.50,
+                            "sample_count": 5,
+                        }
+                    },
+                }
+            },
+        }
+    }
+    project = make_project(design_doc=design_doc)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 1  # exactly one spawn total
+
+    task = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .first()
+    )
+    ctx = task.context or {}
+    # Project-wide fires; per-direction is suppressed for the same category.
+    assert ctx["regression_class"] == "sr_catch_rate"
 
 
 @pytest.mark.asyncio
@@ -7593,6 +7693,564 @@ async def test_ledger_computed_once_per_run_once(db_session, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Fast-track failed-remediation cooldown bypass (cluster 1/2)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_re_arm_default_sets_fast_track_next_spawn():
+    """re_arm() with default args (failure-driven path) flips fast_track_next_spawn."""
+    from app.models import (
+        RegressionCaseStatus,
+        RegressionRemediationCase,
+    )
+
+    case = RegressionRemediationCase(
+        project_id=uuid.uuid4(),
+        regression_class="sr_catch_rate",
+        status=RegressionCaseStatus.MERGED,
+        attempts=0,
+        hit_count=1,
+    )
+    case.re_arm()
+    assert case.attempts == 1
+    assert case.status == RegressionCaseStatus.ACTIVE
+    assert case.fast_track_next_spawn is True
+
+
+@pytest.mark.asyncio
+async def test_re_arm_fast_track_false_does_not_flip_flag():
+    """re_arm(fast_track=False) (recovery-scan path) leaves the flag clear."""
+    from app.models import (
+        RegressionCaseStatus,
+        RegressionRemediationCase,
+    )
+
+    case = RegressionRemediationCase(
+        project_id=uuid.uuid4(),
+        regression_class="sr_catch_rate",
+        status=RegressionCaseStatus.MERGED,
+        attempts=0,
+        hit_count=1,
+    )
+    case.re_arm(fast_track=False)
+    assert case.attempts == 1
+    assert case.status == RegressionCaseStatus.ACTIVE
+    assert case.fast_track_next_spawn is False
+
+
+@pytest.mark.asyncio
+async def test_re_arm_at_max_attempts_does_not_set_fast_track():
+    """Escalation to NEEDS_MANUAL_INTERVENTION must not arm a fast-track spawn."""
+    from app.models import (
+        ESCALATION_REASON_ATTEMPTS_EXHAUSTED,
+        RegressionCaseStatus,
+        RegressionRemediationCase,
+    )
+
+    case = RegressionRemediationCase(
+        project_id=uuid.uuid4(),
+        regression_class="sr_catch_rate",
+        status=RegressionCaseStatus.MERGED,
+        attempts=2,
+        hit_count=1,
+    )
+    case.re_arm()  # attempts -> 3, escalates
+    assert case.status == RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION
+    assert case.escalation_reason == ESCALATION_REASON_ATTEMPTS_EXHAUSTED
+    assert case.fast_track_next_spawn is False
+
+
+@pytest.mark.asyncio
+async def test_fast_track_bypasses_cooldown_and_clears_flag(db_session):
+    """fast_track_next_spawn=True with attempts>0 bypasses the 6h cooldown."""
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+
+    project = make_project(
+        design_doc=_design_doc_with_sr_regression(
+            category="correctness", prior=0.80, current=0.50
+        ),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Prior dispatcher-spawned task was 1 minute ago (well inside 6h window).
+    prior_spawn = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        created_at=_utcnow() - timedelta(minutes=1),
+        context={
+            "spawned_by": "pipeline_regression_dispatcher",
+            "regression_class": "sr_catch_rate",
+        },
+    )
+    db_session.add(prior_spawn)
+
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate",
+        status=RegressionCaseStatus.ACTIVE,
+        attempts=1,
+        hit_count=1,
+        fast_track_next_spawn=True,
+        last_failure_class="REVIEW_REJECTED",
+        last_failure_summary="Reviewer requested broader test coverage on edge cases.",
+        last_remediation_pr_number=4123,
+        signal_snapshot_at_spawn={
+            "prior_rate": 0.80,
+            "current_rate": 0.50,
+            "signal_name": "sr_catch_rate",
+        },
+    )
+    db_session.add(case)
+    await db_session.commit()
+    await db_session.refresh(case)
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 1
+
+    await db_session.refresh(case)
+    # Flag must be cleared (one-shot bypass).
+    assert case.fast_track_next_spawn is False
+
+    # The new investigate task carries the prior failure context block.
+    new_task = (
+        (
+            await db_session.execute(
+                select(Task)
+                .where(
+                    Task.project_id == project.id,
+                    Task.status == TaskStatus.QUEUED,
+                )
+                .order_by(Task.created_at.desc())
+            )
+        )
+        .scalars()
+        .first()
+    )
+    assert new_task is not None
+    prompt = (new_task.first_payload or {}).get("prompt", "")
+    assert "PRIOR REMEDIATION FAILURE CONTEXT" in prompt
+    assert "REVIEW_REJECTED" in prompt
+    assert "#4123" in prompt
+    assert "broader test coverage" in prompt
+
+
+@pytest.mark.asyncio
+async def test_fast_track_does_not_bypass_when_attempts_zero(db_session):
+    """fast_track_next_spawn=True but attempts=0 does NOT bypass cooldown.
+
+    Defends against a race where the flag is set on an unrelated path: the
+    bypass requires attempts > 0 so it can only fire after at least one
+    failed remediation cycle.
+    """
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+
+    project = make_project(
+        design_doc=_design_doc_with_sr_regression(
+            category="correctness", prior=0.80, current=0.50
+        ),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    prior_spawn = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        created_at=_utcnow() - timedelta(minutes=1),
+        context={
+            "spawned_by": "pipeline_regression_dispatcher",
+            "regression_class": "sr_catch_rate",
+        },
+    )
+    db_session.add(prior_spawn)
+
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate",
+        status=RegressionCaseStatus.ACTIVE,
+        attempts=0,
+        hit_count=1,
+        fast_track_next_spawn=True,
+        signal_snapshot_at_spawn={
+            "prior_rate": 0.80,
+            "current_rate": 0.50,
+            "signal_name": "sr_catch_rate",
+        },
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 0
+
+
+@pytest.mark.asyncio
+async def test_fast_track_dedup_still_blocks(db_session):
+    """An in-flight investigation blocks fast-track spawns just like normal spawns."""
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+
+    project = make_project(
+        design_doc=_design_doc_with_sr_regression(
+            category="correctness", prior=0.80, current=0.50
+        ),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # In-flight investigation already running for this regression_class.
+    in_flight = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        created_at=_utcnow() - timedelta(minutes=1),
+        context={
+            "spawned_by": "pipeline_regression_dispatcher",
+            "regression_class": "sr_catch_rate",
+        },
+        payloads=[{"type": "investigate", "prompt": "prior", "base_branch": "main"}],
+    )
+    db_session.add(in_flight)
+    await db_session.commit()
+    await db_session.refresh(in_flight)
+
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate",
+        status=RegressionCaseStatus.ACTIVE,
+        attempts=1,
+        hit_count=1,
+        fast_track_next_spawn=True,
+        last_remediation_task_id=in_flight.id,
+        signal_snapshot_at_spawn={
+            "prior_rate": 0.80,
+            "current_rate": 0.50,
+            "signal_name": "sr_catch_rate",
+        },
+    )
+    db_session.add(case)
+    await db_session.commit()
+    await db_session.refresh(case)
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 0
+
+    # Flag remains armed: dedup blocked the bypass before it could be honored.
+    await db_session.refresh(case)
+    assert case.fast_track_next_spawn is True
+
+
+@pytest.mark.asyncio
+async def test_fast_track_consumes_system_cap_slot(db_session, monkeypatch):
+    """A fast-track spawn occupies one system-cap slot, not unlimited.
+
+    Cap=1, two regression classes tripped (one fast-tracked inside cooldown,
+    one fresh). Only the first one to be evaluated gets a slot.
+    """
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+    from app import pipeline_regression_dispatcher as mod
+
+    monkeypatch.setattr(mod, "_REGRESSION_DISPATCHER_SYSTEM_CAP", 1)
+
+    project = make_project(
+        design_doc={
+            "sr_catch_rate_trends": {
+                "categories": {
+                    "correctness": {
+                        "current_hit_rate": 0.50,
+                        "previous_hit_rate": 0.80,
+                        "current_human_count": 12,
+                        "trend": "decreasing",
+                    },
+                },
+            },
+            # Pipeline success-rate regression (separate signal class).
+            "pipeline_success_rate_trend": {
+                "previous_success_rate": 0.90,
+                "current_success_rate": 0.50,
+                "current_total": 20,
+                "previous_total": 20,
+            },
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # sr_catch_rate already has a recent spawn and a fast-tracked case.
+    prior_spawn = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        created_at=_utcnow() - timedelta(minutes=1),
+        context={
+            "spawned_by": "pipeline_regression_dispatcher",
+            "regression_class": "sr_catch_rate",
+        },
+    )
+    db_session.add(prior_spawn)
+
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate",
+        status=RegressionCaseStatus.ACTIVE,
+        attempts=1,
+        hit_count=1,
+        fast_track_next_spawn=True,
+        signal_snapshot_at_spawn={
+            "prior_rate": 0.80,
+            "current_rate": 0.50,
+            "signal_name": "sr_catch_rate",
+        },
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    spawned = await run_once(db_session, project.id)
+    # System cap is 1 — only one of the two tripped signals gets a slot.
+    assert spawned == 1
+
+
+@pytest.mark.asyncio
+async def test_recovery_rearm_does_not_set_fast_track(db_session):
+    """Recovery-scan path's re_arm(fast_track=False) does not arm the bypass."""
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+
+    project = make_project(
+        design_doc=_design_doc_with_sr_regression(
+            category="correctness", prior=0.80, current=0.50
+        ),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # MERGED case whose signal re-tripped but cooldown has elapsed (>6h prior spawn).
+    prior_spawn = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        created_at=_utcnow() - _REGRESSION_COOLDOWN - timedelta(minutes=5),
+        context={
+            "spawned_by": "pipeline_regression_dispatcher",
+            "regression_class": "sr_catch_rate",
+        },
+    )
+    db_session.add(prior_spawn)
+
+    merged_at = (_utcnow() - timedelta(hours=10)).isoformat()
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate",
+        status=RegressionCaseStatus.MERGED,
+        hit_count=1,
+        attempts=0,
+        signal_snapshot_at_merge={"captured_at": merged_at},
+        signal_snapshot_at_spawn={
+            "prior_rate": 0.80,
+            "current_rate": 0.50,
+            "signal_name": "sr_catch_rate",
+        },
+        fingerprint_to_fix_log=[],
+    )
+    db_session.add(case)
+    await db_session.commit()
+    await db_session.refresh(case)
+
+    changed = await run_recovery_once(db_session, project.id)
+    assert changed == 1
+
+    await db_session.refresh(case)
+    assert case.status == RegressionCaseStatus.ACTIVE
+    assert case.attempts == 1
+    # Recovery-scan re-arm must NOT set the fast-track flag.
+    assert case.fast_track_next_spawn is False
+
+
+@pytest.mark.asyncio
+async def test_fast_track_falls_back_to_task_status_message(db_session):
+    """When last_failure_summary is null, prompt falls back to prior task's latest_status_message."""
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+
+    project = make_project(
+        design_doc=_design_doc_with_sr_regression(
+            category="correctness", prior=0.80, current=0.50
+        ),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    prior_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.FAILED,
+        created_at=_utcnow() - timedelta(minutes=1),
+        context={
+            "spawned_by": "pipeline_regression_dispatcher",
+            "regression_class": "sr_catch_rate",
+        },
+        latest_status_message="MERGE_BLOCKED: PR conflicts with main on backend/app/x.py",
+    )
+    db_session.add(prior_task)
+    await db_session.commit()
+    await db_session.refresh(prior_task)
+
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate",
+        status=RegressionCaseStatus.ACTIVE,
+        attempts=1,
+        hit_count=1,
+        fast_track_next_spawn=True,
+        last_failure_class="MERGE_BLOCKED",
+        last_failure_summary=None,
+        last_remediation_task_id=prior_task.id,
+        signal_snapshot_at_spawn={
+            "prior_rate": 0.80,
+            "current_rate": 0.50,
+            "signal_name": "sr_catch_rate",
+        },
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 1
+
+    new_task = (
+        (
+            await db_session.execute(
+                select(Task)
+                .where(
+                    Task.project_id == project.id,
+                    Task.status == TaskStatus.QUEUED,
+                )
+                .order_by(Task.created_at.desc())
+            )
+        )
+        .scalars()
+        .first()
+    )
+    assert new_task is not None
+    prompt = (new_task.first_payload or {}).get("prompt", "")
+    assert "PRIOR REMEDIATION FAILURE CONTEXT" in prompt
+    assert "MERGE_BLOCKED" in prompt
+    assert "conflicts with main" in prompt
+
+
+# ---------------------------------------------------------------------------
+# sr_false_positive signal class
+# ---------------------------------------------------------------------------
+
+
+def _design_doc_with_fp_regression(
+    *,
+    category: str = "correctness",
+    current_fp_rate: float = 0.50,
+    prev_fp_rate: float = 0.45,
+    human_count: int = 10,
+) -> dict:
+    """Synthesize a sr_catch_rate_trends snapshot that trips the sr_false_positive signal."""
+    return {
+        "sr_catch_rate_trends": {
+            "categories": {
+                category: {
+                    "current_hit_rate": 0.80,
+                    "previous_hit_rate": 0.78,
+                    "current_human_count": human_count,
+                    "trend": "stable",
+                    "false_positive_rate": current_fp_rate,
+                    "previous_fp_rate": prev_fp_rate,
+                    "fp_trend": "increasing",
+                    "precision": round(1 - current_fp_rate, 3),
+                },
+            },
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_sr_false_positive_signal_trips_when_both_windows_above_floor(db_session):
+    """sr_false_positive signal spawns an investigation when FP rate exceeds floor in both windows."""
+    project = make_project(
+        design_doc=_design_doc_with_fp_regression(
+            category="correctness",
+            current_fp_rate=0.50,
+            prev_fp_rate=0.45,
+            human_count=10,
+        ),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 1
+
+    task = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .first()
+    )
+    assert task is not None
+    payload = task.first_payload or {}
+    assert payload.get("type") == "investigate"
+    prompt = payload.get("prompt", "")
+    assert "SR over-paranoia detected" in prompt
+    assert "correctness" in prompt
+    assert "50.0%" in prompt
+    assert (
+        "NOT an application-code change" in prompt
+        or "prompt/criterion change" in prompt
+    )
+
+    ctx = task.context or {}
+    assert ctx["spawned_by"] == "pipeline_regression_dispatcher"
+    assert ctx["regression_class"] == "sr_false_positive"
+    assert ctx["signal_name"] == "sr_false_positive"
+
+
+@pytest.mark.asyncio
+async def test_sr_false_positive_signal_does_not_trip_when_only_one_window_above(
+    db_session,
+):
+    """sr_false_positive does NOT spawn when only the current window exceeds the floor."""
+    project = make_project(
+        design_doc=_design_doc_with_fp_regression(
+            category="correctness",
+            current_fp_rate=0.50,
+            prev_fp_rate=0.20,  # prior window below floor
+            human_count=10,
+        ),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 0
+
+
+@pytest.mark.asyncio
+async def test_sr_false_positive_signal_does_not_trip_below_sample_floor(db_session):
+    """sr_false_positive does NOT spawn when sample size is below the minimum."""
+    project = make_project(
+        design_doc=_design_doc_with_fp_regression(
+            category="correctness",
+            current_fp_rate=0.50,
+            prev_fp_rate=0.45,
+            human_count=3,  # below _SR_FP_MIN_SAMPLE=5
+        ),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 0
+
+
+# ---------------------------------------------------------------------------
 # Cross-layer backfill-lag watchdog tests
 # ---------------------------------------------------------------------------
 
@@ -7722,6 +8380,115 @@ async def test_cross_layer_backfill_lag_not_triggered_for_recent_entries(db_sess
         a for a in alerts if "Cross-layer backfill lag:" in (a.title or "")
     ]
     assert len(backfill_alerts) == 0
+
+
+@pytest.mark.asyncio
+async def test_regression_mtta_data_eta_recovery_per_case(db_session):
+    """Multi-MERGED-case ETA fields are computed per-case, not from a leaked loop var.
+
+    Two MERGED cases (in different projects but the same regression_class, so
+    they roll up into the same class bucket) with different merged_at times
+    must yield distinct eta_to_recovery_sec values keyed off each case's own
+    elapsed-since-merge. The unique (project_id, regression_class) constraint
+    forces using two projects to exercise multi-case-per-class iteration.
+    """
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+
+    rclass = "sr_catch_rate:correctness:dir-a"
+    project_a = make_project(design_doc={})
+    project_b = make_project(design_doc={})
+    db_session.add(project_a)
+    db_session.add(project_b)
+    await db_session.commit()
+    await db_session.refresh(project_a)
+    await db_session.refresh(project_b)
+
+    now = _utcnow()
+    # Each MERGED case carries its own merged_at in fingerprint_to_fix_log.
+    # Without a paired recovered_at these entries don't contribute to p50_mtor
+    # — we add CLOSED siblings (one per project) to seed mtor samples.
+    case_a_merged_at = (now - timedelta(seconds=120)).isoformat()
+    case_a = RegressionRemediationCase(
+        project_id=project_a.id,
+        regression_class=rclass,
+        status=RegressionCaseStatus.MERGED,
+        first_seen_at=now - timedelta(minutes=30),
+        signal_first_crossed_at=now - timedelta(minutes=30),
+        investigate_spawned_at=now - timedelta(minutes=29),
+        fingerprint_to_fix_log=[{"merged_at": case_a_merged_at}],
+    )
+    case_b_merged_at = (now - timedelta(seconds=900)).isoformat()
+    case_b = RegressionRemediationCase(
+        project_id=project_b.id,
+        regression_class=rclass,
+        status=RegressionCaseStatus.MERGED,
+        first_seen_at=now - timedelta(minutes=45),
+        signal_first_crossed_at=now - timedelta(minutes=45),
+        investigate_spawned_at=now - timedelta(minutes=44),
+        fingerprint_to_fix_log=[{"merged_at": case_b_merged_at}],
+    )
+    db_session.add(case_a)
+    db_session.add(case_b)
+    await db_session.commit()
+    await db_session.refresh(case_a)
+    await db_session.refresh(case_b)
+
+    # All-projects query exercises multi-case-per-class iteration.
+    data = await get_regression_mtta_data(db_session)
+
+    rows = {r["regression_class"]: r for r in data["classes"]}
+    row = rows[rclass]
+    actives = {a["case_id"]: a for a in row["active_cases"]}
+    a_info = actives[str(case_a.id)]
+    b_info = actives[str(case_b.id)]
+
+    # elapsed_since_merge_sec must reflect each case's own merged_at.
+    assert a_info["elapsed_since_merge_sec"] is not None
+    assert b_info["elapsed_since_merge_sec"] is not None
+    assert b_info["elapsed_since_merge_sec"] > a_info["elapsed_since_merge_sec"]
+
+    # recovery_check_in_sec is also per-case (case_b's cooldown may already
+    # be exhausted depending on _REGRESSION_RECOVERY_COOLDOWN, but the field
+    # for case_a — fresh merge — must be populated).
+    assert a_info["recovery_check_in_sec"] is not None
+    assert a_info["recovery_check_in_sec"] > 0
+
+    # With no mtor samples (no recovered_at entries), p50_mtor is None and
+    # both ETAs are None — but the leak would still surface if elapsed values
+    # were shared. Force a recoverable-class bucket to populate p50_mtor by
+    # appending a recovered_at-bearing entry on case_b's log (this case is
+    # already MERGED so it acts as historical recovery data for the class).
+    case_b.fingerprint_to_fix_log = [
+        {"merged_at": case_b_merged_at},
+        {
+            "merged_at": (now - timedelta(hours=3)).isoformat(),
+            "recovered_at": (
+                now - timedelta(hours=3) + timedelta(seconds=600)
+            ).isoformat(),
+        },
+    ]
+    from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
+
+    flag_modified(case_b, "fingerprint_to_fix_log")
+    await db_session.commit()
+
+    data = await get_regression_mtta_data(db_session)
+    row = next(r for r in data["classes"] if r["regression_class"] == rclass)
+    actives = {a["case_id"]: a for a in row["active_cases"]}
+    a_info = actives[str(case_a.id)]
+    b_info = actives[str(case_b.id)]
+    p50_mtor = row["stages"]["merge_to_recovery"]["p50_sec"]
+    assert p50_mtor == 600
+
+    # ETA must differ per case (regression test for the leaked-loop-var bug
+    # that previously gave all active cases the last case's rec_check_in).
+    assert a_info["eta_to_recovery_sec"] != b_info["eta_to_recovery_sec"]
+    assert a_info["eta_to_recovery_sec"] == int(
+        p50_mtor - a_info["elapsed_since_merge_sec"]
+    )
+    assert b_info["eta_to_recovery_sec"] == int(
+        p50_mtor - b_info["elapsed_since_merge_sec"]
+    )
 
 
 @pytest.mark.asyncio

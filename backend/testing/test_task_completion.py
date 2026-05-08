@@ -5249,6 +5249,56 @@ class TestRecordRegressionSignalIfMatching:
         assert "remediation_regression_signal" not in project.directions[0]
 
     @pytest.mark.asyncio
+    async def test_post_merged_recurrence_rearm_does_not_set_fast_track(
+        self, db_session
+    ):
+        """Sibling to test_recovery_rearm_does_not_set_fast_track: the
+        _record_regression_signal_if_matching path must also re-arm a MERGED
+        case with fast_track=False so the 6h cooldown is honored."""
+        from app.models import RegressionCaseStatus, RegressionRemediationCase
+
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        case = RegressionRemediationCase(
+            project_id=project.id,
+            regression_class="sr_catch_rate",
+            status=RegressionCaseStatus.MERGED,
+            hit_count=1,
+            attempts=1,
+            fast_track_next_spawn=False,
+        )
+        db_session.add(case)
+        await db_session.commit()
+        await db_session.refresh(case)
+
+        task = make_task(
+            project_id=project.id,
+            context={
+                "regression_class": "sr_catch_rate",
+                "signal_snapshot": {
+                    "value": 0.50,
+                    "threshold": 0.40,
+                    "hit_count": 5,
+                },
+            },
+            latest_status_message="still failing",
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        await _record_regression_signal_if_matching(task, TaskStatus.FAILED, db_session)
+        await db_session.commit()
+        await db_session.refresh(case)
+
+        assert case.status == RegressionCaseStatus.ACTIVE
+        assert case.attempts == 2
+        # Post-MERGED recurrence must NOT arm the cooldown bypass.
+        assert case.fast_track_next_spawn is False
+
+    @pytest.mark.asyncio
     async def test_regression_signal_included_in_followup_prompt(self, db_session):
         """Follow-up investigation spawned after a failed remediation surfaces
         the regression signal so the agent avoids repeating the prior approach."""

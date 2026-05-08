@@ -1569,6 +1569,25 @@ class RegressionRemediationCase(SQLModel, table=True):
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
+    # Failure-driven re-arm flag. Set by re_arm(fast_track=True) (default) when
+    # the prior remediation task failed (review-rejected, CI-failed, merge-blocked).
+    # The dispatcher bypasses the 6h class-level cooldown when this flag is set
+    # AND attempts > 0, then clears it after the next investigate spawn so the
+    # bypass applies only once per failure. Recovery-scan re-arm (post-MERGED
+    # recurrence) passes fast_track=False and continues to honor the cooldown.
+    fast_track_next_spawn: bool = Field(
+        default=False,
+        sa_column=Column(Boolean, nullable=False, server_default=text("false")),
+    )
+    # Brief excerpt (≤500 chars) of the prior remediation's terminal message —
+    # review feedback, CI error tail, or merge-conflict note. Used to populate
+    # the next investigation's prompt with a 'PRIOR REMEDIATION FAILURE CONTEXT'
+    # block so the agent can choose a different angle. Falls back to fetching
+    # the prior task's latest_status_message at spawn time when null.
+    last_failure_summary: Optional[str] = Field(
+        default=None,
+        sa_column=Column(Text, nullable=True),
+    )
     created_at: datetime = Field(
         default_factory=_utcnow,
         sa_column=Column(NaiveUTCDateTime, nullable=False),
@@ -1731,12 +1750,24 @@ class RegressionRemediationCase(SQLModel, table=True):
         )
         return "\n".join(lines)
 
-    def re_arm(self, max_attempts: int = 3) -> None:
+    def re_arm(self, max_attempts: int = 3, *, fast_track: bool = True) -> None:
         """Handle remediation failure or post-MERGED recurrence.
 
         Increments the attempt counter and either resets to ACTIVE for another
         spawn or escalates to NEEDS_MANUAL_INTERVENTION when the cap is reached.
         Idempotent once NEEDS_MANUAL_INTERVENTION is reached.
+
+        ``fast_track`` defaults to True: failure-driven callers (the
+        ``_close_loop_regression_case_on_failure`` task-lifecycle hook) call
+        ``re_arm()`` with no args and opt in to the dispatcher's cooldown
+        bypass on the next cycle. Recovery-scan callers (post-MERGED
+        recurrence) pass ``fast_track=False`` to preserve the 6h cooldown,
+        since a still-tripped post-merge signal needs time to settle rather
+        than an immediate re-investigation.
+
+        The fast-track flag is suppressed when the case escalates to
+        NEEDS_MANUAL_INTERVENTION so the dispatcher does not attempt a bypass
+        on a row that should be quiet.
         """
         if self.status == RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION:
             return
@@ -1748,6 +1779,8 @@ class RegressionRemediationCase(SQLModel, table=True):
             self.escalation_reason = ESCALATION_REASON_ATTEMPTS_EXHAUSTED
         else:
             self.status = RegressionCaseStatus.ACTIVE
+            if fast_track:
+                self.fast_track_next_spawn = True
 
     def escalate_for_divergence(self, detail: Optional[str] = None) -> None:
         """Escalate to NEEDS_MANUAL_INTERVENTION because successive investigations diverged.

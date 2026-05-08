@@ -679,7 +679,7 @@ async def _record_regression_signal_if_matching(
             if recovered:
                 case.mark_closed()
             else:
-                case.re_arm()
+                case.re_arm(fast_track=False)
             session.add(case)
     if status != TaskStatus.FAILED:
         return

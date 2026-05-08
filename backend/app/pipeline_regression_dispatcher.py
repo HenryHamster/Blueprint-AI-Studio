@@ -59,6 +59,10 @@ _REGRESSION_COOLDOWN = timedelta(hours=6)
 # the rest of the pipeline by occupying every research slot.
 _REGRESSION_DISPATCHER_SYSTEM_CAP = 2
 
+# Per-cycle cap on direction-scoped SR catch-rate spawns to prevent signal storms
+# when many directions regress simultaneously.
+_MAX_DIRECTION_SR_SPAWNS_PER_CYCLE = 2
+
 # Conservative floor on the 24h pipeline-success-rate sample. Below this the
 # trend label is too noisy to trigger an investigation. 10 completed/failed
 # tasks in 24h is the same threshold operators use to mute "low signal" pages.
@@ -94,6 +98,13 @@ _FIX_LOOP_DIVERGENCE_FINGERPRINT_WINDOW_DAYS = 7
 # this many times across the 14d window before it is considered a structural gap
 # in the self-review prompt rather than a one-off observation from a single task.
 _SR_BLIND_SPOT_THEME_FLOOR = 5
+
+# SR false-positive signal thresholds. A category's FP rate must exceed this
+# floor in BOTH the current and previous window (≥2 consecutive) before
+# tripping an investigation. The sample floor guards against noise from very
+# small windows (current_human_count used as proxy since fp_count is derived).
+_SR_FP_RATE_FLOOR = 0.40
+_SR_FP_MIN_SAMPLE = 5
 
 # Lookback window for the project-wide layer-defense ledger injected into meta-investigation
 # prompts. Covers ~3 months of defense activity across all regression classes for the project.
@@ -495,12 +506,58 @@ def _format_signal_lines(
     return "\n".join(lines)
 
 
-def _format_prior_attempt_context(case: RegressionRemediationCase) -> str:
+def _format_sr_fp_signal_lines(
+    regression_class: str,
+    current_fp_rate: float,
+    prior_fp_rate: float,
+    sample_size: int,
+) -> str:
+    cat = (
+        regression_class.split(":", 1)[1]
+        if ":" in regression_class
+        else regression_class
+    )
+    lines = [
+        f"SR over-paranoia detected (sr_false_positive / class={regression_class}).",
+        f"Category: {cat}",
+        f"Current false-positive rate: {current_fp_rate:.1%}",
+        f"Prior window false-positive rate: {prior_fp_rate:.1%}",
+        f"Sample size (human-reviewed tasks): {sample_size}",
+        "",
+        "A false positive means the self-review flagged this category as FAILED but no "
+        "fresh reviewer confirmed the issue. Both windows are above the "
+        f"{_SR_FP_RATE_FLOOR:.0%} floor, indicating a persistent over-paranoia pattern.",
+        "",
+        "Investigate whether the SR check criterion for this category is too aggressive. "
+        "Specifically:",
+        "1. Review the self-review prompt wording for this category — does it invite "
+        "false positives by being too broadly worded?",
+        "2. Check whether the verdict threshold needs tightening (e.g. the check flags "
+        "on minor issues that reviewers consistently dismiss).",
+        "3. Look at recent tasks where this category was flagged FAILED but the fresh "
+        "reviewer passed it — what pattern do they share?",
+        "4. Propose a prompt tweak or criterion adjustment, NOT an application-code change.",
+        "",
+        "Produce the structured diagnosis JSON ({summary, root_cause, recommended_fix, "
+        "severity, confidence, affected_files}) where recommended_fix describes the "
+        "prompt/criterion change, not a code fix.",
+    ]
+    return "\n".join(lines)
+
+
+def _format_prior_attempt_context(
+    case: RegressionRemediationCase,
+    *,
+    omit_pr_line: bool = False,
+) -> str:
     """Build a prior-attempt notice to append when re-spawning after >= 2 failures.
 
     Only called when existing_case.attempts >= 2 so the first re-arm (attempts==1)
     keeps the original prompt unchanged — this avoids noise on the second attempt
     and reserves the enrichment for cases that have already failed twice.
+
+    ``omit_pr_line`` lets a sibling block (e.g. PRIOR REMEDIATION FAILURE
+    CONTEXT, which already names the PR) suppress the duplicate PR mention.
     """
     lines = [
         "",
@@ -508,7 +565,7 @@ def _format_prior_attempt_context(case: RegressionRemediationCase) -> str:
         f"This regression has been investigated {case.attempts} time(s) without recovering the signal.",
     ]
     pr = case.last_remediation_pr_number
-    if pr is not None:
+    if pr is not None and not omit_pr_line:
         lines.append(
             f"Prior remediation PR: #{pr}. Read its diff to understand what was already tried "
             f"before forming a new hypothesis."
@@ -521,6 +578,55 @@ def _format_prior_attempt_context(case: RegressionRemediationCase) -> str:
         "Do NOT converge on the same diagnosis as prior attempts. "
         "Approach from a different angle — look for a deeper root cause or a "
         "different contributing factor that the prior fix missed."
+    )
+    return "\n".join(lines)
+
+
+async def _format_prior_failure_context(
+    case: RegressionRemediationCase,
+    session: AsyncSession,
+) -> str:
+    """Build a 'PRIOR REMEDIATION FAILURE CONTEXT' block for fast-track spawns.
+
+    Includes the prior remediation PR number, last_failure_class, and an
+    excerpt of last_failure_summary. When last_failure_summary is null, falls
+    back to the prior remediation task's latest_status_message (truncated to
+    ~400 chars) so the block always carries at least one signal of what went
+    wrong. The agent is told explicitly that the prior diagnosis already
+    failed and to choose a different angle.
+    """
+    lines = [
+        "",
+        "PRIOR REMEDIATION FAILURE CONTEXT",
+        "The prior remediation attempt FAILED (review-rejected, CI-failed, or merge-blocked) "
+        "and this case is being fast-tracked back into investigation.",
+    ]
+    pr = case.last_remediation_pr_number
+    if pr is not None:
+        lines.append(
+            f"Prior remediation PR: #{pr} — read its diff and review comments to "
+            f"understand what the prior fix attempted."
+        )
+    failure_class = case.last_failure_class
+    if failure_class:
+        lines.append(f"Prior failure class: {failure_class}.")
+
+    summary = case.last_failure_summary
+    if not summary and case.last_remediation_task_id is not None:
+        prior_task = await session.get(Task, case.last_remediation_task_id)
+        if prior_task is not None and prior_task.latest_status_message:
+            summary = prior_task.latest_status_message
+    if summary:
+        snippet = summary.strip()
+        if len(snippet) > 400:
+            snippet = snippet[:400] + "…"
+        lines.append("Prior failure excerpt:")
+        lines.append(snippet)
+
+    lines.append(
+        "The prior diagnosis already failed — do NOT repeat the same approach. "
+        "Investigate the regression from a different angle: a deeper root cause, "
+        "a contributing factor the prior attempt missed, or a different layer."
     )
     return "\n".join(lines)
 
@@ -1028,6 +1134,36 @@ async def _current_signal_value_for_class(
             "extras": [],
         }
 
+    _sr_parts = regression_class.split(":", 2)
+    if len(_sr_parts) == 3 and _sr_parts[0] == "sr_catch_rate":
+        # Per-direction form: sr_catch_rate:{cat}:{direction_id}
+        from app.playbook_learning import _MIN_DIRECTION_SR_SAMPLE
+
+        _, cat, direction_id = _sr_parts
+        trends = (project_design_doc or {}).get("sr_catch_rate_trends") or {}
+        dir_entry = (trends.get("by_direction") or {}).get(direction_id) or {}
+        dir_cat = (dir_entry.get("categories") or {}).get(cat) or {}
+        direction_hit_rate = dir_cat.get("hit_rate")
+        sample_count = dir_cat.get("sample_count", 0)
+        if direction_hit_rate is None or sample_count < _MIN_DIRECTION_SR_SAMPLE:
+            return None
+        pw_cat = (trends.get("categories") or {}).get(cat) or {}
+        baseline = pw_cat.get("previous_hit_rate") or pw_cat.get("current_hit_rate")
+        if baseline is None:
+            return None
+        magnitude = round(baseline - direction_hit_rate, 3)
+        return {
+            "signal_name": "sr_catch_rate",
+            "prior_rate": baseline,
+            "current_rate": direction_hit_rate,
+            "sample_size": sample_count,
+            "magnitude": magnitude,
+            "tripped": magnitude >= _TREND_DELTA_THRESHOLD,
+            "extras": [
+                f"Self-review catch-rate for category '{cat}' in direction '{direction_id}' is regressing."
+            ],
+        }
+
     if regression_class.startswith("sr_catch_rate:"):
         cat = regression_class.split(":", 1)[1]
         data = (
@@ -1052,6 +1188,38 @@ async def _current_signal_value_for_class(
             "magnitude": round(prior - curr, 3),
             "tripped": (prior - curr) >= _TREND_DELTA_THRESHOLD,
             "extras": [f"Self-review catch-rate for category '{cat}' is regressing."],
+        }
+
+    if regression_class.startswith("sr_false_positive:"):
+        cat = regression_class.split(":", 1)[1]
+        data = (
+            ((project_design_doc or {}).get("sr_catch_rate_trends") or {}).get(
+                "categories"
+            )
+            or {}
+        ).get(cat) or {}
+        curr_fp_rate = data.get("false_positive_rate")
+        prev_fp_rate = data.get("previous_fp_rate")
+        sample_size = int(data.get("current_human_count") or 0)
+        if curr_fp_rate is None or prev_fp_rate is None:
+            return None
+        if sample_size < _SR_FP_MIN_SAMPLE:
+            return None
+        tripped = (
+            curr_fp_rate >= _SR_FP_RATE_FLOOR and prev_fp_rate >= _SR_FP_RATE_FLOOR
+        )
+        return {
+            "signal_name": "sr_false_positive",
+            "prior_rate": prev_fp_rate,
+            "current_rate": curr_fp_rate,
+            "sample_size": sample_size,
+            "magnitude": round(curr_fp_rate - prev_fp_rate, 3),
+            "tripped": tripped,
+            "extras": [
+                f"SR false-positive rate for category '{cat}' is {curr_fp_rate:.1%} "
+                f"(prior window: {prev_fp_rate:.1%}) — exceeds floor of {_SR_FP_RATE_FLOOR:.0%} "
+                "in both windows."
+            ],
         }
 
     if regression_class.startswith("fix_loop_divergence:"):
@@ -1461,7 +1629,7 @@ def _derive_observation_for_layer_classify(
         stage = "lint"
     elif regression_class.startswith("background_service_crash"):
         stage = "provision"
-    elif signal_name in ("sr_catch_rate", "sr_blind_spot"):
+    elif signal_name in ("sr_catch_rate", "sr_blind_spot", "sr_false_positive"):
         stage = "review"
     elif signal_name == "pipeline_success_rate":
         stage = ""
@@ -2350,22 +2518,40 @@ async def _maybe_spawn(
 
     last_spawn = await _last_spawn_for_class(session, project_id, regression_class)
     now = _utcnow()
+    fast_tracking_failed_remediation = (
+        existing_case is not None
+        and bool(getattr(existing_case, "fast_track_next_spawn", False))
+        and (existing_case.attempts or 0) > 0
+    )
     if last_spawn is not None and last_spawn.created_at:
         last_at = last_spawn.created_at
         if last_at.tzinfo is not None:
             last_at = last_at.replace(tzinfo=None)
         if now < last_at + _REGRESSION_COOLDOWN:
-            if _rj is not None:
-                _rj["cooldown"] = _rj.get("cooldown", 0) + 1
-            logger.info(
-                "[REGRESSION_DISPATCHER] cooldown-hit project=%s class=%s "
-                "last_spawn=%s cooldown_until=%s",
-                project_id,
-                regression_class,
-                last_at.isoformat(),
-                (last_at + _REGRESSION_COOLDOWN).isoformat(),
-            )
-            return None
+            if fast_tracking_failed_remediation:
+                logger.info(
+                    "[REGRESSION_DISPATCHER] fast-track-failed-remediation "
+                    "project=%s class=%s case_id=%s attempts=%s last_spawn=%s "
+                    "cooldown_until=%s",
+                    project_id,
+                    regression_class,
+                    existing_case.id,
+                    existing_case.attempts,
+                    last_at.isoformat(),
+                    (last_at + _REGRESSION_COOLDOWN).isoformat(),
+                )
+            else:
+                if _rj is not None:
+                    _rj["cooldown"] = _rj.get("cooldown", 0) + 1
+                logger.info(
+                    "[REGRESSION_DISPATCHER] cooldown-hit project=%s class=%s "
+                    "last_spawn=%s cooldown_until=%s",
+                    project_id,
+                    regression_class,
+                    last_at.isoformat(),
+                    (last_at + _REGRESSION_COOLDOWN).isoformat(),
+                )
+                return None
 
     # Derive signal_first_seen_at for MTTD across all non-anomaly classes.
     # Anomaly class passes signal_first_seen_at explicitly from entry["first_seen"].
@@ -2539,7 +2725,11 @@ async def _maybe_spawn(
         and existing_case is not None
         and (existing_case.attempts or 0) >= 2
     ):
-        prompt += _format_prior_attempt_context(existing_case)
+        prompt += _format_prior_attempt_context(
+            existing_case, omit_pr_line=fast_tracking_failed_remediation
+        )
+    if fast_tracking_failed_remediation:
+        prompt += await _format_prior_failure_context(existing_case, session)
     payload_dict: dict[str, Any] = {
         "type": "investigate",
         "prompt": prompt,
@@ -2672,6 +2862,12 @@ async def _maybe_spawn(
         # CLOSED case re-tripping is a fresh regression cycle; without this
         # the case would stay CLOSED while a new investigation runs.
         existing_case.status = RegressionCaseStatus.ACTIVE
+        # One-shot: clear the failure-driven fast-track flag now that the
+        # bypass has been honored and a new investigate task is in flight.
+        # A subsequent failure on this new task will set it again via
+        # re_arm()'s default fast_track=True.
+        if existing_case.fast_track_next_spawn:
+            existing_case.fast_track_next_spawn = False
         session.add(existing_case)
 
     mttd_seconds = (
@@ -2748,6 +2944,128 @@ async def _evaluate_sr_catch_rate_signal(
         extra_context_fields={"signals": [s["regression_class"] for s in tripped]},
     )
     return 1 if spawn is not None else 0
+
+
+async def _evaluate_sr_false_positive_signal(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    project_design_doc: dict | None,
+    spawn_budget_left: int,
+) -> int:
+    """Trip when any SR category's false-positive rate exceeds the floor in both windows."""
+    if spawn_budget_left <= 0:
+        return 0
+    categories = ((project_design_doc or {}).get("sr_catch_rate_trends") or {}).get(
+        "categories"
+    ) or {}
+    if not isinstance(categories, dict):
+        return 0
+
+    tripped: list[dict] = []
+    for cat in sorted(categories):
+        if not isinstance(categories[cat], dict):
+            continue
+        rc = f"sr_false_positive:{cat}"
+        state = await _current_signal_value_for_class(
+            session, project_id, rc, project_design_doc
+        )
+        if state is not None and state["tripped"]:
+            state["regression_class"] = rc
+            tripped.append(state)
+
+    if not tripped:
+        return 0
+
+    rep = tripped[0]
+    cats_label = ", ".join(s["regression_class"].split(":")[1] for s in tripped)
+    prompt = _format_sr_fp_signal_lines(
+        regression_class=rep["regression_class"],
+        current_fp_rate=rep["current_rate"],
+        prior_fp_rate=rep["prior_rate"],
+        sample_size=rep["sample_size"],
+    )
+    spawn = await _maybe_spawn(
+        session,
+        project_id,
+        signal_name="sr_false_positive",
+        regression_class="sr_false_positive",
+        prior_rate=rep["prior_rate"],
+        current_rate=rep["current_rate"],
+        sample_size=rep["sample_size"],
+        magnitude=rep["magnitude"],
+        title_hint=f"SR false-positive ({cats_label})",
+        prompt_override=prompt,
+        extra_context_fields={"signals": [s["regression_class"] for s in tripped]},
+    )
+    return 1 if spawn is not None else 0
+
+
+async def _evaluate_sr_catch_rate_direction_signals(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    project_design_doc: dict | None,
+    spawn_budget_left: int,
+) -> int:
+    """Spawn per-direction investigations when a direction regresses but project-wide is healthy."""
+    if spawn_budget_left <= 0:
+        return 0
+    by_direction = ((project_design_doc or {}).get("sr_catch_rate_trends") or {}).get(
+        "by_direction"
+    ) or {}
+    if not isinstance(by_direction, dict):
+        return 0
+    _spawned = 0
+    dir_spawns = 0
+    for direction_id in sorted(by_direction):
+        if (
+            _spawned >= spawn_budget_left
+            or dir_spawns >= _MAX_DIRECTION_SR_SPAWNS_PER_CYCLE
+        ):
+            break
+        dir_cats = sorted(
+            (by_direction[direction_id].get("categories") or {}).items(),
+            key=lambda kv: kv[1].get("miss_rate", 0),
+            reverse=True,
+        )
+        for cat, _ in dir_cats:
+            rc = f"sr_catch_rate:{cat}:{direction_id}"
+            state = await _current_signal_value_for_class(
+                session, project_id, rc, project_design_doc
+            )
+            if state is None or not state["tripped"]:
+                continue
+            # Skip if project-wide aggregate for this category is also tripping.
+            pw_state = await _current_signal_value_for_class(
+                session, project_id, f"sr_catch_rate:{cat}", project_design_doc
+            )
+            if pw_state is not None and pw_state["tripped"]:
+                continue
+            prompt = _format_signal_lines(
+                signal_name=state["signal_name"],
+                regression_class=rc,
+                prior_rate=state["prior_rate"],
+                current_rate=state["current_rate"],
+                sample_size=state["sample_size"],
+                extras=state["extras"],
+            )
+            spawn = await _maybe_spawn(
+                session,
+                project_id,
+                signal_name=state["signal_name"],
+                regression_class=rc,
+                prior_rate=state["prior_rate"],
+                current_rate=state["current_rate"],
+                sample_size=state["sample_size"],
+                magnitude=state["magnitude"],
+                title_hint=f"SR catch-rate ({cat}) direction {direction_id[:8]}",
+                prompt_override=prompt,
+                extra_context_fields={"direction_id": direction_id},
+            )
+            if spawn is not None:
+                _spawned += 1
+                dir_spawns += 1
+            break  # one attempt per direction (worst tripped category first)
+    return _spawned
 
 
 async def _evaluate_fix_loop_divergence_signal(
@@ -3504,7 +3822,13 @@ async def run_recovery_once(session: AsyncSession, project_id: uuid.UUID) -> int
                         (last_at + _REGRESSION_COOLDOWN).isoformat(),
                     )
                     continue
-            case.re_arm()
+            # Recovery-scan re-arm: a MERGED case whose signal re-tripped
+            # honors the 6h class-level cooldown (see guard above). Pass
+            # fast_track=False so the dispatcher does not bypass that cooldown
+            # — the post-merge signal needs time to settle, not an immediate
+            # re-investigation. Failure-driven re-arm (task_lifecycle hook)
+            # uses the default fast_track=True to opt into the bypass.
+            case.re_arm(fast_track=False)
             # Re-armed cases start a fresh recovery clock — do not let a
             # stale healthy_since from a prior lifecycle short-circuit the
             # auto-close stable window after a future escalation.
@@ -4528,6 +4852,18 @@ async def run_once(session: AsyncSession, project_id: uuid.UUID) -> int:
             project.design_doc,
             spawn_budget - _spawned,
         )
+        _spawned += await _evaluate_sr_false_positive_signal(
+            session,
+            project_id,
+            project.design_doc,
+            spawn_budget - _spawned,
+        )
+        _spawned += await _evaluate_sr_catch_rate_direction_signals(
+            session,
+            project_id,
+            project.design_doc,
+            spawn_budget - _spawned,
+        )
         _spawned += await _evaluate_fix_loop_divergence_signal(
             session,
             project_id,
@@ -4610,3 +4946,185 @@ async def run_once(session: AsyncSession, project_id: uuid.UUID) -> int:
         # Cheap when the index hits no expired rows; failures are swallowed.
         await _prune_old_dispatcher_cycle_records(session)
         _last_cycle_monotonic[str(project_id)] = time.monotonic()
+
+
+async def get_regression_mtta_data(
+    session: AsyncSession,
+    project_id: uuid.UUID | None = None,
+    window_days: int = 30,
+) -> dict[str, Any]:
+    """Return MTTA lifecycle stats per regression class.
+
+    Computes p50/p90 per lifecycle stage (signal-trip → detect → investigate →
+    PR-merge → signal-recovery) from historical cases, and enriches active cases
+    with live elapsed time plus predicted ETA derived from the class's historical
+    p50 distribution.  Active cases whose p50 has been exceeded carry a negative
+    ETA (overdue indicator).
+    """
+    from collections import defaultdict  # noqa: PLC0415
+    from datetime import datetime  # noqa: PLC0415
+
+    cutoff = _utcnow() - timedelta(days=window_days)
+    where: list[Any] = [RegressionRemediationCase.first_seen_at >= cutoff]
+    if project_id is not None:
+        where.append(RegressionRemediationCase.project_id == project_id)
+
+    cases = (
+        (
+            await session.execute(
+                select(RegressionRemediationCase).where(*where).limit(2000)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    now = _utcnow()
+
+    def _pct(vals: list[float], p: float) -> float | None:
+        if not vals:
+            return None
+        s = sorted(vals)
+        return s[min(int(len(s) * p), len(s) - 1)]
+
+    def _parse_dt(v: str | None) -> datetime | None:
+        if not v:
+            return None
+        try:
+            return datetime.fromisoformat(v.replace("Z", ""))
+        except (ValueError, TypeError):
+            return None
+
+    class_cases: dict[str, list] = defaultdict(list)
+    for c in cases:
+        class_cases[c.regression_class].append(c)
+
+    rows = []
+    for rclass, cls_cases in class_cases.items():
+        detect_s: list[float] = []
+        invest_s: list[float] = []
+        itom_s: list[float] = []
+        mtor_s: list[float] = []
+        active_info: list[dict[str, Any]] = []
+
+        for c in cls_cases:
+            if (ttd := c.time_to_detect_sec) is not None and ttd >= 0:
+                detect_s.append(ttd)
+            if (tti := c.time_to_investigate_sec) is not None and tti >= 0:
+                invest_s.append(float(tti))
+            for entry in c.fingerprint_to_fix_log or []:
+                if not isinstance(entry, dict):
+                    continue
+                merged_dt = _parse_dt(entry.get("merged_at"))
+                recovered_dt = _parse_dt(entry.get("recovered_at"))
+                if merged_dt and c.investigate_spawned_at:
+                    d = (merged_dt - c.investigate_spawned_at).total_seconds()
+                    if d >= 0:
+                        itom_s.append(d)
+                if merged_dt and recovered_dt:
+                    d2 = (recovered_dt - merged_dt).total_seconds()
+                    if d2 >= 0:
+                        mtor_s.append(d2)
+
+            if c.status == RegressionCaseStatus.CLOSED:
+                continue
+            anchor = (
+                c.signal_first_crossed_at or c.signal_first_seen_at or c.first_seen_at
+            )
+            live_elapsed = round((now - anchor).total_seconds()) if anchor else None
+            live_inv = (
+                round((now - c.investigate_spawned_at).total_seconds())
+                if c.investigate_spawned_at
+                else None
+            )
+            rec_check_in: int | None = None
+            elapsed_since_merge: int | None = None
+            if c.status == RegressionCaseStatus.MERGED:
+                last_entry = next(
+                    (
+                        e
+                        for e in reversed(c.fingerprint_to_fix_log or [])
+                        if isinstance(e, dict) and e.get("merged_at")
+                    ),
+                    None,
+                )
+                if last_entry and (m := _parse_dt(last_entry["merged_at"])):
+                    secs = int(
+                        (m + _REGRESSION_RECOVERY_COOLDOWN - now).total_seconds()
+                    )
+                    rec_check_in = secs if secs > 0 else None
+                    elapsed_since_merge = int((now - m).total_seconds())
+            active_info.append(
+                {
+                    "case_id": str(c.id),
+                    "status": c.status,
+                    "live_elapsed_sec": live_elapsed,
+                    "live_elapsed_investigate_sec": live_inv,
+                    "recovery_check_in_sec": rec_check_in,
+                    "elapsed_since_merge_sec": elapsed_since_merge,
+                }
+            )
+
+        p50_detect = _pct(detect_s, 0.5)
+        p50_invest = _pct(invest_s, 0.5)
+        p50_itom = _pct(itom_s, 0.5)
+        p50_mtor = _pct(mtor_s, 0.5)
+
+        # Enrich active cases with ETA predictions based on class historical p50.
+        # Negative ETAs indicate the case has exceeded the typical p50 duration.
+        for ai in active_info:
+            ai["eta_to_investigate_sec"] = (
+                int(p50_detect - ai["live_elapsed_sec"])
+                if p50_detect is not None and ai["live_elapsed_sec"] is not None
+                else None
+            )
+            ai["eta_to_merge_sec"] = (
+                int(p50_itom - ai["live_elapsed_investigate_sec"])
+                if p50_itom is not None
+                and ai["live_elapsed_investigate_sec"] is not None
+                else None
+            )
+            ai["eta_to_recovery_sec"] = (
+                int(p50_mtor - ai["elapsed_since_merge_sec"])
+                if p50_mtor is not None and ai["elapsed_since_merge_sec"] is not None
+                else None
+            )
+
+        rows.append(
+            {
+                "regression_class": rclass,
+                "sample_count": len(cls_cases),
+                "stages": {
+                    "signal_trip_to_detect": {
+                        "p50_sec": p50_detect,
+                        "p90_sec": _pct(detect_s, 0.9),
+                        "sample_count": len(detect_s),
+                    },
+                    "detect_to_investigate": {
+                        "p50_sec": p50_invest,
+                        "p90_sec": _pct(invest_s, 0.9),
+                        "sample_count": len(invest_s),
+                    },
+                    "investigate_to_merge": {
+                        "p50_sec": p50_itom,
+                        "p90_sec": _pct(itom_s, 0.9),
+                        "sample_count": len(itom_s),
+                    },
+                    "merge_to_recovery": {
+                        "p50_sec": p50_mtor,
+                        "p90_sec": _pct(mtor_s, 0.9),
+                        "sample_count": len(mtor_s),
+                    },
+                },
+                "active_cases": active_info,
+            }
+        )
+
+    rows.sort(key=lambda r: r["sample_count"], reverse=True)
+    return {
+        "project_id": str(project_id) if project_id else None,
+        "window_days": window_days,
+        "class_count": len(rows),
+        "classes": rows,
+        "recovery_cooldown_sec": int(_REGRESSION_RECOVERY_COOLDOWN.total_seconds()),
+    }

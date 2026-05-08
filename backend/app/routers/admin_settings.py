@@ -96,7 +96,7 @@ def _build_notification_config_response(config: dict, *, is_admin: bool) -> dict
 @router.get("/settings")
 async def get_settings(
     session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_admin),
 ):
     from app.shared_state import runtime_config as _runtime_config
     from app.max_plan_pool import _max_plan_pools

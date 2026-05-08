@@ -2803,6 +2803,7 @@ def compute_sr_catch_rate_by_direction(
     *,
     existing_by_direction: Optional[dict] = None,
     is_new_window: bool = True,
+    direction_text_map: Optional[dict[str, str]] = None,
 ) -> dict[str, dict[str, Any]]:
     """Compute per-direction SR catch-rate breakdown.
 
@@ -2818,12 +2819,17 @@ def compute_sr_catch_rate_by_direction(
     *is_new_window* controls whether the current measurement is appended to
     ``rate_history`` (mirrors the per-category rate_history logic).
 
+    When *direction_text_map* is provided, each entry gains a ``direction_text``
+    field (truncated to 120 chars) so investigation prompts can reference the
+    human-readable direction title without a secondary lookup.
+
     Returns a dict keyed by direction_id::
 
         {
           "d-abc123": {
             "sample_count": 5,
             "miss_rate": 0.6,
+            "direction_text": "...",  # only when direction_text_map provided
             "categories": {
               "regression_risk": {
                 "hit_rate": 0.4,
@@ -2897,6 +2903,10 @@ def compute_sr_catch_rate_by_direction(
                 "overall_catch_rate": overall_catch_rate,
                 "categories": categories,
             }
+            if direction_text_map:
+                raw_text = direction_text_map.get(direction_id, "")
+                if raw_text:
+                    entry["direction_text"] = raw_text[:120]
             if existing_by_direction is not None:
                 prev_entry: dict = dict(existing_by_direction.get(direction_id) or {})
                 prev_miss_rate = prev_entry.get("miss_rate")
@@ -3735,9 +3745,13 @@ async def compute_sr_catch_rate_trends(
         categories[cat]["reasoning_engagement_total"] = cat_eng["total_passes"]
 
     # Attach false-positive stats: SR flagged but reviewer didn't independently flag.
+    # Both windows use _compute_cat_fp_stats so reviewer_findings count as confirmations
+    # consistently — without this, previous_fp_rate overcounts FPs and can trigger the
+    # sr_false_positive dispatcher signal spuriously after a fresh-reviewer wave.
     cat_fp_stats, type_cat_fp_stats, scope_cat_fp_stats = _compute_cat_fp_stats(
         current_window_tasks
     )
+    prev_cat_fp_stats, _, _ = _compute_cat_fp_stats(previous_window_tasks)
     for cat, data in categories.items():
         fp_data = cat_fp_stats.get(cat) or {}
         fp = fp_data.get("fp", 0)
@@ -3746,6 +3760,12 @@ async def compute_sr_catch_rate_trends(
         data["tp_count"] = tp
         data["false_positive_rate"] = (
             round(fp / (fp + tp), 3) if (fp + tp) > 0 else None
+        )
+        prev_fp_data = prev_cat_fp_stats.get(cat) or {}
+        prev_fp = prev_fp_data.get("fp", 0)
+        prev_tp = prev_fp_data.get("tp", 0)
+        data["previous_fp_rate"] = (
+            round(prev_fp / (prev_fp + prev_tp), 3) if (prev_fp + prev_tp) > 0 else None
         )
 
     # Attach time-to-miss-detect latency stats per category.
@@ -3981,10 +4001,18 @@ async def compute_sr_catch_rate_trends(
         result["sr_skip_rate"] = sr_skip_rate
         result["sr_skip_reason_distribution"] = sr_skip_dist
 
+    _dir_text_map: dict[str, str] = {
+        str(d.get("id") or d.get("direction_id") or ""): (
+            d.get("text") or d.get("description") or ""
+        )
+        for d in (project.directions or [])
+        if d.get("id") or d.get("direction_id")
+    }
     by_direction = compute_sr_catch_rate_by_direction(
         all_tasks,
         existing_by_direction=existing.get("by_direction") or {},
         is_new_window=is_new_window,
+        direction_text_map=_dir_text_map or None,
     )
     result["by_direction"] = by_direction or {}
 

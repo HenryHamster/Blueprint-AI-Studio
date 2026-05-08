@@ -1389,10 +1389,8 @@ class TestNotificationConfigSettings:
         assert resp.status_code == 200
 
     @pytest.mark.asyncio
-    async def test_get_settings_non_admin_webhook_url_masked(
-        self, override_get_session
-    ):
-        """Non-admin caller gets empty webhook_url and a boolean configured flag instead."""
+    async def test_get_settings_non_admin_returns_403(self, override_get_session):
+        """Non-admin caller is blocked with 403 from GET /api/admin/settings."""
         from app.main import app as _app
         from app.auth import get_current_user as _gcu, require_admin as _ra
 
@@ -1408,15 +1406,6 @@ class TestNotificationConfigSettings:
                 status_code=403, detail="Forbidden"
             )
 
-        # Set a webhook URL in runtime config first
-        from app.shared_state import runtime_config
-
-        runtime_config["notification_config"] = {
-            "webhook_url": "https://hooks.example.com/secret-token",
-            "enabled_events": ["TASK_FAILED"],
-            "throttle_seconds": 30,
-        }
-
         _app.dependency_overrides[_gcu] = _non_admin
         _app.dependency_overrides[_ra] = _reject_admin
         try:
@@ -1424,17 +1413,10 @@ class TestNotificationConfigSettings:
                 transport=ASGITransport(app=_app), base_url="http://test"
             ) as ac:
                 resp = await ac.get("/api/admin/settings")
-            assert resp.status_code == 200
-            nc = resp.json()["notification_config"]
-            assert nc["webhook_url"] == "", "webhook_url must be masked for non-admin"
-            assert nc["webhook_url_configured"] is True, (
-                "configured flag must be True when URL is set"
-            )
+            assert resp.status_code == 403
         finally:
             _app.dependency_overrides.pop(_gcu, None)
             _app.dependency_overrides.pop(_ra, None)
-            # Restore runtime_config
-            runtime_config.pop("notification_config", None)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

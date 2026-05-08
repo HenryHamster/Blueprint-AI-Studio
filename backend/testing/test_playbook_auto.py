@@ -4802,6 +4802,121 @@ async def test_compute_sr_catch_rate_trends_by_direction_rate_history_capped(
     assert 0.5 not in entry["rate_history"]
 
 
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_by_direction_stores_hit_rate_and_sample_count(
+    db_session: AsyncSession,
+):
+    """by_direction category entries must expose hit_rate and sample_count for the
+    dispatcher's _current_signal_value_for_class per-direction handler."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    direction_id = "d-hitsample-test"
+    tasks = []
+    # 3 tasks: 2 caught (SR flagged + human confirmed), 1 missed (SR missed, human caught)
+    for _ in range(2):
+        t = _make_sr_task_with_direction(
+            project.id,
+            direction_id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    t = _make_sr_task_with_direction(
+        project.id,
+        direction_id,
+        age_days=2,
+        human_cats={"correctness": 1},
+        sr_failed_cats=[],  # SR missed this one
+    )
+    db_session.add(t)
+    tasks.append(t)
+    # Project-wide window tasks
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+    assert result is not None
+    cat_entry = result["by_direction"][direction_id]["categories"]["correctness"]
+    assert "hit_rate" in cat_entry, (
+        "dispatcher reads hit_rate for magnitude calculation"
+    )
+    assert "sample_count" in cat_entry, "dispatcher reads sample_count for floor check"
+    assert cat_entry["sample_count"] == 3
+    assert abs(cat_entry["hit_rate"] - round(2 / 3, 3)) < 0.001
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_by_direction_stores_direction_text(
+    db_session: AsyncSession,
+):
+    """direction_text is stored in by_direction entries when project.directions has titles."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    direction_id = "d-text-test"
+    project = await _make_project(db_session)
+    # Inject a direction with a title into the project
+    project.directions = [
+        {"id": direction_id, "text": "Fix the login regression", "status": "active"}
+    ]
+    db_session.add(project)
+
+    tasks = []
+    for _ in range(3):
+        t = _make_sr_task_with_direction(
+            project.id,
+            direction_id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=[],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+    assert result is not None
+    entry = result["by_direction"][direction_id]
+    assert entry.get("direction_text") == "Fix the login regression"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Tests for reasoning engagement in compute_sr_catch_rate_trends
 # ─────────────────────────────────────────────────────────────────────────────
@@ -6714,6 +6829,59 @@ async def test_sr_passes_do_not_affect_false_positive_metric(db_session: AsyncSe
     )
     assert cat["precision"] is None, (
         "SR never failed correctness → precision must be None"
+    )
+
+
+@pytest.mark.asyncio
+async def test_previous_fp_rate_uses_reviewer_findings_for_consistency(
+    db_session: AsyncSession,
+):
+    """previous_fp_rate uses _compute_cat_fp_stats so reviewer_findings in the prior
+    window count as confirmations — preventing phantom sr_false_positive signals after
+    a fresh-reviewer wave raises many reviewer_findings in the previous cycle."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+
+    def _task_with_reviewer_confirmation(age_days):
+        task = Task(
+            project_id=project.id,
+            title="SR task",
+            payloads=[{"type": "create", "prompt": "do something"}],
+            status=TaskStatus.COMPLETED,
+            context={
+                "_self_review_outcome": {
+                    "check_results": {"correctness": {"passed": False, "issue": "x"}},
+                    "reviewer_findings": [
+                        {"category": "correctness", "severity": "HIGH"}
+                    ],
+                },
+                "_first_attempt_rejection_categories": {"test-coverage": 1},
+            },
+        )
+        task.created_at = _utcnow() - timedelta(days=age_days)
+        return task
+
+    for _ in range(5):
+        t = _task_with_reviewer_confirmation(age_days=2)
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(5):
+        t = _task_with_reviewer_confirmation(age_days=20)
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    cat = result["categories"]["correctness"]
+    assert cat["false_positive_rate"] == 0.0, (
+        "reviewer_findings confirmed SR failure in current window → not a FP"
+    )
+    assert cat["previous_fp_rate"] == 0.0, (
+        "reviewer_findings confirmed SR failure in previous window → previous_fp_rate must be 0.0"
     )
 
 

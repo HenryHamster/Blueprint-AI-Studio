@@ -566,6 +566,52 @@ export async function fetchCrossLayerCompliance(
   return res.json();
 }
 
+export interface MttaStageStat {
+  p50_sec: number | null;
+  p90_sec: number | null;
+  sample_count: number;
+}
+
+export interface MttaActiveCase {
+  case_id: string;
+  status: string;
+  live_elapsed_sec: number | null;
+  live_elapsed_investigate_sec: number | null;
+  recovery_check_in_sec: number | null;
+}
+
+export interface MttaClassRow {
+  regression_class: string;
+  sample_count: number;
+  stages: {
+    signal_trip_to_detect: MttaStageStat;
+    detect_to_investigate: MttaStageStat;
+    investigate_to_merge: MttaStageStat;
+    merge_to_recovery: MttaStageStat;
+  };
+  active_cases: MttaActiveCase[];
+}
+
+export interface RegressionMttaResponse {
+  project_id: string | null;
+  window_days: number;
+  class_count: number;
+  classes: MttaClassRow[];
+  recovery_cooldown_sec: number;
+}
+
+export async function fetchRegressionMtta(
+  params?: { project_id?: string; window_days?: number },
+): Promise<RegressionMttaResponse> {
+  const searchParams = new URLSearchParams();
+  if (params?.project_id) searchParams.set('project_id', params.project_id);
+  if (params?.window_days !== undefined) searchParams.set('window_days', String(params.window_days));
+  const query = searchParams.toString();
+  const res = await apiFetch(`/api/admin/regression-dispatcher/mtta${query ? `?${query}` : ''}`);
+  if (!res.ok) throw new Error(`Failed to fetch regression MTTA: ${res.status}`);
+  return res.json();
+}
+
 export async function onboardProject(
   owner: string,
   repo: string,

@@ -1592,6 +1592,8 @@ async def _close_loop_regression_case_on_failure(
             case.id,
             exc,
         )
+    if task.latest_status_message:
+        case.last_failure_summary = task.latest_status_message[:500]
     case.re_arm()
     session.add(case)
 
