@@ -1,8 +1,9 @@
 import { useState, useEffect, useCallback } from 'react';
 import { CheckCircle, Minus, Shield } from 'lucide-react';
 import { apiFetch, fetchCrossLayerCompliance, type CrossLayerComplianceResponse } from '../api';
-import { timeAgo, formatDurationSec, parseTimestamp } from '../utils/time';
+import { timeAgo, formatDurationSec, parseTimestamp, formatTimeToDetect, formatTimeToInvestigate } from '../utils/time';
 import { LayersAffectedBadges, type LayerSummary } from './LayersAffectedBadges';
+import { PhaseChip } from './regressionPhaseChips';
 
 interface RecurrenceEntry {
   merged_count: number;
@@ -49,25 +50,25 @@ interface Props {
   projectId: string;
 }
 
-function formatTimeToDetect(firstSeenAt: string | null, signalFirstCrossedAt?: string | null): string {
-  if (!firstSeenAt || !signalFirstCrossedAt) return 'unknown';
-  const seconds = (parseTimestamp(firstSeenAt).getTime() - parseTimestamp(signalFirstCrossedAt).getTime()) / 1000;
-  return formatDurationSec(Math.max(0, seconds));
-}
 
-function formatTimeToInvestigate(firstSeenAt: string | null, investigateSpawnedAt?: string | null): string {
-  if (!firstSeenAt || !investigateSpawnedAt) return 'unknown';
-  const seconds = (parseTimestamp(investigateSpawnedAt).getTime() - parseTimestamp(firstSeenAt).getTime()) / 1000;
-  return formatDurationSec(Math.max(0, seconds));
-}
+function getStalenessColor(lastFixAt: string | null): { bgClass: string; isStale: boolean; severity: 'high' | 'medium' | null } {
+  if (!lastFixAt) {
+    return { bgClass: '', isStale: false, severity: null };
+  }
 
-function PhaseChip({ label, duration }: { label: string; duration: string }) {
-  return (
-    <span className="flex items-center gap-1">
-      <span className="text-neutral-600">{label}</span>
-      <span className={duration === 'unknown' ? 'text-neutral-700 italic' : 'text-neutral-400'}>{duration}</span>
-    </span>
-  );
+  const lastFixDate = parseTimestamp(lastFixAt);
+  const now = new Date();
+  const daysAgo = (now.getTime() - lastFixDate.getTime()) / (1000 * 60 * 60 * 24);
+
+  if (daysAgo >= 90) {
+    return { bgClass: 'bg-red-950/20', isStale: true, severity: 'high' };
+  } else if (daysAgo >= 60) {
+    return { bgClass: 'bg-amber-950/20', isStale: true, severity: 'medium' };
+  } else if (daysAgo >= 30) {
+    return { bgClass: 'bg-amber-950/10', isStale: false, severity: null };
+  } else {
+    return { bgClass: '', isStale: false, severity: null };
+  }
 }
 
 export function RecentlyResolvedRegressionsPanel({ projectId }: Props) {
@@ -294,24 +295,35 @@ export function RecentlyResolvedRegressionsPanel({ projectId }: Props) {
       )}
       {layerDensity !== null && (
         <div className="mt-4" data-testid="layer-defense-density-section">
-          <h3 className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest mb-1.5 flex items-center gap-1">
-            <Shield className="w-3 h-3" />
-            Layer Defense Density (30d)
-          </h3>
+          <div className="mb-2">
+            <h3 className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest flex items-center gap-1">
+              <Shield className="w-3 h-3" />
+              Layer Defense Density (30d)
+            </h3>
+            <p className="text-[9px] text-neutral-600 mt-0.5">staleness ≥60d highlighted</p>
+          </div>
           <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg overflow-hidden">
             <table className="w-full text-[10px]">
               <tbody className="divide-y divide-neutral-800/30">
-                {layerDensity.map((row) => (
-                  <tr key={row.layer}>
-                    <td className="px-3 py-1 font-mono text-neutral-400 truncate max-w-[120px]">{row.layer}</td>
-                    <td className="px-2 py-1 text-right">
-                      <span className={row.fix_count === 0 ? 'text-neutral-600' : 'text-white font-medium'}>{row.fix_count}</span>
-                    </td>
-                    <td className="px-3 py-1 text-right text-neutral-600">
-                      {row.last_fix_at ? timeAgo(row.last_fix_at) : '—'}
-                    </td>
-                  </tr>
-                ))}
+                {layerDensity.map((row) => {
+                  const { bgClass, isStale, severity } = getStalenessColor(row.last_fix_at);
+                  return (
+                    <tr key={row.layer} className={bgClass}>
+                      <td className="px-3 py-1 font-mono text-neutral-400 truncate max-w-[120px]">{row.layer}</td>
+                      <td className="px-2 py-1 text-right">
+                        <span className={row.fix_count === 0 ? 'text-neutral-600' : 'text-white font-medium'}>{row.fix_count}</span>
+                      </td>
+                      <td className="px-3 py-1 text-right text-neutral-600 flex items-center justify-end gap-2">
+                        {row.last_fix_at ? timeAgo(row.last_fix_at) : '—'}
+                        {isStale && (
+                          <span className={`px-1.5 py-0.5 rounded text-[9px] font-medium whitespace-nowrap ${severity === 'high' ? 'bg-red-500/20 text-red-300 border border-red-500/30' : 'bg-amber-500/20 text-amber-300 border border-amber-500/30'}`}>
+                            stale
+                          </span>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>

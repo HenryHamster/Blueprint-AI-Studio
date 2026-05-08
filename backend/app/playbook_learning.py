@@ -3876,6 +3876,7 @@ async def compute_sr_catch_rate_trends(
 
     # Compute per-scope category breakdown from current window only.
     # Cells with fewer than _MIN_SR_SAMPLE observations are omitted.
+    existing_by_scope: dict = dict(existing.get("by_scope") or {})
     by_scope: dict[str, dict[str, Any]] = {}
     for scope, scat_stats in current_scope_stats.items():
         scope_cats: dict[str, Any] = {}
@@ -3914,6 +3915,27 @@ async def compute_sr_catch_rate_trends(
             entry["false_positive_rate"] = (
                 round(fp_s / (fp_s + tp_s), 3) if (fp_s + tp_s) > 0 else None
             )
+            # Persist rate_history and trend for this (scope, category) cell.
+            prev_scope_entry: dict = dict(
+                (existing_by_scope.get(scope) or {}).get(cat) or {}
+            )
+            scope_rate_history: list = list(prev_scope_entry.get("rate_history") or [])
+            if is_new_window or not scope_rate_history:
+                scope_rate_history.append(hit_rate)
+                scope_rate_history = scope_rate_history[-5:]
+            prev_scope_hit_rate = prev_scope_entry.get("hit_rate")
+            if prev_scope_hit_rate is not None:
+                s_delta = hit_rate - prev_scope_hit_rate
+                if s_delta >= _TREND_DELTA_THRESHOLD:
+                    scope_trend: str = "increasing"
+                elif s_delta <= -_TREND_DELTA_THRESHOLD:
+                    scope_trend = "decreasing"
+                else:
+                    scope_trend = "stable"
+            else:
+                scope_trend = "stable"
+            entry["rate_history"] = scope_rate_history
+            entry["trend"] = scope_trend
             scope_cats[cat] = entry
         if scope_cats:
             by_scope[scope] = scope_cats
@@ -3997,6 +4019,9 @@ async def compute_sr_catch_rate_trends(
         and current_prompt_version != prev_prompt_version
     ):
         result["prompt_version_changed"] = True
+        for _scope_cats in by_scope.values():
+            for _scope_entry in _scope_cats.values():
+                _scope_entry["prompt_version_changed"] = True
     if sr_skip_rate is not None:
         result["sr_skip_rate"] = sr_skip_rate
         result["sr_skip_reason_distribution"] = sr_skip_dist

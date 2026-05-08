@@ -81,6 +81,57 @@ describe('ManualInterventionPanel — layer badges', () => {
   });
 });
 
+describe('ManualInterventionPanel — phase chips', () => {
+  it('renders investigate→ chip with formatted duration when investigate_spawned_at is set', async () => {
+    apiFetchMock.mockResolvedValueOnce(response([{
+      ...baseCase,
+      signal_first_seen_at: '2026-05-07T10:00:00',
+      signal_first_crossed_at: '2026-05-07T09:50:00',
+      investigate_spawned_at: '2026-05-07T10:10:00',
+      time_to_investigate_sec: 600,
+    }]));
+    render(<ManualInterventionPanel projectId="proj-1" />);
+    await screen.findByText('sr_catch_rate:correctness');
+    const timeline = screen.getByTestId('active-phase-timeline');
+    expect(timeline).toBeInTheDocument();
+    expect(timeline).toHaveTextContent('investigate→');
+    expect(timeline).not.toHaveTextContent('pending');
+  });
+
+  it('renders pending when investigate_spawned_at is null', async () => {
+    apiFetchMock.mockResolvedValueOnce(response([{
+      ...baseCase,
+      signal_first_seen_at: '2026-05-07T10:00:00',
+      signal_first_crossed_at: '2026-05-07T09:50:00',
+      investigate_spawned_at: null,
+      time_to_investigate_sec: null,
+    }]));
+    render(<ManualInterventionPanel projectId="proj-1" />);
+    await screen.findByText('sr_catch_rate:correctness');
+    const timeline = screen.getByTestId('active-phase-timeline');
+    expect(timeline).toHaveTextContent('pending');
+  });
+
+  it('renders amber on pending chip when case is older than 2h', async () => {
+    const twoHoursAgo = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString();
+    apiFetchMock.mockResolvedValueOnce(response([{
+      ...baseCase,
+      signal_first_seen_at: twoHoursAgo,
+      signal_first_crossed_at: null,
+      investigate_spawned_at: null,
+      time_to_investigate_sec: null,
+    }]));
+    render(<ManualInterventionPanel projectId="proj-1" />);
+    await screen.findByText('sr_catch_rate:correctness');
+    const timeline = screen.getByTestId('active-phase-timeline');
+    const pendingSpan = Array.from(timeline.querySelectorAll('span')).find(
+      (el) => el.textContent === 'pending'
+    );
+    expect(pendingSpan).toBeDefined();
+    expect(pendingSpan?.className).toContain('amber');
+  });
+});
+
 describe('AutoRecoveredPanel — layer badges', () => {
   it('renders layer badges in auto-recovered cases', async () => {
     apiFetchMock.mockResolvedValueOnce(response([

@@ -14,6 +14,8 @@ const sampleTrends: SrTrendData = {
     correctness: {
       current_hit_rate: 0.72,
       previous_hit_rate: 0.81,
+      current_human_count: 42,
+      previous_human_count: 48,
       miss_rate: 0.28,
       weighted_miss_rate: 0.31,
       false_positive_rate: 0.12,
@@ -24,6 +26,8 @@ const sampleTrends: SrTrendData = {
     database_connection_timeout_handling: {
       current_hit_rate: 0.55,
       previous_hit_rate: 0.48,
+      current_human_count: 35,
+      previous_human_count: 32,
       miss_rate: 0.45,
       trend: 'increasing',
       rate_history: [0.42, 0.44, 0.48, 0.51, 0.55],
@@ -31,6 +35,8 @@ const sampleTrends: SrTrendData = {
     error_handling: {
       current_hit_rate: 0.63,
       previous_hit_rate: 0.65,
+      current_human_count: 38,
+      previous_human_count: 40,
       miss_rate: 0.37,
       trend: 'stable',
       rate_history: [0.66, 0.65, 0.64, 0.65, 0.63],
@@ -42,6 +48,8 @@ const sampleTrends: SrTrendData = {
     scope_drift: {
       current_hit_rate: 0.88,
       previous_hit_rate: 0.86,
+      current_human_count: 28,
+      previous_human_count: 30,
       miss_rate: 0.12,
       trend: 'increasing',
       rate_history: [0.84, 0.85, 0.86, 0.87, 0.88],
@@ -49,6 +57,8 @@ const sampleTrends: SrTrendData = {
     type_safety: {
       current_hit_rate: 0.41,
       previous_hit_rate: 0.44,
+      current_human_count: 29,
+      previous_human_count: 31,
       miss_rate: 0.59,
       trend: 'decreasing',
       rate_history: [0.5, 0.47, 0.45, 0.43, 0.41],
@@ -120,7 +130,7 @@ describe('SrTrendBreakdown — viewport regression', () => {
       });
       const section = host.querySelector('[data-testid="sr-by-fix-iteration-section"]');
       expect(section).not.toBeNull();
-      const toggle = section!.querySelector('button[aria-expanded]') as HTMLButtonElement;
+      const toggle = (section as HTMLElement).querySelector('button[aria-expanded]') as HTMLButtonElement;
       expect(toggle.getAttribute('aria-expanded')).toBe('false');
       await act(async () => {
         toggle.click();

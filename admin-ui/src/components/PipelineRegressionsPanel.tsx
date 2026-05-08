@@ -3,8 +3,9 @@ import { AlertTriangle, CheckCircle, RotateCcw, Activity, ChevronDown, ChevronRi
 import { ResponsiveContainer, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip } from 'recharts';
 import { apiFetch } from '../api';
 import type { MttaClassRow, RegressionMttaResponse } from '../api';
-import { timeAgo, parseTimestamp } from '../utils/time';
+import { timeAgo, parseTimestamp, formatTimeToDetect, formatTimeToInvestigate } from '../utils/time';
 import { LayersAffectedBadges, type LayerSummary } from './LayersAffectedBadges';
+import { PhaseChip } from './regressionPhaseChips';
 
 interface DispatcherCycleClass {
   regression_class: string;
@@ -175,7 +176,11 @@ interface ManualInterventionCase {
   last_seen_at: string | null;
   needs_manual_intervention_at: string | null;
   signal_first_seen_at: string | null;
+  first_seen_at?: string | null;
+  signal_first_crossed_at?: string | null;
   time_to_detect_sec: number | null;
+  investigate_spawned_at?: string | null;
+  time_to_investigate_sec?: number | null;
   escalation_reason: string | null;
   recurrence_count?: number;
   layer_summary?: LayerSummary | null;
@@ -450,6 +455,25 @@ export function ManualInterventionPanel({ projectId, filterClass }: Props) {
                         MTTD {formatMttd(c.time_to_detect_sec)}
                       </span>
                     </div>
+                    {(() => {
+                      const refAt = c.signal_first_seen_at ?? c.first_seen_at ?? null;
+                      const investigateDuration = c.investigate_spawned_at
+                        ? formatTimeToInvestigate(refAt, c.investigate_spawned_at)
+                        : 'pending';
+                      const isAmber = !c.investigate_spawned_at && refAt != null
+                        && (Date.now() - parseTimestamp(refAt).getTime()) > 2 * 60 * 60 * 1000;
+                      return (
+                        <div className="mt-1 flex flex-wrap items-center gap-1 text-[9px]" data-testid="active-phase-timeline">
+                          <PhaseChip label="detect→" duration={formatTimeToDetect(refAt, c.signal_first_crossed_at)} />
+                          <span className="text-neutral-800">·</span>
+                          <PhaseChip
+                            label="investigate→"
+                            duration={investigateDuration}
+                            tone={isAmber ? 'amber' : undefined}
+                          />
+                        </div>
+                      );
+                    })()}
                   </div>
                 </div>
                 {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}

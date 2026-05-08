@@ -658,6 +658,7 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
   const [lastFetchError, setLastFetchError] = useState(false);
   const [showAllIssues, setShowAllIssues] = useState(false);
   const [windowHours, setWindowHours] = useState(24);
+  const [selectedSrCategory, setSelectedSrCategory] = useState<string>('');
   const sparkRef = useRef<SparkPoint[]>([]);
   const [sparkData, setSparkData] = useState<SparkPoint[]>([]);
 
@@ -676,6 +677,11 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
       setOpenPRsRefreshing(false);
     }
   }, [selectedProjectId]);
+
+  const handleCategoryClick = useCallback((category: string) => {
+    setSelectedSrCategory(category);
+    onCategoryClick?.(category);
+  }, [onCategoryClick]);
 
   // Fetch data
   const fetchData = useCallback(async () => {
@@ -1227,7 +1233,7 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
                 <SrTrendBreakdown
                   trends={digest?.self_review_prediction_accuracy_trends}
                   variant="card"
-                  onCategoryClick={onCategoryClick}
+                  onCategoryClick={handleCategoryClick}
                 />
                 <FixIterationBreakdown trends={digest?.self_review_prediction_accuracy_trends} />
                 <EdgesTrendBreakdown trend={digest?.edges_trend} />
@@ -1310,6 +1316,7 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
               </p>
               <SrMissedRetrospective
                 tasks={srRecentMisses}
+                initialCategory={selectedSrCategory}
                 onTaskClick={(taskId) => {
                   const task = tasks.find(t => t.id === taskId);
                   if (task) onViewTask(task);

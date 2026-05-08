@@ -9,6 +9,8 @@ export interface SrMissExample {
 export interface SrCategoryTrend {
   current_hit_rate?: number | null;
   previous_hit_rate?: number | null;
+  current_human_count?: number | null;
+  previous_human_count?: number | null;
   miss_rate?: number | null;
   all_iterations_miss_rate?: number | null;
   weighted_miss_rate?: number | null;
@@ -52,6 +54,9 @@ export interface SrTaskTypeCategoryStats {
   all_iterations_miss_rate?: number | null;
   sample_count: number;
   examples?: SrMissExample[];
+  rate_history?: number[];
+  trend?: 'increasing' | 'decreasing' | 'stable';
+  prompt_version_changed?: boolean | null;
 }
 
 function severityColor(sev: SrMissExample['severity']): string {
@@ -136,12 +141,17 @@ export interface SrTrendData {
 }
 
 const SKIP_RATE_AMBER_THRESHOLD = 0.25;
+const MIN_SAMPLE_SIZE = 5;
 
 const EXECUTION_EVIDENCE_CATS = [
   'tests_executed_cleanly',
   'lint_executed_cleanly',
   'typecheck_executed_cleanly',
 ] as const;
+
+function isSampleTooSmall(sampleCount: number | null | undefined): boolean {
+  return sampleCount == null || sampleCount < MIN_SAMPLE_SIZE;
+}
 
 function trendPriority(t: SrCategoryTrend['trend']): number {
   if (t === 'decreasing') return 0;
@@ -298,12 +308,25 @@ function ByTaskTypeRow({ ttype, cats }: { ttype: string; cats: Record<string, Sr
           {sorted.map(([cat, stats]) => {
             const hasExamples = (stats.examples?.length ?? 0) > 0;
             const isOpen = openCat === cat;
+            const tooSmall = isSampleTooSmall(stats.sample_count);
             const inner = (
               <>
                 <span className="text-neutral-400">{cat}</span>{' '}
-                <span className="font-mono text-orange-400">{Math.round(stats.miss_rate * 100)}%</span>
+                {tooSmall ? (
+                  <span className="font-mono text-neutral-500">{Math.round(stats.miss_rate * 100)}/{stats.sample_count} — too small</span>
+                ) : (
+                  <span className="font-mono text-orange-400">{Math.round(stats.miss_rate * 100)}%</span>
+                )}
                 {stats.all_iterations_miss_rate != null && (
                   <span className="font-mono text-sky-600" title="all-iterations miss rate">{` all:${Math.round(stats.all_iterations_miss_rate * 100)}%`}</span>
+                )}
+                {(stats.rate_history?.length ?? 0) >= 2 && (
+                  <MissRateSparkline
+                    history={stats.rate_history ?? []}
+                    width={32}
+                    height={10}
+                    stroke={trendStroke(stats.trend ?? 'stable', stats.prompt_version_changed)}
+                  />
                 )}
               </>
             );
@@ -364,10 +387,15 @@ function ByFixIterationRow({
             const isOpen = openCat === cat;
             const baseline = baselineCats?.[cat]?.miss_rate;
             const delta = baseline != null ? stats.miss_rate - baseline : null;
+            const tooSmall = isSampleTooSmall(stats.sample_count);
             const inner = (
               <>
                 <span className="text-neutral-400">{cat}</span>{' '}
-                <span className="font-mono text-orange-400">{Math.round(stats.miss_rate * 100)}%</span>
+                {tooSmall ? (
+                  <span className="font-mono text-neutral-500">{Math.round(stats.miss_rate * 100)}/{stats.sample_count} — too small</span>
+                ) : (
+                  <span className="font-mono text-orange-400">{Math.round(stats.miss_rate * 100)}%</span>
+                )}
                 {delta != null && Math.abs(delta) >= 0.05 && (
                   <span
                     className={`font-mono tabular-nums text-[9px] ml-0.5 ${deltaColorClass(delta)}`}
@@ -475,20 +503,27 @@ function SeverityBucketItem({ sev, bucket }: { sev: string; bucket: SrSeverityBu
   const prevMiss = bucket.previous_miss_rate;
   const delta = miss != null && prevMiss != null ? miss - prevMiss : null;
   const trendColor = sevTrendColorClass(bucket.trend);
+  const tooSmall = isSampleTooSmall(bucket.current_sample);
   return (
     <div className="flex items-center gap-1 text-[10px]">
       <span className={`font-mono shrink-0 font-medium ${sevLabelColor(sev)}`} title={sev}>
         {sev[0]}
       </span>
-      <span className={`font-mono font-bold tabular-nums ${trendColor}`}>
-        {miss != null ? `${Math.round(miss * 100)}%` : '–'}
-      </span>
-      {delta != null && (
+      {tooSmall ? (
+        <span className="font-mono tabular-nums text-neutral-500">
+          {miss != null ? `${Math.round(miss * 100)}/${bucket.current_sample} — too small` : '–'}
+        </span>
+      ) : (
+        <span className={`font-mono font-bold tabular-nums ${trendColor}`}>
+          {miss != null ? `${Math.round(miss * 100)}%` : '–'}
+        </span>
+      )}
+      {delta != null && !tooSmall && (
         <span className={`font-mono tabular-nums text-[9px] ${deltaColorClass(delta)}`}>
           {formatDelta(delta)}
         </span>
       )}
-      <SevTrendIcon trend={bucket.trend} />
+      {!tooSmall && <SevTrendIcon trend={bucket.trend} />}
     </div>
   );
 }
@@ -787,12 +822,18 @@ export function DirectionSrBreakdownPanel({
             </div>
             {cats.length > 0 && (
               <div className="flex flex-col gap-0.5">
-                {cats.map(([cat, s]) => (
+                {cats.map(([cat, s]) => {
+                  const tooSmall = isSampleTooSmall(s.sample_count);
+                  return (
                   <div key={cat} className="text-[10px]">
                     <div className="flex items-center gap-1.5">
                       <span className="text-neutral-400">{cat}</span>
                       {s.miss_rate != null && (
-                        <span className="font-mono text-orange-400">{Math.round(s.miss_rate * 100)}% miss</span>
+                        tooSmall ? (
+                          <span className="font-mono text-neutral-500">{Math.round(s.miss_rate * 100)}/{s.sample_count} — too small</span>
+                        ) : (
+                          <span className="font-mono text-orange-400">{Math.round(s.miss_rate * 100)}% miss</span>
+                        )
                       )}
                       {s.all_iterations_miss_rate != null && (
                         <span className="font-mono text-sky-600" title="all-iterations miss rate">{`all:${Math.round(s.all_iterations_miss_rate * 100)}%`}</span>
@@ -819,7 +860,8 @@ export function DirectionSrBreakdownPanel({
                       />
                     )}
                   </div>
-                ))}
+                );
+                })}
               </div>
             )}
           </div>
@@ -906,6 +948,7 @@ function CategoryRow({
   } : {};
 
   const sparklineTitle = c.prompt_version_changed ? 'prompt version changed mid-window — attribution may differ' : undefined;
+  const sampleTooSmall = isSampleTooSmall(c.current_human_count);
   if (variant === 'card') {
     const srAlone = c.sr_alone_hit_rate;
     const reviewerSave = c.reviewer_save_rate;
@@ -915,9 +958,15 @@ function CategoryRow({
     const rowBody = (
       <>
         <span className="text-neutral-300 truncate flex-1" title={cat}>{cat}</span>
-        <span className={`font-mono font-bold tabular-nums ${color}`}>
-          {miss != null ? `${Math.round(miss * 100)}%` : '–'}
-        </span>
+        {sampleTooSmall ? (
+          <span className="font-mono tabular-nums text-neutral-500">
+            {miss != null ? `${Math.round(miss * 100)}/${c.current_human_count} — too small` : '–'}
+          </span>
+        ) : (
+          <span className={`font-mono font-bold tabular-nums ${color}`}>
+            {miss != null ? `${Math.round(miss * 100)}%` : '–'}
+          </span>
+        )}
         {allIterMiss != null && (
           <span className="font-mono tabular-nums text-sky-600" title="miss rate including iteration 2+ feedback (all-iterations)">
             {`all:${Math.round(allIterMiss * 100)}%`}
@@ -969,7 +1018,7 @@ function CategoryRow({
             {`t95:${formatLatencySec(c.time_to_miss_detect_p95_sec)}`}
           </span>
         )}
-        <TrendIcon trend={c.trend} />
+        {!sampleTooSmall && <TrendIcon trend={c.trend} />}
         {belowFloor && (
           <span
             className="shrink-0"
@@ -1033,9 +1082,15 @@ function CategoryRow({
   const inlineBody = (
     <>
       <span className="text-neutral-300">{cat}</span>
-      <span className={`font-mono ${color}`}>
-        {miss != null ? `${Math.round(miss * 100)}%` : '–'} miss
-      </span>
+      {sampleTooSmall ? (
+        <span className="font-mono text-neutral-500">
+          {miss != null ? `${Math.round(miss * 100)}/${c.current_human_count} — too small` : '–'} miss
+        </span>
+      ) : (
+        <span className={`font-mono ${color}`}>
+          {miss != null ? `${Math.round(miss * 100)}%` : '–'} miss
+        </span>
+      )}
       {allIterMiss != null && (
         <span className="font-mono text-sky-600" title="miss rate including iteration 2+ feedback (all-iterations)">
           {`all:${Math.round(allIterMiss * 100)}%`}
@@ -1087,7 +1142,7 @@ function CategoryRow({
           {`t95:${formatLatencySec(c.time_to_miss_detect_p95_sec)}`}
         </span>
       )}
-      <TrendIcon trend={c.trend} />
+      {!sampleTooSmall && <TrendIcon trend={c.trend} />}
       {belowFloor && (
         <span
           className="shrink-0"

@@ -12111,6 +12111,42 @@ async def test_list_regression_manual_intervention_response_shape(
     assert c["needs_manual_intervention_at"] is not None
     assert "last_seen_at" in c
     assert "last_remediation_pr_number" in c
+    assert c["investigate_spawned_at"] is None
+    assert c["time_to_investigate_sec"] is None
+
+
+@pytest.mark.asyncio
+async def test_list_regression_manual_intervention_investigate_spawned_at_populated(
+    client: AsyncClient, db_session
+):
+    """investigate_spawned_at and time_to_investigate_sec are returned when column is set."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    first_seen = datetime(2026, 5, 5, 10, 0, 0)
+    investigate_spawned = datetime(2026, 5, 5, 10, 5, 0)  # 5 minutes later → 300s
+
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate:correctness",
+        status=RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION,
+        first_seen_at=first_seen,
+        investigate_spawned_at=investigate_spawned,
+        needs_manual_intervention_at=_utcnow(),
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    response = await client.get(
+        "/api/admin/regression-cases/manual-intervention",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 200
+    c = response.json()["cases"][0]
+    assert c["investigate_spawned_at"] is not None
+    assert c["time_to_investigate_sec"] == 300
 
 
 # ── GET /regression-cases/recently-closed ─────────────────────────────────────

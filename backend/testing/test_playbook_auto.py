@@ -6010,6 +6010,195 @@ async def test_compute_sr_catch_rate_trends_by_scope_fp_stats(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Tests for by_scope rate_history and trend in compute_sr_catch_rate_trends
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_by_scope_rate_history_and_trend(
+    db_session: AsyncSession,
+):
+    """by_scope cells carry rate_history and trend after multiple windows."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project = await _make_project(db_session)
+    # Seed existing by_scope: small/test-coverage had hit_rate=0.8 last window.
+    doc = dict(project.design_doc or {})
+    doc["sr_catch_rate_trends"] = {
+        "computed_at": (_utcnow() - timedelta(days=15)).isoformat(),
+        "by_scope": {
+            "small": {
+                "test-coverage": {"hit_rate": 0.8, "rate_history": [0.8]},
+            }
+        },
+        "categories": {},
+    }
+    project.design_doc = doc
+    flag_modified(project, "design_doc")
+    await db_session.flush()
+
+    tasks = []
+    # Current window: 2/5 hits (hit_rate=0.4, dropping 0.4 from 0.8 → decreasing)
+    for _ in range(2):
+        t = _set_task_scope(
+            _make_sr_task(
+                project.id,
+                age_days=2,
+                human_cats={"test-coverage": 1},
+                sr_failed_cats=["test-coverage"],
+            ),
+            "small",
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(3):
+        t = _set_task_scope(
+            _make_sr_task(
+                project.id,
+                age_days=2,
+                human_cats={"test-coverage": 1},
+                sr_failed_cats=[],
+            ),
+            "small",
+        )
+        db_session.add(t)
+        tasks.append(t)
+    # Previous window (needed to satisfy _MIN_SR_SAMPLE for the function)
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"test-coverage": 1},
+            sr_failed_cats=["test-coverage"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    cell = result["by_scope"]["small"]["test-coverage"]
+    assert "rate_history" in cell
+    # Existing [0.8] + new 0.4 = [0.8, 0.4]
+    assert len(cell["rate_history"]) == 2
+    assert cell["rate_history"][-1] == round(2 / 5, 3)
+    # hit_rate dropped 0.4 → delta <= -0.05 → "decreasing"
+    assert cell["trend"] == "decreasing"
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_by_scope_rate_history_cap(
+    db_session: AsyncSession,
+):
+    """rate_history per (scope, category) is capped at 5 entries."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project = await _make_project(db_session)
+    doc = dict(project.design_doc or {})
+    doc["sr_catch_rate_trends"] = {
+        "computed_at": (_utcnow() - timedelta(days=15)).isoformat(),
+        "by_scope": {
+            "small": {
+                "test-coverage": {
+                    "hit_rate": 0.8,
+                    "rate_history": [0.9, 0.85, 0.8, 0.75],
+                },
+            }
+        },
+        "categories": {},
+    }
+    project.design_doc = doc
+    flag_modified(project, "design_doc")
+    await db_session.flush()
+
+    tasks = []
+    for _ in range(5):
+        t = _set_task_scope(
+            _make_sr_task(
+                project.id,
+                age_days=2,
+                human_cats={"test-coverage": 1},
+                sr_failed_cats=["test-coverage"],
+            ),
+            "small",
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"test-coverage": 1},
+            sr_failed_cats=["test-coverage"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    cell = result["by_scope"]["small"]["test-coverage"]
+    assert len(cell["rate_history"]) <= 5
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_by_scope_below_sample_no_history(
+    db_session: AsyncSession,
+):
+    """Cells below _MIN_SR_SAMPLE are absent and do not pollute rate_history."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    # 4 small/test-coverage tasks: below _MIN_SR_SAMPLE=5 → cell absent.
+    # One extra task on a different category to keep the current window ≥ 5 total
+    # (otherwise the overall function returns None before reaching by_scope).
+    for _ in range(4):
+        t = _set_task_scope(
+            _make_sr_task(
+                project.id,
+                age_days=2,
+                human_cats={"test-coverage": 1},
+                sr_failed_cats=["test-coverage"],
+            ),
+            "small",
+        )
+        db_session.add(t)
+        tasks.append(t)
+    t = _set_task_scope(
+        _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=[],
+        ),
+        "medium",
+    )
+    db_session.add(t)
+    tasks.append(t)
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"test-coverage": 1},
+            sr_failed_cats=["test-coverage"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    small = (result.get("by_scope") or {}).get("small", {})
+    assert "test-coverage" not in small
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Tests for miss-example collection in compute_sr_catch_rate_trends
 # ─────────────────────────────────────────────────────────────────────────────
 

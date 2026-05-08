@@ -89,3 +89,17 @@ export function formatTimeOnly(v: string | number): string {
 export function secondsUntil(v: string | number): number {
   return Math.max(0, Math.floor((parseTimestamp(v).getTime() - Date.now()) / 1000));
 }
+
+/** "10m 30s" since signal first crossed threshold to case opening. */
+export function formatTimeToDetect(firstSeenAt: string | null, signalFirstCrossedAt?: string | null): string {
+  if (!firstSeenAt || !signalFirstCrossedAt) return 'unknown';
+  const seconds = (parseTimestamp(firstSeenAt).getTime() - parseTimestamp(signalFirstCrossedAt).getTime()) / 1000;
+  return formatDurationSec(Math.max(0, seconds));
+}
+
+/** "10m 30s" from case opening to first investigation task spawn. */
+export function formatTimeToInvestigate(firstSeenAt: string | null, investigateSpawnedAt?: string | null): string {
+  if (!firstSeenAt || !investigateSpawnedAt) return 'unknown';
+  const seconds = (parseTimestamp(investigateSpawnedAt).getTime() - parseTimestamp(firstSeenAt).getTime()) / 1000;
+  return formatDurationSec(Math.max(0, seconds));
+}

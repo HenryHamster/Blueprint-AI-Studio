@@ -2734,6 +2734,10 @@ async def list_regression_manual_intervention_cases(
                 "signal_first_crossed_at": c.signal_first_crossed_at.isoformat()
                 if c.signal_first_crossed_at
                 else None,
+                "investigate_spawned_at": c.investigate_spawned_at.isoformat()
+                if c.investigate_spawned_at
+                else None,
+                "time_to_investigate_sec": c.time_to_investigate_sec,
                 "escalation_reason": c.escalation_reason,
                 "layer_summary": _summarize_symptoms_by_layer(
                     c.symptoms_by_layer, now=now
