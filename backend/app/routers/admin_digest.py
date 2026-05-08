@@ -2343,6 +2343,72 @@ async def clear_regression_manual_intervention(
     }
 
 
+@router.post("/regression-cases/{regression_class}/close")
+async def close_regression_case(
+    regression_class: str,
+    project_id: uuid.UUID,
+    reason: str | None = Query(
+        None, description="Optional human-readable reason for the close"
+    ),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),  # noqa: ARG001
+):
+    """Operator-close a RegressionRemediationCase from any non-CLOSED status.
+
+    Used to clear cases that became noise — e.g. spawns triggered by a signal
+    pattern that has since been gated out at the source (and so will never
+    auto-recover via run_recovery_once, which only handles MERGED→CLOSED).
+
+    Idempotent: returns 200 with status=CLOSED if the case was already CLOSED.
+    Returns 404 if no row exists for (project_id, regression_class). The
+    process-local first_tripped / healthy_since markers are dropped so a
+    re-spawn (if the signal trips again) starts from a clean slate.
+    """
+    result = await session.execute(
+        select(RegressionRemediationCase).where(
+            RegressionRemediationCase.project_id == project_id,
+            RegressionRemediationCase.regression_class == regression_class,
+        )
+    )
+    case = result.scalar_one_or_none()
+    if case is None:
+        raise HTTPException(
+            status_code=404,
+            detail="No regression case found for this regression_class and project",
+        )
+    prior_status = case.status
+    if prior_status != RegressionCaseStatus.CLOSED:
+        case.status = RegressionCaseStatus.CLOSED
+        case.last_remediation_result = "operator_closed"
+        case.needs_manual_intervention_at = None
+        case.updated_at = _utcnow()
+        case.fingerprint_to_fix_log = list(case.fingerprint_to_fix_log or []) + [
+            {
+                "fingerprint": regression_class,
+                "operator_closed_at": _utcnow().isoformat(),
+                "operator_close_reason": reason,
+                "prior_status": prior_status,
+            }
+        ]
+        session.add(case)
+        await session.commit()
+
+    from app.pipeline_regression_dispatcher import (  # noqa: PLC0415
+        _signal_first_tripped,
+        _signal_healthy_since,
+    )
+
+    _signal_healthy_since.pop((str(project_id), regression_class), None)
+    _signal_first_tripped.pop((str(project_id), regression_class), None)
+    return {
+        "id": str(case.id),
+        "regression_class": regression_class,
+        "status": case.status,
+        "prior_status": prior_status,
+        "attempts": case.attempts,
+    }
+
+
 @router.get("/regression-cases/manual-intervention")
 async def list_regression_manual_intervention_cases(
     project_id: uuid.UUID = Query(..., description="Project to query (required)"),

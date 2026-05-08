@@ -10407,6 +10407,143 @@ async def test_clear_regression_manual_intervention_404_when_not_flagged(
     assert response.status_code == 404
 
 
+# ── POST /regression-cases/{regression_class}/close ─────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_close_regression_case_transitions_active_to_closed(
+    client: AsyncClient, db_session
+):
+    """Operator-close transitions ACTIVE→CLOSED and stamps the close-loop log."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    regression_class = "sr_blind_spot:theme:did not run full backend pytest"
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class=regression_class,
+        status=RegressionCaseStatus.ACTIVE,
+        attempts=0,
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    response = await client.post(
+        f"/api/admin/regression-cases/{regression_class}/close",
+        params={"project_id": str(project.id), "reason": "gated at source"},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["regression_class"] == regression_class
+    assert data["status"] == "CLOSED"
+    assert data["prior_status"] == "ACTIVE"
+
+    await db_session.refresh(case)
+    assert case.status == RegressionCaseStatus.CLOSED
+    assert case.last_remediation_result == "operator_closed"
+    log = case.fingerprint_to_fix_log or []
+    assert len(log) == 1
+    assert log[0]["operator_close_reason"] == "gated at source"
+    assert log[0]["prior_status"] == "ACTIVE"
+    assert log[0]["fingerprint"] == regression_class
+
+
+@pytest.mark.asyncio
+async def test_close_regression_case_idempotent_on_already_closed(
+    client: AsyncClient, db_session
+):
+    """Closing an already-CLOSED case is a 200 no-op (no second log entry)."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    regression_class = "sr_blind_spot:theme:did not run full docker pytest"
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class=regression_class,
+        status=RegressionCaseStatus.CLOSED,
+        attempts=0,
+        last_remediation_result="closed",
+        fingerprint_to_fix_log=[
+            {"fingerprint": regression_class, "recovered_at": "2026-05-08T00:00:00"},
+        ],
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    response = await client.post(
+        f"/api/admin/regression-cases/{regression_class}/close",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "CLOSED"
+    assert data["prior_status"] == "CLOSED"
+
+    await db_session.refresh(case)
+    assert case.status == RegressionCaseStatus.CLOSED
+    assert case.last_remediation_result == "closed"
+    assert len(case.fingerprint_to_fix_log or []) == 1
+
+
+@pytest.mark.asyncio
+async def test_close_regression_case_404_when_missing(
+    client: AsyncClient, db_session
+):
+    """Returns 404 when no case row exists for (project_id, regression_class)."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    response = await client.post(
+        "/api/admin/regression-cases/no_such_class/close",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_close_regression_case_drops_process_local_markers(
+    client: AsyncClient, db_session
+):
+    """Process-local first_tripped / healthy_since markers are cleared on close."""
+    from app.pipeline_regression_dispatcher import (
+        _signal_first_tripped,
+        _signal_healthy_since,
+    )
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    regression_class = "sr_blind_spot:theme:operator_close_marker_test"
+    key = (str(project.id), regression_class)
+    _signal_first_tripped[key] = _utcnow()
+    _signal_healthy_since[key] = _utcnow()
+
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class=regression_class,
+        status=RegressionCaseStatus.ACTIVE,
+        attempts=0,
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    response = await client.post(
+        f"/api/admin/regression-cases/{regression_class}/close",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 200
+    assert key not in _signal_first_tripped
+    assert key not in _signal_healthy_since
+
+
 @pytest.mark.asyncio
 async def test_regression_remediation_case_persists_close_loop_fields(db_session):
     """Model accepts and round-trips the close-loop tracking fields added in 0074."""

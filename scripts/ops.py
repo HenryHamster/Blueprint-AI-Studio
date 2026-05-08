@@ -31,6 +31,9 @@ Usage:
     python scripts/ops.py fingerprints --ignore <fp-substring>
     python scripts/ops.py fingerprints --unignore <fp-substring>
     python scripts/ops.py fingerprints --clear      — wipe in-memory residual store
+    python scripts/ops.py regression-cases          — list ACTIVE/REMEDIATING/NMI cases
+    python scripts/ops.py regression-cases --close <class> [--reason "..."]
+    python scripts/ops.py regression-cases --close-prefix <prefix> [--reason "..."]
 """
 import json
 import sys
@@ -1059,6 +1062,102 @@ def cmd_fingerprints(args):
         print(f"    fp: {fp[:200]}")
 
 
+def cmd_regression_cases(args):
+    """List or close regression remediation cases.
+
+    Usage:
+        python scripts/ops.py regression-cases
+        python scripts/ops.py regression-cases --status ACTIVE
+        python scripts/ops.py regression-cases --all
+        python scripts/ops.py regression-cases --close <regression_class> [--reason "why"]
+        python scripts/ops.py regression-cases --close-prefix <prefix> [--reason "why"]
+    """
+    from urllib.parse import quote
+    from blueprint_api import get_project_id
+    pid = get_project_id()
+
+    # Mutations.
+    if args and args[0] == '--close' and len(args) > 1:
+        cls = args[1]
+        reason = None
+        for i, a in enumerate(args[2:]):
+            if a == '--reason' and i + 3 < len(args):
+                reason = args[i + 3]
+                break
+        path = f"/api/admin/regression-cases/{quote(cls, safe='')}/close?project_id={pid}"
+        if reason:
+            path += f"&reason={quote(reason, safe='')}"
+        try:
+            result = api("POST", path)
+            print(f"Closed: {result.get('regression_class', '')[:120]} → {result.get('prior_status')} → {result.get('status')}")
+        except Exception as e:
+            print(f"Error closing {cls!r}: {e}")
+        return
+    if args and args[0] == '--close-prefix' and len(args) > 1:
+        prefix = args[1]
+        reason = None
+        for i, a in enumerate(args[2:]):
+            if a == '--reason' and i + 3 < len(args):
+                reason = args[i + 3]
+                break
+        # Fetch open cases and filter by prefix
+        path = f"/api/admin/regression-cases?project_id={pid}&limit=200"
+        for s in ('ACTIVE', 'REMEDIATING', 'NEEDS_MANUAL_INTERVENTION'):
+            path += f"&status={s}"
+        result = api("GET", path)
+        cases = result.get("cases", [])
+        matches = [c for c in cases if c.get("regression_class", "").startswith(prefix)]
+        if not matches:
+            print(f"No open cases match prefix {prefix!r}")
+            return
+        print(f"Closing {len(matches)} case(s) matching prefix {prefix!r}:")
+        for c in matches:
+            cls = c["regression_class"]
+            close_path = f"/api/admin/regression-cases/{quote(cls, safe='')}/close?project_id={pid}"
+            if reason:
+                close_path += f"&reason={quote(reason, safe='')}"
+            try:
+                r = api("POST", close_path)
+                print(f"  {r.get('prior_status'):28} → {r.get('status'):8}  {cls[:80]}")
+            except Exception as e:
+                print(f"  ERROR  {cls[:80]}: {e}")
+        return
+
+    # List mode.
+    statuses = []
+    show_all = False
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == '--status' and i + 1 < len(args):
+            statuses.append(args[i + 1])
+            i += 2
+            continue
+        if a == '--all':
+            show_all = True
+            i += 1
+            continue
+        i += 1
+    path = f"/api/admin/regression-cases?project_id={pid}&limit=200"
+    if show_all:
+        for s in ('ACTIVE', 'REMEDIATING', 'NEEDS_MANUAL_INTERVENTION', 'CLOSED', 'MERGED'):
+            path += f"&status={s}"
+    else:
+        for s in statuses:
+            path += f"&status={s}"
+    result = api("GET", path)
+    cases = result.get("cases", [])
+    filt = result.get("status_filter", [])
+    print(f"=== REGRESSION CASES ({len(cases)}) status={','.join(filt)} ===")
+    if not cases:
+        print("(none)")
+        return
+    for c in cases:
+        cls = (c.get("regression_class") or "").replace("\n", " ")
+        print(f"  [{c['status']:28}] attempts={c.get('attempts',0)}  hits={c.get('hit_count',0)}  last_seen={(c.get('last_seen_at') or '')[:19]}  pr={c.get('last_remediation_pr_number') or '-'}")
+        print(f"    class: {cls[:200]}")
+
+
 COMMANDS = {
     'status': cmd_status,
     'resume': cmd_resume,
@@ -1087,6 +1186,7 @@ COMMANDS = {
     'trim-playbook-archive': cmd_trim_playbook_archive,
     'strategic-cycle': cmd_strategic_cycle,
     'fingerprints': cmd_fingerprints,
+    'regression-cases': cmd_regression_cases,
 }
 
 if __name__ == '__main__':
