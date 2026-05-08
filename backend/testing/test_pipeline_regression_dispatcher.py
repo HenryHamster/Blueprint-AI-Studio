@@ -1246,6 +1246,160 @@ async def test_recovery_scan_third_rearm_needs_manual(db_session):
 
 
 @pytest.mark.asyncio
+async def test_recovery_rearm_deferred_when_spawn_cooldown_active(db_session):
+    """re-arm is deferred when last dispatcher spawn is within 6h cooldown (case a).
+
+    Status stays MERGED; a subsequent run_once tick must not spawn either.
+    """
+    from app.models import RegressionCaseStatus
+
+    project = make_project(
+        design_doc=_design_doc_with_sr_regression(
+            category="correctness",
+            prior=0.80,
+            current=0.50,
+        ),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Use the aggregate "sr_catch_rate" class — what run_once actually spawns.
+    case = _merged_case(project.id, attempts=0, regression_class="sr_catch_rate")
+    db_session.add(case)
+
+    # Prior dispatcher-spawned task is 1h old — within the 6h cooldown window.
+    prior_spawn = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        created_at=_utcnow() - timedelta(hours=1),
+        context={
+            "spawned_by": "pipeline_regression_dispatcher",
+            "regression_class": "sr_catch_rate",
+        },
+    )
+    db_session.add(prior_spawn)
+    await db_session.commit()
+    await db_session.refresh(case)
+
+    changed = await run_recovery_once(db_session, project.id)
+    assert changed == 0  # deferred — nothing committed
+
+    await db_session.refresh(case)
+    assert case.status == RegressionCaseStatus.MERGED  # still MERGED, not re-armed
+
+    # The dispatcher tick must also skip (MERGED cases are owned by recovery scan).
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 0
+
+
+@pytest.mark.asyncio
+async def test_recovery_rearm_proceeds_after_cooldown_elapsed(db_session):
+    """re-arm fires normally once the 6h spawn cooldown has elapsed (case b)."""
+    from app.models import RegressionCaseStatus
+
+    project = make_project(
+        design_doc=_design_doc_with_sr_regression(
+            category="correctness",
+            prior=0.80,
+            current=0.50,
+        ),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    case = _merged_case(project.id, attempts=0, regression_class="sr_catch_rate")
+    db_session.add(case)
+
+    # Prior spawn is older than 6h — cooldown window has elapsed.
+    prior_spawn = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        created_at=_utcnow() - _REGRESSION_COOLDOWN - timedelta(minutes=5),
+        context={
+            "spawned_by": "pipeline_regression_dispatcher",
+            "regression_class": "sr_catch_rate",
+        },
+    )
+    db_session.add(prior_spawn)
+    await db_session.commit()
+    await db_session.refresh(case)
+
+    changed = await run_recovery_once(db_session, project.id)
+    assert changed == 1
+
+    await db_session.refresh(case)
+    assert case.status == RegressionCaseStatus.ACTIVE
+    assert case.attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_recovery_close_unaffected_by_spawn_cooldown(db_session):
+    """CLOSED transition fires regardless of active spawn cooldown (case c)."""
+    from app.models import RegressionCaseStatus
+
+    # Signal recovered: equal hit rates → not tripped.
+    project = make_project(
+        design_doc=_design_doc_with_sr_regression(
+            category="correctness",
+            prior=0.80,
+            current=0.80,
+        ),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    case = _merged_case(project.id, attempts=0, regression_class="sr_catch_rate")
+    db_session.add(case)
+
+    # Prior spawn is 1h old — still within 6h cooldown.
+    prior_spawn = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        created_at=_utcnow() - timedelta(hours=1),
+        context={
+            "spawned_by": "pipeline_regression_dispatcher",
+            "regression_class": "sr_catch_rate",
+        },
+    )
+    db_session.add(prior_spawn)
+    await db_session.commit()
+    await db_session.refresh(case)
+
+    # Signal not tripped → CLOSED path must not be blocked by spawn cooldown.
+    changed = await run_recovery_once(db_session, project.id)
+    assert changed == 1
+
+    await db_session.refresh(case)
+    assert case.status == RegressionCaseStatus.CLOSED
+
+
+@pytest.mark.asyncio
+async def test_recovery_cooldown_unchanged_by_spawn_cooldown_fix(db_session):
+    """15-min post-merge recovery wait is still enforced (case d)."""
+    project = make_project(
+        design_doc=_design_doc_with_sr_regression(
+            category="correctness",
+            prior=0.80,
+            current=0.50,
+        ),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Merge only 5 min ago — within the 15-min recovery cooldown.
+    case = _merged_case(project.id, minutes_since_merge=5)
+    db_session.add(case)
+    await db_session.commit()
+
+    changed = await run_recovery_once(db_session, project.id)
+    assert changed == 0  # skipped because recovery cooldown not yet elapsed
+
+
+@pytest.mark.asyncio
 async def test_recovery_scan_no_double_close(db_session):
     """Already-CLOSED case is not picked up by the recovery scan."""
     from app.models import RegressionCaseStatus, RegressionRemediationCase
@@ -5061,3 +5215,436 @@ async def test_staleness_alarm_dedup(db_session):
     assert len(alerts) == 1
 
     del _disp._last_cycle_monotonic[str(project.id)]
+
+
+# ---------------------------------------------------------------------------
+# Path-to-layer classification + layers_targeted backfill tests
+# ---------------------------------------------------------------------------
+
+
+def test_classify_layers_from_paths_ci_workflow():
+    from app.pipeline_regression_dispatcher import _classify_layers_from_paths
+
+    assert _classify_layers_from_paths([".github/workflows/ci.yml"]) == ["CI_WORKFLOW"]
+
+
+def test_classify_layers_from_paths_agent_vm():
+    from app.pipeline_regression_dispatcher import _classify_layers_from_paths
+
+    assert _classify_layers_from_paths(["infra/packer/agent.pkr.hcl"]) == ["AGENT_VM"]
+    assert _classify_layers_from_paths(["setup.sh"]) == ["AGENT_VM"]
+
+
+def test_classify_layers_from_paths_agent_verb():
+    from app.pipeline_regression_dispatcher import _classify_layers_from_paths
+
+    # standard.ts is a non-review handler — must classify as AGENT_VERB
+    assert _classify_layers_from_paths(["agent/src/handlers/standard.ts"]) == [
+        "AGENT_VERB"
+    ]
+    assert _classify_layers_from_paths(["agent/src/index.ts"]) == ["AGENT_VERB"]
+
+
+def test_classify_layers_from_paths_baseline_gate():
+    from app.pipeline_regression_dispatcher import _classify_layers_from_paths
+
+    assert _classify_layers_from_paths(["backend/testing/module_size_limits.json"]) == [
+        "BASELINE_GATE"
+    ]
+    assert _classify_layers_from_paths(["admin-ui/eslint.config.js"]) == [
+        "BASELINE_GATE"
+    ]
+
+
+def test_classify_layers_from_paths_reviewer_pass():
+    from app.pipeline_regression_dispatcher import _classify_layers_from_paths
+
+    assert _classify_layers_from_paths(["backend/app/review_pipeline.py"]) == [
+        "REVIEWER_PASS"
+    ]
+    # review-fix handler must NOT also match AGENT_VERB; reviewer takes priority
+    assert _classify_layers_from_paths(["agent/src/handlers/review-fix.ts"]) == [
+        "REVIEWER_PASS"
+    ]
+    assert _classify_layers_from_paths(["agent/src/prompts/self-review.ts"]) == [
+        "REVIEWER_PASS"
+    ]
+
+
+def test_classify_layers_from_paths_mixed_returns_sorted_unique():
+    from app.pipeline_regression_dispatcher import _classify_layers_from_paths
+
+    layers = _classify_layers_from_paths(
+        [
+            ".github/workflows/ci.yml",
+            "infra/packer/agent.pkr.hcl",
+            "agent/src/handlers/standard.ts",
+            "backend/testing/module_size_limits.json",
+            "backend/app/review_pipeline.py",
+            # Duplicate path of the same layer; final list must be deduped
+            ".github/workflows/release.yml",
+            # Off-canvas path that doesn't match any rule should be ignored
+            "README.md",
+            "docs/some-note.md",
+        ]
+    )
+    assert layers == [
+        "AGENT_VERB",
+        "AGENT_VM",
+        "BASELINE_GATE",
+        "CI_WORKFLOW",
+        "REVIEWER_PASS",
+    ]
+
+
+def test_classify_layers_from_paths_no_match_returns_empty():
+    from app.pipeline_regression_dispatcher import _classify_layers_from_paths
+
+    assert _classify_layers_from_paths(["README.md"]) == []
+    assert _classify_layers_from_paths([]) == []
+    # Non-string input is skipped without raising
+    assert _classify_layers_from_paths(["", None]) == []  # type: ignore[list-item]
+
+
+def test_mark_merged_accepts_layers_targeted_directly():
+    """Forward-compat: callers that already classified at merge time pass it in."""
+    from app.models import RegressionRemediationCase
+
+    case = RegressionRemediationCase(
+        project_id=uuid.uuid4(),
+        regression_class="sr_catch_rate",
+        signal_snapshot_at_spawn={"prior_rate": 0.8, "current_rate": 0.5},
+    )
+    case.mark_merged(
+        4321, {"current_rate": 0.7}, layers_targeted=["AGENT_VM", "CI_WORKFLOW"]
+    )
+    assert len(case.fingerprint_to_fix_log) == 1
+    entry = case.fingerprint_to_fix_log[0]
+    assert entry["fix_pr_number"] == 4321
+    assert entry["layers_targeted"] == ["AGENT_VM", "CI_WORKFLOW"]
+
+
+def test_mark_merged_omits_layers_targeted_when_not_provided():
+    """Backwards-compat: legacy callers without the kwarg get a key-less entry."""
+    from app.models import RegressionRemediationCase
+
+    case = RegressionRemediationCase(
+        project_id=uuid.uuid4(),
+        regression_class="sr_catch_rate",
+        signal_snapshot_at_spawn={"prior_rate": 0.8, "current_rate": 0.5},
+    )
+    case.mark_merged(99, {})
+    assert len(case.fingerprint_to_fix_log) == 1
+    entry = case.fingerprint_to_fix_log[0]
+    assert entry["fix_pr_number"] == 99
+    assert "layers_targeted" not in entry
+
+
+@pytest.mark.asyncio
+async def test_backfill_layers_targeted_populates_missing_entries(
+    db_session, monkeypatch
+):
+    """Backfill scan classifies entries with fix_pr_number but no layers_targeted."""
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+    from app.pipeline_regression_dispatcher import _backfill_layers_targeted_once
+
+    project = make_project(
+        github_owner="test-owner",
+        github_repo="test-repo",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate",
+        status=RegressionCaseStatus.MERGED,
+        fingerprint_to_fix_log=[
+            {
+                "fingerprint": "sr_catch_rate",
+                "fix_pr_number": 100,
+                "merged_at": _utcnow().isoformat(),
+            },
+            # Entry without fix_pr_number — must be skipped (e.g. recovery row)
+            {
+                "fingerprint": "sr_catch_rate",
+                "recovered_at": _utcnow().isoformat(),
+                "post_merge_value": 0.85,
+            },
+        ],
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    async def fake_token(owner, repo):
+        assert owner == "test-owner"
+        assert repo == "test-repo"
+        return "fake-token"
+
+    async def fake_get_pr_files(token, owner, repo, pr_number, project_id=None):
+        assert pr_number == 100
+        return [
+            {"filename": ".github/workflows/ci.yml", "status": "modified"},
+            {"filename": "infra/packer/agent.pkr.hcl", "status": "modified"},
+        ]
+
+    monkeypatch.setattr("app.github.get_repo_installation_token", fake_token)
+    monkeypatch.setattr("app.github.get_pr_files", fake_get_pr_files)
+
+    mutated = await _backfill_layers_targeted_once(db_session, project.id)
+    assert mutated == 1
+
+    await db_session.refresh(case)
+    log = case.fingerprint_to_fix_log
+    fix_entry = next(e for e in log if e.get("fix_pr_number") == 100)
+    assert fix_entry["layers_targeted"] == ["AGENT_VM", "CI_WORKFLOW"]
+    # The recovery entry without fix_pr_number must remain untouched
+    rec_entry = next(e for e in log if e.get("recovered_at"))
+    assert "layers_targeted" not in rec_entry
+
+
+@pytest.mark.asyncio
+async def test_backfill_layers_targeted_idempotent(db_session, monkeypatch):
+    """A second backfill pass does not re-process entries that already have it."""
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+    from app.pipeline_regression_dispatcher import _backfill_layers_targeted_once
+
+    project = make_project(github_owner="o", github_repo="r")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate",
+        status=RegressionCaseStatus.MERGED,
+        fingerprint_to_fix_log=[
+            {
+                "fingerprint": "sr_catch_rate",
+                "fix_pr_number": 7,
+                "merged_at": _utcnow().isoformat(),
+            },
+        ],
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    call_counter = {"n": 0}
+
+    async def fake_token(owner, repo):
+        return "tok"
+
+    async def fake_get_pr_files(token, owner, repo, pr_number, project_id=None):
+        call_counter["n"] += 1
+        return [{"filename": ".github/workflows/ci.yml", "status": "modified"}]
+
+    monkeypatch.setattr("app.github.get_repo_installation_token", fake_token)
+    monkeypatch.setattr("app.github.get_pr_files", fake_get_pr_files)
+
+    first = await _backfill_layers_targeted_once(db_session, project.id)
+    assert first == 1
+    assert call_counter["n"] == 1
+
+    # Second pass: the entry already has layers_targeted (even if []), so it
+    # must be skipped and get_pr_files must NOT be invoked again.
+    second = await _backfill_layers_targeted_once(db_session, project.id)
+    assert second == 0
+    assert call_counter["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_backfill_skipped_when_no_github_creds(db_session, monkeypatch):
+    """Project without github_owner/repo or with no installation token is skipped."""
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+    from app.pipeline_regression_dispatcher import _backfill_layers_targeted_once
+
+    project = make_project(github_owner=None, github_repo=None)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate",
+        status=RegressionCaseStatus.MERGED,
+        fingerprint_to_fix_log=[
+            {
+                "fingerprint": "sr_catch_rate",
+                "fix_pr_number": 1,
+                "merged_at": _utcnow().isoformat(),
+            }
+        ],
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    async def must_not_call_token(owner, repo):
+        raise AssertionError("token fetch should not run for project without repo")
+
+    monkeypatch.setattr("app.github.get_repo_installation_token", must_not_call_token)
+
+    mutated = await _backfill_layers_targeted_once(db_session, project.id)
+    assert mutated == 0
+
+
+@pytest.mark.asyncio
+async def test_backfill_handles_get_pr_files_error_gracefully(db_session, monkeypatch):
+    """Transient GitHub errors are logged and the entry stays untouched."""
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+    from app.pipeline_regression_dispatcher import _backfill_layers_targeted_once
+
+    project = make_project(github_owner="o", github_repo="r")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate",
+        status=RegressionCaseStatus.MERGED,
+        fingerprint_to_fix_log=[
+            {
+                "fingerprint": "sr_catch_rate",
+                "fix_pr_number": 200,
+                "merged_at": _utcnow().isoformat(),
+            },
+        ],
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    async def fake_token(owner, repo):
+        return "tok"
+
+    async def boom_get_pr_files(*args, **kwargs):
+        raise RuntimeError("github 502")
+
+    monkeypatch.setattr("app.github.get_repo_installation_token", fake_token)
+    monkeypatch.setattr("app.github.get_pr_files", boom_get_pr_files)
+
+    # Must not raise — error path swallows + logs.
+    mutated = await _backfill_layers_targeted_once(db_session, project.id)
+    assert mutated == 0
+
+    await db_session.refresh(case)
+    entry = case.fingerprint_to_fix_log[0]
+    assert "layers_targeted" not in entry
+
+
+# ---------------------------------------------------------------------------
+# Layer-coverage histogram (admin_digest) — exercised via direct helper call
+# so the test stays in this file per cluster scope.
+# ---------------------------------------------------------------------------
+
+
+def test_layer_coverage_histogram_sorts_and_skips_unclassified():
+    """Per-class histogram ranks combinations by count desc; skips classes with no
+    classified fix-log entries.
+    """
+    from app.models import RegressionRemediationCase
+    from app.routers.admin_digest import _compute_layer_coverage_by_class
+
+    pid = uuid.uuid4()
+    # Class A: 3× [AGENT_VM], 2× [AGENT_VM, CI_WORKFLOW] (across two cases)
+    case_a1 = RegressionRemediationCase(
+        project_id=pid,
+        regression_class="baseline_drift",
+        fingerprint_to_fix_log=[
+            {"fix_pr_number": 1, "layers_targeted": ["AGENT_VM"]},
+            {"fix_pr_number": 2, "layers_targeted": ["AGENT_VM"]},
+            {"fix_pr_number": 3, "layers_targeted": ["AGENT_VM", "CI_WORKFLOW"]},
+        ],
+    )
+    case_a2 = RegressionRemediationCase(
+        project_id=pid,
+        regression_class="baseline_drift",
+        fingerprint_to_fix_log=[
+            {"fix_pr_number": 4, "layers_targeted": ["AGENT_VM"]},
+            {"fix_pr_number": 5, "layers_targeted": ["CI_WORKFLOW", "AGENT_VM"]},
+            # Entry without layers_targeted → unclassified, excluded
+            {"fix_pr_number": 6},
+        ],
+    )
+    # Class B: only unclassified entries → must be omitted from output entirely
+    case_b = RegressionRemediationCase(
+        project_id=pid,
+        regression_class="orphaned",
+        fingerprint_to_fix_log=[
+            {"fix_pr_number": 7},
+        ],
+    )
+
+    out = _compute_layer_coverage_by_class([case_a1, case_a2, case_b])
+    assert "orphaned" not in out
+    assert out["baseline_drift"]["total_fixes_with_layers"] == 5
+    combos = out["baseline_drift"]["combinations"]
+    # Sorted: [AGENT_VM] (3) first, then [AGENT_VM, CI_WORKFLOW] (2)
+    assert combos[0] == {"layers": ["AGENT_VM"], "count": 3}
+    assert combos[1] == {"layers": ["AGENT_VM", "CI_WORKFLOW"], "count": 2}
+
+
+def test_layer_coverage_histogram_empty_layers_targeted_aggregates():
+    """An entry with explicit layers_targeted=[] is classified-as-no-layers."""
+    from app.models import RegressionRemediationCase
+    from app.routers.admin_digest import _compute_layer_coverage_by_class
+
+    pid = uuid.uuid4()
+    case = RegressionRemediationCase(
+        project_id=pid,
+        regression_class="docs_only_fix",
+        fingerprint_to_fix_log=[
+            {"fix_pr_number": 1, "layers_targeted": []},
+            {"fix_pr_number": 2, "layers_targeted": []},
+        ],
+    )
+    out = _compute_layer_coverage_by_class([case])
+    assert out["docs_only_fix"]["total_fixes_with_layers"] == 2
+    # Empty list aggregates as a no-layer bucket
+    assert out["docs_only_fix"]["combinations"] == [{"layers": [], "count": 2}]
+
+
+def test_regression_case_summary_emits_layer_coverage_field():
+    """The regression-case summary response includes per-class layer_coverage."""
+    from datetime import datetime as _dt
+
+    from app.models import RegressionRemediationCase
+    from app.routers.admin_digest import _compute_regression_case_summary
+
+    pid = uuid.uuid4()
+    seen = _dt(2026, 5, 1, 10, 0, 0)
+    merged = _dt(2026, 5, 1, 11, 0, 0)
+    recovered = _dt(2026, 5, 1, 12, 0, 0)
+
+    case = RegressionRemediationCase(
+        project_id=pid,
+        regression_class="sr_catch_rate",
+        first_seen_at=seen,
+        last_seen_at=recovered,
+        fingerprint_to_fix_log=[
+            {
+                "fix_pr_number": 10,
+                "merged_at": merged.isoformat(),
+                "layers_targeted": ["REVIEWER_PASS"],
+            },
+            {
+                "recovered_at": recovered.isoformat(),
+                "post_merge_value": 0.9,
+            },
+        ],
+    )
+
+    summary = _compute_regression_case_summary([case])
+    assert "layer_coverage_by_class" in summary
+    assert (
+        summary["layer_coverage_by_class"]["sr_catch_rate"]["total_fixes_with_layers"]
+        == 1
+    )
+    by_class_entry = next(
+        e
+        for e in summary["by_regression_class"]
+        if e["regression_class"] == "sr_catch_rate"
+    )
+    assert by_class_entry["layer_coverage"]["combinations"] == [
+        {"layers": ["REVIEWER_PASS"], "count": 1}
+    ]

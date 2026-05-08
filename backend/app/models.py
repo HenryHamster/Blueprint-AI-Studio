@@ -1586,7 +1586,12 @@ class RegressionRemediationCase(SQLModel, table=True):
             return None
         return (self.first_seen_at - anchor).total_seconds()
 
-    def mark_merged(self, pr_number: int, signal_snapshot: Dict[str, Any]) -> None:
+    def mark_merged(
+        self,
+        pr_number: int,
+        signal_snapshot: Dict[str, Any],
+        layers_targeted: Optional[List[str]] = None,
+    ) -> None:
         """Transition ACTIVE → MERGED after remediation PR merges.
 
         Captures the post-merge signal snapshot and appends a fix-log entry so
@@ -1594,6 +1599,13 @@ class RegressionRemediationCase(SQLModel, table=True):
         Falls back to signal_snapshot_at_spawn when the caller passes an empty
         snapshot so run_recovery_once can evaluate the MERGED→CLOSED transition
         regardless of which call site triggered the merge.
+
+        ``layers_targeted`` (optional) records which canonical infrastructure
+        layers the remediation PR's changed files mapped to (subset of the 5
+        layers in regression_layer_classifier.ALL_LAYERS). When None or empty,
+        the entry is written without the key — readers must treat absence as
+        "unclassified", not "no layers". Existing fix-log entries written
+        before this field existed remain readable everywhere.
         """
         if not signal_snapshot:
             signal_snapshot = dict(self.signal_snapshot_at_spawn or {})
@@ -1605,6 +1617,8 @@ class RegressionRemediationCase(SQLModel, table=True):
             "fix_pr_number": pr_number,
             "merged_at": _utcnow().isoformat(),
         }
+        if layers_targeted:
+            log_entry["layers_targeted"] = list(layers_targeted)
         self.fingerprint_to_fix_log = list(self.fingerprint_to_fix_log or []) + [
             log_entry
         ]

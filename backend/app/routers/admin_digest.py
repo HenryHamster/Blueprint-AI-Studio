@@ -744,6 +744,61 @@ def _summarize_symptoms_by_layer(
     }
 
 
+def _compute_layer_coverage_by_class(
+    rows: List[RegressionRemediationCase],
+) -> Dict[str, Dict[str, Any]]:
+    """Per-class histogram of which layer-combinations remediation PRs targeted.
+
+    Aggregates over fingerprint_to_fix_log entries that have ``layers_targeted``
+    populated. Entries that lack the key are treated as unclassified and
+    excluded from the histogram (they neither raise nor lower the count).
+
+    Returns a mapping ``regression_class -> {total_fixes_with_layers, combinations}``
+    where each combination is ``{"layers": [...], "count": N}``. Combinations
+    are sorted by count descending then alphabetic on the joined layer string,
+    so the response is deterministic.
+
+    Classes whose fix-logs have no classified entries are omitted from the
+    result (rather than emitted with an empty histogram) so the strategic
+    agent's antipattern scan can iterate the dict without filtering.
+    """
+    by_class: Dict[str, Dict[tuple, int]] = {}
+    for case in rows:
+        for entry in case.fingerprint_to_fix_log or []:
+            if not isinstance(entry, dict):
+                continue
+            if "layers_targeted" not in entry:
+                continue
+            raw = entry.get("layers_targeted") or []
+            if not isinstance(raw, list):
+                continue
+            # Normalize layer order + dedupe so ["AGENT_VM","CI_WORKFLOW"]
+            # and ["CI_WORKFLOW","AGENT_VM","AGENT_VM"] aggregate to the same
+            # bucket. Empty list aggregates to a "no-layer" bucket — treat
+            # those as classified (caller asked us to backfill them) so the
+            # strategic agent can spot when fixes consistently miss all 5
+            # canonical layers (e.g. doc-only or test-only remediations).
+            combo = tuple(sorted({str(x) for x in raw}))
+            bucket = by_class.setdefault(case.regression_class, {})
+            bucket[combo] = bucket.get(combo, 0) + 1
+
+    out: Dict[str, Dict[str, Any]] = {}
+    for regression_class, combos in by_class.items():
+        total = sum(combos.values())
+        sorted_combos = sorted(
+            (
+                {"layers": list(combo), "count": count}
+                for combo, count in combos.items()
+            ),
+            key=lambda d: (-d["count"], ",".join(d["layers"])),
+        )
+        out[regression_class] = {
+            "total_fixes_with_layers": total,
+            "combinations": sorted_combos,
+        }
+    return out
+
+
 def _compute_regression_case_summary(
     rows: List[RegressionRemediationCase],
 ) -> Dict[str, Any]:
@@ -783,26 +838,43 @@ def _compute_regression_case_summary(
                         - _to_naive_utc(case.signal_first_crossed_at)
                     ).total_seconds()
                 )
-    return {
+    layer_coverage_by_class = _compute_layer_coverage_by_class(rows)
+
+    def _entry(regression_class: str, bucket: Dict[str, List[float]]) -> Dict[str, Any]:
+        out: Dict[str, Any] = {
+            "regression_class": regression_class,
+            "count": len(bucket["to_merged"]),
+            "median_time_from_first_seen_to_merged_seconds": round(
+                statistics.median(bucket["to_merged"]), 3
+            ),
+            "median_time_from_merged_to_recovered_seconds": round(
+                statistics.median(bucket["to_recovered"]), 3
+            ),
+            "median_time_to_detect_seconds": round(
+                statistics.median(bucket["to_detect"]), 3
+            )
+            if bucket["to_detect"]
+            else None,
+        }
+        # Only attach layer_coverage when there's a classified fix-log entry
+        # for this class — keeps the response shape backwards-compatible for
+        # callers that strictly equality-check the per-class dict.
+        coverage = layer_coverage_by_class.get(regression_class)
+        if coverage is not None:
+            out["layer_coverage"] = coverage
+        return out
+
+    response: Dict[str, Any] = {
         "by_regression_class": [
-            {
-                "regression_class": regression_class,
-                "count": len(bucket["to_merged"]),
-                "median_time_from_first_seen_to_merged_seconds": round(
-                    statistics.median(bucket["to_merged"]), 3
-                ),
-                "median_time_from_merged_to_recovered_seconds": round(
-                    statistics.median(bucket["to_recovered"]), 3
-                ),
-                "median_time_to_detect_seconds": round(
-                    statistics.median(bucket["to_detect"]), 3
-                )
-                if bucket["to_detect"]
-                else None,
-            }
+            _entry(regression_class, bucket)
             for regression_class, bucket in sorted(by_class.items())
-        ]
+        ],
     }
+    # Top-level histogram is emitted only when at least one class has
+    # classified fix entries — keeps the empty-summary contract intact.
+    if layer_coverage_by_class:
+        response["layer_coverage_by_class"] = layer_coverage_by_class
+    return response
 
 
 def _regression_case_recurrence_count(case: RegressionRemediationCase) -> int:

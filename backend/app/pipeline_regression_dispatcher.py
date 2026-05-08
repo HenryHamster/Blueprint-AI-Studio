@@ -1257,6 +1257,223 @@ def _format_cross_layer_prompt(
     return "\n".join(header)
 
 
+# ---------------------------------------------------------------------------
+# Path-based layer classification (for fix-log layers_targeted backfill)
+# ---------------------------------------------------------------------------
+
+# Bound for how many cases to backfill per dispatcher tick. The recovery scan
+# runs every 60s and each call hits the GitHub API once per case; capping
+# prevents a multi-hundred-case backlog from saturating the API budget.
+_LAYER_BACKFILL_PER_TICK = 5
+
+
+def _classify_layers_from_paths(paths: list[str]) -> list[str]:
+    """Map a list of changed file paths to canonical infrastructure-layer tags.
+
+    Returns a sorted, deduplicated subset of ``ALL_LAYERS`` from
+    ``regression_layer_classifier``. Paths that don't match any rule are
+    silently dropped — empty result is meaningful ("none of the canonical
+    layers were touched") and is preserved as ``[]`` for the caller.
+
+    Rules align with the pattern matcher in ``regression_layer_classifier``
+    so message-based and path-based classifications use the same vocabulary:
+      * ``.github/workflows/**`` → CI_WORKFLOW
+      * ``infra/packer/**``, ``setup.sh``, ``scripts/build*`` → AGENT_VM
+      * ``agent/src/handlers/**``, ``agent/src/index.ts`` → AGENT_VERB
+      * ``backend/app/review_pipeline.py``, ``backend/app/auto_review.py``,
+        ``agent/src/handlers/review-fix.*``, ``agent/src/prompts/self-review.ts``,
+        ``.claude/skills/review*``, ``.claude/skills/security-review*`` → REVIEWER_PASS
+      * ``backend/testing/module_size_limits.json``, lint configs
+        (``eslint.config.js``, ``ruff.toml``, ``pyproject.toml``),
+        ``backend/app/source_ref_validation.py``, ``check`` script,
+        ``backend/app/fix_loop_telemetry.py`` → BASELINE_GATE
+    """
+    from app.regression_layer_classifier import (  # noqa: PLC0415
+        LAYER_AGENT_VERB,
+        LAYER_AGENT_VM,
+        LAYER_BASELINE_GATE,
+        LAYER_CI_WORKFLOW,
+        LAYER_REVIEWER_PASS,
+    )
+
+    tags: set[str] = set()
+    for raw in paths or []:
+        if not raw or not isinstance(raw, str):
+            continue
+        # Strip a leading "./" prefix only — must NOT use lstrip("./") because
+        # that would also chop the leading "." off paths like ".github/...".
+        p = raw.strip()
+        if p.startswith("./"):
+            p = p[2:]
+
+        # CI_WORKFLOW
+        if p.startswith(".github/workflows/"):
+            tags.add(LAYER_CI_WORKFLOW)
+
+        # AGENT_VM — VM image, system-level provisioning
+        if (
+            p.startswith("infra/packer/")
+            or p.startswith("infra/terraform/")
+            or p == "setup.sh"
+            or p.startswith("scripts/build")
+            or p == "Dockerfile"
+            or p.endswith("/Dockerfile")
+        ):
+            tags.add(LAYER_AGENT_VM)
+
+        # REVIEWER_PASS — checked BEFORE AGENT_VERB so review-fix handlers
+        # in agent/src/handlers/ classify as REVIEWER_PASS, not AGENT_VERB.
+        is_reviewer = (
+            p == "backend/app/review_pipeline.py"
+            or p == "backend/app/auto_review.py"
+            or p.startswith("backend/app/sr_")
+            or p == "agent/src/prompts/self-review.ts"
+            or p.startswith("agent/src/handlers/review-fix")
+            or ".claude/skills/review" in p
+            or ".claude/skills/security-review" in p
+        )
+        if is_reviewer:
+            tags.add(LAYER_REVIEWER_PASS)
+
+        # AGENT_VERB — handler invocation / verb dispatch / scope check
+        if not is_reviewer and (
+            p.startswith("agent/src/handlers/")
+            or p == "agent/src/index.ts"
+            or p == "agent/src/prompt.ts"
+            or p.startswith("agent/src/prompts/")
+        ):
+            tags.add(LAYER_AGENT_VERB)
+
+        # BASELINE_GATE — lint/scope/size/baseline configs and gate code
+        if (
+            p == "backend/testing/module_size_limits.json"
+            or p == "eslint.config.js"
+            or p.endswith("/eslint.config.js")
+            or p == "admin-ui/eslint.config.js"
+            or p == "ruff.toml"
+            or p == "pyproject.toml"
+            or p == "backend/app/source_ref_validation.py"
+            or p == "backend/app/fix_loop_telemetry.py"
+            or p == "check"
+            or p == "check-viewport.sh"
+        ):
+            tags.add(LAYER_BASELINE_GATE)
+
+    return sorted(tags)
+
+
+async def _backfill_layers_targeted_once(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> int:
+    """Populate ``layers_targeted`` on fix-log entries that lack it.
+
+    Idempotent backfill helper invoked from ``run_recovery_once``. Iterates
+    cases for ``project_id`` whose ``fingerprint_to_fix_log`` contains entries
+    with ``fix_pr_number`` set but no ``layers_targeted`` populated. For each
+    such entry, fetches the PR's changed files via the existing GitHub helper
+    and writes ``layers_targeted`` (a list, possibly empty) back onto the entry.
+
+    Returns the number of entries mutated. Bounded to
+    ``_LAYER_BACKFILL_PER_TICK`` cases per call so backlog cannot starve the
+    rest of the dispatcher tick. GitHub auth / API failures are logged and
+    skipped — never raised — so a transient outage never breaks recovery.
+    """
+    from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
+
+    from app.github import get_pr_files, get_repo_installation_token  # noqa: PLC0415
+    from app.models import Project  # noqa: PLC0415
+
+    project = await session.get(Project, project_id)
+    if project is None or not project.github_owner or not project.github_repo:
+        return 0
+
+    rows = (
+        (
+            await session.execute(
+                select(RegressionRemediationCase).where(
+                    RegressionRemediationCase.project_id == project_id,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    # Find cases with at least one entry missing layers_targeted.
+    pending: list[RegressionRemediationCase] = []
+    for case in rows:
+        log = case.fingerprint_to_fix_log or []
+        for entry in log:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("fix_pr_number") and "layers_targeted" not in entry:
+                pending.append(case)
+                break
+        if len(pending) >= _LAYER_BACKFILL_PER_TICK:
+            break
+
+    if not pending:
+        return 0
+
+    token: str | None = None
+    try:
+        token = await get_repo_installation_token(
+            project.github_owner, project.github_repo
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[REGRESSION_DISPATCHER] layers backfill skipped — token fetch failed for "
+            "project=%s: %s",
+            project_id,
+            exc,
+        )
+        return 0
+    if not token:
+        return 0
+
+    mutated = 0
+    for case in pending:
+        log = list(case.fingerprint_to_fix_log or [])
+        log_changed = False
+        for entry in log:
+            if not isinstance(entry, dict):
+                continue
+            pr = entry.get("fix_pr_number")
+            if not pr or "layers_targeted" in entry:
+                continue
+            try:
+                files = await get_pr_files(
+                    token,
+                    project.github_owner,
+                    project.github_repo,
+                    int(pr),
+                    project_id=str(project_id),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[REGRESSION_DISPATCHER] layers backfill skipped PR #%s for "
+                    "project=%s case=%s: %s",
+                    pr,
+                    project_id,
+                    case.id,
+                    exc,
+                )
+                continue
+            paths = [str(f.get("filename") or "") for f in files if isinstance(f, dict)]
+            entry["layers_targeted"] = _classify_layers_from_paths(paths)
+            log_changed = True
+            mutated += 1
+        if log_changed:
+            case.fingerprint_to_fix_log = log
+            flag_modified(case, "fingerprint_to_fix_log")
+            session.add(case)
+
+    if mutated:
+        await session.commit()
+    return mutated
+
+
 async def _get_remediation_case(
     session: AsyncSession,
     project_id: uuid.UUID,
@@ -2296,11 +2513,40 @@ async def run_recovery_once(session: AsyncSession, project_id: uuid.UUID) -> int
                 }
             ]
         else:
+            last_spawn = await _last_spawn_for_class(
+                session, project_id, case.regression_class
+            )
+            if last_spawn is not None and last_spawn.created_at:
+                last_at = last_spawn.created_at
+                if last_at.tzinfo is not None:
+                    last_at = last_at.replace(tzinfo=None)
+                if now < last_at + _REGRESSION_COOLDOWN:
+                    logger.info(
+                        "[REGRESSION_DISPATCHER] recovery-rearm-cooldown-deferred "
+                        "project=%s class=%s last_spawn=%s cooldown_until=%s",
+                        project_id,
+                        case.regression_class,
+                        last_at.isoformat(),
+                        (last_at + _REGRESSION_COOLDOWN).isoformat(),
+                    )
+                    continue
             case.re_arm()
         session.add(case)
         changed += 1
     if changed:
         await session.commit()
+
+    # Opportunistic backfill: populate layers_targeted on any fix-log entries
+    # that lack it. Bounded per tick; GitHub failures are logged and skipped.
+    try:
+        await _backfill_layers_targeted_once(session, project_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[REGRESSION_DISPATCHER] layers_targeted backfill raised for project=%s: %s",
+            project_id,
+            exc,
+        )
+
     return changed
 
 

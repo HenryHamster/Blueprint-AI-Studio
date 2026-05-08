@@ -191,12 +191,16 @@ def test_packer_meta_preserved_through_validate_internal_payload():
     This pins Pydantic's extra='allow' behavior — without it, _packer_meta
     would silently disappear and the agent would never see what was trimmed.
     """
+    # ResearchPayload.directions is list[dict] (each item describes a direction);
+    # the fail-closed validator (3eeb693) rejects bare strings here. The test
+    # only cares that _packer_meta survives validation, so any well-typed
+    # directions value works.
     payload = pack_under_budget(
         {
             "type": "research",
             "research_mode": "tactical",
             "base_branch": "main",
-            "directions": ["d1"],
+            "directions": [{"id": "d1"}],
         },
         {
             "type": {"priority": "critical"},

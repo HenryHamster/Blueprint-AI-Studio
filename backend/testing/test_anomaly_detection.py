@@ -678,6 +678,11 @@ def _make_proactive_session(active_proactive_count: int = 0):
 
     empty_result = MagicMock()
     empty_result.all.return_value = []
+    # _get_recent_changes_context calls session.execute(...).scalars().first()
+    # to fetch DeploymentState; with no row present that must yield None so
+    # the InvestigatePayload validator (fail-closed since 3eeb693) sees real
+    # str | None values for deployed_at / current_sha rather than MagicMocks.
+    empty_result.scalars.return_value.first.return_value = None
 
     session.execute = AsyncMock(
         side_effect=[count_result, empty_result, empty_result, empty_result]
