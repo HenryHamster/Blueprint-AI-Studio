@@ -774,12 +774,20 @@ async def reaper_service():
                             and task.started_at
                             and task.started_at
                             < _progress_stale_cutoff(task, now)
+                            and (task.context or {}).get("llm_provider")
+                            == "anthropic"
                         ):
-                            # Stalled-but-heartbeating with zero tool calls ever
-                            # (Codex text-mode pattern, 2026-05-07): agent emits
-                            # heartbeats but never invokes apply_patch / Edit /
-                            # Write. Use started_at as the clock since
-                            # last_tool_use_at is NULL.
+                            # Stalled-but-heartbeating with zero tool calls ever.
+                            # Provider-gated to anthropic only because the agent
+                            # wrapper's outputMode='text' path (Codex/Gemini at
+                            # agent/src/index.ts:3061,3119) never calls
+                            # recordToolUse — only the claude-stream-json parser
+                            # does. So last_tool_use_at IS NULL for every
+                            # Codex/Gemini task by design, regardless of whether
+                            # tools were called. Without this gate the watchdog
+                            # reaps healthy non-anthropic work after 8 min.
+                            # TODO: parse Codex --json events / Gemini events
+                            # to populate tool_trace, then drop the gate.
                             orphaned_ids.append(task.id)
                     elif task.created_at < ten_minutes_ago:
                         orphaned_ids.append(task.id)
@@ -925,14 +933,15 @@ async def reaper_service():
                                 and t.last_tool_use_at is None
                                 and t.started_at
                                 and t.started_at < _progress_stale_cutoff(t, now)
+                                and (t.context or {}).get("llm_provider")
+                                == "anthropic"
                             ):
-                                # Codex-stuck-in-text-mode pattern (c60170b3,
-                                # 291914e6, f5c8a36f, 897a742e on 2026-05-07):
-                                # heartbeats keep flowing while the agent never
-                                # invokes any tool. Without this branch the
-                                # heartbeat-stall reaper only fires after the
-                                # upstream stream finally crashes, wasting 5+
-                                # min per attempt × 3 attempts × N retries.  # noqa: RUF003
+                                # Verification-loop mirror of step-1 guard.
+                                # Provider-gated to anthropic only because the
+                                # agent wrapper's outputMode='text' path
+                                # (Codex/Gemini) never calls recordToolUse, so
+                                # last_tool_use_at IS NULL by design. See
+                                # step-1 branch for the full rationale.
                                 verified.append(t)
                         elif t.created_at < ten_minutes_ago:
                             verified.append(t)

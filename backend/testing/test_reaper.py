@@ -491,11 +491,11 @@ async def test_in_progress_no_heartbeat_started_6min_reaped(
 async def test_in_progress_no_tool_use_past_progress_stale_reaped(
     reaper_db, stop_after_one_cycle, reaper_side_effects
 ):
-    """Heartbeat fresh + last_tool_use_at NULL + started_at >8min (small) → agent_stalled.
+    """Heartbeat fresh + last_tool_use_at NULL + started_at >8min + anthropic → agent_stalled.
 
-    Codex-stuck-in-text-mode pattern: agent process alive (heartbeats keep
-    flowing) but never invokes any tool. Without this branch the only catch
-    is the heartbeat-stall reaper after the upstream stream finally crashes.
+    Anthropic-only because the agent wrapper's claude-stream-json parser is
+    the only path that populates last_tool_use_at (Codex/Gemini under
+    outputMode='text' never call recordToolUse).
     """
     project = await _make_project(reaper_db)
     t = Task(
@@ -507,7 +507,7 @@ async def test_in_progress_no_tool_use_past_progress_stale_reaped(
         started_at=datetime.utcnow() - timedelta(minutes=10),
         last_heartbeat=datetime.utcnow() - timedelta(seconds=30),
         last_tool_use_at=None,
-        context={"scope": "small"},
+        context={"scope": "small", "llm_provider": "anthropic"},
     )
     reaper_db.add(t)
     await reaper_db.commit()
@@ -538,7 +538,39 @@ async def test_in_progress_no_tool_use_within_progress_stale_not_reaped(
         started_at=datetime.utcnow() - timedelta(minutes=3),
         last_heartbeat=datetime.utcnow() - timedelta(seconds=10),
         last_tool_use_at=None,
-        context={"scope": "small"},
+        context={"scope": "small", "llm_provider": "anthropic"},
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    assert t.status == TaskStatus.IN_PROGRESS
+
+
+@pytest.mark.asyncio
+async def test_in_progress_no_tool_use_codex_provider_not_reaped(
+    reaper_db, stop_after_one_cycle, reaper_side_effects
+):
+    """Codex (openai) tasks with last_tool_use_at NULL must NOT be reaped.
+
+    The wrapper's outputMode='text' for Codex never invokes recordToolUse,
+    so last_tool_use_at IS NULL for every Codex task by design — even when
+    Codex is calling apply_patch happily. Pre-fix this watchdog reaped all
+    healthy Codex work after the progress-stale cutoff. Pin the gate.
+    """
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix", "scope": "small", "model": "gpt-5.4"}],
+        vm_instance_id="vm-codex",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        started_at=datetime.utcnow() - timedelta(minutes=10),
+        last_heartbeat=datetime.utcnow() - timedelta(seconds=30),
+        last_tool_use_at=None,
+        context={"scope": "small", "llm_provider": "openai"},
     )
     reaper_db.add(t)
     await reaper_db.commit()
