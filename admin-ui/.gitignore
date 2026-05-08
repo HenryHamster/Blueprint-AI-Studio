@@ -12,6 +12,12 @@ dist
 dist-ssr
 *.local
 
+# Vitest browser-mode failure artifacts (not snapshot baselines — no
+# toMatchScreenshot consumers). screenshotFailures: true dumps these on
+# every failed assertion; they should not be committed.
+.vitest-attachments/
+src/**/__screenshots__/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

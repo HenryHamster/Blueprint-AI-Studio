@@ -3,7 +3,7 @@ import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { LogsTab } from './TaskDetailDrawerLogs';
 import type { Task } from './TaskCard';
-import { expectNoOverflowAt } from '../test/viewport';
+import { expectNoOverflowAt, expectMinTouchTargetAt } from '../test/viewport';
 
 const LONG_LINE =
   '/usr/local/lib/python3.11/site-packages/' +
@@ -92,5 +92,28 @@ describe('TaskDetailDrawerLogs LogsTab — viewport regression', () => {
         );
       });
     });
+  });
+
+  test('interactive controls meet 44px touch target at 375px', async () => {
+    await expectMinTouchTargetAt(375, async () => {
+      host = document.createElement('div');
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <LogsTab
+            logLines={logLines}
+            task={baseTask}
+            logFilter=""
+            setLogFilter={() => {}}
+            logLevel="all"
+            setLogLevel={() => {}}
+            showLineNumbers={true}
+            logsConnecting={false}
+          />,
+        );
+      });
+    }, { selector: 'button, a[href]' });
   });
 });

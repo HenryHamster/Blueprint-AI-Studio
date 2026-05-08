@@ -3,7 +3,7 @@ import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { DetailsTab } from './TaskDetailDrawerMeta';
 import type { Task } from '../types/task';
-import { expectNoOverflowAt } from '../test/viewport';
+import { expectNoOverflowAt, expectMinTouchTargetAt } from '../test/viewport';
 
 vi.mock('../firebase', () => ({
   auth: { currentUser: null, onAuthStateChanged: () => () => {} },
@@ -81,5 +81,15 @@ describe('TaskDetailDrawerMeta DetailsTab — viewport regression', () => {
         await act(async () => { srButton.click(); });
       }
     });
+  });
+
+  test('interactive controls meet 44px touch target at 375px', async () => {
+    await expectMinTouchTargetAt(375, async () => {
+      host = document.createElement('div');
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => { r.render(<DetailsTab task={richTask} />); });
+    }, { selector: 'button, a[href]' });
   });
 });

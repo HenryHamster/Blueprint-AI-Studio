@@ -2,7 +2,7 @@ import { afterEach, describe, test } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { SettingsNotificationsSection } from './SettingsNotificationsSection';
-import { expectNoOverflowAt } from '../test/viewport';
+import { expectNoOverflowAt, expectMinTouchTargetAt } from '../test/viewport';
 
 const ALL_EVENTS = [
   'TASK_FAILED',
@@ -99,5 +99,28 @@ describe('SettingsNotificationsSection — viewport regression', () => {
         );
       });
     });
+  });
+
+  test('interactive controls meet 44px touch target at 375px', async () => {
+    await expectMinTouchTargetAt(375, async () => {
+      host = document.createElement('div');
+      document.body.appendChild(host);
+      root = createRoot(host);
+      await act(async () => {
+        root?.render(
+          <SettingsNotificationsSection
+            webhookUrl="https://hooks.slack.com/services/T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX"
+            onUpdateWebhookUrl={() => {}}
+            enabledEvents={ALL_EVENTS}
+            onUpdateEnabledEvents={() => {}}
+            throttleSeconds={300}
+            onUpdateThrottleSeconds={() => {}}
+            dailyCostCeilingUsd={50}
+            onUpdateDailyCostCeiling={() => {}}
+            isAdmin={true}
+          />
+        );
+      });
+    }, { selector: 'button, a[href]' });
   });
 });

@@ -18,8 +18,12 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+import urllib.parse
+
 import httpx
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.url_security import _resolve_safe_external_url
 
 from app.models import (
     MessageType,
@@ -111,9 +115,43 @@ def get_notification_stats(project_id: Any = None) -> dict:
 
 
 async def _attempt_delivery(webhook_url: str, body: dict) -> int:
-    """POST body to webhook_url. Returns HTTP status code, or 0 on network/timeout error."""
+    """POST body to webhook_url. Returns HTTP status code, or 0 on network/timeout error.
+
+    Defeats DNS rebinding by resolving the hostname ourselves, validating the IP
+    is public, and then pinning the connection to that exact IP — substituting
+    the resolved address into the URL while preserving the original Host header
+    and TLS SNI hostname so cert validation still works against the hostname.
+    httpx's separate getaddrinfo call cannot be redirected to a private IP by a
+    rebinding attacker because the connection target is now a literal address.
+    """
+    safe, reason, resolved_ip = await asyncio.to_thread(
+        _resolve_safe_external_url, webhook_url
+    )
+    if not safe or resolved_ip is None:
+        logger.warning(
+            "[NOTIFY] SSRF check blocked dispatch to %r: %s", webhook_url, reason
+        )
+        return 0
+
+    parsed = urllib.parse.urlparse(webhook_url)
+    original_host = parsed.hostname or ""
+    # IPv6 literals need bracketing in URL netloc
+    ip_in_netloc = f"[{resolved_ip}]" if ":" in resolved_ip else resolved_ip
+    netloc = f"{ip_in_netloc}:{parsed.port}" if parsed.port else ip_in_netloc
+    pinned_url = urllib.parse.urlunparse(parsed._replace(netloc=netloc))
+
+    # Preserve original Host header (for HTTP virtual hosting) and TLS SNI
+    # (for cert validation against the hostname, not the IP).
+    request_host_header = (
+        f"{original_host}:{parsed.port}" if parsed.port else original_host
+    )
+    headers = {"Host": request_host_header}
+    extensions = {"sni_hostname": original_host}
+
     async with httpx.AsyncClient(timeout=5.0) as client:
-        resp = await client.post(webhook_url, json=body)
+        resp = await client.post(
+            pinned_url, json=body, headers=headers, extensions=extensions
+        )
         return resp.status_code
 
 

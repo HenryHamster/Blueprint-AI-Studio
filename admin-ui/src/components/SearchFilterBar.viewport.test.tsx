@@ -134,4 +134,32 @@ describe('SearchFilterBar — viewport regression', () => {
       });
     });
   });
+
+  test('renders without horizontal overflow at 768px (md: breakpoint — input transitions to w-64)', async () => {
+    await expectNoOverflowAt(768, async () => {
+      host = document.createElement('div');
+      host.style.padding = '16px';
+      host.style.display = 'flex';
+      host.style.gap = '0.5rem';
+      host.style.flexWrap = 'wrap';
+      host.style.alignItems = 'center';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <SearchFilterBar
+            searchQuery="test query"
+            onSearchChange={() => {}}
+            taskTypeFilter={['create', 'fix']}
+            onTypeFilterChange={() => {}}
+            dateRange="24h"
+            onDateRangeChange={() => {}}
+            blockedFilter={true}
+            onBlockedFilterChange={() => {}}
+          />,
+        );
+      });
+    });
+  });
 });

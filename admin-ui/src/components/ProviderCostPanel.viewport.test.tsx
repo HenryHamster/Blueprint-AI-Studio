@@ -1,4 +1,4 @@
-import { afterEach, describe, test, vi } from 'vitest';
+import { afterEach, describe, test, vi, expect } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { expectNoOverflowAt } from '../test/viewport';
@@ -65,5 +65,15 @@ describe('ProviderCostPanel — viewport regression', () => {
         await new Promise(resolve => setTimeout(resolve, 0));
       });
     });
+
+    // Find the actual escape-hatch (table wrapper) and assert that its
+    // IN-bounds parent (the section wrapper) stays within 375px. Hard-fail
+    // when the selector breaks rather than silently skipping.
+    const escapeHatch = host!.querySelector('[data-viewport-allow-overflow]') as HTMLElement | null;
+    expect(escapeHatch).not.toBeNull();
+    const parent = escapeHatch!.parentElement;
+    expect(parent).not.toBeNull();
+    const rect = parent!.getBoundingClientRect();
+    expect(rect.right).toBeLessThanOrEqual(388); // 375px content + 12px padding + 1px tolerance
   });
 });

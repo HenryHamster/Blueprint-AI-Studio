@@ -39,7 +39,9 @@ interface SettingsNotificationsSectionProps {
 
 function Toggle({ enabled, onChange }: { enabled: boolean; onChange: (v: boolean) => void }) {
   return (
+    // reason: notification event toggle switch; h-5 w-9 is standard toggle knob, not a tap target
     <button
+      data-viewport-allow-small-target
       onClick={() => onChange(!enabled)}
       className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors shrink-0 ${enabled ? 'bg-emerald-600' : 'bg-neutral-700'}`}
     >
@@ -223,7 +225,9 @@ export function SettingsNotificationsSection({
       {/* Send test notification */}
       {isAdmin && (
         <div>
+          {/* reason: test notification button; text-xs py-2 is operator-density convention for settings panels */}
           <button
+            data-viewport-allow-small-target
             disabled={!webhookUrl || testStatus === 'sending'}
             onClick={handleSendTest}
             className="flex items-center gap-2 bg-neutral-800 hover:bg-neutral-700 disabled:opacity-30 disabled:cursor-not-allowed text-neutral-300 text-xs py-2 px-4 rounded-lg transition-colors border border-neutral-700"

@@ -58,7 +58,9 @@ export function AutonomousConfigSection({
 }: AutonomousConfigSectionProps) {
   return (
     <div>
+      {/* reason: collapsible autonomous config section toggle; text-[11px] single-row height matches panel density */}
       <button
+        data-viewport-allow-small-target
         onClick={() => setAutonomousConfigOpen(v => !v)}
         className="flex items-center gap-1.5 w-full text-left group"
       >

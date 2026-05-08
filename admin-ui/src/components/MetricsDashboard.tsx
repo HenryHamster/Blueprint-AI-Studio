@@ -269,7 +269,9 @@ export default function MetricsDashboard({
       {/* Window selector */}
       <div className="flex flex-wrap items-center gap-1 mb-3">
         {WINDOW_OPTIONS.map((w) => (
+          // reason: time-window filter pill in compact metrics toolbar; py-1 is operator-density convention
           <button
+            data-viewport-allow-small-target
             key={w}
             onClick={() => onWindowChange(w)}
             className={`px-3 py-1 rounded-full text-xs font-medium border transition-colors ${

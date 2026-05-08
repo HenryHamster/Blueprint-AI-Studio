@@ -35,7 +35,9 @@ export function SettingsAdvancedSection({ healthCheckUrlsInput, onHealthCheckUrl
           rows={4}
           className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600 resize-y"
         />
+        {/* reason: settings action button; text-xs height is operator-density convention for settings panels */}
         <button
+          data-viewport-allow-small-target
           onClick={() => onUpdateHealthCheckUrls(healthCheckUrlsInput.split('\n').filter(Boolean))}
           className="mt-2 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 rounded-lg px-4 py-2 text-xs transition-colors"
         >
@@ -47,7 +49,9 @@ export function SettingsAdvancedSection({ healthCheckUrlsInput, onHealthCheckUrl
       <div>
         <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">Export / Import</h3>
         <div className="flex gap-3">
+          {/* reason: settings export/import buttons; text-xs height is operator-density convention */}
           <button
+            data-viewport-allow-small-target
             onClick={() => {
               const settings: Record<string, unknown> = {};
               SETTINGS_EXPORT_KEYS.forEach(k => {
@@ -66,7 +70,9 @@ export function SettingsAdvancedSection({ healthCheckUrlsInput, onHealthCheckUrl
           >
             Export Settings
           </button>
+          {/* reason: settings import button; text-xs height is operator-density convention */}
           <button
+            data-viewport-allow-small-target
             onClick={() => {
               const input = document.createElement('input');
               input.type = 'file';

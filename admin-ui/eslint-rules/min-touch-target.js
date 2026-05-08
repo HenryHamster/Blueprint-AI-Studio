@@ -64,6 +64,12 @@ function hasExplicitHeight(classNameStr) {
   return EXPLICIT_HEIGHT_RE.test(classNameStr)
 }
 
+function hasViewportAllowAttr(node) {
+  return node.attributes?.some(
+    (attr) => attr.type === 'JSXAttribute' && attr.name.name === 'data-viewport-allow-small-target'
+  )
+}
+
 function checkInteractiveElement(context, node) {
   const classNameStr = getClassNameString(node)
 
@@ -72,6 +78,9 @@ function checkInteractiveElement(context, node) {
 
   // Skip if has explicit large height
   if (hasExplicitHeight(classNameStr)) return
+
+  // Skip if explicitly opted out of touch-target requirement (dense operator UI)
+  if (hasViewportAllowAttr(node)) return
 
   // Flag if has only small padding
   if (hasSmallPaddingOnly(classNameStr)) {

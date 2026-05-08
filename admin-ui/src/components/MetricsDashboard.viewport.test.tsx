@@ -2,7 +2,7 @@ import { afterEach, describe, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import MetricsDashboard from './MetricsDashboard';
-import { expectNoOverflowAt } from '../test/viewport';
+import { expectNoOverflowAt, expectMinTouchTargetAt } from '../test/viewport';
 
 vi.mock('recharts', () => ({
   ResponsiveContainer: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
@@ -57,5 +57,28 @@ describe('MetricsDashboard — viewport regression', () => {
         );
       });
     });
+  });
+
+  test('interactive controls meet 44px touch target at 375px', async () => {
+    await expectMinTouchTargetAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '16px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <MetricsDashboard
+            metricsHistory={[]}
+            cumulativeCost={0}
+            cumulativeVmHours={0}
+            maxConcurrentVMs={4}
+            tasks={[]}
+            metricsWindow="1h"
+            onWindowChange={() => {}}
+          />,
+        );
+      });
+    }, { selector: 'button, a[href]' });
   });
 });

@@ -29,6 +29,17 @@ describe('TaskLaunchFAB — mobile viewport', () => {
         root?.render(<TaskLaunchFAB onClick={() => {}} visible={true} />);
       });
     });
+
+    // Verify the FAB container (escape hatch) renders and the FAB button
+    // itself fits within viewport bounds. The fixed FAB is positioned at the
+    // viewport edge so we check its right edge directly. Hard-fail when the
+    // selector breaks rather than silently skipping.
+    const fabContainer = host!.querySelector('div[class*="fixed"]') as HTMLElement | null;
+    expect(fabContainer).not.toBeNull();
+    const fabButton = fabContainer!.querySelector('button[title="Launch new task"]') as HTMLButtonElement | null;
+    expect(fabButton).not.toBeNull();
+    const buttonRect = fabButton!.getBoundingClientRect();
+    expect(buttonRect.right).toBeLessThanOrEqual(376); // 375 + 1px tolerance
   });
 
   test('FAB has sufficient touch target size (minimum 56x56)', async () => {

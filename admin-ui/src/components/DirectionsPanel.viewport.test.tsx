@@ -3,7 +3,7 @@ import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { DirectionsPanel } from './DirectionsPanel';
 import type { Direction } from './DirectionsPanel';
-import { expectNoOverflowAt } from '../test/viewport';
+import { expectNoOverflowAt, expectMinTouchTargetAt } from '../test/viewport';
 
 // Partial mock — preserve every other export from `../api` so transitive
 // imports (TaskCard's `authGet`, etc.) resolve. Browser-mode vitest
@@ -175,5 +175,37 @@ describe('DirectionsPanel — viewport regression', () => {
         await new Promise<void>((resolve) => setTimeout(resolve, 50));
       });
     });
+  });
+
+  test('interactive controls meet 44px touch target at 375px', async () => {
+    await expectMinTouchTargetAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <DirectionsPanel
+            onClose={() => {}}
+            addToast={() => {}}
+            selectedProjectId="proj-test"
+            projects={[{
+              id: 'proj-test',
+              name: 'Test Project',
+              status: 'active',
+              github_owner: 'owner',
+              github_repo: 'repo',
+              autonomous_enabled: true,
+              directions: [],
+              created_at: '2026-01-01T00:00:00Z',
+            }]}
+          />,
+        );
+      });
+      await act(async () => {
+        await new Promise<void>((resolve) => setTimeout(resolve, 50));
+      });
+    }, { selector: 'button, a[href]' });
   });
 });

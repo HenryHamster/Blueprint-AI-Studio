@@ -122,7 +122,9 @@ function EvidencePanel({ finding, repoUrl }: { finding: ResearchFinding; repoUrl
             {visibleClaims.map((c, i) => <li key={i}>{c}</li>)}
           </ul>
           {hiddenCount > 0 && (
+            // reason: expand-claims link in compact finding card; text-[10px] single-line height
             <button
+              data-viewport-allow-small-target
               onClick={e => { e.stopPropagation(); setShowAllClaims(v => !v); }}
               className="mt-0.5 text-[10px] text-cyan-400 hover:text-cyan-300 transition-colors"
             >
@@ -366,7 +368,8 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
               )}
             </p>
           </div>
-          <button onClick={onClose} className="text-neutral-500 hover:text-neutral-300 transition-colors">
+          {/* reason: icon-only close button in panel header; w-4 h-4 icon matches panel header density */}
+          <button data-viewport-allow-small-target onClick={onClose} className="text-neutral-500 hover:text-neutral-300 transition-colors">
             <X className="w-4 h-4" />
           </button>
         </div>
@@ -378,7 +381,8 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
               <span className="text-[10px] text-neutral-500">Filtered:</span>
               <span className="flex items-center gap-1 text-[10px] bg-cyan-950/40 border border-cyan-900/50 text-cyan-400 px-2 py-0.5 rounded max-w-[400px] truncate">
                 <span className="truncate">{directionFilterText.length > 60 ? directionFilterText.slice(0, 60) + '…' : directionFilterText}</span>
-                <button onClick={() => setDirectionFilter(null)} className="ml-0.5 text-cyan-600 hover:text-cyan-300 transition-colors shrink-0">
+                {/* reason: icon-only clear filter button inline in filter chip; w-2.5 h-2.5 icon */}
+                <button data-viewport-allow-small-target onClick={() => setDirectionFilter(null)} className="ml-0.5 text-cyan-600 hover:text-cyan-300 transition-colors shrink-0">
                   <X className="w-2.5 h-2.5" />
                 </button>
               </span>
@@ -396,8 +400,9 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
           </div>
           <div className="flex items-center gap-1 flex-wrap">
             {OUTCOME_FILTER_OPTIONS.map(opt => (
-              // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
+              // reason: outcome filter chip in compact search toolbar; text-[10px] py-0.5 matches search bar density
               <button
+                data-viewport-allow-small-target
                 key={opt.value}
                 onClick={() => setOutcomeFilter(opt.value)}
                 className={`px-2 py-0.5 rounded text-[10px] font-medium transition-colors ${
@@ -432,7 +437,9 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
 
             return (
               <div key={groupKey} className="bg-neutral-900/50 border border-neutral-800 rounded-lg overflow-hidden">
+                {/* reason: finding group expand row; py-3 renders at 44px but sub-pixel margin in compact results list */}
                 <button
+                  data-viewport-allow-small-target
                   onClick={() => toggleGroup(groupKey)}
                   className="w-full flex items-center gap-3 px-4 py-3 hover:bg-neutral-800/30 transition-colors text-left"
                 >
@@ -476,7 +483,9 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
                       const fKey = `${ef.taskId}-${ef.findingIndex}`;
                       const isDetailOpen = expandedFinding === fKey;
                       return (
+                        // reason: finding expand row in research results; px-4 py-2 matches compact finding list density
                         <button
+                          data-viewport-allow-small-target
                           key={fKey}
                           onClick={() => setExpandedFinding(isDetailOpen ? null : fKey)}
                           className="w-full text-left px-4 py-2 hover:bg-neutral-800/20 transition-colors"
@@ -484,7 +493,9 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
                           <div className="flex items-center gap-2">
                             {outcomeInfo && OutcomeIcon && outcomeTaskId && onNavigateToTask
                               ? (
+                                // reason: inline icon-only outcome indicator; w-3 h-3 matches finding row density
                                 <button
+                                  data-viewport-allow-small-target
                                   onClick={e => { e.stopPropagation(); onNavigateToTask(outcomeTaskId); }}
                                   className={`w-3 h-3 shrink-0 ${outcomeInfo.color} hover:opacity-70 transition-opacity`}
                                   title={`View task (${outcomeInfo.label})`}
@@ -522,7 +533,9 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
                               <div className="flex items-center gap-3 flex-wrap text-[10px] text-neutral-600">
                                 {outcomeInfo && outcomeTaskId && onNavigateToTask
                                   ? (
+                                    // reason: inline outcome label link in compact finding detail; text-[10px]
                                     <button
+                                      data-viewport-allow-small-target
                                       onClick={e => { e.stopPropagation(); onNavigateToTask(outcomeTaskId); }}
                                       className={`${outcomeInfo.color} hover:underline`}
                                     >

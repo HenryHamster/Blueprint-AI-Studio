@@ -140,4 +140,26 @@ describe('DashboardHome — viewport regression', () => {
       });
     });
   });
+
+  test('renders without horizontal overflow at 768px (tablet md: breakpoint)', async () => {
+    await expectNoOverflowAt(768, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <DashboardHome
+            tasks={[]}
+            selectedProjectId={null}
+            onViewTask={() => {}}
+          />,
+        );
+      });
+      await act(async () => {
+        await new Promise<void>((resolve) => setTimeout(resolve, 50));
+      });
+    });
+  });
 });

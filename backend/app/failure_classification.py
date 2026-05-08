@@ -142,6 +142,11 @@ AGENT_STALLED = "agent_stalled"
 # Distinct from CODE_ERROR so the regression dispatcher and operator panels can
 # track mobile-rendering regressions separately from unit-test or build breaks.
 VIEWPORT_REGRESSION = "VIEWPORT_REGRESSION"
+# Viewport coverage erosion — a recently merged PR dropped assertion count
+# (deleted/skipped tests) or added data-viewport-allow-* escape-hatch
+# attributes without a legitimate component removal. Used as the regression_class
+# key in RegressionRemediationCase rows created by the coverage-drop signal.
+VIEWPORT_COVERAGE_DROP = "viewport_coverage_drop"
 
 
 # Substrings emitted by expectNoOverflowAt() / expectMinTouchTargetAt() in

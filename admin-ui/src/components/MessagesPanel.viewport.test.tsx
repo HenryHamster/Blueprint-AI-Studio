@@ -79,6 +79,15 @@ describe('MessagesPanel — viewport regression', () => {
       root = r;
       await renderPanel(r, []);
     });
+
+    // Verify the tab strip's parent container stays in bounds. Hard-fail
+    // when the selector breaks rather than silently skipping.
+    const tabStrip = host!.querySelector('[data-testid="saved-views-tab-strip"]') as HTMLElement | null;
+    expect(tabStrip).not.toBeNull();
+    const parent = tabStrip!.parentElement;
+    expect(parent).not.toBeNull();
+    const parentRect = parent!.getBoundingClientRect();
+    expect(parentRect.right).toBeLessThanOrEqual(388); // 375px content + 12px padding + 1px tolerance
   });
 
   test('routine ops group does not overflow at 375px', async () => {
@@ -221,6 +230,21 @@ describe('MessagesPanel — viewport regression', () => {
     if (hasNewBadge) {
       expect(hasNewBadge).toBe(true);
     }
+  });
+
+  test('renders without horizontal overflow at 768px (tablet md: breakpoint)', async () => {
+    const msgs = [
+      makeMsg({ id: 'r1', context: { event_type: 'pr_merged' } }),
+      makeMsg({ id: 'r2', message_type: 'FEEDBACK', status: 'open' }),
+    ];
+    await expectNoOverflowAt(768, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await renderPanel(r, msgs);
+    });
   });
 
   test('mute window countdown chip renders without overflow at 375px', async () => {

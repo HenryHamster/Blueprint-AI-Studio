@@ -38,6 +38,9 @@ tester.run('viewport/min-touch-target', rule, {
     { code: '<div className="p-1">Not interactive</div>' },
     // Mixed padding classes (at least one large)
     { code: '<button className="p-1 pr-4">Click me</button>' },
+    // data-viewport-allow-small-target opt-out for dense operator UI
+    { code: '<button data-viewport-allow-small-target className="p-0.5">Dense toolbar button</button>' },
+    { code: '<button data-viewport-allow-small-target className="p-1 flex items-center">Icon</button>' },
   ],
   invalid: [
     {

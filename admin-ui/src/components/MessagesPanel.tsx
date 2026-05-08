@@ -1254,7 +1254,7 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
             <span className="hidden md:inline">Save view</span>
           </button>
         </div>
-        {/* Saved views tab strip */}
+        {/* Saved views tab strip with compact tabs: allows small touch targets for view-switcher buttons */}
         <div
           className="flex items-center gap-1 overflow-x-auto -mx-1 px-1"
           data-testid="saved-views-tab-strip"

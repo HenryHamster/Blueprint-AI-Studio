@@ -9,7 +9,7 @@ import type {
   ProviderSettingsDefaults,
   TaskTypeProviderOverrides,
 } from '../types/settings';
-import { expectNoOverflowAt } from '../test/viewport';
+import { expectNoOverflowAt, expectMinTouchTargetAt } from '../test/viewport';
 
 const providers: Record<string, ProviderCatalogEntry> = {
   anthropic: {
@@ -87,5 +87,28 @@ describe('ProviderSettingsPanel — viewport regression', () => {
         );
       });
     });
+  });
+
+  test('interactive controls meet 44px touch target at 375px', async () => {
+    await expectMinTouchTargetAt(375, async () => {
+      host = document.createElement('div');
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <ProviderSettingsPanel
+            providers={providers}
+            providerSettingsDefaults={providerSettingsDefaults}
+            taskTypeProviderOverrides={taskTypeProviderOverrides}
+            providerSettingsByEffort={providerSettingsByEffort}
+            maxPlanAccounts={maxPlanAccounts}
+            onUpdateDefaults={async () => {}}
+            onUpdateOverrides={async () => {}}
+            onUpdateProviderSettingsByEffort={async () => {}}
+          />,
+        );
+      });
+    }, { selector: 'button, a[href]' });
   });
 });

@@ -6,6 +6,8 @@ Tests for three admin routers:
 """
 
 import uuid
+from unittest.mock import patch
+
 import pytest
 from httpx import AsyncClient, ASGITransport
 from sqlmodel import select
@@ -1197,6 +1199,26 @@ class TestNotificationConfigSettings:
     """Tests for PATCH /api/admin/settings notification_config validation and
     GET /api/admin/settings webhook_url masking for non-admin callers."""
 
+    @pytest.fixture(autouse=True)
+    def _mock_safe_dns(self):
+        """Stub DNS so the SSRF check accepts hooks.example.com URLs without
+        making a real DNS call, while still rejecting bad schemes.
+
+        Patches the bound name in admin_settings.py rather than socket globally,
+        so asyncpg's own socket.getaddrinfo calls remain unaffected.
+        """
+
+        def _fake(url: str):
+            if not url.startswith(("http://", "https://")):
+                return (False, f"scheme not allowed: {url!r}")
+            return (True, "")
+
+        with patch(
+            "app.routers.admin_settings._is_safe_external_url",
+            side_effect=_fake,
+        ):
+            yield
+
     @pytest.mark.asyncio
     async def test_patch_max_pipeline_slots(self, client: AsyncClient):
         """max_pipeline_slots accepts valid ints and rejects out-of-range / non-numeric."""
@@ -1426,6 +1448,17 @@ class TestNotificationConfigSettings:
 
 class TestDispatchExternalNotification:
     """Tests for dispatch_external_notification in notification_dispatch.py."""
+
+    @pytest.fixture(autouse=True)
+    def _mock_safe_dns_dispatch(self):
+        """Stub the SSRF resolver so dispatch tests can use hooks.example.com
+        without hitting real DNS, and so the mocked httpx client receives the
+        original webhook URL (not an IP-pinned variant)."""
+        with patch(
+            "app.notification_dispatch._resolve_safe_external_url",
+            return_value=(True, "", "93.184.216.34"),
+        ):
+            yield
 
     @pytest.mark.asyncio
     async def test_dispatches_when_event_enabled(self, mocker):

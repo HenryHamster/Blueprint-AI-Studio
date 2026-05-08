@@ -524,8 +524,9 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
         {/* Spawn triggers */}
         <div className="px-5 py-2 border-b border-neutral-800 shrink-0 flex items-center gap-2">
           <div className="shrink-0 flex items-center gap-1">
-            {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
+            {/* reason: inline cycle trigger in dense operator toolbar; text-xs py-1.5 matches toolbar density */}
             <button
+              data-viewport-allow-small-target
               type="button"
               onClick={() => triggerCycle('design_doc')}
               title="Run architecture review (Phase 1 only)"
@@ -533,8 +534,9 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
             >
               <Zap className="w-3 h-3" /> Arch
             </button>
-            {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
+            {/* reason: inline cycle trigger in dense operator toolbar; text-xs py-1.5 matches toolbar density */}
             <button
+              data-viewport-allow-small-target
               type="button"
               onClick={() => triggerCycle('strategic_review')}
               title="Run strategic review (Phase 2 only, skip design doc update)"
@@ -542,8 +544,9 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
             >
               <Zap className="w-3 h-3" /> Strategic
             </button>
-            {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
+            {/* reason: inline cycle trigger in dense operator toolbar; text-xs py-1.5 matches toolbar density */}
             <button
+              data-viewport-allow-small-target
               type="button"
               onClick={() => triggerCycle('full')}
               title="Run full cycle (Phase 1 then chains to Phase 2)"
@@ -556,7 +559,9 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
 
         {/* Tabs */}
         <div className="flex items-center border-b border-neutral-800 shrink-0">
+          {/* reason: panel navigation tab; py-2.5 single-row tab height in compact panel header */}
           <button
+            data-viewport-allow-small-target
             onClick={() => setActiveTab('directions')}
             className={`px-4 py-2.5 text-sm font-medium transition-colors ${
               activeTab === 'directions'
@@ -566,7 +571,9 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
           >
             Directions
           </button>
+          {/* reason: panel navigation tab; py-2.5 single-row tab height in compact panel header */}
           <button
+            data-viewport-allow-small-target
             onClick={() => setActiveTab('problem-model')}
             className={`px-4 py-2.5 text-sm font-medium transition-colors ${
               activeTab === 'problem-model'
@@ -580,7 +587,9 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
               return gapCount > 0 ? <span className="ml-1.5 text-xs text-neutral-500">({gapCount})</span> : null;
             })()}
           </button>
+          {/* reason: panel navigation tab; py-2.5 single-row tab height in compact panel header */}
           <button
+            data-viewport-allow-small-target
             onClick={() => setActiveTab('running-update')}
             className={`px-4 py-2.5 text-sm font-medium transition-colors ${
               activeTab === 'running-update'
@@ -593,7 +602,9 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
               <span className="ml-1.5 inline-block w-1.5 h-1.5 rounded-full bg-emerald-400" aria-label="has content" />
             )}
           </button>
+          {/* reason: panel navigation tab; py-2.5 single-row tab height in compact panel header */}
           <button
+            data-viewport-allow-small-target
             onClick={() => setActiveTab('design-doc')}
             className={`px-4 py-2.5 text-sm font-medium transition-colors ${
               activeTab === 'design-doc'
@@ -617,7 +628,8 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
             <>
               <div className="flex items-center justify-between">
                 <span className="text-[11px] font-medium text-neutral-400 uppercase tracking-wider">Autonomous Mode</span>
-                <button onClick={toggleAutonomous} className="flex items-center gap-1.5 text-sm transition-colors">
+                {/* reason: toggle icon+label; height limited by icon size in single-row layout */}
+                <button data-viewport-allow-small-target onClick={toggleAutonomous} className="flex items-center gap-1.5 text-sm transition-colors">
                   {autonomousEnabled ? (
                     <><ToggleRight className="w-6 h-6 text-emerald-400" /><span className="text-emerald-400 text-xs font-medium">On</span></>
                   ) : (
@@ -698,7 +710,9 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
                 <option value="structural">Structural</option>
                 <option value="mixed">Mixed</option>
               </select>
+              {/* reason: add-direction icon button in compact form; py-1.5 text-xs matches form density */}
               <button
+                data-viewport-allow-small-target
                 onClick={addDirection}
                 disabled={!form.newText.trim()}
                 className="shrink-0 bg-neutral-800 hover:bg-neutral-700 disabled:opacity-30 text-neutral-300 px-3 py-1.5 rounded text-xs transition-colors border border-neutral-700 flex items-center"
@@ -711,7 +725,9 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
               {form.newPathTags.map(tag => (
                 <span key={tag} className="bg-neutral-800 border border-neutral-700 text-neutral-300 text-[10px] font-mono px-1.5 py-0.5 rounded flex items-center gap-1">
                   {tag}
+                  {/* reason: icon-only tag remove button inline in path tag chip; w-2.5 h-2.5 icon */}
                   <button
+                    data-viewport-allow-small-target
                     type="button"
                     onClick={() => form.setNewPathTags(prev => prev.filter(t => t !== tag))}
                     className="text-neutral-500 hover:text-neutral-300 transition-colors leading-none"
@@ -751,7 +767,8 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
         {error && (
           <div className="px-5 py-2 bg-red-950/50 border-b border-red-900/50 flex items-center justify-between shrink-0">
             <span className="text-xs text-red-400">{error}</span>
-            <button onClick={() => setError(null)} className="text-red-400 hover:text-red-300 transition-colors">
+            {/* reason: icon-only close button in error banner; w-3 h-3 icon in compact error row */}
+            <button data-viewport-allow-small-target onClick={() => setError(null)} className="text-red-400 hover:text-red-300 transition-colors">
               <X className="w-3 h-3" />
             </button>
           </div>
@@ -777,8 +794,9 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
             if (modelEmpty) return null;
             return (
             <div className="mb-5">
-              {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
+              {/* reason: quick-link to problem model tab; single-row text-[12px] link in list header */}
               <button
+                data-viewport-allow-small-target
                 onClick={() => setActiveTab('problem-model')}
                 className="flex items-center gap-2 w-full text-left group cursor-pointer hover:bg-neutral-800/50 rounded px-1.5 -mx-1.5 py-1.5 transition-colors"
               >
@@ -819,8 +837,9 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
           {/* Running Update quick-link */}
           {selectedProjectId && !loading && runningUpdate && runningUpdate.trim() && (
             <div className="mb-5">
-              {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
+              {/* reason: quick-link to running-update tab; single-row text-[12px] link in list header */}
               <button
+                data-viewport-allow-small-target
                 onClick={() => setActiveTab('running-update')}
                 className="flex items-center gap-2 w-full text-left group cursor-pointer hover:bg-neutral-800/50 rounded px-1.5 -mx-1.5 py-1.5 transition-colors"
               >
@@ -851,8 +870,9 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
             if (pages.length === 0) return null;
             return (
             <div className="mb-5">
-              {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
+              {/* reason: quick-link to architecture/design-doc tab; single-row text-[12px] link in list header */}
               <button
+                data-viewport-allow-small-target
                 onClick={() => setActiveTab('design-doc')}
                 className="flex items-center gap-2 w-full text-left group cursor-pointer hover:bg-neutral-800/50 rounded px-1.5 -mx-1.5 py-1.5 transition-colors"
               >
@@ -886,8 +906,9 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
           {!loading && directions.length > 0 && (
             <div className="flex items-center gap-1 mb-3">
               {(['all', 'product', 'structural', 'mixed'] as const).map(cat => (
-                // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
+                // reason: category filter chip in compact direction list toolbar; text-[10px] py-0.5
                 <button
+                  data-viewport-allow-small-target
                   key={cat}
                   onClick={() => setCategoryFilter(cat)}
                   className={`text-[10px] px-2 py-0.5 rounded border font-medium transition-colors capitalize ${
@@ -918,7 +939,9 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
                 const isCollapsed = collapsed[key] ?? false;
                 return (
                   <div key={key}>
+                    {/* reason: direction group collapse toggle; single-row section header in compact list */}
                     <button
+                      data-viewport-allow-small-target
                       onClick={() => toggleSection(key)}
                       className="flex items-center gap-1.5 w-full text-left mb-2 group"
                     >

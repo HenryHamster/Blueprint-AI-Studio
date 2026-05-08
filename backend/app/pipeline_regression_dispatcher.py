@@ -3366,6 +3366,75 @@ async def _evaluate_viewport_regression_signal(
     return spawned
 
 
+def _probe_viewport_coverage_drop(project_design_doc: dict | None) -> bool:
+    """Side-effect-free probe: would viewport_coverage_drop trip right now?"""
+    doc = project_design_doc or {}
+    snap = doc.get("viewport_coverage_snapshot")
+    if not isinstance(snap, dict):
+        return False
+    before = snap.get("assertion_count_before")
+    after = snap.get("assertion_count_after")
+    if before is None or after is None:
+        return False
+    removed = snap.get("removed_component_files") or []
+    if removed:
+        return False
+    escape_hatches = int(snap.get("new_escape_hatch_count") or 0)
+    return int(after) < int(before) or escape_hatches > 0
+
+
+async def _evaluate_viewport_coverage_drop_signal(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    project_design_doc: dict | None,
+    spawn_budget_left: int,
+) -> int:
+    """Trip viewport_coverage_drop when a merged PR silences viewport assertions.
+
+    Reads the pre-computed snapshot from project.design_doc[
+    "viewport_coverage_snapshot"] and fires when:
+      - post-merge assertion count is lower than pre-merge count (test deleted /
+        skipped), OR
+      - new data-viewport-allow-overflow / data-viewport-allow-small-target
+        escape-hatch attributes were added (bypass without restoring the test),
+    AND no component file was legitimately removed in the same PR.
+    """
+    if spawn_budget_left <= 0:
+        return 0
+    if not _probe_viewport_coverage_drop(project_design_doc):
+        return 0
+    doc = project_design_doc or {}
+    snap = doc["viewport_coverage_snapshot"]
+    before = int(snap["assertion_count_before"])
+    after = int(snap["assertion_count_after"])
+    escape_hatches = int(snap.get("new_escape_hatch_count") or 0)
+    drop = before - after
+    extras = [
+        f"Assertion count before merge: {before}",
+        f"Assertion count after merge: {after}",
+    ]
+    if drop > 0:
+        extras.append(f"Net assertion drop: {drop}")
+    if escape_hatches > 0:
+        extras.append(f"New escape-hatch attributes added: {escape_hatches}")
+    pr = snap.get("merged_pr")
+    if pr:
+        extras.append(f"Merged PR: #{pr}")
+    spawn = await _maybe_spawn(
+        session,
+        project_id,
+        signal_name="viewport_coverage_drop",
+        regression_class="viewport_coverage_drop",
+        prior_rate=None,
+        current_rate=None,
+        sample_size=max(drop, escape_hatches),
+        magnitude=float(drop + escape_hatches),
+        title_hint="viewport coverage drop: assertions removed or silenced",
+        extras=extras,
+    )
+    return 1 if spawn is not None else 0
+
+
 def _extract_evaluating_since(task: Task) -> datetime:
     """Return when the task most recently entered EVALUATING status.
 
@@ -5097,6 +5166,8 @@ async def _any_signal_would_trip(
         return True
     if await _collect_viewport_failures(session, project_id):
         return True
+    if _probe_viewport_coverage_drop(project_design_doc):
+        return True
     vm_failures = await _collect_agent_vm_failures(session, project_id)
     if len(vm_failures) >= _AGENT_VM_RESOURCE_MIN_FAILURES:
         return True
@@ -5557,6 +5628,12 @@ async def run_once(session: AsyncSession, project_id: uuid.UUID) -> int:
         _spawned += await _evaluate_viewport_regression_signal(
             session,
             project_id,
+            spawn_budget - _spawned,
+        )
+        _spawned += await _evaluate_viewport_coverage_drop_signal(
+            session,
+            project_id,
+            project.design_doc,
             spawn_budget - _spawned,
         )
         _spawned += await _evaluate_reviewer_sla_signal(

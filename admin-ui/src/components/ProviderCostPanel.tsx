@@ -47,6 +47,7 @@ export function ProviderCostPanel({
   return (
     <section>
       <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Provider Cost &amp; Success</h2>
+      {/* Horizontal-scrollable provider table: columns overflow on narrow viewports to keep section in-bounds */}
       <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg overflow-x-auto" data-viewport-allow-overflow>
         <table className="w-full text-xs">
           <thead>

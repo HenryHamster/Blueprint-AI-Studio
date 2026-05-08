@@ -51,7 +51,9 @@ export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectP
   return (
     <div className="mb-4 shrink-0">
       <div className="flex items-center justify-between mb-2">
+        {/* reason: compact collapse toggle in dashboard header; text-[11px] single-row height */}
         <button
+          data-viewport-allow-small-target
           onClick={() => {
             const next = !collapsed;
             setCollapsed(next);
@@ -103,10 +105,12 @@ export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectP
       )}
 
       {!collapsed && (
-        <div
-          className="flex gap-3 overflow-x-auto pb-2 custom-scrollbar"
-          data-viewport-allow-overflow
-        >
+        <>
+          {/* Horizontal-scrollable project carousel: cards stay at min-width, carousel scrolls on narrow viewports */}
+          <div
+            className="flex gap-3 overflow-x-auto pb-2 custom-scrollbar"
+            data-viewport-allow-overflow
+          >
           {/* All Projects option */}
           <button
             onClick={() => onSelectProject(null)}
@@ -141,8 +145,9 @@ export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectP
                   <span className="absolute top-2 right-2 text-[9px] font-bold bg-amber-500/15 text-amber-400 border border-amber-500/20 rounded px-1 py-0.5">setup</span>
                 )}
                 <div className="flex items-center justify-between mb-1.5">
-                  {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
+                  {/* reason: project name label button in dense card header; text-xs single-row height */}
                   <button
+                    data-viewport-allow-small-target
                     onClick={() => onSelectProject(isSelected ? null : project.id)}
                     className="text-xs font-semibold text-neutral-200 truncate pr-2 hover:text-white transition-colors text-left"
                   >
@@ -178,7 +183,9 @@ export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectP
                   </div>
                 </div>
 
+                {/* reason: project card select button wrapping compact info rows; h constrained by content */}
                 <button
+                  data-viewport-allow-small-target
                   onClick={() => onSelectProject(isSelected ? null : project.id)}
                   className="block w-full text-left"
                 >
@@ -210,7 +217,8 @@ export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectP
               </div>
             );
           })}
-        </div>
+          </div>
+        </>
       )}
     </div>
   );

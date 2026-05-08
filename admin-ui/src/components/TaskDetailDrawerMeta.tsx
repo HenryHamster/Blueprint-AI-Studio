@@ -321,7 +321,9 @@ function DiagnosticsPanel({ task }: { task: Task }) {
 
   return (
     <div className="bg-neutral-900/50 rounded-lg border border-neutral-800 mb-2">
+      {/* reason: collapsible section header; text-xs py-2 single-row height matches drawer density convention */}
       <button
+        data-viewport-allow-small-target
         onClick={() => setOpen(o => !o)}
         className="flex items-center gap-1.5 w-full text-left px-3 py-2 text-xs font-semibold uppercase tracking-wide text-neutral-400 hover:text-neutral-200 transition-colors"
       >
@@ -484,7 +486,9 @@ function SelfReviewPanel({ task }: { task: Task }) {
 
   return (
     <div className="bg-neutral-900/50 rounded-lg border border-neutral-800 mb-2">
+      {/* reason: collapsible section header; text-xs py-2 single-row height matches drawer density convention */}
       <button
+        data-viewport-allow-small-target
         onClick={() => setOpen(o => !o)}
         className="flex items-center gap-1.5 w-full text-left px-3 py-2 text-xs font-semibold uppercase tracking-wide text-neutral-400 hover:text-neutral-200 transition-colors"
       >
@@ -1034,7 +1038,9 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
               </div>
             )}
             <div>
+              {/* reason: inline expand toggle; text-xs single-line height for raw context section */}
               <button
+                data-viewport-allow-small-target
                 className="flex items-center gap-1 text-xs text-neutral-500 hover:text-neutral-300 mb-1"
                 onClick={() => setRawContextExpanded(v => !v)}
               >

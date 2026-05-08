@@ -2,7 +2,7 @@ import { afterEach, describe, test } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { DeploySection } from './SettingsDeploySection';
-import { expectNoOverflowAt } from '../test/viewport';
+import { expectNoOverflowAt, expectMinTouchTargetAt } from '../test/viewport';
 import type { DeployState } from '../types/settings';
 
 const noop = async () => {};
@@ -210,5 +210,27 @@ describe('SettingsDeploySection — viewport regression', () => {
         );
       });
     });
+  });
+
+  test('interactive controls meet 44px touch target at 375px', async () => {
+    await expectMinTouchTargetAt(375, async () => {
+      host = document.createElement('div');
+      document.body.appendChild(host);
+      root = createRoot(host);
+      await act(async () => {
+        root?.render(
+          <DeploySection
+            deployState={baseDeployState}
+            onPausePipeline={noop}
+            onResumePipeline={noop}
+            onResetHealth={noop}
+            onRollback={noop}
+            onMarkStable={noop}
+            onRepairState={noop}
+            zoneHealth={zoneHealthAllHealthy}
+          />
+        );
+      });
+    }, { selector: 'button, a[href]' });
   });
 });

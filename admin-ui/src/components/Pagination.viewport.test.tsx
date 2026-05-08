@@ -90,4 +90,27 @@ describe('Pagination — viewport regression', () => {
       });
     });
   });
+
+  test('renders without horizontal overflow at 768px (md: row layout)', async () => {
+    await expectNoOverflowAt(768, async () => {
+      host = document.createElement('div');
+      host.style.padding = '16px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <Pagination
+            page={11}
+            totalTasks={12345}
+            taskCount={25}
+            serverTaskCount={25}
+            limit={25}
+            onPageChange={() => {}}
+            onLimitChange={() => {}}
+          />,
+        );
+      });
+    });
+  });
 });

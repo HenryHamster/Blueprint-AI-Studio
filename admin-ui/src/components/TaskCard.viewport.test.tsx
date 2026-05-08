@@ -2,7 +2,7 @@ import { afterEach, describe, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { TaskCard } from './TaskCard';
-import { expectNoOverflowAt, expectNoTextTruncationAt } from '../test/viewport';
+import { expectNoOverflowAt, expectNoTextTruncationAt, expectMinTouchTargetAt } from '../test/viewport';
 import type { Task } from '../types/task';
 
 vi.mock('../api', () => ({
@@ -132,5 +132,29 @@ describe('TaskCard — viewport regression', () => {
         );
       });
     });
+  });
+
+  test('action-toolbar buttons meet 44px touch target at 375px', async () => {
+    await expectMinTouchTargetAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <TaskCard
+            task={makeTask({
+              status: 'EVALUATING',
+              requires_approval: true,
+              attempt_count: 2,
+            })}
+            {...defaultProps}
+            maxRetries={5}
+            blockingCount={0}
+          />
+        );
+      });
+    }, { selector: 'button[title]' });
   });
 });

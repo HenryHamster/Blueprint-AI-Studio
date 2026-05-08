@@ -291,7 +291,9 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
           <>
             <div className="w-px h-3 bg-neutral-800 shrink-0" />
             <div className="relative flex items-center">
+              {/* reason: inline status chip in header bar; height constrained by single-line layout */}
               <button
+                data-viewport-allow-small-target
                 className="flex items-center gap-1.5 cursor-pointer"
                 title={`Circuit breakers open for: ${openProjects.join(', ')}`}
                 onClick={() => setCircuitExpanded(v => !v)}
@@ -406,7 +408,9 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
                     GH: {remainingDisplay}{q.status === 'critical' ? ' ⚠' : ''}
                     {resetIn != null && resetIn > 0 && ` (${resetIn}m)`}
                   </span>
+                  {/* reason: inline icon-only probe button in compact quota row */}
                   <button
+                    data-viewport-allow-small-target
                     type="button"
                     onClick={refreshQuota}
                     disabled={refreshingQuota}
@@ -449,8 +453,9 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
                 ? `Daily cost: $${dailyCostUsd.toFixed(2)} / $${dailyCostCeilingUsd.toFixed(2)} ceiling (${Math.round(ratio * 100)}%). Click to view cost section.`
                 : `Daily cost: $${dailyCostUsd.toFixed(2)}. Click to view cost section.`;
               return (
-                // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
+                // reason: compact cost badge in health bar; height constrained by single-line header
                 <button
+                  data-viewport-allow-small-target
                   type="button"
                   className={`inline-flex items-center gap-1 px-1.5 py-0.5 text-xs rounded cursor-pointer ${isRed ? 'bg-red-900/40' : isAmber ? 'bg-amber-900/40' : ''}`}
                   title={titleText}

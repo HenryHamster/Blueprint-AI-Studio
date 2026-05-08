@@ -254,16 +254,18 @@ function DirectionCardImpl({
           <div className="flex items-start gap-2">
             <p className="text-sm text-neutral-200 flex-1">{d.text}</p>
             <div className="flex items-center gap-1 shrink-0">
-              {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
+              {/* reason: inline direction action button in dense card; text-[10px] py-0.5 matches card density */}
               <button
+                data-viewport-allow-small-target
                 onClick={() => approveProposal(d.id)}
                 title="Approve — activate this direction"
                 className="text-[10px] px-2 py-0.5 rounded border font-medium transition-colors bg-emerald-950/60 border-emerald-900/50 text-emerald-400 hover:bg-emerald-900/50"
               >
                 Approve
               </button>
-              {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
+              {/* reason: inline direction action button in dense card; text-[10px] py-0.5 matches card density */}
               <button
+                data-viewport-allow-small-target
                 onClick={() => rejectProposal(d.id)}
                 title="Reject — remove this proposal"
                 className="text-[10px] px-2 py-0.5 rounded border font-medium transition-colors bg-red-950/60 border-red-900/50 text-red-400 hover:bg-red-900/50"
@@ -303,16 +305,18 @@ function DirectionCardImpl({
           <div className="flex items-start gap-2">
             <p className="text-sm text-neutral-400 flex-1">{d.text}</p>
             <div className="flex items-center gap-1 shrink-0">
-              {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
+              {/* reason: inline direction action button in dense card; text-[10px] py-0.5 matches card density */}
               <button
+                data-viewport-allow-small-target
                 onClick={() => reviveProposal(d.id)}
                 title="Revive — move back to proposed"
                 className="text-[10px] px-2 py-0.5 rounded border font-medium transition-colors bg-purple-950/60 border-purple-900/50 text-purple-400 hover:bg-purple-900/50"
               >
                 Revive
               </button>
-              {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
+              {/* reason: inline direction action button in dense card; text-[10px] py-0.5 matches card density */}
               <button
+                data-viewport-allow-small-target
                 onClick={() => approveProposal(d.id)}
                 title="Approve — activate this direction"
                 className="text-[10px] px-2 py-0.5 rounded border font-medium transition-colors bg-emerald-950/60 border-emerald-900/50 text-emerald-400 hover:bg-emerald-900/50"
@@ -433,10 +437,12 @@ function DirectionCardImpl({
                 className="w-24 bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600 placeholder-neutral-600"
               />
             )}
-            <button onClick={() => updateDirection(d.id)} className="text-emerald-400 hover:text-emerald-300 transition-colors">
+            {/* reason: inline icon-only confirm/cancel in edit row; w-3.5 h-3.5 icon matches edit form density */}
+            <button data-viewport-allow-small-target onClick={() => updateDirection(d.id)} className="text-emerald-400 hover:text-emerald-300 transition-colors">
               <Check className="w-3.5 h-3.5" />
             </button>
-            <button onClick={() => setEditingId(null)} className="text-neutral-500 hover:text-neutral-300 transition-colors">
+            {/* reason: inline icon-only cancel in edit row; w-3.5 h-3.5 icon matches edit form density */}
+            <button data-viewport-allow-small-target onClick={() => setEditingId(null)} className="text-neutral-500 hover:text-neutral-300 transition-colors">
               <X className="w-3.5 h-3.5" />
             </button>
           </div>
@@ -451,8 +457,9 @@ function DirectionCardImpl({
                 const idx = activeItems.findIndex(x => x.id === d.id);
                 return (<>
                   {idx > 0 && (
-                    // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
+                    // reason: inline icon-only reorder button in dense direction row; p-0.5 w-3 h-3 icon
                     <button
+                      data-viewport-allow-small-target
                       onClick={() => {
                         const next = [...activeItems];
                         [next[idx - 1], next[idx]] = [next[idx], next[idx - 1]];
@@ -465,8 +472,9 @@ function DirectionCardImpl({
                     </button>
                   )}
                   {idx < activeItems.length - 1 && (
-                    // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
+                    // reason: inline icon-only reorder button in dense direction row; p-0.5 w-3 h-3 icon
                     <button
+                      data-viewport-allow-small-target
                       onClick={() => {
                         const next = [...activeItems];
                         [next[idx], next[idx + 1]] = [next[idx + 1], next[idx]];
@@ -485,8 +493,9 @@ function DirectionCardImpl({
                 const inCooldown = cooldownStatus === 'cooling';
                 return (
                   <div className="relative flex items-center gap-1">
-                    {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
+                    {/* reason: inline research trigger chip in dense direction row; text-[10px] py-0.5 */}
                     <button
+                      data-viewport-allow-small-target
                       onClick={() => !inCooldown && triggerResearch(d.id)}
                       disabled={researchingIds[d.id] || inCooldown}
                       title={inCooldown ? 'Direction is in cooldown — use force to bypass' : 'Trigger research for this direction'}
@@ -496,8 +505,9 @@ function DirectionCardImpl({
                     </button>
                     {inCooldown && (
                       <div className="relative">
-                        {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
+                        {/* reason: inline force-research icon chip in dense direction row; text-[10px] py-0.5 */}
                         <button
+                          data-viewport-allow-small-target
                           onClick={() => setForceConfirmId(forceConfirmId === d.id ? null : d.id)}
                           disabled={researchingIds[d.id]}
                           title="Force research (bypass cooldown)"
@@ -535,12 +545,12 @@ function DirectionCardImpl({
                   </div>
                 );
               })()}
-              {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
-              <button onClick={() => startEdit(d)} className="text-neutral-400 hover:text-neutral-300 transition-colors p-0.5">
+              {/* reason: inline icon-only edit button in dense direction row; p-0.5 w-3 h-3 icon */}
+              <button data-viewport-allow-small-target onClick={() => startEdit(d)} className="text-neutral-400 hover:text-neutral-300 transition-colors p-0.5">
                 <Pencil className="w-3 h-3" />
               </button>
-              {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
-              <button onClick={() => deleteDirection(d.id)} className="text-neutral-400 hover:text-red-400 transition-colors p-0.5">
+              {/* reason: inline icon-only delete button in dense direction row; p-0.5 w-3 h-3 icon */}
+              <button data-viewport-allow-small-target onClick={() => deleteDirection(d.id)} className="text-neutral-400 hover:text-red-400 transition-colors p-0.5">
                 <Trash2 className="w-3 h-3" />
               </button>
             </div>
@@ -585,8 +595,9 @@ function DirectionCardImpl({
                   </p>
                 )}
               </div>
-              {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
+              {/* reason: inline unhold action button in dense hold-banner; text-[10px] py-0.5 matches card density */}
               <button
+                data-viewport-allow-small-target
                 onClick={(e) => { e.stopPropagation(); void unholdDirection(d.id); }}
                 className="text-[10px] px-2 py-0.5 rounded border border-red-700 text-red-200 hover:bg-red-900/40 shrink-0"
                 title="Clear the hold so this direction can spawn autonomous tasks again"
@@ -677,7 +688,9 @@ function DirectionCardImpl({
                 ))}
               </div>
               {remediationSummaryRows.length > 2 && (
+                // reason: inline expand-more link in remediation section; text-[10px] single-line
                 <button
+                  data-viewport-allow-small-target
                   onClick={() => setExpandedRemediationIds(prev => ({ ...prev, [d.id]: !prev[d.id] }))}
                   className="mt-1 text-[10px] text-neutral-500 hover:text-neutral-300 transition-colors"
                 >
@@ -691,8 +704,9 @@ function DirectionCardImpl({
               {d.priority}
             </span>
             {d.status === 'active' || d.status === 'paused' ? (
-              // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
+              // reason: inline status toggle chip in dense direction row; text-[10px] py-0.5
               <button
+                data-viewport-allow-small-target
                 onClick={() => quickToggleStatus(d.id, d.status as 'active' | 'paused')}
                 title={d.status === 'active' ? 'Click to pause' : 'Click to activate'}
                 className={`text-[10px] px-1.5 py-0.5 rounded border font-medium transition-opacity hover:opacity-70 cursor-pointer ${statusColors[d.status]}`}
@@ -819,8 +833,9 @@ function DirectionCardImpl({
             })()}
             {/* Reactivate button for auto-paused directions */}
             {d.auto_paused && key === 'paused' && (
-              // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
+              // reason: inline direction action chip; text-[10px] py-0.5 matches card density
               <button
+                data-viewport-allow-small-target
                 onClick={() => reactivateDirection(d.id)}
                 className="text-[10px] px-1.5 py-0.5 rounded border font-medium transition-colors bg-emerald-950/40 border-emerald-900/50 text-emerald-400 hover:bg-emerald-900/40"
               >
@@ -829,8 +844,9 @@ function DirectionCardImpl({
             )}
             {/* Mark Complete button for possibly-complete directions */}
             {d.possibly_complete && key === 'active' && (
-              // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
+              // reason: inline mark-complete action chip; text-[10px] py-0.5 matches card density
               <button
+                data-viewport-allow-small-target
                 onClick={() => markDirectionComplete(d.id)}
                 className="text-[10px] px-1.5 py-0.5 rounded border font-medium transition-colors bg-emerald-950/40 border-emerald-900/50 text-emerald-400 hover:bg-emerald-900/40"
               >
@@ -955,8 +971,9 @@ function DirectionCardImpl({
               return (
                 <div className="flex flex-wrap gap-1">
                   {tasks.map(t => (
-                    // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
+                    // reason: inline active-task badge in dense direction row; text-[10px] py-0.5
                     <button
+                      data-viewport-allow-small-target
                       key={t.id}
                       type="button"
                       onClick={() => onNavigateToTask?.(t.id)}
@@ -1080,7 +1097,9 @@ function DirectionCardImpl({
                   );
                 })()}
                 {onViewFindings && (
+                  // reason: inline link button in compact direction metrics row; text-[10px] single-line
                   <button
+                    data-viewport-allow-small-target
                     onClick={() => onViewFindings(d.id)}
                     className="text-[10px] text-blue-400 hover:text-blue-300 cursor-pointer transition-colors"
                   >
@@ -1155,7 +1174,9 @@ function DirectionCardImpl({
           )}
           {d.research_history && d.research_history.length > 0 && (
             <div className="mt-2">
+              {/* reason: research history section collapse toggle; single-row text-[10px] header */}
               <button
+                data-viewport-allow-small-target
                 onClick={() => setHistoryOpenIds(prev => ({ ...prev, [d.id]: !prev[d.id] }))}
                 className="flex items-center gap-1.5 w-full text-left group"
               >
@@ -1185,7 +1206,9 @@ function DirectionCardImpl({
                         <div className="flex items-center gap-1.5">
                           <span className="text-neutral-400 font-medium">{formatRelativeTime(entry.timestamp)}</span>
                           {entry.task_id && onNavigateToTask && (
+                            // reason: inline task-id link in compact history row; text-[9px]
                             <button
+                              data-viewport-allow-small-target
                               onClick={() => onNavigateToTask(entry.task_id)}
                               className="font-mono text-[9px] text-blue-400 hover:text-blue-300 transition-colors"
                               title="Navigate to research task"

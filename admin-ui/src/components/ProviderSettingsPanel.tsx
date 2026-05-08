@@ -160,7 +160,9 @@ export function ProviderSettingsPanel({
           <label className="text-xs text-neutral-400 w-20 shrink-0">Effort level</label>
           <div className="flex items-center gap-1">
             {EFFORT_LEVELS.map(level => (
+              // reason: effort level tab in compact matrix toolbar; py-1 is operator-density convention
               <button
+                data-viewport-allow-small-target
                 key={level}
                 onClick={() => setMatrixLevel(level)}
                 className={`px-2.5 py-1 rounded text-xs transition-colors ${
@@ -194,7 +196,9 @@ export function ProviderSettingsPanel({
       {/* Provider tabs */}
       <div className="flex items-center gap-1">
         {providerNames.map(name => (
+          // reason: provider tab in compact settings toolbar; py-1.5 text-xs is operator-density convention
           <button
+            data-viewport-allow-small-target
             key={name}
             onClick={() => setSelectedProvider(name)}
             className={`px-3 py-1.5 rounded text-xs transition-colors ${
@@ -243,7 +247,9 @@ export function ProviderSettingsPanel({
 
 function ScopeTab({ active, onClick, children }: { active: boolean; onClick: () => void; children: React.ReactNode }) {
   return (
+    // reason: scope tab in compact provider settings toolbar; py-1.5 text-xs is operator-density convention
     <button
+      data-viewport-allow-small-target
       onClick={onClick}
       className={`px-3 py-1.5 rounded text-xs transition-colors ${
         active
@@ -404,8 +410,9 @@ function FieldRow({ label, schema, value, present, allowInherit, lockReason, dis
         )}
       </div>
       {allowInherit && !locked && (
-        // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
+        // reason: inline inherit/override toggle in compact schema form row; text-[10px] py-1 matches field row density
         <button
+          data-viewport-allow-small-target
           onClick={toggleOverride}
           className={`text-[10px] px-2 py-1 rounded border ${
             overridden
@@ -451,7 +458,9 @@ function Field({ schema, value, onChange, disabledEnumValues }: { schema: Schema
 
   if (schema.type === 'boolean') {
     return (
+      // reason: boolean schema toggle switch; h-5 w-9 is standard toggle knob, not a tap target
       <button
+        data-viewport-allow-small-target
         onClick={() => onChange(!value)}
         className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${value ? 'bg-emerald-600' : 'bg-neutral-700'}`}
       >

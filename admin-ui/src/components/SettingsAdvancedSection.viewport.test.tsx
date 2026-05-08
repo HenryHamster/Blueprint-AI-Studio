@@ -2,7 +2,7 @@ import { afterEach, describe, test } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { SettingsAdvancedSection } from './SettingsAdvancedSection';
-import { expectNoOverflowAt } from '../test/viewport';
+import { expectNoOverflowAt, expectMinTouchTargetAt } from '../test/viewport';
 
 describe('SettingsAdvancedSection — viewport regression', () => {
   let root: Root | null = null;
@@ -55,5 +55,27 @@ describe('SettingsAdvancedSection — viewport regression', () => {
         );
       });
     });
+  });
+
+  test('interactive controls meet 44px touch target at 375px', async () => {
+    const urls = [
+      'https://api.example.com/health',
+      'https://backend.example.com/status',
+    ].join('\n');
+
+    await expectMinTouchTargetAt(375, async () => {
+      host = document.createElement('div');
+      document.body.appendChild(host);
+      root = createRoot(host);
+      await act(async () => {
+        root?.render(
+          <SettingsAdvancedSection
+            healthCheckUrlsInput={urls}
+            onHealthCheckUrlsChange={() => {}}
+            onUpdateHealthCheckUrls={() => {}}
+          />
+        );
+      });
+    }, { selector: 'button, a[href]' });
   });
 });

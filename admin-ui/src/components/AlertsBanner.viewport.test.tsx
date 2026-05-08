@@ -76,6 +76,26 @@ describe('AlertsBanner — viewport regression', () => {
     });
   });
 
+  test('renders without horizontal overflow at 768px (tablet md: breakpoint)', async () => {
+    await expectNoOverflowAt(768, async () => {
+      host = document.createElement('div');
+      host.style.padding = '16px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <AlertsBanner
+            alerts={sampleAlerts}
+            onDismiss={() => {}}
+            onDismissAll={() => {}}
+            onViewTask={() => {}}
+          />,
+        );
+      });
+    });
+  });
+
   test('action buttons meet 44px touch target at 375px', async () => {
     await expectMinTouchTargetAt(375, async () => {
       host = document.createElement('div');

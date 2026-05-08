@@ -368,6 +368,7 @@ export function KanbanBoard({
     >
       {/* Mobile: tab bar + single active column */}
       <div className="flex flex-col flex-1 min-w-0 overflow-hidden md:hidden">
+        {/* Horizontal-scrollable tab bar: column tabs overflow on narrow viewports to keep wrapper in-bounds */}
         <div
           className="flex flex-nowrap gap-1 overflow-x-auto pb-2 sticky top-0 z-20 bg-neutral-950 px-2 pt-2 shrink-0 min-w-0 max-w-full"
           data-viewport-allow-overflow

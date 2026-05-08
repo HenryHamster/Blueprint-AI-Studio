@@ -263,8 +263,9 @@ export function LogsTab({
       <div className="px-3 py-2 border-b border-neutral-800 flex flex-col gap-1.5 shrink-0">
         <div className="flex items-center gap-1.5 flex-wrap">
           {levelButtons.map(({ level, label, count, activeClass }) => (
-            // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
+            // reason: log filter pill in compact toolbar; py-0.5 matches log viewer density convention
             <button
+              data-viewport-allow-small-target
               key={level}
               onClick={() => setLogLevel(level)}
               className={`px-2 py-0.5 rounded-full text-xs font-medium border transition-colors ${

@@ -1,7 +1,7 @@
 import { afterEach, describe, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
-import { expectNoOverflowAt } from '../test/viewport';
+import { expectNoOverflowAt, expectMinTouchTargetAt } from '../test/viewport';
 import { ProjectBuildConfigSection } from './ProjectBuildConfigSection';
 import type { BuildConfig } from '../types/project';
 
@@ -45,5 +45,27 @@ describe('ProjectBuildConfigSection — viewport regression', () => {
         );
       });
     });
+  });
+
+  test('interactive controls meet 44px touch target at 375px', async () => {
+    await expectMinTouchTargetAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <ProjectBuildConfigSection
+            githubOwner="myorg"
+            githubRepo="myrepo"
+            buildConfig={buildConfig}
+            onSave={vi.fn(async () => {})}
+            onDetect={vi.fn(async () => {})}
+            detectAvailable={true}
+          />,
+        );
+      });
+    }, { selector: 'button, a[href]' });
   });
 });

@@ -1,4 +1,4 @@
-import { afterEach, describe, test, vi } from 'vitest';
+import { afterEach, describe, test, vi, expect } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { KanbanBoard, type KanbanColumn } from './KanbanBoard';
@@ -115,6 +115,42 @@ describe('KanbanBoard — viewport regression', () => {
             {...BASE_PROPS}
             tasks={tasks}
             columns={COLUMNS}
+          />,
+        );
+      });
+    });
+
+    // Verify the mobile layout wrapper (parent of the escape-hatch tab bar) stays in bounds.
+    // Hard-fail (not silent skip) when the selector breaks, so a class rename surfaces here.
+    const mobileWrapper = host!.querySelector('div.md\\:hidden') as HTMLElement | null;
+    expect(mobileWrapper).not.toBeNull();
+    const rect = mobileWrapper!.getBoundingClientRect();
+    expect(rect.right).toBeLessThanOrEqual(376); // 375 + 1px tolerance
+  });
+
+  test('desktop kanban columns render without overflow at 768px tablet width', async () => {
+    // At md: (768px) the layout transitions from mobile tab view to desktop columns.
+    // Use 2 columns so each flex-1 min-w-[280px] column fits within 768px.
+    const twoColumns: KanbanColumn[] = [
+      { id: 'QUEUED', label: 'Queued', includes: ['QUEUED'] },
+      { id: 'IN_PROGRESS', label: 'In Progress', includes: ['IN_PROGRESS', 'PROVISIONING'] },
+    ];
+    const tasks = [
+      makeTask({ id: 't1', status: 'QUEUED' }),
+      makeTask({ id: 't2', status: 'IN_PROGRESS' }),
+    ];
+
+    await expectNoOverflowAt(768, async () => {
+      host = document.createElement('div');
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <KanbanBoard
+            {...BASE_PROPS}
+            tasks={tasks}
+            columns={twoColumns}
           />,
         );
       });

@@ -9851,6 +9851,125 @@ class TestViewportRegressionEvaluator:
 
 
 # ---------------------------------------------------------------------------
+# viewport_coverage_drop signal tests
+# ---------------------------------------------------------------------------
+
+
+def _design_doc_with_coverage_drop(
+    *,
+    before: int = 10,
+    after: int = 7,
+    escape_hatches: int = 0,
+    removed_components: list | None = None,
+) -> dict:
+    return {
+        "viewport_coverage_snapshot": {
+            "assertion_count_before": before,
+            "assertion_count_after": after,
+            "new_escape_hatch_count": escape_hatches,
+            "removed_component_files": removed_components or [],
+            "merged_pr": 1234,
+        }
+    }
+
+
+@pytest.mark.asyncio
+async def test_viewport_coverage_drop_test_deletion(db_session):
+    """Signal fires when assertions are deleted (post count < pre count)."""
+    project = make_project(
+        design_doc=_design_doc_with_coverage_drop(before=10, after=7)
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 1
+
+    task = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .first()
+    )
+    assert task is not None
+    ctx = task.context or {}
+    assert ctx["regression_class"] == "viewport_coverage_drop"
+    assert ctx["signal_name"] == "viewport_coverage_drop"
+    payload = task.first_payload or {}
+    assert "viewport_coverage_drop" in payload.get("prompt", "")
+
+
+@pytest.mark.asyncio
+async def test_viewport_coverage_drop_skip_insertion(db_session):
+    """Signal fires when .skip() insertion reduces effective assertion count."""
+    project = make_project(design_doc=_design_doc_with_coverage_drop(before=8, after=5))
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 1
+
+    task = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .first()
+    )
+    assert task is not None
+    assert (task.context or {}).get("regression_class") == "viewport_coverage_drop"
+
+
+@pytest.mark.asyncio
+async def test_viewport_coverage_drop_escape_hatch_attribute(db_session):
+    """Signal fires when new escape-hatch attributes are added (count stable but coverage eroded)."""
+    project = make_project(
+        design_doc=_design_doc_with_coverage_drop(before=10, after=10, escape_hatches=2)
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 1
+
+    task = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .first()
+    )
+    assert task is not None
+    ctx = task.context or {}
+    assert ctx["regression_class"] == "viewport_coverage_drop"
+    payload = task.first_payload or {}
+    assert "escape-hatch" in payload.get("prompt", "")
+
+
+@pytest.mark.asyncio
+async def test_viewport_coverage_drop_no_signal_on_component_removal(db_session):
+    """Signal does NOT fire when a component file was legitimately removed."""
+    project = make_project(
+        design_doc=_design_doc_with_coverage_drop(
+            before=10,
+            after=7,
+            removed_components=["admin-ui/src/components/OldWidget.tsx"],
+        )
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 0
+
+    tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert tasks == []
+
+
+# ---------------------------------------------------------------------------
 # Reviewer SLA stall signal tests
 # ---------------------------------------------------------------------------
 

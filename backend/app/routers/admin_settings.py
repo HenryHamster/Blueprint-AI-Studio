@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 from typing import Dict, Any
+import asyncio
 import os
 import uuid
 import httpx
@@ -10,6 +11,7 @@ from datetime import timedelta
 from sqlalchemy.orm import aliased
 
 from app.database import get_session
+from app.url_security import _is_safe_external_url
 from app.shared_state import limiter, circuit_breakers as _circuit_breakers
 from app.models import (
     DeploymentState,
@@ -1167,11 +1169,13 @@ async def _apply_settings(
                 status_code=400,
                 detail="notification_config.webhook_url must be a string",
             )
-        if webhook_url and not webhook_url.startswith(("http://", "https://")):
-            raise HTTPException(
-                status_code=400,
-                detail="notification_config.webhook_url must start with http:// or https://",
-            )
+        if webhook_url:
+            safe, reason = await asyncio.to_thread(_is_safe_external_url, webhook_url)
+            if not safe:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"notification_config.webhook_url is not allowed: {reason}",
+                )
         _VALID_NOTIFICATION_EVENTS = frozenset(
             [
                 "TASK_FAILED",

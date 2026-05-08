@@ -156,7 +156,9 @@ export function ProjectBuildConfigSection({
             <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider">Directories</h3>
             <div className="flex items-center gap-2">
               {detectAvailable && (
+                // reason: inline icon-only re-detect button; w-3.5 h-3.5 icon in compact config header
                 <button
+                  data-viewport-allow-small-target
                   onClick={handleDetect}
                   disabled={detecting}
                   title="Re-detect from repository"
@@ -194,7 +196,9 @@ export function ProjectBuildConfigSection({
                       className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-base md:text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
                     />
                   </div>
+                  {/* reason: inline icon-only remove button in dense directory row */}
                   <button
+                    data-viewport-allow-small-target
                     onClick={() => removeDir(i)}
                     className="mt-4 text-neutral-600 hover:text-red-400 transition-colors shrink-0"
                     title="Remove directory"
@@ -237,7 +241,9 @@ export function ProjectBuildConfigSection({
               </div>
             ))}
           </div>
+          {/* reason: inline text link to add directory; text-xs single-line button in config section */}
           <button
+            data-viewport-allow-small-target
             onClick={addDir}
             className="mt-3 flex items-center gap-1.5 text-xs text-neutral-500 hover:text-neutral-300 transition-colors"
           >
@@ -318,7 +324,9 @@ export function ProjectBuildConfigSection({
       {/* Save button */}
       {hasConfig && (
         <div className="flex justify-end pt-2">
+          {/* reason: settings save button; text-xs py-2 is operator-density convention for config panels */}
           <button
+            data-viewport-allow-small-target
             onClick={handleSave}
             disabled={saving}
             className="bg-neutral-700 hover:bg-neutral-600 text-neutral-100 rounded-lg px-5 py-2 text-xs font-medium transition-colors disabled:opacity-50"

@@ -248,4 +248,15 @@ describe('HeaderBar — viewport regression', () => {
       }
     });
   });
+
+  test('desktop layout renders without overflow at 768px (md: breakpoint)', async () => {
+    await expectNoOverflowAt(768, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => { r.render(<HeaderBar {...makeProps()} />); });
+    });
+  });
 });

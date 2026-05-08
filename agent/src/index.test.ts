@@ -548,6 +548,44 @@ describe('runViewportSuiteWithFallback', () => {
     const homeEnvIdx = dockerArgs.findIndex(a => a.startsWith('HOME='));
     expect(homeEnvIdx).toBe(-1);
   });
+
+  it('gracefully skips when docker is unavailable', () => {
+    const sendMock = vi.fn();
+    const mockWs = { send: sendMock, readyState: 1 } as unknown as WebSocket;
+    vi.mocked(execFileSync).mockImplementationOnce(() => {
+      throw new Error('libatk-1.0.so.0: cannot open shared object file');
+    });
+    vi.mocked(execFileSync).mockImplementationOnce(() => {
+      throw new Error('command not found: docker');
+    });
+    runViewportSuiteWithFallback('/workspace/admin-ui', {}, 60000, mockWs);
+    expect(sendMock).toHaveBeenCalledWith(
+      expect.stringContaining('viewport suite skipped'),
+    );
+  });
+
+  it('gracefully skips on Docker file-import errors', () => {
+    const sendMock = vi.fn();
+    const mockWs = { send: sendMock, readyState: 1 } as unknown as WebSocket;
+    vi.mocked(execFileSync).mockImplementationOnce(() => {
+      throw new Error('libatk-1.0.so.0: cannot open shared object file');
+    });
+    vi.mocked(execFileSync).mockImplementationOnce(() => {
+      throw new Error('Error: Cannot find module "@vite/something"');
+    });
+    runViewportSuiteWithFallback('/workspace/admin-ui', {}, 60000, mockWs);
+    expect(sendMock).toHaveBeenCalled();
+  });
+
+  it('rethrows Docker test assertion failures', () => {
+    vi.mocked(execFileSync).mockImplementationOnce(() => {
+      throw new Error('libatk-1.0.so.0: cannot open shared object file');
+    });
+    vi.mocked(execFileSync).mockImplementationOnce(() => {
+      throw new Error('Tests 1 failed');
+    });
+    expect(() => { runViewportSuiteWithFallback('/workspace/admin-ui', {}, 60000); }).toThrow('Tests 1 failed');
+  });
 });
 
 // Helper: spawn mock that emits close(code) immediately for each spawn call.
