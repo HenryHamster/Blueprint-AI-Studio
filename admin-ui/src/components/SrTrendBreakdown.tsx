@@ -29,6 +29,8 @@ export interface SrCategoryTrend {
   below_floor?: boolean | null;
   /** Reasoning engagement: fraction of PASS verdicts with substantial reasoning text. */
   reasoning_engagement_rate?: number | null;
+  /** Reasoning quality score: average quality score of reasoning text (0–1 scale). */
+  reasoning_quality_rate?: number | null;
   /** Count of PASS verdicts with reasoning. */
   reasoning_engagement_with?: number | null;
   /** Total PASS verdicts (denominator for engagement rate). */
@@ -47,6 +49,13 @@ export interface SrCategoryTrend {
   time_to_miss_detect_sample_count?: number | null;
   /** True when sample_count >= 2 AND p95 > 7 days — SR is effectively the sole checker. */
   time_to_miss_detect_lone_checker?: boolean | null;
+  /** Severity calibration: how often agent severity matched/under-rated/over-rated reviewer severity for the same category. */
+  severity_calibration?: {
+    under_rated: number;
+    over_rated: number;
+    matched: number;
+    total: number;
+  } | null;
 }
 
 export interface SrTaskTypeCategoryStats {
@@ -1008,6 +1017,15 @@ function CategoryRow({
             </span>
           );
         })()}
+        {c.severity_calibration != null && c.severity_calibration.total >= 5 &&
+          c.severity_calibration.under_rated / c.severity_calibration.total >= 0.30 && (
+          <span
+            className="font-mono tabular-nums text-amber-400"
+            title={`Severity under-rated: agent called ${c.severity_calibration.under_rated}/${c.severity_calibration.total} matched instances at lower severity than reviewer — under-rating suppresses escalation`}
+          >
+            {`undercal:${Math.round(c.severity_calibration.under_rated / c.severity_calibration.total * 100)}%`}
+          </span>
+        )}
         {c.time_to_miss_detect_p50_sec != null && (
           <span className="font-mono tabular-nums text-neutral-500" title={`Median time-to-detect SR miss: ${formatLatencySec(c.time_to_miss_detect_p50_sec)}`}>
             {`t50:${formatLatencySec(c.time_to_miss_detect_p50_sec)}`}
@@ -1132,6 +1150,15 @@ function CategoryRow({
           </span>
         );
       })()}
+      {c.severity_calibration != null && c.severity_calibration.total >= 5 &&
+        c.severity_calibration.under_rated / c.severity_calibration.total >= 0.30 && (
+        <span
+          className="font-mono text-amber-400"
+          title={`Severity under-rated: agent called ${c.severity_calibration.under_rated}/${c.severity_calibration.total} matched instances at lower severity than reviewer — under-rating suppresses escalation`}
+        >
+          {`undercal:${Math.round(c.severity_calibration.under_rated / c.severity_calibration.total * 100)}%`}
+        </span>
+      )}
       {c.time_to_miss_detect_p50_sec != null && (
         <span className="font-mono text-neutral-500" title={`Median time-to-detect SR miss: ${formatLatencySec(c.time_to_miss_detect_p50_sec)}`}>
           {`t50:${formatLatencySec(c.time_to_miss_detect_p50_sec)}`}

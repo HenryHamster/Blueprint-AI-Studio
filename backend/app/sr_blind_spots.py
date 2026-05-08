@@ -740,6 +740,79 @@ def triage_sr_blind_spot_theme(theme: str, examples: list) -> dict:
     return {"verdict": verdict, "signals": signals, "triage_context": triage_context}
 
 
+def aggregate_sr_false_attestation_rates(
+    tasks,
+    *,
+    min_sample: int = _SR_MIN_SAMPLE,
+) -> Dict[str, Any] | None:
+    """Cross-check SR execution-evidence pass claims against actual CI outcomes.
+
+    For each code-change task whose SR marks an execution-evidence category
+    ``passed=True``, checks the task's CI result via
+    ``context["review_loop"]["ci_passed"]``.  A *false attestation* is counted
+    when SR claimed passed but CI recorded ``ci_passed=False``.  Tasks without
+    a CI outcome (no review_loop or ci_passed not set) are tallied separately.
+
+    Returns ``None`` when fewer than ``min_sample`` tasks have both an SR claim
+    and a CI outcome across all three categories.
+
+    Per-category shape::
+
+        {
+            "sr_claimed_passed": int,
+            "ci_confirmed": int,
+            "false_attested": int,
+            "ci_data_missing": int,
+            "false_attestation_rate": float | None,
+        }
+    """
+    cats: Dict[str, Dict[str, int]] = {
+        cat: {
+            "sr_claimed_passed": 0,
+            "false_attested": 0,
+            "ci_confirmed": 0,
+            "ci_data_missing": 0,
+        }
+        for cat in _EXECUTION_EVIDENCE_CATEGORIES
+    }
+
+    for t in tasks:
+        if (t.first_payload or {}).get("type") not in _SR_CODE_CHANGE_TYPES:
+            continue
+        ctx = t.context or {}
+        sro = ctx.get("_self_review_outcome")
+        if not sro or is_skipped_sr_outcome(sro):
+            continue
+        check_results = sro.get("check_results") or {}
+        review_loop = ctx.get("review_loop") or {}
+        ci_passed_val = review_loop.get("ci_passed")  # True, False, or None
+
+        for cat in _EXECUTION_EVIDENCE_CATEGORIES:
+            entry = check_results.get(cat)
+            if not isinstance(entry, dict) or not entry.get("passed", False):
+                continue
+            cats[cat]["sr_claimed_passed"] += 1
+            if ci_passed_val is None:
+                cats[cat]["ci_data_missing"] += 1
+            elif ci_passed_val:
+                cats[cat]["ci_confirmed"] += 1
+            else:
+                cats[cat]["false_attested"] += 1
+
+    total_with_ci = sum(s["ci_confirmed"] + s["false_attested"] for s in cats.values())
+    if total_with_ci < min_sample:
+        return None
+
+    result: Dict[str, Any] = {}
+    for cat, s in cats.items():
+        if s["sr_claimed_passed"] == 0:
+            continue
+        denom = s["ci_confirmed"] + s["false_attested"]
+        rate = round(s["false_attested"] / denom, 3) if denom > 0 else None
+        result[cat] = {**s, "false_attestation_rate": rate}
+    return result or None
+
+
 def classify_theme_example_layers(examples: list) -> list:
     """Return layer tags derived from verbatim blind-spot example texts.
 

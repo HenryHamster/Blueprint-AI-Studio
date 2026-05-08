@@ -411,6 +411,9 @@ function DiagnosticsPanel({ task }: { task: Task }) {
 interface SelfReviewCheckResult {
   passed: boolean;
   issue?: string;
+  reasoning?: string;
+  severity?: string;
+  evidence?: string;
 }
 
 interface ReviewerFinding {
@@ -455,6 +458,41 @@ function getSRPredictionBadge(category: string, checkResults: Record<string, Sel
     return { icon: '✓', label: 'caught by SR', color: 'bg-emerald-950/40 border-emerald-800/40 text-emerald-400' };
   }
   return { icon: '✗', label: 'missed by SR', color: 'bg-red-950/40 border-red-800/40 text-red-400' };
+}
+
+function CheckResultReasoningDisplay({ result }: { result: SelfReviewCheckResult }) {
+  const [expanded, setExpanded] = useState(false);
+  const reasoning = result.reasoning?.trim() ?? '';
+  const hasReasoning = reasoning.length > 0;
+  const isThinReasoning = hasReasoning && reasoning.length < 10;
+  const shouldTruncate = reasoning.length > 200;
+  const displayText = shouldTruncate && !expanded ? reasoning.slice(0, 200) + '…' : reasoning;
+
+  if (!hasReasoning) return null;
+
+  return (
+    <div className={`text-xs ml-3.5 mt-1 break-words ${isThinReasoning ? 'italic text-neutral-500' : 'text-neutral-400'}`}>
+      {displayText}
+      {shouldTruncate && (
+        <button
+          onClick={() => setExpanded(!expanded)}
+          className="ml-1 text-neutral-500 hover:text-neutral-300 underline"
+        >
+          {expanded ? 'less' : 'more'}
+        </button>
+      )}
+      {result.severity && (
+        <span className={`ml-1.5 inline-block text-[9px] px-1.5 py-0.5 rounded font-semibold ${
+          result.severity === 'CRITICAL' ? 'bg-red-950/40 text-red-400'
+          : result.severity === 'HIGH' ? 'bg-orange-950/40 text-orange-400'
+          : result.severity === 'MEDIUM' ? 'bg-yellow-950/40 text-yellow-400'
+          : 'bg-neutral-800 text-neutral-400'
+        }`}>
+          {result.severity}
+        </span>
+      )}
+    </div>
+  );
 }
 
 function SelfReviewPanel({ task }: { task: Task }) {
@@ -539,6 +577,7 @@ function SelfReviewPanel({ task }: { task: Task }) {
                             {isFromReviewer && <span className="text-[9px] px-1 py-0.5 rounded bg-orange-950/40 text-orange-300 font-semibold">from reviewer</span>}
                           </div>
                           {result.issue && <p className="text-neutral-400 ml-3.5 mt-0.5 break-words">{result.issue.startsWith('[reviewer]') ? result.issue.slice(10) : result.issue}</p>}
+                          <CheckResultReasoningDisplay result={result} />
                         </div>
                       );
                     })}
@@ -549,12 +588,28 @@ function SelfReviewPanel({ task }: { task: Task }) {
               {passedCategories.length > 0 && (
                 <div>
                   <p className="text-xs text-neutral-400 font-medium mb-1.5">Passed checks</p>
-                  <div className="flex flex-wrap gap-1.5">
-                    {passedCategories.map(([cat]) => (
-                      <span key={cat} className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-emerald-950/30 border border-emerald-800/30 text-emerald-400">
-                        {cat}
-                      </span>
-                    ))}
+                  <div className="space-y-1.5">
+                    {passedCategories.map(([cat, result]) => {
+                      const reasoning = result.reasoning?.trim() ?? '';
+                      const isThinReasoning = reasoning.length > 0 && reasoning.length < 10;
+                      return (
+                        <div key={cat}>
+                          <div className="flex items-center gap-1.5">
+                            <span className={`w-2 h-2 rounded-full shrink-0 ${isThinReasoning ? 'bg-amber-500/60' : 'bg-emerald-500'}`} />
+                            <span className={`text-[10px] font-mono px-1.5 py-0.5 rounded border ${
+                              isThinReasoning
+                                ? 'bg-amber-950/30 border-amber-800/30 text-amber-400'
+                                : 'bg-emerald-950/30 border-emerald-800/30 text-emerald-400'
+                            }`}>
+                              {cat}
+                            </span>
+                          </div>
+                          {reasoning && (
+                            <CheckResultReasoningDisplay result={result} />
+                          )}
+                        </div>
+                      );
+                    })}
                   </div>
                 </div>
               )}

@@ -3039,6 +3039,69 @@ def _compute_cat_fp_stats(
     return cat_fp, type_cat_fp, scope_cat_fp
 
 
+def _compute_cat_severity_calibration(
+    tasks: list,
+) -> dict[str, dict[str, int]]:
+    """Return per-category severity calibration counts.
+
+    For categories where the agent SR flagged a concern (passed=False, has
+    severity) AND the reviewer independently flagged the same category in
+    review_history, compare the agent's severity against the reviewer's
+    maximum severity for that category.
+
+    Returns {cat: {"under_rated": n, "over_rated": n, "matched": n, "total": n}}.
+    Under-rated = agent severity numerically lower than reviewer's — more
+    dangerous than over-rating because it suppresses escalation.
+    """
+    _sw = {"CRITICAL": 3, "MAJOR": 2, "MINOR": 1}
+    result: dict[str, dict[str, int]] = {}
+    for t in tasks:
+        task_type = (t.first_payload or {}).get("type", "")
+        if task_type not in _SR_CODE_CHANGE_TYPES:
+            continue
+        ctx = t.context or {}
+        sro = ctx.get("_self_review_outcome")
+        if not sro:
+            continue
+        check_results = sro.get("check_results") or {}
+        rev_hist = (ctx.get("review_loop") or {}).get("review_history") or []
+        if not rev_hist:
+            continue
+        rev_cats = _categorize_review_issues(rev_hist)
+        for cat, rev_issues in rev_cats.items():
+            cr = check_results.get(cat)
+            if not isinstance(cr, dict):
+                continue
+            if cr.get("passed", True):
+                continue
+            if cr.get("origin") in _REVIEWER_ORIGINS:
+                continue
+            agent_sev = (cr.get("severity") or "").upper()
+            if agent_sev not in _sw:
+                continue
+            sev_vals = [
+                _sw[i.get("severity", "")]
+                for i in rev_issues
+                if isinstance(i, dict) and i.get("severity", "") in _sw
+            ]
+            if not sev_vals:
+                continue
+            reviewer_max_val = max(sev_vals)
+            agent_val = _sw[agent_sev]
+            bucket = result.setdefault(
+                cat,
+                {"under_rated": 0, "over_rated": 0, "matched": 0, "total": 0},
+            )
+            bucket["total"] += 1
+            if agent_val < reviewer_max_val:
+                bucket["under_rated"] += 1
+            elif agent_val > reviewer_max_val:
+                bucket["over_rated"] += 1
+            else:
+                bucket["matched"] += 1
+    return result
+
+
 def _task_prompt_fingerprint(task: Task) -> str:
     """Resolve the task's prompt fingerprint with legacy context fallback."""
     if isinstance(task.prompt_fingerprint, str) and task.prompt_fingerprint:
@@ -3221,23 +3284,66 @@ def compute_sr_quality_by_fingerprint(
     return results
 
 
+def _score_reasoning_quality(reasoning: str) -> float:
+    """Score reasoning quality on a 0.0–1.0 scale based on specificity signals.
+
+    Rewards: file path citation, test/function name mention, minimum word count (≥6).
+    """
+    import re
+
+    if not reasoning or not isinstance(reasoning, str):
+        return 0.0
+
+    text = reasoning.strip()
+    if not text:
+        return 0.0
+
+    score = 0.0
+    signals = 0
+
+    # Signal 1: file path citation (e.g., "backend/app/foo.py" or "app/foo.py")
+    if re.search(r"\b(?:[\w\-./]*[\w\-/]+\.[\w]+)\b", text):
+        score += 0.33
+        signals += 1
+
+    # Signal 2: test/function name mention (e.g., "test_foo", "test_*.py", "::function")
+    if re.search(r"(?:test_\w+|_test\.py|\:\:\w+|\w+::)", text):
+        score += 0.33
+        signals += 1
+
+    # Signal 3: minimum word count (≥6 words)
+    word_count = len(text.split())
+    if word_count >= 6:
+        score += 0.34
+        signals += 1
+
+    # Normalize to 0.0–1.0 range
+    return min(1.0, score)
+
+
 def _compute_reasoning_engagement(
     tasks: list,
     cats: set[str],
 ) -> dict[str, dict[str, Any]]:
     """For each category in *cats*, compute the fraction of passed entries
-    that include a non-trivial reasoning string.
+    that include a non-trivial reasoning string, plus a quality score.
 
     A reasoning is 'non-trivial' when it is a non-empty string of more than
     10 characters.  Only tasks with a non-skip SR outcome contribute.
 
-    Returns {cat: {"engagement_rate": float|None, "with_reasoning": int,
-                   "total_passes": int}}.
+    Returns {cat: {"engagement_rate": float|None, "reasoning_quality_rate": float|None,
+                   "with_reasoning": int, "with_quality": int, "total_passes": int}}.
     """
     from app.sr_blind_spots import is_skipped_sr_outcome  # noqa: PLC0415
 
-    stats: dict[str, dict[str, int]] = {
-        cat: {"with_reasoning": 0, "total_passes": 0} for cat in cats
+    stats: dict[str, dict[str, int | float]] = {
+        cat: {
+            "with_reasoning": 0,
+            "with_quality": 0,
+            "total_passes": 0,
+            "quality_scores": [],
+        }
+        for cat in cats
     }
     for t in tasks:
         ctx = t.context or {}
@@ -3254,14 +3360,28 @@ def _compute_reasoning_engagement(
             if isinstance(reasoning, str) and len(reasoning.strip()) > 10:
                 stats[cat]["with_reasoning"] += 1
 
+            # Compute quality score
+            quality_score = _score_reasoning_quality(reasoning)
+            stats[cat]["quality_scores"].append(quality_score)
+            if quality_score > 0.5:
+                stats[cat]["with_quality"] += 1
+
     result: dict[str, dict[str, Any]] = {}
     for cat, s in stats.items():
         total = s["total_passes"]
+        quality_scores = s.get("quality_scores", [])
+        avg_quality = (
+            round(sum(quality_scores) / len(quality_scores), 3)
+            if quality_scores
+            else None
+        )
         result[cat] = {
             "engagement_rate": round(s["with_reasoning"] / total, 3)
             if total > 0
             else None,
+            "reasoning_quality_rate": avg_quality,
             "with_reasoning": s["with_reasoning"],
+            "with_quality": s["with_quality"],
             "total_passes": total,
         }
     return result
@@ -3741,6 +3861,7 @@ async def compute_sr_catch_rate_trends(
     eng = _compute_reasoning_engagement(current_window_tasks, all_cats)
     for cat, cat_eng in eng.items():
         categories[cat]["reasoning_engagement_rate"] = cat_eng["engagement_rate"]
+        categories[cat]["reasoning_quality_rate"] = cat_eng["reasoning_quality_rate"]
         categories[cat]["reasoning_engagement_with"] = cat_eng["with_reasoning"]
         categories[cat]["reasoning_engagement_total"] = cat_eng["total_passes"]
 
@@ -3767,6 +3888,14 @@ async def compute_sr_catch_rate_trends(
         data["previous_fp_rate"] = (
             round(prev_fp / (prev_fp + prev_tp), 3) if (prev_fp + prev_tp) > 0 else None
         )
+
+    # Attach severity calibration stats: compares agent severity vs reviewer severity
+    # for categories where both sides flagged it. Under-rating is the dangerous case.
+    sev_cal = _compute_cat_severity_calibration(current_window_tasks)
+    for cat, data in categories.items():
+        cal = sev_cal.get(cat)
+        if cal:
+            data["severity_calibration"] = cal
 
     # Attach time-to-miss-detect latency stats per category.
     miss_latency = _compute_miss_latency_stats(current_window_tasks)
@@ -5654,6 +5783,224 @@ async def compute_sr_regression_risk_test_signal_trends(
         current_rate,
         current_qual,
     )
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# SR false-attestation trends
+# ---------------------------------------------------------------------------
+
+_FALSE_ATTESTATION_RATE_THRESHOLD = 0.10
+_FALSE_ATTESTATION_ALERT_TITLE_PREFIX = "SR false attestation rate elevated"
+
+
+async def compute_sr_false_attestation_trends(
+    project_id: uuid.UUID,
+    session: AsyncSession,
+    all_tasks: list,
+) -> Optional[dict[str, Any]]:
+    """Cross-check SR execution-evidence pass claims against CI outcomes cycle-over-cycle.
+
+    For each code-change task whose SR marks tests_executed_cleanly, lint_executed_cleanly,
+    or typecheck_executed_cleanly as passed=True, checks context["review_loop"]["ci_passed"].
+    Counts tasks where SR claimed passed but CI recorded ci_passed=False as false attestations.
+
+    Mirrors :func:`compute_sr_regression_risk_test_signal_trends` cycle-vs-calendar bucketing.
+
+    **Side effect**: writes the result to
+    ``project.design_doc["sr_false_attestation_trends"]`` and emits a WARNING Alert when
+    any category's false attestation rate exceeds _FALSE_ATTESTATION_RATE_THRESHOLD.
+    """
+    from app.sr_blind_spots import (
+        aggregate_sr_false_attestation_rates,
+        is_skipped_sr_outcome,
+    )
+
+    now = _utcnow()
+
+    def _naive(dt: datetime) -> datetime:
+        return dt.replace(tzinfo=None) if dt.tzinfo else dt
+
+    def _qualifies(task) -> bool:
+        if (task.first_payload or {}).get("type") not in _SR_CODE_CHANGE_TYPES:
+            return False
+        ctx = task.context or {}
+        sro = ctx.get("_self_review_outcome")
+        if not sro or is_skipped_sr_outcome(sro):
+            return False
+        rl = ctx.get("review_loop")
+        return rl is not None and "ci_passed" in rl
+
+    def _qualifying_count(tasks: list) -> int:
+        return sum(1 for t in tasks if _qualifies(t))
+
+    use_cycle_mode = False
+    current_cycle_id: Optional[str] = None
+    previous_cycle_id: Optional[str] = None
+    current_bucket: list = []
+    previous_bucket: list = []
+
+    cycle_stmt = (
+        select(StrategicCycle)
+        .where(StrategicCycle.project_id == project_id)
+        .where(StrategicCycle.outcome == "completed")
+        .order_by(StrategicCycle.phase1_started_at.desc())
+        .limit(4)
+    )
+    cycle_rows = (await session.execute(cycle_stmt)).scalars().all()
+
+    if len(cycle_rows) >= 2:
+        task_by_cycle: dict[str, list] = {}
+        for t in all_tasks:
+            cid = getattr(t, "strategic_cycle_id", None)
+            if cid:
+                task_by_cycle.setdefault(cid, []).append(t)
+        for i in range(len(cycle_rows) - 1):
+            c_cycle = cycle_rows[i]
+            p_cycle = cycle_rows[i + 1]
+            c_tasks = task_by_cycle.get(c_cycle.id, [])
+            p_tasks = task_by_cycle.get(p_cycle.id, [])
+            if (
+                _qualifying_count(c_tasks) >= _MIN_SR_SAMPLE
+                and _qualifying_count(p_tasks) >= _MIN_SR_SAMPLE
+            ):
+                use_cycle_mode = True
+                current_cycle_id = c_cycle.id
+                previous_cycle_id = p_cycle.id
+                current_bucket = c_tasks
+                previous_bucket = p_tasks
+                break
+
+    if not use_cycle_mode:
+        cutoff_14d_n = _naive(now - timedelta(days=14))
+        cutoff_28d_n = _naive(now - timedelta(days=28))
+        sentinel_n = datetime(9999, 12, 31)
+        current_bucket = [
+            t
+            for t in all_tasks
+            if t.created_at and cutoff_14d_n <= _naive(t.created_at) < sentinel_n
+        ]
+        previous_bucket = [
+            t
+            for t in all_tasks
+            if t.created_at and cutoff_28d_n <= _naive(t.created_at) < cutoff_14d_n
+        ]
+
+    if _qualifying_count(current_bucket) < _MIN_SR_SAMPLE:
+        return None
+
+    current_rates = aggregate_sr_false_attestation_rates(current_bucket, min_sample=1)
+    previous_rates = aggregate_sr_false_attestation_rates(previous_bucket, min_sample=1)
+
+    if not current_rates:
+        return None
+
+    per_category: dict[str, Any] = {}
+    for cat, curr in current_rates.items():
+        prev = (previous_rates or {}).get(cat) or {}
+        curr_rate = curr.get("false_attestation_rate")
+        prev_rate = prev.get("false_attestation_rate")
+        if curr_rate is not None and prev_rate is not None:
+            delta = round(curr_rate - prev_rate, 3)
+            trend = (
+                "regressing"
+                if delta >= _TREND_DELTA_THRESHOLD
+                else "improving"
+                if delta <= -_TREND_DELTA_THRESHOLD
+                else "stable"
+            )
+        else:
+            delta = None
+            trend = "stable"
+        per_category[cat] = {
+            **curr,
+            "previous_false_attestation_rate": prev_rate,
+            "delta": delta,
+            "trend": trend,
+        }
+
+    result: dict[str, Any] = {
+        "computed_at": now.isoformat(),
+        "bucket_mode": "cycle" if use_cycle_mode else "calendar",
+        "current_cycle_id": current_cycle_id,
+        "previous_cycle_id": previous_cycle_id,
+        "per_category": per_category,
+    }
+
+    project = await session.get(Project, project_id)
+    if not project:
+        return None
+
+    doc = dict(project.design_doc or {})
+    doc["sr_false_attestation_trends"] = result
+    project.design_doc = doc
+    flag_modified(project, "design_doc")
+    session.add(project)
+
+    logger.info(
+        "[SR_FALSE_ATTESTATION] project=%s bucket=%s cats=%s",
+        project_id,
+        "cycle" if use_cycle_mode else "calendar",
+        list(per_category.keys()),
+    )
+
+    elevated = {
+        cat: data
+        for cat, data in per_category.items()
+        if (data.get("false_attestation_rate") or 0) > _FALSE_ATTESTATION_RATE_THRESHOLD
+    }
+    if elevated:
+        try:
+            from app.notification_dispatch import post_failure_alert_message  # noqa: PLC0415
+
+            lines = [
+                "SR false attestation rate elevated (SR claimed passed but CI failed):"
+            ]
+            for cat, data in sorted(elevated.items()):
+                rate = data.get("false_attestation_rate")
+                n = data.get("false_attested", 0)
+                total = data.get("ci_confirmed", 0) + n
+                lines.append(f"  • {cat}: {rate:.0%} ({n}/{total})")
+            description = "\n".join(lines)
+            await post_failure_alert_message(session, project_id, description)
+
+            new_title = _format_sr_alert_title(
+                _FALSE_ATTESTATION_ALERT_TITLE_PREFIX, sorted(elevated.keys())
+            )
+            existing_alerts = (
+                (
+                    await session.execute(
+                        select(Alert).where(
+                            Alert.project_id == project_id,
+                            Alert.task_id.is_(None),
+                            Alert.severity == AlertSeverity.WARNING,
+                            Alert.dismissed_at.is_(None),
+                            Alert.title.like(
+                                f"{_FALSE_ATTESTATION_ALERT_TITLE_PREFIX}%"
+                            ),
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            for a in existing_alerts:
+                if a.title != new_title:
+                    a.dismissed_at = now
+                    session.add(a)
+            session.add(
+                Alert(
+                    project_id=project_id,
+                    severity=AlertSeverity.WARNING,
+                    title=new_title,
+                    message=description,
+                )
+            )
+        except Exception:
+            logger.exception(
+                "[SR_FALSE_ATTESTATION] alert emission failed (non-critical)"
+            )
 
     return result
 

@@ -1235,4 +1235,104 @@ describe('DashboardHome', () => {
       expect(deltaElement.className).toContain('text-red-400');
     });
   });
+
+  describe('SR False Attestation tile', () => {
+    it('renders false attestation tile with rate and per-category breakdown', async () => {
+      setupApiMocks({
+        digest: {
+          failed_count: 0,
+          pending_approval_count: 0,
+          completed_count: 10,
+          failure_groups: [],
+          direction_progress: [],
+          recent_completions: [],
+          sr_false_attestation_trends: {
+            computed_at: '2026-05-08T00:00:00Z',
+            bucket_mode: 'cycle',
+            per_category: {
+              tests_executed_cleanly: {
+                false_attestation_rate: 0.12,
+                previous_false_attestation_rate: 0.08,
+                delta: 0.04,
+                trend: 'regressing',
+                ci_confirmed: 22,
+                false_attested: 3,
+                ci_data_missing: 1,
+              },
+              lint_executed_cleanly: {
+                false_attestation_rate: 0.04,
+                previous_false_attestation_rate: 0.05,
+                delta: -0.01,
+                trend: 'improving',
+                ci_confirmed: 23,
+                false_attested: 1,
+                ci_data_missing: 0,
+              },
+            },
+          },
+        },
+        diagnostics: makeDiagnostics(),
+      });
+
+      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+
+      const tile = await screen.findByTestId('sr-false-attestation-tile');
+      expect(tile).toBeInTheDocument();
+      // Worst rate (12%) shown as headline
+      expect(tile.textContent).toContain('12%');
+      // Per-category rows for Tests and Lint
+      expect(tile.textContent).toContain('Tests:');
+      expect(tile.textContent).toContain('Lint:');
+    });
+
+    it('does not render false attestation tile when sr_false_attestation_trends is absent', async () => {
+      setupApiMocks({
+        digest: {
+          failed_count: 0,
+          pending_approval_count: 0,
+          completed_count: 0,
+          failure_groups: [],
+          direction_progress: [],
+          recent_completions: [],
+        },
+        diagnostics: makeDiagnostics(),
+      });
+
+      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+
+      await screen.findByText('All systems healthy');
+      expect(screen.queryByTestId('sr-false-attestation-tile')).not.toBeInTheDocument();
+    });
+
+    it('does not render false attestation tile when all rates are null (missing CI data)', async () => {
+      setupApiMocks({
+        digest: {
+          failed_count: 0,
+          pending_approval_count: 0,
+          completed_count: 0,
+          failure_groups: [],
+          direction_progress: [],
+          recent_completions: [],
+          sr_false_attestation_trends: {
+            computed_at: '2026-05-08T00:00:00Z',
+            bucket_mode: 'cycle',
+            per_category: {
+              tests_executed_cleanly: {
+                false_attestation_rate: null,
+                ci_confirmed: 0,
+                false_attested: 0,
+                ci_data_missing: 10,
+              },
+            },
+          },
+        },
+        diagnostics: makeDiagnostics(),
+      });
+
+      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+
+      await screen.findByText('All systems healthy');
+      expect(screen.queryByTestId('sr-false-attestation-tile')).not.toBeInTheDocument();
+    });
+  });
 });

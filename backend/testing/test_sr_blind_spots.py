@@ -1,14 +1,45 @@
 """Tests for the disallowed-blind-spot filter and contract parity."""
 
+import uuid
+
 import pytest
 
+from app.models import TaskStatus
 from app.sr_blind_spots import (
     DISALLOWED_BLIND_SPOT_EXAMPLES,
     DISALLOWED_BLIND_SPOT_PATTERNS,
+    aggregate_sr_false_attestation_rates,
     filter_disallowed_blind_spots,
     is_disallowed_blind_spot,
     triage_sr_blind_spot_theme,
 )
+from testing.factories import make_task
+
+
+def _make_fa_task(
+    project_id,
+    *,
+    sr_cat_passed: bool | None,
+    ci_passed: bool | None,
+    cat: str = "tests_executed_cleanly",
+    task_type: str = "create",
+):
+    """Build a task with an SR execution-evidence claim and an optional CI result."""
+    check_results: dict = {}
+    if sr_cat_passed is not None:
+        check_results[cat] = {"passed": sr_cat_passed}
+    review_loop: dict = {}
+    if ci_passed is not None:
+        review_loop["ci_passed"] = ci_passed
+    return make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": task_type, "prompt": "x"}],
+        context={
+            "_self_review_outcome": {"check_results": check_results},
+            "review_loop": review_loop,
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -201,3 +232,79 @@ def test_triage_mixed_test_files_suppresses_cluster_signal():
     ]
     result = triage_sr_blind_spot_theme(theme, examples)
     assert "single_test_file_cluster" not in result["signals"]
+
+
+# ---------------------------------------------------------------------------
+# Unit: aggregate_sr_false_attestation_rates
+# ---------------------------------------------------------------------------
+
+
+def test_false_attestation_true_attestation_counts_ci_confirmed():
+    """SR claims passed + CI passed → ci_confirmed incremented, false_attested stays 0."""
+    pid = uuid.uuid4()
+    tasks = [_make_fa_task(pid, sr_cat_passed=True, ci_passed=True) for _ in range(5)]
+    result = aggregate_sr_false_attestation_rates(tasks, min_sample=5)
+    assert result is not None
+    cat = result["tests_executed_cleanly"]
+    assert cat["sr_claimed_passed"] == 5
+    assert cat["ci_confirmed"] == 5
+    assert cat["false_attested"] == 0
+    assert cat["false_attestation_rate"] == 0.0
+
+
+def test_false_attestation_detects_ci_failure():
+    """SR claims passed but CI failed → false_attested incremented."""
+    pid = uuid.uuid4()
+    tasks = [
+        _make_fa_task(pid, sr_cat_passed=True, ci_passed=False) for _ in range(3)
+    ] + [_make_fa_task(pid, sr_cat_passed=True, ci_passed=True) for _ in range(2)]
+    result = aggregate_sr_false_attestation_rates(tasks, min_sample=5)
+    assert result is not None
+    cat = result["tests_executed_cleanly"]
+    assert cat["false_attested"] == 3
+    assert cat["ci_confirmed"] == 2
+    assert cat["false_attestation_rate"] == round(3 / 5, 3)
+
+
+def test_false_attestation_missing_ci_data_tallied_separately():
+    """SR claimed passed but no CI outcome → ci_data_missing incremented."""
+    pid = uuid.uuid4()
+    # 5 tasks with CI data (to meet min_sample), plus 3 with no CI data
+    tasks = [
+        _make_fa_task(pid, sr_cat_passed=True, ci_passed=True) for _ in range(5)
+    ] + [_make_fa_task(pid, sr_cat_passed=True, ci_passed=None) for _ in range(3)]
+    result = aggregate_sr_false_attestation_rates(tasks, min_sample=5)
+    assert result is not None
+    cat = result["tests_executed_cleanly"]
+    assert cat["ci_data_missing"] == 3
+    assert cat["ci_confirmed"] == 5
+    assert cat["false_attested"] == 0
+
+
+def test_false_attestation_below_min_sample_returns_none():
+    """Fewer than min_sample tasks with CI outcome → None."""
+    pid = uuid.uuid4()
+    tasks = [_make_fa_task(pid, sr_cat_passed=True, ci_passed=True) for _ in range(4)]
+    assert aggregate_sr_false_attestation_rates(tasks, min_sample=5) is None
+
+
+def test_false_attestation_sr_failed_entry_excluded():
+    """Tasks where SR marks the category failed are not counted (only passed claims)."""
+    pid = uuid.uuid4()
+    # SR failed (passed=False) — these should be invisible to the aggregator
+    tasks_sr_failed = [
+        _make_fa_task(pid, sr_cat_passed=False, ci_passed=False) for _ in range(5)
+    ]
+    result = aggregate_sr_false_attestation_rates(tasks_sr_failed, min_sample=1)
+    # No SR-passed claims → result is None (total_with_ci == 0)
+    assert result is None
+
+
+def test_false_attestation_non_code_change_tasks_excluded():
+    """review/plan task types are excluded; only code-change types qualify."""
+    pid = uuid.uuid4()
+    tasks = [
+        _make_fa_task(pid, sr_cat_passed=True, ci_passed=False, task_type="review")
+        for _ in range(5)
+    ]
+    assert aggregate_sr_false_attestation_rates(tasks, min_sample=1) is None

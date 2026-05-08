@@ -1,4 +1,4 @@
-import { afterEach, describe, test, vi } from 'vitest';
+import { afterEach, describe, test, vi, expect } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { DetailsTab } from './TaskDetailDrawerMeta';
@@ -34,10 +34,10 @@ const richTask: Task = {
       verdict: 'fail',
       fixes_applied: true,
       check_results: {
-        'correctness': { passed: false, issue: 'Off-by-one in loop boundary calculation near line 42' },
-        'type-safety': { passed: false, issue: 'Missing null check on optional field access' },
-        'scope-drift': { passed: true },
-        'style-conventions': { passed: true },
+        'correctness': { passed: false, issue: 'Off-by-one in loop boundary calculation near line 42', reasoning: 'Verified that the loop condition at line 42 does not include the upper bound, which causes the last element to be skipped.' },
+        'type-safety': { passed: false, issue: 'Missing null check on optional field access', reasoning: 'ok' },
+        'scope-drift': { passed: true, reasoning: 'All changes are contained within the declared scope boundaries.' },
+        'style-conventions': { passed: true, reasoning: 'Linting passed with no violations.' },
       },
       edges_considered: [
         { case: 'When the input contains a very long path like /usr/local/lib/python3.11/site-packages/some_deeply_nested_module/utils/helpers.py', handled: true, evidence: 'Path is split at OS separator' },
@@ -81,6 +81,31 @@ describe('TaskDetailDrawerMeta DetailsTab — viewport regression', () => {
         await act(async () => { srButton.click(); });
       }
     });
+  });
+
+  test('displays reasoning text for both passed and failed checks', async () => {
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+
+    await act(async () => { r.render(<DetailsTab task={richTask} />); });
+
+    // Expand the Self-Review panel
+    const buttons = host.querySelectorAll('button');
+    const srButton = Array.from(buttons).find(b => b.textContent?.includes('Self-Review'));
+    if (srButton) {
+      await act(async () => { srButton.click(); });
+    }
+
+    // Check that reasoning text is rendered for failed checks
+    const content = host.textContent ?? '';
+    expect(content).toContain('Verified that the loop condition');
+    expect(content).toContain('ok');
+
+    // Check that reasoning text is rendered for passed checks
+    expect(content).toContain('All changes are contained within');
+    expect(content).toContain('Linting passed with no violations');
   });
 
   test('interactive controls meet 44px touch target at 375px', async () => {

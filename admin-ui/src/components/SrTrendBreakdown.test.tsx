@@ -1060,6 +1060,133 @@ describe('SrTrendBreakdown reasoning engagement', () => {
   });
 });
 
+describe('SrTrendBreakdown severity calibration badge', () => {
+  it('shows undercal badge when under_rated/total >= 30% and total >= 5', () => {
+    const trends: SrTrendData = {
+      categories: {
+        security: {
+          miss_rate: 0.2,
+          trend: 'stable',
+          severity_calibration: { under_rated: 6, over_rated: 1, matched: 3, total: 10 },
+        },
+      },
+    };
+    render(<SrTrendBreakdown trends={trends} variant="card" />);
+    const badge = screen.getByTitle(/Severity under-rated/i);
+    expect(badge).toBeInTheDocument();
+    expect(badge).toHaveTextContent('undercal:60%');
+  });
+
+  it('applies amber color to undercal badge', () => {
+    const trends: SrTrendData = {
+      categories: {
+        correctness: {
+          miss_rate: 0.1,
+          trend: 'stable',
+          severity_calibration: { under_rated: 4, over_rated: 0, matched: 6, total: 10 },
+        },
+      },
+    };
+    render(<SrTrendBreakdown trends={trends} variant="card" />);
+    const badge = screen.getByTitle(/Severity under-rated/i);
+    expect(badge.className).toContain('text-amber-400');
+  });
+
+  it('does not show undercal badge when total < 5 (insufficient sample)', () => {
+    const trends: SrTrendData = {
+      categories: {
+        correctness: {
+          miss_rate: 0.2,
+          trend: 'stable',
+          severity_calibration: { under_rated: 3, over_rated: 0, matched: 1, total: 4 },
+        },
+      },
+    };
+    render(<SrTrendBreakdown trends={trends} variant="card" />);
+    expect(screen.queryByTitle(/Severity under-rated/i)).not.toBeInTheDocument();
+  });
+
+  it('does not show undercal badge when under_rated/total < 30%', () => {
+    const trends: SrTrendData = {
+      categories: {
+        correctness: {
+          miss_rate: 0.2,
+          trend: 'stable',
+          severity_calibration: { under_rated: 1, over_rated: 2, matched: 7, total: 10 },
+        },
+      },
+    };
+    render(<SrTrendBreakdown trends={trends} variant="card" />);
+    expect(screen.queryByTitle(/Severity under-rated/i)).not.toBeInTheDocument();
+  });
+
+  it('does not show undercal badge when severity_calibration is null', () => {
+    const trends: SrTrendData = {
+      categories: {
+        correctness: { miss_rate: 0.2, trend: 'stable', severity_calibration: null },
+      },
+    };
+    render(<SrTrendBreakdown trends={trends} variant="card" />);
+    expect(screen.queryByTitle(/Severity under-rated/i)).not.toBeInTheDocument();
+  });
+
+  it('shows undercal badge in inline variant when threshold is met', () => {
+    const trends: SrTrendData = {
+      categories: {
+        security: {
+          miss_rate: 0.15,
+          trend: 'stable',
+          severity_calibration: { under_rated: 12, over_rated: 2, matched: 6, total: 20 },
+        },
+      },
+    };
+    render(<SrTrendBreakdown trends={trends} variant="inline" />);
+    const badge = screen.getByTitle(/Severity under-rated/i);
+    expect(badge).toHaveTextContent('undercal:60%');
+  });
+
+  it('badge title mentions under_rated count, total, and suppression context', () => {
+    const trends: SrTrendData = {
+      categories: {
+        correctness: {
+          miss_rate: 0.1,
+          trend: 'stable',
+          severity_calibration: { under_rated: 8, over_rated: 1, matched: 3, total: 12 },
+        },
+      },
+    };
+    render(<SrTrendBreakdown trends={trends} variant="card" />);
+    const badge = screen.getByTitle(/Severity under-rated/i);
+    expect(badge.title).toContain('8/12');
+    expect(badge.title).toMatch(/under-rating suppresses escalation/i);
+  });
+
+  it('shows exact 30% boundary: under_rated 3/10 = 30% is shown', () => {
+    const trends: SrTrendData = {
+      categories: {
+        correctness: {
+          miss_rate: 0.2,
+          trend: 'stable',
+          severity_calibration: { under_rated: 3, over_rated: 2, matched: 5, total: 10 },
+        },
+      },
+    };
+    render(<SrTrendBreakdown trends={trends} variant="card" />);
+    expect(screen.getByTitle(/Severity under-rated/i)).toHaveTextContent('undercal:30%');
+  });
+
+  it('does not show badge when severity_calibration is absent from category', () => {
+    const trends: SrTrendData = {
+      categories: {
+        correctness: { miss_rate: 0.3, trend: 'stable' },
+      },
+    };
+    render(<SrTrendBreakdown trends={trends} variant="card" />);
+    expect(screen.queryByTitle(/Severity under-rated/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/undercal/)).not.toBeInTheDocument();
+  });
+});
+
 describe('SrTrendBreakdown by_scope section', () => {
   it('renders By Scope heading and rows when by_scope is populated (card variant)', () => {
     const trends: SrTrendData = {

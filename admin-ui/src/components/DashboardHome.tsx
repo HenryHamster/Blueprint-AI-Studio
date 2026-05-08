@@ -271,6 +271,19 @@ interface DigestData {
     prediction_sample_size: number;
   } | null;
   edges_trend?: EdgesTrend | null;
+  sr_false_attestation_trends?: {
+    computed_at?: string | null;
+    bucket_mode?: string | null;
+    per_category?: Record<string, {
+      false_attestation_rate?: number | null;
+      previous_false_attestation_rate?: number | null;
+      delta?: number | null;
+      trend?: string | null;
+      ci_confirmed?: number | null;
+      false_attested?: number | null;
+      ci_data_missing?: number | null;
+    }> | null;
+  } | null;
   median_cost_per_merged_pr?: number | null;
   prediction_calibration_factor?: number | null;
   prediction_calibration_note?: string | null;
@@ -1065,7 +1078,7 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
           })()}
 
           {/* Section 1d3: Review Quality */}
-          {!loading && (digest?.review_accuracy != null || digest?.self_review_effectiveness != null || digest?.self_review_prediction_accuracy != null || digest?.self_review_prediction_accuracy_trends != null || digest?.self_review_skip_rate != null || digest?.fresh_reviewer_effectiveness != null) && (
+          {!loading && (digest?.review_accuracy != null || digest?.self_review_effectiveness != null || digest?.self_review_prediction_accuracy != null || digest?.self_review_prediction_accuracy_trends != null || digest?.self_review_skip_rate != null || digest?.fresh_reviewer_effectiveness != null || digest?.sr_false_attestation_trends != null) && (
             <section>
               <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-2">Review Quality</p>
               <div className="flex flex-wrap gap-3">
@@ -1227,6 +1240,50 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
                         {Math.round(rate * 100)}%
                       </p>
                       <p className="text-[9px] text-neutral-600 mt-0.5">n={skip.sample_size}</p>
+                    </div>
+                  );
+                })()}
+                {digest?.sr_false_attestation_trends?.per_category != null && (() => {
+                  const cats = digest.sr_false_attestation_trends!.per_category!;
+                  const entries = Object.entries(cats).filter(([, v]) => v.false_attestation_rate != null);
+                  if (entries.length === 0) return null;
+                  const CAT_LABELS: Record<string, string> = {
+                    tests_executed_cleanly: 'Tests',
+                    lint_executed_cleanly: 'Lint',
+                    typecheck_executed_cleanly: 'Typecheck',
+                  };
+                  const tooltipLines = entries.map(([cat, v]) => {
+                    const label = CAT_LABELS[cat] ?? cat;
+                    const rate = v.false_attestation_rate!;
+                    const n = (v.ci_confirmed ?? 0) + (v.false_attested ?? 0);
+                    const trendStr = v.trend === 'improving' ? '↓' : v.trend === 'regressing' ? '↑' : '→';
+                    return `${label}: ${Math.round(rate * 100)}% (${v.false_attested ?? 0}/${n}) ${trendStr}`;
+                  });
+                  const worstRate = Math.max(...entries.map(([, v]) => v.false_attestation_rate ?? 0));
+                  const color = worstRate <= 0.05 ? 'text-emerald-400' : worstRate <= 0.1 ? 'text-amber-400' : 'text-red-400';
+                  return (
+                    <div
+                      className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[130px]"
+                      title={['SR False Attestation (SR passed but CI failed):', ...tooltipLines].join('\n')}
+                      data-testid="sr-false-attestation-tile"
+                    >
+                      <p className="text-[9px] text-neutral-500 uppercase tracking-wide mb-0.5">SR False Attest</p>
+                      <p className={`text-xl font-bold font-mono ${color}`}>
+                        {Math.round(worstRate * 100)}%
+                      </p>
+                      <div className="flex flex-col gap-0.5 mt-0.5">
+                        {entries.map(([cat, v]) => {
+                          const label = CAT_LABELS[cat] ?? cat;
+                          const rate = v.false_attestation_rate!;
+                          const trendIcon = v.trend === 'improving' ? '↓' : v.trend === 'regressing' ? '↑' : '→';
+                          const trendColor = v.trend === 'improving' ? 'text-emerald-500' : v.trend === 'regressing' ? 'text-red-500' : 'text-neutral-500';
+                          return (
+                            <p key={cat} className="text-[9px] text-neutral-600">
+                              {label}: {Math.round(rate * 100)}% <span className={trendColor}>{trendIcon}</span>
+                            </p>
+                          );
+                        })}
+                      </div>
                     </div>
                   );
                 })()}

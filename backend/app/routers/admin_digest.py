@@ -1916,6 +1916,7 @@ async def compute_pipeline_health_summary(
     # SR catch-rate trends from compute_sr_catch_rate_trends stored in project.design_doc.
     self_review_prediction_accuracy_trends: Optional[Dict[str, Any]] = None
     sr_regression_risk_test_signal_trends: Optional[Dict[str, Any]] = None
+    sr_false_attestation_trends: Optional[Dict[str, Any]] = None
     if project and project.design_doc:
         sr_trends = project.design_doc.get("sr_catch_rate_trends") or {}
         if sr_trends:
@@ -1925,6 +1926,9 @@ async def compute_pipeline_health_summary(
         sr_rrts = project.design_doc.get("sr_regression_risk_test_signal_trends")
         if sr_rrts:
             sr_regression_risk_test_signal_trends = sr_rrts
+        sft = project.design_doc.get("sr_false_attestation_trends")
+        if sft:
+            sr_false_attestation_trends = sft
 
     # Fresh-reviewer cycle-over-cycle trend from compute_fresh_reviewer_trend stored in project.design_doc.
     fresh_reviewer_trend: Optional[Dict[str, Any]] = None
@@ -2045,6 +2049,7 @@ async def compute_pipeline_health_summary(
         "self_review_prediction_accuracy": self_review_prediction_accuracy,
         "self_review_prediction_accuracy_trends": self_review_prediction_accuracy_trends,
         "sr_regression_risk_test_signal_trends": sr_regression_risk_test_signal_trends,
+        "sr_false_attestation_trends": sr_false_attestation_trends,
         "fresh_reviewer_trend": fresh_reviewer_trend,
         "edges_trend": edges_trend,
         "edges_considered_metrics": edges_considered_metrics,

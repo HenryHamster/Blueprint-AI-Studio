@@ -5021,6 +5021,110 @@ async def test_reasoning_engagement_populated_for_stable_categories(
 
 
 @pytest.mark.asyncio
+async def test_reasoning_quality_scoring(db_session: AsyncSession):
+    """Reasoning quality score rewards file paths, test names, and word count."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+
+    # Current window: 5 tasks with varying reasoning quality.
+    # Empty reasoning: no quality score
+    t = _make_sr_task(
+        project.id,
+        age_days=2,
+        human_cats={"correctness": 1},
+        sr_failed_cats=[],
+        sr_passed_cats_with_reasoning={"correctness": ""},
+    )
+    db_session.add(t)
+    tasks.append(t)
+
+    # Low quality: "looks ok" (3 words, no signals) → score ≈ 0.0
+    t = _make_sr_task(
+        project.id,
+        age_days=2,
+        human_cats={"correctness": 1},
+        sr_failed_cats=[],
+        sr_passed_cats_with_reasoning={"correctness": "looks ok here"},
+    )
+    db_session.add(t)
+    tasks.append(t)
+
+    # Medium quality: "looks fine to me — checked the diff" (8 words, no signals) → score ≈ 0.34
+    t = _make_sr_task(
+        project.id,
+        age_days=2,
+        human_cats={"correctness": 1},
+        sr_failed_cats=[],
+        sr_passed_cats_with_reasoning={
+            "correctness": "looks fine to me checked the diff"
+        },
+    )
+    db_session.add(t)
+    tasks.append(t)
+
+    # High quality: file path + test name + word count → score = 1.0
+    t = _make_sr_task(
+        project.id,
+        age_days=2,
+        human_cats={"correctness": 1},
+        sr_failed_cats=[],
+        sr_passed_cats_with_reasoning={
+            "correctness": "verified backend/app/foo.py handles the empty list case via test_foo.py::test_empty"
+        },
+    )
+    db_session.add(t)
+    tasks.append(t)
+
+    # Medium-high: file path + word count → score ≈ 0.67
+    t = _make_sr_task(
+        project.id,
+        age_days=2,
+        human_cats={"correctness": 1},
+        sr_failed_cats=[],
+        sr_passed_cats_with_reasoning={
+            "correctness": "checked the logic in backend/app/utils.py and verified all edge cases are correct"
+        },
+    )
+    db_session.add(t)
+    tasks.append(t)
+
+    # Previous window: 5 tasks (same pattern to keep trend stable)
+    for reasoning in [
+        "",
+        "looks ok here",
+        "looks fine to me checked the diff",
+        "verified backend/app/foo.py handles the empty list case via test_foo.py::test_empty",
+        "checked the logic in backend/app/utils.py and verified all edge cases are correct",
+    ]:
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=[],
+            sr_passed_cats_with_reasoning={"correctness": reasoning},
+        )
+        db_session.add(t)
+        tasks.append(t)
+
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+    assert result is not None
+    cat = result["categories"].get("correctness")
+    assert cat is not None
+
+    # Verify quality_rate is present and non-zero (average across all tasks)
+    assert "reasoning_quality_rate" in cat
+    quality_rate = cat["reasoning_quality_rate"]
+    assert quality_rate is not None
+    assert quality_rate > 0.0, "quality rate should be > 0 with mixed-quality inputs"
+    # With the mixed inputs, quality_rate should be moderately good
+    assert quality_rate >= 0.3
+
+
+@pytest.mark.asyncio
 async def test_pass_reasoning_thinning_alert_fires_for_non_regressing_category(
     db_session: AsyncSession,
 ):
@@ -11006,6 +11110,204 @@ async def test_blind_spot_layer_distribution_populated(db_session: AsyncSession)
             assert isinstance(layer_count, int) and layer_count > 0
         total = sum(dist.values())
         assert total <= entry["count"] * 5  # at most 5 layers per example
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests for _compute_cat_severity_calibration
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _make_sr_task_with_severity(
+    project_id,
+    *,
+    age_days: float,
+    human_cats: dict,
+    agent_cat: str,
+    agent_severity: str,
+    reviewer_severity: str,
+    reviewer_keyword: str = "injection",
+) -> Task:
+    """Build a Task with severity-annotated SR check_result and review_loop history."""
+    check_results = {
+        agent_cat: {"passed": False, "issue": "x", "severity": agent_severity}
+    }
+    ctx: dict = {
+        "_self_review_outcome": {"check_results": check_results},
+        "_first_attempt_rejection_categories": human_cats,
+        "review_loop": {
+            "review_history": [
+                {
+                    "iteration": 0,
+                    "issues": [
+                        {
+                            "description": f"{reviewer_keyword} vulnerability found",
+                            "severity": reviewer_severity,
+                        }
+                    ],
+                }
+            ]
+        },
+    }
+    task = Task(
+        project_id=project_id,
+        title="SR severity task",
+        payloads=[{"type": "create", "prompt": "do something"}],
+        status=TaskStatus.COMPLETED,
+        context=ctx,
+    )
+    task.created_at = _utcnow() - timedelta(days=age_days)
+    return task
+
+
+def test_compute_cat_severity_calibration_matched_under_over():
+    """_compute_cat_severity_calibration correctly buckets matched/under/over cases."""
+    from app.playbook_learning import _compute_cat_severity_calibration
+
+    project_id = uuid.uuid4()
+
+    # Task 1: agent=MINOR, reviewer=CRITICAL → under_rated
+    t1 = _make_sr_task_with_severity(
+        project_id,
+        age_days=1,
+        human_cats={"security": 1},
+        agent_cat="security",
+        agent_severity="MINOR",
+        reviewer_severity="CRITICAL",
+        reviewer_keyword="injection",
+    )
+    # Task 2: agent=MAJOR, reviewer=MAJOR → matched
+    t2 = _make_sr_task_with_severity(
+        project_id,
+        age_days=1,
+        human_cats={"security": 1},
+        agent_cat="security",
+        agent_severity="MAJOR",
+        reviewer_severity="MAJOR",
+        reviewer_keyword="injection",
+    )
+    # Task 3: agent=CRITICAL, reviewer=MINOR → over_rated
+    t3 = _make_sr_task_with_severity(
+        project_id,
+        age_days=1,
+        human_cats={"security": 1},
+        agent_cat="security",
+        agent_severity="CRITICAL",
+        reviewer_severity="MINOR",
+        reviewer_keyword="injection",
+    )
+
+    result = _compute_cat_severity_calibration([t1, t2, t3])
+
+    assert "security" in result
+    sec = result["security"]
+    assert sec["under_rated"] == 1
+    assert sec["over_rated"] == 1
+    assert sec["matched"] == 1
+    assert sec["total"] == 3
+
+
+def test_compute_cat_severity_calibration_skips_missing_severity():
+    """Tasks without agent severity or no review_history are skipped."""
+    from app.playbook_learning import _compute_cat_severity_calibration
+
+    project_id = uuid.uuid4()
+
+    # No agent severity
+    t_no_agent_sev = Task(
+        project_id=project_id,
+        title="t",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.COMPLETED,
+        context={
+            "_self_review_outcome": {
+                "check_results": {"security": {"passed": False, "issue": "x"}}
+            },
+            "_first_attempt_rejection_categories": {"security": 1},
+            "review_loop": {
+                "review_history": [
+                    {
+                        "iteration": 0,
+                        "issues": [
+                            {"description": "injection vuln", "severity": "CRITICAL"}
+                        ],
+                    }
+                ]
+            },
+        },
+    )
+    t_no_agent_sev.created_at = _utcnow() - timedelta(days=1)
+
+    # No review_history
+    t_no_rev_hist = Task(
+        project_id=project_id,
+        title="t",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.COMPLETED,
+        context={
+            "_self_review_outcome": {
+                "check_results": {
+                    "security": {"passed": False, "issue": "x", "severity": "MINOR"}
+                }
+            },
+            "_first_attempt_rejection_categories": {"security": 1},
+        },
+    )
+    t_no_rev_hist.created_at = _utcnow() - timedelta(days=1)
+
+    result = _compute_cat_severity_calibration([t_no_agent_sev, t_no_rev_hist])
+    assert result == {}
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_severity_calibration_propagates(
+    db_session: AsyncSession,
+):
+    """severity_calibration is included in categories when conditions are met."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+
+    # Current window (7 tasks): agent rates security as MINOR, reviewer rates CRITICAL
+    for _ in range(7):
+        t = _make_sr_task_with_severity(
+            project.id,
+            age_days=2,
+            human_cats={"security": 1},
+            agent_cat="security",
+            agent_severity="MINOR",
+            reviewer_severity="CRITICAL",
+            reviewer_keyword="injection",
+        )
+        db_session.add(t)
+        tasks.append(t)
+
+    # Previous window (6 tasks): matched severities
+    for _ in range(6):
+        t = _make_sr_task_with_severity(
+            project.id,
+            age_days=20,
+            human_cats={"security": 1},
+            agent_cat="security",
+            agent_severity="MAJOR",
+            reviewer_severity="MAJOR",
+            reviewer_keyword="injection",
+        )
+        db_session.add(t)
+        tasks.append(t)
+
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    assert "security" in result["categories"]
+    cal = result["categories"]["security"].get("severity_calibration")
+    assert cal is not None, "severity_calibration should be present"
+    assert cal["total"] == 7
+    assert cal["under_rated"] == 7
+    assert cal["over_rated"] == 0
+    assert cal["matched"] == 0
 
 
 @pytest.mark.asyncio
