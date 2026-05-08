@@ -16,6 +16,7 @@ paths do not share an in-flight dedup key — each enforces its own.
 from __future__ import annotations
 
 import contextvars
+import hashlib
 import logging
 import time
 import uuid
@@ -99,6 +100,14 @@ _FIX_LOOP_DIVERGENCE_FINGERPRINT_WINDOW_DAYS = 7
 _VIEWPORT_REGRESSION_MIN_FAILURES = 2
 _VIEWPORT_REGRESSION_WINDOW_DAYS = 7
 
+# Agent VM resource exhaustion signal thresholds.
+# VM-layer failures (OOM, spot preemption, provisioning failure, heartbeat loss)
+# must reach this count in the 24h window before an investigation is spawned.
+# Informed by the playbook's e2-standard-2 memory-pressure entry: 3 occurrences
+# is noise suppression matching _ANOMALY_DISPATCH_MIN_OCCURRENCES.
+_AGENT_VM_RESOURCE_MIN_FAILURES = 3
+_AGENT_VM_RESOURCE_WINDOW_HOURS = 24
+
 # SR blind-spot theme occurrence floor. A blind_spot theme must appear at least
 # this many times across the 14d window before it is considered a structural gap
 # in the self-review prompt rather than a one-off observation from a single task.
@@ -123,6 +132,17 @@ _LAYER_DEFENSE_LEDGER_LOOKBACK_DAYS = 90
 _LAYER_CONCENTRATION_MIN_DISTINCT_CASES = 3
 _LAYER_CONCENTRATION_FRAGILE_AVG_HOLD_DAYS = 7.0
 _LAYER_CONCENTRATION_FRAGILE_RETRIPS = 2
+
+# Cross-case error-fingerprint meta-signal thresholds.
+# Trips when the SAME normalized error fingerprint surfaces across at least
+# _CROSS_CASE_FINGERPRINT_MIN_DISTINCT_CLASSES distinct ``regression_class``
+# values AND aggregates at least _CROSS_CASE_FINGERPRINT_MIN_OCCURRENCES
+# entries inside the lookback window. Catches the case where one underlying
+# root cause shows up under multiple surface classes (e.g. an import-ordering
+# breakage that trips fix_loop_divergence:lint and sr_blind_spot:style).
+_CROSS_CASE_FINGERPRINT_LOOKBACK = timedelta(days=14)
+_CROSS_CASE_FINGERPRINT_MIN_DISTINCT_CLASSES = 2
+_CROSS_CASE_FINGERPRINT_MIN_OCCURRENCES = 3
 
 # Strategic-cycle stall threshold: how many hours without a completed
 # strategic_review or design_doc_update before we flag the engine as stalled.
@@ -3290,6 +3310,130 @@ async def _evaluate_viewport_regression_signal(
     return spawned
 
 
+def _extract_evaluating_since(task: Task) -> datetime:
+    """Return when the task most recently entered EVALUATING status.
+
+    Scans status_log (newest-first) for the transition entry; falls back
+    to task.updated_at then task.created_at if no entry is found.
+    """
+    for entry in reversed(task.status_log or []):
+        if "→ EVALUATING" in str(entry.get("msg", "")):
+            ts = _parse_iso_timestamp(entry.get("t"))
+            if ts is not None:
+                return ts
+    anchor = task.updated_at or task.created_at
+    return anchor.replace(tzinfo=None) if getattr(anchor, "tzinfo", None) else anchor
+
+
+def _format_reviewer_sla_stall_prompt(
+    *,
+    case_id: uuid.UUID,
+    pr_number: int | None,
+    elapsed_hours: float,
+    task_id: uuid.UUID,
+    task_status: str,
+    latest_status_message: str | None,
+) -> str:
+    pr_str = f"#{pr_number}" if pr_number is not None else "(no PR recorded)"
+    elapsed_str = f"{elapsed_hours:.1f}h"
+    status_excerpt = (latest_status_message or "").strip()[:500] or "(none)"
+    lines = [
+        f"Pipeline regression detected (reviewer_sla_stall / case={case_id}).",
+        f"Remediation PR {pr_str} has been in EVALUATING for {elapsed_str} with no review action.",
+        f"Linked task: {task_id} (status={task_status})",
+        f"Last status message (truncated to 500 chars):\n  {status_excerpt}",
+        "",
+        "Investigate: why has the remediation PR stalled in review/CI?  Look for:",
+        "  - PR blocked on missing reviewer or review queue backlog",
+        "  - CI rebuild stuck or flaking (no retry attempted)",
+        "  - Merge conflict preventing CI from running",
+        "  - Agent VM failure that left the task in EVALUATING with no forward progress",
+        "  - PR already closed/merged but the case was not updated (stale case state)",
+        "",
+        "Diagnose the root cause and produce the structured diagnosis JSON report "
+        "({summary, root_cause, recommended_fix, severity, confidence, affected_files}). "
+        "Do NOT prescribe a fix — let the investigate→fix chain produce the remediation.",
+    ]
+    return "\n".join(lines)
+
+
+async def _evaluate_reviewer_sla_signal(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    spawn_budget_left: int,
+) -> int:
+    """Trip reviewer_sla_stall:<case_id> when a remediation task sits in EVALUATING too long."""
+    if spawn_budget_left <= 0:
+        return 0
+    if not _runtime_config.get("reviewer_sla_stall_enabled", True):
+        return 0
+
+    threshold_hours = float(_runtime_config.get("reviewer_sla_stall_hours", 6))
+    now = _utcnow()
+
+    cases = (
+        (
+            await session.execute(
+                select(RegressionRemediationCase).where(
+                    RegressionRemediationCase.project_id == project_id,
+                    RegressionRemediationCase.status == RegressionCaseStatus.ACTIVE,
+                    RegressionRemediationCase.last_remediation_task_id.is_not(None),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    spawned = 0
+    for case in cases:
+        if spawned >= spawn_budget_left:
+            break
+
+        task = await session.get(Task, case.last_remediation_task_id)
+        if task is None:
+            continue
+
+        # Terminal tasks have already resolved; non-EVALUATING tasks are not stalled yet.
+        if task.status in (
+            TaskStatus.COMPLETED,
+            TaskStatus.FAILED,
+            TaskStatus.CANCELLED,
+        ):
+            continue
+        if task.status != TaskStatus.EVALUATING:
+            continue
+
+        evaluating_since = _extract_evaluating_since(task)
+        elapsed_hours = (now - evaluating_since).total_seconds() / 3600
+        if elapsed_hours < threshold_hours:
+            continue
+
+        regression_class = f"reviewer_sla_stall:{case.id}"
+        spawn = await _maybe_spawn(
+            session,
+            project_id,
+            signal_name="reviewer_sla_stall",
+            regression_class=regression_class,
+            prior_rate=None,
+            current_rate=None,
+            sample_size=int(elapsed_hours),
+            magnitude=elapsed_hours,
+            title_hint=f"reviewer SLA stall ({elapsed_hours:.1f}h)"[:80],
+            prompt_override=_format_reviewer_sla_stall_prompt(
+                case_id=case.id,
+                pr_number=case.last_remediation_pr_number,
+                elapsed_hours=elapsed_hours,
+                task_id=task.id,
+                task_status=str(task.status),
+                latest_status_message=task.latest_status_message,
+            ),
+        )
+        if spawn is not None:
+            spawned += 1
+    return spawned
+
+
 async def _evaluate_pipeline_success_signal(
     session: AsyncSession,
     project_id: uuid.UUID,
@@ -3527,6 +3671,10 @@ async def _evaluate_sr_blind_spot_signal(
             theme_extras.append(
                 f"Example (task {ex['task_id']} / {ex['task_type']}): {ex['text']}"
             )
+        triage = theme_entry.get("triage") or {}
+        triage_context = triage.get("triage_context") or ""
+        if triage_context:
+            theme_extras.append(f"Triage: {triage_context}")
         spawn = await _maybe_spawn(
             session,
             project_id,
@@ -3629,6 +3777,193 @@ async def _evaluate_layer_concentration_signal(
             sample_size=fix_count,
             magnitude=float(fix_count),
             title_hint=f"Layer concentration: {layer} ({len(sample_case_ids)} cases)",
+            prompt_override=prompt,
+        )
+        if spawn is not None:
+            spawned += 1
+
+    return spawned
+
+
+def _format_cross_case_fingerprint_prompt(
+    *,
+    fingerprint: str,
+    short_hash: str,
+    contributing_classes: list[str],
+    contributing_case_ids: list[str],
+    sample_messages: list[str],
+    occurrence_count: int,
+) -> str:
+    """Build the cross-case-fingerprint meta-investigation prompt."""
+    lines = [
+        f"CROSS-CASE FINGERPRINT META-INVESTIGATION (cross_case_fingerprint:{short_hash})",
+        (
+            "The same normalized error fingerprint has been observed across MULTIPLE "
+            "distinct regression_class values. The dispatcher cannot tell from "
+            "fingerprint identity alone whether this is one shared root cause or "
+            "several unrelated surfaces that happen to normalize the same way — "
+            "your investigation must validate which it is."
+        ),
+        "",
+        f"Normalized fingerprint: {fingerprint}",
+        f"Total occurrences in last {int(_CROSS_CASE_FINGERPRINT_LOOKBACK.days)}d: {occurrence_count}",
+        "",
+        "Contributing regression_class values:",
+    ]
+    for cls in contributing_classes:
+        lines.append(f"  - {cls}")
+    lines += ["", "Contributing case_ids:"]
+    for cid in contributing_case_ids:
+        lines.append(f"  - {cid}")
+    if sample_messages:
+        lines += ["", "Sample failure messages (deduped, truncated):"]
+        for msg in sample_messages:
+            lines.append(f"  - {msg}")
+    lines += [
+        "",
+        "FRAMING QUESTION FOR THE INVESTIGATION",
+        (
+            "Is this one shared root symptom we should fix once, rather than "
+            "fixing each surface independently? If yes, identify the shared "
+            "root cause and propose a single coordinated remediation. If no, "
+            "explain why these surfaces happen to share a fingerprint despite "
+            "being independent (e.g. fingerprint normalization is too coarse), "
+            "and recommend whether the fingerprint extraction should be tightened."
+        ),
+        "",
+        "Produce the structured diagnosis JSON "
+        "({summary, root_cause, recommended_fix, severity, confidence, affected_files}). "
+        "Do NOT prescribe a fix — let the investigate→fix chain produce the remediation.",
+    ]
+    return "\n".join(lines)
+
+
+async def _evaluate_cross_case_fingerprint_signal(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    spawn_budget_left: int,
+) -> int:
+    """Escalate when the SAME error fingerprint surfaces across multiple regression classes.
+
+    Trips when, for a normalized fingerprint string:
+    - Entries observed within ``_CROSS_CASE_FINGERPRINT_LOOKBACK`` span at least
+      ``_CROSS_CASE_FINGERPRINT_MIN_DISTINCT_CLASSES`` distinct
+      ``RegressionRemediationCase.regression_class`` values, AND
+    - Total in-window occurrence count >= ``_CROSS_CASE_FINGERPRINT_MIN_OCCURRENCES``.
+
+    Uses regression_class="cross_case_fingerprint:<short-hash>" so each
+    fingerprint has its own dedup/cooldown slot via the existing _maybe_spawn
+    gates. ``<short-hash>`` is the first 8 hex chars of sha256(fingerprint).
+
+    Skips empty fingerprints and fingerprints whose value equals the case's
+    own ``regression_class`` (the fallback ``_record_layer_observation`` writes
+    when no real classify_layers message was available — clustering those is
+    pure noise).
+    """
+    if spawn_budget_left <= 0:
+        return 0
+
+    all_cases = (
+        (
+            await session.execute(
+                select(RegressionRemediationCase).where(
+                    RegressionRemediationCase.project_id == project_id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not all_cases:
+        return 0
+
+    now = _utcnow()
+    cutoff = now - _CROSS_CASE_FINGERPRINT_LOOKBACK
+
+    # fingerprint -> aggregated state
+    by_fp: dict[str, dict[str, Any]] = {}
+    for case in all_cases:
+        case_class = case.regression_class or ""
+        case_id = str(case.id)
+        symptoms = case.symptoms_by_layer or {}
+        if not isinstance(symptoms, dict):
+            continue
+        for entries in symptoms.values():
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                fp_raw = entry.get("fingerprint")
+                if not isinstance(fp_raw, str):
+                    continue
+                fp = fp_raw.strip()
+                if not fp:
+                    continue
+                if fp == case_class:
+                    continue
+                obs_dt = _parse_iso_timestamp(entry.get("observed_at"))
+                if obs_dt is None or obs_dt < cutoff:
+                    continue
+                bucket = by_fp.setdefault(
+                    fp,
+                    {
+                        "occurrences": 0,
+                        "classes": set(),
+                        "case_ids": [],
+                        "samples": [],
+                    },
+                )
+                bucket["occurrences"] += 1
+                bucket["classes"].add(case_class)
+                if case_id not in bucket["case_ids"]:
+                    bucket["case_ids"].append(case_id)
+                sample = entry.get("sample")
+                if isinstance(sample, str) and sample:
+                    short = sample[:500]
+                    if short not in bucket["samples"] and len(bucket["samples"]) < 5:
+                        bucket["samples"].append(short)
+
+    spawned = 0
+    # Iterate in deterministic order (highest occurrence first, then fingerprint
+    # text) so multiple eligible fingerprints in one cycle resolve consistently.
+    candidates = sorted(
+        by_fp.items(),
+        key=lambda kv: (-kv[1]["occurrences"], kv[0]),
+    )
+    for fingerprint, bucket in candidates:
+        if spawned >= spawn_budget_left:
+            break
+        occurrence_count = bucket["occurrences"]
+        contributing_classes = sorted(bucket["classes"])
+        if len(contributing_classes) < _CROSS_CASE_FINGERPRINT_MIN_DISTINCT_CLASSES:
+            continue
+        if occurrence_count < _CROSS_CASE_FINGERPRINT_MIN_OCCURRENCES:
+            continue
+
+        short_hash = hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()[:8]
+        regression_class = f"cross_case_fingerprint:{short_hash}"
+        prompt = _format_cross_case_fingerprint_prompt(
+            fingerprint=fingerprint,
+            short_hash=short_hash,
+            contributing_classes=contributing_classes,
+            contributing_case_ids=bucket["case_ids"],
+            sample_messages=bucket["samples"],
+            occurrence_count=occurrence_count,
+        )
+        spawn = await _maybe_spawn(
+            session,
+            project_id,
+            signal_name="cross_case_fingerprint",
+            regression_class=regression_class,
+            prior_rate=None,
+            current_rate=None,
+            sample_size=occurrence_count,
+            magnitude=float(occurrence_count),
+            title_hint=(
+                f"cross-case fingerprint {short_hash} "
+                f"({len(contributing_classes)} classes, {occurrence_count} hits)"
+            )[:80],
             prompt_override=prompt,
         )
         if spawn is not None:
@@ -4071,6 +4406,128 @@ async def _evaluate_anomaly_signal(
         if spawn is not None:
             spawned += 1
     return spawned
+
+
+async def _collect_agent_vm_failures(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> list[dict]:
+    """Return recent FAILED tasks classified by VM-resource exit reason.
+
+    Inspects Task.context for failure_category, timeout_subtype, and
+    spot_preemption_count. Only tasks whose failure is attributable to the
+    AGENT_VM infrastructure layer are included; code-level timeouts (cascade,
+    iteration_limit) are excluded so this signal does not double-fire with
+    layer_concentration on the same events.
+
+    Exit-reason labels: 'oom', 'timeout', 'spot_preempt', 'vm_provisioning_failure'.
+    """
+    cutoff = _utcnow() - timedelta(hours=_AGENT_VM_RESOURCE_WINDOW_HOURS)
+    rows = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.project_id == project_id,
+                    Task.status == TaskStatus.FAILED,
+                    Task.created_at >= cutoff,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    from app.failure_classification import classify_vm_exit_reason
+
+    results = []
+    for task in rows:
+        exit_reason = classify_vm_exit_reason(task)
+        if exit_reason is None:
+            continue
+        ctx = task.context or {}
+        payload = task.first_payload or {}
+        results.append(
+            {
+                "task_id": str(task.id),
+                "task_type": payload.get("type", "unknown"),
+                "exit_reason": exit_reason,
+                "scope": ctx.get("scope", "unknown"),
+            }
+        )
+    return results
+
+
+async def _evaluate_agent_vm_resource_signal(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    spawn_budget_left: int,
+) -> int:
+    """Trip agent_vm_resource_exhaustion when VM-layer failures spike in the 24h window."""
+    if spawn_budget_left <= 0:
+        return 0
+    failures = await _collect_agent_vm_failures(session, project_id)
+    if len(failures) < _AGENT_VM_RESOURCE_MIN_FAILURES:
+        return 0
+
+    reason_counts: dict[str, int] = {}
+    task_id_samples: list[str] = []
+    task_types: dict[str, int] = {}
+    scope_counts: dict[str, int] = {}
+    for f in failures:
+        reason = f["exit_reason"]
+        reason_counts[reason] = reason_counts.get(reason, 0) + 1
+        if len(task_id_samples) < 5:
+            task_id_samples.append(f["task_id"])
+        ttype = f["task_type"]
+        task_types[ttype] = task_types.get(ttype, 0) + 1
+        scope = f["scope"]
+        scope_counts[scope] = scope_counts.get(scope, 0) + 1
+
+    count = len(failures)
+    reason_summary = ", ".join(f"{r}:{c}" for r, c in sorted(reason_counts.items()))
+    type_summary = ", ".join(f"{t}:{c}" for t, c in sorted(task_types.items()))
+    scope_summary = ", ".join(f"{s}:{c}" for s, c in sorted(scope_counts.items()))
+
+    prompt = "\n".join(
+        [
+            "Pipeline regression detected (agent_vm_resource / class=agent_vm_resource_exhaustion).",
+            "Canonical layer: AGENT_VM",
+            f"{count} tasks failed with VM-infrastructure exit reasons in the last "
+            f"{_AGENT_VM_RESOURCE_WINDOW_HOURS}h.",
+            f"Exit reasons: {reason_summary}",
+            f"Task types affected: {type_summary}",
+            f"Task scopes affected: {scope_summary}",
+            f"Sample task IDs: {', '.join(task_id_samples)}",
+            "",
+            "Investigate: is this code-budget creep (work outgrew the VM tier), spot "
+            "capacity churn, OS image regression, or something else?",
+            "Specifically:",
+            "1. Is exhaustion concentrated on a particular scope (small/medium/large)?",
+            "2. Is it concentrated on a particular task type?",
+            "3. Are OOM kills indicating memory pressure vs. heartbeat losses indicating "
+            "spot preemption?",
+            "4. Does the timing correlate with an OS image or VM-type change?",
+            "",
+            "Produce the structured diagnosis JSON ({summary, root_cause, recommended_fix, "
+            "severity, confidence, affected_files}).",
+        ]
+    )
+    spawn = await _maybe_spawn(
+        session,
+        project_id,
+        signal_name="agent_vm_resource",
+        regression_class="agent_vm_resource_exhaustion",
+        prior_rate=None,
+        current_rate=None,
+        sample_size=count,
+        magnitude=float(count),
+        title_hint=f"agent VM resource exhaustion ({reason_summary})"[:80],
+        prompt_override=prompt,
+        extra_context_fields={
+            "reason_counts": reason_counts,
+            "canonical_layer": "AGENT_VM",
+        },
+    )
+    return 1 if spawn is not None else 0
 
 
 async def _has_active_remediation_child(
@@ -4584,6 +5041,9 @@ async def _any_signal_would_trip(
         return True
     if await _collect_viewport_failures(session, project_id):
         return True
+    vm_failures = await _collect_agent_vm_failures(session, project_id)
+    if len(vm_failures) >= _AGENT_VM_RESOURCE_MIN_FAILURES:
+        return True
     return False
 
 
@@ -5022,6 +5482,11 @@ async def run_once(session: AsyncSession, project_id: uuid.UUID) -> int:
             project_id,
             spawn_budget - _spawned,
         )
+        _spawned += await _evaluate_cross_case_fingerprint_signal(
+            session,
+            project_id,
+            spawn_budget - _spawned,
+        )
         _spawned += await _evaluate_strategic_cycle_stall_signal(
             session,
             project_id,
@@ -5034,6 +5499,16 @@ async def run_once(session: AsyncSession, project_id: uuid.UUID) -> int:
             spawn_budget - _spawned,
         )
         _spawned += await _evaluate_viewport_regression_signal(
+            session,
+            project_id,
+            spawn_budget - _spawned,
+        )
+        _spawned += await _evaluate_reviewer_sla_signal(
+            session,
+            project_id,
+            spawn_budget - _spawned,
+        )
+        _spawned += await _evaluate_agent_vm_resource_signal(
             session,
             project_id,
             spawn_budget - _spawned,

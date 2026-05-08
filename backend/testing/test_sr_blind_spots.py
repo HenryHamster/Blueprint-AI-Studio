@@ -7,6 +7,7 @@ from app.sr_blind_spots import (
     DISALLOWED_BLIND_SPOT_PATTERNS,
     filter_disallowed_blind_spots,
     is_disallowed_blind_spot,
+    triage_sr_blind_spot_theme,
 )
 
 
@@ -124,3 +125,79 @@ def test_contract_fails_when_blocklist_mutated():
         "No pattern matches the first DISALLOWED_BLIND_SPOT_EXAMPLES entry — "
         "the backend constant is out of sync with the prompt examples."
     )
+
+
+# ---------------------------------------------------------------------------
+# Unit: triage_sr_blind_spot_theme
+# ---------------------------------------------------------------------------
+
+
+def test_triage_stale_assertion_two_signals():
+    """Theme with test-file path + assertion phrase fires ≥2 signals → likely_stale_assertion."""
+    theme = "agent/src/prompt.test.ts now expects ordering"
+    result = triage_sr_blind_spot_theme(theme, [])
+    assert result["verdict"] == "likely_stale_assertion"
+    assert "theme_references_test_file" in result["signals"]
+    assert any(s.startswith("assertion_phrase:") for s in result["signals"])
+    assert result["triage_context"] != ""
+
+
+def test_triage_prompt_regression_no_signals():
+    """Generic theme with no test-file refs or assertion language → likely_prompt_regression."""
+    theme = "missed edge case in retry logic"
+    examples = [
+        {"text": "no coverage for empty input", "task_id": "t1", "task_type": "create"}
+    ]
+    result = triage_sr_blind_spot_theme(theme, examples)
+    assert result["verdict"] == "likely_prompt_regression"
+    assert result["signals"] == []
+    assert result["triage_context"] == ""
+
+
+def test_triage_ambiguous_single_signal():
+    """One signal fires (assertion keyword, no test-file path in theme) → ambiguous."""
+    theme = "assertion mismatch in validation output"
+    result = triage_sr_blind_spot_theme(theme, [])
+    assert result["verdict"] == "ambiguous"
+    assert len(result["signals"]) == 1
+    assert result["triage_context"] != ""
+
+
+def test_triage_single_test_file_cluster_raises_confidence():
+    """All examples from the same test file fires single_test_file_cluster → likely_stale_assertion."""
+    theme = "install command ordering changed"
+    examples = [
+        {
+            "text": "test_install.py now expects ordering of install commands",
+            "task_id": "t1",
+            "task_type": "fix",
+        },
+        {
+            "text": "test_install.py expects ordering after prompt refactor",
+            "task_id": "t2",
+            "task_type": "fix",
+        },
+    ]
+    result = triage_sr_blind_spot_theme(theme, examples)
+    assert "single_test_file_cluster" in result["signals"]
+    # "expects ordering" and "now expects" also fire assertion_phrase → ≥2 signals
+    assert result["verdict"] == "likely_stale_assertion"
+
+
+def test_triage_mixed_test_files_suppresses_cluster_signal():
+    """Examples from different test files → no single_test_file_cluster signal."""
+    theme = "coverage gap in config parsing"
+    examples = [
+        {
+            "text": "test_config.py references old key name",
+            "task_id": "t1",
+            "task_type": "fix",
+        },
+        {
+            "text": "test_loader.py references different key",
+            "task_id": "t2",
+            "task_type": "fix",
+        },
+    ]
+    result = triage_sr_blind_spot_theme(theme, examples)
+    assert "single_test_file_cluster" not in result["signals"]

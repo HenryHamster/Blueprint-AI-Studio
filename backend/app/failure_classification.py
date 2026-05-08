@@ -673,6 +673,45 @@ def classify_timeout_subtype(task: "Task", logs: str | None = None) -> str:
     return _timeout_subtype_from_message(status_msg + " " + (logs or ""))
 
 
+# AGENT_TIMEOUT sub-types that indicate VM-layer deaths (as opposed to code-level
+# cascade/iteration cancellations). Used by classify_vm_exit_reason() and exported
+# so callers can build predicates without re-enumerating the set.
+VM_LAYER_TIMEOUT_SUBTYPES: frozenset[str] = frozenset(
+    {TIMEOUT_HEARTBEAT_LOST, TIMEOUT_PROCESS_CRASH, TIMEOUT_EXECUTION, TIMEOUT_UNKNOWN}
+)
+
+# VM-layer exit reasons used by the agent_vm_resource_exhaustion dispatcher signal.
+# Exported so both failure_classification and pipeline_regression_dispatcher agree
+# on the vocabulary without duplication.
+VM_RESOURCE_EXIT_REASONS: frozenset[str] = frozenset(
+    {"oom", "timeout", "spot_preempt", "vm_provisioning_failure"}
+)
+
+
+def classify_vm_exit_reason(task: "Task") -> str | None:
+    """Return the VM-layer exit reason for a failed task, or None.
+
+    Maps task context fields (failure_category, timeout_subtype, spot_preemption_count)
+    to the canonical exit-reason strings the agent_vm_resource_exhaustion signal uses.
+    Returns None when the failure is code-level or a cascade/iteration cancellation.
+    """
+    ctx = task.context or {}
+    failure_category = ctx.get("failure_category", "")
+    timeout_subtype = ctx.get("timeout_subtype", "")
+    spot_count = int(ctx.get("spot_preemption_count") or 0)
+
+    if failure_category == PROVISION_FAILURE:
+        return "vm_provisioning_failure"
+    if spot_count > 0:
+        return "spot_preempt"
+    if failure_category == AGENT_TIMEOUT:
+        if timeout_subtype == TIMEOUT_OOM:
+            return "oom"
+        if timeout_subtype in VM_LAYER_TIMEOUT_SUBTYPES:
+            return "timeout"
+    return None
+
+
 # EXTERNAL_API sub-types — finer breakdown so auto-remediation can apply
 # tailored recovery patterns per failure mode.
 EXTERNAL_API_SUBTYPE_PROVIDER_AUTH = "provider_auth"

@@ -4319,6 +4319,150 @@ async def test_sr_blind_spot_ingestion_filter_prevents_theme_spawn(db_session):
 
 
 @pytest.mark.asyncio
+async def test_sr_blind_spot_theme_stale_assertion_triage_context_in_prompt(db_session):
+    """likely_stale_assertion theme → spawned prompt includes triage context."""
+    from app.pipeline_regression_dispatcher import _SR_BLIND_SPOT_THEME_FLOOR
+    from app.time_utils import _utcnow as _ts_now
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _ts_now()
+    # This text produces a theme with ≥2 stale-assertion signals:
+    # Signal 1: "agent/src/prompt.test.ts" matches the test-file pattern.
+    # Signal 2: "expects ordering" matches the assertion-phrase list.
+    stale_text = "agent/src/prompt.test.ts now expects ordering of install commands"
+    for _ in range(_SR_BLIND_SPOT_THEME_FLOOR):
+        sro = {
+            "verdict": "pass",
+            "check_results": {"correctness": {"passed": True}},
+            "blind_spots": [stale_text],
+            "reviewer_findings": [],
+        }
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create", "prompt": "x", "base_branch": "main"}],
+                context={"_self_review_outcome": sro},
+                created_at=now - timedelta(days=3),
+            )
+        )
+    await db_session.commit()
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 1
+
+    all_tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    task = _get_investigate_task(all_tasks)
+    assert task is not None
+    prompt = (task.first_payload or {}).get("prompt", "")
+    assert "Triage:" in prompt, "Stale-assertion triage context must appear in prompt"
+    assert "stale" in prompt.lower(), "Prompt should mention stale assertion"
+
+
+@pytest.mark.asyncio
+async def test_sr_blind_spot_theme_prompt_regression_no_triage_context(db_session):
+    """likely_prompt_regression theme → spawned prompt has no triage context appended."""
+    from app.pipeline_regression_dispatcher import _SR_BLIND_SPOT_THEME_FLOOR
+    from app.time_utils import _utcnow as _ts_now
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _ts_now()
+    # This text fires zero stale-assertion signals: no test-file path, no assertion keywords.
+    regression_text = "missing error handling for null input edge case"
+    for _ in range(_SR_BLIND_SPOT_THEME_FLOOR):
+        sro = {
+            "verdict": "pass",
+            "check_results": {"correctness": {"passed": True}},
+            "blind_spots": [regression_text],
+            "reviewer_findings": [],
+        }
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create", "prompt": "x", "base_branch": "main"}],
+                context={"_self_review_outcome": sro},
+                created_at=now - timedelta(days=3),
+            )
+        )
+    await db_session.commit()
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 1
+
+    all_tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    task = _get_investigate_task(all_tasks)
+    assert task is not None
+    prompt = (task.first_payload or {}).get("prompt", "")
+    assert "Triage:" not in prompt, (
+        "Prompt-regression theme must not include triage context"
+    )
+
+
+@pytest.mark.asyncio
+async def test_sr_blind_spot_theme_ambiguous_triage_context_in_prompt(db_session):
+    """ambiguous theme (1 signal) → spawned prompt includes triage context."""
+    from app.pipeline_regression_dispatcher import _SR_BLIND_SPOT_THEME_FLOOR
+    from app.time_utils import _utcnow as _ts_now
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _ts_now()
+    # Signal 1 only: "test_utils.py" matches test-file pattern.
+    # No assertion keywords → ambiguous (1 signal).
+    ambiguous_text = "test_utils.py behavior edge cases not covered by suite"
+    for _ in range(_SR_BLIND_SPOT_THEME_FLOOR):
+        sro = {
+            "verdict": "pass",
+            "check_results": {"correctness": {"passed": True}},
+            "blind_spots": [ambiguous_text],
+            "reviewer_findings": [],
+        }
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create", "prompt": "x", "base_branch": "main"}],
+                context={"_self_review_outcome": sro},
+                created_at=now - timedelta(days=3),
+            )
+        )
+    await db_session.commit()
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 1
+
+    all_tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    task = _get_investigate_task(all_tasks)
+    assert task is not None
+    prompt = (task.first_payload or {}).get("prompt", "")
+    assert "Triage:" in prompt, "Ambiguous triage context must appear in prompt"
+
+
+@pytest.mark.asyncio
 async def test_sr_blind_spot_dedup_inflight_blocks_second_spawn(db_session):
     """Second run_once with an in-flight sr_blind_spot investigation → no duplicate spawn."""
     from app.playbook_learning import _MIN_SR_SAMPLE
@@ -9598,3 +9742,1126 @@ class TestViewportRegressionEvaluator:
             .all()
         )
         assert len(cases) == 1
+
+
+# ---------------------------------------------------------------------------
+# Reviewer SLA stall signal tests
+# ---------------------------------------------------------------------------
+
+
+class TestReviewerSlaStallSignal:
+    """Tests for _evaluate_reviewer_sla_signal."""
+
+    @pytest.mark.asyncio
+    async def test_stall_trips_and_spawns(self, db_session):
+        """ACTIVE case with EVALUATING task older than threshold spawns an investigation."""
+        from app.models import RegressionCaseStatus, RegressionRemediationCase
+        from app.pipeline_regression_dispatcher import _evaluate_reviewer_sla_signal
+        import app.shared_state as _shared_state
+
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        now = _utcnow()
+        evaluating_at = now - timedelta(hours=10)
+        stalled_task = make_task(
+            project_id=project.id,
+            status=TaskStatus.EVALUATING,
+            created_at=evaluating_at,
+            updated_at=evaluating_at,
+        )
+        stalled_task.status_log = [
+            {
+                "t": evaluating_at.isoformat(),
+                "msg": "Status changed: IN_PROGRESS → EVALUATING",
+            }
+        ]
+        db_session.add(stalled_task)
+        await db_session.commit()
+        await db_session.refresh(stalled_task)
+
+        case = RegressionRemediationCase(
+            project_id=project.id,
+            regression_class="sr_catch_rate",
+            status=RegressionCaseStatus.ACTIVE,
+            hit_count=1,
+            last_remediation_task_id=stalled_task.id,
+            last_remediation_pr_number=1234,
+        )
+        db_session.add(case)
+        await db_session.commit()
+
+        original_config = dict(_shared_state.runtime_config)
+        _shared_state.runtime_config["reviewer_sla_stall_hours"] = 6
+        try:
+            spawned = await _evaluate_reviewer_sla_signal(db_session, project.id, 2)
+        finally:
+            _shared_state.runtime_config.clear()
+            _shared_state.runtime_config.update(original_config)
+
+        assert spawned == 1
+        await db_session.commit()
+
+        tasks = (
+            (
+                await db_session.execute(
+                    select(Task).where(Task.project_id == project.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        investigate_tasks = [
+            t for t in tasks if (t.first_payload or {}).get("type") == "investigate"
+        ]
+        assert len(investigate_tasks) == 1
+        ctx = investigate_tasks[0].context or {}
+        assert ctx.get("regression_class", "").startswith("reviewer_sla_stall:")
+        assert ctx.get("signal_name") == "reviewer_sla_stall"
+        prompt = (investigate_tasks[0].first_payload or {}).get("prompt", "")
+        assert "#1234" in prompt
+        assert "EVALUATING" in prompt
+
+    @pytest.mark.asyncio
+    async def test_within_sla_does_not_spawn(self, db_session):
+        """ACTIVE case with EVALUATING task younger than threshold does not spawn."""
+        from app.models import RegressionCaseStatus, RegressionRemediationCase
+        from app.pipeline_regression_dispatcher import _evaluate_reviewer_sla_signal
+        import app.shared_state as _shared_state
+
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        now = _utcnow()
+        recent_at = now - timedelta(hours=2)
+        task = make_task(
+            project_id=project.id,
+            status=TaskStatus.EVALUATING,
+            created_at=recent_at,
+            updated_at=recent_at,
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        case = RegressionRemediationCase(
+            project_id=project.id,
+            regression_class="sr_catch_rate",
+            status=RegressionCaseStatus.ACTIVE,
+            hit_count=1,
+            last_remediation_task_id=task.id,
+        )
+        db_session.add(case)
+        await db_session.commit()
+
+        original_config = dict(_shared_state.runtime_config)
+        _shared_state.runtime_config["reviewer_sla_stall_hours"] = 6
+        try:
+            spawned = await _evaluate_reviewer_sla_signal(db_session, project.id, 2)
+        finally:
+            _shared_state.runtime_config.clear()
+            _shared_state.runtime_config.update(original_config)
+
+        assert spawned == 0
+
+    @pytest.mark.asyncio
+    async def test_skip_terminal_task(self, db_session):
+        """Cases whose linked task is COMPLETED/FAILED/CANCELLED are skipped."""
+        from app.models import RegressionCaseStatus, RegressionRemediationCase
+        from app.pipeline_regression_dispatcher import _evaluate_reviewer_sla_signal
+        import app.shared_state as _shared_state
+
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        old_at = _utcnow() - timedelta(hours=20)
+        for terminal_status in (
+            TaskStatus.COMPLETED,
+            TaskStatus.FAILED,
+            TaskStatus.CANCELLED,
+        ):
+            task = make_task(
+                project_id=project.id,
+                status=terminal_status,
+                created_at=old_at,
+                updated_at=old_at,
+            )
+            db_session.add(task)
+        await db_session.commit()
+
+        terminal_tasks = (
+            (
+                await db_session.execute(
+                    select(Task).where(Task.project_id == project.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for t in terminal_tasks:
+            case = RegressionRemediationCase(
+                project_id=project.id,
+                regression_class=f"sr_catch_rate:{t.id}",
+                status=RegressionCaseStatus.ACTIVE,
+                hit_count=1,
+                last_remediation_task_id=t.id,
+            )
+            db_session.add(case)
+        await db_session.commit()
+
+        original_config = dict(_shared_state.runtime_config)
+        _shared_state.runtime_config["reviewer_sla_stall_hours"] = 6
+        try:
+            spawned = await _evaluate_reviewer_sla_signal(db_session, project.id, 5)
+        finally:
+            _shared_state.runtime_config.clear()
+            _shared_state.runtime_config.update(original_config)
+
+        assert spawned == 0
+
+    @pytest.mark.asyncio
+    async def test_skip_non_evaluating_task(self, db_session):
+        """Cases whose task is IN_PROGRESS (not yet in EVALUATING) are skipped."""
+        from app.models import RegressionCaseStatus, RegressionRemediationCase
+        from app.pipeline_regression_dispatcher import _evaluate_reviewer_sla_signal
+        import app.shared_state as _shared_state
+
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        old_at = _utcnow() - timedelta(hours=20)
+        task = make_task(
+            project_id=project.id,
+            status=TaskStatus.IN_PROGRESS,
+            created_at=old_at,
+            updated_at=old_at,
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        case = RegressionRemediationCase(
+            project_id=project.id,
+            regression_class="sr_catch_rate",
+            status=RegressionCaseStatus.ACTIVE,
+            hit_count=1,
+            last_remediation_task_id=task.id,
+        )
+        db_session.add(case)
+        await db_session.commit()
+
+        original_config = dict(_shared_state.runtime_config)
+        _shared_state.runtime_config["reviewer_sla_stall_hours"] = 6
+        try:
+            spawned = await _evaluate_reviewer_sla_signal(db_session, project.id, 2)
+        finally:
+            _shared_state.runtime_config.clear()
+            _shared_state.runtime_config.update(original_config)
+
+        assert spawned == 0
+
+    @pytest.mark.asyncio
+    async def test_dedup_in_flight_investigation_blocks_second_spawn(self, db_session):
+        """A second cycle with the prior SLA investigation still in-flight does not re-spawn."""
+        from app.models import RegressionCaseStatus, RegressionRemediationCase
+        from app.pipeline_regression_dispatcher import _evaluate_reviewer_sla_signal
+        import app.shared_state as _shared_state
+
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        now = _utcnow()
+        evaluating_at = now - timedelta(hours=10)
+        stalled_task = make_task(
+            project_id=project.id,
+            status=TaskStatus.EVALUATING,
+            created_at=evaluating_at,
+            updated_at=evaluating_at,
+        )
+        db_session.add(stalled_task)
+        await db_session.commit()
+        await db_session.refresh(stalled_task)
+
+        case = RegressionRemediationCase(
+            project_id=project.id,
+            regression_class="sr_catch_rate",
+            status=RegressionCaseStatus.ACTIVE,
+            hit_count=1,
+            last_remediation_task_id=stalled_task.id,
+        )
+        db_session.add(case)
+        await db_session.commit()
+        await db_session.refresh(case)
+
+        original_config = dict(_shared_state.runtime_config)
+        _shared_state.runtime_config["reviewer_sla_stall_hours"] = 6
+        try:
+            first = await _evaluate_reviewer_sla_signal(db_session, project.id, 2)
+            assert first == 1
+            await db_session.commit()
+
+            second = await _evaluate_reviewer_sla_signal(db_session, project.id, 2)
+            assert second == 0
+        finally:
+            _shared_state.runtime_config.clear()
+            _shared_state.runtime_config.update(original_config)
+
+    @pytest.mark.asyncio
+    async def test_status_log_fallback_uses_updated_at(self, db_session):
+        """When status_log has no EVALUATING entry, elapsed is derived from updated_at."""
+        from app.models import RegressionCaseStatus, RegressionRemediationCase
+        from app.pipeline_regression_dispatcher import _evaluate_reviewer_sla_signal
+        import app.shared_state as _shared_state
+
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        old_at = _utcnow() - timedelta(hours=10)
+        task = make_task(
+            project_id=project.id,
+            status=TaskStatus.EVALUATING,
+            created_at=old_at,
+            updated_at=old_at,
+            status_log=[],
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        case = RegressionRemediationCase(
+            project_id=project.id,
+            regression_class="sr_catch_rate_fallback",
+            status=RegressionCaseStatus.ACTIVE,
+            hit_count=1,
+            last_remediation_task_id=task.id,
+        )
+        db_session.add(case)
+        await db_session.commit()
+
+        original_config = dict(_shared_state.runtime_config)
+        _shared_state.runtime_config["reviewer_sla_stall_hours"] = 6
+        try:
+            spawned = await _evaluate_reviewer_sla_signal(db_session, project.id, 2)
+        finally:
+            _shared_state.runtime_config.clear()
+            _shared_state.runtime_config.update(original_config)
+
+        assert spawned == 1
+
+    @pytest.mark.asyncio
+    async def test_feature_flag_disabled_suppresses_spawns(self, db_session):
+        """Setting reviewer_sla_stall_enabled=False suppresses all spawns."""
+        from app.models import RegressionCaseStatus, RegressionRemediationCase
+        from app.pipeline_regression_dispatcher import _evaluate_reviewer_sla_signal
+        import app.shared_state as _shared_state
+
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        old_at = _utcnow() - timedelta(hours=20)
+        task = make_task(
+            project_id=project.id,
+            status=TaskStatus.EVALUATING,
+            created_at=old_at,
+            updated_at=old_at,
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        case = RegressionRemediationCase(
+            project_id=project.id,
+            regression_class="sr_catch_rate",
+            status=RegressionCaseStatus.ACTIVE,
+            hit_count=1,
+            last_remediation_task_id=task.id,
+        )
+        db_session.add(case)
+        await db_session.commit()
+
+        original_config = dict(_shared_state.runtime_config)
+        _shared_state.runtime_config["reviewer_sla_stall_enabled"] = False
+        try:
+            spawned = await _evaluate_reviewer_sla_signal(db_session, project.id, 2)
+        finally:
+            _shared_state.runtime_config.clear()
+            _shared_state.runtime_config.update(original_config)
+
+        assert spawned == 0
+
+    @pytest.mark.asyncio
+    async def test_high_threshold_suppresses_borderline_case(self, db_session):
+        """Setting reviewer_sla_stall_hours=48 suppresses a case stalled for only 8h."""
+        from app.models import RegressionCaseStatus, RegressionRemediationCase
+        from app.pipeline_regression_dispatcher import _evaluate_reviewer_sla_signal
+        import app.shared_state as _shared_state
+
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        old_at = _utcnow() - timedelta(hours=8)
+        task = make_task(
+            project_id=project.id,
+            status=TaskStatus.EVALUATING,
+            created_at=old_at,
+            updated_at=old_at,
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        case = RegressionRemediationCase(
+            project_id=project.id,
+            regression_class="sr_catch_rate",
+            status=RegressionCaseStatus.ACTIVE,
+            hit_count=1,
+            last_remediation_task_id=task.id,
+        )
+        db_session.add(case)
+        await db_session.commit()
+
+        original_config = dict(_shared_state.runtime_config)
+        _shared_state.runtime_config["reviewer_sla_stall_hours"] = 48
+        try:
+            spawned = await _evaluate_reviewer_sla_signal(db_session, project.id, 2)
+        finally:
+            _shared_state.runtime_config.clear()
+            _shared_state.runtime_config.update(original_config)
+
+        assert spawned == 0
+
+    @pytest.mark.asyncio
+    async def test_budget_zero_returns_immediately(self, db_session):
+        """spawn_budget_left=0 returns 0 without touching DB."""
+        from app.pipeline_regression_dispatcher import _evaluate_reviewer_sla_signal
+
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        spawned = await _evaluate_reviewer_sla_signal(db_session, project.id, 0)
+        assert spawned == 0
+
+
+# ---------------------------------------------------------------------------
+# _evaluate_cross_case_fingerprint_signal integration tests
+# ---------------------------------------------------------------------------
+
+
+def _make_ccf_case(
+    *,
+    project_id,
+    regression_class: str,
+    symptoms_by_layer: dict,
+    now,
+):
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+
+    return RegressionRemediationCase(
+        project_id=project_id,
+        regression_class=regression_class,
+        status=RegressionCaseStatus.ACTIVE,
+        signal_snapshot_at_spawn={"signal_name": "persistent_anomaly"},
+        last_seen_at=now - timedelta(hours=1),
+        hit_count=1,
+        signal_first_crossed_at=now - timedelta(hours=1),
+        signal_first_seen_at=now - timedelta(hours=1),
+        symptoms_by_layer=symptoms_by_layer,
+    )
+
+
+def _ccf_tasks(tasks):
+    return [
+        t
+        for t in tasks
+        if (t.context or {})
+        .get("regression_class", "")
+        .startswith("cross_case_fingerprint:")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_cross_case_fingerprint_trips_when_distinct_classes_and_occurrences_met(
+    db_session,
+):
+    """≥2 distinct regression_class values + ≥3 entries inside lookback → spawn."""
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    fp = "ImportError: cannot import name foo from bar"
+
+    case_a = _make_ccf_case(
+        project_id=project.id,
+        regression_class="fix_loop_divergence:lint",
+        symptoms_by_layer={
+            "AGENT_VM": [
+                {
+                    "fingerprint": fp,
+                    "observed_at": (now - timedelta(days=1)).isoformat(),
+                    "sample": "lint failed: " + fp,
+                },
+                {
+                    "fingerprint": fp,
+                    "observed_at": (now - timedelta(days=2)).isoformat(),
+                    "sample": "lint failed again: " + fp,
+                },
+            ]
+        },
+        now=now,
+    )
+    case_b = _make_ccf_case(
+        project_id=project.id,
+        regression_class="sr_blind_spot:style",
+        symptoms_by_layer={
+            "AGENT_VM": [
+                {
+                    "fingerprint": fp,
+                    "observed_at": (now - timedelta(days=3)).isoformat(),
+                    "sample": "style review: " + fp,
+                }
+            ]
+        },
+        now=now,
+    )
+    db_session.add(case_a)
+    db_session.add(case_b)
+    await db_session.commit()
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned >= 1
+
+    tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    ccf = _ccf_tasks(tasks)
+    assert len(ccf) == 1
+    task = ccf[0]
+    ctx = task.context or {}
+    assert ctx["signal_name"] == "cross_case_fingerprint"
+    assert ctx["regression_class"].startswith("cross_case_fingerprint:")
+
+    payload = task.first_payload or {}
+    prompt = payload.get("prompt") or ""
+    assert "CROSS-CASE FINGERPRINT META-INVESTIGATION" in prompt
+    assert "fix_loop_divergence:lint" in prompt
+    assert "sr_blind_spot:style" in prompt
+    assert str(case_a.id) in prompt
+    assert str(case_b.id) in prompt
+    assert "is this one shared root symptom" in prompt.lower()
+
+
+@pytest.mark.asyncio
+async def test_cross_case_fingerprint_skips_when_only_one_distinct_class(db_session):
+    """3 entries of the same fingerprint, but only one regression_class → no spawn."""
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    fp = "TypeError: NoneType has no attr foo"
+
+    case = _make_ccf_case(
+        project_id=project.id,
+        regression_class="fix_loop_divergence:lint",
+        symptoms_by_layer={
+            "AGENT_VM": [
+                {
+                    "fingerprint": fp,
+                    "observed_at": (now - timedelta(days=i)).isoformat(),
+                    "sample": "msg",
+                }
+                for i in range(3)
+            ]
+        },
+        now=now,
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    await run_once(db_session, project.id)
+
+    tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert len(_ccf_tasks(tasks)) == 0
+
+
+@pytest.mark.asyncio
+async def test_cross_case_fingerprint_skips_when_below_occurrence_floor(db_session):
+    """2 distinct classes but only 2 total occurrences → no spawn."""
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    fp = "AssertionError: expected 1 == 2"
+
+    case_a = _make_ccf_case(
+        project_id=project.id,
+        regression_class="fix_loop_divergence:lint",
+        symptoms_by_layer={
+            "AGENT_VM": [
+                {
+                    "fingerprint": fp,
+                    "observed_at": (now - timedelta(days=1)).isoformat(),
+                    "sample": "m1",
+                }
+            ]
+        },
+        now=now,
+    )
+    case_b = _make_ccf_case(
+        project_id=project.id,
+        regression_class="sr_blind_spot:style",
+        symptoms_by_layer={
+            "AGENT_VM": [
+                {
+                    "fingerprint": fp,
+                    "observed_at": (now - timedelta(days=2)).isoformat(),
+                    "sample": "m2",
+                }
+            ]
+        },
+        now=now,
+    )
+    db_session.add(case_a)
+    db_session.add(case_b)
+    await db_session.commit()
+
+    await run_once(db_session, project.id)
+
+    tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert len(_ccf_tasks(tasks)) == 0
+
+
+@pytest.mark.asyncio
+async def test_cross_case_fingerprint_dedup_blocks_second_tick(db_session):
+    """Cooldown / in-flight dedup blocks a second run_once from re-spawning."""
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    fp = "RuntimeError: import order broke under_concurrency"
+
+    case_a = _make_ccf_case(
+        project_id=project.id,
+        regression_class="fix_loop_divergence:lint",
+        symptoms_by_layer={
+            "AGENT_VM": [
+                {
+                    "fingerprint": fp,
+                    "observed_at": (now - timedelta(days=1)).isoformat(),
+                    "sample": "ms1",
+                },
+                {
+                    "fingerprint": fp,
+                    "observed_at": (now - timedelta(days=2)).isoformat(),
+                    "sample": "ms2",
+                },
+            ]
+        },
+        now=now,
+    )
+    case_b = _make_ccf_case(
+        project_id=project.id,
+        regression_class="sr_blind_spot:style",
+        symptoms_by_layer={
+            "AGENT_VM": [
+                {
+                    "fingerprint": fp,
+                    "observed_at": (now - timedelta(days=3)).isoformat(),
+                    "sample": "ms3",
+                }
+            ]
+        },
+        now=now,
+    )
+    db_session.add(case_a)
+    db_session.add(case_b)
+    await db_session.commit()
+
+    await run_once(db_session, project.id)
+    await run_once(db_session, project.id)
+
+    tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    # First tick spawned, the second was blocked by in-flight dedup → exactly 1 task.
+    assert len(_ccf_tasks(tasks)) == 1
+
+
+@pytest.mark.asyncio
+async def test_cross_case_fingerprint_skips_entries_outside_lookback(db_session):
+    """Entries older than 14d are excluded — without that filter the signal would trip."""
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    fp = "ValueError: stale entry"
+
+    case_a = _make_ccf_case(
+        project_id=project.id,
+        regression_class="fix_loop_divergence:lint",
+        symptoms_by_layer={
+            "AGENT_VM": [
+                {
+                    "fingerprint": fp,
+                    "observed_at": (now - timedelta(days=20)).isoformat(),
+                    "sample": "old1",
+                },
+                {
+                    "fingerprint": fp,
+                    "observed_at": (now - timedelta(days=25)).isoformat(),
+                    "sample": "old2",
+                },
+            ]
+        },
+        now=now,
+    )
+    case_b = _make_ccf_case(
+        project_id=project.id,
+        regression_class="sr_blind_spot:style",
+        symptoms_by_layer={
+            "AGENT_VM": [
+                {
+                    "fingerprint": fp,
+                    "observed_at": (now - timedelta(days=30)).isoformat(),
+                    "sample": "old3",
+                }
+            ]
+        },
+        now=now,
+    )
+    db_session.add(case_a)
+    db_session.add(case_b)
+    await db_session.commit()
+
+    await run_once(db_session, project.id)
+
+    tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert len(_ccf_tasks(tasks)) == 0
+
+
+@pytest.mark.asyncio
+async def test_cross_case_fingerprint_skips_fallback_fingerprint_equal_to_regression_class(
+    db_session,
+):
+    """Entries whose fingerprint equals the case's regression_class are ignored as noise."""
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+
+    # Both cases use a fingerprint that equals case_a's class. For case_a these
+    # entries are filtered out (fingerprint == regression_class). Only case_b's
+    # entry survives → one distinct contributing class, below the threshold.
+    fallback_fp = "fix_loop_divergence:lint"
+    case_a = _make_ccf_case(
+        project_id=project.id,
+        regression_class="fix_loop_divergence:lint",
+        symptoms_by_layer={
+            "AGENT_VM": [
+                {
+                    "fingerprint": fallback_fp,
+                    "observed_at": (now - timedelta(days=1)).isoformat(),
+                    "sample": "fallback1",
+                },
+                {
+                    "fingerprint": fallback_fp,
+                    "observed_at": (now - timedelta(days=2)).isoformat(),
+                    "sample": "fallback2",
+                },
+            ]
+        },
+        now=now,
+    )
+    case_b = _make_ccf_case(
+        project_id=project.id,
+        regression_class="sr_blind_spot:style",
+        symptoms_by_layer={
+            "AGENT_VM": [
+                {
+                    "fingerprint": fallback_fp,
+                    "observed_at": (now - timedelta(days=3)).isoformat(),
+                    "sample": "fallback3",
+                }
+            ]
+        },
+        now=now,
+    )
+    db_session.add(case_a)
+    db_session.add(case_b)
+    await db_session.commit()
+
+    await run_once(db_session, project.id)
+
+    tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert len(_ccf_tasks(tasks)) == 0
+
+
+@pytest.mark.asyncio
+async def test_cross_case_fingerprint_skips_empty_fingerprints(db_session):
+    """Empty / missing fingerprint strings do not aggregate into a cluster."""
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    case_a = _make_ccf_case(
+        project_id=project.id,
+        regression_class="fix_loop_divergence:lint",
+        symptoms_by_layer={
+            "AGENT_VM": [
+                {
+                    "fingerprint": "",
+                    "observed_at": (now - timedelta(days=1)).isoformat(),
+                    "sample": "blank1",
+                },
+                {
+                    "fingerprint": "   ",
+                    "observed_at": (now - timedelta(days=2)).isoformat(),
+                    "sample": "blank2",
+                },
+            ]
+        },
+        now=now,
+    )
+    case_b = _make_ccf_case(
+        project_id=project.id,
+        regression_class="sr_blind_spot:style",
+        symptoms_by_layer={
+            "AGENT_VM": [
+                {
+                    "observed_at": (now - timedelta(days=3)).isoformat(),
+                    "sample": "blank3",
+                }
+            ]
+        },
+        now=now,
+    )
+    db_session.add(case_a)
+    db_session.add(case_b)
+    await db_session.commit()
+
+    await run_once(db_session, project.id)
+
+    tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert len(_ccf_tasks(tasks)) == 0
+
+
+@pytest.mark.asyncio
+async def test_cross_case_fingerprint_respects_spawn_budget():
+    """spawn_budget_left=0 short-circuits the evaluator without DB work."""
+    from app.pipeline_regression_dispatcher import (
+        _evaluate_cross_case_fingerprint_signal,
+    )
+
+    spawned = await _evaluate_cross_case_fingerprint_signal(
+        session=None,  # type: ignore[arg-type]
+        project_id=uuid.uuid4(),
+        spawn_budget_left=0,
+    )
+    assert spawned == 0
+
+
+# ---------------------------------------------------------------------------
+# Agent VM resource exhaustion signal tests
+# ---------------------------------------------------------------------------
+
+
+def _make_vm_failed_task(
+    project_id,
+    *,
+    failure_category: str = "AGENT_TIMEOUT",
+    timeout_subtype: str = "oom",
+    spot_preemption_count: int = 0,
+    scope: str = "small",
+    task_type: str = "create",
+) -> Task:
+    from app.time_utils import _utcnow as _tn
+
+    ctx: dict = {"failure_category": failure_category, "scope": scope}
+    if timeout_subtype:
+        ctx["timeout_subtype"] = timeout_subtype
+    if spot_preemption_count:
+        ctx["spot_preemption_count"] = spot_preemption_count
+    return make_task(
+        project_id=project_id,
+        status=TaskStatus.FAILED,
+        created_at=_tn() - timedelta(hours=1),
+        context=ctx,
+        payloads=[{"type": task_type, "prompt": "x", "base_branch": "main"}],
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_vm_resource_zero_baseline_no_trip(db_session):
+    """No FAILED tasks in window → no spawn."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 0
+
+
+@pytest.mark.asyncio
+async def test_agent_vm_resource_spike_trips(db_session):
+    """Three OOM failures in 24h window trips agent_vm_resource_exhaustion."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    for _ in range(3):
+        db_session.add(
+            _make_vm_failed_task(
+                project.id,
+                failure_category="AGENT_TIMEOUT",
+                timeout_subtype="oom",
+            )
+        )
+    await db_session.commit()
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 1
+
+    task = (
+        (
+            await db_session.execute(
+                select(Task).where(
+                    Task.project_id == project.id,
+                    Task.context["regression_class"].as_string()
+                    == "agent_vm_resource_exhaustion",
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    assert task is not None
+    payload = task.first_payload or {}
+    assert payload.get("type") == "investigate"
+    prompt = payload.get("prompt", "")
+    assert "AGENT_VM" in prompt
+    assert "oom" in prompt
+    ctx = task.context or {}
+    assert ctx["regression_class"] == "agent_vm_resource_exhaustion"
+    assert ctx["canonical_layer"] == "AGENT_VM"
+
+
+@pytest.mark.asyncio
+async def test_agent_vm_resource_dedup_blocks_second_spawn(db_session):
+    """In-flight investigation blocks a second spawn (dedup)."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    for _ in range(3):
+        db_session.add(_make_vm_failed_task(project.id, timeout_subtype="oom"))
+    await db_session.commit()
+
+    first = await run_once(db_session, project.id)
+    assert first == 1
+
+    second = await run_once(db_session, project.id)
+    assert second == 0
+
+    rows = (
+        (
+            await db_session.execute(
+                select(Task).where(
+                    Task.project_id == project.id,
+                    Task.context["regression_class"].as_string()
+                    == "agent_vm_resource_exhaustion",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_agent_vm_resource_below_threshold_no_trip(db_session):
+    """Two OOM failures (below threshold of 3) do not trip the signal."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    for _ in range(2):
+        db_session.add(_make_vm_failed_task(project.id, timeout_subtype="oom"))
+    await db_session.commit()
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 0
+
+
+@pytest.mark.parametrize(
+    "fixture_kwargs, expected_reason",
+    [
+        ({"failure_category": "AGENT_TIMEOUT", "timeout_subtype": "oom"}, "oom"),
+        (
+            {"failure_category": "AGENT_TIMEOUT", "timeout_subtype": "heartbeat_lost"},
+            "timeout",
+        ),
+        (
+            {"failure_category": "AGENT_TIMEOUT", "timeout_subtype": "process_crash"},
+            "timeout",
+        ),
+        (
+            {
+                "failure_category": "AGENT_TIMEOUT",
+                "timeout_subtype": "execution_timeout",
+            },
+            "timeout",
+        ),
+        (
+            {"failure_category": "AGENT_TIMEOUT", "timeout_subtype": "unknown"},
+            "timeout",
+        ),
+        (
+            {
+                "failure_category": "AGENT_TIMEOUT",
+                "timeout_subtype": "",
+                "spot_preemption_count": 1,
+            },
+            "spot_preempt",
+        ),
+        (
+            {"failure_category": "PROVISION_FAILURE", "timeout_subtype": ""},
+            "vm_provisioning_failure",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_agent_vm_resource_exit_reason_walks_vocabulary(
+    db_session, fixture_kwargs, expected_reason
+):
+    """Each VM-layer exit reason in VM_RESOURCE_EXIT_REASONS trips the signal
+    and surfaces the correct reason in the spawned investigation prompt.
+
+    Regression guard for the 'execution' vs 'execution_timeout' literal mismatch:
+    walks every value of failure_classification.VM_RESOURCE_EXIT_REASONS so any
+    future divergence between the dispatcher and the classifier helper is
+    caught here, not in production.
+    """
+    from app.failure_classification import VM_RESOURCE_EXIT_REASONS
+
+    assert expected_reason in VM_RESOURCE_EXIT_REASONS
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    for _ in range(3):
+        db_session.add(_make_vm_failed_task(project.id, **fixture_kwargs))
+    await db_session.commit()
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 1
+
+    task = (
+        (
+            await db_session.execute(
+                select(Task).where(
+                    Task.project_id == project.id,
+                    Task.context["regression_class"].as_string()
+                    == "agent_vm_resource_exhaustion",
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    assert task is not None
+    payload = task.first_payload or {}
+    prompt = payload.get("prompt", "")
+    assert expected_reason in prompt, (
+        f"expected {expected_reason!r} in spawned investigation prompt; got: {prompt!r}"
+    )
+
+
+@pytest.mark.parametrize(
+    "fixture_kwargs",
+    [
+        {
+            "failure_category": "AGENT_TIMEOUT",
+            "timeout_subtype": "cascade_cancellation",
+        },
+        {"failure_category": "AGENT_TIMEOUT", "timeout_subtype": "iteration_limit"},
+    ],
+)
+@pytest.mark.asyncio
+async def test_agent_vm_resource_code_level_subtypes_excluded(
+    db_session, fixture_kwargs
+):
+    """Code-level cancellations (cascade, iteration_limit) must not be counted
+    as VM-resource exhaustion — they belong to layer_concentration, not this signal."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    for _ in range(3):
+        db_session.add(_make_vm_failed_task(project.id, **fixture_kwargs))
+    await db_session.commit()
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 0

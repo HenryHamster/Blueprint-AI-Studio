@@ -223,6 +223,7 @@ async def aggregate_sr_blind_spot_themes(
             "count": d["count"],
             "examples": d["examples"],
             "layer_distribution": d["layer_distribution"],
+            "triage": triage_sr_blind_spot_theme(t, d["examples"]),
         }
         for t, d in top
     ]
@@ -343,6 +344,7 @@ async def aggregate_sr_blind_spot_envelope(
                 "count": d["count"],
                 "examples": d["examples"],
                 "layer_distribution": d["layer_distribution"],
+                "triage": triage_sr_blind_spot_theme(t, d["examples"]),
             }
             for t, d in top
         ],
@@ -646,6 +648,96 @@ def _count_reviewer_disagreement_directions(tasks) -> Dict[tuple, Dict[str, int]
             else:
                 bucket["fp"] += 1
     return counts
+
+
+# ---------------------------------------------------------------------------
+# Stale-assertion triage
+# ---------------------------------------------------------------------------
+
+# Phrases characteristic of test-assertion language rather than feature-behavior language.
+# The theme string is already lowercased (first-6-token normalisation), so all entries
+# here must be lowercase.
+_STALE_ASSERTION_PHRASES = (
+    "expects ordering",
+    "expects to contain",
+    "index of",
+    "tobe(",  # .toBe( lowercased
+    "toequal(",  # .toEqual( lowercased
+    "assertion",
+    "expected to",
+    "now expects",  # "test_foo.py now expects …" pattern
+)
+
+# Test-file path fragments: *.test.ts, *.spec.tsx, test_*.py, etc.
+_TEST_FILE_RE = re.compile(
+    r"[\w./\-]+\.(?:test|spec)\.(?:ts|tsx|js|jsx)"
+    r"|test_\w+\.py",
+    re.IGNORECASE,
+)
+
+
+def triage_sr_blind_spot_theme(theme: str, examples: list) -> dict:
+    """Classify a recurring blind-spot theme as likely stale assertion or prompt regression.
+
+    Heuristics (multiple signals raise confidence):
+    - Theme text itself references a test-file path (*.test.ts, test_*.py, …)
+    - Theme or example texts contain test-assertion language keywords
+    - All examples consistently trace back to the same single test file
+
+    Returns::
+
+        {
+            "verdict": "likely_stale_assertion" | "ambiguous" | "likely_prompt_regression",
+            "signals": [...],      # signal names that fired
+            "triage_context": "…", # human-readable note for spawned investigation
+        }
+
+    A verdict of ``"likely_stale_assertion"`` means ≥2 signals fired; ``"ambiguous"``
+    means exactly 1 signal; ``"likely_prompt_regression"`` means no signals.
+    """
+    signals: List[str] = []
+    theme_lower = theme.lower()
+    example_texts = [
+        ex.get("text", "")
+        for ex in (examples or [])
+        if isinstance(ex, dict) and ex.get("text")
+    ]
+    combined = " ".join([theme_lower] + [t.lower() for t in example_texts])
+
+    # Signal 1: theme itself names a test file path
+    if _TEST_FILE_RE.search(theme):
+        signals.append("theme_references_test_file")
+
+    # Signal 2: assertion-language keywords present anywhere in theme or examples
+    for phrase in _STALE_ASSERTION_PHRASES:
+        if phrase in combined:
+            signals.append(f"assertion_phrase:{phrase}")
+            break  # one phrase is sufficient to fire this signal
+
+    # Signal 3: all examples come from a single test file (consistent source cluster)
+    test_file_refs: set = set()
+    for text in example_texts:
+        for m in _TEST_FILE_RE.finditer(text):
+            test_file_refs.add(m.group(0).lower())
+    if test_file_refs and len(test_file_refs) == 1:
+        signals.append("single_test_file_cluster")
+
+    if len(signals) >= 2:
+        verdict = "likely_stale_assertion"
+    elif signals:
+        verdict = "ambiguous"
+    else:
+        verdict = "likely_prompt_regression"
+
+    triage_context = (
+        f"Stale-assertion triage ({verdict}): {', '.join(signals)}. "
+        "Verify whether the test assertion at the referenced file is stale "
+        "relative to current behavior before treating this as a prompt regression."
+        if signals
+        else ""
+    )
+
+    return {"verdict": verdict, "signals": signals, "triage_context": triage_context}
 
 
 def classify_theme_example_layers(examples: list) -> list:
