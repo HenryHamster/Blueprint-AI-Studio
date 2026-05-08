@@ -83,6 +83,7 @@ def filter_disallowed_blind_spots(sro: Dict[str, Any]) -> Dict[str, Any]:
 
 
 _TASK_SCAN_CAP = 2000
+_BLIND_SPOT_EXAMPLES_PER_THEME = 3
 
 
 def stamp_sr_blind_spot_computed_at(
@@ -122,7 +123,7 @@ async def _scan_blind_spot_counts(
     project_id: uuid.UUID,
     *,
     days: int,
-) -> Dict[str, int]:
+) -> Dict[str, dict]:
     cutoff = datetime.utcnow() - timedelta(days=days)
     stmt = (
         select(Task)
@@ -138,18 +139,26 @@ async def _scan_blind_spot_counts(
     result = await session.execute(stmt)
     all_tasks = result.scalars().all()
 
-    theme_counts: Dict[str, int] = defaultdict(int)
+    theme_data: Dict[str, dict] = {}
     for t in all_tasks:
         ctx = t.context or {}
         sro = ctx.get("_self_review_outcome")
         if not sro or is_skipped_sr_outcome(sro):
             continue
+        task_id = str(t.id)
+        task_type = (t.first_payload or {}).get("type") or ""
         for entry in sro.get("blind_spots") or []:
             if not isinstance(entry, str) or not entry.strip():
                 continue
             theme = " ".join(entry.lower().split()[:6])
-            theme_counts[theme] += 1
-    return theme_counts
+            if theme not in theme_data:
+                theme_data[theme] = {"count": 0, "examples": []}
+            theme_data[theme]["count"] += 1
+            if len(theme_data[theme]["examples"]) < _BLIND_SPOT_EXAMPLES_PER_THEME:
+                theme_data[theme]["examples"].append(
+                    {"text": entry, "task_id": task_id, "task_type": task_type}
+                )
+    return theme_data
 
 
 async def compute_sr_blind_spot_themes(
@@ -194,9 +203,11 @@ async def aggregate_sr_blind_spot_themes(
     ./done fallback path doesn't inflate counts. Result is ``[{"theme":
     str, "count": int}, ...]`` sorted by count desc.
     """
-    theme_counts = await _scan_blind_spot_counts(session, project_id, days=days)
-    top = sorted(theme_counts.items(), key=lambda x: -x[1])[:limit]
-    return [{"theme": t, "count": c} for t, c in top]
+    theme_data = await _scan_blind_spot_counts(session, project_id, days=days)
+    top = sorted(theme_data.items(), key=lambda x: -x[1]["count"])[:limit]
+    return [
+        {"theme": t, "count": d["count"], "examples": d["examples"]} for t, d in top
+    ]
 
 
 async def _scan_fp_stats(
@@ -303,12 +314,14 @@ async def aggregate_sr_blind_spot_envelope(
     HTTP endpoint preserves its ``window_days`` / ``total_distinct_themes``
     contract.
     """
-    theme_counts = await _scan_blind_spot_counts(session, project_id, days=days)
-    top = sorted(theme_counts.items(), key=lambda x: -x[1])[:limit]
+    theme_data = await _scan_blind_spot_counts(session, project_id, days=days)
+    top = sorted(theme_data.items(), key=lambda x: -x[1]["count"])[:limit]
     return {
         "window_days": days,
-        "total_distinct_themes": len(theme_counts),
-        "themes": [{"theme": t, "count": c} for t, c in top],
+        "total_distinct_themes": len(theme_data),
+        "themes": [
+            {"theme": t, "count": d["count"], "examples": d["examples"]} for t, d in top
+        ],
     }
 
 
@@ -579,6 +592,29 @@ def _count_reviewer_disagreement_directions(tasks) -> Dict[tuple, Dict[str, int]
             else:
                 bucket["fp"] += 1
     return counts
+
+
+def classify_theme_example_layers(examples: list) -> list:
+    """Return layer tags derived from verbatim blind-spot example texts.
+
+    Runs ``classify_layers`` on each example's ``text`` field individually with
+    no stage constraint (stage=None), so content patterns can surface
+    CI_WORKFLOW, AGENT_VM, AGENT_VERB, and BASELINE_GATE tags beyond the
+    REVIEWER_PASS that the signal-level ``stage='review'`` always contributes.
+
+    The dispatcher includes example texts in the combined ``theme_extras``
+    message (giving classify_layers full context), but calling this function
+    separately lets callers record per-example layer observations in
+    ``symptoms_by_layer`` independently from the signal-level observation.
+    """
+    from app.regression_layer_classifier import classify_layers  # noqa: PLC0415
+
+    layers: set = set()
+    for ex in examples or []:
+        text = (ex.get("text") or "").strip()
+        if text:
+            layers.update(classify_layers("SR_BLIND_SPOT", text, None))
+    return sorted(layers)
 
 
 def count_reviewer_disagreements_in_tasks(tasks) -> Dict[tuple, int]:

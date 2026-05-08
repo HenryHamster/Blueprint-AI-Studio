@@ -9031,12 +9031,178 @@ async def test_sr_blind_spots_aggregates_themes(client: AsyncClient, db_session)
     assert response.status_code == 200
     body = response.json()
     assert body["window_days"] == 30
-    themes = {t["theme"]: t["count"] for t in body["themes"]}
+    themes_by_name = {t["theme"]: t for t in body["themes"]}
     # The 3 identical long strings normalise to the same 6-token prefix
-    assert themes.get("did not verify file path number") == 3
-    assert themes.get("async error propagation not checked") == 1
+    assert themes_by_name["did not verify file path number"]["count"] == 3
+    assert themes_by_name["async error propagation not checked"]["count"] == 1
     # Skipped envelope contributes no entries
     assert body["total_distinct_themes"] == 2
+    # Each theme entry must carry an examples list
+    for entry in body["themes"]:
+        assert "examples" in entry
+        for ex in entry["examples"]:
+            assert "text" in ex and "task_id" in ex and "task_type" in ex
+    # The repeated-theme has examples capped and preserves verbatim text
+    repeated = themes_by_name["did not verify file path number"]
+    assert len(repeated["examples"]) == 3
+    for ex in repeated["examples"]:
+        assert ex["text"].startswith("did not verify file path number")
+        assert ex["task_type"] == "create"
+
+
+@pytest.mark.asyncio
+async def test_sr_blind_spots_examples_capped_at_limit(client: AsyncClient, db_session):
+    """Examples are capped at _BLIND_SPOT_EXAMPLES_PER_THEME even when count exceeds it."""
+    from app.sr_blind_spots import _BLIND_SPOT_EXAMPLES_PER_THEME
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Create more tasks than the example cap for a single theme
+    for i in range(_BLIND_SPOT_EXAMPLES_PER_THEME + 2):
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "fix"}],
+                context={
+                    "_self_review_outcome": {
+                        "verdict": "pass",
+                        "fixes_applied": False,
+                        "check_results": {"correctness": {"passed": True}},
+                        "blind_spots": [f"did not run the full test suite variant {i}"],
+                    }
+                },
+            )
+        )
+    await db_session.commit()
+
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/sr-blind-spots?days=30"
+    )
+    assert response.status_code == 200
+    body = response.json()
+    theme = body["themes"][0]
+    assert theme["count"] == _BLIND_SPOT_EXAMPLES_PER_THEME + 2
+    assert len(theme["examples"]) == _BLIND_SPOT_EXAMPLES_PER_THEME
+
+
+@pytest.mark.asyncio
+async def test_sr_blind_spots_missing_task_type_produces_empty_string(
+    client: AsyncClient, db_session
+):
+    """task_type is '' when first_payload has no 'type' key."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{}],  # no 'type' key
+            context={
+                "_self_review_outcome": {
+                    "verdict": "pass",
+                    "fixes_applied": False,
+                    "check_results": {},
+                    "blind_spots": ["async propagation not verified at all"],
+                }
+            },
+        )
+    )
+    await db_session.commit()
+
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/sr-blind-spots?days=30"
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["themes"]
+    ex = body["themes"][0]["examples"][0]
+    assert ex["task_type"] == ""
+
+
+@pytest.mark.asyncio
+async def test_sr_blind_spots_skipped_envelopes_contribute_zero_examples(
+    client: AsyncClient, db_session
+):
+    """Skipped/fallback SR envelopes produce no theme entries and no examples."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            context={"_self_review_outcome": _sr_skipped_envelope_unknown_verdict()},
+        )
+    )
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            context={
+                "_self_review_outcome": _sr_skipped_envelope_blind_spot_marker(
+                    "self-review skipped"
+                )
+            },
+        )
+    )
+    await db_session.commit()
+
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/sr-blind-spots?days=30"
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["themes"] == []
+    assert body["total_distinct_themes"] == 0
+
+
+@pytest.mark.asyncio
+async def test_sr_blind_spots_example_task_id_matches_source_task(
+    client: AsyncClient, db_session
+):
+    """Each example carries the task_id of the task that emitted that blind_spot."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "refactor"}],
+        context={
+            "_self_review_outcome": {
+                "verdict": "pass",
+                "fixes_applied": False,
+                "check_results": {},
+                "blind_spots": ["did not check caller compatibility thoroughly here"],
+            }
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/sr-blind-spots?days=30"
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["themes"]
+    ex = body["themes"][0]["examples"][0]
+    assert ex["task_id"] == str(task.id)
+    assert ex["task_type"] == "refactor"
 
 
 @pytest.mark.asyncio
@@ -10497,9 +10663,7 @@ async def test_close_regression_case_idempotent_on_already_closed(
 
 
 @pytest.mark.asyncio
-async def test_close_regression_case_404_when_missing(
-    client: AsyncClient, db_session
-):
+async def test_close_regression_case_404_when_missing(client: AsyncClient, db_session):
     """Returns 404 when no case row exists for (project_id, regression_class)."""
     project = make_project()
     db_session.add(project)

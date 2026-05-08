@@ -3339,6 +3339,233 @@ async def test_sr_blind_spot_theme_below_floor_no_spawn(db_session):
 
 
 @pytest.mark.asyncio
+async def test_sr_blind_spot_theme_prompt_has_layer_enumeration_block(db_session):
+    """Theme spawn prompt includes the META-INVESTIGATION layer-enumeration block on first dispatch."""
+    from app.pipeline_regression_dispatcher import _SR_BLIND_SPOT_THEME_FLOOR
+    from app.time_utils import _utcnow as _ts_now
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _ts_now()
+    theme_text = "missing null check in async handler path"
+    for _ in range(_SR_BLIND_SPOT_THEME_FLOOR):
+        sro = {
+            "verdict": "pass",
+            "check_results": {"correctness": {"passed": True}},
+            "blind_spots": [theme_text],
+            "reviewer_findings": [],
+        }
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create", "prompt": "x", "base_branch": "main"}],
+                context={"_self_review_outcome": sro},
+                created_at=now - timedelta(days=3),
+            )
+        )
+    await db_session.commit()
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 1
+
+    all_tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    task = _get_investigate_task(all_tasks)
+    assert task is not None
+    prompt = (task.first_payload or {}).get("prompt", "")
+    assert "META-INVESTIGATION" in prompt
+    assert "Enumerate ALL FIVE canonical layers explicitly" in prompt
+    for layer in (
+        "CI_WORKFLOW",
+        "AGENT_VM",
+        "AGENT_VERB",
+        "BASELINE_GATE",
+        "REVIEWER_PASS",
+    ):
+        assert layer in prompt
+
+
+@pytest.mark.asyncio
+async def test_sr_blind_spot_theme_prompt_includes_verbatim_examples(db_session):
+    """Theme spawn prompt contains verbatim example blind_spot entries with task IDs."""
+    from app.pipeline_regression_dispatcher import _SR_BLIND_SPOT_THEME_FLOOR
+    from app.time_utils import _utcnow as _ts_now
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _ts_now()
+    theme_text = "unhandled edge case in the new feature code"
+    for _ in range(_SR_BLIND_SPOT_THEME_FLOOR):
+        sro = {
+            "verdict": "pass",
+            "check_results": {"correctness": {"passed": True}},
+            "blind_spots": [theme_text],
+            "reviewer_findings": [],
+        }
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create", "prompt": "x", "base_branch": "main"}],
+                context={"_self_review_outcome": sro},
+                created_at=now - timedelta(days=3),
+            )
+        )
+    await db_session.commit()
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 1
+
+    all_tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    task = _get_investigate_task(all_tasks)
+    assert task is not None
+    prompt = (task.first_payload or {}).get("prompt", "")
+    # Verbatim examples are formatted as "Example (task <id> / <type>): <text>".
+    assert "Example (task" in prompt
+    assert theme_text in prompt
+
+
+@pytest.mark.asyncio
+async def test_sr_blind_spot_theme_symptoms_by_layer_populated_from_examples(
+    db_session,
+):
+    """symptoms_by_layer is populated from example texts when classify_layers matches them.
+
+    Uses a theme text matching the CI_WORKFLOW "github actions.*fail" pattern so
+    that a layer beyond the default REVIEWER_PASS (from stage='review') is recorded.
+    """
+    from app.models import RegressionRemediationCase
+    from app.pipeline_regression_dispatcher import _SR_BLIND_SPOT_THEME_FLOOR
+    from app.time_utils import _utcnow as _ts_now
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _ts_now()
+    # Matches _CI_WORKFLOW_PATTERNS: "github actions.*fail"
+    theme_text = "github actions failed for the ci workflow check step"
+    for _ in range(_SR_BLIND_SPOT_THEME_FLOOR):
+        sro = {
+            "verdict": "pass",
+            "check_results": {"correctness": {"passed": True}},
+            "blind_spots": [theme_text],
+            "reviewer_findings": [],
+        }
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create", "prompt": "x", "base_branch": "main"}],
+                context={"_self_review_outcome": sro},
+                created_at=now - timedelta(days=3),
+            )
+        )
+    await db_session.commit()
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 1
+
+    case = (
+        (
+            await db_session.execute(
+                select(RegressionRemediationCase).where(
+                    RegressionRemediationCase.project_id == project.id,
+                    RegressionRemediationCase.regression_class.like(
+                        "sr_blind_spot:theme:%"
+                    ),
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    assert case is not None
+    sbl = case.symptoms_by_layer or {}
+    # REVIEWER_PASS is always tagged for sr_blind_spot signals (stage='review').
+    assert "REVIEWER_PASS" in sbl
+    # CI_WORKFLOW is tagged because the example text matches "github actions.*fail".
+    assert "CI_WORKFLOW" in sbl
+
+
+@pytest.mark.asyncio
+async def test_sr_blind_spot_theme_cooldown_suppresses_spawn(db_session):
+    """Per-class cooldown blocks a second theme spawn within the 6h window after the first terminates."""
+    from app.pipeline_regression_dispatcher import (
+        _REGRESSION_COOLDOWN,
+        _SR_BLIND_SPOT_THEME_FLOOR,
+    )
+    from app.time_utils import _utcnow as _ts_now
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _ts_now()
+    theme_text = "scope drift detected in the new code path here"
+    for _ in range(_SR_BLIND_SPOT_THEME_FLOOR):
+        sro = {
+            "verdict": "pass",
+            "check_results": {"correctness": {"passed": True}},
+            "blind_spots": [theme_text],
+            "reviewer_findings": [],
+        }
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create", "prompt": "x", "base_branch": "main"}],
+                context={"_self_review_outcome": sro},
+                created_at=now - timedelta(days=3),
+            )
+        )
+    await db_session.commit()
+
+    first = await run_once(db_session, project.id)
+    assert first == 1
+
+    # Mark the spawned investigate task as COMPLETED — no longer in-flight.
+    spawned_task = _get_investigate_task(
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert spawned_task is not None
+    spawned_task.status = TaskStatus.COMPLETED
+    db_session.add(spawned_task)
+    await db_session.commit()
+
+    # Cooldown still active — should suppress even though task is COMPLETED.
+    second = await run_once(db_session, project.id)
+    assert second == 0
+
+    # Backdate the spawn beyond the cooldown window.
+    spawned_task.created_at = _ts_now() - _REGRESSION_COOLDOWN - timedelta(minutes=5)
+    db_session.add(spawned_task)
+    await db_session.commit()
+
+    # Cooldown elapsed — a fresh spawn should fire.
+    third = await run_once(db_session, project.id)
+    assert third == 1
+
+
+@pytest.mark.asyncio
 async def test_sr_blind_spot_disallowed_theme_does_not_spawn(db_session):
     """Disallowed blind_spot theme at/above floor does not spawn an investigation.
 

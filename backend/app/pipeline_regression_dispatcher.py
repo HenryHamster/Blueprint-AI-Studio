@@ -637,6 +637,33 @@ def _format_recurrence_meta_prompt(
     return "\n".join(lines)
 
 
+def _format_theme_layer_meta_prompt(base_lines: str) -> str:
+    """Prepend the canonical layer-enumeration block for SR blind-spot theme regressions.
+
+    Themes only fire after _SR_BLIND_SPOT_THEME_FLOOR (5+) occurrences, so the
+    first spawn is already evidence that single-symptom fixes haven't resolved it.
+    Force the full layer enumeration on every first dispatch rather than waiting
+    for an explicit recurrence cycle.
+    """
+    lines = [
+        "META-INVESTIGATION — SR BLIND-SPOT THEME",
+        (
+            "This theme has recurred across multiple tasks; single-symptom fixes "
+            "have not extinguished the pattern."
+        ),
+        "",
+        "Enumerate ALL FIVE canonical layers explicitly:",
+        ", ".join(_CANONICAL_RECURRENCE_LAYERS),
+        (
+            "For each layer answer: is it involved? if yes, what defense "
+            "should we add? if no, why is it ruled out?"
+        ),
+        "",
+        base_lines,
+    ]
+    return "\n".join(lines)
+
+
 def _format_bundle_signal_lines(signals: list[dict]) -> str:
     """Format a single investigate prompt covering a bundle of related signals."""
     lines = [
@@ -1880,6 +1907,18 @@ async def _maybe_spawn(
             )
             prompt = _format_recurrence_meta_prompt(existing_case, base_prompt)
 
+    # SR blind-spot theme regressions already represent 5+ recurrences of the same
+    # pattern; force the layer-enumeration meta block on every first dispatch so the
+    # agent enumerates all five canonical layers rather than doing single-symptom triage.
+    # Recurrence meta (above) already includes layer enumeration; cross-layer (above)
+    # takes precedence; this only fires when neither of those paths ran.
+    if (
+        not is_cross_layer
+        and recurrence_context is None
+        and regression_class.startswith("sr_blind_spot:theme:")
+    ):
+        prompt = _format_theme_layer_meta_prompt(base_prompt)
+
     if (
         recurrence_context is None
         and existing_case is not None
@@ -2417,6 +2456,13 @@ async def _evaluate_sr_blind_spot_signal(
             )
             continue
         regression_class = f"sr_blind_spot:theme:{theme}"
+        theme_extras: list[str] = [
+            f"Recurring SR blind-spot theme: '{theme}' appeared {count}x in the last 14 days.",
+        ]
+        for ex in theme_entry.get("examples") or []:
+            theme_extras.append(
+                f"Example (task {ex['task_id']} / {ex['task_type']}): {ex['text']}"
+            )
         spawn = await _maybe_spawn(
             session,
             project_id,
@@ -2426,9 +2472,7 @@ async def _evaluate_sr_blind_spot_signal(
             current_rate=None,
             sample_size=count,
             magnitude=float(count),
-            extras=[
-                f"Recurring SR blind-spot theme: '{theme}' appeared {count}x in the last 14 days.",
-            ],
+            extras=theme_extras,
             title_hint=f"SR blind-spot theme: {theme}"[:80],
         )
         if spawn is not None:
