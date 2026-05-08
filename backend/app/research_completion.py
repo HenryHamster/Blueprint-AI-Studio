@@ -63,7 +63,11 @@ from app.research_direction_state import (  # noqa: F401 — re-exported for cal
     _detect_dedup_deadlock,
     apply_post_spawn_state,
 )
-from app.source_ref_validation import validate_source_refs, _parse_ref
+from app.source_ref_validation import (
+    validate_source_refs,
+    _parse_ref,
+    summarize_broken_refs,
+)
 from app.scope_complexity import _composite_complexity_score
 from app.shared_state import (
     runtime_config as _runtime_config,
@@ -772,6 +776,13 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 ]
                 # Validate file-type source refs at write time
                 _f["sources"] = validate_source_refs(_f["sources"])
+                # Attach a structured provenance summary when the validation
+                # marks file refs invalid. The finding still spawns; the data
+                # is here so downstream consumers (admin UI, agent prompts)
+                # can flag research with bad citations as lower-trust.
+                _provenance = summarize_broken_refs(_f["sources"])
+                if _provenance is not None:
+                    _f["_provenance_warnings"] = _provenance
 
     _structural_downgrades = _apply_structural_actionability_downgrade(findings)
 
@@ -2012,6 +2023,11 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 ),
                 **({"medium_exploration": True} if _medium_exploration else {}),
                 **({"auto_decomposed": True} if finding.get("auto_decomposed") else {}),
+                **(
+                    {"_provenance_warnings": finding["_provenance_warnings"]}
+                    if finding.get("_provenance_warnings")
+                    else {}
+                ),
                 **(
                     {"_predicted_file_utilization": _predicted_utilization}
                     if _predicted_utilization is not None

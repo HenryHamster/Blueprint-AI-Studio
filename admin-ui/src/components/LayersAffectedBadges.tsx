@@ -17,13 +17,22 @@ interface Props {
   summary?: LayerSummary | null;
 }
 
-const LAYER_SHORT_LABELS: Record<string, string> = {
+// eslint-disable-next-line react-refresh/only-export-components
+export const LAYER_SHORT_LABELS: Record<string, string> = {
   CI_WORKFLOW: 'CI',
   AGENT_VM: 'VM',
   AGENT_VERB: 'VERB',
   BASELINE_GATE: 'BASELINE',
   REVIEWER_PASS: 'REVIEWER',
 };
+
+// eslint-disable-next-line react-refresh/only-export-components
+export const CANONICAL_LAYERS = ['CI_WORKFLOW', 'AGENT_VM', 'AGENT_VERB', 'BASELINE_GATE', 'REVIEWER_PASS'] as const;
+export type CanonicalLayer = typeof CANONICAL_LAYERS[number];
+
+export interface LayerCoverageCombo { layers: string[]; count: number; }
+export interface LayerCoverageEntry { total_fixes_with_layers: number; combinations: LayerCoverageCombo[]; }
+export type LayerCoverageByClass = Record<string, LayerCoverageEntry>;
 
 function shortLabel(layer: string): string {
   return LAYER_SHORT_LABELS[layer] ?? layer;

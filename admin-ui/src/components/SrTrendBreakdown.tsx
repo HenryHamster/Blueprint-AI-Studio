@@ -111,6 +111,7 @@ export interface SrTrendData {
   prompt_version_changed?: boolean | null;
   categories?: Record<string, SrCategoryTrend> | null;
   by_task_type?: Record<string, Record<string, SrTaskTypeCategoryStats>> | null;
+  by_scope?: Record<string, Record<string, SrTaskTypeCategoryStats>> | null;
   by_fix_iteration?: Record<string, Record<string, SrTaskTypeCategoryStats>> | null;
   sr_skip_rate?: number | null;
   sr_skip_reason_distribution?: Record<string, number> | null;
@@ -312,6 +313,25 @@ function ByTaskTypeSection({ byTaskType }: { byTaskType: Record<string, Record<s
       <p className="text-[9px] text-neutral-500 uppercase tracking-wide mb-1">By Task Type</p>
       {types.map(ttype => (
         <ByTaskTypeRow key={ttype} ttype={ttype} cats={byTaskType[ttype]} />
+      ))}
+    </div>
+  );
+}
+
+const SCOPE_ORDER: readonly string[] = ['small', 'medium', 'large'];
+
+function ByScopeSection({ byScope }: { byScope: Record<string, Record<string, SrTaskTypeCategoryStats>> }) {
+  const known = SCOPE_ORDER.filter(s => byScope[s] && Object.keys(byScope[s]).length > 0);
+  const extras = Object.keys(byScope)
+    .filter(s => !SCOPE_ORDER.includes(s) && Object.keys(byScope[s]).length > 0)
+    .sort();
+  const scopes = [...known, ...extras];
+  if (scopes.length === 0) return null;
+  return (
+    <div data-testid="sr-trend-by-scope" className="mt-1.5 pt-1.5 border-t border-neutral-800/60">
+      <p className="text-[9px] text-neutral-500 uppercase tracking-wide mb-1">By Scope</p>
+      {scopes.map(scope => (
+        <ByTaskTypeRow key={scope} ttype={scope} cats={byScope[scope]} />
       ))}
     </div>
   );
@@ -1039,6 +1059,9 @@ export function SrTrendBreakdown({ trends, variant, onCategoryClick }: SrTrendBr
             </>
           );
         })()}
+        {trends?.by_scope && Object.keys(trends.by_scope).length > 0 && (
+          <ByScopeSection byScope={trends.by_scope} />
+        )}
         {trends?.by_task_type && Object.keys(trends.by_task_type).length > 0 && (
           <ByTaskTypeSection byTaskType={trends.by_task_type} />
         )}

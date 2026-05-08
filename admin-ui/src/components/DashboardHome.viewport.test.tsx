@@ -86,6 +86,15 @@ vi.mock('../api', () => ({
   fetchSrMissedRetrospectives: vi.fn(async () => ({ items: [], total: 0 })),
   fetchSrRecentMisses: vi.fn(async () => ({ items: [] })),
   fetchDirectionSrBreakdown: vi.fn(async () => ({ directions: [] })),
+  fetchCrossLayerCompliance: vi.fn(async () => ({
+    total_classified: 0,
+    compliant: 0,
+    non_compliant: 0,
+    awaiting_backfill_count: 0,
+    compliance_rate: null,
+    failure_modes: { doc_test_only: 0, most_recent_layer_only: 0 },
+    by_class: {},
+  })),
   onboardProject: vi.fn(async () => ({})),
 }));
 

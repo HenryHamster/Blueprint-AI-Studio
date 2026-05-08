@@ -1554,7 +1554,17 @@ async def _close_loop_regression_case_on_merge(
         # Fall back to spawn-time snapshot; run_recovery_once requires a
         # non-empty snapshot to evaluate the MERGED→CLOSED transition.
         snapshot = dict(case.signal_snapshot_at_spawn or {})
-    case.mark_merged(pr_number, snapshot)
+    ctx = task.context or {}
+    spawn_was_cross_layer = bool(ctx.get("cross_layer"))
+    spawn_layers_enumerated = list(ctx.get("cross_layer_layers") or [])
+    case.mark_merged(
+        pr_number,
+        snapshot,
+        spawn_was_cross_layer=spawn_was_cross_layer,
+        spawn_layers_enumerated=spawn_layers_enumerated
+        if spawn_was_cross_layer
+        else None,
+    )
     session.add(case)
 
 

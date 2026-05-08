@@ -14,6 +14,7 @@ from app.source_ref_validation import (
     _parse_ref,
     collect_stale_refs,
     extract_source_file_paths,
+    summarize_broken_refs,
     validate_source_refs,
 )
 from app.time_utils import _utcnow
@@ -585,6 +586,138 @@ class TestCollectStaleRefs:
         ]
         stale = collect_stale_refs(validated)
         assert stale == ["a.py", "b.py"]
+
+
+class TestSummarizeBrokenRefs:
+    """summarize_broken_refs: structured provenance summary of broken file refs."""
+
+    def test_returns_none_when_all_valid(self):
+        validated = [
+            {"type": "file", "ref": "backend/app/foo.py"},
+            {"type": "pr", "ref": "https://github.com/o/r/pull/1"},
+        ]
+        assert summarize_broken_refs(validated) is None
+
+    def test_returns_none_for_empty_or_non_list(self):
+        assert summarize_broken_refs([]) is None
+        assert summarize_broken_refs(None) is None
+        assert summarize_broken_refs("not a list") is None
+
+    def test_single_broken_ref(self):
+        validated = [
+            {"type": "file", "ref": "backend/app/foo.py"},
+            {"type": "file", "ref": "backend/app/missing.py", "valid": False},
+        ]
+        result = summarize_broken_refs(validated)
+        assert result == {
+            "broken_source_ref_count": 1,
+            "broken_refs": ["backend/app/missing.py"],
+        }
+
+    def test_five_broken_refs_all_distinct(self):
+        validated = [
+            {"type": "file", "ref": f"backend/app/missing_{i}.py", "valid": False}
+            for i in range(5)
+        ]
+        result = summarize_broken_refs(validated)
+        assert result is not None
+        assert result["broken_source_ref_count"] == 5
+        assert sorted(result["broken_refs"]) == sorted(
+            f"backend/app/missing_{i}.py" for i in range(5)
+        )
+
+    def test_dedupes_by_path_across_line_numbers(self):
+        validated = [
+            {"type": "file", "ref": "backend/app/foo.py:5", "valid": False},
+            {"type": "file", "ref": "backend/app/foo.py:10-20", "valid": False},
+            {"type": "file", "ref": "backend/app/foo.py#L42", "valid": False},
+            {"type": "file", "ref": "backend/app/bar.py:7", "valid": False},
+        ]
+        result = summarize_broken_refs(validated)
+        assert result is not None
+        assert result["broken_source_ref_count"] == 2
+        assert result["broken_refs"] == ["backend/app/foo.py", "backend/app/bar.py"]
+
+    def test_ignores_non_file_invalid_sources(self):
+        validated = [
+            {"type": "pr", "ref": "https://github.com/o/r/pull/1", "valid": False},
+            {"type": "message", "ref": "slack-msg-123", "valid": False},
+        ]
+        assert summarize_broken_refs(validated) is None
+
+    def test_ignores_valid_file_sources(self):
+        validated = [
+            {"type": "file", "ref": "backend/app/foo.py"},
+            {"type": "file", "ref": "backend/app/bar.py", "valid": False},
+        ]
+        result = summarize_broken_refs(validated)
+        assert result == {
+            "broken_source_ref_count": 1,
+            "broken_refs": ["backend/app/bar.py"],
+        }
+
+
+class TestProvenanceWarningsAttachment:
+    """End-to-end: validate_source_refs + summarize_broken_refs flow used by
+    research_completion to attach provenance to findings."""
+
+    def test_clean_finding_has_no_provenance_key(self, monkeypatch):
+        from app import source_ref_validation as srv
+
+        monkeypatch.setattr(srv, "_file_exists_at_head", lambda path: True)
+        finding = {
+            "title": "F1",
+            "description": "D1",
+            "sources": [
+                {"type": "file", "ref": "backend/app/foo.py"},
+                {"type": "pr", "ref": "https://github.com/o/r/pull/1"},
+            ],
+        }
+        finding["sources"] = validate_source_refs(finding["sources"])
+        prov = summarize_broken_refs(finding["sources"])
+        if prov is not None:
+            finding["_provenance_warnings"] = prov
+        assert "_provenance_warnings" not in finding
+
+    def test_finding_with_one_broken_ref_gets_provenance(self, monkeypatch):
+        from app import source_ref_validation as srv
+
+        broken = "backend/app/missing.py"
+        monkeypatch.setattr(srv, "_file_exists_at_head", lambda path: path != broken)
+        finding = {
+            "title": "F1",
+            "description": "D1",
+            "sources": [
+                {"type": "file", "ref": "backend/app/foo.py"},
+                {"type": "file", "ref": broken},
+            ],
+        }
+        finding["sources"] = validate_source_refs(finding["sources"])
+        prov = summarize_broken_refs(finding["sources"])
+        if prov is not None:
+            finding["_provenance_warnings"] = prov
+        assert finding["_provenance_warnings"] == {
+            "broken_source_ref_count": 1,
+            "broken_refs": [broken],
+        }
+
+    def test_finding_with_five_broken_refs_dedupes_paths(self, monkeypatch):
+        from app import source_ref_validation as srv
+
+        broken_paths = {f"backend/app/missing_{i}.py" for i in range(5)}
+        monkeypatch.setattr(
+            srv, "_file_exists_at_head", lambda path: path not in broken_paths
+        )
+        # Two refs share a path with different line numbers — should dedupe.
+        sources = [
+            {"type": "file", "ref": f"backend/app/missing_{i}.py:5"} for i in range(5)
+        ] + [{"type": "file", "ref": "backend/app/missing_0.py:99"}]
+        finding = {"title": "F", "description": "D", "sources": sources}
+        finding["sources"] = validate_source_refs(finding["sources"])
+        prov = summarize_broken_refs(finding["sources"])
+        finding["_provenance_warnings"] = prov
+        assert finding["_provenance_warnings"]["broken_source_ref_count"] == 5
+        assert set(finding["_provenance_warnings"]["broken_refs"]) == broken_paths
 
 
 class TestQueryFindingsIndex:

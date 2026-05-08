@@ -161,6 +161,47 @@ def extract_source_file_paths(sources: Optional[list]) -> list:
     return paths
 
 
+def summarize_broken_refs(
+    validated_sources: Optional[list],
+) -> Optional[Dict[str, Any]]:
+    """Summarize file-type sources marked invalid by validate_source_refs.
+
+    Walks the output of validate_source_refs and returns a structured
+    provenance summary for findings whose citations include broken file refs:
+
+        {"broken_source_ref_count": N, "broken_refs": [path, ...]}
+
+    Paths are deduplicated using _parse_ref so different line numbers on the
+    same file collapse to one entry. Returns None when there are no broken
+    file refs (count would be 0). Non-file invalid sources are ignored.
+    """
+    if not isinstance(validated_sources, list):
+        return None
+    seen: set = set()
+    broken_paths: list = []
+    for source in validated_sources:
+        if not isinstance(source, dict):
+            continue
+        if source.get("valid") is not False:
+            continue
+        if source.get("type", "").lower() != "file":
+            continue
+        ref = source.get("ref")
+        if not ref:
+            continue
+        path, _, _ = _parse_ref(ref)
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        broken_paths.append(path)
+    if not broken_paths:
+        return None
+    return {
+        "broken_source_ref_count": len(broken_paths),
+        "broken_refs": broken_paths,
+    }
+
+
 def collect_stale_refs(validated_sources: list) -> list:
     """Return refs marked invalid by validate_source_refs.
 

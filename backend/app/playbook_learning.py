@@ -2517,16 +2517,23 @@ def _compute_edges_stats(tasks: list) -> Optional[dict[str, Any]]:
 def _stats_for_tasks(
     tasks: list,
 ) -> tuple[
-    int, dict[str, dict], dict[str, dict[str, dict]], dict[str, dict], dict[str, dict]
+    int,
+    dict[str, dict],
+    dict[str, dict[str, dict]],
+    dict[str, dict],
+    dict[str, dict],
+    dict[str, dict[str, dict]],
 ]:
     """Compute SR stats for a pre-filtered task list (no date filtering).
 
-    Returns (count, cat_stats, type_cat_stats, all_iter_cat_stats, sev_stats).
-    ``all_iter_cat_stats`` uses ALL review iterations as the human-truth set
-    (not just iteration 0).  Falls back to first-attempt categories when
-    ``review_loop.review_history`` is absent (backward compat).
+    Returns (count, cat_stats, type_cat_stats, all_iter_cat_stats, sev_stats,
+    scope_cat_stats). ``all_iter_cat_stats`` uses ALL review iterations as the
+    human-truth set (not just iteration 0). Falls back to first-attempt
+    categories when ``review_loop.review_history`` is absent (backward compat).
     ``sev_stats`` accumulates per-severity hit/miss counts from review_history
-    issues across all categories.
+    issues across all categories. ``scope_cat_stats`` mirrors
+    ``type_cat_stats`` keyed by task scope (small|medium|large) instead of
+    task type, using ``task.context['scope']`` (default: small).
     """
     _sw = {"CRITICAL": 3, "MAJOR": 2, "MINOR": 1}
 
@@ -2543,6 +2550,7 @@ def _stats_for_tasks(
     type_cat_stats: dict[str, dict[str, dict]] = {}
     all_iter_cat_stats: dict[str, dict] = {}
     sev_stats: dict[str, dict] = {}
+    scope_cat_stats: dict[str, dict[str, dict]] = {}
     for t in tasks:
         ctx = t.context or {}
         if "_self_review_outcome" not in ctx:
@@ -2609,6 +2617,7 @@ def _stats_for_tasks(
                 if cat_name in sr_failed:
                     sev_stats[sev]["hit_count"] += 1
         task_type = t.first_payload.get("type", "")
+        task_scope = (t.context or {}).get("scope", DEFAULT_TASK_SCOPE)
         for cat in human_cats:
             if cat not in cat_stats:
                 cat_stats[cat] = {
@@ -2662,6 +2671,30 @@ def _stats_for_tasks(
                         type_cat_stats[task_type][cat]["miss_examples"].append(
                             {"desc": issue["desc"], "severity": issue["severity"]}
                         )
+            if task_scope:
+                if task_scope not in scope_cat_stats:
+                    scope_cat_stats[task_scope] = {}
+                if cat not in scope_cat_stats[task_scope]:
+                    scope_cat_stats[task_scope][cat] = {
+                        "hit_count": 0,
+                        "sr_alone_hit_count": 0,
+                        "reviewer_save_hit_count": 0,
+                        "human_count": 0,
+                        "miss_examples": [],
+                    }
+                scope_cat_stats[task_scope][cat]["human_count"] += 1
+                if cat in sr_failed:
+                    scope_cat_stats[task_scope][cat]["hit_count"] += 1
+                    bucket = _origin_bucket(check_results.get(cat))
+                    if bucket == "sr_alone":
+                        scope_cat_stats[task_scope][cat]["sr_alone_hit_count"] += 1
+                    else:
+                        scope_cat_stats[task_scope][cat]["reviewer_save_hit_count"] += 1
+                else:
+                    for issue in rev_cats.get(cat, []):
+                        scope_cat_stats[task_scope][cat]["miss_examples"].append(
+                            {"desc": issue["desc"], "severity": issue["severity"]}
+                        )
         # All-iterations human truth: prefer persisted _all_iterations_rejection_categories
         # (written by task_lifecycle on every rejection iteration); fall back to
         # categorising review_history in-line, then to first-attempt categories.
@@ -2678,7 +2711,14 @@ def _stats_for_tasks(
             all_iter_cat_stats[cat]["human_count"] += 1
             if cat in sr_failed:
                 all_iter_cat_stats[cat]["hit_count"] += 1
-    return count, cat_stats, type_cat_stats, all_iter_cat_stats, sev_stats
+    return (
+        count,
+        cat_stats,
+        type_cat_stats,
+        all_iter_cat_stats,
+        sev_stats,
+        scope_cat_stats,
+    )
 
 
 def _sr_skip_stats(
@@ -2800,7 +2840,7 @@ def compute_sr_catch_rate_by_direction(
 
     result: dict[str, dict[str, Any]] = {}
     for direction_id, tasks in by_direction.items():
-        count, cat_stats, _, _, _ = _stats_for_tasks(tasks)
+        count, cat_stats, _, _, _, _ = _stats_for_tasks(tasks)
         if count < _MIN_DIRECTION_SR_SAMPLE:
             continue
         categories: dict[str, Any] = {}
@@ -2913,16 +2953,22 @@ def compute_direction_sr_breakdown_for_endpoint(
 
 def _compute_cat_fp_stats(
     tasks: list,
-) -> tuple[dict[str, dict[str, int]], dict[str, dict[str, dict[str, int]]]]:
+) -> tuple[
+    dict[str, dict[str, int]],
+    dict[str, dict[str, dict[str, int]]],
+    dict[str, dict[str, dict[str, int]]],
+]:
     """Return per-category fp/tp counts for SR failures.
 
     A category counted as TP when ANY downstream signal independently
     confirms the SR failure: reviewer_findings, _first_attempt_rejection_categories,
     or review_loop.review_history (keyword-categorised). Otherwise FP.
-    Returns (cat_fp, type_cat_fp) where keys are category and (task_type, category).
+    Returns (cat_fp, type_cat_fp, scope_cat_fp) where keys are category,
+    (task_type, category), and (task_scope, category) respectively.
     """
     cat_fp: dict[str, dict[str, int]] = {}
     type_cat_fp: dict[str, dict[str, dict[str, int]]] = {}
+    scope_cat_fp: dict[str, dict[str, dict[str, int]]] = {}
     for t in tasks:
         task_type = (t.first_payload or {}).get("type", "")
         if task_type not in _SR_CODE_CHANGE_TYPES:
@@ -2954,18 +3000,24 @@ def _compute_cat_fp_stats(
         if rev_hist:
             rev_hist_cats = set(_categorize_review_issues_keyword(rev_hist).keys())
         confirmed = reviewer_cats | human_cats | rev_hist_cats
+        task_scope = ctx.get("scope", DEFAULT_TASK_SCOPE)
         for cat in sr_failed:
             bucket = cat_fp.setdefault(cat, {"fp": 0, "tp": 0})
             tbucket = type_cat_fp.setdefault(task_type, {}).setdefault(
                 cat, {"fp": 0, "tp": 0}
             )
+            sbucket = scope_cat_fp.setdefault(task_scope, {}).setdefault(
+                cat, {"fp": 0, "tp": 0}
+            )
             if cat in confirmed:
                 bucket["tp"] += 1
                 tbucket["tp"] += 1
+                sbucket["tp"] += 1
             else:
                 bucket["fp"] += 1
                 tbucket["fp"] += 1
-    return cat_fp, type_cat_fp
+                sbucket["fp"] += 1
+    return cat_fp, type_cat_fp, scope_cat_fp
 
 
 def _task_prompt_fingerprint(task: Task) -> str:
@@ -3075,7 +3127,7 @@ def compute_sr_quality_by_fingerprint(
             )
             results[fp] = result
             continue
-        cat_fp_stats, _ = _compute_cat_fp_stats(bucket["tasks"])
+        cat_fp_stats, _, _ = _compute_cat_fp_stats(bucket["tasks"])
         fp_total = sum(stats.get("fp", 0) for stats in cat_fp_stats.values())
         tp_total = sum(stats.get("tp", 0) for stats in cat_fp_stats.values())
         catch_rate = (
@@ -3268,10 +3320,15 @@ async def compute_sr_catch_rate_trends(
         for i in range(len(cycle_rows) - 1):
             c_cycle = cycle_rows[i]
             p_cycle = cycle_rows[i + 1]
-            c_count, c_stats, c_type_stats, c_all_iter, c_sev = _stats_for_tasks(
-                task_by_cycle.get(c_cycle.id, [])
-            )
-            p_count, p_stats, _, p_all_iter, p_sev = _stats_for_tasks(
+            (
+                c_count,
+                c_stats,
+                c_type_stats,
+                c_all_iter,
+                c_sev,
+                c_scope_stats,
+            ) = _stats_for_tasks(task_by_cycle.get(c_cycle.id, []))
+            p_count, p_stats, _, p_all_iter, p_sev, _ = _stats_for_tasks(
                 task_by_cycle.get(p_cycle.id, [])
             )
             if c_count >= _MIN_SR_SAMPLE and p_count >= _MIN_SR_SAMPLE:
@@ -3283,6 +3340,7 @@ async def compute_sr_catch_rate_trends(
                 current_stats = c_stats
                 previous_stats = p_stats
                 current_type_stats = c_type_stats
+                current_scope_stats = c_scope_stats
                 current_window_tasks = task_by_cycle.get(c_cycle.id, [])
                 previous_window_tasks = task_by_cycle.get(p_cycle.id, [])
                 current_all_iter_stats = c_all_iter
@@ -3312,6 +3370,7 @@ async def compute_sr_catch_rate_trends(
             current_type_stats,
             current_all_iter_stats,
             current_sev_stats,
+            current_scope_stats,
         ) = _stats_for_tasks(cal_current)
         (
             previous_count,
@@ -3319,6 +3378,7 @@ async def compute_sr_catch_rate_trends(
             _,
             previous_all_iter_stats,
             previous_sev_stats,
+            _,
         ) = _stats_for_tasks(cal_previous)
         current_window_tasks = cal_current
         previous_window_tasks = cal_previous
@@ -3510,7 +3570,9 @@ async def compute_sr_catch_rate_trends(
             categories[cat]["reasoning_engagement_total"] = cat_eng["total_passes"]
 
     # Attach false-positive stats: SR flagged but reviewer didn't independently flag.
-    cat_fp_stats, type_cat_fp_stats = _compute_cat_fp_stats(current_window_tasks)
+    cat_fp_stats, type_cat_fp_stats, scope_cat_fp_stats = _compute_cat_fp_stats(
+        current_window_tasks
+    )
     for cat, data in categories.items():
         fp_data = cat_fp_stats.get(cat) or {}
         fp = fp_data.get("fp", 0)
@@ -3564,6 +3626,50 @@ async def compute_sr_catch_rate_trends(
             type_cats[cat] = entry
         if type_cats:
             by_task_type[ttype] = type_cats
+
+    # Compute per-scope category breakdown from current window only.
+    # Cells with fewer than _MIN_SR_SAMPLE observations are omitted.
+    by_scope: dict[str, dict[str, Any]] = {}
+    for scope, scat_stats in current_scope_stats.items():
+        scope_cats: dict[str, Any] = {}
+        for cat, stats in scat_stats.items():
+            if stats["human_count"] < _MIN_SR_SAMPLE:
+                continue
+            hit_rate = round(stats["hit_count"] / stats["human_count"], 3)
+            sr_alone_hit_rate = (
+                round(stats["sr_alone_hit_count"] / stats["human_count"], 3)
+                if stats["human_count"] > 0
+                else None
+            )
+            reviewer_save_rate = (
+                round(stats["reviewer_save_hit_count"] / stats["human_count"], 3)
+                if stats["human_count"] > 0
+                else None
+            )
+            raw_ex = stats.get("miss_examples", [])
+            ex = _finalize_examples(raw_ex)
+            entry: dict[str, Any] = {
+                "hit_rate": hit_rate,
+                "miss_rate": round(1 - hit_rate, 3),
+                "sample_count": stats["human_count"],
+                "sr_alone_hit_count": stats["sr_alone_hit_count"],
+                "reviewer_save_hit_count": stats["reviewer_save_hit_count"],
+                "sr_alone_hit_rate": sr_alone_hit_rate,
+                "reviewer_save_rate": reviewer_save_rate,
+            }
+            if ex:
+                entry["examples"] = ex
+            sfp = (scope_cat_fp_stats.get(scope) or {}).get(cat) or {}
+            fp_s = sfp.get("fp", 0)
+            tp_s = sfp.get("tp", 0)
+            entry["fp_count"] = fp_s
+            entry["tp_count"] = tp_s
+            entry["false_positive_rate"] = (
+                round(fp_s / (fp_s + tp_s), 3) if (fp_s + tp_s) > 0 else None
+            )
+            scope_cats[cat] = entry
+        if scope_cats:
+            by_scope[scope] = scope_cats
 
     sr_skip_rate, sr_skip_dist = _sr_skip_stats(current_window_tasks)
 
@@ -3627,6 +3733,7 @@ async def compute_sr_catch_rate_trends(
         "previous_cycle_id": previous_cycle_id,
         "categories": categories,
         "by_task_type": by_task_type,
+        "by_scope": by_scope,
         "by_severity": by_severity,
         "edges_considered_stats": edges_stats,
         "sr_skip_rate": sr_skip_rate,

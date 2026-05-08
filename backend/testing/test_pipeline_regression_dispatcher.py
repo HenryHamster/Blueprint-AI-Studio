@@ -5437,6 +5437,65 @@ async def test_cross_layer_two_layers_escalates(db_session):
 
 
 @pytest.mark.asyncio
+async def test_cross_layer_mark_merged_records_spawn_context(db_session):
+    """After cross-layer spawn + mark_merged, fix-log entry preserves spawn context."""
+    from app.models import (
+        RegressionCaseStatus,
+        RegressionRemediationCase,
+    )
+    from app.regression_layer_classifier import LAYER_AGENT_VM, LAYER_CI_WORKFLOW
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    fingerprint = "PROVISION_FAILURE"
+    regression_class = f"anomaly:{fingerprint}"
+    now = _utcnow()
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class=regression_class,
+        status=RegressionCaseStatus.ACTIVE,
+        signal_snapshot_at_spawn={"signal_name": "persistent_anomaly"},
+        last_seen_at=now - timedelta(hours=2),
+        hit_count=1,
+        signal_first_crossed_at=now - timedelta(hours=2),
+        signal_first_seen_at=now - timedelta(hours=2),
+        symptoms_by_layer={
+            LAYER_AGENT_VM: [
+                {
+                    "fingerprint": "agentvm-fp-1",
+                    "observed_at": (now - timedelta(hours=2)).isoformat(),
+                    "sample": "error while loading shared libraries",
+                }
+            ]
+        },
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    case.mark_merged(
+        pr_number=555,
+        signal_snapshot={"signal_name": "persistent_anomaly"},
+        spawn_was_cross_layer=True,
+        spawn_layers_enumerated=[LAYER_AGENT_VM, LAYER_CI_WORKFLOW],
+    )
+    db_session.add(case)
+    await db_session.commit()
+    await db_session.refresh(case)
+
+    log = case.fingerprint_to_fix_log or []
+    assert len(log) == 1
+    entry = log[0]
+    assert entry["spawn_was_cross_layer"] is True
+    assert LAYER_AGENT_VM in entry["spawn_layers_enumerated"]
+    assert LAYER_CI_WORKFLOW in entry["spawn_layers_enumerated"]
+    assert entry["fix_pr_number"] == 555
+    assert "layers_targeted" not in entry  # backfill not yet applied
+
+
+@pytest.mark.asyncio
 async def test_cross_layer_cooldown_still_blocks(db_session):
     """Same regression class re-trips within 6h → cooldown blocks (no double-dispatch)."""
     project = make_project(design_doc={})

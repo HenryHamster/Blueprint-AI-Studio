@@ -1604,6 +1604,9 @@ class RegressionRemediationCase(SQLModel, table=True):
         pr_number: int,
         signal_snapshot: Dict[str, Any],
         layers_targeted: Optional[List[str]] = None,
+        *,
+        spawn_was_cross_layer: bool = False,
+        spawn_layers_enumerated: Optional[List[str]] = None,
     ) -> None:
         """Transition ACTIVE → MERGED after remediation PR merges.
 
@@ -1619,6 +1622,11 @@ class RegressionRemediationCase(SQLModel, table=True):
         the entry is written without the key — readers must treat absence as
         "unclassified", not "no layers". Existing fix-log entries written
         before this field existed remain readable everywhere.
+
+        ``spawn_was_cross_layer`` / ``spawn_layers_enumerated`` record the
+        dispatcher's cross-layer escalation context at spawn time so the
+        compliance metric can compare layers observed vs layers touched.
+        Only written when truthy; absence means non-cross-layer or legacy entry.
         """
         if not signal_snapshot:
             signal_snapshot = dict(self.signal_snapshot_at_spawn or {})
@@ -1632,6 +1640,9 @@ class RegressionRemediationCase(SQLModel, table=True):
         }
         if layers_targeted:
             log_entry["layers_targeted"] = list(layers_targeted)
+        if spawn_was_cross_layer:
+            log_entry["spawn_was_cross_layer"] = True
+            log_entry["spawn_layers_enumerated"] = list(spawn_layers_enumerated or [])
         self.fingerprint_to_fix_log = list(self.fingerprint_to_fix_log or []) + [
             log_entry
         ]

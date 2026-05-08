@@ -822,8 +822,118 @@ def _compute_layer_coverage_by_class(
     return out
 
 
+def _compute_symptom_layers_by_class(
+    rows: List[RegressionRemediationCase],
+) -> Dict[str, List[str]]:
+    """Union of canonical symptom layers observed per regression class.
+
+    Used by the UI to compute the under-defended signal: a class is
+    under-defended when the fix-history omits a layer that has appeared
+    in its symptoms (i.e. we keep patching where the pain isn't).
+    """
+    by_class: Dict[str, set] = {}
+    for case in rows:
+        if not case.symptoms_by_layer:
+            continue
+        layers = {str(k) for k in case.symptoms_by_layer.keys()}
+        by_class.setdefault(case.regression_class, set()).update(layers)
+    return {cls: sorted(layers) for cls, layers in sorted(by_class.items())}
+
+
+def _compute_cross_layer_compliance(
+    rows: List[RegressionRemediationCase],
+    cutoff: datetime,
+) -> Dict[str, Any]:
+    """Compliance metric for cross-layer-escalated regression remediations.
+
+    For fix-log entries where ``spawn_was_cross_layer`` is True:
+    - Entries without a ``layers_targeted`` key are awaiting backfill and are
+      excluded from both numerator and denominator.
+    - Compliant: fix touched >=2 distinct canonical layers.
+    - Non-compliant: fix touched 0 or 1 canonical layers.
+      - doc_test_only: layers_targeted is empty (no canonical layers).
+      - most_recent_layer_only: layers_targeted matches exactly the last
+        observed layer from spawn_layers_enumerated.
+
+    ``cutoff`` is the oldest ``merged_at`` timestamp to include.
+    Non-cross-layer entries are never counted in any bucket.
+    """
+    from app.regression_layer_classifier import ALL_LAYERS
+
+    total = compliant = doc_test_only = most_recent_layer_only = awaiting_backfill = 0
+    non_compliant = 0
+    by_class: Dict[str, Dict[str, Any]] = {}
+
+    for case in rows:
+        cls_compliant = cls_non_compliant = cls_awaiting = 0
+        for entry in case.fingerprint_to_fix_log or []:
+            if not isinstance(entry, dict):
+                continue
+            if not entry.get("spawn_was_cross_layer"):
+                continue
+            merged_at_raw = entry.get("merged_at")
+            if not merged_at_raw:
+                continue
+            try:
+                merged_dt = _to_naive_utc(
+                    datetime.fromisoformat(str(merged_at_raw).replace("Z", "+00:00"))
+                )
+            except (ValueError, TypeError):
+                continue
+            if merged_dt < cutoff:
+                continue
+
+            if "layers_targeted" not in entry:
+                awaiting_backfill += 1
+                cls_awaiting += 1
+                continue
+
+            raw_targeted = entry.get("layers_targeted") or []
+            targeted_canonical = {str(x) for x in raw_targeted if str(x) in ALL_LAYERS}
+            spawn_layers = list(entry.get("spawn_layers_enumerated") or [])
+
+            total += 1
+            if len(targeted_canonical) >= 2:
+                compliant += 1
+                cls_compliant += 1
+            else:
+                non_compliant += 1
+                cls_non_compliant += 1
+                if not targeted_canonical:
+                    doc_test_only += 1
+                elif spawn_layers:
+                    most_recent = spawn_layers[-1]
+                    if targeted_canonical == {most_recent}:
+                        most_recent_layer_only += 1
+
+        if cls_compliant + cls_non_compliant + cls_awaiting > 0:
+            cls_total = cls_compliant + cls_non_compliant
+            by_class[case.regression_class] = {
+                "compliant": cls_compliant,
+                "non_compliant": cls_non_compliant,
+                "awaiting_backfill": cls_awaiting,
+                "compliance_rate": (
+                    round(cls_compliant / cls_total, 4) if cls_total > 0 else None
+                ),
+            }
+
+    return {
+        "total_classified": total,
+        "compliant": compliant,
+        "non_compliant": non_compliant,
+        "awaiting_backfill_count": awaiting_backfill,
+        "compliance_rate": round(compliant / total, 4) if total > 0 else None,
+        "failure_modes": {
+            "doc_test_only": doc_test_only,
+            "most_recent_layer_only": most_recent_layer_only,
+        },
+        "by_class": by_class,
+    }
+
+
 def _compute_regression_case_summary(
     rows: List[RegressionRemediationCase],
+    all_rows: List[RegressionRemediationCase] | None = None,
 ) -> Dict[str, Any]:
     by_class: Dict[str, Dict[str, List[float]]] = {}
     for case in rows:
@@ -862,6 +972,9 @@ def _compute_regression_case_summary(
                     ).total_seconds()
                 )
     layer_coverage_by_class = _compute_layer_coverage_by_class(rows)
+    symptom_layers_by_class = _compute_symptom_layers_by_class(
+        list(all_rows) if all_rows is not None else rows
+    )
 
     def _entry(regression_class: str, bucket: Dict[str, List[float]]) -> Dict[str, Any]:
         out: Dict[str, Any] = {
@@ -897,6 +1010,8 @@ def _compute_regression_case_summary(
     # classified fix entries — keeps the empty-summary contract intact.
     if layer_coverage_by_class:
         response["layer_coverage_by_class"] = layer_coverage_by_class
+    if symptom_layers_by_class:
+        response["symptom_layers_by_class"] = symptom_layers_by_class
     return response
 
 
@@ -2272,7 +2387,9 @@ async def list_regression_cases(
     return {
         "count": len(rows),
         "status_filter": status_filter,
-        "summary": _compute_regression_case_summary(closed_rows),
+        "summary": _compute_regression_case_summary(
+            closed_rows, all_rows=list(rows) + list(closed_rows)
+        ),
         "cases": [
             {
                 "id": str(c.id),
@@ -2658,10 +2775,15 @@ async def list_recently_closed_regression_cases(
         .all()
     )
 
+    from app.pipeline_regression_dispatcher import (  # noqa: PLC0415
+        _extract_recurrence_cycles,
+    )
+
     cases = []
     for c in rows:
         fix_pr_number = None
         recovered_at = None
+        hold_days_history = []
 
         if c.fingerprint_to_fix_log:
             for entry in c.fingerprint_to_fix_log:
@@ -2669,6 +2791,25 @@ async def list_recently_closed_regression_cases(
                     fix_pr_number = entry["fix_pr_number"]
                 if "recovered_at" in entry:
                     recovered_at = entry["recovered_at"]
+
+        # Pair merged_at/recovered_at across separate fix-log entries
+        # (production shape: mark_merged writes one entry, the recovery scan
+        # writes a second with recovered_at — see pipeline_regression_dispatcher
+        # ._extract_recurrence_cycles).
+        for cycle in _extract_recurrence_cycles(c):
+            merged_dt = cycle.get("merged_at")
+            recovered_dt = cycle.get("recovered_at")
+            if not (
+                isinstance(merged_dt, datetime) and isinstance(recovered_dt, datetime)
+            ):
+                continue
+            merged_naive = _to_naive_utc(merged_dt)
+            recovered_naive = _to_naive_utc(recovered_dt)
+            hold_duration_seconds = (recovered_naive - merged_naive).total_seconds()
+            hold_days = hold_duration_seconds / (24 * 3600)
+            hold_days_history.append(round(hold_days, 2))
+
+        is_fragile = any(hold_days < 2.0 for hold_days in hold_days_history)
 
         time_to_recover_sec = None
         if recovered_at and c.first_seen_at:
@@ -2703,6 +2844,8 @@ async def list_recently_closed_regression_cases(
                 else None,
                 "time_to_detect_sec": c.time_to_detect_sec,
                 "time_to_recover_sec": time_to_recover_sec,
+                "hold_days_history": hold_days_history,
+                "is_fragile": is_fragile,
                 "layer_summary": _summarize_symptoms_by_layer(
                     c.symptoms_by_layer, now=now
                 ),
@@ -2713,6 +2856,36 @@ async def list_recently_closed_regression_cases(
         "count": len(cases),
         "cases": cases,
     }
+
+
+@router.get("/regression-cases/cross-layer-compliance")
+async def get_cross_layer_compliance(
+    project_id: uuid.UUID = Query(..., description="Project to query (required)"),
+    window_days: int = Query(30, ge=1, le=90, description="Rolling window in days"),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),  # noqa: ARG001
+) -> Dict[str, Any]:
+    """Cross-layer escalation compliance metric over a rolling window.
+
+    For fix-log entries produced by cross-layer-escalated investigations,
+    computes how often the resulting fix actually targeted >=2 distinct
+    canonical infrastructure layers (compliant) vs. only 1 or 0 (non-compliant).
+    Entries still awaiting the layers_targeted backfill are excluded from
+    both numerator and denominator and reported in awaiting_backfill_count.
+    """
+    cutoff = _utcnow() - timedelta(days=window_days)
+    rows = (
+        (
+            await session.execute(
+                select(RegressionRemediationCase).where(
+                    RegressionRemediationCase.project_id == project_id,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return _compute_cross_layer_compliance(rows, cutoff)
 
 
 @router.get("/regression-class-kpis")

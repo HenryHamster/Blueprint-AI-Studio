@@ -4991,6 +4991,252 @@ async def test_compute_sr_catch_rate_trends_by_task_type_threshold_omits_low_sam
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Tests for by_scope breakdown in compute_sr_catch_rate_trends
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _set_task_scope(task: Task, scope: str) -> Task:
+    """Attach scope to task.context, preserving SR fields set by _make_sr_task."""
+    ctx = dict(task.context or {})
+    ctx["scope"] = scope
+    task.context = ctx
+    return task
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_by_scope_basic(
+    db_session: AsyncSession,
+):
+    """by_scope contains correct hit/miss rates per (scope, category)."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    # 5 small-scope tasks: 4 hits on test-coverage
+    for _ in range(4):
+        t = _set_task_scope(
+            _make_sr_task(
+                project.id,
+                age_days=2,
+                human_cats={"test-coverage": 1},
+                sr_failed_cats=["test-coverage"],
+            ),
+            "small",
+        )
+        db_session.add(t)
+        tasks.append(t)
+    t = _set_task_scope(
+        _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"test-coverage": 1},
+            sr_failed_cats=[],
+        ),
+        "small",
+    )
+    db_session.add(t)
+    tasks.append(t)
+    # 5 large-scope tasks: 1 hit on test-coverage (markedly more misses)
+    for _ in range(1):
+        t = _set_task_scope(
+            _make_sr_task(
+                project.id,
+                age_days=2,
+                human_cats={"test-coverage": 1},
+                sr_failed_cats=["test-coverage"],
+            ),
+            "large",
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(4):
+        t = _set_task_scope(
+            _make_sr_task(
+                project.id,
+                age_days=2,
+                human_cats={"test-coverage": 1},
+                sr_failed_cats=[],
+            ),
+            "large",
+        )
+        db_session.add(t)
+        tasks.append(t)
+    # Previous window
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"test-coverage": 1},
+            sr_failed_cats=["test-coverage"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    assert "by_scope" in result
+    by_scope = result["by_scope"]
+    assert "small" in by_scope
+    assert "large" in by_scope
+    small_cell = by_scope["small"]["test-coverage"]
+    assert small_cell["hit_rate"] == round(4 / 5, 3)
+    assert small_cell["miss_rate"] == round(1 / 5, 3)
+    assert small_cell["sample_count"] == 5
+    large_cell = by_scope["large"]["test-coverage"]
+    assert large_cell["hit_rate"] == round(1 / 5, 3)
+    assert large_cell["miss_rate"] == round(4 / 5, 3)
+    assert large_cell["sample_count"] == 5
+    # Observability win: large-scope miss rate is markedly higher than small.
+    assert large_cell["miss_rate"] > small_cell["miss_rate"]
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_by_scope_threshold_omits_low_sample(
+    db_session: AsyncSession,
+):
+    """Cells with fewer than 5 samples per (scope, category) are omitted from by_scope."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    # 5 small-scope tasks (meets threshold)
+    for _ in range(5):
+        t = _set_task_scope(
+            _make_sr_task(
+                project.id,
+                age_days=2,
+                human_cats={"correctness": 1},
+                sr_failed_cats=["correctness"],
+            ),
+            "small",
+        )
+        db_session.add(t)
+        tasks.append(t)
+    # 4 medium-scope tasks (below threshold — must be omitted)
+    for _ in range(4):
+        t = _set_task_scope(
+            _make_sr_task(
+                project.id,
+                age_days=2,
+                human_cats={"correctness": 1},
+                sr_failed_cats=["correctness"],
+            ),
+            "medium",
+        )
+        db_session.add(t)
+        tasks.append(t)
+    # Previous window
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    by_scope = result["by_scope"]
+    assert "small" in by_scope
+    # medium had 4 samples — must be omitted entirely (no 0%/100% sentinel cell)
+    assert "medium" not in by_scope
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_by_scope_default_small_when_missing(
+    db_session: AsyncSession,
+):
+    """Tasks without an explicit scope bucket under DEFAULT_TASK_SCOPE='small'."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    # 5 tasks with no scope set in context — should bucket under 'small' (default).
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    # Previous window
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    by_scope = result["by_scope"]
+    assert "small" in by_scope
+    assert by_scope["small"]["correctness"]["sample_count"] == 5
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_by_scope_fp_stats(
+    db_session: AsyncSession,
+):
+    """by_scope cells carry fp_count / tp_count / false_positive_rate."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    # 5 large-scope create tasks: SR flags `correctness` but human never confirms → FP=5
+    for _ in range(5):
+        t = _set_task_scope(
+            _make_sr_task(
+                project.id,
+                age_days=2,
+                human_cats={"correctness": 1},
+                sr_failed_cats=["correctness"],
+            ),
+            "large",
+        )
+        db_session.add(t)
+        tasks.append(t)
+    # Previous window
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    by_scope = result["by_scope"]
+    assert "large" in by_scope
+    cell = by_scope["large"]["correctness"]
+    assert "fp_count" in cell
+    assert "tp_count" in cell
+    assert "false_positive_rate" in cell
+    # All 5 SR flags were confirmed by human → all TPs, no FPs.
+    assert cell["tp_count"] == 5
+    assert cell["fp_count"] == 0
+    assert cell["false_positive_rate"] == 0.0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Tests for miss-example collection in compute_sr_catch_rate_trends
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -6974,6 +7220,7 @@ async def test_compute_sr_catch_rate_trends_all_fields_always_present(
         "previous_cycle_id",
         "categories",
         "by_task_type",
+        "by_scope",
         "by_severity",
         "edges_considered_stats",
         "sr_skip_rate",
@@ -7601,7 +7848,7 @@ def test_compute_cat_fp_stats_fp_and_tp_counts():
         ),
     ]
 
-    cat_fp, type_cat_fp = _compute_cat_fp_stats(tasks)
+    cat_fp, type_cat_fp, _scope_cat_fp = _compute_cat_fp_stats(tasks)
 
     assert cat_fp["correctness"]["tp"] == 1
     assert cat_fp["correctness"]["fp"] == 1
@@ -7630,10 +7877,11 @@ def test_compute_cat_fp_stats_skips_non_code_types():
         ),
     ]
 
-    cat_fp, type_cat_fp = _compute_cat_fp_stats(tasks)
+    cat_fp, type_cat_fp, scope_cat_fp = _compute_cat_fp_stats(tasks)
 
     assert cat_fp == {}
     assert type_cat_fp == {}
+    assert scope_cat_fp == {}
 
 
 def test_compute_cat_fp_stats_skips_tasks_without_sro():
@@ -7649,7 +7897,7 @@ def test_compute_cat_fp_stats_skips_tasks_without_sro():
         context={},
     )
 
-    cat_fp, type_cat_fp = _compute_cat_fp_stats([task])
+    cat_fp, type_cat_fp, _scope_cat_fp = _compute_cat_fp_stats([task])
 
     assert cat_fp == {}
 
@@ -7667,7 +7915,7 @@ def test_compute_cat_fp_stats_false_positive_rate_formula():
         ),
     ]
 
-    cat_fp, _ = _compute_cat_fp_stats(tasks)
+    cat_fp, _, _ = _compute_cat_fp_stats(tasks)
 
     fp = cat_fp["correctness"]["fp"]
     tp = cat_fp["correctness"]["tp"]
@@ -7853,11 +8101,12 @@ def test_compute_cat_fp_stats_excludes_reviewer_origin_from_sr_failed(origin):
         context={"_self_review_outcome": sro},
     )
 
-    cat_fp, type_cat_fp = _compute_cat_fp_stats([task])
+    cat_fp, type_cat_fp, scope_cat_fp = _compute_cat_fp_stats([task])
 
     # Reviewer-stamped failure must not be attributed to the author SR.
     assert cat_fp == {}
     assert type_cat_fp == {}
+    assert scope_cat_fp == {}
 
 
 def test_compute_cat_fp_stats_legacy_no_origin_still_counts():
@@ -7869,7 +8118,7 @@ def test_compute_cat_fp_stats_legacy_no_origin_still_counts():
         project_id, sr_failed_cats=["correctness"], reviewer_cats=["correctness"]
     )
 
-    cat_fp, _ = _compute_cat_fp_stats([task])
+    cat_fp, _, _ = _compute_cat_fp_stats([task])
 
     assert cat_fp["correctness"]["tp"] == 1
     assert cat_fp["correctness"].get("fp", 0) == 0
@@ -7971,7 +8220,7 @@ def test_stats_for_tasks_reviewer_origin_excluded_from_sr_failed_count():
         check_result_overrides={"security": {"origin": "reviewer_disagreement"}},
     )
 
-    _count, cat_stats, _type_cat, _all_iter, _sev = _stats_for_tasks(
+    _count, cat_stats, _type_cat, _all_iter, _sev, _scope_cat = _stats_for_tasks(
         [author_task, reviewer_task]
     )
 
@@ -8006,7 +8255,7 @@ def test_stats_for_tasks_reviewer_origin_keeps_combined_hit_count():
         check_result_overrides={"correctness": {"origin": "reviewer"}},
     )
 
-    _count, cat_stats, _type_cat, _all_iter, _sev = _stats_for_tasks([task])
+    _count, cat_stats, _type_cat, _all_iter, _sev, _scope_cat = _stats_for_tasks([task])
 
     cat = cat_stats.get("correctness") or {}
     assert cat.get("hit_count", 0) == 1

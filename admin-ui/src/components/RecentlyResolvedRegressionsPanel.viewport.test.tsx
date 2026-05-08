@@ -8,6 +8,15 @@ import { expectNoOverflowAt } from '../test/viewport';
 // the pattern in RecentlyResolvedRegressionsPanel.test.tsx).
 vi.mock('../api', () => ({
   apiFetch: vi.fn(async () => new Response(JSON.stringify({ cases: [] }), { status: 200 })),
+  fetchCrossLayerCompliance: vi.fn(async () => ({
+    total_classified: 0,
+    compliant: 0,
+    non_compliant: 0,
+    awaiting_backfill_count: 0,
+    compliance_rate: null,
+    failure_modes: { doc_test_only: 0, most_recent_layer_only: 0 },
+    by_class: {},
+  })),
   authHeaders: vi.fn(async () => ({})),
   API_BASE_URL: 'http://localhost:8000',
 }));

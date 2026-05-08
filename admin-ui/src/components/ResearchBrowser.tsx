@@ -506,6 +506,14 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
                                 })()
                             }
                             <span className="text-xs text-neutral-200 flex-1 truncate">{ef.finding.title}</span>
+                            {ef.finding._provenance_warnings && ef.finding._provenance_warnings.broken_source_ref_count > 0 && (
+                              <span
+                                className="shrink-0 inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-amber-900/40 text-amber-400 text-[10px] font-mono tabular-nums"
+                                title={`Broken source refs:\n${ef.finding._provenance_warnings.broken_refs.slice(0, 5).join('\n')}`}
+                              >
+                                ⚠ {ef.finding._provenance_warnings.broken_source_ref_count} broken refs
+                              </span>
+                            )}
                             <span className="text-[10px] text-neutral-600 shrink-0">{relativeDate(ef.taskCreatedAt)}</span>
                           </div>
                           {isDetailOpen && (

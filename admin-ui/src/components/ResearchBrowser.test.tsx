@@ -90,6 +90,54 @@ describe('ResearchBrowser evidence panel', () => {
     expect(screen.queryByRole('link', { name: 'agent/src/foo.ts:42' })).toBeNull();
   });
 
+  it('renders broken-refs badge when finding has broken_source_ref_count > 0', () => {
+    const finding = makeFinding({
+      title: 'Hallucinated finding',
+      _provenance_warnings: {
+        broken_source_ref_count: 2,
+        broken_refs: ['agent/src/missing.ts', 'backend/app/gone.py'],
+      },
+    });
+    render(
+      <ResearchBrowser
+        tasks={[makeResearchTask([finding])]}
+        selectedProjectId={null}
+        onClose={() => {}}
+      />,
+    );
+    const badge = screen.getByText(/2 broken refs/);
+    expect(badge).toBeInTheDocument();
+    expect(badge).toHaveAttribute('title', expect.stringContaining('agent/src/missing.ts'));
+    expect(badge).toHaveAttribute('title', expect.stringContaining('backend/app/gone.py'));
+  });
+
+  it('does not render broken-refs badge when no provenance warnings', () => {
+    render(
+      <ResearchBrowser
+        tasks={[makeResearchTask([makeFinding({ title: 'Clean finding' })])]}
+        selectedProjectId={null}
+        onClose={() => {}}
+      />,
+    );
+    expect(screen.getByText('Clean finding')).toBeInTheDocument();
+    expect(screen.queryByText(/broken refs/)).not.toBeInTheDocument();
+  });
+
+  it('does not render broken-refs badge when broken_source_ref_count is 0', () => {
+    const finding = makeFinding({
+      title: 'Zero-count finding',
+      _provenance_warnings: { broken_source_ref_count: 0, broken_refs: [] },
+    });
+    render(
+      <ResearchBrowser
+        tasks={[makeResearchTask([finding])]}
+        selectedProjectId={null}
+        onClose={() => {}}
+      />,
+    );
+    expect(screen.queryByText(/broken refs/)).not.toBeInTheDocument();
+  });
+
   it('renders nothing when finding has no claims and no sources', async () => {
     const user = userEvent.setup();
     render(

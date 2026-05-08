@@ -15,6 +15,7 @@ export interface ResearchFinding {
   direction_id?: string;
   claims?: string[];
   sources?: Array<{ type?: string; ref: string; excerpt?: string }>;
+  _provenance_warnings?: { broken_source_ref_count: number; broken_refs: string[] };
 }
 
 export interface Task {

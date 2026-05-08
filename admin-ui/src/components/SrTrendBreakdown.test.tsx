@@ -815,3 +815,95 @@ describe('SrTrendBreakdown reasoning engagement', () => {
     expect(engEl).toHaveTextContent('eng:50%');
   });
 });
+
+describe('SrTrendBreakdown by_scope section', () => {
+  it('renders By Scope heading and rows when by_scope is populated (card variant)', () => {
+    const trends: SrTrendData = {
+      categories: {
+        correctness: { miss_rate: 0.3, trend: 'stable' },
+      },
+      by_scope: {
+        small: {
+          correctness: { miss_rate: 0.1, sample_count: 8 },
+        },
+        large: {
+          correctness: { miss_rate: 0.6, sample_count: 6 },
+        },
+      },
+    };
+    render(<SrTrendBreakdown trends={trends} variant="card" />);
+    expect(screen.getByText('By Scope')).toBeInTheDocument();
+    const section = screen.getByTestId('sr-trend-by-scope');
+    expect(section).toHaveTextContent('small');
+    expect(section).toHaveTextContent('large');
+    expect(section).toHaveTextContent('10%');
+    expect(section).toHaveTextContent('60%');
+  });
+
+  it('renders scopes in canonical order small > medium > large', () => {
+    const trends: SrTrendData = {
+      categories: { correctness: { miss_rate: 0.3, trend: 'stable' } },
+      by_scope: {
+        large: { correctness: { miss_rate: 0.6, sample_count: 6 } },
+        small: { correctness: { miss_rate: 0.1, sample_count: 8 } },
+        medium: { correctness: { miss_rate: 0.3, sample_count: 7 } },
+      },
+    };
+    render(<SrTrendBreakdown trends={trends} variant="card" />);
+    const section = screen.getByTestId('sr-trend-by-scope');
+    const text = section.textContent ?? '';
+    const small = text.indexOf('small');
+    const medium = text.indexOf('medium');
+    const large = text.indexOf('large');
+    expect(small).toBeGreaterThanOrEqual(0);
+    expect(small).toBeLessThan(medium);
+    expect(medium).toBeLessThan(large);
+  });
+
+  it('omits the section when by_scope is missing or empty', () => {
+    const trends: SrTrendData = {
+      categories: { correctness: { miss_rate: 0.3, trend: 'stable' } },
+    };
+    render(<SrTrendBreakdown trends={trends} variant="card" />);
+    expect(screen.queryByTestId('sr-trend-by-scope')).not.toBeInTheDocument();
+    expect(screen.queryByText('By Scope')).not.toBeInTheDocument();
+  });
+
+  it('skips scopes whose category record is empty', () => {
+    const trends: SrTrendData = {
+      categories: { correctness: { miss_rate: 0.3, trend: 'stable' } },
+      by_scope: {
+        small: { correctness: { miss_rate: 0.1, sample_count: 8 } },
+        medium: {},
+      },
+    };
+    render(<SrTrendBreakdown trends={trends} variant="card" />);
+    const section = screen.getByTestId('sr-trend-by-scope');
+    expect(section).toHaveTextContent('small');
+    expect(section).not.toHaveTextContent('medium');
+  });
+
+  it('reveals examples when a category cell with examples is clicked', async () => {
+    const user = userEvent.setup();
+    const trends: SrTrendData = {
+      categories: { correctness: { miss_rate: 0.3, trend: 'stable' } },
+      by_scope: {
+        large: {
+          correctness: {
+            miss_rate: 0.6,
+            sample_count: 6,
+            examples: [
+              { severity: 'CRITICAL', desc: 'large-scope miss example' },
+            ],
+          },
+        },
+      },
+    };
+    render(<SrTrendBreakdown trends={trends} variant="card" />);
+    const section = screen.getByTestId('sr-trend-by-scope');
+    const button = section.querySelector('button');
+    if (!button) throw new Error('expected at least one clickable category cell');
+    await user.click(button);
+    expect(section).toHaveTextContent('large-scope miss example');
+  });
+});

@@ -204,6 +204,63 @@ interface Props {
   onClassSelect?: (cls: string | null) => void;
 }
 
+interface LayerCoverageCombo { layers: string[]; count: number; }
+interface LayerCoverageEntry { total_fixes_with_layers: number; combinations: LayerCoverageCombo[]; }
+type LayerCoverageByClass = Record<string, LayerCoverageEntry>;
+
+const LAYER_SHORT: Record<string, string> = { CI_WORKFLOW: 'CI', AGENT_VM: 'VM', AGENT_VERB: 'VERB', BASELINE_GATE: 'BASELINE', REVIEWER_PASS: 'REVIEWER' };
+const CANONICAL_LAYERS = ['CI_WORKFLOW', 'AGENT_VM', 'AGENT_VERB', 'BASELINE_GATE', 'REVIEWER_PASS'];
+
+export function LayerCoverageHistogramPanel({ projectId }: Props) {
+  const [coverage, setCoverage] = useState<LayerCoverageByClass | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    apiFetch(`/api/admin/regression-cases?project_id=${encodeURIComponent(projectId)}`)
+      .then(async (res) => { if (!cancelled && res.ok) { const d = await res.json(); setCoverage(d.summary?.layer_coverage_by_class ?? null); } })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [projectId]);
+
+  if (!coverage || Object.keys(coverage).length === 0) return null;
+
+  return (
+    <section data-testid="layer-coverage-histogram-panel" className="mb-4">
+      <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Layer Coverage by Class</h2>
+      <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg divide-y divide-neutral-800/30 overflow-hidden">
+        {Object.entries(coverage).map(([cls, entry]) => {
+          const targeted = new Set(entry.combinations.flatMap(c => c.layers));
+          const missing = CANONICAL_LAYERS.filter(l => !targeted.has(l));
+          const underDefended = targeted.size > 0 && missing.length > 0;
+          const noLayerCount = entry.combinations.find(c => c.layers.length === 0)?.count ?? 0;
+          const top2 = entry.combinations.filter(c => c.layers.length > 0).slice(0, 2);
+          return (
+            <div key={cls}
+              className={`px-3 py-1.5 ${underDefended ? 'bg-amber-950/10 border-l-2 border-l-amber-500/60' : ''}`}
+              title={underDefended ? `Under-defended: no fix has ever targeted ${missing.map(l => LAYER_SHORT[l] ?? l).join(', ')}` : undefined}
+            >
+              <div className="flex items-center gap-1.5 flex-wrap min-w-0">
+                <span className="text-[10px] font-mono text-neutral-300 truncate flex-1 min-w-0">{cls}</span>
+                {top2.map((c, i) => (
+                  <span key={i} className="text-[10px] px-1.5 py-0.5 rounded bg-neutral-800/60 text-neutral-300 border border-neutral-700 font-mono whitespace-nowrap">
+                    {c.layers.map(l => LAYER_SHORT[l] ?? l).join('+')} ×{c.count}
+                  </span>
+                ))}
+                {noLayerCount > 0 && (
+                  <span className="text-[10px] px-1.5 py-0.5 rounded bg-neutral-700/30 text-neutral-500 border border-neutral-700/40 whitespace-nowrap" title="Fixes targeting no canonical layer (doc-only / test-only)">
+                    no-layer ×{noLayerCount}
+                  </span>
+                )}
+                {underDefended && <span className="text-[10px] text-amber-400/80" aria-label="under-defended">⚠</span>}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
 function formatMttd(sec: number | null | undefined): string {
   if (sec === null || sec === undefined) return 'unknown';
   if (sec < 0) return '—';

@@ -1,7 +1,7 @@
 import { afterEach, describe, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
-import { DispatcherHealthPanel, ManualInterventionPanel, RegressionRateTrendPanel } from './PipelineRegressionsPanel';
+import { DispatcherHealthPanel, LayerCoverageHistogramPanel, ManualInterventionPanel, RegressionRateTrendPanel } from './PipelineRegressionsPanel';
 import { expectNoOverflowAt } from '../test/viewport';
 
 vi.mock('recharts', () => ({
@@ -46,6 +46,31 @@ vi.mock('../api', () => ({
         return { date: d.toISOString().slice(0, 10), opened: Math.floor(Math.random() * 5), closed: Math.floor(Math.random() * 4) };
       });
       return new Response(JSON.stringify({ project_id: 'project-123', days: 30, daily, by_class: {} }), { status: 200 });
+    }
+    if (url.includes('regression-cases') && !url.includes('manual-intervention') && !url.includes('auto-recovered') && !url.includes('trend')) {
+      return new Response(JSON.stringify({
+        count: 2,
+        status_filter: ['ACTIVE'],
+        summary: {
+          by_regression_class: [],
+          layer_coverage_by_class: {
+            sr_regression_pipeline_success_rate: {
+              total_fixes_with_layers: 5,
+              combinations: [
+                { layers: ['AGENT_VM'], count: 3 },
+                { layers: ['AGENT_VM', 'CI_WORKFLOW'], count: 2 },
+              ],
+            },
+            long_running_class_name_with_no_canonical_layer_targeted_ever: {
+              total_fixes_with_layers: 2,
+              combinations: [
+                { layers: [], count: 2 },
+              ],
+            },
+          },
+        },
+        cases: [],
+      }), { status: 200 });
     }
     if (url.includes('/manual-intervention')) {
       return new Response(JSON.stringify({ cases: Array.from({ length: 6 }, (_, i) => ({
@@ -134,6 +159,22 @@ describe('ManualInterventionPanel — viewport regression', () => {
       document.body.appendChild(host);
       root = createRoot(host);
       await act(async () => { root?.render(<ManualInterventionPanel projectId="project-123" />); });
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 50)); });
+    });
+  });
+});
+
+describe('LayerCoverageHistogramPanel — viewport regression', () => {
+  let root: Root | null = null;
+  let host: HTMLDivElement | null = null;
+  afterEach(() => { if (root) act(() => root?.unmount()); root = null; host?.remove(); host = null; });
+  test('renders without horizontal overflow at 375px', async () => {
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      root = createRoot(host);
+      await act(async () => { root?.render(<LayerCoverageHistogramPanel projectId="project-123" />); });
       await act(async () => { await new Promise((resolve) => setTimeout(resolve, 50)); });
     });
   });

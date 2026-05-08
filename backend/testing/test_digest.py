@@ -18,6 +18,8 @@ from app.models import (
 )
 from app.routers.admin_analytics import _derive_completed_at
 from app.routers.admin_digest import (
+    _compute_layer_coverage_by_class,
+    _compute_symptom_layers_by_class,
     _stash_projected_task_fields,
     _summarize_symptoms_by_layer,
 )
@@ -10252,6 +10254,15 @@ async def test_digest_sr_trends_full_fidelity_passthrough(
                 }
             },
             "by_task_type": {"create": {"correctness": {"hit_count": 3}}},
+            "by_scope": {
+                "large": {
+                    "correctness": {
+                        "hit_rate": 0.4,
+                        "miss_rate": 0.6,
+                        "sample_count": 5,
+                    }
+                }
+            },
             "by_severity": {
                 "high": {
                     "current_miss_rate": 0.1,
@@ -10288,6 +10299,8 @@ async def test_digest_sr_trends_full_fidelity_passthrough(
     assert trends["by_severity"]["high"]["trend"] == "stable"
     assert trends["computed_at"] == "2026-05-01T00:00:00"
     assert trends["categories"]["correctness"]["fp_count"] == 1
+    assert trends["by_scope"]["large"]["correctness"]["miss_rate"] == 0.6
+    assert trends["by_scope"]["large"]["correctness"]["sample_count"] == 5
 
 
 @pytest.mark.asyncio
@@ -13104,6 +13117,188 @@ async def test_list_regression_cases_layer_summary_empty_for_default_case(
     }
 
 
+@pytest.mark.asyncio
+async def test_list_recently_closed_hold_days_history_no_prior_attempts(
+    client: AsyncClient, db_session
+):
+    """When fingerprint_to_fix_log has no entries with both merged_at+recovered_at, hold_days_history is empty."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate:correctness",
+        status=RegressionCaseStatus.CLOSED,
+        fingerprint_to_fix_log=[
+            {"fingerprint": "abc", "fix_pr_number": 1111},
+            {"fingerprint": "def", "fix_pr_number": 2222},
+        ],
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    response = await client.get(
+        "/api/admin/regression-cases/recently-closed",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["count"] == 1
+
+    c = data["cases"][0]
+    assert c["hold_days_history"] == []
+    assert c["is_fragile"] is False
+
+
+@pytest.mark.asyncio
+async def test_list_recently_closed_hold_days_history_with_short_hold(
+    client: AsyncClient, db_session
+):
+    """When a prior attempt re-tripped within 48h, it appears in hold_days_history and is_fragile is True."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate:correctness",
+        status=RegressionCaseStatus.CLOSED,
+        fingerprint_to_fix_log=[
+            {
+                "fingerprint": "abc",
+                "fix_pr_number": 1111,
+                "merged_at": "2026-05-05T10:00:00+00:00",
+            },
+            {
+                "fingerprint": "abc",
+                "recovered_at": "2026-05-05T16:30:00+00:00",  # 6.5 hours = 0.27 days
+            },
+        ],
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    response = await client.get(
+        "/api/admin/regression-cases/recently-closed",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["count"] == 1
+
+    c = data["cases"][0]
+    assert len(c["hold_days_history"]) == 1
+    assert c["hold_days_history"][0] < 1.0  # 6.5 hours is less than 1 day
+    assert c["is_fragile"] is True
+
+
+@pytest.mark.asyncio
+async def test_list_recently_closed_hold_days_history_with_long_hold(
+    client: AsyncClient, db_session
+):
+    """When all prior attempts held >7 days, hold_days_history contains those durations and is_fragile is False."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate:correctness",
+        status=RegressionCaseStatus.CLOSED,
+        fingerprint_to_fix_log=[
+            {
+                "fingerprint": "abc",
+                "fix_pr_number": 1111,
+                "merged_at": "2026-04-28T10:00:00+00:00",
+            },
+            {
+                "fingerprint": "abc",
+                "recovered_at": "2026-05-05T10:00:00+00:00",  # 7 days exactly
+            },
+        ],
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    response = await client.get(
+        "/api/admin/regression-cases/recently-closed",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["count"] == 1
+
+    c = data["cases"][0]
+    assert len(c["hold_days_history"]) == 1
+    assert c["hold_days_history"][0] == 7.0
+    assert c["is_fragile"] is False
+
+
+@pytest.mark.asyncio
+async def test_list_recently_closed_hold_days_history_mixed_holds_with_fragile(
+    client: AsyncClient, db_session
+):
+    """When hold_days_history has mixed durations including a short hold, is_fragile is True."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate:correctness",
+        status=RegressionCaseStatus.CLOSED,
+        fingerprint_to_fix_log=[
+            {
+                "fingerprint": "abc",
+                "fix_pr_number": 1111,
+                "merged_at": "2026-05-01T10:00:00+00:00",
+            },
+            {
+                "fingerprint": "abc",
+                "recovered_at": "2026-05-02T10:00:00+00:00",  # 1.0 day
+            },
+            {
+                "fingerprint": "def",
+                "fix_pr_number": 2222,
+                "merged_at": "2026-05-02T11:00:00+00:00",
+            },
+            {
+                "fingerprint": "def",
+                "recovered_at": "2026-05-02T17:00:00+00:00",  # 0.25 days (6 hours) - fragile!
+            },
+            {
+                "fingerprint": "ghi",
+                "fix_pr_number": 3333,
+                "merged_at": "2026-05-02T18:00:00+00:00",
+            },
+            {
+                "fingerprint": "ghi",
+                "recovered_at": "2026-05-10T18:00:00+00:00",  # 8.0 days
+            },
+        ],
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    response = await client.get(
+        "/api/admin/regression-cases/recently-closed",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["count"] == 1
+
+    c = data["cases"][0]
+    assert len(c["hold_days_history"]) == 3
+    assert c["hold_days_history"] == [1.0, 0.25, 8.0]
+    assert c["is_fragile"] is True  # Because 0.25 < 2.0
+
+
 # ── GET /regression-cases/trend ──────────────────────────────────────────────
 
 
@@ -13181,3 +13376,303 @@ async def test_regression_case_trend_counts_opened_and_closed(
     )
     assert div_today["opened"] == 0
     assert div_today["closed"] == 1
+
+
+# ── _compute_layer_coverage_by_class / _compute_symptom_layers_by_class ──────
+
+
+def _make_regression_case(regression_class: str, fix_log=None, symptoms=None):
+    """Lightweight stub — only the fields accessed by the coverage helpers."""
+    import types
+
+    case = types.SimpleNamespace(
+        regression_class=regression_class,
+        fingerprint_to_fix_log=fix_log or [],
+        symptoms_by_layer=symptoms or {},
+    )
+    return case
+
+
+def test_layer_coverage_by_class_basic():
+    rows = [
+        _make_regression_case(
+            "baseline_drift",
+            fix_log=[
+                {"layers_targeted": ["AGENT_VM", "AGENT_VM", "CI_WORKFLOW"]},
+                {"layers_targeted": ["AGENT_VM"]},
+                {"layers_targeted": ["AGENT_VM"]},
+            ],
+        ),
+    ]
+    out = _compute_layer_coverage_by_class(rows)
+    assert "baseline_drift" in out
+    entry = out["baseline_drift"]
+    assert entry["total_fixes_with_layers"] == 3
+    combos = entry["combinations"]
+    # [AGENT_VM] appears 2x, [AGENT_VM, CI_WORKFLOW] appears 1x; sorted by count desc
+    assert combos[0] == {"layers": ["AGENT_VM"], "count": 2}
+    assert combos[1] == {"layers": ["AGENT_VM", "CI_WORKFLOW"], "count": 1}
+
+
+def test_layer_coverage_by_class_no_layer_bucket():
+    rows = [
+        _make_regression_case(
+            "flaky_ci",
+            fix_log=[
+                {"layers_targeted": []},  # doc-only fix
+                {"layers_targeted": ["CI_WORKFLOW"]},
+            ],
+        ),
+    ]
+    out = _compute_layer_coverage_by_class(rows)
+    entry = out["flaky_ci"]
+    assert entry["total_fixes_with_layers"] == 2
+    no_layer = next(c for c in entry["combinations"] if c["layers"] == [])
+    assert no_layer["count"] == 1
+
+
+def test_layer_coverage_by_class_skips_unclassified():
+    rows = [
+        _make_regression_case(
+            "flaky_ci",
+            fix_log=[{"merged_at": "2024-01-01T00:00:00Z"}],  # no layers_targeted key
+        ),
+    ]
+    out = _compute_layer_coverage_by_class(rows)
+    assert "flaky_ci" not in out
+
+
+def test_compute_symptom_layers_by_class_basic():
+    rows = [
+        _make_regression_case(
+            "baseline_drift", symptoms={"CI_WORKFLOW": {}, "AGENT_VM": {}}
+        ),
+        _make_regression_case("baseline_drift", symptoms={"BASELINE_GATE": {}}),
+        _make_regression_case("flaky_ci", symptoms={"CI_WORKFLOW": {}}),
+    ]
+    out = _compute_symptom_layers_by_class(rows)
+    assert sorted(out["baseline_drift"]) == ["AGENT_VM", "BASELINE_GATE", "CI_WORKFLOW"]
+    assert out["flaky_ci"] == ["CI_WORKFLOW"]
+
+
+def test_compute_symptom_layers_by_class_empty_symptoms_skipped():
+    rows = [
+        _make_regression_case("no_symptoms", symptoms={}),
+        _make_regression_case("no_symptoms_none", symptoms=None),
+    ]
+    out = _compute_symptom_layers_by_class(rows)
+    assert out == {}
+
+
+# ── GET /regression-cases/cross-layer-compliance ─────────────────────────────
+
+
+def _make_cross_layer_case(project_id, regression_class, fix_log_entries):
+    return RegressionRemediationCase(
+        project_id=project_id,
+        regression_class=regression_class,
+        status=RegressionCaseStatus.ACTIVE,
+        fingerprint_to_fix_log=fix_log_entries,
+    )
+
+
+def _cross_layer_entry(layers_targeted=None, spawn_layers=None, days_ago=1):
+    now = _utcnow()
+    entry = {
+        "fingerprint": "test_class",
+        "fix_pr_number": 100,
+        "merged_at": (now - timedelta(days=days_ago)).isoformat(),
+        "spawn_was_cross_layer": True,
+        "spawn_layers_enumerated": spawn_layers or ["CI_WORKFLOW", "AGENT_VM"],
+    }
+    if layers_targeted is not None:
+        entry["layers_targeted"] = layers_targeted
+    return entry
+
+
+@pytest.mark.asyncio
+async def test_cross_layer_compliance_compliant(client: AsyncClient, db_session):
+    """Cross-layer spawn + fix touches >=2 layers => compliant."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    case = _make_cross_layer_case(
+        project.id,
+        "sr_catch_rate",
+        [_cross_layer_entry(layers_targeted=["CI_WORKFLOW", "AGENT_VM"])],
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    response = await client.get(
+        "/api/admin/regression-cases/cross-layer-compliance",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total_classified"] == 1
+    assert body["compliant"] == 1
+    assert body["non_compliant"] == 0
+    assert body["compliance_rate"] == 1.0
+    assert body["awaiting_backfill_count"] == 0
+    assert body["by_class"]["sr_catch_rate"]["compliant"] == 1
+
+
+@pytest.mark.asyncio
+async def test_cross_layer_compliance_non_compliant_one_layer(
+    client: AsyncClient, db_session
+):
+    """Cross-layer spawn + fix touches only 1 layer => non-compliant."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    case = _make_cross_layer_case(
+        project.id,
+        "sr_catch_rate",
+        [_cross_layer_entry(layers_targeted=["CI_WORKFLOW"])],
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    response = await client.get(
+        "/api/admin/regression-cases/cross-layer-compliance",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total_classified"] == 1
+    assert body["compliant"] == 0
+    assert body["non_compliant"] == 1
+    assert body["compliance_rate"] == 0.0
+    assert body["by_class"]["sr_catch_rate"]["non_compliant"] == 1
+
+
+@pytest.mark.asyncio
+async def test_cross_layer_compliance_awaiting_backfill_excluded(
+    client: AsyncClient, db_session
+):
+    """Entry without layers_targeted key => excluded from numerator/denominator."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Entry has no layers_targeted key (awaiting backfill).
+    case = _make_cross_layer_case(
+        project.id,
+        "sr_catch_rate",
+        [_cross_layer_entry(layers_targeted=None)],
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    response = await client.get(
+        "/api/admin/regression-cases/cross-layer-compliance",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total_classified"] == 0
+    assert body["awaiting_backfill_count"] == 1
+    assert body["compliance_rate"] is None
+
+
+@pytest.mark.asyncio
+async def test_cross_layer_compliance_non_cross_layer_excluded(
+    client: AsyncClient, db_session
+):
+    """Fix-log entry without spawn_was_cross_layer => not counted in any bucket."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    entry = {
+        "fingerprint": "sr_catch_rate",
+        "fix_pr_number": 200,
+        "merged_at": now.isoformat(),
+        "layers_targeted": ["CI_WORKFLOW", "AGENT_VM"],
+        # no spawn_was_cross_layer field
+    }
+    case = _make_cross_layer_case(project.id, "sr_catch_rate", [entry])
+    db_session.add(case)
+    await db_session.commit()
+
+    response = await client.get(
+        "/api/admin/regression-cases/cross-layer-compliance",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total_classified"] == 0
+    assert body["awaiting_backfill_count"] == 0
+    assert body["compliance_rate"] is None
+
+
+@pytest.mark.asyncio
+async def test_cross_layer_compliance_doc_test_only_failure_mode(
+    client: AsyncClient, db_session
+):
+    """Cross-layer spawn + zero canonical layers => doc_test_only failure mode."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    case = _make_cross_layer_case(
+        project.id,
+        "sr_catch_rate",
+        [_cross_layer_entry(layers_targeted=[])],
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    response = await client.get(
+        "/api/admin/regression-cases/cross-layer-compliance",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total_classified"] == 1
+    assert body["non_compliant"] == 1
+    assert body["failure_modes"]["doc_test_only"] == 1
+
+
+@pytest.mark.asyncio
+async def test_cross_layer_compliance_most_recent_layer_only_failure_mode(
+    client: AsyncClient, db_session
+):
+    """Cross-layer spawn + fix only touches last spawn layer => most_recent_layer_only."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # spawn_layers_enumerated has AGENT_VM last; fix only touches AGENT_VM.
+    case = _make_cross_layer_case(
+        project.id,
+        "sr_catch_rate",
+        [
+            _cross_layer_entry(
+                layers_targeted=["AGENT_VM"],
+                spawn_layers=["CI_WORKFLOW", "AGENT_VM"],
+            )
+        ],
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    response = await client.get(
+        "/api/admin/regression-cases/cross-layer-compliance",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total_classified"] == 1
+    assert body["non_compliant"] == 1
+    assert body["failure_modes"]["most_recent_layer_only"] == 1

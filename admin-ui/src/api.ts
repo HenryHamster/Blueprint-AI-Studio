@@ -470,6 +470,52 @@ export async function fetchRegressionRateTrend(
   return res.json();
 }
 
+export interface LayerCoverageCombo { layers: string[]; count: number; }
+export interface LayerCoverageEntry { total_fixes_with_layers: number; combinations: LayerCoverageCombo[]; }
+export type LayerCoverageByClass = Record<string, LayerCoverageEntry>;
+
+export async function fetchLayerCoverageByClass(
+  projectId: string,
+): Promise<LayerCoverageByClass | null> {
+  const res = await apiFetch(
+    `/api/admin/regression-cases?project_id=${encodeURIComponent(projectId)}`,
+  );
+  if (!res.ok) throw new Error(`Failed to fetch regression cases: ${res.status}`);
+  const data = await res.json();
+  return (data.summary?.layer_coverage_by_class as LayerCoverageByClass) ?? null;
+}
+
+export interface CrossLayerComplianceByClass {
+  compliant: number;
+  non_compliant: number;
+  awaiting_backfill: number;
+  compliance_rate: number | null;
+}
+
+export interface CrossLayerComplianceResponse {
+  total_classified: number;
+  compliant: number;
+  non_compliant: number;
+  awaiting_backfill_count: number;
+  compliance_rate: number | null;
+  failure_modes: {
+    doc_test_only: number;
+    most_recent_layer_only: number;
+  };
+  by_class: Record<string, CrossLayerComplianceByClass>;
+}
+
+export async function fetchCrossLayerCompliance(
+  projectId: string,
+  windowDays = 30,
+): Promise<CrossLayerComplianceResponse> {
+  const res = await apiFetch(
+    `/api/admin/regression-cases/cross-layer-compliance?project_id=${encodeURIComponent(projectId)}&window_days=${windowDays}`,
+  );
+  if (!res.ok) throw new Error(`Failed to fetch cross-layer compliance: ${res.status}`);
+  return res.json();
+}
+
 export async function onboardProject(
   owner: string,
   repo: string,

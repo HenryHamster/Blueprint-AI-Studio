@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { CheckCircle, Minus } from 'lucide-react';
-import { apiFetch } from '../api';
+import { apiFetch, fetchCrossLayerCompliance, type CrossLayerComplianceResponse } from '../api';
 import { timeAgo, formatDurationSec, parseTimestamp } from '../utils/time';
 import { LayersAffectedBadges, type LayerSummary } from './LayersAffectedBadges';
 
@@ -14,6 +14,8 @@ interface RecentlyClosedCase {
   time_to_recover_sec: number | null;
   recurrence_count?: number;
   layer_summary?: LayerSummary | null;
+  hold_days_history?: number[];
+  is_fragile?: boolean;
 }
 
 interface Props {
@@ -28,6 +30,7 @@ function formatTimeToDetect(firstSeenAt: string | null, signalFirstCrossedAt?: s
 
 export function RecentlyResolvedRegressionsPanel({ projectId }: Props) {
   const [cases, setCases] = useState<RecentlyClosedCase[]>([]);
+  const [compliance, setCompliance] = useState<CrossLayerComplianceResponse | null>(null);
   const [loaded, setLoaded] = useState(false);
 
   const fetchCases = useCallback(async () => {
@@ -45,14 +48,69 @@ export function RecentlyResolvedRegressionsPanel({ projectId }: Props) {
     } catch { /* silent */ }
   }, [projectId]);
 
+  const fetchCompliance = useCallback(async () => {
+    try {
+      const data = await fetchCrossLayerCompliance(projectId);
+      setCompliance(data);
+    } catch { /* silent */ }
+  }, [projectId]);
+
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect -- async fetch sets state after await, intentional
     fetchCases();
-    const id = setInterval(fetchCases, 60_000);
+    fetchCompliance();
+    const id = setInterval(() => {
+      fetchCases();
+      fetchCompliance();
+    }, 60_000);
     return () => clearInterval(id);
-  }, [fetchCases]);
+  }, [fetchCases, fetchCompliance]);
 
   if (!loaded) return null;
+
+  const renderComplianceMetric = () => {
+    if (!compliance) return null;
+
+    if (compliance.total_classified === 0) {
+      if (compliance.awaiting_backfill_count > 0) {
+        return (
+          <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 text-neutral-500 text-xs mb-3">
+            <span className="text-neutral-400">Pending classification</span>
+            <span className="text-neutral-600 ml-2">({compliance.awaiting_backfill_count} awaiting backfill)</span>
+          </div>
+        );
+      }
+      return (
+        <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 text-neutral-500 text-xs mb-3">
+          No cross-layer remediations classified yet
+        </div>
+      );
+    }
+
+    return (
+      <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 mb-3">
+        <div className="flex items-center justify-between mb-2">
+          <span className="text-[10px] font-semibold text-neutral-400 uppercase tracking-widest">Cross-layer Compliance</span>
+          <span className="text-[11px] font-medium text-emerald-400">
+            {compliance.compliant} / {compliance.total_classified} ({Math.round((compliance.compliance_rate ?? 0) * 100)}%)
+          </span>
+        </div>
+        <div className="flex gap-4 text-[10px] text-neutral-500">
+          {compliance.failure_modes.doc_test_only > 0 && (
+            <span className="text-neutral-600">no-canonical: {compliance.failure_modes.doc_test_only}</span>
+          )}
+          {compliance.failure_modes.most_recent_layer_only > 0 && (
+            <span className="text-neutral-600">recent-layer-only: {compliance.failure_modes.most_recent_layer_only}</span>
+          )}
+        </div>
+        {compliance.awaiting_backfill_count > 0 && (
+          <div className="mt-1.5 text-[9px] text-neutral-600">
+            {compliance.awaiting_backfill_count} awaiting backfill
+          </div>
+        )}
+      </div>
+    );
+  };
 
   return (
     <section data-testid="recently-resolved-regressions-panel">
@@ -64,6 +122,7 @@ export function RecentlyResolvedRegressionsPanel({ projectId }: Props) {
           </span>
         )}
       </h2>
+      {renderComplianceMetric()}
       {cases.length === 0 ? (
         <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 flex items-center gap-2 text-neutral-500 text-xs">
           <Minus className="w-4 h-4 shrink-0" />
@@ -89,6 +148,18 @@ export function RecentlyResolvedRegressionsPanel({ projectId }: Props) {
                     {(c.recurrence_count ?? 0) > 0 && (
                       <span className="text-[10px] px-1.5 py-0.5 rounded bg-neutral-500/10 text-neutral-400 border border-neutral-500/20">
                         recurred {c.recurrence_count}x
+                      </span>
+                    )}
+                    {c.is_fragile && (
+                      <span
+                        className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 border border-amber-500/20"
+                        data-testid="fragile-chip"
+                        title={c.hold_days_history && c.hold_days_history.length > 0
+                          ? `${c.hold_days_history.map(d => `${d}d`).join(', ')} before re-trip`
+                          : undefined
+                        }
+                      >
+                        fragile
                       </span>
                     )}
                     <LayersAffectedBadges summary={c.layer_summary} />

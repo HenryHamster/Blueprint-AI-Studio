@@ -1675,7 +1675,12 @@ async def _transition_regression_case_async(
                     return
                 if action == "merge":
                     case.mark_merged(
-                        kwargs["pr_number"], kwargs.get("signal_snapshot") or {}
+                        kwargs["pr_number"],
+                        kwargs.get("signal_snapshot") or {},
+                        spawn_was_cross_layer=bool(
+                            kwargs.get("spawn_was_cross_layer", False)
+                        ),
+                        spawn_layers_enumerated=kwargs.get("spawn_layers_enumerated"),
                     )
                 elif action == "recover":
                     case.mark_closed()
@@ -1714,6 +1719,8 @@ def schedule_regression_close_loop_merge(
     regression_class: str,
     pr_number: int,
     signal_snapshot: dict | None = None,
+    spawn_was_cross_layer: bool = False,
+    spawn_layers_enumerated: list | None = None,
 ) -> None:
     """Fire-and-forget ACTIVE → MERGED after a remediation PR merges."""
     _schedule_regression_case_transition(
@@ -1722,6 +1729,8 @@ def schedule_regression_close_loop_merge(
         "merge",
         pr_number=pr_number,
         signal_snapshot=signal_snapshot or {},
+        spawn_was_cross_layer=spawn_was_cross_layer,
+        spawn_layers_enumerated=spawn_layers_enumerated,
     )
 
 
