@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { render, screen } from '@testing-library/react';
-import { LayersAffectedBadges, type LayerSummary } from './LayersAffectedBadges';
+import { LayersAffectedBadges, LayerMismatchBadge, type LayerSummary } from './LayersAffectedBadges';
 
 const summary = (overrides: Partial<LayerSummary> = {}): LayerSummary => ({
   cross_layer: false,
@@ -94,5 +94,48 @@ describe('LayersAffectedBadges', () => {
       />,
     );
     expect(screen.getByTestId('layer-badge-UNKNOWN_LAYER')).toHaveTextContent('UNKNOWN_LAYER · 1');
+  });
+});
+
+describe('LayerMismatchBadge', () => {
+  it('renders nothing when layer_mismatch is absent or false (no prior fixes)', () => {
+    const { container } = render(<LayerMismatchBadge />);
+    expect(container.firstChild).toBeNull();
+  });
+
+  it('renders nothing when prior and current layers overlap (no mismatch)', () => {
+    const { container } = render(
+      <LayerMismatchBadge
+        layer_mismatch={false}
+        prior_fix_layers={['CI_WORKFLOW']}
+        current_symptom_layers={['CI_WORKFLOW']}
+      />,
+    );
+    expect(container.firstChild).toBeNull();
+  });
+
+  it('renders badge with disjoint-layer tooltip when layer_mismatch is true', () => {
+    render(
+      <LayerMismatchBadge
+        layer_mismatch={true}
+        prior_fix_layers={['CI_WORKFLOW']}
+        current_symptom_layers={['AGENT_VM']}
+      />,
+    );
+    const badge = screen.getByTestId('layer-mismatch-badge');
+    expect(badge).toHaveTextContent('layer mismatch');
+    expect(badge.getAttribute('title')).toBe('prior fixes targeted CI; current symptoms on VM');
+  });
+
+  it('uses full layer name for unknown layers in tooltip', () => {
+    render(
+      <LayerMismatchBadge
+        layer_mismatch={true}
+        prior_fix_layers={['CUSTOM_LAYER']}
+        current_symptom_layers={['AGENT_VM']}
+      />,
+    );
+    const badge = screen.getByTestId('layer-mismatch-badge');
+    expect(badge.getAttribute('title')).toBe('prior fixes targeted CUSTOM_LAYER; current symptoms on VM');
   });
 });

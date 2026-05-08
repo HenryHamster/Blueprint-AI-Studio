@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, Fragment } from 'react';
 import { AlertTriangle, CheckCircle, RotateCcw, Activity, ChevronDown, ChevronRight, Shield, Clock } from 'lucide-react';
 import { ResponsiveContainer, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip } from 'recharts';
 import { apiFetch } from '../api';
@@ -330,6 +330,22 @@ function recurrenceBadge(count: number | undefined) {
   ) : null;
 }
 
+function layerMismatchBadge(c: ManualInterventionCase) {
+  if (!c.layer_summary?.layer_mismatch) return null;
+  const fmt = (layers: string[] | null | undefined) =>
+    (layers ?? []).map(l => LAYER_SHORT[l] ?? l).join(', ') || '?';
+  const tip = `prior fixes targeted ${fmt(c.layer_summary.prior_fix_layers)}; current symptoms on ${fmt(c.layer_summary.current_symptom_layers)}`;
+  return (
+    <span
+      data-testid="layer-mismatch-badge"
+      className="text-[10px] px-1.5 py-0.5 rounded bg-orange-500/10 text-orange-300 border border-orange-500/20"
+      title={tip}
+    >
+      layer mismatch
+    </span>
+  );
+}
+
 export function ManualInterventionPanel({ projectId, filterClass }: Props) {
   const [cases, setCases] = useState<ManualInterventionCase[]>([]);
   const [loaded, setLoaded] = useState(false);
@@ -443,6 +459,7 @@ export function ManualInterventionPanel({ projectId, filterClass }: Props) {
                       </span>
                     )}
                     <LayersAffectedBadges summary={c.layer_summary} />
+                    {layerMismatchBadge(c)}
                   </div>
                   <div className="mt-1.5 space-y-0.5">
                     <div className="text-[10px] text-neutral-500">
@@ -712,6 +729,17 @@ interface LayerDefenseEntry {
   fix_count: number;
   last_fix_at: string | null;
   sample_case_ids: string[];
+  avg_hold_days?: number | null;
+  still_holding_count?: number;
+  held_gt_7d_count?: number;
+  retripped_within_48h_count?: number;
+}
+
+function isFragileLayer(row: LayerDefenseEntry): boolean {
+  return (
+    (row.avg_hold_days != null && row.avg_hold_days < 7) ||
+    (row.retripped_within_48h_count ?? 0) >= 2
+  );
 }
 
 export function LayerDefenseDensityPanel({ projectId }: Props) {
@@ -749,12 +777,10 @@ export function LayerDefenseDensityPanel({ projectId }: Props) {
           <option value={90}>90d</option>
         </select>
       </div>
-      {!data || data.layers.every(l => l.fix_count === 0) ? (
-        <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 text-neutral-500 text-xs">
-          No layer defenses recorded in the last {days} days
-        </div>
-      ) : (
-        <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg overflow-hidden">
+      <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg overflow-hidden">
+        {!data ? (
+          <div className="p-3 text-neutral-600 text-[10px]">No data</div>
+        ) : (
           <table className="w-full text-[10px]">
             <thead>
               <tr className="border-b border-neutral-800/50 text-neutral-500">
@@ -765,31 +791,58 @@ export function LayerDefenseDensityPanel({ projectId }: Props) {
               </tr>
             </thead>
             <tbody className="divide-y divide-neutral-800/30">
-              {(data?.layers ?? []).map((row) => (
-                <tr key={row.layer}>
-                  <td className="px-3 py-1.5 font-mono text-neutral-300 truncate max-w-[120px]">{row.layer}</td>
-                  <td className="px-2 py-1.5 text-right">
-                    <span className={row.fix_count === 0 ? 'text-neutral-600' : 'text-white font-medium'}>
-                      {row.fix_count}
-                    </span>
-                  </td>
-                  <td className="px-3 py-1.5 hidden sm:table-cell">
-                    <div className="h-1.5 bg-neutral-800 rounded-full overflow-hidden w-full">
-                      <div
-                        className="h-full rounded-full bg-blue-500/70"
-                        style={{ width: `${Math.round((row.fix_count / maxCount) * 100)}%` }}
-                      />
-                    </div>
-                  </td>
-                  <td className="px-3 py-1.5 text-right text-neutral-500">
-                    {row.last_fix_at ? timeAgo(row.last_fix_at) : <span className="text-neutral-700">—</span>}
-                  </td>
-                </tr>
-              ))}
+              {data.layers.map((row) => {
+                const fragile = isFragileLayer(row);
+                const hasFragStats = row.fix_count > 0 && (
+                  row.avg_hold_days != null ||
+                  (row.still_holding_count ?? 0) > 0 ||
+                  (row.held_gt_7d_count ?? 0) > 0 ||
+                  (row.retripped_within_48h_count ?? 0) > 0
+                );
+                return (
+                  <Fragment key={row.layer}>
+                    <tr className={fragile ? 'bg-amber-950/20' : ''}>
+                      <td className={`px-3 py-1.5 font-mono truncate max-w-[120px] ${fragile ? 'text-amber-300' : row.fix_count === 0 ? 'text-neutral-600' : 'text-neutral-300'}`}>
+                        {row.layer}
+                      </td>
+                      <td className="px-2 py-1.5 text-right">
+                        <span className={row.fix_count === 0 ? 'text-neutral-600' : 'text-white font-medium'}>
+                          {row.fix_count === 0 ? '—' : row.fix_count}
+                        </span>
+                      </td>
+                      <td className="px-3 py-1.5 hidden sm:table-cell">
+                        <div className="h-1.5 bg-neutral-800 rounded-full overflow-hidden w-full">
+                          <div
+                            className="h-full rounded-full bg-blue-500/70"
+                            style={{ width: `${Math.round((row.fix_count / maxCount) * 100)}%` }}
+                          />
+                        </div>
+                      </td>
+                      <td className="px-3 py-1.5 text-right text-neutral-500">
+                        {row.last_fix_at ? timeAgo(row.last_fix_at) : <span className="text-neutral-700">—</span>}
+                      </td>
+                    </tr>
+                    {hasFragStats && (
+                      <tr>
+                        <td colSpan={4} className="px-3 pb-1.5 text-[9px] text-neutral-500">
+                          <span className="flex flex-wrap gap-x-2">
+                            {row.avg_hold_days != null && <span>avg hold {row.avg_hold_days.toFixed(1)}d</span>}
+                            {(row.still_holding_count ?? 0) > 0 && <span>{row.still_holding_count} holding</span>}
+                            {(row.held_gt_7d_count ?? 0) > 0 && <span>{row.held_gt_7d_count} &gt;7d</span>}
+                            {(row.retripped_within_48h_count ?? 0) > 0 && (
+                              <span className="text-amber-400">{row.retripped_within_48h_count} re-tripped &lt;48h</span>
+                            )}
+                          </span>
+                        </td>
+                      </tr>
+                    )}
+                  </Fragment>
+                );
+              })}
             </tbody>
           </table>
-        </div>
-      )}
+        )}
+      </div>
     </section>
   );
 }
@@ -912,6 +965,88 @@ export function MttaTimelinePanel({ projectId }: Props) {
   );
 }
 
+interface EscalationOutcomeBucket {
+  merged_count: number;
+  retripped_within_30d_count: number;
+  durable_resolution_rate: number | null;
+  median_hold_days: number | null;
+  in_flight_excluded_count: number;
+}
+
+interface EscalationOutcomeData {
+  by_reason: Record<string, EscalationOutcomeBucket>;
+  lookback_days: number;
+}
+
+const ESCALATION_BUCKET_LABELS: Record<string, string> = {
+  escalated_cross_layer: 'Cross-layer',
+  escalated_layer_concentration: 'Layer conc.',
+  escalated_cross_case_fingerprint: 'Cross-case fp',
+  escalated_recurrence: 'Recurrence',
+  all_other: 'All other',
+};
+
+export function EscalationOutcomePanel({ projectId }: Props) {
+  const [data, setData] = useState<EscalationOutcomeData | null>(null);
+  const [loaded, setLoaded] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    apiFetch(`/api/admin/regression-dispatcher/escalation-outcomes?project_id=${encodeURIComponent(projectId)}`)
+      .then(async (res) => { if (!cancelled && res.ok) setData(await res.json()); })
+      .catch(() => {})
+      .finally(() => { if (!cancelled) setLoaded(true); });
+    return () => { cancelled = true; };
+  }, [projectId]);
+
+  if (!loaded || !data) return null;
+
+  const buckets = Object.entries(data.by_reason);
+  if (!buckets.some(([, b]) => b.merged_count > 0)) return null;
+
+  return (
+    <section data-testid="escalation-outcome-panel" className="mb-4">
+      <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">
+        Meta-Escalation Outcomes ({data.lookback_days}d)
+      </h2>
+      <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg overflow-hidden">
+        <table className="w-full text-[10px]">
+          <thead>
+            <tr className="border-b border-neutral-800/50 text-neutral-500">
+              <th className="text-left px-3 py-1.5 font-medium">Reason</th>
+              <th className="text-right px-2 py-1.5 font-medium">Merged</th>
+              <th className="text-right px-2 py-1.5 font-medium">Retripped</th>
+              <th className="text-right px-2 py-1.5 font-medium">Durable</th>
+              <th className="text-right px-3 py-1.5 font-medium">Med. hold</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-neutral-800/30">
+            {buckets.map(([reason, b]) => (
+              <tr key={reason} className={reason === 'all_other' ? 'border-t border-neutral-700/50' : ''}>
+                <td className="px-3 py-1.5 text-neutral-300 truncate max-w-[120px]">
+                  {ESCALATION_BUCKET_LABELS[reason] ?? reason}
+                </td>
+                <td className="px-2 py-1.5 text-right text-white">{b.merged_count || <span className="text-neutral-600">—</span>}</td>
+                <td className="px-2 py-1.5 text-right">
+                  {b.retripped_within_30d_count > 0 ? <span className="text-amber-400">{b.retripped_within_30d_count}</span> : <span className="text-neutral-600">—</span>}
+                </td>
+                <td className="px-2 py-1.5 text-right">
+                  {b.durable_resolution_rate !== null
+                    ? <span className={b.durable_resolution_rate >= 0.7 ? 'text-emerald-400' : 'text-amber-400'}>{Math.round(b.durable_resolution_rate * 100)}%</span>
+                    : <span className="text-neutral-600">—</span>}
+                </td>
+                <td className="px-3 py-1.5 text-right text-neutral-400">
+                  {b.median_hold_days !== null ? `${b.median_hold_days.toFixed(1)}d` : <span className="text-neutral-600">—</span>}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  );
+}
+
 export function AutoRecoveredPanel({ projectId }: Props) {
   const [cases, setCases] = useState<ManualInterventionCase[]>([]);
   const [loaded, setLoaded] = useState(false);
@@ -981,6 +1116,7 @@ export function AutoRecoveredPanel({ projectId }: Props) {
                     </span>
                   )}
                   <LayersAffectedBadges summary={c.layer_summary} />
+                  {layerMismatchBadge(c)}
                 </div>
                 <div className="mt-1.5 space-y-0.5">
                   <div className="text-[10px] text-neutral-500">

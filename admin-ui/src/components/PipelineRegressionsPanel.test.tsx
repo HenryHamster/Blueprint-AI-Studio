@@ -132,6 +132,58 @@ describe('ManualInterventionPanel — phase chips', () => {
   });
 });
 
+describe('ManualInterventionPanel — layer mismatch badge', () => {
+  it('shows no badge when layer_mismatch is absent', async () => {
+    apiFetchMock.mockResolvedValueOnce(response([baseCase]));
+    render(<ManualInterventionPanel projectId="proj-1" />);
+    await screen.findByText('sr_catch_rate:correctness');
+    expect(screen.queryByTestId('layer-mismatch-badge')).toBeNull();
+  });
+
+  it('shows no badge when layer_mismatch is false', async () => {
+    apiFetchMock.mockResolvedValueOnce(response([
+      {
+        ...baseCase,
+        layer_summary: {
+          cross_layer: false,
+          layers_affected: ['CI_WORKFLOW'],
+          window_hours: 48,
+          layers: [],
+          layer_mismatch: false,
+          prior_fix_layers: ['CI_WORKFLOW'],
+          current_symptom_layers: ['CI_WORKFLOW'],
+        },
+      },
+    ]));
+    render(<ManualInterventionPanel projectId="proj-1" />);
+    await screen.findByText('sr_catch_rate:correctness');
+    expect(screen.queryByTestId('layer-mismatch-badge')).toBeNull();
+  });
+
+  it('shows badge with disjoint-layer tooltip when layer_mismatch is true', async () => {
+    apiFetchMock.mockResolvedValueOnce(response([
+      {
+        ...baseCase,
+        layer_summary: {
+          cross_layer: false,
+          layers_affected: ['AGENT_VM'],
+          window_hours: 48,
+          layers: [],
+          layer_mismatch: true,
+          prior_fix_layers: ['CI_WORKFLOW'],
+          current_symptom_layers: ['AGENT_VM'],
+        },
+      },
+    ]));
+    render(<ManualInterventionPanel projectId="proj-1" />);
+    await screen.findByText('sr_catch_rate:correctness');
+    const badge = screen.getByTestId('layer-mismatch-badge');
+    expect(badge).toBeInTheDocument();
+    expect(badge).toHaveTextContent('layer mismatch');
+    expect(badge).toHaveAttribute('title', 'prior fixes targeted CI; current symptoms on VM');
+  });
+});
+
 describe('AutoRecoveredPanel — layer badges', () => {
   it('renders layer badges in auto-recovered cases', async () => {
     apiFetchMock.mockResolvedValueOnce(response([

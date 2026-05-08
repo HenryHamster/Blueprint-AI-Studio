@@ -11296,6 +11296,243 @@ async def test_agent_vm_resource_code_level_subtypes_excluded(
 
 
 # ---------------------------------------------------------------------------
+# compute_escalation_outcome_breakdown — pure-function unit tests
+# ---------------------------------------------------------------------------
+
+
+def _make_escalation_case(
+    escalation_reason: str | None,
+    *,
+    fix_log: list[dict],
+    project_id: str = "00000000-0000-0000-0000-000000000001",
+):
+    """Build a RegressionRemediationCase for testing compute_escalation_outcome_breakdown."""
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+
+    return RegressionRemediationCase(
+        project_id=project_id,
+        regression_class="sr_catch_rate:correctness",
+        status=RegressionCaseStatus.MERGED,
+        hit_count=1,
+        attempts=0,
+        escalation_reason=escalation_reason,
+        signal_snapshot_at_merge={},
+        signal_snapshot_at_spawn={
+            "prior_rate": 0.80,
+            "current_rate": 0.50,
+            "signal_name": "sr_catch_rate",
+        },
+        fingerprint_to_fix_log=fix_log,
+    )
+
+
+def test_escalation_outcome_breakdown_empty_cases():
+    """Empty input returns all five buckets with merged_count=0 and durable_resolution_rate=None."""
+    from app.pipeline_regression_dispatcher import (
+        _ESCALATION_BUCKET_ALL_OTHER,
+        _ESCALATION_BUCKET_ORDER,
+        ESCALATION_REASON_ESCALATED_CROSS_CASE_FINGERPRINT,
+        ESCALATION_REASON_ESCALATED_CROSS_LAYER,
+        ESCALATION_REASON_ESCALATED_LAYER_CONCENTRATION,
+        ESCALATION_REASON_ESCALATED_RECURRENCE,
+        compute_escalation_outcome_breakdown,
+    )
+
+    out = compute_escalation_outcome_breakdown([])
+    assert set(out["by_reason"].keys()) == set(_ESCALATION_BUCKET_ORDER)
+    for bucket_name in _ESCALATION_BUCKET_ORDER:
+        b = out["by_reason"][bucket_name]
+        assert b["merged_count"] == 0
+        assert b["retripped_within_30d_count"] == 0
+        assert b["durable_resolution_rate"] is None
+        assert b["median_hold_days"] is None
+        assert b["in_flight_excluded_count"] == 0
+    assert out["lookback_days"] == 30
+    assert out["generated_at"] is not None
+    # Verify expected bucket names are present
+    assert ESCALATION_REASON_ESCALATED_CROSS_LAYER in out["by_reason"]
+    assert ESCALATION_REASON_ESCALATED_LAYER_CONCENTRATION in out["by_reason"]
+    assert ESCALATION_REASON_ESCALATED_CROSS_CASE_FINGERPRINT in out["by_reason"]
+    assert ESCALATION_REASON_ESCALATED_RECURRENCE in out["by_reason"]
+    assert _ESCALATION_BUCKET_ALL_OTHER in out["by_reason"]
+
+
+def test_escalation_outcome_breakdown_meta_vs_other_bucketing():
+    """Cases with meta escalation_reason land in the correct bucket; None → all_other."""
+    from app.pipeline_regression_dispatcher import (
+        _ESCALATION_BUCKET_ALL_OTHER,
+        ESCALATION_REASON_ESCALATED_CROSS_CASE_FINGERPRINT,
+        ESCALATION_REASON_ESCALATED_CROSS_LAYER,
+        ESCALATION_REASON_ESCALATED_LAYER_CONCENTRATION,
+        ESCALATION_REASON_ESCALATED_RECURRENCE,
+        compute_escalation_outcome_breakdown,
+    )
+
+    now = _utcnow()
+    merged_at = (now - timedelta(days=5)).isoformat()
+
+    fix_log = [{"fix_pr_number": 100, "merged_at": merged_at}]
+    cases = [
+        _make_escalation_case(ESCALATION_REASON_ESCALATED_CROSS_LAYER, fix_log=fix_log),
+        _make_escalation_case(
+            ESCALATION_REASON_ESCALATED_LAYER_CONCENTRATION, fix_log=fix_log
+        ),
+        _make_escalation_case(
+            ESCALATION_REASON_ESCALATED_CROSS_CASE_FINGERPRINT, fix_log=fix_log
+        ),
+        _make_escalation_case(ESCALATION_REASON_ESCALATED_RECURRENCE, fix_log=fix_log),
+        _make_escalation_case(None, fix_log=fix_log),
+        _make_escalation_case("attempts_exhausted", fix_log=fix_log),
+    ]
+
+    out = compute_escalation_outcome_breakdown(cases, now=now)
+    by = out["by_reason"]
+    assert by[ESCALATION_REASON_ESCALATED_CROSS_LAYER]["merged_count"] == 1
+    assert by[ESCALATION_REASON_ESCALATED_LAYER_CONCENTRATION]["merged_count"] == 1
+    assert by[ESCALATION_REASON_ESCALATED_CROSS_CASE_FINGERPRINT]["merged_count"] == 1
+    assert by[ESCALATION_REASON_ESCALATED_RECURRENCE]["merged_count"] == 1
+    assert by[_ESCALATION_BUCKET_ALL_OTHER]["merged_count"] == 2
+
+
+def test_escalation_outcome_breakdown_lookback_window_filters():
+    """Fix merged before cutoff is excluded; fix exactly at boundary is excluded by < cutoff."""
+    from app.pipeline_regression_dispatcher import (
+        _ESCALATION_BUCKET_ALL_OTHER,
+        compute_escalation_outcome_breakdown,
+    )
+
+    now = _utcnow()
+    # merged 35 days ago — outside 30d window
+    old_merge = (now - timedelta(days=35)).isoformat()
+    # merged 10 days ago — inside window
+    recent_merge = (now - timedelta(days=10)).isoformat()
+
+    cases = [
+        _make_escalation_case(
+            None, fix_log=[{"fix_pr_number": 1, "merged_at": old_merge}]
+        ),
+        _make_escalation_case(
+            None, fix_log=[{"fix_pr_number": 2, "merged_at": recent_merge}]
+        ),
+    ]
+
+    out = compute_escalation_outcome_breakdown(cases, lookback_days=30, now=now)
+    b = out["by_reason"][_ESCALATION_BUCKET_ALL_OTHER]
+    assert b["merged_count"] == 1  # only the recent one
+
+
+def test_escalation_outcome_breakdown_retrip_detection():
+    """A case with a second cycle within 30d of the first is counted as retripped."""
+    from app.pipeline_regression_dispatcher import (
+        ESCALATION_REASON_ESCALATED_CROSS_LAYER,
+        compute_escalation_outcome_breakdown,
+    )
+
+    now = _utcnow()
+    merged1 = (now - timedelta(days=20)).isoformat()
+    recovered1 = (now - timedelta(days=18)).isoformat()
+    merged2 = (now - timedelta(days=10)).isoformat()  # 10d after merged1 — within 30d
+
+    fix_log = [
+        {"fix_pr_number": 1, "merged_at": merged1},
+        {"recovered_at": recovered1},
+        {"fix_pr_number": 2, "merged_at": merged2},
+    ]
+    case = _make_escalation_case(
+        ESCALATION_REASON_ESCALATED_CROSS_LAYER, fix_log=fix_log
+    )
+
+    out = compute_escalation_outcome_breakdown([case], now=now)
+    b = out["by_reason"][ESCALATION_REASON_ESCALATED_CROSS_LAYER]
+    assert b["merged_count"] >= 1
+    assert b["retripped_within_30d_count"] >= 1
+    assert b["durable_resolution_rate"] == 0.0
+
+
+def test_escalation_outcome_breakdown_all_durable():
+    """Case with one merged+recovered cycle and no retrip → durable_resolution_rate == 1.0."""
+    from app.pipeline_regression_dispatcher import (
+        ESCALATION_REASON_ESCALATED_RECURRENCE,
+        compute_escalation_outcome_breakdown,
+    )
+
+    now = _utcnow()
+    merged_at = (now - timedelta(days=15)).isoformat()
+    recovered_at = (now - timedelta(days=10)).isoformat()
+
+    fix_log = [
+        {"fix_pr_number": 1, "merged_at": merged_at},
+        {"recovered_at": recovered_at},
+    ]
+    case = _make_escalation_case(
+        ESCALATION_REASON_ESCALATED_RECURRENCE, fix_log=fix_log
+    )
+
+    out = compute_escalation_outcome_breakdown([case], now=now)
+    b = out["by_reason"][ESCALATION_REASON_ESCALATED_RECURRENCE]
+    assert b["merged_count"] == 1
+    assert b["retripped_within_30d_count"] == 0
+    assert b["durable_resolution_rate"] == 1.0
+    assert b["median_hold_days"] is not None
+    assert abs(b["median_hold_days"] - 5.0) < 0.1
+
+
+def test_escalation_outcome_breakdown_durable_resolution_rate_mixed():
+    """2 merged, 1 retripped → durable_resolution_rate == 0.5."""
+    from app.pipeline_regression_dispatcher import (
+        _ESCALATION_BUCKET_ALL_OTHER,
+        compute_escalation_outcome_breakdown,
+    )
+
+    now = _utcnow()
+    in_window = (now - timedelta(days=5)).isoformat()
+    retrip = (now - timedelta(days=2)).isoformat()
+
+    # Case 1: durable (single merged cycle, no retrip)
+    case1 = _make_escalation_case(
+        None, fix_log=[{"fix_pr_number": 1, "merged_at": in_window}]
+    )
+    # Case 2: retripped (two cycles, second within 30d)
+    case2 = _make_escalation_case(
+        None,
+        fix_log=[
+            {"fix_pr_number": 2, "merged_at": in_window},
+            {"fix_pr_number": 3, "merged_at": retrip},
+        ],
+    )
+
+    out = compute_escalation_outcome_breakdown([case1, case2], now=now)
+    b = out["by_reason"][_ESCALATION_BUCKET_ALL_OTHER]
+    assert b["merged_count"] == 2
+    assert b["retripped_within_30d_count"] == 1
+    assert abs(b["durable_resolution_rate"] - 0.5) < 1e-9
+
+
+def test_escalation_outcome_breakdown_in_flight_excluded():
+    """Cases whose only fix entry has merged_at=None are excluded from denominators."""
+    from app.pipeline_regression_dispatcher import (
+        _ESCALATION_BUCKET_ALL_OTHER,
+        compute_escalation_outcome_breakdown,
+    )
+
+    now = _utcnow()
+    in_flight = _make_escalation_case(
+        None, fix_log=[{"fix_pr_number": 42, "merged_at": None}]
+    )
+    merged = _make_escalation_case(
+        None,
+        fix_log=[
+            {"fix_pr_number": 1, "merged_at": (now - timedelta(days=5)).isoformat()}
+        ],
+    )
+
+    out = compute_escalation_outcome_breakdown([in_flight, merged], now=now)
+    b = out["by_reason"][_ESCALATION_BUCKET_ALL_OTHER]
+    assert b["in_flight_excluded_count"] == 1
+    assert b["merged_count"] == 1  # only the merged case counts
+
+
+# ---------------------------------------------------------------------------
 # Marginal-recovery follow-up investigation spawning
 # ---------------------------------------------------------------------------
 

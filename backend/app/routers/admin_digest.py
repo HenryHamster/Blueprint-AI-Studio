@@ -712,6 +712,7 @@ def _summarize_symptoms_by_layer(
     *,
     now: datetime,
     window: timedelta = _LAYER_SUMMARY_WINDOW,
+    fingerprint_to_fix_log: list[Any] | None = None,
 ) -> Dict[str, Any]:
     """Compact per-layer summary of recent regression-case symptom observations.
 
@@ -720,6 +721,12 @@ def _summarize_symptoms_by_layer(
     least one observation inside ``window`` (default 48h), sorted by
     most-recent ``last_observed_at`` first; cross_layer is true when >=2
     layers have non-empty entries within the window.
+
+    When ``fingerprint_to_fix_log`` is supplied, the response also carries
+    ``layer_mismatch``, ``prior_fix_layers``, and ``current_symptom_layers``
+    so the admin UI can flag cases where prior fixes never targeted the
+    layer where the regression is currently surfacing. ``layer_mismatch``
+    is True only when both sides are non-empty AND fully disjoint.
     """
     cutoff = now - window
     layers_out: list[dict[str, Any]] = []
@@ -759,11 +766,23 @@ def _summarize_symptoms_by_layer(
             )
     layers_out.sort(key=lambda d: d["last_observed_at"], reverse=True)
     affected = sorted(d["layer"] for d in layers_out)
+    from app.pipeline_regression_dispatcher import (  # noqa: PLC0415
+        _layers_targeted_union,
+    )
+
+    prior_set = _layers_targeted_union(fingerprint_to_fix_log)
+    affected_set = set(affected)
+    layer_mismatch = (
+        bool(prior_set) and bool(affected_set) and prior_set.isdisjoint(affected_set)
+    )
     return {
         "layers": layers_out,
         "layers_affected": affected,
         "cross_layer": len(affected) >= 2,
         "window_hours": int(window.total_seconds() // 3600),
+        "layer_mismatch": layer_mismatch,
+        "prior_fix_layers": sorted(prior_set),
+        "current_symptom_layers": affected,
     }
 
 
@@ -2515,7 +2534,9 @@ async def list_regression_cases(
                 and c.last_remediation_pr_number is None
                 and c.first_seen_at < stall_threshold,
                 "layer_summary": _summarize_symptoms_by_layer(
-                    c.symptoms_by_layer, now=now
+                    c.symptoms_by_layer,
+                    now=now,
+                    fingerprint_to_fix_log=c.fingerprint_to_fix_log,
                 ),
             }
             for c in rows
@@ -2538,7 +2559,10 @@ async def regression_cases_layer_defense_density(
     BASELINE_GATE, REVIEWER_PASS) — including layers with zero defenses —
     so the UI can render a stable five-row table.
     """
-    from app.pipeline_regression_dispatcher import compute_layer_defense_density
+    from app.pipeline_regression_dispatcher import (
+        _compute_layer_fragility_stats,
+        compute_layer_defense_density,
+    )
 
     cases = (
         (
@@ -2556,6 +2580,14 @@ async def regression_cases_layer_defense_density(
         for entry in case.fingerprint_to_fix_log or []:
             pairs.append((str(case.id), entry))
     layers = compute_layer_defense_density(pairs, lookback_days=days)
+    all_fix_logs = [entry for _, entry in pairs]
+    fragility = _compute_layer_fragility_stats(all_fix_logs, lookback_days=days)
+    for row in layers:
+        frag = fragility.get(row["layer"], {})
+        row["avg_hold_days"] = frag.get("avg_hold_days")
+        row["still_holding_count"] = frag.get("still_holding_count", 0)
+        row["held_gt_7d_count"] = frag.get("held_gt_7d_count", 0)
+        row["retripped_within_48h_count"] = frag.get("retripped_within_48h_count", 0)
     return {
         "days": days,
         "generated_at": _utcnow().isoformat(),
@@ -2745,7 +2777,9 @@ async def list_regression_manual_intervention_cases(
                 "time_to_investigate_sec": c.time_to_investigate_sec,
                 "escalation_reason": c.escalation_reason,
                 "layer_summary": _summarize_symptoms_by_layer(
-                    c.symptoms_by_layer, now=now
+                    c.symptoms_by_layer,
+                    now=now,
+                    fingerprint_to_fix_log=c.fingerprint_to_fix_log,
                 ),
             }
             for c in rows
@@ -2822,7 +2856,9 @@ async def list_regression_auto_recovered_cases(
                 "recovered_at": recovered_at,
                 "updated_at": c.updated_at.isoformat() if c.updated_at else None,
                 "layer_summary": _summarize_symptoms_by_layer(
-                    c.symptoms_by_layer, now=now
+                    c.symptoms_by_layer,
+                    now=now,
+                    fingerprint_to_fix_log=c.fingerprint_to_fix_log,
                 ),
             }
         )
@@ -2990,7 +3026,9 @@ async def list_recently_closed_regression_cases(
                 "hold_days_history": hold_days_history,
                 "is_fragile": is_fragile,
                 "layer_summary": _summarize_symptoms_by_layer(
-                    c.symptoms_by_layer, now=now
+                    c.symptoms_by_layer,
+                    now=now,
+                    fingerprint_to_fix_log=c.fingerprint_to_fix_log,
                 ),
             }
         )
@@ -8341,3 +8379,45 @@ async def get_regression_mtta(
         "classes": rows,
         "recovery_cooldown_sec": int(_REGRESSION_RECOVERY_COOLDOWN.total_seconds()),
     }
+
+
+@router.get("/regression-dispatcher/escalation-outcomes")
+async def get_regression_escalation_outcomes(
+    project_id: Optional[uuid.UUID] = Query(default=None),
+    lookback_days: int = Query(default=30, ge=1, le=180),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),  # noqa: ARG001
+) -> Dict[str, Any]:
+    """Aggregate case outcomes by escalation_reason bucket.
+
+    Groups RegressionRemediationCase rows into five buckets — one per
+    meta-escalation reason plus 'all_other' — and returns per-bucket
+    merged_count, retripped_within_30d_count, durable_resolution_rate,
+    median_hold_days, and in_flight_excluded_count so operators can
+    compare meta-escalation durability against ordinary investigations.
+    """
+    from app.pipeline_regression_dispatcher import (  # noqa: PLC0415
+        compute_escalation_outcome_breakdown,
+    )
+
+    cutoff = datetime.utcnow() - timedelta(days=lookback_days)
+    where: List = [RegressionRemediationCase.first_seen_at >= cutoff]
+    if project_id is not None:
+        where.append(RegressionRemediationCase.project_id == project_id)
+
+    cases = (
+        (
+            await session.execute(
+                select(RegressionRemediationCase)
+                .where(*where)
+                .order_by(RegressionRemediationCase.first_seen_at.desc())
+                .limit(2000)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    return compute_escalation_outcome_breakdown(
+        list(cases), lookback_days=lookback_days
+    )

@@ -1,7 +1,7 @@
 import { afterEach, describe, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
-import { DispatcherHealthPanel, LayerCoverageHistogramPanel, ManualInterventionPanel, RegressionRateTrendPanel, LayerDefenseDensityPanel } from './PipelineRegressionsPanel';
+import { DispatcherHealthPanel, LayerCoverageHistogramPanel, ManualInterventionPanel, RegressionRateTrendPanel, LayerDefenseDensityPanel, EscalationOutcomePanel } from './PipelineRegressionsPanel';
 import { expectNoOverflowAt, expectMinTouchTargetAt, expectNoTextTruncationAt } from '../test/viewport';
 
 vi.mock('recharts', () => ({
@@ -52,11 +52,11 @@ vi.mock('../api', () => ({
         days: 30,
         generated_at: new Date().toISOString(),
         layers: [
-          { layer: 'CI_WORKFLOW', fix_count: 8, last_fix_at: new Date(Date.now() - 86400_000).toISOString(), sample_case_ids: ['case-1', 'case-2'] },
-          { layer: 'AGENT_VM', fix_count: 0, last_fix_at: null, sample_case_ids: [] },
-          { layer: 'AGENT_VERB', fix_count: 3, last_fix_at: new Date(Date.now() - 172800_000).toISOString(), sample_case_ids: ['case-3'] },
-          { layer: 'BASELINE_GATE', fix_count: 1, last_fix_at: new Date(Date.now() - 604800_000).toISOString(), sample_case_ids: ['case-4'] },
-          { layer: 'REVIEWER_PASS', fix_count: 5, last_fix_at: new Date(Date.now() - 43200_000).toISOString(), sample_case_ids: ['case-5'] },
+          { layer: 'CI_WORKFLOW', fix_count: 8, last_fix_at: new Date(Date.now() - 86400_000).toISOString(), sample_case_ids: ['case-1', 'case-2'], avg_hold_days: 12.3, still_holding_count: 2, held_gt_7d_count: 3, retripped_within_48h_count: 0 },
+          { layer: 'AGENT_VM', fix_count: 0, last_fix_at: null, sample_case_ids: [], avg_hold_days: null, still_holding_count: 0, held_gt_7d_count: 0, retripped_within_48h_count: 0 },
+          { layer: 'AGENT_VERB', fix_count: 3, last_fix_at: new Date(Date.now() - 172800_000).toISOString(), sample_case_ids: ['case-3'], avg_hold_days: 4.1, still_holding_count: 0, held_gt_7d_count: 0, retripped_within_48h_count: 1 },
+          { layer: 'BASELINE_GATE', fix_count: 1, last_fix_at: new Date(Date.now() - 604800_000).toISOString(), sample_case_ids: ['case-4'], avg_hold_days: null, still_holding_count: 1, held_gt_7d_count: 1, retripped_within_48h_count: 0 },
+          { layer: 'REVIEWER_PASS', fix_count: 5, last_fix_at: new Date(Date.now() - 43200_000).toISOString(), sample_case_ids: ['case-5'], avg_hold_days: 2.5, still_holding_count: 0, held_gt_7d_count: 0, retripped_within_48h_count: 3 },
         ],
       }), { status: 200 });
     }
@@ -83,6 +83,19 @@ vi.mock('../api', () => ({
           },
         },
         cases: [],
+      }), { status: 200 });
+    }
+    if (url.includes('escalation-outcomes')) {
+      return new Response(JSON.stringify({
+        by_reason: {
+          escalated_cross_layer: { merged_count: 3, retripped_within_30d_count: 1, durable_resolution_rate: 0.67, median_hold_days: 12.5, in_flight_excluded_count: 0 },
+          escalated_layer_concentration: { merged_count: 2, retripped_within_30d_count: 0, durable_resolution_rate: 1.0, median_hold_days: 8.0, in_flight_excluded_count: 0 },
+          escalated_cross_case_fingerprint: { merged_count: 1, retripped_within_30d_count: 0, durable_resolution_rate: 1.0, median_hold_days: null, in_flight_excluded_count: 0 },
+          escalated_recurrence: { merged_count: 0, retripped_within_30d_count: 0, durable_resolution_rate: null, median_hold_days: null, in_flight_excluded_count: 1 },
+          all_other: { merged_count: 15, retripped_within_30d_count: 3, durable_resolution_rate: 0.8, median_hold_days: 5.2, in_flight_excluded_count: 2 },
+        },
+        lookback_days: 30,
+        generated_at: new Date().toISOString(),
       }), { status: 200 });
     }
     if (url.includes('/manual-intervention')) {
@@ -250,11 +263,11 @@ describe('LayerDefenseDensityPanel — viewport regression', () => {
         days: 30,
         generated_at: new Date().toISOString(),
         layers: [
-          { layer: 'CI_WORKFLOW', fix_count: 0, last_fix_at: null, sample_case_ids: [] },
-          { layer: 'AGENT_VM', fix_count: 0, last_fix_at: null, sample_case_ids: [] },
-          { layer: 'AGENT_VERB', fix_count: 0, last_fix_at: null, sample_case_ids: [] },
-          { layer: 'BASELINE_GATE', fix_count: 0, last_fix_at: null, sample_case_ids: [] },
-          { layer: 'REVIEWER_PASS', fix_count: 0, last_fix_at: null, sample_case_ids: [] },
+          { layer: 'CI_WORKFLOW', fix_count: 0, last_fix_at: null, sample_case_ids: [], avg_hold_days: null, still_holding_count: 0, held_gt_7d_count: 0, retripped_within_48h_count: 0 },
+          { layer: 'AGENT_VM', fix_count: 0, last_fix_at: null, sample_case_ids: [], avg_hold_days: null, still_holding_count: 0, held_gt_7d_count: 0, retripped_within_48h_count: 0 },
+          { layer: 'AGENT_VERB', fix_count: 0, last_fix_at: null, sample_case_ids: [], avg_hold_days: null, still_holding_count: 0, held_gt_7d_count: 0, retripped_within_48h_count: 0 },
+          { layer: 'BASELINE_GATE', fix_count: 0, last_fix_at: null, sample_case_ids: [], avg_hold_days: null, still_holding_count: 0, held_gt_7d_count: 0, retripped_within_48h_count: 0 },
+          { layer: 'REVIEWER_PASS', fix_count: 0, last_fix_at: null, sample_case_ids: [], avg_hold_days: null, still_holding_count: 0, held_gt_7d_count: 0, retripped_within_48h_count: 0 },
         ],
       }), { status: 200 })
     );
@@ -266,5 +279,66 @@ describe('LayerDefenseDensityPanel — viewport regression', () => {
       await act(async () => { root?.render(<LayerDefenseDensityPanel projectId="project-123" />); });
       await act(async () => { await new Promise((resolve) => setTimeout(resolve, 50)); });
     });
+  });
+
+  test('renders fragile layers (avg_hold_days < 7 or retripped >= 2) without overflow at 375px', async () => {
+    const { apiFetch } = await import('../api');
+    vi.mocked(apiFetch).mockResolvedValueOnce(
+      new Response(JSON.stringify({
+        days: 30,
+        generated_at: new Date().toISOString(),
+        layers: [
+          { layer: 'CI_WORKFLOW', fix_count: 4, last_fix_at: new Date(Date.now() - 86400_000).toISOString(), sample_case_ids: ['c1'], avg_hold_days: 1.2, still_holding_count: 0, held_gt_7d_count: 0, retripped_within_48h_count: 3 },
+          { layer: 'AGENT_VM', fix_count: 2, last_fix_at: new Date(Date.now() - 43200_000).toISOString(), sample_case_ids: ['c2'], avg_hold_days: 0.5, still_holding_count: 0, held_gt_7d_count: 0, retripped_within_48h_count: 2 },
+          { layer: 'AGENT_VERB', fix_count: 0, last_fix_at: null, sample_case_ids: [], avg_hold_days: null, still_holding_count: 0, held_gt_7d_count: 0, retripped_within_48h_count: 0 },
+          { layer: 'BASELINE_GATE', fix_count: 1, last_fix_at: new Date(Date.now() - 172800_000).toISOString(), sample_case_ids: ['c3'], avg_hold_days: 14.0, still_holding_count: 0, held_gt_7d_count: 1, retripped_within_48h_count: 0 },
+          { layer: 'REVIEWER_PASS', fix_count: 3, last_fix_at: new Date(Date.now() - 3600_000).toISOString(), sample_case_ids: ['c4'], avg_hold_days: null, still_holding_count: 3, held_gt_7d_count: 2, retripped_within_48h_count: 0 },
+        ],
+      }), { status: 200 })
+    );
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      root = createRoot(host);
+      await act(async () => { root?.render(<LayerDefenseDensityPanel projectId="project-123" />); });
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 50)); });
+    });
+  });
+});
+
+describe('EscalationOutcomePanel — viewport regression', () => {
+  let root: Root | null = null;
+  let host: HTMLDivElement | null = null;
+  afterEach(() => { if (root) act(() => root?.unmount()); root = null; host?.remove(); host = null; });
+  test('renders populated state without overflow at 375px', async () => {
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      root = createRoot(host);
+      await act(async () => { root?.render(<EscalationOutcomePanel projectId="project-123" />); });
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 50)); });
+    });
+  });
+  test('does not render when all merged_count are zero', async () => {
+    const { apiFetch } = await import('../api');
+    vi.mocked(apiFetch).mockResolvedValueOnce(
+      new Response(JSON.stringify({
+        by_reason: {
+          escalated_cross_layer: { merged_count: 0, retripped_within_30d_count: 0, durable_resolution_rate: null, median_hold_days: null, in_flight_excluded_count: 0 },
+          all_other: { merged_count: 0, retripped_within_30d_count: 0, durable_resolution_rate: null, median_hold_days: null, in_flight_excluded_count: 0 },
+        },
+        lookback_days: 30,
+        generated_at: new Date().toISOString(),
+      }), { status: 200 })
+    );
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    root = createRoot(host);
+    await act(async () => { root?.render(<EscalationOutcomePanel projectId="project-123" />); });
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 50)); });
+    const panel = host.querySelector('[data-testid="escalation-outcome-panel"]');
+    if (panel) throw new Error('panel should not render when all merged_count are zero');
   });
 });

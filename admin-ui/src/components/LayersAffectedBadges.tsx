@@ -11,6 +11,9 @@ export interface LayerSummary {
   layers_affected: string[];
   window_hours: number;
   layers: LayerSummaryEntry[];
+  layer_mismatch?: boolean | null;
+  prior_fix_layers?: string[] | null;
+  current_symptom_layers?: string[] | null;
 }
 
 interface Props {
@@ -36,6 +39,28 @@ export type LayerCoverageByClass = Record<string, LayerCoverageEntry>;
 
 function shortLabel(layer: string): string {
   return LAYER_SHORT_LABELS[layer] ?? layer;
+}
+
+interface LayerMismatchProps {
+  layer_mismatch?: boolean | null;
+  prior_fix_layers?: string[] | null;
+  current_symptom_layers?: string[] | null;
+}
+
+export function LayerMismatchBadge({ layer_mismatch, prior_fix_layers, current_symptom_layers }: LayerMismatchProps) {
+  if (!layer_mismatch) return null;
+  const fmt = (layers: string[] | null | undefined) =>
+    (layers ?? []).map((l) => shortLabel(l)).join(', ') || '?';
+  const tip = `prior fixes targeted ${fmt(prior_fix_layers)}; current symptoms on ${fmt(current_symptom_layers)}`;
+  return (
+    <span
+      data-testid="layer-mismatch-badge"
+      className="text-[10px] px-1.5 py-0.5 rounded bg-orange-500/10 text-orange-300 border border-orange-500/20"
+      title={tip}
+    >
+      layer mismatch
+    </span>
+  );
 }
 
 export function LayersAffectedBadges({ summary }: Props) {

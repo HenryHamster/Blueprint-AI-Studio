@@ -913,6 +913,136 @@ def _compute_layer_fragility_stats(
     return result
 
 
+_META_ESCALATION_REASONS: frozenset[str] = frozenset(
+    [
+        ESCALATION_REASON_ESCALATED_CROSS_LAYER,
+        ESCALATION_REASON_ESCALATED_LAYER_CONCENTRATION,
+        ESCALATION_REASON_ESCALATED_CROSS_CASE_FINGERPRINT,
+        ESCALATION_REASON_ESCALATED_RECURRENCE,
+    ]
+)
+
+_ESCALATION_BUCKET_ALL_OTHER = "all_other"
+
+_ESCALATION_BUCKET_ORDER: list[str] = [
+    ESCALATION_REASON_ESCALATED_CROSS_LAYER,
+    ESCALATION_REASON_ESCALATED_LAYER_CONCENTRATION,
+    ESCALATION_REASON_ESCALATED_CROSS_CASE_FINGERPRINT,
+    ESCALATION_REASON_ESCALATED_RECURRENCE,
+    _ESCALATION_BUCKET_ALL_OTHER,
+]
+
+
+def compute_escalation_outcome_breakdown(
+    cases: list[RegressionRemediationCase],
+    *,
+    lookback_days: int = 30,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Aggregate case outcomes by escalation_reason bucket.
+
+    Groups cases into five buckets — one per meta-escalation reason plus
+    'all_other' for None or any non-meta value — and computes per-bucket:
+    - merged_count: number of cases whose first cycle merged within the window
+    - retripped_within_30d_count: of those, how many had a subsequent cycle
+      within 30 days of the first cycle's merged_at
+    - durable_resolution_rate: 1 - retripped / merged, or None when merged_count == 0
+    - median_hold_days: median of (recovered_at - merged_at) in days for cases
+      whose first cycle has both timestamps
+    - in_flight_excluded_count: cases whose every fix entry has merged_at == None
+
+    Uses _extract_recurrence_cycles to walk fingerprint_to_fix_log. Cases whose
+    all fix-log entries have merged_at == None are counted as in-flight and excluded
+    from merged_count and all rate denominators.
+    """
+    if now is None:
+        now = _utcnow()
+    cutoff = now - timedelta(days=lookback_days)
+    retrip_window = timedelta(days=30)
+
+    def _bucket_for(reason: str | None) -> str:
+        if reason in _META_ESCALATION_REASONS:
+            return str(reason)
+        return _ESCALATION_BUCKET_ALL_OTHER
+
+    bucket_state: dict[str, dict[str, Any]] = {
+        b: {
+            "merged_count": 0,
+            "retripped_within_30d_count": 0,
+            "hold_days": [],
+            "in_flight_excluded_count": 0,
+        }
+        for b in _ESCALATION_BUCKET_ORDER
+    }
+
+    for case in cases:
+        bucket = _bucket_for(getattr(case, "escalation_reason", None))
+        st = bucket_state[bucket]
+
+        raw_log = case.fingerprint_to_fix_log or []
+        fix_entries = [
+            e
+            for e in raw_log
+            if isinstance(e, dict) and e.get("fix_pr_number") is not None
+        ]
+        if fix_entries and all(e.get("merged_at") is None for e in fix_entries):
+            st["in_flight_excluded_count"] += 1
+            continue
+
+        cycles = _extract_recurrence_cycles(case)
+        if not cycles:
+            continue
+
+        first = cycles[0]
+        merged_at = first["merged_at"]
+        if merged_at is None or not (cutoff <= merged_at <= now):
+            continue
+
+        st["merged_count"] += 1
+
+        recovered_at = first.get("recovered_at")
+        if isinstance(recovered_at, datetime):
+            hold = (recovered_at - merged_at).total_seconds() / 86400.0
+            if hold >= 0:
+                st["hold_days"].append(hold)
+
+        for later in cycles[1:]:
+            next_merged = later["merged_at"]
+            if next_merged is not None and next_merged <= merged_at + retrip_window:
+                st["retripped_within_30d_count"] += 1
+                break
+
+    result: dict[str, Any] = {}
+    for bucket in _ESCALATION_BUCKET_ORDER:
+        s = bucket_state[bucket]
+        mc = s["merged_count"]
+        rc = s["retripped_within_30d_count"]
+        hold_list: list[float] = s["hold_days"]
+        median_hold: float | None = None
+        if hold_list:
+            sorted_hold = sorted(hold_list)
+            n = len(sorted_hold)
+            mid = n // 2
+            median_hold = (
+                sorted_hold[mid]
+                if n % 2 == 1
+                else (sorted_hold[mid - 1] + sorted_hold[mid]) / 2.0
+            )
+        result[bucket] = {
+            "merged_count": mc,
+            "retripped_within_30d_count": rc,
+            "durable_resolution_rate": (1.0 - rc / mc) if mc > 0 else None,
+            "median_hold_days": median_hold,
+            "in_flight_excluded_count": s["in_flight_excluded_count"],
+        }
+
+    return {
+        "by_reason": result,
+        "lookback_days": lookback_days,
+        "generated_at": now.isoformat(),
+    }
+
+
 def _build_layer_defense_ledger(
     all_fix_logs: list[dict[str, Any]],
     lookback_days: int = _LAYER_DEFENSE_LEDGER_LOOKBACK_DAYS,
@@ -956,6 +1086,34 @@ def _build_layer_defense_ledger(
     return "\n".join(lines)
 
 
+def _layers_targeted_union(entries: list[dict[str, Any]] | None) -> set[str]:
+    """Union of ``layers_targeted`` across entries that have the key populated.
+
+    Accepts both the raw ``fingerprint_to_fix_log`` shape (entries with
+    ``"layers_targeted" in entry``) and the ``_extract_recurrence_cycles``
+    shape (cycles with ``layers_targeted_present`` flagged True). Entries
+    awaiting backfill — those without the key / flag — are skipped, matching
+    the existing semantics in ``_format_recurrence_meta_prompt`` and
+    ``_compute_layer_coverage_by_class``.
+    """
+    out: set[str] = set()
+    for entry in entries or []:
+        if not isinstance(entry, dict):
+            continue
+        if "layers_targeted_present" in entry:
+            if not entry.get("layers_targeted_present"):
+                continue
+        elif "layers_targeted" not in entry:
+            continue
+        raw = entry.get("layers_targeted") or []
+        if not isinstance(raw, list):
+            continue
+        for layer in raw:
+            if isinstance(layer, str) and layer:
+                out.add(layer)
+    return out
+
+
 def _format_recurrence_meta_prompt(
     case: RegressionRemediationCase,
     base_lines: str,
@@ -976,10 +1134,7 @@ def _format_recurrence_meta_prompt(
             return "layers: none of the canonical layers"
         return f"layers: {', '.join(layers)}"
 
-    prior_layers_union: set[str] = set()
-    for attempt in attempts:
-        if attempt.get("layers_targeted_present"):
-            prior_layers_union.update(attempt.get("layers_targeted") or [])
+    prior_layers_union = _layers_targeted_union(attempts)
     obs_layers_set = set(obs_layers)
     mismatch = (
         bool(prior_layers_union)

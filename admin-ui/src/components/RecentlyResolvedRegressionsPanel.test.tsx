@@ -338,6 +338,102 @@ describe('RecentlyResolvedRegressionsPanel', () => {
     expect(countEl).toHaveTextContent('2 marginal recovery (signal may re-trip)');
   });
 
+  it('renders no layer mismatch badge when layer_mismatch is absent or false', async () => {
+    apiFetchMock.mockResolvedValueOnce(response([
+      {
+        id: '14',
+        regression_class: 'clean-layers',
+        fix_pr_number: 110,
+        recovered_at: '2026-05-06T10:15:00',
+        first_seen_at: '2026-05-06T10:10:00',
+        signal_first_crossed_at: '2026-05-06T10:05:00',
+        time_to_recover_sec: 300,
+        layer_summary: {
+          cross_layer: false,
+          layers_affected: ['CI_WORKFLOW'],
+          window_hours: 48,
+          layers: [],
+          layer_mismatch: false,
+          prior_fix_layers: ['CI_WORKFLOW'],
+          current_symptom_layers: ['CI_WORKFLOW'],
+        },
+      },
+    ]));
+    render(<RecentlyResolvedRegressionsPanel projectId="proj-1" />);
+    await screen.findByText('clean-layers');
+    expect(screen.queryByTestId('layer-mismatch-badge')).toBeNull();
+  });
+
+  it('renders no layer mismatch badge when layer_mismatch is absent (no prior fixes)', async () => {
+    apiFetchMock.mockResolvedValueOnce(response([
+      {
+        id: '15',
+        regression_class: 'no-fixes',
+        fix_pr_number: null,
+        recovered_at: null,
+        first_seen_at: '2026-05-06T10:10:00',
+        time_to_recover_sec: null,
+      },
+    ]));
+    render(<RecentlyResolvedRegressionsPanel projectId="proj-1" />);
+    await screen.findByText('no-fixes');
+    expect(screen.queryByTestId('layer-mismatch-badge')).toBeNull();
+  });
+
+  it('renders layer mismatch badge with tooltip naming disjoint layers', async () => {
+    apiFetchMock.mockResolvedValueOnce(response([
+      {
+        id: '16',
+        regression_class: 'layer-disjoint',
+        fix_pr_number: 111,
+        recovered_at: '2026-05-06T10:15:00',
+        first_seen_at: '2026-05-06T10:10:00',
+        signal_first_crossed_at: '2026-05-06T10:05:00',
+        time_to_recover_sec: 300,
+        layer_summary: {
+          cross_layer: false,
+          layers_affected: ['AGENT_VM'],
+          window_hours: 48,
+          layers: [],
+          layer_mismatch: true,
+          prior_fix_layers: ['CI_WORKFLOW'],
+          current_symptom_layers: ['AGENT_VM'],
+        },
+      },
+    ]));
+    render(<RecentlyResolvedRegressionsPanel projectId="proj-1" />);
+    await screen.findByText('layer-disjoint');
+    const badge = screen.getByTestId('layer-mismatch-badge');
+    expect(badge).toBeInTheDocument();
+    expect(badge).toHaveTextContent('layer mismatch');
+    expect(badge).toHaveAttribute('title', 'prior fixes targeted CI; current symptoms on VM');
+  });
+
+  it('renders escalation outcome panel when escalation-outcomes endpoint returns data with merged cases', async () => {
+    apiFetchMock.mockImplementation(async (url: string) => {
+      if (url.includes('recently-closed')) return response([]);
+      if (url.includes('layer-defense-density')) return { ok: false } as Response;
+      if (url.includes('escalation-outcomes')) {
+        return {
+          ok: true, status: 200, json: async () => ({
+            lookback_days: 30,
+            by_reason: {
+              escalated_cross_layer: { merged_count: 3, retripped_within_30d_count: 1, durable_resolution_rate: 0.67, median_hold_days: 14.0 },
+              all_other: { merged_count: 10, retripped_within_30d_count: 2, durable_resolution_rate: 0.8, median_hold_days: 7.5 },
+            },
+          }),
+        } as Response;
+      }
+      return { ok: false } as Response;
+    });
+    fetchComplianceMock.mockResolvedValueOnce({ total_classified: 0, compliant: 0, non_compliant: 0, awaiting_backfill_count: 0, compliance_rate: null, failure_modes: { doc_test_only: 0, most_recent_layer_only: 0 }, by_class: {} });
+    render(<RecentlyResolvedRegressionsPanel projectId="proj-1" />);
+    await screen.findByTestId('escalation-outcome-panel');
+    expect(screen.getByText('Meta-Escalation Outcomes (30d)')).toBeInTheDocument();
+    expect(screen.getByText('Cross-layer')).toBeInTheDocument();
+    expect(screen.getByText('All other')).toBeInTheDocument();
+  });
+
   it('renders both recurrence and fragile chips when applicable', async () => {
     apiFetchMock.mockResolvedValueOnce(response([
       {

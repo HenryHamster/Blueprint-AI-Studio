@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { CheckCircle, Minus, Shield } from 'lucide-react';
 import { apiFetch, fetchCrossLayerCompliance, type CrossLayerComplianceResponse } from '../api';
+import { EscalationOutcomePanel } from './PipelineRegressionsPanel';
 import { timeAgo, formatDurationSec, parseTimestamp, formatTimeToDetect, formatTimeToInvestigate } from '../utils/time';
 import { LayersAffectedBadges, type LayerSummary } from './LayersAffectedBadges';
 import { PhaseChip } from './regressionPhaseChips';
@@ -15,6 +16,8 @@ interface RecurrenceEntry {
 type ComplianceWithRecurrence = CrossLayerComplianceResponse & {
   recurrence_by_bucket?: Record<string, RecurrenceEntry>;
 };
+
+const LAYER_SHORT: Record<string, string> = { CI_WORKFLOW: 'CI', AGENT_VM: 'VM', AGENT_VERB: 'VERB', BASELINE_GATE: 'BASELINE', REVIEWER_PASS: 'REVIEWER' };
 
 const CLASS_PREFIX_CHIPS: Record<string, string> = {
   viewport_regression: 'bg-violet-900/60 text-violet-300 border-violet-700/50',
@@ -68,6 +71,22 @@ interface LayerDefenseEntry {
   layer: string;
   fix_count: number;
   last_fix_at: string | null;
+}
+
+function layerMismatchBadge(c: RecentlyClosedCase) {
+  if (!c.layer_summary?.layer_mismatch) return null;
+  const fmt = (layers: string[] | null | undefined) =>
+    (layers ?? []).map(l => LAYER_SHORT[l] ?? l).join(', ') || '?';
+  const tip = `prior fixes targeted ${fmt(c.layer_summary.prior_fix_layers)}; current symptoms on ${fmt(c.layer_summary.current_symptom_layers)}`;
+  return (
+    <span
+      data-testid="layer-mismatch-badge"
+      className="text-[10px] px-1.5 py-0.5 rounded bg-orange-500/10 text-orange-300 border border-orange-500/20"
+      title={tip}
+    >
+      layer mismatch
+    </span>
+  );
 }
 
 interface Props {
@@ -280,6 +299,7 @@ export function RecentlyResolvedRegressionsPanel({ projectId }: Props) {
                       </span>
                     )}
                     <LayersAffectedBadges summary={c.layer_summary} />
+                    {layerMismatchBadge(c)}
                   </div>
                   <div className="mt-1.5 flex flex-wrap items-center gap-3 text-[10px] text-neutral-500">
                     {c.time_to_recover_sec != null && (
@@ -353,6 +373,9 @@ export function RecentlyResolvedRegressionsPanel({ projectId }: Props) {
           </div>
         </div>
       )}
+      <div className="mt-4">
+        <EscalationOutcomePanel projectId={projectId} />
+      </div>
     </section>
   );
 }

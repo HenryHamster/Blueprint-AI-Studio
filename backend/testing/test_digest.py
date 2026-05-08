@@ -13051,6 +13051,9 @@ def test_summarize_symptoms_by_layer_empty_and_malformed_safe():
         "layers_affected": [],
         "cross_layer": False,
         "window_hours": 48,
+        "layer_mismatch": False,
+        "prior_fix_layers": [],
+        "current_symptom_layers": [],
     }
     assert _summarize_symptoms_by_layer(None, now=now) == empty_shape
     assert _summarize_symptoms_by_layer({}, now=now) == empty_shape
@@ -13281,6 +13284,9 @@ async def test_list_regression_cases_layer_summary_empty_for_default_case(
         "layers_affected": [],
         "cross_layer": False,
         "window_hours": 48,
+        "layer_mismatch": False,
+        "prior_fix_layers": [],
+        "current_symptom_layers": [],
     }
 
 
@@ -13713,6 +13719,119 @@ async def test_layer_defense_density_endpoint_validates_days_param(
         params={"project_id": str(project.id), "days": 1000},
     )
     assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_layer_defense_density_endpoint_includes_fragility_stats(
+    client: AsyncClient, db_session
+):
+    """Endpoint includes avg_hold_days, still_holding_count, held_gt_7d_count,
+    retripped_within_48h_count for each layer row."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="rc:frag",
+        status=RegressionCaseStatus.ACTIVE,
+        fingerprint_to_fix_log=[
+            {
+                "fingerprint": "fp1",
+                "merged_at": (now - timedelta(days=5)).isoformat(),
+                "recovered_at": (now - timedelta(days=4, hours=23)).isoformat(),
+                "layers_targeted": ["CI_WORKFLOW"],
+            },
+            {
+                "fingerprint": "fp2",
+                "merged_at": (now - timedelta(days=10)).isoformat(),
+                "layers_targeted": ["BASELINE_GATE"],
+            },
+        ],
+    )
+    db_session.add(case)
+    await db_session.commit()
+    await db_session.refresh(case)
+
+    response = await client.get(
+        "/api/admin/regression-cases/layer-defense-density",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    by_layer = {r["layer"]: r for r in body["layers"]}
+
+    for row in body["layers"]:
+        assert "avg_hold_days" in row
+        assert "still_holding_count" in row
+        assert "held_gt_7d_count" in row
+        assert "retripped_within_48h_count" in row
+
+    ci = by_layer["CI_WORKFLOW"]
+    assert ci["fix_count"] == 1
+    assert ci["avg_hold_days"] is not None
+    assert ci["avg_hold_days"] < 2.0
+    assert ci["retripped_within_48h_count"] == 1
+    assert ci["still_holding_count"] == 0
+
+    bg = by_layer["BASELINE_GATE"]
+    assert bg["fix_count"] == 1
+    assert bg["avg_hold_days"] is None
+    assert bg["still_holding_count"] == 1
+    assert bg["retripped_within_48h_count"] == 0
+
+    av = by_layer["AGENT_VM"]
+    assert av["fix_count"] == 0
+    assert av["avg_hold_days"] is None
+    assert av["still_holding_count"] == 0
+    assert av["held_gt_7d_count"] == 0
+    assert av["retripped_within_48h_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_layer_defense_density_endpoint_fragility_held_gt_7d(
+    client: AsyncClient, db_session
+):
+    """held_gt_7d_count increments for still-holding entries older than 7 days."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="rc:held",
+        status=RegressionCaseStatus.ACTIVE,
+        fingerprint_to_fix_log=[
+            {
+                "fingerprint": "old",
+                "merged_at": (now - timedelta(days=20)).isoformat(),
+                "layers_targeted": ["REVIEWER_PASS"],
+            },
+            {
+                "fingerprint": "recent",
+                "merged_at": (now - timedelta(days=3)).isoformat(),
+                "layers_targeted": ["REVIEWER_PASS"],
+            },
+        ],
+    )
+    db_session.add(case)
+    await db_session.commit()
+    await db_session.refresh(case)
+
+    response = await client.get(
+        "/api/admin/regression-cases/layer-defense-density",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 200
+    by_layer = {r["layer"]: r for r in response.json()["layers"]}
+    rp = by_layer["REVIEWER_PASS"]
+    assert rp["still_holding_count"] == 2
+    assert rp["held_gt_7d_count"] == 1
+    assert rp["avg_hold_days"] is None
 
 
 # ── _compute_layer_coverage_by_class / _compute_symptom_layers_by_class ──────

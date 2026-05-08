@@ -17,6 +17,9 @@ vi.mock('../api', () => ({
         { layer: 'REVIEWER_PASS', fix_count: 0, last_fix_at: null, sample_case_ids: [] },
       ] }), { status: 200 });
     }
+    if (url.includes('escalation-outcomes')) {
+      return new Response(JSON.stringify({ lookback_days: 30, by_reason: {} }), { status: 200 });
+    }
     return new Response(JSON.stringify({ cases: [] }), { status: 200 });
   }),
   fetchCrossLayerCompliance: vi.fn(async () => ({
