@@ -55,7 +55,7 @@ import {
 export type FailureCategory = 'clone_failed' | 'build_failed' | 'test_failed' | 'lint_failed' | 'pr_creation_failed' | 'claude_code_failed' | 'parse_failed' | 'fatal' | 'rate_limited' | 'timeout' | 'oauth_rotation_failed' | 'reset_failed';
 type ProviderName = 'anthropic' | 'openai' | 'gemini';
 type AuthMode = 'oauth' | 'api_key' | 'service_account';
-type OutputMode = 'claude-stream-json' | 'text';
+type OutputMode = 'claude-stream-json' | 'codex-jsonl' | 'text';
 
 const RATE_LIMIT_PATTERNS: Readonly<Record<ProviderName, Partial<Record<AuthMode, readonly string[]>>>> = {
   anthropic: {
@@ -3042,7 +3042,12 @@ export function getProviderRunner(provider: ProviderName = PROVIDER, authMode: A
         //   The VM itself is the isolation boundary. Do NOT pass `--full-auto`:
         //   it aliases `--sandbox workspace-write` which would override a
         //   bypass and leave sandbox behavior undefined.
-        const args = ['exec', '--skip-git-repo-check'];
+        // --json: emit JSONL events instead of human-formatted output. Required
+        // for tool-call telemetry — without it, Codex tasks are a black box
+        // (last_tool_use_at stays NULL because recordToolUse never fires).
+        // 2026-05-08 incident: the agent_stalled watchdog falsely reaped
+        // healthy Codex work because we couldn't see its tool calls.
+        const args = ['exec', '--skip-git-repo-check', '--json'];
         if (LLM_CLI_TRANSLATION) {
           args.push(...LLM_CLI_TRANSLATION.args);
         } else {
@@ -3058,7 +3063,7 @@ export function getProviderRunner(provider: ProviderName = PROVIDER, authMode: A
           command: 'codex',
           args,
           env: baseEnv,
-          outputMode: 'text',
+          outputMode: 'codex-jsonl',
           timeoutMs: claudeTimeoutForEffort(effort),
           promptInput: 'stdin',
           displayName: 'OpenAI Codex',
@@ -3606,6 +3611,179 @@ echo ""
         drainingJsonChunks = false;
       }
     };
+    // Codex JSONL parser (mirrors drainJsonChunks). Codex's --json output uses
+    // a different event taxonomy than Claude (thread.started / turn.* / item.*
+    // with item subtypes command_execution / file_change / mcp_tool_call /
+    // web_search / agent_message / reasoning / todo_list / error). Each
+    // tool-bearing item subtype maps to recordToolUse so last_tool_use_at gets
+    // populated — without this, every Codex task looks structurally stalled
+    // (2026-05-08 incident: false-reaped healthy Codex work).
+    const pendingCodexChunks: string[] = [];
+    let drainingCodexChunks = false;
+    let codexCarry = '';
+    const _codexToolNameForItem = (item: unknown): string | null => {
+      if (!item || typeof item !== 'object') return null;
+      const itemType = (item as { type?: string }).type;
+      switch (itemType) {
+        case 'command_execution':
+          return 'Bash';
+        case 'file_change':
+          return 'apply_patch';
+        case 'mcp_tool_call': {
+          const t = (item as { tool?: string }).tool;
+          return typeof t === 'string' && t ? `MCP:${t}` : 'MCP';
+        }
+        case 'web_search':
+          return 'WebSearch';
+        case 'todo_list':
+          return 'TodoWrite';
+        default:
+          return null;
+      }
+    };
+    const _codexItemPreview = (item: unknown): string => {
+      if (!item || typeof item !== 'object') return '';
+      const it = item as Record<string, unknown>;
+      switch (it.type) {
+        case 'command_execution':
+          return typeof it.command === 'string' ? it.command : '';
+        case 'file_change': {
+          const changes = Array.isArray(it.changes) ? it.changes : [];
+          return `${changes.length} file change(s)`;
+        }
+        case 'mcp_tool_call':
+          return JSON.stringify(it.arguments ?? {}).slice(0, 200);
+        case 'web_search':
+          return typeof it.query === 'string' ? it.query : '';
+        case 'agent_message':
+        case 'reasoning':
+          return typeof it.text === 'string' ? it.text.slice(0, 200) : '';
+        default:
+          return '';
+      }
+    };
+    const drainCodexChunks = async () => {
+      if (drainingCodexChunks) return;
+      drainingCodexChunks = true;
+      try {
+        while (pendingCodexChunks.length > 0) {
+          const chunk = pendingCodexChunks.shift();
+          if (chunk === undefined) break;
+          if (chunk.length >= HEAVY_CHUNK_BYTES) {
+            await new Promise(r => setImmediate(r));
+          }
+          // Carry handles partial-line splits across data events.
+          const combined = codexCarry + chunk;
+          const lastNewline = combined.lastIndexOf('\n');
+          const completeChunk = lastNewline >= 0 ? combined.slice(0, lastNewline) : '';
+          codexCarry = lastNewline >= 0 ? combined.slice(lastNewline + 1) : combined;
+          let linesSinceYield = 0;
+          let lastYieldAt = Date.now();
+          for (const line of completeChunk.split('\n')) {
+            if (!line) continue;
+            if (linesSinceYield >= WITHIN_CHUNK_YIELD_LINES
+                || Date.now() - lastYieldAt >= WITHIN_CHUNK_YIELD_MS) {
+              await new Promise(r => setImmediate(r));
+              linesSinceYield = 0;
+              lastYieldAt = Date.now();
+            }
+            // Codex emits non-JSON ERROR log lines to stdout when auth fails
+            // (`2026-05-08T... ERROR codex_login: ...`). Skip them quietly so
+            // they don't pollute the parse stream — they're already on stderr.
+            if (!line.startsWith('{')) {
+              sendLog(ws, line + '\n');
+              continue;
+            }
+            let obj: Record<string, unknown> | null = null;
+            try {
+              obj = JSON.parse(line) as Record<string, unknown>;
+            } catch {
+              sendLog(ws, line + '\n');
+              continue;
+            }
+            linesSinceYield += 1;
+            const eventType = typeof obj.type === 'string' ? obj.type : '';
+            if (eventType === 'thread.started') {
+              const tid = typeof obj.thread_id === 'string' ? obj.thread_id : '';
+              sendLog(ws, `[codex] thread.started ${tid}\n`);
+            } else if (eventType === 'turn.started') {
+              sendLog(ws, '[codex] turn.started\n');
+              statusRef.value = 'Codex thinking';
+            } else if (eventType === 'turn.completed') {
+              sendLog(ws, '[codex] turn.completed\n');
+            } else if (eventType === 'turn.failed') {
+              const err = (obj.error as { message?: string } | undefined)?.message ?? '';
+              const oneLine = `[codex] turn.failed: ${err}\n`;
+              sendLog(ws, oneLine);
+              stderrBuffer = appendBoundedTail(stderrBuffer, oneLine, STDERR_TAIL_BYTES);
+            } else if (eventType === 'error') {
+              const msg = typeof obj.message === 'string' ? obj.message : '';
+              const oneLine = `[codex] error: ${msg}\n`;
+              sendLog(ws, oneLine);
+              stderrBuffer = appendBoundedTail(stderrBuffer, oneLine, STDERR_TAIL_BYTES);
+            } else if (
+              eventType === 'item.started'
+              || eventType === 'item.updated'
+              || eventType === 'item.completed'
+            ) {
+              const item = obj.item as Record<string, unknown> | undefined;
+              const itemType = item && typeof item.type === 'string' ? item.type : '';
+              const preview = _codexItemPreview(item);
+              const toolName = _codexToolNameForItem(item);
+              if (toolName) {
+                // Tool-bearing items: stamp tool use on item.started so the
+                // watchdog sees fresh activity early. item.updated also stamps
+                // (covers long-running shell exec). item.completed clears
+                // toolInFlight so the stall watchdog stops counting.
+                if (eventType === 'item.started' || eventType === 'item.updated') {
+                  sendLog(
+                    ws,
+                    `[tool: ${toolName}] ${preview.slice(0, 200)}\n`,
+                  );
+                  statusRef.value = `Using tool: ${toolName}`;
+                  recordToolUse(toolName, item ?? {});
+                  toolInFlight = true;
+                  lastToolUseAt = Date.now();
+                  if (
+                    enableCheckWatchdog
+                    && toolName === 'Bash'
+                    && isCheckInvocation(preview)
+                  ) {
+                    lastCheckOutputOffset = allOutput.length;
+                  }
+                } else {
+                  toolInFlight = false;
+                  const status = item && typeof item.status === 'string' ? item.status : '';
+                  sendLog(ws, `[tool: ${toolName}] ${status}\n`);
+                }
+              } else if (itemType === 'agent_message') {
+                if (eventType === 'item.completed' || eventType === 'item.updated') {
+                  sendLog(ws, preview + '\n');
+                  if (preview) statusRef.value = preview.slice(0, 100);
+                  if (eventType === 'item.completed') {
+                    lastResultText = preview;
+                  }
+                }
+              } else if (itemType === 'reasoning') {
+                // Don't count reasoning as tool use — it's the model thinking.
+                // But still update status so heartbeats show progress.
+                if (eventType === 'item.completed') {
+                  statusRef.value = `Reasoning: ${preview.slice(0, 80)}`;
+                }
+              } else if (itemType === 'error') {
+                const msg = item && typeof item.message === 'string' ? item.message : '';
+                const oneLine = `[codex] item error: ${msg}\n`;
+                sendLog(ws, oneLine);
+                stderrBuffer = appendBoundedTail(stderrBuffer, oneLine, STDERR_TAIL_BYTES);
+              }
+            }
+          }
+          await new Promise(r => setImmediate(r));
+        }
+      } finally {
+        drainingCodexChunks = false;
+      }
+    };
     child.stdout.on('data', (data: Buffer) => {
       resetStallWatchdog();
       const text = data.toString();
@@ -3614,6 +3792,11 @@ echo ""
         pendingJsonChunks.push(text);
         drainJsonChunks().catch((e: unknown) => {
           sendLog(ws, `[runtime] drainJsonChunks error: ${String(e)}\n`);
+        });
+      } else if (runCommand.outputMode === 'codex-jsonl') {
+        pendingCodexChunks.push(text);
+        drainCodexChunks().catch((e: unknown) => {
+          sendLog(ws, `[runtime] drainCodexChunks error: ${String(e)}\n`);
         });
       } else {
         sendLog(ws, text);
@@ -3640,6 +3823,9 @@ echo ""
       try {
         if (pendingJsonChunks.length > 0 || drainingJsonChunks) {
           await drainJsonChunks();
+        }
+        if (pendingCodexChunks.length > 0 || drainingCodexChunks) {
+          await drainCodexChunks();
         }
       } catch (e) {
         sendLog(ws, `[runtime] final drain error: ${String(e)}\n`);

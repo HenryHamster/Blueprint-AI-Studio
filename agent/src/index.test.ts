@@ -1239,8 +1239,12 @@ describe('provider runner prompt transport', () => {
     // are ephemeral; sandboxing inside them stalls on approval prompts
     // nobody can answer. `--full-auto` is explicitly avoided since it
     // aliases --sandbox workspace-write and would override the bypass.
-    expect(command.args).toEqual(['exec', '--skip-git-repo-check', '--dangerously-bypass-approvals-and-sandbox', '-m', 'gpt-5']);
+    // --json: emit JSONL events (added 2026-05-08) so the agent wrapper can
+    // parse Codex tool calls and populate last_tool_use_at. Without it, every
+    // Codex task is structurally invisible to the watchdog.
+    expect(command.args).toEqual(['exec', '--skip-git-repo-check', '--json', '--dangerously-bypass-approvals-and-sandbox', '-m', 'gpt-5']);
     expect(command.args.join(' ')).not.toContain('Very long prompt body');
+    expect(command.outputMode).toBe('codex-jsonl');
   });
 
   it('uses stdin for Gemini run commands instead of argv prompts', () => {
