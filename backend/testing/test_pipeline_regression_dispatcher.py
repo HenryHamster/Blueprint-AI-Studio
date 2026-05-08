@@ -10167,6 +10167,197 @@ async def test_viewport_coverage_drop_no_signal_on_component_removal(db_session)
 
 
 # ---------------------------------------------------------------------------
+# viewport_coverage_snapshot producer tests
+# ---------------------------------------------------------------------------
+
+
+class TestComputeViewportCoverageSnapshot:
+    """Unit tests for compute_viewport_coverage_snapshot (pure function)."""
+
+    def _make_diff(
+        self,
+        *,
+        removed_assertions: int = 0,
+        added_assertions: int = 0,
+        context_assertions: int = 0,
+        escape_hatches: int = 0,
+        deleted_component: str | None = None,
+    ) -> str:
+        lines = []
+        if deleted_component:
+            lines.append(f"diff --git a/{deleted_component} b/{deleted_component}")
+            lines.append("deleted file mode 100644")
+            lines.append(f"--- a/{deleted_component}")
+            lines.append("+++ /dev/null")
+
+        lines.append(
+            "diff --git a/admin-ui/src/components/Foo.viewport.test.tsx"
+            " b/admin-ui/src/components/Foo.viewport.test.tsx"
+        )
+        lines.append("--- a/admin-ui/src/components/Foo.viewport.test.tsx")
+        lines.append("+++ b/admin-ui/src/components/Foo.viewport.test.tsx")
+        for _ in range(context_assertions):
+            lines.append(" expectNoOverflowAt(container, 375);")
+        for _ in range(removed_assertions):
+            lines.append("-expectNoOverflowAt(container, 375);")
+        for _ in range(added_assertions):
+            lines.append("+expectNoTextTruncationAt(container, 375);")
+
+        if escape_hatches:
+            lines.append(
+                "diff --git a/admin-ui/src/components/Bar.tsx"
+                " b/admin-ui/src/components/Bar.tsx"
+            )
+            lines.append("--- a/admin-ui/src/components/Bar.tsx")
+            lines.append("+++ b/admin-ui/src/components/Bar.tsx")
+            for _ in range(escape_hatches):
+                lines.append("+  <div data-viewport-allow-overflow>")
+
+        return "\n".join(lines)
+
+    def test_happy_path_drop(self):
+        from app.pipeline_regression_dispatcher import (
+            compute_viewport_coverage_snapshot,
+        )
+
+        diff = self._make_diff(
+            context_assertions=5, removed_assertions=3, added_assertions=0
+        )
+        snap = compute_viewport_coverage_snapshot(diff, pr_number=42)
+        # before = 5 context + 3 removed = 8
+        assert snap["assertion_count_before"] == 8
+        # after = 5 context + 0 added = 5
+        assert snap["assertion_count_after"] == 5
+        assert snap["new_escape_hatch_count"] == 0
+        assert snap["removed_component_files"] == []
+        assert snap["merged_pr"] == 42
+
+    def test_escape_hatch_addition(self):
+        from app.pipeline_regression_dispatcher import (
+            compute_viewport_coverage_snapshot,
+        )
+
+        diff = self._make_diff(
+            context_assertions=4,
+            removed_assertions=0,
+            added_assertions=0,
+            escape_hatches=2,
+        )
+        snap = compute_viewport_coverage_snapshot(diff, pr_number=99)
+        assert snap["assertion_count_before"] == snap["assertion_count_after"] == 4
+        assert snap["new_escape_hatch_count"] == 2
+
+    def test_legitimate_component_removal_suppresses(self):
+        from app.pipeline_regression_dispatcher import (
+            compute_viewport_coverage_snapshot,
+            _probe_viewport_coverage_drop,
+        )
+
+        diff = self._make_diff(
+            context_assertions=5,
+            removed_assertions=3,
+            deleted_component="admin-ui/src/components/OldWidget.tsx",
+        )
+        snap = compute_viewport_coverage_snapshot(diff, pr_number=77)
+        assert snap["removed_component_files"] == [
+            "admin-ui/src/components/OldWidget.tsx"
+        ]
+        # Probe should suppress when a component was legitimately removed
+        assert not _probe_viewport_coverage_drop({"viewport_coverage_snapshot": snap})
+
+    def test_no_admin_ui_files_skipped(self):
+        from app.pipeline_regression_dispatcher import (
+            compute_viewport_coverage_snapshot,
+        )
+
+        diff = "diff --git a/backend/app/foo.py b/backend/app/foo.py\n-old\n+new\n"
+        snap = compute_viewport_coverage_snapshot(diff, pr_number=1)
+        assert snap["assertion_count_before"] == 0
+        assert snap["assertion_count_after"] == 0
+        assert snap["new_escape_hatch_count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_update_writes_to_design_doc(self, db_session):
+        """update_viewport_coverage_snapshot_from_diff writes to project.design_doc."""
+        from app.pipeline_regression_dispatcher import (
+            update_viewport_coverage_snapshot_from_diff,
+        )
+
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        diff = self._make_diff(context_assertions=6, removed_assertions=2)
+        await update_viewport_coverage_snapshot_from_diff(
+            db_session, project, 123, diff
+        )
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        snap = (project.design_doc or {}).get("viewport_coverage_snapshot")
+        assert snap is not None
+        assert snap["assertion_count_before"] == 8
+        assert snap["assertion_count_after"] == 6
+        assert snap["merged_pr"] == 123
+
+    @pytest.mark.asyncio
+    async def test_update_skips_when_no_admin_ui(self, db_session):
+        """update_viewport_coverage_snapshot_from_diff is a no-op when no admin-ui in diff."""
+        from app.pipeline_regression_dispatcher import (
+            update_viewport_coverage_snapshot_from_diff,
+        )
+
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        diff = "diff --git a/backend/app/foo.py b/backend/app/foo.py\n+pass\n"
+        await update_viewport_coverage_snapshot_from_diff(db_session, project, 99, diff)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        snap = (project.design_doc or {}).get("viewport_coverage_snapshot")
+        assert snap is None
+
+    @pytest.mark.asyncio
+    async def test_round_trip_triggers_dispatcher(self, db_session):
+        """Producer write + dispatcher read + run_once spawns a case end-to-end."""
+        from app.pipeline_regression_dispatcher import (
+            update_viewport_coverage_snapshot_from_diff,
+        )
+
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        # Diff that drops 3 assertions: before=8, after=5
+        diff = self._make_diff(context_assertions=5, removed_assertions=3)
+        await update_viewport_coverage_snapshot_from_diff(
+            db_session, project, 555, diff
+        )
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        spawned = await run_once(db_session, project.id)
+        assert spawned == 1
+
+        task = (
+            (
+                await db_session.execute(
+                    select(Task).where(Task.project_id == project.id)
+                )
+            )
+            .scalars()
+            .first()
+        )
+        assert task is not None
+        assert (task.context or {}).get("regression_class") == "viewport_coverage_drop"
+
+
+# ---------------------------------------------------------------------------
 # Reviewer SLA stall signal tests
 # ---------------------------------------------------------------------------
 
@@ -11747,7 +11938,9 @@ async def test_false_positive_status_suppresses_spawn_within_ttl(db_session):
         project_id=project.id,
         regression_class="sr_catch_rate",
         status=RegressionCaseStatus.FALSE_POSITIVE,
-        false_positive_until_at=now + _REGRESSION_FALSE_POSITIVE_TTL - timedelta(hours=1),
+        false_positive_until_at=now
+        + _REGRESSION_FALSE_POSITIVE_TTL
+        - timedelta(hours=1),
         false_positive_reason="documented design — partial backend test run",
         hit_count=1,
     )

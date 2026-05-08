@@ -3682,6 +3682,138 @@ describe('writeCodeChangeHelpers — self-review fallback', () => {
     expect(checkScript.indexOf('admin-ui viewport')).toBeLessThan(checkScript.indexOf('admin-ui build'));
   });
 
+  it('generated ./check script passes `bash -n` syntax check', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    writeCodeChangeHelpers({
+      taskId: 'test-task-123',
+      workBranch: 'blueprint/test-task-123',
+      baseBranch: 'main',
+      owner: 'test-owner',
+      repo: 'test-repo',
+      testsOnMainBranch: true,
+    });
+
+    const checkScript = capturedScripts['/tmp/workspace/check'];
+    expect(checkScript).toBeDefined();
+
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const realCp = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+    const tmp = `/tmp/check_smoke_${process.pid}_${Date.now()}.sh`;
+    realFs.writeFileSync(tmp, checkScript);
+    try {
+      realCp.execFileSync('bash', ['-n', tmp], { stdio: 'pipe' });
+    } finally {
+      try { realFs.unlinkSync(tmp); } catch { /* ignore */ }
+    }
+  });
+
+  it('includes missing viewport test check in ./check script', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    writeCodeChangeHelpers({
+      taskId: 'test-task-123',
+      workBranch: 'blueprint/test-task-123',
+      baseBranch: 'main',
+      owner: 'test-owner',
+      repo: 'test-repo',
+      testsOnMainBranch: true,
+    });
+
+    const checkScript = capturedScripts['/tmp/workspace/check'];
+    expect(checkScript).toBeDefined();
+
+    // Check script should contain the new component viewport test guard
+    expect(checkScript).toContain('Check for new admin-ui components without viewport tests');
+    expect(checkScript).toContain('admin-ui/src/components/[^/]+\\.tsx');
+    expect(checkScript).toContain('@viewport-test-exempt');
+    expect(checkScript).toContain('Expected test file:');
+    expect(checkScript).toContain('admin-ui/src/test/viewport.ts');
+    // Loop must run in the parent shell (process substitution), and a
+    // missing sibling test must populate FAILED so the script-level
+    // gate exits non-zero. A piped `while` would lose the FAILED+= in a
+    // subshell and the gate would only print a warning.
+    expect(checkScript).toContain('done < <(printf');
+    expect(checkScript).toContain('FAILED+=("admin-ui new component viewport test")');
+    expect(checkScript).not.toMatch(/\| while read -r comp; do[\s\S]*?exit 1/);
+  });
+
+  it('./check new-component gate exits non-zero when sibling viewport test is missing', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    writeCodeChangeHelpers({
+      taskId: 'test-task-123',
+      workBranch: 'blueprint/test-task-123',
+      baseBranch: 'main',
+      owner: 'test-owner',
+      repo: 'test-repo',
+      testsOnMainBranch: true,
+    });
+    const checkScript = capturedScripts['/tmp/workspace/check'];
+    expect(checkScript).toBeDefined();
+
+    // Extract the new-component gate block in isolation. We can't easily
+    // run the entire check script (it sets up git diffs, npm ci, etc.);
+    // running just the gate with stubbed inputs is enough to verify the
+    // pipeline-vs-process-substitution fix.
+    const startMarker = '# Check for new admin-ui components without viewport tests';
+    const endMarker = ': > /tmp/check_viewport_tests.txt';
+    const startIdx = checkScript.indexOf(startMarker);
+    const endIdx = checkScript.indexOf(endMarker, startIdx);
+    expect(startIdx).toBeGreaterThan(-1);
+    expect(endIdx).toBeGreaterThan(startIdx);
+    const gate = checkScript.slice(startIdx, endIdx);
+
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const realCp = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+    const realOs = await vi.importActual<typeof import('node:os')>('node:os');
+    const realPath = await vi.importActual<typeof import('node:path')>('node:path');
+
+    const runGate = (setupFiles: Array<[string, string]>): number => {
+      const dir = realFs.mkdtempSync(realPath.join(realOs.tmpdir(), 'check-newcomp-'));
+      try {
+        for (const [rel, body] of setupFiles) {
+          const abs = realPath.join(dir, rel);
+          realFs.mkdirSync(realPath.dirname(abs), { recursive: true });
+          realFs.writeFileSync(abs, body);
+        }
+        const harness = [
+          'set -uo pipefail',
+          `cd "${dir}"`,
+          'FULL_SCOPE=0',
+          'ADMIN_UI_CHANGED="admin-ui/src/components/Foo.tsx"',
+          'FAILED=()',
+          gate,
+          'exit ${#FAILED[@]}',
+        ].join('\n');
+        const tmp = realPath.join(dir, 'harness.sh');
+        realFs.writeFileSync(tmp, harness);
+        try {
+          realCp.execFileSync('bash', [tmp], { stdio: 'pipe' });
+          return 0;
+        } catch (err: unknown) {
+          const e = err as { status?: number };
+          return e.status ?? -1;
+        }
+      } finally {
+        realFs.rmSync(dir, { recursive: true, force: true });
+      }
+    };
+
+    // Missing sibling viewport test → gate must register a failure.
+    expect(runGate([
+      ['admin-ui/src/components/Foo.tsx', 'export const Foo = () => null;\n'],
+    ])).toBeGreaterThan(0);
+
+    // Sibling viewport test present → gate must pass cleanly.
+    expect(runGate([
+      ['admin-ui/src/components/Foo.tsx', 'export const Foo = () => null;\n'],
+      ['admin-ui/src/components/Foo.viewport.test.tsx', ''],
+    ])).toBe(0);
+
+    // Exemption marker → gate must pass cleanly.
+    expect(runGate([
+      ['admin-ui/src/components/Foo.tsx', '// @viewport-test-exempt\nexport const Foo = () => null;\n'],
+    ])).toBe(0);
+  });
+
   it('generates ./pr script with SR section injection for new PR path', async () => {
     const { writeCodeChangeHelpers } = await import('./prompt.js');
     writeCodeChangeHelpers({

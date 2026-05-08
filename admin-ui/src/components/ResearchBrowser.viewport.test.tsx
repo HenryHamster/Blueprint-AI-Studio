@@ -3,7 +3,7 @@ import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { ResearchBrowser } from './ResearchBrowser';
 import type { Task } from '../types/task';
-import { expectNoOverflowAt, expectMinTouchTargetAt } from '../test/viewport';
+import { expectNoOverflowAt, expectMinTouchTargetAt, expectNoTextTruncationAt } from '../test/viewport';
 
 vi.mock('../api', () => ({
   API_BASE_URL: '',
@@ -129,6 +129,28 @@ describe('ResearchBrowser — viewport regression', () => {
         await new Promise<void>((resolve) => setTimeout(resolve, 50));
       });
     });
+  });
+
+  test('finding titles and descriptions do not silently clip text at 375px', async () => {
+    await expectNoTextTruncationAt(375, async () => {
+      host = document.createElement('div');
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <ResearchBrowser
+            tasks={sampleTasks}
+            selectedProjectId="project-test"
+            onClose={() => {}}
+            onNavigateToTask={() => {}}
+          />,
+        );
+      });
+      await act(async () => {
+        await new Promise<void>((resolve) => setTimeout(resolve, 50));
+      });
+    }, { waitMs: 50 });
   });
 
   test('interactive controls meet 44px touch target at 375px', async () => {

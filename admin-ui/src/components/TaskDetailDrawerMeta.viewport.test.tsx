@@ -3,7 +3,7 @@ import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { DetailsTab } from './TaskDetailDrawerMeta';
 import type { Task } from '../types/task';
-import { expectNoOverflowAt, expectMinTouchTargetAt } from '../test/viewport';
+import { expectNoOverflowAt, expectMinTouchTargetAt, expectNoTextTruncationAt } from '../test/viewport';
 
 vi.mock('../firebase', () => ({
   auth: { currentUser: null, onAuthStateChanged: () => () => {} },
@@ -106,6 +106,23 @@ describe('TaskDetailDrawerMeta DetailsTab — viewport regression', () => {
     // Check that reasoning text is rendered for passed checks
     expect(content).toContain('All changes are contained within');
     expect(content).toContain('Linting passed with no violations');
+  });
+
+  test('meta key/value pairs do not silently clip text at 375px', async () => {
+    await expectNoTextTruncationAt(375, async () => {
+      host = document.createElement('div');
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => { r.render(<DetailsTab task={richTask} />); });
+
+      // Expand the Self-Review panel to show all meta information
+      const buttons = host.querySelectorAll('button');
+      const srButton = Array.from(buttons).find(b => b.textContent?.includes('Self-Review'));
+      if (srButton) {
+        await act(async () => { srButton.click(); });
+      }
+    });
   });
 
   test('interactive controls meet 44px touch target at 375px', async () => {

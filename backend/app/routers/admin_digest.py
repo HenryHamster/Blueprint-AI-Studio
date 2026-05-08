@@ -1,10 +1,12 @@
 """Catch-up digest and pipeline health summary endpoints."""
 
 import asyncio
+import re as _re
 import uuid
 import logging
 import statistics
 from collections import defaultdict
+from pathlib import Path as _Path
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
 
@@ -8391,6 +8393,144 @@ async def get_regression_mtta(
         "classes": rows,
         "recovery_cooldown_sec": int(_REGRESSION_RECOVERY_COOLDOWN.total_seconds()),
     }
+
+
+# ---------------------------------------------------------------------------
+# Viewport Debt Endpoint
+# ---------------------------------------------------------------------------
+
+_VIEWPORT_DEBT_CACHE: Optional[tuple[datetime, List[Dict[str, Any]]]] = None
+_VIEWPORT_DEBT_CACHE_TTL = 300  # 5 minutes
+
+_ESLINT_VIEWPORT_RE = _re.compile(
+    r"eslint-disable(?:-next-line)?.*viewport/(?:min-touch-target|no-fixed-width)"
+)
+_DATA_SMALL_TARGET_RE = _re.compile(r"data-viewport-allow-small-target")
+_DATA_OVERFLOW_RE = _re.compile(r"data-viewport-allow-overflow")
+_DATA_TRUNCATION_RE = _re.compile(r"data-viewport-allow-truncation")
+
+
+def _find_components_dir() -> Optional[_Path]:
+    here = _Path(__file__).resolve().parent
+    for _ in range(6):
+        candidate = here / "admin-ui" / "src" / "components"
+        if candidate.is_dir():
+            return candidate
+        here = here.parent
+    return None
+
+
+def _scan_viewport_debt_rows() -> List[Dict[str, Any]]:
+    global _VIEWPORT_DEBT_CACHE
+    now = datetime.utcnow()
+    if _VIEWPORT_DEBT_CACHE is not None:
+        cached_at, cached_rows = _VIEWPORT_DEBT_CACHE
+        if (now - cached_at).total_seconds() < _VIEWPORT_DEBT_CACHE_TTL:
+            return cached_rows
+
+    components_dir = _find_components_dir()
+    if components_dir is None:
+        return []
+
+    rows = []
+    for tsx_file in sorted(components_dir.glob("*.tsx")):
+        name = tsx_file.name
+        if ".test." in name or ".spec." in name:
+            continue
+        try:
+            content = tsx_file.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+
+        eslint_count = len(_ESLINT_VIEWPORT_RE.findall(content))
+        small_target = len(_DATA_SMALL_TARGET_RE.findall(content))
+        overflow = len(_DATA_OVERFLOW_RE.findall(content))
+        truncation = len(_DATA_TRUNCATION_RE.findall(content))
+        total = eslint_count + small_target + overflow + truncation
+
+        if total == 0:
+            continue
+
+        stem = tsx_file.stem  # e.g. "MessagesPanel"
+        vp_test = (tsx_file.parent / f"{stem}.viewport.test.tsx").exists()
+        rel_path = f"admin-ui/src/components/{name}"
+        rows.append(
+            {
+                "component": rel_path,
+                "eslint_disable_count": eslint_count,
+                "data_viewport_allow_small_target": small_target,
+                "data_viewport_allow_overflow": overflow,
+                "data_viewport_allow_truncation": truncation,
+                "total_opt_outs": total,
+                "has_viewport_test": vp_test,
+                "regression_case_count": 0,
+                "source_url": None,
+            }
+        )
+
+    rows.sort(key=lambda r: r["total_opt_outs"], reverse=True)
+    rows = rows[:15]
+    _VIEWPORT_DEBT_CACHE = (now, rows)
+    return rows
+
+
+@router.get("/projects/{project_id}/viewport-debt")
+async def get_viewport_debt(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),  # noqa: ARG001
+) -> Dict[str, Any]:
+    """Per-component viewport opt-out debt summary.
+
+    Scans admin-ui/src/components/*.tsx for eslint-disable viewport/* lines
+    and data-viewport-allow-* attributes.  Returns top-15 components sorted
+    by total opt-out count, with a flag indicating whether a .viewport.test.tsx
+    companion exists and a count of viewport_regression dispatcher cases in the
+    last 30 days.  Result is cached in-process for 5 minutes.
+    """
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, min_role="viewer"
+    )
+
+    # Shallow-copy cached rows: the scan result is a process-wide cache and
+    # we annotate per-project below. Without the copy, concurrent requests
+    # for different projects would race on regression_case_count / source_url.
+    rows = [dict(r) for r in _scan_viewport_debt_rows()]
+
+    # Annotate each row with recent regression case count from the DB.
+    if rows:
+        cutoff = datetime.utcnow() - timedelta(days=30)
+        stmt = select(RegressionRemediationCase).where(
+            RegressionRemediationCase.project_id == project_id,
+            RegressionRemediationCase.regression_class.startswith(
+                "viewport_regression:"
+            ),
+            RegressionRemediationCase.first_seen_at >= cutoff,
+        )
+        vp_cases = (await session.execute(stmt)).scalars().all()
+
+        # Map component stem → case count
+        case_counts: Dict[str, int] = {}
+        for c in vp_cases:
+            cls = c.regression_class  # e.g. "viewport_regression:MessagesPanel.tsx@375"
+            # Extract component name between ":" and "@"
+            inner = cls[len("viewport_regression:") :]
+            comp = inner.split("@")[0]  # e.g. "MessagesPanel.tsx"
+            case_counts[comp] = case_counts.get(comp, 0) + 1
+
+        project = await session.get(Project, project_id)
+        gh_owner = project.github_owner if project else None
+        gh_repo = project.github_repo if project else None
+
+        for row in rows:
+            stem_tsx = _Path(row["component"]).name  # e.g. "MessagesPanel.tsx"
+            row["regression_case_count"] = case_counts.get(stem_tsx, 0)
+            if gh_owner and gh_repo:
+                row["source_url"] = (
+                    f"https://github.com/{gh_owner}/{gh_repo}/blob/main/{row['component']}"
+                )
+
+    return {"rows": rows, "scanned_at": datetime.utcnow().isoformat()}
 
 
 @router.get("/regression-dispatcher/escalation-outcomes")

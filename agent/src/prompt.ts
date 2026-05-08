@@ -646,6 +646,35 @@ if admin_ui_runtime_touched; then
   #    tree untouched.
   ADMIN_UI_CHANGED=$(printf '%s\\n' "$CHANGED" | grep -E '^admin-ui/' || true)
   NON_COMPONENT=$(printf '%s\\n' "$ADMIN_UI_CHANGED" | grep -vE '^admin-ui/src/components/[^/]+\\.(viewport\\.test\\.tsx|tsx)$' || true)
+
+  # Check for new admin-ui components without viewport tests.
+  # Uses process substitution (\`done < <(...)\`) so the loop runs in the
+  # current shell — a piped \`while\` would run in a subshell and any
+  # FAILED+= or flag set inside would be lost, leaving the gate
+  # advisory-only.
+  if [ "$FULL_SCOPE" = "0" ] && [ -n "$ADMIN_UI_CHANGED" ]; then
+    NEW_COMPONENTS=$(printf '%s\\n' "$ADMIN_UI_CHANGED" | grep -E '^admin-ui/src/components/[^/]+\\.tsx$' | grep -vE '\\.test\\.tsx$|\\.viewport\\.test\\.tsx$' || true)
+    if [ -n "$NEW_COMPONENTS" ]; then
+      MISSING_VIEWPORT_TESTS=()
+      while IFS= read -r comp; do
+        [ -z "$comp" ] && continue
+        [ -f "\${comp%.tsx}.viewport.test.tsx" ] && continue
+        basename "$comp" .tsx | grep -qE '^[a-z]' && continue
+        grep -q '@viewport-test-exempt' "$comp" 2>/dev/null && continue
+        MISSING_VIEWPORT_TESTS+=("$comp")
+      done < <(printf '%s\\n' "$NEW_COMPONENTS")
+      if [ \${#MISSING_VIEWPORT_TESTS[@]} -gt 0 ]; then
+        echo "[check] ERROR: New component(s) without viewport test:" >&2
+        for comp in "\${MISSING_VIEWPORT_TESTS[@]}"; do
+          echo "  $comp" >&2
+          echo "  Expected test file: \${comp%.tsx}.viewport.test.tsx" >&2
+        done
+        echo "  See admin-ui/src/test/viewport.ts for examples" >&2
+        FAILED+=("admin-ui new component viewport test")
+      fi
+    fi
+  fi
+
   : > /tmp/check_viewport_tests.txt
   if [ "$FULL_SCOPE" = "0" ] && [ -z "$NON_COMPONENT" ]; then
     printf '%s\\n' "$ADMIN_UI_CHANGED" | grep -E '^admin-ui/src/components/[^/]+\\.viewport\\.test\\.tsx$' | while IFS= read -r f; do
@@ -670,7 +699,20 @@ if admin_ui_runtime_touched; then
     # first and fall through to the bare install, with --with-deps as a
     # last-resort fallback for fresh local machines.
     # See admin-ui/CONTRIBUTING.md for developer-machine setup.
-    run "admin-ui playwright chromium" bash -c 'cd admin-ui && { [ -d "$HOME/.cache/ms-playwright" ] && ls "$HOME/.cache/ms-playwright"/chromium-* >/dev/null 2>&1 || npx playwright install chromium || npx playwright install --with-deps chromium; } 2>&1'
+    run "admin-ui playwright chromium" bash -c '
+      cd admin-ui || exit 1
+      if [ -d "$HOME/.cache/ms-playwright" ] && ls "$HOME/.cache/ms-playwright"/chromium-* >/dev/null 2>&1; then
+        exit 0
+      fi
+      if npx playwright install chromium 2>&1; then
+        exit 0
+      fi
+      if npx playwright install --with-deps chromium 2>&1; then
+        exit 0
+      fi
+      echo "[check] Retrying inside Docker container..." >&2
+      docker run --rm -v "$PWD:/work" -w /work mcr.microsoft.com/playwright:v1.59.1-jammy npx playwright install chromium 2>&1 || exit 1
+    ' 2>&1
   fi
 
   if [ "$FULL_SCOPE" = "1" ]; then

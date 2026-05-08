@@ -285,7 +285,7 @@ function DirectionCardImpl({
               <span className="italic">{d.completion_criteria}</span>
             </p>
           )}
-          <div className="flex items-center gap-2 mt-2">
+          <div className="flex flex-wrap items-center gap-2 mt-2 min-w-0">
             <span className={`text-[10px] px-1.5 py-0.5 rounded border font-medium ${priorityColors[d.priority]}`}>
               {d.priority}
             </span>
@@ -336,7 +336,7 @@ function DirectionCardImpl({
               <span className="italic">{d.completion_criteria}</span>
             </p>
           )}
-          <div className="flex items-center gap-2 mt-2">
+          <div className="flex flex-wrap items-center gap-2 mt-2 min-w-0">
             <span className={`text-[10px] px-1.5 py-0.5 rounded border font-medium ${priorityColors[d.priority]}`}>
               {d.priority}
             </span>
@@ -699,7 +699,7 @@ function DirectionCardImpl({
               )}
             </div>
           )}
-          <div className="flex items-center gap-2 mt-2">
+          <div className="flex flex-wrap items-center gap-2 mt-2 min-w-0">
             <span className={`text-[10px] px-1.5 py-0.5 rounded border font-medium ${priorityColors[d.priority]}`}>
               {d.priority}
             </span>

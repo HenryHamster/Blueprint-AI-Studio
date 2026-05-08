@@ -2252,3 +2252,158 @@ class TestViewportRegressionDigest:
         # The existing class' opened count must not be polluted
         assert by_class["fix_loop_divergence:lint"]["cases_opened"] == 1
         assert by_class["viewport_regression:AlertsBanner@375"]["cases_opened"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Viewport debt endpoint tests
+# ---------------------------------------------------------------------------
+
+
+class TestViewportDebt:
+    """Tests for GET /api/admin/projects/{project_id}/viewport-debt."""
+
+    @pytest.mark.asyncio
+    async def test_returns_rows_and_scanned_at(self, client: AsyncClient, db_session):
+        """Happy path: returns rows list and scanned_at timestamp."""
+        from unittest.mock import patch
+
+        project = await _make_project(db_session)
+        fake_rows = [
+            {
+                "component": "admin-ui/src/components/MessagesPanel.tsx",
+                "eslint_disable_count": 3,
+                "data_viewport_allow_small_target": 2,
+                "data_viewport_allow_overflow": 1,
+                "data_viewport_allow_truncation": 0,
+                "total_opt_outs": 6,
+                "has_viewport_test": True,
+                "regression_case_count": 0,
+                "source_url": None,
+            }
+        ]
+        with patch(
+            "app.routers.admin_digest._scan_viewport_debt_rows",
+            return_value=fake_rows,
+        ):
+            resp = await client.get(f"/api/admin/projects/{project.id}/viewport-debt")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "rows" in data
+        assert "scanned_at" in data
+        assert len(data["rows"]) == 1
+        row = data["rows"][0]
+        assert row["component"] == "admin-ui/src/components/MessagesPanel.tsx"
+        assert row["eslint_disable_count"] == 3
+        assert row["total_opt_outs"] == 6
+        assert row["has_viewport_test"] is True
+
+    @pytest.mark.asyncio
+    async def test_regression_cases_annotated(self, client: AsyncClient, db_session):
+        """Viewport regression cases are counted and annotated on matching rows."""
+        from unittest.mock import patch
+        from app.models import RegressionRemediationCase, RegressionCaseStatus
+
+        project = await _make_project(db_session)
+
+        case = RegressionRemediationCase(
+            project_id=project.id,
+            regression_class="viewport_regression:MessagesPanel.tsx@375",
+            signal_name="viewport_regression",
+            status=RegressionCaseStatus.ACTIVE,
+            first_seen_at=__import__("datetime").datetime.utcnow(),
+        )
+        db_session.add(case)
+        await db_session.commit()
+
+        fake_rows = [
+            {
+                "component": "admin-ui/src/components/MessagesPanel.tsx",
+                "eslint_disable_count": 1,
+                "data_viewport_allow_small_target": 0,
+                "data_viewport_allow_overflow": 0,
+                "data_viewport_allow_truncation": 0,
+                "total_opt_outs": 1,
+                "has_viewport_test": True,
+                "regression_case_count": 0,
+                "source_url": None,
+            }
+        ]
+        with patch(
+            "app.routers.admin_digest._scan_viewport_debt_rows",
+            return_value=fake_rows,
+        ):
+            resp = await client.get(f"/api/admin/projects/{project.id}/viewport-debt")
+
+        assert resp.status_code == 200
+        rows = resp.json()["rows"]
+        assert rows[0]["regression_case_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_rows_when_no_debt(
+        self, client: AsyncClient, db_session
+    ):
+        """Returns empty rows list when no components have opt-outs."""
+        from unittest.mock import patch
+
+        project = await _make_project(db_session)
+        with patch(
+            "app.routers.admin_digest._scan_viewport_debt_rows",
+            return_value=[],
+        ):
+            resp = await client.get(f"/api/admin/projects/{project.id}/viewport-debt")
+
+        assert resp.status_code == 200
+        assert resp.json()["rows"] == []
+
+    @pytest.mark.asyncio
+    async def test_non_member_project_returns_404(
+        self, client: AsyncClient, db_session
+    ):
+        """Project the user is not a member of returns 404."""
+        project = Project(name="Other Project", user_id="other-owner")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        resp = await client.get(f"/api/admin/projects/{project.id}/viewport-debt")
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_endpoint_does_not_mutate_cached_rows(
+        self, client: AsyncClient, db_session
+    ):
+        """Per-project annotations must not mutate the shared cache rows.
+
+        Regression: the endpoint annotates regression_case_count and source_url
+        on each row. Without a copy, those values would leak across concurrent
+        requests for different projects.
+        """
+        from unittest.mock import patch
+
+        project = await _make_project(db_session)
+        cached_rows = [
+            {
+                "component": "admin-ui/src/components/MessagesPanel.tsx",
+                "eslint_disable_count": 1,
+                "data_viewport_allow_small_target": 0,
+                "data_viewport_allow_overflow": 0,
+                "data_viewport_allow_truncation": 0,
+                "total_opt_outs": 1,
+                "has_viewport_test": True,
+                "regression_case_count": 0,
+                "source_url": None,
+            }
+        ]
+        # Snapshot the cached row so we can compare after the request.
+        snapshot = dict(cached_rows[0])
+
+        with patch(
+            "app.routers.admin_digest._scan_viewport_debt_rows",
+            return_value=cached_rows,
+        ):
+            resp = await client.get(f"/api/admin/projects/{project.id}/viewport-debt")
+
+        assert resp.status_code == 200
+        # The shared cached row must remain identical to its pre-request state.
+        assert cached_rows[0] == snapshot

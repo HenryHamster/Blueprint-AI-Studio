@@ -638,8 +638,8 @@ function SelfReviewPanel({ task }: { task: Task }) {
                     </div>
                     {outcome.edges_considered.map((edge, i) => (
                       <div key={i} className={`px-2 py-1.5 border-t border-neutral-700/50 ${!edge.handled ? 'bg-amber-950/20' : ''}`}>
-                        <div className="grid grid-cols-[1fr_auto] gap-2 items-start">
-                          <span className="text-neutral-300 break-words">{edge.case}</span>
+                        <div className="grid grid-cols-[1fr_auto] gap-2 items-start min-w-0">
+                          <span className="text-neutral-300 break-words overflow-hidden">{edge.case}</span>
                           <span className={`font-semibold shrink-0 ${edge.handled ? 'text-emerald-400' : 'text-amber-400'}`}>
                             {edge.handled ? '✓ yes' : '✗ no'}
                           </span>

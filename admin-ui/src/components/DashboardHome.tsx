@@ -34,6 +34,7 @@ import { SrTrendBreakdown, SrMissedRetrospective, SrReviewerDisagreementsPanel, 
 import { TAXONOMY_COLORS, TAXONOMY_LABELS, TAXONOMY_ORDER } from './dashboardConstants';
 import { ManualInterventionPanel, AutoRecoveredPanel, AnomalyTrackerPanel } from './PipelineRegressionsPanel';
 import { RecentlyResolvedRegressionsPanel } from './RecentlyResolvedRegressionsPanel';
+import { ViewportDebtPanel } from './ViewportDebtPanel';
 import type { Task } from '../types/task';
 import type { ProjectDiagnostics } from '../types/diagnostics';
 
@@ -937,6 +938,9 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
 
       {/* Recently Resolved Regressions */}
       {selectedProjectId && <RecentlyResolvedRegressionsPanel projectId={selectedProjectId} />}
+
+      {/* Viewport Debt */}
+      {selectedProjectId && <ViewportDebtPanel projectId={selectedProjectId} />}
 
       {/* System Status */}
       <SystemStatusCard digest={digest} loading={loading} />

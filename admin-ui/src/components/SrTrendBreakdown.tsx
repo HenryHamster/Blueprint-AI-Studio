@@ -615,7 +615,7 @@ export function FreshReviewerTrendBreakdown({ trend }: { trend: FreshReviewerTre
         <div className="flex flex-col gap-0.5 mb-1">
           <p className="text-[9px] text-neutral-600">Hit rate by category</p>
           {Object.entries(cats).map(([cat, m]) => (
-            <div key={cat} className="flex items-center gap-2 text-[10px]">
+            <div key={cat} className="flex items-center gap-2 text-[10px] min-w-0">
               <span className="text-neutral-300 flex-1 truncate">{cat}</span>
               <span className={`font-mono tabular-nums ${frTrendColor(m.trend)}`}>
                 {m.current != null ? `${Math.round(m.current * 100)}%` : '–'}
@@ -1099,17 +1099,17 @@ function CategoryRow({
     );
     return (
       <div>
-        <div className="flex items-center gap-2 text-[10px]">
+        <div className="flex items-center gap-2 text-[10px] min-w-0">
           {chevron}
           {clickable ? (
             <div
-              className="flex items-center gap-2 flex-1 rounded px-0.5 cursor-pointer hover:bg-neutral-800/60"
+              className="flex items-center gap-2 flex-1 rounded px-0.5 cursor-pointer hover:bg-neutral-800/60 min-w-0"
               {...interactiveProps}
             >
               {rowBody}
             </div>
           ) : (
-            <div className="flex items-center gap-2 flex-1 rounded px-0.5">
+            <div className="flex items-center gap-2 flex-1 rounded px-0.5 min-w-0">
               {rowBody}
             </div>
           )}

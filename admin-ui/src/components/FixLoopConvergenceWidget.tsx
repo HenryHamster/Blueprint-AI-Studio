@@ -138,8 +138,8 @@ function LoopCard({ name, data, onChipClick }: { name: string; data: LoopAggrega
         {topReasons.map(([reason, count]) => {
           const cls = EXIT_REASON_COLORS[reason] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30';
           return (
-            // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
             <button
+              data-viewport-allow-small-target
               key={reason}
               onClick={() => onChipClick(name, reason)}
               className={`inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded border cursor-pointer hover:brightness-125 transition-all ${cls}`}
@@ -234,8 +234,7 @@ function DrillDownPanel({
           </span>
           {!loading && <span className="text-[10px] text-neutral-500">{total} task{total !== 1 ? 's' : ''}</span>}
         </div>
-        {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
-        <button onClick={onClose} className="text-neutral-500 hover:text-neutral-300 text-xs leading-none px-1" aria-label="Close">✕</button>
+        <button data-viewport-allow-small-target onClick={onClose} className="text-neutral-500 hover:text-neutral-300 text-xs leading-none px-1" aria-label="Close">✕</button>
       </div>
       {isDivergenceFilter && DIVERGENCE_PATTERNS.some(p => (patternCounts[p] ?? 0) > 0) && (
         <div className="flex flex-wrap gap-1 mb-2">
@@ -245,8 +244,8 @@ function DrillDownPanel({
             const cls = EXIT_REASON_COLORS[p] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30';
             const isActive = activePattern === p;
             return (
-              // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
               <button
+                data-viewport-allow-small-target
                 key={p}
                 onClick={() => setActivePattern(prev => prev === p ? null : p)}
                 className={`inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded border transition-all ${cls} ${isActive ? 'ring-1 ring-white/30' : 'opacity-60 hover:opacity-100'}`}
@@ -258,8 +257,7 @@ function DrillDownPanel({
             );
           })}
           {activePattern && (
-            // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
-            <button onClick={() => setActivePattern(null)} className="text-[10px] text-neutral-400 hover:text-neutral-200 px-1">
+            <button data-viewport-allow-small-target onClick={() => setActivePattern(null)} className="text-[10px] text-neutral-400 hover:text-neutral-200 px-1">
               show all
             </button>
           )}
@@ -279,6 +277,7 @@ function DrillDownPanel({
                 <span className="text-[11px] text-neutral-200 font-medium leading-tight truncate flex-1" title={t.title}>{t.title}</span>
                 {onViewTask && (
                   <button
+                    data-viewport-allow-small-target
                     onClick={() => onViewTask(t.task_id)}
                     className="text-[10px] text-neutral-400 hover:text-neutral-100 shrink-0 ml-1 underline underline-offset-2"
                   >

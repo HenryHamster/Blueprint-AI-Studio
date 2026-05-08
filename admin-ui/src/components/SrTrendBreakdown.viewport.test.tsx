@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { SrTrendBreakdown, type SrTrendData } from './SrTrendBreakdown';
-import { expectNoOverflowAt } from '../test/viewport';
+import { expectNoOverflowAt, expectNoTextTruncationAt } from '../test/viewport';
 
 const sampleTrends: SrTrendData = {
   computed_at: '2026-05-06T00:00:00Z',
@@ -170,6 +170,21 @@ describe('SrTrendBreakdown — viewport regression', () => {
       await act(async () => {
         r.render(
           <SrTrendBreakdown trends={sampleTrends} variant="inline" />,
+        );
+      });
+    });
+  });
+
+  test('category labels and rate text do not silently clip at 375px', async () => {
+    await expectNoTextTruncationAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <SrTrendBreakdown trends={sampleTrends} variant="card" />,
         );
       });
     });
