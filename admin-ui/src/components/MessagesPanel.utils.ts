@@ -1,6 +1,34 @@
-export const HIGH_SIGNAL_NOTE_EVENTS = new Set([
+// Canonical set of escalation event types emitted by backend/app/notification_dispatch.py.
+// One source of truth: high-signal classification, error toast severity, and ContextBadges
+// all read from this set, so a new escalation type added here automatically gets surfaced
+// across all three behaviors. Keep in sync with notification_dispatch.py escalation emitters.
+export const ESCALATION_EVENT_TYPES: ReadonlySet<string> = new Set([
+  'auto_fix_escalated',
+  'residual_fix_escalated',
+  'residual_fix_audit_deferred',
+  'remediation_escalated',
+]);
+
+// Per-event-type label and Tailwind class for the ContextBadges escalation badge.
+// Adding a new entry to ESCALATION_EVENT_TYPES without a corresponding entry here
+// is caught by the invariant test in MessagesPanel.utils.test.ts.
+export const ESCALATION_BADGE_LABELS: Readonly<Record<string, string>> = {
+  auto_fix_escalated: 'Auto-fix Escalated',
+  residual_fix_escalated: 'Residual Fix Escalated',
+  residual_fix_audit_deferred: 'Audit Deferred',
+  remediation_escalated: 'Remediation Escalated',
+};
+
+export const HIGH_SIGNAL_NOTE_EVENTS: ReadonlySet<string> = new Set([
   'failure_alert', 'rollback_recommended', 'fix_loop_divergence_regressed',
   'feedback_acknowledgment', 'account_model_regression_quarantined',
+  ...ESCALATION_EVENT_TYPES,
+]);
+
+export const CRITICAL_NOTE_EVENTS: ReadonlySet<string> = new Set([
+  'failure_alert', 'rollback_recommended', 'fix_loop_divergence_regressed',
+  'account_model_regression_quarantined',
+  ...ESCALATION_EVENT_TYPES,
 ]);
 
 export const ROUTINE_EVENT_LABELS: Record<string, string> = {
@@ -91,24 +119,93 @@ export type RoutineRow<T> =
   | { kind: 'single'; msg: T }
   | { kind: 'group'; key: string; event_type: string; label: string; msgs: T[] };
 
-export function groupRoutineMessages<T extends { id: string; context: Record<string, unknown> }>(
+export function groupRoutineMessages<T extends { id: string; context: Record<string, unknown>; created_at?: string | null }>(
   msgs: T[],
 ): RoutineRow<T>[] {
-  const rows: RoutineRow<T>[] = [];
-  let i = 0;
-  while (i < msgs.length) {
-    const et = msgs[i].context.event_type as string | undefined;
-    let j = i + 1;
-    while (j < msgs.length && (msgs[j].context.event_type as string | undefined) === et) j++;
-    const run = msgs.slice(i, j);
-    if (run.length >= 3 && et) {
-      const label = ROUTINE_EVENT_LABELS[et] ?? et.replace(/_/g, ' ');
-      rows.push({ kind: 'group', key: run[0].id, event_type: et, label, msgs: run });
-    } else {
-      run.forEach(m => rows.push({ kind: 'single', msg: m }));
+  // Import parseTimestamp inline to avoid circular dependencies
+  const parseTimestamp = (v: string | null | undefined): Date => {
+    if (!v) return new Date(0);
+    return new Date(v.endsWith('Z') || v.includes('+') ? v : v + 'Z');
+  };
+
+  const TIME_WINDOW_MS = 3600000; // 1 hour
+
+  // First pass: assign each message to a group based on time window and event type
+  const groupAssignments: number[] = [];
+  const groups: { msgs: T[]; et: string; dateStr: string; label: string; firstIdx: number }[] = [];
+
+  for (let idx = 0; idx < msgs.length; idx++) {
+    const msg = msgs[idx];
+    const et = msg.context.event_type as string | undefined;
+
+    if (!et) {
+      groupAssignments.push(-1); // Single message without event type
+      continue;
     }
-    i = j;
+
+    const dateStr = getMessageDateString(msg as { created_at: string | null });
+    const msgTime = msg.created_at ? parseTimestamp(msg.created_at).getTime() : 0;
+
+    // Find a matching group (same event_type, same date, within time window)
+    let groupIdx = -1;
+    for (let i = 0; i < groups.length; i++) {
+      const group = groups[i];
+      if (group.et === et && group.dateStr === dateStr && group.msgs.length > 0) {
+        const lastMsg = group.msgs[group.msgs.length - 1];
+        const lastMsgTime = lastMsg.created_at ? parseTimestamp(lastMsg.created_at).getTime() : 0;
+        if (msgTime - lastMsgTime <= TIME_WINDOW_MS) {
+          groupIdx = i;
+          break;
+        }
+      }
+    }
+
+    if (groupIdx === -1) {
+      // Create new group
+      const label = ROUTINE_EVENT_LABELS[et] ?? et.replace(/_/g, ' ');
+      groupIdx = groups.length;
+      groups.push({ msgs: [msg], et, dateStr, label, firstIdx: idx });
+    } else {
+      // Add to existing group
+      groups[groupIdx].msgs.push(msg);
+    }
+
+    groupAssignments.push(groupIdx);
   }
+
+  // Second pass: render in order, rendering groups at their first message (if 3+)
+  const rows: RoutineRow<T>[] = [];
+  const renderedGroups = new Set<number>();
+
+  for (let i = 0; i < msgs.length; i++) {
+    const msg = msgs[i];
+    const groupIdx = groupAssignments[i];
+
+    if (groupIdx === -1) {
+      // Single message without event type
+      rows.push({ kind: 'single', msg });
+    } else {
+      const group = groups[groupIdx];
+      if (group.msgs.length >= 3) {
+        // Render as group chip at first message position only
+        if (i === group.firstIdx && !renderedGroups.has(groupIdx)) {
+          rows.push({
+            kind: 'group',
+            key: group.msgs[0].id,
+            event_type: group.et,
+            label: group.label,
+            msgs: group.msgs,
+          });
+          renderedGroups.add(groupIdx);
+        }
+        // Skip other messages in the group (already part of the group chip)
+      } else {
+        // Below threshold: render as single at each original position
+        rows.push({ kind: 'single', msg });
+      }
+    }
+  }
+
   return rows;
 }
 
@@ -146,9 +243,8 @@ export function routineSummary(msgs: { message_type: string; context: Record<str
 
 export function getToastSeverity(msg: { message_type: string; from_type: string; context: Record<string, unknown> }): 'error' | 'info' {
   const et = msg.context.event_type as string | undefined;
-  const criticalNoteEvents = new Set(['failure_alert', 'rollback_recommended', 'fix_loop_divergence_regressed', 'account_model_regression_quarantined']);
   if (msg.message_type === 'BLOCKER' || msg.message_type === 'BUG_REPORT') return 'error';
-  if (et && criticalNoteEvents.has(et)) return 'error';
+  if (et && CRITICAL_NOTE_EVENTS.has(et)) return 'error';
   return 'info';
 }
 

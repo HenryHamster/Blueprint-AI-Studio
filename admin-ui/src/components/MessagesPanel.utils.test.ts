@@ -1,5 +1,17 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { loadEventPrefs, saveEventPrefs, type EventPref, eventPrefsKey } from './MessagesPanel.utils';
+import { describe, it, expect, beforeEach, afterEach, test } from 'vitest';
+import {
+  loadEventPrefs,
+  saveEventPrefs,
+  type EventPref,
+  eventPrefsKey,
+  groupRoutineMessages,
+  ESCALATION_EVENT_TYPES,
+  ESCALATION_BADGE_LABELS,
+  HIGH_SIGNAL_NOTE_EVENTS,
+  CRITICAL_NOTE_EVENTS,
+  classifySignalLevel,
+  getToastSeverity,
+} from './MessagesPanel.utils';
 
 describe('MessagesPanel.utils - Event Preferences', () => {
   beforeEach(() => {
@@ -120,5 +132,271 @@ describe('MessagesPanel.utils - Event Preferences', () => {
 
     const loaded = loadEventPrefs('user1', 'project1');
     expect(loaded).toEqual({});
+  });
+});
+
+// ── Escalation event invariants ────────────────────────────────────────────
+//
+// Backend escalation emitters in notification_dispatch.py post these event_types
+// to surface that the autonomous loop's automatic remediation has been escalated
+// for operator attention. The frontend wires high-signal classification, error
+// toast severity, and a red ContextBadge through ONE source of truth
+// (ESCALATION_EVENT_TYPES) so a new escalation type added there can't drift
+// out of any one of those three behaviors.
+
+describe('escalation event invariants', () => {
+  const KNOWN_ESCALATIONS = [
+    'auto_fix_escalated',
+    'residual_fix_escalated',
+    'residual_fix_audit_deferred',
+    'remediation_escalated',
+  ] as const;
+
+  test('all four canonical escalation types are present in ESCALATION_EVENT_TYPES', () => {
+    for (const et of KNOWN_ESCALATIONS) {
+      expect(ESCALATION_EVENT_TYPES.has(et)).toBe(true);
+    }
+  });
+
+  test('every escalation type is high-signal (HIGH_SIGNAL_NOTE_EVENTS)', () => {
+    for (const et of ESCALATION_EVENT_TYPES) {
+      expect(HIGH_SIGNAL_NOTE_EVENTS.has(et)).toBe(true);
+    }
+  });
+
+  test('every escalation type fires error toasts (CRITICAL_NOTE_EVENTS)', () => {
+    for (const et of ESCALATION_EVENT_TYPES) {
+      expect(CRITICAL_NOTE_EVENTS.has(et)).toBe(true);
+    }
+  });
+
+  test('every escalation type has a badge label entry', () => {
+    // Guards future drift: a new escalation type added to ESCALATION_EVENT_TYPES
+    // without a corresponding ContextBadges label fails this test loudly.
+    for (const et of ESCALATION_EVENT_TYPES) {
+      expect(ESCALATION_BADGE_LABELS[et]).toBeTruthy();
+    }
+  });
+
+  test('badge labels do not include unknown event types', () => {
+    for (const et of Object.keys(ESCALATION_BADGE_LABELS)) {
+      expect(ESCALATION_EVENT_TYPES.has(et)).toBe(true);
+    }
+  });
+
+  describe('classifySignalLevel covers escalation events', () => {
+    const base = { from_type: 'system', context: {} };
+
+    for (const et of KNOWN_ESCALATIONS) {
+      test(`${et} classifies as high under BLOCKER`, () => {
+        expect(classifySignalLevel({ ...base, message_type: 'BLOCKER', context: { event_type: et } })).toBe('high');
+      });
+
+      test(`${et} classifies as high under NOTE`, () => {
+        // Future-proof: if backend ever changes message_type to NOTE, classification still escalates.
+        expect(classifySignalLevel({ ...base, message_type: 'NOTE', context: { event_type: et } })).toBe('high');
+      });
+    }
+  });
+
+  describe('getToastSeverity covers escalation events', () => {
+    const base = { from_type: 'system', context: {} };
+
+    for (const et of KNOWN_ESCALATIONS) {
+      test(`${et} fires error toast under NOTE`, () => {
+        expect(getToastSeverity({ ...base, message_type: 'NOTE', context: { event_type: et } })).toBe('error');
+      });
+
+      test(`${et} fires error toast under BLOCKER`, () => {
+        expect(getToastSeverity({ ...base, message_type: 'BLOCKER', context: { event_type: et } })).toBe('error');
+      });
+    }
+  });
+
+  test('regression: existing high-signal NOTE events still classify correctly', () => {
+    const base = { from_type: 'system', message_type: 'NOTE' as const };
+    expect(classifySignalLevel({ ...base, context: { event_type: 'failure_alert' } })).toBe('high');
+    expect(classifySignalLevel({ ...base, context: { event_type: 'rollback_recommended' } })).toBe('high');
+    expect(classifySignalLevel({ ...base, context: { event_type: 'pr_merged' } })).toBe('routine');
+  });
+});
+
+describe('MessagesPanel.utils - Time-window grouping', () => {
+  // Helper to create a test message
+  interface TestMessage {
+    id: string;
+    context: { event_type: string | undefined };
+    created_at: string;
+  }
+  const createMsg = (id: string, eventType: string | undefined, createdAt: string): TestMessage => ({
+    id,
+    context: { event_type: eventType },
+    created_at: createdAt,
+  });
+
+  // Helper to create timestamps within the same day (for divider tests)
+  const createToday = (hour: number, minute: number = 0) => {
+    const now = new Date();
+    const today = new Date(now.getFullYear(), now.getMonth(), now.getDate(), hour, minute, 0);
+    return today.toISOString().split('T')[0] + `T${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}:00`;
+  };
+
+  it('(a) interleaved arrival groups correctly within time window', () => {
+    const msgs = [
+      createMsg('m1', 'pr_merged', createToday(10, 0)),
+      createMsg('m2', 'cycle_summary', createToday(10, 30)),
+      createMsg('m3', 'pr_merged', createToday(10, 45)),
+    ];
+
+    const rows = groupRoutineMessages(msgs);
+
+    // m1 and m3 should be in the same group (even though m2 is between them)
+    const groups = rows.filter(r => r.kind === 'group');
+    const singles = rows.filter(r => r.kind === 'single');
+
+    // Should have 0 groups (only 2 msgs of same type, below threshold) and 3 singles
+    expect(groups.length).toBe(0);
+    expect(singles.length).toBe(3);
+    expect(singles.map(s => s.msg.id)).toEqual(['m1', 'm2', 'm3']);
+  });
+
+  it('(b) consecutive arrivals still group as before', () => {
+    const msgs = [
+      createMsg('a1', 'auto_fix_result', createToday(10, 0)),
+      createMsg('a2', 'auto_fix_result', createToday(10, 15)),
+      createMsg('a3', 'auto_fix_result', createToday(10, 30)),
+    ];
+
+    const rows = groupRoutineMessages(msgs);
+
+    const groups = rows.filter(r => r.kind === 'group');
+    const singles = rows.filter(r => r.kind === 'single');
+
+    // Should have 1 group with all 3 consecutive msgs
+    expect(groups.length).toBe(1);
+    expect(singles.length).toBe(0);
+    expect(groups[0].msgs.map((m: TestMessage) => m.id)).toEqual(['a1', 'a2', 'a3']);
+  });
+
+  it('(c) single event-type with 2 occurrences in window renders individually (below threshold)', () => {
+    const msgs = [
+      createMsg('x1', 'issue_implementation_spawned', createToday(10, 0)),
+      createMsg('x2', 'issue_implementation_spawned', createToday(10, 30)),
+    ];
+
+    const rows = groupRoutineMessages(msgs);
+
+    const groups = rows.filter(r => r.kind === 'group');
+    const singles = rows.filter(r => r.kind === 'single');
+
+    // 2 msgs is below the 3-msg threshold, so rendered as singles
+    expect(groups.length).toBe(0);
+    expect(singles.length).toBe(2);
+    expect(singles.map(s => s.msg.id)).toEqual(['x1', 'x2']);
+  });
+
+  it('(d) groups do not span time dividers (different days)', () => {
+    const now = new Date();
+    const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const yesterday = new Date(today);
+    yesterday.setDate(yesterday.getDate() - 1);
+
+    const todayStr = today.toISOString().split('T')[0] + 'T10:00:00';
+    const yesterdayStr = yesterday.toISOString().split('T')[0] + 'T10:00:00';
+
+    const msgs = [
+      createMsg('m1', 'direction_milestone', yesterdayStr),
+      createMsg('m2', 'direction_milestone', todayStr),
+      createMsg('m3', 'direction_milestone', todayStr.replace('10:', '11:')),
+    ];
+
+    const rows = groupRoutineMessages(msgs);
+
+    // m2 and m3 are on the same day and within 1 hour, should group
+    // m1 is on a different day, should not group with m2/m3
+    const groups = rows.filter(r => r.kind === 'group');
+    const singles = rows.filter(r => r.kind === 'single');
+
+    // m1 rendered as single, m2+m3 as single or group depending on other criteria
+    // Since m2+m3 are only 2 msgs, they render as singles too
+    expect(groups.length).toBe(0);
+    expect(singles.length).toBe(3);
+  });
+
+  it('groups messages only within the 1-hour time window', () => {
+    const msgs = [
+      createMsg('early', 'auto_fix_result', createToday(10, 0)),
+      createMsg('inwindow', 'auto_fix_result', createToday(10, 30)),
+      createMsg('outofwindow', 'auto_fix_result', createToday(11, 5)), // 65 min after early
+      createMsg('alsooutside', 'auto_fix_result', createToday(11, 10)), // Within window of outofwindow, but not early
+    ];
+
+    const rows = groupRoutineMessages(msgs);
+
+    // early + inwindow = 30min apart, within 1hr
+    // inwindow + outofwindow = 35min apart, within 1hr (rolling window)
+    // So all should be in one group? Let me reconsider...
+    // Actually, with rolling window: early (10:00), inwindow (10:30 within 1hr of early), outofwindow (11:05 within 1hr of inwindow at 10:30)
+    // So yes, all 4 should be in same group since each is within 1hr of the previous
+
+    const groups = rows.filter(r => r.kind === 'group');
+    expect(groups.length).toBe(1);
+    expect(groups[0].msgs.length).toBe(4);
+  });
+
+  it('maintains chronological order when rendering groups', () => {
+    const msgs = [
+      createMsg('a1', 'auto_fix_result', createToday(10, 0)),
+      createMsg('b1', 'cycle_summary', createToday(10, 15)),
+      createMsg('a2', 'auto_fix_result', createToday(10, 30)),
+      createMsg('c1', 'direction_milestone', createToday(10, 45)),
+      createMsg('a3', 'auto_fix_result', createToday(11, 0)),
+    ];
+
+    const rows = groupRoutineMessages(msgs);
+
+    // Expected order: a1,a2,a3 in group (or as singles), then b1 as single, then c1 as single
+    // But since a1,a2,a3 are interleaved with b1 and c1, rendering at first occurrence:
+    // Position of a1: render group [a1,a2,a3]
+    // Position of b1: render single [b1]
+    // Position of c1: render single [c1]
+    // But output should maintain the message order, so between group and singles...
+
+    // Let's verify the IDs are in a reasonable order
+    const ids = rows.map(r => (r.kind === 'group' ? `group(${r.msgs.map((m: TestMessage) => m.id).join(',')})` : r.msg.id));
+    expect(ids[0]).toBe('group(a1,a2,a3)'); // a1 group rendered first
+    expect(ids[1]).toBe('b1');
+    expect(ids[2]).toBe('c1');
+  });
+
+  it('handles messages without event_type as singles', () => {
+    const msgs = [
+      createMsg('m1', undefined, createToday(10, 0)),
+      createMsg('m2', 'auto_fix_result', createToday(10, 15)),
+      createMsg('m3', undefined, createToday(10, 30)),
+    ];
+
+    const rows = groupRoutineMessages(msgs);
+
+    const singles = rows.filter(r => r.kind === 'single');
+    expect(singles.length).toBe(3);
+    expect(singles.map(s => s.msg.id)).toEqual(['m1', 'm2', 'm3']);
+  });
+
+  it('creates multiple groups for same event_type if they are separated in time', () => {
+    const msgs = [
+      createMsg('m1', 'pr_merged', createToday(10, 0)),
+      createMsg('m2', 'pr_merged', createToday(10, 30)),
+      createMsg('m3', 'pr_merged', createToday(12, 0)), // 90 minutes after m1, outside window
+      createMsg('m4', 'pr_merged', createToday(12, 15)),
+    ];
+
+    const rows = groupRoutineMessages(msgs);
+
+    // m1, m2 are within 1 hour -> group 1 (but <3 so singles)
+    // m3, m4 are within 1 hour -> group 2 (but <3 so singles)
+    // All rendered as singles due to <3 threshold
+    const singles = rows.filter(r => r.kind === 'single');
+    expect(singles.length).toBe(4);
   });
 });
