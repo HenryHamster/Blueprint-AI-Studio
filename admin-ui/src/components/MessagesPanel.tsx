@@ -1237,11 +1237,10 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
             )}
             {webhookStats && webhookStats.total_dispatched > 0 && (
               <div className="relative">
-                {/* eslint-disable-next-line viewport/min-touch-target -- badge-row in dense header; same pattern as other header chips */}
                 <button
                   onClick={() => setShowWebhookDetail(v => !v)}
                   title="Webhook delivery health"
-                  className={`text-[11px] px-2 py-0.5 rounded-full border font-semibold transition-colors ${
+                  className={`text-[11px] px-2 py-0.5 rounded-full border font-semibold transition-colors min-h-[44px] md:min-h-[28px] flex items-center ${
                     webhookStats.total_failed > 0
                       ? 'bg-amber-500/20 text-amber-400 border-amber-500/40'
                       : 'bg-emerald-500/20 text-emerald-400 border-emerald-500/40'
@@ -1396,10 +1395,9 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
                           )}
                         </div>
                         {(['surfaced', 'routine', 'mute'] as EventPref[]).map(p => (
-                          // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
                           <button key={p} onClick={() => updatePref(et, p)}
                             title={p}
-                            className={`text-[10px] px-1.5 py-0.5 rounded border transition-colors ${pref === p ? (p === 'mute' ? 'border-red-500/50 text-red-400 bg-red-500/10' : p === 'surfaced' ? 'border-amber-500/50 text-amber-400 bg-amber-500/10' : 'border-neutral-600 text-neutral-300 bg-neutral-800') : 'border-transparent text-neutral-600 hover:text-neutral-400'}`}>
+                            className={`text-[10px] px-1.5 py-0.5 rounded border transition-colors min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center ${pref === p ? (p === 'mute' ? 'border-red-500/50 text-red-400 bg-red-500/10' : p === 'surfaced' ? 'border-amber-500/50 text-amber-400 bg-amber-500/10' : 'border-neutral-600 text-neutral-300 bg-neutral-800') : 'border-transparent text-neutral-600 hover:text-neutral-400'}`}>
                             {p === 'surfaced' ? '↑' : p === 'mute' ? '✕' : '·'}
                           </button>
                         ))}
@@ -1448,11 +1446,10 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
               const showModified = isActive && activeTabModified;
               return (
                 <div key={tab.id} className="relative shrink-0 flex items-center">
-                  {/* eslint-disable-next-line viewport/min-touch-target -- compact tab; matches density of header chips */}
                   <button
                     onClick={() => applyView(tab.id)}
                     title={tab.view?.description || tab.name}
-                    className={`flex items-center gap-1 px-2.5 py-1 rounded-md text-xs transition-colors border ${
+                    className={`flex items-center gap-1 px-2.5 py-1 rounded-md text-xs transition-colors border min-h-[44px] md:min-h-[36px] ${
                       isActive
                         ? 'bg-blue-500/15 text-blue-300 border-blue-500/40'
                         : 'text-neutral-500 hover:text-neutral-300 border-transparent hover:border-neutral-800/60'
@@ -1465,12 +1462,11 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
                   </button>
                   {!tab.isDefault && tab.view && (
                     <div ref={openKebabId === tab.id ? kebabRef : undefined} className="relative">
-                      {/* eslint-disable-next-line viewport/min-touch-target -- kebab in dense tab strip; matches existing chip density */}
                       <button
                         onClick={() => setOpenKebabId(prev => (prev === tab.id ? null : tab.id))}
                         title="Manage view"
                         aria-label={`Manage view ${tab.name}`}
-                        className="text-neutral-600 hover:text-neutral-300 p-1 rounded transition-colors"
+                        className="text-neutral-600 hover:text-neutral-300 p-1 rounded transition-colors min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center"
                       >
                         <MoreVertical className="w-3.5 h-3.5" />
                       </button>
@@ -1514,8 +1510,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
               <h3 className="text-sm font-semibold text-neutral-100">
                 {saveDialogMode === 'rename' ? 'Rename view' : 'Save view'}
               </h3>
-              {/* eslint-disable-next-line viewport/min-touch-target -- close button in dense modal header */}
-              <button onClick={closeSaveDialog} className="text-neutral-500 hover:text-neutral-300 p-1">
+              <button onClick={closeSaveDialog} className="text-neutral-500 hover:text-neutral-300 p-1 min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center">
                 <X className="w-4 h-4" />
               </button>
             </div>
@@ -1651,10 +1646,9 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
                     <ChevronUp className="w-3 h-3" />
                     NEW since {formatTimestamp(dividerTime)}
                   </span>
-                  {/* eslint-disable-next-line viewport/min-touch-target -- dense divider toolbar */}
                   <button
                     onClick={dismissDivider}
-                    className="px-2 py-0.5 text-xs bg-blue-600/50 hover:bg-blue-600/70 rounded border border-blue-500/60 text-blue-200 transition-colors min-h-[28px]"
+                    className="px-2 py-0.5 text-xs bg-blue-600/50 hover:bg-blue-600/70 rounded border border-blue-500/60 text-blue-200 transition-colors min-h-[44px] md:min-h-[28px] flex items-center"
                     title="Mark all caught up and dismiss this divider"
                   >
                     All caught up
@@ -1747,8 +1741,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
                       <span className="text-xs text-red-300 font-medium">{row.msgs.length} {row.label}</span>
                       {bd && <span className="text-xs text-red-400">{bd}</span>}
                     </button>
-                    {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
-                    <button onClick={() => handleResolveGroup(row.msgs)} title="Resolve all" className="text-emerald-500/70 hover:text-emerald-400 p-1 rounded transition-colors">
+                    <button onClick={() => handleResolveGroup(row.msgs)} title="Resolve all" className="text-emerald-500/70 hover:text-emerald-400 p-1 rounded transition-colors min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center">
                       <Check className="w-3 h-3" />
                     </button>
                   </div>
@@ -1774,10 +1767,9 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
                     <span className="text-[11px] text-neutral-600 truncate">{routineSummary(routineOpen)}</span>
                   </button>
                   <div className="relative shrink-0 px-2">
-                    {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                     <button
                       onClick={() => setShowTempMuteMenu(v => !v)}
-                      className="text-neutral-500 hover:text-neutral-300 p-1.5 rounded transition-colors"
+                      className="text-neutral-500 hover:text-neutral-300 p-1.5 rounded transition-colors min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center"
                       title="Temporarily mute event types"
                     >
                       <MoreVertical className="w-4 h-4" />
@@ -1803,12 +1795,11 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
                                           ['Tomorrow', 86400000, 'Mute until tomorrow'] as const,
                                         ]
                                       ).map(([shortLabel, ms, title]) => (
-                                        // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
                                         <button
                                           key={shortLabel}
                                           onClick={() => addTemporaryMute(eventType, ms)}
                                           title={title}
-                                          className={`text-[11px] px-2 py-1 rounded transition-colors ${isActive ? 'bg-amber-500/20 text-amber-400' : 'bg-neutral-800 text-neutral-300 hover:bg-neutral-700'}`}
+                                          className={`text-[11px] px-2 py-1 rounded transition-colors min-h-[44px] md:min-h-auto flex items-center ${isActive ? 'bg-amber-500/20 text-amber-400' : 'bg-neutral-800 text-neutral-300 hover:bg-neutral-700'}`}
                                         >
                                           {shortLabel}
                                         </button>
@@ -1889,11 +1880,10 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
                                     <ChevronDown className={`w-3 h-3 text-neutral-600 shrink-0 transition-transform ${isGroupExpanded ? 'rotate-180' : ''}`} />
                                     <span className="text-xs text-neutral-500 font-medium">{row.msgs.length} {row.label}{bd ? ` ${bd}` : ''}</span>
                                   </button>
-                                  {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                                   <button
                                     onClick={() => handleResolveGroup(row.msgs)}
                                     title="Resolve all"
-                                    className="text-emerald-500/70 hover:text-emerald-400 p-1 rounded transition-colors"
+                                    className="text-emerald-500/70 hover:text-emerald-400 p-1 rounded transition-colors min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center"
                                   >
                                     <Check className="w-3 h-3" />
                                   </button>
@@ -1975,10 +1965,9 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
             {/* Resolved toggle + clear */}
             {hiddenResolvedCount > 0 && (
               <div className="flex justify-center gap-3 pt-1">
-                {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                 <button
                   onClick={() => setShowResolved(true)}
-                  className="text-[11px] text-neutral-600 hover:text-neutral-400 transition-colors px-2 py-1"
+                  className="text-[11px] text-neutral-600 hover:text-neutral-400 transition-colors px-2 py-1 min-h-[44px] md:min-h-auto flex items-center"
                 >
                   Show {hiddenResolvedCount} older resolved
                 </button>
@@ -1986,17 +1975,15 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
             )}
             {showResolved && resolvedMessages.length > 0 && (
               <div className="flex justify-center gap-3 pt-1">
-                {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                 <button
                   onClick={() => setShowResolved(false)}
-                  className="text-[11px] text-neutral-600 hover:text-neutral-400 transition-colors px-2 py-1"
+                  className="text-[11px] text-neutral-600 hover:text-neutral-400 transition-colors px-2 py-1 min-h-[44px] md:min-h-auto flex items-center"
                 >
                   Hide older resolved
                 </button>
-                {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                 <button
                   onClick={handleBulkDeleteResolved}
-                  className="text-[11px] text-neutral-600 hover:text-red-400 transition-colors px-2 py-1"
+                  className="text-[11px] text-neutral-600 hover:text-red-400 transition-colors px-2 py-1 min-h-[44px] md:min-h-auto flex items-center"
                 >
                   Clear all resolved
                 </button>
@@ -2007,10 +1994,9 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
 
         {/* Scroll to bottom button */}
         {showScrollDown && (
-          // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
           <button
             onClick={scrollToBottom}
-            className="sticky bottom-2 left-1/2 -translate-x-1/2 bg-neutral-800 border border-neutral-700 text-neutral-400 hover:text-neutral-200 p-2 rounded-full shadow-lg transition-colors z-10"
+            className="sticky bottom-2 left-1/2 -translate-x-1/2 bg-neutral-800 border border-neutral-700 text-neutral-400 hover:text-neutral-200 p-2 rounded-full shadow-lg transition-colors z-10 min-h-[44px] min-w-[44px] flex items-center justify-center"
           >
             <ArrowDown className="w-4 h-4" />
           </button>
@@ -2040,8 +2026,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
             <span className="text-xs text-neutral-400 truncate flex-1">
               Replying to <span className="text-neutral-300">{replyTo.from}</span>: {replyTo.content.slice(0, 80)}{replyTo.content.length > 80 ? '...' : ''}
             </span>
-            {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
-            <button onClick={() => setReplyTo(null)} className="text-neutral-500 hover:text-neutral-300 p-0.5 shrink-0">
+            <button onClick={() => setReplyTo(null)} className="text-neutral-500 hover:text-neutral-300 p-0.5 shrink-0 min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center">
               <X className="w-3 h-3" />
             </button>
           </div>
