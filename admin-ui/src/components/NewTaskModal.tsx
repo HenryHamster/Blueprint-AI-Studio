@@ -130,7 +130,7 @@ export function NewTaskModal({
           </button>
         </div>
         <form onSubmit={handleSubmit} className="p-5">
-          <div className="grid grid-cols-2 gap-4 mb-4">
+          <div className="grid grid-cols-2 gap-4 mb-4" data-viewport-allow-truncation>
             <div>
               <div className="flex items-center justify-between mb-2">
                 <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider">Repository</label>

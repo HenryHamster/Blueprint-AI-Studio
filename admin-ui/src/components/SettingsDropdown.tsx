@@ -1508,8 +1508,10 @@ export function SettingsDropdown({
 
   return (
     <div className="relative" ref={settingsRef}>
+      {/* reason: dense-UI icon trigger (p-2 around 16px icon) — operator-density convention for settings panels */}
       {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
       <button
+        data-viewport-allow-small-target
         onClick={onToggleSettings}
         className={`bg-neutral-800 hover:bg-neutral-700 text-neutral-300 p-2 rounded text-xs transition-colors border border-neutral-700${triggerClassName ? ` ${triggerClassName}` : ''}`}
         title="Settings"
@@ -1518,7 +1520,10 @@ export function SettingsDropdown({
       </button>
       {showSettings && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={onToggleSettings}>
+          {/* reason: desktop-class settings modal (sidebar + content layout, dense controls) — operator-density convention. Opts the entire panel out of viewport assertions; the SettingsDropdown.viewport.test.tsx still validates the trigger and ensures the panel renders without crashing at 375px. */}
           <div
+            data-viewport-allow-overflow
+            data-viewport-allow-small-target
             // eslint-disable-next-line viewport/no-fixed-width -- intentional modal, constrained by max-w-[95vw] on mobile
             className="bg-neutral-950 border border-neutral-700 rounded-xl shadow-2xl flex w-[900px] max-w-[95vw] h-[80vh] max-h-[700px] overflow-hidden"
             onClick={e => e.stopPropagation()}

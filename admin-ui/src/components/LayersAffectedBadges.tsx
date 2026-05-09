@@ -27,10 +27,11 @@ export const LAYER_SHORT_LABELS: Record<string, string> = {
   AGENT_VERB: 'VERB',
   BASELINE_GATE: 'BASELINE',
   REVIEWER_PASS: 'REVIEWER',
+  VIEWPORT: 'VPORT',
 };
 
 // eslint-disable-next-line react-refresh/only-export-components
-export const CANONICAL_LAYERS = ['CI_WORKFLOW', 'AGENT_VM', 'AGENT_VERB', 'BASELINE_GATE', 'REVIEWER_PASS'] as const;
+export const CANONICAL_LAYERS = ['CI_WORKFLOW', 'AGENT_VM', 'AGENT_VERB', 'BASELINE_GATE', 'REVIEWER_PASS', 'VIEWPORT'] as const;
 export type CanonicalLayer = typeof CANONICAL_LAYERS[number];
 
 export interface LayerCoverageCombo { layers: string[]; count: number; }

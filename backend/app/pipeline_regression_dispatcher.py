@@ -193,6 +193,7 @@ _CANONICAL_RECURRENCE_LAYERS = (
     "AGENT_VERB",
     "BASELINE_GATE",
     "REVIEWER_PASS",
+    "VIEWPORT",
 )
 
 # Cycle records moved to durable storage: see ``DispatcherCycleRecord`` in
@@ -1113,7 +1114,7 @@ def _build_layer_defense_ledger(
 
     Aggregates fingerprint_to_fix_log entries from all RegressionRemediationCase rows
     for a project, filters to merged_at within lookback_days, and computes per-layer
-    statistics. All five canonical layers always appear. Returns empty string when
+    statistics. All six canonical layers always appear. Returns empty string when
     all_fix_logs is empty.
     """
     if not all_fix_logs:
@@ -1277,7 +1278,7 @@ def _format_recurrence_meta_prompt(
     lines.extend(
         [
             "",
-            "Enumerate ALL FIVE canonical layers explicitly:",
+            "Enumerate ALL SIX canonical layers explicitly:",
             ", ".join(_CANONICAL_RECURRENCE_LAYERS),
             (
                 "For each layer answer: is it involved? if yes, what defense "
@@ -1377,7 +1378,7 @@ def _format_theme_layer_meta_prompt(
             "have not extinguished the pattern."
         ),
         "",
-        "Enumerate ALL FIVE canonical layers explicitly:",
+        "Enumerate ALL SIX canonical layers explicitly:",
         ", ".join(_CANONICAL_RECURRENCE_LAYERS),
         (
             "For each layer answer: is it involved? if yes, what defense "
@@ -2008,12 +2009,24 @@ async def _collect_viewport_failures(
 
         key = (component, width)
         item = grouped.setdefault(
-            key, {"tasks": set(), "samples": [], "failure_types": set()}
+            key,
+            {
+                "tasks": set(),
+                "samples": [],
+                "failure_types": set(),
+                "earliest_task": None,
+            },
         )
         item["tasks"].add(str(task.id))
         item["failure_types"].add(_extract_failure_type(msg))
         if msg and len(item["samples"]) < 2:
             item["samples"].append(msg[:240])
+        # Track the earliest failing task for introducing-PR attribution.
+        if (
+            item["earliest_task"] is None
+            or task.updated_at < item["earliest_task"].updated_at
+        ):
+            item["earliest_task"] = task
 
     trips: list[dict[str, Any]] = []
     for (component, width), item in grouped.items():
@@ -2028,6 +2041,23 @@ async def _collect_viewport_failures(
             failure_type = types.pop()
         else:
             failure_type = "mixed"
+        # Derive introducing-PR / introducing-commit from the earliest failing task.
+        earliest_task = item.get("earliest_task")
+        introducing_pr_number: int | None = None
+        introducing_commit_sha: str | None = None
+        if earliest_task is not None:
+            pr_num = earliest_task.first_payload.get("pr_number")
+            if pr_num is not None:
+                try:
+                    introducing_pr_number = int(pr_num)
+                except (TypeError, ValueError):
+                    pass
+            if introducing_pr_number is None:
+                head_sha = (earliest_task.context or {}).get(
+                    "head_sha"
+                ) or earliest_task.first_payload.get("head_sha")
+                if head_sha:
+                    introducing_commit_sha = str(head_sha)
         trips.append(
             {
                 "component": component,
@@ -2035,6 +2065,8 @@ async def _collect_viewport_failures(
                 "count": count,
                 "samples": item["samples"],
                 "failure_type": failure_type,
+                "introducing_pr_number": introducing_pr_number,
+                "introducing_commit_sha": introducing_commit_sha,
             }
         )
     return sorted(trips, key=lambda x: (-x["count"], x["component"], x["width"]))
@@ -2081,7 +2113,7 @@ def _derive_observation_for_layer_classify(
     elif regression_class.startswith("background_service_crash"):
         stage = "provision"
     elif regression_class.startswith("viewport_regression:"):
-        stage = "baseline"
+        stage = "viewport"
     elif signal_name in ("sr_catch_rate", "sr_blind_spot", "sr_false_positive"):
         stage = "review"
     elif signal_name == "pipeline_success_rate":
@@ -2422,6 +2454,7 @@ def _classify_layers_from_paths(paths: list[str]) -> list[str]:
         LAYER_BASELINE_GATE,
         LAYER_CI_WORKFLOW,
         LAYER_REVIEWER_PASS,
+        LAYER_VIEWPORT,
     )
 
     tags: set[str] = set()
@@ -2483,9 +2516,16 @@ def _classify_layers_from_paths(paths: list[str]) -> list[str]:
             or p == "backend/app/source_ref_validation.py"
             or p == "backend/app/fix_loop_telemetry.py"
             or p == "check"
-            or p == "check-viewport.sh"
         ):
             tags.add(LAYER_BASELINE_GATE)
+
+        # VIEWPORT — viewport test infrastructure and check script
+        if (
+            p == "check-viewport.sh"
+            or p == "admin-ui/src/test/viewport.ts"
+            or (p.startswith("admin-ui/src/") and p.endswith(".viewport.test.tsx"))
+        ):
+            tags.add(LAYER_VIEWPORT)
 
     return sorted(tags)
 
@@ -3224,7 +3264,7 @@ async def _maybe_spawn(
 
     # SR blind-spot theme regressions already represent 5+ recurrences of the same
     # pattern; force the layer-enumeration meta block on every first dispatch so the
-    # agent enumerates all five canonical layers rather than doing single-symptom triage.
+    # agent enumerates all six canonical layers rather than doing single-symptom triage.
     # Recurrence meta (above) already includes layer enumeration; cross-layer and
     # recurrence may both fire together; this only fires when neither path ran.
     if (
@@ -3747,6 +3787,20 @@ async def _evaluate_viewport_regression_signal(
         )
         if spawn is not None:
             spawned += 1
+            if hasattr(RegressionRemediationCase, "introducing_pr_number"):
+                case = await _get_remediation_case(
+                    session, project_id, regression_class
+                )
+                if case is not None:
+                    setattr(
+                        case, "introducing_pr_number", trip.get("introducing_pr_number")
+                    )
+                    setattr(
+                        case,
+                        "introducing_commit_sha",
+                        trip.get("introducing_commit_sha"),
+                    )
+                    session.add(case)
     return spawned
 
 

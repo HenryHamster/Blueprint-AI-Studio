@@ -270,3 +270,55 @@ export async function expectMinTouchTargetAt(
     );
   }
 }
+
+/**
+ * Options for `expectFullViewportAt`.
+ *
+ * Merges the options of all three sub-checks. Per-check overrides (selector,
+ * minTouchSize, tolerance) let callers tune individual assertions without
+ * giving up the convenience of a single call site.
+ *
+ * - `tolerance`: overflow tolerance in px (default 1).
+ * - `textSelector`: CSS selector for the text-truncation check (default 'body *').
+ * - `touchSelector`: CSS selector for the touch-target check (default 'button').
+ * - `minTouchSize`: minimum touch target in px (default 44).
+ * - `height`: viewport height in px (default 800).
+ * - `waitMs`: extra ms to pause after `render()` before each sub-check.
+ */
+export interface ExpectFullViewportOptions {
+  tolerance?: number;
+  textSelector?: string;
+  touchSelector?: string;
+  minTouchSize?: number;
+  height?: number;
+  waitMs?: number;
+}
+
+/**
+ * Run all three viewport assertions — overflow, text-truncation, and touch
+ * target — in a single call.
+ *
+ * Use this for components that show operator-facing text AND interactive
+ * controls. When one check is intentionally inapplicable (e.g. a read-only
+ * panel with no buttons), use the individual helpers and add a one-line
+ * comment explaining the omission so reviewers don't flag it as missing.
+ *
+ * Opt individual nodes out of specific checks via:
+ *   `data-viewport-allow-overflow`       — skips the overflow check for that subtree
+ *   `data-viewport-allow-truncation`     — skips text-truncation for that subtree
+ *   `data-viewport-allow-small-target`   — skips touch-target for that subtree
+ */
+export async function expectFullViewportAt(
+  width: number,
+  render: () => Promise<void> | void,
+  options?: ExpectFullViewportOptions,
+): Promise<void> {
+  const shared = { height: options?.height, waitMs: options?.waitMs };
+  await expectNoOverflowAt(width, render, { ...shared, tolerance: options?.tolerance });
+  await expectNoTextTruncationAt(width, render, { ...shared, selector: options?.textSelector });
+  await expectMinTouchTargetAt(width, render, {
+    ...shared,
+    selector: options?.touchSelector,
+    minSize: options?.minTouchSize,
+  });
+}

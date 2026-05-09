@@ -1665,6 +1665,14 @@ class RegressionRemediationCase(SQLModel, table=True):
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
+    # Attribution for the PR/commit that introduced this regression. Set when
+    # a new case is first created or re-tripped after CLOSED. Null for legacy
+    # rows and cases where attribution could not be determined.
+    introducing_pr_number: Optional[int] = Field(default=None)
+    introducing_commit_sha: Optional[str] = Field(
+        default=None,
+        sa_column=Column(String(40), nullable=True),
+    )
     created_at: datetime = Field(
         default_factory=_utcnow,
         sa_column=Column(NaiveUTCDateTime, nullable=False),

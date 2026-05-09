@@ -2,7 +2,7 @@ import { afterEach, describe, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { NewTaskModal } from './NewTaskModal';
-import { expectNoOverflowAt, expectMinTouchTargetAt } from '../test/viewport';
+import { expectNoOverflowAt, expectMinTouchTargetAt, expectNoTextTruncationAt } from '../test/viewport';
 
 vi.mock('../api', () => ({
   apiFetch: vi.fn(async () => new Response('{}', { status: 200 })),
@@ -233,6 +233,59 @@ describe('NewTaskModal — viewport regression', () => {
             useManualRepo={false}
             setUseManualRepo={() => {}}
             branchOptions={['main', 'develop', 'staging']}
+            branchLoading={false}
+            branchError={null}
+            useManualBranch={false}
+            setUseManualBranch={() => {}}
+            setBranchOptions={() => {}}
+            onRepoChange={() => {}}
+            onSubmit={async () => {}}
+            onClose={() => {}}
+          />,
+        );
+      });
+      await act(async () => {
+        await new Promise<void>((resolve) => setTimeout(resolve, 50));
+      });
+    });
+  });
+
+  test('labels and field text are not silently clipped at 375px', async () => {
+    await expectNoTextTruncationAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <NewTaskModal
+            newTaskRepo="example/repo"
+            newTaskBranch="main"
+            newTaskTitle="Add comprehensive error handling to the authentication module with detailed logging and recovery strategies"
+            newTaskPrompt="Implement robust error handling across all authentication flows. Include detailed logging for debugging, implement retry logic with exponential backoff, and provide meaningful error messages to users."
+            newTaskType="create"
+            newTaskPrNumber=""
+            newTaskPrBranch=""
+            setNewTaskRepo={() => {}}
+            setNewTaskBranch={() => {}}
+            setNewTaskTitle={() => {}}
+            setNewTaskPrompt={() => {}}
+            setNewTaskType={() => {}}
+            setNewTaskPrNumber={() => {}}
+            setNewTaskPrBranch={() => {}}
+            newTaskModel=""
+            newTaskEffort=""
+            setNewTaskModel={() => {}}
+            setNewTaskEffort={() => {}}
+            getDefaultModelForType={() => 'claude-opus-4-7'}
+            getDefaultEffortForType={() => 'medium'}
+            repoOptions={[{ full_name: 'example/repo', default_branch: 'main' }]}
+            repoLoading={false}
+            repoError={null}
+            useManualRepo={false}
+            setUseManualRepo={() => {}}
+            branchOptions={['main']}
             branchLoading={false}
             branchError={null}
             useManualBranch={false}

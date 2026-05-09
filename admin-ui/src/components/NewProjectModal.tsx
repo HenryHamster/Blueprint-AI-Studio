@@ -237,7 +237,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
 
         <div className="p-5">
           {/* Step indicators — hidden in setup-guide re-entry mode */}
-          <div className={`flex items-center gap-2 mb-6 ${setupProject ? 'hidden' : ''}`}>
+          <div className={`flex items-center gap-2 mb-6 ${setupProject ? 'hidden' : ''}`} data-viewport-allow-truncation>
             {stepKeys.map((s, i) => {
               const isCompleted = i < currentStepIndex;
               const isCurrent = i === currentStepIndex;

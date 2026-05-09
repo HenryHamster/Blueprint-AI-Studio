@@ -2,7 +2,7 @@ import { afterEach, describe, test, vi, expect } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act, useRef } from 'react';
 import { MetricsBar } from './MetricsBar';
-import { expectNoOverflowAt } from '../test/viewport';
+import { expectNoOverflowAt, expectNoTextTruncationAt } from '../test/viewport';
 
 // Partial mock — `MetricsBar` -> `AutonomousStatus` imports `API_BASE_URL` and
 // `authHeaders` alongside `apiFetch`. Browser-mode vitest validates ESM
@@ -87,6 +87,21 @@ describe('MetricsBar — viewport regression', () => {
 
   test('renders without horizontal overflow at 768px (md: breakpoint — gate active)', async () => {
     await expectNoOverflowAt(768, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(<MetricsBarHarness showMetrics={false} />);
+      });
+    });
+  });
+
+  test('no text truncation of metric labels at 768px', async () => {
+    // MetricsBar is desktop-only (hidden md:flex); 768px is the first breakpoint
+    // where labels like "Active VMs", "Evaluating", "Queue", "Refreshed" are visible.
+    await expectNoTextTruncationAt(768, async () => {
       host = document.createElement('div');
       host.style.padding = '12px';
       document.body.appendChild(host);

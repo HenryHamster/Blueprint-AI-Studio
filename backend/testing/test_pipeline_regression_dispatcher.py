@@ -4228,13 +4228,14 @@ async def test_sr_blind_spot_theme_prompt_has_layer_enumeration_block(db_session
     assert task is not None
     prompt = (task.first_payload or {}).get("prompt", "")
     assert "META-INVESTIGATION" in prompt
-    assert "Enumerate ALL FIVE canonical layers explicitly" in prompt
+    assert "Enumerate ALL SIX canonical layers explicitly" in prompt
     for layer in (
         "CI_WORKFLOW",
         "AGENT_VM",
         "AGENT_VERB",
         "BASELINE_GATE",
         "REVIEWER_PASS",
+        "VIEWPORT",
     ):
         assert layer in prompt
 
@@ -6560,7 +6561,7 @@ async def test_cross_layer_with_recurrence_blends_prompts(db_session):
 
         # Recurrence details should be present.
         assert "4321" in prompt
-        assert "Enumerate ALL FIVE canonical layers explicitly:" in prompt
+        assert "Enumerate ALL SIX canonical layers explicitly:" in prompt
     finally:
         import app.shared_state as _ss
 
@@ -10159,6 +10160,141 @@ class TestViewportRegressionEvaluator:
         trips = await _collect_viewport_failures(db_session, project.id)
         assert len(trips) == 1
         assert trips[0]["failure_type"] == "mixed"
+
+    @pytest.mark.asyncio
+    async def test_introducing_pr_number_in_trip_dict(self, db_session):
+        """Trip dict includes introducing_pr_number when earliest task has pr_number in payload."""
+        from app.pipeline_regression_dispatcher import (
+            _VIEWPORT_REGRESSION_MIN_FAILURES,
+            _collect_viewport_failures,
+        )
+
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        msg = (
+            "expectNoOverflowAt(375): overflow detected\n"
+            "Found in MessagesPanel.viewport.test.tsx"
+        )
+        now = _utcnow()
+        for i in range(_VIEWPORT_REGRESSION_MIN_FAILURES):
+            task = make_task(
+                project_id=project.id,
+                status=TaskStatus.FAILED,
+                payloads=[{"type": "review", "pr_number": 1234}],
+                created_at=now - timedelta(hours=i + 1),
+                updated_at=now - timedelta(hours=i + 1),
+            )
+            task.latest_status_message = msg
+            db_session.add(task)
+        await db_session.commit()
+
+        trips = await _collect_viewport_failures(db_session, project.id)
+        assert len(trips) == 1
+        assert trips[0]["introducing_pr_number"] == 1234
+        assert trips[0]["introducing_commit_sha"] is None
+
+    @pytest.mark.asyncio
+    async def test_introducing_commit_sha_in_trip_dict_when_no_pr(self, db_session):
+        """Trip dict includes introducing_commit_sha from context head_sha when no pr_number."""
+        from app.pipeline_regression_dispatcher import (
+            _VIEWPORT_REGRESSION_MIN_FAILURES,
+            _collect_viewport_failures,
+        )
+
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        msg = (
+            "expectNoOverflowAt(375): overflow detected\n"
+            "Found in KanbanBoard.viewport.test.tsx"
+        )
+        sha = "abc123def456789"
+        now = _utcnow()
+        for i in range(_VIEWPORT_REGRESSION_MIN_FAILURES):
+            task = make_task(
+                project_id=project.id,
+                status=TaskStatus.FAILED,
+                context={"head_sha": sha},
+                created_at=now - timedelta(hours=i + 1),
+                updated_at=now - timedelta(hours=i + 1),
+            )
+            task.latest_status_message = msg
+            db_session.add(task)
+        await db_session.commit()
+
+        trips = await _collect_viewport_failures(db_session, project.id)
+        assert len(trips) == 1
+        assert trips[0]["introducing_pr_number"] is None
+        assert trips[0]["introducing_commit_sha"] == sha
+
+    @pytest.mark.asyncio
+    async def test_introducing_attribution_none_when_no_signals(self, db_session):
+        """Trip dict has both attribution fields as None when task has no pr_number or head_sha."""
+        from app.pipeline_regression_dispatcher import (
+            _VIEWPORT_REGRESSION_MIN_FAILURES,
+            _collect_viewport_failures,
+        )
+
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        msg = (
+            "expectNoOverflowAt(375): overflow detected\n"
+            "Found in DirectionsPanel.viewport.test.tsx"
+        )
+        for _ in range(_VIEWPORT_REGRESSION_MIN_FAILURES):
+            db_session.add(_make_viewport_task(project.id, status_message=msg))
+        await db_session.commit()
+
+        trips = await _collect_viewport_failures(db_session, project.id)
+        assert len(trips) == 1
+        assert trips[0]["introducing_pr_number"] is None
+        assert trips[0]["introducing_commit_sha"] is None
+
+    @pytest.mark.asyncio
+    async def test_earliest_task_used_for_attribution(self, db_session):
+        """The earliest failing task's pr_number is used, not the most recent."""
+        from app.pipeline_regression_dispatcher import (
+            _VIEWPORT_REGRESSION_MIN_FAILURES,
+            _collect_viewport_failures,
+        )
+
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        msg = (
+            "expectNoOverflowAt(375): overflow detected\n"
+            "Found in ResearchBrowser.viewport.test.tsx"
+        )
+        now = _utcnow()
+        # Create tasks from newest to oldest; the oldest (highest offset) has pr_number=100.
+        # All other (newer) tasks have pr_number=999.
+        for i in range(_VIEWPORT_REGRESSION_MIN_FAILURES):
+            pr_num = 100 if i == _VIEWPORT_REGRESSION_MIN_FAILURES - 1 else 999
+            task = make_task(
+                project_id=project.id,
+                status=TaskStatus.FAILED,
+                payloads=[{"type": "review", "pr_number": pr_num}],
+                created_at=now - timedelta(hours=i + 1),
+                updated_at=now - timedelta(hours=i + 1),
+            )
+            task.latest_status_message = msg
+            db_session.add(task)
+        await db_session.commit()
+
+        trips = await _collect_viewport_failures(db_session, project.id)
+        assert len(trips) == 1
+        # The oldest task (pr_number=100) should determine attribution
+        assert trips[0]["introducing_pr_number"] == 100
 
 
 # ---------------------------------------------------------------------------

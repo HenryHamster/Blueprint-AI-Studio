@@ -61,7 +61,9 @@ export function ProjectAutoReviewSection({ config, canSave, onSave }: ProjectAut
         </p>
         <div className="bg-neutral-900 border border-neutral-800 rounded-lg px-4 py-3 flex items-center justify-between">
           <span className="text-xs text-neutral-300">Enable auto-review</span>
+          {/* reason: dense-UI toggle (h-5 w-9) — operator-density convention for settings panels */}
           <button
+            data-viewport-allow-small-target
             onClick={() => setEnabled(v => !v)}
             className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors shrink-0 ${enabled ? 'bg-emerald-600' : 'bg-neutral-700'}`}
           >
@@ -102,7 +104,9 @@ export function ProjectAutoReviewSection({ config, canSave, onSave }: ProjectAut
 
       <div className="flex justify-end pt-2">
         {canSave ? (
+          /* reason: dense-UI Save button (text-xs py-2) — operator-density convention for settings panels */
           <button
+            data-viewport-allow-small-target
             onClick={handleSave}
             disabled={saving || !hasChanges || !maxPerHourValid || !maxConcurrentValid}
             className="bg-neutral-700 hover:bg-neutral-600 text-neutral-100 rounded-lg px-5 py-2 text-xs font-medium transition-colors disabled:opacity-50"

@@ -2375,9 +2375,14 @@ class TestViewportDebt:
                 "source_url": None,
             }
         ]
+        fake_summary = {
+            "total_components": 1,
+            "untested_count": 0,
+            "untested_components": [],
+        }
         with patch(
             "app.routers.admin_digest._scan_viewport_debt_rows",
-            return_value=fake_rows,
+            return_value=(fake_rows, fake_summary),
         ):
             resp = await client.get(f"/api/admin/projects/{project.id}/viewport-debt")
 
@@ -2423,9 +2428,14 @@ class TestViewportDebt:
                 "source_url": None,
             }
         ]
+        fake_summary = {
+            "total_components": 1,
+            "untested_count": 0,
+            "untested_components": [],
+        }
         with patch(
             "app.routers.admin_digest._scan_viewport_debt_rows",
-            return_value=fake_rows,
+            return_value=(fake_rows, fake_summary),
         ):
             resp = await client.get(f"/api/admin/projects/{project.id}/viewport-debt")
 
@@ -2441,9 +2451,14 @@ class TestViewportDebt:
         from unittest.mock import patch
 
         project = await _make_project(db_session)
+        empty_summary = {
+            "total_components": 0,
+            "untested_count": 0,
+            "untested_components": [],
+        }
         with patch(
             "app.routers.admin_digest._scan_viewport_debt_rows",
-            return_value=[],
+            return_value=([], empty_summary),
         ):
             resp = await client.get(f"/api/admin/projects/{project.id}/viewport-debt")
 
@@ -2492,9 +2507,14 @@ class TestViewportDebt:
         # Snapshot the cached row so we can compare after the request.
         snapshot = dict(cached_rows[0])
 
+        cached_summary = {
+            "total_components": 1,
+            "untested_count": 0,
+            "untested_components": [],
+        }
         with patch(
             "app.routers.admin_digest._scan_viewport_debt_rows",
-            return_value=cached_rows,
+            return_value=(cached_rows, cached_summary),
         ):
             resp = await client.get(f"/api/admin/projects/{project.id}/viewport-debt")
 

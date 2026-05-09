@@ -13876,7 +13876,7 @@ async def test_regression_case_trend_counts_opened_and_closed(
 async def test_layer_defense_density_endpoint_returns_canonical_layers_with_counts(
     client: AsyncClient, db_session
 ):
-    """Endpoint returns all five canonical layers with correct counts and sample case ids."""
+    """Endpoint returns all six canonical layers with correct counts and sample case ids."""
     project = make_project()
     db_session.add(project)
     await db_session.commit()
@@ -13932,6 +13932,7 @@ async def test_layer_defense_density_endpoint_returns_canonical_layers_with_coun
         "AGENT_VERB",
         "BASELINE_GATE",
         "REVIEWER_PASS",
+        "VIEWPORT",
     ]
     by_layer = {r["layer"]: r for r in layers}
     assert by_layer["BASELINE_GATE"]["fix_count"] == 2
@@ -13996,7 +13997,7 @@ async def test_layer_defense_density_endpoint_respects_days_param(
 async def test_layer_defense_density_endpoint_no_cases_returns_zeroed_layers(
     client: AsyncClient, db_session
 ):
-    """Project with no regression cases returns five zero-row layers."""
+    """Project with no regression cases returns six zero-row layers."""
     project = make_project()
     db_session.add(project)
     await db_session.commit()
@@ -14009,7 +14010,7 @@ async def test_layer_defense_density_endpoint_no_cases_returns_zeroed_layers(
     assert response.status_code == 200
     body = response.json()
     layers = body["layers"]
-    assert len(layers) == 5
+    assert len(layers) == 6
     for row in layers:
         assert row["fix_count"] == 0
         assert row["last_fix_at"] is None
@@ -14681,6 +14682,121 @@ async def test_cross_layer_compliance_new_additive_fields(
     oldest_dt = datetime.fromisoformat(body["awaiting_backfill_oldest_merged_at"])
     expected_oldest = now - timedelta(days=3)
     assert abs((oldest_dt - expected_oldest).total_seconds()) < 5
+
+
+# ---------------------------------------------------------------------------
+# Viewport-debt coverage_summary tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_viewport_debt_coverage_summary_in_response(
+    client: AsyncClient, db_session
+):
+    """GET /viewport-debt returns coverage_summary with correct shape."""
+    from unittest.mock import patch
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    membership = make_membership(project.id, user_id="test-user-123", role="owner")
+    db_session.add(membership)
+    await db_session.commit()
+
+    fake_rows = [
+        {
+            "component": f"admin-ui/src/components/Comp{i}.tsx",
+            "eslint_disable_count": 1,
+            "data_viewport_allow_small_target": 0,
+            "data_viewport_allow_overflow": 0,
+            "data_viewport_allow_truncation": 0,
+            "total_opt_outs": 20 - i,
+            "has_viewport_test": (i % 5 == 0),
+            "regression_case_count": 0,
+            "source_url": None,
+        }
+        for i in range(20)
+    ]
+    top_rows = fake_rows[:15]
+    # 4 rows have viewport tests (i=0,5,10,15); 16 do not
+    untested_paths = [r["component"] for r in fake_rows if not r["has_viewport_test"]]
+    expected_summary = {
+        "total_components": 20,
+        "untested_count": 16,
+        "untested_components": untested_paths,
+    }
+
+    with patch(
+        "app.routers.admin_digest._scan_viewport_debt_rows",
+        return_value=(top_rows, expected_summary),
+    ):
+        response = await client.get(f"/api/admin/projects/{project.id}/viewport-debt")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert "rows" in body
+    assert "scanned_at" in body
+    assert "coverage_summary" in body
+    cs = body["coverage_summary"]
+    assert cs["total_components"] == 20
+    assert cs["untested_count"] == 16
+    assert len(cs["untested_components"]) == 16
+
+
+@pytest.mark.asyncio
+async def test_viewport_debt_coverage_summary_counts_full_set(
+    client: AsyncClient, db_session
+):
+    """coverage_summary reflects pre-truncation totals; untested_components capped at 50."""
+    from unittest.mock import patch
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    membership = make_membership(project.id, user_id="test-user-123", role="owner")
+    db_session.add(membership)
+    await db_session.commit()
+
+    # 60 components all untested — verifies the 50-cap on untested_components
+    fake_rows_all = [
+        {
+            "component": f"admin-ui/src/components/Big{i}.tsx",
+            "eslint_disable_count": 1,
+            "data_viewport_allow_small_target": 0,
+            "data_viewport_allow_overflow": 0,
+            "data_viewport_allow_truncation": 0,
+            "total_opt_outs": 60 - i,
+            "has_viewport_test": False,
+            "regression_case_count": 0,
+            "source_url": None,
+        }
+        for i in range(60)
+    ]
+    top_rows = fake_rows_all[:15]
+    untested_paths = [r["component"] for r in fake_rows_all]
+    expected_summary = {
+        "total_components": 60,
+        "untested_count": 60,
+        "untested_components": untested_paths[:50],
+    }
+
+    with patch(
+        "app.routers.admin_digest._scan_viewport_debt_rows",
+        return_value=(top_rows, expected_summary),
+    ):
+        response = await client.get(f"/api/admin/projects/{project.id}/viewport-debt")
+
+    assert response.status_code == 200
+    body = response.json()
+    cs = body["coverage_summary"]
+    assert cs["total_components"] == 60
+    assert cs["untested_count"] == 60
+    # top_rows are the truncated 15; rows in response should be 15
+    assert len(body["rows"]) == 15
+    # untested_components capped at 50
+    assert len(cs["untested_components"]) == 50
 
 
 # ---------------------------------------------------------------------------

@@ -2626,8 +2626,8 @@ async def regression_cases_layer_defense_density(
     Loads every ``RegressionRemediationCase`` for the project, walks each
     case's ``fingerprint_to_fix_log`` entries, and returns one row per
     canonical infrastructure layer (CI_WORKFLOW, AGENT_VM, AGENT_VERB,
-    BASELINE_GATE, REVIEWER_PASS) — including layers with zero defenses —
-    so the UI can render a stable five-row table.
+    BASELINE_GATE, REVIEWER_PASS, VIEWPORT) — including layers with zero
+    defenses — so the UI can render a stable six-row table.
     """
     from app.pipeline_regression_dispatcher import (
         _compute_layer_fragility_stats,
@@ -7623,6 +7623,8 @@ async def get_pipeline_regressions(
                 "prior_rate": None,
                 "resolved": False,
                 "resolved_at": None,
+                "introducing_pr_number": getattr(case, "introducing_pr_number", None),
+                "introducing_commit_sha": getattr(case, "introducing_commit_sha", None),
             }
         )
 
@@ -8556,7 +8558,9 @@ async def get_regression_mtta(
 # Viewport Debt Endpoint
 # ---------------------------------------------------------------------------
 
-_VIEWPORT_DEBT_CACHE: Optional[tuple[datetime, List[Dict[str, Any]]]] = None
+_VIEWPORT_DEBT_CACHE: Optional[
+    tuple[datetime, List[Dict[str, Any]], Dict[str, Any]]
+] = None
 _VIEWPORT_DEBT_CACHE_TTL = 300  # 5 minutes
 
 _ESLINT_VIEWPORT_RE = _re.compile(
@@ -8577,17 +8581,22 @@ def _find_components_dir() -> Optional[_Path]:
     return None
 
 
-def _scan_viewport_debt_rows() -> List[Dict[str, Any]]:
+def _scan_viewport_debt_rows() -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
     global _VIEWPORT_DEBT_CACHE
     now = datetime.utcnow()
     if _VIEWPORT_DEBT_CACHE is not None:
-        cached_at, cached_rows = _VIEWPORT_DEBT_CACHE
+        cached_at, cached_rows, cached_summary = _VIEWPORT_DEBT_CACHE
         if (now - cached_at).total_seconds() < _VIEWPORT_DEBT_CACHE_TTL:
-            return cached_rows
+            return cached_rows, cached_summary
 
     components_dir = _find_components_dir()
     if components_dir is None:
-        return []
+        empty_summary: Dict[str, Any] = {
+            "total_components": 0,
+            "untested_count": 0,
+            "untested_components": [],
+        }
+        return [], empty_summary
 
     rows = []
     for tsx_file in sorted(components_dir.glob("*.tsx")):
@@ -8626,9 +8635,18 @@ def _scan_viewport_debt_rows() -> List[Dict[str, Any]]:
         )
 
     rows.sort(key=lambda r: r["total_opt_outs"], reverse=True)
+
+    # Compute coverage_summary over the full pre-truncation set.
+    untested = [r["component"] for r in rows if not r["has_viewport_test"]]
+    coverage_summary: Dict[str, Any] = {
+        "total_components": len(rows),
+        "untested_count": len(untested),
+        "untested_components": untested[:50],
+    }
+
     rows = rows[:15]
-    _VIEWPORT_DEBT_CACHE = (now, rows)
-    return rows
+    _VIEWPORT_DEBT_CACHE = (now, rows, coverage_summary)
+    return rows, coverage_summary
 
 
 @router.get("/projects/{project_id}/viewport-debt")
@@ -8652,7 +8670,8 @@ async def get_viewport_debt(
     # Shallow-copy cached rows: the scan result is a process-wide cache and
     # we annotate per-project below. Without the copy, concurrent requests
     # for different projects would race on regression_case_count / source_url.
-    rows = [dict(r) for r in _scan_viewport_debt_rows()]
+    top_rows, coverage_summary = _scan_viewport_debt_rows()
+    rows = [dict(r) for r in top_rows]
 
     # Annotate each row with recent regression case count from the DB.
     if rows:
@@ -8687,7 +8706,11 @@ async def get_viewport_debt(
                     f"https://github.com/{gh_owner}/{gh_repo}/blob/main/{row['component']}"
                 )
 
-    return {"rows": rows, "scanned_at": datetime.utcnow().isoformat()}
+    return {
+        "rows": rows,
+        "scanned_at": datetime.utcnow().isoformat(),
+        "coverage_summary": coverage_summary,
+    }
 
 
 @router.get("/regression-dispatcher/escalation-outcomes")

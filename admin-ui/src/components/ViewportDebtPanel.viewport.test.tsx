@@ -16,6 +16,8 @@ const MOCK_ROWS = [
     has_viewport_test: true,
     regression_case_count: 2,
     source_url: 'https://github.com/example/repo/blob/main/admin-ui/src/components/MessagesPanel.tsx',
+    introducing_pr_number: 4321,
+    introducing_commit_sha: 'abc1234def5678',
   },
   {
     component: 'admin-ui/src/components/TaskDetailDrawer.tsx',
@@ -41,10 +43,16 @@ const MOCK_ROWS = [
   },
 ];
 
+const MOCK_COVERAGE_SUMMARY = {
+  total_components: 3,
+  untested_count: 1,
+  untested_components: ['admin-ui/src/components/TaskDetailDrawer.tsx'],
+};
+
 vi.mock('../api', () => ({
   apiFetch: vi.fn(async () =>
     new Response(
-      JSON.stringify({ rows: MOCK_ROWS, scanned_at: new Date().toISOString() }),
+      JSON.stringify({ rows: MOCK_ROWS, scanned_at: new Date().toISOString(), coverage_summary: MOCK_COVERAGE_SUMMARY }),
       { status: 200 },
     )
   ),
@@ -113,5 +121,23 @@ describe('ViewportDebtPanel — viewport regression', () => {
       await act(async () => { root?.render(<ViewportDebtPanel projectId="project-123" />); });
       await act(async () => { await new Promise((resolve) => setTimeout(resolve, 50)); });
     }, { selector: 'a[aria-label]', waitMs: 50 });
+  });
+
+  test('untested-only filter active: no overflow and button meets 44px at 375px', async () => {
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      root = createRoot(host);
+      await act(async () => { root?.render(<ViewportDebtPanel projectId="project-123" />); });
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 50)); });
+      const btn = host.querySelector('button[aria-label]') as HTMLButtonElement | null;
+      if (!btn) throw new Error('filter toggle button not found');
+      await act(async () => { btn.click(); });
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 10)); });
+    }, { waitMs: 10 });
+
+    // Component still mounted with filter on — check the toggle button meets 44px
+    await expectMinTouchTargetAt(375, async () => {}, { selector: 'button[aria-label]', waitMs: 0 });
   });
 });

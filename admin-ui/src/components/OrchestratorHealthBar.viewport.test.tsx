@@ -2,7 +2,7 @@ import { afterEach, describe, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { OrchestratorHealthBar } from './OrchestratorHealthBar';
-import { expectNoOverflowAt, expectMinTouchTargetAt } from '../test/viewport';
+import { expectNoOverflowAt, expectMinTouchTargetAt, expectNoTextTruncationAt } from '../test/viewport';
 
 const { apiFetchMock } = vi.hoisted(() => ({
   apiFetchMock: vi.fn(),
@@ -134,5 +134,26 @@ describe('OrchestratorHealthBar — viewport regression', () => {
         await new Promise<void>((resolve) => setTimeout(resolve, 75));
       });
     }, { selector: 'button, a[href]' });
+  });
+
+  test('operator-facing text is not silently clipped at 375px', async () => {
+    apiFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ daily_cost_usd: 94.32, daily_cost_ceiling_usd: 100 }),
+    } as Response);
+
+    await expectNoTextTruncationAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(<OrchestratorHealthBar {...baseProps} />);
+      });
+      await act(async () => {
+        await new Promise<void>((resolve) => setTimeout(resolve, 75));
+      });
+    });
   });
 });

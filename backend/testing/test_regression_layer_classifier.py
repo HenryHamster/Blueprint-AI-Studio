@@ -7,6 +7,7 @@ from app.regression_layer_classifier import (
     LAYER_BASELINE_GATE,
     LAYER_CI_WORKFLOW,
     LAYER_REVIEWER_PASS,
+    LAYER_VIEWPORT,
     build_layer_meta_block,
     classify_layers,
     compute_untargeted_layers,
@@ -145,6 +146,66 @@ class TestReviewerPass:
     def test_stage_review(self):
         result = classify_layers("CODE_ERROR", "", stage="review_pipeline")
         assert LAYER_REVIEWER_PASS in result
+
+
+# ---------------------------------------------------------------------------
+# VIEWPORT layer
+# ---------------------------------------------------------------------------
+
+
+class TestViewportLayer:
+    def test_failure_class_viewport_regression(self):
+        msg = "expectNoOverflowAt(375) failed: MessagesPanel overflows viewport"
+        result = classify_layers("VIEWPORT_REGRESSION", msg)
+        assert LAYER_VIEWPORT in result
+
+    def test_stage_viewport_routes_to_viewport(self):
+        result = classify_layers("CODE_ERROR", "", stage="viewport")
+        assert LAYER_VIEWPORT in result
+
+    def test_viewport_test_file_message(self):
+        msg = "MessagesPanel.viewport.test.tsx: overflow detected at 375px"
+        result = classify_layers("CODE_ERROR", msg)
+        assert LAYER_VIEWPORT in result
+
+    def test_expect_no_overflow_message(self):
+        msg = "expectNoOverflowAt assertion failed in KanbanBoard"
+        result = classify_layers("VIEWPORT_REGRESSION", msg)
+        assert LAYER_VIEWPORT in result
+
+    def test_expect_min_touch_target_message(self):
+        msg = "expectMinTouchTargetAt(375): button is only 32px tall"
+        result = classify_layers("VIEWPORT_REGRESSION", msg)
+        assert LAYER_VIEWPORT in result
+
+    def test_375px_keyword(self):
+        msg = "component overflows at 375px mobile width"
+        result = classify_layers("CODE_ERROR", msg)
+        assert LAYER_VIEWPORT in result
+
+    def test_viewport_regression_not_in_baseline_gate(self):
+        # The key regression guard: viewport inputs must never also tag BASELINE_GATE.
+        msg = "expectNoOverflowAt(375) failed"
+        result = classify_layers("VIEWPORT_REGRESSION", msg, stage="viewport")
+        assert LAYER_VIEWPORT in result
+        assert LAYER_BASELINE_GATE not in result
+
+    def test_stage_viewport_not_in_baseline_gate(self):
+        result = classify_layers("CODE_ERROR", "", stage="viewport")
+        assert LAYER_BASELINE_GATE not in result
+
+    def test_lint_still_goes_to_baseline_gate(self):
+        # Verify BASELINE_GATE behavior for lint inputs is unchanged.
+        msg = "eslint found errors in unchanged files — pre-existing baseline violation"
+        result = classify_layers("CODE_ERROR", msg, stage="lint")
+        assert LAYER_BASELINE_GATE in result
+        assert LAYER_VIEWPORT not in result
+
+    def test_ruff_still_goes_to_baseline_gate(self):
+        msg = "ruff E501 line too long in unchanged file"
+        result = classify_layers("CODE_ERROR", msg)
+        assert LAYER_BASELINE_GATE in result
+        assert LAYER_VIEWPORT not in result
 
 
 # ---------------------------------------------------------------------------

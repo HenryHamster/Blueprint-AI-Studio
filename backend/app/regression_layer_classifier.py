@@ -1,7 +1,7 @@
 """Layer classifier for pipeline regression symptoms.
 
 Pure-function module — no DB, no session, no side effects.
-Returns a subset of the five canonical layer tags based on fingerprint
+Returns a subset of the six canonical layer tags based on fingerprint
 heuristics applied to failure_class, message text, and optional stage name.
 
 Layer tags:
@@ -10,6 +10,7 @@ Layer tags:
   AGENT_VERB    — agent/src/handlers/ (what gates fire, scope enforcement)
   BASELINE_GATE — lint/test/typecheck baselines, scope rules, strictness
   REVIEWER_PASS — fresh-reviewer pass, build-gate disagreement detection
+  VIEWPORT      — client-rendering / 375px viewport regressions in admin-ui components
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ LAYER_AGENT_VM = "AGENT_VM"
 LAYER_AGENT_VERB = "AGENT_VERB"
 LAYER_BASELINE_GATE = "BASELINE_GATE"
 LAYER_REVIEWER_PASS = "REVIEWER_PASS"
+LAYER_VIEWPORT = "VIEWPORT"
 
 ALL_LAYERS: frozenset[str] = frozenset(
     [
@@ -33,6 +35,7 @@ ALL_LAYERS: frozenset[str] = frozenset(
         LAYER_AGENT_VERB,
         LAYER_BASELINE_GATE,
         LAYER_REVIEWER_PASS,
+        LAYER_VIEWPORT,
     ]
 )
 
@@ -149,6 +152,21 @@ _REVIEWER_PASS_STAGE_KEYWORDS: list[str] = [
     "review_pipeline",
 ]
 
+# VIEWPORT: client-rendering / 375px viewport regressions in admin-ui components
+_VIEWPORT_PATTERNS: list[re.Pattern] = [
+    re.compile(r"viewport.{0,20}regression", re.IGNORECASE),
+    re.compile(r"expectNoOverflowAt", re.IGNORECASE),
+    re.compile(r"expectMinTouchTargetAt", re.IGNORECASE),
+    re.compile(r"expectNoTextTruncationAt", re.IGNORECASE),
+    re.compile(r"\.viewport\.test\.tsx", re.IGNORECASE),
+    re.compile(r"375px", re.IGNORECASE),
+    re.compile(r"mobile.{0,20}width.{0,20}overflow", re.IGNORECASE),
+]
+
+_VIEWPORT_FAILURE_CLASSES: frozenset[str] = frozenset(["VIEWPORT_REGRESSION"])
+
+_VIEWPORT_STAGE_KEYWORDS: list[str] = ["viewport"]
+
 # ---------------------------------------------------------------------------
 # Layer descriptions (used by meta-investigation prompt builders)
 # ---------------------------------------------------------------------------
@@ -159,6 +177,7 @@ LAYER_DESCRIPTIONS: dict[str, str] = {
     LAYER_AGENT_VERB: "agent/src/handlers/ — gate scope enforcement, handler invocations",
     LAYER_BASELINE_GATE: "lint/typecheck baselines, scope rules, module size limits",
     LAYER_REVIEWER_PASS: "fresh-reviewer pass, build-gate disagreement detection",
+    LAYER_VIEWPORT: "client-rendering / 375px viewport regressions in admin-ui components",
 }
 
 # Stable display order for meta-investigation prompts.
@@ -168,6 +187,7 @@ _LAYER_DISPLAY_ORDER: tuple[str, ...] = (
     LAYER_AGENT_VERB,
     LAYER_BASELINE_GATE,
     LAYER_REVIEWER_PASS,
+    LAYER_VIEWPORT,
 )
 
 
@@ -247,15 +267,25 @@ def classify_layers(
     ):
         tags.append(LAYER_AGENT_VERB)
 
-    # --- BASELINE_GATE ---
-    if _matches_any(message, _BASELINE_GATE_PATTERNS) or any(
-        kw in _stage for kw in _BASELINE_GATE_STAGE_KEYWORDS
+    # --- VIEWPORT ---
+    # Checked before BASELINE_GATE so viewport inputs are never also tagged BASELINE_GATE.
+    if (
+        _fc in _VIEWPORT_FAILURE_CLASSES
+        or _matches_any(message, _VIEWPORT_PATTERNS)
+        or any(kw in _stage for kw in _VIEWPORT_STAGE_KEYWORDS)
     ):
-        tags.append(LAYER_BASELINE_GATE)
-    elif _fc in _BASELINE_GATE_FAILURE_CLASSES and any(
-        kw in _stage for kw in ("lint", "typecheck", "ruff", "mypy", "eslint")
-    ):
-        tags.append(LAYER_BASELINE_GATE)
+        tags.append(LAYER_VIEWPORT)
+
+    # --- BASELINE_GATE --- (skipped when VIEWPORT already matched)
+    if LAYER_VIEWPORT not in tags:
+        if _matches_any(message, _BASELINE_GATE_PATTERNS) or any(
+            kw in _stage for kw in _BASELINE_GATE_STAGE_KEYWORDS
+        ):
+            tags.append(LAYER_BASELINE_GATE)
+        elif _fc in _BASELINE_GATE_FAILURE_CLASSES and any(
+            kw in _stage for kw in ("lint", "typecheck", "ruff", "mypy", "eslint")
+        ):
+            tags.append(LAYER_BASELINE_GATE)
 
     # --- REVIEWER_PASS ---
     if _matches_any(message, _REVIEWER_PASS_PATTERNS) or any(
