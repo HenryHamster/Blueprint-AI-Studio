@@ -1454,12 +1454,34 @@ async def create_task_manually(
         task_payload["branch"] = payload.branch or ""
         if payload.task_type == "review":
             task_payload["original_prompt"] = payload.prompt
-    # Research tasks auto-include project directions
+    # Research tasks auto-include project directions. For ad-hoc manual
+    # spawns we ship lightweight direction summaries (id/text/priority/
+    # status/system + truncated research_context) — full
+    # research_context + research_history can be tens of KB per direction
+    # and easily blow past validate_task_payload's 190 KB cap on projects
+    # with many fat directions. The agent can fetch full direction state
+    # via ``./fetch direction <id>`` when it needs it.
     if payload.task_type == "research":
         active_directions = [
             d for d in (project.directions or []) if d.get("status") == "active"
         ]
-        task_payload["directions"] = active_directions
+        trimmed_directions = []
+        for d in active_directions:
+            if not isinstance(d, dict):
+                continue
+            ctx = d.get("research_context") or ""
+            entry = {
+                "id": d.get("id"),
+                "text": d.get("text"),
+                "priority": d.get("priority"),
+                "status": d.get("status"),
+            }
+            if d.get("system"):
+                entry["system"] = d.get("system")
+            if isinstance(ctx, str) and ctx:
+                entry["research_context"] = ctx[:2000]
+            trimmed_directions.append(entry)
+        task_payload["directions"] = trimmed_directions
 
     try:
         task_payload = validate_task_payload(task_payload)
