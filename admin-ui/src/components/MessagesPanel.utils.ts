@@ -114,6 +114,7 @@ export type SavedView = {
   sort: 'importance' | 'recent';
   showResolved: boolean;
   routineExpanded: boolean;
+  showOnlyNew: boolean;
   createdAt: number;
 };
 
@@ -143,6 +144,7 @@ function sanitizeSavedView(raw: unknown): SavedView | null {
     sort: r.sort === 'recent' ? 'recent' : 'importance',
     showResolved: r.showResolved === true,
     routineExpanded: r.routineExpanded === true,
+    showOnlyNew: r.showOnlyNew === true,
     createdAt: typeof r.createdAt === 'number' ? r.createdAt : Date.now(),
   };
 }

@@ -7,26 +7,28 @@ import { routineSummary, effectiveSignal, loadEventPrefs, saveEventPrefs, type E
 
 const DEFAULT_VIEW_ID = '__default__';
 
-function viewSummaryLine(query: string, prefs: Record<string, EventPref>, sort: 'importance' | 'recent', showResolved: boolean): string {
+function viewSummaryLine(query: string, prefs: Record<string, EventPref>, sort: 'importance' | 'recent', showResolved: boolean, showOnlyNew?: boolean): string {
   const parts: string[] = [];
   parts.push(query.trim() ? `Search: ${query.trim().slice(0, 40)}` : 'No search');
   const muted = Object.values(prefs).filter(v => v === 'mute').length;
   const surfaced = Object.values(prefs).filter(v => v === 'surfaced').length;
   if (muted > 0) parts.push(`${muted} muted`);
   if (surfaced > 0) parts.push(`${surfaced} surfaced`);
+  if (showOnlyNew) parts.push('only new');
   parts.push(`sort: ${sort}`);
   parts.push(showResolved ? 'resolved shown' : 'resolved hidden');
   return parts.join(' · ');
 }
 
 function viewMatches(
-  view: { query: string; prefs: Record<string, EventPref>; sort: 'importance' | 'recent'; showResolved: boolean; routineExpanded: boolean },
-  state: { query: string; prefs: Record<string, EventPref>; sort: 'importance' | 'recent'; showResolved: boolean; routineExpanded: boolean },
+  view: { query: string; prefs: Record<string, EventPref>; sort: 'importance' | 'recent'; showResolved: boolean; routineExpanded: boolean; showOnlyNew: boolean },
+  state: { query: string; prefs: Record<string, EventPref>; sort: 'importance' | 'recent'; showResolved: boolean; routineExpanded: boolean; showOnlyNew: boolean },
 ): boolean {
   if (view.query !== state.query) return false;
   if (view.sort !== state.sort) return false;
   if (view.showResolved !== state.showResolved) return false;
   if (view.routineExpanded !== state.routineExpanded) return false;
+  if (view.showOnlyNew !== state.showOnlyNew) return false;
   const aKeys = Object.keys(view.prefs);
   const bKeys = Object.keys(state.prefs);
   if (aKeys.length !== bKeys.length) return false;
@@ -287,6 +289,8 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
   const [dividerTime, setDividerTime] = useState<number | null>(null);
   const dividerTimeRef = useRef<number | null>(null);
   const dividerDismissedRef = useRef(false);
+  // Toggle to show only messages newer than the divider time
+  const [showOnlyNew, setShowOnlyNew] = useState(false);
 
   const dismissDivider = useCallback(() => {
     if (!dividerDismissedRef.current && selectedProjectId) {
@@ -297,6 +301,10 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
       dividerDismissedRef.current = true;
     }
   }, [selectedProjectId]);
+
+  // Refs for scrolling to sections from summary card
+  const blockersRefEl = useRef<HTMLDivElement>(null);
+  const routineRefEl = useRef<HTMLDivElement>(null);
 
   // Stable ref for addToast
   const addToastRef = useRef(addToast);
@@ -364,16 +372,29 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
   };
 
   const SEVERITY_RANK: Record<string, number> = { BLOCKER: 0, BUG_REPORT: 1, FEEDBACK: 2, NOTE: 3 };
+  const CONTEXT_SEVERITY_RANK: Record<string, number> = { high: 0, medium: 1, low: 2 };
   const bySeverity = (a: ProjectMessage, b: ProjectMessage) => {
     const ra = SEVERITY_RANK[a.message_type] ?? 3;
     const rb = SEVERITY_RANK[b.message_type] ?? 3;
     if (ra !== rb) return ra - rb;
+    // Same message_type, compare by context.severity
+    const sa = (a.context.severity as string | undefined) ?? 'undefined';
+    const sb = (b.context.severity as string | undefined) ?? 'undefined';
+    const sa_rank = CONTEXT_SEVERITY_RANK[sa] ?? 3;
+    const sb_rank = CONTEXT_SEVERITY_RANK[sb] ?? 3;
+    if (sa_rank !== sb_rank) return sa_rank - sb_rank;
     return byTimeDesc(a, b);
   };
 
   const openMessages = messages.filter(m => m.status === 'open' && (!criticalOnly || isCriticalSeverity(m)));
   const resolvedMessages = messages.filter(m => m.status === 'resolved');
   const openFeedbackMessages = openMessages.filter(m => m.message_type === 'FEEDBACK' && matchesSearch(m));
+
+  // Filter to only new messages when showOnlyNew is enabled
+  const isNewMessage = (m: ProjectMessage): boolean => {
+    if (!showOnlyNew || !dividerTime || !m.created_at) return true;
+    return parseTimestamp(m.created_at).getTime() > dividerTime;
+  };
 
   // Count new high-signal messages (created after divider time)
   const newHighSignalCount = dividerTime
@@ -384,12 +405,41 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
       ).length
     : 0;
 
+  // Count new messages by type for the summary card (respecting mute prefs and criticalOnly)
+  const newMessageCounts = dividerTime
+    ? {
+        blockers: openMessages.filter(m =>
+          m.message_type === 'BLOCKER' &&
+          m.created_at &&
+          parseTimestamp(m.created_at).getTime() > dividerTime &&
+          effectiveSignal(m, eventPrefs) !== 'mute'
+        ).length,
+        feedback: openMessages.filter(m =>
+          m.message_type === 'FEEDBACK' &&
+          m.created_at &&
+          parseTimestamp(m.created_at).getTime() > dividerTime &&
+          effectiveSignal(m, eventPrefs) !== 'mute'
+        ).length,
+        bugReports: openMessages.filter(m =>
+          m.message_type === 'BUG_REPORT' &&
+          m.created_at &&
+          parseTimestamp(m.created_at).getTime() > dividerTime &&
+          effectiveSignal(m, eventPrefs) !== 'mute'
+        ).length,
+        routine: openMessages.filter(m =>
+          effectiveSignal(m, eventPrefs) === 'routine' &&
+          m.created_at &&
+          parseTimestamp(m.created_at).getTime() > dividerTime
+        ).length,
+      }
+    : { blockers: 0, feedback: 0, bugReports: 0, routine: 0 };
+
   // Split open messages by signal level, respecting per-event-type prefs, then filter by search
   const muteActive = isMuteWindowActive(muteWindow);
-  const highSignalOpen = [...openMessages.filter(m => effectiveSignal(m, eventPrefs) === 'high' && matchesSearch(m))]
+  const highSignalOpen = [...openMessages.filter(m => effectiveSignal(m, eventPrefs) === 'high' && matchesSearch(m) && isNewMessage(m))]
     .sort(sortMode === 'importance' ? bySeverity : byTimeDesc);
   // Always compute routine messages; mute only filters them from the non-promoted routine section
-  const routineOpen = [...openMessages.filter(m => effectiveSignal(m, eventPrefs) === 'routine' && matchesSearch(m))].sort(byTimeDesc);
+  const routineOpen = [...openMessages.filter(m => effectiveSignal(m, eventPrefs) === 'routine' && matchesSearch(m) && isNewMessage(m))].sort(byTimeDesc);
 
   // In importance mode, pin BLOCKERs at the top with a visual divider
   const pinnedBlockers = sortMode === 'importance' ? highSignalOpen.filter(m => m.message_type === 'BLOCKER') : [];
@@ -469,16 +519,16 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
   // Active tab is "modified" when current panel state diverges from its saved
   // snapshot. For Default the baseline is the empty/initial state.
   const activeTabModified = useMemo(() => {
-    const current = { query: searchQuery, prefs: eventPrefs, sort: sortMode, showResolved, routineExpanded };
+    const current = { query: searchQuery, prefs: eventPrefs, sort: sortMode, showResolved, routineExpanded, showOnlyNew };
     if (activeViewId === DEFAULT_VIEW_ID) {
       return !viewMatches(
-        { query: '', prefs: {}, sort: 'importance', showResolved: false, routineExpanded: false },
+        { query: '', prefs: {}, sort: 'importance', showResolved: false, routineExpanded: false, showOnlyNew: false },
         current,
       );
     }
     if (!activeView) return false;
     return !viewMatches(activeView, current);
-  }, [activeView, activeViewId, searchQuery, eventPrefs, sortMode, showResolved, routineExpanded]);
+  }, [activeView, activeViewId, searchQuery, eventPrefs, sortMode, showResolved, routineExpanded, showOnlyNew]);
 
   function applyView(viewId: string) {
     setOpenKebabId(null);
@@ -490,6 +540,7 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
       setSortMode('importance');
       setShowResolved(false);
       setRoutineExpanded(false);
+      setShowOnlyNew(false);
       return;
     }
     const view = savedViews.find(v => v.id === viewId);
@@ -501,6 +552,7 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
     setSortMode(view.sort);
     setShowResolved(view.showResolved);
     setRoutineExpanded(view.routineExpanded);
+    setShowOnlyNew(view.showOnlyNew);
   }
 
   function openSaveDialog() {
@@ -547,6 +599,7 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
         sort: sortMode,
         showResolved,
         routineExpanded,
+        showOnlyNew,
         createdAt: Date.now(),
       };
       const next = [...savedViews, view];
@@ -700,12 +753,6 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
     return () => el.removeEventListener('scroll', onScroll);
   }, []);
 
-  // Auto-dismiss divider after 5 seconds of panel being visible
-  useEffect(() => {
-    if (!dividerTime || dividerDismissedRef.current) return;
-    const timer = setTimeout(dismissDivider, 5000);
-    return () => clearTimeout(timer);
-  }, [dividerTime, selectedProjectId, dismissDivider]);
 
   // Scroll-based divider dismissal: detect when user scrolls past the divider
   useEffect(() => {
@@ -1119,6 +1166,18 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
           >
             <AlertTriangle className="w-3.5 h-3.5" />
           </button>
+          <button
+            onClick={() => setShowOnlyNew(v => !v)}
+            disabled={!dividerTime}
+            title={!dividerTime ? 'No messages to filter (visit first)' : showOnlyNew ? 'Show all messages' : 'Only new since last visit'}
+            className={`text-xs px-2 py-1 rounded-lg transition-colors border min-h-[44px] min-w-[44px] md:min-h-[36px] md:min-w-auto flex items-center justify-center disabled:opacity-40 disabled:cursor-not-allowed ${
+              showOnlyNew && dividerTime
+                ? 'text-blue-400 bg-blue-500/10 border-blue-500/30'
+                : 'text-neutral-500 hover:text-neutral-300 border-neutral-800/60'
+            }`}
+          >
+            <ChevronUp className="w-3.5 h-3.5" />
+          </button>
           {openFeedbackMessages.length > 1 && (
             <button
               onClick={() => {
@@ -1367,7 +1426,7 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
             {saveDialogMode === 'create' && (
               <div className="text-[11px] text-neutral-500 bg-neutral-950/50 border border-neutral-800/60 rounded-md px-3 py-2">
                 <span className="text-neutral-400">Saving:</span>{' '}
-                {viewSummaryLine(searchQuery, eventPrefs, sortMode, showResolved)}
+                {viewSummaryLine(searchQuery, eventPrefs, sortMode, showResolved, showOnlyNew)}
               </div>
             )}
             {saveDialogError && (
@@ -1403,6 +1462,12 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
             <p className="text-sm">No messages yet</p>
             <p className="text-xs mt-1 opacity-70">Send feedback, report bugs, or ask questions</p>
           </div>
+        ) : showOnlyNew && dividerTime && highSignalOpen.length === 0 && routineOpen.length === 0 && visibleResolved.length === 0 ? (
+          <div className="flex flex-col items-center justify-center py-16 text-neutral-500">
+            <MessageSquare className="w-8 h-8 mb-3 opacity-40" />
+            <p className="text-sm">No new messages since {formatTimestamp(dividerTime)}</p>
+            <p className="text-xs mt-1 opacity-70">You're all caught up!</p>
+          </div>
         ) : searchQuery.trim() && highSignalOpen.length === 0 && routineOpen.length === 0 && visibleResolved.length === 0 ? (
           <div className="flex flex-col items-center justify-center py-16 text-neutral-500">
             <MessageSquare className="w-8 h-8 mb-3 opacity-40" />
@@ -1437,15 +1502,80 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
             {dividerTime && newHighSignalCount > 0 && !dividerDismissedRef.current && (
               <div data-divider-marker className="flex items-center gap-2 px-2 py-3 text-[11px] text-blue-300/70">
                 <div className="flex-1 border-t border-blue-500/40" />
-                <span className="whitespace-nowrap font-medium flex items-center gap-1">
-                  <ChevronUp className="w-3 h-3" />
-                  NEW since {formatTimestamp(dividerTime)}
-                </span>
+                <div className="flex items-center gap-2 whitespace-nowrap font-medium">
+                  <span className="flex items-center gap-1">
+                    <ChevronUp className="w-3 h-3" />
+                    NEW since {formatTimestamp(dividerTime)}
+                  </span>
+                  {/* eslint-disable-next-line viewport/min-touch-target -- dense divider toolbar */}
+                  <button
+                    onClick={dismissDivider}
+                    className="px-2 py-0.5 text-xs bg-blue-600/50 hover:bg-blue-600/70 rounded border border-blue-500/60 text-blue-200 transition-colors min-h-[28px]"
+                    title="Mark all caught up and dismiss this divider"
+                  >
+                    All caught up
+                  </button>
+                </div>
                 <div className="flex-1 border-t border-blue-500/40" />
               </div>
             )}
+
+            {/* Summary card: show counts of new messages if divider is active */}
+            {dividerTime && !dividerDismissedRef.current && (newMessageCounts.blockers > 0 || newMessageCounts.feedback > 0 || newMessageCounts.bugReports > 0 || newMessageCounts.routine > 0) && (
+              <div className="mx-2 my-3 p-3 rounded-lg bg-gradient-to-r from-blue-950/40 to-blue-900/30 border border-blue-800/40 text-[11px] text-blue-200/90">
+                <div className="font-semibold mb-2 text-blue-300">Since you last looked</div>
+                <div className="space-y-1.5">
+                  {newMessageCounts.blockers > 0 && (
+                    <button
+                      onClick={() => {
+                        blockersRefEl.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                      }}
+                      className="block w-full text-left hover:text-blue-100 transition-colors"
+                      data-testid="summary-card-blockers"
+                    >
+                      <span className="font-medium text-amber-300">{newMessageCounts.blockers}</span> new blocker{newMessageCounts.blockers !== 1 ? 's' : ''}
+                    </button>
+                  )}
+                  {newMessageCounts.bugReports > 0 && (
+                    <button
+                      onClick={() => {
+                        blockersRefEl.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                      }}
+                      className="block w-full text-left hover:text-blue-100 transition-colors"
+                      data-testid="summary-card-bugs"
+                    >
+                      <span className="font-medium text-red-300">{newMessageCounts.bugReports}</span> new bug{newMessageCounts.bugReports !== 1 ? 's' : ''}
+                    </button>
+                  )}
+                  {newMessageCounts.feedback > 0 && (
+                    <button
+                      onClick={() => {
+                        blockersRefEl.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                      }}
+                      className="block w-full text-left hover:text-blue-100 transition-colors"
+                      data-testid="summary-card-feedback"
+                    >
+                      <span className="font-medium text-purple-300">{newMessageCounts.feedback}</span> new feedback
+                    </button>
+                  )}
+                  {newMessageCounts.routine > 0 && (
+                    <button
+                      onClick={() => {
+                        routineRefEl.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                      }}
+                      className="block w-full text-left hover:text-blue-100 transition-colors"
+                      data-testid="summary-card-routine"
+                    >
+                      <span className="font-medium text-neutral-300">{newMessageCounts.routine}</span> routine ops
+                    </button>
+                  )}
+                </div>
+              </div>
+            )}
+
             {/* Other high-signal open messages */}
-            {insertTimeDividers(otherHighSignal).map((item, idx) =>
+            <div ref={blockersRefEl}>
+              {insertTimeDividers(otherHighSignal).map((item, idx) =>
               item.kind === 'divider' ? (
                 <div key={`divider-high-${idx}`} className="flex items-center gap-1.5 text-[11px] text-neutral-600 font-semibold uppercase tracking-wide px-1 mt-2">
                   <div className="flex-1 border-t border-neutral-800/60" />
@@ -1456,6 +1586,7 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
                 renderBubble(item.msg, false, false, messages)
               )
             )}
+            </div>
 
             {/* Auto-promoted failing routine groups */}
             {promotedGroups.map(row => {
@@ -1488,7 +1619,7 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
 
             {/* Routine ops group — collapsed by default */}
             {routineOpen.length > 0 && (
-              <div className="border border-neutral-800/50 rounded-xl overflow-hidden">
+              <div ref={routineRefEl} className="border border-neutral-800/50 rounded-xl overflow-hidden">
                 <button
                   onClick={() => setRoutineExpanded(e => !e)}
                   className="w-full flex items-center gap-2 px-4 py-2.5 bg-neutral-900/40 hover:bg-neutral-900/70 transition-colors text-left min-h-[44px]"
