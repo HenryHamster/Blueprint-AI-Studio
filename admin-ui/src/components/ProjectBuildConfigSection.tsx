@@ -2,14 +2,7 @@ import { useState, useEffect } from 'react';
 import { Plus, Trash2, RefreshCw } from 'lucide-react';
 import type { BuildConfig, BuildConfigDirectory } from '../types/project';
 import { apiFetch } from '../api';
-
-const SR_CATEGORIES: { id: string; label: string }[] = [
-  { id: 'correctness', label: 'Correctness' },
-  { id: 'error-handling', label: 'Error Handling' },
-  { id: 'security', label: 'Security' },
-  { id: 'test-coverage', label: 'Test Coverage' },
-  { id: 'regression_risk', label: 'Regression Risk' },
-];
+import { SR_CANONICAL_CATEGORIES } from './SrTrendBreakdown';
 
 interface ProjectBuildConfigSectionProps {
   githubOwner: string | null;
@@ -358,8 +351,8 @@ export function ProjectBuildConfigSection({
           <p className="text-[11px] text-neutral-600 mb-3">
             Set a minimum hit-rate (%) per SR category. An alert fires when a category stays below target for ≥2 consecutive windows. Leave blank for no target.
           </p>
-          <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
-            {SR_CATEGORIES.map(({ id, label }) => (
+          <div className="grid grid-cols-3 gap-2">
+            {SR_CANONICAL_CATEGORIES.map(({ id, label }) => (
               <div key={id}>
                 <label className="block text-[10px] text-neutral-500 mb-0.5 uppercase">{label}</label>
                 <div className="flex items-center gap-1">

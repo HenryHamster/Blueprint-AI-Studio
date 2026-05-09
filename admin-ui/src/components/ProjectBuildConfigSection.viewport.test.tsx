@@ -41,6 +41,7 @@ describe('ProjectBuildConfigSection — viewport regression', () => {
             onSave={vi.fn(async () => {})}
             onDetect={vi.fn(async () => {})}
             detectAvailable={true}
+            projectId="test-project"
           />,
         );
       });
@@ -63,6 +64,7 @@ describe('ProjectBuildConfigSection — viewport regression', () => {
             onSave={vi.fn(async () => {})}
             onDetect={vi.fn(async () => {})}
             detectAvailable={true}
+            projectId="test-project"
           />,
         );
       });

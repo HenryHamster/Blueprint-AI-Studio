@@ -135,6 +135,22 @@ export interface SrCoFailurePair {
   lift: number;
 }
 
+// eslint-disable-next-line react-refresh/only-export-components
+export const SR_CANONICAL_CATEGORIES: { id: string; label: string }[] = [
+  { id: 'correctness', label: 'Correctness' },
+  { id: 'error-handling', label: 'Error Handling' },
+  { id: 'security', label: 'Security' },
+  { id: 'style-conventions', label: 'Style Conventions' },
+  { id: 'type-safety', label: 'Type Safety' },
+  { id: 'documentation', label: 'Documentation' },
+  { id: 'performance', label: 'Performance' },
+  { id: 'architecture', label: 'Architecture' },
+  { id: 'test-coverage', label: 'Test Coverage' },
+  { id: 'scope-drift', label: 'Scope Drift' },
+  { id: 'regression_risk', label: 'Regression Risk' },
+  { id: 'cross-system-contract', label: 'Cross-System Contract' },
+];
+
 export interface SrTrendData {
   computed_at?: string | null;
   bucket_mode?: 'cycle' | 'calendar' | null;
@@ -265,12 +281,14 @@ export function MissRateSparkline({
   height,
   stroke,
   title,
+  target,
 }: {
   history: number[];
   width: number;
   height: number;
   stroke: string;
   title?: string;
+  target?: number | null;
 }) {
   if (!history || history.length < 2) {
     return <span className="inline-block" style={{ width, height }} aria-hidden="true" />;
@@ -285,6 +303,19 @@ export function MissRateSparkline({
       return `${x.toFixed(1)},${y.toFixed(1)}`;
     })
     .join(' ');
+
+  const targetMissRate = target != null ? 1 - target : null;
+  const targetY = targetMissRate != null ? height - Math.max(0, Math.min(1, targetMissRate)) * height : null;
+  const targetPercent = target != null ? Math.round(target * 100) : null;
+
+  const combinedTitle = title
+    ? targetPercent != null
+      ? `${title} — target: ${targetPercent}% hit rate`
+      : title
+    : targetPercent != null
+      ? `target: ${targetPercent}% hit rate`
+      : undefined;
+
   return (
     <svg
       width={width}
@@ -292,11 +323,14 @@ export function MissRateSparkline({
       viewBox={`0 0 ${width} ${height}`}
       className="inline-block align-middle"
       aria-hidden="true"
-      role={title ? 'img' : undefined}
-      aria-label={title}
+      role={combinedTitle ? 'img' : undefined}
+      aria-label={combinedTitle}
     >
-      {title && <title>{title}</title>}
+      {combinedTitle && <title>{combinedTitle}</title>}
       <polyline fill="none" stroke={stroke} strokeWidth="1" points={points} />
+      {targetY != null && (
+        <line x1="0" y1={targetY} x2={width} y2={targetY} stroke="rgb(64, 64, 64)" strokeWidth="1" strokeDasharray="2,2" />
+      )}
     </svg>
   );
 }
@@ -941,6 +975,8 @@ interface SrTrendBreakdownProps {
   onCategoryClick?: (category: string) => void;
   /** Per-category minimum hit-rate targets configured by the operator. When unset, falls back to the default 50% floor. */
   srCatchRateTargets?: Record<string, number> | null;
+  /** Callback invoked when the user clicks the "configure targets" CTA. Parent is responsible for routing to the settings destination. */
+  onConfigureTargets?: () => void;
 }
 
 function CategoryRow({
@@ -1109,6 +1145,7 @@ function CategoryRow({
           height={12}
           stroke={trendStroke(c.trend, c.prompt_version_changed)}
           title={sparklineTitle}
+          target={targetHitRate}
         />
       </>
     );
@@ -1242,6 +1279,7 @@ function CategoryRow({
         height={10}
         stroke={trendStroke(c.trend, c.prompt_version_changed)}
         title={sparklineTitle}
+        target={targetHitRate}
       />
     </>
   );
@@ -1269,7 +1307,7 @@ function CategoryRow({
   );
 }
 
-export function SrTrendBreakdown({ trends, variant, onCategoryClick, srCatchRateTargets }: SrTrendBreakdownProps) {
+export function SrTrendBreakdown({ trends, variant, onCategoryClick, srCatchRateTargets, onConfigureTargets }: SrTrendBreakdownProps) {
   const categories = trends?.categories;
   if (!categories || Object.keys(categories).length === 0) return null;
   const entries = sortedEntries(categories);
@@ -1327,6 +1365,17 @@ export function SrTrendBreakdown({ trends, variant, onCategoryClick, srCatchRate
             </span>
           )}
         </div>
+        {!srCatchRateTargets || Object.keys(srCatchRateTargets).length === 0 ? (
+          <p className="text-[11px] text-neutral-400 hover:text-neutral-200 mb-1">
+            <button
+              onClick={onConfigureTargets}
+              className="hover:underline cursor-pointer"
+              data-testid="configure-targets-cta"
+            >
+              Configure SR catch-rate targets →
+            </button>
+          </p>
+        ) : null}
         {skipRate != null && (
           <p
             data-testid="sr-skip-rate-line"

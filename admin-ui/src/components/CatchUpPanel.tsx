@@ -22,6 +22,7 @@ import type { RecentCompletion, TimeWindow, DismissedState } from './catchupHelp
 import { WaitingBadge, CompletionRow, SkeletonRow } from './catchupRows';
 import { SrTrendBreakdown, type SrTrendData } from './SrTrendBreakdown';
 import { PipelineRegressionsPanel } from './DashboardHome';
+import type { Project } from '../types/project';
 
 interface NeedsAttentionItem {
   task_id: string;
@@ -340,6 +341,7 @@ interface DigestData {
 
 export interface CatchUpPanelProps {
   selectedProjectId: string | null;
+  projects?: Project[];
   lastVisitTimestamp: number | null;
   refreshInterval: number;
   onSelectTask: (task: { id: string }) => void;
@@ -352,7 +354,7 @@ export interface CatchUpPanelProps {
   wsRef?: RefObject<WebSocket | null>;
 }
 
-export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisitTimestamp, refreshInterval, onSelectTask, needsAttentionCount = 0, onApprove, onRetry, onBulkApprove, onBulkRetry, wsRef }: CatchUpPanelProps) {
+export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: _lastVisitTimestamp, refreshInterval, onSelectTask, needsAttentionCount = 0, onApprove, onRetry, onBulkApprove, onBulkRetry, wsRef }: CatchUpPanelProps) {
   // Track when the user last viewed the catch-up panel (not page load).
   // Read once on mount; updated when the user collapses the panel after reading.
   const [lastCatchUpViewed] = useState(() => getLastCatchUpViewed() ?? _lastVisitTimestamp);
@@ -402,6 +404,9 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const autoSectionExpandedRef = useRef(false);
   const dropdownRef = useRef<HTMLDivElement | null>(null);
+
+  const selectedProject = projects?.find(p => p.id === selectedProjectId);
+  const srCatchRateTargets = selectedProject?.sr_catch_rate_targets;
 
   const fetchDigest = useCallback(async (silent = false) => {
     if (!silent) setLoading(true);
@@ -2219,7 +2224,7 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                         {hasSpaTrends && (
                           <div className="flex flex-col gap-0.5">
                             <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Prediction by category</span>
-                            <SrTrendBreakdown trends={spaTrends} variant="inline" />
+                            <SrTrendBreakdown trends={spaTrends} variant="inline" srCatchRateTargets={srCatchRateTargets} />
                           </div>
                         )}
                         {ra && hasRa && (

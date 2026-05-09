@@ -189,4 +189,19 @@ describe('SrTrendBreakdown — viewport regression', () => {
       });
     });
   });
+
+  test('configure targets CTA renders without overflow at 375px when targets are empty', async () => {
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <SrTrendBreakdown trends={sampleTrends} variant="card" />,
+        );
+      });
+    });
+  });
 });

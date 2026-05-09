@@ -38,6 +38,7 @@ import { RecentlyResolvedRegressionsPanel } from './RecentlyResolvedRegressionsP
 import { ViewportDebtPanel } from './ViewportDebtPanel';
 import type { Task } from '../types/task';
 import type { ProjectDiagnostics } from '../types/diagnostics';
+import type { Project } from '../types/project';
 
 // ---------- local types ----------
 
@@ -448,6 +449,7 @@ function PipelineEfficiencyPanel({ projectId }: { projectId: string | null }) {
 export interface DashboardHomeProps {
   tasks: Task[];
   selectedProjectId: string | null;
+  projects?: Project[];
   onViewTask: (task: Task) => void;
   onDirectionClick?: (directionId: string) => void;
   onCategoryClick?: (category: string) => void;
@@ -693,7 +695,7 @@ const WINDOW_OPTIONS = [
   { label: '7d', value: 168 },
 ];
 
-export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectionClick, onCategoryClick }: DashboardHomeProps) {
+export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, onDirectionClick, onCategoryClick }: DashboardHomeProps) {
   const [digest, setDigest] = useState<DigestData | null>(null);
   const [diagnostics, setDiagnostics] = useState<ProjectDiagnostics | null>(null);
   const [openPRs, setOpenPRs] = useState<OpenPR[]>([]);
@@ -724,6 +726,9 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
   const [sparkData, setSparkData] = useState<SparkPoint[]>([]);
   const reviewQualitySectionRef = useRef<HTMLElement>(null);
 
+  const selectedProject = projects?.find(p => p.id === selectedProjectId);
+  const srCatchRateTargets = selectedProject?.sr_catch_rate_targets;
+
   // Fetch open PRs only — used by manual refresh button
   const fetchOpenPRs = useCallback(async () => {
     if (!selectedProjectId) return;
@@ -747,6 +752,11 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
 
   const handleScrollToReviewQuality = useCallback(() => {
     reviewQualitySectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }, []);
+
+  const handleConfigureTargets = useCallback(() => {
+    // Parent (App.tsx) is responsible for implementing the navigation to settings
+    // For now, this is a no-op callback that can be enhanced to navigate or show a modal
   }, []);
 
   // Fetch data
@@ -1384,6 +1394,8 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
                   trends={digest?.self_review_prediction_accuracy_trends}
                   variant="card"
                   onCategoryClick={handleCategoryClick}
+                  srCatchRateTargets={srCatchRateTargets}
+                  onConfigureTargets={handleConfigureTargets}
                 />
                 <FixIterationBreakdown trends={digest?.self_review_prediction_accuracy_trends} />
                 <EdgesTrendBreakdown trend={digest?.edges_trend} />

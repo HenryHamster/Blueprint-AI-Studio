@@ -8,6 +8,7 @@ import {
   EdgesTrendBreakdown,
   SrScopeDriftVsExpansionCard,
   SrReviewerDisagreementsPanel,
+  MissRateSparkline,
   type SrTrendData,
   type DirectionSrEntry,
   type EdgesTrend,
@@ -1532,5 +1533,142 @@ describe('SrTrendBreakdown by_scope section', () => {
     if (!button) throw new Error('expected at least one clickable category cell');
     await user.click(button);
     expect(section).toHaveTextContent('large-scope miss example');
+  });
+});
+
+describe('SrTrendBreakdown with srCatchRateTargets', () => {
+  it('renders with srCatchRateTargets prop passed through correctly', () => {
+    const trends: SrTrendData = {
+      categories: {
+        security: {
+          current_hit_rate: 0.65,
+          miss_rate: 0.35,
+          trend: 'stable',
+        },
+        correctness: {
+          current_hit_rate: 0.8,
+          miss_rate: 0.2,
+          trend: 'stable',
+        },
+      },
+    };
+    const targets = { security: 0.7, correctness: 0.75 };
+    const { container } = render(<SrTrendBreakdown trends={trends} variant="card" srCatchRateTargets={targets} />);
+    // Verify that the component renders successfully with targets
+    expect(container).toBeInTheDocument();
+    // Verify the categories are rendered
+    expect(screen.getByText(/security/i)).toBeInTheDocument();
+    expect(screen.getByText(/correctness/i)).toBeInTheDocument();
+  });
+});
+
+describe('SrTrendBreakdown onConfigureTargets CTA', () => {
+  const makeTrendsWithCategories = (): SrTrendData => ({
+    categories: {
+      correctness: {
+        miss_rate: 0.2,
+        trend: 'stable',
+      },
+    },
+  });
+
+  it('shows configure targets CTA when srCatchRateTargets is undefined', () => {
+    render(<SrTrendBreakdown trends={makeTrendsWithCategories()} variant="card" />);
+    expect(screen.getByTestId('configure-targets-cta')).toBeInTheDocument();
+    expect(screen.getByText(/Configure SR catch-rate targets/)).toBeInTheDocument();
+  });
+
+  it('shows configure targets CTA when srCatchRateTargets is empty object', () => {
+    render(<SrTrendBreakdown trends={makeTrendsWithCategories()} variant="card" srCatchRateTargets={{}} />);
+    expect(screen.getByTestId('configure-targets-cta')).toBeInTheDocument();
+  });
+
+  it('shows configure targets CTA when srCatchRateTargets is null', () => {
+    render(<SrTrendBreakdown trends={makeTrendsWithCategories()} variant="card" srCatchRateTargets={null} />);
+    expect(screen.getByTestId('configure-targets-cta')).toBeInTheDocument();
+  });
+
+  it('hides configure targets CTA when srCatchRateTargets has at least one entry', () => {
+    render(<SrTrendBreakdown trends={makeTrendsWithCategories()} variant="card" srCatchRateTargets={{ correctness: 0.8 }} />);
+    expect(screen.queryByTestId('configure-targets-cta')).not.toBeInTheDocument();
+  });
+
+  it('invokes onConfigureTargets callback when CTA is clicked', async () => {
+    const onConfigureTargets = vi.fn();
+    render(
+      <SrTrendBreakdown
+        trends={makeTrendsWithCategories()}
+        variant="card"
+        onConfigureTargets={onConfigureTargets}
+      />,
+    );
+    const button = screen.getByTestId('configure-targets-cta');
+    await userEvent.click(button);
+    expect(onConfigureTargets).toHaveBeenCalledOnce();
+  });
+
+  it('does not show CTA in inline variant even when targets are empty', () => {
+    render(<SrTrendBreakdown trends={makeTrendsWithCategories()} variant="inline" />);
+    expect(screen.queryByTestId('configure-targets-cta')).not.toBeInTheDocument();
+  });
+});
+
+describe('MissRateSparkline target reference line', () => {
+  it('renders a dashed horizontal line when target is provided', () => {
+    const { container } = render(
+      <MissRateSparkline
+        history={[0.9, 0.8, 0.75, 0.7]}
+        width={100}
+        height={50}
+        stroke="rgb(100, 200, 255)"
+        target={0.8}
+      />
+    );
+    const line = container.querySelector('line');
+    expect(line).toBeInTheDocument();
+    expect(line).toHaveAttribute('stroke', 'rgb(64, 64, 64)');
+    expect(line).toHaveAttribute('stroke-dasharray', '2,2');
+    expect(line).toHaveAttribute('x1', '0');
+    expect(line).toHaveAttribute('x2', '100');
+  });
+
+  it('does not render a dashed line when target is null or undefined', () => {
+    const { container: containerNull } = render(
+      <MissRateSparkline
+        history={[0.9, 0.8, 0.75, 0.7]}
+        width={100}
+        height={50}
+        stroke="rgb(100, 200, 255)"
+        target={null}
+      />
+    );
+    expect(containerNull.querySelector('line')).not.toBeInTheDocument();
+
+    const { container: containerUndefined } = render(
+      <MissRateSparkline
+        history={[0.9, 0.8, 0.75, 0.7]}
+        width={100}
+        height={50}
+        stroke="rgb(100, 200, 255)"
+      />
+    );
+    expect(containerUndefined.querySelector('line')).not.toBeInTheDocument();
+  });
+
+  it('includes target in aria-label when provided', () => {
+    const targetHitRate = 0.75;
+    const { container } = render(
+      <MissRateSparkline
+        history={[0.9, 0.8, 0.75, 0.7]}
+        width={100}
+        height={50}
+        stroke="rgb(100, 200, 255)"
+        target={targetHitRate}
+        title="miss rate trend"
+      />
+    );
+    const svg = container.querySelector('svg');
+    const expectedPercent = Math.round(targetHitRate * 100);
+    expect(svg).toHaveAttribute('aria-label', `miss rate trend — target: ${expectedPercent}% hit rate`);
   });
 });
