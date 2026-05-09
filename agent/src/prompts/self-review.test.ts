@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { formatSrBlindSpotThemesForSrPrompt, formatExecutionEvidenceForSrPrompt, formatSrRecentMissExamplesForSrPrompt, formatPersistentBlindSpotHintForSrPrompt, formatHighFpRateLoosenHintForSrPrompt } from './self-review.js';
+import { formatSrBlindSpotThemesForSrPrompt, formatExecutionEvidenceForSrPrompt, formatSrRecentMissExamplesForSrPrompt, formatPersistentBlindSpotHintForSrPrompt, formatHighFpRateLoosenHintForSrPrompt, formatSrCoFailurePairsForSrPrompt, formatSeverityCalibrationHintForSrPrompt } from './self-review.js';
 
 describe('formatHighFpRateLoosenHintForSrPrompt', () => {
   it('returns empty string for null, undefined, and empty object', () => {
@@ -299,5 +299,229 @@ describe('formatSrBlindSpotThemesForSrPrompt', () => {
     expect(result).toContain('theme 7');
     expect(result).not.toContain('theme 8');
     expect(result).not.toContain('theme 11');
+  });
+});
+
+describe('formatSrCoFailurePairsForSrPrompt', () => {
+  it('returns empty string for null', () => {
+    expect(formatSrCoFailurePairsForSrPrompt(null)).toBe('');
+  });
+
+  it('returns empty string for undefined', () => {
+    expect(formatSrCoFailurePairsForSrPrompt(undefined)).toBe('');
+  });
+
+  it('returns empty string for empty array', () => {
+    expect(formatSrCoFailurePairsForSrPrompt([])).toBe('');
+  });
+
+  it('returns empty string when all pairs below lift threshold', () => {
+    const result = formatSrCoFailurePairsForSrPrompt([
+      { cat_a: 'correctness', cat_b: 'test-coverage', lift: 1.2 },
+      { cat_a: 'security', cat_b: 'error-handling', lift: 1.1 },
+    ]);
+    expect(result).toBe('');
+  });
+
+  it('emits section with pairs above lift threshold', () => {
+    const result = formatSrCoFailurePairsForSrPrompt([
+      { cat_a: 'correctness', cat_b: 'test-coverage', lift: 2.3 },
+    ]);
+    expect(result).toContain('## Co-failure pairs');
+    expect(result).toContain('correctness');
+    expect(result).toContain('test-coverage');
+    expect(result).toContain('2.3x');
+  });
+
+  it('includes pairs at exact lift=1.5 boundary', () => {
+    const result = formatSrCoFailurePairsForSrPrompt([
+      { cat_a: 'type-safety', cat_b: 'regression_risk', lift: 1.5 },
+    ]);
+    expect(result).toContain('type-safety');
+    expect(result).toContain('regression_risk');
+  });
+
+  it('excludes pairs below lift=1.5 boundary', () => {
+    const result = formatSrCoFailurePairsForSrPrompt([
+      { cat_a: 'style-conventions', cat_b: 'documentation', lift: 1.49 },
+    ]);
+    expect(result).toBe('');
+  });
+
+  it('includes both above-threshold and excludes below-threshold pairs', () => {
+    const result = formatSrCoFailurePairsForSrPrompt([
+      { cat_a: 'correctness', cat_b: 'test-coverage', lift: 2.5 },
+      { cat_a: 'style-conventions', cat_b: 'documentation', lift: 1.2 },
+      { cat_a: 'security', cat_b: 'error-handling', lift: 3.1 },
+    ]);
+    expect(result).toContain('correctness');
+    expect(result).toContain('test-coverage');
+    expect(result).toContain('security');
+    expect(result).not.toContain('style-conventions');
+  });
+
+  it('caps output at 5 pairs', () => {
+    const pairs = Array.from({ length: 8 }, (_, i) => ({
+      cat_a: `cat_a_${i}`,
+      cat_b: `cat_b_${i}`,
+      lift: 2.0 + i * 0.1,
+    }));
+    const result = formatSrCoFailurePairsForSrPrompt(pairs);
+    expect(result).toContain('cat_a_0');
+    expect(result).toContain('cat_b_4');
+    expect(result).not.toContain('cat_a_5');
+  });
+
+  it('stays under ~800 chars even with many pairs', () => {
+    const pairs = Array.from({ length: 10 }, (_, i) => ({
+      cat_a: `very_long_category_name_${i}`,
+      cat_b: `another_very_long_category_name_${i}`,
+      lift: 2.5 + i * 0.1,
+    }));
+    const result = formatSrCoFailurePairsForSrPrompt(pairs);
+    expect(result.length).toBeLessThan(850);
+  });
+
+  it('instructs agent to re-check partner before marking PASS', () => {
+    const result = formatSrCoFailurePairsForSrPrompt([
+      { cat_a: 'correctness', cat_b: 'test-coverage', lift: 2.0 },
+    ]);
+    expect(result).toContain('re-check');
+    expect(result).toContain('before marking PASS');
+  });
+});
+
+describe('formatSeverityCalibrationHintForSrPrompt', () => {
+  it('returns empty string for null', () => {
+    expect(formatSeverityCalibrationHintForSrPrompt(null)).toBe('');
+  });
+
+  it('returns empty string for undefined', () => {
+    expect(formatSeverityCalibrationHintForSrPrompt(undefined)).toBe('');
+  });
+
+  it('returns empty string when input is empty object', () => {
+    expect(formatSeverityCalibrationHintForSrPrompt({})).toBe('');
+  });
+
+  it('returns empty string when no category meets 0.30 ratio threshold', () => {
+    const result = formatSeverityCalibrationHintForSrPrompt({
+      correctness: {
+        severity_calibration: { under_rated: 1, over_rated: 0, matched: 9, total: 10 },
+      },
+    });
+    expect(result).toBe('');
+  });
+
+  it('returns empty string when total is below 5 samples threshold', () => {
+    const result = formatSeverityCalibrationHintForSrPrompt({
+      correctness: {
+        severity_calibration: { under_rated: 2, over_rated: 0, matched: 1, total: 3 },
+      },
+    });
+    expect(result).toBe('');
+  });
+
+  it('includes heading when under_rated threshold is met', () => {
+    const result = formatSeverityCalibrationHintForSrPrompt({
+      correctness: {
+        severity_calibration: { under_rated: 3, over_rated: 0, matched: 2, total: 5 },
+      },
+    });
+    expect(result).toContain('## Severity calibration tightening');
+    expect(result).toContain('under-rated');
+  });
+
+  it('includes heading when over_rated threshold is met', () => {
+    const result = formatSeverityCalibrationHintForSrPrompt({
+      correctness: {
+        severity_calibration: { under_rated: 0, over_rated: 3, matched: 2, total: 5 },
+      },
+    });
+    expect(result).toContain('## Severity calibration tightening');
+    expect(result).toContain('over-rated');
+  });
+
+  it('surfaces both under_rated and over_rated when both thresholds met', () => {
+    const result = formatSeverityCalibrationHintForSrPrompt({
+      correctness: {
+        severity_calibration: { under_rated: 3, over_rated: 0, matched: 2, total: 5 },
+      },
+      security: {
+        severity_calibration: { under_rated: 0, over_rated: 2, matched: 3, total: 5 },
+      },
+    });
+    expect(result).toContain('under-rated');
+    expect(result).toContain('over-rated');
+    expect(result).toContain('correctness');
+    expect(result).toContain('security');
+  });
+
+  it('caps to top 3 under_rated categories by ratio', () => {
+    const result = formatSeverityCalibrationHintForSrPrompt({
+      cat1: { severity_calibration: { under_rated: 4, over_rated: 0, matched: 1, total: 5 } },
+      cat2: { severity_calibration: { under_rated: 3, over_rated: 0, matched: 2, total: 5 } },
+      cat3: { severity_calibration: { under_rated: 2, over_rated: 0, matched: 3, total: 5 } },
+      cat4: { severity_calibration: { under_rated: 2, over_rated: 0, matched: 3, total: 5 } },
+    });
+    expect(result).toContain('cat1');
+    expect(result).toContain('cat2');
+    expect(result).toContain('cat3');
+    expect(result).not.toContain('cat4');
+  });
+
+  it('includes percentage and sample size for under_rated category', () => {
+    const result = formatSeverityCalibrationHintForSrPrompt({
+      correctness: {
+        severity_calibration: { under_rated: 3, over_rated: 0, matched: 2, total: 10 },
+      },
+    });
+    expect(result).toContain('30%');
+    expect(result).toContain('n=10');
+  });
+
+  it('rounds percentages correctly', () => {
+    const result = formatSeverityCalibrationHintForSrPrompt({
+      correctness: {
+        severity_calibration: { under_rated: 3, over_rated: 0, matched: 7, total: 10 },
+      },
+    });
+    expect(result).toContain('30%');
+  });
+
+  it('ends with double newline when populated', () => {
+    const result = formatSeverityCalibrationHintForSrPrompt({
+      correctness: {
+        severity_calibration: { under_rated: 3, over_rated: 0, matched: 2, total: 5 },
+      },
+    });
+    expect(result.endsWith('\n\n')).toBe(true);
+  });
+
+  it('ignores categories without severity_calibration', () => {
+    const result = formatSeverityCalibrationHintForSrPrompt({
+      correctness: { severity_calibration: { under_rated: 3, over_rated: 0, matched: 2, total: 5 } },
+      security: {},
+    });
+    expect(result).toContain('correctness');
+    expect(result).not.toContain('security');
+  });
+
+  it('includes LEAN toward MAJOR for under_rated guidance', () => {
+    const result = formatSeverityCalibrationHintForSrPrompt({
+      correctness: {
+        severity_calibration: { under_rated: 3, over_rated: 0, matched: 2, total: 5 },
+      },
+    });
+    expect(result).toContain('MAJOR');
+  });
+
+  it('includes LEAN toward MINOR for over_rated guidance', () => {
+    const result = formatSeverityCalibrationHintForSrPrompt({
+      correctness: {
+        severity_calibration: { under_rated: 0, over_rated: 3, matched: 2, total: 5 },
+      },
+    });
+    expect(result).toContain('MINOR');
   });
 });

@@ -14935,3 +14935,310 @@ async def test_acknowledge_regression_case_not_found(client: AsyncClient, db_ses
         params={"project_id": str(project.id)},
     )
     assert response.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# _evaluate_sr_catch_rate_targets tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_evaluate_sr_catch_rate_targets_fires_after_2_windows(db_session):
+    """Alert fires when >=2 consecutive windows are below the configured target."""
+    from app.routers.admin_digest import _evaluate_sr_catch_rate_targets
+    from app.models import Alert, AlertSeverity
+
+    project = make_project()
+    project.sr_catch_rate_targets = {"correctness": 0.80}
+    project.design_doc = {
+        "sr_catch_rate_trends": {
+            "categories": {
+                "correctness": {
+                    "current_hit_rate": 0.60,
+                    "rate_history": [0.62, 0.60],
+                    "trend": "decreasing",
+                }
+            }
+        }
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _evaluate_sr_catch_rate_targets(db_session, project.id)
+
+    alerts = (
+        (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.severity == AlertSeverity.WARNING,
+                    Alert.title == "SR catch-rate below target: correctness",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+    assert "0.80" in alerts[0].message or "80%" in alerts[0].message
+
+
+@pytest.mark.asyncio
+async def test_evaluate_sr_catch_rate_targets_suppressed_on_1_window(db_session):
+    """Alert is NOT emitted when only 1 window is below target."""
+    from app.routers.admin_digest import _evaluate_sr_catch_rate_targets
+    from app.models import Alert
+
+    project = make_project()
+    project.sr_catch_rate_targets = {"security": 0.75}
+    project.design_doc = {
+        "sr_catch_rate_trends": {
+            "categories": {
+                "security": {
+                    "current_hit_rate": 0.60,
+                    "rate_history": [0.60],
+                    "trend": "stable",
+                }
+            }
+        }
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _evaluate_sr_catch_rate_targets(db_session, project.id)
+
+    alerts = (
+        (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.title == "SR catch-rate below target: security",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 0
+
+
+@pytest.mark.asyncio
+async def test_evaluate_sr_catch_rate_targets_resolves_on_recovery(db_session):
+    """Existing alert is dismissed when category recovers above target."""
+    from app.routers.admin_digest import _evaluate_sr_catch_rate_targets
+    from app.models import Alert, AlertSeverity
+
+    project = make_project()
+    project.sr_catch_rate_targets = {"regression_risk": 0.70}
+    project.design_doc = {
+        "sr_catch_rate_trends": {
+            "categories": {
+                "regression_risk": {
+                    "current_hit_rate": 0.85,
+                    "rate_history": [0.85],
+                    "trend": "increasing",
+                }
+            }
+        }
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Seed an existing undismissed alert.
+    existing_alert = Alert(
+        project_id=project.id,
+        severity=AlertSeverity.WARNING,
+        title="SR catch-rate below target: regression_risk",
+        message="old alert",
+    )
+    db_session.add(existing_alert)
+    await db_session.commit()
+    await db_session.refresh(existing_alert)
+
+    await _evaluate_sr_catch_rate_targets(db_session, project.id)
+
+    await db_session.refresh(existing_alert)
+    assert existing_alert.dismissed_at is not None
+
+
+@pytest.mark.asyncio
+async def test_evaluate_sr_catch_rate_targets_no_fire_when_unset(db_session):
+    """No alert fires when sr_catch_rate_targets is empty."""
+    from app.routers.admin_digest import _evaluate_sr_catch_rate_targets
+    from app.models import Alert
+
+    project = make_project()
+    project.sr_catch_rate_targets = {}
+    project.design_doc = {
+        "sr_catch_rate_trends": {
+            "categories": {
+                "correctness": {
+                    "current_hit_rate": 0.30,
+                    "rate_history": [0.30, 0.35],
+                    "trend": "stable",
+                }
+            }
+        }
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _evaluate_sr_catch_rate_targets(db_session, project.id)
+
+    count = len(
+        (await db_session.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert count == 0
+
+
+@pytest.mark.asyncio
+async def test_evaluate_sr_catch_rate_targets_prompt_version_changed_suppression(
+    db_session,
+):
+    """Alert is suppressed when prompt_version_changed is True."""
+    from app.routers.admin_digest import _evaluate_sr_catch_rate_targets
+    from app.models import Alert
+
+    project = make_project()
+    project.sr_catch_rate_targets = {"correctness": 0.80}
+    project.design_doc = {
+        "sr_catch_rate_trends": {
+            "prompt_version_changed": True,
+            "categories": {
+                "correctness": {
+                    "current_hit_rate": 0.50,
+                    "rate_history": [0.50, 0.48],
+                    "trend": "decreasing",
+                }
+            },
+        }
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _evaluate_sr_catch_rate_targets(db_session, project.id)
+
+    alerts = (
+        (await db_session.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 0
+
+
+# ---------------------------------------------------------------------------
+# _evaluate_lone_checker_alert tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_evaluate_lone_checker_alert_fires_on_2_lone_checker_categories(
+    db_session,
+):
+    """Alert fires when >=2 categories have time_to_miss_detect_lone_checker=True."""
+    from app.routers.admin_digest import _evaluate_lone_checker_alert
+    from app.models import Alert, AlertSeverity
+
+    project = make_project()
+    project.design_doc = {
+        "sr_catch_rate_trends": {
+            "categories": {
+                "security": {"time_to_miss_detect_lone_checker": True},
+                "regression_risk": {"time_to_miss_detect_lone_checker": True},
+                "correctness": {"time_to_miss_detect_lone_checker": False},
+            }
+        }
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _evaluate_lone_checker_alert(db_session, project.id)
+
+    alerts = (
+        (await db_session.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.WARNING
+    assert "lone-checker" in alerts[0].title.lower()
+    assert "security" in alerts[0].message
+    assert "regression_risk" in alerts[0].message
+
+
+@pytest.mark.asyncio
+async def test_evaluate_lone_checker_alert_no_fire_on_1_category(db_session):
+    """Alert does not fire when only one category is in lone-checker state."""
+    from app.routers.admin_digest import _evaluate_lone_checker_alert
+    from app.models import Alert
+
+    project = make_project()
+    project.design_doc = {
+        "sr_catch_rate_trends": {
+            "categories": {
+                "security": {"time_to_miss_detect_lone_checker": True},
+                "correctness": {"time_to_miss_detect_lone_checker": False},
+            }
+        }
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _evaluate_lone_checker_alert(db_session, project.id)
+
+    count = len(
+        (await db_session.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert count == 0
+
+
+@pytest.mark.asyncio
+async def test_evaluate_lone_checker_alert_dedup(db_session):
+    """Alert is not duplicated if an open alert with the same title already exists."""
+    from app.routers.admin_digest import (
+        _evaluate_lone_checker_alert,
+        _LONE_CHECKER_ALERT_TITLE,
+    )
+    from app.models import Alert, AlertSeverity
+
+    project = make_project()
+    project.design_doc = {
+        "sr_catch_rate_trends": {
+            "categories": {
+                "security": {"time_to_miss_detect_lone_checker": True},
+                "regression_risk": {"time_to_miss_detect_lone_checker": True},
+            }
+        }
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    existing = Alert(
+        project_id=project.id,
+        severity=AlertSeverity.WARNING,
+        title=_LONE_CHECKER_ALERT_TITLE,
+        message="existing",
+    )
+    db_session.add(existing)
+    await db_session.commit()
+
+    await _evaluate_lone_checker_alert(db_session, project.id)
+
+    all_alerts = (
+        (await db_session.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert len(all_alerts) == 1

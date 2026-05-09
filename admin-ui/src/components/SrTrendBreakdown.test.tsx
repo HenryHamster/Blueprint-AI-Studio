@@ -795,6 +795,83 @@ describe('SrTrendBreakdown below_floor from backend', () => {
   });
 });
 
+describe('SrTrendBreakdown srCatchRateTargets per-category floor', () => {
+  it('shows below-floor icon when category is below configured target (no backend below_floor)', () => {
+    const trends: SrTrendData = {
+      categories: {
+        security: {
+          current_hit_rate: 0.72,
+          trend: 'stable',
+          rate_history: [0.72, 0.74],  // above default 50% floor, but below configured 0.80
+        },
+      },
+    };
+    render(<SrTrendBreakdown trends={trends} variant="card" srCatchRateTargets={{ security: 0.80 }} />);
+    const alertSpan = screen.getByLabelText(/below floor/i);
+    expect(alertSpan).toBeInTheDocument();
+    expect(alertSpan.querySelector('svg')).toBeInTheDocument();
+  });
+
+  it('tooltip shows configured target percentage when srCatchRateTargets is set', () => {
+    const trends: SrTrendData = {
+      categories: {
+        security: {
+          current_hit_rate: 0.72,
+          trend: 'stable',
+          rate_history: [0.72, 0.74],
+        },
+      },
+    };
+    render(<SrTrendBreakdown trends={trends} variant="card" srCatchRateTargets={{ security: 0.80 }} />);
+    const alertSpan = screen.getByLabelText(/below floor/i);
+    expect(alertSpan.getAttribute('title')).toContain('80%');
+    expect(alertSpan.getAttribute('title')).toContain('configured target');
+  });
+
+  it('does not show below-floor icon when category is above configured target', () => {
+    const trends: SrTrendData = {
+      categories: {
+        security: {
+          current_hit_rate: 0.85,
+          trend: 'stable',
+          rate_history: [0.85, 0.87],  // above both default 50% and configured 0.80 target
+        },
+      },
+    };
+    render(<SrTrendBreakdown trends={trends} variant="card" srCatchRateTargets={{ security: 0.80 }} />);
+    expect(screen.queryByLabelText(/below floor/i)).not.toBeInTheDocument();
+  });
+
+  it('falls back to default 50% floor when srCatchRateTargets is not set', () => {
+    const trends: SrTrendData = {
+      categories: {
+        correctness: {
+          current_hit_rate: 0.6,
+          trend: 'stable',
+          rate_history: [0.6, 0.62],  // above 50% floor — should NOT trigger
+        },
+      },
+    };
+    render(<SrTrendBreakdown trends={trends} variant="card" />);
+    expect(screen.queryByLabelText(/below floor/i)).not.toBeInTheDocument();
+  });
+
+  it('backend below_floor overrides srCatchRateTargets local derivation', () => {
+    const trends: SrTrendData = {
+      categories: {
+        correctness: {
+          current_hit_rate: 0.72,
+          trend: 'stable',
+          rate_history: [0.72, 0.74],
+          below_floor: true,  // backend forces the flag regardless of target
+        },
+      },
+    };
+    render(<SrTrendBreakdown trends={trends} variant="card" srCatchRateTargets={{ correctness: 0.80 }} />);
+    expect(screen.getByLabelText(/below floor/i)).toBeInTheDocument();
+  });
+});
+
 describe('SrTrendBreakdown by_fix_iteration section', () => {
   function makeIterTrends(byFixIteration: SrTrendData['by_fix_iteration']): SrTrendData {
     return {

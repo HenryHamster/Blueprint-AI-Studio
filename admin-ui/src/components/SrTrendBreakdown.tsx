@@ -939,6 +939,8 @@ interface SrTrendBreakdownProps {
   trends: SrTrendData | null | undefined;
   variant: 'card' | 'inline';
   onCategoryClick?: (category: string) => void;
+  /** Per-category minimum hit-rate targets configured by the operator. When unset, falls back to the default 50% floor. */
+  srCatchRateTargets?: Record<string, number> | null;
 }
 
 function CategoryRow({
@@ -946,10 +948,12 @@ function CategoryRow({
   c,
   variant,
   onCategoryClick,
+  targetHitRate,
 }: {
   cat: string;
   c: SrCategoryTrend;
   variant: 'card' | 'inline';
+  targetHitRate?: number | null;
   onCategoryClick?: (category: string) => void;
 }) {
   const [open, setOpen] = useState(false);
@@ -961,8 +965,9 @@ function CategoryRow({
   const color = trendColorClass(c.trend);
   const delta = calculateMissRateDelta(c);
   const deltaColor = delta != null ? deltaColorClass(delta) : '';
+  const effectiveFloor = targetHitRate ?? FLOOR_HIT_RATE;
   // Use backend below_floor if provided; fall back to local derivation for backward compat
-  const belowFloor = c.below_floor != null ? c.below_floor : isBelowFloor(c);
+  const belowFloor = c.below_floor != null ? c.below_floor : isBelowFloor(c, effectiveFloor);
   const quadrant = c.precision_recall_quadrant;
   const quadrantBadge = (() => {
     if (!quadrant || quadrant === 'healthy' || quadrant === 'mixed' || quadrant === 'flat') return null;
@@ -1082,7 +1087,7 @@ function CategoryRow({
         {belowFloor && (
           <span
             className="shrink-0"
-            title={`Hit rate stuck below ${Math.round(FLOOR_HIT_RATE * 100)}% for ${FLOOR_MIN_WINDOWS}+ windows`}
+            title={`Hit rate stuck below ${Math.round(effectiveFloor * 100)}%${targetHitRate != null ? ' (configured target)' : ''} for ${FLOOR_MIN_WINDOWS}+ windows`}
             aria-label="below floor"
           >
             <AlertTriangle className="w-3 h-3 text-orange-400" />
@@ -1264,7 +1269,7 @@ function CategoryRow({
   );
 }
 
-export function SrTrendBreakdown({ trends, variant, onCategoryClick }: SrTrendBreakdownProps) {
+export function SrTrendBreakdown({ trends, variant, onCategoryClick, srCatchRateTargets }: SrTrendBreakdownProps) {
   const categories = trends?.categories;
   if (!categories || Object.keys(categories).length === 0) return null;
   const entries = sortedEntries(categories);
@@ -1341,7 +1346,7 @@ export function SrTrendBreakdown({ trends, variant, onCategoryClick }: SrTrendBr
             <>
               <div className="flex flex-col gap-0.5">
                 {regularEntries.map(([cat, c]) => (
-                  <CategoryRow key={cat} cat={cat} c={c} variant="card" onCategoryClick={onCategoryClick} />
+                  <CategoryRow key={cat} cat={cat} c={c} variant="card" onCategoryClick={onCategoryClick} targetHitRate={srCatchRateTargets?.[cat] ?? null} />
                 ))}
               </div>
               {execEntries.length > 0 && (
@@ -1349,7 +1354,7 @@ export function SrTrendBreakdown({ trends, variant, onCategoryClick }: SrTrendBr
                   <p className="text-[9px] text-neutral-500 uppercase tracking-wide mb-0.5">Execution Evidence</p>
                   <div className="flex flex-col gap-0.5">
                     {execEntries.map(([cat, c]) => (
-                      <CategoryRow key={cat} cat={cat} c={c} variant="card" onCategoryClick={onCategoryClick} />
+                      <CategoryRow key={cat} cat={cat} c={c} variant="card" onCategoryClick={onCategoryClick} targetHitRate={srCatchRateTargets?.[cat] ?? null} />
                     ))}
                   </div>
                 </div>
@@ -1379,7 +1384,7 @@ export function SrTrendBreakdown({ trends, variant, onCategoryClick }: SrTrendBr
         <SeveritySection bySeverity={trends.by_severity} inline />
       )}
       {entries.map(([cat, c]) => (
-        <CategoryRow key={cat} cat={cat} c={c} variant="inline" onCategoryClick={onCategoryClick} />
+        <CategoryRow key={cat} cat={cat} c={c} variant="inline" onCategoryClick={onCategoryClick} targetHitRate={srCatchRateTargets?.[cat] ?? null} />
       ))}
     </div>
   );

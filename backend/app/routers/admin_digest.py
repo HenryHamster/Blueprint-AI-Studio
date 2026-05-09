@@ -82,6 +82,150 @@ _REGRESSION_STALL_THRESHOLD_HOURS = (
     4  # ACTIVE case without PR older than this → stalled
 )
 _SIGNAL_STALENESS_TITLE_PREFIX = "Signal staleness: "
+_SR_CATCH_RATE_TARGET_ALERT_PREFIX = "SR catch-rate below target: "
+_SR_CATCH_RATE_TARGET_MIN_WINDOWS = 2
+_LONE_CHECKER_ALERT_TITLE = "SR lone-checker blind spot: ≥2 categories uncorroborated"
+_LONE_CHECKER_MIN_CATEGORIES = 2
+
+
+async def _evaluate_sr_catch_rate_targets(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> None:
+    """Emit/dismiss WARNING Alerts for per-category SR catch-rate targets.
+
+    For each category in project.sr_catch_rate_targets, emits a WARNING Alert
+    when rate_history shows >=2 consecutive windows below the configured target.
+    Dismisses existing alerts when the category recovers. Suppressed when
+    prompt_version_changed is True (avoids false alarms during prompt rollouts).
+    """
+    project = await session.get(Project, project_id)
+    if not project:
+        return
+    targets: Dict[str, Any] = project.sr_catch_rate_targets or {}
+    if not targets:
+        return
+    doc = project.design_doc or {}
+    sr_trends = doc.get("sr_catch_rate_trends") or {}
+    if sr_trends.get("prompt_version_changed"):
+        return
+    categories = sr_trends.get("categories") or {}
+    for cat, target in targets.items():
+        try:
+            target_float = float(target)
+        except (TypeError, ValueError):
+            continue
+        cat_data = categories.get(cat) or {}
+        current_hit_rate = cat_data.get("current_hit_rate")
+        title = f"{_SR_CATCH_RATE_TARGET_ALERT_PREFIX}{cat}"
+
+        existing = (
+            (
+                await session.execute(
+                    select(Alert).where(
+                        Alert.project_id == project_id,
+                        Alert.task_id.is_(None),
+                        Alert.severity == AlertSeverity.WARNING,
+                        Alert.dismissed_at.is_(None),
+                        Alert.title == title,
+                    )
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if current_hit_rate is not None and current_hit_rate >= target_float:
+            if existing is not None:
+                existing.dismissed_at = _utcnow()
+                await session.commit()
+            continue
+        rate_history = cat_data.get("rate_history") or []
+        if len(rate_history) < _SR_CATCH_RATE_TARGET_MIN_WINDOWS:
+            continue
+        if not all(
+            r < target_float for r in rate_history[-_SR_CATCH_RATE_TARGET_MIN_WINDOWS:]
+        ):
+            continue
+        if existing is not None:
+            continue
+        trend = cat_data.get("trend") or "unknown"
+        curr_str = f"{current_hit_rate:.0%}" if current_hit_rate is not None else "n/a"
+        message = (
+            f"Self-review catch-rate for '{cat}' has been below the configured target "
+            f"({target_float:.0%}) for the last {_SR_CATCH_RATE_TARGET_MIN_WINDOWS} "
+            f"measurement windows. Current: {curr_str}. Trend: {trend}. "
+            f"Review the SR Trend Breakdown in the admin dashboard."
+        )
+        session.add(
+            Alert(
+                project_id=project_id,
+                severity=AlertSeverity.WARNING,
+                title=title,
+                message=message[:1000],
+            )
+        )
+        await session.commit()
+
+
+async def _evaluate_lone_checker_alert(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> None:
+    """Open a WARNING Alert when >=2 categories are in lone-checker state.
+
+    Lone-checker means SR is the only reviewer for a category, so an SR PASS
+    is uncorroborated and catch-rate measurement is unreliable.  Dedup mirrors
+    _evaluate_sr_catch_rate_targets — skip if an open Alert with the same title
+    already exists.
+    """
+    project = await session.get(Project, project_id)
+    if not project:
+        return
+    doc = project.design_doc or {}
+    categories = (doc.get("sr_catch_rate_trends") or {}).get("categories") or {}
+    lone_cats = [
+        cat
+        for cat, data in categories.items()
+        if (data or {}).get("time_to_miss_detect_lone_checker")
+    ]
+    if len(lone_cats) < _LONE_CHECKER_MIN_CATEGORIES:
+        return
+
+    existing = (
+        (
+            await session.execute(
+                select(Alert).where(
+                    Alert.project_id == project_id,
+                    Alert.task_id.is_(None),
+                    Alert.severity == AlertSeverity.WARNING,
+                    Alert.dismissed_at.is_(None),
+                    Alert.title == _LONE_CHECKER_ALERT_TITLE,
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if existing is not None:
+        return
+
+    cats_str = ", ".join(sorted(lone_cats))
+    message = (
+        f"{len(lone_cats)} categories have entered lone-checker state "
+        f"(SR is the only reviewer, catch-rate unmeasurable): {cats_str}. "
+        f"Fresh-reviewer is auto-enabled for tasks whose risk surface overlaps "
+        f"these categories. Operator action: arrange human review coverage or "
+        f"adjust category scope to exit lone-checker state."
+    )
+    session.add(
+        Alert(
+            project_id=project_id,
+            severity=AlertSeverity.WARNING,
+            title=_LONE_CHECKER_ALERT_TITLE,
+            message=message[:1000],
+        )
+    )
+    await session.commit()
 
 
 def _stash_projected_task_fields(

@@ -11848,3 +11848,69 @@ async def test_compute_sr_catch_rate_trends_includes_co_failure_pairs(
     assert result is not None
     assert "co_failure_pairs" in result
     assert isinstance(result["co_failure_pairs"], list)
+
+
+# ---------------------------------------------------------------------------
+# lone_checker_recovery origin attribution in catch-rate stats
+# ---------------------------------------------------------------------------
+
+
+def test_stats_for_tasks_lone_checker_recovery_is_reviewer_save():
+    """lone_checker_recovery origin counts as reviewer_save, not sr_alone."""
+    import uuid as _uuid
+    from app.playbook_learning import _stats_for_tasks
+
+    project_id = _uuid.uuid4()
+    check_results = {
+        "security": {
+            "passed": False,
+            "origin": "lone_checker_recovery",
+            "issue": "fresh-reviewer caught this",
+        }
+    }
+    ctx = {
+        "_self_review_outcome": {"check_results": check_results},
+        "_first_attempt_rejection_categories": {"security": 1},
+    }
+    t = Task(
+        project_id=project_id,
+        title="lone checker task",
+        payloads=[{"type": "create", "prompt": "p"}],
+        status=TaskStatus.COMPLETED,
+        context=ctx,
+    )
+    _, cat_stats, _, _, _, _ = _stats_for_tasks([t])
+    assert "security" in cat_stats
+    assert cat_stats["security"]["reviewer_save_hit_count"] == 1
+    assert cat_stats["security"]["sr_alone_hit_count"] == 0
+
+
+def test_stats_for_tasks_lone_checker_recovery_excluded_from_sr_failed_author():
+    """lone_checker_recovery findings are not counted as author SR false positives."""
+    import uuid as _uuid
+    from app.playbook_learning import _stats_for_tasks
+
+    project_id = _uuid.uuid4()
+    # SR passed (lone-checker reviewer flagged security), human did NOT reject.
+    check_results = {
+        "security": {
+            "passed": False,
+            "origin": "lone_checker_recovery",
+            "issue": "fresh-reviewer only",
+        }
+    }
+    ctx = {
+        "_self_review_outcome": {"check_results": check_results},
+        "_first_attempt_rejection_categories": {},
+    }
+    t = Task(
+        project_id=project_id,
+        title="lone checker no human rejection",
+        payloads=[{"type": "create", "prompt": "p"}],
+        status=TaskStatus.COMPLETED,
+        context=ctx,
+    )
+    _, cat_stats, _, _, _, _ = _stats_for_tasks([t])
+    # lone_checker_recovery is not an author SR failure, so fp_count must be 0.
+    security = cat_stats.get("security", {})
+    assert security.get("fp_count", 0) == 0

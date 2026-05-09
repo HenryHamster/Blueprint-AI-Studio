@@ -1304,6 +1304,7 @@ AGENT_SELF_REVIEW_CATEGORIES = frozenset(
         "test-coverage",
         "scope-drift",
         "regression_risk",
+        "cross-system-contract",
     }
 )
 

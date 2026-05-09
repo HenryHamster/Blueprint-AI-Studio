@@ -289,6 +289,13 @@ class Project(SQLModel, table=True):
         default_factory=dict,
         sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
     )
+    # Per-category self-review catch-rate targets set by the operator.
+    # Shape: {category_id: float} e.g. {'security': 0.80, 'regression_risk': 0.75}.
+    # Absent key = no target configured for that category (default: no alerting).
+    sr_catch_rate_targets: Dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
+    )
 
     tasks: List["Task"] = Relationship(
         back_populates="project",

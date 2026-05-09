@@ -249,3 +249,90 @@ export function formatSrBlindSpotThemesForSrPrompt(
     `${rows}\n\n`
   );
 }
+
+// Format co-failure pairs for injection into the agent's self-review prompt.
+// When categories A and B are missed together at a significantly higher rate than
+// by chance (lift > 1), fixing A requires re-checking B — single prompt fix addressable.
+// Returns '' when pairs is empty, null, or undefined, or below a lift threshold.
+// Shape: [{ cat_a, cat_b, co_fail_count, p_b_given_a, base_rate_b, lift }, ...]
+export function formatSrCoFailurePairsForSrPrompt(
+  pairs: Array<{ cat_a: string; cat_b: string; lift: number }> | null | undefined,
+): string {
+  if (!pairs || pairs.length === 0) return '';
+  const MIN_LIFT_THRESHOLD = 1.5;
+  const filtered = pairs.filter(p => p.lift >= MIN_LIFT_THRESHOLD);
+  if (filtered.length === 0) return '';
+  const rows = filtered.slice(0, 5).map(p => `- When you flag/miss **${p.cat_a}**, re-check **${p.cat_b}** before marking PASS (lift ${p.lift.toFixed(1)}x)`).join('\n');
+  return (
+    `## Co-failure pairs — re-check before marking PASS\n` +
+    `These categories frequently miss together. After you finish one, revisit its partner:\n` +
+    `${rows}\n\n`
+  );
+}
+
+// Format severity calibration hints for injection into the agent's self-review prompt.
+// Shows categories where the agent has been chronically under-rating (should lean toward major)
+// or over-rating (should lean toward minor) severity. When a category's under_rated/total
+// or over_rated/total ratio >= 0.30 and total >= 5, surfaces the pattern with a brief nudge.
+// Caps to top 3 categories by ratio. Returns '' when no categories meet thresholds.
+export function formatSeverityCalibrationHintForSrPrompt(
+  categories: Record<string, { severity_calibration?: { under_rated?: number; over_rated?: number; matched?: number; total?: number } }> | null | undefined,
+): string {
+  if (!categories || typeof categories !== 'object') return '';
+
+  const RATIO_THRESHOLD = 0.30;
+  const MIN_SAMPLES = 5;
+  const MAX_CATS = 3;
+
+  const underRated: Array<{ cat: string; ratio: number; total: number }> = [];
+  const overRated: Array<{ cat: string; ratio: number; total: number }> = [];
+
+  for (const [cat, data] of Object.entries(categories)) {
+    const cal = data.severity_calibration;
+    if (!cal || typeof cal !== 'object') continue;
+
+    const total = typeof cal.total === 'number' ? cal.total : 0;
+    if (total < MIN_SAMPLES) continue;
+
+    const underCount = typeof cal.under_rated === 'number' ? cal.under_rated : 0;
+    const overCount = typeof cal.over_rated === 'number' ? cal.over_rated : 0;
+
+    const underRatio = underCount / total;
+    const overRatio = overCount / total;
+
+    if (underRatio >= RATIO_THRESHOLD) {
+      underRated.push({ cat, ratio: underRatio, total });
+    }
+    if (overRatio >= RATIO_THRESHOLD) {
+      overRated.push({ cat, ratio: overRatio, total });
+    }
+  }
+
+  // Sort by ratio descending and cap to top 3
+  underRated.sort((a, b) => b.ratio - a.ratio);
+  overRated.sort((a, b) => b.ratio - a.ratio);
+
+  const topUnderRated = underRated.slice(0, MAX_CATS);
+  const topOverRated = overRated.slice(0, MAX_CATS);
+
+  if (topUnderRated.length === 0 && topOverRated.length === 0) return '';
+
+  const lines: string[] = ['## Severity calibration tightening'];
+  if (topUnderRated.length > 0) {
+    lines.push(`You have under-rated severity in these categories (leaning toward MINOR when the issue warrants MAJOR). Lean toward MAJOR when in doubt:`);
+    for (const item of topUnderRated) {
+      const percent = Math.round(item.ratio * 100);
+      lines.push(`- ${item.cat}: ${percent}% under-rated (n=${item.total})`);
+    }
+  }
+  if (topOverRated.length > 0) {
+    if (topUnderRated.length > 0) lines.push('');
+    lines.push(`You have over-rated severity in these categories (leaning toward MAJOR when MINOR is more appropriate). Lean toward MINOR when in doubt:`);
+    for (const item of topOverRated) {
+      const percent = Math.round(item.ratio * 100);
+      lines.push(`- ${item.cat}: ${percent}% over-rated (n=${item.total})`);
+    }
+  }
+
+  return lines.join('\n') + '\n\n';
+}

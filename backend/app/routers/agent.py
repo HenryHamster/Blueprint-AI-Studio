@@ -64,7 +64,10 @@ from app.github import (
     create_check_run,
 )
 from app.broadcast import broadcast_to_project
-from app.sr_blind_spots import aggregate_sr_blind_spot_themes
+from app.sr_blind_spots import (
+    aggregate_sr_blind_spot_themes,
+    aggregate_sr_co_failure_pairs,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -2760,6 +2763,9 @@ async def claim_task(
                     tp_count = data.get("tp_count")
                     if isinstance(fp_count, int) and isinstance(tp_count, int):
                         entry["sr_flag_sample_size"] = fp_count + tp_count
+                    sev_cal = data.get("severity_calibration")
+                    if isinstance(sev_cal, dict):
+                        entry["severity_calibration"] = sev_cal
                     return entry
 
                 cats = {
@@ -2852,6 +2858,36 @@ async def claim_task(
         except Exception:
             logger.exception(
                 "[AGENT] Failed to inject sr_blind_spot_themes (non-critical)"
+            )
+
+    # Inject SR co-failure pairs (top 5 pairs, lift >= 1.5). When categories A and B
+    # miss together at a significantly higher rate than by chance, fixing A requires
+    # re-checking B. Shape: project_context.sr_co_failure_pairs =
+    #   [{"cat_a": str, "cat_b": str, "lift": float}, ...]
+    # Scans last 14 days of tasks; returns None when sample < min_sample threshold.
+    if task_type in ("create", "fix", "refactor", "migrate") and project_for_playbook:
+        try:
+            high_iter_tasks = await session.scalars(
+                select(Task)
+                .where(
+                    Task.project_id == project_for_playbook.id,
+                    Task.status == TaskStatus.COMPLETED,
+                    Task.completed_at > _utcnow() - timedelta(days=14),
+                )
+                .order_by(Task.completed_at.desc())
+                .limit(2000)
+            )
+            pairs = aggregate_sr_co_failure_pairs(high_iter_tasks)
+            if pairs:
+                if "project_context" not in response:
+                    response["project_context"] = {}
+                response["project_context"]["sr_co_failure_pairs"] = [
+                    {"cat_a": p["cat_a"], "cat_b": p["cat_b"], "lift": p["lift"]}
+                    for p in pairs
+                ]
+        except Exception:
+            logger.exception(
+                "[AGENT] Failed to inject sr_co_failure_pairs (non-critical)"
             )
 
     # Inject persistent SR blind-spot hint for categories exceeding disagreement threshold

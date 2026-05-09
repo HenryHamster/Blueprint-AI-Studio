@@ -112,7 +112,7 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports under test ────────────────────────────────────────────────────────
-import { handleCreate, handleRefactor, handleDocs, handleQA, handleDeps, extractSelfReviewJson, needsMigrationGeneration, buildSmallScopeCallerNote, runFreshReviewerPass, SR_SKIP_REASONS, computeRegressionRiskHeuristic } from './standard.js';
+import { handleCreate, handleRefactor, handleDocs, handleQA, handleDeps, extractSelfReviewJson, needsMigrationGeneration, buildSmallScopeCallerNote, runFreshReviewerPass, SR_SKIP_REASONS, computeRegressionRiskHeuristic, loneCheckerCategoriesForTask } from './standard.js';
 import { setupWorkspace, captureTestBaseline, runClaudeCode } from '../index.js';
 import { extractModuleInterfaces, discoverAffectedConsumers, parseAnalysisPlanFiles, parseAnalysisPlanTestFiles, parseAnalysisPlanVerifyFiles, buildAnalysisPrompt } from '../prompt.js';
 import { runCodeChangeTask } from './code-change.js';
@@ -2762,6 +2762,202 @@ describe('maybeRunIncompleteReviewRecovery', () => {
     const recoveryFn = vi.fn().mockResolvedValue(undefined);
     await realMaybeRunIncompleteReviewRecovery('t-mr5', null, recoveryFn);
     expect(recoveryFn).not.toHaveBeenCalled();
+  });
+});
+
+// ── loneCheckerCategoriesForTask unit tests ───────────────────────────────────
+describe('loneCheckerCategoriesForTask', () => {
+  it('returns empty array when no categories have lone-checker set', () => {
+    const ctx = { self_review_catch_rate: { categories: { security: { miss_rate: 0.1 } } } };
+    expect(loneCheckerCategoriesForTask(ctx, ['backend/app/foo.py'])).toEqual([]);
+  });
+
+  it('returns overlapping lone-checker categories for backend task', () => {
+    const ctx = {
+      self_review_catch_rate: {
+        categories: {
+          security: { time_to_miss_detect_lone_checker: true },
+          documentation: { time_to_miss_detect_lone_checker: true },
+        },
+      },
+    };
+    const result = loneCheckerCategoriesForTask(ctx, ['backend/app/foo.py']);
+    expect(result).toContain('security');
+    expect(result).not.toContain('documentation');
+  });
+
+  it('returns empty array when lone-checker categories do not overlap task risk surface', () => {
+    const ctx = {
+      self_review_catch_rate: {
+        categories: { documentation: { time_to_miss_detect_lone_checker: true } },
+      },
+    };
+    expect(loneCheckerCategoriesForTask(ctx, ['backend/app/foo.py'])).toEqual([]);
+  });
+
+  it('returns all lone-checker categories for unknown task type', () => {
+    const ctx = {
+      self_review_catch_rate: {
+        categories: {
+          security: { time_to_miss_detect_lone_checker: true },
+          documentation: { time_to_miss_detect_lone_checker: true },
+        },
+      },
+    };
+    const result = loneCheckerCategoriesForTask(ctx, ['some/other/file.ts']);
+    expect(result).toContain('security');
+    expect(result).toContain('documentation');
+  });
+
+  it('returns overlapping lone-checker categories for agent/ task', () => {
+    const ctx = {
+      self_review_catch_rate: {
+        categories: {
+          security: { time_to_miss_detect_lone_checker: true },
+          'type-safety': { time_to_miss_detect_lone_checker: true },
+          documentation: { time_to_miss_detect_lone_checker: true },
+        },
+      },
+    };
+    const result = loneCheckerCategoriesForTask(ctx, ['agent/src/handlers/standard.ts']);
+    expect(result).toContain('security');
+    expect(result).toContain('type-safety');
+    expect(result).not.toContain('documentation');
+  });
+
+  it('returns overlapping lone-checker categories for admin-ui/ task', () => {
+    const ctx = {
+      self_review_catch_rate: {
+        categories: {
+          'type-safety': { time_to_miss_detect_lone_checker: true },
+          correctness: { time_to_miss_detect_lone_checker: true },
+          documentation: { time_to_miss_detect_lone_checker: true },
+        },
+      },
+    };
+    const result = loneCheckerCategoriesForTask(ctx, ['admin-ui/src/components/Foo.tsx']);
+    expect(result).toContain('type-safety');
+    expect(result).toContain('correctness');
+    expect(result).not.toContain('documentation');
+  });
+});
+
+// ── lone-checker auto-trigger fresh-reviewer integration ──────────────────────
+describe('handleCreate — lone-checker auto-trigger', () => {
+  const BIG_DIFF = Array.from({ length: 25 }, (_, i) => `+line ${i}`).join('\n');
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    // Reset readFileSync to empty so no stale incomplete_review state leaks in
+    const { default: fs } = await import('fs');
+    vi.mocked(fs.readFileSync).mockReturnValue('');
+  });
+
+  it('auto-triggers fresh-reviewer when a lone-checker category overlaps task risk surface', async () => {
+    const idx = await import('../index.js');
+    vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
+    vi.mocked(idx.runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '{"reviewer_findings":[]}' });
+    vi.mocked(idx.setupWorkspace).mockResolvedValue({ workBranch: 'task-lc1', shortId: 'lc1' });
+
+    const task = {
+      title: 'Backend fix', description: '',
+      context: { related_files: ['backend/app/foo.py'] },
+      project_context: {
+        self_review_catch_rate: {
+          categories: { security: { time_to_miss_detect_lone_checker: true } },
+        },
+      },
+      project_metadata: { enable_fresh_reviewer: false, is_self_repo: false },
+    };
+    await handleCreate(TASK_ID, { prompt: 'Fix it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const reviewerCall = vi.mocked(idx.runClaudeCode).mock.calls.find(
+      call => typeof call[0] === 'string' && call[0].includes('You are reviewing a PR'),
+    );
+    expect(reviewerCall).toBeDefined();
+  });
+
+  it('does NOT auto-trigger fresh-reviewer when no lone-checker categories are present', async () => {
+    const idx = await import('../index.js');
+    vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
+    vi.mocked(idx.runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+    vi.mocked(idx.setupWorkspace).mockResolvedValue({ workBranch: 'task-lc2', shortId: 'lc2' });
+
+    const task = {
+      title: 'Backend fix', description: '',
+      context: { related_files: ['backend/app/foo.py'] },
+      project_context: {
+        self_review_catch_rate: { categories: { security: { miss_rate: 0.1 } } },
+      },
+      project_metadata: { enable_fresh_reviewer: false, is_self_repo: false },
+    };
+    await handleCreate(TASK_ID, { prompt: 'Fix it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const reviewerCall = vi.mocked(idx.runClaudeCode).mock.calls.find(
+      call => typeof call[0] === 'string' && call[0].includes('You are reviewing a PR'),
+    );
+    expect(reviewerCall).toBeUndefined();
+  });
+
+  it('does NOT run lone-checker fresh-reviewer when enable_fresh_reviewer already triggered it', async () => {
+    const idx = await import('../index.js');
+    vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
+    vi.mocked(idx.runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '{"reviewer_findings":[]}' });
+    vi.mocked(idx.setupWorkspace).mockResolvedValue({ workBranch: 'task-lc3', shortId: 'lc3' });
+
+    // enable_fresh_reviewer=true: normal path runs, freshReviewerAlreadyRan=true.
+    // Lone-checker path should be skipped (only one reviewer pass total).
+    const task = {
+      title: 'Backend fix', description: '',
+      context: { related_files: ['backend/app/foo.py'] },
+      project_context: {
+        self_review_catch_rate: {
+          categories: { security: { time_to_miss_detect_lone_checker: true } },
+        },
+      },
+      project_metadata: { enable_fresh_reviewer: true, is_self_repo: false },
+    };
+    await handleCreate(TASK_ID, { prompt: 'Fix it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const reviewerCalls = vi.mocked(idx.runClaudeCode).mock.calls.filter(
+      call => typeof call[0] === 'string' && call[0].includes('You are reviewing a PR'),
+    );
+    // Only one reviewer pass (the normal enable_fresh_reviewer path), not two
+    expect(reviewerCalls.length).toBe(1);
+  });
+});
+
+// ── origin=lone_checker_recovery tagging ──────────────────────────────────────
+describe('runFreshReviewerPass lone_checker_recovery origin', () => {
+  const BIG_DIFF = Array.from({ length: 25 }, (_, i) => `+line ${i}`).join('\n');
+  let fsModule: typeof import('fs');
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    fsModule = await import('fs');
+  });
+
+  it('tags findings with origin=lone_checker_recovery when loneCheckerRecovery=true', async () => {
+    const idx = await import('../index.js');
+    vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
+    vi.mocked(fsModule.readFileSync).mockReturnValue(JSON.stringify({
+      verdict: 'pass',
+      check_results: {},
+    }));
+    let captured: Record<string, unknown> | null = null;
+    vi.mocked(fsModule.writeFileSync).mockImplementation((_p: unknown, data: unknown) => {
+      captured = JSON.parse(data as string) as Record<string, unknown>;
+    });
+    vi.mocked(idx.runClaudeCode).mockResolvedValue({
+      exitCode: 0,
+      allOutput: '',
+      lastResultText: '{"reviewer_findings":[{"category":"security","severity":"HIGH","description":"Missing auth check"}]}',
+    });
+
+    await runFreshReviewerPass('lc-origin', 'Title', 'Desc', [], null, { value: '' }, undefined, undefined, false, true);
+
+    expect(captured).not.toBeNull();
+    const json = captured as unknown as Record<string, unknown>;
+    const checkResults = json.check_results as Record<string, Record<string, unknown>>;
+    expect(checkResults.security.origin).toBe('lone_checker_recovery');
+    expect(json.reviewer_recovery_origin).toBe('lone_checker_recovery');
   });
 });
 

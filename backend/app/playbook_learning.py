@@ -43,6 +43,12 @@ from app.models import (
 )
 from app.sr_blind_spots import _REVIEWER_ORIGINS
 
+# lone_checker_recovery is set by the fresh-reviewer pass when it runs because SR
+# is the sole checker for a category.  Extend the reviewer-origin set locally so
+# catch-rate attribution treats these findings as reviewer saves, not author SR hits.
+_LONE_CHECKER_RECOVERY_ORIGIN = "lone_checker_recovery"
+_ALL_REVIEWER_ORIGINS = _REVIEWER_ORIGINS | frozenset({_LONE_CHECKER_RECOVERY_ORIGIN})
+
 # In-app Alert row title prefixes for SR catch-rate alerts. The router that
 # powers AlertsBanner returns Alert rows verbatim; we use these prefixes both
 # to format new rows and to find/dismiss prior matching rows on clear-transition.
@@ -278,6 +284,22 @@ _REVIEW_CATEGORIES: dict[str, list[str]] = {
         "scope creep",
         "too broad",
         "unrelated files",
+    ],
+    "cross-system-contract": [
+        "url mismatch",
+        "route mismatch",
+        "endpoint mismatch",
+        "path mismatch",
+        "dto mismatch",
+        "cross-system",
+        "cross system",
+        "missing route",
+        "missing endpoint",
+        "api contract",
+        "contract drift",
+        "unmatched path",
+        "frontend calls",
+        "backend exposes",
     ],
 }
 
@@ -2562,7 +2584,7 @@ def _stats_for_tasks(
         entry: dict[str, Any] | None,
     ) -> Literal["sr_alone", "reviewer_save"]:
         origin = entry.get("origin") if isinstance(entry, dict) else None
-        if isinstance(origin, str) and origin.startswith("reviewer"):
+        if isinstance(origin, str) and origin in _ALL_REVIEWER_ORIGINS:
             return "reviewer_save"
         return "sr_alone"
 
@@ -2587,7 +2609,7 @@ def _stats_for_tasks(
         sr_failed_author = {
             c
             for c in sr_failed
-            if (check_results.get(c) or {}).get("origin") not in _REVIEWER_ORIGINS
+            if (check_results.get(c) or {}).get("origin") not in _ALL_REVIEWER_ORIGINS
         }
         rev_hist = (ctx.get("review_loop") or {}).get("review_history") or []
         cat_weights: dict[str, int] = {}
@@ -3083,7 +3105,7 @@ def _compute_cat_fp_stats(
             for c, r in check_results.items()
             if isinstance(r, dict)
             and not r.get("passed", True)
-            and r.get("origin") not in _REVIEWER_ORIGINS
+            and r.get("origin") not in _ALL_REVIEWER_ORIGINS
         }
         if not sr_failed:
             continue
@@ -3153,7 +3175,7 @@ def _compute_cat_severity_calibration(
                 continue
             if cr.get("passed", True):
                 continue
-            if cr.get("origin") in _REVIEWER_ORIGINS:
+            if cr.get("origin") in _ALL_REVIEWER_ORIGINS:
                 continue
             agent_sev = (cr.get("severity") or "").upper()
             if agent_sev not in _sw:
@@ -3232,7 +3254,7 @@ def compute_sr_quality_by_fingerprint(
             for cat, result in check_results.items()
             if isinstance(result, dict)
             and not result.get("passed", True)
-            and result.get("origin") not in _REVIEWER_ORIGINS
+            and result.get("origin") not in _ALL_REVIEWER_ORIGINS
         }
         reviewer_cats = {
             finding.get("category")
@@ -5278,7 +5300,7 @@ async def compute_fresh_reviewer_trend(
                 for c, r in check_results.items()
                 if isinstance(r, dict)
                 and not r.get("passed", True)
-                and r.get("origin") not in _REVIEWER_ORIGINS
+                and r.get("origin") not in _ALL_REVIEWER_ORIGINS
             }
             for finding in findings:
                 cat = finding.get("category") if isinstance(finding, dict) else None
@@ -6228,7 +6250,7 @@ def get_sr_alert_drilldown_tasks(
             for c, r in check_results.items()
             if isinstance(r, dict)
             and not r.get("passed", True)
-            and r.get("origin") not in _REVIEWER_ORIGINS
+            and r.get("origin") not in _ALL_REVIEWER_ORIGINS
         }
         human_cats = set(ctx.get("_first_attempt_rejection_categories") or [])
         missed_in_target = (human_cats & target_cats) - sr_failed

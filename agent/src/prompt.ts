@@ -2048,6 +2048,7 @@ backend review vocabulary — must match exactly):
 - \`test-coverage\` — missing tests for new behavior, untested edge cases
 - \`scope-drift\` — diff materially exceeds the declared task scope (see thresholds below)
 - \`regression_risk\` — previously-passing test now fails after changes (omit if no baseline available)
+- \`cross-system-contract\` — URL path, DTO field, or shared type referenced on one side has no matching definition on the other (see check below)
 
 **Scope-drift check (required for code-change tasks):**
 The \`scope-drift\` category has TWO triggers that both feed the SAME \`scope-drift\` entry
@@ -2122,6 +2123,27 @@ regressions. Compare this list against any test failures surfaced by your most r
 
 Like \`scope-drift\`, this check does NOT block \`./done\` — it is informational and feeds
 the catch-rate dashboard.
+
+**Cross-system-contract check (fires when diff is cross-system):**
+This check is REQUIRED when the diff touches ≥2 of {admin-ui, backend, agent} OR when it adds or
+changes HTTP route paths, FastAPI router decorators (\`@router.get\`, \`@router.post\`, etc.), or
+fetch/axios call sites.
+
+Steps:
+1. Enumerate every new or changed URL path string, DTO field name, and shared TypeScript/Python
+   type name in the diff (look for string literals like \`'/api/...'\`, decorator paths like
+   \`@router.get('/...')\`, and \`fetch('/...')\` / \`axios.get('/...')\` calls).
+2. For each URL path found on one side, grep the *other* side's tree for a matching route
+   definition or call site (e.g., if admin-ui calls \`/api/admin/foo\`, grep backend for \`/foo\`
+   in router files; if backend adds \`@router.post('/bar')\`, grep admin-ui for \`/bar\`).
+3. For each DTO field name or shared type name, grep the other side for its definition or usage.
+4. Record \`passed: false\` with \`severity: "major"\` for URL/route mismatches (these break
+   runtime), or \`severity: "minor"\` for type-name drift where runtime is unaffected.
+   Include the path string and the side that is missing the definition in the \`issue\` field.
+5. If the diff is not cross-system and contains no HTTP path changes, record \`passed: true\`
+   with \`issue: "diff does not cross system boundaries"\`.
+
+This check does NOT block \`./done\` — it is informational and feeds the catch-rate dashboard.
 
 Schema:
 

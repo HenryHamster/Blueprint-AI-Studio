@@ -64,6 +64,7 @@ async def get_all_projects(
             "build_config": project.build_config or {},
             "autonomous_enabled": project.autonomous_enabled,
             "is_self_repo": project.is_self_repo,
+            "sr_catch_rate_targets": project.sr_catch_rate_targets or {},
             "my_role": role,
         }
         result.append(data)
@@ -77,6 +78,9 @@ class ProjectUpdate(BaseModel):
     design_doc: Dict[str, Any] | None = None
     build_config: Dict[str, Any] | None = None
     autonomous_enabled: bool | None = None
+    # Per-category SR catch-rate targets, e.g. {'security': 0.80}.
+    # Absent key = no target; empty dict {} clears all targets.
+    sr_catch_rate_targets: Dict[str, Any] | None = None
     # User-editable subset of problem_model — intent, constraints, context.
     # Gaps / capabilities / friction are agent-owned and not writable here.
     problem_model_patch: Dict[str, Any] | None = None
@@ -146,6 +150,19 @@ async def update_project(
                 status_code=400, detail="Invalid build_config structure"
             ) from e
         flag_modified(project, "build_config")
+
+    if payload.sr_catch_rate_targets is not None:
+        # Validate: values must be floats in [0, 1]
+        for cat, val in payload.sr_catch_rate_targets.items():
+            if not isinstance(val, (int, float)) or not (0.0 <= float(val) <= 1.0):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"sr_catch_rate_targets[{cat!r}] must be a float in [0, 1]",
+                )
+        project.sr_catch_rate_targets = {
+            k: float(v) for k, v in payload.sr_catch_rate_targets.items()
+        }
+        flag_modified(project, "sr_catch_rate_targets")
 
     if payload.problem_model_patch is not None:
         # User-editable subset only — intent / context / constraints. Agent-

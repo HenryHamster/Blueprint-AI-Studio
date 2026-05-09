@@ -3955,6 +3955,35 @@ describe('CODE_CHANGE_HELPER_GUIDANCE — regression_risk category', () => {
   });
 });
 
+describe('CODE_CHANGE_HELPER_GUIDANCE — cross-system-contract category', () => {
+  it('includes cross-system-contract in the canonical category list', async () => {
+    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
+    expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('`cross-system-contract`');
+  });
+
+  it('fires when diff touches 2+ of {admin-ui, backend, agent}', async () => {
+    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
+    expect(CODE_CHANGE_HELPER_GUIDANCE).toMatch(/admin-ui.*backend.*agent|≥2|>=2/);
+  });
+
+  it('instructs agent to grep the other side for matching route definitions', async () => {
+    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
+    expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('grep');
+    expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('other');
+  });
+
+  it('specifies major severity for URL/route mismatch', async () => {
+    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
+    expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('major');
+    expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('minor');
+  });
+
+  it('instructs agent to record passed:true when diff is not cross-system', async () => {
+    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
+    expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('diff does not cross system boundaries');
+  });
+});
+
 // ── TASK_TYPE_HINTS dispatch parity ───────────────────────────────────────
 describe('TASK_TYPE_HINTS dispatch parity', () => {
   it('ensures every handler dispatch key is either in TASK_TYPE_HINTS or in TASK_TYPES_WITHOUT_HINT', () => {

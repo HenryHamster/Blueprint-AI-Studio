@@ -5509,6 +5509,36 @@ async def run_recovery_once(session: AsyncSession, project_id: uuid.UUID) -> int
             exc,
         )
 
+    # Non-spawning observation: open a WARNING alert when >=2 SR categories
+    # have entered lone-checker state (SR is the only reviewer, catch-rate
+    # unmeasurable). Wrapped in try/except for the same reason as above.
+    try:
+        from app.routers.admin_digest import _evaluate_lone_checker_alert
+
+        await _evaluate_lone_checker_alert(session, project_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[REGRESSION_DISPATCHER] lone-checker alert evaluation raised "
+            "for project=%s: %s",
+            project_id,
+            exc,
+        )
+
+    # Non-spawning observation: emit/dismiss WARNING alerts when SR catch-rate
+    # for any configured category falls below the project's per-category target
+    # for >=2 consecutive windows. Same try/except pattern.
+    try:
+        from app.routers.admin_digest import _evaluate_sr_catch_rate_targets
+
+        await _evaluate_sr_catch_rate_targets(session, project_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[REGRESSION_DISPATCHER] sr_catch_rate_targets alert evaluation "
+            "raised for project=%s: %s",
+            project_id,
+            exc,
+        )
+
     try:
         await _run_compliance_followup_once(session, project_id)
     except Exception as exc:  # noqa: BLE001

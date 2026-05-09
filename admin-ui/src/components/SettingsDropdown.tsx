@@ -1421,6 +1421,7 @@ export function SettingsDropdown({
         onSave={onUpdateBuildConfig}
         onDetect={onDetectBuildConfig}
         detectAvailable={Boolean(selectedProjectOwner && selectedProjectRepo)}
+        projectId={selectedProjectId}
       />
     );
   }
