@@ -59,12 +59,27 @@ function parseSrAlert(title: string): { alertType: 'trends' | 'floor'; categorie
   return { alertType: isTrends ? 'trends' : 'floor', categories };
 }
 
+interface MissedCategoryFinding {
+  severity: string | null;
+  description: string;
+  has_more: boolean;
+  full_description: string | null;
+}
+
 interface DrilldownRow {
   task_id: string;
   title: string;
   missed_categories: string[];
   sr_verdict: string | null;
   pr_url?: string | null;
+  missed_category_findings?: Record<string, MissedCategoryFinding>;
+}
+
+function findingSeverityStyle(sev: string | null | undefined): string {
+  if (sev === 'CRITICAL') return 'text-red-400';
+  if (sev === 'HIGH') return 'text-orange-400';
+  if (sev === 'MEDIUM') return 'text-amber-400';
+  return 'text-neutral-400';
 }
 
 interface AlertsBannerProps {
@@ -84,6 +99,7 @@ export function AlertsBanner({ alerts, onDismiss, onDismissAll, onViewTask, regr
   const [drilldownId, setDrilldownId] = useState<string | null>(null);
   const [drilldownRows, setDrilldownRows] = useState<DrilldownRow[]>([]);
   const [drilldownLoading, setDrilldownLoading] = useState(false);
+  const [expandedFindings, setExpandedFindings] = useState<Set<string>>(new Set());
 
   const fetchInterventionCount = useCallback(async () => {
     if (!projectId) return;
@@ -213,22 +229,57 @@ export function AlertsBanner({ alerts, onDismiss, onDismissAll, onViewTask, regr
                 <span className="text-neutral-500 text-[11px] font-medium uppercase tracking-wide">Contributing tasks</span>
                 {drilldownLoading && <span className="text-neutral-500">Loading…</span>}
                 {!drilldownLoading && drilldownRows.length === 0 && <span className="text-neutral-500">No contributing tasks found in the current alert window.</span>}
-                {!drilldownLoading && drilldownRows.map(row => (
-                  <div key={row.task_id} className="flex items-start gap-2">
-                    <span className={`shrink-0 mt-0.5 text-[10px] px-1.5 py-0.5 rounded border font-medium ${row.sr_verdict === 'pass' ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30' : 'bg-red-500/10 text-red-400 border-red-500/30'}`}>
-                      SR {row.sr_verdict ?? '?'}
-                    </span>
-                    <div className="flex-1 min-w-0">
-                      <span className="text-neutral-200 truncate block">{row.title}</span>
-                      <span className="text-neutral-500 text-[10px]">missed: {row.missed_categories.join(', ')}</span>
+                {!drilldownLoading && drilldownRows.map(row => {
+                  const findingsByCategory = row.missed_category_findings ?? {};
+                  return (
+                    <div key={row.task_id} className="flex items-start gap-2">
+                      <span className={`shrink-0 mt-0.5 text-[10px] px-1.5 py-0.5 rounded border font-medium ${row.sr_verdict === 'pass' ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30' : 'bg-red-500/10 text-red-400 border-red-500/30'}`}>
+                        SR {row.sr_verdict ?? '?'}
+                      </span>
+                      <div className="flex-1 min-w-0">
+                        <span className="text-neutral-200 truncate block">{row.title}</span>
+                        <div className="flex flex-col gap-0.5 mt-0.5">
+                          {row.missed_categories.map(cat => {
+                            const finding = findingsByCategory[cat];
+                            const key = `${row.task_id}:${cat}`;
+                            const isExpanded = expandedFindings.has(key);
+                            const hasFinding = !!finding && !!finding.severity;
+                            return (
+                              <div key={cat} className="text-[10px] leading-relaxed">
+                                <span className="text-neutral-500">{cat}: </span>
+                                {hasFinding ? (
+                                  <>
+                                    <span className={`font-medium mr-1 ${findingSeverityStyle(finding.severity)}`}>{finding.severity}</span>
+                                    <span className="text-neutral-400">{isExpanded && finding.full_description ? finding.full_description : finding.description}</span>
+                                    {finding.has_more && (
+                                      <button
+                                        onClick={() => setExpandedFindings(prev => {
+                                          const next = new Set(prev);
+                                          if (isExpanded) { next.delete(key); } else { next.add(key); }
+                                          return next;
+                                        })}
+                                        className="ml-1 text-neutral-500 hover:text-neutral-300 transition-colors underline"
+                                      >
+                                        {isExpanded ? 'less' : 'more'}
+                                      </button>
+                                    )}
+                                  </>
+                                ) : (
+                                  <span className="text-neutral-600 italic">no description recorded</span>
+                                )}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                      {onViewTask && (
+                        <button onClick={() => onViewTask(row.task_id)} className="shrink-0 opacity-60 hover:opacity-100 transition-opacity min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center" title="View task SR panel">
+                          <ExternalLink className="w-3 h-3" />
+                        </button>
+                      )}
                     </div>
-                    {onViewTask && (
-                      <button onClick={() => onViewTask(row.task_id)} className="shrink-0 opacity-60 hover:opacity-100 transition-opacity min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center" title="View task SR panel">
-                        <ExternalLink className="w-3 h-3" />
-                      </button>
-                    )}
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             )}
           </div>

@@ -1679,3 +1679,105 @@ export function SrMissedRetrospective({ tasks, onTaskClick, initialCategory }: S
     </div>
   );
 }
+
+export interface SrUnhandledEdge {
+  case: string;
+  handled: boolean;
+  blind_spot?: string | null;
+  origin?: string | null;
+}
+
+export interface SrUnhandledEdgesTask {
+  task_id: string;
+  title: string;
+  task_type?: string | null;
+  scope?: string | null;
+  created_at?: string | null;
+  unhandled_edges: SrUnhandledEdge[];
+  pr_url?: string | null;
+}
+
+interface SrUnhandledEdgesRetrospectiveProps {
+  tasks: SrUnhandledEdgesTask[];
+  onTaskClick?: (taskId: string) => void;
+}
+
+export function SrUnhandledEdgesRetrospective({ tasks, onTaskClick }: SrUnhandledEdgesRetrospectiveProps) {
+  const [typeFilter, setTypeFilter] = useState('');
+  const [windowDays, setWindowDays] = useState(14);
+  const [openTaskIds, setOpenTaskIds] = useState<Set<string>>(() => new Set());
+  const [mountedAt] = useState(() => Date.now());
+
+  const allTypes = Array.from(new Set(tasks.map(t => t.task_type).filter(Boolean) as string[])).sort();
+
+  const cutoff = mountedAt - windowDays * 86400_000;
+  const visible = tasks.filter(t => {
+    if (t.created_at && new Date(t.created_at).getTime() < cutoff) return false;
+    if (typeFilter && t.task_type !== typeFilter) return false;
+    return true;
+  });
+  const toggleTask = (taskId: string) => setOpenTaskIds(prev => {
+    const next = new Set(prev);
+    if (next.has(taskId)) next.delete(taskId); else next.add(taskId);
+    return next;
+  });
+
+  return (
+    <div data-testid="sr-unhandled-edges-retrospective" className="flex flex-col gap-2">
+      <div className="flex flex-wrap items-center gap-2 text-[10px]">
+        <span className="text-neutral-500 uppercase tracking-wide">Time</span>
+        {WINDOW_OPTIONS.map(w => (
+          // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
+          <button
+            key={w.days}
+            onClick={() => setWindowDays(w.days)}
+            className={`px-1.5 py-0.5 rounded border ${windowDays === w.days ? 'border-blue-500 text-blue-300' : 'border-neutral-700 text-neutral-400 hover:border-neutral-500'}`}
+          >{w.label}</button>
+        ))}
+        {allTypes.length > 0 && (
+          <select
+            value={typeFilter}
+            onChange={e => setTypeFilter(e.target.value)}
+            className="bg-neutral-900 border border-neutral-700 rounded px-1 py-0.5 text-neutral-300"
+          >
+            <option value="">All types</option>
+            {allTypes.map(t => <option key={t} value={t}>{t}</option>)}
+          </select>
+        )}
+        <span className="text-neutral-600">{visible.length} task{visible.length !== 1 ? 's' : ''}</span>
+      </div>
+      {visible.length === 0 ? (
+        <p className="text-[10px] text-neutral-600 italic">No tasks with unhandled edges for this filter.</p>
+      ) : (
+        <div className="flex flex-col gap-1">
+          {visible.map(t => (
+            // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
+            <div key={t.task_id} className={`bg-neutral-900/50 border border-neutral-800/50 rounded px-2 py-1.5 text-[10px] ${onTaskClick ? 'cursor-pointer hover:border-neutral-600' : ''}`} onClick={() => onTaskClick?.(t.task_id)}>
+              <div className="flex items-center gap-1.5 mb-0.5">
+                <button type="button" className="text-neutral-500 hover:text-neutral-300 shrink-0" aria-label={`${openTaskIds.has(t.task_id) ? 'collapse' : 'expand'} ${t.title}`} aria-expanded={openTaskIds.has(t.task_id)} onClick={e => { e.stopPropagation(); toggleTask(t.task_id); }}>
+                  {openTaskIds.has(t.task_id) ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
+                </button>
+                <span className="text-neutral-200 truncate flex-1 font-medium" title={t.title}>{t.title}</span>
+                {t.task_type && <span className="text-neutral-500 shrink-0">{t.task_type}</span>}
+                {t.scope && <span className="text-neutral-600 shrink-0">{t.scope}</span>}
+                {t.created_at && <span className="text-neutral-600 shrink-0" title={t.created_at}>{new Date(t.created_at).toLocaleDateString()}</span>}
+                {t.pr_url && <a href={t.pr_url} target="_blank" rel="noopener noreferrer" onClick={e => e.stopPropagation()} className="text-blue-400 hover:underline shrink-0" title={t.pr_url}>PR</a>}
+              </div>
+              {openTaskIds.has(t.task_id) && (
+                <div className="mt-1.5 flex flex-col gap-1">
+                  {t.unhandled_edges.map((edge, i) => (
+                    <div key={i} className="rounded border border-neutral-800/60 bg-neutral-950/50 p-1.5">
+                      <div className="mb-1 text-neutral-400 font-medium text-[10px]">{edge.case}</div>
+                      {edge.blind_spot && <div className="text-neutral-500 text-[9px]">{edge.blind_spot}</div>}
+                      {edge.origin && <div className="text-neutral-600 text-[9px]">source: {edge.origin}</div>}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}

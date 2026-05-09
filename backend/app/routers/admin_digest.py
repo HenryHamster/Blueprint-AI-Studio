@@ -7395,6 +7395,114 @@ async def list_sr_missed_retrospectives(
     return {"items": items, "total": total_matched}
 
 
+@router.get("/projects/{project_id}/sr-unhandled-edges-retrospectives")
+async def list_sr_unhandled_edges_retrospectives(
+    project_id: uuid.UUID,
+    days: int = Query(14, ge=1, le=90),
+    task_type: Optional[str] = Query(None),
+    page: int = Query(0, ge=0),
+    page_size: int = Query(50, ge=1, le=200),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),  # noqa: ARG001
+) -> Dict[str, Any]:
+    """List code-change tasks with unhandled edge cases flagged by the agent.
+
+    Surfaces which specific recent tasks shipped with unhandled-edge admissions
+    (handled: false in edges_considered), enabling audit of whether these
+    correlate with later reviewer rejections and spot patterns.
+    """
+    cutoff = datetime.utcnow() - timedelta(days=days)
+    page_start = page * page_size
+    page_end = page_start + page_size
+
+    stmt = (
+        select(Task)
+        .where(
+            Task.project_id == project_id,
+            Task.status == TaskStatus.COMPLETED,
+            Task.created_at >= cutoff,
+        )
+        .options(
+            load_only(
+                Task.id,
+                Task.title,
+                Task.created_at,
+                Task.context,
+                Task.project_id,
+                Task.payloads,
+            )
+        )
+        .order_by(Task.created_at.desc())
+    )
+
+    page_items = []
+    total_matched = 0
+    task_stream = await session.stream(stmt)
+    async for t in task_stream.scalars():
+        ctx = t.context or {}
+        sr_outcome = ctx.get("_self_review_outcome") or {}
+        edges = sr_outcome.get("edges_considered") or []
+        if not isinstance(edges, list):
+            edges = []
+
+        # Find unhandled edges
+        unhandled_edges = [
+            e for e in edges if isinstance(e, dict) and not e.get("handled", True)
+        ]
+        if not unhandled_edges:
+            continue
+
+        t_type = (t.first_payload or {}).get("type")
+        if task_type and t_type != task_type:
+            continue
+
+        current_index = total_matched
+        total_matched += 1
+        if current_index < page_start or current_index >= page_end:
+            continue
+
+        page_items.append(
+            {
+                "task_id": str(t.id),
+                "title": t.title or "",
+                "task_type": t_type,
+                "scope": ctx.get("scope"),
+                "created_at": t.created_at.isoformat() if t.created_at else None,
+                "unhandled_edges": unhandled_edges,
+            }
+        )
+
+    # Batch-fetch PR artifacts for items on this page
+    page_task_ids = [uuid.UUID(m["task_id"]) for m in page_items]
+    pr_map: Dict[str, str] = {}
+    if page_task_ids:
+        art_result = await session.execute(
+            select(Artifact.task_id, Artifact.pr_url).where(
+                Artifact.task_id.in_(page_task_ids),
+                Artifact.artifact_type == ArtifactType.PULL_REQUEST,
+            )
+        )
+        for row in art_result.all():
+            if row.pr_url:
+                pr_map[str(row.task_id)] = row.pr_url
+
+    items = []
+    for m in page_items:
+        items.append(
+            {
+                "task_id": m["task_id"],
+                "title": m["title"],
+                "task_type": m["task_type"],
+                "scope": m["scope"],
+                "created_at": m["created_at"],
+                "unhandled_edges": m["unhandled_edges"],
+                "pr_url": pr_map.get(m["task_id"]),
+            }
+        )
+
+    return {"items": items, "total": total_matched}
+
+
 @router.get("/projects/{project_id}/sr-alert-drilldown")
 async def get_sr_alert_drilldown(
     project_id: uuid.UUID,
@@ -7463,8 +7571,39 @@ async def get_sr_alert_drilldown(
             if art_row.pr_url:
                 pr_map[str(art_row.task_id)] = art_row.pr_url
 
+    task_map = {str(t.id): t for t in all_tasks}
+
     for r in rows:
         r["pr_url"] = pr_map.get(r["task_id"])
+
+        task = task_map.get(r["task_id"])
+        ctx = (task.context or {}) if task else {}
+        sr_outcome = ctx.get("_self_review_outcome") or {}
+        findings_list = sr_outcome.get("reviewer_findings") or []
+        findings_by_cat = {
+            f["category"]: f
+            for f in findings_list
+            if isinstance(f, dict) and "category" in f
+        }
+        missed_findings: Dict[str, Any] = {}
+        for cat in r.get("missed_categories", []):
+            finding = findings_by_cat.get(cat)
+            if finding:
+                desc = finding.get("description") or ""
+                missed_findings[cat] = {
+                    "severity": finding.get("severity"),
+                    "description": desc[:140],
+                    "has_more": len(desc) > 140,
+                    "full_description": desc if len(desc) > 140 else None,
+                }
+            else:
+                missed_findings[cat] = {
+                    "severity": None,
+                    "description": "no description recorded",
+                    "has_more": False,
+                    "full_description": None,
+                }
+        r["missed_category_findings"] = missed_findings
 
     return {
         "items": rows,

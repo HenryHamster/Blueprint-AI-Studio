@@ -4363,6 +4363,16 @@ async def compute_sr_catch_rate_trends(
                         )
                 description = "\n".join(lines)
 
+                # Add caveat if SR prompt changed during this window
+                if result.get("prompt_version_changed") or result.get(
+                    "mixed_prompt_versions"
+                ):
+                    description = (
+                        description
+                        + "\n\nNote: SR prompt version changed during this window — "
+                        + "attribution may be partly due to the prompt update"
+                    )
+
                 await post_failure_alert_message(session, project_id, description)
 
                 # Surface the regression in AlertsBanner as a real Alert row.
@@ -4442,6 +4452,13 @@ async def compute_sr_catch_rate_trends(
                         for sev in current_regressing_sevs
                     ],
                 }
+                if result.get("prompt_version_changed") or result.get(
+                    "mixed_prompt_versions"
+                ):
+                    webhook_payload["prompt_version_caveat"] = (
+                        "SR prompt version changed during this window — "
+                        + "attribution may be partly due to the prompt update"
+                    )
                 asyncio.ensure_future(
                     dispatch_external_notification(
                         project_id,
@@ -4564,6 +4581,16 @@ async def compute_sr_catch_rate_trends(
                     )
                 description = "\n".join(lines)
 
+                # Add caveat if SR prompt changed during this window
+                if result.get("prompt_version_changed") or result.get(
+                    "mixed_prompt_versions"
+                ):
+                    description = (
+                        description
+                        + "\n\nNote: SR prompt version changed during this window — "
+                        + "attribution may be partly due to the prompt update"
+                    )
+
                 await post_failure_alert_message(session, project_id, description)
 
                 # Surface as ERROR Alert row in AlertsBanner (stricter than the
@@ -4619,6 +4646,13 @@ async def compute_sr_catch_rate_trends(
                         for cat in current_floor_cats
                     ],
                 }
+                if result.get("prompt_version_changed") or result.get(
+                    "mixed_prompt_versions"
+                ):
+                    floor_payload["prompt_version_caveat"] = (
+                        "SR prompt version changed during this window — "
+                        + "attribution may be partly due to the prompt update"
+                    )
                 asyncio.ensure_future(
                     dispatch_external_notification(
                         project_id,
@@ -4724,6 +4758,16 @@ async def compute_sr_catch_rate_trends(
                     )
                 description = "\n".join(lines)
 
+                # Add caveat if SR prompt changed during this window
+                if result.get("prompt_version_changed") or result.get(
+                    "mixed_prompt_versions"
+                ):
+                    description = (
+                        description
+                        + "\n\nNote: SR prompt version changed during this window — "
+                        + "attribution may be partly due to the prompt update"
+                    )
+
                 await post_failure_alert_message(session, project_id, description)
 
                 new_quadrant_title = _format_sr_alert_title(
@@ -4774,6 +4818,13 @@ async def compute_sr_catch_rate_trends(
                         for cat in current_quadrant_cats
                     ],
                 }
+                if result.get("prompt_version_changed") or result.get(
+                    "mixed_prompt_versions"
+                ):
+                    q_payload["prompt_version_caveat"] = (
+                        "SR prompt version changed during this window — "
+                        + "attribution may be partly due to the prompt update"
+                    )
                 asyncio.ensure_future(
                     dispatch_external_notification(
                         project_id,
@@ -4891,6 +4942,16 @@ async def compute_sr_catch_rate_trends(
                     )
                 description = "\n".join(lines)
 
+                # Add caveat if SR prompt changed during this window
+                if result.get("prompt_version_changed") or result.get(
+                    "mixed_prompt_versions"
+                ):
+                    description = (
+                        description
+                        + "\n\nNote: SR prompt version changed during this window — "
+                        + "attribution may be partly due to the prompt update"
+                    )
+
                 await post_failure_alert_message(session, project_id, description)
 
                 new_eng_title = _format_sr_alert_title(
@@ -4943,6 +5004,13 @@ async def compute_sr_catch_rate_trends(
                         for cat in current_thinning_cats
                     ],
                 }
+                if result.get("prompt_version_changed") or result.get(
+                    "mixed_prompt_versions"
+                ):
+                    thinning_payload["prompt_version_caveat"] = (
+                        "SR prompt version changed during this window — "
+                        + "attribution may be partly due to the prompt update"
+                    )
                 asyncio.ensure_future(
                     dispatch_external_notification(
                         project_id,
@@ -6168,6 +6236,30 @@ def get_sr_alert_drilldown_tasks(
             continue
         caught_in_target = human_cats & target_cats & sr_failed
         payload = t.first_payload or {}
+        findings_list = ctx["_self_review_outcome"].get("reviewer_findings") or []
+        findings_by_cat = {
+            f["category"]: f
+            for f in findings_list
+            if isinstance(f, dict) and "category" in f
+        }
+        missed_category_findings: dict[str, Any] = {}
+        for cat in missed_in_target:
+            finding = findings_by_cat.get(cat)
+            if finding:
+                desc = finding.get("description") or ""
+                missed_category_findings[cat] = {
+                    "severity": finding.get("severity"),
+                    "description": desc[:140],
+                    "has_more": len(desc) > 140,
+                    "full_description": desc if len(desc) > 140 else None,
+                }
+            else:
+                missed_category_findings[cat] = {
+                    "severity": None,
+                    "description": "no description recorded",
+                    "has_more": False,
+                    "full_description": None,
+                }
         results.append(
             {
                 "task_id": str(t.id),
@@ -6178,6 +6270,7 @@ def get_sr_alert_drilldown_tasks(
                 "missed_categories": sorted(missed_in_target),
                 "caught_categories": sorted(caught_in_target),
                 "sr_verdict": ctx["_self_review_outcome"].get("verdict"),
+                "missed_category_findings": missed_category_findings,
             }
         )
 

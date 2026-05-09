@@ -184,6 +184,89 @@ function SrDisallowedBadge({ task }: { task: Task }) {
   );
 }
 
+interface SrDivergenceState {
+  variant: 'missed' | 'over-flagged';
+  category: string;
+  allDivergences: { variant: 'missed' | 'over-flagged'; category: string }[];
+}
+
+function getSrDivergenceBadgeState(task: Task): SrDivergenceState | null {
+  const ctx = task.context as Record<string, unknown> | undefined;
+  const outcome = ctx?._self_review_outcome as SelfReviewOutcome | undefined;
+  const humanCategories = ctx?._first_attempt_rejection_categories as Record<string, unknown> | undefined;
+
+  if (!outcome || !humanCategories) return null;
+  const checkResults = outcome.check_results ?? {};
+
+  const divergences: SrDivergenceState['allDivergences'] = [];
+
+  // Find SR missed categories (reviewer flagged, SR passed or didn't check)
+  for (const cat of Object.keys(humanCategories)) {
+    const srResult = checkResults[cat] as SelfReviewCheckResult | undefined;
+    if (!srResult || srResult.passed) {
+      divergences.push({ variant: 'missed', category: cat });
+    }
+  }
+
+  // Find over-flagged categories (SR failed, reviewer didn't flag)
+  for (const cat of Object.keys(checkResults)) {
+    const srResult = checkResults[cat] as SelfReviewCheckResult;
+    if (!srResult.passed && !(cat in humanCategories)) {
+      divergences.push({ variant: 'over-flagged', category: cat });
+    }
+  }
+
+  if (divergences.length === 0) return null;
+
+  // Sort: misses first (higher severity), then lexically
+  const sorted = divergences.sort((a, b) => {
+    if (a.variant !== b.variant) return a.variant === 'missed' ? -1 : 1;
+    return a.category.localeCompare(b.category);
+  });
+
+  return {
+    variant: sorted[0].variant,
+    category: sorted[0].category,
+    allDivergences: sorted,
+  };
+}
+
+function SrDivergenceBadge({ task, onClick }: { task: Task; onClick?: () => void }) {
+  const state = getSrDivergenceBadgeState(task);
+  if (!state) return null;
+
+  const isMissed = state.variant === 'missed';
+  const colorClass = isMissed ? 'bg-red-500/10 border-red-500/20 text-red-400' : 'bg-amber-500/10 border-amber-500/20 text-amber-400';
+  const label = isMissed ? `SR missed ${state.category}` : `SR over-flagged ${state.category}`;
+  const allLabels = state.allDivergences.map(d => `${d.variant === 'missed' ? 'missed' : 'over-flagged'} ${d.category}`).join(', ');
+  const tooltip = state.allDivergences.length > 1
+    ? `${label}; all divergences: ${allLabels}`
+    : label;
+
+  if (onClick) {
+    return (
+      // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
+      <button
+        type="button"
+        title={tooltip}
+        onClick={(e) => { e.stopPropagation(); onClick(); }}
+        className={`inline-flex items-center text-[10px] font-medium border px-1.5 py-0.5 rounded ${colorClass} hover:opacity-80 transition-opacity`}
+      >
+        {label}
+      </button>
+    );
+  }
+
+  return (
+    <span
+      title={tooltip}
+      className={`inline-flex items-center text-[10px] font-medium border px-1.5 py-0.5 rounded ${colorClass}`}
+    >
+      {label}
+    </span>
+  );
+}
+
 function FixLoopBadge({ summary }: { summary: FixLoopSummary[] }) {
   // Show up to 2 badges: non_success first, then high-iteration-count
   const sorted = [...summary].sort((a, b) => {
@@ -784,6 +867,9 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
         )}
         {(isTerminal || task.status === 'EVALUATING') && (
           <SrDisallowedBadge task={task} />
+        )}
+        {(isTerminal || task.status === 'EVALUATING') && (
+          <SrDivergenceBadge task={task} onClick={onOpenSelfReview} />
         )}
       </div>
 

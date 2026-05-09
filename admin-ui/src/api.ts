@@ -239,6 +239,44 @@ export async function fetchSrRecentMisses(
   return res.json();
 }
 
+export interface SrUnhandledEdge {
+  case: string;
+  handled: boolean;
+  blind_spot?: string | null;
+  origin?: string | null;
+}
+
+export interface SrUnhandledEdgesTask {
+  task_id: string;
+  title: string;
+  task_type?: string | null;
+  scope?: string | null;
+  created_at?: string | null;
+  unhandled_edges: SrUnhandledEdge[];
+  pr_url?: string | null;
+}
+
+export interface SrUnhandledEdgesRetrospectiveResponse {
+  items: SrUnhandledEdgesTask[];
+  total: number;
+}
+
+export async function fetchSrUnhandledEdgesRetrospectives(
+  projectId: string,
+  params?: { task_type?: string; days?: number; page?: number; page_size?: number },
+): Promise<SrUnhandledEdgesRetrospectiveResponse> {
+  const searchParams = new URLSearchParams();
+  if (params?.task_type) searchParams.set('task_type', params.task_type);
+  if (params?.days !== undefined) searchParams.set('days', String(params.days));
+  if (params?.page !== undefined) searchParams.set('page', String(params.page));
+  if (params?.page_size !== undefined) searchParams.set('page_size', String(params.page_size));
+  const query = searchParams.toString();
+  const url = `/api/admin/projects/${encodeURIComponent(projectId)}/sr-unhandled-edges-retrospectives${query ? `?${query}` : ''}`;
+  const res = await apiFetch(url);
+  if (!res.ok) throw new Error(`Failed to fetch SR unhandled edges: ${res.status}`);
+  return res.json();
+}
+
 export interface DirectionSrCatStat {
   sample_count: number;
   hit_rate?: number | null;

@@ -9650,6 +9650,127 @@ def test_get_sr_alert_drilldown_tasks_reviewer_rescue_still_a_miss():
     assert "correctness" not in rows[0]["caught_categories"]
 
 
+def test_get_sr_alert_drilldown_tasks_includes_reviewer_findings():
+    """Each drilldown row includes missed_category_findings with severity and description."""
+    from app.playbook_learning import get_sr_alert_drilldown_tasks
+
+    project_id = uuid.uuid4()
+    ctx = {
+        "_self_review_outcome": {
+            "check_results": {"correctness": {"passed": True}},
+            "verdict": "pass",
+            "reviewer_findings": [
+                {
+                    "category": "correctness",
+                    "severity": "HIGH",
+                    "description": "The null check is missing on the payload field.",
+                }
+            ],
+        },
+        "_first_attempt_rejection_categories": ["correctness"],
+    }
+    task = Task(
+        project_id=project_id,
+        title="missing null check",
+        payloads=[{"type": "create", "prompt": "do something"}],
+        status=TaskStatus.COMPLETED,
+        context=ctx,
+    )
+    task.created_at = _utcnow() - timedelta(days=1)
+
+    rows = get_sr_alert_drilldown_tasks(
+        all_tasks=[task],
+        design_doc={},
+        categories=["correctness"],
+    )
+
+    assert len(rows) == 1
+    findings = rows[0]["missed_category_findings"]
+    assert "correctness" in findings
+    assert findings["correctness"]["severity"] == "HIGH"
+    assert (
+        findings["correctness"]["description"]
+        == "The null check is missing on the payload field."
+    )
+    assert findings["correctness"]["has_more"] is False
+
+
+def test_get_sr_alert_drilldown_tasks_fallback_when_no_reviewer_finding():
+    """When reviewer_findings has no entry for a missed category, a placeholder is used."""
+    from app.playbook_learning import get_sr_alert_drilldown_tasks
+
+    project_id = uuid.uuid4()
+    ctx = {
+        "_self_review_outcome": {
+            "check_results": {"correctness": {"passed": True}},
+            "verdict": "pass",
+            "reviewer_findings": [],
+        },
+        "_first_attempt_rejection_categories": ["correctness"],
+    }
+    task = Task(
+        project_id=project_id,
+        title="no findings task",
+        payloads=[{"type": "create", "prompt": "do something"}],
+        status=TaskStatus.COMPLETED,
+        context=ctx,
+    )
+    task.created_at = _utcnow() - timedelta(days=1)
+
+    rows = get_sr_alert_drilldown_tasks(
+        all_tasks=[task],
+        design_doc={},
+        categories=["correctness"],
+    )
+
+    assert len(rows) == 1
+    findings = rows[0]["missed_category_findings"]
+    assert findings["correctness"]["description"] == "no description recorded"
+    assert findings["correctness"]["severity"] is None
+
+
+def test_get_sr_alert_drilldown_tasks_truncates_long_description():
+    """Descriptions longer than 140 chars are truncated with has_more=True."""
+    from app.playbook_learning import get_sr_alert_drilldown_tasks
+
+    project_id = uuid.uuid4()
+    long_desc = "x" * 200
+    ctx = {
+        "_self_review_outcome": {
+            "check_results": {"security": {"passed": True}},
+            "verdict": "pass",
+            "reviewer_findings": [
+                {
+                    "category": "security",
+                    "severity": "CRITICAL",
+                    "description": long_desc,
+                }
+            ],
+        },
+        "_first_attempt_rejection_categories": ["security"],
+    }
+    task = Task(
+        project_id=project_id,
+        title="long desc task",
+        payloads=[{"type": "create", "prompt": "do something"}],
+        status=TaskStatus.COMPLETED,
+        context=ctx,
+    )
+    task.created_at = _utcnow() - timedelta(days=1)
+
+    rows = get_sr_alert_drilldown_tasks(
+        all_tasks=[task],
+        design_doc={},
+        categories=["security"],
+    )
+
+    assert len(rows) == 1
+    finding = rows[0]["missed_category_findings"]["security"]
+    assert len(finding["description"]) == 140
+    assert finding["has_more"] is True
+    assert finding["full_description"] == long_desc
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Tests for compute_edges_trend
 # ─────────────────────────────────────────────────────────────────────────────
