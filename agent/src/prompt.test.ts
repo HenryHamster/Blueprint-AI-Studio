@@ -4154,6 +4154,11 @@ describe('CREATE_TASK_FOCUS — content invariants', () => {
     const { CREATE_TASK_FOCUS } = await import('./prompt.js');
     expect(CREATE_TASK_FOCUS).toContain('grep');
   });
+
+  it('requires cross-file consistency check for multi-file diffs', async () => {
+    const { CREATE_TASK_FOCUS } = await import('./prompt.js');
+    expect(CREATE_TASK_FOCUS).toContain('Cross-file consistency');
+  });
 });
 
 describe('FIX_TASK_FOCUS — content invariants', () => {
@@ -4177,6 +4182,11 @@ describe('FIX_TASK_FOCUS — content invariants', () => {
     const { FIX_TASK_FOCUS } = await import('./prompt.js');
     expect(FIX_TASK_FOCUS).toContain('_self_review_outcome');
     expect(FIX_TASK_FOCUS).toContain('ORCHESTRATOR');
+  });
+
+  it('requires cross-file consistency check for multi-file fixes', async () => {
+    const { FIX_TASK_FOCUS } = await import('./prompt.js');
+    expect(FIX_TASK_FOCUS).toContain('Cross-file consistency');
   });
 });
 
@@ -4609,6 +4619,53 @@ describe('CODE_CHANGE_HELPER_GUIDANCE — regressing-category reasoning', () => 
   });
 });
 
+// ── CODE_CHANGE_HELPER_GUIDANCE — evidence anchors for high-stakes PASS verdicts ──
+describe('CODE_CHANGE_HELPER_GUIDANCE — evidence anchors', () => {
+  it('requires evidence anchors for PASS on correctness category', async () => {
+    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
+    expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('correctness');
+    expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('evidence anchor');
+  });
+
+  it('requires evidence anchors for PASS on error-handling category', async () => {
+    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
+    expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('error-handling');
+    expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('evidence anchor');
+  });
+
+  it('requires evidence anchors for PASS on security category', async () => {
+    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
+    expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('security');
+    expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('evidence anchor');
+  });
+
+  it('requires evidence anchors for PASS on regression_risk category', async () => {
+    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
+    expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('regression_risk');
+    expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('evidence anchor');
+  });
+
+  it('specifies file:line format as a valid anchor type', async () => {
+    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
+    expect(CODE_CHANGE_HELPER_GUIDANCE).toMatch(/file:line|path\/to\/file\.ts:/);
+  });
+
+  it('specifies code snippet format as a valid anchor type', async () => {
+    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
+    expect(CODE_CHANGE_HELPER_GUIDANCE).toMatch(/code snippet|quoted|backtick/);
+  });
+
+  it('mentions that this requirement applies to high-stakes categories only', async () => {
+    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
+    expect(CODE_CHANGE_HELPER_GUIDANCE).toMatch(/high-stakes|four categories/);
+  });
+
+  it('excludes lower-stakes categories from evidence anchor requirement', async () => {
+    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
+    expect(CODE_CHANGE_HELPER_GUIDANCE).toMatch(/lower-stakes|style-conventions|documentation/);
+  });
+});
+
 // ── writeCodeChangeHelpers — regressingCategories edge cases ─────────────────
 describe('writeCodeChangeHelpers — regressingCategories edge cases', () => {
   let capturedScripts: Record<string, string> = {};
@@ -4656,5 +4713,28 @@ describe('writeCodeChangeHelpers — regressingCategories edge cases', () => {
     expect(doneScript).toContain('REGRESSING_CATS=("correctness")');
     expect(doneScript).toContain('Regressing categories need a reasoning field');
     expect(doneScript).toContain('exit 1');
+  });
+
+  it('generates ./done with evidence-anchor gate for high-stakes categories', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    writeCodeChangeHelpers({
+      taskId: 'edge-task-3',
+      workBranch: 'blueprint/edge-task-3',
+      baseBranch: 'main',
+      owner: 'test-owner',
+      repo: 'test-repo',
+      testsOnMainBranch: false,
+      regressingCategories: [],
+    });
+
+    const doneScript = capturedScripts['/tmp/workspace/done'];
+    expect(doneScript).toBeDefined();
+    expect(doneScript).toContain('HIGH_STAKES_CATS=');
+    expect(doneScript).toContain('correctness');
+    expect(doneScript).toContain('error-handling');
+    expect(doneScript).toContain('security');
+    expect(doneScript).toContain('regression_risk');
+    expect(doneScript).toContain('evidence anchor');
+    expect(doneScript).toContain('MISSING_EVIDENCE');
   });
 });

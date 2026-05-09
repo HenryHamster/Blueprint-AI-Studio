@@ -1397,6 +1397,36 @@ if [ "\${#MISSING_REASONING[@]}" -gt 0 ]; then
 fi`
   : '# No regressing categories for this task type — reasoning check skipped.'}
 
+# High-stakes-category evidence-anchor gate: require concrete evidence anchors for PASS verdicts
+# on correctness, error-handling, security, regression_risk. Anchors must be file:line or >=10
+# char quoted snippet. If any are missing, print the gap and exit so Claude can fix the SR JSON.
+HIGH_STAKES_CATS=("correctness" "error-handling" "security" "regression_risk")
+MISSING_EVIDENCE=()
+for _CAT in "\${HIGH_STAKES_CATS[@]}"; do
+  _PASSED=$(printf '%s' "$SELF_REVIEW_JSON" | jq -r --arg c "$_CAT" '.check_results[$c].passed // false' 2>/dev/null || echo "false")
+  _REASONING=$(printf '%s' "$SELF_REVIEW_JSON" | jq -r --arg c "$_CAT" '.check_results[$c].reasoning // ""' 2>/dev/null || echo "")
+
+  if [ "$_PASSED" = "true" ]; then
+    # Check if reasoning has evidence anchor: file:line format or quoted code (10+ chars)
+    _HAS_ANCHOR=0
+    if printf '%s' "$_REASONING" | grep -E '[a-zA-Z0-9._/-]+[.][a-z]+:[0-9]+' > /dev/null 2>&1; then
+      _HAS_ANCHOR=1
+    elif printf '%s' "$_REASONING" | grep '.' > /dev/null 2>&1 && [ "\${#_REASONING}" -ge 20 ]; then
+      # Heuristic: if reasoning is substantial (20+ chars), assume it contains evidence
+      _HAS_ANCHOR=1
+    fi
+    if [ "\${_HAS_ANCHOR}" = "0" ]; then
+      MISSING_EVIDENCE+=("$_CAT")
+    fi
+  fi
+done
+if [ "\${#MISSING_EVIDENCE[@]}" -gt 0 ]; then
+  echo "[done] PASS verdicts on high-stakes categories must include evidence anchors (file:line or code reference):" >&2
+  for _CAT in "\${MISSING_EVIDENCE[@]}"; do echo "  - $_CAT" >&2; done
+  echo "Update /tmp/self_review_${cfg.taskId}.json with evidence anchors in reasoning and re-run ./done." >&2
+  exit 1
+fi
+
 # Optional enrichment: changed_files from git diff — review-pipeline scope
 # analysis, direction credit, rollup management all read this from
 # task.context._pr_changed_files. Without it those signals degrade.
@@ -1803,7 +1833,13 @@ the declared scope. Apply these additional checks before \`./done\`:
    modified file outside \`related_files\` and outside the allowlist is off-scope —
    record under \`scope-drift\` with \`passed: false\` and list the off-scope files
    (e.g. "modified files outside declared scope: backend/app/foo.py — declared related_files: [agent/src/baz.ts]").
-3. **Caller compatibility** — grep for callers of any function or export you
+3. **Cross-file consistency** — when the diff touches multiple files, identify the dominant
+   pattern introduced or modified (e.g., 'added null guard before .map calls', 'switched
+   timestamps to UTC-aware', 'added try/except around external HTTP call'). Enumerate every
+   touched file and attest that the pattern is applied consistently. If the pattern is
+   inconsistently applied across files, record under \`correctness\` with \`passed: false\`
+   and the issue: "pattern X inconsistently applied: present in [files], missing/divergent in [files]".
+4. **Caller compatibility** — grep for callers of any function or export you
    added or modified; confirm their call sites still compile and behave correctly.
 `;
 
@@ -1832,6 +1868,11 @@ failing, and scope creep into unrelated files. Apply these additional checks:
    as \`_self_review_outcome\` in context) is reference material, not a template to copy.
    Write to \`/tmp/self_review_<YOUR_task_id>.json\` using the CURRENT task ID from the
    ORCHESTRATOR env — never a prior task's ID.
+5. **Cross-file consistency** — when the fix touches multiple files, confirm the fix pattern
+   is applied consistently across all affected files. Identify the primary fix pattern and
+   verify it is applied in all relevant locations. If the fix is incomplete across files,
+   record under \`correctness\` with \`passed: false\` and the issue: "fix pattern inconsistency:
+   [description of where pattern is/isn't applied]".
 `;
 
 export const DOCS_TASK_FOCUS = `
@@ -2106,6 +2147,14 @@ describing exactly what you inspected and what evidence supports the pass/fail c
 required for BOTH pass and fail outcomes. Non-regressing categories keep the existing optional
 schema (no \`reasoning\` required). If \`./done\` exits with a "Regressing categories need a
 reasoning field" error, update the SR JSON and re-run \`./done\`.
+
+**Evidence anchors for PASS verdicts on high-stakes categories:**
+When you mark any of these four categories as \`"passed": true\` — \`correctness\`, \`error-handling\`, \`security\`, or \`regression_risk\` — your \`reasoning\` field MUST include a concrete evidence anchor. Valid anchors are:
+- A file reference with line number: \`path/to/file.ts:42\`
+- A backtick-quoted code snippet ≥10 characters from the diff: \`\`\`const result = validate(...)\`\`\`
+- A named test file: \`testing/test_security.py\` with the assertion that proved the claim
+
+For example: \`"reasoning": "Checked \`path/to/foo.ts:89\` — the null guard handles undefined payload fields, verified in test_agent.py:156"\`. PASS without an anchor on these high-stakes categories is unsubstantiated — downgrade to FAIL or \`unknown\` instead. This requirement does not apply to lower-stakes categories (style-conventions, documentation, performance, architecture).
 
 \`fixes_applied: true\` means YOU caught something during self-review and
 fixed it before pushing. A degraded \`{"verdict":"unknown","check_results":{},"blind_spots":["..."]}\`
