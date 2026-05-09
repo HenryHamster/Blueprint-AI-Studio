@@ -173,10 +173,12 @@ function EvidencePanel({ finding, repoUrl }: { finding: ResearchFinding; repoUrl
   );
 }
 
-type OutcomeFilter = 'all' | 'shipped' | 'in_progress' | 'proposed' | 'failed';
+type OutcomeFilter = 'all' | 'shipped' | 'in_progress' | 'proposed' | 'failed' | 'findings_documented';
 
 const IN_PROGRESS_OUTCOMES = new Set(['IN_PROGRESS', 'EVALUATING', 'QUEUED', 'PROVISIONING']);
 const FAILED_OUTCOMES = new Set(['FAILED', 'CANCELLED']);
+
+const METADATA_FINDING_TYPES = new Set(['design_doc_observation', 'direction_note', 'direction_proposal', 'direction_update']);
 
 const OUTCOME_FILTER_OPTIONS: { value: OutcomeFilter; label: string; color: string }[] = [
   { value: 'all', label: 'All', color: 'text-neutral-300' },
@@ -184,6 +186,7 @@ const OUTCOME_FILTER_OPTIONS: { value: OutcomeFilter; label: string; color: stri
   { value: 'in_progress', label: 'In Progress', color: 'text-cyan-400' },
   { value: 'proposed', label: 'Proposed', color: 'text-neutral-400' },
   { value: 'failed', label: 'Failed', color: 'text-red-400' },
+  { value: 'findings_documented', label: 'Documented', color: 'text-violet-400' },
 ];
 
 export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateToTask, initialDirectionId }: ResearchBrowserProps) {
@@ -254,8 +257,6 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
       for (let i = 0; i < findings.length; i++) {
         const f = findings[i];
         if (!f.title || !f.description) continue;
-        // Skip non-actionable finding types
-        if (f.type === 'design_doc_observation' || f.type === 'direction_proposal' || f.type === 'direction_note' || f.type === 'direction_update') continue;
 
         const dirId = f.direction_id || '_undirected';
         const key = `${task.id}-${i}`;
@@ -311,6 +312,10 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
   // Filter by search and outcome
   const filteredGroups = useMemo(() => {
     const matchesOutcome = (f: EnrichedFinding): boolean => {
+      const isMetadata = METADATA_FINDING_TYPES.has(f.finding.type ?? '');
+      if (outcomeFilter === 'findings_documented') return isMetadata;
+      // All non-documented filters exclude metadata findings (they have no implementation child).
+      if (isMetadata) return false;
       if (outcomeFilter === 'all') return true;
       if (outcomeFilter === 'shipped') return f.outcome?.status === 'COMPLETED';
       if (outcomeFilter === 'in_progress') return !!f.outcome && IN_PROGRESS_OUTCOMES.has(f.outcome.status);

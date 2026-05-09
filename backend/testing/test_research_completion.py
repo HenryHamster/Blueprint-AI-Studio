@@ -881,6 +881,71 @@ class TestQueryFindingsIndex:
         assert rows == []
 
 
+class TestFindingsDocumentedOutcome:
+    """completion_outcome='findings_documented' terminal pathway for metadata-only research."""
+
+    def _detect_outcome(
+        self, direction_notes, direction_proposals, type_filtered_count, child_tasks
+    ):
+        """Mirrors the logic in research_direction_state.apply_post_spawn_state."""
+        if child_tasks:
+            return None  # implementation children → not findings_documented
+        _has_metadata = bool(
+            direction_notes or direction_proposals or type_filtered_count > 0
+        )
+        return "findings_documented" if _has_metadata else None
+
+    def test_direction_notes_only_triggers_findings_documented(self):
+        """direction_notes with no children → findings_documented."""
+        outcome = self._detect_outcome(
+            direction_notes=[{"type": "direction_note", "title": "note"}],
+            direction_proposals=[],
+            type_filtered_count=0,
+            child_tasks=[],
+        )
+        assert outcome == "findings_documented"
+
+    def test_direction_proposals_only_triggers_findings_documented(self):
+        """direction_proposals with no children → findings_documented."""
+        outcome = self._detect_outcome(
+            direction_notes=[],
+            direction_proposals=[{"type": "direction_proposal", "title": "proposal"}],
+            type_filtered_count=0,
+            child_tasks=[],
+        )
+        assert outcome == "findings_documented"
+
+    def test_design_doc_observations_type_filtered_triggers_findings_documented(self):
+        """design_doc_observation findings counted in type_filtered_count → findings_documented."""
+        outcome = self._detect_outcome(
+            direction_notes=[],
+            direction_proposals=[],
+            type_filtered_count=2,
+            child_tasks=[],
+        )
+        assert outcome == "findings_documented"
+
+    def test_no_metadata_no_children_no_findings_documented(self):
+        """No metadata findings, no children → None (existing dedup/empty-prompt path)."""
+        outcome = self._detect_outcome(
+            direction_notes=[],
+            direction_proposals=[],
+            type_filtered_count=0,
+            child_tasks=[],
+        )
+        assert outcome is None
+
+    def test_mixed_with_child_tasks_no_findings_documented(self):
+        """When implementation child tasks exist, no findings_documented outcome."""
+        outcome = self._detect_outcome(
+            direction_notes=[{"type": "direction_note", "title": "note"}],
+            direction_proposals=[],
+            type_filtered_count=0,
+            child_tasks=[object()],  # non-empty → implementation path
+        )
+        assert outcome is None
+
+
 class TestRecordResearchTaskFailureScopeEmpty:
     """_record_research_task_failure: SCOPE_EMPTY is benign and must not penalize direction health."""
 

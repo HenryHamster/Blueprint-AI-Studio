@@ -152,3 +152,62 @@ describe('ResearchBrowser evidence panel', () => {
     expect(screen.queryByText(/^Sources$/i)).not.toBeInTheDocument();
   });
 });
+
+describe('ResearchBrowser findings_documented filter', () => {
+  it('shows metadata findings only under Documented filter', async () => {
+    const user = userEvent.setup();
+    const metaFinding = makeFinding({ title: 'Design observation', type: 'design_doc_observation' });
+    const implFinding = makeFinding({ title: 'Implementation finding' });
+    render(
+      <ResearchBrowser
+        tasks={[makeResearchTask([metaFinding, implFinding])]}
+        selectedProjectId={null}
+        onClose={() => {}}
+      />,
+    );
+
+    // Before filtering: only implementation findings are shown (All filter excludes metadata).
+    expect(screen.getByText('Implementation finding')).toBeInTheDocument();
+    expect(screen.queryByText('Design observation')).not.toBeInTheDocument();
+
+    // Switch to Documented filter.
+    await user.click(screen.getByRole('button', { name: 'Documented' }));
+    expect(screen.getByText('Design observation')).toBeInTheDocument();
+    expect(screen.queryByText('Implementation finding')).not.toBeInTheDocument();
+  });
+
+  it('shows direction_note and direction_proposal findings under Documented filter', async () => {
+    const user = userEvent.setup();
+    const noteFinding = makeFinding({ title: 'Direction note', type: 'direction_note' });
+    const proposalFinding = makeFinding({ title: 'Direction proposal', type: 'direction_proposal' });
+    render(
+      <ResearchBrowser
+        tasks={[makeResearchTask([noteFinding, proposalFinding])]}
+        selectedProjectId={null}
+        onClose={() => {}}
+      />,
+    );
+
+    await user.click(screen.getByRole('button', { name: 'Documented' }));
+    expect(screen.getByText('Direction note')).toBeInTheDocument();
+    expect(screen.getByText('Direction proposal')).toBeInTheDocument();
+  });
+
+  it('metadata findings not shown in Proposed filter (backward compatible)', async () => {
+    const user = userEvent.setup();
+    const metaFinding = makeFinding({ title: 'Meta only', type: 'direction_note' });
+    const implFinding = makeFinding({ title: 'Impl proposed' });
+    render(
+      <ResearchBrowser
+        tasks={[makeResearchTask([metaFinding, implFinding])]}
+        selectedProjectId={null}
+        onClose={() => {}}
+      />,
+    );
+
+    await user.click(screen.getByRole('button', { name: 'Proposed' }));
+    // Only implementation findings without a child task appear under Proposed.
+    expect(screen.getByText('Impl proposed')).toBeInTheDocument();
+    expect(screen.queryByText('Meta only')).not.toBeInTheDocument();
+  });
+});

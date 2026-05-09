@@ -2600,6 +2600,68 @@ describe('MessagesPanel summary card', () => {
     // Summary card should show routine ops
     expect(mockAddToast).toHaveBeenCalled();
   });
+
+  test('caught-up indicator shows when dividerTime set and zero new messages', async () => {
+    const dividerTime = Date.now();
+    const oldMsg = {
+      id: 'm1',
+      project_id: 'proj-1',
+      message_type: 'BLOCKER',
+      from_type: 'agent',
+      content: 'Old message',
+      context: {},
+      status: 'open',
+      resolution: null,
+      resolved_at: null,
+      created_at: new Date(dividerTime - 5000).toISOString(),
+    };
+    const el = await renderPanelWithDivider([oldMsg], dividerTime);
+    // Should show caught-up indicator with reset button
+    expect(el.textContent).toContain('No new since');
+    expect([...el.querySelectorAll('button')].some(b => b.textContent?.includes('Reset baseline'))).toBe(true);
+  });
+
+  test('caught-up indicator does not show when there are new high-signal messages', async () => {
+    const dividerTime = Date.now();
+    const msgs = [
+      {
+        id: 'm1',
+        project_id: 'proj-1',
+        message_type: 'BLOCKER',
+        from_type: 'agent',
+        content: 'New blocker',
+        context: {},
+        status: 'open',
+        resolution: null,
+        resolved_at: null,
+        created_at: new Date(dividerTime + 1000).toISOString(),
+      },
+    ];
+    const el = await renderPanelWithDivider(msgs, dividerTime);
+    // Should show the regular "X new since" banner, not the caught-up indicator
+    expect(el.textContent).toContain('1 new since');
+    expect(el.textContent).not.toContain('No new since');
+  });
+
+  test('caught-up indicator does not show when dividerTime is null', async () => {
+    const msgs = [
+      {
+        id: 'm1',
+        project_id: 'proj-1',
+        message_type: 'BLOCKER',
+        from_type: 'agent',
+        content: 'Message',
+        context: {},
+        status: 'open',
+        resolution: null,
+        resolved_at: null,
+        created_at: new Date().toISOString(),
+      },
+    ];
+    const el = await renderPanelWithDivider(msgs, null);
+    // Should not show caught-up indicator when divider time is null
+    expect(el.textContent).not.toContain('No new since');
+  });
 });
 
 // ── Temporary mutes unit tests ───────────────────────────────────────────

@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { TrendingUp, TrendingDown, Minus, ChevronRight, ChevronDown, AlertTriangle } from 'lucide-react';
+import { TrendingUp, TrendingDown, Minus, ChevronRight, ChevronDown, AlertTriangle, ArrowDownRight, ArrowUpRight } from 'lucide-react';
 
 export interface SrMissExample {
   severity: 'CRITICAL' | 'MAJOR' | 'MINOR';
@@ -969,6 +969,101 @@ export interface SrMissedTask {
   reviewer_findings?: SrReviewerFinding[];
 }
 
+// eslint-disable-next-line react-refresh/only-export-components
+export interface TargetHealthStats {
+  configured: number;
+  belowTarget: number;
+  newlyMissed: number;
+  newlyRecovered: number;
+  hasCycleData: boolean;
+}
+
+// eslint-disable-next-line react-refresh/only-export-components
+export function computeTargetHealth(
+  categories: Record<string, SrCategoryTrend> | null | undefined,
+  targets: Record<string, number> | null | undefined,
+): TargetHealthStats | null {
+  if (!targets || Object.keys(targets).length === 0) return null;
+  const configured = Object.keys(targets).length;
+  let belowTarget = 0;
+  let newlyMissed = 0;
+  let newlyRecovered = 0;
+  let hasCycleData = false;
+
+  for (const [cat, target] of Object.entries(targets)) {
+    const c = categories?.[cat];
+    if (!c) continue;
+    const cur = c.current_hit_rate;
+    const prev = c.previous_hit_rate;
+    if (cur == null) continue;
+    const nowBelow = cur < target;
+    if (nowBelow) belowTarget++;
+    if (prev != null) {
+      hasCycleData = true;
+      const wasBelow = prev < target;
+      if (nowBelow && !wasBelow) newlyMissed++;
+      if (!nowBelow && wasBelow) newlyRecovered++;
+    }
+  }
+
+  return { configured, belowTarget, newlyMissed, newlyRecovered, hasCycleData };
+}
+
+function TargetHealthSummaryCard({ stats }: { stats: TargetHealthStats }) {
+  const allHealthy = stats.belowTarget === 0;
+  return (
+    <div
+      data-testid="target-health-summary"
+      className={`flex items-center gap-3 px-2 py-1 rounded mb-1.5 text-[10px] font-mono border ${
+        allHealthy
+          ? 'bg-emerald-950/40 border-emerald-800/30 text-emerald-400'
+          : 'bg-red-950/30 border-red-800/30 text-red-400'
+      }`}
+    >
+      <span title={`${stats.configured} categories have a configured target`}>
+        {stats.configured} configured
+      </span>
+      <span className="text-neutral-600">·</span>
+      <span
+        title={`${stats.belowTarget} of ${stats.configured} categories are currently below their target hit rate`}
+        className={stats.belowTarget > 0 ? 'text-red-400' : 'text-emerald-400'}
+      >
+        {stats.belowTarget} below target
+      </span>
+      {stats.hasCycleData && (
+        <>
+          {stats.newlyMissed > 0 && (
+            <>
+              <span className="text-neutral-600">·</span>
+              <span
+                data-testid="newly-missed-indicator"
+                title={`${stats.newlyMissed} categories crossed below their target this cycle`}
+                className="flex items-center gap-0.5 text-red-400"
+              >
+                <ArrowDownRight className="w-2.5 h-2.5" />
+                {stats.newlyMissed} new miss
+              </span>
+            </>
+          )}
+          {stats.newlyRecovered > 0 && (
+            <>
+              <span className="text-neutral-600">·</span>
+              <span
+                data-testid="newly-recovered-indicator"
+                title={`${stats.newlyRecovered} categories recovered above their target this cycle`}
+                className="flex items-center gap-0.5 text-emerald-400"
+              >
+                <ArrowUpRight className="w-2.5 h-2.5" />
+                {stats.newlyRecovered} recovered
+              </span>
+            </>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
 interface SrTrendBreakdownProps {
   trends: SrTrendData | null | undefined;
   variant: 'card' | 'inline';
@@ -1119,6 +1214,20 @@ function CategoryRow({
             {`t95:${formatLatencySec(c.time_to_miss_detect_p95_sec)}`}
           </span>
         )}
+        {targetHitRate != null && c.current_hit_rate != null && (() => {
+          const gap = (targetHitRate - c.current_hit_rate) * 100;
+          const isMissing = gap > 0;
+          const gapColor = isMissing ? 'text-red-400' : 'text-neutral-400';
+          const gapSign = gap > 0 ? '−' : '';
+          return (
+            <span
+              className={`font-mono tabular-nums text-xs ${gapColor}`}
+              title={`Target: ${Math.round(targetHitRate * 100)}% hit rate — gap: ${gapSign}${Math.abs(Math.round(gap))}pp`}
+            >
+              {`target ${Math.round(targetHitRate * 100)}% (${gapSign}${Math.abs(Math.round(gap))}pp)`}
+            </span>
+          );
+        })()}
         {!sampleTooSmall && <TrendIcon trend={c.trend} />}
         {belowFloor && (
           <span
@@ -1253,6 +1362,20 @@ function CategoryRow({
           {`t95:${formatLatencySec(c.time_to_miss_detect_p95_sec)}`}
         </span>
       )}
+      {targetHitRate != null && c.current_hit_rate != null && (() => {
+        const gap = (targetHitRate - c.current_hit_rate) * 100;
+        const isMissing = gap > 0;
+        const gapColor = isMissing ? 'text-red-400' : 'text-neutral-400';
+        const gapSign = gap > 0 ? '−' : '';
+        return (
+          <span
+            className={`font-mono text-xs ${gapColor}`}
+            title={`Target: ${Math.round(targetHitRate * 100)}% hit rate — gap: ${gapSign}${Math.abs(Math.round(gap))}pp`}
+          >
+            {`target ${Math.round(targetHitRate * 100)}% (${gapSign}${Math.abs(Math.round(gap))}pp)`}
+          </span>
+        );
+      })()}
       {!sampleTooSmall && <TrendIcon trend={c.trend} />}
       {belowFloor && (
         <span
@@ -1375,7 +1498,10 @@ export function SrTrendBreakdown({ trends, variant, onCategoryClick, srCatchRate
               Configure SR catch-rate targets →
             </button>
           </p>
-        ) : null}
+        ) : (() => {
+          const healthStats = computeTargetHealth(categories, srCatchRateTargets);
+          return healthStats ? <TargetHealthSummaryCard stats={healthStats} /> : null;
+        })()}
         {skipRate != null && (
           <p
             data-testid="sr-skip-rate-line"

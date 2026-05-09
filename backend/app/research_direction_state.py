@@ -699,6 +699,14 @@ async def apply_post_spawn_state(
     )
 
     if not child_tasks:
+        # findings_documented: research produced only metadata findings (direction_notes,
+        # direction_proposals, or design_doc_observations counted in type_filtered_count)
+        # with no implementation children — record as a successful documentation outcome.
+        _has_metadata = bool(
+            direction_notes or direction_proposals or type_filtered_count > 0
+        )
+        _completion_outcome = "findings_documented" if _has_metadata else None
+
         task.status = TaskStatus.COMPLETED
         task.latest_status_message = (
             status_msg + " — auto-completed (no actionable tasks)"
@@ -707,6 +715,11 @@ async def apply_post_spawn_state(
             **(task.context or {}),
             "research_branch": research_branch,
             "original_base": original_base,
+            **(
+                {"completion_outcome": "findings_documented"}
+                if _completion_outcome
+                else {}
+            ),
         }
         session.add(task)
 

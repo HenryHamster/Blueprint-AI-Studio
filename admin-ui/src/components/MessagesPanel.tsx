@@ -1630,6 +1630,25 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
           </div>
         )}
 
+        {/* Caught-up indicator: when divider is set, not dismissed, and zero new messages of any kind */}
+        {dividerTime && !dividerDismissedRef.current && newHighSignalCount === 0 && newMessageCounts.blockers === 0 && newMessageCounts.feedback === 0 && newMessageCounts.bugReports === 0 && newMessageCounts.routine === 0 && !showOnlyNew && (
+          <div className="mb-3 p-3 md:p-4 rounded-lg bg-gradient-to-r from-emerald-600/20 to-emerald-500/10 border border-emerald-500/50 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+            <div className="flex-1 min-w-0">
+              <div className="text-sm font-semibold text-emerald-300 truncate">
+                No new since {formatSinceTimestamp(dividerTime)}
+              </div>
+            </div>
+            <div className="flex items-center gap-2 flex-wrap">
+              <button
+                onClick={dismissDivider}
+                className="shrink-0 px-3 py-2 rounded-lg border border-emerald-500/60 text-emerald-300 hover:bg-emerald-500/10 text-xs font-medium transition-colors min-h-[44px] md:min-h-auto"
+              >
+                Reset baseline
+              </button>
+            </div>
+          </div>
+        )}
+
         {loading ? (
           <p className="text-xs text-neutral-500 text-center py-8">Loading...</p>
         ) : messages.length === 0 ? (
