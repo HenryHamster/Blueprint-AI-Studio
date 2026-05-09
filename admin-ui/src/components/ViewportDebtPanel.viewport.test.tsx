@@ -43,16 +43,51 @@ const MOCK_ROWS = [
   },
 ];
 
+const MOCK_UNTESTED_ROWS = [
+  {
+    component: 'admin-ui/src/components/QuickFilterPresets.tsx',
+    eslint_disable_count: 0,
+    data_viewport_allow_small_target: 0,
+    data_viewport_allow_overflow: 0,
+    data_viewport_allow_truncation: 0,
+    total_opt_outs: 0,
+    has_viewport_test: false,
+    regression_case_count: 0,
+    source_url:
+      'https://github.com/example/repo/blob/main/admin-ui/src/components/QuickFilterPresets.tsx',
+  },
+  {
+    component: 'admin-ui/src/components/RunningUpdatePanel.tsx',
+    eslint_disable_count: 0,
+    data_viewport_allow_small_target: 0,
+    data_viewport_allow_overflow: 0,
+    data_viewport_allow_truncation: 0,
+    total_opt_outs: 0,
+    has_viewport_test: false,
+    regression_case_count: 0,
+    source_url: null,
+  },
+];
+
 const MOCK_COVERAGE_SUMMARY = {
-  total_components: 3,
-  untested_count: 1,
-  untested_components: ['admin-ui/src/components/TaskDetailDrawer.tsx'],
+  total_components: 5,
+  untested_count: 3,
+  untested_components: [
+    'admin-ui/src/components/TaskDetailDrawer.tsx',
+    'admin-ui/src/components/QuickFilterPresets.tsx',
+    'admin-ui/src/components/RunningUpdatePanel.tsx',
+  ],
 };
 
 vi.mock('../api', () => ({
   apiFetch: vi.fn(async () =>
     new Response(
-      JSON.stringify({ rows: MOCK_ROWS, scanned_at: new Date().toISOString(), coverage_summary: MOCK_COVERAGE_SUMMARY }),
+      JSON.stringify({
+        rows: MOCK_ROWS,
+        untested_rows: MOCK_UNTESTED_ROWS,
+        scanned_at: new Date().toISOString(),
+        coverage_summary: MOCK_COVERAGE_SUMMARY,
+      }),
       { status: 200 },
     )
   ),
@@ -121,6 +156,41 @@ describe('ViewportDebtPanel — viewport regression', () => {
       await act(async () => { root?.render(<ViewportDebtPanel projectId="project-123" />); });
       await act(async () => { await new Promise((resolve) => setTimeout(resolve, 50)); });
     }, { selector: 'a[aria-label]', waitMs: 50 });
+  });
+
+  test('renders untested rows when rows is empty', async () => {
+    vi.mocked(apiFetch).mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          rows: [],
+          untested_rows: MOCK_UNTESTED_ROWS,
+          scanned_at: new Date().toISOString(),
+          coverage_summary: {
+            total_components: 2,
+            untested_count: 2,
+            untested_components: MOCK_UNTESTED_ROWS.map((r) => r.component),
+          },
+        }),
+        { status: 200 },
+      )
+    );
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      root = createRoot(host);
+      await act(async () => { root?.render(<ViewportDebtPanel projectId="project-untested" />); });
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 50)); });
+      const panel = host.querySelector('[data-testid="viewport-debt-panel"]');
+      if (!panel) throw new Error('panel did not mount when only untested_rows are present');
+      const rendered = host.textContent ?? '';
+      if (!rendered.includes('QuickFilterPresets')) {
+        throw new Error('untested row component name not rendered in table');
+      }
+      if (!rendered.includes('RunningUpdatePanel')) {
+        throw new Error('second untested row component name not rendered in table');
+      }
+    });
   });
 
   test('untested-only filter active: no overflow and button meets 44px at 375px', async () => {

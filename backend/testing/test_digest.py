@@ -14779,13 +14779,14 @@ async def test_viewport_debt_coverage_summary_in_response(
 
     with patch(
         "app.routers.admin_digest._scan_viewport_debt_rows",
-        return_value=(top_rows, expected_summary),
+        return_value=(top_rows, [], expected_summary),
     ):
         response = await client.get(f"/api/admin/projects/{project.id}/viewport-debt")
 
     assert response.status_code == 200
     body = response.json()
     assert "rows" in body
+    assert "untested_rows" in body
     assert "scanned_at" in body
     assert "coverage_summary" in body
     cs = body["coverage_summary"]
@@ -14834,7 +14835,7 @@ async def test_viewport_debt_coverage_summary_counts_full_set(
 
     with patch(
         "app.routers.admin_digest._scan_viewport_debt_rows",
-        return_value=(top_rows, expected_summary),
+        return_value=(top_rows, [], expected_summary),
     ):
         response = await client.get(f"/api/admin/projects/{project.id}/viewport-debt")
 

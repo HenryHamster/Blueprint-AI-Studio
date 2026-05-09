@@ -8727,9 +8727,10 @@ async def get_regression_mtta(
 # ---------------------------------------------------------------------------
 
 _VIEWPORT_DEBT_CACHE: Optional[
-    tuple[datetime, List[Dict[str, Any]], Dict[str, Any]]
+    tuple[datetime, List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]
 ] = None
 _VIEWPORT_DEBT_CACHE_TTL = 300  # 5 minutes
+_VIEWPORT_DEBT_UNTESTED_CAP = 30
 
 _ESLINT_VIEWPORT_RE = _re.compile(
     r"eslint-disable(?:-next-line)?.*viewport/(?:min-touch-target|no-fixed-width)"
@@ -8749,13 +8750,15 @@ def _find_components_dir() -> Optional[_Path]:
     return None
 
 
-def _scan_viewport_debt_rows() -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+def _scan_viewport_debt_rows() -> tuple[
+    List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]
+]:
     global _VIEWPORT_DEBT_CACHE
     now = datetime.utcnow()
     if _VIEWPORT_DEBT_CACHE is not None:
-        cached_at, cached_rows, cached_summary = _VIEWPORT_DEBT_CACHE
+        cached_at, cached_rows, cached_untested, cached_summary = _VIEWPORT_DEBT_CACHE
         if (now - cached_at).total_seconds() < _VIEWPORT_DEBT_CACHE_TTL:
-            return cached_rows, cached_summary
+            return cached_rows, cached_untested, cached_summary
 
     components_dir = _find_components_dir()
     if components_dir is None:
@@ -8764,9 +8767,12 @@ def _scan_viewport_debt_rows() -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
             "untested_count": 0,
             "untested_components": [],
         }
-        return [], empty_summary
+        return [], [], empty_summary
 
     rows = []
+    untested_rows: List[Dict[str, Any]] = []
+    untested_paths: List[str] = []
+    total_components = 0
     for tsx_file in sorted(components_dir.glob("*.tsx")):
         name = tsx_file.name
         if ".test." in name or ".spec." in name:
@@ -8776,18 +8782,37 @@ def _scan_viewport_debt_rows() -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
         except OSError:
             continue
 
+        total_components += 1
         eslint_count = len(_ESLINT_VIEWPORT_RE.findall(content))
         small_target = len(_DATA_SMALL_TARGET_RE.findall(content))
         overflow = len(_DATA_OVERFLOW_RE.findall(content))
         truncation = len(_DATA_TRUNCATION_RE.findall(content))
         total = eslint_count + small_target + overflow + truncation
 
-        if total == 0:
-            continue
-
         stem = tsx_file.stem  # e.g. "MessagesPanel"
         vp_test = (tsx_file.parent / f"{stem}.viewport.test.tsx").exists()
         rel_path = f"admin-ui/src/components/{name}"
+
+        if not vp_test:
+            untested_paths.append(rel_path)
+
+        if total == 0:
+            if not vp_test:
+                untested_rows.append(
+                    {
+                        "component": rel_path,
+                        "eslint_disable_count": 0,
+                        "data_viewport_allow_small_target": 0,
+                        "data_viewport_allow_overflow": 0,
+                        "data_viewport_allow_truncation": 0,
+                        "total_opt_outs": 0,
+                        "has_viewport_test": False,
+                        "regression_case_count": 0,
+                        "source_url": None,
+                    }
+                )
+            continue
+
         rows.append(
             {
                 "component": rel_path,
@@ -8803,18 +8828,18 @@ def _scan_viewport_debt_rows() -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
         )
 
     rows.sort(key=lambda r: r["total_opt_outs"], reverse=True)
+    untested_rows.sort(key=lambda r: r["component"])
 
-    # Compute coverage_summary over the full pre-truncation set.
-    untested = [r["component"] for r in rows if not r["has_viewport_test"]]
     coverage_summary: Dict[str, Any] = {
-        "total_components": len(rows),
-        "untested_count": len(untested),
-        "untested_components": untested[:50],
+        "total_components": total_components,
+        "untested_count": len(untested_paths),
+        "untested_components": sorted(untested_paths)[:50],
     }
 
     rows = rows[:15]
-    _VIEWPORT_DEBT_CACHE = (now, rows, coverage_summary)
-    return rows, coverage_summary
+    untested_rows = untested_rows[:_VIEWPORT_DEBT_UNTESTED_CAP]
+    _VIEWPORT_DEBT_CACHE = (now, rows, untested_rows, coverage_summary)
+    return rows, untested_rows, coverage_summary
 
 
 @router.get("/projects/{project_id}/viewport-debt")
@@ -8838,11 +8863,11 @@ async def get_viewport_debt(
     # Shallow-copy cached rows: the scan result is a process-wide cache and
     # we annotate per-project below. Without the copy, concurrent requests
     # for different projects would race on regression_case_count / source_url.
-    top_rows, coverage_summary = _scan_viewport_debt_rows()
+    top_rows, top_untested, coverage_summary = _scan_viewport_debt_rows()
     rows = [dict(r) for r in top_rows]
+    untested_rows = [dict(r) for r in top_untested]
 
-    # Annotate each row with recent regression case count from the DB.
-    if rows:
+    if rows or untested_rows:
         cutoff = datetime.utcnow() - timedelta(days=30)
         stmt = select(RegressionRemediationCase).where(
             RegressionRemediationCase.project_id == project_id,
@@ -8866,7 +8891,7 @@ async def get_viewport_debt(
         gh_owner = project.github_owner if project else None
         gh_repo = project.github_repo if project else None
 
-        for row in rows:
+        for row in (*rows, *untested_rows):
             stem_tsx = _Path(row["component"]).name  # e.g. "MessagesPanel.tsx"
             row["regression_case_count"] = case_counts.get(stem_tsx, 0)
             if gh_owner and gh_repo:
@@ -8876,6 +8901,7 @@ async def get_viewport_debt(
 
     return {
         "rows": rows,
+        "untested_rows": untested_rows,
         "scanned_at": datetime.utcnow().isoformat(),
         "coverage_summary": coverage_summary,
     }
@@ -8959,3 +8985,95 @@ async def get_regression_escalation_outcomes(
     return compute_escalation_outcome_breakdown(
         list(cases), lookback_days=lookback_days
     )
+
+
+@router.get("/pipeline-efficiency")
+async def get_pipeline_efficiency(
+    project_id: Optional[uuid.UUID] = Query(default=None),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),  # noqa: ARG001
+) -> Dict[str, Any]:
+    """Aggregate VM cold-start latency, warm reuse rate, and review iterations.
+
+    Returns p50/p95 of cold-start setup_secs, warm VM reuse fraction, and
+    review-iteration median/p95 for the last 24h and 7d windows, each with a
+    14-day-prior delta for trend comparison.
+    """
+    now = _utcnow()
+    filters = [
+        Task.created_at >= now - timedelta(days=21),
+        Task.status == TaskStatus.COMPLETED,
+    ]
+    if project_id:
+        filters.append(Task.project_id == project_id)
+    tasks = (
+        (
+            await session.execute(
+                select(Task)
+                .where(*filters)
+                .options(load_only(Task.id, Task.status, Task.context, Task.created_at))
+                .limit(5000)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    def _pct(values: list, p: int):
+        if not values:
+            return None
+        s = sorted(values)
+        return s[min(int(len(s) * p / 100), len(s) - 1)]
+
+    def _metrics(bucket: list) -> Dict[str, Any]:
+        timing_list = [(t.context or {}).get("_timing") or {} for t in bucket]
+        cold = [
+            float(tm["setup_secs"])
+            for tm in timing_list
+            if isinstance(tm.get("setup_secs"), (int, float))
+            and not tm.get("warm_start")
+        ]
+        warm_n = sum(1 for tm in timing_list if tm.get("warm_start") is True)
+        timed_n = sum(1 for tm in timing_list if tm)
+        iters = [
+            int((t.context or {}).get("review_loop", {}).get("iteration") or 0)
+            for t in bucket
+            if (t.context or {}).get("review_loop")
+        ]
+        return {
+            "setup_p50_secs": _pct(cold, 50),
+            "setup_p95_secs": _pct(cold, 95),
+            "setup_sample_n": len(cold),
+            "warm_reuse_rate": round(warm_n / timed_n, 3) if timed_n else None,
+            "warm_reuse_sample_n": timed_n,
+            "review_iter_median": _pct(iters, 50),
+            "review_iter_p95": _pct(iters, 95),
+            "review_iter_sample_n": len(iters),
+        }
+
+    def _in(start, end):
+        return [t for t in tasks if start <= (t.created_at or now) < end]
+
+    prior_end = now - timedelta(days=14)
+    cur_24h = _metrics(_in(now - timedelta(hours=24), now))
+    cur_7d = _metrics(_in(now - timedelta(days=7), now))
+    pri_24h = _metrics(_in(now - timedelta(hours=24) - timedelta(days=14), prior_end))
+    pri_7d = _metrics(_in(now - timedelta(days=21), prior_end))
+
+    def _delta(a, b, k):
+        av, bv = a.get(k), b.get(k)
+        return round(av - bv, 4) if av is not None and bv is not None else None
+
+    def _augment(cur, pri):
+        return {
+            **cur,
+            "vs_prior_setup_p50_delta": _delta(cur, pri, "setup_p50_secs"),
+            "vs_prior_warm_reuse_rate_delta": _delta(cur, pri, "warm_reuse_rate"),
+            "vs_prior_review_iter_median_delta": _delta(cur, pri, "review_iter_median"),
+        }
+
+    return {
+        "computed_at": now.isoformat(),
+        "window_24h": _augment(cur_24h, pri_24h),
+        "window_7d": _augment(cur_7d, pri_7d),
+    }

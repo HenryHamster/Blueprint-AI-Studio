@@ -435,6 +435,25 @@ export function formatTimestamp(timestamp: number): string {
   return `${days}d ago`;
 }
 
+export function formatSinceTimestamp(timestamp: number): string {
+  const date = new Date(timestamp);
+  const now = new Date();
+  const dayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  const isToday = date.toDateString() === now.toDateString();
+  const isYesterday = new Date(date.getTime() + 86400000).toDateString() === now.toDateString();
+
+  const day = dayNames[date.getDay()];
+  const hour = date.getHours();
+  const min = date.getMinutes().toString().padStart(2, '0');
+  const ampm = hour >= 12 ? 'pm' : 'am';
+  const displayHour = hour % 12 || 12;
+
+  const time = `${displayHour}:${min}${ampm}`;
+  if (isToday) return `Today ${time}`;
+  if (isYesterday) return `Yesterday ${time}`;
+  return `${day} ${time}`;
+}
+
 export type MessageWithDivider<T> =
   | { kind: 'divider'; label: string }
   | { kind: 'message'; msg: T };

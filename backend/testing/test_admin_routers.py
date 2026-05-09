@@ -2382,7 +2382,7 @@ class TestViewportDebt:
         }
         with patch(
             "app.routers.admin_digest._scan_viewport_debt_rows",
-            return_value=(fake_rows, fake_summary),
+            return_value=(fake_rows, [], fake_summary),
         ):
             resp = await client.get(f"/api/admin/projects/{project.id}/viewport-debt")
 
@@ -2435,7 +2435,7 @@ class TestViewportDebt:
         }
         with patch(
             "app.routers.admin_digest._scan_viewport_debt_rows",
-            return_value=(fake_rows, fake_summary),
+            return_value=(fake_rows, [], fake_summary),
         ):
             resp = await client.get(f"/api/admin/projects/{project.id}/viewport-debt")
 
@@ -2458,7 +2458,7 @@ class TestViewportDebt:
         }
         with patch(
             "app.routers.admin_digest._scan_viewport_debt_rows",
-            return_value=([], empty_summary),
+            return_value=([], [], empty_summary),
         ):
             resp = await client.get(f"/api/admin/projects/{project.id}/viewport-debt")
 
@@ -2514,10 +2514,73 @@ class TestViewportDebt:
         }
         with patch(
             "app.routers.admin_digest._scan_viewport_debt_rows",
-            return_value=(cached_rows, cached_summary),
+            return_value=(cached_rows, [], cached_summary),
         ):
             resp = await client.get(f"/api/admin/projects/{project.id}/viewport-debt")
 
         assert resp.status_code == 200
         # The shared cached row must remain identical to its pre-request state.
         assert cached_rows[0] == snapshot
+
+    @pytest.mark.asyncio
+    async def test_untested_rows_returned_with_source_url(
+        self, client: AsyncClient, db_session
+    ):
+        """Untested-no-debt rows are returned and annotated with source_url."""
+        from unittest.mock import patch
+
+        project = Project(
+            name="Annotated",
+            user_id=TEST_USER_ID,
+            github_owner="acme",
+            github_repo="repo",
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        member = ProjectMember(
+            project_id=project.id, user_id=TEST_USER_ID, role="owner"
+        )
+        db_session.add(member)
+        await db_session.commit()
+
+        fake_untested = [
+            {
+                "component": "admin-ui/src/components/QuickFilterPresets.tsx",
+                "eslint_disable_count": 0,
+                "data_viewport_allow_small_target": 0,
+                "data_viewport_allow_overflow": 0,
+                "data_viewport_allow_truncation": 0,
+                "total_opt_outs": 0,
+                "has_viewport_test": False,
+                "regression_case_count": 0,
+                "source_url": None,
+            }
+        ]
+        fake_summary = {
+            "total_components": 1,
+            "untested_count": 1,
+            "untested_components": [
+                "admin-ui/src/components/QuickFilterPresets.tsx",
+            ],
+        }
+        with patch(
+            "app.routers.admin_digest._scan_viewport_debt_rows",
+            return_value=([], fake_untested, fake_summary),
+        ):
+            resp = await client.get(f"/api/admin/projects/{project.id}/viewport-debt")
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["rows"] == []
+        assert "untested_rows" in body
+        assert len(body["untested_rows"]) == 1
+        ut = body["untested_rows"][0]
+        assert ut["component"] == "admin-ui/src/components/QuickFilterPresets.tsx"
+        assert ut["has_viewport_test"] is False
+        assert ut["total_opt_outs"] == 0
+        assert ut["regression_case_count"] == 0
+        assert ut["source_url"] == (
+            "https://github.com/acme/repo/blob/main/"
+            "admin-ui/src/components/QuickFilterPresets.tsx"
+        )

@@ -3,7 +3,7 @@ import { X, MessageSquare, Send, Check, AlertTriangle, HelpCircle, Bug, StickyNo
 import { auth } from '../firebase';
 import { apiFetch, API_BASE_URL, authHeaders } from '../api';
 import { parseTimestamp } from '../utils/time';
-import { routineSummary, effectiveSignal, loadEventPrefs, saveEventPrefs, type EventPref, groupRoutineMessages, collapseStaleRoutineRows, formatDailyDigestSummary, outcomeBreakdown, isFailingGroup, getToastSeverity, type RoutineRow, loadLastSeen, saveLastSeen, formatTimestamp, insertTimeDividers, type MessageWithDivider, ESCALATION_BADGE_LABELS, isCriticalSeverity, type MuteWindow, loadMuteWindow, saveMuteWindow, clearMuteWindow, isMuteWindowActive, formatMuteCountdown, type SavedView, loadSavedViews, saveSavedViews, SAVED_VIEWS_CAP, type TemporaryMutes, loadTemporaryMutes, saveTemporaryMutes, ROUTINE_EVENT_LABELS } from './MessagesPanel.utils';
+import { routineSummary, effectiveSignal, loadEventPrefs, saveEventPrefs, type EventPref, groupRoutineMessages, collapseStaleRoutineRows, formatDailyDigestSummary, outcomeBreakdown, isFailingGroup, getToastSeverity, type RoutineRow, loadLastSeen, saveLastSeen, formatTimestamp, formatSinceTimestamp, insertTimeDividers, type MessageWithDivider, ESCALATION_BADGE_LABELS, isCriticalSeverity, type MuteWindow, loadMuteWindow, saveMuteWindow, clearMuteWindow, isMuteWindowActive, formatMuteCountdown, type SavedView, loadSavedViews, saveSavedViews, SAVED_VIEWS_CAP, type TemporaryMutes, loadTemporaryMutes, saveTemporaryMutes, ROUTINE_EVENT_LABELS } from './MessagesPanel.utils';
 
 const DEFAULT_VIEW_ID = '__default__';
 
@@ -308,6 +308,17 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
       dividerDismissedRef.current = true;
     }
   }, [selectedProjectId]);
+
+  const handleShowOnlyNew = useCallback(() => {
+    setShowOnlyNew(true);
+    // Scroll to first new message on next render
+    setTimeout(() => {
+      const msgBubbles = scrollRef.current?.querySelectorAll('[data-testid="message-bubble"]');
+      if (msgBubbles && msgBubbles.length > 0) {
+        (msgBubbles[0] as HTMLElement).scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }
+    }, 100);
+  }, []);
 
   // Refs for scrolling to sections from summary card
   const blockersRefEl = useRef<HTMLDivElement>(null);
@@ -1562,6 +1573,31 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
 
       {/* Messages list — chat-style scroll area */}
       <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 md:px-6 py-4 space-y-3 relative">
+        {/* Prominent banner: X new since {time} with action buttons */}
+        {dividerTime && newHighSignalCount > 0 && !dividerDismissedRef.current && (
+          <div className="mb-3 p-3 md:p-4 rounded-lg bg-gradient-to-r from-blue-600/20 to-blue-500/10 border border-blue-500/50 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+            <div className="flex-1 min-w-0">
+              <div className="text-sm font-semibold text-blue-300 truncate">
+                {newHighSignalCount} new since {formatSinceTimestamp(dividerTime)}
+              </div>
+            </div>
+            <div className="flex items-center gap-2 flex-wrap">
+              <button
+                onClick={handleShowOnlyNew}
+                className="shrink-0 px-3 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-xs font-medium transition-colors min-h-[44px] md:min-h-auto"
+              >
+                Show only new
+              </button>
+              <button
+                onClick={dismissDivider}
+                className="shrink-0 px-3 py-2 rounded-lg border border-blue-500/60 text-blue-300 hover:bg-blue-500/10 text-xs font-medium transition-colors min-h-[44px] md:min-h-auto"
+              >
+                Mark all read
+              </button>
+            </div>
+          </div>
+        )}
+
         {loading ? (
           <p className="text-xs text-neutral-500 text-center py-8">Loading...</p>
         ) : messages.length === 0 ? (
@@ -1684,16 +1720,16 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
             {/* Other high-signal open messages */}
             <div ref={blockersRefEl}>
               {insertTimeDividers(otherHighSignal).map((item, idx) =>
-              item.kind === 'divider' ? (
-                <div key={`divider-high-${idx}`} className="flex items-center gap-1.5 text-[11px] text-neutral-600 font-semibold uppercase tracking-wide px-1 mt-2">
-                  <div className="flex-1 border-t border-neutral-800/60" />
-                  <span className="shrink-0">{item.label}</span>
-                  <div className="flex-1 border-t border-neutral-800/60" />
-                </div>
-              ) : (
-                renderBubble(item.msg, false, false, messages)
-              )
-            )}
+                item.kind === 'divider' ? (
+                  <div key={`divider-high-${idx}`} className="flex items-center gap-1.5 text-[11px] text-neutral-600 font-semibold uppercase tracking-wide px-1 mt-2">
+                    <div className="flex-1 border-t border-neutral-800/60" />
+                    <span className="shrink-0">{item.label}</span>
+                    <div className="flex-1 border-t border-neutral-800/60" />
+                  </div>
+                ) : (
+                  renderBubble(item.msg, false, false, messages)
+                )
+              )}
             </div>
 
             {/* Auto-promoted failing routine groups */}
