@@ -16,6 +16,7 @@ Layer tags:
 from __future__ import annotations
 
 import re
+from typing import Any
 
 # ---------------------------------------------------------------------------
 # Canonical layer tags
@@ -421,6 +422,47 @@ def parse_viewport_regression_class(regression_class: str) -> dict[str, str | No
     else:
         component, assertion_type = left, None
     return {"component": component, "assertion_type": assertion_type, "width": width}
+
+
+def compute_recovery_layer_mismatch(
+    fix_log: list[dict] | None,
+    symptoms_by_layer: dict[str, Any] | None,
+    *,
+    evaluated_at: str,
+) -> dict[str, Any] | None:
+    """Return a mismatch record when the fix didn't cover all symptom layers.
+
+    Compares the union of ``layers_targeted`` across fix-log entries against
+    the canonical layer keys present in ``symptoms_by_layer``.  Returns None
+    when either side is empty or when all symptom layers were addressed.
+
+    Parameters
+    ----------
+    fix_log:
+        List of fix-log entry dicts (each may carry ``layers_targeted``).
+    symptoms_by_layer:
+        Per-layer observation dict populated by the dispatcher during the
+        case lifecycle.  Only keys that are canonical layer names (``ALL_LAYERS``)
+        are considered — unknown keys are silently ignored.
+    evaluated_at:
+        ISO-format timestamp string to stamp the returned record.
+    """
+    fix_layers = aggregate_targeted_layers(fix_log or [])
+    symptom_layers = {
+        k for k in (symptoms_by_layer or {}) if isinstance(k, str) and k in ALL_LAYERS
+    }
+    if not fix_layers or not symptom_layers:
+        return None
+    unaddressed = symptom_layers - fix_layers
+    if not unaddressed:
+        return None
+    return {
+        "type": "recovery_layer_mismatch",
+        "evaluated_at": evaluated_at,
+        "fix_layers": sorted(fix_layers),
+        "symptom_layers": sorted(symptom_layers),
+        "unaddressed_layers": sorted(unaddressed),
+    }
 
 
 def _matches_any(text: str, patterns: list[re.Pattern]) -> bool:

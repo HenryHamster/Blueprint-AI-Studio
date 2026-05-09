@@ -38,7 +38,7 @@ from app.direction_metrics import (  # noqa: F401 — re-exported for callers/te
     _compute_productivity_score,
     _update_cycle_history,
 )
-from app.failure_classification import classify_failure
+from app.failure_classification import INFRA_CLASSES, classify_failure
 from app.finding_deduplication import (
     build_dedup_state,
     deduplicate_findings,
@@ -1765,6 +1765,17 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         prior_retry_ctx: dict = {}
         _retry_prompt_suffix = ""
         _prior = prior_failure_by_hash.get(fhash)
+        if _prior is not None:
+            # Infra failures (SCOPE_EMPTY, PROVISION_FAILURE, RATE_LIMIT, …) are
+            # pre-emptions or infra events — the task never produced useful output.
+            # Treat re-spawns as fresh attempts; injecting "_attempt_number: 2"
+            # for an infra failure would mislead the agent into conservative retry
+            # behaviour that is only appropriate after a real code failure.
+            try:
+                if classify_failure(_prior) in INFRA_CLASSES:
+                    _prior = None
+            except Exception:
+                pass
         if _prior is not None:
             _prior_ctx = _prior.context or {}
             prior_retry_ctx["_attempt_number"] = 2

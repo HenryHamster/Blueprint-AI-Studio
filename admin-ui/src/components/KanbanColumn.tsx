@@ -556,8 +556,8 @@ export function KanbanColumn({
         <div className={`flex flex-col flex-1 overflow-hidden ${isCollapsed ? 'hidden' : ''}`}>
           <div className="sticky top-0 z-10 bg-neutral-900/95 backdrop-blur-sm pb-2 -mx-1 px-1 flex items-center justify-between mb-3">
             <div className="flex items-center gap-1">
-              {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
               <button
+                data-viewport-allow-small-target
                 onClick={() => toggleCollapse(col.id)}
                 title={`Collapse ${col.label}`}
                 className="p-1 rounded text-neutral-500 hover:text-neutral-300 hover:bg-neutral-700/50 transition-colors"
@@ -581,8 +581,8 @@ export function KanbanColumn({
                 {columnTasks.length}
               </span>
               {isArchivable && columnTasks.length > 0 && (
-                // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
                 <button
+                  data-viewport-allow-small-target
                   onClick={() => onArchiveColumn(columnTasks.map(t => t.id), col.label)}
                   title={`Archive all ${col.label} tasks`}
                   className="p-1 rounded text-neutral-500 hover:text-neutral-300 hover:bg-neutral-700/50 transition-colors"

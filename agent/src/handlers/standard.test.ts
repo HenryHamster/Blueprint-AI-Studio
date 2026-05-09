@@ -338,6 +338,28 @@ describe('execution-evidence SR categories in prompt', () => {
   });
 });
 
+// ── Viewport infra skip guidance ──────────────────────────────────────────────
+describe('viewport infra skip guidance in prompt', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('includes VIEWPORT_GATE_INFRA_UNAVAILABLE sentinel guidance in handleCreate prompt', async () => {
+    const task = { title: 'Task', description: '' };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt = capturedPrompt();
+    expect(prompt).toContain('VIEWPORT_GATE_INFRA_UNAVAILABLE');
+    expect(prompt).toContain('./blocked');
+  });
+
+  it('includes viewport infra skip guidance in handleRefactor prompt', async () => {
+    const task = { title: 'Refactor task', description: '' };
+    await handleRefactor(TASK_ID, { prompt: 'Improve it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt = capturedPrompt();
+    expect(prompt).toContain('VIEWPORT_GATE_INFRA_UNAVAILABLE');
+  });
+});
+
 // ── Module interface extraction (scope-conditional) ───────────────────────────
 describe('module interface extraction', () => {
   beforeEach(() => {
@@ -3032,5 +3054,148 @@ describe('runFreshReviewerPass engagement_gaps', () => {
     await runFreshReviewerPass('eg-2', 'Title', 'Desc', [], null, { value: '' });
     expect(captured).not.toBeNull();
     expect((captured as unknown as Record<string, unknown>).engagement_gaps).toBeUndefined();
+  });
+});
+
+// ── SCOPE_EMPTY pre-flight guard ──────────────────────────────────────────────
+// When an auto-decomposed cluster task's declared related_files are fully
+// covered by completed sibling tasks, the handler should emit SCOPE_EMPTY
+// and return early (no LLM call, no retry budget consumed).
+describe('handleCreate — SCOPE_EMPTY pre-flight guard', () => {
+  beforeEach(() => { vi.clearAllMocks(); });
+
+  it('exits with SCOPE_EMPTY when all related_files are covered by completed siblings', async () => {
+    const idx = await import('../index.js');
+    const task = {
+      title: 'Cluster 2/3',
+      description: '',
+      context: {
+        auto_decomposed: true,
+        related_files: ['agent/src/handlers/standard.ts'],
+      },
+      project_context: {
+        sibling_tasks: [
+          {
+            status: 'COMPLETED',
+            title: 'Cluster 1/3',
+            files: ['agent/src/handlers/standard.ts'],
+          },
+        ],
+      },
+    };
+    await handleCreate(
+      TASK_ID,
+      { prompt: 'Do something', related_files: ['agent/src/handlers/standard.ts'] },
+      task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+    expect(vi.mocked(runCodeChangeTask)).not.toHaveBeenCalled();
+    expect(vi.mocked(idx.persistAndPostStatus)).toHaveBeenCalledWith(
+      TASK_ID,
+      expect.objectContaining({
+        status: 'BLOCKED_PRECONDITION',
+        failure_category: 'SCOPE_EMPTY',
+      }),
+    );
+    const call = vi.mocked(idx.persistAndPostStatus).mock.calls.find(
+      ([, body]) => body.failure_category === 'SCOPE_EMPTY',
+    );
+    expect(call?.[1].logs).toContain('agent/src/handlers/standard.ts');
+    expect(call?.[1].logs).toContain('Cluster 1/3');
+  });
+
+  it('proceeds normally when some related_files are NOT covered by completed siblings', async () => {
+    const task = {
+      title: 'Cluster 2/3',
+      description: '',
+      context: {
+        auto_decomposed: true,
+        related_files: ['agent/src/handlers/standard.ts', 'agent/src/handlers/code-change.ts'],
+      },
+      project_context: {
+        sibling_tasks: [
+          {
+            status: 'COMPLETED',
+            title: 'Cluster 1/3',
+            files: ['agent/src/handlers/standard.ts'],
+          },
+        ],
+      },
+    };
+    await handleCreate(
+      TASK_ID,
+      { prompt: 'Do something', related_files: ['agent/src/handlers/standard.ts', 'agent/src/handlers/code-change.ts'] },
+      task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+    expect(vi.mocked(runCodeChangeTask)).toHaveBeenCalled();
+  });
+
+  it('proceeds normally when auto_decomposed is false even if sibling files match', async () => {
+    const task = {
+      title: 'Regular task',
+      description: '',
+      context: {
+        auto_decomposed: false,
+        related_files: ['agent/src/handlers/standard.ts'],
+      },
+      project_context: {
+        sibling_tasks: [
+          {
+            status: 'COMPLETED',
+            title: 'Sibling',
+            files: ['agent/src/handlers/standard.ts'],
+          },
+        ],
+      },
+    };
+    await handleCreate(
+      TASK_ID,
+      { prompt: 'Do something', related_files: ['agent/src/handlers/standard.ts'] },
+      task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+    expect(vi.mocked(runCodeChangeTask)).toHaveBeenCalled();
+  });
+
+  it('proceeds normally when sibling tasks list is empty', async () => {
+    const task = {
+      title: 'Cluster 2/3',
+      description: '',
+      context: {
+        auto_decomposed: true,
+        related_files: ['agent/src/handlers/standard.ts'],
+      },
+      project_context: { sibling_tasks: [] },
+    };
+    await handleCreate(
+      TASK_ID,
+      { prompt: 'Do something', related_files: ['agent/src/handlers/standard.ts'] },
+      task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+    expect(vi.mocked(runCodeChangeTask)).toHaveBeenCalled();
+  });
+
+  it('proceeds normally when no siblings are in COMPLETED status', async () => {
+    const task = {
+      title: 'Cluster 2/3',
+      description: '',
+      context: {
+        auto_decomposed: true,
+        related_files: ['agent/src/handlers/standard.ts'],
+      },
+      project_context: {
+        sibling_tasks: [
+          {
+            status: 'IN_PROGRESS',
+            title: 'Cluster 1/3',
+            files: ['agent/src/handlers/standard.ts'],
+          },
+        ],
+      },
+    };
+    await handleCreate(
+      TASK_ID,
+      { prompt: 'Do something', related_files: ['agent/src/handlers/standard.ts'] },
+      task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+    expect(vi.mocked(runCodeChangeTask)).toHaveBeenCalled();
   });
 });

@@ -8,7 +8,14 @@ vi.mock('../index.js', async (importOriginal) => {
     git: vi.fn(),
     sendLog: vi.fn(),
     persistAndPostStatus: vi.fn().mockResolvedValue(undefined),
+    runClaudeCode: vi.fn().mockResolvedValue({ exitCode: 0, allOutput: '' }),
+    rotateOAuthCredentialsIfChanged: vi.fn().mockResolvedValue(undefined),
   };
+});
+
+vi.mock('../prompt.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../prompt.js')>();
+  return { ...actual, writeCodeChangeHelpers: vi.fn() };
 });
 
 vi.mock('fs', () => {
@@ -25,8 +32,8 @@ vi.mock('fs', () => {
 });
 
 // ── Imports under test ────────────────────────────────────────────────────────
-import { augmentSelfReview } from './code-change.js';
-import { git } from '../index.js';
+import { augmentSelfReview, runCodeChangeTask } from './code-change.js';
+import { git, persistAndPostStatus, runClaudeCode } from '../index.js';
 import * as fs from 'fs';
 
 describe('augmentSelfReview', () => {
@@ -66,9 +73,9 @@ describe('augmentSelfReview', () => {
     const result = augmentSelfReview(selfReview, 'task-123', 'base-commit');
 
     expect(result).not.toBeNull();
-    const regression = ((result as Record<string, unknown>).check_results as Record<string, unknown>).regression_risk as Record<string, unknown>;
+    const regression = (result.check_results as Record<string, unknown>).regression_risk as Record<string, unknown>;
     expect(regression.passed).toBe(true);
-    expect((regression.issue as string)).toContain('[heuristic-derived]');
+    expect(regression.issue as string).toContain('[heuristic-derived]');
   });
 
   it('injects regression_risk with passed=false when high-risk signals detected', () => {
@@ -81,9 +88,9 @@ describe('augmentSelfReview', () => {
     const result = augmentSelfReview(selfReview, 'task-123', 'base-commit');
 
     expect(result).not.toBeNull();
-    const regression = ((result as Record<string, unknown>).check_results as Record<string, unknown>).regression_risk as Record<string, unknown>;
+    const regression = (result.check_results as Record<string, unknown>).regression_risk as Record<string, unknown>;
     expect(regression.passed).toBe(false);
-    expect((regression.issue as string)).toContain('source lines / 0 test lines');
+    expect(regression.issue as string).toContain('source lines / 0 test lines');
   });
 
   it('returns selfReview unchanged on git error', () => {
@@ -107,9 +114,9 @@ describe('augmentSelfReview', () => {
     };
     const result = augmentSelfReview(selfReview, 'task-123', 'base-commit');
 
-    expect(result?.check_results).toHaveProperty('correctness');
-    expect(result?.check_results).toHaveProperty('type-safety');
-    expect(result?.check_results).toHaveProperty('regression_risk');
+    expect(result.check_results).toHaveProperty('correctness');
+    expect(result.check_results).toHaveProperty('type-safety');
+    expect(result.check_results).toHaveProperty('regression_risk');
   });
 
   it('handles selfReview with missing check_results property', () => {
@@ -118,8 +125,8 @@ describe('augmentSelfReview', () => {
     const selfReview = { verdict: 'pass' };
     const result = augmentSelfReview(selfReview, 'task-123', 'base-commit');
 
-    expect(result?.check_results).toBeDefined();
-    expect(result?.check_results).toHaveProperty('regression_risk');
+    expect(result.check_results).toBeDefined();
+    expect(result.check_results).toHaveProperty('regression_risk');
   });
 
   it('detects test files correctly and counts them separately', () => {
@@ -137,8 +144,91 @@ diff --git a/src/main.test.ts b/src/main.test.ts
     const result = augmentSelfReview(selfReview, 'task-123', 'base-commit');
 
     expect(result).not.toBeNull();
-    const regression = ((result as Record<string, unknown>).check_results as Record<string, unknown>).regression_risk as Record<string, unknown>;
+    const regression = (result.check_results as Record<string, unknown>).regression_risk as Record<string, unknown>;
     // Should pass because there ARE test changes
     expect(regression.passed).toBe(true);
+  });
+});
+
+describe('runCodeChangeTask SCOPE_EMPTY guard', () => {
+  const baseOpts = {
+    taskId: 'task-scope-guard',
+    prompt: 'do the thing',
+    ws: null,
+    statusRef: { value: '' },
+    workBranch: 'blueprint/task-scope-guard',
+    baseBranch: 'main',
+    owner: 'owner',
+    repo: 'repo',
+    testsOnMainBranch: true,
+    baseCommit: 'abc123',
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+    vi.mocked(fs.writeFileSync).mockImplementation(() => {});
+    vi.mocked(fs.unlinkSync).mockImplementation(() => {});
+    vi.mocked(git).mockReturnValue('abc123');
+  });
+
+  it('exits with SCOPE_EMPTY when all related_files are covered by completed siblings', async () => {
+    await runCodeChangeTask({
+      ...baseOpts,
+      autoDecomposed: true,
+      relatedFiles: ['agent/src/handlers/code-change.ts'],
+      siblingTasks: [{ status: 'COMPLETED', files: ['agent/src/handlers/code-change.ts'], title: 'cluster 1/5' }],
+    });
+    expect(vi.mocked(runClaudeCode)).not.toHaveBeenCalled();
+    expect(vi.mocked(persistAndPostStatus)).toHaveBeenCalledWith(
+      'task-scope-guard',
+      expect.objectContaining({ failure_category: 'SCOPE_EMPTY', status: 'BLOCKED_PRECONDITION' }),
+    );
+    const payload = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(String(payload.logs)).toMatch(/SCOPE_EMPTY:/);
+    expect(String(payload.logs)).toMatch(/cluster 1\/5/);
+  });
+
+  it('skips guard when autoDecomposed is false', async () => {
+    await runCodeChangeTask({
+      ...baseOpts,
+      autoDecomposed: false,
+      relatedFiles: ['agent/src/handlers/code-change.ts'],
+      siblingTasks: [{ status: 'COMPLETED', files: ['agent/src/handlers/code-change.ts'] }],
+    });
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalled();
+    const scopeEmptyCalls = vi.mocked(persistAndPostStatus).mock.calls.filter(
+      c => c[1].failure_category === 'SCOPE_EMPTY',
+    );
+    expect(scopeEmptyCalls).toHaveLength(0);
+  });
+
+  it('skips guard when only some related_files are covered by siblings', async () => {
+    await runCodeChangeTask({
+      ...baseOpts,
+      autoDecomposed: true,
+      relatedFiles: ['agent/src/handlers/code-change.ts', 'agent/src/handlers/standard.ts'],
+      siblingTasks: [{ status: 'COMPLETED', files: ['agent/src/handlers/code-change.ts'] }],
+    });
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalled();
+  });
+
+  it('skips guard when no sibling task is COMPLETED', async () => {
+    await runCodeChangeTask({
+      ...baseOpts,
+      autoDecomposed: true,
+      relatedFiles: ['agent/src/handlers/code-change.ts'],
+      siblingTasks: [{ status: 'IN_PROGRESS', files: ['agent/src/handlers/code-change.ts'] }],
+    });
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalled();
+  });
+
+  it('skips guard when siblingTasks is not provided', async () => {
+    await runCodeChangeTask({
+      ...baseOpts,
+      autoDecomposed: true,
+      relatedFiles: ['agent/src/handlers/code-change.ts'],
+    });
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalled();
   });
 });

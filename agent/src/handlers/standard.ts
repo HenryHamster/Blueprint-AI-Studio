@@ -165,6 +165,17 @@ export function buildSmallScopeCallerNote(relatedFiles: string[]): string {
 
 const FRESH_REVIEWER_MIN_LINES = 20;
 
+const VIEWPORT_INFRA_SKIP_GUIDANCE = `## Viewport gate: infra-skip sentinel
+
+If \`./check\` output contains \`VIEWPORT_GATE_INFRA_UNAVAILABLE:\` OR the
+"admin-ui playwright chromium" bootstrap step fails AND \`docker info\` also
+errors (Docker unavailable), this is an infrastructure shortfall — NOT a code
+defect. Chromium and its system-library dependencies cannot be installed by a
+code edit on this VM. Call \`./blocked "VIEWPORT_GATE_INFRA_UNAVAILABLE: <reason>"\`
+immediately. Do NOT attempt to install Chromium, modify viewport tests to bypass
+the browser requirement, or weaken test assertions to work around the missing runtime.
+`;
+
 export const SR_SKIP_REASONS = {
   DIFF_TOO_SMALL: 'diff_too_small',
   REVIEWER_SESSION_FAILED: 'reviewer_session_failed',
@@ -681,12 +692,58 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   const coFailurePairs = projectCtxForSr?.sr_co_failure_pairs as Array<{ cat_a: string; cat_b: string; lift: number }> | null | undefined;
   const coFailurePairsSection = formatSrCoFailurePairsForSrPrompt(coFailurePairs);
   const severityCalibrationHintSection = formatSeverityCalibrationHintForSrPrompt(srCategories);
-  const finalPrompt = claudeMdPrefix + playbookSection + retryContext + buildPrompt({ contextPrefix, parentCtx, rawPrompt }) + taskTypeHint + firstTaskSection + CODE_CHANGE_HELPER_GUIDANCE + taskTypeFocusBlock + loosenHintSection + coFailurePairsSection + severityCalibrationHintSection + executionEvidenceSection + PLAYBOOK_GUIDANCE + `\nNote: If lint or test fixes required non-obvious steps, save them to the playbook (e.g., ./playbook set "lint-gotcha" "description").\n` + assembleFailureGuidanceBlocks() + `\n\n${DEFAULT_TOOL_GUIDANCE}` + promptSuffix;
+  const finalPrompt = claudeMdPrefix + playbookSection + retryContext + buildPrompt({ contextPrefix, parentCtx, rawPrompt }) + taskTypeHint + firstTaskSection + CODE_CHANGE_HELPER_GUIDANCE + taskTypeFocusBlock + loosenHintSection + coFailurePairsSection + severityCalibrationHintSection + executionEvidenceSection + PLAYBOOK_GUIDANCE + `\nNote: If lint or test fixes required non-obvious steps, save them to the playbook (e.g., ./playbook set "lint-gotcha" "description").\n` + assembleFailureGuidanceBlocks() + VIEWPORT_INFRA_SKIP_GUIDANCE + `\n\n${DEFAULT_TOOL_GUIDANCE}` + promptSuffix;
 
   const { workBranch } = await setupWorkspace(owner, repo, ghToken, baseBranch, branchPrefix, taskId, ws, statusRef, buildConfig);
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);
   const disallowedTools = configureAgentPermissions(taskTypeKey);
+
+  // ── SCOPE_EMPTY pre-flight (auto-decomposed cluster siblings) ────────────
+  // When all declared related_files were already shipped by completed sibling
+  // cluster PRs, exit cleanly rather than burning retries on CODE_ERROR.
+  if (ctx.auto_decomposed) {
+    const guardFiles = (
+      (payload.related_files as string[] | undefined) ||
+      (ctx.related_files as string[] | undefined) ||
+      []
+    );
+    if (guardFiles.length > 0) {
+      const projectCtxForGuard = task.project_context as Record<string, unknown> | undefined;
+      const siblingTasksRaw = projectCtxForGuard?.sibling_tasks as Array<Record<string, unknown>> | undefined;
+      if (Array.isArray(siblingTasksRaw)) {
+        const completedSiblingFiles = new Set<string>();
+        const coveringTitles: string[] = [];
+        for (const sibling of siblingTasksRaw) {
+          if (sibling.status !== 'COMPLETED') continue;
+          const sFiles = sibling.files as string[] | undefined;
+          if (!Array.isArray(sFiles)) continue;
+          const overlaps = sFiles.filter(f => guardFiles.includes(f));
+          if (overlaps.length > 0) {
+            for (const f of sFiles) completedSiblingFiles.add(f);
+            const rawTitle = sibling.title;
+          const rawId = sibling.id;
+          const title = typeof rawTitle === 'string' && rawTitle ? rawTitle
+            : typeof rawId === 'string' && rawId ? rawId
+            : 'sibling task';
+            if (!coveringTitles.includes(title)) coveringTitles.push(title);
+          }
+        }
+        if (completedSiblingFiles.size > 0 && guardFiles.every(f => completedSiblingFiles.has(f))) {
+          const scopeEmptyMsg = `SCOPE_EMPTY: All declared related_files [${guardFiles.join(', ')}] were already covered by completed sibling tasks (${coveringTitles.join(', ')}). Exiting cleanly — no retry needed.`;
+          sendLog(ws, `[ScopeGuard] ${scopeEmptyMsg}\n`);
+          await persistAndPostStatus(taskId, {
+            task_id: taskId,
+            status: 'BLOCKED_PRECONDITION',
+            artifact_type: 'ERROR_LOG',
+            logs: scopeEmptyMsg,
+            failure_category: 'SCOPE_EMPTY',
+          });
+          return;
+        }
+      }
+    }
+  }
 
   // Capture test baseline on main branch so the test fix loop can distinguish
   // pre-existing failures from newly-broken tests. Scoped to related_files to stay fast.

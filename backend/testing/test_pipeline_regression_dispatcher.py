@@ -23,6 +23,9 @@ from app.pipeline_regression_dispatcher import (
     _REGRESSION_COOLDOWN,
     _WATCHDOG_ACTIVE_STALE_THRESHOLD,
     _WATCHDOG_MERGED_STALE_THRESHOLD,
+    _format_cross_layer_prompt,
+    _format_fragile_recurrence_meta_prompt,
+    _format_layer_concentration_prompt,
     get_dispatcher_cycle_records,
     get_regression_mtta_data,
     run_dispatcher_watchdog_alarms,
@@ -30,6 +33,7 @@ from app.pipeline_regression_dispatcher import (
     run_recovery_once,
     run_watchdog_once,
 )
+from app.regression_layer_classifier import LAYER_DISPLAY_ORDER
 from app.time_utils import _utcnow
 
 from testing.factories import make_project, make_task, make_task_history
@@ -13898,3 +13902,284 @@ async def test_get_sr_persistent_blind_spot_hint_returns_categories_above_thresh
     assert "correctness" in cats
     assert result["hint"] is not None
     assert "correctness" in result["hint"]
+
+
+# ---------------------------------------------------------------------------
+# Tests for meta-prompt builders (cross-layer, layer-concentration, fragile-recurrence)
+# ---------------------------------------------------------------------------
+
+
+class TestMetaPromptBuilders:
+    """Pin structural contracts for meta-investigation prompt builders."""
+
+    def test_format_cross_layer_prompt_includes_all_canonical_layers(self):
+        """Cross-layer prompt enumerates all canonical layers."""
+        layers_evidence = [
+            {
+                "layer": "CI_WORKFLOW",
+                "fingerprint": "test fp 1",
+                "sample": "test sample 1",
+            },
+            {
+                "layer": "AGENT_VM",
+                "fingerprint": "test fp 2",
+                "sample": "test sample 2",
+            },
+        ]
+        prompt = _format_cross_layer_prompt(
+            signal_name="test_signal",
+            regression_class="test_class",
+            layers_evidence=layers_evidence,
+            base_lines="Test base content",
+        )
+        # All canonical layers should be mentioned in evidence section
+        assert "Layer: CI_WORKFLOW" in prompt
+        assert "Layer: AGENT_VM" in prompt
+
+    def test_format_cross_layer_prompt_requires_multi_layer_defense(self):
+        """Cross-layer prompt mandates AT LEAST TWO distinct layers in defense."""
+        layers_evidence = [
+            {"layer": "CI_WORKFLOW", "fingerprint": "fp1", "sample": "sample1"},
+            {"layer": "AGENT_VM", "fingerprint": "fp2", "sample": "sample2"},
+        ]
+        prompt = _format_cross_layer_prompt(
+            signal_name="test_signal",
+            regression_class="test_class",
+            layers_evidence=layers_evidence,
+            base_lines="Test base content",
+        )
+        # Pin the defensive mandate language (allow fuzzy rewording)
+        assert "AT LEAST TWO" in prompt or "at least two" in prompt
+        assert "layer" in prompt.lower()
+
+    def test_format_cross_layer_prompt_injects_samples_when_present(self):
+        """Samples and fingerprints are injected into prompt when provided."""
+        layers_evidence = [
+            {
+                "layer": "CI_WORKFLOW",
+                "fingerprint": "unique_fingerprint_123",
+                "sample": "unique_sample_456",
+            }
+        ]
+        prompt = _format_cross_layer_prompt(
+            signal_name="test_signal",
+            regression_class="test_class",
+            layers_evidence=layers_evidence,
+            base_lines="Test base content",
+        )
+        assert "unique_fingerprint_123" in prompt
+        assert "unique_sample_456" in prompt
+
+    def test_format_cross_layer_prompt_omits_empty_samples(self):
+        """Empty samples are gracefully omitted from prompt."""
+        layers_evidence = [
+            {"layer": "CI_WORKFLOW", "fingerprint": "", "sample": ""},
+            {"layer": "AGENT_VM", "sample": None},
+        ]
+        prompt = _format_cross_layer_prompt(
+            signal_name="test_signal",
+            regression_class="test_class",
+            layers_evidence=layers_evidence,
+            base_lines="Test base content",
+        )
+        # Should not crash and should contain layer names
+        assert "Layer: CI_WORKFLOW" in prompt
+        assert "Layer: AGENT_VM" in prompt
+
+    def test_format_fragile_recurrence_meta_prompt_includes_canonical_layers(self):
+        """Fragile-recurrence prompt lists canonical layers for enumeration."""
+        case = SimpleNamespace(
+            _recurrence_count=3,
+            _recurrence_attempts=[
+                {"layers_targeted": ["CI_WORKFLOW"]},
+                {"layers_targeted": ["AGENT_VM"]},
+            ],
+        )
+        prompt = _format_fragile_recurrence_meta_prompt(
+            case=case,
+            base_lines="Test base content",
+        )
+        # Should enumerate all canonical layers
+        for layer in LAYER_DISPLAY_ORDER:
+            assert layer in prompt
+
+    def test_fragile_recurrence_meta_prompt_requires_multi_layer_defense(self):
+        """Fragile-recurrence prompt mandates AT LEAST TWO distinct layers."""
+        case = SimpleNamespace(
+            _recurrence_count=3,
+            _recurrence_attempts=[{"layers_targeted": ["CI_WORKFLOW"]}],
+        )
+        prompt = _format_fragile_recurrence_meta_prompt(
+            case=case,
+            base_lines="Test base content",
+        )
+        # Pin the defensive mandate
+        assert "AT LEAST TWO" in prompt
+        assert (
+            "distinguish" not in prompt
+            or "defense across" in prompt
+            or "distinct layers" in prompt.lower()
+        )
+
+    def test_fragile_recurrence_meta_prompt_flags_untargeted_layers(self):
+        """Untargeted layers are marked as candidates for defense."""
+        case = SimpleNamespace(
+            _recurrence_count=3,
+            _recurrence_attempts=[
+                {"layers_targeted": ["CI_WORKFLOW"]},
+                {"layers_targeted": ["AGENT_VM"]},
+            ],
+        )
+        prompt = _format_fragile_recurrence_meta_prompt(
+            case=case,
+            base_lines="Test base content",
+        )
+        # Untargeted layers section should exist
+        assert "Untargeted layers" in prompt or "untargeted" in prompt.lower()
+        # The untargeted layers should be called out (at least some of them)
+        # CI_WORKFLOW and AGENT_VM are targeted, so BASELINE_GATE, REVIEWER_PASS, VIEWPORT should be untargeted
+        assert (
+            "BASELINE_GATE" in prompt
+            or "REVIEWER_PASS" in prompt
+            or "VIEWPORT" in prompt
+        )
+
+    def test_fragile_recurrence_meta_prompt_handles_empty_attempts(self):
+        """Empty recurrence attempts list is handled gracefully."""
+        case = SimpleNamespace(
+            _recurrence_count=0,
+            _recurrence_attempts=[],
+        )
+        prompt = _format_fragile_recurrence_meta_prompt(
+            case=case,
+            base_lines="Test base content",
+        )
+        # Should not crash and should still list canonical layers
+        for layer in LAYER_DISPLAY_ORDER:
+            assert layer in prompt
+
+    def test_format_layer_concentration_prompt_enumerates_case_ids(self):
+        """Layer-concentration prompt enumerates distinct case IDs."""
+        sample_case_ids = ["case-1", "case-2", "case-3"]
+        all_fix_logs = [
+            ("case-1", {"layers_targeted": ["CI_WORKFLOW"], "merged_at": "2026-01-01"}),
+            ("case-2", {"layers_targeted": ["CI_WORKFLOW"], "merged_at": "2026-01-02"}),
+            ("case-3", {"layers_targeted": ["CI_WORKFLOW"], "merged_at": "2026-01-03"}),
+        ]
+        prompt = _format_layer_concentration_prompt(
+            layer="CI_WORKFLOW",
+            sample_case_ids=sample_case_ids,
+            all_fix_logs_with_case_ids=all_fix_logs,
+        )
+        # All case IDs should appear
+        for case_id in sample_case_ids:
+            assert case_id in prompt
+
+    def test_layer_concentration_prompt_requires_multi_layer_defense(self):
+        """Layer-concentration prompt mandates defense in AT LEAST ONE OTHER layer."""
+        sample_case_ids = ["case-1"]
+        all_fix_logs = [
+            ("case-1", {"layers_targeted": ["CI_WORKFLOW"], "merged_at": "2026-01-01"}),
+        ]
+        prompt = _format_layer_concentration_prompt(
+            layer="CI_WORKFLOW",
+            sample_case_ids=sample_case_ids,
+            all_fix_logs_with_case_ids=all_fix_logs,
+        )
+        # Should mandate multi-layer thinking
+        assert "AT LEAST ONE OTHER" in prompt or "at least one other" in prompt
+        assert "layer" in prompt.lower()
+
+    def test_layer_concentration_prompt_names_focal_layer(self):
+        """Layer-concentration prompt explicitly names the focal layer."""
+        sample_case_ids = []
+        all_fix_logs = []
+        prompt = _format_layer_concentration_prompt(
+            layer="REVIEWER_PASS",
+            sample_case_ids=sample_case_ids,
+            all_fix_logs_with_case_ids=all_fix_logs,
+        )
+        # Focal layer should be named
+        assert "REVIEWER_PASS" in prompt
+
+    def test_layer_concentration_prompt_handles_empty_case_list(self):
+        """Empty case list is handled gracefully."""
+        prompt = _format_layer_concentration_prompt(
+            layer="AGENT_VM",
+            sample_case_ids=[],
+            all_fix_logs_with_case_ids=[],
+        )
+        # Should not crash and should still contain structural elements
+        assert "AGENT_VM" in prompt
+
+
+# ---------------------------------------------------------------------------
+# _compute_recovery_layer_mismatch unit tests
+# ---------------------------------------------------------------------------
+
+
+class TestComputeRecoveryLayerMismatch:
+    """Unit tests for the recovery-layer-mismatch detection helper."""
+
+    def setup_method(self):
+        from app.pipeline_regression_dispatcher import _compute_recovery_layer_mismatch
+        from app.time_utils import _utcnow
+
+        self._fn = _compute_recovery_layer_mismatch
+        self._now = _utcnow()
+
+    def test_mismatch_detected_when_symptom_layer_not_fixed(self):
+        """Symptom fired from layer Y while fix only targeted layer X → mismatch."""
+        fix_log = [{"layers_targeted": ["CI_WORKFLOW"], "fix_pr_number": 1}]
+        symptoms = {
+            "AGENT_VM": [{"fingerprint": "fp1", "observed_at": "2026-01-01T00:00:00"}]
+        }
+        result = self._fn(fix_log, symptoms, self._now)
+        assert result is not None
+        assert result["type"] == "recovery_layer_mismatch"
+        assert "AGENT_VM" in result["unaddressed_layers"]
+        assert "CI_WORKFLOW" in result["fix_layers"]
+        assert result["evaluated_at"] is not None
+
+    def test_no_mismatch_when_layers_aligned(self):
+        """Fix targeted the same layer as symptoms → no mismatch entry."""
+        fix_log = [{"layers_targeted": ["CI_WORKFLOW"], "fix_pr_number": 1}]
+        symptoms = {
+            "CI_WORKFLOW": [
+                {"fingerprint": "fp1", "observed_at": "2026-01-01T00:00:00"}
+            ]
+        }
+        result = self._fn(fix_log, symptoms, self._now)
+        assert result is None
+
+    def test_no_mismatch_when_no_symptom_data(self):
+        """Empty symptoms_by_layer → no mismatch (nothing to compare)."""
+        fix_log = [{"layers_targeted": ["CI_WORKFLOW"], "fix_pr_number": 1}]
+        result = self._fn(fix_log, {}, self._now)
+        assert result is None
+
+    def test_no_mismatch_when_no_fix_layer_data(self):
+        """Fix log without layers_targeted → no mismatch (no fix data)."""
+        fix_log = [{"fix_pr_number": 1}]
+        symptoms = {
+            "AGENT_VM": [{"fingerprint": "fp1", "observed_at": "2026-01-01T00:00:00"}]
+        }
+        result = self._fn(fix_log, symptoms, self._now)
+        assert result is None
+
+    def test_partial_mismatch_captures_only_unaddressed(self):
+        """Fix covered one of two symptom layers → only unaddressed layer listed."""
+        fix_log = [
+            {"layers_targeted": ["CI_WORKFLOW", "REVIEWER_PASS"], "fix_pr_number": 1}
+        ]
+        symptoms = {
+            "CI_WORKFLOW": [
+                {"fingerprint": "fp1", "observed_at": "2026-01-01T00:00:00"}
+            ],
+            "AGENT_VM": [{"fingerprint": "fp2", "observed_at": "2026-01-01T00:00:00"}],
+        }
+        result = self._fn(fix_log, symptoms, self._now)
+        assert result is not None
+        assert result["unaddressed_layers"] == ["AGENT_VM"]
+        assert set(result["fix_layers"]) == {"CI_WORKFLOW", "REVIEWER_PASS"}
+        assert set(result["symptom_layers"]) == {"CI_WORKFLOW", "AGENT_VM"}

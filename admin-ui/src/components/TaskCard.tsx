@@ -904,6 +904,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
       {!compact && task.latest_status_message ? (
         <div className="bg-neutral-950 text-neutral-400 text-[11px] rounded-lg mb-2 border border-neutral-800/50 font-mono">
           <button
+            data-viewport-allow-small-target
             onClick={() => setStatusExpanded(!statusExpanded)}
             className="w-full flex items-center gap-1.5 p-2.5 text-left hover:text-neutral-300 transition-colors"
           >

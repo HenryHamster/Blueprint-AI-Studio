@@ -1,8 +1,8 @@
 import { useState, useEffect, useCallback, Fragment } from 'react';
 import { AlertTriangle, CheckCircle, RotateCcw, Activity, ChevronDown, ChevronRight, Shield, Clock } from 'lucide-react';
 import { ResponsiveContainer, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip } from 'recharts';
-import { apiFetch } from '../api';
-import type { MttaClassRow, RegressionMttaResponse } from '../api';
+import { apiFetch, fetchCanonicalRegressionLayers, CANONICAL_LAYER_NAMES } from '../api';
+import type { MttaClassRow, RegressionMttaResponse, CanonicalRegressionLayer } from '../api';
 import { timeAgo, parseTimestamp, formatTimeToDetect, formatTimeToInvestigate } from '../utils/time';
 import { LayersAffectedBadges, type LayerSummary } from './LayersAffectedBadges';
 import { PhaseChip } from './regressionPhaseChips';
@@ -279,21 +279,37 @@ interface LayerCoverageCombo { layers: string[]; count: number; }
 interface LayerCoverageEntry { total_fixes_with_layers: number; combinations: LayerCoverageCombo[]; }
 type LayerCoverageByClass = Record<string, LayerCoverageEntry>;
 
-const LAYER_SHORT: Record<string, string> = { CI_WORKFLOW: 'CI', AGENT_VM: 'VM', AGENT_VERB: 'VERB', BASELINE_GATE: 'BASELINE', REVIEWER_PASS: 'REVIEWER' };
-const CANONICAL_LAYERS = ['CI_WORKFLOW', 'AGENT_VM', 'AGENT_VERB', 'BASELINE_GATE', 'REVIEWER_PASS'];
+interface RecoveryMismatch {
+  type: string;
+  evaluated_at: string;
+  fix_layers: string[];
+  symptom_layers: string[];
+  unaddressed_layers: string[];
+}
+
+const LAYER_SHORT: Record<string, string> = { CI_WORKFLOW: 'CI', AGENT_VM: 'VM', AGENT_VERB: 'VERB', BASELINE_GATE: 'BASELINE', REVIEWER_PASS: 'REVIEWER', VIEWPORT: 'VIEWPORT' };
 
 export function LayerCoverageHistogramPanel({ projectId }: Props) {
   const [coverage, setCoverage] = useState<LayerCoverageByClass | null>(null);
+  const [canonicalLayers, setCanonicalLayers] = useState<CanonicalRegressionLayer[]>([]);
+  const [recoveryMismatches, setRecoveryMismatches] = useState<Record<string, RecoveryMismatch[]>>({});
 
   useEffect(() => {
     let cancelled = false;
-    apiFetch(`/api/admin/regression-cases?project_id=${encodeURIComponent(projectId)}`)
-      .then(async (res) => { if (!cancelled && res.ok) { const d = await res.json(); setCoverage(d.summary?.layer_coverage_by_class ?? null); } })
-      .catch(() => {});
+    Promise.all([
+      apiFetch(`/api/admin/regression-cases?project_id=${encodeURIComponent(projectId)}`)
+        .then(async (res) => { if (!cancelled && res.ok) { const d = await res.json(); setCoverage(d.summary?.layer_coverage_by_class ?? null); setRecoveryMismatches(d.summary?.recovery_mismatches_by_class ?? {}); } })
+        .catch(() => {}),
+      fetchCanonicalRegressionLayers()
+        .then((data) => { if (!cancelled) setCanonicalLayers(data.layers); })
+        .catch(() => {}),
+    ]);
     return () => { cancelled = true; };
   }, [projectId]);
 
   if (!coverage || Object.keys(coverage).length === 0) return null;
+
+  const canonicalLayerNames = canonicalLayers.map(l => l.name);
 
   return (
     <section data-testid="layer-coverage-histogram-panel" className="mb-4">
@@ -301,10 +317,11 @@ export function LayerCoverageHistogramPanel({ projectId }: Props) {
       <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg divide-y divide-neutral-800/30 overflow-hidden">
         {Object.entries(coverage).map(([cls, entry]) => {
           const targeted = new Set(entry.combinations.flatMap(c => c.layers));
-          const missing = CANONICAL_LAYERS.filter(l => !targeted.has(l));
+          const missing = canonicalLayerNames.filter(l => !targeted.has(l));
           const underDefended = targeted.size > 0 && missing.length > 0;
           const noLayerCount = entry.combinations.find(c => c.layers.length === 0)?.count ?? 0;
           const top2 = entry.combinations.filter(c => c.layers.length > 0).slice(0, 2);
+          const mismatches = recoveryMismatches[cls] ?? [];
           return (
             <div key={cls}
               className={`px-3 py-1.5 ${underDefended ? 'bg-amber-950/10 border-l-2 border-l-amber-500/60' : ''}`}
@@ -320,6 +337,15 @@ export function LayerCoverageHistogramPanel({ projectId }: Props) {
                 {noLayerCount > 0 && (
                   <span className="text-[10px] px-1.5 py-0.5 rounded bg-neutral-700/30 text-neutral-500 border border-neutral-700/40 whitespace-nowrap" title="Fixes targeting no canonical layer (doc-only / test-only)">
                     no-layer ×{noLayerCount}
+                  </span>
+                )}
+                {mismatches.length > 0 && (
+                  <span
+                    data-testid="recovery-mismatch-badge"
+                    className="text-[10px] px-1.5 py-0.5 rounded bg-orange-500/10 text-orange-300 border border-orange-500/20 whitespace-nowrap"
+                    title={`${mismatches.length} recovery: fix layers didn't cover all symptom layers (unaddressed: ${[...new Set(mismatches.flatMap(m => m.unaddressed_layers))].map(l => LAYER_SHORT[l] ?? l).join(', ')})`}
+                  >
+                    {mismatches.length} recovery mismatch{mismatches.length !== 1 ? 'es' : ''}
                   </span>
                 )}
                 {underDefended && <span className="text-[10px] text-amber-400/80" aria-label="under-defended">⚠</span>}
@@ -404,7 +430,7 @@ function untargetedLayersBadge(c: ManualInterventionCase) {
   const layers = c.untargeted_layers ?? [];
   // Suppress when nothing is untargeted (full coverage) or everything is
   // untargeted (brand-new case with no fix history) — both states are noisy.
-  if (layers.length === 0 || layers.length >= CANONICAL_LAYERS.length) return null;
+  if (layers.length === 0 || layers.length >= CANONICAL_LAYER_NAMES.length) return null;
   const labels = layers.map(l => LAYER_SHORT[l] ?? l);
   return (
     <span

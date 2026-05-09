@@ -1,3 +1,5 @@
+import { CANONICAL_LAYER_NAMES } from '../api';
+
 export interface LayerSummaryEntry {
   layer: string;
   count: number;
@@ -30,9 +32,7 @@ export const LAYER_SHORT_LABELS: Record<string, string> = {
   VIEWPORT: 'VPORT',
 };
 
-// eslint-disable-next-line react-refresh/only-export-components
-export const CANONICAL_LAYERS = ['CI_WORKFLOW', 'AGENT_VM', 'AGENT_VERB', 'BASELINE_GATE', 'REVIEWER_PASS', 'VIEWPORT'] as const;
-export type CanonicalLayer = typeof CANONICAL_LAYERS[number];
+export type CanonicalLayer = 'CI_WORKFLOW' | 'AGENT_VM' | 'AGENT_VERB' | 'BASELINE_GATE' | 'REVIEWER_PASS' | 'VIEWPORT';
 
 export interface LayerCoverageCombo { layers: string[]; count: number; }
 export interface LayerCoverageEntry { total_fixes_with_layers: number; combinations: LayerCoverageCombo[]; }
@@ -60,7 +60,7 @@ export function UntargetedLayersBadge({ untargeted_layers }: UntargetedLayersPro
   const layers = untargeted_layers ?? [];
   // Suppress when all layers are untargeted (no fix history yet) or none are
   // (full coverage) — both extremes are noise.
-  if (layers.length === 0 || layers.length >= CANONICAL_LAYERS.length) return null;
+  if (layers.length === 0 || layers.length >= CANONICAL_LAYER_NAMES.length) return null;
   const labels = layers.map((l) => shortLabel(l));
   return (
     <span
@@ -79,11 +79,11 @@ interface LayerDefenseCountsProps {
 
 export function LayerDefenseCountsBadge({ layer_defense_counts }: LayerDefenseCountsProps) {
   if (!layer_defense_counts) return null;
-  const defended = CANONICAL_LAYERS
+  const defended = CANONICAL_LAYER_NAMES
     .filter((l) => (layer_defense_counts[l] ?? 0) > 0)
     .map((l) => `${shortLabel(l)}×${layer_defense_counts[l]}`);
   if (defended.length === 0) return null;
-  const tip = `Canonical layers defended and fix counts: ${CANONICAL_LAYERS.map((l) => `${l}:${layer_defense_counts[l] ?? 0}`).join(', ')}`;
+  const tip = `Canonical layers defended and fix counts: ${CANONICAL_LAYER_NAMES.map((l) => `${l}:${layer_defense_counts[l] ?? 0}`).join(', ')}`;
   return (
     <span
       data-testid="layer-defense-counts-badge"

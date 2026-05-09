@@ -33,6 +33,8 @@ vi.mock('../api', () => ({
   })),
   authHeaders: vi.fn(async () => ({})),
   API_BASE_URL: 'http://localhost:8000',
+  CANONICAL_LAYER_NAMES: ['CI_WORKFLOW', 'AGENT_VM', 'AGENT_VERB', 'BASELINE_GATE', 'REVIEWER_PASS', 'VIEWPORT'] as const,
+  fetchCanonicalRegressionLayers: vi.fn(async () => ({ layers: [] })),
 }));
 
 const populatedCases = [

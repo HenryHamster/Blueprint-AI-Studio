@@ -1066,6 +1066,27 @@ def _compute_symptom_layers_by_class(
     return {cls: sorted(layers) for cls, layers in sorted(by_class.items())}
 
 
+def _compute_recovery_mismatches_by_class(
+    rows: List[RegressionRemediationCase],
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Recovery-layer-mismatch events from fix logs, keyed by regression class.
+
+    Scans fingerprint_to_fix_log for entries of type 'recovery_layer_mismatch'
+    (written by _compute_recovery_layer_mismatch at case closure).  Used by
+    the pipeline health summary so operators can see which closed cases had
+    fix/symptom layer divergence.
+    """
+    by_class: Dict[str, List[Dict[str, Any]]] = {}
+    for case in rows:
+        for entry in case.fingerprint_to_fix_log or []:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("type") != "recovery_layer_mismatch":
+                continue
+            by_class.setdefault(case.regression_class, []).append(entry)
+    return by_class
+
+
 def compute_cross_layer_compliance(
     rows: List[RegressionRemediationCase],
     cutoff: datetime,
@@ -1280,9 +1301,9 @@ def _compute_regression_case_summary(
                     ).total_seconds()
                 )
     layer_coverage_by_class = _compute_layer_coverage_by_class(rows)
-    symptom_layers_by_class = _compute_symptom_layers_by_class(
-        list(all_rows) if all_rows is not None else rows
-    )
+    all_rows_list = list(all_rows) if all_rows is not None else rows
+    symptom_layers_by_class = _compute_symptom_layers_by_class(all_rows_list)
+    recovery_mismatches_by_class = _compute_recovery_mismatches_by_class(all_rows_list)
 
     def _entry(regression_class: str, bucket: Dict[str, List[float]]) -> Dict[str, Any]:
         out: Dict[str, Any] = {
@@ -1320,6 +1341,8 @@ def _compute_regression_case_summary(
         response["layer_coverage_by_class"] = layer_coverage_by_class
     if symptom_layers_by_class:
         response["symptom_layers_by_class"] = symptom_layers_by_class
+    if recovery_mismatches_by_class:
+        response["recovery_mismatches_by_class"] = recovery_mismatches_by_class
     return response
 
 
@@ -9220,4 +9243,25 @@ async def get_pipeline_efficiency(
         "computed_at": now.isoformat(),
         "window_24h": _augment(cur_24h, pri_24h),
         "window_7d": _augment(cur_7d, pri_7d),
+    }
+
+
+@router.get("/canonical-regression-layers")
+async def get_canonical_regression_layers(
+    current_user: dict = Depends(get_current_user),  # noqa: ARG001
+):
+    """Return the canonical regression layers with descriptions and display order."""
+    from app.regression_layer_classifier import (  # noqa: PLC0415
+        LAYER_DISPLAY_ORDER,
+        LAYER_DESCRIPTIONS,
+    )
+
+    return {
+        "layers": [
+            {
+                "name": layer,
+                "description": LAYER_DESCRIPTIONS.get(layer, ""),
+            }
+            for layer in LAYER_DISPLAY_ORDER
+        ]
     }

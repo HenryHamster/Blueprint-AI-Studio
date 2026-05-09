@@ -15,6 +15,8 @@ vi.mock('recharts', () => ({
 }));
 
 vi.mock('../api', () => ({
+  CANONICAL_LAYER_NAMES: ['CI_WORKFLOW', 'AGENT_VM', 'AGENT_VERB', 'BASELINE_GATE', 'REVIEWER_PASS', 'VIEWPORT'] as const,
+  fetchCanonicalRegressionLayers: vi.fn(async () => ({ layers: [] })),
   apiFetch: vi.fn(async (url: string) => {
     if (url.includes('regression-dispatcher/health')) {
       return new Response(JSON.stringify({

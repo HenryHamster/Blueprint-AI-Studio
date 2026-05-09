@@ -43,6 +43,7 @@ from app.orchestrator_filters import (
     filter_held_directions,
     filter_pipeline_duplicates,
     filter_migration_serialization,
+    filter_scope_empty,
 )
 from app.storage import upload_json_payload
 import app.shared_state as _shared_state
@@ -2155,6 +2156,14 @@ async def orchestrator_worker():
                 # original_task_id resolutions for the same effective chain).
                 # Never cancels the sole survivor — see filter docstring.
                 eligible_ids = await filter_pipeline_duplicates(
+                    eligible_ids, candidate_tasks, session, broadcast_to_project
+                )
+
+                # Step 2.76: SCOPE_EMPTY pre-flight — pre-empt auto-decomposed
+                # cluster siblings whose related_files are fully covered by a
+                # completed sibling. Transitions directly to FAILED/SCOPE_EMPTY
+                # (an INFRA_CLASS) so the retry budget is NOT consumed.
+                eligible_ids = await filter_scope_empty(
                     eligible_ids, candidate_tasks, session, broadcast_to_project
                 )
 

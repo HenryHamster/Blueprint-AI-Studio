@@ -40,8 +40,8 @@ echo "[check] admin-ui viewport: Chromium bootstrap failure detected."
 
 # Try Docker fallback (matches agent harness runViewportSuiteWithFallback behavior)
 if ! docker info >/dev/null 2>&1; then
-  echo "[check] WARNING: admin-ui viewport skipped (Chromium bootstrap failure, Docker unavailable). CI will enforce coverage."
-  exit 0
+  echo "VIEWPORT_GATE_INFRA_UNAVAILABLE: Chromium bootstrap failure detected, Docker unavailable"
+  exit 75
 fi
 
 PLAYWRIGHT_IMAGE=mcr.microsoft.com/playwright:v1.59.1-jammy
@@ -68,6 +68,12 @@ fi
 if echo "$DOCKER_OUT" | grep -qE "Tests +[0-9]+ failed"; then
   echo "[check] admin-ui viewport: Docker run has test assertion failures — blocking."
   exit 1
+fi
+
+# Docker failed without test assertions — check if bootstrap errors persisted into Docker
+if echo "$DOCKER_OUT" | grep -qiE "$BOOTSTRAP_PATTERNS"; then
+  echo "VIEWPORT_GATE_INFRA_UNAVAILABLE: Chromium bootstrap failure persists in Docker fallback"
+  exit 75
 fi
 
 echo "[check] WARNING: admin-ui viewport has file-import errors in Docker (pre-existing env issue); no test assertions failed. CI will enforce full coverage."

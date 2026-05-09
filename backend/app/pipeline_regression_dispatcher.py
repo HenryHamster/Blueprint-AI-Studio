@@ -1307,6 +1307,33 @@ def _layers_targeted_union(entries: list[dict[str, Any]] | None) -> set[str]:
     return aggregate_targeted_layers(entries or [])
 
 
+def _compute_recovery_layer_mismatch(
+    fix_log: list[dict[str, Any]] | None,
+    symptoms_by_layer: dict[str, Any] | None,
+    now: datetime,
+) -> dict[str, Any] | None:
+    """Return a recovery_layer_mismatch entry when fix didn't cover all symptom layers.
+
+    Compares the union of layers_targeted across fix-log entries against the
+    layers that fired symptoms during the case lifecycle.  Returns None when
+    there is no data to compare or when all symptom layers were addressed.
+    """
+    fix_layers = _layers_targeted_union(fix_log)
+    symptom_layers = set((symptoms_by_layer or {}).keys())
+    if not fix_layers or not symptom_layers:
+        return None
+    unaddressed = symptom_layers - fix_layers
+    if not unaddressed:
+        return None
+    return {
+        "type": "recovery_layer_mismatch",
+        "evaluated_at": now.isoformat(),
+        "fix_layers": sorted(fix_layers),
+        "symptom_layers": sorted(symptom_layers),
+        "unaddressed_layers": sorted(unaddressed),
+    }
+
+
 def compute_untargeted_layers(
     fingerprint_to_fix_log: list[dict[str, Any]] | None,
 ) -> list[str]:
@@ -5423,18 +5450,26 @@ async def run_recovery_once(session: AsyncSession, project_id: uuid.UUID) -> int
         if state is None:
             continue
         if not state["tripped"]:
+            mismatch_entry = _compute_recovery_layer_mismatch(
+                case.fingerprint_to_fix_log, case.symptoms_by_layer, now
+            )
             case.mark_closed()
             # Reset the recovery clock so a future re-escalation does not
             # pick up a stale healthy_since on the same row (mirrors the
             # prior process-local ``_signal_healthy_since.pop`` semantics).
             case.signal_healthy_since_at = None
-            case.fingerprint_to_fix_log = list(case.fingerprint_to_fix_log or []) + [
+            new_entries: list[dict[str, Any]] = [
                 {
                     "fingerprint": case.regression_class,
                     "recovered_at": now.isoformat(),
                     "post_merge_value": state["current_rate"],
                 }
             ]
+            if mismatch_entry:
+                new_entries.append(mismatch_entry)
+            case.fingerprint_to_fix_log = (
+                list(case.fingerprint_to_fix_log or []) + new_entries
+            )
         else:
             last_spawn = await _last_spawn_for_class(
                 session, project_id, case.regression_class
@@ -6255,9 +6290,12 @@ async def _auto_close_recovered_manual_intervention(
                 CLOSE_REASON_RECOVERED_UNATTENDED,
             )
 
+        watchdog_mismatch = _compute_recovery_layer_mismatch(
+            locked.fingerprint_to_fix_log, locked.symptoms_by_layer, now
+        )
         locked.mark_closed()
         locked.last_remediation_result = close_reason
-        locked.fingerprint_to_fix_log = list(locked.fingerprint_to_fix_log or []) + [
+        watchdog_entries: list[dict[str, Any]] = [
             {
                 "fingerprint": locked.regression_class,
                 "recovered_at": now.isoformat(),
@@ -6265,6 +6303,11 @@ async def _auto_close_recovered_manual_intervention(
                 "reason": close_reason,
             }
         ]
+        if watchdog_mismatch:
+            watchdog_entries.append(watchdog_mismatch)
+        locked.fingerprint_to_fix_log = (
+            list(locked.fingerprint_to_fix_log or []) + watchdog_entries
+        )
         # Cleared on close so the column never carries a stale value across
         # case lifecycles — mirrors the prior process-local ``.pop()`` calls.
         locked.signal_healthy_since_at = None

@@ -66,6 +66,16 @@ export interface CodeChangeTaskOpts {
    *  Forwarded to writeCodeChangeHelpers so ./done enforces a non-trivial
    *  `reasoning` field in check_results for each regressing category. */
   regressingCategories?: string[];
+  /** When true, this task was auto-decomposed from a larger finding into a
+   *  cluster sibling. Combined with relatedFiles + siblingTasks, enables the
+   *  SCOPE_EMPTY pre-flight guard (see runCodeChangeTask). */
+  autoDecomposed?: boolean;
+  /** Files declared in the task scope. Used by the SCOPE_EMPTY guard. */
+  relatedFiles?: string[];
+  /** Sibling task summaries passed from project_context. Each entry has at
+   *  minimum a status field; completed siblings expose their files list so
+   *  the guard can check whether all relatedFiles are already covered. */
+  siblingTasks?: Array<{ status: string; files?: string[]; title?: string; id?: string }>;
   /**
    * Called when SR has categories=["incomplete_review"] and no reviewer_findings yet.
    * Implementations run a fresh-reviewer pass with incompleteSrRecovery=true so
@@ -202,6 +212,36 @@ export async function runCodeChangeTask(opts: CodeChangeTaskOpts): Promise<void>
     `/tmp/test_baseline_${taskId}.json`,
   ]) {
     try { fs.unlinkSync(f); } catch { /* not present — fine */ }
+  }
+
+  // ── SCOPE_EMPTY pre-flight (auto-decomposed cluster siblings) ────────────
+  // When all declared related_files were already shipped by completed sibling
+  // cluster PRs, exit cleanly without consuming the retry budget.
+  if (opts.autoDecomposed && (opts.relatedFiles ?? []).length > 0 && Array.isArray(opts.siblingTasks)) {
+    const guardFiles = opts.relatedFiles as string[];
+    const coveredFiles = new Set<string>();
+    const coveringTitles: string[] = [];
+    for (const sibling of opts.siblingTasks) {
+      if (sibling.status !== 'COMPLETED') continue;
+      const sFiles = sibling.files ?? [];
+      if (sFiles.some(f => guardFiles.includes(f))) {
+        for (const f of sFiles) coveredFiles.add(f);
+        const title = sibling.title ?? sibling.id ?? 'sibling task';
+        if (!coveringTitles.includes(title)) coveringTitles.push(title);
+      }
+    }
+    if (coveredFiles.size > 0 && guardFiles.every(f => coveredFiles.has(f))) {
+      const msg = `SCOPE_EMPTY: All declared related_files [${guardFiles.join(', ')}] were already covered by completed sibling tasks (${coveringTitles.join(', ')}). Exiting cleanly — no retry needed.`;
+      sendLog(ws, `[ScopeGuard] ${msg}\n`);
+      await persistAndPostStatus(taskId, {
+        task_id: taskId,
+        status: 'BLOCKED_PRECONDITION',
+        artifact_type: 'ERROR_LOG',
+        logs: msg,
+        failure_category: 'SCOPE_EMPTY',
+      });
+      return;
+    }
   }
 
   // Persist baseCommit so ./done can compute the changed_files diff for

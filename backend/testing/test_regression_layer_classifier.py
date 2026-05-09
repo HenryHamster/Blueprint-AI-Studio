@@ -12,6 +12,7 @@ from app.regression_layer_classifier import (
     build_layer_meta_block,
     classify_layers,
     compute_layer_defense_counts,
+    compute_recovery_layer_mismatch,
     compute_untargeted_layers,
     is_recurring_cross_layer_class,
     parse_viewport_regression_class,
@@ -660,3 +661,83 @@ class TestParseViewportRegressionClass:
     def test_missing_at_sign_returns_all_none(self):
         result = parse_viewport_regression_class("viewport_regression:TaskCard")
         assert result == {"component": None, "assertion_type": None, "width": None}
+
+
+# ---------------------------------------------------------------------------
+# compute_recovery_layer_mismatch
+# ---------------------------------------------------------------------------
+
+_TS = "2026-05-09T12:00:00+00:00"
+
+
+class TestComputeRecoveryLayerMismatch:
+    def _fix_entry(self, layers: list[str]) -> dict:
+        return {"layers_targeted": layers, "merged_at": _TS}
+
+    def _symptoms(self, *layers: str) -> dict:
+        return {
+            layer: [{"fingerprint": "fp-1", "observed_at": _TS}] for layer in layers
+        }
+
+    def test_mismatch_returns_record(self):
+        fix_log = [self._fix_entry([LAYER_AGENT_VM])]
+        symptoms = self._symptoms(LAYER_AGENT_VM, LAYER_CI_WORKFLOW)
+        result = compute_recovery_layer_mismatch(fix_log, symptoms, evaluated_at=_TS)
+        assert result is not None
+        assert result["type"] == "recovery_layer_mismatch"
+        assert result["evaluated_at"] == _TS
+        assert result["unaddressed_layers"] == [LAYER_CI_WORKFLOW]
+        assert LAYER_AGENT_VM in result["fix_layers"]
+        assert LAYER_CI_WORKFLOW in result["symptom_layers"]
+
+    def test_aligned_fix_returns_none(self):
+        fix_log = [self._fix_entry([LAYER_AGENT_VM, LAYER_CI_WORKFLOW])]
+        symptoms = self._symptoms(LAYER_AGENT_VM, LAYER_CI_WORKFLOW)
+        assert (
+            compute_recovery_layer_mismatch(fix_log, symptoms, evaluated_at=_TS) is None
+        )
+
+    def test_empty_fix_log_returns_none(self):
+        symptoms = self._symptoms(LAYER_AGENT_VM)
+        assert compute_recovery_layer_mismatch([], symptoms, evaluated_at=_TS) is None
+
+    def test_none_fix_log_returns_none(self):
+        symptoms = self._symptoms(LAYER_AGENT_VM)
+        assert compute_recovery_layer_mismatch(None, symptoms, evaluated_at=_TS) is None
+
+    def test_empty_symptoms_returns_none(self):
+        fix_log = [self._fix_entry([LAYER_AGENT_VM])]
+        assert compute_recovery_layer_mismatch(fix_log, {}, evaluated_at=_TS) is None
+
+    def test_none_symptoms_returns_none(self):
+        fix_log = [self._fix_entry([LAYER_AGENT_VM])]
+        assert compute_recovery_layer_mismatch(fix_log, None, evaluated_at=_TS) is None
+
+    def test_non_canonical_symptom_keys_ignored(self):
+        fix_log = [self._fix_entry([LAYER_AGENT_VM])]
+        symptoms = {LAYER_AGENT_VM: [], "UNKNOWN_LAYER": []}
+        result = compute_recovery_layer_mismatch(fix_log, symptoms, evaluated_at=_TS)
+        assert (
+            result is None
+        )  # UNKNOWN_LAYER not canonical — no unaddressed canonical layer
+
+    def test_unaddressed_layers_sorted(self):
+        fix_log = [self._fix_entry([LAYER_CI_WORKFLOW])]
+        symptoms = self._symptoms(
+            LAYER_CI_WORKFLOW, LAYER_AGENT_VM, LAYER_BASELINE_GATE
+        )
+        result = compute_recovery_layer_mismatch(fix_log, symptoms, evaluated_at=_TS)
+        assert result is not None
+        assert result["unaddressed_layers"] == sorted(result["unaddressed_layers"])
+
+    def test_fix_layers_sorted(self):
+        fix_log = [
+            self._fix_entry([LAYER_BASELINE_GATE]),
+            self._fix_entry([LAYER_AGENT_VM]),
+        ]
+        symptoms = self._symptoms(
+            LAYER_AGENT_VM, LAYER_BASELINE_GATE, LAYER_CI_WORKFLOW
+        )
+        result = compute_recovery_layer_mismatch(fix_log, symptoms, evaluated_at=_TS)
+        assert result is not None
+        assert result["fix_layers"] == sorted(result["fix_layers"])

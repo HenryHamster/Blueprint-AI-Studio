@@ -565,6 +565,25 @@ export async function fetchLayerCoverageByClass(
   return (data.summary?.layer_coverage_by_class as LayerCoverageByClass) ?? null;
 }
 
+export interface CanonicalRegressionLayer {
+  name: string;
+  description: string;
+}
+
+export interface CanonicalRegressionLayersResponse {
+  layers: CanonicalRegressionLayer[];
+}
+
+// Canonical regression layers in stable display order (single source of truth from backend)
+export const CANONICAL_LAYER_NAMES = ['CI_WORKFLOW', 'AGENT_VM', 'AGENT_VERB', 'BASELINE_GATE', 'REVIEWER_PASS', 'VIEWPORT'] as const;
+export type CanonicalLayerName = typeof CANONICAL_LAYER_NAMES[number];
+
+export async function fetchCanonicalRegressionLayers(): Promise<CanonicalRegressionLayersResponse> {
+  const res = await apiFetch('/api/admin/canonical-regression-layers');
+  if (!res.ok) throw new Error(`Failed to fetch canonical regression layers: ${res.status}`);
+  return res.json();
+}
+
 export interface CrossLayerComplianceByClass {
   compliant: number;
   non_compliant: number;

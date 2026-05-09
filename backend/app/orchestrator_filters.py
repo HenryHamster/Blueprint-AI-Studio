@@ -408,6 +408,98 @@ async def filter_migration_serialization(
     return non_blocked
 
 
+async def filter_scope_empty(
+    eligible_ids: list[uuid.UUID],
+    candidate_tasks: list[Task],
+    session,
+    broadcast_fn: Callable[..., Coroutine[Any, Any, None]],
+) -> list[uuid.UUID]:
+    """Pre-empt auto-decomposed cluster siblings whose scope is fully covered.
+
+    When a QUEUED task carries ``auto_decomposed=True`` and a sibling task
+    (same parent_task_id) has already reached COMPLETED status with overlapping
+    related_files, the candidate's work was already done by the sibling.
+    Transition the candidate directly to FAILED with SCOPE_EMPTY so it does
+    NOT consume the retry budget and does NOT penalize direction health.
+    """
+    if not eligible_ids:
+        return eligible_ids
+
+    auto_decomp = [
+        t
+        for t in candidate_tasks
+        if t.id in eligible_ids
+        and (t.context or {}).get("auto_decomposed")
+        and t.parent_task_id is not None
+    ]
+    if not auto_decomp:
+        return eligible_ids
+
+    parent_ids = list({t.parent_task_id for t in auto_decomp})
+    completed_siblings = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.parent_task_id.in_(parent_ids),
+                    Task.status == TaskStatus.COMPLETED,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not completed_siblings:
+        return eligible_ids
+
+    covered_by_parent: dict[uuid.UUID, set[str]] = {}
+    sibling_title_by_parent: dict[uuid.UUID, dict[str, str]] = {}
+    for sib in completed_siblings:
+        files = _prod_files((sib.context or {}).get("related_files", []))
+        if files:
+            covered_by_parent.setdefault(sib.parent_task_id, set()).update(files)
+            titles = sibling_title_by_parent.setdefault(sib.parent_task_id, {})
+            for f in files:
+                titles.setdefault(f, sib.title or str(sib.id))
+
+    from app.failure_classification import SCOPE_EMPTY, persist_failure_category  # noqa: PLC0415
+
+    pre_empted: set[uuid.UUID] = set()
+    for candidate in auto_decomp:
+        cfiles = _prod_files((candidate.context or {}).get("related_files", []))
+        if not cfiles:
+            continue
+        covered = covered_by_parent.get(candidate.parent_task_id, set())
+        if not cfiles.issubset(covered):
+            continue
+        # All declared files already covered by a completed sibling — pre-empt.
+        titles = sibling_title_by_parent.get(candidate.parent_task_id, {})
+        sibling_title = next((titles[f] for f in cfiles if f in titles), None)
+        msg = "SCOPE_EMPTY: all declared files already covered by completed sibling" + (
+            f" '{sibling_title[:60]}'" if sibling_title else ""
+        )
+        candidate.status = TaskStatus.FAILED
+        candidate.latest_status_message = msg
+        persist_failure_category(candidate, SCOPE_EMPTY)
+        session.add(candidate)
+        pre_empted.add(candidate.id)
+        try:
+            await broadcast_fn(
+                str(candidate.project_id),
+                "task_updated",
+                {"task_id": str(candidate.id), "status": "FAILED", "message": msg},
+            )
+        except Exception:
+            logger.debug(
+                f"Failed to broadcast SCOPE_EMPTY for {candidate.id}", exc_info=True
+            )
+        logger.info(
+            f"[DISPATCH] SCOPE_EMPTY: pre-empting task {candidate.id} — "
+            f"all {len(cfiles)} file(s) covered by completed sibling under parent {candidate.parent_task_id}"
+        )
+
+    return [eid for eid in eligible_ids if eid not in pre_empted]
+
+
 async def filter_pipeline_duplicates(
     eligible_ids: list[uuid.UUID],
     candidate_tasks: list[Task],
