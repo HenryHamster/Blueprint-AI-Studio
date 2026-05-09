@@ -56,8 +56,6 @@ function makeProps(direction: Direction, statusKey = 'active') {
     researchSuccessIds: {},
     forceConfirmId: null,
     setForceConfirmId: vi.fn(),
-    historyOpenIds: {},
-    setHistoryOpenIds: vi.fn(),
   };
 }
 
@@ -454,6 +452,7 @@ describe('DirectionCard per-cycle delta badge', () => {
       research_history: [makeResearchEntry({ prs_merged: 3 })],
     });
     render(<DirectionCard {...makeProps(d)} />);
+    fireEvent.click(screen.getByRole('button', { name: /Research History/ }));
     expect(screen.getByText('3 this cycle')).toBeInTheDocument();
     expect(screen.queryByText(/vs prior/)).not.toBeInTheDocument();
   });
@@ -466,6 +465,7 @@ describe('DirectionCard per-cycle delta badge', () => {
       ],
     });
     render(<DirectionCard {...makeProps(d)} />);
+    fireEvent.click(screen.getByRole('button', { name: /Research History/ }));
     const badge = screen.getByText('+2 vs prior');
     expect(badge).toBeInTheDocument();
     expect(badge.className).toMatch(/emerald/);
@@ -479,6 +479,7 @@ describe('DirectionCard per-cycle delta badge', () => {
       ],
     });
     render(<DirectionCard {...makeProps(d)} />);
+    fireEvent.click(screen.getByRole('button', { name: /Research History/ }));
     const badge = screen.getByText('-2 vs prior');
     expect(badge).toBeInTheDocument();
     expect(badge.className).toMatch(/red/);
@@ -492,6 +493,7 @@ describe('DirectionCard per-cycle delta badge', () => {
       ],
     });
     render(<DirectionCard {...makeProps(d)} />);
+    fireEvent.click(screen.getByRole('button', { name: /Research History/ }));
     const badge = screen.getByText('0 vs prior');
     expect(badge).toBeInTheDocument();
     expect(badge.className).not.toMatch(/emerald/);
@@ -507,6 +509,7 @@ describe('DirectionCard per-cycle delta badge', () => {
       ],
     });
     render(<DirectionCard {...makeProps(d)} />);
+    fireEvent.click(screen.getByRole('button', { name: /Research History/ }));
     // avg of last 3: (2+4+3)/3 = 3.0
     expect(screen.getByText('avg 3/cycle')).toBeInTheDocument();
   });
@@ -529,6 +532,7 @@ describe('DirectionCard autonomous/assisted merge split', () => {
       research_history: [makeResearchEntry({ prs_merged: 5 })],
     });
     render(<DirectionCard {...makeProps(d)} />);
+    fireEvent.click(screen.getByRole('button', { name: /Research History/ }));
     expect(screen.getByText('5 PRs shipped')).toBeInTheDocument();
   });
 
@@ -537,6 +541,7 @@ describe('DirectionCard autonomous/assisted merge split', () => {
       research_history: [makeResearchEntry({ prs_merged: 8, autonomous_prs_merged: 8, assisted_prs_merged: 0 })],
     });
     render(<DirectionCard {...makeProps(d)} />);
+    fireEvent.click(screen.getByRole('button', { name: /Research History/ }));
     expect(screen.getByText('8 auto')).toBeInTheDocument();
     expect(screen.queryByText(/assisted/)).not.toBeInTheDocument();
   });
@@ -546,8 +551,9 @@ describe('DirectionCard autonomous/assisted merge split', () => {
       research_history: [makeResearchEntry({ prs_merged: 3, autonomous_prs_merged: 0, assisted_prs_merged: 3 })],
     });
     render(<DirectionCard {...makeProps(d)} />);
+    fireEvent.click(screen.getByRole('button', { name: /Research History/ }));
     expect(screen.getByText('3 assisted')).toBeInTheDocument();
-    expect(screen.queryByText(/auto/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/\bauto\b/)).not.toBeInTheDocument();
   });
 
   it('shows both auto and assisted badges when split', () => {
@@ -555,6 +561,7 @@ describe('DirectionCard autonomous/assisted merge split', () => {
       research_history: [makeResearchEntry({ prs_merged: 10, autonomous_prs_merged: 8, assisted_prs_merged: 2 })],
     });
     render(<DirectionCard {...makeProps(d)} />);
+    fireEvent.click(screen.getByRole('button', { name: /Research History/ }));
     expect(screen.getByText('8 auto')).toBeInTheDocument();
     expect(screen.getByText('2 assisted')).toBeInTheDocument();
   });
@@ -564,6 +571,7 @@ describe('DirectionCard autonomous/assisted merge split', () => {
       research_history: [makeResearchEntry({ prs_merged: 0, autonomous_prs_merged: 0, assisted_prs_merged: 0 })],
     });
     render(<DirectionCard {...makeProps(d)} />);
+    fireEvent.click(screen.getByRole('button', { name: /Research History/ }));
     expect(screen.getByText('0 PRs shipped')).toBeInTheDocument();
   });
 
@@ -573,6 +581,7 @@ describe('DirectionCard autonomous/assisted merge split', () => {
       history_aggregate: { total_operator_actions: 0 },
     });
     render(<DirectionCard {...makeProps(d)} />);
+    fireEvent.click(screen.getByRole('button', { name: /Research History/ }));
     expect(screen.getByText('✓ self-sufficient')).toBeInTheDocument();
   });
 
@@ -582,6 +591,8 @@ describe('DirectionCard autonomous/assisted merge split', () => {
       history_aggregate: { total_operator_actions: 1 },
     });
     render(<DirectionCard {...makeProps(d)} />);
+    // Self-sufficient badge not shown even when history is expanded (operator actions present)
+    fireEvent.click(screen.getByRole('button', { name: /Research History/ }));
     expect(screen.queryByText('✓ self-sufficient')).not.toBeInTheDocument();
   });
 });

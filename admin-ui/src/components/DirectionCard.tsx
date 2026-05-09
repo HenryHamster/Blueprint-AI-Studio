@@ -109,9 +109,6 @@ export interface DirectionCardProps {
   // Force confirm popover
   forceConfirmId: string | null;
   setForceConfirmId: React.Dispatch<React.SetStateAction<string | null>>;
-  // Research history
-  historyOpenIds: Record<string, boolean>;
-  setHistoryOpenIds: React.Dispatch<React.SetStateAction<Record<string, boolean>>>;
   // Navigation callbacks
   onViewFindings?: (directionId: string) => void;
   onNavigateToTask?: (taskId: string) => void;
@@ -129,11 +126,12 @@ function DirectionCardImpl({
   applyDirectionUpdate, dismissDirectionUpdate, triggerResearch, reorderDirections,
   taskCounts, activeTasks, cooldownMinutes, researchingIds, researchSuccessIds,
   forceConfirmId, setForceConfirmId,
-  historyOpenIds, setHistoryOpenIds,
   onViewFindings, onNavigateToTask,
 }: DirectionCardProps) {
   const forceConfirmRef = useRef<HTMLDivElement | null>(null);
   const [expandedNotes, setExpandedNotes] = useState<Set<number>>(new Set());
+  const [notesOpen, setNotesOpen] = useState(false);
+  const [historyOpen, setHistoryOpen] = useState(false);
   const [expandedRemediationIds, setExpandedRemediationIds] = useState<Record<string, boolean>>({});
   const showAllRemediation = Boolean(expandedRemediationIds[d.id]);
 
@@ -247,7 +245,7 @@ function DirectionCardImpl({
   }, [forceConfirmId, d.id, setForceConfirmId]);
 
   return (
-    <div className={`border rounded-lg p-3 ${d.status === 'proposed' ? 'bg-purple-950/20 border-purple-900/40' : d.status === 'expired' ? 'bg-neutral-900/30 border-neutral-800/40 opacity-70' : 'bg-neutral-900/50 border-neutral-800/50'}`}>
+    <div className={`border rounded-lg p-2 ${d.status === 'proposed' ? 'bg-purple-950/20 border-purple-900/40' : d.status === 'expired' ? 'bg-neutral-900/30 border-neutral-800/40 opacity-70' : 'bg-neutral-900/50 border-neutral-800/50'}`}>
       {d.status === 'proposed' ? (
         /* Proposed direction — approve or reject */
         <div>
@@ -746,91 +744,6 @@ function DirectionCardImpl({
                 </span>
               );
             })()}
-            {/* Aggregate product ratio badge from latest research history entry */}
-            {(() => {
-              const entries = d.research_history?.filter(e => e.product_ratio != null);
-              if (!entries || entries.length === 0) return null;
-              const latest = [...entries].reverse()[0];
-              const ratio = latest.product_ratio as number;
-              const pct = Math.round(ratio * 100);
-              const color = ratio > 0.3 ? 'emerald' : ratio >= 0.1 ? 'amber' : 'red';
-              return (
-                <span className={`text-[10px] px-1.5 py-0.5 rounded border font-medium bg-${color}-950/40 border-${color}-900/50 text-${color}-400`}>
-                  {pct}% product
-                </span>
-              );
-            })()}
-            {/* Productivity score badge — (merged - 0.5*rejected) / cycles; quality-weighted, can go negative */}
-            {(() => {
-              const hasHistory = d.research_history && d.research_history.length >= 3;
-              if (!hasHistory || d.merge_rate == null) return null;
-              const score = d.merge_rate as number;
-              const color = score >= 0.5 ? 'emerald' : score >= 0.2 ? 'amber' : score >= 0 ? 'red' : 'red';
-              return (
-                <span
-                  title="Productivity score: (merged − 0.5 × rejected) / cycles. Negative values indicate rejections outweighed merges."
-                  className={`text-[10px] px-1.5 py-0.5 rounded border font-medium bg-${color}-950/40 border-${color}-900/50 text-${color}-400`}
-                >
-                  {score.toFixed(2)} productivity
-                </span>
-              );
-            })()}
-            {/* Acceptance rate badge — merged / (merged + rejected) */}
-            {(() => {
-              const history = d.research_history;
-              if (!history || history.length === 0) return null;
-              const historyMerged = history.reduce((sum, e) => sum + (e.prs_merged ?? 0), 0);
-              const historyRejected = history.reduce((sum, e) => sum + (e.prs_rejected ?? 0), 0);
-              const aggMerged = (d.history_aggregate?.total_prs_merged as number | null) ?? 0;
-              const aggRejected = (d.history_aggregate?.total_prs_rejected as number | null) ?? 0;
-              const totalMerged = historyMerged + aggMerged;
-              const totalRejected = historyRejected + aggRejected;
-              const totalDecided = totalMerged + totalRejected;
-              if (totalRejected === 0 || totalDecided === 0) return null;
-              const rate = totalMerged / totalDecided;
-              const pct = Math.round(rate * 100);
-              const color = rate >= 0.6 ? 'emerald' : rate >= 0.3 ? 'amber' : 'red';
-              return (
-                <span
-                  title={`${totalMerged} merged / ${totalDecided} decided (${totalRejected} rejected)`}
-                  className={`text-[10px] px-1.5 py-0.5 rounded border font-medium bg-${color}-950/40 border-${color}-900/50 text-${color}-400`}
-                >
-                  {pct}% acceptance
-                </span>
-              );
-            })()}
-            {/* Lifetime metrics badges */}
-            {(() => {
-              const history = d.research_history;
-              if (!history || history.length === 0) return null;
-              const totalPrsMerged = history.reduce((sum, e) => sum + (e.prs_merged ?? 0), 0);
-              const totalTasksCreated = history.reduce((sum, e) => sum + (e.tasks_created ?? 0), 0);
-              const rawRate = totalTasksCreated > 0 ? totalPrsMerged / totalTasksCreated : 0;
-              // tasks_created is frozen at cycle-complete time, but prs_merged keeps
-              // updating as children (including later auto-remediation spawns under
-              // the same parent) finish merging — so the raw ratio can exceed 1.0.
-              // Clamp for display; surface the raw numbers in the tooltip.
-              const displayRate = Math.min(rawRate, 1);
-              const totalCycles = history.length;
-              const colorBucket = displayRate >= 0.5 ? 'emerald' : displayRate >= 0.2 ? 'amber' : 'red';
-              return (
-                <>
-                  {totalPrsMerged > 0 && (
-                    <span className="text-[10px] px-1.5 py-0.5 rounded border font-medium bg-blue-950/40 border-blue-900/50 text-blue-400">
-                      {totalPrsMerged} PRs merged
-                    </span>
-                  )}
-                  {totalCycles >= 2 && (
-                    <span
-                      title={`${totalPrsMerged} merged across ${totalTasksCreated} spawned tasks${rawRate > 1 ? ' (capped at 100%; later auto-remediation children inflated the ratio)' : ''}`}
-                      className={`text-[10px] px-1.5 py-0.5 rounded border font-medium bg-${colorBucket}-950/40 border-${colorBucket}-900/50 text-${colorBucket}-400`}
-                    >
-                      {Math.round(displayRate * 100)}% success
-                    </span>
-                  )}
-                </>
-              );
-            })()}
             {/* Reactivate button for auto-paused directions */}
             {d.auto_paused && key === 'paused' && (
               // reason: inline direction action chip; text-[10px] py-0.5 matches card density
@@ -1002,37 +915,50 @@ function DirectionCardImpl({
             </div>
           )}
           {d.notes && d.notes.length > 0 && (
-            <div className="mt-2 p-1.5 bg-neutral-800/30 border border-neutral-700/40 rounded text-xs">
-              <div className="text-neutral-500 font-medium mb-1">Agent notes ({d.notes.length}):</div>
-              {d.notes.slice(-3).map((n, ni) => {
-                const expanded = expandedNotes.has(ni);
-                const truncated = n.text.length > 200;
-                const body = expanded || !truncated ? n.text : `${n.text.slice(0, 200)}…`;
-                return (
-                  <div
-                    key={ni}
-                    className={`text-neutral-500 leading-relaxed break-words ${truncated ? 'cursor-pointer hover:text-neutral-400' : ''}`}
-                    onClick={() => {
-                      if (!truncated) return;
-                      setExpandedNotes((prev) => {
-                        const next = new Set(prev);
-                        if (next.has(ni)) next.delete(ni);
-                        else next.add(ni);
-                        return next;
-                      });
-                    }}
-                    role={truncated ? 'button' : undefined}
-                    tabIndex={truncated ? 0 : undefined}
-                  >
-                    • {body}
-                    {truncated && (
-                      <span className="ml-1 text-neutral-600 text-[10px]">
-                        {expanded ? '(click to collapse)' : '(click to expand)'}
-                      </span>
-                    )}
-                  </div>
-                );
-              })}
+            <div className="mt-1.5">
+              <button
+                onClick={() => setNotesOpen(o => !o)}
+                className="flex items-center gap-1 text-[10px] text-neutral-500 hover:text-neutral-400 transition-colors"
+              >
+                {notesOpen
+                  ? <ChevronDown className="w-3 h-3" />
+                  : <ChevronRight className="w-3 h-3" />
+                }
+                <span className="font-medium">Agent notes ({d.notes.length})</span>
+              </button>
+              {notesOpen && (
+                <div className="mt-0.5 p-1.5 bg-neutral-800/30 border border-neutral-700/40 rounded text-xs">
+                  {d.notes.slice(-3).map((n, ni) => {
+                    const expanded = expandedNotes.has(ni);
+                    const truncated = n.text.length > 200;
+                    const body = expanded || !truncated ? n.text : `${n.text.slice(0, 200)}…`;
+                    return (
+                      <div
+                        key={ni}
+                        className={`text-neutral-500 leading-relaxed break-words ${truncated ? 'cursor-pointer hover:text-neutral-400' : ''}`}
+                        onClick={() => {
+                          if (!truncated) return;
+                          setExpandedNotes((prev) => {
+                            const next = new Set(prev);
+                            if (next.has(ni)) next.delete(ni);
+                            else next.add(ni);
+                            return next;
+                          });
+                        }}
+                        role={truncated ? 'button' : undefined}
+                        tabIndex={truncated ? 0 : undefined}
+                      >
+                        • {body}
+                        {truncated && (
+                          <span className="ml-1 text-neutral-600 text-[10px]">
+                            {expanded ? '(click to collapse)' : '(click to expand)'}
+                          </span>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
             </div>
           )}
           {d.pending_update && (
@@ -1055,138 +981,27 @@ function DirectionCardImpl({
               </div>
             </div>
           )}
-          {/* Lifetime outcome metrics */}
-          {lifetimeMetrics && (
-            <div className="mt-1.5 space-y-0.5">
-              <div className="flex flex-wrap items-center gap-1.5">
-                {lifetimeMetrics.totalAutonomous != null || lifetimeMetrics.totalAssisted != null ? (
-                  <>
-                    {(lifetimeMetrics.totalAutonomous ?? 0) > 0 && (
-                      <span className="text-[10px] px-1.5 py-0.5 rounded border font-medium bg-emerald-950/40 border-emerald-900/50 text-emerald-400">
-                        {lifetimeMetrics.totalAutonomous} auto
-                      </span>
-                    )}
-                    {(lifetimeMetrics.totalAssisted ?? 0) > 0 && (
-                      <span className="text-[10px] px-1.5 py-0.5 rounded border font-medium bg-blue-950/40 border-blue-900/50 text-blue-400">
-                        {lifetimeMetrics.totalAssisted} assisted
-                      </span>
-                    )}
-                    {(lifetimeMetrics.totalAutonomous ?? 0) === 0 && (lifetimeMetrics.totalAssisted ?? 0) === 0 && (
-                      <span className="text-[10px] px-1.5 py-0.5 rounded border font-medium bg-neutral-800/60 border-neutral-700/60 text-neutral-500">
-                        0 PRs shipped
-                      </span>
-                    )}
-                    {(lifetimeMetrics.totalAutonomous ?? 0) >= 10 && lifetimeMetrics.totalOperatorActions === 0 && (
-                      <span className="text-[10px] px-1.5 py-0.5 rounded border font-medium bg-emerald-900/30 border-emerald-700/50 text-emerald-300" title="Direction ships autonomously — eligible for retirement review">
-                        ✓ self-sufficient
-                      </span>
-                    )}
-                  </>
-                ) : (
-                  <span className={`text-[10px] px-1.5 py-0.5 rounded border font-medium ${lifetimeMetrics.totalMerged > 0 ? 'bg-emerald-950/40 border-emerald-900/50 text-emerald-400' : 'bg-neutral-800/60 border-neutral-700/60 text-neutral-500'}`}>
-                    {lifetimeMetrics.totalMerged} PRs shipped
-                  </span>
-                )}
-                {lifetimeMetrics.successRate !== null && (() => {
-                  const rate = lifetimeMetrics.successRate;
-                  const color = rate >= 70 ? 'emerald' : rate >= 40 ? 'amber' : 'red';
-                  return (
-                    <span className={`text-[10px] px-1.5 py-0.5 rounded border font-medium bg-${color}-950/40 border-${color}-900/50 text-${color}-400`}>
-                      {rate}% success
-                    </span>
-                  );
-                })()}
-                {onViewFindings && (
-                  // reason: inline link button in compact direction metrics row; text-[10px] single-line
-                  <button
-                    data-viewport-allow-small-target
-                    onClick={() => onViewFindings(d.id)}
-                    className="text-[10px] text-blue-400 hover:text-blue-300 cursor-pointer transition-colors"
-                  >
-                    View findings →
-                  </button>
-                )}
-              </div>
-              {lifetimeMetrics.latestShipped && lifetimeMetrics.truncatedTitle && (
-                <p className="text-[10px] text-neutral-600 italic leading-relaxed">
-                  Latest shipped: {lifetimeMetrics.truncatedTitle} <span className="not-italic">({formatRelativeTime(lifetimeMetrics.latestShipped.timestamp)})</span>
-                </p>
-              )}
-              {lifetimeMetrics.sparkData.length >= 3 && (
-                <div className="mt-1">
-                  <ResponsiveContainer width="100%" height={30}>
-                    <BarChart data={lifetimeMetrics.sparkData} barCategoryGap="15%" margin={{ top: 0, right: 0, bottom: 0, left: 0 }}>
-                      <Bar dataKey="prs" isAnimationActive={false}>
-                        {lifetimeMetrics.sparkData.map((entry, index) => (
-                          <Cell
-                            key={`cell-${index}`}
-                            fill={entry.prs > 0 ? '#10b981' : '#404040'}
-                          />
-                        ))}
-                      </Bar>
-                      <RechartsTooltip
-                        cursor={{ fill: 'rgba(255,255,255,0.05)' }}
-                        content={({ active, payload }) => {
-                          if (!active || !payload?.length) return null;
-                          const pt = payload[0].payload as { prs: number; timestamp: string; findings: string[] };
-                          return (
-                            <div className="text-[10px] bg-neutral-900 border border-neutral-700 rounded px-2 py-1 max-w-[180px] shadow-lg">
-                              <div className="text-neutral-400">{formatRelativeTime(pt.timestamp)}</div>
-                              <div className="text-emerald-400 font-medium">{pt.prs} PR{pt.prs !== 1 ? 's' : ''} merged</div>
-                              {pt.findings.slice(0, 2).map((f, fi) => (
-                                <div key={fi} className="text-neutral-500 truncate">• {f.slice(0, 45)}</div>
-                              ))}
-                            </div>
-                          );
-                        }}
-                      />
-                    </BarChart>
-                  </ResponsiveContainer>
-                </div>
-              )}
-              <div className="flex items-center gap-1.5 mt-0.5 flex-wrap">
-                <p className="text-[10px] text-neutral-600">{lifetimeMetrics.lastCycleLabel}</p>
-                {lifetimeMetrics.deltaPrs != null ? (
-                  <span
-                    title={`Latest cycle: ${lifetimeMetrics.latestCyclePrs} PRs merged`}
-                    className={`text-[10px] px-1.5 py-0.5 rounded border font-medium ${
-                      lifetimeMetrics.deltaPrs > 0
-                        ? 'bg-emerald-950/40 border-emerald-900/50 text-emerald-400'
-                        : lifetimeMetrics.deltaPrs < 0
-                          ? 'bg-red-950/40 border-red-900/50 text-red-400'
-                          : 'bg-neutral-800/60 border-neutral-700/60 text-neutral-500'
-                    }`}
-                  >
-                    {lifetimeMetrics.deltaPrs > 0 ? '+' : ''}{lifetimeMetrics.deltaPrs} vs prior
-                  </span>
-                ) : (
-                  <span className="text-[10px] px-1.5 py-0.5 rounded border font-medium bg-neutral-800/60 border-neutral-700/60 text-neutral-500">
-                    {lifetimeMetrics.latestCyclePrs} this cycle
-                  </span>
-                )}
-                {lifetimeMetrics.rollingAvg3 != null && (
-                  <span className="text-[10px] text-neutral-600">
-                    avg {lifetimeMetrics.rollingAvg3 % 1 === 0 ? lifetimeMetrics.rollingAvg3.toFixed(0) : lifetimeMetrics.rollingAvg3.toFixed(1)}/cycle
-                  </span>
-                )}
-              </div>
-            </div>
-          )}
           {d.research_history && d.research_history.length > 0 && (
-            <div className="mt-2">
+            <div className="mt-1.5">
               {/* reason: research history section collapse toggle; single-row text-[10px] header */}
               <button
                 data-viewport-allow-small-target
-                onClick={() => setHistoryOpenIds(prev => ({ ...prev, [d.id]: !prev[d.id] }))}
+                onClick={() => setHistoryOpen(o => !o)}
                 className="flex items-center gap-1.5 w-full text-left group"
               >
-                {historyOpenIds[d.id]
+                {historyOpen
                   ? <ChevronDown className="w-3 h-3 text-neutral-600 group-hover:text-neutral-400 transition-colors" />
                   : <ChevronRight className="w-3 h-3 text-neutral-600 group-hover:text-neutral-400 transition-colors" />
                 }
                 <span className="text-[10px] font-medium text-neutral-500 uppercase tracking-wider group-hover:text-neutral-400 transition-colors flex-1">
                   Research History ({d.research_history.length})
                 </span>
+                {!historyOpen && lifetimeMetrics && (
+                  <span className="text-[10px] text-neutral-600 font-mono">
+                    {lifetimeMetrics.totalMerged} merged
+                    {lifetimeMetrics.successRate !== null ? ` · ${lifetimeMetrics.successRate}%` : ''}
+                  </span>
+                )}
                 {d.possibly_saturated && (
                   <span className="text-[10px] px-1.5 py-0.5 rounded border font-medium bg-amber-950/40 text-amber-400 border-amber-900/50">
                     possibly saturated
@@ -1198,8 +1013,125 @@ function DirectionCardImpl({
                   </span>
                 )}
               </button>
-              {historyOpenIds[d.id] && (
-                <div className="mt-1.5 space-y-2">
+              {historyOpen && (
+                <div>
+                  {lifetimeMetrics && (
+                    <div className="mt-1 mb-2 space-y-0.5">
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        {lifetimeMetrics.totalAutonomous != null || lifetimeMetrics.totalAssisted != null ? (
+                          <>
+                            {(lifetimeMetrics.totalAutonomous ?? 0) > 0 && (
+                              <span className="text-[10px] px-1.5 py-0.5 rounded border font-medium bg-emerald-950/40 border-emerald-900/50 text-emerald-400">
+                                {lifetimeMetrics.totalAutonomous} auto
+                              </span>
+                            )}
+                            {(lifetimeMetrics.totalAssisted ?? 0) > 0 && (
+                              <span className="text-[10px] px-1.5 py-0.5 rounded border font-medium bg-blue-950/40 border-blue-900/50 text-blue-400">
+                                {lifetimeMetrics.totalAssisted} assisted
+                              </span>
+                            )}
+                            {(lifetimeMetrics.totalAutonomous ?? 0) === 0 && (lifetimeMetrics.totalAssisted ?? 0) === 0 && (
+                              <span className="text-[10px] px-1.5 py-0.5 rounded border font-medium bg-neutral-800/60 border-neutral-700/60 text-neutral-500">
+                                0 PRs shipped
+                              </span>
+                            )}
+                            {(lifetimeMetrics.totalAutonomous ?? 0) >= 10 && lifetimeMetrics.totalOperatorActions === 0 && (
+                              <span className="text-[10px] px-1.5 py-0.5 rounded border font-medium bg-emerald-900/30 border-emerald-700/50 text-emerald-300" title="Direction ships autonomously — eligible for retirement review">
+                                ✓ self-sufficient
+                              </span>
+                            )}
+                          </>
+                        ) : (
+                          <span className={`text-[10px] px-1.5 py-0.5 rounded border font-medium ${lifetimeMetrics.totalMerged > 0 ? 'bg-emerald-950/40 border-emerald-900/50 text-emerald-400' : 'bg-neutral-800/60 border-neutral-700/60 text-neutral-500'}`}>
+                            {lifetimeMetrics.totalMerged} PRs shipped
+                          </span>
+                        )}
+                        {lifetimeMetrics.successRate !== null && (() => {
+                          const rate = lifetimeMetrics.successRate;
+                          const color = rate >= 70 ? 'emerald' : rate >= 40 ? 'amber' : 'red';
+                          return (
+                            <span className={`text-[10px] px-1.5 py-0.5 rounded border font-medium bg-${color}-950/40 border-${color}-900/50 text-${color}-400`}>
+                              {rate}% success
+                            </span>
+                          );
+                        })()}
+                        {onViewFindings && (
+                          // reason: inline link button in compact direction metrics row; text-[10px] single-line
+                          <button
+                            data-viewport-allow-small-target
+                            onClick={() => onViewFindings(d.id)}
+                            className="text-[10px] text-blue-400 hover:text-blue-300 cursor-pointer transition-colors"
+                          >
+                            View findings →
+                          </button>
+                        )}
+                      </div>
+                      {lifetimeMetrics.latestShipped && lifetimeMetrics.truncatedTitle && (
+                        <p className="text-[10px] text-neutral-600 italic leading-relaxed">
+                          Latest shipped: {lifetimeMetrics.truncatedTitle} <span className="not-italic">({formatRelativeTime(lifetimeMetrics.latestShipped.timestamp)})</span>
+                        </p>
+                      )}
+                      {lifetimeMetrics.sparkData.length >= 3 && (
+                        <div className="mt-1">
+                          <ResponsiveContainer width="100%" height={30}>
+                            <BarChart data={lifetimeMetrics.sparkData} barCategoryGap="15%" margin={{ top: 0, right: 0, bottom: 0, left: 0 }}>
+                              <Bar dataKey="prs" isAnimationActive={false}>
+                                {lifetimeMetrics.sparkData.map((entry, index) => (
+                                  <Cell
+                                    key={`cell-${index}`}
+                                    fill={entry.prs > 0 ? '#10b981' : '#404040'}
+                                  />
+                                ))}
+                              </Bar>
+                              <RechartsTooltip
+                                cursor={{ fill: 'rgba(255,255,255,0.05)' }}
+                                content={({ active, payload }) => {
+                                  if (!active || !payload?.length) return null;
+                                  const pt = payload[0].payload as { prs: number; timestamp: string; findings: string[] };
+                                  return (
+                                    <div className="text-[10px] bg-neutral-900 border border-neutral-700 rounded px-2 py-1 max-w-[180px] shadow-lg">
+                                      <div className="text-neutral-400">{formatRelativeTime(pt.timestamp)}</div>
+                                      <div className="text-emerald-400 font-medium">{pt.prs} PR{pt.prs !== 1 ? 's' : ''} merged</div>
+                                      {pt.findings.slice(0, 2).map((f, fi) => (
+                                        <div key={fi} className="text-neutral-500 truncate">• {f.slice(0, 45)}</div>
+                                      ))}
+                                    </div>
+                                  );
+                                }}
+                              />
+                            </BarChart>
+                          </ResponsiveContainer>
+                        </div>
+                      )}
+                      <div className="flex items-center gap-1.5 mt-0.5 flex-wrap">
+                        <p className="text-[10px] text-neutral-600">{lifetimeMetrics.lastCycleLabel}</p>
+                        {lifetimeMetrics.deltaPrs != null ? (
+                          <span
+                            title={`Latest cycle: ${lifetimeMetrics.latestCyclePrs} PRs merged`}
+                            className={`text-[10px] px-1.5 py-0.5 rounded border font-medium ${
+                              lifetimeMetrics.deltaPrs > 0
+                                ? 'bg-emerald-950/40 border-emerald-900/50 text-emerald-400'
+                                : lifetimeMetrics.deltaPrs < 0
+                                  ? 'bg-red-950/40 border-red-900/50 text-red-400'
+                                  : 'bg-neutral-800/60 border-neutral-700/60 text-neutral-500'
+                            }`}
+                          >
+                            {lifetimeMetrics.deltaPrs > 0 ? '+' : ''}{lifetimeMetrics.deltaPrs} vs prior
+                          </span>
+                        ) : (
+                          <span className="text-[10px] px-1.5 py-0.5 rounded border font-medium bg-neutral-800/60 border-neutral-700/60 text-neutral-500">
+                            {lifetimeMetrics.latestCyclePrs} this cycle
+                          </span>
+                        )}
+                        {lifetimeMetrics.rollingAvg3 != null && (
+                          <span className="text-[10px] text-neutral-600">
+                            avg {lifetimeMetrics.rollingAvg3 % 1 === 0 ? lifetimeMetrics.rollingAvg3.toFixed(0) : lifetimeMetrics.rollingAvg3.toFixed(1)}/cycle
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                  )}
+                  <div className="space-y-2">
                   {[...d.research_history].reverse().slice(0, 5).map((entry, i) => (
                     <div key={entry.task_id ?? i} className="p-2 bg-neutral-900/60 border border-neutral-800/60 rounded text-[10px]">
                       <div className="flex items-center justify-between mb-1">
@@ -1286,6 +1218,7 @@ function DirectionCardImpl({
                       )}
                     </div>
                   ))}
+                  </div>
                 </div>
               )}
             </div>

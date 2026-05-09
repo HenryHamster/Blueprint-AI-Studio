@@ -158,7 +158,6 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({ expired: true });
 
   // Research history open state per direction
-  const [historyOpenIds, setHistoryOpenIds] = useState<Record<string, boolean>>({});
 
   // Research button state
   const [researchingIds, setResearchingIds] = useState<Record<string, boolean>>({});
@@ -998,8 +997,6 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
                             researchSuccessIds={researchSuccessIds}
                             forceConfirmId={forceConfirmId}
                             setForceConfirmId={setForceConfirmId}
-                            historyOpenIds={historyOpenIds}
-                            setHistoryOpenIds={setHistoryOpenIds}
                             onViewFindings={onViewFindings}
                             onNavigateToTask={onNavigateToTask}
                           />
