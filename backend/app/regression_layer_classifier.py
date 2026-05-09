@@ -266,6 +266,26 @@ def classify_layers(
     return tags
 
 
+def compute_untargeted_layers(fix_log: list[dict]) -> list[str]:
+    """Return canonical layer names that have zero targeted fixes in fix_log.
+
+    Scans each entry's ``layers_targeted`` field (a list of layer name strings).
+    Entries missing the field, or with an empty list, contribute nothing to the
+    "targeted" set — they are treated as unclassified, not as targeting all layers.
+    Unknown layer names are silently ignored.
+
+    Returns a sorted list of layer names from ``ALL_LAYERS`` that appear in no
+    fix entry's ``layers_targeted``.  Returns all five layers when fix_log is
+    empty or no entry carries a ``layers_targeted`` field.
+    """
+    targeted: set[str] = set()
+    for entry in fix_log:
+        for layer in entry.get("layers_targeted") or []:
+            if layer in ALL_LAYERS:
+                targeted.add(layer)
+    return sorted(ALL_LAYERS - targeted)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

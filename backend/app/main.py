@@ -119,7 +119,7 @@ from app.strategic_constants import (  # noqa: E402
 
 # Expected schema revision — must match the latest alembic migration.
 # Update this when adding new migrations.
-EXPECTED_SCHEMA_REVISION = "0092"
+EXPECTED_SCHEMA_REVISION = "0093"
 
 # --- Task Priority Map ---
 # Maps priority string labels to integer values stored on Task.priority.
@@ -3376,6 +3376,7 @@ async def strategic_operation(
 
 # _github_token_cache, invalidate_github_token_cache, get_github_token_for_task,
 # and GitHub proxy endpoints — moved to app.routers.agent
+
 
 # --- Static Files for Frontend (One-Line Deploy) ---
 static_dir = os.path.join(os.path.dirname(__file__), "..", "static")

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 
 vi.mock('../api', () => ({ apiFetch: vi.fn(), authHeaders: vi.fn(), API_BASE_URL: '' }));
 
@@ -181,6 +181,28 @@ describe('ManualInterventionPanel — layer mismatch badge', () => {
     expect(badge).toBeInTheDocument();
     expect(badge).toHaveTextContent('layer mismatch');
     expect(badge).toHaveAttribute('title', 'prior fixes targeted CI; current symptoms on VM');
+  });
+});
+
+describe('ManualInterventionPanel — Acknowledge button', () => {
+  it('POSTs to /acknowledge with project_id query param', async () => {
+    apiFetchMock.mockResolvedValueOnce(response([baseCase]));
+    apiFetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => ({ id: baseCase.id, operator_acknowledged_at: '2026-05-08T12:00:00+00:00' }),
+    } as Response);
+
+    render(<ManualInterventionPanel projectId="proj-abc" />);
+    const button = await screen.findByRole('button', { name: /Acknowledge/ });
+    fireEvent.click(button);
+
+    await waitFor(() => expect(apiFetchMock).toHaveBeenCalledTimes(2));
+    const ackCall = apiFetchMock.mock.calls[1];
+    expect(ackCall[0]).toBe(
+      `/api/admin/regression-cases/${encodeURIComponent(baseCase.id)}/acknowledge?project_id=proj-abc`
+    );
+    expect(ackCall[1]).toEqual({ method: 'POST' });
   });
 });
 

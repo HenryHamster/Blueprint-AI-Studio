@@ -1562,6 +1562,15 @@ class RegressionRemediationCase(SQLModel, table=True):
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
+    # Timestamp when an operator first acknowledged the manual-intervention
+    # escalation. NULL for unacknowledged cases and for historical cases
+    # predating this column. Set once via the acknowledge endpoint; idempotent
+    # (never overwritten once stamped). Enables MTTI metric:
+    # needs_manual_intervention_at → operator_acknowledged_at.
+    operator_acknowledged_at: Optional[datetime] = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
     # Timestamp when the underlying signal first crossed its threshold during
     # the most recent dispatcher pass. Separate from first_seen_at (case
     # creation) and last_remediation_task_id spawn time. Enables time-to-detect

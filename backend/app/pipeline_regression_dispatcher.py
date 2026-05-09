@@ -401,6 +401,24 @@ async def get_dispatcher_cycle_records(
     ]
 
 
+def compute_mtti_p50_sec(cases: list) -> float | None:
+    """Return median seconds from escalation to operator acknowledgement.
+
+    Filters to cases where both ``needs_manual_intervention_at`` and
+    ``operator_acknowledged_at`` are set.  Returns ``None`` when no acked
+    cases are present in the input.  Uses ``statistics.median`` — no numpy.
+    """
+    import statistics  # noqa: PLC0415
+
+    deltas = [
+        (c.operator_acknowledged_at - c.needs_manual_intervention_at).total_seconds()
+        for c in cases
+        if c.needs_manual_intervention_at is not None
+        and c.operator_acknowledged_at is not None
+    ]
+    return statistics.median(deltas) if deltas else None
+
+
 async def _prune_old_dispatcher_cycle_records(session: AsyncSession) -> int:
     """Delete DispatcherCycleRecord rows older than the retention window.
 
@@ -890,6 +908,10 @@ def _compute_layer_fragility_stats(
             "still_holding_ages": [],
             "retripped_within_48h": 0,
             "held_gt_7d": 0,
+            "single_layer_fix_count": 0,
+            "single_layer_hold_days": [],
+            "multi_layer_fix_count": 0,
+            "multi_layer_hold_days": [],
         }
         for layer in _CANONICAL_RECURRENCE_LAYERS
     }
@@ -905,15 +927,24 @@ def _compute_layer_fragility_stats(
             continue
         recovered_dt = _parse_dispatcher_dt(entry.get("recovered_at"))
         age_days = (now - merged_dt).total_seconds() / 86400.0
+        is_multi_layer = len(layers_targeted) >= 2
 
         for layer in layers_targeted:
             if layer not in layer_stats:
                 continue
             s = layer_stats[layer]
             s["fix_count"] += 1
+            if is_multi_layer:
+                s["multi_layer_fix_count"] += 1
+            else:
+                s["single_layer_fix_count"] += 1
             if recovered_dt is not None:
                 hold = (recovered_dt - merged_dt).total_seconds() / 86400.0
                 s["hold_days"].append(hold)
+                if is_multi_layer:
+                    s["multi_layer_hold_days"].append(hold)
+                else:
+                    s["single_layer_hold_days"].append(hold)
                 if hold < 2.0:
                     s["retripped_within_48h"] += 1
                 if hold > 7.0:
@@ -923,18 +954,23 @@ def _compute_layer_fragility_stats(
                 if age_days > 7.0:
                     s["held_gt_7d"] += 1
 
+    def _avg_or_none(values: list[float]) -> float | None:
+        return sum(values) / len(values) if values else None
+
     result: dict[str, dict[str, Any]] = {}
     for layer in _CANONICAL_RECURRENCE_LAYERS:
         s = layer_stats[layer]
         hold_days_list = s["hold_days"]
         result[layer] = {
             "fix_count": s["fix_count"],
-            "avg_hold_days": sum(hold_days_list) / len(hold_days_list)
-            if hold_days_list
-            else None,
+            "avg_hold_days": _avg_or_none(hold_days_list),
             "still_holding_count": len(s["still_holding_ages"]),
             "held_gt_7d_count": s["held_gt_7d"],
             "retripped_within_48h_count": s["retripped_within_48h"],
+            "single_layer_fix_count": s["single_layer_fix_count"],
+            "single_layer_avg_hold_days": _avg_or_none(s["single_layer_hold_days"]),
+            "multi_layer_fix_count": s["multi_layer_fix_count"],
+            "multi_layer_avg_hold_days": _avg_or_none(s["multi_layer_hold_days"]),
         }
     return result
 
@@ -1140,6 +1176,25 @@ def _layers_targeted_union(entries: list[dict[str, Any]] | None) -> set[str]:
     return out
 
 
+def compute_untargeted_layers(
+    fingerprint_to_fix_log: list[dict[str, Any]] | None,
+) -> list[str]:
+    """Canonical layers never targeted by any prior fix in this case's history.
+
+    Returns layers from ``_CANONICAL_RECURRENCE_LAYERS`` (in canonical order)
+    that do not appear in any entry's ``layers_targeted`` list. Unrecognized
+    layer names in the fix-log are silently dropped so a typo or future-added
+    layer never crashes the read path. Empty / missing / non-list fix-log
+    yields the full canonical tuple — everything is untargeted by default.
+    """
+    if not isinstance(fingerprint_to_fix_log, list):
+        return list(_CANONICAL_RECURRENCE_LAYERS)
+    targeted = _layers_targeted_union(fingerprint_to_fix_log)
+    canonical = set(_CANONICAL_RECURRENCE_LAYERS)
+    targeted &= canonical
+    return [layer for layer in _CANONICAL_RECURRENCE_LAYERS if layer not in targeted]
+
+
 def _format_recurrence_meta_prompt(
     case: RegressionRemediationCase,
     base_lines: str,
@@ -1269,14 +1324,8 @@ def _format_fragile_recurrence_meta_prompt(
         attempts
     )
 
-    all_targeted: set[str] = set()
-    for attempt in attempts:
-        if attempt.get("layers_targeted_present"):
-            all_targeted.update(attempt.get("layers_targeted") or [])
-
-    untargeted = [
-        layer for layer in _CANONICAL_RECURRENCE_LAYERS if layer not in all_targeted
-    ]
+    all_targeted = _layers_targeted_union(attempts) & set(_CANONICAL_RECURRENCE_LAYERS)
+    untargeted = compute_untargeted_layers(attempts)
 
     lines: list[str] = [
         "FRAGILE-RECURRENCE META-INVESTIGATION",

@@ -18,22 +18,44 @@ vi.mock('../api', () => ({
   apiFetch: vi.fn(async (url: string) => {
     if (url.includes('regression-dispatcher/health')) {
       return new Response(JSON.stringify({
-        cycles_last_24h: 47,
-        signals_tripped_last_24h: 12,
-        spawns_last_24h: 4,
-        cooldown_blocks_last_24h: 8,
-        cap_blocks_last_24h: 0,
-        classes: [
+        window_hours: 24,
+        aggregate: {
+          cycles: 47,
+          signals_evaluated: 50,
+          signals_tripped: 12,
+          spawns: 4,
+          mttd_p50_sec: 150.5,
+          recoveries: {
+            marginal: 2,
+            confirmed: 3,
+          },
+          rejections: {
+            cooldown: 8,
+            dedup: 1,
+            system_cap: 0,
+            manual_intervention_suppressed: 0,
+          },
+        },
+        spawns_sparkline: Array.from({ length: 24 }, (_, i) => ({
+          hour_start: new Date(Date.now() - (23 - i) * 3600_000).toISOString(),
+          spawns: Math.floor(Math.random() * 5),
+          cycles: Math.floor(Math.random() * 10),
+        })),
+        per_class: [
           {
+            project_id: 'project-123',
             regression_class: 'sr_regression_pipeline_success_rate',
-            last_spawn_at: new Date(Date.now() - 3600_000).toISOString(),
-            last_rejection_reason: null,
+            status: 'ACTIVE',
+            last_seen_at: new Date(Date.now() - 3600_000).toISOString(),
+            attempts: 2,
             in_cooldown_until: new Date(Date.now() + 3600_000).toISOString(),
           },
           {
+            project_id: 'project-123',
             regression_class: 'sr_regression_first_attempt_success',
-            last_spawn_at: new Date(Date.now() - 7200_000).toISOString(),
-            last_rejection_reason: 'cooldown',
+            status: 'ACTIVE',
+            last_seen_at: new Date(Date.now() - 7200_000).toISOString(),
+            attempts: 1,
             in_cooldown_until: null,
           },
         ],
@@ -150,12 +172,30 @@ describe('DispatcherHealthPanel — viewport regression', () => {
     const { apiFetch } = await import('../api');
     vi.mocked(apiFetch).mockResolvedValueOnce(
       new Response(JSON.stringify({
-        cycles_last_24h: 0,
-        signals_tripped_last_24h: 0,
-        spawns_last_24h: 0,
-        cooldown_blocks_last_24h: 0,
-        cap_blocks_last_24h: 0,
-        classes: [],
+        window_hours: 24,
+        aggregate: {
+          cycles: 0,
+          signals_evaluated: 0,
+          signals_tripped: 0,
+          spawns: 0,
+          mttd_p50_sec: null,
+          recoveries: {
+            marginal: 0,
+            confirmed: 0,
+          },
+          rejections: {
+            cooldown: 0,
+            dedup: 0,
+            system_cap: 0,
+            manual_intervention_suppressed: 0,
+          },
+        },
+        spawns_sparkline: Array.from({ length: 24 }, (_, i) => ({
+          hour_start: new Date(Date.now() - (23 - i) * 3600_000).toISOString(),
+          spawns: 0,
+          cycles: 0,
+        })),
+        per_class: [],
       }), { status: 200 })
     );
     await expectNoOverflowAt(375, async () => {

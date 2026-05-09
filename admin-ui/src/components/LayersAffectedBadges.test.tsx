@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { render, screen } from '@testing-library/react';
-import { LayersAffectedBadges, LayerMismatchBadge, type LayerSummary } from './LayersAffectedBadges';
+import { LayersAffectedBadges, LayerMismatchBadge, UntargetedLayersBadge, type LayerSummary } from './LayersAffectedBadges';
 
 const summary = (overrides: Partial<LayerSummary> = {}): LayerSummary => ({
   cross_layer: false,
@@ -94,6 +94,39 @@ describe('LayersAffectedBadges', () => {
       />,
     );
     expect(screen.getByTestId('layer-badge-UNKNOWN_LAYER')).toHaveTextContent('UNKNOWN_LAYER · 1');
+  });
+});
+
+describe('UntargetedLayersBadge', () => {
+  it('renders nothing when untargeted_layers is null or undefined', () => {
+    const { container } = render(<UntargetedLayersBadge untargeted_layers={null} />);
+    expect(container.firstChild).toBeNull();
+    const undef = render(<UntargetedLayersBadge />);
+    expect(undef.container.firstChild).toBeNull();
+  });
+
+  it('renders nothing when all canonical layers are untargeted (no fix history)', () => {
+    const allLayers = ['CI_WORKFLOW', 'AGENT_VM', 'AGENT_VERB', 'BASELINE_GATE', 'REVIEWER_PASS'];
+    const { container } = render(<UntargetedLayersBadge untargeted_layers={allLayers} />);
+    expect(container.firstChild).toBeNull();
+  });
+
+  it('renders nothing when untargeted_layers is empty (full coverage)', () => {
+    const { container } = render(<UntargetedLayersBadge untargeted_layers={[]} />);
+    expect(container.firstChild).toBeNull();
+  });
+
+  it('renders badge with short labels when some layers are untargeted', () => {
+    render(<UntargetedLayersBadge untargeted_layers={['AGENT_VM', 'REVIEWER_PASS']} />);
+    const badge = screen.getByTestId('untargeted-layers-badge');
+    expect(badge).toHaveTextContent('never defended in: VM, REVIEWER');
+    expect(badge.getAttribute('title')).toBe('Layers no prior fix has targeted: AGENT_VM, REVIEWER_PASS');
+  });
+
+  it('uses full layer name for unrecognized layers', () => {
+    render(<UntargetedLayersBadge untargeted_layers={['CUSTOM_LAYER', 'AGENT_VM']} />);
+    const badge = screen.getByTestId('untargeted-layers-badge');
+    expect(badge).toHaveTextContent('never defended in: CUSTOM_LAYER, VM');
   });
 });
 

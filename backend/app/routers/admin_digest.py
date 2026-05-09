@@ -2539,6 +2539,10 @@ async def list_regression_cases(
     rows = (await session.execute(query)).scalars().all()
     now = _utcnow()
     stall_threshold = now - timedelta(hours=_REGRESSION_STALL_THRESHOLD_HOURS)
+    from app.pipeline_regression_dispatcher import (  # noqa: PLC0415
+        compute_untargeted_layers,
+    )
+
     closed_rows = (
         (
             await session.execute(
@@ -2601,6 +2605,9 @@ async def list_regression_cases(
                     now=now,
                     fingerprint_to_fix_log=c.fingerprint_to_fix_log,
                 ),
+                "untargeted_layers": compute_untargeted_layers(
+                    c.fingerprint_to_fix_log
+                ),
             }
             for c in rows
         ],
@@ -2651,6 +2658,10 @@ async def regression_cases_layer_defense_density(
         row["still_holding_count"] = frag.get("still_holding_count", 0)
         row["held_gt_7d_count"] = frag.get("held_gt_7d_count", 0)
         row["retripped_within_48h_count"] = frag.get("retripped_within_48h_count", 0)
+        row["single_layer_fix_count"] = frag.get("single_layer_fix_count", 0)
+        row["single_layer_avg_hold_days"] = frag.get("single_layer_avg_hold_days")
+        row["multi_layer_fix_count"] = frag.get("multi_layer_fix_count", 0)
+        row["multi_layer_avg_hold_days"] = frag.get("multi_layer_avg_hold_days")
     return {
         "days": days,
         "generated_at": _utcnow().isoformat(),
@@ -2702,6 +2713,38 @@ async def clear_regression_manual_intervention(
         "status": RegressionCaseStatus.ACTIVE,
         "attempts": case.attempts,
         "needs_manual_intervention_at": None,
+    }
+
+
+@router.post("/regression-cases/{case_id}/acknowledge")
+async def acknowledge_regression_case(
+    case_id: uuid.UUID,
+    project_id: uuid.UUID = Query(...),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),  # noqa: ARG001
+):
+    """Stamp operator_acknowledged_at on a RegressionRemediationCase.
+
+    Idempotent: if the case is already acknowledged the existing timestamp is
+    returned unchanged. Returns 404 if no matching case exists for this project.
+    """
+    result = await session.execute(
+        select(RegressionRemediationCase).where(
+            RegressionRemediationCase.id == case_id,
+            RegressionRemediationCase.project_id == project_id,
+        )
+    )
+    case = result.scalar_one_or_none()
+    if case is None:
+        raise HTTPException(status_code=404, detail="Regression case not found")
+    if case.operator_acknowledged_at is None:
+        case.operator_acknowledged_at = _utcnow()
+        case.updated_at = _utcnow()
+        session.add(case)
+        await session.commit()
+    return {
+        "id": str(case.id),
+        "operator_acknowledged_at": case.operator_acknowledged_at.isoformat(),
     }
 
 
@@ -2788,6 +2831,10 @@ async def list_regression_manual_intervention_cases(
 ):
     """List regression cases escalated to manual intervention."""
     now = _utcnow()
+    from app.pipeline_regression_dispatcher import (  # noqa: PLC0415
+        compute_untargeted_layers,
+    )
+
     rows = (
         (
             await session.execute(
@@ -2839,10 +2886,16 @@ async def list_regression_manual_intervention_cases(
                 else None,
                 "time_to_investigate_sec": c.time_to_investigate_sec,
                 "escalation_reason": c.escalation_reason,
+                "operator_acknowledged_at": c.operator_acknowledged_at.isoformat()
+                if c.operator_acknowledged_at
+                else None,
                 "layer_summary": _summarize_symptoms_by_layer(
                     c.symptoms_by_layer,
                     now=now,
                     fingerprint_to_fix_log=c.fingerprint_to_fix_log,
+                ),
+                "untargeted_layers": compute_untargeted_layers(
+                    c.fingerprint_to_fix_log
                 ),
             }
             for c in rows
@@ -2865,6 +2918,10 @@ async def list_regression_auto_recovered_cases(
     log entry and an ``updated_at`` field so operators can sort by close time.
     """
     now = _utcnow()
+    from app.pipeline_regression_dispatcher import (  # noqa: PLC0415
+        compute_untargeted_layers,
+    )
+
     rows = (
         (
             await session.execute(
@@ -2922,6 +2979,9 @@ async def list_regression_auto_recovered_cases(
                     c.symptoms_by_layer,
                     now=now,
                     fingerprint_to_fix_log=c.fingerprint_to_fix_log,
+                ),
+                "untargeted_layers": compute_untargeted_layers(
+                    c.fingerprint_to_fix_log
                 ),
             }
         )
@@ -3007,6 +3067,7 @@ async def list_recently_closed_regression_cases(
 
     from app.pipeline_regression_dispatcher import (  # noqa: PLC0415
         _extract_recurrence_cycles,
+        compute_untargeted_layers,
     )
 
     cases = []
@@ -3092,6 +3153,9 @@ async def list_recently_closed_regression_cases(
                     c.symptoms_by_layer,
                     now=now,
                     fingerprint_to_fix_log=c.fingerprint_to_fix_log,
+                ),
+                "untargeted_layers": compute_untargeted_layers(
+                    c.fingerprint_to_fix_log
                 ),
             }
         )
@@ -8059,6 +8123,7 @@ async def get_regression_dispatcher_health(
     rather than crashing.
     """
     from app.pipeline_regression_dispatcher import (  # noqa: PLC0415
+        compute_mtti_p50_sec,
         get_dispatcher_cycle_records,
     )
 
@@ -8090,6 +8155,20 @@ async def get_regression_dispatcher_health(
     total_mi_suppressed = sum(
         r.get("rejections_by_reason", {}).get("manual_intervention_suppressed", 0)
         for r in cycles
+    )
+
+    # Compute mttd_p50_sec as mean of non-None values
+    mttd_values = [
+        r.get("mttd_p50_sec") for r in cycles if r.get("mttd_p50_sec") is not None
+    ]
+    mttd_p50_sec = sum(mttd_values) / len(mttd_values) if mttd_values else None
+
+    # Sum recovery counts across cycles
+    total_marginal_recoveries = sum(
+        r.get("marginal_recoveries_count", 0) for r in cycles
+    )
+    total_confirmed_recoveries = sum(
+        r.get("confirmed_recoveries_count", 0) for r in cycles
     )
 
     # Per-hour sparkline: count spawns_emitted in each 1-hour bucket
@@ -8135,6 +8214,25 @@ async def get_regression_dispatcher_health(
 
     from app.pipeline_regression_dispatcher import _REGRESSION_COOLDOWN  # noqa: PLC0415
 
+    # Compute MTTI: query cases acknowledged within the window
+    cutoff = datetime.utcnow() - timedelta(hours=window_hours)
+    mtti_where = [
+        RegressionRemediationCase.operator_acknowledged_at >= cutoff,
+        RegressionRemediationCase.needs_manual_intervention_at.is_not(None),
+    ]
+    if project_id is not None:
+        mtti_where.append(RegressionRemediationCase.project_id == project_id)
+    acked_cases = (
+        (
+            await session.execute(
+                select(RegressionRemediationCase).where(*mtti_where).limit(1000)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    mtti_p50_sec = compute_mtti_p50_sec(list(acked_cases))
+
     per_class: List[Dict[str, Any]] = []
     for case in cases:
         last_seen = case.last_seen_at
@@ -8161,6 +8259,12 @@ async def get_regression_dispatcher_health(
             "signals_evaluated": total_signals_evaluated,
             "signals_tripped": total_signals_tripped,
             "spawns": total_spawns,
+            "mttd_p50_sec": mttd_p50_sec,
+            "mtti_p50_sec": mtti_p50_sec,
+            "recoveries": {
+                "marginal": total_marginal_recoveries,
+                "confirmed": total_confirmed_recoveries,
+            },
             "rejections": {
                 "cooldown": total_cooldown,
                 "dedup": total_dedup,

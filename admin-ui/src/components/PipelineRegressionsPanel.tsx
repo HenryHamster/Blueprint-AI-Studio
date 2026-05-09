@@ -42,19 +42,40 @@ function RegressionClassLabel({ cls }: { cls: string }) {
 }
 
 interface DispatcherCycleClass {
+  project_id: string;
   regression_class: string;
-  last_spawn_at: string | null;
-  last_rejection_reason: string | null;
+  status: string;
+  last_seen_at: string | null;
+  attempts: number;
   in_cooldown_until: string | null;
 }
 
 interface DispatcherHealthData {
-  cycles_last_24h: number;
-  signals_tripped_last_24h: number;
-  spawns_last_24h: number;
-  cooldown_blocks_last_24h: number;
-  cap_blocks_last_24h: number;
-  classes: DispatcherCycleClass[];
+  window_hours: number;
+  aggregate: {
+    cycles: number;
+    signals_evaluated: number;
+    signals_tripped: number;
+    spawns: number;
+    mttd_p50_sec: number | null;
+    mtti_p50_sec?: number | null;
+    recoveries: {
+      marginal: number;
+      confirmed: number;
+    };
+    rejections: {
+      cooldown: number;
+      dedup: number;
+      system_cap: number;
+      manual_intervention_suppressed: number;
+    };
+  };
+  spawns_sparkline: Array<{
+    hour_start: string;
+    spawns: number;
+    cycles: number;
+  }>;
+  per_class: DispatcherCycleClass[];
 }
 
 export function DispatcherHealthPanel({ projectId }: Props) {
@@ -80,32 +101,35 @@ export function DispatcherHealthPanel({ projectId }: Props) {
         <Activity className="w-3 h-3" />
         Dispatcher Health
       </h2>
-      {!data || data.cycles_last_24h === 0 ? (
+      {!data || data.aggregate.cycles === 0 ? (
         <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 text-neutral-500 text-xs">
           No dispatcher cycles in the last 24h
         </div>
       ) : (
         <div className="space-y-2">
           <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 text-xs text-neutral-400 flex flex-wrap gap-x-4 gap-y-1">
-            <span><span className="text-white font-medium">{data.cycles_last_24h}</span> cycles</span>
-            <span><span className="text-white font-medium">{data.signals_tripped_last_24h}</span> signals tripped</span>
-            <span><span className="text-emerald-400 font-medium">{data.spawns_last_24h}</span> spawns</span>
-            <span><span className="text-amber-400 font-medium">{data.cooldown_blocks_last_24h}</span> cooldown</span>
-            <span><span className="text-red-400 font-medium">{data.cap_blocks_last_24h}</span> cap</span>
+            <span><span className="text-white font-medium">{data.aggregate.cycles}</span> cycles</span>
+            <span><span className="text-white font-medium">{data.aggregate.signals_tripped}</span> signals tripped</span>
+            <span><span className="text-emerald-400 font-medium">{data.aggregate.spawns}</span> spawns</span>
+            <span><span className="text-amber-400 font-medium">{data.aggregate.rejections.cooldown}</span> cooldown</span>
+            <span><span className="text-red-400 font-medium">{data.aggregate.rejections.system_cap}</span> cap</span>
+            <span>mttd p50: <span className="text-neutral-300 font-medium">{data.aggregate.mttd_p50_sec !== null ? `${data.aggregate.mttd_p50_sec.toFixed(1)}s` : '—'}</span></span>
+            <span>mtti p50: <span className="text-neutral-300 font-medium">{data.aggregate.mtti_p50_sec != null ? `${data.aggregate.mtti_p50_sec.toFixed(1)}s` : '—'}</span></span>
+            <span>recoveries: <span className="text-neutral-300 font-medium">{data.aggregate.recoveries.marginal} marginal / {data.aggregate.recoveries.confirmed} confirmed</span></span>
           </div>
-          {data.classes.length > 0 && (
+          {data.per_class.length > 0 && (
             <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg divide-y divide-neutral-800/50 overflow-hidden">
-              {data.classes.map((c) => (
+              {data.per_class.map((c) => (
                 <div key={c.regression_class} className="px-3 py-1.5 flex flex-wrap items-center gap-x-3 gap-y-0.5">
                   <span className="text-[10px] min-w-0 flex-1 overflow-hidden"><RegressionClassLabel cls={c.regression_class} /></span>
-                  {c.last_spawn_at && (
-                    <span className="text-[10px] text-neutral-500">spawn {timeAgo(c.last_spawn_at)}</span>
+                  {c.last_seen_at && (
+                    <span className="text-[10px] text-neutral-500">seen {timeAgo(c.last_seen_at)}</span>
                   )}
                   {c.in_cooldown_until && new Date(c.in_cooldown_until) > new Date() && (
                     <span className="text-[10px] text-amber-400/80">cooldown {timeAgo(c.in_cooldown_until)}</span>
                   )}
-                  {c.last_rejection_reason && (
-                    <span className="text-[10px] text-neutral-600 font-mono">{c.last_rejection_reason}</span>
+                  {c.attempts > 0 && (
+                    <span className="text-[10px] text-neutral-600 font-mono">{c.attempts} attempts</span>
                   )}
                 </div>
               ))}
@@ -216,8 +240,10 @@ interface ManualInterventionCase {
   investigate_spawned_at?: string | null;
   time_to_investigate_sec?: number | null;
   escalation_reason: string | null;
+  operator_acknowledged_at?: string | null;
   recurrence_count?: number;
   layer_summary?: LayerSummary | null;
+  untargeted_layers?: string[];
 }
 
 const ESCALATION_REASON_LABELS: Record<string, string> = {
@@ -330,6 +356,23 @@ function recurrenceBadge(count: number | undefined) {
   ) : null;
 }
 
+function untargetedLayersBadge(c: ManualInterventionCase) {
+  const layers = c.untargeted_layers ?? [];
+  // Suppress when nothing is untargeted (full coverage) or everything is
+  // untargeted (brand-new case with no fix history) — both states are noisy.
+  if (layers.length === 0 || layers.length >= CANONICAL_LAYERS.length) return null;
+  const labels = layers.map(l => LAYER_SHORT[l] ?? l);
+  return (
+    <span
+      data-testid="untargeted-layers-badge"
+      className="text-[10px] px-1.5 py-0.5 rounded bg-neutral-500/10 text-neutral-400 border border-neutral-500/20"
+      title={`Layers no prior fix has targeted: ${layers.join(', ')}`}
+    >
+      never defended in: {labels.join(', ')}
+    </span>
+  );
+}
+
 function layerMismatchBadge(c: ManualInterventionCase) {
   if (!c.layer_summary?.layer_mismatch) return null;
   const fmt = (layers: string[] | null | undefined) =>
@@ -350,6 +393,8 @@ export function ManualInterventionPanel({ projectId, filterClass }: Props) {
   const [cases, setCases] = useState<ManualInterventionCase[]>([]);
   const [loaded, setLoaded] = useState(false);
   const [clearing, setClearing] = useState<string | null>(null);
+  const [acknowledging, setAcknowledging] = useState<string | null>(null);
+  const [ackedAt, setAckedAt] = useState<Record<string, string>>({});
   const [sortKey, setSortKey] = useState<'last_seen_at' | 'mttd'>('last_seen_at');
 
   const fetchCases = useCallback(async () => {
@@ -386,6 +431,22 @@ export function ManualInterventionPanel({ projectId, filterClass }: Props) {
       }
     } catch { /* silent */ }
     setClearing(null);
+  }, [projectId]);
+
+  const handleAcknowledge = useCallback(async (caseId: string) => {
+    setAcknowledging(caseId);
+    try {
+      const res = await apiFetch(
+        `/api/admin/regression-cases/${encodeURIComponent(caseId)}/acknowledge?project_id=${encodeURIComponent(projectId)}`,
+        { method: 'POST' }
+      );
+      if (res.ok) {
+        const body = await res.json();
+        const ts: string = body.operator_acknowledged_at ?? new Date().toISOString();
+        setAckedAt(prev => ({ ...prev, [caseId]: ts }));
+      }
+    } catch { /* silent */ }
+    setAcknowledging(null);
   }, [projectId]);
 
   if (!loaded) return null;
@@ -460,6 +521,7 @@ export function ManualInterventionPanel({ projectId, filterClass }: Props) {
                     )}
                     <LayersAffectedBadges summary={c.layer_summary} />
                     {layerMismatchBadge(c)}
+                    {untargetedLayersBadge(c)}
                   </div>
                   <div className="mt-1.5 space-y-0.5">
                     <div className="text-[10px] text-neutral-500">
@@ -531,15 +593,36 @@ export function ManualInterventionPanel({ projectId, filterClass }: Props) {
                     })()}
                   </div>
                 </div>
-                <button
-                  onClick={() => handleClear(c.regression_class)}
-                  disabled={clearing === c.regression_class}
-                  className="shrink-0 flex items-center gap-1.5 text-[10px] px-2 py-1 min-h-11 rounded border border-neutral-700 text-neutral-300 hover:text-white hover:border-neutral-500 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                  title="Clear manual intervention and re-arm autonomous remediation"
-                >
-                  <RotateCcw className={`w-3 h-3 ${clearing === c.regression_class ? 'animate-spin' : ''}`} />
-                  Clear &amp; re-arm
-                </button>
+                <div className="shrink-0 flex flex-col gap-1">
+                  {(() => {
+                    const acked = ackedAt[c.id] ?? c.operator_acknowledged_at ?? null;
+                    return acked ? (
+                      <span className="flex items-center gap-1 text-[10px] px-2 py-1 text-emerald-400" title={`Acknowledged at ${acked}`}>
+                        <Shield className="w-3 h-3" />
+                        Acknowledged
+                      </span>
+                    ) : (
+                      <button
+                        onClick={() => handleAcknowledge(c.id)}
+                        disabled={acknowledging === c.id}
+                        className="flex items-center gap-1.5 text-[10px] px-2 py-1 min-h-11 rounded border border-neutral-700 text-neutral-300 hover:text-white hover:border-neutral-500 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                        title="Acknowledge — stamps operator review timestamp for MTTI metric"
+                      >
+                        <Shield className={`w-3 h-3 ${acknowledging === c.id ? 'animate-pulse' : ''}`} />
+                        Acknowledge
+                      </button>
+                    );
+                  })()}
+                  <button
+                    onClick={() => handleClear(c.regression_class)}
+                    disabled={clearing === c.regression_class}
+                    className="flex items-center gap-1.5 text-[10px] px-2 py-1 min-h-11 rounded border border-neutral-700 text-neutral-300 hover:text-white hover:border-neutral-500 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                    title="Clear manual intervention and re-arm autonomous remediation"
+                  >
+                    <RotateCcw className={`w-3 h-3 ${clearing === c.regression_class ? 'animate-spin' : ''}`} />
+                    Clear &amp; re-arm
+                  </button>
+                </div>
               </div>
             </div>
           ))}
@@ -733,6 +816,10 @@ interface LayerDefenseEntry {
   still_holding_count?: number;
   held_gt_7d_count?: number;
   retripped_within_48h_count?: number;
+  single_layer_fix_count?: number;
+  single_layer_avg_hold_days?: number | null;
+  multi_layer_fix_count?: number;
+  multi_layer_avg_hold_days?: number | null;
 }
 
 function isFragileLayer(row: LayerDefenseEntry): boolean {
@@ -831,6 +918,13 @@ export function LayerDefenseDensityPanel({ projectId }: Props) {
                             {(row.held_gt_7d_count ?? 0) > 0 && <span>{row.held_gt_7d_count} &gt;7d</span>}
                             {(row.retripped_within_48h_count ?? 0) > 0 && (
                               <span className="text-amber-400">{row.retripped_within_48h_count} re-tripped &lt;48h</span>
+                            )}
+                            {(row.single_layer_avg_hold_days != null || row.multi_layer_avg_hold_days != null) && (
+                              <span className="text-neutral-400">
+                                single {row.single_layer_avg_hold_days != null ? `${row.single_layer_avg_hold_days.toFixed(1)}d` : '—'}
+                                {' / '}
+                                multi {row.multi_layer_avg_hold_days != null ? `${row.multi_layer_avg_hold_days.toFixed(1)}d` : '—'}
+                              </span>
                             )}
                           </span>
                         </td>
@@ -1117,6 +1211,7 @@ export function AutoRecoveredPanel({ projectId }: Props) {
                   )}
                   <LayersAffectedBadges summary={c.layer_summary} />
                   {layerMismatchBadge(c)}
+                  {untargetedLayersBadge(c)}
                 </div>
                 <div className="mt-1.5 space-y-0.5">
                   <div className="text-[10px] text-neutral-500">

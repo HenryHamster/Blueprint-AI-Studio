@@ -47,6 +47,27 @@ interface LayerMismatchProps {
   current_symptom_layers?: string[] | null;
 }
 
+interface UntargetedLayersProps {
+  untargeted_layers?: string[] | null;
+}
+
+export function UntargetedLayersBadge({ untargeted_layers }: UntargetedLayersProps) {
+  const layers = untargeted_layers ?? [];
+  // Suppress when all layers are untargeted (no fix history yet) or none are
+  // (full coverage) — both extremes are noise.
+  if (layers.length === 0 || layers.length >= CANONICAL_LAYERS.length) return null;
+  const labels = layers.map((l) => shortLabel(l));
+  return (
+    <span
+      data-testid="untargeted-layers-badge"
+      className="text-[10px] px-1.5 py-0.5 rounded bg-neutral-500/10 text-neutral-400 border border-neutral-500/20"
+      title={`Layers no prior fix has targeted: ${layers.join(', ')}`}
+    >
+      never defended in: {labels.join(', ')}
+    </span>
+  );
+}
+
 export function LayerMismatchBadge({ layer_mismatch, prior_fix_layers, current_symptom_layers }: LayerMismatchProps) {
   if (!layer_mismatch) return null;
   const fmt = (layers: string[] | null | undefined) =>

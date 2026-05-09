@@ -9,6 +9,7 @@ from app.regression_layer_classifier import (
     LAYER_REVIEWER_PASS,
     build_layer_meta_block,
     classify_layers,
+    compute_untargeted_layers,
 )
 
 
@@ -271,3 +272,74 @@ class TestBuildLayerMetaBlock:
         )
         layer_mentions = [layer for layer in ALL_LAYERS if layer in block]
         assert len(layer_mentions) >= 2
+
+
+# ---------------------------------------------------------------------------
+# compute_untargeted_layers
+# ---------------------------------------------------------------------------
+
+
+class TestComputeUntargetedLayers:
+    def test_empty_fix_log_all_untargeted(self):
+        result = compute_untargeted_layers([])
+        assert set(result) == ALL_LAYERS
+
+    def test_no_layers_targeted_field_all_untargeted(self):
+        fix_log = [
+            {
+                "fingerprint": "cls-A",
+                "fix_pr_number": 1,
+                "merged_at": "2026-01-01T00:00:00Z",
+            }
+        ]
+        result = compute_untargeted_layers(fix_log)
+        assert set(result) == ALL_LAYERS
+
+    def test_single_layer_targeted_leaves_rest_untargeted(self):
+        fix_log = [{"layers_targeted": [LAYER_AGENT_VM]}]
+        result = compute_untargeted_layers(fix_log)
+        assert LAYER_AGENT_VM not in result
+        assert len(result) == len(ALL_LAYERS) - 1
+
+    def test_all_layers_targeted_returns_empty(self):
+        fix_log = [{"layers_targeted": list(ALL_LAYERS)}]
+        result = compute_untargeted_layers(fix_log)
+        assert result == []
+
+    def test_layers_targeted_across_multiple_entries(self):
+        fix_log = [
+            {"layers_targeted": [LAYER_CI_WORKFLOW]},
+            {"layers_targeted": [LAYER_AGENT_VM, LAYER_BASELINE_GATE]},
+        ]
+        result = compute_untargeted_layers(fix_log)
+        assert LAYER_CI_WORKFLOW not in result
+        assert LAYER_AGENT_VM not in result
+        assert LAYER_BASELINE_GATE not in result
+        assert LAYER_AGENT_VERB in result
+        assert LAYER_REVIEWER_PASS in result
+
+    def test_unrecognized_layer_name_ignored(self):
+        fix_log = [{"layers_targeted": ["UNKNOWN_LAYER", LAYER_CI_WORKFLOW]}]
+        result = compute_untargeted_layers(fix_log)
+        assert LAYER_CI_WORKFLOW not in result
+        assert "UNKNOWN_LAYER" not in result
+        assert set(result) | {LAYER_CI_WORKFLOW} == ALL_LAYERS
+
+    def test_empty_layers_targeted_list_treated_as_unclassified(self):
+        fix_log = [{"layers_targeted": []}]
+        result = compute_untargeted_layers(fix_log)
+        assert set(result) == ALL_LAYERS
+
+    def test_none_layers_targeted_treated_as_unclassified(self):
+        fix_log = [{"layers_targeted": None}]
+        result = compute_untargeted_layers(fix_log)
+        assert set(result) == ALL_LAYERS
+
+    def test_returns_sorted_list(self):
+        result = compute_untargeted_layers([])
+        assert result == sorted(result)
+
+    def test_result_subset_of_all_layers(self):
+        fix_log = [{"layers_targeted": [LAYER_AGENT_VM]}]
+        result = compute_untargeted_layers(fix_log)
+        assert all(layer in ALL_LAYERS for layer in result)

@@ -12742,6 +12742,8 @@ async def test_regression_dispatcher_health_empty(client: AsyncClient, db_sessio
     assert agg["cycles"] == 0
     assert agg["spawns"] == 0
     assert agg["signals_tripped"] == 0
+    assert agg["mttd_p50_sec"] is None
+    assert agg["recoveries"] == {"marginal": 0, "confirmed": 0}
     assert data["per_class"] == []
     assert len(data["spawns_sparkline"]) == 24
 
@@ -12781,6 +12783,22 @@ async def test_regression_dispatcher_health_with_cycle_and_case(
             spawns_emitted=1,
             rejections_by_reason={"cooldown": 0, "dedup": 1},
             mttd_p50_sec=120.0,
+            marginal_recoveries_count=1,
+            confirmed_recoveries_count=2,
+        )
+    )
+    db_session.add(
+        DispatcherCycleRecord(
+            project_id=project.id,
+            cycle_started_at=now - timedelta(minutes=3),
+            cycle_finished_at=now - timedelta(minutes=2),
+            signals_evaluated=2,
+            signals_tripped=0,
+            spawns_emitted=0,
+            rejections_by_reason={"cooldown": 0, "dedup": 0},
+            mttd_p50_sec=180.0,
+            marginal_recoveries_count=0,
+            confirmed_recoveries_count=1,
         )
     )
     await db_session.commit()
@@ -12793,15 +12811,177 @@ async def test_regression_dispatcher_health_with_cycle_and_case(
     assert response.status_code == 200
     data = response.json()
     agg = data["aggregate"]
-    assert agg["cycles"] == 1
+    assert agg["cycles"] == 2
     assert agg["signals_tripped"] == 1
     assert agg["spawns"] == 1
     assert agg["rejections"]["dedup"] == 1
+    # mttd_p50_sec should be mean of 120.0 and 180.0
+    assert agg["mttd_p50_sec"] == 150.0
+    # recoveries should sum across both cycles
+    assert agg["recoveries"]["marginal"] == 1
+    assert agg["recoveries"]["confirmed"] == 3
 
     assert len(data["per_class"]) == 1
     cls = data["per_class"][0]
     assert cls["regression_class"] == "sr_catch_rate:correctness"
     assert cls["status"] == RegressionCaseStatus.ACTIVE
+
+
+@pytest.mark.asyncio
+async def test_regression_dispatcher_health_mttd_with_none_values(
+    client: AsyncClient, db_session
+):
+    """mttd_p50_sec aggregates only non-None values; None cycles are skipped."""
+    from app.models import DispatcherCycleRecord
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    db_session.add(
+        DispatcherCycleRecord(
+            project_id=project.id,
+            cycle_started_at=now - timedelta(minutes=5),
+            cycle_finished_at=now - timedelta(minutes=4),
+            signals_evaluated=1,
+            signals_tripped=0,
+            spawns_emitted=0,
+            rejections_by_reason={},
+            mttd_p50_sec=100.0,
+        )
+    )
+    db_session.add(
+        DispatcherCycleRecord(
+            project_id=project.id,
+            cycle_started_at=now - timedelta(minutes=3),
+            cycle_finished_at=now - timedelta(minutes=2),
+            signals_evaluated=1,
+            signals_tripped=0,
+            spawns_emitted=0,
+            rejections_by_reason={},
+            mttd_p50_sec=None,
+        )
+    )
+    await db_session.commit()
+
+    response = await client.get(
+        "/api/admin/regression-dispatcher/health",
+        params={"project_id": str(project.id), "window_hours": 24},
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    agg = data["aggregate"]
+    assert agg["cycles"] == 2
+    # mttd_p50_sec should be 100.0 (only non-None value)
+    assert agg["mttd_p50_sec"] == 100.0
+    assert agg["recoveries"] == {"marginal": 0, "confirmed": 0}
+
+
+@pytest.mark.asyncio
+async def test_regression_dispatcher_health_mtti_null_when_no_acked_cases(
+    client: AsyncClient, db_session
+):
+    """mtti_p50_sec is None when no cases have operator_acknowledged_at set."""
+    from app.models import DispatcherCycleRecord
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    # Case escalated but not yet acknowledged
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate:mtti_test",
+        status=RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION,
+        needs_manual_intervention_at=now - timedelta(hours=1),
+        operator_acknowledged_at=None,
+    )
+    db_session.add(case)
+    db_session.add(
+        DispatcherCycleRecord(
+            project_id=project.id,
+            cycle_started_at=now - timedelta(minutes=5),
+            cycle_finished_at=now - timedelta(minutes=4),
+            signals_evaluated=1,
+            signals_tripped=1,
+            spawns_emitted=1,
+            rejections_by_reason={},
+            mttd_p50_sec=60.0,
+        )
+    )
+    await db_session.commit()
+
+    response = await client.get(
+        "/api/admin/regression-dispatcher/health",
+        params={"project_id": str(project.id), "window_hours": 24},
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["aggregate"]["mtti_p50_sec"] is None
+
+
+@pytest.mark.asyncio
+async def test_regression_dispatcher_health_mtti_p50_with_acked_cases(
+    client: AsyncClient, db_session
+):
+    """mtti_p50_sec is the median seconds from escalation to acknowledgement."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    # Case 1: 600s MTTI (10 minutes)
+    db_session.add(
+        RegressionRemediationCase(
+            project_id=project.id,
+            regression_class="sr_catch_rate:mtti_case1",
+            status=RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION,
+            needs_manual_intervention_at=now - timedelta(hours=2),
+            operator_acknowledged_at=now - timedelta(hours=2) + timedelta(seconds=600),
+        )
+    )
+    # Case 2: 1200s MTTI (20 minutes)
+    db_session.add(
+        RegressionRemediationCase(
+            project_id=project.id,
+            regression_class="sr_catch_rate:mtti_case2",
+            status=RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION,
+            needs_manual_intervention_at=now - timedelta(hours=1),
+            operator_acknowledged_at=now - timedelta(hours=1) + timedelta(seconds=1200),
+        )
+    )
+    # Case 3: not acknowledged — must be excluded from MTTI
+    db_session.add(
+        RegressionRemediationCase(
+            project_id=project.id,
+            regression_class="sr_catch_rate:mtti_unacked",
+            status=RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION,
+            needs_manual_intervention_at=now - timedelta(minutes=30),
+            operator_acknowledged_at=None,
+        )
+    )
+    await db_session.commit()
+
+    response = await client.get(
+        "/api/admin/regression-dispatcher/health",
+        params={"project_id": str(project.id), "window_hours": 24},
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    agg = data["aggregate"]
+    # Median of [600, 1200] = 900
+    assert agg["mtti_p50_sec"] == 900.0
+
+
+# test: compute_mtti_p50_sec helper directly (unit tests in test_pipeline_regression_dispatcher.py)
 
 
 # ---------------------------------------------------------------------------
@@ -13263,6 +13443,58 @@ async def test_list_regression_manual_intervention_includes_layer_summary(
     layer_summary = data["cases"][0]["layer_summary"]
     assert layer_summary["cross_layer"] is False
     assert layer_summary["layers_affected"] == ["REVIEWER_PASS"]
+
+
+@pytest.mark.asyncio
+async def test_list_regression_cases_includes_untargeted_layers(
+    client: AsyncClient, db_session
+):
+    """GET /regression-cases includes untargeted_layers from the dispatcher helper."""
+    from app.pipeline_regression_dispatcher import (
+        _CANONICAL_RECURRENCE_LAYERS,
+        compute_untargeted_layers,
+    )
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    fix_log = [
+        {"fingerprint": "abc", "fix_pr_number": 1, "layers_targeted": ["AGENT_VM"]},
+        {
+            "fingerprint": "abc",
+            "fix_pr_number": 2,
+            "layers_targeted": ["REVIEWER_PASS"],
+        },
+    ]
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate:correctness",
+        status=RegressionCaseStatus.ACTIVE,
+        fingerprint_to_fix_log=fix_log,
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    response = await client.get(
+        "/api/admin/regression-cases",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["count"] == 1
+    untargeted = data["cases"][0]["untargeted_layers"]
+    # Helper-produced answer is the source of truth.
+    expected = compute_untargeted_layers(fix_log)
+    assert untargeted == expected
+    # Sanity: AGENT_VM and REVIEWER_PASS were targeted; the other three remain
+    # in canonical order.
+    assert untargeted == [
+        layer
+        for layer in _CANONICAL_RECURRENCE_LAYERS
+        if layer not in {"AGENT_VM", "REVIEWER_PASS"}
+    ]
 
 
 @pytest.mark.asyncio
@@ -13877,6 +14109,80 @@ async def test_layer_defense_density_endpoint_includes_fragility_stats(
 
 
 @pytest.mark.asyncio
+async def test_layer_defense_density_endpoint_includes_single_vs_multi_cohort_stats(
+    client: AsyncClient, db_session
+):
+    """Endpoint forwards single_layer_* / multi_layer_* cohort fields per row."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="rc:cohort",
+        status=RegressionCaseStatus.ACTIVE,
+        fingerprint_to_fix_log=[
+            # single-layer CI_WORKFLOW fix, recovered hold=2d
+            {
+                "fingerprint": "fp-single",
+                "merged_at": (now - timedelta(days=10)).isoformat(),
+                "recovered_at": (now - timedelta(days=8)).isoformat(),
+                "layers_targeted": ["CI_WORKFLOW"],
+            },
+            # multi-layer CI_WORKFLOW + BASELINE_GATE fix, recovered hold=10d
+            {
+                "fingerprint": "fp-multi",
+                "merged_at": (now - timedelta(days=20)).isoformat(),
+                "recovered_at": (now - timedelta(days=10)).isoformat(),
+                "layers_targeted": ["CI_WORKFLOW", "BASELINE_GATE"],
+            },
+        ],
+    )
+    db_session.add(case)
+    await db_session.commit()
+    await db_session.refresh(case)
+
+    response = await client.get(
+        "/api/admin/regression-cases/layer-defense-density",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    by_layer = {r["layer"]: r for r in body["layers"]}
+
+    for row in body["layers"]:
+        assert "single_layer_fix_count" in row
+        assert "single_layer_avg_hold_days" in row
+        assert "multi_layer_fix_count" in row
+        assert "multi_layer_avg_hold_days" in row
+
+    ci = by_layer["CI_WORKFLOW"]
+    assert ci["fix_count"] == 2
+    assert ci["single_layer_fix_count"] == 1
+    assert ci["single_layer_avg_hold_days"] is not None
+    assert abs(ci["single_layer_avg_hold_days"] - 2.0) < 0.1
+    assert ci["multi_layer_fix_count"] == 1
+    assert ci["multi_layer_avg_hold_days"] is not None
+    assert abs(ci["multi_layer_avg_hold_days"] - 10.0) < 0.1
+
+    bg = by_layer["BASELINE_GATE"]
+    assert bg["fix_count"] == 1
+    assert bg["single_layer_fix_count"] == 0
+    assert bg["single_layer_avg_hold_days"] is None
+    assert bg["multi_layer_fix_count"] == 1
+    assert bg["multi_layer_avg_hold_days"] is not None
+    assert abs(bg["multi_layer_avg_hold_days"] - 10.0) < 0.1
+
+    av = by_layer["AGENT_VM"]
+    assert av["single_layer_fix_count"] == 0
+    assert av["single_layer_avg_hold_days"] is None
+    assert av["multi_layer_fix_count"] == 0
+    assert av["multi_layer_avg_hold_days"] is None
+
+
+@pytest.mark.asyncio
 async def test_layer_defense_density_endpoint_fragility_held_gt_7d(
     client: AsyncClient, db_session
 ):
@@ -14375,3 +14681,90 @@ async def test_cross_layer_compliance_new_additive_fields(
     oldest_dt = datetime.fromisoformat(body["awaiting_backfill_oldest_merged_at"])
     expected_oldest = now - timedelta(days=3)
     assert abs((oldest_dt - expected_oldest).total_seconds()) < 5
+
+
+# ---------------------------------------------------------------------------
+# Acknowledge endpoint
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_acknowledge_regression_case_stamps_timestamp(
+    client: AsyncClient, db_session
+):
+    """POST /regression-cases/{case_id}/acknowledge stamps operator_acknowledged_at."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate:correctness",
+        status=RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION,
+        needs_manual_intervention_at=_utcnow(),
+    )
+    db_session.add(case)
+    await db_session.commit()
+    await db_session.refresh(case)
+
+    assert case.operator_acknowledged_at is None
+
+    response = await client.post(
+        f"/api/admin/regression-cases/{case.id}/acknowledge",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["id"] == str(case.id)
+    assert body["operator_acknowledged_at"] is not None
+
+    await db_session.refresh(case)
+    assert case.operator_acknowledged_at is not None
+
+
+@pytest.mark.asyncio
+async def test_acknowledge_regression_case_idempotent(client: AsyncClient, db_session):
+    """POST /regression-cases/{case_id}/acknowledge is idempotent — second call preserves original timestamp."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    original_ack = _utcnow() - timedelta(hours=1)
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate:architecture",
+        status=RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION,
+        needs_manual_intervention_at=_utcnow() - timedelta(hours=2),
+        operator_acknowledged_at=original_ack,
+    )
+    db_session.add(case)
+    await db_session.commit()
+    await db_session.refresh(case)
+
+    response = await client.post(
+        f"/api/admin/regression-cases/{case.id}/acknowledge",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    returned_at = datetime.fromisoformat(body["operator_acknowledged_at"])
+    assert abs((returned_at - original_ack).total_seconds()) < 2
+
+
+@pytest.mark.asyncio
+async def test_acknowledge_regression_case_not_found(client: AsyncClient, db_session):
+    """POST /regression-cases/{case_id}/acknowledge returns 404 for unknown case."""
+    import uuid
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    response = await client.post(
+        f"/api/admin/regression-cases/{uuid.uuid4()}/acknowledge",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 404

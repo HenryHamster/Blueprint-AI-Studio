@@ -8966,6 +8966,120 @@ def test_compute_layer_fragility_stats_durable_long_hold_not_fragile():
     assert s["avg_hold_days"] > 7.0
 
 
+def test_compute_layer_fragility_stats_empty_cohort_fields_zeroed():
+    """Empty input yields zeroed cohort counts and None cohort averages."""
+    from app.pipeline_regression_dispatcher import _compute_layer_fragility_stats
+
+    stats = _compute_layer_fragility_stats([])
+    for s in stats.values():
+        assert s["single_layer_fix_count"] == 0
+        assert s["single_layer_avg_hold_days"] is None
+        assert s["multi_layer_fix_count"] == 0
+        assert s["multi_layer_avg_hold_days"] is None
+
+
+def test_compute_layer_fragility_stats_all_single_layer():
+    """All-single-layer entries → multi cohort empty/None, single cohort populated."""
+    from app.pipeline_regression_dispatcher import _compute_layer_fragility_stats
+
+    now = _utcnow()
+    entries = [
+        {
+            "merged_at": (now - timedelta(days=10)).isoformat(),
+            "recovered_at": (now - timedelta(days=6)).isoformat(),  # hold=4d
+            "layers_targeted": ["CI_WORKFLOW"],
+        },
+        {
+            "merged_at": (now - timedelta(days=20)).isoformat(),
+            "recovered_at": (now - timedelta(days=14)).isoformat(),  # hold=6d
+            "layers_targeted": ["CI_WORKFLOW"],
+        },
+    ]
+    stats = _compute_layer_fragility_stats(entries)
+    s = stats["CI_WORKFLOW"]
+    assert s["fix_count"] == 2
+    assert s["single_layer_fix_count"] == 2
+    assert s["multi_layer_fix_count"] == 0
+    assert s["multi_layer_avg_hold_days"] is None
+    assert s["single_layer_avg_hold_days"] is not None
+    assert abs(s["single_layer_avg_hold_days"] - 5.0) < 0.1
+
+
+def test_compute_layer_fragility_stats_all_multi_layer():
+    """All-multi-layer entries → single cohort empty/None, multi cohort populated for each layer."""
+    from app.pipeline_regression_dispatcher import _compute_layer_fragility_stats
+
+    now = _utcnow()
+    entries = [
+        {
+            "merged_at": (now - timedelta(days=20)).isoformat(),
+            "recovered_at": (now - timedelta(days=10)).isoformat(),  # hold=10d
+            "layers_targeted": ["CI_WORKFLOW", "AGENT_VM"],
+        },
+    ]
+    stats = _compute_layer_fragility_stats(entries)
+    for layer in ("CI_WORKFLOW", "AGENT_VM"):
+        s = stats[layer]
+        assert s["fix_count"] == 1
+        assert s["single_layer_fix_count"] == 0
+        assert s["single_layer_avg_hold_days"] is None
+        assert s["multi_layer_fix_count"] == 1
+        assert s["multi_layer_avg_hold_days"] is not None
+        assert abs(s["multi_layer_avg_hold_days"] - 10.0) < 0.1
+
+
+def test_compute_layer_fragility_stats_mixed_cohorts_and_still_holding():
+    """Mixed entries (single/multi, recovered/still-holding) split correctly per cohort."""
+    from app.pipeline_regression_dispatcher import _compute_layer_fragility_stats
+
+    now = _utcnow()
+    entries = [
+        # single-layer, recovered, hold=2d
+        {
+            "merged_at": (now - timedelta(days=10)).isoformat(),
+            "recovered_at": (now - timedelta(days=8)).isoformat(),
+            "layers_targeted": ["BASELINE_GATE"],
+        },
+        # single-layer, still holding (no recovered_at)
+        {
+            "merged_at": (now - timedelta(days=4)).isoformat(),
+            "layers_targeted": ["BASELINE_GATE"],
+        },
+        # multi-layer including BASELINE_GATE, recovered, hold=20d
+        {
+            "merged_at": (now - timedelta(days=25)).isoformat(),
+            "recovered_at": (now - timedelta(days=5)).isoformat(),
+            "layers_targeted": ["BASELINE_GATE", "REVIEWER_PASS"],
+        },
+        # multi-layer including BASELINE_GATE, still holding
+        {
+            "merged_at": (now - timedelta(days=2)).isoformat(),
+            "layers_targeted": ["BASELINE_GATE", "AGENT_VM"],
+        },
+    ]
+    stats = _compute_layer_fragility_stats(entries)
+    bg = stats["BASELINE_GATE"]
+    # Blended totals preserved.
+    assert bg["fix_count"] == 4
+    assert bg["avg_hold_days"] is not None
+    assert abs(bg["avg_hold_days"] - 11.0) < 0.1  # avg of 2d, 20d
+    # Single cohort: 2 entries (one recovered hold=2d, one still holding).
+    assert bg["single_layer_fix_count"] == 2
+    assert bg["single_layer_avg_hold_days"] is not None
+    assert abs(bg["single_layer_avg_hold_days"] - 2.0) < 0.1
+    # Multi cohort: 2 entries (one recovered hold=20d, one still holding).
+    assert bg["multi_layer_fix_count"] == 2
+    assert bg["multi_layer_avg_hold_days"] is not None
+    assert abs(bg["multi_layer_avg_hold_days"] - 20.0) < 0.1
+    # REVIEWER_PASS only saw the multi-layer recovered entry.
+    rp = stats["REVIEWER_PASS"]
+    assert rp["single_layer_fix_count"] == 0
+    assert rp["single_layer_avg_hold_days"] is None
+    assert rp["multi_layer_fix_count"] == 1
+    assert rp["multi_layer_avg_hold_days"] is not None
+    assert abs(rp["multi_layer_avg_hold_days"] - 20.0) < 0.1
+
+
 def test_build_layer_defense_ledger_unchanged_after_refactor():
     """String output after helper refactor matches pre-refactor fixture."""
     from app.pipeline_regression_dispatcher import (
@@ -11913,6 +12027,156 @@ async def test_marginal_followup_disabled_by_config(db_session):
         t for t in tasks if (t.context or {}).get("signal_name") == "marginal_followup"
     ]
     assert len(followup_tasks) == 0, "disabled config should suppress follow-up spawn"
+
+
+# ---------------------------------------------------------------------------
+# compute_mtti_p50_sec unit tests
+# ---------------------------------------------------------------------------
+
+
+def _make_case(needs_at, acked_at):
+    """Return a SimpleNamespace mimicking RegressionRemediationCase timestamps."""
+    return SimpleNamespace(
+        needs_manual_intervention_at=needs_at,
+        operator_acknowledged_at=acked_at,
+    )
+
+
+def test_compute_mtti_p50_sec_no_rows():
+    """Returns None when no cases are provided."""
+    from app.pipeline_regression_dispatcher import compute_mtti_p50_sec
+
+    assert compute_mtti_p50_sec([]) is None
+
+
+def test_compute_mtti_p50_sec_no_acked_cases():
+    """Returns None when cases exist but none are acknowledged."""
+    from datetime import datetime, timezone
+    from app.pipeline_regression_dispatcher import compute_mtti_p50_sec
+
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    cases = [
+        _make_case(now - timedelta(hours=1), None),
+        _make_case(now - timedelta(hours=2), None),
+    ]
+    assert compute_mtti_p50_sec(cases) is None
+
+
+def test_compute_mtti_p50_sec_median_two_rows():
+    """Returns median seconds for two acked cases; unacked cases excluded."""
+    from datetime import datetime, timezone
+    from app.pipeline_regression_dispatcher import compute_mtti_p50_sec
+
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    cases = [
+        _make_case(
+            now - timedelta(hours=2), now - timedelta(hours=2) + timedelta(seconds=600)
+        ),
+        _make_case(
+            now - timedelta(hours=1), now - timedelta(hours=1) + timedelta(seconds=1200)
+        ),
+        _make_case(now - timedelta(minutes=30), None),  # unacked — excluded
+    ]
+    result = compute_mtti_p50_sec(cases)
+    assert result == 900.0
+
+
+def test_compute_mtti_p50_sec_idempotent():
+    """Repeated calls with the same input return the same value."""
+    from datetime import datetime, timezone
+    from app.pipeline_regression_dispatcher import compute_mtti_p50_sec
+
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    cases = [
+        _make_case(
+            now - timedelta(hours=1), now - timedelta(hours=1) + timedelta(seconds=300)
+        ),
+    ]
+    assert compute_mtti_p50_sec(cases) == compute_mtti_p50_sec(cases)
+
+
+# ---------------------------------------------------------------------------
+# compute_untargeted_layers unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_compute_untargeted_layers_empty_or_invalid_returns_all_canonical():
+    """Empty / None / non-list fix-log → every canonical layer is untargeted."""
+    from app.pipeline_regression_dispatcher import (
+        _CANONICAL_RECURRENCE_LAYERS,
+        compute_untargeted_layers,
+    )
+
+    expected = list(_CANONICAL_RECURRENCE_LAYERS)
+    assert compute_untargeted_layers(None) == expected
+    assert compute_untargeted_layers([]) == expected
+    assert compute_untargeted_layers("not-a-list") == expected  # type: ignore[arg-type]
+    assert compute_untargeted_layers({}) == expected  # type: ignore[arg-type]
+
+
+def test_compute_untargeted_layers_single_layer_history():
+    """A single-layer fix history returns the other four layers."""
+    from app.pipeline_regression_dispatcher import (
+        _CANONICAL_RECURRENCE_LAYERS,
+        compute_untargeted_layers,
+    )
+
+    fix_log = [{"fix_pr_number": 1, "layers_targeted": ["AGENT_VM"]}]
+    out = compute_untargeted_layers(fix_log)
+    assert out == [
+        layer for layer in _CANONICAL_RECURRENCE_LAYERS if layer != "AGENT_VM"
+    ]
+
+
+def test_compute_untargeted_layers_full_coverage_returns_empty():
+    """All five canonical layers targeted at least once → empty list."""
+    from app.pipeline_regression_dispatcher import (
+        _CANONICAL_RECURRENCE_LAYERS,
+        compute_untargeted_layers,
+    )
+
+    fix_log = [
+        {"fix_pr_number": idx, "layers_targeted": [layer]}
+        for idx, layer in enumerate(_CANONICAL_RECURRENCE_LAYERS)
+    ]
+    assert compute_untargeted_layers(fix_log) == []
+
+
+def test_compute_untargeted_layers_drops_unrecognized_layers():
+    """Unrecognized layer names are silently dropped, not counted as targeted."""
+    from app.pipeline_regression_dispatcher import (
+        _CANONICAL_RECURRENCE_LAYERS,
+        compute_untargeted_layers,
+    )
+
+    fix_log = [
+        {"fix_pr_number": 1, "layers_targeted": ["AGENT_VM", "NOT_A_REAL_LAYER", 42]},
+        {"fix_pr_number": 2},  # backfill-pending entry: no key, contributes nothing
+    ]
+    out = compute_untargeted_layers(fix_log)
+    # AGENT_VM is recognized; the bogus name + non-string are dropped.
+    assert out == [
+        layer for layer in _CANONICAL_RECURRENCE_LAYERS if layer != "AGENT_VM"
+    ]
+
+
+def test_compute_untargeted_layers_canonical_order():
+    """Result order follows the canonical tuple, not insertion order in fix_log."""
+    from app.pipeline_regression_dispatcher import (
+        _CANONICAL_RECURRENCE_LAYERS,
+        compute_untargeted_layers,
+    )
+
+    # Target REVIEWER_PASS and CI_WORKFLOW; the remaining three should come back
+    # in canonical order, not the order they happened to appear here.
+    fix_log = [{"layers_targeted": ["REVIEWER_PASS", "CI_WORKFLOW"]}]
+    out = compute_untargeted_layers(fix_log)
+    expected = [
+        layer
+        for layer in _CANONICAL_RECURRENCE_LAYERS
+        if layer not in {"REVIEWER_PASS", "CI_WORKFLOW"}
+    ]
+    assert out == expected
 
 
 # ---------------------------------------------------------------------------
