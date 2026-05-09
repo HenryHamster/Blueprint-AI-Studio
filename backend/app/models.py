@@ -1691,6 +1691,15 @@ class RegressionRemediationCase(SQLModel, table=True):
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
+    # Timestamp when the most recent compliance follow-up investigate task was
+    # spawned for this case. Acts as a durable cooldown anchor: the dispatcher
+    # skips spawning a new compliance follow-up if now − compliance_followup_spawned_at
+    # is within the configured cooldown window (default 72 h). Null for cases that
+    # have never triggered a compliance follow-up or pre-date this column.
+    compliance_followup_spawned_at: Optional[datetime] = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
     # Attribution for the PR/commit that introduced this regression. Set when
     # a new case is first created or re-tripped after CLOSED. Null for legacy
     # rows and cases where attribution could not be determined.

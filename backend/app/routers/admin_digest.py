@@ -922,7 +922,7 @@ def _compute_symptom_layers_by_class(
     return {cls: sorted(layers) for cls, layers in sorted(by_class.items())}
 
 
-def _compute_cross_layer_compliance(
+def compute_cross_layer_compliance(
     rows: List[RegressionRemediationCase],
     cutoff: datetime,
     over_threshold_hours: int = 24,
@@ -3203,7 +3203,7 @@ async def get_cross_layer_compliance(
         .scalars()
         .all()
     )
-    return _compute_cross_layer_compliance(rows, cutoff)
+    return compute_cross_layer_compliance(rows, cutoff)
 
 
 @router.get("/regression-class-kpis")

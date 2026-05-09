@@ -2583,6 +2583,22 @@ _PATH_CLASSIFIER_COVERAGE_TOP_PATHS = 10
 # does not pile up duplicate alerts each cycle.
 _PATH_CLASSIFIER_COVERAGE_ALERT_TITLE = "Path-layer classifier coverage stale"
 
+# Awaiting-backfill backlog alert thresholds. Cross-layer compliance buckets
+# fix-log entries with spawn_was_cross_layer=True and merged_at set but no
+# layers_targeted into ``awaiting_backfill``. The 24h grace inside
+# ``compute_cross_layer_compliance`` already separates transient (recent
+# merges, backfill not yet retried) from systemic backlog. The thresholds
+# below trip the operator alert when EITHER signal indicates the backlog has
+# stopped draining: 5 entries past the 24h grace, OR an oldest entry older
+# than 3 days. Both point at the same likely causes — GitHub auth failures in
+# ``_backfill_layers_targeted_once`` (which logs and continues silently) or
+# path-classifier coverage gaps that yield empty layer assignments.
+_AWAITING_BACKFILL_COUNT_THRESHOLD = 5
+_AWAITING_BACKFILL_AGE_THRESHOLD = timedelta(days=3)
+# Window mirrors the GET /regression-cases/cross-layer-compliance default.
+_AWAITING_BACKFILL_WINDOW = timedelta(days=30)
+_AWAITING_BACKFILL_ALERT_TITLE = "Cross-layer awaiting_backfill backlog stuck"
+
 
 def _classify_layers_from_paths(paths: list[str]) -> list[str]:
     """Map a list of changed file paths to canonical infrastructure-layer tags.
@@ -2957,6 +2973,107 @@ async def _evaluate_path_classifier_coverage(
         f"unmatched paths:\n{path_lines}\n"
         f"Update _classify_layers_from_paths or extend the canonical layer "
         f"list to cover these paths."
+    )
+    session.add(
+        Alert(
+            project_id=project_id,
+            severity=AlertSeverity.WARNING,
+            title=title,
+            message=message[:1000],
+        )
+    )
+    await session.commit()
+
+
+async def _evaluate_awaiting_backfill_alert(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> None:
+    """Open a project-scoped Alert when cross-layer awaiting_backfill backlog is stuck.
+
+    Non-spawning observation step — never spawns investigate tasks or consumes
+    spawn budget. Wrapped by callers in try/except so a transient failure here
+    cannot break the rest of the recovery scan.
+
+    Trips when EITHER:
+      * ``awaiting_backfill_over_threshold_count >= _AWAITING_BACKFILL_COUNT_THRESHOLD``
+      * ``awaiting_backfill_oldest_merged_at`` is older than ``_AWAITING_BACKFILL_AGE_THRESHOLD``
+
+    Dedup mirrors ``_evaluate_path_classifier_coverage`` — skip insertion when
+    an open Alert with the same project_id, no task_id, WARNING severity, and
+    matching title already exists.
+    """
+    # Lazy import: admin_digest imports from this module at function scope
+    # (compute_pipeline_health_summary), so importing it at module-level here
+    # would create a load-time cycle.
+    from app.routers.admin_digest import compute_cross_layer_compliance
+
+    cutoff = _utcnow() - _AWAITING_BACKFILL_WINDOW
+    cases = (
+        (
+            await session.execute(
+                select(RegressionRemediationCase).where(
+                    RegressionRemediationCase.project_id == project_id,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    metrics = compute_cross_layer_compliance(list(cases), cutoff)
+
+    awaiting_count = int(metrics.get("awaiting_backfill_count") or 0)
+    over_threshold = int(metrics.get("awaiting_backfill_over_threshold_count") or 0)
+    oldest_iso = metrics.get("awaiting_backfill_oldest_merged_at")
+    oldest_dt: datetime | None = None
+    if oldest_iso:
+        try:
+            oldest_dt = _to_naive_utc(
+                datetime.fromisoformat(str(oldest_iso).replace("Z", "+00:00"))
+            )
+        except (ValueError, TypeError):
+            oldest_dt = None
+
+    age_trip = (
+        oldest_dt is not None
+        and (_utcnow() - oldest_dt) >= _AWAITING_BACKFILL_AGE_THRESHOLD
+    )
+    count_trip = over_threshold >= _AWAITING_BACKFILL_COUNT_THRESHOLD
+    if not (age_trip or count_trip):
+        return
+
+    title = _AWAITING_BACKFILL_ALERT_TITLE
+    existing = (
+        (
+            await session.execute(
+                select(Alert).where(
+                    Alert.project_id == project_id,
+                    Alert.task_id.is_(None),
+                    Alert.severity == AlertSeverity.WARNING,
+                    Alert.dismissed_at.is_(None),
+                    Alert.title == title,
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if existing is not None:
+        return
+
+    oldest_str = oldest_iso if oldest_iso else "(none)"
+    message = (
+        f"Cross-layer awaiting_backfill backlog is not draining: "
+        f"{awaiting_count} entries total, {over_threshold} older than 24h, "
+        f"oldest merged_at={oldest_str}. Likely causes: (1) GitHub auth "
+        f"failures in _backfill_layers_targeted_once (which logs and "
+        f"continues silently — check logs for token/installation errors), "
+        f"(2) path-classifier coverage gaps in _classify_layers_from_paths "
+        f"that yield empty layer assignments and never advance to a "
+        f"layers_targeted value. Backlog growth corrupts the "
+        f"cross-layer-compliance numerator/denominator surfaced at "
+        f"GET /api/regression-cases/cross-layer-compliance."
     )
     session.add(
         Alert(
@@ -4801,6 +4918,28 @@ async def _evaluate_cross_case_fingerprint_signal(
     return spawned
 
 
+def _classify_cycle_compliance(row: dict) -> str:
+    """Return the compliance label for a single PER-CYCLE LAYER HISTORY row.
+
+    Labels:
+      - ``compliant``         — mandate True AND >=2 distinct canonical layers targeted
+      - ``non-compliant``     — mandate True AND layers_targeted recorded but <2 canonical layers
+      - ``awaiting-backfill`` — mandate True AND layers_targeted not yet present (do NOT accuse)
+      - ``not-mandated``      — mandate False or absent
+    """
+    if not row.get("spawn_was_cross_layer"):
+        return "not-mandated"
+    if not row.get("layers_targeted_present"):
+        return "awaiting-backfill"
+    canonical = set(LAYER_DISPLAY_ORDER)
+    distinct_canonical = {
+        layer for layer in (row.get("layers_targeted") or []) if layer in canonical
+    }
+    if len(distinct_canonical) >= 2:
+        return "compliant"
+    return "non-compliant"
+
+
 def _format_recurring_class_prompt(
     *,
     regression_class: str,
@@ -4822,13 +4961,49 @@ def _format_recurring_class_prompt(
         "",
         "PER-CYCLE LAYER HISTORY",
     ]
+    non_compliant_targeted: set[str] = set()
+    canonical_set = set(LAYER_DISPLAY_ORDER)
     for row in cycle_rows:
         layers = (
             ", ".join(row["layers_targeted"]) if row["layers_targeted"] else "unknown"
         )
+        compliance = _classify_cycle_compliance(row)
+        mandate = "yes" if row.get("spawn_was_cross_layer") else "no"
         lines.append(
             f"  Cycle {row['cycle']}: layers={layers}  merged_at={row['merged_at']}"
+            f"  cross_layer_mandate={mandate}  compliance={compliance}"
         )
+        if compliance == "non-compliant":
+            for layer in row.get("layers_targeted") or []:
+                if layer in canonical_set:
+                    non_compliant_targeted.add(layer)
+
+    if non_compliant_targeted:
+        # Reuse compute_untargeted_layers over the same per-row layers_targeted
+        # data the cycle history was built from — equivalent to running it over
+        # the project's full aggregated fix-log entries for this class.
+        untargeted = compute_untargeted_layers(cycle_rows)
+        targeted_str = ", ".join(sorted(non_compliant_targeted))
+        untargeted_str = (
+            ", ".join(untargeted)
+            if untargeted
+            else "(none — every layer has a prior fix)"
+        )
+        lines += [
+            "",
+            "PRIOR MANDATE NON-COMPLIANCE",
+            (
+                f"At least one prior cycle was spawned with the cross-layer mandate "
+                f"but shipped a single-layer fix targeting only: {targeted_str}. "
+                "That fix did NOT comply with the multi-layer requirement."
+            ),
+            (
+                f"Canonical layers still UNTARGETED across this class's full fix history: "
+                f"{untargeted_str}. "
+                "Steer the new defense toward these untargeted layers."
+            ),
+        ]
+
     lines += [
         "",
         "REQUIRED: propose defenses in AT LEAST 2 distinct canonical layers.",
@@ -4934,6 +5109,8 @@ async def _evaluate_recurring_class_signal(
                 "cycle": i + 1,
                 "layers_targeted": e.get("layers_targeted") or [],
                 "merged_at": e.get("merged_at") or "unknown",
+                "spawn_was_cross_layer": bool(e.get("spawn_was_cross_layer")),
+                "layers_targeted_present": "layers_targeted" in e,
             }
             for i, e in enumerate(all_entries)
         ]
@@ -5313,6 +5490,30 @@ async def run_recovery_once(session: AsyncSession, project_id: uuid.UUID) -> int
         logger.warning(
             "[REGRESSION_DISPATCHER] path-classifier coverage evaluation raised "
             "for project=%s: %s",
+            project_id,
+            exc,
+        )
+
+    # Non-spawning observation: open a WARNING alert when the cross-layer
+    # awaiting_backfill backlog stops draining (count past 24h grace exceeds
+    # threshold OR the oldest entry is older than age threshold). Wrapped in
+    # try/except so a transient failure here cannot break the rest of the
+    # recovery scan.
+    try:
+        await _evaluate_awaiting_backfill_alert(session, project_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[REGRESSION_DISPATCHER] awaiting_backfill alert evaluation raised "
+            "for project=%s: %s",
+            project_id,
+            exc,
+        )
+
+    try:
+        await _run_compliance_followup_once(session, project_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[REGRESSION_DISPATCHER] compliance-followup raised for project=%s: %s",
             project_id,
             exc,
         )
@@ -6187,6 +6388,163 @@ async def _auto_close_recovered_manual_intervention(
     if marginal_closed or confirmed_closed or mutated_rows:
         await session.commit()
     return marginal_closed, confirmed_closed
+
+
+async def _run_compliance_followup_once(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> int:
+    """Spawn compliance follow-up tasks for non-compliant cross-layer fixes.
+
+    Scans MERGED/CLOSED cases for fix-log entries where spawn_was_cross_layer
+    is True and layers_targeted (post-backfill) covers <2 distinct canonical
+    layers. Entries that include recommended_unmodifiable_layers (e.g. CI_WORKFLOW
+    documented in the diagnosis report) count toward the effective layer total so
+    that a fix that correctly documented an unmodifiable layer is not penalized.
+    Gated by runtime config and a per-case cooldown column.
+    """
+    from app.regression_layer_classifier import ALL_LAYERS
+
+    if not bool(_runtime_config.get("regression_compliance_followup_enabled", True)):
+        return 0
+
+    cooldown_hours = int(
+        _runtime_config.get("regression_compliance_followup_cooldown_hours", 72) or 72
+    )
+    now = _utcnow()
+    _all_layers = set(ALL_LAYERS)
+
+    rows = (
+        (
+            await session.execute(
+                select(RegressionRemediationCase).where(
+                    RegressionRemediationCase.project_id == project_id,
+                    RegressionRemediationCase.status.in_(
+                        [RegressionCaseStatus.MERGED, RegressionCaseStatus.CLOSED]
+                    ),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    spawned = 0
+    for case in rows:
+        last_at = getattr(case, "compliance_followup_spawned_at", None)
+        if last_at is not None:
+            if last_at.tzinfo is not None:
+                last_at = last_at.replace(tzinfo=None)
+            if now - last_at < timedelta(hours=cooldown_hours):
+                continue
+
+        # Only the most-recent classified cross-layer-mandated entry decides
+        # compliance for the case. If that entry is compliant, do not look further
+        # back: an older non-compliant entry has already been superseded by a
+        # newer compliant fix and re-spawning would be a permanent loop, since
+        # the spawned compliance_followup's own merged fix is recorded with
+        # spawn_was_cross_layer=False and never displaces the older entry.
+        non_compliant_entry = None
+        for entry in reversed(case.fingerprint_to_fix_log or []):
+            if not isinstance(entry, dict):
+                continue
+            if not entry.get("spawn_was_cross_layer"):
+                continue
+            if "layers_targeted" not in entry:
+                continue  # awaiting_backfill — not yet classified
+            targeted = set(entry.get("layers_targeted") or []) & _all_layers
+            recommended_unmod = (
+                set(entry.get("recommended_unmodifiable_layers") or []) & _all_layers
+            )
+            if len(targeted | recommended_unmod) < 2:
+                non_compliant_entry = entry
+            break
+
+        if non_compliant_entry is None:
+            continue
+
+        targeted = set(non_compliant_entry.get("layers_targeted") or []) & _all_layers
+        spawn_layers = list(non_compliant_entry.get("spawn_layers_enumerated") or [])
+        missing = [la for la in spawn_layers if la not in targeted]
+
+        _prompt = (
+            f"Cross-layer investigation for '{case.regression_class}' required "
+            f"defenses in >=2 distinct canonical layers, but PR #"
+            f"{non_compliant_entry.get('fix_pr_number', 'unknown')} only targeted: "
+            f"{sorted(targeted) or ['(none)']}. "
+            f"Layers seen in symptoms but not yet defended: {missing or ['(unknown)']}. "
+            "Propose a defense in a distinct canonical layer not yet addressed.\n\n"
+            "Note: .github/workflows/ cannot be modified by the agent. A CI_WORKFLOW "
+            "recommendation belongs in the diagnosis report (set "
+            "'recommended_unmodifiable_layers': ['CI_WORKFLOW'] in context), not the diff."
+        )
+        _payload = validate_internal_payload(
+            {
+                "type": "investigate",
+                "prompt": _prompt,
+                "base_branch": "main",
+                "effort": "low",
+            },
+            "pipeline_regression_dispatcher:compliance_followup",
+        )
+        _task = Task(
+            project_id=project_id,
+            title=f"Compliance follow-up: {case.regression_class}"[:200],
+            description=(
+                "Auto-spawned: cross-layer fix targeted <2 canonical layers — "
+                "compliance follow-up required."
+            )[:500],
+            payloads=[_payload],
+            context={
+                "spawned_by": "pipeline_regression_dispatcher_compliance_followup",
+                "regression_class": case.regression_class,
+                "signal_name": "compliance_followup",
+                "targeted_layers": sorted(targeted),
+                "missing_layers": missing,
+                "remediation_case_id": str(case.id),
+            },
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+            status=TaskStatus.QUEUED,
+            created_by="ORCHESTRATOR",
+        )
+        session.add(_task)
+        await session.flush()
+        session.add(
+            TaskHistory(
+                task_id=_task.id,
+                action="SPAWNED",
+                details={
+                    "spawned_by": "PIPELINE_REGRESSION_DISPATCHER_COMPLIANCE_FOLLOWUP",
+                    "regression_class": case.regression_class,
+                    "signal_name": "compliance_followup",
+                },
+            )
+        )
+        case.compliance_followup_spawned_at = now
+        case.fingerprint_to_fix_log = list(case.fingerprint_to_fix_log or []) + [
+            {
+                "type": "compliance_followup_spawned",
+                "spawned_at": now.isoformat(),
+                "task_id": str(_task.id),
+                "targeted_layers": sorted(targeted),
+                "missing_layers": missing,
+            }
+        ]
+        session.add(case)
+        spawned += 1
+        logger.info(
+            "[REGRESSION_WATCHDOG] compliance-followup-spawned project=%s "
+            "class=%s task_id=%s targeted=%s missing=%s",
+            project_id,
+            case.regression_class,
+            _task.id,
+            sorted(targeted),
+            missing,
+        )
+
+    if spawned:
+        await session.commit()
+    return spawned
 
 
 async def _any_signal_would_trip(
