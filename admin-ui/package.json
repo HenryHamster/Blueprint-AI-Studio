@@ -10,7 +10,7 @@
     "preview": "vite preview",
     "test": "vitest",
     "test:run": "vitest run",
-    "test:viewport": "vitest run --config vitest.viewport.config.ts"
+    "test:viewport": "node scripts/check-viewport-coverage.js && vitest run --config vitest.viewport.config.ts"
   },
   "dependencies": {
     "@dnd-kit/core": "^6.3.1",

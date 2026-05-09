@@ -2848,6 +2848,26 @@ async def claim_task(
                 "[AGENT] Failed to inject sr_blind_spot_themes (non-critical)"
             )
 
+    # Inject persistent SR blind-spot hint for categories exceeding disagreement threshold
+    # across >=2 consecutive 7-day windows. Shape: project_context.persistent_blind_spots
+    if task_type in ("create", "fix", "refactor", "migrate") and project_for_playbook:
+        try:
+            from app.pipeline_regression_dispatcher import (
+                get_sr_persistent_blind_spot_hint,
+            )  # noqa: PLC0415
+
+            _pbs = await get_sr_persistent_blind_spot_hint(
+                session, project_for_playbook.id
+            )
+            if _pbs:
+                if "project_context" not in response:
+                    response["project_context"] = {}
+                response["project_context"]["persistent_blind_spots"] = _pbs
+        except Exception:
+            logger.exception(
+                "[AGENT] Failed to inject persistent_blind_spots (non-critical)"
+            )
+
     # Inject concrete recent miss examples for the worst-performing SR categories.
     # Unlike sr_blind_spot_themes (aggregated keyword patterns), these are verbatim
     # reviewer findings that SR missed in the most recent window — giving the agent

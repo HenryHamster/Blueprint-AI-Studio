@@ -59,6 +59,7 @@ ESCALATION_REASON_ESCALATED_LAYER_CONCENTRATION = "escalated_layer_concentration
 ESCALATION_REASON_ESCALATED_CROSS_CASE_FINGERPRINT = "escalated_cross_case_fingerprint"
 ESCALATION_REASON_ESCALATED_RECURRENCE = "escalated_recurrence"
 ESCALATION_REASON_FRAGILE_RECURRENCE_META = "fragile_recurrence_meta"
+ESCALATION_REASON_RECURRING_CLASS_META = "recurring_class_meta"
 
 # Cooldown between consecutive spawns for the SAME regression_class. Mirrors
 # the self_audit_dispatch cooldown pattern — keeps a noisy regression from
@@ -129,6 +130,16 @@ _AGENT_VM_RESOURCE_WINDOW_HOURS = 24
 # held < _FRAGILE_RECURRENCE_SHORT_HOLD_DAYS before the signal re-tripped.
 _FRAGILE_RECURRENCE_MIN_COUNT = 3
 _FRAGILE_RECURRENCE_SHORT_HOLD_DAYS = 2.0
+
+# Recurring-class proactive meta-signal thresholds.
+# A regression_class trips the signal when its fix-log history across all cases
+# (within the lookback window) spans >= _RECURRING_CLASS_MIN_CYCLES fix cycles AND
+# those cycles have collectively targeted >= _RECURRING_CLASS_MIN_LAYERS distinct
+# canonical layers.  Catches classes that accumulate cross-layer history without
+# any single signal firing all layers simultaneously.
+_RECURRING_CLASS_LOOKBACK = timedelta(days=30)
+_RECURRING_CLASS_MIN_CYCLES = 3
+_RECURRING_CLASS_MIN_LAYERS = 2
 
 # SR blind-spot theme occurrence floor. A blind_spot theme must appear at least
 # this many times across the 14d window before it is considered a structural gap
@@ -1338,7 +1349,8 @@ def _format_fragile_recurrence_meta_prompt(
         ),
         (
             "Single-layer fixes have not held. This meta-investigation must enumerate "
-            "ALL canonical layers and propose a defense in at least one untargeted layer."
+            "ALL canonical layers and propose defenses in AT LEAST TWO distinct layers, "
+            "OR provide explicit written justification for why a single-layer defense is sufficient."
         ),
         "",
         f"Canonical defense layers: {', '.join(_CANONICAL_RECURRENCE_LAYERS)}",
@@ -2283,10 +2295,11 @@ def _format_cross_layer_prompt(
             f"infrastructure layer(s) within the last 48h: {layer_names}."
         ),
         (
-            "Diagnose the SHARED root cause and propose a coordinated fix that "
-            "addresses all of the layers below — do NOT bias toward whichever "
-            "layer surfaced most recently. Each layer below shows one "
-            "representative fingerprint + sample from this window."
+            "Diagnose the SHARED root cause and propose defenses in AT LEAST TWO distinct "
+            "infrastructure layers, OR provide explicit written justification for why a "
+            "single-layer defense is sufficient. Do NOT bias toward whichever layer "
+            "surfaced most recently. Each layer below shows one representative fingerprint "
+            "+ sample from this window."
         ),
         "",
         "PER-LAYER EVIDENCE",
@@ -2378,10 +2391,11 @@ def _format_layer_concentration_prompt(
             "have a systemic gap that point-fixes cannot close."
         ),
         (
-            f"  2. Should additional defenses be added at OTHER layers to compensate "
-            f"for {layer}'s fragility? E.g. if {layer} is chronically fragile, "
-            "hardening adjacent layers (pre-flight checks, gate policies) may provide "
-            "defense-in-depth that reduces blast radius when this layer fails."
+            f"  2. Propose defenses in AT LEAST ONE OTHER layer to compensate for "
+            f"{layer}'s fragility, OR provide written justification for why {layer}-only "
+            "defense is sufficient. Defense-in-depth strategies (pre-flight checks, gate "
+            "policies, observation thresholds in adjacent layers) may reduce blast radius "
+            "when this layer fails."
         ),
         "",
         "Produce the structured diagnosis JSON "
@@ -4640,6 +4654,170 @@ async def _evaluate_cross_case_fingerprint_signal(
     return spawned
 
 
+def _format_recurring_class_prompt(
+    *,
+    regression_class: str,
+    targeted_layers: list[str],
+    cycle_rows: list[dict],
+    layer_defense_block: str = "",
+) -> str:
+    """Build the recurring-class proactive meta-investigation prompt."""
+    cycle_count = len(cycle_rows)
+    layer_list = ", ".join(targeted_layers)
+    lines = [
+        f"RECURRING CROSS-LAYER CLASS META-INVESTIGATION (recurring_class:{regression_class})",
+        (
+            f"Regression class '{regression_class}' has accumulated {cycle_count} fix cycles "
+            f"across {len(targeted_layers)} distinct canonical layers ({layer_list}). "
+            "Each cycle applied a single-layer fix that held temporarily, then re-tripped "
+            "on a different layer — a pattern indicating an unaddressed shared root cause."
+        ),
+        "",
+        "PER-CYCLE LAYER HISTORY",
+    ]
+    for row in cycle_rows:
+        layers = (
+            ", ".join(row["layers_targeted"]) if row["layers_targeted"] else "unknown"
+        )
+        lines.append(
+            f"  Cycle {row['cycle']}: layers={layers}  merged_at={row['merged_at']}"
+        )
+    lines += [
+        "",
+        "REQUIRED: propose defenses in AT LEAST 2 distinct canonical layers.",
+        f"Canonical layers: {', '.join(_CANONICAL_RECURRENCE_LAYERS)}",
+        (
+            "A single-layer fix has already been tried multiple times — "
+            "a multi-layer defense is mandatory."
+        ),
+        "",
+        (
+            ".github/workflows/ files cannot be modified by the agent; "
+            "treat workflow findings as notes in the diagnosis report."
+        ),
+    ]
+    if layer_defense_block:
+        lines.append("")
+        lines.append(layer_defense_block)
+    return "\n".join(lines)
+
+
+async def _evaluate_recurring_class_signal(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    spawn_budget_left: int,
+) -> int:
+    """Proactively escalate when a regression class spans 2+ layers across 3+ cycles.
+
+    Unlike the inline cross-layer detection in _maybe_spawn (which only fires when
+    the current signal also trips), this evaluator scans historical case records so
+    a class that accumulated cross-layer history without concurrent signals is caught.
+
+    Uses regression_class="recurring_class:<original_class>" for dedup/cooldown.
+    """
+    if spawn_budget_left <= 0:
+        return 0
+
+    cutoff = _utcnow() - _RECURRING_CLASS_LOOKBACK
+    all_cases = (
+        (
+            await session.execute(
+                select(RegressionRemediationCase).where(
+                    RegressionRemediationCase.project_id == project_id,
+                    RegressionRemediationCase.first_seen_at >= cutoff,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not all_cases:
+        return 0
+
+    # Group fix-log entries by regression_class, skipping meta-investigation classes.
+    _META_PREFIXES = (
+        "layer_concentration:",
+        "cross_case_fingerprint:",
+        "recurring_class:",
+        "anomaly:",
+    )
+    by_class: dict[str, list[dict]] = {}
+    for case in all_cases:
+        rc = case.regression_class or ""
+        if any(rc.startswith(p) for p in _META_PREFIXES):
+            continue
+        fix_log = case.fingerprint_to_fix_log or []
+        if not isinstance(fix_log, list):
+            continue
+        entries = [e for e in fix_log if isinstance(e, dict) and "layers_targeted" in e]
+        if entries:
+            by_class.setdefault(rc, []).extend(entries)
+
+    if not by_class:
+        return 0
+
+    # Compute layer defense block once (only if at least one class will trip).
+    _layer_defense_block: str | None = None
+
+    spawned = 0
+    for regression_class, all_entries in sorted(by_class.items()):
+        if spawned >= spawn_budget_left:
+            break
+        if len(all_entries) < _RECURRING_CLASS_MIN_CYCLES:
+            continue
+        targeted = _layers_targeted_union(all_entries) & set(
+            _CANONICAL_RECURRENCE_LAYERS
+        )
+        if len(targeted) < _RECURRING_CLASS_MIN_LAYERS:
+            continue
+
+        if _layer_defense_block is None:
+            all_fix_logs_with_case_ids: list[tuple[str, dict]] = [
+                (str(c.id), entry)
+                for c in all_cases
+                for entry in (c.fingerprint_to_fix_log or [])
+                if isinstance(entry, dict)
+            ]
+            _layer_defense_block = _build_layer_defense_ledger(
+                all_fix_logs_with_case_ids
+            )
+
+        cycle_rows = [
+            {
+                "cycle": i + 1,
+                "layers_targeted": e.get("layers_targeted") or [],
+                "merged_at": e.get("merged_at") or "unknown",
+            }
+            for i, e in enumerate(all_entries)
+        ]
+        prompt = _format_recurring_class_prompt(
+            regression_class=regression_class,
+            targeted_layers=sorted(targeted),
+            cycle_rows=cycle_rows,
+            layer_defense_block=_layer_defense_block or "",
+        )
+        meta_class = f"recurring_class:{regression_class}"
+        spawn = await _maybe_spawn(
+            session,
+            project_id,
+            signal_name="recurring_class",
+            regression_class=meta_class,
+            prior_rate=None,
+            current_rate=None,
+            sample_size=len(all_entries),
+            magnitude=float(len(all_entries)),
+            title_hint=(
+                f"Recurring cross-layer class: {regression_class} "
+                f"({len(all_entries)} cycles, {len(targeted)} layers)"
+            )[:80],
+            prompt_override=prompt,
+        )
+        if spawn is not None:
+            spawned += 1
+
+    return spawned
+
+
 def _get_staleness_raw_ts(
     signal_name: str,
     doc: dict,
@@ -6372,6 +6550,11 @@ async def run_once(session: AsyncSession, project_id: uuid.UUID) -> int:
             project_id,
             spawn_budget - _spawned,
         )
+        _spawned += await _evaluate_recurring_class_signal(
+            session,
+            project_id,
+            spawn_budget - _spawned,
+        )
         _spawned += await _evaluate_strategic_cycle_stall_signal(
             session,
             project_id,
@@ -6627,3 +6810,37 @@ async def get_regression_mtta_data(
         "classes": rows,
         "recovery_cooldown_sec": int(_REGRESSION_RECOVERY_COOLDOWN.total_seconds()),
     }
+
+
+async def get_sr_persistent_blind_spot_hint(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    days: int = 14,
+) -> dict[str, Any] | None:
+    """Return the persistent SR blind-spot hint for agent task context injection.
+
+    Queries the last *days* of completed tasks and calls
+    ``sr_blind_spots.compute_persistent_sr_blind_spot_hint`` to identify
+    categories whose reviewer-disagreement rate exceeds the threshold in >=2
+    consecutive 7-day windows.  Returns None when no persistent categories
+    exist (i.e. below-threshold or insufficient sample size).
+    """
+    from app.sr_blind_spots import compute_persistent_sr_blind_spot_hint  # noqa: PLC0415
+
+    now = _utcnow()
+    tasks = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.project_id == project_id,
+                    Task.status == TaskStatus.COMPLETED,
+                    Task.created_at >= now - timedelta(days=days),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    result = compute_persistent_sr_blind_spot_hint(tasks, now=now)
+    return result if result.get("categories") else None

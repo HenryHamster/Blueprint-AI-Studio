@@ -2021,6 +2021,123 @@ describe('MessagesPanel saved views', () => {
   });
 });
 
+describe('MessagesPanel Investigate action', () => {
+  let root: Root | null = null;
+  let host: HTMLDivElement | null = null;
+
+  beforeEach(() => {
+    localStorage.clear();
+    vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    const r = root;
+    if (r) act(() => r.unmount());
+    root = null;
+    host?.remove();
+    host = null;
+    localStorage.clear();
+    vi.clearAllMocks();
+  });
+
+  async function renderWithMessages(messages: ReturnType<typeof makeMsg>[]) {
+    (apiFetch as ReturnType<typeof vi.fn>).mockClear();
+    (apiFetch as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Response(JSON.stringify({ messages }), { status: 200 }),
+    );
+    global.fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ id: 'task-123' }), { status: 200 }),
+    );
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <MessagesPanel
+          selectedProjectId="proj-1"
+          githubRepo="owner/repo"
+          onClose={() => {}}
+          addToast={() => {}}
+          onMessageCountChange={() => {}}
+        />,
+      );
+    });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 50)); });
+    return host as HTMLDivElement;
+  }
+
+  test('Investigate button only renders for BLOCKER messages', async () => {
+    const blocker = makeMsg({
+      id: 'msg-blocker',
+      message_type: 'BLOCKER',
+      content: 'System is down',
+      status: 'open',
+    });
+    const feedback = makeMsg({
+      id: 'msg-feedback',
+      message_type: 'FEEDBACK',
+      content: 'Consider adding feature',
+      status: 'open',
+    });
+    const el = await renderWithMessages([blocker, feedback]);
+    // Check that the blocker message is rendered
+    expect(el.textContent).toContain('System is down');
+    // Check that the Investigate button is present
+    const buttons = el.querySelectorAll('button[title="Investigate"]');
+    expect(buttons.length).toBeGreaterThan(0);
+  });
+
+  test('Investigate button only renders for BUG_REPORT messages', async () => {
+    const bugReport = makeMsg({
+      id: 'msg-bug',
+      message_type: 'BUG_REPORT',
+      content: 'App crashes on login',
+      status: 'open',
+    });
+    const el = await renderWithMessages([bugReport]);
+    const button = el.querySelector('button[title="Investigate"]');
+    expect(button).toBeTruthy();
+  });
+
+  test('clicking Investigate button shows inline confirmation', async () => {
+    const blocker = makeMsg({
+      id: 'msg-1',
+      message_type: 'BLOCKER',
+      content: 'Critical issue',
+      status: 'open',
+    });
+    const el = await renderWithMessages([blocker]);
+    const investigateBtn = el.querySelector('button[title="Investigate"]') as HTMLButtonElement;
+    expect(investigateBtn).toBeTruthy();
+    await act(async () => { investigateBtn.click(); });
+    const confirmText = el.textContent?.includes('Spawn investigation?');
+    expect(confirmText).toBe(true);
+  });
+
+  test('Investigate confirmation flow shows inline dialog', async () => {
+    const blocker = makeMsg({
+      id: 'msg-1',
+      message_type: 'BLOCKER',
+      content: 'Critical issue',
+      status: 'open',
+    });
+    const el = await renderWithMessages([blocker]);
+    // Investigate button renders for BLOCKER
+    const investigateBtn = el.querySelector('button[title="Investigate"]') as HTMLButtonElement;
+    expect(investigateBtn).toBeTruthy();
+    // Click Investigate button
+    await act(async () => { investigateBtn.click(); });
+    // Confirmation UI appears with prompt text
+    expect(el.textContent).toContain('Spawn investigation?');
+    // Confirm and cancel buttons appear
+    const confirmBtn = [...el.querySelectorAll('button')].find(b => b.title === 'Confirm investigation');
+    const cancelBtn = [...el.querySelectorAll('button')].find(b => b.title === 'Cancel' && el.textContent?.includes('Spawn investigation'));
+    expect(confirmBtn).toBeTruthy();
+    expect(cancelBtn).toBeTruthy();
+  });
+});
+
 describe('MessagesPanel showOnlyNew filter', () => {
   const userId = 'test-user@example.com';
 

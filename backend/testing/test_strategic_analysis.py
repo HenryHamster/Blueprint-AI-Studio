@@ -2124,3 +2124,92 @@ def test_build_outcome_evaluation_no_findings_by_direction_unchanged():
     result = _real_build_outcome_evaluation(project, [])
     d_out = result["directions"][0]
     assert "recent_findings" not in d_out
+
+
+def test_recent_diagnosis_included_when_present():
+    """recent_diagnosis block appears when direction has diagnosis_summary."""
+    directions = [
+        {
+            "id": "d-1",
+            "status": "active",
+            "diagnosis_summary": "The root cause was a race condition in the async loop. Fixed by adding proper synchronization.",
+            "diagnosis_completed_at": "2026-03-15T10:30:00",
+            "diagnosed_affected_files": [
+                "backend/app/async_handler.py",
+                "backend/app/sync.py",
+            ],
+            "research_history": [{"timestamp": "2026-01-01T00:00:00", "prs_merged": 1}],
+        }
+    ]
+    project = _make_project(directions=directions)
+    result = _build_outcome_evaluation(
+        project, (project.vision or {}).get("_strategic_cycle_history") or []
+    )
+    d = result["directions"][0]
+    assert "recent_diagnosis" in d
+    assert (
+        d["recent_diagnosis"]["summary"]
+        == "The root cause was a race condition in the async loop. Fixed by adding proper synchronization."
+    )
+    assert d["recent_diagnosis"]["diagnosed_at"] == "2026-03-15T10:30:00"
+    assert "backend/app/async_handler.py" in d["recent_diagnosis"]["affected_files"]
+
+
+def test_recent_diagnosis_absent_when_empty():
+    """recent_diagnosis block is absent when diagnosis_summary is empty or missing."""
+    directions = [
+        {
+            "id": "d-1",
+            "status": "active",
+            "research_history": [{"timestamp": "2026-01-01T00:00:00", "prs_merged": 1}],
+        }
+    ]
+    project = _make_project(directions=directions)
+    result = _build_outcome_evaluation(
+        project, (project.vision or {}).get("_strategic_cycle_history") or []
+    )
+    d = result["directions"][0]
+    assert "recent_diagnosis" not in d
+
+
+def test_recent_diagnosis_truncates_long_summary():
+    """recent_diagnosis summary is capped at 500 chars."""
+    long_summary = "A" * 600
+    directions = [
+        {
+            "id": "d-1",
+            "status": "active",
+            "diagnosis_summary": long_summary,
+            "diagnosis_completed_at": "2026-03-15T10:30:00",
+            "research_history": [{"timestamp": "2026-01-01T00:00:00", "prs_merged": 1}],
+        }
+    ]
+    project = _make_project(directions=directions)
+    result = _build_outcome_evaluation(
+        project, (project.vision or {}).get("_strategic_cycle_history") or []
+    )
+    d = result["directions"][0]
+    assert "recent_diagnosis" in d
+    assert len(d["recent_diagnosis"]["summary"]) == 500
+    assert d["recent_diagnosis"]["summary"] == "A" * 500
+
+
+def test_recent_diagnosis_omits_missing_optional_fields():
+    """recent_diagnosis includes only non-empty optional fields."""
+    directions = [
+        {
+            "id": "d-1",
+            "status": "active",
+            "diagnosis_summary": "A simple diagnosis with no other metadata.",
+            "research_history": [{"timestamp": "2026-01-01T00:00:00", "prs_merged": 1}],
+        }
+    ]
+    project = _make_project(directions=directions)
+    result = _build_outcome_evaluation(
+        project, (project.vision or {}).get("_strategic_cycle_history") or []
+    )
+    d = result["directions"][0]
+    assert "recent_diagnosis" in d
+    assert "summary" in d["recent_diagnosis"]
+    assert "diagnosed_at" not in d["recent_diagnosis"]
+    assert "affected_files" not in d["recent_diagnosis"]

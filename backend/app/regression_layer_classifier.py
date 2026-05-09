@@ -296,6 +296,51 @@ def classify_layers(
     return tags
 
 
+def aggregate_targeted_layers(entries: list[dict]) -> set[str]:
+    """Return the set of canonical layers targeted across all fix-log entries.
+
+    Accepts the ``fingerprint_to_fix_log`` list format.  Entries missing
+    ``layers_targeted`` or with an empty list contribute nothing to the union.
+    Unknown layer names (not in ``ALL_LAYERS``) are silently dropped.
+    """
+    targeted: set[str] = set()
+    for entry in entries or []:
+        if not isinstance(entry, dict):
+            continue
+        for layer in entry.get("layers_targeted") or []:
+            if isinstance(layer, str) and layer in ALL_LAYERS:
+                targeted.add(layer)
+    return targeted
+
+
+def is_recurring_cross_layer_class(
+    entries: list[dict],
+    min_cycles: int = 3,
+    min_layers: int = 2,
+) -> bool:
+    """Return True when fix-log history qualifies as a recurring cross-layer class.
+
+    A class qualifies when its combined fix-log entries span at least
+    ``min_cycles`` cycles AND collectively targeted at least ``min_layers``
+    distinct canonical layers.  Identifies regression classes where single-layer
+    fixes repeatedly fail to hold, signalling a shared root cause across layers.
+
+    Parameters
+    ----------
+    entries:
+        Combined ``fingerprint_to_fix_log`` entries across all
+        RegressionRemediationCase records for this regression class.
+    min_cycles:
+        Minimum number of fix cycles required.  Defaults to 3.
+    min_layers:
+        Minimum number of distinct canonical layers that must have been targeted.
+        Defaults to 2.
+    """
+    if not entries or len(entries) < min_cycles:
+        return False
+    return len(aggregate_targeted_layers(entries)) >= min_layers
+
+
 def compute_untargeted_layers(fix_log: list[dict]) -> list[str]:
     """Return canonical layer names that have zero targeted fixes in fix_log.
 

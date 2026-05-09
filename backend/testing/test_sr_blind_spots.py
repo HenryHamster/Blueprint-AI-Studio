@@ -1,6 +1,7 @@
 """Tests for the disallowed-blind-spot filter and contract parity."""
 
 import uuid
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -9,6 +10,8 @@ from app.sr_blind_spots import (
     DISALLOWED_BLIND_SPOT_EXAMPLES,
     DISALLOWED_BLIND_SPOT_PATTERNS,
     aggregate_sr_false_attestation_rates,
+    compute_persistent_sr_blind_spot_hint,
+    count_reviewer_disagreements_in_tasks,
     filter_disallowed_blind_spots,
     is_disallowed_blind_spot,
     triage_sr_blind_spot_theme,
@@ -437,3 +440,200 @@ def test_disagreement_directions_defaults_severity_to_low():
     )
     counts = _count_reviewer_disagreement_directions([task])
     assert counts[("correctness", "create")]["examples"][0]["severity"] == "LOW"
+
+
+# ---------------------------------------------------------------------------
+# Unit: compute_persistent_sr_blind_spot_hint
+# ---------------------------------------------------------------------------
+
+
+def _make_reviewer_miss_task(
+    project_id,
+    *,
+    created_at: datetime,
+    category: str = "correctness",
+    task_type: str = "create",
+):
+    """Task where the reviewer caught *category* but SR passed it."""
+    return make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": task_type, "prompt": "x"}],
+        created_at=created_at,
+        context={
+            "_self_review_outcome": {
+                "check_results": {category: {"passed": True}},
+                "reviewer_findings": [
+                    {
+                        "category": category,
+                        "severity": "HIGH",
+                        "description": "missed by SR",
+                    }
+                ],
+            }
+        },
+    )
+
+
+def _make_clean_task(
+    project_id,
+    *,
+    created_at: datetime,
+    task_type: str = "create",
+):
+    """Task with no reviewer disagreement (SR and reviewer agree)."""
+    return make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": task_type, "prompt": "x"}],
+        created_at=created_at,
+        context={
+            "_self_review_outcome": {
+                "check_results": {"correctness": {"passed": True}},
+                "reviewer_findings": [],
+            }
+        },
+    )
+
+
+def test_persistent_hint_empty_below_threshold_in_one_window():
+    """Rate below threshold in window 0 → no persistent categories."""
+    now = datetime(2026, 1, 14, 12, 0, 0)
+    pid = uuid.uuid4()
+    # Window 0 (0-7 days ago): 1 miss / 5 tasks = 0.20 — below 0.25
+    tasks = [_make_reviewer_miss_task(pid, created_at=now - timedelta(days=2))] + [
+        _make_clean_task(pid, created_at=now - timedelta(days=2)) for _ in range(4)
+    ]
+    # Window 1 (7-14 days ago): 2 misses / 5 tasks = 0.40 — above 0.25
+    tasks += [
+        _make_reviewer_miss_task(pid, created_at=now - timedelta(days=10))
+        for _ in range(2)
+    ] + [_make_clean_task(pid, created_at=now - timedelta(days=10)) for _ in range(3)]
+    result = compute_persistent_sr_blind_spot_hint(
+        tasks, threshold=0.25, min_sample=3, now=now
+    )
+    assert result["categories"] == []
+    assert result["hint"] is None
+
+
+def test_persistent_hint_populated_when_above_threshold_both_windows():
+    """Rate exceeds threshold in both windows → hint names the category."""
+    now = datetime(2026, 1, 14, 12, 0, 0)
+    pid = uuid.uuid4()
+    tasks = []
+    # Both windows: 2 misses / 4 tasks = 0.50 — above 0.25
+    for days_ago in (3, 10):
+        tasks += [
+            _make_reviewer_miss_task(pid, created_at=now - timedelta(days=days_ago))
+            for _ in range(2)
+        ]
+        tasks += [
+            _make_clean_task(pid, created_at=now - timedelta(days=days_ago))
+            for _ in range(2)
+        ]
+    result = compute_persistent_sr_blind_spot_hint(
+        tasks, threshold=0.25, min_sample=3, now=now
+    )
+    assert len(result["categories"]) == 1
+    assert result["categories"][0]["category"] == "correctness"
+    assert result["categories"][0]["task_type"] == "create"
+    assert result["categories"][0]["rate"] == pytest.approx(0.5, abs=0.01)
+    assert result["hint"] is not None
+    assert "correctness" in result["hint"]
+    assert "50%" in result["hint"]
+
+
+def test_persistent_hint_empty_when_window_below_min_sample():
+    """A window with fewer than min_sample qualifying tasks does not block but does not count."""
+    now = datetime(2026, 1, 14, 12, 0, 0)
+    pid = uuid.uuid4()
+    # Window 0 (0-7 days ago): only 2 qualifying tasks — below min_sample=3
+    tasks = [
+        _make_reviewer_miss_task(pid, created_at=now - timedelta(days=2))
+        for _ in range(2)
+    ]
+    # Window 1 (7-14 days ago): 3/4 tasks disagree (above threshold)
+    tasks += [
+        _make_reviewer_miss_task(pid, created_at=now - timedelta(days=10))
+        for _ in range(3)
+    ] + [_make_clean_task(pid, created_at=now - timedelta(days=10))]
+    result = compute_persistent_sr_blind_spot_hint(
+        tasks, threshold=0.25, min_sample=3, now=now
+    )
+    # Window 0 has too few samples → its rates dict is empty → key missing → not persistent
+    assert result["categories"] == []
+    assert result["hint"] is None
+
+
+def test_persistent_hint_no_double_counting_with_catch_rate():
+    """Running compute_persistent_sr_blind_spot_hint does not alter count_reviewer_disagreements_in_tasks."""
+    now = datetime(2026, 1, 14, 12, 0, 0)
+    pid = uuid.uuid4()
+    tasks = [
+        _make_reviewer_miss_task(pid, created_at=now - timedelta(days=3))
+        for _ in range(3)
+    ] + [_make_clean_task(pid, created_at=now - timedelta(days=3)) for _ in range(2)]
+
+    counts_before = count_reviewer_disagreements_in_tasks(tasks)
+    compute_persistent_sr_blind_spot_hint(tasks, threshold=0.25, min_sample=3, now=now)
+    counts_after = count_reviewer_disagreements_in_tasks(tasks)
+
+    assert counts_before == counts_after
+
+
+def test_persistent_hint_multiple_categories_listed_in_hint():
+    """When two categories exceed the threshold, the hint names both."""
+    now = datetime(2026, 1, 14, 12, 0, 0)
+    pid = uuid.uuid4()
+    tasks = []
+    for days_ago in (3, 10):
+        # 2 correctness misses + 2 scope-drift misses + 4 clean → each at 0.25 rate
+        tasks += [
+            _make_reviewer_miss_task(
+                pid, created_at=now - timedelta(days=days_ago), category="correctness"
+            )
+            for _ in range(2)
+        ]
+        tasks += [
+            _make_reviewer_miss_task(
+                pid, created_at=now - timedelta(days=days_ago), category="scope-drift"
+            )
+            for _ in range(2)
+        ]
+        tasks += [
+            _make_clean_task(pid, created_at=now - timedelta(days=days_ago))
+            for _ in range(4)
+        ]
+    result = compute_persistent_sr_blind_spot_hint(
+        tasks, threshold=0.25, min_sample=3, now=now
+    )
+    cats = {c["category"] for c in result["categories"]}
+    assert "correctness" in cats
+    assert "scope-drift" in cats
+    assert result["hint"] is not None
+    assert "correctness" in result["hint"]
+    assert "scope-drift" in result["hint"]
+
+
+def test_persistent_hint_fix_task_type_tracked_separately():
+    """Reviewer-disagreement rates for 'fix' task type are tracked separately from 'create'."""
+    now = datetime(2026, 1, 14, 12, 0, 0)
+    pid = uuid.uuid4()
+    tasks = []
+    for days_ago in (3, 10):
+        tasks += [
+            _make_reviewer_miss_task(
+                pid, created_at=now - timedelta(days=days_ago), task_type="fix"
+            )
+            for _ in range(2)
+        ]
+        tasks += [
+            _make_clean_task(pid, created_at=now - timedelta(days=days_ago))
+            for _ in range(2)
+        ]
+    result = compute_persistent_sr_blind_spot_hint(
+        tasks, threshold=0.25, min_sample=3, now=now
+    )
+    task_types = {c["task_type"] for c in result["categories"]}
+    assert "fix" in task_types
+    assert "create" not in task_types

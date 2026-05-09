@@ -884,6 +884,101 @@ def classify_theme_example_layers(examples: list) -> list:
     return sorted(layers)
 
 
+_PERSISTENT_BLIND_SPOT_THRESHOLD = 0.25
+_PERSISTENT_BLIND_SPOT_MIN_SAMPLE = 3
+
+
+def compute_persistent_sr_blind_spot_hint(
+    tasks,
+    *,
+    threshold: float = _PERSISTENT_BLIND_SPOT_THRESHOLD,
+    min_sample: int = _PERSISTENT_BLIND_SPOT_MIN_SAMPLE,
+    window_count: int = 2,
+    window_days: int = 7,
+    now: datetime | None = None,
+) -> Dict[str, Any]:
+    """Return a persistent_blind_spots hint for injection into the SR prompt.
+
+    Splits *tasks* into *window_count* consecutive *window_days*-day buckets
+    (most-recent-first).  A category is 'persistent' when its reviewer-disagreement
+    rate (reviewer_misses / qualifying_tasks_in_window) exceeds *threshold* in
+    every bucket that has at least *min_sample* qualifying tasks.
+
+    Returns::
+
+        {
+            "categories": [{"category": str, "task_type": str, "rate": float}, ...],
+            "hint": str | None,
+        }
+
+    Empty ``categories`` and ``hint=None`` when no persistent categories exist.
+    Pass *now* in tests to pin the clock.
+    """
+    _now = now or datetime.utcnow()
+
+    def _qualifying(window_tasks):
+        out = []
+        for t in window_tasks:
+            if (t.first_payload or {}).get("type") not in _SR_CODE_CHANGE_TYPES:
+                continue
+            sro = (t.context or {}).get("_self_review_outcome")
+            if not sro or is_skipped_sr_outcome(sro):
+                continue
+            out.append(t)
+        return out
+
+    window_results: List[Dict[tuple, float]] = []
+    for i in range(window_count):
+        cutoff_end = _now - timedelta(days=i * window_days)
+        cutoff_start = _now - timedelta(days=(i + 1) * window_days)
+        bucket = [
+            t
+            for t in tasks
+            if t.created_at is not None and cutoff_start <= t.created_at < cutoff_end
+        ]
+        qual = _qualifying(bucket)
+        if len(qual) < min_sample:
+            window_results.append({})
+            continue
+        counts = _count_reviewer_disagreement_directions(qual)
+        total = len(qual)
+        rates: Dict[tuple, float] = {}
+        for key, data in counts.items():
+            miss = data["miss"]
+            if miss > 0:
+                rates[key] = round(miss / total, 4)
+        window_results.append(rates)
+
+    all_keys: set = set()
+    for wr in window_results:
+        all_keys.update(wr.keys())
+
+    persistent: List[Dict[str, Any]] = []
+    for key in all_keys:
+        per_window = [wr.get(key) for wr in window_results]
+        if all(r is not None and r >= threshold for r in per_window):
+            cat, ttype = key
+            avg_rate = sum(per_window) / len(per_window)  # type: ignore[arg-type]
+            persistent.append(
+                {"category": cat, "task_type": ttype, "rate": round(avg_rate, 4)}
+            )
+
+    if not persistent:
+        return {"categories": [], "hint": None}
+
+    persistent.sort(key=lambda x: -x["rate"])
+    cat_phrases = ", ".join(
+        f"{p['category']} ({p['rate'] * 100:.0f}%)" for p in persistent
+    )
+    hint = (
+        f"Persistent self-review blind spots (reviewer-disagreement rate over"
+        f" {window_count} x {window_days}-day windows): {cat_phrases}."
+        " Spend extra attention on these categories — reviewers have consistently"
+        " flagged issues the self-review pass missed."
+    )
+    return {"categories": persistent, "hint": hint}
+
+
 def count_reviewer_disagreements_in_tasks(tasks) -> Dict[tuple, int]:
     """Single source of truth for the (category, task_type) -> count tally.
 

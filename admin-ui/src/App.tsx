@@ -591,6 +591,7 @@ export default function App() {
       ) : s.showMessages ? (
         <MessagesPanel
           selectedProjectId={s.selectedProjectId}
+          githubRepo={selectedProject ? `${selectedProject.github_owner}/${selectedProject.github_repo}` : undefined}
           onClose={() => s.setShowMessages(false)}
           addToast={s.addToast}
           onMessageCountChange={handleMessageCountChange}

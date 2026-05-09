@@ -3748,6 +3748,10 @@ async def test_fragile_recurrence_meta_on_third_recurrence(db_session):
     assert "FRAGILE-RECURRENCE META-INVESTIGATION" in prompt
     assert "meta-investigation" in prompt.lower()
 
+    # Prompt must require >=2 layer defenses or explicit justification.
+    assert "AT LEAST TWO distinct" in prompt
+    assert "justification" in prompt.lower()
+
     # Must reference at least 2 distinct canonical layer classes.
     layer_mentions = [
         layer
@@ -7842,6 +7846,9 @@ def test_format_cross_layer_prompt_includes_layer_defense_block():
     assert "CROSS-LAYER REGRESSION DETECTED" in result
     assert "RECENT DEFENSE ACTIVITY BY LAYER" in result
     assert "base prompt" in result
+    # Verify the prompt requires >=2 layer defenses or explicit justification.
+    assert "AT LEAST TWO distinct" in result
+    assert "justification" in result
 
 
 def test_format_theme_layer_meta_prompt_includes_layer_defense_block():
@@ -9150,6 +9157,9 @@ def test_format_layer_concentration_prompt_content():
     assert "STRUCTURAL QUESTIONS" in prompt
     assert ".github/workflows/" in prompt
     assert "RECENT DEFENSE ACTIVITY BY LAYER" in prompt
+    # Verify the prompt requires defenses in at least one other layer or justification.
+    assert "AT LEAST ONE OTHER layer" in prompt
+    assert "justification" in prompt.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -12461,3 +12471,268 @@ async def test_dispatcher_prompt_documents_verdict_triage(db_session):
     assert "intentional" in prompt or "intended" in prompt
     assert "known-incomplete pipeline step" in prompt
     assert "verdict_reason" in prompt
+
+
+# ---------------------------------------------------------------------------
+# _evaluate_recurring_class_signal integration tests
+# ---------------------------------------------------------------------------
+
+
+def _make_rc_fix_log_entry(layer: str, merged_days_ago: float) -> dict:
+    """Build a fix-log entry targeting ``layer``, merged ``merged_days_ago`` days ago."""
+    merged = (_utcnow() - timedelta(days=merged_days_ago)).isoformat()
+    return {"merged_at": merged, "layers_targeted": [layer]}
+
+
+@pytest.mark.asyncio
+async def test_recurring_class_trips_when_class_spans_2_layers_across_3_cycles(
+    db_session,
+):
+    """Class with 3 fix-log entries across CI_WORKFLOW + AGENT_VM → spawns recurring_class meta."""
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="fix_loop_divergence:lint",
+        status=RegressionCaseStatus.ACTIVE,
+        signal_snapshot_at_spawn={"signal_name": "fix_loop_divergence"},
+        first_seen_at=now - timedelta(days=20),
+        hit_count=3,
+        fingerprint_to_fix_log=[
+            _make_rc_fix_log_entry("CI_WORKFLOW", merged_days_ago=15),
+            _make_rc_fix_log_entry("AGENT_VM", merged_days_ago=10),
+            _make_rc_fix_log_entry("CI_WORKFLOW", merged_days_ago=5),
+        ],
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned >= 1
+
+    tasks = (
+        (
+            await db_session.execute(
+                select(Task)
+                .where(Task.project_id == project.id)
+                .order_by(Task.created_at.desc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    rc_tasks = [
+        t
+        for t in tasks
+        if (t.context or {}).get("regression_class", "").startswith("recurring_class:")
+    ]
+    assert len(rc_tasks) >= 1
+
+    task = rc_tasks[0]
+    ctx = task.context or {}
+    assert ctx["regression_class"] == "recurring_class:fix_loop_divergence:lint"
+    assert ctx["signal_name"] == "recurring_class"
+
+    prompt = (task.first_payload or {}).get("prompt", "")
+    assert "RECURRING CROSS-LAYER CLASS META-INVESTIGATION" in prompt
+    assert "fix_loop_divergence:lint" in prompt
+    assert "AT LEAST 2 distinct canonical layers" in prompt
+    assert "PER-CYCLE LAYER HISTORY" in prompt
+
+
+@pytest.mark.asyncio
+async def test_recurring_class_does_not_trip_when_single_layer(db_session):
+    """Class with 3+ cycles all on the same layer does NOT spawn."""
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="fix_loop_divergence:test",
+        status=RegressionCaseStatus.ACTIVE,
+        signal_snapshot_at_spawn={"signal_name": "fix_loop_divergence"},
+        first_seen_at=now - timedelta(days=20),
+        hit_count=3,
+        fingerprint_to_fix_log=[
+            _make_rc_fix_log_entry("CI_WORKFLOW", merged_days_ago=15),
+            _make_rc_fix_log_entry("CI_WORKFLOW", merged_days_ago=10),
+            _make_rc_fix_log_entry("CI_WORKFLOW", merged_days_ago=5),
+        ],
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    await run_once(db_session, project.id)
+
+    tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    rc_tasks = [
+        t
+        for t in tasks
+        if (t.context or {}).get("regression_class", "").startswith("recurring_class:")
+    ]
+    assert len(rc_tasks) == 0
+
+
+@pytest.mark.asyncio
+async def test_recurring_class_deduplicates_within_cooldown(db_session):
+    """Second run_once within cooldown does not re-spawn the same recurring_class meta."""
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="fix_loop_divergence:lint",
+        status=RegressionCaseStatus.ACTIVE,
+        signal_snapshot_at_spawn={"signal_name": "fix_loop_divergence"},
+        first_seen_at=now - timedelta(days=20),
+        hit_count=3,
+        fingerprint_to_fix_log=[
+            _make_rc_fix_log_entry("CI_WORKFLOW", merged_days_ago=15),
+            _make_rc_fix_log_entry("AGENT_VM", merged_days_ago=10),
+            _make_rc_fix_log_entry("CI_WORKFLOW", merged_days_ago=5),
+        ],
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    first = await run_once(db_session, project.id)
+    assert first >= 1
+
+    await run_once(db_session, project.id)
+
+    tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    rc_tasks = [
+        t
+        for t in tasks
+        if (t.context or {}).get("regression_class", "")
+        == "recurring_class:fix_loop_divergence:lint"
+    ]
+    # Only one spawn despite two run_once calls — cooldown deduplicates.
+    assert len(rc_tasks) == 1
+
+
+# ---------------------------------------------------------------------------
+# get_sr_persistent_blind_spot_hint — DB-backed integration tests
+# ---------------------------------------------------------------------------
+
+
+def _make_sr_miss_task(project_id, *, created_at, category="correctness"):
+    """Task where reviewer caught *category* but SR marked it passed."""
+    return make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "x"}],
+        created_at=created_at,
+        context={
+            "_self_review_outcome": {
+                "check_results": {category: {"passed": True}},
+                "reviewer_findings": [
+                    {"category": category, "severity": "HIGH", "description": "missed"}
+                ],
+            }
+        },
+    )
+
+
+def _make_sr_clean_task(project_id, *, created_at):
+    """Task with no reviewer disagreement."""
+    return make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "x"}],
+        created_at=created_at,
+        context={
+            "_self_review_outcome": {
+                "check_results": {"correctness": {"passed": True}},
+                "reviewer_findings": [],
+            }
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_sr_persistent_blind_spot_hint_returns_none_below_threshold(
+    db_session,
+):
+    """Returns None when miss rate is below threshold in one of the two windows."""
+    from app.pipeline_regression_dispatcher import get_sr_persistent_blind_spot_hint
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    # Window 0 (0-7 days): 1 miss / 5 tasks = 0.20 — below 0.25 threshold
+    tasks_w0 = [_make_sr_miss_task(project.id, created_at=now - timedelta(days=2))] + [
+        _make_sr_clean_task(project.id, created_at=now - timedelta(days=2))
+        for _ in range(4)
+    ]
+    # Window 1 (7-14 days): 3 misses / 4 tasks = 0.75 — above 0.25 threshold
+    tasks_w1 = [
+        _make_sr_miss_task(project.id, created_at=now - timedelta(days=10))
+        for _ in range(3)
+    ] + [_make_sr_clean_task(project.id, created_at=now - timedelta(days=10))]
+    for t in tasks_w0 + tasks_w1:
+        db_session.add(t)
+    await db_session.commit()
+
+    result = await get_sr_persistent_blind_spot_hint(db_session, project.id)
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_get_sr_persistent_blind_spot_hint_returns_categories_above_threshold(
+    db_session,
+):
+    """Returns hint dict with categories when miss rate exceeds threshold in both windows."""
+    from app.pipeline_regression_dispatcher import get_sr_persistent_blind_spot_hint
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    # Both windows: 3 misses / 4 tasks = 0.75 — above 0.25 threshold
+    tasks = []
+    for days_ago in (3, 10):
+        tasks += [
+            _make_sr_miss_task(project.id, created_at=now - timedelta(days=days_ago))
+            for _ in range(3)
+        ] + [_make_sr_clean_task(project.id, created_at=now - timedelta(days=days_ago))]
+    for t in tasks:
+        db_session.add(t)
+    await db_session.commit()
+
+    result = await get_sr_persistent_blind_spot_hint(db_session, project.id)
+    assert result is not None
+    assert len(result["categories"]) >= 1
+    cats = [c["category"] for c in result["categories"]]
+    assert "correctness" in cats
+    assert result["hint"] is not None
+    assert "correctness" in result["hint"]

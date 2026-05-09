@@ -1,5 +1,53 @@
 import { describe, it, expect } from 'vitest';
-import { formatSrBlindSpotThemesForSrPrompt, formatExecutionEvidenceForSrPrompt, formatSrRecentMissExamplesForSrPrompt } from './self-review.js';
+import { formatSrBlindSpotThemesForSrPrompt, formatExecutionEvidenceForSrPrompt, formatSrRecentMissExamplesForSrPrompt, formatPersistentBlindSpotHintForSrPrompt } from './self-review.js';
+
+describe('formatPersistentBlindSpotHintForSrPrompt', () => {
+  it('returns empty string for null', () => {
+    expect(formatPersistentBlindSpotHintForSrPrompt(null)).toBe('');
+  });
+
+  it('returns empty string for undefined', () => {
+    expect(formatPersistentBlindSpotHintForSrPrompt(undefined)).toBe('');
+  });
+
+  it('returns empty string when categories is empty', () => {
+    expect(formatPersistentBlindSpotHintForSrPrompt({ categories: [], hint: 'some hint' })).toBe('');
+  });
+
+  it('returns empty string when hint is null', () => {
+    expect(formatPersistentBlindSpotHintForSrPrompt({
+      categories: [{ category: 'correctness', task_type: 'create', rate: 0.4 }],
+      hint: null,
+    })).toBe('');
+  });
+
+  it('returns formatted block with section heading when categories present', () => {
+    const result = formatPersistentBlindSpotHintForSrPrompt({
+      categories: [{ category: 'correctness', task_type: 'create', rate: 0.4 }],
+      hint: 'Persistent self-review blind spots: correctness (40%). Spend extra attention.',
+    });
+    expect(result).toContain('## Persistent Self-Review Blind Spots');
+    expect(result).toContain('correctness');
+    expect(result).toContain('40%');
+  });
+
+  it('includes the backend hint text verbatim', () => {
+    const hint = 'Persistent self-review blind spots (reviewer-disagreement rate over 2 x 7-day windows): scope-drift (35%). Spend extra attention on these categories.';
+    const result = formatPersistentBlindSpotHintForSrPrompt({
+      categories: [{ category: 'scope-drift', task_type: 'create', rate: 0.35 }],
+      hint,
+    });
+    expect(result).toContain(hint);
+  });
+
+  it('returns non-empty string ending with double newline when populated', () => {
+    const result = formatPersistentBlindSpotHintForSrPrompt({
+      categories: [{ category: 'security', task_type: 'fix', rate: 0.3 }],
+      hint: 'Persistent blind spots: security (30%).',
+    });
+    expect(result.endsWith('\n\n')).toBe(true);
+  });
+});
 
 describe('formatExecutionEvidenceForSrPrompt', () => {
   it('includes all three category names', () => {

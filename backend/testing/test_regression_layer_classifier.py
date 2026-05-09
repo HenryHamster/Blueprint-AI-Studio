@@ -8,9 +8,11 @@ from app.regression_layer_classifier import (
     LAYER_CI_WORKFLOW,
     LAYER_REVIEWER_PASS,
     LAYER_VIEWPORT,
+    aggregate_targeted_layers,
     build_layer_meta_block,
     classify_layers,
     compute_untargeted_layers,
+    is_recurring_cross_layer_class,
 )
 
 
@@ -404,3 +406,117 @@ class TestComputeUntargetedLayers:
         fix_log = [{"layers_targeted": [LAYER_AGENT_VM]}]
         result = compute_untargeted_layers(fix_log)
         assert all(layer in ALL_LAYERS for layer in result)
+
+
+# ---------------------------------------------------------------------------
+# aggregate_targeted_layers
+# ---------------------------------------------------------------------------
+
+
+class TestAggregateTargetedLayers:
+    def test_empty_entries_returns_empty_set(self):
+        assert aggregate_targeted_layers([]) == set()
+
+    def test_none_entries_returns_empty_set(self):
+        assert aggregate_targeted_layers(None) == set()  # type: ignore[arg-type]
+
+    def test_single_entry_single_layer(self):
+        result = aggregate_targeted_layers([{"layers_targeted": [LAYER_AGENT_VM]}])
+        assert result == {LAYER_AGENT_VM}
+
+    def test_multi_entry_multi_layer_union(self):
+        entries = [
+            {"layers_targeted": [LAYER_CI_WORKFLOW]},
+            {"layers_targeted": [LAYER_AGENT_VM, LAYER_BASELINE_GATE]},
+        ]
+        result = aggregate_targeted_layers(entries)
+        assert result == {LAYER_CI_WORKFLOW, LAYER_AGENT_VM, LAYER_BASELINE_GATE}
+
+    def test_unknown_layers_silently_dropped(self):
+        entries = [{"layers_targeted": ["UNKNOWN_LAYER", LAYER_REVIEWER_PASS]}]
+        result = aggregate_targeted_layers(entries)
+        assert result == {LAYER_REVIEWER_PASS}
+        assert "UNKNOWN_LAYER" not in result
+
+    def test_entries_without_layers_targeted_skipped(self):
+        entries = [{"fingerprint": "x"}, {"layers_targeted": [LAYER_AGENT_VERB]}]
+        result = aggregate_targeted_layers(entries)
+        assert result == {LAYER_AGENT_VERB}
+
+    def test_non_dict_entries_skipped(self):
+        entries = ["not-a-dict", {"layers_targeted": [LAYER_CI_WORKFLOW]}]
+        result = aggregate_targeted_layers(entries)  # type: ignore[arg-type]
+        assert result == {LAYER_CI_WORKFLOW}
+
+    def test_result_is_subset_of_all_layers(self):
+        entries = [
+            {"layers_targeted": [LAYER_CI_WORKFLOW, LAYER_AGENT_VM]},
+        ]
+        result = aggregate_targeted_layers(entries)
+        assert result <= ALL_LAYERS
+
+
+# ---------------------------------------------------------------------------
+# is_recurring_cross_layer_class
+# ---------------------------------------------------------------------------
+
+
+class TestIsRecurringCrossLayerClass:
+    def _make_entry(self, layers: list[str]) -> dict:
+        return {"layers_targeted": layers, "merged_at": "2026-01-01T00:00:00Z"}
+
+    def test_trips_when_class_spans_2_layers_across_3_cycles(self):
+        """3 fix cycles across CI_WORKFLOW and AGENT_VM → True."""
+        entries = [
+            self._make_entry([LAYER_CI_WORKFLOW]),
+            self._make_entry([LAYER_AGENT_VM]),
+            self._make_entry([LAYER_CI_WORKFLOW]),
+        ]
+        assert is_recurring_cross_layer_class(entries) is True
+
+    def test_does_not_trip_when_single_layer(self):
+        """3+ cycles but only one distinct canonical layer → False."""
+        entries = [
+            self._make_entry([LAYER_BASELINE_GATE]),
+            self._make_entry([LAYER_BASELINE_GATE]),
+            self._make_entry([LAYER_BASELINE_GATE]),
+        ]
+        assert is_recurring_cross_layer_class(entries) is False
+
+    def test_does_not_trip_below_min_cycles(self):
+        """Only 2 cycles even with 2 distinct layers → False (default min is 3)."""
+        entries = [
+            self._make_entry([LAYER_CI_WORKFLOW]),
+            self._make_entry([LAYER_AGENT_VM]),
+        ]
+        assert is_recurring_cross_layer_class(entries) is False
+
+    def test_custom_thresholds_respected(self):
+        entries = [
+            self._make_entry([LAYER_CI_WORKFLOW]),
+            self._make_entry([LAYER_AGENT_VM]),
+        ]
+        assert (
+            is_recurring_cross_layer_class(entries, min_cycles=2, min_layers=2) is True
+        )
+
+    def test_empty_entries_returns_false(self):
+        assert is_recurring_cross_layer_class([]) is False
+
+    def test_entries_without_layers_targeted_do_not_count_towards_layers(self):
+        entries = [
+            {"fingerprint": "x"},
+            {"fingerprint": "y"},
+            {"fingerprint": "z"},
+        ]
+        assert is_recurring_cross_layer_class(entries) is False
+
+    def test_exactly_min_cycles_and_min_layers_trips(self):
+        entries = [
+            self._make_entry([LAYER_CI_WORKFLOW]),
+            self._make_entry([LAYER_AGENT_VM]),
+            self._make_entry([LAYER_REVIEWER_PASS]),
+        ]
+        assert (
+            is_recurring_cross_layer_class(entries, min_cycles=3, min_layers=2) is True
+        )

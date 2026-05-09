@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { X, MessageSquare, Send, Check, AlertTriangle, HelpCircle, Bug, StickyNote, ChevronDown, PlusCircle, Trash2, CheckSquare, ArrowDown, Reply, Settings, ChevronUp, BellOff, Save, MoreVertical, Pencil } from 'lucide-react';
 import { auth } from '../firebase';
-import { apiFetch, API_BASE_URL } from '../api';
+import { apiFetch, API_BASE_URL, authHeaders } from '../api';
 import { parseTimestamp } from '../utils/time';
 import { routineSummary, effectiveSignal, loadEventPrefs, saveEventPrefs, type EventPref, groupRoutineMessages, collapseStaleRoutineRows, formatDailyDigestSummary, outcomeBreakdown, isFailingGroup, getToastSeverity, type RoutineRow, loadLastSeen, saveLastSeen, formatTimestamp, insertTimeDividers, type MessageWithDivider, ESCALATION_BADGE_LABELS, isCriticalSeverity, type MuteWindow, loadMuteWindow, saveMuteWindow, clearMuteWindow, isMuteWindowActive, formatMuteCountdown, type SavedView, loadSavedViews, saveSavedViews, SAVED_VIEWS_CAP } from './MessagesPanel.utils';
 
@@ -63,6 +63,7 @@ interface WebhookStats {
 
 interface MessagesPanelProps {
   selectedProjectId: string | null;
+  githubRepo?: string | null;
   onClose: () => void;
   addToast: (message: string, type: 'success' | 'error' | 'info') => void;
   onMessageCountChange?: (count: number) => void;
@@ -223,7 +224,7 @@ function ContextBadges({ context, fromType }: { context: Record<string, unknown>
 }
 
 
-export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageCountChange, onOpenTask }: MessagesPanelProps) {
+export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast, onMessageCountChange, onOpenTask }: MessagesPanelProps) {
   const [messages, setMessages] = useState<ProjectMessage[]>([]);
   const [loading, setLoading] = useState(true);
   // Compose
@@ -238,6 +239,8 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
   const [resolveInput, setResolveInput] = useState('');
   const [deletingIds, setDeletingIds] = useState<Set<string>>(new Set());
   const [creatingDirectionIds, setCreatingDirectionIds] = useState<Set<string>>(new Set());
+  const [investigatingId, setInvestigatingId] = useState<string | null>(null);
+  const [investigatingIds, setInvestigatingIds] = useState<Set<string>>(new Set());
 
   // Batch selection
   const [selectMode, setSelectMode] = useState(false);
@@ -874,6 +877,39 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
     }
   }
 
+  async function handleCreateInvestigation(msg: ProjectMessage): Promise<boolean> {
+    if (!selectedProjectId || !githubRepo) return false;
+    setInvestigatingIds(prev => new Set(prev).add(msg.id));
+    try {
+      const lines = msg.content.split('\n');
+      const title = lines[0].slice(0, 100);
+      const prompt = `${msg.content}\n\nOriginal message: ${msg.id}`;
+      const res = await fetch(`${API_BASE_URL}/api/admin/tasks`, {
+        method: 'POST',
+        headers: await authHeaders(),
+        body: JSON.stringify({
+          github_repo: githubRepo,
+          title,
+          prompt,
+          base_branch: 'main',
+          task_type: 'investigate',
+        }),
+      });
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData?.detail || errData?.error?.message || `HTTP ${res.status}`);
+      }
+      setInvestigatingId(null);
+      addToast('Investigation task created', 'success');
+      return true;
+    } catch (err) {
+      addToast(`Failed to create investigation: ${err instanceof Error ? err.message : 'Unknown error'}`, 'error');
+      return false;
+    } finally {
+      setInvestigatingIds(prev => { const next = new Set(prev); next.delete(msg.id); return next; });
+    }
+  }
+
   const KEEP_RESOLVED = 20;
 
   async function handleBulkDeleteResolved() {
@@ -1037,6 +1073,36 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
                 >
                   <PlusCircle className="w-3.5 h-3.5" />
                 </button>
+              )}
+              {(msg.message_type === 'BLOCKER' || msg.message_type === 'BUG_REPORT') && investigatingId !== msg.id && !investigatingIds.has(msg.id) && (
+                <button
+                  onClick={() => setInvestigatingId(msg.id)}
+                  disabled={investigatingIds.has(msg.id)}
+                  title="Investigate"
+                  className="text-amber-500/70 hover:text-amber-400 p-2.5 md:p-1.5 rounded transition-colors disabled:opacity-30 min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center"
+                >
+                  <AlertTriangle className="w-3.5 h-3.5" />
+                </button>
+              )}
+              {investigatingId === msg.id && (
+                <div className="flex items-center gap-1 bg-neutral-900 border border-neutral-700 rounded-lg px-2 py-1 ml-1">
+                  <span className="text-xs text-neutral-400 whitespace-nowrap">Spawn investigation?</span>
+                  <button
+                    onClick={() => handleCreateInvestigation(msg)}
+                    disabled={investigatingIds.has(msg.id)}
+                    className="text-amber-400 hover:text-amber-300 p-1 rounded transition-colors disabled:opacity-30 min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center"
+                    title="Confirm investigation"
+                  >
+                    <Check className="w-3 h-3" />
+                  </button>
+                  <button
+                    onClick={() => setInvestigatingId(null)}
+                    className="text-neutral-500 hover:text-neutral-400 p-1 rounded transition-colors min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center"
+                    title="Cancel"
+                  >
+                    <X className="w-3 h-3" />
+                  </button>
+                </div>
               )}
               {!isResolving ? (
                 <button

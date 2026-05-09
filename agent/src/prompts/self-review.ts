@@ -187,6 +187,25 @@ export function formatSrRecentMissExamplesForSrPrompt(
   );
 }
 
+// Format a persistent blind-spot tightening hint for injection into the agent's
+// self-review prompt. Consumed when a category's reviewer-disagreement rate
+// exceeds the threshold for ≥2 consecutive aggregation windows (computed by
+// sr_blind_spots.compute_persistent_sr_blind_spot_hint in the backend).
+// Returns '' when no persistent categories are present or hint is absent.
+export function formatPersistentBlindSpotHintForSrPrompt(
+  data: {
+    categories: Array<{ category: string; task_type: string; rate: number }>;
+    hint: string | null;
+  } | null | undefined,
+): string {
+  if (!data || !Array.isArray(data.categories) || data.categories.length === 0) return '';
+  if (!data.hint) return '';
+  return (
+    `## Persistent Self-Review Blind Spots\n` +
+    `${data.hint}\n\n`
+  );
+}
+
 // Format blind-spot themes for injection into the agent's own self-review prompt.
 // Unlike formatProjectBlindSpotSummary (which addresses a reviewer reading the diff),
 // this section is written TO the agent — framing themes as categories it has historically
