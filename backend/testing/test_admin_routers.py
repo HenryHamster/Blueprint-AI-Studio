@@ -877,6 +877,28 @@ class TestMessages:
         assert resp.status_code == 400
 
     @pytest.mark.asyncio
+    async def test_create_routine_message_appends_running_update(
+        self, client: AsyncClient, db_session
+    ):
+        """Creating a NOTE with a routine event_type appends a digest to running_update."""
+        project = await _make_project(db_session)
+
+        resp = await client.post(
+            "/api/admin/messages",
+            json={
+                "project_id": str(project.id),
+                "message_type": "NOTE",
+                "content": "PR #123 merged into main",
+                "context": {"event_type": "pr_merged"},
+            },
+        )
+        assert resp.status_code == 200
+        await db_session.refresh(project)
+        assert project.running_update is not None
+        assert "pr_merged" in project.running_update
+        assert "PR #123 merged into main" in project.running_update
+
+    @pytest.mark.asyncio
     async def test_resolve_message(self, client: AsyncClient, db_session):
         """An open message can be resolved."""
         project = await _make_project(db_session)

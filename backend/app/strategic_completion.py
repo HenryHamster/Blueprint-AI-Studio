@@ -1660,15 +1660,25 @@ async def _handle_strategic_completion(
             msg_type = MessageType(msg_entry.get("type", "NOTE").upper())
         except ValueError:
             msg_type = MessageType.NOTE
+        _msg_ctx = msg_entry.get("context") or {}
         new_msg = ProjectMessage(
             project_id=project.id,
             message_type=msg_type,
             from_type="strategic",
             from_task_id=task.id,
             content=content,
-            context=msg_entry.get("context") or {},
+            context=_msg_ctx,
         )
         session.add(new_msg)
+        _event_type = _msg_ctx.get("event_type") if isinstance(_msg_ctx, dict) else None
+        if _event_type:
+            from app.routers.admin_notifications import (  # noqa: PLC0415
+                ROUTINE_EVENT_TYPES as _ROUTINE_EVENT_TYPES,
+                append_routine_digest as _append_routine_digest,
+            )
+
+            if _event_type in _ROUTINE_EVENT_TYPES:
+                _append_routine_digest(project, _event_type, content)
         msgs_created += 1
 
     # Resolve messages the agent addressed

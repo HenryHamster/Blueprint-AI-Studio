@@ -42,21 +42,6 @@ describe('viewport test coverage invariant', () => {
       // Internal mapper: generates chip DOM from phase data; not standalone,
       // layout controlled by parent container.
       'regressionPhaseChips',
-      // Utility component: renders member list rows inside ProjectMembers table;
-      // not standalone. Defer viewport test pending table layout clarification.
-      'ProjectMembers',
-      // Internal component: renders analysis metadata inside ResearchBrowser;
-      // layout controlled by parent. Defer pending parent viewport coverage.
-      'ProblemModelViewer',
-      // Internal component: renders editor inside ResearchBrowser; layout
-      // controlled by parent. Defer pending parent viewport coverage.
-      'ProblemModelEditor',
-      // Renders status row in MetricsDashboard/HeaderBar; layout delegated
-      // to parent. Defer viewport test pending parent clarification.
-      'StatusBar',
-      // Utility component: renders status row in strategic direction contexts;
-      // layout handled by parent. Defer viewport test pending parent viewport gate.
-      'StrategicStatus',
     ]);
 
     const missingTests = components

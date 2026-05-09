@@ -3428,3 +3428,61 @@ class TestFormatFindingsForPrompt:
         assert result.count("\n") == 4  # 5 lines = 4 newlines
         assert "T0" in result
         assert "T5" not in result
+
+
+# ── Routine event digest → project.running_update ────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_strategic_completion_appends_routine_digest_to_running_update(
+    db_session, mocker
+):
+    """Fallback path: messages with routine event_types append a one-line digest
+    to project.running_update in addition to creating a ProjectMessage row."""
+    import json
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="P",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[],
+        running_update=None,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "messages": [
+                {
+                    "type": "NOTE",
+                    "content": "PR #42 merged successfully",
+                    "context": {"event_type": "pr_merged"},
+                }
+            ],
+        }
+    )
+
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    assert project.running_update is not None
+    assert "pr_merged" in project.running_update
+    assert "PR #42 merged" in project.running_update

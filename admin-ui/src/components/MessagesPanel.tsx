@@ -1248,6 +1248,17 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
     <div className="flex-1 overflow-hidden flex flex-col min-h-0">
       {/* Header */}
       <div className="px-4 md:px-6 py-3 border-b border-neutral-800 flex flex-col gap-2 shrink-0">
+        {/* Persistent last-visit anchor */}
+        {dividerTime && (
+          <div className="flex items-center gap-2 text-xs text-neutral-500 px-1">
+            <span>Last visit: {formatTimestamp(dividerTime)}</span>
+            {newHighSignalCount + newMessageCounts.blockers + newMessageCounts.feedback + newMessageCounts.bugReports + newMessageCounts.routine > 0 && (
+              <span className="text-blue-400 font-medium">
+                ({newHighSignalCount + newMessageCounts.blockers + newMessageCounts.feedback + newMessageCounts.bugReports + newMessageCounts.routine} new)
+              </span>
+            )}
+          </div>
+        )}
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
             <MessageSquare className="w-4 h-4 text-neutral-400" />

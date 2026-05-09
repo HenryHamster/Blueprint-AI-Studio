@@ -297,6 +297,18 @@ class Project(SQLModel, table=True):
         sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
     )
 
+    def append_routine_digest(self, event_type: str, summary: str) -> None:
+        """Append a one-line digest entry for a routine event to running_update.
+
+        Canonical home for this logic — callers (notification_dispatch, admin_notifications,
+        strategic_completion) mutate running_update through this method so the format stays
+        consistent. Does NOT commit — caller is responsible for session.add(project).
+        """
+        now_str = _utcnow().strftime("%Y-%m-%d %H:%M")
+        line = f"- [{now_str}] **{event_type}**: {summary[:200]}"
+        current = (self.running_update or "").rstrip()
+        self.running_update = f"{current}\n{line}" if current else line
+
     tasks: List["Task"] = Relationship(
         back_populates="project",
         sa_relationship_kwargs={"cascade": "all, delete-orphan"},

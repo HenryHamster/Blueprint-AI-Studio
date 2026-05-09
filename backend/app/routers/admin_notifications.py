@@ -17,6 +17,7 @@ from sqlmodel import select
 from app.database import get_session
 from app.models import (
     Alert,
+    Project,
     ProjectMember,
     ProjectMessage,
     MessageType,
@@ -70,6 +71,36 @@ class AdminPlaybookSet(BaseModel):
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 _ADMIN_PLAYBOOK_KEY_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9\-]{0,49}$")
+
+# Mirrors ROUTINE_EVENT_LABELS keys in admin-ui/src/components/MessagesPanel.utils.ts.
+# Events in this set trigger a one-line digest appended to project.running_update.
+ROUTINE_EVENT_TYPES: frozenset = frozenset(
+    {
+        "pr_merged",
+        "direction_milestone",
+        "cycle_summary",
+        "account_model_regression_quarantined",
+        "account_model_regression_recovered",
+        "auto_fix_spawned",
+        "auto_fix_result",
+        "residual_fix_spawned",
+        "residual_fix_result",
+        "residual_fix_unsuspended",
+        "residual_case_auto_resolved",
+        "issue_implementation_spawned",
+        "review_feedback",
+        "feedback_acknowledgment",
+    }
+)
+
+
+def append_routine_digest(project: Project, event_type: str, summary: str) -> None:
+    """Append a one-line digest entry for a routine event to project.running_update."""
+    now_str = _utcnow().strftime("%Y-%m-%d %H:%M")
+    line = f"- [{now_str}] **{event_type}**: {summary[:200]}"
+    current = (project.running_update or "").rstrip()
+    project.running_update = f"{current}\n{line}" if current else line
+
 
 from app.payload_schemas import ALL_TASK_TYPES as _VALID_TASK_TYPES  # noqa: E402
 
@@ -340,7 +371,7 @@ async def create_message(
     except (ValueError, TypeError):
         raise HTTPException(status_code=400, detail="Invalid project_id format")
     # Verify user has access
-    await _get_user_project(project_id, current_user["user_id"], session)
+    project = await _get_user_project(project_id, current_user["user_id"], session)
 
     valid_types = {t.value for t in MessageType}
     msg_type = payload.message_type.upper()
@@ -364,6 +395,9 @@ async def create_message(
         context=ctx,
     )
     session.add(msg)
+    event_type = ctx.get("event_type")
+    if event_type and event_type in ROUTINE_EVENT_TYPES:
+        append_routine_digest(project, event_type, payload.content.strip())
     await session.commit()
     await session.refresh(msg)
     return {"id": str(msg.id), "status": "created"}
