@@ -988,6 +988,71 @@ class TestMessages:
         assert resp.status_code == 400
 
 
+class TestMessagesLastSeen:
+    @pytest.mark.asyncio
+    async def test_get_last_seen_empty(self, client: AsyncClient, db_session):
+        """Returns null when no last-seen record exists for the operator."""
+        project = await _make_project(db_session)
+        resp = await client.get(
+            f"/api/admin/messages/last-seen?project_id={project.id}"
+        )
+        assert resp.status_code == 200
+        assert resp.json()["last_seen_at"] is None
+
+    @pytest.mark.asyncio
+    async def test_round_trip(self, client: AsyncClient, db_session):
+        """PUT stores the timestamp; subsequent GET returns the same value."""
+        project = await _make_project(db_session)
+        ts = 1_700_000_000_000  # arbitrary ms epoch
+
+        put_resp = await client.put(
+            "/api/admin/messages/last-seen",
+            json={"project_id": str(project.id), "timestamp": ts},
+        )
+        assert put_resp.status_code == 200
+        assert put_resp.json()["last_seen_at"] == ts
+
+        get_resp = await client.get(
+            f"/api/admin/messages/last-seen?project_id={project.id}"
+        )
+        assert get_resp.status_code == 200
+        assert get_resp.json()["last_seen_at"] == ts
+
+    @pytest.mark.asyncio
+    async def test_update_advances_timestamp(self, client: AsyncClient, db_session):
+        """A second PUT overwrites the previous value."""
+        project = await _make_project(db_session)
+        ts1, ts2 = 1_700_000_000_000, 1_700_000_060_000
+
+        await client.put(
+            "/api/admin/messages/last-seen",
+            json={"project_id": str(project.id), "timestamp": ts1},
+        )
+        await client.put(
+            "/api/admin/messages/last-seen",
+            json={"project_id": str(project.id), "timestamp": ts2},
+        )
+        get_resp = await client.get(
+            f"/api/admin/messages/last-seen?project_id={project.id}"
+        )
+        assert get_resp.json()["last_seen_at"] == ts2
+
+    @pytest.mark.asyncio
+    async def test_no_access_returns_404(self, client: AsyncClient, db_session):
+        """Cannot read or write last-seen for a project the user is not a member of."""
+        random_pid = str(uuid.uuid4())
+        get_resp = await client.get(
+            f"/api/admin/messages/last-seen?project_id={random_pid}"
+        )
+        assert get_resp.status_code == 404
+
+        put_resp = await client.put(
+            "/api/admin/messages/last-seen",
+            json={"project_id": random_pid, "timestamp": 1_700_000_000_000},
+        )
+        assert put_resp.status_code == 404
+
+
 class TestPlaybook:
     @pytest.mark.asyncio
     async def test_playbook_list_empty(self, client: AsyncClient, db_session):

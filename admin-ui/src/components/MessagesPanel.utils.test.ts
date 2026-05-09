@@ -25,6 +25,9 @@ import {
   isMuteWindowActive,
   formatMuteCountdown,
   muteWindowKey,
+  loadLastSeen,
+  saveLastSeen,
+  resolveLastSeen,
 } from './MessagesPanel.utils';
 
 describe('MessagesPanel.utils - Event Preferences', () => {
@@ -700,5 +703,51 @@ describe('Failing group detection (mute escape hatch)', () => {
       { id: 'msg2', context: { result: 'merged' } },
     ];
     expect(isFailingGroup(msgs)).toBe(false);
+  });
+});
+
+// ── Last-seen storage utilities ───────────────────────────────────────────────
+
+describe('loadLastSeen / saveLastSeen', () => {
+  beforeEach(() => { localStorage.clear(); });
+  afterEach(() => { localStorage.clear(); });
+
+  test('round-trips a timestamp correctly', () => {
+    const ts = Date.now() - 5000;
+    saveLastSeen('user1', 'proj1', ts);
+    expect(loadLastSeen('user1', 'proj1')).toBe(ts);
+  });
+
+  test('returns null when no entry exists', () => {
+    expect(loadLastSeen('user1', 'proj1')).toBeNull();
+  });
+
+  test('two users have independent last-seen values for the same project', () => {
+    saveLastSeen('user1', 'proj1', 1000);
+    saveLastSeen('user2', 'proj1', 2000);
+    expect(loadLastSeen('user1', 'proj1')).toBe(1000);
+    expect(loadLastSeen('user2', 'proj1')).toBe(2000);
+  });
+});
+
+describe('resolveLastSeen (backend + localStorage merge)', () => {
+  test('prefers backend when it is more recent', () => {
+    expect(resolveLastSeen(100, 200)).toBe(200);
+  });
+
+  test('prefers localStorage when it is more recent', () => {
+    expect(resolveLastSeen(300, 200)).toBe(300);
+  });
+
+  test('falls back to localStorage when backend is null (offline fallback)', () => {
+    expect(resolveLastSeen(100, null)).toBe(100);
+  });
+
+  test('returns backend when localStorage is null', () => {
+    expect(resolveLastSeen(null, 200)).toBe(200);
+  });
+
+  test('returns null when both sources are null', () => {
+    expect(resolveLastSeen(null, null)).toBeNull();
   });
 });

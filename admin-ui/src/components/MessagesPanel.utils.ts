@@ -370,6 +370,14 @@ export function saveLastSeen(userId: string | null | undefined, projectId: strin
   } catch { /* ignore */ }
 }
 
+// Merges a localStorage timestamp with a backend timestamp, preferring the more recent value.
+// Returns null when both are absent. Use this to implement the offline fallback: pass backend
+// result (or null if the fetch failed) and let the function select the correct source.
+export function resolveLastSeen(localTs: number | null, backendTs: number | null): number | null {
+  if (localTs !== null && backendTs !== null) return Math.max(localTs, backendTs);
+  return backendTs ?? localTs;
+}
+
 // ── Time-window mute (hides routine ops for a chosen duration) ────────────────
 
 export type MuteWindow = { expiresAt: number };

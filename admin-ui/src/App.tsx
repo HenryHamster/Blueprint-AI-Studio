@@ -74,9 +74,25 @@ export default function App() {
     localStorage.setItem(SORT_KEY, sortBy);
   }, [sortBy]);
 
+  // Update browser tab title with unread message count
+  useEffect(() => {
+    if (openMessageCount > 0) {
+      document.title = `(${openMessageCount}) Blueprint AI Studio`;
+    } else {
+      document.title = 'Blueprint AI Studio';
+    }
+  }, [openMessageCount]);
+
   // Fetch open message count periodically (when panel is closed the callback won't fire)
   const selectedProjectId = s.selectedProjectId;
   const showMessages = s.showMessages;
+
+  // Clear message count when panel opens
+  useEffect(() => {
+    if (showMessages) {
+      setOpenMessageCount(0);
+    }
+  }, [showMessages]);
   useEffect(() => {
     if (!selectedProjectId || showMessages) return;
     const pid = selectedProjectId; // narrowed to string

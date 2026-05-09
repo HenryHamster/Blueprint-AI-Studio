@@ -1149,6 +1149,7 @@ interface EscalationOutcomeData {
 
 const ESCALATION_BUCKET_LABELS: Record<string, string> = {
   escalated_cross_layer: 'Cross-layer',
+  compliance_followup: '↳ Compliance re-fix',
   escalated_layer_concentration: 'Layer conc.',
   escalated_cross_case_fingerprint: 'Cross-case fp',
   escalated_recurrence: 'Recurrence',
@@ -1192,8 +1193,8 @@ export function EscalationOutcomePanel({ projectId }: Props) {
           </thead>
           <tbody className="divide-y divide-neutral-800/30">
             {buckets.map(([reason, b]) => (
-              <tr key={reason} className={reason === 'all_other' ? 'border-t border-neutral-700/50' : ''}>
-                <td className="px-3 py-1.5 text-neutral-300 truncate max-w-[120px]">
+              <tr key={reason} className={`${reason === 'all_other' ? 'border-t border-neutral-700/50' : ''} ${reason === 'compliance_followup' ? 'bg-neutral-800/20' : ''}`}>
+                <td className={`py-1.5 truncate max-w-[120px] ${reason === 'compliance_followup' ? 'px-3 text-neutral-400 italic' : 'px-3 text-neutral-300'}`}>
                   {ESCALATION_BUCKET_LABELS[reason] ?? reason}
                 </td>
                 <td className="px-2 py-1.5 text-right text-white">{b.merged_count || <span className="text-neutral-600">—</span>}</td>

@@ -4,6 +4,7 @@ import logging
 import re
 import uuid
 import json
+from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -14,7 +15,14 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.database import get_session
-from app.models import Alert, ProjectMember, ProjectMessage, MessageType, _utcnow
+from app.models import (
+    Alert,
+    ProjectMember,
+    ProjectMessage,
+    MessageType,
+    MessagesLastSeen,
+    _utcnow,
+)
 from app.auth import get_current_user
 from app.shared_state import limiter
 from app.admin import _get_user_project, _get_user_project_with_role, _user_project_ids
@@ -42,6 +50,11 @@ class MessageCreate(BaseModel):
 
 class MessageResolve(BaseModel):
     resolution: Optional[str] = None
+
+
+class LastSeenUpdate(BaseModel):
+    project_id: str
+    timestamp: int  # Unix ms epoch
 
 
 class AdminPlaybookSet(BaseModel):
@@ -394,6 +407,78 @@ async def delete_message(
     await session.delete(msg)
     await session.commit()
     return {"deleted": True}
+
+
+# ── Messages Last-Seen Endpoints ─────────────────────────────────────────────
+
+
+@router.get("/messages/last-seen")
+async def get_messages_last_seen(
+    project_id: str = Query(...),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return the operator's last-seen timestamp (ms epoch) for the messages panel divider."""
+    try:
+        pid = uuid.UUID(project_id)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid project_id format")
+    await _get_user_project(pid, current_user["user_id"], session)
+
+    row = (
+        await session.execute(
+            select(MessagesLastSeen).where(
+                MessagesLastSeen.user_id == current_user["user_id"],
+                MessagesLastSeen.project_id == pid,
+            )
+        )
+    ).scalar_one_or_none()
+
+    if row is None:
+        return {"last_seen_at": None}
+    return {"last_seen_at": int(row.last_seen_at.timestamp() * 1000)}
+
+
+@router.put("/messages/last-seen")
+async def put_messages_last_seen(
+    payload: LastSeenUpdate,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Upsert the operator's last-seen timestamp (ms epoch) for the messages panel divider."""
+    try:
+        pid = uuid.UUID(payload.project_id)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid project_id format")
+    await _get_user_project(pid, current_user["user_id"], session)
+
+    new_ts = datetime.fromtimestamp(
+        payload.timestamp / 1000.0, tz=timezone.utc
+    ).replace(tzinfo=None)
+
+    row = (
+        await session.execute(
+            select(MessagesLastSeen).where(
+                MessagesLastSeen.user_id == current_user["user_id"],
+                MessagesLastSeen.project_id == pid,
+            )
+        )
+    ).scalar_one_or_none()
+
+    if row is None:
+        row = MessagesLastSeen(
+            user_id=current_user["user_id"],
+            project_id=pid,
+            last_seen_at=new_ts,
+            updated_at=new_ts,
+        )
+    else:
+        row.last_seen_at = new_ts
+        row.updated_at = _utcnow()
+
+    session.add(row)
+    await session.commit()
+    return {"status": "ok", "last_seen_at": int(new_ts.timestamp() * 1000)}
 
 
 # ── Admin Playbook Endpoints ──────────────────────────────────────────────────

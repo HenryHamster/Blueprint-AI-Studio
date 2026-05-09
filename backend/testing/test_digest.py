@@ -14938,6 +14938,95 @@ async def test_acknowledge_regression_case_not_found(client: AsyncClient, db_ses
 
 
 # ---------------------------------------------------------------------------
+# /api/admin/regression-dispatcher/escalation-outcomes
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_regression_escalation_outcomes_baseline_vs_compliance_followup(
+    client: AsyncClient, db_session
+):
+    """Baseline cross-layer fix and compliance-followup fix bucket separately with independent prevention rates."""
+    from app.pipeline_regression_dispatcher import (
+        ESCALATION_REASON_ESCALATED_CROSS_LAYER,
+        _ESCALATION_BUCKET_COMPLIANCE_FOLLOWUP,
+    )
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    baseline_merged = (now - timedelta(days=35)).isoformat()
+    cf_original_merged = (now - timedelta(days=50)).isoformat()
+    cf_followup_merged = (now - timedelta(days=35)).isoformat()
+
+    # Baseline: compliant multi-layer fix, no compliance-followup marker → escalated_cross_layer bucket
+    baseline_case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate:correctness",
+        status=RegressionCaseStatus.ACTIVE,
+        escalation_reason=ESCALATION_REASON_ESCALATED_CROSS_LAYER,
+        first_seen_at=now - timedelta(days=55),
+        fingerprint_to_fix_log=[
+            {
+                "fix_pr_number": 1,
+                "merged_at": baseline_merged,
+                "layers_targeted": ["BACKEND", "FRONTEND"],
+            },
+        ],
+    )
+    db_session.add(baseline_case)
+
+    # Compliance-followup: original non-compliant fix + spawned marker + followup fix → compliance_followup bucket
+    cf_case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate:architecture",
+        status=RegressionCaseStatus.ACTIVE,
+        escalation_reason=ESCALATION_REASON_ESCALATED_CROSS_LAYER,
+        first_seen_at=now - timedelta(days=55),
+        fingerprint_to_fix_log=[
+            {
+                "fix_pr_number": 2,
+                "merged_at": cf_original_merged,
+                "layers_targeted": ["BACKEND"],
+            },
+            {
+                "type": "compliance_followup_spawned",
+                "spawned_at": (now - timedelta(days=42)).isoformat(),
+            },
+            {
+                "fix_pr_number": 3,
+                "merged_at": cf_followup_merged,
+                "layers_targeted": ["BACKEND", "FRONTEND"],
+            },
+        ],
+    )
+    db_session.add(cf_case)
+    await db_session.commit()
+
+    response = await client.get(
+        "/api/admin/regression-dispatcher/escalation-outcomes",
+        params={"project_id": str(project.id), "lookback_days": 60},
+    )
+    assert response.status_code == 200
+    by = response.json()["by_reason"]
+
+    # Baseline fix stays in cross_layer bucket with durable prevention
+    b_cross = by[ESCALATION_REASON_ESCALATED_CROSS_LAYER]
+    assert b_cross["merged_count"] == 1
+    assert (
+        b_cross["prevention_rate_30d"] == 1.0
+    )  # no retrip within 30d of baseline merge
+
+    # Compliance-followup fix lands in its own bucket with independent prevention rate
+    b_cf = by[_ESCALATION_BUCKET_COMPLIANCE_FOLLOWUP]
+    assert b_cf["merged_count"] == 1
+    assert b_cf["prevention_rate_30d"] == 1.0  # cf fix held, no retrip within 30d
+
+
+# ---------------------------------------------------------------------------
 # _evaluate_sr_catch_rate_targets tests
 # ---------------------------------------------------------------------------
 

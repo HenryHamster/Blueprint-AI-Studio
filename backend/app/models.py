@@ -321,6 +321,33 @@ class ProjectMember(SQLModel, table=True):
     )
 
 
+class MessagesLastSeen(SQLModel, table=True):
+    """Per-operator, per-project last-seen timestamp for the messages panel divider.
+
+    Enables cross-device persistence of the since-last-visit divider position.
+    localStorage remains the offline fallback; this table is the authoritative
+    source when the backend is reachable.
+    """
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    user_id: str = Field(index=True, max_length=128)
+    project_id: uuid.UUID = Field(foreign_key="project.id", index=True)
+    last_seen_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False),
+    )
+    updated_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, onupdate=_utcnow),
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id", "project_id", name="uq_messageslastseen_user_project"
+        ),
+    )
+
+
 class Task(SQLModel, table=True):
     """
     Extensible Task model. The 'payloads' JSONB column holds a flexible list

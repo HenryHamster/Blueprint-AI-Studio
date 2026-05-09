@@ -4,7 +4,7 @@ import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 vi.mock('../api', () => ({ apiFetch: vi.fn(), authHeaders: vi.fn(), API_BASE_URL: '' }));
 
 import { apiFetch } from '../api';
-import { ManualInterventionPanel, AutoRecoveredPanel } from './PipelineRegressionsPanel';
+import { ManualInterventionPanel, AutoRecoveredPanel, EscalationOutcomePanel } from './PipelineRegressionsPanel';
 
 const apiFetchMock = apiFetch as unknown as ReturnType<typeof vi.fn>;
 const response = (cases: unknown[]): Response =>
@@ -230,5 +230,36 @@ describe('AutoRecoveredPanel — layer badges', () => {
     expect(screen.getByTestId('layer-badge-AGENT_VERB')).toHaveTextContent('VERB · 1');
     expect(screen.getByTestId('layer-badge-CI_WORKFLOW')).toHaveTextContent('CI · 1');
     expect(screen.getByTestId('cross-layer-badge')).toBeInTheDocument();
+  });
+});
+
+const escalationResponse = (byReason: Record<string, unknown>): Response =>
+  ({ ok: true, status: 200, json: async () => ({ by_reason: byReason, lookback_days: 30 }) }) as Response;
+
+describe('EscalationOutcomePanel — compliance_followup bucket', () => {
+  it('renders both cross-layer baseline and compliance_followup rows as separate entries', async () => {
+    apiFetchMock.mockResolvedValueOnce(escalationResponse({
+      escalated_cross_layer: { merged_count: 3, retripped_within_30d_count: 1, durable_resolution_rate: 0.67, median_hold_days: 12.5, in_flight_excluded_count: 0, prevention_rate_30d: 0.70 },
+      compliance_followup: { merged_count: 2, retripped_within_30d_count: 0, durable_resolution_rate: 1.0, median_hold_days: 18.3, in_flight_excluded_count: 0, prevention_rate_30d: 0.85 },
+    }));
+    render(<EscalationOutcomePanel projectId="proj-1" />);
+    await screen.findByText('Cross-layer');
+    expect(screen.getByText('↳ Compliance re-fix')).toBeInTheDocument();
+    // baseline row shows merged_count 3, followup row shows 2 — they are independent
+    const cells = screen.getAllByRole('cell');
+    const mergedCounts = cells.filter(c => c.textContent === '3' || c.textContent === '2');
+    expect(mergedCounts.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('shows compliance_followup row with higher durable_resolution_rate than baseline', async () => {
+    apiFetchMock.mockResolvedValueOnce(escalationResponse({
+      escalated_cross_layer: { merged_count: 4, retripped_within_30d_count: 2, durable_resolution_rate: 0.5, median_hold_days: 8.0, in_flight_excluded_count: 0, prevention_rate_30d: 0.60 },
+      compliance_followup: { merged_count: 2, retripped_within_30d_count: 0, durable_resolution_rate: 1.0, median_hold_days: 20.0, in_flight_excluded_count: 0, prevention_rate_30d: 0.90 },
+    }));
+    render(<EscalationOutcomePanel projectId="proj-1" />);
+    await screen.findByText('Cross-layer');
+    // baseline durable_resolution_rate = 50%; followup = 100%
+    expect(screen.getByText('50%')).toBeInTheDocument();
+    expect(screen.getByText('100%')).toBeInTheDocument();
   });
 });

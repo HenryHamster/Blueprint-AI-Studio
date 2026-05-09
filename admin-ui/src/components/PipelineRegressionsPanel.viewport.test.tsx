@@ -113,6 +113,7 @@ vi.mock('../api', () => ({
       return new Response(JSON.stringify({
         by_reason: {
           escalated_cross_layer: { merged_count: 3, retripped_within_30d_count: 1, durable_resolution_rate: 0.67, median_hold_days: 12.5, in_flight_excluded_count: 0 },
+          compliance_followup: { merged_count: 2, retripped_within_30d_count: 0, durable_resolution_rate: 1.0, median_hold_days: 18.3, in_flight_excluded_count: 0, prevention_rate_30d: 0.85 },
           escalated_layer_concentration: { merged_count: 2, retripped_within_30d_count: 0, durable_resolution_rate: 1.0, median_hold_days: 8.0, in_flight_excluded_count: 0 },
           escalated_cross_case_fingerprint: { merged_count: 1, retripped_within_30d_count: 0, durable_resolution_rate: 1.0, median_hold_days: null, in_flight_excluded_count: 0 },
           escalated_recurrence: { merged_count: 0, retripped_within_30d_count: 0, durable_resolution_rate: null, median_hold_days: null, in_flight_excluded_count: 1 },

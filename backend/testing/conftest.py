@@ -106,6 +106,7 @@ async def db_session():
                 "projectmember",
                 "residualremediationcase",
                 "systemmaturity",
+                "messageslastseen",
                 # Drift time-series (project_id not a FK constraint, safe to delete standalone)
                 "directiondriftsnapshot",
                 # Base tables

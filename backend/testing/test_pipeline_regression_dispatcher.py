@@ -12097,7 +12097,7 @@ def _make_escalation_case(
 
 
 def test_escalation_outcome_breakdown_empty_cases():
-    """Empty input returns all five buckets with merged_count=0 and durable_resolution_rate=None."""
+    """Empty input returns all buckets (one per _ESCALATION_BUCKET_ORDER entry) with merged_count=0 and durable_resolution_rate=None."""
     from app.pipeline_regression_dispatcher import (
         _ESCALATION_BUCKET_ALL_OTHER,
         _ESCALATION_BUCKET_ORDER,
@@ -13180,6 +13180,138 @@ def test_escalation_outcome_breakdown_prevention_rate_excludes_recent_defense():
     assert b["merged_count"] == 1
     assert b["prevention_rate_30d"] is None
     assert b["recurrences_observed"] == 0
+
+
+# ---------------------------------------------------------------------------
+# compute_escalation_outcome_breakdown — compliance_followup bucket
+# ---------------------------------------------------------------------------
+
+
+def test_escalation_outcome_compliance_followup_bucket_exists():
+    """compliance_followup bucket is present in all outputs."""
+    from app.pipeline_regression_dispatcher import (
+        _ESCALATION_BUCKET_COMPLIANCE_FOLLOWUP,
+        _ESCALATION_BUCKET_ORDER,
+        compute_escalation_outcome_breakdown,
+    )
+
+    assert _ESCALATION_BUCKET_COMPLIANCE_FOLLOWUP in _ESCALATION_BUCKET_ORDER
+    out = compute_escalation_outcome_breakdown([])
+    assert _ESCALATION_BUCKET_COMPLIANCE_FOLLOWUP in out["by_reason"]
+
+
+def test_escalation_outcome_compliance_followup_baseline_durable():
+    """Baseline cross-layer fix (no compliance followup) stays in escalated_cross_layer bucket with durable prevention."""
+    from app.pipeline_regression_dispatcher import (
+        ESCALATION_REASON_ESCALATED_CROSS_LAYER,
+        compute_escalation_outcome_breakdown,
+    )
+
+    now = _utcnow()
+    merged_at = (now - timedelta(days=35)).isoformat()
+
+    case = _make_escalation_case(
+        ESCALATION_REASON_ESCALATED_CROSS_LAYER,
+        fix_log=[
+            {
+                "fix_pr_number": 100,
+                "merged_at": merged_at,
+                "spawn_was_cross_layer": True,
+            }
+        ],
+    )
+
+    # Use lookback_days=60 so the 35d-old merge falls within the window
+    out = compute_escalation_outcome_breakdown([case], now=now, lookback_days=60)
+    b_cross = out["by_reason"][ESCALATION_REASON_ESCALATED_CROSS_LAYER]
+    assert b_cross["merged_count"] == 1
+    assert b_cross["prevention_rate_30d"] == 1.0
+
+
+def test_escalation_outcome_compliance_followup_held():
+    """Compliance-followup fix that held 35d → prevention_rate_30d=1.0 in compliance_followup bucket; cross_layer baseline is empty."""
+    from app.pipeline_regression_dispatcher import (
+        ESCALATION_REASON_ESCALATED_CROSS_LAYER,
+        _ESCALATION_BUCKET_COMPLIANCE_FOLLOWUP,
+        compute_escalation_outcome_breakdown,
+    )
+
+    now = _utcnow()
+    original_merged = (now - timedelta(days=50)).isoformat()
+    cf_merged = (now - timedelta(days=35)).isoformat()
+
+    case = _make_escalation_case(
+        ESCALATION_REASON_ESCALATED_CROSS_LAYER,
+        fix_log=[
+            {
+                "fix_pr_number": 200,
+                "merged_at": original_merged,
+                "spawn_was_cross_layer": True,
+            },
+            {
+                "type": "compliance_followup_spawned",
+                "spawned_at": original_merged,
+                "task_id": "t1",
+            },
+            {"fix_pr_number": 201, "merged_at": cf_merged},
+        ],
+    )
+
+    # lookback_days=60 so both the original (50d) and cf fix (35d) are in the window
+    out = compute_escalation_outcome_breakdown([case], now=now, lookback_days=60)
+    b_cf = out["by_reason"][_ESCALATION_BUCKET_COMPLIANCE_FOLLOWUP]
+    b_cross = out["by_reason"][ESCALATION_REASON_ESCALATED_CROSS_LAYER]
+    # compliance followup fix is durable — no retrip within 30d of cf_merged
+    assert b_cf["merged_count"] == 1
+    assert b_cf["prevention_rate_30d"] == 1.0
+    # baseline cross-layer bucket is empty (this case moved to compliance_followup)
+    assert b_cross["merged_count"] == 0
+
+
+def test_escalation_outcome_compliance_followup_separate_prevention_rates():
+    """Baseline and compliance-followup fixes bucket separately with independent prevention rates."""
+    from app.pipeline_regression_dispatcher import (
+        ESCALATION_REASON_ESCALATED_CROSS_LAYER,
+        _ESCALATION_BUCKET_COMPLIANCE_FOLLOWUP,
+        compute_escalation_outcome_breakdown,
+    )
+
+    now = _utcnow()
+    old = (now - timedelta(days=50)).isoformat()
+    cf_merged = (now - timedelta(days=35)).isoformat()
+    retrip = (now - timedelta(days=20)).isoformat()  # within 30d of cf_merged
+
+    # baseline case: cross-layer fix held without needing a compliance followup
+    case_baseline = _make_escalation_case(
+        ESCALATION_REASON_ESCALATED_CROSS_LAYER,
+        fix_log=[
+            {"fix_pr_number": 300, "merged_at": old, "spawn_was_cross_layer": True}
+        ],
+    )
+    # compliance followup case: original non-compliant, then followup fix that retripped within 30d
+    case_cf = _make_escalation_case(
+        ESCALATION_REASON_ESCALATED_CROSS_LAYER,
+        fix_log=[
+            {"fix_pr_number": 301, "merged_at": old, "spawn_was_cross_layer": True},
+            {"type": "compliance_followup_spawned", "spawned_at": old, "task_id": "t2"},
+            {"fix_pr_number": 302, "merged_at": cf_merged},
+            {"fix_pr_number": 303, "merged_at": retrip},
+        ],
+    )
+
+    # lookback_days=60 so 50d-old and 35d-old merges are in the window
+    out = compute_escalation_outcome_breakdown(
+        [case_baseline, case_cf], now=now, lookback_days=60
+    )
+    b_cross = out["by_reason"][ESCALATION_REASON_ESCALATED_CROSS_LAYER]
+    b_cf = out["by_reason"][_ESCALATION_BUCKET_COMPLIANCE_FOLLOWUP]
+    # baseline: 1 durable fix → prevention_rate = 1.0
+    assert b_cross["merged_count"] == 1
+    assert b_cross["prevention_rate_30d"] == 1.0
+    # compliance followup: retripped within 30d of cf fix → prevention_rate = 0.0
+    assert b_cf["merged_count"] == 1
+    assert b_cf["prevention_rate_30d"] == 0.0
+    assert b_cf["recurrences_observed"] == 1
 
 
 # ---------------------------------------------------------------------------

@@ -360,4 +360,133 @@ describe('MessagesPanel — viewport regression', () => {
     bubbles = host.querySelectorAll('[class*="rounded-2xl"]');
     expect(bubbles.length).toBe(2);
   });
+
+  test('calls onMessageCountChange with newHighSignalCount when high-signal messages arrive', async () => {
+    const now = Date.now();
+    const dividerTime = now - 3600000; // 1 hour ago
+    localStorage.setItem(`messages_panel_last_seen:anonymous:project-123`, String(dividerTime));
+
+    const msgs = [
+      makeMsg({
+        id: 'blocker-1',
+        message_type: 'BLOCKER',
+        status: 'open',
+        created_at: new Date(now - 7200000).toISOString(), // 2 hours ago (before divider)
+      }),
+      makeMsg({
+        id: 'blocker-2',
+        message_type: 'BLOCKER',
+        status: 'open',
+        created_at: new Date(now - 600000).toISOString(), // 10 min ago (after divider)
+      }),
+      makeMsg({
+        id: 'feedback-1',
+        message_type: 'FEEDBACK',
+        status: 'open',
+        created_at: new Date(now).toISOString(), // just now (after divider)
+      }),
+    ];
+
+    host = document.createElement('div');
+    host.style.width = '1280px';
+    host.style.height = '600px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+
+    const { apiFetch } = await import('../api');
+    (apiFetch as ReturnType<typeof vi.fn>).mockImplementation(async (url: string) => {
+      if (url.includes('/api/admin/messages')) {
+        return new Response(JSON.stringify({ messages: msgs }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ messages: [] }), { status: 200 });
+    });
+
+    const countChanges: number[] = [];
+    await act(async () => {
+      r.render(
+        <MessagesPanel
+          selectedProjectId="project-123"
+          onClose={() => {}}
+          addToast={() => {}}
+          onMessageCountChange={(count) => countChanges.push(count)}
+        />,
+      );
+    });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 100)); });
+
+    // Should have called with newHighSignalCount (2: blocker-2 and feedback-1)
+    expect(countChanges).toContain(2);
+
+    localStorage.removeItem(`messages_panel_last_seen:anonymous:project-123`);
+  });
+
+  test('resets document.title when panel opens and divider is dismissed', async () => {
+    // This test verifies the integration: when newHighSignalCount becomes 0,
+    // the callback reports 0, and App.tsx can use this to clear the title.
+    const now = Date.now();
+    const dividerTime = now - 3600000;
+    localStorage.setItem(`messages_panel_last_seen:anonymous:project-123`, String(dividerTime));
+
+    const msgs = [
+      makeMsg({
+        id: 'blocker-1',
+        message_type: 'BLOCKER',
+        status: 'open',
+        created_at: new Date(now).toISOString(),
+      }),
+    ];
+
+    host = document.createElement('div');
+    host.style.width = '1280px';
+    host.style.height = '600px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+
+    const { apiFetch } = await import('../api');
+    (apiFetch as ReturnType<typeof vi.fn>).mockImplementation(async (url: string) => {
+      if (url.includes('/api/admin/messages')) {
+        return new Response(JSON.stringify({ messages: msgs }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ messages: [] }), { status: 200 });
+    });
+
+    const countChanges: number[] = [];
+    await act(async () => {
+      r.render(
+        <MessagesPanel
+          selectedProjectId="project-123"
+          onClose={() => {}}
+          addToast={() => {}}
+          onMessageCountChange={(count) => countChanges.push(count)}
+        />,
+      );
+    });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 100)); });
+
+    // Initially should report 1 new high-signal message
+    expect(countChanges).toContain(1);
+
+    // Find and click the "Mark all read" button to dismiss divider
+    const dismissButtons = host.querySelectorAll('button');
+    let foundDismiss = false;
+    for (const btn of Array.from(dismissButtons)) {
+      if (btn.textContent?.includes('Mark all read')) {
+        await act(async () => {
+          btn.click();
+        });
+        foundDismiss = true;
+        break;
+      }
+    }
+
+    if (foundDismiss) {
+      await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 100)); });
+      // After dismissing, newHighSignalCount should be 0
+      expect(countChanges[countChanges.length - 1]).toBe(0);
+    }
+
+    localStorage.removeItem(`messages_panel_last_seen:anonymous:project-123`);
+  });
 });

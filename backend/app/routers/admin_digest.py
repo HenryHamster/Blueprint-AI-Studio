@@ -9121,11 +9121,15 @@ async def get_regression_escalation_outcomes(
 ) -> Dict[str, Any]:
     """Aggregate case outcomes by escalation_reason bucket.
 
-    Groups RegressionRemediationCase rows into five buckets — one per
-    meta-escalation reason plus 'all_other' — and returns per-bucket
-    merged_count, retripped_within_30d_count, durable_resolution_rate,
-    median_hold_days, and in_flight_excluded_count so operators can
-    compare meta-escalation durability against ordinary investigations.
+    Groups RegressionRemediationCase rows into six buckets: four meta-escalation
+    reasons (escalated_cross_layer, escalated_layer_concentration,
+    escalated_cross_case_fingerprint, escalated_recurrence), one
+    compliance_followup bucket for cross-layer cases where a followup fix was
+    spawned and merged, and all_other.  Returns per-bucket merged_count,
+    retripped_within_30d_count, durable_resolution_rate, median_hold_days,
+    prevention_rate_30d, recurrences_observed, and in_flight_excluded_count.
+    Cross-layer cases with a compliance followup fix are re-bucketed into
+    compliance_followup so operators can compare the loop's lift against baseline.
     """
     from app.pipeline_regression_dispatcher import (  # noqa: PLC0415
         compute_escalation_outcome_breakdown,

@@ -1005,14 +1005,35 @@ _META_ESCALATION_REASONS: frozenset[str] = frozenset(
 )
 
 _ESCALATION_BUCKET_ALL_OTHER = "all_other"
+_ESCALATION_BUCKET_COMPLIANCE_FOLLOWUP = "compliance_followup"
 
 _ESCALATION_BUCKET_ORDER: list[str] = [
     ESCALATION_REASON_ESCALATED_CROSS_LAYER,
     ESCALATION_REASON_ESCALATED_LAYER_CONCENTRATION,
     ESCALATION_REASON_ESCALATED_CROSS_CASE_FINGERPRINT,
     ESCALATION_REASON_ESCALATED_RECURRENCE,
+    _ESCALATION_BUCKET_COMPLIANCE_FOLLOWUP,
     _ESCALATION_BUCKET_ALL_OTHER,
 ]
+
+
+def _compliance_followup_fix_idx(raw_log: list) -> int:
+    """Return the 0-based fix-cycle index of the first fix entry after a compliance_followup_spawned marker.
+
+    Returns -1 if no such entry exists (no followup spawned or the spawned task has not yet merged).
+    """
+    saw_spawn = False
+    fix_idx = 0
+    for entry in raw_log:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("type") == "compliance_followup_spawned":
+            saw_spawn = True
+        elif entry.get("fix_pr_number") is not None:
+            if saw_spawn:
+                return fix_idx
+            fix_idx += 1
+    return -1
 
 
 def compute_escalation_outcome_breakdown(
@@ -1042,7 +1063,12 @@ def compute_escalation_outcome_breakdown(
     cutoff = now - timedelta(days=lookback_days)
     retrip_window = timedelta(days=30)
 
-    def _bucket_for(reason: str | None) -> str:
+    def _bucket_for(reason: str | None, raw_log: list) -> str:
+        if (
+            reason == ESCALATION_REASON_ESCALATED_CROSS_LAYER
+            and _compliance_followup_fix_idx(raw_log) >= 0
+        ):
+            return _ESCALATION_BUCKET_COMPLIANCE_FOLLOWUP
         if reason in _META_ESCALATION_REASONS:
             return str(reason)
         return _ESCALATION_BUCKET_ALL_OTHER
@@ -1060,10 +1086,10 @@ def compute_escalation_outcome_breakdown(
     }
 
     for case in cases:
-        bucket = _bucket_for(getattr(case, "escalation_reason", None))
+        raw_log = case.fingerprint_to_fix_log or []
+        bucket = _bucket_for(getattr(case, "escalation_reason", None), raw_log)
         st = bucket_state[bucket]
 
-        raw_log = case.fingerprint_to_fix_log or []
         fix_entries = [
             e
             for e in raw_log
@@ -1074,10 +1100,17 @@ def compute_escalation_outcome_breakdown(
             continue
 
         cycles = _extract_recurrence_cycles(case)
-        if not cycles:
+        # For compliance_followup cases, start from the cycle after the followup was spawned
+        # so metrics reflect the compliance followup fix's durability, not the original non-compliant fix.
+        if bucket == _ESCALATION_BUCKET_COMPLIANCE_FOLLOWUP:
+            cf_idx = _compliance_followup_fix_idx(raw_log)
+            effective_cycles = cycles[cf_idx:] if 0 <= cf_idx < len(cycles) else []
+        else:
+            effective_cycles = cycles
+        if not effective_cycles:
             continue
 
-        first = cycles[0]
+        first = effective_cycles[0]
         merged_at = first["merged_at"]
 
         # Prevention rate: observe defenses with a complete 30d window (merged >= 30d ago).
@@ -1086,7 +1119,7 @@ def compute_escalation_outcome_breakdown(
             _retripped = any(
                 c["merged_at"] is not None
                 and c["merged_at"] <= merged_at + retrip_window
-                for c in cycles[1:]
+                for c in effective_cycles[1:]
             )
             if _retripped:
                 st["prevention_recurred"] += 1
@@ -1104,7 +1137,7 @@ def compute_escalation_outcome_breakdown(
             if hold >= 0:
                 st["hold_days"].append(hold)
 
-        for later in cycles[1:]:
+        for later in effective_cycles[1:]:
             next_merged = later["merged_at"]
             if next_merged is not None and next_merged <= merged_at + retrip_window:
                 st["retripped_within_30d_count"] += 1

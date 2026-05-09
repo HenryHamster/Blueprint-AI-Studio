@@ -224,6 +224,27 @@ function ContextBadges({ context, fromType }: { context: Record<string, unknown>
 }
 
 
+async function fetchBackendLastSeen(projectId: string): Promise<number | null> {
+  try {
+    const res = await apiFetch(`${API_BASE_URL}/api/admin/messages/last-seen?project_id=${encodeURIComponent(projectId)}`);
+    if (!res.ok) return null;
+    const data = await res.json() as { last_seen_at?: number | null };
+    const val = data.last_seen_at;
+    return typeof val === 'number' && val > 0 ? val : null;
+  } catch {
+    return null;
+  }
+}
+
+async function postBackendLastSeen(projectId: string, timestamp: number): Promise<void> {
+  try {
+    await apiFetch(`${API_BASE_URL}/api/admin/messages/last-seen`, {
+      method: 'PUT',
+      body: JSON.stringify({ project_id: projectId, timestamp }),
+    });
+  } catch { /* ignore — localStorage already saved */ }
+}
+
 export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast, onMessageCountChange, onOpenTask }: MessagesPanelProps) {
   const [messages, setMessages] = useState<ProjectMessage[]>([]);
   const [loading, setLoading] = useState(true);
@@ -305,6 +326,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
       setDividerTime(now);
       dividerTimeRef.current = now;
       saveLastSeen(auth.currentUser?.email, selectedProjectId, now);
+      void postBackendLastSeen(selectedProjectId, now);
       dividerDismissedRef.current = true;
     }
   }, [selectedProjectId]);
@@ -353,6 +375,16 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
     setDividerTime(lastSeen);
     dividerTimeRef.current = lastSeen;
     dividerDismissedRef.current = false;
+    // Prefer backend last-seen over localStorage — if backend has a more recent
+    // timestamp (e.g. dismissed on another device), update the divider position.
+    if (selectedProjectId) {
+      fetchBackendLastSeen(selectedProjectId).then(backendTs => {
+        if (backendTs !== null && backendTs > (dividerTimeRef.current ?? 0)) {
+          setDividerTime(backendTs);
+          dividerTimeRef.current = backendTs;
+        }
+      });
+    }
     // Reload saved views for the new project — views never bleed across projects.
     setSavedViews(loadSavedViews(auth.currentUser?.email, selectedProjectId));
     setActiveViewId(DEFAULT_VIEW_ID);
@@ -795,6 +827,11 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
     // Don't scroll at all on polling refresh with same count — preserves position
     prevMessageCountRef.current = currentCount;
   }, [highSignalOpen, routineOpen, visibleResolved]);
+
+  // Update parent with new high-signal message count (for tab title badge)
+  useEffect(() => {
+    onMessageCountChange?.(newHighSignalCount);
+  }, [newHighSignalCount, onMessageCountChange]);
 
   // Track scroll position for "scroll to bottom" button
   useEffect(() => {
