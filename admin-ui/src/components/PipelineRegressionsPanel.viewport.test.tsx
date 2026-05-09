@@ -382,3 +382,35 @@ describe('EscalationOutcomePanel — viewport regression', () => {
     if (panel) throw new Error('panel should not render when all merged_count are zero');
   });
 });
+
+describe('ManualInterventionPanel — viewport_regression baseline disclosure', () => {
+  let root: Root | null = null;
+  let host: HTMLDivElement | null = null;
+  afterEach(() => { if (root) act(() => root?.unmount()); root = null; host?.remove(); host = null; });
+  test('renders viewport_regression case with baseline disclosure without overflow at 375px', async () => {
+    const { apiFetch } = await import('../api');
+    vi.mocked(apiFetch).mockImplementation(async (url: string) => {
+      if (url.includes('/manual-intervention')) {
+        return new Response(JSON.stringify({ cases: [{
+          id: 'vp-case-1', regression_class: 'viewport_regression:MessagesPanel@375',
+          signal_name: 'viewport_regression', status: 'NEEDS_ATTENTION', attempts: 2,
+          last_remediation_pr_number: null, last_failure_class: null,
+          signal_snapshot_at_spawn: null, signal_snapshot_at_merge: null,
+          fingerprint_to_fix_log: [],
+          last_seen_at: '2026-05-09T10:00:00Z', needs_manual_intervention_at: '2026-05-09T10:00:00Z',
+          first_seen_at: '2026-05-09T09:00:00Z', signal_first_crossed_at: '2026-05-09T09:00:00Z',
+          time_to_detect_sec: 3600,
+        }] }), { status: 200 });
+      }
+      return new Response('{}', { status: 404 });
+    });
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      root = createRoot(host);
+      await act(async () => { root?.render(<ManualInterventionPanel projectId="project-123" />); });
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 50)); });
+    });
+  });
+});

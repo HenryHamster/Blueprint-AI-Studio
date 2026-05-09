@@ -9,6 +9,19 @@ function _callerTestFile(): string {
   return m ? m[1] : '';
 }
 
+// When VITE_CAPTURE_BASELINES=true (set on main-branch CI runs), save a PNG
+// of the component after each passing assertion. One file per component per
+// width — overwriting keeps storage bounded to one baseline per slot.
+async function _captureBaselineIfEnabled(callerFile: string, width: number): Promise<void> {
+  if (import.meta.env.VITE_CAPTURE_BASELINES !== 'true') return;
+  const name = callerFile.replace(/\.viewport\.test\.tsx$/i, '') || 'unknown';
+  try {
+    await page.screenshot({ path: `viewport-baselines/${name}-${width}px.png` });
+  } catch {
+    // Never fail a passing test because of screenshot I/O
+  }
+}
+
 /**
  * Options for `expectNoOverflowAt`.
  *
@@ -103,6 +116,8 @@ export async function expectNoOverflowAt(
       `expectNoOverflowAt(${width})${fileTag}: ${overflowing.length} element(s) overflow at width=${width}px:\n${lines}${more}`,
     );
   }
+
+  await _captureBaselineIfEnabled(callerFile, width);
 }
 
 /**
@@ -191,6 +206,8 @@ export async function expectNoTextTruncationAt(
       `expectNoTextTruncationAt(${width})${fileTag}: ${truncated.length} element(s) have text clipped without ellipsis at width=${width}px:\n${lines}${more}`,
     );
   }
+
+  await _captureBaselineIfEnabled(callerFile, width);
 }
 
 /**
@@ -269,6 +286,8 @@ export async function expectMinTouchTargetAt(
       `expectMinTouchTargetAt(${width})${fileTag}: ${undersized.length} element(s) below ${minSize}px touch target:\n${lines}${more}`,
     );
   }
+
+  await _captureBaselineIfEnabled(callerFile, width);
 }
 
 /**

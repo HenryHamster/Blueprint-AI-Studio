@@ -478,6 +478,32 @@ class Task(SQLModel, table=True):
     )
     vm_spot: bool = Field(default=False)
 
+    # Efficiency-direction (d-91d8dede) foundational instrumentation.
+    # vm_cold_start_ms = (first agent heartbeat - vm_provisioned_at) in ms.
+    # Recorded once per VM lifecycle and guarded by IS NULL so a re-provision
+    # restamp of vm_provisioned_at (orchestrator.py line ~3240) does not
+    # overwrite the genuine cold-start measurement.
+    vm_cold_start_ms: Optional[int] = Field(
+        default=None,
+        sa_column=Column(Integer, nullable=True),
+    )
+    # vm_warm_start is True when the VM was reused from a warm pool / cached
+    # image rather than freshly provisioned. There is no warm pool today, so
+    # all provisions write False — the column is foundational scaffolding so
+    # that vm_reuse_rate has a real signal once warm pooling lands.
+    vm_warm_start: Optional[bool] = Field(
+        default=False,
+        sa_column=Column(Boolean, nullable=True, server_default=text("false")),
+    )
+    # Cumulative per-task LLM telemetry posted by the agent on every heartbeat.
+    # Shape: {"llm_call_count": int, "total_input_tokens": int,
+    # "total_output_tokens": int, "last_updated_at": iso8601}.
+    # Backwards-compatible — older agents that don't ship these fields leave
+    # this column NULL.
+    api_call_summary: Optional[Dict[str, Any]] = Field(
+        default=None, sa_column=Column(JSONB, nullable=True)
+    )
+
     # Lifecycle flags promoted from JSONB context (audit 2026-04-25 W1).
     # Reading these via SELECT FOR UPDATE returns DB-fresh values without
     # the stale-in-memory races that JSONB-based idempotency guards had.
@@ -2036,4 +2062,8 @@ class DispatcherCycleRecord(SQLModel, table=True):
     confirmed_recoveries_count: int = Field(
         default=0,
         sa_column=Column(Integer, nullable=False, server_default=text("0")),
+    )
+    avg_prevention_rate_7d: Optional[float] = Field(
+        default=None,
+        sa_column=Column(Float, nullable=True),
     )

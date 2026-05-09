@@ -4252,6 +4252,11 @@ async def compute_sr_catch_rate_trends(
     exec_evidence = _compute_execution_evidence_miss_rates(current_window_tasks)
     result["execution_evidence_miss_rates"] = exec_evidence or {}
 
+    from app.sr_blind_spots import aggregate_sr_co_failure_pairs  # noqa: PLC0415
+
+    co_pairs = aggregate_sr_co_failure_pairs(current_window_tasks)
+    result["co_failure_pairs"] = co_pairs or []
+
     doc["sr_catch_rate_trends"] = result
     project.design_doc = doc
     flag_modified(project, "design_doc")

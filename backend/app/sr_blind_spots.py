@@ -861,6 +861,81 @@ def aggregate_sr_false_attestation_rates(
     return result or None
 
 
+def aggregate_sr_co_failure_pairs(
+    tasks,
+    *,
+    min_sample: int = _SR_MIN_SAMPLE,
+    min_co_count: int = 2,
+    top_n: int = 5,
+) -> List[Dict[str, Any]] | None:
+    """Pairwise co-failure rates for SR check_result categories.
+
+    For each ordered pair (cat_a, cat_b), computes:
+        lift = P(cat_b miss | cat_a miss) / P(cat_b miss)
+
+    High lift signals that cat_a and cat_b share a reasoning gap addressable
+    by a single prompt-level fix.  Qualifying tasks: code-change type,
+    non-skip SR outcome.  Returns ``None`` when fewer than ``min_sample``
+    qualifying tasks exist.
+
+    Each entry:
+        {"cat_a": str, "cat_b": str, "co_fail_count": int,
+         "p_b_given_a": float, "base_rate_b": float, "lift": float}
+    """
+    total = 0
+    cat_miss_counts: Dict[str, int] = defaultdict(int)
+    pair_counts: Dict[tuple, int] = defaultdict(int)
+
+    for t in tasks:
+        if (t.first_payload or {}).get("type") not in _SR_CODE_CHANGE_TYPES:
+            continue
+        ctx = t.context or {}
+        sro = ctx.get("_self_review_outcome")
+        if not sro or is_skipped_sr_outcome(sro):
+            continue
+        total += 1
+        check_results = sro.get("check_results") or {}
+        failed = {
+            c
+            for c, r in check_results.items()
+            if isinstance(r, dict) and not r.get("passed", True)
+        }
+        for cat in failed:
+            cat_miss_counts[cat] += 1
+        for cat_a in failed:
+            for cat_b in failed:
+                if cat_a != cat_b:
+                    pair_counts[(cat_a, cat_b)] += 1
+
+    if total < min_sample:
+        return None
+
+    pairs = []
+    for (cat_a, cat_b), co_count in pair_counts.items():
+        if co_count < min_co_count:
+            continue
+        miss_a = cat_miss_counts[cat_a]
+        miss_b = cat_miss_counts[cat_b]
+        if miss_a == 0 or miss_b == 0:
+            continue
+        p_b_given_a = co_count / miss_a
+        base_rate_b = miss_b / total
+        lift = p_b_given_a / base_rate_b
+        pairs.append(
+            {
+                "cat_a": cat_a,
+                "cat_b": cat_b,
+                "co_fail_count": co_count,
+                "p_b_given_a": round(p_b_given_a, 4),
+                "base_rate_b": round(base_rate_b, 4),
+                "lift": round(lift, 4),
+            }
+        )
+
+    pairs.sort(key=lambda x: -x["lift"])
+    return pairs[:top_n]
+
+
 def classify_theme_example_layers(examples: list) -> list:
     """Return layer tags derived from verbatim blind-spot example texts.
 

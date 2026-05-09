@@ -128,6 +128,22 @@ class TestBaselineGate:
         result = classify_layers("CODE_ERROR", "", stage="ruff_check")
         assert LAYER_BASELINE_GATE in result
 
+    # Viewport inputs that fall through to BASELINE_GATE because they don't
+    # match any VIEWPORT layer pattern (no expect*At, no .viewport.test.tsx,
+    # no "viewport regression"/375px) — so the precedence guard at
+    # regression_layer_classifier.py:288 does NOT skip BASELINE_GATE here.
+    # Inputs that DO match VIEWPORT patterns are covered in TestViewportLayer
+    # with assertions that BASELINE_GATE is correctly suppressed.
+    def test_viewport_coverage_drop(self):
+        msg = "viewport coverage drop: 3 components now unguarded after PR merge"
+        result = classify_layers("CODE_ERROR", msg)
+        assert LAYER_BASELINE_GATE in result
+
+    def test_check_viewport_sh_reference(self):
+        msg = "check-viewport.sh exited 1 — viewport gate failed"
+        result = classify_layers("CODE_ERROR", msg)
+        assert LAYER_BASELINE_GATE in result
+
 
 class TestReviewerPass:
     def test_reviewer_disagreement(self):

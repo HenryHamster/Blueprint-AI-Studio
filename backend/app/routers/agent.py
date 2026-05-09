@@ -889,6 +889,12 @@ async def claim_task(
                 **(task.context or {}),
                 "claim_latency_secs": round(claim_latency, 1),
             }
+            # Promote claim_latency to the dedicated vm_cold_start_ms column
+            # for the efficiency direction (d-91d8dede). Guarded by IS NULL
+            # so re-provision restamps of vm_provisioned_at (orchestrator.py
+            # ~line 3240) cannot clobber the genuine first-claim measurement.
+            if task.vm_cold_start_ms is None:
+                task.vm_cold_start_ms = max(0, int(claim_latency * 1000))
         session.add(task)
         await session.commit()
         await session.refresh(task)
@@ -3151,6 +3157,17 @@ async def agent_heartbeat(
     task.last_heartbeat = _utcnow()
     if task.vm_started_at is None:
         task.vm_started_at = _utcnow()
+
+    # Cold-start fallback: /claim is the canonical first-contact site that
+    # writes vm_cold_start_ms, but if a heartbeat ever lands before a claim
+    # row was committed (or for the warm-VM continuity path), derive it here
+    # too. Guard with IS NULL so a re-provision restamp of vm_provisioned_at
+    # cannot overwrite a real first-heartbeat measurement.
+    if task.vm_cold_start_ms is None and task.vm_provisioned_at is not None:
+        cold_start_ms = (
+            task.last_heartbeat - task.vm_provisioned_at
+        ).total_seconds() * 1000
+        task.vm_cold_start_ms = max(0, int(cold_start_ms))
     if req.status_message:
         task.latest_status_message = req.status_message
         # Log interesting lifecycle beacons so they're visible in Cloud
@@ -3300,6 +3317,23 @@ async def agent_heartbeat(
             ctx = dict(task.context or {})
             ctx["prompt_fingerprint"] = req.prompt_fingerprint
             task.context = ctx
+
+    # Per-task LLM telemetry (efficiency direction d-91d8dede). Cumulative
+    # counters posted on every heartbeat — last write wins. Backwards-
+    # compatible: older agents that don't ship these fields leave the column
+    # untouched. Mirrors the every-heartbeat cadence of last_metrics_json so
+    # downstream aggregations always see the freshest snapshot.
+    if (
+        req.llm_call_count is not None
+        or req.total_input_tokens is not None
+        or req.total_output_tokens is not None
+    ):
+        task.api_call_summary = {
+            "llm_call_count": int(req.llm_call_count or 0),
+            "total_input_tokens": int(req.total_input_tokens or 0),
+            "total_output_tokens": int(req.total_output_tokens or 0),
+            "last_updated_at": _utcnow().isoformat(),
+        }
 
     # Record VM image identity so the orchestrator can detect stale Packer images.
     # Called on every heartbeat that carries image fields; no-ops when both are None.

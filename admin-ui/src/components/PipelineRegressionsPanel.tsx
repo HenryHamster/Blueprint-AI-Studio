@@ -348,6 +348,49 @@ function snapshotSummary(snap: Record<string, unknown> | null): string {
   return entries.length ? entries.join(', ') : '—';
 }
 
+/** Collapsible image disclosure for viewport_regression cases. Shows the saved
+ * baseline PNG (written by viewport.ts when VITE_CAPTURE_BASELINES=true); falls
+ * back gracefully when no baseline exists yet. */
+function ViewportBaselineDisclosure({ regressionClass }: { regressionClass: string }) {
+  const [open, setOpen] = useState(false);
+  const [missing, setMissing] = useState(false);
+
+  // regression_class format: "viewport_regression:ComponentName@375"
+  const inner = regressionClass.slice('viewport_regression:'.length);
+  const atIdx = inner.lastIndexOf('@');
+  const component = atIdx !== -1 ? inner.slice(0, atIdx) : inner;
+  const width = atIdx !== -1 ? inner.slice(atIdx + 1) : '375';
+  // viewport.ts strips ".viewport.test.tsx" suffix when naming the file
+  const stem = component.replace(/\.viewport\.test\.tsx$/i, '');
+  const baselineUrl = `/viewport-baselines/${stem}-${width}px.png`;
+
+  return (
+    <div className="mt-1.5">
+      {/* eslint-disable-next-line viewport/min-touch-target -- inline disclosure toggle in dense regression row */}
+      <button type="button" onClick={() => setOpen(v => !v)}
+        className="flex items-center gap-1 text-[10px] text-violet-400 hover:text-violet-300 transition-colors">
+        {open ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
+        images
+      </button>
+      {open && (
+        <div className="mt-1 space-y-1">
+          <div className="text-[9px] text-neutral-500 font-medium uppercase tracking-wide">Baseline (passing at {width}px)</div>
+          {missing ? (
+            <div className="text-[9px] text-neutral-600 italic">
+              no baseline yet — captured on main when VITE_CAPTURE_BASELINES=true
+            </div>
+          ) : (
+            <img src={baselineUrl} alt={`${stem} at ${width}px`}
+              style={{ maxWidth: `${width}px` }}
+              className="rounded border border-neutral-700/50 max-w-full"
+              onError={() => setMissing(true)} />
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function recurrenceBadge(count: number | undefined) {
   return count && count > 0 ? (
     <span className="text-[10px] px-1.5 py-0.5 rounded bg-neutral-500/10 text-neutral-400 border border-neutral-500/20">
@@ -591,6 +634,9 @@ export function ManualInterventionPanel({ projectId, filterClass }: Props) {
                         </div>
                       );
                     })()}
+                    {c.regression_class.startsWith('viewport_regression:') && (
+                      <ViewportBaselineDisclosure regressionClass={c.regression_class} />
+                    )}
                   </div>
                 </div>
                 <div className="shrink-0 flex flex-col gap-1">
@@ -1065,6 +1111,8 @@ interface EscalationOutcomeBucket {
   durable_resolution_rate: number | null;
   median_hold_days: number | null;
   in_flight_excluded_count: number;
+  prevention_rate_30d?: number | null;
+  recurrences_observed?: number;
 }
 
 interface EscalationOutcomeData {
@@ -1111,6 +1159,7 @@ export function EscalationOutcomePanel({ projectId }: Props) {
               <th className="text-right px-2 py-1.5 font-medium">Merged</th>
               <th className="text-right px-2 py-1.5 font-medium">Retripped</th>
               <th className="text-right px-2 py-1.5 font-medium">Durable</th>
+              <th className="text-right px-2 py-1.5 font-medium hidden sm:table-cell">Prevented (30d)</th>
               <th className="text-right px-3 py-1.5 font-medium">Med. hold</th>
             </tr>
           </thead>
@@ -1127,6 +1176,18 @@ export function EscalationOutcomePanel({ projectId }: Props) {
                 <td className="px-2 py-1.5 text-right">
                   {b.durable_resolution_rate !== null
                     ? <span className={b.durable_resolution_rate >= 0.7 ? 'text-emerald-400' : 'text-amber-400'}>{Math.round(b.durable_resolution_rate * 100)}%</span>
+                    : <span className="text-neutral-600">—</span>}
+                </td>
+                <td className="px-2 py-1.5 text-right hidden sm:table-cell">
+                  {b.prevention_rate_30d != null
+                    ? (
+                      <span className={b.prevention_rate_30d < 0.6 ? 'text-red-400' : 'text-emerald-400'}>
+                        {Math.round(b.prevention_rate_30d * 100)}%
+                        {(b.recurrences_observed ?? 0) > 0 && (
+                          <span className="text-neutral-500 ml-1">&middot; {b.recurrences_observed}r</span>
+                        )}
+                      </span>
+                    )
                     : <span className="text-neutral-600">—</span>}
                 </td>
                 <td className="px-3 py-1.5 text-right text-neutral-400">

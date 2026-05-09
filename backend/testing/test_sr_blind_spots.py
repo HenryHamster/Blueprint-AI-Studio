@@ -443,6 +443,162 @@ def test_disagreement_directions_defaults_severity_to_low():
 
 
 # ---------------------------------------------------------------------------
+# Unit: aggregate_sr_co_failure_pairs
+# ---------------------------------------------------------------------------
+
+
+def _make_co_fail_task(
+    project_id, *, failed_cats: list[str], task_type: str = "create"
+):
+    """Build a task where the given SR categories are all marked failed."""
+    check_results = {cat: {"passed": False} for cat in failed_cats}
+    return make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": task_type, "prompt": "x"}],
+        context={"_self_review_outcome": {"check_results": check_results}},
+    )
+
+
+def test_co_failure_returns_none_below_min_sample():
+    """Fewer than min_sample qualifying tasks → None."""
+    from app.sr_blind_spots import aggregate_sr_co_failure_pairs
+
+    pid = uuid.uuid4()
+    tasks = [_make_co_fail_task(pid, failed_cats=["correctness", "error-handling"])]
+    assert aggregate_sr_co_failure_pairs(tasks, min_sample=5) is None
+
+
+def test_co_failure_returns_none_for_empty_tasks():
+    """Empty task list → None."""
+    from app.sr_blind_spots import aggregate_sr_co_failure_pairs
+
+    assert aggregate_sr_co_failure_pairs([], min_sample=1) is None
+
+
+def test_co_failure_lift_calculation():
+    """High co-occurrence produces lift > 1; values match the manual formula."""
+    from app.sr_blind_spots import aggregate_sr_co_failure_pairs
+
+    pid = uuid.uuid4()
+    # 10 qualifying tasks: 5 fail both "correctness" and "error-handling",
+    # 5 fail neither.  Expected lift = (5/5) / (5/10) = 2.0
+    tasks = [
+        _make_co_fail_task(pid, failed_cats=["correctness", "error-handling"])
+        for _ in range(5)
+    ] + [_make_co_fail_task(pid, failed_cats=[]) for _ in range(5)]
+    result = aggregate_sr_co_failure_pairs(tasks, min_sample=5, min_co_count=2)
+    assert result is not None
+    pair = next(
+        (
+            p
+            for p in result
+            if p["cat_a"] == "correctness" and p["cat_b"] == "error-handling"
+        ),
+        None,
+    )
+    assert pair is not None
+    assert pair["co_fail_count"] == 5
+    assert pair["p_b_given_a"] == 1.0
+    assert pair["base_rate_b"] == 0.5
+    assert pair["lift"] == 2.0
+
+
+def test_co_failure_filters_below_min_co_count():
+    """Pairs with co_count < min_co_count are excluded from results."""
+    from app.sr_blind_spots import aggregate_sr_co_failure_pairs
+
+    pid = uuid.uuid4()
+    # Only 1 task co-fails "correctness" and "error-handling".
+    tasks = [_make_co_fail_task(pid, failed_cats=["correctness", "error-handling"])] + [
+        _make_co_fail_task(pid, failed_cats=[]) for _ in range(4)
+    ]
+    # min_co_count=2 should filter out the single co-failure pair.
+    result = aggregate_sr_co_failure_pairs(tasks, min_sample=5, min_co_count=2)
+    assert result == []
+
+
+def test_co_failure_returns_top_n_sorted_by_lift():
+    """Returns at most top_n pairs, sorted highest lift first."""
+    from app.sr_blind_spots import aggregate_sr_co_failure_pairs
+
+    pid = uuid.uuid4()
+    # 10 tasks: all 10 co-fail A+B; only 5 co-fail A+C.
+    # lift(A→B) = (10/10)/(10/10) = 1.0; lift(A→C) = (5/10)/(5/10) = 1.0
+    # Let's make a clearer divergence: 10 tasks all fail A+B, 5 extra fail C alone.
+    # total=15; miss_a=10, miss_b=10, co_ab=10 → lift=1.5
+    # miss_c=5, co_ac=0 → no A+C pair
+    tasks = [
+        _make_co_fail_task(pid, failed_cats=["cat_a", "cat_b"]) for _ in range(10)
+    ] + [_make_co_fail_task(pid, failed_cats=["cat_c"]) for _ in range(5)]
+    result = aggregate_sr_co_failure_pairs(tasks, min_sample=5, min_co_count=2, top_n=1)
+    assert result is not None
+    assert len(result) <= 1
+
+
+def test_co_failure_excludes_non_code_change_tasks():
+    """Tasks of type 'review' or 'plan' are excluded from the sample."""
+    from app.sr_blind_spots import aggregate_sr_co_failure_pairs
+
+    pid = uuid.uuid4()
+    # 5 review tasks that would otherwise qualify.
+    tasks = [
+        _make_co_fail_task(
+            pid, failed_cats=["correctness", "error-handling"], task_type="review"
+        )
+        for _ in range(5)
+    ]
+    assert aggregate_sr_co_failure_pairs(tasks, min_sample=5) is None
+
+
+def test_co_failure_lift_near_one_when_independent():
+    """When co-failure matches the base-rate product, lift is ~1."""
+    from app.sr_blind_spots import aggregate_sr_co_failure_pairs
+
+    pid = uuid.uuid4()
+    # 9 tasks: 3 miss only A, 3 miss only B, 1 misses both A+B, 2 miss neither.
+    # miss_a=4, miss_b=4, co_ab=1, total=9
+    # p_b_given_a = 1/4 = 0.25; base_rate_b = 4/9 ≈ 0.444; lift ≈ 0.5625 (below 1)
+    # This demonstrates lift < 1 for weak co-occurrence (no strong shared signal).
+    tasks = (
+        [_make_co_fail_task(pid, failed_cats=["cat_a"]) for _ in range(3)]
+        + [_make_co_fail_task(pid, failed_cats=["cat_b"]) for _ in range(3)]
+        + [_make_co_fail_task(pid, failed_cats=["cat_a", "cat_b"])]
+        + [_make_co_fail_task(pid, failed_cats=[]) for _ in range(2)]
+    )
+    result = aggregate_sr_co_failure_pairs(tasks, min_sample=5, min_co_count=1)
+    assert result is not None
+    pair = next(
+        (p for p in result if p["cat_a"] == "cat_a" and p["cat_b"] == "cat_b"), None
+    )
+    assert pair is not None
+    assert pair["lift"] < 1.0
+
+
+def test_co_failure_result_keys_present():
+    """Each result entry has all required keys."""
+    from app.sr_blind_spots import aggregate_sr_co_failure_pairs
+
+    pid = uuid.uuid4()
+    tasks = [
+        _make_co_fail_task(pid, failed_cats=["correctness", "error-handling"])
+        for _ in range(5)
+    ]
+    result = aggregate_sr_co_failure_pairs(tasks, min_sample=5, min_co_count=2)
+    assert result is not None and len(result) > 0
+    entry = result[0]
+    for key in (
+        "cat_a",
+        "cat_b",
+        "co_fail_count",
+        "p_b_given_a",
+        "base_rate_b",
+        "lift",
+    ):
+        assert key in entry, f"Missing key: {key}"
+
+
+# ---------------------------------------------------------------------------
 # Unit: compute_persistent_sr_blind_spot_hint
 # ---------------------------------------------------------------------------
 

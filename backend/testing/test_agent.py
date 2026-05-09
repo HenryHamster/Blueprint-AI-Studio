@@ -9495,3 +9495,145 @@ async def test_claim_sr_recent_miss_examples_falls_back_to_global_when_direction
     assert "Global fallback example" in miss_ex["correctness"][0]["desc"]
     assert "scope-drift" not in miss_ex
     assert "architecture" not in miss_ex
+
+
+# ── Efficiency-direction (d-91d8dede) foundational instrumentation ───────────
+
+
+@pytest.mark.asyncio
+async def test_claim_records_vm_cold_start_ms_once(client: AsyncClient, db_session):
+    """The first /claim sets vm_cold_start_ms from (last_heartbeat - vm_provisioned_at);
+    a re-provision restamp of vm_provisioned_at must NOT clobber that measurement."""
+    project = Project(name="Cold Start Claim", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    provisioned = datetime.utcnow() - timedelta(seconds=12)
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "ls"}],
+        vm_instance_id="agent-vm-cold-start",
+        status=TaskStatus.QUEUED,
+        vm_provisioned_at=provisioned,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    assert task.vm_cold_start_ms is None
+
+    token = create_agent_token(str(task.id), "agent-vm-cold-start")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    assert task.vm_cold_start_ms is not None
+    # ~12s elapsed, so cold-start should be ≥10s and ≤30s (test slack).
+    assert 10_000 <= task.vm_cold_start_ms <= 30_000
+    initial_cold_start = task.vm_cold_start_ms
+
+    # Simulate a re-provision restamp of vm_provisioned_at, then heartbeat.
+    # The IS NULL guard must prevent vm_cold_start_ms from being overwritten.
+    task.vm_provisioned_at = datetime.utcnow()
+    db_session.add(task)
+    await db_session.commit()
+
+    hb_resp = await client.post(
+        "/api/agent/heartbeat",
+        json={"task_id": str(task.id), "status_message": "tick"},
+        headers={"x-agent-token": token},
+    )
+    assert hb_resp.status_code == 200
+    await db_session.refresh(task)
+    assert task.vm_cold_start_ms == initial_cold_start
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_persists_api_call_summary(client: AsyncClient, db_session):
+    """Heartbeat persists llm_call_count + token totals into Task.api_call_summary."""
+    project = Project(name="API Call Summary", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-api-summary",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    assert task.api_call_summary is None
+
+    token = create_agent_token(str(task.id), "agent-vm-api-summary")
+    resp = await client.post(
+        "/api/agent/heartbeat",
+        json={
+            "task_id": str(task.id),
+            "llm_call_count": 3,
+            "total_input_tokens": 12345,
+            "total_output_tokens": 678,
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    summary = task.api_call_summary
+    assert summary is not None
+    assert summary["llm_call_count"] == 3
+    assert summary["total_input_tokens"] == 12345
+    assert summary["total_output_tokens"] == 678
+    assert "last_updated_at" in summary
+
+    # Subsequent heartbeat with higher cumulative counts overwrites.
+    resp2 = await client.post(
+        "/api/agent/heartbeat",
+        json={
+            "task_id": str(task.id),
+            "llm_call_count": 5,
+            "total_input_tokens": 20000,
+            "total_output_tokens": 999,
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp2.status_code == 200
+    await db_session.refresh(task)
+    assert task.api_call_summary["llm_call_count"] == 5
+    assert task.api_call_summary["total_input_tokens"] == 20000
+    assert task.api_call_summary["total_output_tokens"] == 999
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_omits_api_call_summary_when_fields_absent(
+    client: AsyncClient, db_session
+):
+    """Backwards-compat: older agents that don't ship LLM telemetry leave
+    api_call_summary untouched (NULL) — heartbeat still succeeds."""
+    project = Project(name="Backcompat Heartbeat", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-backcompat",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-backcompat")
+    resp = await client.post(
+        "/api/agent/heartbeat",
+        json={"task_id": str(task.id), "status_message": "ok"},
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    assert task.api_call_summary is None

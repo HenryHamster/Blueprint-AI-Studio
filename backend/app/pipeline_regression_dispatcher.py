@@ -166,6 +166,13 @@ _LAYER_CONCENTRATION_MIN_DISTINCT_CASES = 3
 _LAYER_CONCENTRATION_FRAGILE_AVG_HOLD_DAYS = 7.0
 _LAYER_CONCENTRATION_FRAGILE_RETRIPS = 2
 
+# Prevention-rate signal thresholds. When the 7d unweighted average prevention
+# rate (defenses with complete 30d observation window) drops below this floor
+# AND at least _PREVENTION_RATE_MIN_SAMPLE eligible defenses exist, an
+# investigate task is spawned to diagnose why cross-layer defenses are not holding.
+_PREVENTION_RATE_THRESHOLD = 0.60
+_PREVENTION_RATE_MIN_SAMPLE = 5
+
 # Cross-case error-fingerprint meta-signal thresholds.
 # Trips when the SAME normalized error fingerprint surfaces across at least
 # _CROSS_CASE_FINGERPRINT_MIN_DISTINCT_CLASSES distinct ``regression_class``
@@ -1045,6 +1052,8 @@ def compute_escalation_outcome_breakdown(
             "retripped_within_30d_count": 0,
             "hold_days": [],
             "in_flight_excluded_count": 0,
+            "prevention_prevented": 0,
+            "prevention_recurred": 0,
         }
         for b in _ESCALATION_BUCKET_ORDER
     }
@@ -1069,6 +1078,20 @@ def compute_escalation_outcome_breakdown(
 
         first = cycles[0]
         merged_at = first["merged_at"]
+
+        # Prevention rate: observe defenses with a complete 30d window (merged >= 30d ago).
+        # This is independent of the merged_count lookback filter.
+        if merged_at is not None and merged_at + retrip_window <= now:
+            _retripped = any(
+                c["merged_at"] is not None
+                and c["merged_at"] <= merged_at + retrip_window
+                for c in cycles[1:]
+            )
+            if _retripped:
+                st["prevention_recurred"] += 1
+            else:
+                st["prevention_prevented"] += 1
+
         if merged_at is None or not (cutoff <= merged_at <= now):
             continue
 
@@ -1102,12 +1125,17 @@ def compute_escalation_outcome_breakdown(
                 if n % 2 == 1
                 else (sorted_hold[mid - 1] + sorted_hold[mid]) / 2.0
             )
+        _prev = s["prevention_prevented"]
+        _prec = s["prevention_recurred"]
+        _pdenom = _prev + _prec
         result[bucket] = {
             "merged_count": mc,
             "retripped_within_30d_count": rc,
             "durable_resolution_rate": (1.0 - rc / mc) if mc > 0 else None,
             "median_hold_days": median_hold,
             "in_flight_excluded_count": s["in_flight_excluded_count"],
+            "prevention_rate_30d": (_prev / _pdenom) if _pdenom > 0 else None,
+            "recurrences_observed": _prec,
         }
 
     return {
@@ -1115,6 +1143,111 @@ def compute_escalation_outcome_breakdown(
         "lookback_days": lookback_days,
         "generated_at": now.isoformat(),
     }
+
+
+def compute_avg_prevention_rate_7d(
+    cases: list[RegressionRemediationCase],
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Unweighted average prevention rate for defenses whose 30d window closed in the last 7d.
+
+    A defense is eligible when its first cycle's merged_at falls in [now-37d, now-30d]
+    (the 30d observation window opened and closed within the past 7 days).
+    A defense "prevented" when no subsequent cycle occurred within 30d of that merge.
+
+    Returns a dict with keys: avg_rate (float|None), eligible_count, prevented_count,
+    recurred_count.
+    """
+    if now is None:
+        now = _utcnow()
+    window_open = now - timedelta(days=37)
+    window_close = now - timedelta(days=30)
+    retrip_window = timedelta(days=30)
+
+    prevented = 0
+    recurred = 0
+
+    for case in cases:
+        raw_log = case.fingerprint_to_fix_log or []
+        fix_entries = [
+            e
+            for e in raw_log
+            if isinstance(e, dict) and e.get("fix_pr_number") is not None
+        ]
+        if fix_entries and all(e.get("merged_at") is None for e in fix_entries):
+            continue
+        cycles = _extract_recurrence_cycles(case)
+        if not cycles:
+            continue
+        first = cycles[0]
+        merged_at = first["merged_at"]
+        if merged_at is None:
+            continue
+        if not (window_open <= merged_at <= window_close):
+            continue
+        retripped = any(
+            c["merged_at"] is not None and c["merged_at"] <= merged_at + retrip_window
+            for c in cycles[1:]
+        )
+        if retripped:
+            recurred += 1
+        else:
+            prevented += 1
+
+    eligible = prevented + recurred
+    return {
+        "avg_rate": prevented / eligible if eligible > 0 else None,
+        "eligible_count": eligible,
+        "prevented_count": prevented,
+        "recurred_count": recurred,
+    }
+
+
+async def _evaluate_low_prevention_rate_signal(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    spawn_budget_left: int,
+) -> int:
+    """Fire a research signal when the 7d average defense prevention rate drops below threshold."""
+    if spawn_budget_left <= 0:
+        return 0
+
+    cases = list(
+        (
+            await session.execute(
+                select(RegressionRemediationCase).where(
+                    RegressionRemediationCase.project_id == project_id
+                )
+            )
+        ).scalars()
+    )
+
+    result = compute_avg_prevention_rate_7d(cases)
+    avg_rate = result["avg_rate"]
+    eligible_count = result["eligible_count"]
+
+    if avg_rate is None or avg_rate >= _PREVENTION_RATE_THRESHOLD:
+        return 0
+    if eligible_count < _PREVENTION_RATE_MIN_SAMPLE:
+        return 0
+
+    spawn = await _maybe_spawn(
+        session,
+        project_id,
+        signal_name="low_prevention_rate_7d",
+        regression_class="cross_layer_defense_prevention_low",
+        prior_rate=_PREVENTION_RATE_THRESHOLD,
+        current_rate=avg_rate,
+        sample_size=eligible_count,
+        magnitude=_PREVENTION_RATE_THRESHOLD - avg_rate,
+        title_hint=f"Low cross-layer defense prevention rate ({avg_rate:.0%})",
+        extra_context_fields={
+            "prevention_rate_7d": avg_rate,
+            "eligible_defenses": eligible_count,
+            "recurred_count": result["recurred_count"],
+        },
+    )
+    return 1 if spawn is not None else 0
 
 
 def _build_layer_defense_ledger(
@@ -6583,6 +6716,11 @@ async def run_once(session: AsyncSession, project_id: uuid.UUID) -> int:
             spawn_budget - _spawned,
         )
         _spawned += await _evaluate_agent_vm_resource_signal(
+            session,
+            project_id,
+            spawn_budget - _spawned,
+        )
+        _spawned += await _evaluate_low_prevention_rate_signal(
             session,
             project_id,
             spawn_budget - _spawned,

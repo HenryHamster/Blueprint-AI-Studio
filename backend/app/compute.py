@@ -423,6 +423,11 @@ async def provision_agent_vm(
     secret_version_name: Pre-computed Secret Manager version (from prepare_and_store_agent_secret).
         If provided, skips the internal secret build+store step.
     """
+    # TODO(warm-pool): efficiency direction d-91d8dede needs a vm_reuse_rate
+    # signal. Today every call here is a cold provision, so the dispatch site
+    # in orchestrator.py writes Task.vm_warm_start=False. When a warm-pool /
+    # image-reuse path lands here, fan out the True case at the reuse branch
+    # so vm_reuse_rate has a real signal to aggregate.
     if payload_uri:
         validate_payload_uri(payload_uri)
     # Block provisioning if image family is invalid. Retry validation periodically
@@ -1639,6 +1644,7 @@ async def _delete_gcp(vm_instance_id: str):
             GoogleAPICallError,
             RetryError,
         )
+
         if isinstance(e, (RetryError, GoogleAPICallError)):
             logger.warning(
                 f"Failed to terminate VM {vm_instance_id}: "

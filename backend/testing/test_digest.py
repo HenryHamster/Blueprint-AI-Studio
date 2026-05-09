@@ -10390,6 +10390,56 @@ async def test_digest_sr_trends_full_fidelity_passthrough(
 
 
 @pytest.mark.asyncio
+async def test_digest_sr_trends_co_failure_pairs_passthrough(
+    client: AsyncClient, db_session
+):
+    """Digest passes co_failure_pairs from sr_catch_rate_trends in design_doc."""
+    project = make_project()
+    project.design_doc = {
+        "sr_catch_rate_trends": {
+            "computed_at": "2026-05-01T00:00:00",
+            "signal_last_computed_at": "2026-05-01T00:00:00",
+            "categories": {},
+            "by_task_type": {},
+            "co_failure_pairs": [
+                {
+                    "cat_a": "correctness",
+                    "cat_b": "test-coverage",
+                    "co_fail_count": 5,
+                    "p_b_given_a": 0.8333,
+                    "base_rate_b": 0.4167,
+                    "lift": 2.0,
+                },
+                {
+                    "cat_a": "test-coverage",
+                    "cat_b": "correctness",
+                    "co_fail_count": 5,
+                    "p_b_given_a": 1.0,
+                    "base_rate_b": 0.5,
+                    "lift": 2.0,
+                },
+            ],
+        }
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    trends = response.json().get("self_review_prediction_accuracy_trends")
+    assert trends is not None
+    pairs = trends.get("co_failure_pairs")
+    assert isinstance(pairs, list)
+    assert len(pairs) == 2
+    first = pairs[0]
+    assert first["cat_a"] == "correctness"
+    assert first["cat_b"] == "test-coverage"
+    assert first["co_fail_count"] == 5
+    assert first["lift"] == 2.0
+
+
+@pytest.mark.asyncio
 async def test_digest_sr_trends_empty_optional_fields_present(
     client: AsyncClient, db_session
 ):

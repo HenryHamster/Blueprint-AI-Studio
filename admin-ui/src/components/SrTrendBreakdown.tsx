@@ -126,6 +126,15 @@ export interface ExecutionEvidenceMissRate {
   sample_count?: number | null;
 }
 
+export interface SrCoFailurePair {
+  cat_a: string;
+  cat_b: string;
+  co_fail_count: number;
+  p_b_given_a: number;
+  base_rate_b: number;
+  lift: number;
+}
+
 export interface SrTrendData {
   computed_at?: string | null;
   bucket_mode?: 'cycle' | 'calendar' | null;
@@ -147,6 +156,7 @@ export interface SrTrendData {
   by_direction?: Record<string, Record<string, DirectionSrCatStat>> | null;
   execution_evidence_miss_rates?: Record<string, ExecutionEvidenceMissRate> | null;
   edges_considered_stats?: Record<string, number> | null;
+  co_failure_pairs?: SrCoFailurePair[] | null;
 }
 
 const SKIP_RATE_AMBER_THRESHOLD = 0.25;
@@ -1356,6 +1366,9 @@ export function SrTrendBreakdown({ trends, variant, onCategoryClick }: SrTrendBr
         {trends?.by_fix_iteration && Object.keys(trends.by_fix_iteration).length > 0 && (
           <ByFixIterationSection byFixIteration={trends.by_fix_iteration} />
         )}
+        {trends?.co_failure_pairs && trends.co_failure_pairs.length > 0 && (
+          <CoFailurePairsSection pairs={trends.co_failure_pairs} />
+        )}
       </div>
     );
   }
@@ -1489,6 +1502,43 @@ export function SrScopeDriftVsExpansionCard({ data }: { data: SrScopeDriftVsExpa
         {(data.gray_zone ?? 0) > 0 && (
           <span title="SR passed + 1.5 < ratio < 2.0 (ambiguous)">gray: {data.gray_zone}</span>
         )}
+      </div>
+    </div>
+  );
+}
+
+const CO_FAILURE_LIFT_THRESHOLD = 1.5;
+const CO_FAILURE_TOP_N = 5;
+
+function CoFailurePairsSection({ pairs }: { pairs: SrCoFailurePair[] }) {
+  const top = pairs
+    .filter(p => p.lift >= CO_FAILURE_LIFT_THRESHOLD)
+    .sort((a, b) => b.lift - a.lift)
+    .slice(0, CO_FAILURE_TOP_N);
+  if (top.length === 0) return null;
+  return (
+    <div className="mt-1.5 pt-1.5 border-t border-neutral-800/60" data-testid="sr-co-failure-pairs">
+      <p className="text-[9px] text-neutral-500 uppercase tracking-wide mb-1">Co-failures</p>
+      <div className="flex flex-col gap-0.5">
+        {top.map((p, i) => {
+          const liftColor = p.lift >= 2.5 ? 'text-red-400' : p.lift >= 1.8 ? 'text-amber-400' : 'text-neutral-400';
+          return (
+            <div key={i} className="flex items-center gap-1.5 text-[10px] min-w-0">
+              <span className="text-neutral-300 truncate flex-1" title={`${p.cat_a} + ${p.cat_b} co-fail`}>
+                <span className="font-medium">{p.cat_a}</span>
+                <span className="text-neutral-600 mx-0.5">+</span>
+                <span className="font-medium">{p.cat_b}</span>
+              </span>
+              <span
+                className={`font-mono tabular-nums shrink-0 ${liftColor}`}
+                title={`lift=${p.lift.toFixed(2)}: P(${p.cat_b}|${p.cat_a})=${Math.round(p.p_b_given_a * 100)}% vs base ${Math.round(p.base_rate_b * 100)}%`}
+              >
+                {`×${p.lift.toFixed(1)}`}
+              </span>
+              <span className="font-mono tabular-nums text-neutral-600 shrink-0 text-[9px]">n={p.co_fail_count}</span>
+            </div>
+          );
+        })}
       </div>
     </div>
   );

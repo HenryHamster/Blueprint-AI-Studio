@@ -30,7 +30,11 @@ from app.models import (
 )
 from app.broadcast import broadcast_to_project
 from app.direction_metrics import _fold_evicted_into_aggregate
-from app.research_context import _build_research_context, build_recent_findings_evidence
+from app.research_context import (
+    _build_research_context,
+    build_recent_findings_evidence,
+    extract_diagnosis_from_context,
+)
 from app.shared_state import DEFAULT_TASK_SCOPE
 from app.time_utils import _utcnow
 
@@ -38,6 +42,8 @@ logger = logging.getLogger(__name__)
 
 
 _EVICTED_FINDINGS_CAP = 50
+_ARCHIVED_DIAGNOSES_CAP = 50
+_DIAGNOSIS_MAX_CHARS = 500
 
 
 def _append_evicted_findings(direction: dict, new_entries: list) -> None:
@@ -54,6 +60,35 @@ def _append_evicted_findings(direction: dict, new_entries: list) -> None:
         existing = existing[-_EVICTED_FINDINGS_CAP:]
     agg["evicted_findings"] = existing
     direction["history_aggregate"] = agg
+
+
+def _append_archived_diagnosis(
+    project: Project, direction: dict, direction_id: str
+) -> None:
+    """Archive a direction's diagnosis when it is completed/retired.
+
+    Extracts the diagnosis summary from the direction's research_context and appends
+    it to project.design_doc['retired_diagnoses_archive']. Maintains FIFO list capped
+    at _ARCHIVED_DIAGNOSES_CAP entries, each truncated to _DIAGNOSIS_MAX_CHARS.
+    """
+    research_context = direction.get("research_context", "")
+    diagnosis = extract_diagnosis_from_context(research_context)
+    if not diagnosis or not diagnosis.strip():
+        return
+    diagnosis = diagnosis.strip()[:_DIAGNOSIS_MAX_CHARS]
+    design_doc = dict(project.design_doc or {})
+    archive = list(design_doc.get("retired_diagnoses_archive") or [])
+    archive.append(
+        {
+            "direction_id": direction_id,
+            "diagnosis": diagnosis,
+            "archived_at": _utcnow().isoformat(),
+        }
+    )
+    if len(archive) > _ARCHIVED_DIAGNOSES_CAP:
+        archive = archive[-_ARCHIVED_DIAGNOSES_CAP:]
+    design_doc["retired_diagnoses_archive"] = archive
+    project.design_doc = design_doc
 
 
 def _compute_saturation(history: list) -> bool:
@@ -443,6 +478,8 @@ async def apply_post_spawn_state(
                                 f"Auto-completed: direction saturated with {total_merged} "
                                 f"total PRs merged across {total_cycles} cycles"
                             )
+                            # Archive this direction's diagnosis before it ages out
+                            _append_archived_diagnosis(project, d, did)
                             alert = Alert(
                                 project_id=task.project_id,
                                 severity=AlertSeverity.INFO,

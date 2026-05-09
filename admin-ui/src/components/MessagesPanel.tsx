@@ -3,7 +3,7 @@ import { X, MessageSquare, Send, Check, AlertTriangle, HelpCircle, Bug, StickyNo
 import { auth } from '../firebase';
 import { apiFetch, API_BASE_URL, authHeaders } from '../api';
 import { parseTimestamp } from '../utils/time';
-import { routineSummary, effectiveSignal, loadEventPrefs, saveEventPrefs, type EventPref, groupRoutineMessages, collapseStaleRoutineRows, formatDailyDigestSummary, outcomeBreakdown, isFailingGroup, getToastSeverity, type RoutineRow, loadLastSeen, saveLastSeen, formatTimestamp, insertTimeDividers, type MessageWithDivider, ESCALATION_BADGE_LABELS, isCriticalSeverity, type MuteWindow, loadMuteWindow, saveMuteWindow, clearMuteWindow, isMuteWindowActive, formatMuteCountdown, type SavedView, loadSavedViews, saveSavedViews, SAVED_VIEWS_CAP } from './MessagesPanel.utils';
+import { routineSummary, effectiveSignal, loadEventPrefs, saveEventPrefs, type EventPref, groupRoutineMessages, collapseStaleRoutineRows, formatDailyDigestSummary, outcomeBreakdown, isFailingGroup, getToastSeverity, type RoutineRow, loadLastSeen, saveLastSeen, formatTimestamp, insertTimeDividers, type MessageWithDivider, ESCALATION_BADGE_LABELS, isCriticalSeverity, type MuteWindow, loadMuteWindow, saveMuteWindow, clearMuteWindow, isMuteWindowActive, formatMuteCountdown, type SavedView, loadSavedViews, saveSavedViews, SAVED_VIEWS_CAP, type TemporaryMutes, loadTemporaryMutes, saveTemporaryMutes, ROUTINE_EVENT_LABELS } from './MessagesPanel.utils';
 
 const DEFAULT_VIEW_ID = '__default__';
 
@@ -271,6 +271,10 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
   const [showWebhookDetail, setShowWebhookDetail] = useState(false);
   const [muteWindow, setMuteWindow] = useState<MuteWindow | null>(() => loadMuteWindow(auth.currentUser?.email, selectedProjectId));
   const [showMuteMenu, setShowMuteMenu] = useState(false);
+  const [tempMutes, setTempMutes] = useState<TemporaryMutes>(() =>
+    loadTemporaryMutes(auth.currentUser?.email, selectedProjectId),
+  );
+  const [showTempMuteMenu, setShowTempMuteMenu] = useState(false);
 
   // Saved views — named filter combos persisted per-user-per-project. activeViewId
   // tracks which tab is currently applied; when the operator mutates any underlying
@@ -319,6 +323,8 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
   const seenPromotedGroupKeysRef = useRef<Set<string>>(new Set());
   const eventPrefsRef = useRef(eventPrefs);
   eventPrefsRef.current = eventPrefs;
+  const tempMutesRef = useRef(tempMutes);
+  tempMutesRef.current = tempMutes;
 
   // Reset toast suppression state when switching projects so that the next
   // fetch is treated as an initial load for the new project (avoids a flood
@@ -329,6 +335,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
     seenPromotedGroupKeysRef.current = new Set();
     hasInitiallyLoadedRef.current = false;
     setEventPrefs(loadEventPrefs(auth.currentUser?.email, selectedProjectId));
+    setTempMutes(loadTemporaryMutes(auth.currentUser?.email, selectedProjectId));
     setWebhookStats(null);
     setMuteWindow(loadMuteWindow(auth.currentUser?.email, selectedProjectId));
     const lastSeen = loadLastSeen(auth.currentUser?.email, selectedProjectId);
@@ -403,7 +410,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
   const newHighSignalCount = dividerTime
     ? openMessages.filter(m =>
         m.created_at &&
-        effectiveSignal(m, eventPrefs) === 'high' &&
+        effectiveSignal(m, eventPrefs, tempMutes) === 'high' &&
         parseTimestamp(m.created_at).getTime() > dividerTime
       ).length
     : 0;
@@ -415,34 +422,34 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
           m.message_type === 'BLOCKER' &&
           m.created_at &&
           parseTimestamp(m.created_at).getTime() > dividerTime &&
-          effectiveSignal(m, eventPrefs) !== 'mute'
+          effectiveSignal(m, eventPrefs, tempMutes) !== 'mute'
         ).length,
         feedback: openMessages.filter(m =>
           m.message_type === 'FEEDBACK' &&
           m.created_at &&
           parseTimestamp(m.created_at).getTime() > dividerTime &&
-          effectiveSignal(m, eventPrefs) !== 'mute'
+          effectiveSignal(m, eventPrefs, tempMutes) !== 'mute'
         ).length,
         bugReports: openMessages.filter(m =>
           m.message_type === 'BUG_REPORT' &&
           m.created_at &&
           parseTimestamp(m.created_at).getTime() > dividerTime &&
-          effectiveSignal(m, eventPrefs) !== 'mute'
+          effectiveSignal(m, eventPrefs, tempMutes) !== 'mute'
         ).length,
         routine: openMessages.filter(m =>
-          effectiveSignal(m, eventPrefs) === 'routine' &&
+          effectiveSignal(m, eventPrefs, tempMutes) === 'routine' &&
           m.created_at &&
           parseTimestamp(m.created_at).getTime() > dividerTime
         ).length,
       }
     : { blockers: 0, feedback: 0, bugReports: 0, routine: 0 };
 
-  // Split open messages by signal level, respecting per-event-type prefs, then filter by search
+  // Split open messages by signal level, respecting per-event-type prefs and temp mutes, then filter by search
   const muteActive = isMuteWindowActive(muteWindow);
-  const highSignalOpen = [...openMessages.filter(m => effectiveSignal(m, eventPrefs) === 'high' && matchesSearch(m) && isNewMessage(m))]
+  const highSignalOpen = [...openMessages.filter(m => effectiveSignal(m, eventPrefs, tempMutes) === 'high' && matchesSearch(m) && isNewMessage(m))]
     .sort(sortMode === 'importance' ? bySeverity : byTimeDesc);
   // Always compute routine messages; mute only filters them from the non-promoted routine section
-  const routineOpen = [...openMessages.filter(m => effectiveSignal(m, eventPrefs) === 'routine' && matchesSearch(m) && isNewMessage(m))].sort(byTimeDesc);
+  const routineOpen = [...openMessages.filter(m => effectiveSignal(m, eventPrefs, tempMutes) === 'routine' && matchesSearch(m) && isNewMessage(m))].sort(byTimeDesc);
 
   // In importance mode, pin BLOCKERs at the top with a visual divider
   const pinnedBlockers = sortMode === 'importance' ? highSignalOpen.filter(m => m.message_type === 'BLOCKER') : [];
@@ -512,6 +519,29 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
       saveEventPrefs(auth.currentUser?.email, selectedProjectId, next);
       return next;
     });
+  }
+
+  function addTemporaryMute(eventType: string, durationMs: number) {
+    setTempMutes(prev => {
+      const next = { ...prev, [eventType]: Date.now() + durationMs };
+      saveTemporaryMutes(auth.currentUser?.email, selectedProjectId, next);
+      return next;
+    });
+    setShowTempMuteMenu(false);
+  }
+
+  function getTop3NoisyEventTypes(): Array<[string, number]> {
+    if (routineOpen.length === 0) return [];
+    const now = Date.now();
+    const oneHourAgo = now - 3600000;
+    const eventTypeCounts: Record<string, number> = {};
+    for (const msg of routineOpen) {
+      const et = msg.context.event_type as string | undefined;
+      if (et && msg.created_at && parseTimestamp(msg.created_at).getTime() > oneHourAgo) {
+        eventTypeCounts[et] = (eventTypeCounts[et] || 0) + 1;
+      }
+    }
+    return Object.entries(eventTypeCounts).sort((a, b) => b[1] - a[1]).slice(0, 3);
   }
 
   const activeView = useMemo(
@@ -646,6 +676,18 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
     return () => clearInterval(interval);
   }, [muteExpiresAt, selectedProjectId]);
 
+  // Auto-clean expired temporary mutes
+  useEffect(() => {
+    const now = Date.now();
+    const cleaned = Object.fromEntries(
+      Object.entries(tempMutes).filter(([, expiresAt]) => expiresAt > now)
+    );
+    if (Object.keys(cleaned).length !== Object.keys(tempMutes).length) {
+      setTempMutes(cleaned);
+      saveTemporaryMutes(auth.currentUser?.email, selectedProjectId, cleaned);
+    }
+  }, [selectedProjectId]);
+
   // Resolved: show last 5 by default, toggle to show all, filtered by search
   const RECENT_RESOLVED = 5;
   const sortedResolved = [...resolvedMessages.filter(m => matchesSearch(m))].sort(byTime);
@@ -665,7 +707,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
       if (hasInitiallyLoadedRef.current) {
         const newHighSignal = msgs.filter(m =>
           m.status === 'open' &&
-          effectiveSignal(m, eventPrefs) === 'high' &&
+          effectiveSignal(m, eventPrefsRef.current, tempMutesRef.current) === 'high' &&
           !seenMessageIdsRef.current.has(m.id)
         );
 
@@ -682,7 +724,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
 
       // Detect + toast for newly promoted failing routine groups
       const wasLoaded = hasInitiallyLoadedRef.current;
-      const routineMsgs = msgs.filter(m => m.status === 'open' && effectiveSignal(m, eventPrefsRef.current) === 'routine');
+      const routineMsgs = msgs.filter(m => m.status === 'open' && effectiveSignal(m, eventPrefsRef.current, tempMutesRef.current) === 'routine');
       for (const row of groupRoutineMessages(routineMsgs)) {
         if (row.kind === 'group' && isFailingGroup(row.msgs) && eventPrefsRef.current[row.event_type] !== 'mute') {
           if (wasLoaded && !seenPromotedGroupKeysRef.current.has(row.key)) {
@@ -1686,14 +1728,68 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
             {/* Routine ops group — collapsed by default */}
             {routineOpen.length > 0 && (
               <div ref={routineRefEl} className="border border-neutral-800/50 rounded-xl overflow-hidden">
-                <button
-                  onClick={() => setRoutineExpanded(e => !e)}
-                  className="w-full flex items-center gap-2 px-4 py-2.5 bg-neutral-900/40 hover:bg-neutral-900/70 transition-colors text-left min-h-[44px]"
-                >
-                  <ChevronDown className={`w-3.5 h-3.5 text-neutral-600 shrink-0 transition-transform ${routineExpanded ? 'rotate-180' : ''}`} />
-                  <span className="text-xs text-neutral-500 font-medium shrink-0">{routineOpen.length} routine ops</span>
-                  <span className="text-[11px] text-neutral-600 truncate">{routineSummary(routineOpen)}</span>
-                </button>
+                <div className="flex items-center bg-neutral-900/40 hover:bg-neutral-900/70 transition-colors min-h-[44px]">
+                  <button
+                    onClick={() => setRoutineExpanded(e => !e)}
+                    className="flex-1 flex items-center gap-2 px-4 py-2.5 text-left"
+                  >
+                    <ChevronDown className={`w-3.5 h-3.5 text-neutral-600 shrink-0 transition-transform ${routineExpanded ? 'rotate-180' : ''}`} />
+                    <span className="text-xs text-neutral-500 font-medium shrink-0">{routineOpen.length} routine ops</span>
+                    <span className="text-[11px] text-neutral-600 truncate">{routineSummary(routineOpen)}</span>
+                  </button>
+                  <div className="relative shrink-0 px-2">
+                    {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
+                    <button
+                      onClick={() => setShowTempMuteMenu(v => !v)}
+                      className="text-neutral-500 hover:text-neutral-300 p-1.5 rounded transition-colors"
+                      title="Temporarily mute event types"
+                    >
+                      <MoreVertical className="w-4 h-4" />
+                    </button>
+                    {showTempMuteMenu && (
+                      <>
+                        <div className="fixed inset-0 z-40" onClick={() => setShowTempMuteMenu(false)} />
+                        <div className="absolute right-0 top-full mt-1 z-50 bg-neutral-900 border border-neutral-700 rounded-lg shadow-xl p-2 space-y-1 min-w-48">
+                          {getTop3NoisyEventTypes().length > 0 ? (
+                            <>
+                              <p className="text-[10px] text-neutral-500 px-2 py-1">Mute for</p>
+                              {getTop3NoisyEventTypes().map(([eventType, count]) => {
+                                const label = ROUTINE_EVENT_LABELS[eventType] ?? eventType.replace(/_/g, ' ');
+                                const isActive = tempMutes[eventType] && tempMutes[eventType] > Date.now();
+                                return (
+                                  <div key={eventType} className="text-xs px-2 py-1 text-neutral-400">
+                                    <div className="font-medium mb-1">{label} ({count})</div>
+                                    <div className="flex gap-1 flex-wrap">
+                                      {(
+                                        [
+                                          ['30m', 1800000, 'Mute 30m'] as const,
+                                          ['1h', 3600000, 'Mute 1h'] as const,
+                                          ['Tomorrow', 86400000, 'Mute until tomorrow'] as const,
+                                        ]
+                                      ).map(([shortLabel, ms, title]) => (
+                                        // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
+                                        <button
+                                          key={shortLabel}
+                                          onClick={() => addTemporaryMute(eventType, ms)}
+                                          title={title}
+                                          className={`text-[11px] px-2 py-1 rounded transition-colors ${isActive ? 'bg-amber-500/20 text-amber-400' : 'bg-neutral-800 text-neutral-300 hover:bg-neutral-700'}`}
+                                        >
+                                          {shortLabel}
+                                        </button>
+                                      ))}
+                                    </div>
+                                  </div>
+                                );
+                              })}
+                            </>
+                          ) : (
+                            <p className="text-[10px] text-neutral-500 px-2 py-2">No recent events to mute</p>
+                          )}
+                        </div>
+                      </>
+                    )}
+                  </div>
+                </div>
                 {muteActive && (
                   <div className="px-4 py-2 bg-amber-950/30 border-t border-amber-800/30 text-[11px] text-amber-400">
                     🔕 Mute active, but failing groups still surface

@@ -629,3 +629,21 @@ export async function onboardProject(
   }
   return res.json();
 }
+
+export interface EfficiencyAxis {
+  current: number | null;
+  baseline: number | null;
+  drift_pct: number | null;
+}
+
+export interface EfficiencyAxesResponse {
+  axes: Record<string, EfficiencyAxis>;
+  baseline_captured_at: string | null;
+  last_snapshot_at: string | null;
+}
+
+export async function fetchEfficiencyAxes(projectId: string): Promise<EfficiencyAxesResponse> {
+  const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(projectId)}/efficiency-axes`);
+  if (!res.ok) throw new Error(`Failed to fetch efficiency axes: ${res.status}`);
+  return res.json();
+}

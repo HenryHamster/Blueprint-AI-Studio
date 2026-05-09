@@ -484,6 +484,7 @@ export default function App() {
             tasks={s.tasks}
             metricsWindow={s.metricsWindow}
             onWindowChange={s.setMetricsWindow}
+            projectId={s.selectedProjectId ?? undefined}
           />
         </ErrorBoundary>
       </div>

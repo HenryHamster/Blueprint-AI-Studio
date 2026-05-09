@@ -3,7 +3,7 @@ import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { render, waitFor } from '@testing-library/react';
 import { MessagesPanel } from './MessagesPanel';
-import { classifySignalLevel, effectiveSignal, loadEventPrefs, EVENT_PREFS_KEY, groupRoutineMessages, outcomeBreakdown, isFailingGroup, getToastSeverity, isCriticalSeverity } from './MessagesPanel.utils';
+import { classifySignalLevel, effectiveSignal, loadEventPrefs, EVENT_PREFS_KEY, groupRoutineMessages, outcomeBreakdown, isFailingGroup, getToastSeverity, isCriticalSeverity, loadTemporaryMutes, saveTemporaryMutes, isEventTypeTemporarilyMuted } from './MessagesPanel.utils';
 
 vi.mock('../firebase', () => ({
   auth: { currentUser: { email: 'test-user@example.com' } },
@@ -2599,6 +2599,100 @@ describe('MessagesPanel summary card', () => {
     localStorage.setItem('messages_panel_last_seen:test-user@example.com:proj-1', String(dividerTime));
     // Summary card should show routine ops
     expect(mockAddToast).toHaveBeenCalled();
+  });
+});
+
+// ── Temporary mutes unit tests ───────────────────────────────────────────
+
+describe('temporary mutes', () => {
+  afterEach(() => {
+    localStorage.clear();
+  });
+
+  test('effectiveSignal returns mute for temporarily muted event types', () => {
+    const now = Date.now();
+    const msg = { message_type: 'NOTE', from_type: 'system', context: { event_type: 'pr_merged' } };
+    const tempMutes = { pr_merged: now + 3600000 };
+
+    expect(effectiveSignal(msg, {}, tempMutes)).toBe('mute');
+  });
+
+  test('effectiveSignal ignores expired temporary mutes', () => {
+    const now = Date.now();
+    const msg = { message_type: 'NOTE', from_type: 'system', context: { event_type: 'pr_merged' } };
+    const tempMutes = { pr_merged: now - 1000 }; // expired
+
+    expect(effectiveSignal(msg, {}, tempMutes)).toBe('routine');
+  });
+
+  test('temporary mute takes precedence over permanent pref', () => {
+    const now = Date.now();
+    const msg = { message_type: 'NOTE', from_type: 'system', context: { event_type: 'pr_merged' } };
+    const prefs = { pr_merged: 'routine' as const };
+    const tempMutes = { pr_merged: now + 3600000 };
+
+    expect(effectiveSignal(msg, prefs, tempMutes)).toBe('mute');
+  });
+
+  test('isEventTypeTemporarilyMuted returns true for active mute', () => {
+    const now = Date.now();
+    const tempMutes = { pr_merged: now + 3600000 };
+
+    expect(isEventTypeTemporarilyMuted('pr_merged', tempMutes)).toBe(true);
+  });
+
+  test('isEventTypeTemporarilyMuted returns false for expired mute', () => {
+    const now = Date.now();
+    const tempMutes = { pr_merged: now - 1000 };
+
+    expect(isEventTypeTemporarilyMuted('pr_merged', tempMutes)).toBe(false);
+  });
+
+  test('isEventTypeTemporarilyMuted returns false for unmuted type', () => {
+    const tempMutes = {};
+
+    expect(isEventTypeTemporarilyMuted('pr_merged', tempMutes)).toBe(false);
+  });
+
+  test('loadTemporaryMutes filters out expired entries', () => {
+    const now = Date.now();
+    const key = 'messages_panel_temp_mutes:test-user@example.com:proj-1';
+    const data = {
+      pr_merged: now + 3600000, // active
+      cycle_summary: now - 1000, // expired
+      auto_fix_result: now + 7200000, // active
+    };
+    localStorage.setItem(key, JSON.stringify(data));
+
+    const loaded = loadTemporaryMutes('test-user@example.com', 'proj-1');
+
+    expect(loaded).toHaveProperty('pr_merged');
+    expect(loaded).toHaveProperty('auto_fix_result');
+    expect(loaded).not.toHaveProperty('cycle_summary');
+  });
+
+  test('saveTemporaryMutes persists to localStorage', () => {
+    const now = Date.now();
+    const tempMutes = {
+      pr_merged: now + 3600000,
+      auto_fix_result: now + 7200000,
+    };
+
+    saveTemporaryMutes('test-user@example.com', 'proj-1', tempMutes);
+
+    const key = 'messages_panel_temp_mutes:test-user@example.com:proj-1';
+    const stored = JSON.parse(localStorage.getItem(key) || '{}');
+
+    expect(stored).toEqual(tempMutes);
+  });
+
+  test('saveTemporaryMutes removes key when mutes are empty', () => {
+    const key = 'messages_panel_temp_mutes:test-user@example.com:proj-1';
+    localStorage.setItem(key, '{"pr_merged": 999999999999}');
+
+    saveTemporaryMutes('test-user@example.com', 'proj-1', {});
+
+    expect(localStorage.getItem(key)).toBeNull();
   });
 });
 

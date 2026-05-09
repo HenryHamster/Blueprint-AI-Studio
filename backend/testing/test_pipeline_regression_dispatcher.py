@@ -12474,6 +12474,347 @@ async def test_dispatcher_prompt_documents_verdict_triage(db_session):
 
 
 # ---------------------------------------------------------------------------
+# compute_escalation_outcome_breakdown — prevention_rate_30d new fields
+# ---------------------------------------------------------------------------
+
+
+def test_escalation_outcome_breakdown_has_prevention_rate_fields():
+    """All buckets in the breakdown include prevention_rate_30d and recurrences_observed."""
+    from app.pipeline_regression_dispatcher import (
+        _ESCALATION_BUCKET_ORDER,
+        compute_escalation_outcome_breakdown,
+    )
+
+    out = compute_escalation_outcome_breakdown([])
+    for bucket_name in _ESCALATION_BUCKET_ORDER:
+        b = out["by_reason"][bucket_name]
+        assert "prevention_rate_30d" in b
+        assert "recurrences_observed" in b
+        assert b["prevention_rate_30d"] is None
+        assert b["recurrences_observed"] == 0
+
+
+def test_escalation_outcome_breakdown_prevention_rate_single_durable():
+    """Defense merged 35d ago with no recurrence → prevention_rate_30d = 1.0, recurrences_observed = 0."""
+    from app.pipeline_regression_dispatcher import (
+        ESCALATION_REASON_ESCALATED_CROSS_LAYER,
+        compute_escalation_outcome_breakdown,
+    )
+
+    now = _utcnow()
+    merged_at = (now - timedelta(days=35)).isoformat()
+
+    case = _make_escalation_case(
+        ESCALATION_REASON_ESCALATED_CROSS_LAYER,
+        fix_log=[{"fix_pr_number": 1, "merged_at": merged_at}],
+    )
+
+    out = compute_escalation_outcome_breakdown([case], now=now)
+    b = out["by_reason"][ESCALATION_REASON_ESCALATED_CROSS_LAYER]
+    assert b["prevention_rate_30d"] == 1.0
+    assert b["recurrences_observed"] == 0
+
+
+def test_escalation_outcome_breakdown_prevention_rate_single_recurred():
+    """Defense merged 35d ago with a recurrence within 30d → prevention_rate_30d = 0.0, recurrences_observed = 1."""
+    from app.pipeline_regression_dispatcher import (
+        ESCALATION_REASON_ESCALATED_RECURRENCE,
+        compute_escalation_outcome_breakdown,
+    )
+
+    now = _utcnow()
+    merged1 = (now - timedelta(days=35)).isoformat()
+    merged2 = (now - timedelta(days=20)).isoformat()  # within 30d of merged1
+
+    case = _make_escalation_case(
+        ESCALATION_REASON_ESCALATED_RECURRENCE,
+        fix_log=[
+            {"fix_pr_number": 1, "merged_at": merged1},
+            {"fix_pr_number": 2, "merged_at": merged2},
+        ],
+    )
+
+    out = compute_escalation_outcome_breakdown([case], now=now)
+    b = out["by_reason"][ESCALATION_REASON_ESCALATED_RECURRENCE]
+    assert b["prevention_rate_30d"] == 0.0
+    assert b["recurrences_observed"] == 1
+
+
+def test_escalation_outcome_breakdown_prevention_rate_mixed():
+    """3 defenses ≥30d old: 2 prevented, 1 recurred → prevention_rate_30d = 2/3."""
+    from app.pipeline_regression_dispatcher import (
+        _ESCALATION_BUCKET_ALL_OTHER,
+        compute_escalation_outcome_breakdown,
+    )
+
+    now = _utcnow()
+    old = (now - timedelta(days=35)).isoformat()
+    retrip = (now - timedelta(days=20)).isoformat()  # within 30d of old
+
+    case_durable1 = _make_escalation_case(
+        None, fix_log=[{"fix_pr_number": 1, "merged_at": old}]
+    )
+    case_durable2 = _make_escalation_case(
+        None, fix_log=[{"fix_pr_number": 2, "merged_at": old}]
+    )
+    case_recurred = _make_escalation_case(
+        None,
+        fix_log=[
+            {"fix_pr_number": 3, "merged_at": old},
+            {"fix_pr_number": 4, "merged_at": retrip},
+        ],
+    )
+
+    out = compute_escalation_outcome_breakdown(
+        [case_durable1, case_durable2, case_recurred], now=now
+    )
+    b = out["by_reason"][_ESCALATION_BUCKET_ALL_OTHER]
+    assert abs(b["prevention_rate_30d"] - 2.0 / 3.0) < 1e-9
+    assert b["recurrences_observed"] == 1
+
+
+def test_escalation_outcome_breakdown_prevention_rate_excludes_recent_defense():
+    """Defense merged 10d ago is excluded from prevention_rate_30d but still counted in merged_count."""
+    from app.pipeline_regression_dispatcher import (
+        _ESCALATION_BUCKET_ALL_OTHER,
+        compute_escalation_outcome_breakdown,
+    )
+
+    now = _utcnow()
+    recent = (now - timedelta(days=10)).isoformat()
+
+    case = _make_escalation_case(
+        None, fix_log=[{"fix_pr_number": 1, "merged_at": recent}]
+    )
+
+    out = compute_escalation_outcome_breakdown([case], now=now)
+    b = out["by_reason"][_ESCALATION_BUCKET_ALL_OTHER]
+    assert b["merged_count"] == 1
+    assert b["prevention_rate_30d"] is None
+    assert b["recurrences_observed"] == 0
+
+
+# ---------------------------------------------------------------------------
+# compute_avg_prevention_rate_7d — pure-function unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_compute_avg_prevention_rate_7d_empty():
+    """Empty cases list returns avg_rate=None and eligible_count=0."""
+    from app.pipeline_regression_dispatcher import compute_avg_prevention_rate_7d
+
+    result = compute_avg_prevention_rate_7d([])
+    assert result["avg_rate"] is None
+    assert result["eligible_count"] == 0
+    assert result["prevented_count"] == 0
+    assert result["recurred_count"] == 0
+
+
+def test_compute_avg_prevention_rate_7d_in_window_excluded():
+    """Defense merged 15d ago (window not yet closed) is excluded."""
+    from app.pipeline_regression_dispatcher import compute_avg_prevention_rate_7d
+
+    now = _utcnow()
+    recent = (now - timedelta(days=15)).isoformat()  # < 30d old — window still open
+
+    case = _make_escalation_case(
+        None, fix_log=[{"fix_pr_number": 1, "merged_at": recent}]
+    )
+
+    result = compute_avg_prevention_rate_7d([case], now=now)
+    assert result["avg_rate"] is None
+    assert result["eligible_count"] == 0
+
+
+def test_compute_avg_prevention_rate_7d_too_old_excluded():
+    """Defense merged 40d ago (window closed >7d ago) is excluded."""
+    from app.pipeline_regression_dispatcher import compute_avg_prevention_rate_7d
+
+    now = _utcnow()
+    old = (
+        now - timedelta(days=40)
+    ).isoformat()  # > 37d old — outside 7d collection window
+
+    case = _make_escalation_case(None, fix_log=[{"fix_pr_number": 1, "merged_at": old}])
+
+    result = compute_avg_prevention_rate_7d([case], now=now)
+    assert result["avg_rate"] is None
+    assert result["eligible_count"] == 0
+
+
+def test_compute_avg_prevention_rate_7d_perfect_prevention():
+    """All eligible defenses prevented → avg_rate = 1.0."""
+    from app.pipeline_regression_dispatcher import compute_avg_prevention_rate_7d
+
+    now = _utcnow()
+    # merged_at in [now-37d, now-30d] — window closed within last 7d
+    merged_at = (now - timedelta(days=33)).isoformat()
+
+    case1 = _make_escalation_case(
+        None, fix_log=[{"fix_pr_number": 1, "merged_at": merged_at}]
+    )
+    case2 = _make_escalation_case(
+        None, fix_log=[{"fix_pr_number": 2, "merged_at": merged_at}]
+    )
+
+    result = compute_avg_prevention_rate_7d([case1, case2], now=now)
+    assert result["avg_rate"] == 1.0
+    assert result["eligible_count"] == 2
+    assert result["prevented_count"] == 2
+    assert result["recurred_count"] == 0
+
+
+def test_compute_avg_prevention_rate_7d_mixed_rate():
+    """2 prevented, 1 recurred in eligible window → avg_rate = 2/3."""
+    from app.pipeline_regression_dispatcher import compute_avg_prevention_rate_7d
+
+    now = _utcnow()
+    merged_at_str = (now - timedelta(days=33)).isoformat()
+    retrip_str = (now - timedelta(days=15)).isoformat()  # within 30d of merged_at
+
+    case_good1 = _make_escalation_case(
+        None, fix_log=[{"fix_pr_number": 1, "merged_at": merged_at_str}]
+    )
+    case_good2 = _make_escalation_case(
+        None, fix_log=[{"fix_pr_number": 2, "merged_at": merged_at_str}]
+    )
+    case_bad = _make_escalation_case(
+        None,
+        fix_log=[
+            {"fix_pr_number": 3, "merged_at": merged_at_str},
+            {"fix_pr_number": 4, "merged_at": retrip_str},
+        ],
+    )
+
+    result = compute_avg_prevention_rate_7d([case_good1, case_good2, case_bad], now=now)
+    assert abs(result["avg_rate"] - 2.0 / 3.0) < 1e-9
+    assert result["eligible_count"] == 3
+    assert result["prevented_count"] == 2
+    assert result["recurred_count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# _evaluate_low_prevention_rate_signal — threshold + spawn behaviour
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_low_prevention_rate_signal_fires_when_threshold_crossed(db_session):
+    """Signal spawns investigate task when avg_rate < 0.60 and eligible_count >= 5."""
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+    from app.pipeline_regression_dispatcher import (
+        _PREVENTION_RATE_MIN_SAMPLE,
+        _evaluate_low_prevention_rate_signal,
+    )
+
+    project = make_project(design_doc=_design_doc_no_sr_regression())
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    merged_at_str = (now - timedelta(days=33)).isoformat()
+    retrip_str = (now - timedelta(days=15)).isoformat()
+
+    # Create 5 cases where each recurred (rate = 0.0 < 0.60)
+    for i in range(_PREVENTION_RATE_MIN_SAMPLE):
+        case = RegressionRemediationCase(
+            project_id=project.id,
+            regression_class=f"sr_catch_rate:cls{i}",
+            status=RegressionCaseStatus.CLOSED,
+            fingerprint_to_fix_log=[
+                {"fix_pr_number": i * 10 + 1, "merged_at": merged_at_str},
+                {"fix_pr_number": i * 10 + 2, "merged_at": retrip_str},
+            ],
+            signal_snapshot_at_spawn={},
+        )
+        db_session.add(case)
+    await db_session.commit()
+
+    spawned = await _evaluate_low_prevention_rate_signal(db_session, project.id, 1)
+    assert spawned == 1
+
+    task = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .first()
+    )
+    assert task is not None
+    assert (task.context or {}).get(
+        "regression_class"
+    ) == "cross_layer_defense_prevention_low"
+
+
+@pytest.mark.asyncio
+async def test_low_prevention_rate_signal_suppressed_when_rate_ok(db_session):
+    """Signal does not fire when prevention rate is above threshold."""
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+    from app.pipeline_regression_dispatcher import (
+        _PREVENTION_RATE_MIN_SAMPLE,
+        _evaluate_low_prevention_rate_signal,
+    )
+
+    project = make_project(design_doc=_design_doc_no_sr_regression())
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    merged_at_str = (now - timedelta(days=33)).isoformat()
+
+    # Create 5 cases where none recurred (rate = 1.0 >= 0.60)
+    for i in range(_PREVENTION_RATE_MIN_SAMPLE):
+        case = RegressionRemediationCase(
+            project_id=project.id,
+            regression_class=f"sr_catch_rate:cls{i}",
+            status=RegressionCaseStatus.CLOSED,
+            fingerprint_to_fix_log=[
+                {"fix_pr_number": i + 1, "merged_at": merged_at_str},
+            ],
+            signal_snapshot_at_spawn={},
+        )
+        db_session.add(case)
+    await db_session.commit()
+
+    spawned = await _evaluate_low_prevention_rate_signal(db_session, project.id, 1)
+    assert spawned == 0
+
+
+@pytest.mark.asyncio
+async def test_low_prevention_rate_signal_suppressed_when_below_min_sample(db_session):
+    """Signal does not fire when eligible count is below min sample."""
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+    from app.pipeline_regression_dispatcher import _evaluate_low_prevention_rate_signal
+
+    project = make_project(design_doc=_design_doc_no_sr_regression())
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    merged_at_str = (now - timedelta(days=33)).isoformat()
+    retrip_str = (now - timedelta(days=15)).isoformat()
+
+    # Only 3 cases (below min sample of 5) even though rate is low
+    for i in range(3):
+        case = RegressionRemediationCase(
+            project_id=project.id,
+            regression_class=f"sr_catch_rate:cls{i}",
+            status=RegressionCaseStatus.CLOSED,
+            fingerprint_to_fix_log=[
+                {"fix_pr_number": i * 10 + 1, "merged_at": merged_at_str},
+                {"fix_pr_number": i * 10 + 2, "merged_at": retrip_str},
+            ],
+            signal_snapshot_at_spawn={},
+        )
+        db_session.add(case)
+    await db_session.commit()
+
+    spawned = await _evaluate_low_prevention_rate_signal(db_session, project.id, 1)
+    assert spawned == 0
+
+
+# ---------------------------------------------------------------------------
 # _evaluate_recurring_class_signal integration tests
 # ---------------------------------------------------------------------------
 

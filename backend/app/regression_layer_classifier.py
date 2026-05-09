@@ -118,6 +118,13 @@ _BASELINE_GATE_PATTERNS: list[re.Pattern] = [
     # Broad lint failures that cascade beyond the changed files
     re.compile(r"(ruff|mypy|eslint).*E\d{3,}", re.IGNORECASE),
     re.compile(r"module.size.limit", re.IGNORECASE),
+    # Viewport regression gate — viewport.test.tsx failures and coverage drops
+    re.compile(r"viewport.*test.*\.tsx", re.IGNORECASE),
+    re.compile(r"expect(?:NoOverflow|MinTouchTarget)At", re.IGNORECASE),
+    re.compile(
+        r"viewport.{0,30}(?:overflow|regression|baseline|coverage)", re.IGNORECASE
+    ),
+    re.compile(r"check-viewport\.sh", re.IGNORECASE),
 ]
 
 _BASELINE_GATE_FAILURE_CLASSES: frozenset[str] = frozenset(
@@ -131,6 +138,7 @@ _BASELINE_GATE_STAGE_KEYWORDS: list[str] = [
     "eslint",
     "ruff",
     "mypy",
+    "viewport",
 ]
 
 # REVIEWER_PASS: fresh-reviewer disagreement, build-gate conflicts

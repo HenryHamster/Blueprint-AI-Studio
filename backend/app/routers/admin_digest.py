@@ -5466,6 +5466,24 @@ async def _compute_digest(
                 "by_path": _by_path,
             }
 
+    # --- Prevention-rate 7d aggregate ---
+    avg_prevention_rate_7d: Optional[Dict[str, Any]] = None
+    if project_id:
+        from app.pipeline_regression_dispatcher import (  # noqa: PLC0415
+            compute_avg_prevention_rate_7d,
+        )
+
+        _prev_cases = list(
+            (
+                await session.execute(
+                    select(RegressionRemediationCase).where(
+                        RegressionRemediationCase.project_id == project_id
+                    )
+                )
+            ).scalars()
+        )
+        avg_prevention_rate_7d = compute_avg_prevention_rate_7d(_prev_cases)
+
     # --- Prevention efficacy summary ---
     # Aggregate preventive-context outcomes across recent research_history
     # entries so operators can see whether proactive context injection actually
@@ -6541,6 +6559,7 @@ async def _compute_digest(
         "pipeline_filter_funnel": pipeline_filter_funnel or None,
         "scope_mismatch_summary": scope_mismatch_summary,
         "escalation_outcome_summary": escalation_outcome_summary,
+        "avg_prevention_rate_7d": avg_prevention_rate_7d,
         "prevention_efficacy": prevention_efficacy,
         "rejection_pattern_summary": rejection_pattern_summary,
         "retry_pattern_summary": retry_pattern_summary,
@@ -8711,6 +8730,44 @@ async def get_viewport_debt(
         "scanned_at": datetime.utcnow().isoformat(),
         "coverage_summary": coverage_summary,
     }
+
+
+@router.get("/projects/{project_id}/efficiency-axes")
+async def get_efficiency_axes(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Return per-axis current/baseline/drift for the project's efficiency baseline.
+
+    Reads ``project.design_doc["efficiency_baseline"]`` (populated weekly by
+    the ``_efficiency_snapshot_service``) and returns each of the five
+    foundational axes — ``cost_per_merged_pr``, ``vm_cold_start_p50_ms``,
+    ``vm_reuse_rate``, ``median_api_calls_per_task``,
+    ``median_review_iterations`` — with the latest snapshot value, the
+    immutable baseline value, and percentage drift from baseline.
+
+    Response shape::
+
+        {
+          "axes": {
+            "<axis>": {"current": float|None, "baseline": float|None, "drift_pct": float|None},
+            ...
+          },
+          "baseline_captured_at": iso8601|None,
+          "last_snapshot_at": iso8601|None
+        }
+
+    ``drift_pct`` is None whenever either side is missing or baseline is 0.
+    Before the first snapshot fires, all axis values are None and both
+    timestamps are None.
+    """
+    from app.efficiency_snapshot import read_baseline_with_drift  # noqa: PLC0415
+
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, min_role="viewer"
+    )
+    return await read_baseline_with_drift(session, project_id)
 
 
 @router.get("/regression-dispatcher/escalation-outcomes")

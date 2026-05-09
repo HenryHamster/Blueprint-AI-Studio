@@ -188,8 +188,10 @@ export function saveSavedViews(
 export function effectiveSignal(
   msg: { message_type: string; from_type: string; context: Record<string, unknown> },
   prefs: Record<string, EventPref>,
+  tempMutes?: TemporaryMutes,
 ): 'high' | 'routine' | 'mute' {
   const et = msg.context.event_type as string | undefined;
+  if (tempMutes && isEventTypeTemporarilyMuted(et, tempMutes)) return 'mute';
   const pref = et ? prefs[et] : undefined;
   if (pref === 'mute') return 'mute';
   if (pref === 'routine') return 'routine';
@@ -488,6 +490,54 @@ export function isCriticalSeverity(msg: {
   return false;
 }
 
+// ── Temporary event-type mutes (short-duration silence for noisy types) ────────
+
+export type TemporaryMutes = Record<string, number>; // event_type -> expiresAt (ms)
+
+export function temporaryMutesKey(userId: string | undefined, projectId: string | undefined): string {
+  return `messages_panel_temp_mutes:${userId || 'anonymous'}:${projectId || 'default'}`;
+}
+
+export function loadTemporaryMutes(userId?: string | null, projectId?: string | null): TemporaryMutes {
+  try {
+    const key = temporaryMutesKey(userId || undefined, projectId || undefined);
+    const raw = localStorage.getItem(key);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    const now = Date.now();
+    const mutes: TemporaryMutes = {};
+    for (const [et, expiresAt] of Object.entries(parsed)) {
+      if (typeof expiresAt === 'number' && expiresAt > now) {
+        mutes[et] = expiresAt;
+      }
+    }
+    return mutes;
+  } catch {
+    return {};
+  }
+}
+
+export function saveTemporaryMutes(
+  userId: string | undefined | null,
+  projectId: string | undefined | null,
+  mutes: TemporaryMutes,
+): void {
+  try {
+    const key = temporaryMutesKey(userId || undefined, projectId || undefined);
+    if (Object.keys(mutes).length === 0) {
+      localStorage.removeItem(key);
+    } else {
+      localStorage.setItem(key, JSON.stringify(mutes));
+    }
+  } catch { /* ignore */ }
+}
+
+export function isEventTypeTemporarilyMuted(eventType: string | undefined, tempMutes: TemporaryMutes): boolean {
+  if (!eventType) return false;
+  const expiresAt = tempMutes[eventType];
+  return expiresAt !== undefined && expiresAt > Date.now();
+}
+
 // Collapses stale routine rows (older than STALE_ROUTINE_COLLAPSE_AGE_MS) into per-day digest
 // entries. Failing groups and high-signal events are never collapsed.
 export function collapseStaleRoutineRows<T extends { id: string; context: Record<string, unknown>; created_at?: string | null }>(
@@ -520,6 +570,7 @@ export function collapseStaleRoutineRows<T extends { id: string; context: Record
         output.push(day);
         digestBuckets.set(day, { msgs: [], breakdown: {} });
       }
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
       const bucket = digestBuckets.get(day)!;
       for (const m of rowMsgs) {
         bucket.msgs.push(m);
@@ -533,6 +584,7 @@ export function collapseStaleRoutineRows<T extends { id: string; context: Record
 
   return output.map(item => {
     if (typeof item !== 'string') return item;
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
     const b = digestBuckets.get(item)!;
     return { kind: 'daily_digest' as const, day: item, count: b.msgs.length, breakdown: b.breakdown, msgs: b.msgs };
   });

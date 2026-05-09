@@ -548,6 +548,59 @@ async def lifespan(app):
 
     regression_watchdog_task = asyncio.create_task(_regression_watchdog_scan_service())
 
+    # Start the Efficiency Snapshot service (weekly per-project axis snapshots).
+    async def _efficiency_snapshot_service():
+        """Hourly leader-only tick that writes a weekly efficiency snapshot per project.
+
+        Cadence is enforced inside ``maybe_write_weekly_snapshot`` via the
+        ``last_run_at`` marker stored under
+        ``project.design_doc["efficiency_baseline"]``, so the in-instance
+        sleep can be coarse without producing duplicate snapshots.
+        """
+        from app.efficiency_snapshot import (  # noqa: PLC0415
+            SNAPSHOT_INTERVAL_SECONDS,
+            maybe_write_weekly_snapshot,
+        )
+
+        while True:
+            await asyncio.sleep(SNAPSHOT_INTERVAL_SECONDS)
+            try:
+                async with AsyncSessionLocal() as scan_session:
+                    projects = (
+                        (
+                            await scan_session.execute(
+                                select(Project).options(load_only(Project.id))
+                            )
+                        )
+                        .scalars()
+                        .all()
+                    )
+                    for project in projects:
+                        try:
+                            written = await maybe_write_weekly_snapshot(
+                                scan_session, project.id
+                            )
+                            if written is not None:
+                                await scan_session.commit()
+                                logger.info(
+                                    "[EFFICIENCY_SNAPSHOT] project=%s wrote weekly snapshot",
+                                    project.id,
+                                )
+                        except Exception as proj_exc:
+                            logger.warning(
+                                "[EFFICIENCY_SNAPSHOT] project=%s error=%s",
+                                project.id,
+                                proj_exc,
+                            )
+            except asyncio.CancelledError:
+                raise
+            except Exception as scan_exc:
+                logger.error(
+                    "[EFFICIENCY_SNAPSHOT] scan error: %s", scan_exc, exc_info=True
+                )
+
+    efficiency_snapshot_task = asyncio.create_task(_efficiency_snapshot_service())
+
     # Start the Orchestrator Worker background task
     orchestrator_task = asyncio.create_task(orchestrator_worker())
 
@@ -574,6 +627,7 @@ async def lifespan(app):
     _bg_tasks["auto_archive"] = auto_archive_task
     _bg_tasks["regression_recovery_scan"] = regression_recovery_task
     _bg_tasks["regression_watchdog_scan"] = regression_watchdog_task
+    _bg_tasks["efficiency_snapshot"] = efficiency_snapshot_task
     _bg_tasks["config_sync"] = config_sync_task
     _bg_tasks["availability_refresh"] = availability_refresh_task
 
@@ -601,6 +655,7 @@ async def lifespan(app):
             "auto_archive": auto_archive_service,
             "regression_recovery_scan": _regression_recovery_scan_service,
             "regression_watchdog_scan": _regression_watchdog_scan_service,
+            "efficiency_snapshot": _efficiency_snapshot_service,
             "config_sync": runtime_config_sync_service,
             "availability_refresh": account_availability_refresh_service,
         }

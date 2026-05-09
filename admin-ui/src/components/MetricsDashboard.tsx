@@ -1,6 +1,7 @@
-import { useMemo, useState } from 'react';
+import { useMemo, useState, useEffect } from 'react';
 import { parseTimestamp } from '../utils/time';
 import type { Task } from './TaskCard';
+import { apiFetch, type EfficiencyAxesResponse } from '../api';
 import {
   ResponsiveContainer,
   AreaChart,
@@ -31,6 +32,7 @@ interface MetricsDashboardProps {
   tasks: Task[];
   metricsWindow: '15m' | '30m' | '1h' | '2h' | '3h' | '6h' | '12h' | '24h' | 'all';
   onWindowChange: (w: '15m' | '30m' | '1h' | '2h' | '3h' | '6h' | '12h' | '24h' | 'all') => void;
+  projectId?: string;
 }
 
 const WINDOW_MS: Record<'15m' | '30m' | '1h' | '2h' | '3h' | '6h' | '12h' | '24h' | 'all', number> = { '15m': 900000, '30m': 1800000, '1h': 3600000, '2h': 7200000, '3h': 10800000, '6h': 21600000, '12h': 43200000, '24h': 86400000, 'all': Number.MAX_SAFE_INTEGER };
@@ -201,6 +203,94 @@ function getTaskFailedTime(task: Task): number | null {
 
 const WINDOW_OPTIONS: Array<'15m' | '30m' | '1h' | '2h' | '3h' | '6h' | '12h' | '24h' | 'all'> = ['15m', '30m', '1h', '2h', '3h', '6h', '12h', '24h', 'all'];
 
+interface EfficiencyAxisDef {
+  key: string;
+  label: string;
+  unit: string;
+  favorableDirection: 'lower' | 'higher';
+}
+
+const EFFICIENCY_AXES: EfficiencyAxisDef[] = [
+  { key: 'cost_per_merged_pr', label: 'Cost per merged PR', unit: '$', favorableDirection: 'lower' },
+  { key: 'vm_cold_start_p50_ms', label: 'VM cold-start p50', unit: 'ms', favorableDirection: 'lower' },
+  { key: 'vm_reuse_rate', label: 'VM reuse rate', unit: '%', favorableDirection: 'higher' },
+  { key: 'median_api_calls_per_task', label: 'Median API calls per task', unit: '', favorableDirection: 'lower' },
+  { key: 'median_review_iterations', label: 'Median review iterations', unit: '', favorableDirection: 'lower' },
+];
+
+function getDriftColor(driftPct: number | null, favorableDirection: 'lower' | 'higher'): string {
+  if (driftPct === null) return 'text-neutral-500';
+  const isImproving = (favorableDirection === 'lower' && driftPct < 0) || (favorableDirection === 'higher' && driftPct > 0);
+  return isImproving ? 'text-emerald-400' : 'text-red-400';
+}
+
+function EfficiencyWidget({ projectId }: { projectId: string }) {
+  const [data, setData] = useState<EfficiencyAxesResponse | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let mounted = true;
+    (async () => {
+      try {
+        const result = await apiFetch(`/api/admin/projects/${encodeURIComponent(projectId)}/efficiency-axes`);
+        if (!result.ok) throw new Error(`Failed to fetch efficiency data: ${result.status}`);
+        if (mounted) {
+          setData(await result.json());
+          setError(null);
+        }
+      } catch (err) {
+        if (mounted) {
+          setError(err instanceof Error ? err.message : 'Unknown error');
+        }
+      } finally {
+        if (mounted) setLoading(false);
+      }
+    })();
+    return () => { mounted = false; };
+  }, [projectId]);
+
+  if (loading) {
+    return <div className="flex items-center justify-center h-24 text-neutral-500 text-xs">Loading efficiency data…</div>;
+  }
+
+  if (error) {
+    return <div className="flex items-center justify-center h-24 text-red-400 text-xs">{error}</div>;
+  }
+
+  if (!data || !data.axes || Object.keys(data.axes).length === 0) {
+    return <div className="flex items-center justify-center h-24 text-neutral-500 text-xs">Baseline pending (waiting for first weekly snapshot)</div>;
+  }
+
+  const hasBaseline = Object.values(data.axes).some(axis => axis.baseline !== null);
+  if (!hasBaseline) {
+    return <div className="flex items-center justify-center h-24 text-neutral-500 text-xs">Baseline pending (waiting for first weekly snapshot)</div>;
+  }
+
+  return (
+    <div className="space-y-2">
+      {EFFICIENCY_AXES.map((axisDef) => {
+        const axisData = data.axes[axisDef.key];
+        if (!axisData) return null;
+        const { current, baseline, drift_pct } = axisData;
+        const driftColor = getDriftColor(drift_pct, axisDef.favorableDirection);
+        const driftArrow = drift_pct === null ? '—' : (drift_pct < 0 ? '↓' : '↑');
+        const driftDisplay = drift_pct === null ? '—' : `${driftArrow} ${Math.abs(drift_pct).toFixed(1)}%`;
+        return (
+          <div key={axisDef.key} className="flex justify-between items-center py-1.5 px-3 rounded bg-neutral-800/50 text-xs">
+            <span className="text-neutral-400">{axisDef.label}</span>
+            <div className="flex gap-4 items-center text-neutral-300 font-mono">
+              <span>{current !== null ? `${current.toFixed(1)}${axisDef.unit}` : '—'}</span>
+              <span className="text-neutral-500">baseline: {baseline !== null ? `${baseline.toFixed(1)}${axisDef.unit}` : '—'}</span>
+              <span className={`${driftColor} min-w-12 text-right`}>{driftDisplay}</span>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 export default function MetricsDashboard({
   metricsHistory,
   cumulativeCost,
@@ -209,6 +299,7 @@ export default function MetricsDashboard({
   tasks,
   metricsWindow,
   onWindowChange,
+  projectId,
 }: MetricsDashboardProps) {
   const windowMs = WINDOW_MS[metricsWindow];
   const [now] = useState(Date.now);
@@ -356,6 +447,14 @@ export default function MetricsDashboard({
           <div className="text-xs font-semibold text-neutral-400 uppercase tracking-wide mb-2">Failure Rate</div>
           <FailureRateChart points={metricsHistory} windowMs={windowMs} />
         </div>
+
+        {/* Efficiency axes widget — full width */}
+        {projectId && (
+          <div className={`${cardClass} sm:col-span-2`}>
+            <div className="text-xs font-semibold text-neutral-400 uppercase tracking-wide mb-3">Efficiency Axes</div>
+            <EfficiencyWidget projectId={projectId} />
+          </div>
+        )}
       </div>
     </div>
   );

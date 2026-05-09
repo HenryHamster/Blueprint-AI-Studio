@@ -3069,6 +3069,12 @@ async def orchestrator_worker():
                     task.status = TaskStatus.PROVISIONING
                     task.started_at = _utcnow()
                     task.vm_provisioned_at = _utcnow()
+                    # Foundational scaffolding for vm_reuse_rate (efficiency
+                    # direction d-91d8dede). There is no warm pool today, so
+                    # every dispatch is a cold provision — TODO(warm-pool):
+                    # flip to True at the reuse path once pooling lands. See
+                    # compute.provision_agent_vm for the corresponding marker.
+                    task.vm_warm_start = False
                     # vm_spot must be written here — it's read by ~30 cost-rate sites
                     # (admin_digest, ci_completion, task_completion, etc.) gating
                     # SPOT_RATE vs ON_DEMAND_RATE. Without this write every cost
@@ -4747,9 +4753,11 @@ async def orchestrator_worker():
                             if status_code == 404:
                                 ci_task.status = TaskStatus.FAILED
                                 ci_task.latest_status_message = "CI polling failed: PR not found (404) — PR may have been deleted"
-                                _pr_num_404 = (ci_task.context or {}).get(
-                                    "review_loop", {}
-                                ).get("pr_number")
+                                _pr_num_404 = (
+                                    (ci_task.context or {})
+                                    .get("review_loop", {})
+                                    .get("pr_number")
+                                )
                                 logger.exception(
                                     f"[CI] PR #{_pr_num_404} returned 404 — marking task {ci_task_id} FAILED"
                                 )

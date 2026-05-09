@@ -125,6 +125,14 @@ class HeartbeatRequest(BaseModel):
     # Unix timestamp (seconds) extracted from the image name suffix, e.g.
     # "blueprint-agent-v2-1730000000" → 1730000000. None when unparseable.
     vm_image_build_ts: int | None = None
+    # Cumulative per-task LLM telemetry. Optional/backwards-compatible — older
+    # agents that don't yet emit these fields silently skip persistence; newer
+    # agents send running totals on every heartbeat. Persisted into
+    # Task.api_call_summary so the orchestrator can aggregate
+    # api-calls-per-task and total-tokens-per-task across the fleet.
+    llm_call_count: int | None = Field(None, ge=0)
+    total_input_tokens: int | None = Field(None, ge=0)
+    total_output_tokens: int | None = Field(None, ge=0)
 
 
 class SpawnTaskRequest(BaseModel):

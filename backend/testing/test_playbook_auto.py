@@ -11445,3 +11445,159 @@ async def test_blind_spot_layer_distribution_empty_for_unclassifiable(
     dist = themes[0]["layer_distribution"]
     assert isinstance(dist, dict)
     # May be empty — unclassifiable text produces no layer tags
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests for aggregate_sr_co_failure_pairs
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _make_co_fail_task(project_id, *, age_days: float, failed_cats: list) -> Task:
+    """Build a code-change task with the given SR-failed categories."""
+    check_results = {c: {"passed": False, "issue": "x"} for c in failed_cats}
+    task = Task(
+        project_id=project_id,
+        title="co-fail test",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.COMPLETED,
+        context={
+            "_self_review_outcome": {"check_results": check_results},
+            "_first_attempt_rejection_categories": {},
+        },
+    )
+    task.created_at = _utcnow() - timedelta(days=age_days)
+    return task
+
+
+def test_aggregate_sr_co_failure_pairs_returns_none_below_min_sample():
+    """Returns None when fewer than min_sample qualifying tasks exist."""
+    from app.sr_blind_spots import aggregate_sr_co_failure_pairs
+
+    tasks = [
+        _make_co_fail_task(
+            uuid.uuid4(), age_days=1, failed_cats=["correctness", "style-conventions"]
+        )
+    ]
+    result = aggregate_sr_co_failure_pairs(tasks, min_sample=5)
+    assert result is None
+
+
+def test_aggregate_sr_co_failure_pairs_high_lift_pair_surfaced():
+    """Pair with lift >> 1 appears in output sorted by lift desc.
+
+    Setup: 5 tasks where A+B co-fail, 3 tasks where B fails alone.
+    total=8, miss_A=5, miss_B=8; P(B|A)=5/5=1.0, base_rate(B)=8/8=1.0 — wrong.
+
+    Better: 5 co-fail tasks, 0 B-alone tasks, 3 no-fail tasks.
+    total=8, miss_A=5, miss_B=5; P(B|A)=1.0, base=5/8=0.625 → lift=1.6
+    """
+    from app.sr_blind_spots import aggregate_sr_co_failure_pairs
+
+    project_id = uuid.uuid4()
+    tasks = []
+    # 5 tasks: both A and B fail
+    for _ in range(5):
+        tasks.append(
+            _make_co_fail_task(
+                project_id, age_days=1, failed_cats=["correctness", "security"]
+            )
+        )
+    # 3 tasks: neither fails (qualify for total count)
+    for _ in range(3):
+        tasks.append(_make_co_fail_task(project_id, age_days=1, failed_cats=[]))
+
+    result = aggregate_sr_co_failure_pairs(tasks, min_sample=5, min_co_count=2)
+    assert result is not None
+    pair = next(
+        (p for p in result if p["cat_a"] == "correctness" and p["cat_b"] == "security"),
+        None,
+    )
+    assert pair is not None
+    # P(B|A) = 5/5 = 1.0; base_rate(B) = 5/8 = 0.625; lift ≈ 1.6
+    assert pair["lift"] > 1.0
+    assert pair["co_fail_count"] == 5
+    assert abs(pair["lift"] - pair["p_b_given_a"] / pair["base_rate_b"]) < 0.01
+
+
+def test_aggregate_sr_co_failure_pairs_base_rate_equals_conditional_gives_lift_one():
+    """When P(B|A)==base_rate(B), lift rounds to 1.0."""
+    from app.sr_blind_spots import aggregate_sr_co_failure_pairs
+
+    project_id = uuid.uuid4()
+    tasks = []
+    # 6 tasks: all have both cats failing → P(B|A)=1.0, base_rate(B)=1.0, lift=1.0
+    for _ in range(6):
+        tasks.append(
+            _make_co_fail_task(
+                project_id, age_days=1, failed_cats=["correctness", "security"]
+            )
+        )
+
+    result = aggregate_sr_co_failure_pairs(tasks, min_sample=5, min_co_count=2)
+    assert result is not None
+    pair = next(
+        (p for p in result if p["cat_a"] == "correctness" and p["cat_b"] == "security"),
+        None,
+    )
+    assert pair is not None
+    assert round(pair["lift"], 2) == 1.0
+
+
+def test_aggregate_sr_co_failure_pairs_single_task_miss_filtered_by_min_co_count():
+    """A pair that appears in only 1 task is excluded by default min_co_count=2."""
+    from app.sr_blind_spots import aggregate_sr_co_failure_pairs
+
+    project_id = uuid.uuid4()
+    tasks = []
+    # 5 tasks where only one has co-failure
+    tasks.append(
+        _make_co_fail_task(
+            project_id, age_days=1, failed_cats=["correctness", "security"]
+        )
+    )
+    for _ in range(4):
+        tasks.append(
+            _make_co_fail_task(project_id, age_days=1, failed_cats=["correctness"])
+        )
+
+    result = aggregate_sr_co_failure_pairs(tasks, min_sample=5, min_co_count=2)
+    # The pair exists but co_count=1 < min_co_count=2 → filtered out
+    assert result == []
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_includes_co_failure_pairs(
+    db_session: AsyncSession,
+):
+    """compute_sr_catch_rate_trends writes co_failure_pairs into the result."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+
+    # Build enough tasks for both windows (5+ each)
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=3,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness", "security"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+    assert result is not None
+    assert "co_failure_pairs" in result
+    assert isinstance(result["co_failure_pairs"], list)
