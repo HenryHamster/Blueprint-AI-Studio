@@ -11,8 +11,10 @@ from app.regression_layer_classifier import (
     aggregate_targeted_layers,
     build_layer_meta_block,
     classify_layers,
+    compute_layer_defense_counts,
     compute_untargeted_layers,
     is_recurring_cross_layer_class,
+    parse_viewport_regression_class,
 )
 
 
@@ -536,3 +538,125 @@ class TestIsRecurringCrossLayerClass:
         assert (
             is_recurring_cross_layer_class(entries, min_cycles=3, min_layers=2) is True
         )
+
+
+# ---------------------------------------------------------------------------
+# compute_layer_defense_counts
+# ---------------------------------------------------------------------------
+
+
+class TestComputeLayerDefenseCounts:
+    def test_empty_fix_log_all_zeros(self):
+        result = compute_layer_defense_counts([])
+        assert set(result.keys()) == ALL_LAYERS
+        assert all(v == 0 for v in result.values())
+
+    def test_all_canonical_layers_present(self):
+        result = compute_layer_defense_counts([{"layers_targeted": [LAYER_AGENT_VM]}])
+        assert set(result.keys()) == ALL_LAYERS
+
+    def test_counts_incremented_per_layer(self):
+        fix_log = [
+            {"layers_targeted": [LAYER_AGENT_VM, LAYER_CI_WORKFLOW]},
+            {"layers_targeted": [LAYER_AGENT_VM]},
+        ]
+        result = compute_layer_defense_counts(fix_log)
+        assert result[LAYER_AGENT_VM] == 2
+        assert result[LAYER_CI_WORKFLOW] == 1
+        assert result[LAYER_BASELINE_GATE] == 0
+
+    def test_unknown_layer_ignored(self):
+        fix_log = [{"layers_targeted": ["UNKNOWN_LAYER", LAYER_REVIEWER_PASS]}]
+        result = compute_layer_defense_counts(fix_log)
+        assert result[LAYER_REVIEWER_PASS] == 1
+        assert "UNKNOWN_LAYER" not in result
+
+    def test_none_layers_targeted_treated_as_empty(self):
+        fix_log = [{"layers_targeted": None}]
+        result = compute_layer_defense_counts(fix_log)
+        assert all(v == 0 for v in result.values())
+
+    def test_entry_without_layers_targeted_skipped(self):
+        fix_log = [{"fingerprint": "x"}, {"layers_targeted": [LAYER_VIEWPORT]}]
+        result = compute_layer_defense_counts(fix_log)
+        assert result[LAYER_VIEWPORT] == 1
+        assert result[LAYER_AGENT_VM] == 0
+
+    def test_non_dict_entry_skipped(self):
+        fix_log = ["not-a-dict", {"layers_targeted": [LAYER_AGENT_VERB]}]
+        result = compute_layer_defense_counts(fix_log)  # type: ignore[arg-type]
+        assert result[LAYER_AGENT_VERB] == 1
+
+    def test_none_fix_log_all_zeros(self):
+        result = compute_layer_defense_counts(None)  # type: ignore[arg-type]
+        assert set(result.keys()) == ALL_LAYERS
+        assert all(v == 0 for v in result.values())
+
+
+# ---------------------------------------------------------------------------
+# parse_viewport_regression_class
+# ---------------------------------------------------------------------------
+
+
+class TestParseViewportRegressionClass:
+    def test_new_format_text_truncation(self):
+        result = parse_viewport_regression_class(
+            "viewport_regression:TaskCard:text_truncation@375"
+        )
+        assert result == {
+            "component": "TaskCard",
+            "assertion_type": "text_truncation",
+            "width": "375",
+        }
+
+    def test_new_format_touch_target(self):
+        result = parse_viewport_regression_class(
+            "viewport_regression:KanbanBoard:touch_target@375"
+        )
+        assert result == {
+            "component": "KanbanBoard",
+            "assertion_type": "touch_target",
+            "width": "375",
+        }
+
+    def test_new_format_overflow(self):
+        result = parse_viewport_regression_class(
+            "viewport_regression:DashboardHome:overflow@375"
+        )
+        assert result == {
+            "component": "DashboardHome",
+            "assertion_type": "overflow",
+            "width": "375",
+        }
+
+    def test_legacy_format_no_assertion_type(self):
+        result = parse_viewport_regression_class(
+            "viewport_regression:MessagesPanel.tsx@375"
+        )
+        assert result == {
+            "component": "MessagesPanel.tsx",
+            "assertion_type": None,
+            "width": "375",
+        }
+
+    def test_unknown_assertion_type_preserved(self):
+        result = parse_viewport_regression_class(
+            "viewport_regression:TaskCard:unknown@375"
+        )
+        assert result == {
+            "component": "TaskCard",
+            "assertion_type": "unknown",
+            "width": "375",
+        }
+
+    def test_non_viewport_class_returns_all_none(self):
+        result = parse_viewport_regression_class("fix_loop_divergence:some-fingerprint")
+        assert result == {"component": None, "assertion_type": None, "width": None}
+
+    def test_empty_string_returns_all_none(self):
+        result = parse_viewport_regression_class("")
+        assert result == {"component": None, "assertion_type": None, "width": None}
+
+    def test_missing_at_sign_returns_all_none(self):
+        result = parse_viewport_regression_class("viewport_regression:TaskCard")
+        assert result == {"component": None, "assertion_type": None, "width": None}

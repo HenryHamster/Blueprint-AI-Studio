@@ -2540,6 +2540,7 @@ async def list_regression_cases(
     now = _utcnow()
     stall_threshold = now - timedelta(hours=_REGRESSION_STALL_THRESHOLD_HOURS)
     from app.pipeline_regression_dispatcher import (  # noqa: PLC0415
+        compute_class_layer_defense_counts,
         compute_untargeted_layers,
     )
 
@@ -2557,6 +2558,12 @@ async def list_regression_cases(
         .scalars()
         .all()
     )
+    # Aggregate fix-log entries by regression_class across all open+closed cases
+    # so each case row can show class-level defense counts (not just its own log).
+    fix_logs_by_class: dict[str, list] = {}
+    for c in list(rows) + list(closed_rows):
+        bucket = fix_logs_by_class.setdefault(c.regression_class, [])
+        bucket.extend(c.fingerprint_to_fix_log or [])
     return {
         "count": len(rows),
         "status_filter": status_filter,
@@ -2606,7 +2613,10 @@ async def list_regression_cases(
                     fingerprint_to_fix_log=c.fingerprint_to_fix_log,
                 ),
                 "untargeted_layers": compute_untargeted_layers(
-                    c.fingerprint_to_fix_log
+                    fix_logs_by_class.get(c.regression_class)
+                ),
+                "layer_defense_counts_by_class": compute_class_layer_defense_counts(
+                    fix_logs_by_class.get(c.regression_class)
                 ),
             }
             for c in rows

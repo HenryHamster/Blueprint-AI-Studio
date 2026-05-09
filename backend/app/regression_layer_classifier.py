@@ -189,7 +189,7 @@ LAYER_DESCRIPTIONS: dict[str, str] = {
 }
 
 # Stable display order for meta-investigation prompts.
-_LAYER_DISPLAY_ORDER: tuple[str, ...] = (
+LAYER_DISPLAY_ORDER: tuple[str, ...] = (
     LAYER_CI_WORKFLOW,
     LAYER_AGENT_VM,
     LAYER_AGENT_VERB,
@@ -211,7 +211,7 @@ def build_layer_meta_block(
     """
     targeted = frozenset(targeted_layers or [])
     lines: list[str] = ["Canonical defense layers:"]
-    for layer in _LAYER_DISPLAY_ORDER:
+    for layer in LAYER_DISPLAY_ORDER:
         status = "targeted" if layer in targeted else "UNTARGETED"
         desc = LAYER_DESCRIPTIONS.get(layer, "")
         lines.append(f"  {layer} [{status}]: {desc}")
@@ -349,6 +349,23 @@ def is_recurring_cross_layer_class(
     return len(aggregate_targeted_layers(entries)) >= min_layers
 
 
+def compute_layer_defense_counts(fix_log: list[dict]) -> dict[str, int]:
+    """Per-canonical-layer fix counts across a list of fix-log entries.
+
+    Returns one entry per canonical layer in stable display order, including
+    layers with zero fixes, so callers can render a stable six-column table.
+    Unknown layer names in ``layers_targeted`` are silently ignored.
+    """
+    counts: dict[str, int] = {layer: 0 for layer in LAYER_DISPLAY_ORDER}
+    for entry in fix_log or []:
+        if not isinstance(entry, dict):
+            continue
+        for layer in entry.get("layers_targeted") or []:
+            if layer in counts:
+                counts[layer] += 1
+    return counts
+
+
 def compute_untargeted_layers(fix_log: list[dict]) -> list[str]:
     """Return canonical layer names that have zero targeted fixes in fix_log.
 
@@ -372,6 +389,38 @@ def compute_untargeted_layers(fix_log: list[dict]) -> list[str]:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def parse_viewport_regression_class(regression_class: str) -> dict[str, str | None]:
+    """Parse a viewport_regression: class string into component, assertion type, and width.
+
+    Handles both formats:
+    - Old: ``viewport_regression:<Component>@<width>`` (assertion_type → None)
+    - New: ``viewport_regression:<Component>:<assertion_type>@<width>``
+
+    Returns a dict with keys ``component``, ``assertion_type``, and ``width``.
+    All values are ``None`` for strings that don't start with ``viewport_regression:``.
+    """
+    _empty: dict[str, str | None] = {
+        "component": None,
+        "assertion_type": None,
+        "width": None,
+    }
+    prefix = "viewport_regression:"
+    if not regression_class.startswith(prefix):
+        return _empty
+    inner = regression_class[len(prefix) :]
+    at_parts = inner.split("@", 1)
+    if len(at_parts) != 2:
+        return _empty
+    left, width = at_parts
+    colon_parts = left.split(":", 1)
+    assertion_type: str | None
+    if len(colon_parts) == 2:
+        component, assertion_type = colon_parts
+    else:
+        component, assertion_type = left, None
+    return {"component": component, "assertion_type": assertion_type, "width": width}
 
 
 def _matches_any(text: str, patterns: list[re.Pattern]) -> bool:

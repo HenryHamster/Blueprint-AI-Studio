@@ -3,7 +3,7 @@ import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { BulkActionBar } from './BulkActionBar';
 import type { Task } from '../types/task';
-import { expectNoOverflowAt, expectMinTouchTargetAt } from '../test/viewport';
+import { expectNoOverflowAt, expectMinTouchTargetAt, expectNoTextTruncationAt } from '../test/viewport';
 
 const createSampleTask = (id: string, status: string, title: string): Task => ({
   id,
@@ -98,6 +98,45 @@ describe('BulkActionBar — viewport regression', () => {
             cancellableTasks={[]}
             failedTasks={[]}
             terminalTasks={[]}
+            setConfirmDialog={() => {}}
+            handleBulkAction={() => {}}
+            handleBulkCancel={() => {}}
+            handleBulkArchiveColumn={() => {}}
+            toggleSelectionMode={() => {}}
+          />,
+        );
+      });
+    });
+  });
+
+  test('selected-count label and button labels do not silently clip at 375px', async () => {
+    const approvableTasks = [
+      createSampleTask('task-1', 'EVALUATING', 'feat(auth): implement token-refresh flow with sliding expiry and cross-tab sync for long-running operator sessions'),
+      createSampleTask('task-2', 'EVALUATING', 'fix(backend): handle edge case where pipeline_regression_dispatcher emits duplicate escalation_reason labels on retry'),
+    ];
+    const cancellableTasks = [
+      createSampleTask('task-3', 'IN_PROGRESS', 'refactor: simplify component state management across kanban board and task detail drawer to reduce prop-drilling depth'),
+    ];
+    const failedTasks = [
+      createSampleTask('task-4', 'FAILED', 'test: add comprehensive integration tests for regression dispatcher retry logic and dedup guard path'),
+      createSampleTask('task-5', 'FAILED', 'docs: update API documentation with examples for all admin endpoints including pagination and filtering'),
+    ];
+    const terminalTasks: Task[] = [];
+
+    await expectNoTextTruncationAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <BulkActionBar
+            selectedCount={approvableTasks.length + cancellableTasks.length + failedTasks.length}
+            approvableTasks={approvableTasks}
+            cancellableTasks={cancellableTasks}
+            failedTasks={failedTasks}
+            terminalTasks={terminalTasks}
             setConfirmDialog={() => {}}
             handleBulkAction={() => {}}
             handleBulkCancel={() => {}}

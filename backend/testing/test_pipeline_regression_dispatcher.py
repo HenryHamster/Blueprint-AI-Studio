@@ -9964,7 +9964,7 @@ class TestViewportRegressionEvaluator:
                     select(RegressionRemediationCase).where(
                         RegressionRemediationCase.project_id == project.id,
                         RegressionRemediationCase.regression_class
-                        == "viewport_regression:MessagesPanel@375",
+                        == "viewport_regression:MessagesPanel:overflow@375",
                     )
                 )
             )
@@ -10170,6 +10170,69 @@ class TestViewportRegressionEvaluator:
         trips = await _collect_viewport_failures(db_session, project.id)
         assert len(trips) == 1
         assert trips[0]["failure_type"] == "mixed"
+
+    def test_extract_failure_type_text_truncation(self):
+        """_extract_failure_type returns 'text_truncation' for expectNoTextTruncationAt messages."""
+        from app.pipeline_regression_dispatcher import _extract_failure_type
+
+        msg = "expectNoTextTruncationAt(375): 1 element(s) truncated at width=375px"
+        assert _extract_failure_type(msg) == "text_truncation"
+
+    def test_extract_failure_type_overflow(self):
+        """_extract_failure_type returns 'overflow' for expectNoOverflowAt messages."""
+        from app.pipeline_regression_dispatcher import _extract_failure_type
+
+        msg = "expectNoOverflowAt(375): 2 element(s) overflow at width=375px"
+        assert _extract_failure_type(msg) == "overflow"
+
+    def test_extract_failure_type_unknown(self):
+        """_extract_failure_type returns 'unknown' when no known assertion is in the message."""
+        from app.pipeline_regression_dispatcher import _extract_failure_type
+
+        assert _extract_failure_type("some generic failure") == "unknown"
+
+    @pytest.mark.asyncio
+    async def test_regression_class_includes_assertion_type(self, db_session):
+        """Emitted regression_class includes assertion type: viewport_regression:<C>:<type>@<w>."""
+        from app.models import RegressionRemediationCase
+        from app.pipeline_regression_dispatcher import (
+            _VIEWPORT_REGRESSION_MIN_FAILURES,
+            _evaluate_viewport_regression_signal,
+        )
+
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        msg = (
+            "expectMinTouchTargetAt(375): 1 element(s) below 44px touch target\n"
+            "Found in TaskCard.viewport.test.tsx"
+        )
+        for _ in range(_VIEWPORT_REGRESSION_MIN_FAILURES):
+            db_session.add(_make_viewport_task(project.id, status_message=msg))
+        await db_session.commit()
+
+        spawned = await _evaluate_viewport_regression_signal(
+            db_session, project.id, spawn_budget_left=2
+        )
+        assert spawned == 1
+        await db_session.commit()
+
+        cases = (
+            (
+                await db_session.execute(
+                    select(RegressionRemediationCase).where(
+                        RegressionRemediationCase.project_id == project.id,
+                        RegressionRemediationCase.regression_class
+                        == "viewport_regression:TaskCard:touch_target@375",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(cases) == 1
 
     @pytest.mark.asyncio
     async def test_introducing_pr_number_in_trip_dict(self, db_session):
@@ -12885,6 +12948,28 @@ async def test_recurring_class_trips_when_class_spans_2_layers_across_3_cycles(
     assert "fix_loop_divergence:lint" in prompt
     assert "AT LEAST 2 distinct canonical layers" in prompt
     assert "PER-CYCLE LAYER HISTORY" in prompt
+
+    # Recurring-class meta-spawns get a dedicated escalation_reason so
+    # operators can distinguish them from generic cross-layer escalations.
+    from app.pipeline_regression_dispatcher import (  # noqa: PLC0415
+        ESCALATION_REASON_RECURRING_CLASS_META,
+    )
+
+    rc_case = (
+        (
+            await db_session.execute(
+                select(RegressionRemediationCase).where(
+                    RegressionRemediationCase.project_id == project.id,
+                    RegressionRemediationCase.regression_class
+                    == "recurring_class:fix_loop_divergence:lint",
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    assert rc_case is not None
+    assert rc_case.escalation_reason == ESCALATION_REASON_RECURRING_CLASS_META
 
 
 @pytest.mark.asyncio

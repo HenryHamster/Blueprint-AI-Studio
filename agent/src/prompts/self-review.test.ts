@@ -1,5 +1,77 @@
 import { describe, it, expect } from 'vitest';
-import { formatSrBlindSpotThemesForSrPrompt, formatExecutionEvidenceForSrPrompt, formatSrRecentMissExamplesForSrPrompt, formatPersistentBlindSpotHintForSrPrompt } from './self-review.js';
+import { formatSrBlindSpotThemesForSrPrompt, formatExecutionEvidenceForSrPrompt, formatSrRecentMissExamplesForSrPrompt, formatPersistentBlindSpotHintForSrPrompt, formatHighFpRateLoosenHintForSrPrompt } from './self-review.js';
+
+describe('formatHighFpRateLoosenHintForSrPrompt', () => {
+  it('returns empty string for null, undefined, and empty object', () => {
+    expect(formatHighFpRateLoosenHintForSrPrompt(null)).toBe('');
+    expect(formatHighFpRateLoosenHintForSrPrompt(undefined)).toBe('');
+    expect(formatHighFpRateLoosenHintForSrPrompt({})).toBe('');
+  });
+
+  it('returns empty string when fp_rate is below 0.5 threshold', () => {
+    expect(formatHighFpRateLoosenHintForSrPrompt({ correctness: { false_positive_rate: 0.4, sr_flag_sample_size: 20 } })).toBe('');
+  });
+
+  it('returns empty string when sample_size is below 10 threshold', () => {
+    expect(formatHighFpRateLoosenHintForSrPrompt({ correctness: { false_positive_rate: 0.8, sr_flag_sample_size: 9 } })).toBe('');
+  });
+
+  it('emits section with category name and fp_rate when both thresholds are met', () => {
+    const result = formatHighFpRateLoosenHintForSrPrompt({
+      'scope-drift': { false_positive_rate: 0.68, sr_flag_sample_size: 15 },
+    });
+    expect(result).toContain('## Over-flagged categories');
+    expect(result).toContain('scope-drift');
+    expect(result).toContain('68%');
+    expect(result).toContain('n=15');
+  });
+
+  it('includes categories above threshold and excludes those below', () => {
+    const result = formatHighFpRateLoosenHintForSrPrompt({
+      'scope-drift': { false_positive_rate: 0.68, sr_flag_sample_size: 15 },
+      correctness: { false_positive_rate: 0.3, sr_flag_sample_size: 20 },
+    });
+    expect(result).toContain('scope-drift');
+    expect(result).not.toContain('correctness');
+  });
+
+  it('ends with double newline when populated', () => {
+    const result = formatHighFpRateLoosenHintForSrPrompt({
+      correctness: { false_positive_rate: 0.6, sr_flag_sample_size: 12 },
+    });
+    expect(result.endsWith('\n\n')).toBe(true);
+  });
+
+  it('includes category at exact fp_rate=0.5 boundary', () => {
+    const result = formatHighFpRateLoosenHintForSrPrompt({
+      correctness: { false_positive_rate: 0.5, sr_flag_sample_size: 10 },
+    });
+    expect(result).toContain('correctness');
+    expect(result).toContain('50%');
+  });
+
+  it('excludes category at exact fp_rate=0.49 (just below boundary)', () => {
+    const result = formatHighFpRateLoosenHintForSrPrompt({
+      correctness: { false_positive_rate: 0.49, sr_flag_sample_size: 20 },
+    });
+    expect(result).toBe('');
+  });
+
+  it('excludes category at exact sample_size=9 (just below boundary)', () => {
+    const result = formatHighFpRateLoosenHintForSrPrompt({
+      correctness: { false_positive_rate: 0.9, sr_flag_sample_size: 9 },
+    });
+    expect(result).toBe('');
+  });
+
+  it('instructs agent to require concrete evidence before flagging', () => {
+    const result = formatHighFpRateLoosenHintForSrPrompt({
+      correctness: { false_positive_rate: 0.6, sr_flag_sample_size: 12 },
+    });
+    expect(result).toContain('concrete');
+    expect(result).toContain('evidence');
+  });
+});
 
 describe('formatPersistentBlindSpotHintForSrPrompt', () => {
   it('returns empty string for null', () => {
@@ -50,14 +122,31 @@ describe('formatPersistentBlindSpotHintForSrPrompt', () => {
 });
 
 describe('formatExecutionEvidenceForSrPrompt', () => {
-  it('includes all three category names', () => {
+  it('includes all three command-execution category names', () => {
     const result = formatExecutionEvidenceForSrPrompt();
     expect(result).toContain('tests_executed_cleanly');
     expect(result).toContain('lint_executed_cleanly');
     expect(result).toContain('typecheck_executed_cleanly');
   });
 
-  it('instructs agent to use severity=major for failures', () => {
+  it('includes test_assertion_quality sub-check', () => {
+    const result = formatExecutionEvidenceForSrPrompt();
+    expect(result).toContain('test_assertion_quality');
+  });
+
+  it('describes test_assertion_quality as checking assertion specificity vs smoke', () => {
+    const result = formatExecutionEvidenceForSrPrompt();
+    expect(result).toContain('smoke');
+    expect(result).toContain('specific behavior changed');
+  });
+
+  it('describes severity levels for test_assertion_quality', () => {
+    const result = formatExecutionEvidenceForSrPrompt();
+    expect(result).toContain('"minor"');
+    expect(result).toContain('"major"');
+  });
+
+  it('instructs agent to use severity=major for command failures', () => {
     const result = formatExecutionEvidenceForSrPrompt();
     expect(result).toContain('severity="major"');
   });

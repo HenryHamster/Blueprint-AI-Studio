@@ -2205,6 +2205,65 @@ describe('code-change handler structural prompt invariants', () => {
   });
 });
 
+// ── Pre-execution FP-rate loosen hint wiring ─────────────────────────────────
+describe('pre-execution FP-rate loosen hint in prompt', () => {
+  beforeEach(() => { vi.clearAllMocks(); });
+
+  it('emits loosen hint when a category has fp_rate >= 0.5 and sample_size >= 10', async () => {
+    const task = {
+      title: 'T', description: '', context: {},
+      project_context: {
+        self_review_catch_rate: {
+          categories: {
+            correctness: { false_positive_rate: 0.7, sr_flag_sample_size: 15 },
+          },
+        },
+      },
+    };
+    await handleCreate(TASK_ID, { prompt: 'do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const p = capturedPrompt();
+    expect(p).toContain('Over-flagged categories');
+    expect(p).toContain('correctness');
+    expect(p).toContain('70% false-positive rate');
+  });
+
+  it('omits loosen hint when fp_rate is below 0.5', async () => {
+    const task = {
+      title: 'T', description: '', context: {},
+      project_context: {
+        self_review_catch_rate: {
+          categories: {
+            correctness: { false_positive_rate: 0.4, sr_flag_sample_size: 20 },
+          },
+        },
+      },
+    };
+    await handleCreate(TASK_ID, { prompt: 'do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(capturedPrompt()).not.toContain('Over-flagged categories');
+  });
+
+  it('omits loosen hint when sample_size is below 10', async () => {
+    const task = {
+      title: 'T', description: '', context: {},
+      project_context: {
+        self_review_catch_rate: {
+          categories: {
+            correctness: { false_positive_rate: 0.8, sr_flag_sample_size: 9 },
+          },
+        },
+      },
+    };
+    await handleCreate(TASK_ID, { prompt: 'do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(capturedPrompt()).not.toContain('Over-flagged categories');
+  });
+
+  it('omits loosen hint when project_context has no self_review_catch_rate', async () => {
+    const task = { title: 'T', description: '', context: {}, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(capturedPrompt()).not.toContain('Over-flagged categories');
+  });
+});
+
 // ── Task-type-specific self-review focus blocks ───────────────────────────────
 describe('task-type self-review focus blocks', () => {
   const TASK = { title: 'T', description: '', context: {}, project_context: {} };

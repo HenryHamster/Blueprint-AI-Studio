@@ -112,22 +112,26 @@ export function formatProjectBlindSpotSummary(
 }
 
 // Generate the execution-evidence category instructions for injection into the agent's
-// self-review prompt. Instructs the agent to populate three sub-categories in
-// check_results — tests_executed_cleanly, lint_executed_cleanly, typecheck_executed_cleanly —
-// and to PASS only when the command was actually run on this VM with a zero exit code.
+// self-review prompt. Instructs the agent to populate four sub-categories in
+// check_results — tests_executed_cleanly, lint_executed_cleanly, typecheck_executed_cleanly,
+// and test_assertion_quality — and to PASS only when the command was actually run on
+// this VM with a zero exit code (or assertions were inspected for the quality check).
 export function formatExecutionEvidenceForSrPrompt(): string {
   return (
     `## Execution-evidence categories (required in check_results)\n` +
-    `You MUST populate these three sub-categories every time you write a self-review:\n\n` +
+    `You MUST populate these four sub-categories every time you write a self-review:\n\n` +
     `- **tests_executed_cleanly** — did the test suite run on this VM and exit 0?\n` +
     `- **lint_executed_cleanly** — did the linter / style checker run on this VM and exit 0?\n` +
-    `- **typecheck_executed_cleanly** — did the type-checker run on this VM and exit 0?\n\n` +
-    `Each entry MUST have this shape:\n` +
+    `- **typecheck_executed_cleanly** — did the type-checker run on this VM and exit 0?\n` +
+    `- **test_assertion_quality** — for each test added or modified in this PR: does the assertion exercise the specific behavior changed (e.g., a particular output value, a side-effect, a specific error type/message), or is it essentially smoke (e.g., "returns a value", "no exception", asserts truthiness only)? If a test mocks the unit under test, is the mock surface narrow enough that the test still validates the changed logic, or is the changed code path effectively unverified?\n\n` +
+    `The first three entries MUST have this shape:\n` +
     `  { "passed": <bool>, "severity": "major", "evidence": "exit_code=0 from <command>" }\n\n` +
-    `**PASS rules (both must hold):**\n` +
+    `**test_assertion_quality** uses: { "passed": <bool>, "severity": "minor"|"major", "evidence": "<test_file>:<line> asserts <specific value/behavior>, not just truthiness" }\n` +
+    `Set severity="major" when ALL new/modified tests are smoke-only or mock the unit under test entirely; "minor" when at least one meaningful assertion exists but some tests are weak.\n\n` +
+    `**PASS rules for tests_executed_cleanly / lint_executed_cleanly / typecheck_executed_cleanly (both must hold):**\n` +
     `1. You personally ran the command on this VM during this task — not in a prior session, not assumed from context.\n` +
     `2. You captured the output and the exit code was 0.\n\n` +
-    `**FAIL rules:**\n` +
+    `**FAIL rules (command categories):**\n` +
     `- If you did NOT run the command, set passed=false, severity="major", evidence="command not run".\n` +
     `- If the command exited non-zero, set passed=false, severity="major", evidence="exit_code=<N> from <command>".\n` +
     `- Claiming a command passed when you have no execution log is a FAIL with severity=major.\n\n` +
@@ -203,6 +207,27 @@ export function formatPersistentBlindSpotHintForSrPrompt(
   return (
     `## Persistent Self-Review Blind Spots\n` +
     `${data.hint}\n\n`
+  );
+}
+
+// Format a pre-execution loosen-hint for categories with a reliably high false-positive
+// rate. When fp_rate >= 0.5 and sample_size >= 10, the agent has chronically over-flagged
+// that category — instruct it to require concrete evidence before flagging there.
+// This is the symmetric counterpart to the tightening hints: tighten where we miss,
+// loosen where we over-flag. Returns '' when no category meets both thresholds.
+export function formatHighFpRateLoosenHintForSrPrompt(
+  categories: Record<string, { false_positive_rate?: number; precision?: number; sr_flag_sample_size?: number }> | null | undefined,
+): string {
+  if (!categories || typeof categories !== 'object') return '';
+  const rows = Object.entries(categories)
+    .filter(([, d]) => (d.false_positive_rate ?? 0) >= 0.5 && (d.sr_flag_sample_size ?? 0) >= 10)
+    .map(([cat, d]) => `- ${cat}: ${Math.round((d.false_positive_rate ?? 0) * 100)}% false-positive rate (n=${d.sr_flag_sample_size ?? 0})`);
+  if (rows.length === 0) return '';
+  return (
+    `## Over-flagged categories — require concrete evidence before flagging\n` +
+    `These categories have a sustained high false-positive rate in this project (≥50%, n≥10). ` +
+    `Do NOT flag unless you have concrete, specific evidence — vague concerns add noise that trains operators to discount SR output:\n` +
+    rows.join('\n') + `\n\n`
   );
 }
 

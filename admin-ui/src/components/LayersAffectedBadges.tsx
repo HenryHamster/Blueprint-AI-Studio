@@ -38,6 +38,10 @@ export interface LayerCoverageCombo { layers: string[]; count: number; }
 export interface LayerCoverageEntry { total_fixes_with_layers: number; combinations: LayerCoverageCombo[]; }
 export type LayerCoverageByClass = Record<string, LayerCoverageEntry>;
 
+// Per-canonical-layer fix counts for a single regression class.
+// Matches the shape returned by compute_class_layer_defense_counts on the backend.
+export type LayerDefenseCounts = Record<string, number>;
+
 function shortLabel(layer: string): string {
   return LAYER_SHORT_LABELS[layer] ?? layer;
 }
@@ -65,6 +69,28 @@ export function UntargetedLayersBadge({ untargeted_layers }: UntargetedLayersPro
       title={`Layers no prior fix has targeted: ${layers.join(', ')}`}
     >
       never defended in: {labels.join(', ')}
+    </span>
+  );
+}
+
+interface LayerDefenseCountsProps {
+  layer_defense_counts?: LayerDefenseCounts | null;
+}
+
+export function LayerDefenseCountsBadge({ layer_defense_counts }: LayerDefenseCountsProps) {
+  if (!layer_defense_counts) return null;
+  const defended = CANONICAL_LAYERS
+    .filter((l) => (layer_defense_counts[l] ?? 0) > 0)
+    .map((l) => `${shortLabel(l)}×${layer_defense_counts[l]}`);
+  if (defended.length === 0) return null;
+  const tip = `Canonical layers defended and fix counts: ${CANONICAL_LAYERS.map((l) => `${l}:${layer_defense_counts[l] ?? 0}`).join(', ')}`;
+  return (
+    <span
+      data-testid="layer-defense-counts-badge"
+      className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20"
+      title={tip}
+    >
+      defended: {defended.join(', ')}
     </span>
   );
 }

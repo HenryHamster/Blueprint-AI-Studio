@@ -46,6 +46,11 @@ from app.models import (
     TaskStatus,
 )
 from app.payload_schemas import validate_internal_payload
+from app.regression_layer_classifier import (
+    LAYER_DISPLAY_ORDER,
+    aggregate_targeted_layers,
+    is_recurring_cross_layer_class,
+)
 import app.shared_state as _shared_state
 from app.shared_state import runtime_config as _runtime_config
 from app.time_utils import _to_naive_utc, _utcnow
@@ -205,14 +210,10 @@ _ACTIVE_INVESTIGATE_STATUSES = (
     TaskStatus.EVALUATING,
 )
 
-_CANONICAL_RECURRENCE_LAYERS = (
-    "CI_WORKFLOW",
-    "AGENT_VM",
-    "AGENT_VERB",
-    "BASELINE_GATE",
-    "REVIEWER_PASS",
-    "VIEWPORT",
-)
+# Canonical layer order is owned by regression_layer_classifier.LAYER_DISPLAY_ORDER;
+# this alias keeps the dispatcher's historical name available to existing
+# callers (tests, admin_digest) without re-introducing a second source tuple.
+_CANONICAL_RECURRENCE_LAYERS = LAYER_DISPLAY_ORDER
 
 # Cycle records moved to durable storage: see ``DispatcherCycleRecord`` in
 # ``backend/app/models.py``. ``run_once()`` inserts one row per tick; the
@@ -859,7 +860,7 @@ def compute_layer_defense_density(
             "last_fix_at": None,  # datetime
             "case_contribs": [],  # list[(merged_dt, case_id)] for sampling
         }
-        for layer in _CANONICAL_RECURRENCE_LAYERS
+        for layer in LAYER_DISPLAY_ORDER
     }
 
     for case_id, entry in all_fix_logs_with_case_ids:
@@ -881,7 +882,7 @@ def compute_layer_defense_density(
             s["case_contribs"].append((merged_dt, str(case_id)))
 
     result: list[dict[str, Any]] = []
-    for layer in _CANONICAL_RECURRENCE_LAYERS:
+    for layer in LAYER_DISPLAY_ORDER:
         s = layer_state[layer]
         contribs = sorted(s["case_contribs"], key=lambda p: p[0], reverse=True)
         seen: set[str] = set()
@@ -932,7 +933,7 @@ def _compute_layer_fragility_stats(
             "multi_layer_fix_count": 0,
             "multi_layer_hold_days": [],
         }
-        for layer in _CANONICAL_RECURRENCE_LAYERS
+        for layer in LAYER_DISPLAY_ORDER
     }
 
     for entry in all_fix_logs:
@@ -977,7 +978,7 @@ def _compute_layer_fragility_stats(
         return sum(values) / len(values) if values else None
 
     result: dict[str, dict[str, Any]] = {}
-    for layer in _CANONICAL_RECURRENCE_LAYERS:
+    for layer in LAYER_DISPLAY_ORDER:
         s = layer_stats[layer]
         hold_days_list = s["hold_days"]
         result[layer] = {
@@ -1270,7 +1271,7 @@ def _build_layer_defense_ledger(
         "",
         f"RECENT DEFENSE ACTIVITY BY LAYER (last {lookback_days} days)",
     ]
-    for layer in _CANONICAL_RECURRENCE_LAYERS:
+    for layer in LAYER_DISPLAY_ORDER:
         s = stats[layer]
         if s["fix_count"] == 0:
             lines.append(
@@ -1294,31 +1295,16 @@ def _build_layer_defense_ledger(
 
 
 def _layers_targeted_union(entries: list[dict[str, Any]] | None) -> set[str]:
-    """Union of ``layers_targeted`` across entries that have the key populated.
+    """Union of canonical ``layers_targeted`` across fix-log / cycle entries.
 
-    Accepts both the raw ``fingerprint_to_fix_log`` shape (entries with
-    ``"layers_targeted" in entry``) and the ``_extract_recurrence_cycles``
-    shape (cycles with ``layers_targeted_present`` flagged True). Entries
-    awaiting backfill — those without the key / flag — are skipped, matching
-    the existing semantics in ``_format_recurrence_meta_prompt`` and
-    ``_compute_layer_coverage_by_class``.
+    Backwards-compatible name for callers (tests, admin_digest); the actual
+    aggregation is owned by ``regression_layer_classifier.aggregate_targeted_layers``.
+    Entries from ``_extract_recurrence_cycles`` carry an empty ``layers_targeted``
+    list when ``layers_targeted_present`` is False, so the classifier's
+    canonical-layer filter yields the same result as the prior dispatcher
+    implementation.
     """
-    out: set[str] = set()
-    for entry in entries or []:
-        if not isinstance(entry, dict):
-            continue
-        if "layers_targeted_present" in entry:
-            if not entry.get("layers_targeted_present"):
-                continue
-        elif "layers_targeted" not in entry:
-            continue
-        raw = entry.get("layers_targeted") or []
-        if not isinstance(raw, list):
-            continue
-        for layer in raw:
-            if isinstance(layer, str) and layer:
-                out.add(layer)
-    return out
+    return aggregate_targeted_layers(entries or [])
 
 
 def compute_untargeted_layers(
@@ -1326,18 +1312,38 @@ def compute_untargeted_layers(
 ) -> list[str]:
     """Canonical layers never targeted by any prior fix in this case's history.
 
-    Returns layers from ``_CANONICAL_RECURRENCE_LAYERS`` (in canonical order)
+    Returns layers from ``LAYER_DISPLAY_ORDER`` (in canonical order)
     that do not appear in any entry's ``layers_targeted`` list. Unrecognized
     layer names in the fix-log are silently dropped so a typo or future-added
     layer never crashes the read path. Empty / missing / non-list fix-log
     yields the full canonical tuple — everything is untargeted by default.
     """
     if not isinstance(fingerprint_to_fix_log, list):
-        return list(_CANONICAL_RECURRENCE_LAYERS)
+        return list(LAYER_DISPLAY_ORDER)
     targeted = _layers_targeted_union(fingerprint_to_fix_log)
-    canonical = set(_CANONICAL_RECURRENCE_LAYERS)
+    canonical = set(LAYER_DISPLAY_ORDER)
     targeted &= canonical
-    return [layer for layer in _CANONICAL_RECURRENCE_LAYERS if layer not in targeted]
+    return [layer for layer in LAYER_DISPLAY_ORDER if layer not in targeted]
+
+
+def compute_class_layer_defense_counts(
+    fix_logs: list[dict[str, Any]] | None,
+) -> dict[str, int]:
+    """Per-canonical-layer fix counts across a list of fix-log entries.
+
+    Caller should pass the aggregated fix-log entries for all cases that share
+    the same regression_class.  Returns one entry per canonical layer in
+    canonical order (including layers with zero fixes) so the UI renders a
+    stable six-row table.
+    """
+    counts: dict[str, int] = {layer: 0 for layer in LAYER_DISPLAY_ORDER}
+    for entry in fix_logs or []:
+        if not isinstance(entry, dict):
+            continue
+        for layer in entry.get("layers_targeted") or []:
+            if layer in counts:
+                counts[layer] += 1
+    return counts
 
 
 def _format_recurrence_meta_prompt(
@@ -1423,7 +1429,7 @@ def _format_recurrence_meta_prompt(
         [
             "",
             "Enumerate ALL SIX canonical layers explicitly:",
-            ", ".join(_CANONICAL_RECURRENCE_LAYERS),
+            ", ".join(LAYER_DISPLAY_ORDER),
             (
                 "For each layer answer: is it involved? if yes, what defense "
                 "should we add? if no, why is it ruled out?"
@@ -1469,7 +1475,7 @@ def _format_fragile_recurrence_meta_prompt(
         attempts
     )
 
-    all_targeted = _layers_targeted_union(attempts) & set(_CANONICAL_RECURRENCE_LAYERS)
+    all_targeted = _layers_targeted_union(attempts) & set(LAYER_DISPLAY_ORDER)
     untargeted = compute_untargeted_layers(attempts)
 
     lines: list[str] = [
@@ -1486,7 +1492,7 @@ def _format_fragile_recurrence_meta_prompt(
             "OR provide explicit written justification for why a single-layer defense is sufficient."
         ),
         "",
-        f"Canonical defense layers: {', '.join(_CANONICAL_RECURRENCE_LAYERS)}",
+        f"Canonical defense layers: {', '.join(LAYER_DISPLAY_ORDER)}",
         (
             f"Layers already targeted by prior fixes: "
             f"{', '.join(sorted(all_targeted)) if all_targeted else 'none recorded'}"
@@ -1524,7 +1530,7 @@ def _format_theme_layer_meta_prompt(
         ),
         "",
         "Enumerate ALL SIX canonical layers explicitly:",
-        ", ".join(_CANONICAL_RECURRENCE_LAYERS),
+        ", ".join(LAYER_DISPLAY_ORDER),
         (
             "For each layer answer: is it involved? if yes, what defense "
             "should we add? if no, why is it ruled out?"
@@ -2089,11 +2095,14 @@ async def _collect_fix_loop_divergence_fingerprints(
 def _extract_failure_type(msg: str) -> str:
     """Extract failure type from viewport test error message.
 
-    Returns 'overflow' for expectNoOverflowAt, 'touch_target' for expectMinTouchTargetAt,
-    or 'unknown' if neither is found.
+    Returns 'overflow' for expectNoOverflowAt, 'text_truncation' for
+    expectNoTextTruncationAt, 'touch_target' for expectMinTouchTargetAt,
+    or 'unknown' if none is found.
     """
     if "expectNoOverflowAt" in msg:
         return "overflow"
+    if "expectNoTextTruncationAt" in msg:
+        return "text_truncation"
     if "expectMinTouchTargetAt" in msg:
         return "touch_target"
     return "unknown"
@@ -2135,7 +2144,8 @@ async def _collect_viewport_failures(
     )
 
     _width_re = re.compile(
-        r"expect(?:NoOverflow|MinTouchTarget)At\((\d+)\)", re.IGNORECASE
+        r"expect(?:NoOverflow|NoTextTruncation|MinTouchTarget)At\((\d+)\)",
+        re.IGNORECASE,
     )
     _component_re = re.compile(r"(\w+)\.viewport\.test\.tsx", re.IGNORECASE)
 
@@ -3441,6 +3451,10 @@ async def _maybe_spawn(
         )
     elif signal_name == "cross_case_fingerprint":
         case_escalation_reason = ESCALATION_REASON_ESCALATED_CROSS_CASE_FINGERPRINT
+    elif signal_name == "recurring_class":
+        # Proactive recurring-class meta-spawns get their own audit-trail reason
+        # so operators can distinguish them from generic cross-layer escalations.
+        case_escalation_reason = ESCALATION_REASON_RECURRING_CLASS_META
     elif is_cross_layer:
         case_escalation_reason = ESCALATION_REASON_ESCALATED_CROSS_LAYER
     elif _fragile_recurrence:
@@ -3895,7 +3909,7 @@ async def _evaluate_viewport_regression_signal(
     project_id: uuid.UUID,
     spawn_budget_left: int,
 ) -> int:
-    """Trip viewport_regression:<Component>@<width> when ≥2 viewport-test failures recur."""
+    """Trip viewport_regression:<Component>:<AssertionType>@<width> when ≥2 viewport-test failures recur."""
     if spawn_budget_left <= 0:
         return 0
     trips = await _collect_viewport_failures(session, project_id)
@@ -3906,7 +3920,7 @@ async def _evaluate_viewport_regression_signal(
         component = trip["component"]
         width = trip["width"]
         failure_type = trip.get("failure_type", "unknown")
-        regression_class = f"viewport_regression:{component}@{width}"
+        regression_class = f"viewport_regression:{component}:{failure_type}@{width}"
         prompt = _format_signal_lines(
             signal_name="viewport_regression",
             regression_class=regression_class,
@@ -4818,7 +4832,7 @@ def _format_recurring_class_prompt(
     lines += [
         "",
         "REQUIRED: propose defenses in AT LEAST 2 distinct canonical layers.",
-        f"Canonical layers: {', '.join(_CANONICAL_RECURRENCE_LAYERS)}",
+        f"Canonical layers: {', '.join(LAYER_DISPLAY_ORDER)}",
         (
             "A single-layer fix has already been tried multiple times — "
             "a multi-layer defense is mandatory."
@@ -4896,13 +4910,13 @@ async def _evaluate_recurring_class_signal(
     for regression_class, all_entries in sorted(by_class.items()):
         if spawned >= spawn_budget_left:
             break
-        if len(all_entries) < _RECURRING_CLASS_MIN_CYCLES:
+        if not is_recurring_cross_layer_class(
+            all_entries,
+            min_cycles=_RECURRING_CLASS_MIN_CYCLES,
+            min_layers=_RECURRING_CLASS_MIN_LAYERS,
+        ):
             continue
-        targeted = _layers_targeted_union(all_entries) & set(
-            _CANONICAL_RECURRENCE_LAYERS
-        )
-        if len(targeted) < _RECURRING_CLASS_MIN_LAYERS:
-            continue
+        targeted = aggregate_targeted_layers(all_entries)
 
         if _layer_defense_block is None:
             all_fix_logs_with_case_ids: list[tuple[str, dict]] = [

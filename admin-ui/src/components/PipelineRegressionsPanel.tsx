@@ -256,6 +256,7 @@ const ESCALATION_REASON_LABELS: Record<string, string> = {
   escalated_layer_concentration: 'Meta: layer concentration',
   escalated_cross_case_fingerprint: 'Meta: cross-case fingerprint',
   escalated_recurrence: 'Meta: recurrence',
+  recurring_class_meta: 'Meta: recurring cross-layer class',
 };
 
 interface ClassKpiRow {

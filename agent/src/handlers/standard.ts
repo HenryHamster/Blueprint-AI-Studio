@@ -18,7 +18,7 @@ import {
 import { resolveBuildConfig } from '../build-config.js';
 import { SCOPE_OVERFLOW_THRESHOLDS, MEDIUM_ANALYSIS_PLAN_FILE_LIMIT } from '../constants.js';
 import { runCodeChangeTask } from './code-change.js';
-import { formatExecutionEvidenceForSrPrompt } from '../prompts/self-review.js';
+import { formatExecutionEvidenceForSrPrompt, formatHighFpRateLoosenHintForSrPrompt } from '../prompts/self-review.js';
 
 // ── Standard Handler Helper ───────────────────────────────────────────────
 
@@ -330,6 +330,7 @@ Check specifically for:
 - type-safety: unsafe casts, any-typed externals, missing null guards in TypeScript
 - architecture: boundary violations, coupling regressions, abstraction leaks
 - test-coverage: new behavior without tests, untested edge cases or error paths
+- test_assertion_quality: for each test added or modified, does the assertion verify the specific behavior changed (a particular output value, side-effect, error type/message), or is it smoke-only ("returns something", "no exception", truthiness)? Flag tests that mock the unit under test so thoroughly that the changed logic is effectively unverified.
 
 Also enumerate edge cases YOU spot from a fresh read of the diff. Use the SAME shape the
 implementing author uses for their \`edges_considered\` field — \`{case, handled, evidence?, blind_spot?}\`.
@@ -340,7 +341,7 @@ cases. Cite file + line in \`evidence\` when claiming an edge is handled.
 Output ONLY a JSON object:
 {"reviewer_findings": [{"category": "<id>", "severity": "CRITICAL|HIGH|MEDIUM|LOW", "description": "..."}],
  "reviewer_edges_considered": [{"case": "...", "handled": true|false, "evidence": "...", "blind_spot": "..."}]}
-Category IDs: correctness, error-handling, security, type-safety, scope-drift, regression_risk, architecture, test-coverage
+Category IDs: correctness, error-handling, security, type-safety, scope-drift, regression_risk, architecture, test-coverage, test_assertion_quality
 If no issues found: {"reviewer_findings": [], "reviewer_edges_considered": []}`;
 
   const { exitCode, lastResultText } = await runClaudeCode(
@@ -639,7 +640,10 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   const firstTaskSection = task.first_task_on_repo ? FIRST_TASK_GUIDANCE : '';
   const taskTypeFocusBlock = getTaskTypeFocusBlock(taskTypeKey);
   const executionEvidenceSection = formatExecutionEvidenceForSrPrompt();
-  const finalPrompt = claudeMdPrefix + playbookSection + retryContext + buildPrompt({ contextPrefix, parentCtx, rawPrompt }) + taskTypeHint + firstTaskSection + CODE_CHANGE_HELPER_GUIDANCE + taskTypeFocusBlock + executionEvidenceSection + PLAYBOOK_GUIDANCE + `\nNote: If lint or test fixes required non-obvious steps, save them to the playbook (e.g., ./playbook set "lint-gotcha" "description").\n` + assembleFailureGuidanceBlocks() + `\n\n${DEFAULT_TOOL_GUIDANCE}` + promptSuffix;
+  const projectCtxForSr = task.project_context as Record<string, unknown> | undefined;
+  const srCategories = (projectCtxForSr?.self_review_catch_rate as { categories?: Record<string, { false_positive_rate?: number; precision?: number; sr_flag_sample_size?: number }> } | null | undefined)?.categories;
+  const loosenHintSection = formatHighFpRateLoosenHintForSrPrompt(srCategories);
+  const finalPrompt = claudeMdPrefix + playbookSection + retryContext + buildPrompt({ contextPrefix, parentCtx, rawPrompt }) + taskTypeHint + firstTaskSection + CODE_CHANGE_HELPER_GUIDANCE + taskTypeFocusBlock + loosenHintSection + executionEvidenceSection + PLAYBOOK_GUIDANCE + `\nNote: If lint or test fixes required non-obvious steps, save them to the playbook (e.g., ./playbook set "lint-gotcha" "description").\n` + assembleFailureGuidanceBlocks() + `\n\n${DEFAULT_TOOL_GUIDANCE}` + promptSuffix;
 
   const { workBranch } = await setupWorkspace(owner, repo, ghToken, baseBranch, branchPrefix, taskId, ws, statusRef, buildConfig);
   writePlaybookHelper(taskId);

@@ -3,7 +3,7 @@ import { CheckCircle, Minus, Shield } from 'lucide-react';
 import { apiFetch, fetchCrossLayerCompliance, type CrossLayerComplianceResponse } from '../api';
 import { EscalationOutcomePanel } from './PipelineRegressionsPanel';
 import { timeAgo, formatDurationSec, parseTimestamp, formatTimeToDetect, formatTimeToInvestigate } from '../utils/time';
-import { LayersAffectedBadges, type LayerSummary } from './LayersAffectedBadges';
+import { LayersAffectedBadges, UntargetedLayersBadge, type LayerSummary } from './LayersAffectedBadges';
 import { PhaseChip } from './regressionPhaseChips';
 
 interface RecurrenceEntry {
@@ -26,6 +26,26 @@ const CLASS_PREFIX_CHIPS: Record<string, string> = {
   sr_catch_rate: 'bg-sky-900/60 text-sky-300 border-sky-700/50',
 };
 
+const ASSERTION_TYPE_CHIPS: Record<string, string> = {
+  overflow: 'bg-rose-900/60 text-rose-300 border-rose-700/50',
+  text_truncation: 'bg-amber-900/60 text-amber-300 border-amber-700/50',
+  touch_target: 'bg-blue-900/60 text-blue-300 border-blue-700/50',
+};
+
+function parseViewportSubkey(subkey: string): { component: string; assertionType?: string; width?: string } {
+  const colonIdx = subkey.indexOf(':');
+  if (colonIdx === -1) {
+    const atIdx = subkey.indexOf('@');
+    return atIdx === -1 ? { component: subkey } : { component: subkey.slice(0, atIdx), width: subkey.slice(atIdx + 1) };
+  }
+  const component = subkey.slice(0, colonIdx);
+  const rest = subkey.slice(colonIdx + 1);
+  const atIdx = rest.indexOf('@');
+  return atIdx === -1
+    ? { component, assertionType: rest }
+    : { component, assertionType: rest.slice(0, atIdx), width: rest.slice(atIdx + 1) };
+}
+
 function RegressionClassLabel({ cls }: { cls: string }) {
   const colon = cls.indexOf(':');
   if (colon === -1) return <span className="font-mono text-emerald-300">{cls}</span>;
@@ -33,6 +53,29 @@ function RegressionClassLabel({ cls }: { cls: string }) {
   const subkey = cls.slice(colon + 1);
   const chipCls = CLASS_PREFIX_CHIPS[prefix];
   if (!chipCls) return <span className="font-mono text-emerald-300">{cls}</span>;
+
+  if (prefix === 'viewport_regression') {
+    const { component, assertionType, width } = parseViewportSubkey(subkey);
+    const assertionChipCls = assertionType ? ASSERTION_TYPE_CHIPS[assertionType] : undefined;
+    return (
+      <span className="inline-flex items-center gap-1 min-w-0 flex-wrap">
+        <span className={`inline-block text-[9px] font-semibold px-1 py-px rounded border ${chipCls} shrink-0`}>
+          {prefix.replace(/_/g, ' ')}
+        </span>
+        <span className="font-mono text-emerald-300">{component}</span>
+        {assertionType && (
+          <span
+            data-testid="assertion-type-chip"
+            className={`inline-block text-[9px] font-semibold px-1 py-px rounded border shrink-0 ${assertionChipCls ?? 'bg-neutral-800/60 text-neutral-400 border-neutral-700/50'}`}
+          >
+            {assertionType.replace(/_/g, ' ')}
+          </span>
+        )}
+        {width && <span className="font-mono text-neutral-500 text-[9px]">@{width}</span>}
+      </span>
+    );
+  }
+
   return (
     <span className="inline-flex items-center gap-1 min-w-0">
       <span className={`inline-block text-[9px] font-semibold px-1 py-px rounded border ${chipCls} shrink-0`}>
@@ -65,6 +108,7 @@ interface RecentlyClosedCase {
   hold_days_history?: number[];
   is_fragile?: boolean;
   last_remediation_result?: string | null;
+  untargeted_layers?: string[] | null;
 }
 
 interface LayerDefenseEntry {
@@ -299,6 +343,7 @@ export function RecentlyResolvedRegressionsPanel({ projectId }: Props) {
                       </span>
                     )}
                     <LayersAffectedBadges summary={c.layer_summary} />
+                    <UntargetedLayersBadge untargeted_layers={c.untargeted_layers} />
                     {layerMismatchBadge(c)}
                   </div>
                   <div className="mt-1.5 flex flex-wrap items-center gap-3 text-[10px] text-neutral-500">

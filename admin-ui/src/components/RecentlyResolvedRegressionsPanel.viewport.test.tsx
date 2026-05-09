@@ -139,6 +139,35 @@ describe('RecentlyResolvedRegressionsPanel — viewport regression', () => {
     });
   });
 
+  test('untargeted-layers badge renders without overflow at 375px', async () => {
+    const { apiFetch } = await import('../api');
+    (apiFetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      new Response(JSON.stringify({
+        cases: [{
+          id: 'case-ut',
+          regression_class: 'viewport_regression:header-overflow',
+          fix_pr_number: 4400,
+          recovered_at: new Date(Date.now() - 600_000).toISOString(),
+          first_seen_at: new Date(Date.now() - 3_600_000).toISOString(),
+          signal_first_crossed_at: new Date(Date.now() - 4_000_000).toISOString(),
+          time_to_recover_sec: 3000,
+          untargeted_layers: ['AGENT_VM', 'REVIEWER_PASS'],
+        }],
+      }), { status: 200 }),
+    );
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(<RecentlyResolvedRegressionsPanel projectId="proj-1" />);
+      });
+      await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+    });
+  });
+
   test('populated cases have no silently clipped text at 375px', async () => {
     const { apiFetch } = await import('../api');
     (apiFetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(

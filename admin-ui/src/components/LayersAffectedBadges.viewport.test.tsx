@@ -3,6 +3,7 @@ import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import {
   LayersAffectedBadges,
+  LayerDefenseCountsBadge,
   LayerMismatchBadge,
   UntargetedLayersBadge,
   type LayerSummary,
@@ -164,6 +165,23 @@ describe('LayersAffectedBadges — viewport regression', () => {
       await act(async () => {
         r.render(
           <UntargetedLayersBadge untargeted_layers={['AGENT_VERB', 'BASELINE_GATE']} />,
+        );
+      });
+    });
+  });
+
+  test('LayerDefenseCountsBadge renders without overflow at 375px', async () => {
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '16px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <LayerDefenseCountsBadge
+            layer_defense_counts={{ CI_WORKFLOW: 3, AGENT_VM: 0, AGENT_VERB: 1, BASELINE_GATE: 0, REVIEWER_PASS: 0, VIEWPORT: 0 }}
+          />,
         );
       });
     });

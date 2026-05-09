@@ -434,6 +434,42 @@ describe('RecentlyResolvedRegressionsPanel', () => {
     expect(screen.getByText('All other')).toBeInTheDocument();
   });
 
+  it('renders assertion-type chip for viewport_regression with assertion type', async () => {
+    apiFetchMock.mockResolvedValueOnce(response([
+      {
+        id: '20',
+        regression_class: 'viewport_regression:TaskCard:text_truncation@375',
+        fix_pr_number: 200,
+        recovered_at: '2026-05-06T10:15:00',
+        first_seen_at: '2026-05-06T10:10:00',
+        signal_first_crossed_at: '2026-05-06T10:05:00',
+        time_to_recover_sec: 300,
+      },
+    ]));
+    render(<RecentlyResolvedRegressionsPanel projectId="proj-1" />);
+    await screen.findByText('TaskCard');
+    expect(screen.getByTestId('assertion-type-chip')).toHaveTextContent('text truncation');
+    expect(screen.getByText('@375')).toBeInTheDocument();
+  });
+
+  it('renders viewport_regression without assertion type in legacy format (no assertion chip)', async () => {
+    apiFetchMock.mockResolvedValueOnce(response([
+      {
+        id: '21',
+        regression_class: 'viewport_regression:TaskCard@375',
+        fix_pr_number: 201,
+        recovered_at: '2026-05-06T10:15:00',
+        first_seen_at: '2026-05-06T10:10:00',
+        signal_first_crossed_at: '2026-05-06T10:05:00',
+        time_to_recover_sec: 300,
+      },
+    ]));
+    render(<RecentlyResolvedRegressionsPanel projectId="proj-1" />);
+    await screen.findByText('TaskCard');
+    expect(screen.queryByTestId('assertion-type-chip')).toBeNull();
+    expect(screen.getByText('@375')).toBeInTheDocument();
+  });
+
   it('renders both recurrence and fragile chips when applicable', async () => {
     apiFetchMock.mockResolvedValueOnce(response([
       {

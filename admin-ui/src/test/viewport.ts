@@ -84,7 +84,7 @@ export async function expectNoOverflowAt(
   if (docScrollWidth > limit) {
     const fileTag = callerFile ? ` [${callerFile}]` : '';
     throw new Error(
-      `expectNoOverflowAt(${width})${fileTag}: document.documentElement.scrollWidth=${docScrollWidth}px > ${limit}px`,
+      `expectNoOverflowAt(${width})${fileTag} [assertion_type:overflow]: document.documentElement.scrollWidth=${docScrollWidth}px > ${limit}px`,
     );
   }
 
@@ -113,7 +113,7 @@ export async function expectNoOverflowAt(
     const more = overflowing.length > 5 ? `\n  ... and ${overflowing.length - 5} more` : '';
     const fileTag = callerFile ? ` [${callerFile}]` : '';
     throw new Error(
-      `expectNoOverflowAt(${width})${fileTag}: ${overflowing.length} element(s) overflow at width=${width}px:\n${lines}${more}`,
+      `expectNoOverflowAt(${width})${fileTag} [assertion_type:overflow]: ${overflowing.length} element(s) overflow at width=${width}px:\n${lines}${more}`,
     );
   }
 
@@ -203,7 +203,7 @@ export async function expectNoTextTruncationAt(
     const more = truncated.length > 5 ? `\n  ... and ${truncated.length - 5} more` : '';
     const fileTag = callerFile ? ` [${callerFile}]` : '';
     throw new Error(
-      `expectNoTextTruncationAt(${width})${fileTag}: ${truncated.length} element(s) have text clipped without ellipsis at width=${width}px:\n${lines}${more}`,
+      `expectNoTextTruncationAt(${width})${fileTag} [assertion_type:text_truncation]: ${truncated.length} element(s) have text clipped without ellipsis at width=${width}px:\n${lines}${more}`,
     );
   }
 
@@ -283,7 +283,7 @@ export async function expectMinTouchTargetAt(
     const more = undersized.length > 5 ? `\n  ... and ${undersized.length - 5} more` : '';
     const fileTag = callerFile ? ` [${callerFile}]` : '';
     throw new Error(
-      `expectMinTouchTargetAt(${width})${fileTag}: ${undersized.length} element(s) below ${minSize}px touch target:\n${lines}${more}`,
+      `expectMinTouchTargetAt(${width})${fileTag} [assertion_type:touch_target]: ${undersized.length} element(s) below ${minSize}px touch target:\n${lines}${more}`,
     );
   }
 

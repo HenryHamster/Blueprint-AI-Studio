@@ -7273,6 +7273,132 @@ async def test_previous_fp_rate_uses_reviewer_findings_for_consistency(
 
 
 # ---------------------------------------------------------------------------
+# Tests for loosen-hint data pipeline: fp_count + tp_count >= 10 threshold
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_stores_loosen_hint_threshold_fields(
+    db_session: AsyncSession,
+):
+    """compute_sr_catch_rate_trends stores fp_count, tp_count, and false_positive_rate
+    at values that cross the pre-execution loosen-hint thresholds (fp_rate >= 0.5,
+    fp+tp >= 10). The formatHighFpRateLoosenHintForSrPrompt formatter reads these
+    fields via self_review_catch_rate.categories to build its pre-execution section."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+
+    # Current window: 7 FP + 3 TP tasks for 'correctness'.
+    # FP: SR flags correctness but human flags test-coverage (unrelated).
+    # TP: SR flags correctness AND human flags correctness.
+    # Result: fp_count=7, tp_count=3, false_positive_rate=0.7, sample=10.
+    for _ in range(7):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"test-coverage": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(3):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+
+    # Previous window: 5 tasks where correctness is confirmed (TPs) — needed
+    # for _MIN_SR_SAMPLE (5) so the function doesn't return None.
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    cat = result["categories"]["correctness"]
+
+    # Verify fields needed by formatHighFpRateLoosenHintForSrPrompt (via _cat_entry).
+    assert cat["fp_count"] == 7, f"expected fp_count=7, got {cat['fp_count']}"
+    assert cat["tp_count"] == 3, f"expected tp_count=3, got {cat['tp_count']}"
+    assert cat["false_positive_rate"] == 0.7, (
+        f"fp_rate = 7/(7+3) = 0.7, got {cat['false_positive_rate']}"
+    )
+    # Both loosen-hint thresholds are met: fp_rate >= 0.5 and sample >= 10.
+    sample = cat["fp_count"] + cat["tp_count"]
+    assert sample >= 10, f"loosen-hint needs sample>=10, got {sample}"
+    assert cat["false_positive_rate"] >= 0.5, "loosen-hint needs fp_rate>=0.5"
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_below_loosen_hint_sample_threshold(
+    db_session: AsyncSession,
+):
+    """When sample size (fp+tp) < 10, fp_count and tp_count are stored correctly
+    but the loosen-hint threshold is not crossed — category is not over-flagged."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+
+    # Current window: 4 FP + 2 TP = 6 total, below the sample=10 threshold.
+    for _ in range(4):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"test-coverage": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(2):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+
+    # Previous window: 5 tasks so the function does not return None.
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    cat = result["categories"]["correctness"]
+    assert cat["fp_count"] == 4
+    assert cat["tp_count"] == 2
+    sample = cat["fp_count"] + cat["tp_count"]
+    assert sample == 6 and sample < 10, (
+        "sample below loosen-hint threshold — category should not trigger loosen hint"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Tests for per-severity catch-rate breakdown in compute_sr_catch_rate_trends
 # ---------------------------------------------------------------------------
 
