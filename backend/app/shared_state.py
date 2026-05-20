@@ -377,6 +377,13 @@ runtime_config: Dict = {
     # preserves existing behavior until Phase 1 activates.
     # Operator-tunable via runtime_config_json; persisted across restarts.
     "integration_branch": "main",
+    # Release qualifier (Phase 3+). promotion_enabled gates whether the
+    # qualifier may promote a qualified automain candidate to main — default
+    # False ships the qualifier in dry-run (score + log, never promote).
+    # smoketest_enabled gates smoketest task spawns. Operator-tunable via
+    # runtime_config_json; persisted across restarts.
+    "promotion_enabled": False,
+    "smoketest_enabled": False,
 }
 
 # Scope-aware per-class retry budgets. When a task's context includes a scope
@@ -643,6 +650,16 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     )
                 if "integration_branch" in config_json:
                     _set("integration_branch", str(config_json["integration_branch"]))
+                if "promotion_enabled" in config_json:
+                    _set(
+                        "promotion_enabled",
+                        bool(config_json["promotion_enabled"]),
+                    )
+                if "smoketest_enabled" in config_json:
+                    _set(
+                        "smoketest_enabled",
+                        bool(config_json["smoketest_enabled"]),
+                    )
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[CONFIG-SYNC] Could not sync runtime_config_json: {e}")
 
