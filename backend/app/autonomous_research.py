@@ -1,6 +1,7 @@
 """Autonomous research spawning functions."""
 
 import asyncio
+import contextlib
 import logging
 import os
 import uuid
@@ -62,7 +63,7 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
 
 # Re-export the self_audit helpers for backwards compat with callers /
 # tests that patch them under ``app.autonomous_research``.
-from app.self_audit_dispatch import (  # noqa: E402, F401 — re-export
+from app.self_audit_dispatch import (
     _record_residual_audit_deferral,
     _should_dispatch_self_audit,
     _spawn_self_audit_task,
@@ -183,8 +184,8 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     #   - _resurrection_count not yet set (can still be resurrected once)
     # Genuinely-dead tasks (CODE_ERROR / OOM / pr_closed_unmerged /
     # already-resurrected) won't match and won't block.
-    from sqlalchemy import or_, and_  # noqa: PLC0415
-    from app.failure_classification import INFRA_CLASSES  # noqa: PLC0415
+    from sqlalchemy import or_, and_
+    from app.failure_classification import INFRA_CLASSES
 
     busy_direction_ids: set = set()
     resurrection_lookback = now - timedelta(hours=2)
@@ -531,7 +532,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     if not force_strategic:
         try:
             audit_decision = await _should_dispatch_self_audit(project, session)
-        except Exception:  # noqa: BLE001 — audit decision must never break dispatch
+        except Exception:
             logger.exception(
                 f"[SELF_AUDIT] decision failed for project {project.id}; "
                 "falling through to regular dispatch"
@@ -541,7 +542,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
             try:
                 if await _spawn_self_audit_task(project, session, audit_decision):
                     return  # Audit dispatched; skip tactical/strategic this tick.
-            except Exception:  # noqa: BLE001 — never break dispatch on audit failure
+            except Exception:
                 logger.exception(
                     f"[SELF_AUDIT] spawn failed for project {project.id}; "
                     "falling through to regular dispatch"
@@ -865,12 +866,13 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         return
 
     # Autonomous research creates independent tasks (no parent_task_id), so they
-    # must always branch from main.  Staging branches (research/*, plan/*) are
-    # ephemeral — they get deleted when their parent's rollup merges.  An
-    # independent task using someone else's staging branch will break when that
-    # rollup cleans up.  Actual subresearch (spawned by _handle_research_completion
-    # with parent_task_id set) correctly inherits its parent's staging branch.
-    base_branch = "main"
+    # must always branch from the integration trunk.  Staging branches
+    # (research/*, plan/*) are ephemeral — they get deleted when their parent's
+    # rollup merges.  An independent task using someone else's staging branch
+    # will break when that rollup cleans up.  Actual subresearch (spawned by
+    # _handle_research_completion with parent_task_id set) correctly inherits
+    # its parent's staging branch.
+    base_branch = _runtime_config.get("integration_branch", "main")
 
     # Use per-type defaults
     research_model = _runtime_config.get("task_type_models", {}).get("research") or None
@@ -921,8 +923,8 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                 ),
             )
             session.add(alert)
-            asyncio.ensure_future(
-                dispatch_external_notification(  # noqa: RUF006 — fire-and-forget notification
+            asyncio.ensure_future(  # noqa: RUF006
+                dispatch_external_notification(
                     str(project.id),
                     "ANOMALY_ADJUSTMENT",
                     {
@@ -947,8 +949,8 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                 ),
             )
             session.add(alert)
-            asyncio.ensure_future(
-                dispatch_external_notification(  # noqa: RUF006 — fire-and-forget notification
+            asyncio.ensure_future(  # noqa: RUF006
+                dispatch_external_notification(
                     str(project.id),
                     "ANOMALY_RESTORED",
                     {
@@ -968,16 +970,20 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     spawned_tasks = []
     for chosen_direction in directions_to_spawn:
         _mode = normalized_recommended_mode(chosen_direction)
-        if chosen_direction and _mode == "audit" and chosen_direction.get("system_id"):
-            if await _spawn_self_audit_task(
+        if (
+            chosen_direction
+            and _mode == "audit"
+            and chosen_direction.get("system_id")
+            and await _spawn_self_audit_task(
                 project,
                 session,
                 {
                     "focus_systems": [chosen_direction.get("system_id")],
                     "max_systems": 1,
                 },
-            ):
-                continue
+            )
+        ):
+            continue
 
         # Build lightweight direction summaries — include compact history for
         # agent-side stats (aggregateDirectionStats, buildScopeCalibrationSignal).
@@ -1101,7 +1107,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
             append_prompt_suffix(research_payload, _mode_hint)
         # Inject failure-mode coaching derived from direction's first-attempt rejection history
         if chosen_direction:
-            from app.spawn_calibration import _get_failure_coaching_suffix  # noqa: PLC0415
+            from app.spawn_calibration import _get_failure_coaching_suffix
 
             _dir_id = chosen_direction.get("id")
             _coaching = (
@@ -1446,10 +1452,11 @@ async def _spawn_periodic_task(project: Project, task_type: str, session: AsyncS
         .scalars()
         .first()
     )
+    _integration_branch = _runtime_config.get("integration_branch", "main")
     base_branch = (
-        (recent_task.first_payload).get("base_branch", "main")
+        (recent_task.first_payload).get("base_branch", _integration_branch)
         if recent_task
-        else "main"
+        else _integration_branch
     )
 
     task_model = _runtime_config.get("task_type_models", {}).get(task_type) or None
@@ -1804,7 +1811,7 @@ async def _spawn_task_failure_investigation(
                     ),
                 )
             )
-        except Exception as _msg_exc:
+        except Exception as _msg_exc:  # noqa: BLE001
             logger.warning(
                 f"[TASK FAILURE INVESTIGATION] Failed to post depth-cap message: {_msg_exc}"
             )
@@ -2229,10 +2236,8 @@ async def _infer_fingerprint_audit_system(
         return None
     uuids = []
     for tid in task_ids[:5]:
-        try:
+        with contextlib.suppress(ValueError, AttributeError):
             uuids.append(uuid.UUID(str(tid)))
-        except (ValueError, AttributeError):
-            pass
     if not uuids:
         return None
     rows = (await session.execute(select(Task.context).where(Task.id.in_(uuids)))).all()
@@ -2498,7 +2503,7 @@ async def _spawn_residual_fingerprint_remediation(
                     d = int((rc or {}).get("investigation_depth") or 0)
                     if d > source_max_depth:
                         source_max_depth = d
-            except Exception as _depth_exc:
+            except Exception as _depth_exc:  # noqa: BLE001
                 logger.debug(
                     f"[AUTO REMEDIATION] depth lookup failed for {fp[:32]}: {_depth_exc}"
                 )
@@ -2544,7 +2549,7 @@ async def _spawn_residual_fingerprint_remediation(
                 sample_message=primary_sample,
                 task_id=new_task.id,
             )
-        except Exception as _spawn_msg_exc:
+        except Exception as _spawn_msg_exc:  # noqa: BLE001
             logger.warning(
                 "[AUTO REMEDIATION] Failed to post spawned message for %s: %s",
                 fp[:32],

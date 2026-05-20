@@ -171,8 +171,9 @@ def _summarize_drift_signals(drift: dict) -> dict:
     by_system = drift.get("by_system") or {}
     # Keep flagged directions in full; for others summarize only if the
     # consistency dropped below 0.8.
-    interesting_directions = {}
-    for did, sig in by_direction.items():
+    interesting_directions = {
+        did: sig
+        for did, sig in by_direction.items()
         if (
             sig.get("over_claim_flag")
             or sig.get("stalled_despite_churn_flag")
@@ -180,8 +181,8 @@ def _summarize_drift_signals(drift: dict) -> dict:
                 sig.get("claim_shipped_consistency", 1.0) < 0.8
                 and sig.get("claimed_changes_count", 0) > 0
             )
-        ):
-            interesting_directions[did] = sig
+        )
+    }
     return {
         "by_direction": interesting_directions,
         "by_system": by_system,
@@ -208,7 +209,7 @@ async def _enrich_drift_with_trend(
 
     Only enriches directions already filtered into drift_summary by
     _summarize_drift_signals, so the extra queries are bounded by the
-    flagged-direction count (typically 0–3 per project).
+    flagged-direction count (typically 0-3 per project).
     """
     from app.drift_detection import last_n_drift_snapshots
 
@@ -1132,7 +1133,7 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
             "problem_model": _agent_view_problem_model(project.problem_model),
             "open_messages": open_msgs,
             "shipped_changes_manifest": shipped_changes_manifest,
-            "base_branch": "main",
+            "base_branch": _runtime_config.get("integration_branch", "main"),
             **({"model": doc_model} if doc_model else {}),
             **({"effort": doc_effort} if doc_effort else {}),
         },
@@ -1344,7 +1345,7 @@ async def _spawn_strategic_review(
             )
         mode_hint_lines.append(f"- {direction_label} — {hint}")
     prompt_suffix = (
-        "\n".join(["Mode hints for this cycle:"] + mode_hint_lines)
+        "\n".join(["Mode hints for this cycle:", *mode_hint_lines])
         if mode_hint_lines
         else None
     )
@@ -1524,7 +1525,7 @@ async def _spawn_strategic_review(
                 if (_retired_summary := _build_retired_directions_summary(project))
                 else {}
             ),
-            "base_branch": "main",
+            "base_branch": _runtime_config.get("integration_branch", "main"),
             **({"model": review_model} if review_model else {}),
             **({"effort": review_effort} if review_effort else {}),
         },
