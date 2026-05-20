@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import random
 import re as _re
 from datetime import datetime
@@ -70,7 +71,7 @@ def _normalize_endpoint_template(method: str, url: str) -> str:
 def _record_call(method: str, url: str) -> None:
     """Bump the per-endpoint counter so we can see which endpoints drain
     the 5000/hr quota when the window runs low."""
-    import app.shared_state as _ss  # noqa: PLC0415
+    import app.shared_state as _ss
 
     template = _normalize_endpoint_template(method, url)
     _ss.github_call_counts[template] = _ss.github_call_counts.get(template, 0) + 1
@@ -86,7 +87,7 @@ async def probe_rate_limit() -> bool:
     # Pull any currently-cached installation token — doesn't spend quota
     # on a refresh.  If nothing's cached, skip the probe; real activity
     # will populate the pill soon enough.
-    from app.routers.agent import _github_token_cache  # noqa: PLC0415
+    from app.routers.agent import _github_token_cache
 
     cached_token: str | None = None
     for entry in _github_token_cache.values():
@@ -109,7 +110,7 @@ async def probe_rate_limit() -> bool:
             max_retries=1,
         )
         return resp is not None
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.debug(f"[GITHUB] probe_rate_limit failed: {e}")
         return False
 
@@ -130,7 +131,7 @@ def _relevant_bucket(url: str, headers: dict | None) -> dict:
     only *gate* on values we actually observed, so an unused bucket won't cause
     spurious short-circuits.
     """
-    import app.shared_state as _ss  # noqa: PLC0415
+    import app.shared_state as _ss
 
     auth = (headers or {}).get("Authorization", "")
     if "/app/" in url or auth.startswith("Bearer eyJ"):
@@ -159,7 +160,7 @@ def _update_quota_state(
     bucket is tracked independently and does not affect the counter.
     """
     from datetime import datetime, timezone
-    import app.shared_state as _ss  # noqa: PLC0415
+    import app.shared_state as _ss
 
     q = _ss.github_jwt_quota if bucket_name == "jwt" else _ss.github_quota
     now_iso = datetime.now(timezone.utc).isoformat()
@@ -246,7 +247,7 @@ async def _github_request(
         and b_reset is not None
         and (b_reset - int(time.time())) > RATE_LIMIT_FAST_FAIL_THRESHOLD_S
     ):
-        import app.shared_state as _ss  # noqa: PLC0415
+        import app.shared_state as _ss
 
         label = "JWT" if bucket is _ss.github_jwt_quota else "install-token"
         _ss.github_cache_hits["bucket_short_circuit"] = (
@@ -337,7 +338,7 @@ async def _github_request(
                 else:
                     _bucket_name = None  # unauthenticated / unknown — don't track
                 if _bucket_name is not None:
-                    try:
+                    with contextlib.suppress(ValueError, TypeError):
                         _update_quota_state(
                             remaining=int(remaining),
                             limit=int(response.headers.get("X-RateLimit-Limit", 0))
@@ -346,15 +347,13 @@ async def _github_request(
                             or None,
                             bucket_name=_bucket_name,
                         )
-                    except (ValueError, TypeError):
-                        pass  # Malformed headers, skip
             if response.status_code == 401:
                 logger.warning(
                     f"[GITHUB] {method} {url} returned 401 Unauthorized — "
                     f"token may be expired or revoked"
                 )
                 if project_id:
-                    from app.routers.agent import invalidate_github_token_cache  # noqa: PLC0415
+                    from app.routers.agent import invalidate_github_token_cache
 
                     invalidate_github_token_cache(project_id)
                     logger.info(
@@ -367,7 +366,7 @@ async def _github_request(
                         f"after {max_retries} attempts"
                     )
                 return response
-            delay = 2**attempt * (0.5 + random.random() * 0.5)  # jittered: 0.5x–1x base
+            delay = 2**attempt * (0.5 + random.random() * 0.5)  # jittered: 0.5x-1x base
             logger.warning(
                 f"[GITHUB] {method} {url} returned {response.status_code}, "
                 f"retrying in {delay:.2f}s (attempt {attempt + 1}/{max_retries})"
@@ -394,7 +393,7 @@ async def _github_request(
                 logger.warning(
                     f"[GITHUB] Reset HTTP client after transport error: {type(exc).__name__}"
                 )
-            delay = 2**attempt * (0.5 + random.random() * 0.5)  # jittered: 0.5x–1x base
+            delay = 2**attempt * (0.5 + random.random() * 0.5)  # jittered: 0.5x-1x base
             logger.warning(
                 f"[GITHUB] {method} {url} network error: {exc}, "
                 f"retrying in {delay:.2f}s (attempt {attempt + 1}/{max_retries})"
@@ -746,7 +745,7 @@ async def create_check_run(
         "X-GitHub-Api-Version": "2022-11-28",
     }
     # Audit W1/F8: use _utcnow() for consistency with the rest of the app.
-    from app.time_utils import _utcnow as _ut  # noqa: PLC0415
+    from app.time_utils import _utcnow as _ut
 
     payload: dict = {
         "name": name,
@@ -805,7 +804,7 @@ async def update_check_run(
         output["annotations"] = annotations[:50]
 
     # Audit W1/F8: use _utcnow() for consistency with the rest of the app.
-    from app.time_utils import _utcnow as _ut  # noqa: PLC0415
+    from app.time_utils import _utcnow as _ut
 
     payload: dict = {
         "status": "completed",
@@ -1127,7 +1126,7 @@ async def get_issue_comments(
             )
             return []
         return response.json()
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         logger.warning(f"Error fetching comments for issue #{issue_number}: {exc}")
         return []
 
@@ -1207,6 +1206,97 @@ async def create_branch(
         )
 
     return response.json()
+
+
+async def create_tag(
+    token: str,
+    owner: str,
+    repo: str,
+    tag: str,
+    sha: str,
+    message: str | None = None,
+    project_id: str | None = None,
+) -> dict:
+    """Create an annotated git tag in the specified repository.
+
+    Two-step: first creates the annotated tag object via POST git/tags, then
+    creates the ref ``refs/tags/{tag}`` pointing at the tag object SHA.
+
+    Returns the created ref object dict on success.  Raises HTTPException on
+    API errors so callers can choose to wrap in try/except for best-effort use.
+    """
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    from app.time_utils import _utcnow as _ut
+
+    tag_message = message or f"Release {tag}"
+
+    # Step 1: create the annotated tag object.
+    tag_payload = {
+        "tag": tag,
+        "message": tag_message,
+        "object": sha,
+        "type": "commit",
+        "tagger": {
+            "name": "Blueprint",
+            "email": "blueprint@users.noreply.github.com",
+            "date": _ut().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        },
+    }
+    tag_resp = await _github_request(
+        "POST",
+        f"https://api.github.com/repos/{owner}/{repo}/git/tags",
+        headers,
+        json=tag_payload,
+        project_id=project_id,
+    )
+    if tag_resp.status_code != 201:
+        logger.error(
+            f"[GITHUB] create_tag: failed to create tag object '{tag}': "
+            f"{tag_resp.status_code} {tag_resp.text[:300]}"
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=(
+                f"Failed to create tag object '{tag}' on GitHub "
+                f"(GitHub {tag_resp.status_code})."
+            ),
+        )
+    tag_object_sha = tag_resp.json()["sha"]
+
+    # Step 2: create the ref refs/tags/{tag} pointing at the tag object.
+    ref_payload = {"ref": f"refs/tags/{tag}", "sha": tag_object_sha}
+    ref_resp = await _github_request(
+        "POST",
+        f"https://api.github.com/repos/{owner}/{repo}/git/refs",
+        headers,
+        json=ref_payload,
+        project_id=project_id,
+    )
+    if ref_resp.status_code == 422:
+        # Tag ref may already exist (idempotent re-tag on retry).
+        logger.info(
+            f"[GITHUB] create_tag: ref refs/tags/{tag} already exists (422) — reusing"
+        )
+        return {"ref": f"refs/tags/{tag}", "object": {"sha": tag_object_sha}}
+
+    if ref_resp.status_code != 201:
+        logger.error(
+            f"[GITHUB] create_tag: failed to create ref refs/tags/{tag}: "
+            f"{ref_resp.status_code} {ref_resp.text[:300]}"
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=(
+                f"Failed to create tag ref 'refs/tags/{tag}' on GitHub "
+                f"(GitHub {ref_resp.status_code})."
+            ),
+        )
+
+    return ref_resp.json()
 
 
 async def get_branch_sha(token: str, owner: str, repo: str, branch: str) -> str:
@@ -1718,7 +1808,7 @@ async def update_branch(
     if response.status_code == 202:
         try:
             data = response.json() or {}
-        except Exception:
+        except Exception:  # noqa: BLE001
             data = {}
         msg = data.get("message", "Update queued")
         logger.info(f"[UPDATE-BRANCH] PR #{pr_number} update queued: {msg}")
@@ -1726,7 +1816,7 @@ async def update_branch(
     if response.status_code in (403, 404, 422):
         try:
             data = response.json() or {}
-        except Exception:
+        except Exception:  # noqa: BLE001
             data = {}
         msg = data.get("message", f"HTTP {response.status_code}")
         logger.info(
@@ -1772,7 +1862,7 @@ async def update_branch_with_sha_retry(
         )
     except HTTPException as exc:
         return {"updated": False, "message": f"HTTP error: {exc.detail}"}
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         return {"updated": False, "message": f"{type(exc).__name__}: {exc}"}
     if result.get("updated"):
         return result
@@ -1780,7 +1870,7 @@ async def update_branch_with_sha_retry(
         fresh = await get_pull_request(
             token, owner, repo, pr_number, project_id=project_id
         )
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         logger.debug(f"[UPDATE-BRANCH] PR #{pr_number} refetch failed: {exc}")
         return result
     fresh_sha = (fresh.get("head") or {}).get("sha")
@@ -1801,7 +1891,7 @@ async def update_branch_with_sha_retry(
         )
     except HTTPException as exc:
         return {"updated": False, "message": f"HTTP error on retry: {exc.detail}"}
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         return {"updated": False, "message": f"{type(exc).__name__} on retry: {exc}"}
 
 
@@ -2026,7 +2116,7 @@ async def get_check_runs(
                     for job in result.json().get("jobs", []):
                         if job.get("conclusion") == "failure":
                             job_id_by_name[job.get("name", "")] = job["id"]
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.debug(f"[GITHUB] Workflow runs pre-fetch failed for {ref}: {exc}")
 
         for cr in check_runs:
@@ -2153,7 +2243,7 @@ async def get_check_runs_cached(
     simultaneous fan-out from siblings watching the same PR, not to mask
     status changes over time.
     """
-    import app.shared_state as _ss  # noqa: PLC0415
+    import app.shared_state as _ss
 
     key = (owner, repo, head_sha)
     now = time.time()
@@ -2166,7 +2256,7 @@ async def get_check_runs_cached(
     result = await get_check_runs(token, owner, repo, head_sha, project_id=project_id)
     _check_runs_cache[key] = (result, now)
     # Lazy eviction: when the dict gets oversized, drop anything older than
-    # 2×TTL.  Cheap, avoids unbounded growth across long-lived processes.
+    # 2x TTL.  Cheap, avoids unbounded growth across long-lived processes.
     if len(_check_runs_cache) > _CHECK_RUNS_CACHE_MAX:
         cutoff = now - (ttl * 2)
         for k in [k for k, (_, ts) in _check_runs_cache.items() if ts < cutoff]:
@@ -2251,7 +2341,7 @@ async def post_merge_summary_comment(
     try:
         await create_pr_comment(token, owner, repo, pr_number, body)
         return True
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         logger.warning(
             f"[GITHUB] post_merge_summary_comment failed for PR #{pr_number}: {exc}"
         )
@@ -2268,8 +2358,8 @@ def build_blueprint_pr_merge_summary_comment(
     direction_title: str | None = None,
 ) -> str:
     """Build a markdown merge-summary comment for Blueprint-authored PRs."""
-    from app.max_plan_pool import get_task_llm_provider  # noqa: PLC0415
-    from app.task_completion import _estimated_task_cost_usd  # noqa: PLC0415
+    from app.max_plan_pool import get_task_llm_provider
+    from app.task_completion import _estimated_task_cost_usd
 
     ctx, pld = task.context or {}, task.first_payload or {}
     if iteration_count is None and isinstance(
@@ -2311,7 +2401,7 @@ async def post_pipeline_merge_summary_comment(
     pr_number: int,
 ) -> None:
     """Post a one-time merge summary comment on a Blueprint-merged PR (errors swallowed)."""
-    from app.task_completion import _estimated_task_cost_usd  # noqa: PLC0415
+    from app.task_completion import _estimated_task_cost_usd
 
     if (orig_task.created_by or "").upper() == "USER":
         return
@@ -2351,7 +2441,7 @@ async def post_pipeline_merge_summary_comment(
     )
     try:
         await create_pr_comment(gh_token, owner, repo, pr_number, body)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.warning(
             f"[PIPELINE] merge-summary comment failed for PR #{pr_number}: {e}"
         )

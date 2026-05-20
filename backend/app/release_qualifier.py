@@ -894,6 +894,26 @@ async def _finalize_qualification(
         session.add(version)
         return {"status": "error", "error": "missing_candidate_sha"}
 
+    # Resolve credentials now so promote() can pass them to _record_promotion_success
+    # for tagging.  promote() would resolve them itself if omitted, but resolving here
+    # avoids a second round-trip and lets the tag share the same token.
+    project = await session.get(Project, version.project_id)
+    resolved_creds: tuple[str, str, str] | None = None
+    if project is not None:
+        resolved_creds = await _resolve_github_with_session(session, project)
+
+    if resolved_creds is not None:
+        _token, _owner, _repo = resolved_creds
+        return await promote(
+            session,
+            version,
+            candidate_sha,
+            composite=composite,
+            base_record=base_record,
+            token=_token,
+            owner=_owner,
+            repo=_repo,
+        )
     return await promote(
         session,
         version,
@@ -1065,6 +1085,9 @@ async def promote(
     *,
     composite: dict[str, Any] | None = None,
     base_record: dict[str, Any] | None = None,
+    token: str | None = None,
+    owner: str | None = None,
+    repo: str | None = None,
 ) -> dict[str, Any]:
     """Promote the ``automain`` candidate to ``main``.
 
@@ -1084,6 +1107,10 @@ async def promote(
     On failure / non-merge: records the outcome in ``version.last_qualification``,
     keeps the version open, and sets ``phase = "stabilize"``.
 
+    ``token``, ``owner``, ``repo`` may be pre-resolved by the caller
+    (``_finalize_qualification`` already holds them); if omitted they are
+    resolved here from the project row.
+
     The caller commits the session.  Returns a result dict.
     """
     base_record = dict(base_record or {})
@@ -1095,12 +1122,13 @@ async def promote(
         )
         return {"status": "error", "error": "project_not_found"}
 
-    resolved = await _resolve_github_with_session(session, project)
-    if resolved is None:
-        return _record_promotion_failure(
-            session, version, base_record, "no_credentials"
-        )
-    token, owner, repo = resolved
+    if not token or not owner or not repo:
+        resolved = await _resolve_github_with_session(session, project)
+        if resolved is None:
+            return _record_promotion_failure(
+                session, version, base_record, "no_credentials"
+            )
+        token, owner, repo = resolved
 
     # 1. Open the automain → main PR.
     try:
@@ -1147,7 +1175,15 @@ async def promote(
             version.version_number,
         )
         return await _record_promotion_success(
-            session, version, candidate_sha, base_record, pr_url, empty_diff=True
+            session,
+            version,
+            candidate_sha,
+            base_record,
+            pr_url,
+            token=token,
+            owner=owner,
+            repo=repo,
+            empty_diff=True,
         )
 
     if not pr_number:
@@ -1210,7 +1246,14 @@ async def promote(
         pr_number,
     )
     return await _record_promotion_success(
-        session, version, candidate_sha, base_record, pr_url
+        session,
+        version,
+        candidate_sha,
+        base_record,
+        pr_url,
+        token=token,
+        owner=owner,
+        repo=repo,
     )
 
 
@@ -1268,6 +1311,9 @@ async def _record_promotion_success(
     base_record: dict[str, Any],
     pr_url: str,
     *,
+    token: str | None = None,
+    owner: str | None = None,
+    repo: str | None = None,
     empty_diff: bool = False,
 ) -> dict[str, Any]:
     """Record a successful promotion and open the next version.
@@ -1275,6 +1321,11 @@ async def _record_promotion_success(
     Marks ``version`` ``status="promoted"``, stamps ``promoted_at`` /
     ``promoted_sha``, then opens version N+1 in the ``build`` phase with its
     ``base_sha`` set to the just-promoted SHA.
+
+    After the version is marked promoted, creates a git tag
+    ``v{version.version_number}`` on the promoted SHA.  A tag-creation failure
+    is non-fatal — it is wrapped in try/except and only logs a warning.  The
+    merge already succeeded; the tag is cosmetic convenience.
     """
     now = _utcnow()
     record = {
@@ -1305,6 +1356,34 @@ async def _record_promotion_success(
         candidate_sha[:8],
         next_version.version_number,
     )
+
+    # Best-effort: create a git tag v{version_number} on the promoted SHA.
+    # A tag-creation failure must NEVER abort or fail the promotion — the merge
+    # already succeeded and the tag is cosmetic convenience only.
+    if token and owner and repo:
+        tag_name = f"v{version.version_number}"
+        try:
+            await github.create_tag(
+                token,
+                owner,
+                repo,
+                tag_name,
+                candidate_sha,
+                message=f"Release {tag_name} (automain → main promotion)",
+                project_id=str(version.project_id),
+            )
+            logger.info(
+                "[RELEASE_QUALIFIER] created release tag %s on %s",
+                tag_name,
+                candidate_sha[:8],
+            )
+        except Exception as exc:  # noqa: BLE001 — tag failure must not abort promotion
+            logger.warning(
+                "[RELEASE_QUALIFIER] failed to create release tag %s (non-fatal): %s",
+                tag_name,
+                exc,
+            )
+
     return {
         "status": "promoted",
         "promoted_sha": candidate_sha,

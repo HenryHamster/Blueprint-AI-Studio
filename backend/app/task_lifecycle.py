@@ -2523,11 +2523,17 @@ async def _process_post_commit(
                                 "backend/app/auth.py",
                                 "agent/src/index.ts",
                                 "CLAUDE.md",
+                                # Phase 4 trusted core — also in CRITICAL_FILES.
+                                "backend/promotion_policy.yaml",
                             }
                             CRITICAL_FILES = {
                                 "backend/app/security.py",
                                 "backend/app/auth.py",
                                 "CLAUDE.md",
+                                # The release-qualifier promotion rubric — the
+                                # human-owned trusted core. Autonomous changes to
+                                # it must be human-approved before merge.
+                                "backend/promotion_policy.yaml",
                             }
                             touched_infra = [
                                 f["filename"]

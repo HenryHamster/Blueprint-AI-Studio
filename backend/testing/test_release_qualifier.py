@@ -1148,6 +1148,105 @@ async def test_maybe_finalize_both_children_terminal_calls_finalize(
     assert version.last_qualification["status"] == "dry_run"
 
 
+# ===========================================================================
+# Release tagging — Phase 4: v{N} tag on promotion, failure is non-fatal
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_promote_success_creates_release_tag(db_session, mocker):
+    """A successful promotion creates a git tag v{version_number} on the
+    promoted SHA via github.create_tag."""
+    _project, version = await _make_project_and_version(db_session)
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch(
+        "app.github.create_pull_request",
+        new=AsyncMock(return_value={"number": 42, "html_url": "http://pr/42"}),
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        new=AsyncMock(return_value={"merged": True, "message": "Merged"}),
+    )
+    tag_mock = mocker.patch(
+        "app.github.create_tag",
+        new=AsyncMock(
+            return_value={"ref": "refs/tags/v1", "object": {"sha": "abc" * 13 + "a"}}
+        ),
+    )
+
+    result = await rq.promote(
+        db_session,
+        version,
+        "abcd" * 10,
+        composite={"confidence": 0.9},
+    )
+    await db_session.commit()
+
+    assert result["status"] == "promoted"
+
+    # create_tag was called once with the v1 tag on the promoted SHA.
+    tag_mock.assert_called_once()
+    call_kwargs = tag_mock.call_args
+    assert call_kwargs.args[3] == "v1"        # tag name
+    assert call_kwargs.args[4] == "abcd" * 10  # sha
+
+
+@pytest.mark.asyncio
+async def test_promote_success_tag_failure_does_not_abort_promotion(db_session, mocker):
+    """A create_tag failure (any exception) is non-fatal: the promotion still
+    succeeds (status='promoted') and the next version is still opened."""
+    _project, version = await _make_project_and_version(db_session)
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch(
+        "app.github.create_pull_request",
+        new=AsyncMock(return_value={"number": 99, "html_url": "http://pr/99"}),
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        new=AsyncMock(return_value={"merged": True, "message": "Merged"}),
+    )
+    # Simulate a tag creation failure (e.g. GitHub 500, network error, etc.)
+    from fastapi import HTTPException as _HTTPException
+
+    mocker.patch(
+        "app.github.create_tag",
+        new=AsyncMock(side_effect=_HTTPException(status_code=500, detail="GitHub 500")),
+    )
+
+    result = await rq.promote(
+        db_session,
+        version,
+        "beef" * 10,
+        composite={"confidence": 0.95},
+    )
+    await db_session.commit()
+
+    # The promotion itself must succeed despite the tag failure.
+    assert result["status"] == "promoted"
+    assert result["promoted_sha"] == "beef" * 10
+    assert result["next_version_number"] == 2
+
+    # The version row must be promoted.
+    await db_session.refresh(version)
+    assert version.status == "promoted"
+    assert version.promoted_sha == "beef" * 10
+
+    # The next version was opened normally.
+    from app import release_version as rv_mod
+
+    next_version = await rv_mod.current_open_version(db_session, version.project_id)
+    assert next_version is not None
+    assert next_version.version_number == 2
+
+
 @pytest.mark.asyncio
 async def test_maybe_finalize_already_finalized_version_returns_none(db_session):
     """If the version's last_qualification.status is not 'pending' (e.g.
