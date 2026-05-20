@@ -620,6 +620,63 @@ export function formatRetiredDirectionsSummary(raw: unknown): string {
   return '\n' + lines.join('\n') + '\n';
 }
 
+/**
+ * Builds the version-phase status block for the strategic thinker prompt.
+ * Explains the current phase, what each phase means, and instructs the agent
+ * to emit version_phase_decision when it decides to flip.
+ */
+export function buildVersionPhaseSection(versionPhase: Record<string, unknown> | undefined): string {
+  if (!versionPhase || typeof versionPhase !== 'object') return '';
+  const versionNumber = typeof versionPhase.version_number === 'number' ? versionPhase.version_number : null;
+  const phase = typeof versionPhase.phase === 'string' ? versionPhase.phase : null;
+  if (versionNumber === null || (phase !== 'build' && phase !== 'stabilize')) return '';
+
+  const phaseChangedAt = typeof versionPhase.phase_changed_at === 'string' ? versionPhase.phase_changed_at : null;
+  const tasksMergedThisVersion = typeof versionPhase.tasks_merged_this_version === 'number'
+    ? versionPhase.tasks_merged_this_version : null;
+  const lastQualification = typeof versionPhase.last_qualification === 'string'
+    ? versionPhase.last_qualification : null;
+
+  const parts: string[] = [];
+  parts.push(`\n## Version Phase`);
+  parts.push(`Current: **v${versionNumber} — ${phase.toUpperCase()}**`);
+
+  if (phaseChangedAt) {
+    parts.push(`Phase entered: ${phaseChangedAt}`);
+  }
+  if (tasksMergedThisVersion !== null) {
+    parts.push(`Tasks merged this version: ${tasksMergedThisVersion}`);
+  }
+  if (lastQualification) {
+    parts.push(`Last qualification check: ${lastQualification}`);
+  }
+
+  parts.push(`
+**Phase meanings:**
+- **build** — pursue the version's feature and improvement work at full pace. The version is actively developing; continue creating and executing directions that advance the intent.
+- **stabilize** — shift the work-mix toward audit, cleanup, and hardening. The version is approaching a release-qualifiable state; prioritize directions that reduce risk, fix known issues, and improve test coverage over net-new feature work. New feature directions should be deferred to the next version unless they directly unblock stabilization.
+
+**Your judgment on phase:**
+Assess whether the current phase still fits the project's state. You are not bound to a schedule or a fixed rule — phase transitions are YOUR call, based on what you observe.
+
+- Flip from **build → stabilize** when: enough feature work has landed that further additions would outpace the project's ability to qualify them, or when there are enough known issues, technical debt, or stability concerns that they should be addressed before continuing to build.
+- Flip from **stabilize → build** when: the version has been sufficiently hardened, qualification criteria look achievable, and continued stabilization work has diminishing returns.
+
+If you decide to flip the phase, emit a \`version_phase_decision\` field in your Section 6 problem_model update (as a top-level JSON field alongside the model):
+\`\`\`json
+{
+  "version_phase_decision": {
+    "phase": "build" | "stabilize",
+    "reasoning": "One or two sentences explaining why you're flipping now."
+  }
+}
+\`\`\`
+
+If you are staying in the current phase, do NOT emit \`version_phase_decision\` — omitting it means "no change."`);
+
+  return parts.join('\n');
+}
+
 // Portfolio-level view computed from per-direction data — surfaces imbalances
 // (category skew, system coverage gaps, concentration, age) as explicit
 // decision inputs for the strategic thinker.
@@ -903,6 +960,7 @@ export interface ThinkerPromptParams {
   feedbackSection: string;
   threadSection: string;
   taskId: string;
+  versionPhaseSection: string;
 }
 
 export function buildThinkerPrompt(p: ThinkerPromptParams): string {
@@ -936,7 +994,7 @@ ${p.userPausedSection}${p.rejectedProposalsSection}
 ## Portfolio Composition
 ${p.portfolioCompositionText}
 ${p.systemMaturitySection}${p.driftSection}
-${p.recentWorkSection}${p.feedbackSection}${p.threadSection}
+${p.recentWorkSection}${p.feedbackSection}${p.threadSection}${p.versionPhaseSection}
 # Your job
 
 You operate on a **problem model** — a structured representation of what the user wants (intent), what the project can do (capabilities), and what's between those (gaps). Directions are *moves* toward specific gaps. Friction is *obstacles* in the way.
@@ -2089,6 +2147,9 @@ point of self-repo. Just do it and tell the user in whats_changed.` : '';
     // ── Pass 1: Thinker — analyze freely, write prose ──
     // Let the agent do what it's good at: read code, reason about architecture,
     // write a strategic analysis. No API constraints, no JSON formatting.
+    const versionPhase = payload.version_phase && typeof payload.version_phase === 'object'
+      ? payload.version_phase as Record<string, unknown>
+      : undefined;
     const thinkerPrompt = buildThinkerPrompt({
       contextPrefix,
       projectName,
@@ -2118,6 +2179,7 @@ point of self-repo. Just do it and tell the user in whats_changed.` : '';
       feedbackSection,
       threadSection,
       taskId,
+      versionPhaseSection: buildVersionPhaseSection(versionPhase),
     });
 
     const thinkerGateResult = await runThinkerWithGate(
@@ -2242,15 +2304,19 @@ ${analysisText.slice(0, 50_000)}
 
 4. **Retired-direction critique (REQUIRED).** From Section 3.5, call \`./strategic set-retirement-critiques\` with a JSON array of critique objects. If the Thinker wrote "No eligible retirements", pass \`'{"no_eligible_retirements": true}'\`. Never skip this call.
 
-5. **Self-reflection (optional).** If Section 5 has non-empty content, emit via \`./strategic reflect\`. If the Thinker wrote nothing (or wrote "none" / "N/A" / empty), SKIP — do not fabricate.
+5. **Version phase decision (conditional).** If the Thinker's analysis includes a \`version_phase_decision\` field (look in Section 6 and throughout the analysis), extract it and embed it as a top-level sibling in the problem_model JSON before calling \`./strategic set-problem-model\`:
+   \`{"version_phase_decision": {"phase": "build" or "stabilize", "reasoning": "..."}, ...rest_of_problem_model}\`
+   If the Thinker did NOT emit \`version_phase_decision\`, SKIP — do not fabricate one, and do not include the field. Absence means "no phase change this cycle."
 
-6. **Pending confirmations (optional).** For each external blocker the Thinker identified in Section 4's blockers field (credentials, access, major pivots), emit one \`./strategic pending-confirm\`. Do NOT create these for coding questions.
+6. **Self-reflection (optional).** If Section 5 has non-empty content, emit via \`./strategic reflect\`. If the Thinker wrote nothing (or wrote "none" / "N/A" / empty), SKIP — do not fabricate.
 
-7. **Messages.** Resolve any user messages the analysis addressed: \`./messages resolve <id> 'Answered — [summary]'\`. Check the conversation for your prior QUESTION messages — if a user reply answers one, resolve it. Do not post a cycle-summary message — the running_update is the voice now.
+7. **Pending confirmations (optional).** For each external blocker the Thinker identified in Section 4's blockers field (credentials, access, major pivots), emit one \`./strategic pending-confirm\`. Do NOT create these for coding questions.
 
-8. **Guardrails.** Ensure at least 3 active directions remain after retires.
+8. **Messages.** Resolve any user messages the analysis addressed: \`./messages resolve <id> 'Answered — [summary]'\`. Check the conversation for your prior QUESTION messages — if a user reply answers one, resolve it. Do not post a cycle-summary message — the running_update is the voice now.
 
-9. Done. Do not write anything else.`;
+9. **Guardrails.** Ensure at least 3 active directions remain after retires.
+
+10. Done. Do not write anything else.`;
 
     statusRef.value = 'Running strategic execution (pass 2: applying decisions)...';
     let { exitCode, allOutput, lastResultText } = await runClaudeCode(executorPrompt, ws, statusRef, model, effort, disallowedTools);

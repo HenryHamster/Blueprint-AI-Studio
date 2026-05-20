@@ -70,6 +70,7 @@ import {
   formatPreviousDecisionOutcomes,
   readProgressArtifact,
   buildPortfolioComposition,
+  buildVersionPhaseSection,
   buildThinkerPrompt,
   runThinkerWithGate,
   type ThinkerPromptParams,
@@ -1040,6 +1041,71 @@ describe('buildPortfolioComposition', () => {
   });
 });
 
+describe('buildVersionPhaseSection', () => {
+  it('returns empty string when versionPhase is undefined', () => {
+    expect(buildVersionPhaseSection(undefined)).toBe('');
+  });
+
+  it('returns empty string when versionPhase is missing required fields', () => {
+    expect(buildVersionPhaseSection({})).toBe('');
+    expect(buildVersionPhaseSection({ version_number: 1 })).toBe('');
+    expect(buildVersionPhaseSection({ phase: 'build' })).toBe('');
+  });
+
+  it('returns empty string when phase is an invalid value', () => {
+    expect(buildVersionPhaseSection({ version_number: 1, phase: 'unknown' })).toBe('');
+  });
+
+  it('renders build phase with version number', () => {
+    const result = buildVersionPhaseSection({ version_number: 3, phase: 'build' });
+    expect(result).toContain('v3');
+    expect(result).toContain('BUILD');
+    expect(result).toContain('Version Phase');
+  });
+
+  it('renders stabilize phase with version number', () => {
+    const result = buildVersionPhaseSection({ version_number: 5, phase: 'stabilize' });
+    expect(result).toContain('v5');
+    expect(result).toContain('STABILIZE');
+  });
+
+  it('includes phase_changed_at when present', () => {
+    const result = buildVersionPhaseSection({ version_number: 2, phase: 'build', phase_changed_at: '2026-05-10T12:00:00Z' });
+    expect(result).toContain('2026-05-10T12:00:00Z');
+  });
+
+  it('includes tasks_merged_this_version when present', () => {
+    const result = buildVersionPhaseSection({ version_number: 2, phase: 'build', tasks_merged_this_version: 42 });
+    expect(result).toContain('42');
+    expect(result).toContain('Tasks merged this version');
+  });
+
+  it('includes last_qualification when present', () => {
+    const result = buildVersionPhaseSection({ version_number: 2, phase: 'stabilize', last_qualification: '2026-05-15T08:00:00Z' });
+    expect(result).toContain('Last qualification check');
+    expect(result).toContain('2026-05-15T08:00:00Z');
+  });
+
+  it('explains both phase meanings', () => {
+    const result = buildVersionPhaseSection({ version_number: 1, phase: 'build' });
+    expect(result).toContain('build');
+    expect(result).toContain('stabilize');
+    expect(result).toContain('audit');
+    expect(result).toContain('hardening');
+  });
+
+  it('instructs agent to emit version_phase_decision when flipping', () => {
+    const result = buildVersionPhaseSection({ version_number: 1, phase: 'build' });
+    expect(result).toContain('version_phase_decision');
+    expect(result).toContain('reasoning');
+  });
+
+  it('instructs agent to omit version_phase_decision when staying in current phase', () => {
+    const result = buildVersionPhaseSection({ version_number: 1, phase: 'build' });
+    expect(result).toMatch(/omit|no change|do NOT emit/i);
+  });
+});
+
 describe('buildThinkerPrompt', () => {
   const base: ThinkerPromptParams = {
     contextPrefix: '',
@@ -1070,6 +1136,7 @@ describe('buildThinkerPrompt', () => {
     feedbackSection: '',
     threadSection: '',
     taskId: 'test-task-123',
+    versionPhaseSection: '',
   };
 
   it('includes required structural headers when inputs are populated', () => {
@@ -1181,6 +1248,27 @@ describe('buildThinkerPrompt', () => {
     expect(prompt).toContain('retire');
     // Moves section must explicitly list retirement
     expect(prompt).toMatch(/Directions to retire/);
+  });
+
+  it('versionPhaseSection rendered only when non-empty', () => {
+    const withPhase = buildThinkerPrompt({ ...base, versionPhaseSection: '\n## Version Phase\nv3 — BUILD\n' });
+    expect(withPhase).toContain('## Version Phase');
+    expect(withPhase).toContain('v3 — BUILD');
+
+    const withoutPhase = buildThinkerPrompt({ ...base, versionPhaseSection: '' });
+    expect(withoutPhase).not.toContain('## Version Phase');
+  });
+
+  it('version phase section appears before # Your job', () => {
+    const prompt = buildThinkerPrompt({
+      ...base,
+      versionPhaseSection: '\n## Version Phase\nv2 — STABILIZE\n',
+    });
+    const phaseIdx = prompt.indexOf('## Version Phase');
+    const jobIdx = prompt.indexOf('# Your job');
+    expect(phaseIdx).toBeGreaterThan(-1);
+    expect(jobIdx).toBeGreaterThan(-1);
+    expect(phaseIdx).toBeLessThan(jobIdx);
   });
 
   it('does not contain banned legacy directive phrases', () => {
