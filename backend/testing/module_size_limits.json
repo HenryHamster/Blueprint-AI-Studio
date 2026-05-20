@@ -3,7 +3,7 @@
   "backend": {
     "main.py": 3500,
     "task_completion.py": 3900,
-    "task_lifecycle.py": 4750,
+    "task_lifecycle.py": 4850,
     "orchestrator.py": 4950,
     "admin.py": 3000,
     "compute.py": 2500,

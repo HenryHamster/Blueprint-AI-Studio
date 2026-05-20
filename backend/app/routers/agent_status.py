@@ -1229,7 +1229,14 @@ async def update_agent_status(
                         )
                     else:
                         base_branch = (task.first_payload).get("base_branch", "main")
-                        is_post_promotion = base_branch == "main"
+                        # A base_branch=="main" smoketest is a post-promotion
+                        # (production) failure only once the LTS cutover is done.
+                        # Before integration_branch flips to "automain", rollups
+                        # still merge to main, so a "main" smoketest is an ordinary
+                        # rollup-merge smoketest — not a promotion.
+                        is_post_promotion = base_branch == "main" and (
+                            _runtime_config.get("integration_branch") == "automain"
+                        )
                         failure_summary = "\n".join(
                             f"- {t['name']}: {t.get('message', 'no details')}"
                             for t in failed_tests

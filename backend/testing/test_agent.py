@@ -6642,6 +6642,62 @@ async def test_smoketest_curated_failure_spawns_plan_task_priority_70(
 
 
 @pytest.mark.asyncio
+async def test_smoketest_main_failure_post_cutover_spawns_hotfix(
+    client: AsyncClient, db_session, mocker
+):
+    """Post-cutover (integration_branch=automain), a base_branch=main smoketest
+    failure is a post-promotion production failure: the spawned plan task is a
+    hotfix at priority >= 90 even when only the curated suite failed."""
+    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+    mocker.patch.dict(
+        "app.shared_state.runtime_config", {"integration_branch": "automain"}
+    )
+
+    _, task = await _setup_smoketest_task(db_session, "agent-vm-smoke-hotfix")
+
+    import json as _json
+
+    smoketest_payload = {
+        "passed": False,
+        "tests": [
+            {"name": "login_flow", "status": "fail", "message": "assertion failed"}
+        ],
+        "suites": {
+            "startup": {"passed": True, "tests": []},
+            "curated": {
+                "passed": False,
+                "tests": [{"name": "login_flow", "status": "fail"}],
+            },
+        },
+    }
+    token = create_agent_token(str(task.id), "agent-vm-smoke-hotfix")
+    payload = {
+        "task_id": str(task.id),
+        "status": "FAILED",
+        "artifact_type": "SMOKETEST_RESULT",
+        "logs": _json.dumps(smoketest_payload),
+    }
+    resp = await client.post(
+        "/api/agent/status", json=payload, headers={"x-agent-token": token}
+    )
+    assert resp.status_code == 200
+
+    result = await db_session.execute(
+        select(Task).where(Task.parent_task_id == task.id)
+    )
+    spawned = result.scalars().all()
+    assert len(spawned) == 1
+    # A curated-only failure is normally priority 70; escalated to >= 90 here
+    # because post-cutover a base_branch=main smoketest is a post-promotion
+    # (production) failure, routed as a hotfix.
+    assert spawned[0].priority >= 90
+    assert spawned[0].first_payload.get("hotfix") is True
+    assert spawned[0].first_payload.get("type") == "plan"
+
+
+@pytest.mark.asyncio
 async def test_smoketest_passing_does_not_spawn_plan_task(
     client: AsyncClient, db_session, mocker
 ):
