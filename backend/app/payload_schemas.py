@@ -258,6 +258,11 @@ class SelfAuditPayload(_SystemPopulated):
     max_systems: int | None = None
 
 
+class ReleaseAuditPayload(_SystemPopulated):
+    diff_range: str | None = None
+    prompt: str | None = None
+
+
 class QAPayload(_SystemPopulated):
     pass
 
@@ -309,6 +314,7 @@ _MODEL_FOR_TYPE: dict[TaskType, type[BasePayload]] = {
     TaskType.debug: DebugPayload,
     TaskType.perf: PerfPayload,
     TaskType.self_audit: SelfAuditPayload,
+    TaskType.release_audit: ReleaseAuditPayload,
 }
 
 

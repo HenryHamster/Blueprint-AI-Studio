@@ -928,3 +928,141 @@ Rules:
     logs,
   });
 }
+
+// ── Handler: Release Audit (review main...automain diff against main's standards) ──
+export async function handleReleaseAudit(
+  taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
+  ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
+  model?: string, effort?: string
+) {
+  // CRITICAL: always clone base_branch (main), never automain. The audit must
+  // judge the incoming changes by main's standards, not the new code's standards.
+  const rawBaseBranch = strVal(payload.base_branch, 'main');
+  const baseBranch = validateBranchName(rawBaseBranch, 'base_branch');
+  const diffRange = strVal(payload.diff_range, `${baseBranch}...automain`);
+
+  statusRef.value = `Cloning ${owner}/${repo} (${baseBranch}) for release audit...`;
+  sendLog(ws, `Starting release audit — cloning ${baseBranch} (reference branch)...\n`);
+  const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
+  await prepareWorkspaceForRole({
+    workspace: WORKSPACE, repoUrl: cloneUrl, githubToken: ghToken,
+    branch: baseBranch, baseBranch, depth: DEFAULT_CLONE_DEPTH,
+  });
+
+  // Fetch automain so git diff can compute the diff range — but do NOT check
+  // it out. The working tree stays on baseBranch (main).
+  sendLog(ws, `Fetching origin/automain for diff computation (staying on ${baseBranch})...\n`);
+  try {
+    execFileSync('git', ['fetch', 'origin', 'automain'], { cwd: WORKSPACE, stdio: ['ignore', 'pipe', 'pipe'] });
+    sendLog(ws, `Fetched origin/automain successfully.\n`);
+  } catch (e) {
+    sendLog(ws, `[WARNING] git fetch origin automain failed: ${e instanceof Error ? e.message : String(e)}\n`);
+    sendLog(ws, `Diff range ${diffRange} may not be resolvable. Continuing...\n`);
+  }
+
+  writePlaybookHelper(taskId);
+  writeMessagesHelper(taskId);
+  const disallowedTools = configureAgentPermissions('release_audit');
+
+  const contextPrefix = buildContextPrefix(task);
+  const claudeMd = readClaudeMd();
+  const codebaseSummary = claudeMd ? `## Codebase Instructions\n${claudeMd}\n\n` : '';
+  const fileTreeSection = buildFileTree(ws);
+  const playbookSection = formatPlaybook(task.playbook as Record<string, PlaybookEntry | string> | undefined);
+  const retryContext = buildRetryContext(task);
+  const firstTaskSection = task.first_task_on_repo ? FIRST_TASK_GUIDANCE : '';
+
+  const releaseAuditPrompt = `${codebaseSummary}${playbookSection}${retryContext}${contextPrefix}${fileTreeSection}You are a release audit agent. You have been cloned onto \`${baseBranch}\` — the last known-good LTS branch — and your job is to review the incoming diff range \`${diffRange}\` against \`${baseBranch}\`'s standards.
+
+IMPORTANT: You are running on \`${baseBranch}\` intentionally. You must judge the incoming changes by \`${baseBranch}\`'s standards, NOT by the new code's standards. This asymmetry is the entire point of the audit.
+
+## Your task
+
+1. **Obtain the diff.** Run: \`git diff ${diffRange}\` to see what \`automain\` adds relative to \`${baseBranch}\`. Also run \`git diff --stat ${diffRange}\` for a file summary and \`git log ${diffRange} --oneline\` for the commit list.
+
+2. **Assess test erosion.** Identify:
+   - Any test files deleted in the diff (files under \`testing/\`, \`tests/\`, \`__tests__/\`, \`*.test.*\`, \`*.spec.*\` that appear as deleted).
+   - Net change in assertion count: search for \`assert \`, \`expect(\`, \`assertEqual\`, \`assertRaises\`, \`it(\`, \`describe(\` in the diff's added/removed lines.
+   - Net change in test function/case count: count added vs removed \`def test_\`, \`test(\`, \`it(\`, \`describe(\` patterns.
+
+3. **Review code quality** against \`${baseBranch}\`'s conventions (read CLAUDE.md for standards). Focus on:
+   - Correctness and logic errors introduced
+   - Security regressions (new hardcoded secrets, unsafe operations, auth bypasses)
+   - Architecture drift (patterns inconsistent with the existing codebase conventions)
+   - Test coverage gaps for new behavior
+   - Documentation / comment accuracy
+
+4. **Score and emit results.** Write your findings as a JSON object to \`/tmp/release_audit_report_${taskId}.json\` with EXACTLY this structure:
+
+\`\`\`json
+{
+  "audit_score": 0.85,
+  "test_erosion": {
+    "deleted_test_files": [],
+    "assertion_delta": 12,
+    "test_count_delta": 3
+  },
+  "findings": [
+    {
+      "severity": "high",
+      "summary": "One sentence describing the issue",
+      "file": "path/to/affected/file.py"
+    }
+  ]
+}
+\`\`\`
+
+Field semantics:
+- \`audit_score\`: float [0, 1] — 1.0 means no issues found; deduct per finding by severity (critical: -0.30, high: -0.15, medium: -0.07, low: -0.02). Clamp to [0, 1].
+- \`test_erosion.deleted_test_files\`: list of test file paths deleted in the diff. An empty list is good.
+- \`test_erosion.assertion_delta\`: integer — positive means more assertions added than removed (good), negative means erosion.
+- \`test_erosion.test_count_delta\`: integer — positive means more tests added than removed (good), negative means erosion.
+- \`findings\`: each entry has \`severity\` (critical|high|medium|low), \`summary\` (one sentence), and \`file\` (file path or empty string if cross-cutting).
+
+Rules:
+- Read the actual diff — do NOT speculate about code you haven't read.
+- If \`git diff ${diffRange}\` produces no output (empty diff), set \`audit_score: 1.0\`, \`findings: []\`, and note it in a single low-severity finding.
+- IMPORTANT: Write ONLY the JSON object to \`/tmp/release_audit_report_${taskId}.json\` — no markdown, no code fences, no extra text.
+- Also output the same JSON object as the final output in your logs.
+- Do NOT modify any files in the repository.`;
+
+  const buildConfig = resolveBuildConfig(task);
+  const promptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${strVal(payload.prompt_suffix)}` : '';
+  const typeHints = getTaskTypeHints(buildConfig);
+  const typeHint = typeHints['release_audit'] ? '\n\n' + typeHints['release_audit'] : '';
+  statusRef.value = 'Running release audit...';
+  const releaseAuditFingerprint = computePromptFingerprint('release_audit', buildConfig);
+  setCurrentPromptFingerprint(releaseAuditFingerprint);
+  sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: releaseAuditFingerprint });
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(
+    releaseAuditPrompt + typeHint + firstTaskSection + promptSuffix + PLAYBOOK_GUIDANCE + `\n\n${DEFAULT_TOOL_GUIDANCE}`,
+    ws, statusRef, model, effort, disallowedTools,
+  );
+
+  const handlerOutput = readHandlerOutput(taskId, 'release_audit_report', ws) as {
+    audit_score?: number;
+    test_erosion?: { deleted_test_files?: unknown[]; assertion_delta?: number; test_count_delta?: number };
+    findings?: unknown[];
+  } | null;
+
+  let logs = '';
+  if (handlerOutput !== null) {
+    logs = sanitize(JSON.stringify(handlerOutput));
+  } else {
+    const haystack = (allOutput || '') + '\n' + (lastResultText || '');
+    const objExtract = extractJsonObjectDetailed(haystack, 'audit_score', 'findings');
+    if (objExtract.ok) {
+      logs = sanitize(JSON.stringify(objExtract.value));
+    } else {
+      sendLog(ws, `[WARNING] Could not extract release audit JSON: ${describeJsonExtractionResult(objExtract)}\n`);
+      logs = sanitize(lastResultText || allOutput.slice(-50_000));
+    }
+  }
+
+  await persistAndPostStatus(taskId, {
+    task_id: taskId,
+    status: exitCode === 0 ? 'COMPLETED' : 'FAILED',
+    ...(exitCode !== 0 ? { artifact_type: 'ERROR_LOG', failure_category: 'claude_code_failed' } : { artifact_type: 'RELEASE_AUDIT_REPORT' }),
+    logs,
+  });
+}
