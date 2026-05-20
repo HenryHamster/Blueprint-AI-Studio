@@ -370,6 +370,9 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     # Raw retired-direction context (metrics + failed_approaches). Lower priority
     # than past_retirement_critiques (curated) — dropped first when budget is tight.
     "retired_directions_summary": {"priority": "low"},
+    # LTS version/phase context — present only on self-repo projects. High priority
+    # so it survives budget pressure (the agent needs it for phase-transition decisions).
+    "version_phase": {"priority": "high"},
 }
 
 
@@ -1460,6 +1463,40 @@ async def _spawn_strategic_review(
     except Exception:
         logger.exception("[STRATEGIC] drift signal computation failed; continuing")
         drift_summary = {}
+    # LTS version/phase context — only for self-repo projects.  Best-effort:
+    # if release_version is not yet deployed (pre-Phase 2a), _open_version stays None.
+    _open_version = None
+    _version_phase_block: dict | None = None
+    if project.is_self_repo:
+        try:
+            from app.release_version import count_merged_since, current_open_version, to_phase_block
+
+            _open_version = await current_open_version(session, project.id)
+            if _open_version is not None:
+                _tasks_merged = await count_merged_since(
+                    session, project.id, _open_version.opened_at
+                )
+                _version_phase_block = {
+                    **to_phase_block(_open_version),
+                    "tasks_merged_this_version": _tasks_merged,
+                }
+        except Exception:
+            logger.exception(
+                "[STRATEGIC] version_phase block build failed; continuing"
+            )
+    # Stabilize phase directive — when the open version is in stabilize, bias the
+    # strategic agent's work-mix toward audit/cleanup/hardening so the version
+    # converges toward qualification rather than accumulating net-new feature work.
+    if _open_version is not None and _open_version.phase == "stabilize":
+        _stabilize_hint = (
+            "Version phase: STABILIZE. Bias the work-mix toward audit, cleanup, and "
+            "hardening this cycle. Prefer recommended_mode='audit' or 'fundamentals' "
+            "for active directions. Defer new feature directions — do not propose "
+            "net-new feature work while the version is stabilizing."
+        )
+        prompt_suffix = (
+            f"{prompt_suffix}\n{_stabilize_hint}" if prompt_suffix else _stabilize_hint
+        )
     payload: dict = pack_under_budget(
         {
             "type": "strategic_review",
@@ -1515,6 +1552,9 @@ async def _spawn_strategic_review(
                 else {}
             ),
             **({"drift_signals": drift_summary} if drift_summary else {}),
+            **(
+                {"version_phase": _version_phase_block} if _version_phase_block else {}
+            ),
             **(
                 {"past_retirement_critiques": _past_critiques}
                 if (_past_critiques := _build_past_retirement_critiques(cycle_history))
