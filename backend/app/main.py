@@ -3188,15 +3188,32 @@ async def strategic_operation(
         from pydantic import ValidationError as _PmValidationError
 
         from app.problem_model import apply_agent_update
+        from app.strategic_completion import (
+            VERSION_PHASE_DECISION_CONTEXT_KEY,
+            extract_version_phase_decision,
+        )
 
         if not isinstance(data, dict):
             raise HTTPException(
                 status_code=400, detail="problem_model must be an object"
             )
+        # version_phase_decision is a transient per-cycle signal the strategic
+        # agent embeds as a top-level sibling of the problem_model (see the
+        # research-plan executor prompt). It is NOT part of the durable model —
+        # ProblemModel is extra="forbid", so it MUST be lifted out before
+        # apply_agent_update validates, or the whole update is rejected (400).
+        # The sanitized {phase, reasoning} dict rides task.context to the
+        # strategic-completion handler's API path; the completion handler
+        # applies it to the open ReleaseVersion and it never persists in
+        # project.problem_model.
+        pm_data = dict(data)
+        version_phase_decision = extract_version_phase_decision(
+            pm_data.pop("version_phase_decision", None)
+        )
         try:
             new_pm_raw, pm_diff = apply_agent_update(
                 current_raw=project.problem_model,
-                proposed_raw=data,
+                proposed_raw=pm_data,
                 now_iso=_utcnow().isoformat(),
             )
         except _PmValidationError as ve:
@@ -3207,11 +3224,14 @@ async def strategic_operation(
         flag_modified(project, "problem_model")
         session.add(project)
         ctx = task.context or {}
-        task.context = {
+        new_ctx = {
             **ctx,
             "_strategic_api_called": True,
             "_strategic_problem_model_set": True,
         }
+        if version_phase_decision is not None:
+            new_ctx[VERSION_PHASE_DECISION_CONTEXT_KEY] = version_phase_decision
+        task.context = new_ctx
         flag_modified(task, "context")
         session.add(task)
         await session.commit()
@@ -3219,12 +3239,20 @@ async def strategic_operation(
             f"[STRATEGIC API] problem_model updated for project {project.id} "
             f"to revision {new_pm_raw.get('revision')} ({pm_diff or 'no diff'})"
         )
+        if version_phase_decision is not None:
+            logger.info(
+                "[STRATEGIC API] version_phase_decision (phase=%s) routed to "
+                "task.context for task %s — applied at strategic completion",
+                version_phase_decision["phase"],
+                task.id,
+            )
         return _resp(
             {
                 "status": "ok",
                 "op": "set_problem_model",
                 "revision": new_pm_raw.get("revision"),
                 "diff": pm_diff,
+                "version_phase_decision_received": version_phase_decision is not None,
             }
         )
 

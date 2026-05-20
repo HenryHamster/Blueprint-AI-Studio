@@ -189,6 +189,18 @@ def _normalize_recommended_mode(value: object) -> str | None:
 
 _VALID_VERSION_PHASES = frozenset({"build", "stabilize"})
 
+# Cap on the persisted reasoning string carried with a version_phase_decision.
+# Matches release_version._PHASE_REASONING_MAX so the value the endpoint stores
+# in task.context and the value release_version persists agree on bounds.
+_VPD_REASONING_MAX = 500
+
+# The transient task.context key that carries an agent-emitted
+# version_phase_decision from the set_problem_model endpoint to the
+# strategic-completion handler's API path.  Single source of truth so the
+# producer (main.strategic_operation) and consumer (_handle_strategic_completion)
+# never drift.
+VERSION_PHASE_DECISION_CONTEXT_KEY = "_strategic_version_phase_decision"
+
 
 def _normalize_version_phase(value: object) -> str | None:
     """Return a canonical version phase string or None.
@@ -202,6 +214,37 @@ def _normalize_version_phase(value: object) -> str | None:
     if cleaned in _VALID_VERSION_PHASES:
         return cleaned
     return None
+
+
+def extract_version_phase_decision(raw: object) -> dict | None:
+    """Validate + normalize a raw ``version_phase_decision`` value.
+
+    Accepts the value the strategic agent embeds as a top-level sibling in the
+    ``set-problem-model`` payload — shape ``{phase, reasoning}`` — and returns a
+    clean ``{"phase": <build|stabilize>, "reasoning": <str>}`` dict, or ``None``
+    when the input is absent or unusable.
+
+    Returning a *sanitized* dict (canonical phase, trimmed/bounded reasoning)
+    rather than the raw value means the transient blob stored in ``task.context``
+    is already validated — ``_apply_version_phase_decision`` re-validates anyway,
+    so a bad value is defensively no-op'd, never raised.
+
+    Used by the ``set_problem_model`` endpoint to lift the field out of the
+    problem_model JSON *before* ``ProblemModel`` validation (which is
+    ``extra="forbid"`` and would otherwise reject the whole update).
+    """
+    if not isinstance(raw, dict):
+        return None
+    phase = _normalize_version_phase(raw.get("phase"))
+    if not phase:
+        return None
+    reasoning_raw = raw.get("reasoning")
+    reasoning = (
+        reasoning_raw.strip()[:_VPD_REASONING_MAX]
+        if isinstance(reasoning_raw, str)
+        else ""
+    )
+    return {"phase": phase, "reasoning": reasoning}
 
 
 async def _apply_version_phase_decision(
@@ -1027,10 +1070,12 @@ async def _handle_strategic_completion(
                 session,
                 f"{open_feedback_count} FEEDBACK message(s) remain unaddressed after strategic review — agent may be ignoring user requests",
             )
-        # Apply version_phase_decision if the agent supplied one via context.
-        # The incremental API can store it in task.context under the key
-        # ``_strategic_version_phase_decision``; shape: {phase, reasoning}.
-        _vpd_ctx = (task.context or {}).get("_strategic_version_phase_decision")
+        # Apply version_phase_decision if the agent supplied one via the API.
+        # The ``set_problem_model`` endpoint lifts the field out of the
+        # problem_model JSON (ProblemModel is extra="forbid") and stows the
+        # sanitized {phase, reasoning} dict under
+        # ``VERSION_PHASE_DECISION_CONTEXT_KEY`` in task.context.
+        _vpd_ctx = (task.context or {}).get(VERSION_PHASE_DECISION_CONTEXT_KEY)
         await _apply_version_phase_decision(
             _vpd_ctx, task, project, session, path="api"
         )
