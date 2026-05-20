@@ -8,7 +8,7 @@ import uuid
 import asyncio
 from collections import deque
 from datetime import datetime, timedelta
-from typing import List, Dict, Any, Literal, Optional
+from typing import List, Dict, Any, Literal
 from fastapi import (
     FastAPI,
     Depends,
@@ -81,7 +81,7 @@ logger = logging.getLogger(__name__)
 
 
 def _cap_str(
-    value: Any, max_len: int, field_name: str, warnings: Optional[List[str]] = None
+    value: Any, max_len: int, field_name: str, warnings: List[str] | None = None
 ) -> str:
     """Cap a string field, appending a human-readable warning if truncation occurred."""
     s = str(value) if value is not None else ""
@@ -96,7 +96,7 @@ def _cap_str(
 
 
 def _cap_list(
-    lst: list, max_items: int, field_name: str, warnings: Optional[List[str]] = None
+    lst: list, max_items: int, field_name: str, warnings: List[str] | None = None
 ) -> list:
     """Cap a list to the last N items, warning if older items were dropped."""
     if len(lst) > max_items:
@@ -110,7 +110,7 @@ def _cap_list(
     return lst
 
 
-from app.strategic_constants import (  # noqa: E402
+from app.strategic_constants import (
     STRATEGIC_DIRECTION_TEXT_MAX,
     STRATEGIC_RATIONALE_MAX,
     STRATEGIC_SYSTEM_ID_MAX,
@@ -121,7 +121,7 @@ from app.strategic_constants import (  # noqa: E402
 
 # Expected schema revision — must match the latest alembic migration.
 # Update this when adding new migrations.
-EXPECTED_SCHEMA_REVISION = "0099"
+EXPECTED_SCHEMA_REVISION = "0100"
 
 # --- Task Priority Map ---
 # Maps priority string labels to integer values stored on Task.priority.
@@ -199,7 +199,7 @@ def is_orchestrator_initiated_delete(vm_id: str) -> tuple[bool, str | None]:
 # patch them via app.main.X (see test_pipeline_reliability.py:105+) and
 # orchestrator code imports them via the same path. noqa: F401 pins them so
 # a future --fix can't repeat the regression.
-from app.max_plan_pool import (  # noqa: E402,F401
+from app.max_plan_pool import (  # noqa: F401
     _account_by_id,
     _max_plan_pool_lock,
     _all_accounts,
@@ -433,7 +433,7 @@ async def _init_deployment_state():
         # Restore persisted runtime config values so settings survive restarts.
         # Shared with the periodic cross-instance sync (see sync_runtime_config_loop).
         try:
-            from app.shared_state import sync_runtime_config_from_state  # noqa: PLC0415
+            from app.shared_state import sync_runtime_config_from_state
 
             restored = await sync_runtime_config_from_state(state)
             if restored:
@@ -623,7 +623,7 @@ async def _init_deployment_state():
         # (in-memory deque is empty otherwise, blocking recovery for ~2h).
         if _shared_state.anomaly_adjustments.get("active"):
             try:
-                from app.anomaly_detection import seed_task_results_from_db  # noqa: PLC0415
+                from app.anomaly_detection import seed_task_results_from_db
 
                 seeded = await seed_task_results_from_db(session)
                 logger.info(
@@ -1061,11 +1061,11 @@ async def _maybe_create_failure_alert(
         {"alert_id": str(alert.id), "severity": "ERROR", "title": alert.title},
     )
     try:
-        from app.notification_dispatch import dispatch_external_notification  # noqa: PLC0415
+        from app.notification_dispatch import dispatch_external_notification
         from app.failure_classification import (
             classify_failure,
             classify_failure_taxonomy,
-        )  # noqa: PLC0415
+        )
         import asyncio as _asyncio
 
         ctx = task.context or {}
@@ -1076,7 +1076,7 @@ async def _maybe_create_failure_alert(
         pr_url = (
             ctx.get("pr_url") or ctx.get("rollup_pr_url") or payload.get("pr_url") or ""
         )
-        _asyncio.ensure_future(
+        _asyncio.ensure_future(  # noqa: RUF006  # fire-and-forget; caller does not await
             dispatch_external_notification(
                 task.project_id,
                 "TASK_FAILED",
@@ -1210,7 +1210,7 @@ def _get_zone_health_summary() -> dict:
 def _get_notification_stats() -> dict:
     """Return notification delivery stats from notification_dispatch module."""
     try:
-        from app.notification_dispatch import get_notification_stats  # noqa: PLC0415
+        from app.notification_dispatch import get_notification_stats
 
         return get_notification_stats()
     except Exception:
@@ -1308,12 +1308,11 @@ async def debug_orchestrator(
         }
 
     hung = False
-    if _orch._orchestrator_cycle_started and _orch._orchestrator_last_cycle:
-        if _orch._orchestrator_cycle_started > _orch._orchestrator_last_cycle:
-            hung_seconds = (
-                _utcnow() - _orch._orchestrator_cycle_started
-            ).total_seconds()
-            hung = hung_seconds > 300  # 5 minutes without completing a cycle
+    if _orch._orchestrator_cycle_started and _orch._orchestrator_last_cycle and _orch._orchestrator_cycle_started > _orch._orchestrator_last_cycle:
+        hung_seconds = (
+            _utcnow() - _orch._orchestrator_cycle_started
+        ).total_seconds()
+        hung = hung_seconds > 300  # 5 minutes without completing a cycle
 
     return {
         "orchestrator_alive": _orch._orchestrator_last_cycle is not None,
@@ -1366,7 +1365,7 @@ async def health_detailed(
 
     # --- DB ---
     db_status = "ok"
-    db_latency_ms: Optional[float] = None
+    db_latency_ms: float | None = None
     try:
         t0 = time.monotonic()
         await session.execute(text("SELECT 1"))
@@ -1400,7 +1399,7 @@ async def health_detailed(
     }
 
     # --- Orchestrator ---
-    cycle_age: Optional[float] = None
+    cycle_age: float | None = None
     if _orch._orchestrator_last_cycle:
         cycle_age = (_utcnow() - _orch._orchestrator_last_cycle).total_seconds()
     if cycle_age is None:
@@ -1641,12 +1640,11 @@ async def health_check():
 
     # Detect hung orchestrator (cycle started but not completed in 5+ minutes)
     orchestrator_hung = False
-    if _orch._orchestrator_cycle_started and _orch._orchestrator_last_cycle:
-        if _orch._orchestrator_cycle_started > _orch._orchestrator_last_cycle:
-            hung_seconds = (
-                _utcnow() - _orch._orchestrator_cycle_started
-            ).total_seconds()
-            orchestrator_hung = hung_seconds > 300
+    if _orch._orchestrator_cycle_started and _orch._orchestrator_last_cycle and _orch._orchestrator_cycle_started > _orch._orchestrator_last_cycle:
+        hung_seconds = (
+            _utcnow() - _orch._orchestrator_cycle_started
+        ).total_seconds()
+        orchestrator_hung = hung_seconds > 300
 
     # Only DB is critical for 503 — provider or external API outages shouldn't remove us from LB.
     critical_healthy = external_health.get("db", True)
@@ -1706,7 +1704,7 @@ async def prometheus_metrics(request: Request):
         if not hmac.compare_digest(token, _METRICS_TOKEN):
             return JSONResponse(status_code=403, content={"error": "forbidden"})
 
-    cycle_age: Optional[float] = None
+    cycle_age: float | None = None
     if _orch._orchestrator_last_cycle:
         cycle_age = (_utcnow() - _orch._orchestrator_last_cycle).total_seconds()
 
@@ -1720,7 +1718,7 @@ async def prometheus_metrics(request: Request):
     lines: list[str] = []
 
     def gauge(
-        name: str, help_text: str, value: float, labels: Optional[Dict[str, str]] = None
+        name: str, help_text: str, value: float, labels: Dict[str, str] | None = None
     ) -> None:
         lines.append(f"# HELP {name} {help_text}")
         lines.append(f"# TYPE {name} gauge")
@@ -1784,7 +1782,9 @@ async def prometheus_metrics(request: Request):
     # database.py). Gives us a direct signal whether the cutover-safe
     # connection-eject pattern is firing — lets a future Cloud Run rollout
     # be measured against the 2026-05-04 cascade baseline.
-    try:
+    import contextlib
+
+    with contextlib.suppress(Exception):
         from app.database import get_db_pool_invalidation_stats
 
         _db_stats = get_db_pool_invalidation_stats()
@@ -1798,28 +1798,23 @@ async def prometheus_metrics(request: Request):
             "Consecutive failures of connection.invalidate() calls (escalates to pool.dispose at threshold)",
             _db_stats.get("invalidate_consecutive_failures", 0),
         )
-    except Exception:
-        # Metrics endpoint must not raise on stat collection failure.
-        pass
 
     # _orchestrator_deleted_vms tracker size — observability into the in-memory
     # delete-tracker that drives reaper preemption-classification correctness.
-    try:
+    with contextlib.suppress(Exception):
         gauge(
             "blueprint_orchestrator_deleted_vms_size",
             "Number of entries in the orchestrator-initiated VM delete tracker",
             len(_orchestrator_deleted_vms),
         )
-    except Exception:
-        pass
 
     # Reaper liveness — counter increments only on a fully-successful cycle.
     # Production 2026-05-04: reaper crashed every cycle for 80+ minutes
     # (MissingGreenlet at reaper.py:724) before operator noticed via stuck
     # task heartbeat ages. Alert on ``last_cycle_age_seconds > 300`` to
     # catch any reaper crash-loop within ~5 successful-cycle windows.
-    try:
-        from app.reaper import get_reaper_stats  # noqa: PLC0415
+    with contextlib.suppress(Exception):
+        from app.reaper import get_reaper_stats
 
         _reaper_stats = get_reaper_stats()
         counter(
@@ -1832,8 +1827,6 @@ async def prometheus_metrics(request: Request):
             "Seconds since last fully-successful reaper cycle (-1 if never completed)",
             _reaper_stats.get("last_cycle_age_seconds", -1),
         )
-    except Exception:
-        pass
 
     body = "\n".join(lines) + "\n"
     from fastapi.responses import PlainTextResponse
@@ -2039,14 +2032,14 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
         manager.remove_ip(websocket)
 
 
-from app.strategic_completion import (  # noqa: E402
+from app.strategic_completion import (
     _find_matching_direction,
     _is_direction_duplicate,
     _normalize_recommended_mode,
 )
 
 
-from app.task_locking import lock_project_or_429 as _lock_project_or_429  # noqa: E402, F401
+from app.task_locking import lock_project_or_429 as _lock_project_or_429
 # Backward-compat re-export. Canonical home is ``app.task_locking`` (Phase A1).
 
 
@@ -2055,8 +2048,8 @@ class DesignDocUpdate(BaseModel):
 
     task_id: uuid.UUID
     op: str  # "set", "delete", "list"
-    key: Optional[str] = None
-    value: Optional[Any] = None
+    key: str | None = None
+    value: Any | None = None
 
 
 @app.post("/api/agent/design-doc")
@@ -2089,7 +2082,7 @@ async def update_design_doc(
     if payload.op == "list":
         project = await session.get(Project, task.project_id)
         doc = project.design_doc or {} if project else {}
-        return {"keys": [k for k in doc.keys() if not k.startswith("_")]}
+        return {"keys": [k for k in doc if not k.startswith("_")]}
 
     if payload.op == "get":
         project = await session.get(Project, task.project_id)
@@ -2178,18 +2171,18 @@ async def update_design_doc(
 # Any agent task type can read/write persistent operational knowledge stored
 # as playbook/* keys in the project's design_doc JSONB column.
 
-from app.payload_schemas import (  # noqa: E402
+from app.payload_schemas import (
     ALL_TASK_TYPES as _VALID_TASK_TYPES,
     validate_internal_payload as _validate_internal_payload,
-)  # noqa: E402
+)
 
 
 class PlaybookUpdate(BaseModel):
     task_id: uuid.UUID
     op: str  # "get", "set", "delete", "list"
-    key: Optional[str] = None  # alphanumeric + hyphens, max 50 chars
-    value: Optional[str] = None  # plain text, max 2KB
-    applicable_types: Optional[List[str]] = (
+    key: str | None = None  # alphanumeric + hyphens, max 50 chars
+    value: str | None = None  # plain text, max 2KB
+    applicable_types: List[str] | None = (
         None  # task types this entry applies to; None = all types
     )
 
@@ -2345,14 +2338,14 @@ class AgentAnnotation(BaseModel):
     task_id: uuid.UUID
     annotation_type: Literal["comment", "issue", "vision", "size_breach"]
     content: str = ""  # free-form prose (comment/issue/vision); ignored for size_breach
-    target_page: Optional[str] = None  # design doc page key (for comments)
-    severity: Optional[str] = None  # low/medium/high (for issues)
+    target_page: str | None = None  # design doc page key (for comments)
+    severity: str | None = None  # low/medium/high (for issues)
     # size_breach fields — programmatic signal from a test-invariant failure.
     # Server bumps the limit (policy-driven, not agent-judgment) and returns
     # new_limit; the agent applies it to module_size_limits.json and commits.
-    file_path: Optional[str] = None
-    current_size: Optional[int] = None
-    change_summary: Optional[str] = None
+    file_path: str | None = None
+    current_size: int | None = None
+    change_summary: str | None = None
 
 
 _ANNOTATION_TYPE_MAP = {

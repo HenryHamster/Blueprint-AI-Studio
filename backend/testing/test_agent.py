@@ -5553,43 +5553,42 @@ async def test_playbook_admin_list_stale_flag(client: AsyncClient, db_session):
     """
     from app.models import ProjectMember
 
-    project = Project(name="Playbook Stale Test", user_id="test-user-123")
-    # Fresh-entry dates are computed relative to now so the test doesn't rot:
-    # hardcoded absolute dates silently cross the 30-day staleness threshold as
-    # wall-clock time passes (this test broke once 2026-04-13 aged past 30 days).
     _now = datetime.utcnow()
-    fresh_updated = (_now - timedelta(days=4)).isoformat()
-    fresh_referenced = (_now - timedelta(days=1)).isoformat()
-    fresh_confirmed = (_now - timedelta(days=2)).isoformat()
+    _yesterday = (_now - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S")
+    _two_days_ago = (_now - timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%S")
+    _sixty_days_ago = (_now - timedelta(days=60)).strftime("%Y-%m-%dT%H:%M:%S")
+    _forty_five_days_ago = (_now - timedelta(days=45)).strftime("%Y-%m-%dT%H:%M:%S")
+
+    project = Project(name="Playbook Stale Test", user_id="test-user-123")
     project.design_doc = {
         "playbook/fresh-entry": {
             "content": "fresh content",
-            "updated_at": fresh_updated,
+            "updated_at": _two_days_ago,
             "confirmed_count": 3,
             "reference_count": 5,
-            "last_referenced_at": fresh_referenced,  # 1 day ago — not stale
-            "last_confirmed_at": fresh_confirmed,
+            "last_referenced_at": _yesterday,  # 1 day ago — not stale
+            "last_confirmed_at": _two_days_ago,
             "effectiveness_score": 0.6,
         },
         "playbook/stale-entry": {
             "content": "old content",
-            "updated_at": "2025-12-01T00:00:00",  # >30 days ago, never referenced
+            "updated_at": _sixty_days_ago,  # >30 days ago, never referenced
             "confirmed_count": 0,
             "reference_count": 0,
         },
         "playbook/stale-ref-entry": {
             "content": "referenced long ago",
-            "updated_at": "2025-12-01T00:00:00",
+            "updated_at": _sixty_days_ago,
             "confirmed_count": 0,
             "reference_count": 3,
-            "last_referenced_at": "2025-12-15T00:00:00",  # >30 days ago
+            "last_referenced_at": _forty_five_days_ago,  # >30 days ago
         },
         "playbook/auto-archived-entry": {
             "content": "persistently ineffective",
-            "updated_at": "2026-04-01T00:00:00",
+            "updated_at": _two_days_ago,
             "confirmed_count": 0,
             "reference_count": 10,
-            "last_referenced_at": "2026-04-13T00:00:00",  # recent but stale=True stored
+            "last_referenced_at": _yesterday,  # recent but stale=True stored
             "stale": True,
             "effectiveness_score": 0.0,
         },
@@ -5610,8 +5609,8 @@ async def test_playbook_admin_list_stale_flag(client: AsyncClient, db_session):
 
     fresh = entries["fresh-entry"]
     assert fresh["reference_count"] == 5
-    assert fresh["last_referenced_at"] == fresh_referenced
-    assert fresh["last_confirmed_at"] == fresh_confirmed
+    assert fresh["last_referenced_at"] == _yesterday
+    assert fresh["last_confirmed_at"] == _two_days_ago
     assert fresh["effectiveness_score"] == 0.6
     assert fresh["stale"] is False
 
@@ -9078,7 +9077,7 @@ async def test_claim_injects_sr_recent_miss_examples_for_create_task(
     assert "security" in miss_ex
     assert "style-conventions" not in miss_ex
     # correctness ranked higher (weighted_miss_rate 0.45 > 0.35) → appears first
-    assert list(miss_ex.keys())[0] == "correctness"
+    assert next(iter(miss_ex.keys())) == "correctness"
     # Examples carry severity and desc fields
     assert miss_ex["correctness"][0]["severity"] == "CRITICAL"
     assert "Off-by-one" in miss_ex["correctness"][0]["desc"]
@@ -9437,7 +9436,7 @@ async def test_claim_sr_recent_miss_examples_prefers_direction_examples(
     assert "architecture" in miss_ex
     assert "correctness" not in miss_ex
     # scope-drift ranked first (miss_rate 0.80 > 0.60)
-    assert list(miss_ex.keys())[0] == "scope-drift"
+    assert next(iter(miss_ex.keys())) == "scope-drift"
     assert "Direction scope-drift example" in miss_ex["scope-drift"][0]["desc"]
 
 

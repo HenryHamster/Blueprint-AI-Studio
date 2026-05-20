@@ -1,5 +1,5 @@
 from enum import Enum
-from typing import Optional, Dict, Any, List
+from typing import Dict, Any, List
 from sqlmodel import SQLModel, Field, Relationship
 from sqlmodel.sql.sqltypes import GUID
 from sqlalchemy import (
@@ -143,11 +143,11 @@ class AllowedUser(SQLModel, table=True):
 
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
     email: str = Field(index=True, unique=True)
-    firebase_uid: Optional[str] = Field(default=None, index=True)
+    firebase_uid: str | None = Field(default=None, index=True)
     # Allowed values: 'admin' | 'user'. Enforced server-side by
     # ``chk_alloweduser_role`` (alembic 0065 / audit L-S1, Postgres-only).
     role: str = Field(default="user")
-    display_name: Optional[str] = None
+    display_name: str | None = None
     # TIMESTAMPTZ + server_default (migration 0061 / audit H-S4 + H-S5):
     # default_factory is retained as an additive Python-side guard so ORM
     # callers don't see ``None`` between construction and commit; the
@@ -156,7 +156,7 @@ class AllowedUser(SQLModel, table=True):
         default_factory=_utcnow,
         sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
     )
-    last_login_at: Optional[datetime] = Field(
+    last_login_at: datetime | None = Field(
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
@@ -176,11 +176,11 @@ class UserIntegration(SQLModel, table=True):
     user_id: str = Field()
 
     # GitHub App Installation ID
-    github_installation_id: Optional[str] = None
-    github_account_name: Optional[str] = None
+    github_installation_id: str | None = None
+    github_account_name: str | None = None
 
     # GitHub Fine-Grained Personal Access Token (Alternative to App Installation)
-    github_pat: Optional[str] = None
+    github_pat: str | None = None
 
     created_at: datetime = Field(
         default_factory=_utcnow,
@@ -210,8 +210,8 @@ class Project(SQLModel, table=True):
         default=ProjectStatus.DRAFT,
         sa_column=Column(String, default=ProjectStatus.DRAFT),
     )
-    github_owner: Optional[str] = None
-    github_repo: Optional[str] = None
+    github_owner: str | None = None
+    github_repo: str | None = None
     # TIMESTAMPTZ + server_default (migration 0061 / audit H-S4 + H-S5).
     # NaiveUTCDateTime strips tz on read (round 2 audit / C3 + H1).
     created_at: datetime = Field(
@@ -255,11 +255,11 @@ class Project(SQLModel, table=True):
     # sees a clean current view, not a log of per-cycle summaries. User
     # acknowledges to stamp running_update_acknowledged_at; the document
     # persists and the agent refines it on the next cycle.
-    running_update: Optional[str] = Field(
+    running_update: str | None = Field(
         default=None,
         sa_column=Column(Text, nullable=True),
     )
-    running_update_acknowledged_at: Optional[datetime] = Field(
+    running_update_acknowledged_at: datetime | None = Field(
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
@@ -273,14 +273,14 @@ class Project(SQLModel, table=True):
     # Set True when github_owner/github_repo matches Blueprint's own repo
     is_self_repo: bool = Field(default=False)
     # Build configuration: directories, commands, git identity for the agent
-    build_config: Optional[Dict[str, Any]] = Field(
+    build_config: Dict[str, Any] | None = Field(
         default=None, sa_column=Column(JSONB, nullable=True)
     )
     # Project-level CI auto-remediation outcomes for fixes that could not be
     # linked to a direction (novel failures whose fingerprint matched no
     # direction). Shape: {"attempts": int, "last_result": str, "last_at": iso,
     # "history": [{task_id, result, timestamp, fingerprint, failure_class}]}.
-    remediation_tracking: Optional[Dict[str, Any]] = Field(
+    remediation_tracking: Dict[str, Any] | None = Field(
         default=None, sa_column=Column(JSONB, nullable=True)
     )
     # Regression-class trip markers used to persist first-tripped timestamps
@@ -372,10 +372,10 @@ class Task(SQLModel, table=True):
     # Multi-Agent & Hierarchy Fields
     title: str = Field(default="Untitled Task")
     description: str = Field(default="")
-    parent_task_id: Optional[uuid.UUID] = Field(
+    parent_task_id: uuid.UUID | None = Field(
         default=None, foreign_key="task.id", index=True
     )
-    latest_status_message: Optional[str] = None
+    latest_status_message: str | None = None
     status_log: List[Dict[str, Any]] = Field(
         default_factory=list,
         sa_column=Column(JSONB, nullable=False, server_default=text("'[]'")),
@@ -390,10 +390,10 @@ class Task(SQLModel, table=True):
     # introduced in production code paths. Enforced server-side by
     # ``chk_task_created_by`` (alembic 0065 / audit L-S1, Postgres-only).
     created_by: str = Field(default="USER")
-    launched_by_user_id: Optional[str] = Field(
+    launched_by_user_id: str | None = Field(
         default=None
     )  # Firebase UID of the user who launched this task (for launcher-pays billing)
-    idempotency_key: Optional[str] = Field(
+    idempotency_key: str | None = Field(
         default=None, sa_column=Column(String(255), nullable=True)
     )
     requires_approval: bool = Field(default=False)
@@ -403,7 +403,7 @@ class Task(SQLModel, table=True):
     )
 
     # Push Model: Orchestrator assigns this task to a specific VM
-    vm_instance_id: Optional[str] = Field(default=None, index=True)
+    vm_instance_id: str | None = Field(default=None, index=True)
 
     # Task dependency DAG: list of task UUIDs that must be COMPLETED+merged before dispatch
     depends_on: List[str] = Field(
@@ -439,12 +439,12 @@ class Task(SQLModel, table=True):
     )
 
     # Stores parsed plan output from plan-type tasks (for debugging/admin visibility)
-    plan_output: Optional[Dict[str, Any]] = Field(
+    plan_output: Dict[str, Any] | None = Field(
         default=None, sa_column=Column(JSONB, nullable=True)
     )
 
     # Agent Heartbeat mechanism
-    last_heartbeat: Optional[datetime] = Field(
+    last_heartbeat: datetime | None = Field(
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
@@ -456,15 +456,15 @@ class Task(SQLModel, table=True):
     # updates without TOAST churn. Audit-trail-ish ring buffers
     # (metrics_history, _tool_trace) stay in context but only persist every
     # 5th heartbeat (handler-side modulo).
-    last_metrics_json: Optional[Dict[str, Any]] = Field(
+    last_metrics_json: Dict[str, Any] | None = Field(
         default=None, sa_column=Column(JSONB, nullable=True)
     )
-    last_tool_use_at: Optional[datetime] = Field(
+    last_tool_use_at: datetime | None = Field(
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
     # Stable 12-hex prompt digest for the assembled guidance that drove this task.
-    prompt_fingerprint: Optional[str] = Field(default=None, max_length=12)
+    prompt_fingerprint: str | None = Field(default=None, max_length=12)
 
     # Heartbeat audit-trail gate counter (R3-W1 / Round 3 C1, alembic 0066).
     # Round 2 F2 stored this in ``task.context['_heartbeat_count']`` to gate
@@ -489,7 +489,7 @@ class Task(SQLModel, table=True):
         default_factory=_utcnow,
         sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
     )
-    started_at: Optional[datetime] = Field(
+    started_at: datetime | None = Field(
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
@@ -510,15 +510,15 @@ class Task(SQLModel, table=True):
     archived: bool = Field(default=False)
 
     # VM lifecycle timing for cost tracking
-    vm_provisioned_at: Optional[datetime] = Field(
+    vm_provisioned_at: datetime | None = Field(
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
-    vm_started_at: Optional[datetime] = Field(
+    vm_started_at: datetime | None = Field(
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
-    vm_stopped_at: Optional[datetime] = Field(
+    vm_stopped_at: datetime | None = Field(
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
@@ -529,7 +529,7 @@ class Task(SQLModel, table=True):
     # Recorded once per VM lifecycle and guarded by IS NULL so a re-provision
     # restamp of vm_provisioned_at (orchestrator.py line ~3240) does not
     # overwrite the genuine cold-start measurement.
-    vm_cold_start_ms: Optional[int] = Field(
+    vm_cold_start_ms: int | None = Field(
         default=None,
         sa_column=Column(Integer, nullable=True),
     )
@@ -537,7 +537,7 @@ class Task(SQLModel, table=True):
     # image rather than freshly provisioned. There is no warm pool today, so
     # all provisions write False — the column is foundational scaffolding so
     # that vm_reuse_rate has a real signal once warm pooling lands.
-    vm_warm_start: Optional[bool] = Field(
+    vm_warm_start: bool | None = Field(
         default=False,
         sa_column=Column(Boolean, nullable=True, server_default=text("false")),
     )
@@ -546,7 +546,7 @@ class Task(SQLModel, table=True):
     # "total_output_tokens": int, "last_updated_at": iso8601}.
     # Backwards-compatible — older agents that don't ship these fields leave
     # this column NULL.
-    api_call_summary: Optional[Dict[str, Any]] = Field(
+    api_call_summary: Dict[str, Any] | None = Field(
         default=None, sa_column=Column(JSONB, nullable=True)
     )
 
@@ -565,36 +565,36 @@ class Task(SQLModel, table=True):
         default=False,
         sa_column=Column(Boolean, nullable=False, server_default=text("false")),
     )
-    infra_wait_until: Optional[datetime] = Field(
+    infra_wait_until: datetime | None = Field(
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
-    retry_after_until: Optional[datetime] = Field(
+    retry_after_until: datetime | None = Field(
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
-    previous_error_fingerprint: Optional[str] = Field(default=None)
+    previous_error_fingerprint: str | None = Field(default=None)
     auto_remediation: bool = Field(
         default=False,
         sa_column=Column(Boolean, nullable=False, server_default=text("false")),
     )
-    strategic_cycle_id: Optional[str] = Field(default=None, max_length=36)
+    strategic_cycle_id: str | None = Field(default=None, max_length=36)
     spawn_failed: bool = Field(
         default=False,
         sa_column=Column(Boolean, nullable=False, server_default=text("false")),
     )
-    last_remediation_at: Optional[datetime] = Field(
+    last_remediation_at: datetime | None = Field(
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
-    last_token_refresh_at: Optional[datetime] = Field(
+    last_token_refresh_at: datetime | None = Field(
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
-    provider: Optional[str] = Field(default=None)
-    account_id: Optional[str] = Field(default=None)
-    model: Optional[str] = Field(default=None)
-    estimated_cost_usd: Optional[float] = Field(
+    provider: str | None = Field(default=None)
+    account_id: str | None = Field(default=None)
+    model: str | None = Field(default=None)
+    estimated_cost_usd: float | None = Field(
         default=None, sa_column=Column(Float, nullable=True)
     )
 
@@ -836,7 +836,7 @@ def _on_status_set(target: Task, value, oldvalue, initiator):
             for cb in _on_task_terminal_callbacks:
                 try:
                     cb(task_id)
-                except Exception as e:
+                except Exception as e:  # noqa: PERF203
                     logger.error(
                         f"[MODELS] Terminal callback failed for task {task_id}: {e}",
                         exc_info=True,
@@ -848,7 +848,7 @@ def _on_status_set(target: Task, value, oldvalue, initiator):
             for cb in _on_task_revive_callbacks:
                 try:
                     cb(task_id)
-                except Exception as e:
+                except Exception as e:  # noqa: PERF203
                     logger.error(
                         f"[MODELS] Revive callback failed for task {task_id}: {e}",
                         exc_info=True,
@@ -872,7 +872,7 @@ class Alert(SQLModel, table=True):
     message: str
     # Audit 2026-04-29 (M-S3): FK to task.id with ondelete=SET NULL added in
     # migration 0056. Alert messages survive parent-task GC for the admin UI.
-    task_id: Optional[uuid.UUID] = Field(
+    task_id: uuid.UUID | None = Field(
         default=None,
         sa_column=Column(ForeignKey("task.id", ondelete="SET NULL"), nullable=True),
     )
@@ -882,7 +882,7 @@ class Alert(SQLModel, table=True):
         default_factory=_utcnow,
         sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
     )
-    dismissed_at: Optional[datetime] = Field(
+    dismissed_at: datetime | None = Field(
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
@@ -922,21 +922,21 @@ class StrategicCycle(SQLModel, table=True):
 
     # Phase tracking. *_started_at = task creation time;
     # *_completed_at = terminal status.
-    phase1_task_id: Optional[uuid.UUID] = Field(default=None, foreign_key="task.id")
+    phase1_task_id: uuid.UUID | None = Field(default=None, foreign_key="task.id")
     phase1_started_at: datetime = Field(
         default_factory=_utcnow,
         sa_column=Column(NaiveUTCDateTime, nullable=False),
     )
-    phase1_completed_at: Optional[datetime] = Field(
+    phase1_completed_at: datetime | None = Field(
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
-    phase2_task_id: Optional[uuid.UUID] = Field(default=None, foreign_key="task.id")
-    phase2_started_at: Optional[datetime] = Field(
+    phase2_task_id: uuid.UUID | None = Field(default=None, foreign_key="task.id")
+    phase2_started_at: datetime | None = Field(
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
-    phase2_completed_at: Optional[datetime] = Field(
+    phase2_completed_at: datetime | None = Field(
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
@@ -957,13 +957,13 @@ class StrategicCycle(SQLModel, table=True):
     )
 
     # Free-form text fields surfaced to the UI / next cycle's context.
-    cycle_reasoning: Optional[str] = Field(
+    cycle_reasoning: str | None = Field(
         default=None, sa_column=Column(Text, nullable=True)
     )
-    summary_text: Optional[str] = Field(
+    summary_text: str | None = Field(
         default=None, sa_column=Column(Text, nullable=True)
     )
-    failure_reason: Optional[str] = Field(
+    failure_reason: str | None = Field(
         default=None, sa_column=Column(Text, nullable=True)
     )
 
@@ -984,7 +984,7 @@ class StrategicCycle(SQLModel, table=True):
     )
 
     @property
-    def completed_at(self) -> Optional[datetime]:
+    def completed_at(self) -> datetime | None:
         """Effective cycle completion time: phase2 if available, else phase1, else updated_at."""
         return self.phase2_completed_at or self.phase1_completed_at or self.updated_at
 
@@ -1036,14 +1036,14 @@ class ProjectMessage(SQLModel, table=True):
     # server-side by ``chk_projectmessage_from_type`` (alembic 0065 /
     # audit L-S1, Postgres-only).
     from_type: str = Field(default="user")
-    from_task_id: Optional[uuid.UUID] = Field(default=None, foreign_key="task.id")
+    from_task_id: uuid.UUID | None = Field(default=None, foreign_key="task.id")
     content: str = Field(default="")
     context: Dict[str, Any] = Field(
         default_factory=dict, sa_column=Column(JSONB, nullable=True, default={})
     )
     status: str = Field(default="open")  # "open" | "resolved"
-    resolution: Optional[str] = None
-    resolved_at: Optional[datetime] = Field(
+    resolution: str | None = None
+    resolved_at: datetime | None = Field(
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
@@ -1086,11 +1086,11 @@ class DeploymentState(SQLModel, table=True):
     )
     last_known_good_revision: str = Field(default="")
     last_known_good_sha: str = Field(default="")
-    rolled_back_from_sha: Optional[str] = Field(default=None)
-    rollback_reason: Optional[str] = Field(default=None)
+    rolled_back_from_sha: str | None = Field(default=None)
+    rollback_reason: str | None = Field(default=None)
     rollback_count: int = Field(default=0)  # consecutive rollbacks (reset on STABLE)
-    pause_reason: Optional[str] = Field(default=None)
-    paused_at: Optional[datetime] = Field(
+    pause_reason: str | None = Field(default=None)
+    paused_at: datetime | None = Field(
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
@@ -1102,53 +1102,53 @@ class DeploymentState(SQLModel, table=True):
     total_auto_paused_seconds: float = Field(default=0.0)
     # "manual" or "auto" while paused; None while running. Routes the
     # in-flight window to the correct counter at resume.
-    paused_kind: Optional[str] = Field(default=None)
+    paused_kind: str | None = Field(default=None)
     # Pre-deploy saved max_concurrent_vms for PAUSE mode restore
-    pre_pause_max_vms: Optional[int] = Field(default=None)
+    pre_pause_max_vms: int | None = Field(default=None)
     # Persisted runtime config — restored on startup so settings survive restarts
-    runtime_max_concurrent_vms: Optional[int] = Field(default=None)
-    runtime_max_retries: Optional[int] = Field(default=None)
-    runtime_max_autonomous_tasks_per_hour: Optional[int] = Field(default=None)
-    runtime_max_global_autonomous_tasks_per_hour: Optional[int] = Field(default=None)
-    runtime_autonomous_research_interval_minutes: Optional[int] = Field(default=None)
-    runtime_autonomous_direction_cooldown_minutes: Optional[int] = Field(default=None)
-    runtime_autonomous_research_model: Optional[str] = Field(default=None)
-    runtime_autonomous_research_effort: Optional[str] = Field(default=None)
+    runtime_max_concurrent_vms: int | None = Field(default=None)
+    runtime_max_retries: int | None = Field(default=None)
+    runtime_max_autonomous_tasks_per_hour: int | None = Field(default=None)
+    runtime_max_global_autonomous_tasks_per_hour: int | None = Field(default=None)
+    runtime_autonomous_research_interval_minutes: int | None = Field(default=None)
+    runtime_autonomous_direction_cooldown_minutes: int | None = Field(default=None)
+    runtime_autonomous_research_model: str | None = Field(default=None)
+    runtime_autonomous_research_effort: str | None = Field(default=None)
     # Persisted circuit breaker states — survives restarts/deploys
-    circuit_breaker_states: Optional[Dict[str, Any]] = Field(
+    circuit_breaker_states: Dict[str, Any] | None = Field(
         default=None, sa_column=Column(JSONB, nullable=True)
     )
     # Persisted zone health/cooldown — prevents retry storms after restart
-    zone_health_state: Optional[Dict[str, Any]] = Field(
+    zone_health_state: Dict[str, Any] | None = Field(
         default=None, sa_column=Column(JSONB, nullable=True)
     )
     # Persisted dict/list runtime config (task_type_models, agent_prompt_suffixes, etc.)
-    runtime_config_json: Optional[Dict[str, Any]] = Field(
+    runtime_config_json: Dict[str, Any] | None = Field(
         default=None, sa_column=Column(JSONB, nullable=True)
     )
     # Persisted anomaly detection state — occurrence counts and active adjustments survive restarts
-    persistent_anomaly_state: Optional[Dict[str, Any]] = Field(
+    persistent_anomaly_state: Dict[str, Any] | None = Field(
         default=None, sa_column=Column(JSONB, nullable=True)
     )
     # Persisted direction failure streaks — holds survive restarts silently
-    direction_streak_state: Optional[Dict[str, Any]] = Field(
+    direction_streak_state: Dict[str, Any] | None = Field(
         default=None, sa_column=Column(JSONB, nullable=True)
     )
     # Persisted pipeline events ring buffer — alert windows survive restarts
-    pipeline_events_state: Optional[Dict[str, Any]] = Field(
+    pipeline_events_state: Dict[str, Any] | None = Field(
         default=None, sa_column=Column(JSONB, nullable=True)
     )
     # Previous deploy tracking — populated when a new deploy supersedes the
     # current one. Lets RecentChangesContext builders compute the commit range
     # (prior_deploy_sha..current_sha) without a live git checkout.
-    prior_deploy_sha: Optional[str] = Field(default=None)
-    prior_deployed_at: Optional[datetime] = Field(
+    prior_deploy_sha: str | None = Field(default=None)
+    prior_deployed_at: datetime | None = Field(
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
 
     # Timestamp when HALTED state was entered — used for auto-recovery timer
-    halted_at: Optional[datetime] = Field(
+    halted_at: datetime | None = Field(
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
@@ -1196,40 +1196,40 @@ class MaxPlanAccount(SQLModel, table=True):
             default=LLMAuthMode.OAUTH,
         ),
     )
-    oauth_token: Optional[str] = Field(
+    oauth_token: str | None = Field(
         default=None
     )  # Secret Manager resource name (or raw token for backward compat)
-    claude_config_json: Optional[str] = Field(
+    claude_config_json: str | None = Field(
         default=None
     )  # ~/.claude.json content for onboarding bypass
-    secret_blob_ref: Optional[str] = Field(default=None)
-    provider_metadata: Optional[Dict[str, Any]] = Field(
+    secret_blob_ref: str | None = Field(default=None)
+    provider_metadata: Dict[str, Any] | None = Field(
         default=None, sa_column=Column(JSONB, nullable=True)
     )
     enabled: bool = Field(default=True)
     total_tasks: int = Field(default=0)
-    token_created_at: Optional[datetime] = Field(
+    token_created_at: datetime | None = Field(
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )  # When the token was added (for age tracking)
-    rate_limit_state: Optional[Dict[str, Any]] = Field(
+    rate_limit_state: Dict[str, Any] | None = Field(
         default=None, sa_column=Column(JSONB, nullable=True)
     )
     # Usage caps (null = unlimited).
-    daily_task_cap: Optional[int] = Field(default=None)
-    max_concurrent_tasks: Optional[int] = Field(default=None)
-    auto_disable_after_rate_limits: Optional[int] = Field(default=None)
+    daily_task_cap: int | None = Field(default=None)
+    max_concurrent_tasks: int | None = Field(default=None)
+    auto_disable_after_rate_limits: int | None = Field(default=None)
     daily_task_count: int = Field(default=0)
-    daily_task_count_reset_at: Optional[datetime] = Field(
+    daily_task_count_reset_at: datetime | None = Field(
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
-    disabled_reason: Optional[str] = Field(default=None)
+    disabled_reason: str | None = Field(default=None)
     # Set when auto-disable trips (rate-limit threshold). Persisted so
     # recheck_disabled_accounts can re-enable after cooldown across
     # orchestrator restarts. Null for never-disabled or admin-disabled
     # accounts (admin disable doesn't auto-recover).
-    disabled_at: Optional[datetime] = Field(
+    disabled_at: datetime | None = Field(
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
@@ -1289,7 +1289,7 @@ class ResidualRemediationCase(SQLModel, table=True):
     """
 
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
-    project_id: Optional[uuid.UUID] = Field(
+    project_id: uuid.UUID | None = Field(
         default=None, foreign_key="project.id", index=True
     )
     fingerprint: str = Field(index=True, max_length=512)
@@ -1306,16 +1306,16 @@ class ResidualRemediationCase(SQLModel, table=True):
         sa_column=Column(NaiveUTCDateTime, nullable=False),
     )
     hit_count: int = Field(default=1)
-    sample_message: Optional[str] = Field(default=None)
+    sample_message: str | None = Field(default=None)
     # Lifecycle fields (added 0054). All nullable / default-0 / default-[]
     # so existing rows backfilled by the migration's server_default work
     # without a Python-side touch.
-    last_spawned_task_id: Optional[uuid.UUID] = Field(
+    last_spawned_task_id: uuid.UUID | None = Field(
         default=None,
         sa_column=Column(ForeignKey("task.id", ondelete="SET NULL"), nullable=True),
     )
-    last_spawned_pr_number: Optional[int] = Field(default=None)
-    last_spawned_at: Optional[datetime] = Field(
+    last_spawned_pr_number: int | None = Field(default=None)
+    last_spawned_at: datetime | None = Field(
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
@@ -1323,7 +1323,7 @@ class ResidualRemediationCase(SQLModel, table=True):
         default=0,
         sa_column=Column(Integer, nullable=False, server_default=text("0")),
     )
-    suspended_at: Optional[datetime] = Field(
+    suspended_at: datetime | None = Field(
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
@@ -1353,7 +1353,7 @@ class ResidualRemediationCase(SQLModel, table=True):
         default=0,
         sa_column=Column(Integer, nullable=False, server_default=text("0")),
     )
-    audit_deferred_system_id: Optional[str] = Field(default=None)
+    audit_deferred_system_id: str | None = Field(default=None)
 
     __table_args__ = (
         Index("ix_residual_case_status_last_seen", "status", "last_seen_at"),
@@ -1397,13 +1397,13 @@ class Artifact(SQLModel, table=True):
     )
 
     # Git-based outputs
-    commit_hash: Optional[str] = None
-    repo_url: Optional[str] = None
-    pr_url: Optional[str] = None
+    commit_hash: str | None = None
+    repo_url: str | None = None
+    pr_url: str | None = None
 
     # For visual feedback or logs
-    storage_uri: Optional[str] = None
-    logs: Optional[str] = None
+    storage_uri: str | None = None
+    logs: str | None = None
 
     iteration: int = Field(default=0)
     created_at: datetime = Field(
@@ -1439,7 +1439,7 @@ class SystemMaturity(SQLModel, table=True):
     )
 
     # audit | fundamentals | ship | pause — validated at ingest
-    recommended_mode: Optional[str] = None
+    recommended_mode: str | None = None
 
     top_issues: List[Dict[str, Any]] = Field(
         default_factory=list,
@@ -1461,7 +1461,7 @@ class SystemMaturity(SQLModel, table=True):
         sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
     )
 
-    source_task_id: Optional[uuid.UUID] = Field(
+    source_task_id: uuid.UUID | None = Field(
         default=None,
         sa_column=Column(
             GUID(),
@@ -1589,14 +1589,14 @@ class RegressionRemediationCase(SQLModel, table=True):
         sa_column=Column(NaiveUTCDateTime, nullable=False),
     )
     hit_count: int = Field(default=1)
-    sample_message: Optional[str] = Field(default=None)
-    last_remediation_task_id: Optional[uuid.UUID] = Field(
+    sample_message: str | None = Field(default=None)
+    last_remediation_task_id: uuid.UUID | None = Field(
         default=None,
         sa_column=Column(ForeignKey("task.id", ondelete="SET NULL"), nullable=True),
     )
     # Prompt fingerprint active when this regression was first spawned for remediation.
     # Lets operators ask: "did this regression appear before or after prompt change X?"
-    prompt_fingerprint_at_spawn: Optional[str] = Field(default=None, max_length=12)
+    prompt_fingerprint_at_spawn: str | None = Field(default=None, max_length=12)
     # Close-loop tracking fields (added 0074). All nullable / default-0 / default-[]
     # so existing rows backfilled by the migration server_default work without a
     # Python-side touch. The dispatcher writes attempts/snapshots at spawn; the
@@ -1615,9 +1615,9 @@ class RegressionRemediationCase(SQLModel, table=True):
         default=0,
         sa_column=Column(Integer, nullable=False, server_default=text("0")),
     )
-    last_remediation_pr_number: Optional[int] = Field(default=None)
-    last_remediation_result: Optional[str] = Field(default=None)
-    last_failure_class: Optional[str] = Field(default=None)
+    last_remediation_pr_number: int | None = Field(default=None)
+    last_remediation_result: str | None = Field(default=None)
+    last_failure_class: str | None = Field(default=None)
     signal_snapshot_at_spawn: Dict[str, Any] = Field(
         default_factory=dict,
         sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
@@ -1630,7 +1630,7 @@ class RegressionRemediationCase(SQLModel, table=True):
         default_factory=list,
         sa_column=Column(JSONB, nullable=False, server_default=text("'[]'")),
     )
-    needs_manual_intervention_at: Optional[datetime] = Field(
+    needs_manual_intervention_at: datetime | None = Field(
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
@@ -1639,7 +1639,7 @@ class RegressionRemediationCase(SQLModel, table=True):
     # predating this column. Set once via the acknowledge endpoint; idempotent
     # (never overwritten once stamped). Enables MTTI metric:
     # needs_manual_intervention_at → operator_acknowledged_at.
-    operator_acknowledged_at: Optional[datetime] = Field(
+    operator_acknowledged_at: datetime | None = Field(
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
@@ -1647,21 +1647,21 @@ class RegressionRemediationCase(SQLModel, table=True):
     # the most recent dispatcher pass. Separate from first_seen_at (case
     # creation) and last_remediation_task_id spawn time. Enables time-to-detect
     # metric: signal_first_crossed_at → first_seen_at gap.
-    signal_first_crossed_at: Optional[datetime] = Field(
+    signal_first_crossed_at: datetime | None = Field(
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
     # Timestamp when the underlying signal FIRST crossed threshold. Enables
     # MTTD = first_seen_at → case.created_at. Null for cases opened before
     # this column was added, and for signals without a durable first-seen record.
-    signal_first_seen_at: Optional[datetime] = Field(
+    signal_first_seen_at: datetime | None = Field(
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
     # Path that drove this case into NEEDS_MANUAL_INTERVENTION; one of
     # REGRESSION_ESCALATION_REASONS. Nullable for legacy rows pre-dating
     # the field and for cases that have not been escalated yet.
-    escalation_reason: Optional[str] = Field(
+    escalation_reason: str | None = Field(
         default=None,
         sa_column=Column(String, nullable=True),
     )
@@ -1674,7 +1674,7 @@ class RegressionRemediationCase(SQLModel, table=True):
     # case re-arm/closure, and when the operator presses Clear — mirroring
     # the .pop() semantics of the deprecated process-local
     # ``_signal_healthy_since`` dict.
-    signal_healthy_since_at: Optional[datetime] = Field(
+    signal_healthy_since_at: datetime | None = Field(
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
@@ -1684,13 +1684,13 @@ class RegressionRemediationCase(SQLModel, table=True):
     # to now+TTL. The dispatcher silently skips spawn while this is in the
     # future; once it lapses, the next tick re-arms to ACTIVE so genuine
     # recurrence after expiry is still caught. NULL on every other status.
-    false_positive_until_at: Optional[datetime] = Field(
+    false_positive_until_at: datetime | None = Field(
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
     # Free-form reason captured from the investigate report's verdict_reason
     # so operators can audit auto-suppressions. Truncated to 500 chars.
-    false_positive_reason: Optional[str] = Field(
+    false_positive_reason: str | None = Field(
         default=None,
         sa_column=Column(String, nullable=True),
     )
@@ -1705,7 +1705,7 @@ class RegressionRemediationCase(SQLModel, table=True):
     # Timestamp when the dispatcher first spawned an investigate Task for this case.
     # Null for cases pre-dating this column. Never overwritten on re-spawns so
     # operators always see the original detection-to-action latency.
-    investigate_spawned_at: Optional[datetime] = Field(
+    investigate_spawned_at: datetime | None = Field(
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
@@ -1724,33 +1724,33 @@ class RegressionRemediationCase(SQLModel, table=True):
     # the next investigation's prompt with a 'PRIOR REMEDIATION FAILURE CONTEXT'
     # block so the agent can choose a different angle. Falls back to fetching
     # the prior task's latest_status_message at spawn time when null.
-    last_failure_summary: Optional[str] = Field(
+    last_failure_summary: str | None = Field(
         default=None,
         sa_column=Column(Text, nullable=True),
     )
     # Timestamp when the most recent marginal-recovery follow-up investigate task
     # was spawned for this case. Used as a durable cooldown anchor: the dispatcher
-    # skips spawning a new follow-up if now − marginal_followup_spawned_at is
+    # skips spawning a new follow-up if now - marginal_followup_spawned_at is
     # within the configured cooldown window (default 72 h). Null for cases that
     # have never had a marginal follow-up or pre-date this column.
-    marginal_followup_spawned_at: Optional[datetime] = Field(
+    marginal_followup_spawned_at: datetime | None = Field(
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
     # Timestamp when the most recent compliance follow-up investigate task was
     # spawned for this case. Acts as a durable cooldown anchor: the dispatcher
-    # skips spawning a new compliance follow-up if now − compliance_followup_spawned_at
+    # skips spawning a new compliance follow-up if now - compliance_followup_spawned_at
     # is within the configured cooldown window (default 72 h). Null for cases that
     # have never triggered a compliance follow-up or pre-date this column.
-    compliance_followup_spawned_at: Optional[datetime] = Field(
+    compliance_followup_spawned_at: datetime | None = Field(
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
     # Attribution for the PR/commit that introduced this regression. Set when
     # a new case is first created or re-tripped after CLOSED. Null for legacy
     # rows and cases where attribution could not be determined.
-    introducing_pr_number: Optional[int] = Field(default=None)
-    introducing_commit_sha: Optional[str] = Field(
+    introducing_pr_number: int | None = Field(default=None)
+    introducing_commit_sha: str | None = Field(
         default=None,
         sa_column=Column(String(40), nullable=True),
     )
@@ -1782,7 +1782,7 @@ class RegressionRemediationCase(SQLModel, table=True):
     )
 
     @property
-    def time_to_detect_sec(self) -> Optional[float]:
+    def time_to_detect_sec(self) -> float | None:
         """Seconds between signal crossing threshold and this case being opened.
 
         Prefers signal_first_crossed_at (current dispatcher writes both fields;
@@ -1796,7 +1796,7 @@ class RegressionRemediationCase(SQLModel, table=True):
         return (self.first_seen_at - anchor).total_seconds()
 
     @property
-    def time_to_investigate_sec(self) -> Optional[int]:
+    def time_to_investigate_sec(self) -> int | None:
         """Seconds between first_seen_at and the first investigate Task spawn.
 
         Returns None when investigate_spawned_at is missing (legacy rows) or
@@ -1811,10 +1811,10 @@ class RegressionRemediationCase(SQLModel, table=True):
         self,
         pr_number: int,
         signal_snapshot: Dict[str, Any],
-        layers_targeted: Optional[List[str]] = None,
+        layers_targeted: List[str] | None = None,
         *,
         spawn_was_cross_layer: bool = False,
-        spawn_layers_enumerated: Optional[List[str]] = None,
+        spawn_layers_enumerated: List[str] | None = None,
     ) -> None:
         """Transition ACTIVE → MERGED after remediation PR merges.
 
@@ -1851,15 +1851,13 @@ class RegressionRemediationCase(SQLModel, table=True):
         if spawn_was_cross_layer:
             log_entry["spawn_was_cross_layer"] = True
             log_entry["spawn_layers_enumerated"] = list(spawn_layers_enumerated or [])
-        self.fingerprint_to_fix_log = list(self.fingerprint_to_fix_log or []) + [
-            log_entry
-        ]
+        self.fingerprint_to_fix_log = [*list(self.fingerprint_to_fix_log or []), log_entry]
         self.status = RegressionCaseStatus.MERGED
 
     def mark_closed(
         self,
-        post_merge_value: Optional[float] = None,
-        recovered_at: Optional[str] = None,
+        post_merge_value: float | None = None,
+        recovered_at: str | None = None,
     ) -> None:
         """Transition MERGED → CLOSED when the signal shows recovery.
 
@@ -1878,9 +1876,7 @@ class RegressionRemediationCase(SQLModel, table=True):
                 "recovered_at": recovered_at or _utcnow().isoformat(),
                 "post_merge_value": post_merge_value,
             }
-            self.fingerprint_to_fix_log = list(self.fingerprint_to_fix_log or []) + [
-                entry
-            ]
+            self.fingerprint_to_fix_log = [*list(self.fingerprint_to_fix_log or []), entry]
 
     def prior_attempt_context_suffix(self) -> str:
         """Return a formatted prior-attempt context block for re-spawned prompts.
@@ -1948,7 +1944,7 @@ class RegressionRemediationCase(SQLModel, table=True):
             if fast_track:
                 self.fast_track_next_spawn = True
 
-    def escalate_for_divergence(self, detail: Optional[str] = None) -> None:
+    def escalate_for_divergence(self, detail: str | None = None) -> None:
         """Escalate to NEEDS_MANUAL_INTERVENTION because successive investigations diverged.
 
         Idempotent once already NEEDS_MANUAL_INTERVENTION (preserves the prior
@@ -2042,8 +2038,8 @@ class AnomalyFingerprintState(SQLModel, table=True):
         default_factory=_utcnow,
         sa_column=Column(NaiveUTCDateTime, nullable=False),
     )
-    severity: Optional[str] = Field(default=None, max_length=64)
-    latest_details: Optional[str] = Field(
+    severity: str | None = Field(default=None, max_length=64)
+    latest_details: str | None = Field(
         default=None, sa_column=Column(Text, nullable=True)
     )
     updated_at: datetime = Field(
@@ -2109,7 +2105,7 @@ class DispatcherCycleRecord(SQLModel, table=True):
         default_factory=dict,
         sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
     )
-    mttd_p50_sec: Optional[float] = Field(default=None)
+    mttd_p50_sec: float | None = Field(default=None)
     marginal_recoveries_count: int = Field(
         default=0,
         sa_column=Column(Integer, nullable=False, server_default=text("0")),
@@ -2118,7 +2114,129 @@ class DispatcherCycleRecord(SQLModel, table=True):
         default=0,
         sa_column=Column(Integer, nullable=False, server_default=text("0")),
     )
-    avg_prevention_rate_7d: Optional[float] = Field(
+    avg_prevention_rate_7d: float | None = Field(
         default=None,
         sa_column=Column(Float, nullable=True),
+    )
+
+
+class ReleaseVersion(SQLModel, table=True):
+    """Release-version lifecycle record for automain → main promotion gating.
+
+    A "version" is the span of automain between two promotions.  The strategic
+    layer drives phase transitions:
+
+      build      — normal feature work on automain
+      stabilize  — shift work-mix to audit/cleanup/hardening before qualify
+      qualify    — heavy gate running once per version (Phase 3)
+      promote    — transition to next version after successful promotion
+
+    Only one row per project should have ``status="open"`` at a time.
+    ``version_number`` is monotonically increasing per project.
+
+    Columns named *_sha are nullable per migration linter rules.
+    All non-null columns carry ``server_default`` for safe backfill.
+    """
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+
+    project_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("project.id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        ),
+    )
+
+    # Monotonically increasing per project (1-based).
+    version_number: int = Field(
+        default=1,
+        sa_column=Column(Integer, nullable=False, server_default=text("1")),
+    )
+
+    # phase: build | stabilize  (qualify / promote are transient orchestrator ops,
+    # not durable DB phases — they are reflected by status transitions).
+    phase: str = Field(
+        default="build",
+        sa_column=Column(String(32), nullable=False, server_default="build"),
+    )
+
+    # status: open | promoted | abandoned
+    status: str = Field(
+        default="open",
+        sa_column=Column(String(32), nullable=False, server_default="open"),
+    )
+
+    opened_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+
+    # Stamped when phase changes (build → stabilize, etc.).
+    phase_changed_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+
+    # Stamped when status transitions to "promoted".
+    promoted_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+
+    # SHA columns are nullable per migration linter rules.
+    # base_sha: automain HEAD when this version was opened.
+    base_sha: str | None = Field(
+        default=None,
+        sa_column=Column(String(40), nullable=True),
+    )
+
+    # promoted_sha: automain HEAD at the time of successful promotion.
+    promoted_sha: str | None = Field(
+        default=None,
+        sa_column=Column(String(40), nullable=True),
+    )
+
+    # Structured result of the last qualification run (Phase 3).
+    # Shape: {score, sub_scores, blocker, attempted_at, …}
+    last_qualification: Dict[str, Any] | None = Field(
+        default=None,
+        sa_column=Column(JSONB, nullable=True),
+    )
+
+    # Total number of qualification attempts on this version (Phase 3).
+    qualification_attempts: int = Field(
+        default=0,
+        sa_column=Column(Integer, nullable=False, server_default=text("0")),
+    )
+
+    # Free-form reasoning text from the strategic agent explaining the latest
+    # phase decision.
+    phase_reasoning: str | None = Field(
+        default=None,
+        sa_column=Column(Text, nullable=True),
+    )
+
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+    updated_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(
+            NaiveUTCDateTime,
+            nullable=False,
+            server_default=func.now(),
+            onupdate=_utcnow,
+        ),
+    )
+
+    __table_args__ = (
+        Index("ix_releaseversion_project_status", "project_id", "status"),
+        UniqueConstraint(
+            "project_id",
+            "version_number",
+            name="uq_releaseversion_project_version",
+        ),
     )
