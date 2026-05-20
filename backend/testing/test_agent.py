@@ -5554,14 +5554,21 @@ async def test_playbook_admin_list_stale_flag(client: AsyncClient, db_session):
     from app.models import ProjectMember
 
     project = Project(name="Playbook Stale Test", user_id="test-user-123")
+    # Fresh-entry dates are computed relative to now so the test doesn't rot:
+    # hardcoded absolute dates silently cross the 30-day staleness threshold as
+    # wall-clock time passes (this test broke once 2026-04-13 aged past 30 days).
+    _now = datetime.utcnow()
+    fresh_updated = (_now - timedelta(days=4)).isoformat()
+    fresh_referenced = (_now - timedelta(days=1)).isoformat()
+    fresh_confirmed = (_now - timedelta(days=2)).isoformat()
     project.design_doc = {
         "playbook/fresh-entry": {
             "content": "fresh content",
-            "updated_at": "2026-04-10T00:00:00",
+            "updated_at": fresh_updated,
             "confirmed_count": 3,
             "reference_count": 5,
-            "last_referenced_at": "2026-04-13T00:00:00",  # 1 day ago — not stale
-            "last_confirmed_at": "2026-04-12T00:00:00",
+            "last_referenced_at": fresh_referenced,  # 1 day ago — not stale
+            "last_confirmed_at": fresh_confirmed,
             "effectiveness_score": 0.6,
         },
         "playbook/stale-entry": {
@@ -5603,8 +5610,8 @@ async def test_playbook_admin_list_stale_flag(client: AsyncClient, db_session):
 
     fresh = entries["fresh-entry"]
     assert fresh["reference_count"] == 5
-    assert fresh["last_referenced_at"] == "2026-04-13T00:00:00"
-    assert fresh["last_confirmed_at"] == "2026-04-12T00:00:00"
+    assert fresh["last_referenced_at"] == fresh_referenced
+    assert fresh["last_confirmed_at"] == fresh_confirmed
     assert fresh["effectiveness_score"] == 0.6
     assert fresh["stale"] is False
 

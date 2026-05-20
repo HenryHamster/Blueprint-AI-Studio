@@ -2692,7 +2692,7 @@ describe('runFreshReviewerPass origin field tagging', () => {
     expect(checkResults.correctness.origin).toBe('reviewer_recovery_after_incomplete_sr');
   });
 
-  it('applies origin tags uniformly: agent entries get sr, reviewer entries get reviewer', async () => {
+  it('applies origin tags uniformly: agent entries get sr, reviewer overrides get reviewer_disagreement', async () => {
     const idx = await import('../index.js');
     vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
     vi.mocked(fsModule.readFileSync).mockReturnValue(JSON.stringify({
@@ -2719,8 +2719,9 @@ describe('runFreshReviewerPass origin field tagging', () => {
     const checkResults = json.check_results as Record<string, Record<string, unknown>>;
     // Agent entries without origin get backfilled with 'sr'
     expect(checkResults['type-safety'].origin).toBe('sr');
-    // Reviewer entries get 'reviewer'
-    expect(checkResults.correctness.origin).toBe('reviewer');
+    // A reviewer finding that overrides a passing self-review entry is tagged
+    // 'reviewer_disagreement' (the agent passed it; the reviewer disagreed).
+    expect(checkResults.correctness.origin).toBe('reviewer_disagreement');
   });
 });
 
