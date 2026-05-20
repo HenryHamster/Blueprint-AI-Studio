@@ -231,6 +231,9 @@ class StrategicReviewPayload(_SystemPopulated):
     # Short-window claim-vs-shipped drift signals; complements lifetime
     # prediction calibration with a fast-reacting drift detector.
     drift_signals: dict[str, Any] | None = None
+    # Current LTS version/phase context. Keys: version_number, phase,
+    # phase_changed_at, tasks_merged_this_version, last_qualification.
+    version_phase: dict[str, Any] | None = None
 
 
 class DesignDocUpdatePayload(_SystemPopulated):
