@@ -3189,7 +3189,9 @@ async def strategic_operation(
 
         from app.problem_model import apply_agent_update
         from app.strategic_completion import (
+            QUALIFY_REQUEST_CONTEXT_KEY,
             VERSION_PHASE_DECISION_CONTEXT_KEY,
+            extract_qualify_request,
             extract_version_phase_decision,
         )
 
@@ -3197,18 +3199,22 @@ async def strategic_operation(
             raise HTTPException(
                 status_code=400, detail="problem_model must be an object"
             )
-        # version_phase_decision is a transient per-cycle signal the strategic
-        # agent embeds as a top-level sibling of the problem_model (see the
-        # research-plan executor prompt). It is NOT part of the durable model —
-        # ProblemModel is extra="forbid", so it MUST be lifted out before
-        # apply_agent_update validates, or the whole update is rejected (400).
-        # The sanitized {phase, reasoning} dict rides task.context to the
+        # version_phase_decision and qualify_request are transient per-cycle
+        # signals the strategic agent embeds as top-level siblings of the
+        # problem_model (see the research-plan executor prompt). Neither is part
+        # of the durable model — ProblemModel is extra="forbid", so they MUST be
+        # lifted out before apply_agent_update validates, or the whole update is
+        # rejected (400). The sanitized dicts ride task.context to the
         # strategic-completion handler's API path; the completion handler
-        # applies it to the open ReleaseVersion and it never persists in
-        # project.problem_model.
+        # applies them (version_phase_decision flips the open ReleaseVersion's
+        # phase; qualify_request kicks off the release qualifier) and neither
+        # persists in project.problem_model.
         pm_data = dict(data)
         version_phase_decision = extract_version_phase_decision(
             pm_data.pop("version_phase_decision", None)
+        )
+        qualify_request = extract_qualify_request(
+            pm_data.pop("qualify_request", None)
         )
         try:
             new_pm_raw, pm_diff = apply_agent_update(
@@ -3231,6 +3237,8 @@ async def strategic_operation(
         }
         if version_phase_decision is not None:
             new_ctx[VERSION_PHASE_DECISION_CONTEXT_KEY] = version_phase_decision
+        if qualify_request is not None:
+            new_ctx[QUALIFY_REQUEST_CONTEXT_KEY] = qualify_request
         task.context = new_ctx
         flag_modified(task, "context")
         session.add(task)
@@ -3246,6 +3254,13 @@ async def strategic_operation(
                 version_phase_decision["phase"],
                 task.id,
             )
+        if qualify_request is not None:
+            logger.info(
+                "[STRATEGIC API] qualify_request routed to task.context for "
+                "task %s — release qualifier runs at strategic completion if "
+                "the open version is in stabilize",
+                task.id,
+            )
         return _resp(
             {
                 "status": "ok",
@@ -3253,6 +3268,7 @@ async def strategic_operation(
                 "revision": new_pm_raw.get("revision"),
                 "diff": pm_diff,
                 "version_phase_decision_received": version_phase_decision is not None,
+                "qualify_request_received": qualify_request is not None,
             }
         )
 

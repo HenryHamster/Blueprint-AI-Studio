@@ -201,6 +201,16 @@ _VPD_REASONING_MAX = 500
 # never drift.
 VERSION_PHASE_DECISION_CONTEXT_KEY = "_strategic_version_phase_decision"
 
+# Cap on the qualify_request reason string the endpoint stows in task.context.
+# Advisory only (logged, not stored on ReleaseVersion), so a generous cap is fine.
+_QUALIFY_REQUEST_REASON_MAX = 500
+
+# Transient task.context key carrying an agent-emitted qualify_request from the
+# set_problem_model endpoint to _handle_strategic_completion's API path. Mirrors
+# VERSION_PHASE_DECISION_CONTEXT_KEY — one source of truth so producer + consumer
+# never drift.
+QUALIFY_REQUEST_CONTEXT_KEY = "_strategic_qualify_request"
+
 
 def _normalize_version_phase(value: object) -> str | None:
     """Return a canonical version phase string or None.
@@ -245,6 +255,32 @@ def extract_version_phase_decision(raw: object) -> dict | None:
         else ""
     )
     return {"phase": phase, "reasoning": reasoning}
+
+
+def extract_qualify_request(raw: object) -> dict | None:
+    """Validate + normalize a raw ``qualify_request`` value.
+
+    Accepts the {reason} value the strategic agent embeds as a top-level sibling
+    in the ``set-problem-model`` payload and returns a clean ``{"reason": str}``
+    dict, or ``None`` when the input is absent or unusable. A qualify_request is
+    the agent's transient signal that an ``open`` version in ``stabilize`` is
+    release-ready and the heavy qualifier should run (automain-lts-plan-v1.md
+    Phase 3) — never durable model state.
+
+    Used by the ``set_problem_model`` endpoint to lift the field out of the
+    problem_model JSON *before* ``ProblemModel`` validation (``extra="forbid"``,
+    which would otherwise reject the whole update). ``_apply_qualify_request``
+    re-checks the phase gate, so a wrong-phase request is no-op'd, never raised.
+    """
+    if not isinstance(raw, dict):
+        return None
+    reason_raw = raw.get("reason")
+    reason = (
+        reason_raw.strip()[:_QUALIFY_REQUEST_REASON_MAX]
+        if isinstance(reason_raw, str)
+        else ""
+    )
+    return {"reason": reason}
 
 
 async def _apply_version_phase_decision(
@@ -322,6 +358,79 @@ async def _apply_version_phase_decision(
     except Exception:
         logger.exception(
             "[STRATEGIC] Task %s (%s path): failed to apply version_phase_decision "
+            "(non-fatal)",
+            task.id,
+            path,
+        )
+
+
+async def _apply_qualify_request(
+    request: object,
+    task: Task,
+    project: Project,
+    session: AsyncSession,
+    *,
+    path: str,
+) -> None:
+    """Parse and apply an optional ``qualify_request`` from the strategic agent.
+
+    ``request`` is the raw {reason: str} value from the API path
+    (``task.context[QUALIFY_REQUEST_CONTEXT_KEY]``) — the agent's signal that an
+    ``open`` version in ``stabilize`` is release-ready (automain-lts-plan-v1.md
+    Phase 3). When valid, looks up the open ``ReleaseVersion``, gates on
+    ``phase == "stabilize"``, and calls ``release_qualifier.run_qualification``
+    (which snapshots the candidate SHA + spawns the audit/smoketest children;
+    the caller's surrounding commit persists its version-row writes).
+
+    Silently no-ops when ``request`` is None/not a dict, there is no open
+    ``ReleaseVersion``, or that version is not in ``stabilize``. All errors are
+    logged and swallowed — a bad or absent request must never block the write.
+    """
+    if not request or not isinstance(request, dict):
+        return
+    reason_raw = request.get("reason")
+    reason = (
+        reason_raw.strip() or None if isinstance(reason_raw, str) else None
+    )
+    try:
+        from app import release_qualifier as _rq
+        from app import release_version as _rv
+
+        open_ver = await _rv.current_open_version(session, project.id)
+        if open_ver is None:
+            logger.debug(
+                "[STRATEGIC] Task %s (%s path): no open ReleaseVersion for project "
+                "%s — skipping qualify_request",
+                task.id,
+                path,
+                project.id,
+            )
+            return
+        if open_ver.phase != "stabilize":
+            logger.info(
+                "[STRATEGIC] Task %s (%s path): qualify_request for project %s "
+                "version v%d ignored — version is in phase=%s, not stabilize",
+                task.id,
+                path,
+                project.id,
+                open_ver.version_number,
+                open_ver.phase,
+            )
+            return
+        result = await _rq.run_qualification(session, project.id, open_ver)
+        logger.info(
+            "[STRATEGIC] Task %s (%s path): qualify_request ran qualification "
+            "for project %s version v%d — status=%s (reason=%r)",
+            task.id,
+            path,
+            project.id,
+            open_ver.version_number,
+            (result or {}).get("status"),
+            reason,
+        )
+    except Exception:
+        logger.exception(
+            "[STRATEGIC] Task %s (%s path): failed to apply qualify_request "
             "(non-fatal)",
             task.id,
             path,
@@ -1079,6 +1188,14 @@ async def _handle_strategic_completion(
         await _apply_version_phase_decision(
             _vpd_ctx, task, project, session, path="api"
         )
+        # Apply qualify_request if the agent supplied one via the API. Same
+        # transport as version_phase_decision: the ``set_problem_model``
+        # endpoint lifts the field out of the problem_model JSON and stows the
+        # sanitized {reason} dict under ``QUALIFY_REQUEST_CONTEXT_KEY``. When the
+        # open ReleaseVersion is in ``stabilize`` this kicks off the release
+        # qualifier.
+        _qr_ctx = (task.context or {}).get(QUALIFY_REQUEST_CONTEXT_KEY)
+        await _apply_qualify_request(_qr_ctx, task, project, session, path="api")
 
         # Per-cycle message post removed: the strategic agent now maintains
         # project.running_update as a living markdown document it rewrites

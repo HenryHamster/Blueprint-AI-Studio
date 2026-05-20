@@ -3444,7 +3444,13 @@ async def _process_post_commit(
                                         await session.commit()
                                         # Clean up branches (staging + feature)
                                         await _cleanup_branches(orig, session)
-                                        # Spawn a smoketest after rollup merges to main
+                                        # Spawn a smoketest after rollup merges to main.
+                                        # After Phase 1 (automain/LTS), normal rollups target
+                                        # `automain`; only promotion PRs (automain → main) still
+                                        # merge to `main`. So base_branch == "main" here means a
+                                        # PROMOTION just landed — this smoketest acts as a
+                                        # post-promotion production health-check, not a routine
+                                        # integration check.
                                         # Supported runtime_config keys for smoketest:
                                         #   health_check_urls: list[str] — live URLs to probe with HTTP GET after local tests
                                         if (
@@ -4451,6 +4457,17 @@ async def _process_post_commit(
                 elif task_type == "self_audit":
                     self_audit_logs = payload.logs or task.latest_status_message or ""
                     await _handle_self_audit_completion(task, self_audit_logs, session)
+
+                elif task_type == "release_audit":
+                    # Advance the release qualification when both children (this
+                    # release_audit and the qualifier-smoketest) have terminated.
+                    # maybe_finalize_qualification is idempotent and a cheap no-op
+                    # for tasks whose version is not awaiting qualification.
+                    from app import release_qualifier
+
+                    await release_qualifier.maybe_finalize_qualification(
+                        session, task
+                    )
 
                 elif payload.artifact_type == ArtifactType.INVESTIGATION_REPORT:
                     await _handle_investigation_completion(task, payload, session)

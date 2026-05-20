@@ -672,7 +672,18 @@ If you decide to flip the phase, emit a \`version_phase_decision\` field in your
 }
 \`\`\`
 
-If you are staying in the current phase, do NOT emit \`version_phase_decision\` — omitting it means "no change."`);
+If you are staying in the current phase, do NOT emit \`version_phase_decision\` — omitting it means "no change."
+
+**Requesting qualification (stabilize only):**
+When the version is in **stabilize** and you judge it ready for release — hardening is sufficient, known issues are addressed, and the qualification criteria look achievable — request qualification. The orchestrator then snapshots the integration branch and runs the automated release qualifier (CI, test-erosion, audit, smoketest). Emit a \`qualify_request\` field in your Section 6 problem_model update (a top-level JSON field alongside the model):
+\`\`\`json
+{
+  "qualify_request": {
+    "reason": "One sentence explaining why the version is ready to qualify now."
+  }
+}
+\`\`\`
+Only request qualification from the **stabilize** phase — it is ignored in **build**. If the version is not yet release-ready, do NOT emit \`qualify_request\` — omitting it means "not ready." \`version_phase_decision\` and \`qualify_request\` are independent: you may emit either, both, or neither.`);
 
   return parts.join('\n');
 }
@@ -2307,6 +2318,10 @@ ${analysisText.slice(0, 50_000)}
 5. **Version phase decision (conditional).** If the Thinker's analysis includes a \`version_phase_decision\` field (look in Section 6 and throughout the analysis), extract it and embed it as a top-level sibling in the problem_model JSON before calling \`./strategic set-problem-model\`:
    \`{"version_phase_decision": {"phase": "build" or "stabilize", "reasoning": "..."}, ...rest_of_problem_model}\`
    If the Thinker did NOT emit \`version_phase_decision\`, SKIP — do not fabricate one, and do not include the field. Absence means "no phase change this cycle."
+
+   Likewise, if the Thinker's analysis includes a \`qualify_request\` field (look in Section 6 and throughout the analysis), extract it and embed it as a top-level sibling in the same problem_model JSON before calling \`./strategic set-problem-model\`:
+   \`{"qualify_request": {"reason": "..."}, ...rest_of_problem_model}\`
+   If the Thinker did NOT emit \`qualify_request\`, SKIP — do not fabricate one, and do not include the field. Absence means "do not qualify this cycle." \`version_phase_decision\` and \`qualify_request\` are independent siblings; embed whichever the Thinker emitted (either, both, or neither).
 
 6. **Self-reflection (optional).** If Section 5 has non-empty content, emit via \`./strategic reflect\`. If the Thinker wrote nothing (or wrote "none" / "N/A" / empty), SKIP — do not fabricate.
 

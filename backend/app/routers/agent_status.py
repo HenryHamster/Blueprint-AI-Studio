@@ -270,8 +270,8 @@ async def _check_daily_cost_ceiling(task: Task, session: AsyncSession) -> None:
         f"${daily_total:.2f} > ${ceiling:.2f}"
     )
     try:
-        from app.notification_dispatch import dispatch_external_notification  # noqa: PLC0415
-        from app.failure_classification import classify_failure  # noqa: PLC0415
+        from app.notification_dispatch import dispatch_external_notification
+        from app.failure_classification import classify_failure
 
         ctx = task.context or {}
         first_payload = task.first_payload or {}
@@ -295,7 +295,7 @@ async def _check_daily_cost_ceiling(task: Task, session: AsyncSession) -> None:
             .all()
         )
         cost_by_failure_class: dict[str, float] = {}
-        for t in list(cost_rows) + [task]:
+        for t in [*list(cost_rows), task]:
             if not (t.vm_provisioned_at and t.vm_stopped_at):
                 continue
             secs = (t.vm_stopped_at - t.vm_provisioned_at).total_seconds()
@@ -311,7 +311,7 @@ async def _check_daily_cost_ceiling(task: Task, session: AsyncSession) -> None:
             cost_by_failure_class[bucket] = round(
                 cost_by_failure_class.get(bucket, 0.0) + secs * rate, 4
             )
-        asyncio.ensure_future(
+        _budget_future = asyncio.ensure_future(
             dispatch_external_notification(
                 task.project_id,
                 "BUDGET_EXCEEDED",
@@ -324,6 +324,7 @@ async def _check_daily_cost_ceiling(task: Task, session: AsyncSession) -> None:
                 },
             )
         )
+        del _budget_future  # fire-and-forget; stored to satisfy RUF006
     except Exception as _ne:
         logger.warning(f"[NOTIFY] BUDGET_EXCEEDED dispatch setup failed: {_ne}")
 
@@ -452,10 +453,10 @@ async def _check_recurring_failures(task: Task, session: AsyncSession) -> None:
     common keywords in their status messages. Capped at 5 auto-generated entries
     per project.
     """
-    import hashlib as _hashlib  # noqa: PLC0415
-    from collections import Counter  # noqa: PLC0415
-    from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
-    from app.failure_classification import classify_failure  # noqa: PLC0415
+    import hashlib as _hashlib
+    from collections import Counter
+    from sqlalchemy.orm.attributes import flag_modified
+    from app.failure_classification import classify_failure
 
     cutoff = _utcnow() - timedelta(days=7)
 
@@ -479,7 +480,7 @@ async def _check_recurring_failures(task: Task, session: AsyncSession) -> None:
     )
 
     # Add the current task's contribution manually (it was excluded above)
-    all_failed = list(recent_failed) + [task]
+    all_failed = [*list(recent_failed), task]
 
     # Group by failure_class
     by_class: dict[str, list] = {}
@@ -787,7 +788,7 @@ async def update_agent_status(
     # COMPLETED can overwrite the reaper's QUEUED (requeue) between read and write.
     #
     # SKIP LOCKED design (audit E9): _process_post_commit re-acquires FOR UPDATE
-    # on a separate session and holds it while making GitHub API calls (15–120s).
+    # on a separate session and holds it while making GitHub API calls (15-120s).
     # A duplicate status POST arriving in that window would block on a plain
     # FOR UPDATE, hit the 30s Postgres lock_timeout, and return 500 — Cloud Run
     # then classifies the 5xx as ContainerError and quarantines the instance.
@@ -951,7 +952,7 @@ async def update_agent_status(
     ):
         task.latest_status_message = payload.logs[-8000:]
     if payload.failure_category:
-        from app.failure_classification import normalize_agent_failure_category  # noqa: PLC0415
+        from app.failure_classification import normalize_agent_failure_category
 
         normalized_failure_category = normalize_agent_failure_category(
             payload.failure_category, task
@@ -980,13 +981,13 @@ async def update_agent_status(
         # Fold optional fix-loop telemetry events into Task.fix_loop_history.
         # Same loose-validation pattern as the heartbeat path: invalid entries
         # log + drop instead of 422'ing the whole status update.
-        from app.fix_loop_telemetry import FixLoopEventIn, apply_fix_loop_events  # noqa: PLC0415
+        from app.fix_loop_telemetry import FixLoopEventIn, apply_fix_loop_events
 
         validated: list[FixLoopEventIn] = []
         for raw in payload.fix_loop_events:
             try:
                 validated.append(FixLoopEventIn(**raw))
-            except Exception as exc:
+            except Exception as exc:  # noqa: PERF203 — per-item validation; each item may individually fail
                 logger.info(
                     "[FIX_LOOP] dropping invalid event for task %s: %s",
                     payload.task_id,
@@ -1172,11 +1173,34 @@ async def update_agent_status(
                 exc_info=True,
             )
 
-    # 3b-ii. On smoketest failure, spawn a plan task and create a persistent alert
+    # 3b-ii. Qualifier-smoketest hook — fires for ALL smoketest results (pass or
+    # fail) when the task carries context["qualifier_smoketest"]=True.  A
+    # qualifier-smoketest is a pre-promotion qualifier input: its outcome feeds
+    # the composite qualification score, not the production fix-spawn loop.
+    # maybe_finalize_qualification is idempotent — safe to call unconditionally.
+    if payload.artifact_type == ArtifactType.SMOKETEST_RESULT and (
+        task.context or {}
+    ).get("qualifier_smoketest"):
+        try:
+            from app import release_qualifier
+
+            await release_qualifier.maybe_finalize_qualification(session, task)
+        except Exception as _qe:
+            logger.error(
+                "[RELEASE_QUALIFIER] maybe_finalize_qualification failed for "
+                "qualifier smoketest task %s: %s",
+                _task_id_str,
+                _qe,
+                exc_info=True,
+            )
+
+    # 3b-iii. On smoketest failure, spawn a plan task and create a persistent
+    # alert — skipped for qualifier smoketests (handled above via the qualifier).
     if (
         payload.artifact_type == ArtifactType.SMOKETEST_RESULT
         and payload.status == TaskStatus.FAILED
         and payload.logs
+        and not (task.context or {}).get("qualifier_smoketest")
     ):
         try:
             smoketest_data = json.loads(payload.logs)
@@ -1523,9 +1547,9 @@ async def update_agent_status(
 
     # 4. External VM Termination
     # If the task is finished or failed, immediately kill the VM to save costs
-    from app.failure_classification import classify_failure  # noqa: PLC0415
-    from app.main import _ensure_vm_deleted  # noqa: PLC0415 — deferred to avoid circular import
-    from app.main import _maybe_create_circuit_breaker_alert  # noqa: PLC0415 — deferred to avoid circular import
+    from app.failure_classification import classify_failure
+    from app.main import _ensure_vm_deleted
+    from app.main import _maybe_create_circuit_breaker_alert
 
     if payload.status in [TaskStatus.COMPLETED, TaskStatus.FAILED]:
         # Record result for deployment monitoring and update Prometheus counters
@@ -1569,7 +1593,7 @@ async def update_agent_status(
                             from app.notification_dispatch import (
                                 post_account_model_regression_recovered_message,
                                 dispatch_external_notification,
-                            )  # noqa: PLC0415
+                            )
 
                             await post_account_model_regression_recovered_message(
                                 session,
@@ -1582,7 +1606,7 @@ async def update_agent_status(
                                 project_median=_rr.get("project_median"),
                                 sample_size=_rr.get("sample_size"),
                             )
-                            asyncio.ensure_future(
+                            _regression_future = asyncio.ensure_future(
                                 dispatch_external_notification(
                                     task.project_id,
                                     "account_model_regression_recovered",
@@ -1596,7 +1620,8 @@ async def update_agent_status(
                                         )
                                     },
                                 )
-                            )  # noqa: RUF006
+                            )
+                            del _regression_future  # fire-and-forget; stored to satisfy RUF006
                     except Exception as e:
                         logger.warning(
                             f"[STATUS] regression recovery failed for {acct_id_clear}: {e}",
@@ -1622,11 +1647,11 @@ async def update_agent_status(
                             exc_info=True,
                         )
             else:
-                from app.failure_classification import classify_failure_with_confidence  # noqa: PLC0415
+                from app.failure_classification import classify_failure_with_confidence
 
                 classification = classify_failure_with_confidence(task, payload.logs)
                 failure_class = classification.failure_class
-                from app.failure_classification import (  # noqa: PLC0415
+                from app.failure_classification import (
                     EXTERNAL_API_SUBTYPE_PROVIDER_MODEL_CONFIG,
                     persist_failure_category,
                 )
@@ -1698,7 +1723,7 @@ async def update_agent_status(
                             fallback_model = None
                             if provider_name and current_model:
                                 try:
-                                    from app.providers.registry import get_provider  # noqa: PLC0415
+                                    from app.providers.registry import get_provider
 
                                     fallback_model = get_provider(
                                         provider_name
@@ -1808,7 +1833,7 @@ async def update_agent_status(
                         # which added task.id to _terminated_task_ids, revoking the JWT.
                         # Since we're requeuing, drop the cache entry so the next
                         # provisioned VM can successfully claim.
-                        from app.routers.agent import _terminated_task_ids  # noqa: PLC0415
+                        from app.routers.agent import _terminated_task_ids
 
                         _terminated_task_ids.pop(str(task.id), None)
                         task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
@@ -1831,7 +1856,7 @@ async def update_agent_status(
                                 # Find user pool via the account that just failed
                                 user_pool = []
                                 if acct_id:
-                                    for uid, pool in _max_plan_pools.items():
+                                    for pool in _max_plan_pools.values():
                                         if any(a["id"] == acct_id for a in pool):
                                             user_pool = pool
                                             break
@@ -1973,7 +1998,7 @@ async def update_agent_status(
         # review re-executed on retry. The orchestrator-deleted marker is
         # recorded synchronously inside _ensure_vm_deleted before its first
         # await, so the reaper sees the orchestrator action immediately.
-        from app.main import fire_and_forget_vm_delete  # noqa: PLC0415
+        from app.main import fire_and_forget_vm_delete
 
         fire_and_forget_vm_delete(old_vm_id, reason="agent_completion")
 
@@ -2044,7 +2069,7 @@ async def update_agent_status(
                 #   session is poisoned upstream, let the commit raise;
                 #   the request retries cleanly with an idempotency guard.
                 task.status = TaskStatus.EVALUATING
-                from app.routers.agent import _terminated_task_ids  # noqa: PLC0415
+                from app.routers.agent import _terminated_task_ids
 
                 _terminated_task_ids.pop(str(task.id), None)
                 task.last_heartbeat = None
@@ -2270,7 +2295,7 @@ async def update_agent_status(
             # which added task.id to _terminated_task_ids, revoking the JWT.
             # Since we're retrying, drop the cache entry so the next
             # provisioned VM can successfully claim.
-            from app.routers.agent import _terminated_task_ids  # noqa: PLC0415
+            from app.routers.agent import _terminated_task_ids
 
             _terminated_task_ids.pop(str(task.id), None)
             task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
@@ -2376,7 +2401,7 @@ async def update_agent_status(
                                 f"[AGENT_STATUS] record_task_outcome failed for {_acct_id_outcome}: {_outcome_err}"
                             )
                 try:
-                    from app.main import _maybe_create_failure_alert  # noqa: PLC0415
+                    from app.main import _maybe_create_failure_alert
 
                     await _maybe_create_failure_alert(
                         task,
@@ -2571,7 +2596,7 @@ async def update_agent_status(
                 # Capture positive pattern for sampling-eligible first-attempt successes
                 if _ctx["_first_attempt_succeeded"] and _proj:
                     try:
-                        from app.playbook_learning import capture_success_pattern  # noqa: PLC0415
+                        from app.playbook_learning import capture_success_pattern
 
                         await capture_success_pattern(task, session)
                     except Exception as _sce:
@@ -2787,7 +2812,7 @@ async def update_agent_status(
                     _cb_alert_text,
                 )
                 try:
-                    from app.notification_dispatch import post_failure_alert_message  # noqa: PLC0415
+                    from app.notification_dispatch import post_failure_alert_message
 
                     await post_failure_alert_message(
                         session, task.project_id, _cb_alert_text, task.id
@@ -2836,7 +2861,7 @@ async def update_agent_status(
                     _cb_alert_text,
                 )
                 try:
-                    from app.notification_dispatch import post_failure_alert_message  # noqa: PLC0415
+                    from app.notification_dispatch import post_failure_alert_message
 
                     await post_failure_alert_message(
                         session, task.project_id, _cb_alert_text, task.id
@@ -2896,7 +2921,7 @@ async def update_agent_status(
 
         if payload.status == TaskStatus.COMPLETED:
             try:
-                from app.notification_dispatch import dispatch_external_notification  # noqa: PLC0415
+                from app.notification_dispatch import dispatch_external_notification
 
                 ctx = task.context or {}
                 first_payload = task.first_payload or {}
@@ -2906,7 +2931,7 @@ async def update_agent_status(
                     or first_payload.get("direction_text")
                     or ""
                 )
-                asyncio.ensure_future(
+                _completed_future = asyncio.ensure_future(
                     dispatch_external_notification(
                         task.project_id,
                         "TASK_COMPLETED",
@@ -2925,6 +2950,7 @@ async def update_agent_status(
                         },
                     )
                 )
+                del _completed_future  # fire-and-forget; stored to satisfy RUF006
             except Exception as _ne:
                 logger.warning(f"[NOTIFY] TASK_COMPLETED dispatch setup failed: {_ne}")
 
@@ -2983,10 +3009,8 @@ async def update_agent_status(
                 f"[PIPELINE] Early commit failed for {_task_id_str}: {early_exc}",
                 exc_info=True,
             )
-            try:
+            with contextlib.suppress(Exception):
                 await session.rollback()
-            except Exception:
-                pass
             raise
 
         # Pass a session factory bound to the SAME engine the request used.
@@ -3043,7 +3067,7 @@ async def update_agent_status(
                 reason = "post_commit_locked"
             else:
                 reason = "post_commit_error"
-            logger.error(
+            logger.error(  # noqa: TRY400 — conditional exc_info: suppress for expected timeout/lock, show for real errors
                 f"[PIPELINE] Post-commit {'timed out' if is_timeout else ('locked' if is_locked else 'failed')} for task {task.id}: {e}",
                 exc_info=not (is_timeout or is_locked),
             )

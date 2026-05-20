@@ -37,6 +37,7 @@ from app.payload_schemas import (
 )
 from app.routers.admin_analytics import ON_DEMAND_RATE, SPOT_RATE
 from app.compute import _capture_serial_for_vm, get_vm_zone, get_vm_status
+from app import release_qualifier, release_version
 
 
 def _estimated_cost_usd(task: Task) -> float | None:
@@ -2429,6 +2430,35 @@ async def trigger_self_audit(
         "project_id": str(project.id),
         "status": new_task.status,
     }
+
+
+@router.post("/projects/{project_id}/qualify")
+async def trigger_qualify(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Manually trigger the release qualifier for this project's open version.
+
+    Members and above can trigger qualification on demand (used during the
+    Phase 4 dry-run calibration window).  Resolves the current open
+    ``ReleaseVersion``, runs ``release_qualifier.run_qualification``, and
+    returns its result dict.  Returns 404 when there is no open version.
+    """
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+
+    open_version = await release_version.current_open_version(session, project_id)
+    if open_version is None:
+        raise HTTPException(
+            status_code=404,
+            detail="No open release version found for this project.",
+        )
+
+    result = await release_qualifier.run_qualification(session, project_id, open_version)
+    await session.commit()
+    return result
 
 
 @router.post("/projects/{project_id}/clear-wave-deps")

@@ -3721,3 +3721,270 @@ async def test_set_problem_model_ignores_invalid_version_phase_decision(
 
     await db_session.refresh(task)
     assert "_strategic_version_phase_decision" not in (task.context or {})
+
+
+# ── qualify_request transport (automain LTS Phase 3 / batch 3b) ──────────────
+
+
+@pytest.mark.asyncio
+async def test_qualify_request_flows_end_to_end(client, db_session, mocker):
+    """End-to-end: a qualify_request embedded in a set_problem_model call rides
+    task.context through to strategic completion and triggers the release
+    qualifier when the open ReleaseVersion is in the stabilize phase.
+
+    This is the seam Phase 3 batch 3b connects: the strategic agent embeds
+    qualify_request as a top-level sibling of the problem_model; the
+    /api/agent/strategic endpoint must lift it out (ProblemModel is
+    extra="forbid"), stash it on task.context, and the completion handler must
+    call release_qualifier.run_qualification on the open version. The test
+    exercises the REAL HTTP transport, not a mocked context write — the absence
+    of exactly this kind of end-to-end test let the version_phase_decision seam
+    silently break earlier.
+    """
+    from unittest.mock import AsyncMock
+    from app.auth import create_agent_token
+    from app.models import TaskStatus
+    from app.strategic_completion import _handle_strategic_completion
+    from app import release_version as rv
+    from app import strategic_cycle
+
+    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+    # The real qualifier resolves GitHub credentials and spawns child tasks.
+    # Stub it: the seam under test is "qualify_request reaches run_qualification",
+    # not the qualifier internals (those are tested in test_release_qualifier).
+    run_qualification = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new_callable=AsyncMock,
+        return_value={"status": "spawned"},
+    )
+
+    project = Project(
+        name="QR-E2E",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Open ReleaseVersion in the stabilize phase — qualification only runs from
+    # stabilize, so the version must be flipped there first.
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    rv.set_version_phase(version, "stabilize", reasoning="hardening")
+    db_session.add(version)
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    await db_session.commit()
+    await db_session.refresh(version)
+    assert version.phase == "stabilize"
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="vm-qr-e2e",
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={"strategic_cycle_id": cycle.id},
+        strategic_cycle_id=cycle.id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id), "vm-qr-e2e", task_type="strategic_review"
+    )
+
+    # The agent embeds qualify_request as a TOP-LEVEL SIBLING of the
+    # problem_model fields — exactly what the research-plan executor prompt
+    # instructs. The endpoint must strip it before ProblemModel validation.
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "set_problem_model",
+            "data": {
+                "intent": {"purpose": "Ship the thing", "current_focus": "qualify"},
+                "capabilities": [],
+                "gaps": [],
+                "qualify_request": {
+                    "reason": "Hardening is sufficient; the version is release-ready.",
+                },
+            },
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["op"] == "set_problem_model"
+    assert body["qualify_request_received"] is True
+
+    # The transient signal must NOT linger in the stored problem_model.
+    await db_session.refresh(project)
+    assert "qualify_request" not in (project.problem_model or {})
+    assert (project.problem_model or {}).get("intent", {}).get("purpose") == (
+        "Ship the thing"
+    )
+
+    # It rides task.context to the completion handler.
+    await db_session.refresh(task)
+    stored = (task.context or {}).get("_strategic_qualify_request")
+    assert stored == {
+        "reason": "Hardening is sufficient; the version is release-ready.",
+    }
+
+    # The qualifier has not run yet — only set_problem_model has been called.
+    run_qualification.assert_not_called()
+
+    # Completion handler's API path triggers qualification on the open version.
+    await _handle_strategic_completion(task, "", db_session)
+
+    run_qualification.assert_awaited_once()
+    call_args = run_qualification.await_args.args
+    # run_qualification(session, project_id, version)
+    assert call_args[0] is db_session
+    assert call_args[1] == project.id
+    assert call_args[2].id == version.id
+
+
+@pytest.mark.asyncio
+async def test_qualify_request_skipped_when_version_not_in_stabilize(
+    client, db_session, mocker
+):
+    """A qualify_request is dropped (qualifier not run) when the open version is
+    still in the build phase — qualification only runs from stabilize.
+
+    The transport still works (the field is stripped + stashed), but the
+    completion handler's phase gate blocks run_qualification.
+    """
+    from unittest.mock import AsyncMock
+    from app.auth import create_agent_token
+    from app.models import TaskStatus
+    from app.strategic_completion import _handle_strategic_completion
+    from app import release_version as rv
+    from app import strategic_cycle
+
+    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+    run_qualification = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new_callable=AsyncMock,
+        return_value={"status": "spawned"},
+    )
+
+    project = Project(
+        name="QR-BUILD",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Open ReleaseVersion left in the default build phase.
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    await db_session.commit()
+    await db_session.refresh(version)
+    assert version.phase == "build"
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="vm-qr-build",
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={"strategic_cycle_id": cycle.id},
+        strategic_cycle_id=cycle.id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id), "vm-qr-build", task_type="strategic_review"
+    )
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "set_problem_model",
+            "data": {
+                "intent": {"purpose": "Build"},
+                "qualify_request": {"reason": "premature ask"},
+            },
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+    # The transport works — the field is received and stashed.
+    assert resp.json()["qualify_request_received"] is True
+    await db_session.refresh(task)
+    assert (task.context or {}).get("_strategic_qualify_request") == {
+        "reason": "premature ask"
+    }
+
+    # But the completion handler's stabilize gate blocks the qualifier.
+    await _handle_strategic_completion(task, "", db_session)
+    run_qualification.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_set_problem_model_with_qualify_request_does_not_400(
+    client, db_session
+):
+    """Embedding qualify_request in set_problem_model must not break the
+    problem_model write itself.
+
+    ProblemModel is extra="forbid"; an unstripped sibling key would reach
+    apply_agent_update and 400 the whole call. The endpoint must strip it first
+    so the revision still bumps.
+    """
+    from app.auth import create_agent_token
+    from app.models import TaskStatus
+
+    project = Project(
+        name="QR-NO400",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="vm-qr-no400",
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id), "vm-qr-no400", task_type="strategic_review"
+    )
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "set_problem_model",
+            "data": {
+                "intent": {"purpose": "Build"},
+                "qualify_request": {"reason": "ready"},
+            },
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    # problem_model write succeeded: revision bumped off the empty baseline.
+    assert body["revision"] == 1
+    assert body["qualify_request_received"] is True
