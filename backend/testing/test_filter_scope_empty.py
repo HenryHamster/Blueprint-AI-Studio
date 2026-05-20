@@ -9,7 +9,9 @@ from app.orchestrator_filters import filter_scope_empty
 from testing.factories import make_task
 
 
-def _task(project_id, parent_id, status, files=None, auto_decomposed=True):
+def _task(
+    project_id, parent_id, status, files=None, auto_decomposed=True, ptype="create"
+):
     ctx = {"related_files": files or []}
     if auto_decomposed:
         ctx["auto_decomposed"] = True
@@ -18,7 +20,7 @@ def _task(project_id, parent_id, status, files=None, auto_decomposed=True):
         parent_task_id=parent_id,
         status=status,
         context=ctx,
-        payloads=[{"type": "create"}],
+        payloads=[{"type": ptype}],
     )
 
 
@@ -53,6 +55,34 @@ class TestFilterScopeEmpty:
         assert "SCOPE_EMPTY" in (candidate.latest_status_message or "")
         assert (candidate.context or {}).get("failure_category") == "SCOPE_EMPTY"
         broadcast.assert_awaited_once()
+
+    @pytest.mark.parametrize("ptype", ["review", "fix", "plan"])
+    @pytest.mark.asyncio
+    async def test_non_cluster_task_types_not_pre_empted(self, ptype):
+        """Regression (2026-05-09 SCOPE_EMPTY loop): review/fix/plan tasks
+        inherit ``auto_decomposed`` from the create-task they descend from, but
+        a sibling cluster covering the same files does not make their work
+        redundant. Pre-empting a review stranded PR #4717 and spawned 795
+        respawned review tasks in 9.5h — only the implementation task is
+        pre-emptible."""
+        pid = uuid.uuid4()
+        parent_id = uuid.uuid4()
+        files = ["backend/app/foo.py"]
+        sibling = _task(pid, parent_id, TaskStatus.COMPLETED, files=files)
+        candidate = _task(
+            pid, parent_id, TaskStatus.QUEUED, files=files, ptype=ptype
+        )
+
+        session = _mock_session([sibling])
+        broadcast = AsyncMock()
+
+        result = await filter_scope_empty(
+            [candidate.id], [candidate], session, broadcast
+        )
+
+        assert result == [candidate.id], f"{ptype} task must not be pre-empted"
+        assert candidate.status == TaskStatus.QUEUED
+        broadcast.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_passes_through_when_not_fully_covered(self):
