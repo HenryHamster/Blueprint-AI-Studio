@@ -3547,6 +3547,38 @@ async def _process_post_commit(
                                                     f"[SMOKETEST] Failed to spawn smoketest after rollup merge: {e}",
                                                     exc_info=True,
                                                 )
+                                        # Back-merge: when a HOTFIX merges to main, open a
+                                        # main -> automain PR so the branches don't diverge.
+                                        # A hotfix is a `plan` task with base_branch="main" and
+                                        # hotfix:true in its payload.  A missed back-merge makes
+                                        # the next automain -> main promotion conflict.
+                                        # (automain/LTS plan Phase 5)
+                                        if (
+                                            is_rollup_merge
+                                            and base_branch == "main"
+                                            and bool(
+                                                orig.first_payload.get("hotfix")
+                                            )
+                                        ):
+                                            try:
+                                                from app import hotfix_backmerge
+
+                                                _merged_pr_url = (
+                                                    f"https://github.com/{owner}/{repo}/pull/{pr_number}"
+                                                    if owner and repo and pr_number
+                                                    else ""
+                                                )
+                                                await hotfix_backmerge.open_backmerge_pr(
+                                                    session,
+                                                    task.project_id,
+                                                    merged_pr_url=_merged_pr_url,
+                                                    hotfix_task_id=orig.id,
+                                                )
+                                            except Exception as _bm_exc:
+                                                logger.warning(
+                                                    f"[HOTFIX_BACKMERGE] Back-merge trigger failed for hotfix task {orig.id}: {_bm_exc!r}",
+                                                    exc_info=True,
+                                                )
                                         # Spawn security rescan if merged task's parent was a security_audit
                                         if orig.parent_task_id:
                                             try:
