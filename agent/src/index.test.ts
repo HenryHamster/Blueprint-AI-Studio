@@ -69,7 +69,7 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
-import { strVal, sanitize, validateBranchName, readHandlerOutput, runProjectLintChecks, testFixLoop, lintFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, isViewportBootstrapFailure, runViewportSuiteWithFallback, fetchVmImageIdentity, type FailureCategory } from './index.js';
+import { strVal, sanitize, validateBranchName, readHandlerOutput, runProjectLintChecks, testFixLoop, lintFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, isViewportBootstrapFailure, runViewportSuiteWithFallback, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, type FailureCategory } from './index.js';
 import { clearPidRegistry, _getRegisteredPids } from './processTracking.js';
 import {
   drainFixLoopEventBuffer,
@@ -3469,5 +3469,54 @@ describe('fetchVmImageIdentity', () => {
     const result = await fetchVmImageIdentity();
     expect(result.image_name).toBe('blueprint-agent-v2');
     expect(result.image_ts).toBeNull();
+  });
+});
+
+// ── Per-task LLM telemetry (efficiency direction d-91d8dede) ────────────────
+describe('LLM telemetry counters', () => {
+  beforeEach(() => {
+    resetLlmTelemetry();
+  });
+
+  it('starts at zero', () => {
+    expect(getLlmTelemetry()).toEqual({
+      llm_call_count: 0,
+      total_input_tokens: 0,
+      total_output_tokens: 0,
+    });
+  });
+
+  it('counts CLI invocations and accumulates tokens across calls', () => {
+    recordLlmCallStart();
+    recordLlmTokens(100, 50);
+    recordLlmCallStart();
+    recordLlmTokens(200, 75);
+    expect(getLlmTelemetry()).toEqual({
+      llm_call_count: 2,
+      total_input_tokens: 300,
+      total_output_tokens: 125,
+    });
+  });
+
+  it('ignores non-finite or negative token counts', () => {
+    recordLlmTokens(Number.NaN, 50);
+    recordLlmTokens(-5, -10);
+    recordLlmTokens(100, Number.POSITIVE_INFINITY);
+    expect(getLlmTelemetry()).toEqual({
+      llm_call_count: 0,
+      total_input_tokens: 100,
+      total_output_tokens: 50,
+    });
+  });
+
+  it('resets between roles so warm-VM continuity does not leak counts', () => {
+    recordLlmCallStart();
+    recordLlmTokens(500, 250);
+    resetLlmTelemetry();
+    expect(getLlmTelemetry()).toEqual({
+      llm_call_count: 0,
+      total_input_tokens: 0,
+      total_output_tokens: 0,
+    });
   });
 });

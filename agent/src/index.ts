@@ -1101,6 +1101,7 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
         tool_trace: snapshotToolTrace(),
         ...(fix_loop_events.length > 0 ? { fix_loop_events } : {}),
         ...(currentPromptFingerprint ? { prompt_fingerprint: currentPromptFingerprint } : {}),
+        ...getLlmTelemetry(),
       }, HEARTBEAT_API_MAX_RETRIES, HEARTBEAT_API_TIMEOUT);
       traceHeartbeat('initial', start, Date.now(), 'ok');
     } catch (e) {
@@ -1144,6 +1145,7 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
         tool_trace: snapshotToolTrace(),
         ...(fix_loop_events.length > 0 ? { fix_loop_events } : {}),
         ...(currentPromptFingerprint ? { prompt_fingerprint: currentPromptFingerprint } : {}),
+        ...getLlmTelemetry(),
       }, HEARTBEAT_API_MAX_RETRIES, HEARTBEAT_API_TIMEOUT);
       traceHeartbeat('periodic', start, Date.now(), 'ok');
     } catch (e: unknown) {
@@ -1171,6 +1173,7 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
               metrics: retryMetrics,
               tool_trace: snapshotToolTrace(),
               ...(currentPromptFingerprint ? { prompt_fingerprint: currentPromptFingerprint } : {}),
+              ...getLlmTelemetry(),
             }, HEARTBEAT_API_MAX_RETRIES, HEARTBEAT_API_TIMEOUT);
             log('Heartbeat retry succeeded');
             traceHeartbeat('retry-409', retryStart, Date.now(), 'ok');
@@ -1225,6 +1228,7 @@ export function sendHeartbeatSync(
       task_id: taskId,
       status_message: `[${metrics.heap_used_mb}MB] ${statusMessage}`,
       metrics,
+      ...getLlmTelemetry(),
       ...(extras || {}),
     });
     execFileSync('curl', [
@@ -1958,6 +1962,51 @@ export function setCurrentPromptFingerprint(fp: string): void {
 
 export function getCurrentPromptFingerprint(): string | null {
   return currentPromptFingerprint;
+}
+
+// ── Per-task LLM telemetry (efficiency direction d-91d8dede) ─────────────────
+// Cumulative counters posted on every heartbeat / terminal status. Bumped by
+// the LLM CLI runner (one increment per spawn) and by the stream-json result
+// parser (token totals). Reset between roles so warm-VM continuity does not
+// double-count prior roles' usage. Tokens accumulate across all turns within
+// a single CLI invocation; llm_call_count counts CLI invocations.
+let _llmCallCount = 0;
+let _totalInputTokens = 0;
+let _totalOutputTokens = 0;
+
+/** Increment the per-task LLM call counter (one per CLI invocation). */
+export function recordLlmCallStart(): void {
+  _llmCallCount += 1;
+}
+
+/** Add the input/output token totals reported by a single CLI result event. */
+export function recordLlmTokens(inputTokens: number, outputTokens: number): void {
+  if (Number.isFinite(inputTokens) && inputTokens > 0) {
+    _totalInputTokens += Math.floor(inputTokens);
+  }
+  if (Number.isFinite(outputTokens) && outputTokens > 0) {
+    _totalOutputTokens += Math.floor(outputTokens);
+  }
+}
+
+/** Snapshot the current cumulative LLM telemetry for heartbeat / status posts. */
+export function getLlmTelemetry(): {
+  llm_call_count: number;
+  total_input_tokens: number;
+  total_output_tokens: number;
+} {
+  return {
+    llm_call_count: _llmCallCount,
+    total_input_tokens: _totalInputTokens,
+    total_output_tokens: _totalOutputTokens,
+  };
+}
+
+/** Reset between roles so per-task counters don't bleed across warm-VM continuity. */
+export function resetLlmTelemetry(): void {
+  _llmCallCount = 0;
+  _totalInputTokens = 0;
+  _totalOutputTokens = 0;
 }
 
 // ── Divergence detection helpers ─────────────────────────────────────────────
@@ -3376,6 +3425,10 @@ echo ""
       detached: true,
       stdio: [runCommand.promptInput === 'stdin' ? 'pipe' : (promptFd ?? 'ignore'), 'pipe', 'pipe'],
     });
+    // Per-task LLM telemetry (efficiency direction d-91d8dede): one CLI
+    // invocation = one llm_call_count tick. Token totals are added when the
+    // runner emits a `result` event with a usage block.
+    recordLlmCallStart();
     // Phase 1: register the child's PID so the reset routine can SIGKILL
     // it between roles if it lingers. Unregistered on close. We track the
     // leader PID; the timeout path already kills the whole process group
@@ -3595,6 +3648,21 @@ echo ""
             } else if (objType === 'result') {
               lastResultText = (obj as { result?: string }).result ?? '';
               sendLog(ws, `\n--- Result ---\n${lastResultText}\n`);
+              // Per-task token telemetry (efficiency direction d-91d8dede).
+              // Claude stream-json result events carry a `usage` block with
+              // input_tokens / output_tokens (cache hit/creation tokens
+              // optional). Sum cache tokens into input so the heartbeat
+              // counter reflects total tokens billed against the account.
+              const usage = (obj as { usage?: Record<string, unknown> }).usage;
+              if (usage && typeof usage === 'object') {
+                const inputTokens = (
+                  Number(usage.input_tokens ?? 0)
+                  + Number(usage.cache_creation_input_tokens ?? 0)
+                  + Number(usage.cache_read_input_tokens ?? 0)
+                );
+                const outputTokens = Number(usage.output_tokens ?? 0);
+                recordLlmTokens(inputTokens, outputTokens);
+              }
               // Arm the post-result grace timer so a hung subprocess doesn't
               // burn the wall-clock budget. Only set it once — extra result
               // events (defensive — Claude Code shouldn't emit multiple) don't
@@ -3757,6 +3825,19 @@ echo ""
               statusRef.value = 'Codex thinking';
             } else if (eventType === 'turn.completed') {
               sendLog(ws, '[codex] turn.completed\n');
+              // Codex turn.completed may carry a usage block analogous to
+              // Claude's result-event usage. Best-effort — older Codex
+              // versions omit it, in which case the counter stays put.
+              const usage = obj.usage as Record<string, unknown> | undefined;
+              if (usage && typeof usage === 'object') {
+                const inputTokens = (
+                  Number(usage.input_tokens ?? 0)
+                  + Number(usage.cache_creation_input_tokens ?? 0)
+                  + Number(usage.cache_read_input_tokens ?? 0)
+                );
+                const outputTokens = Number(usage.output_tokens ?? 0);
+                recordLlmTokens(inputTokens, outputTokens);
+              }
             } else if (eventType === 'turn.failed') {
               const err = (obj.error as { message?: string } | undefined)?.message ?? '';
               const oneLine = `[codex] turn.failed: ${err}\n`;
@@ -4197,6 +4278,10 @@ async function main() {
       // without a reset, the next role's synthesized iterations continue
       // numbering from the prior role and carry a stale started_at.
       resetCheckSynthesizerState();
+      // Per-task LLM telemetry must reset too (efficiency direction
+      // d-91d8dede) — without this, warm-VM continuity rolls the prior
+      // role's call/token totals into the next task's heartbeat payload.
+      resetLlmTelemetry();
     }
   } finally {
     // Workspace teardown happens once at process exit, not per-role —

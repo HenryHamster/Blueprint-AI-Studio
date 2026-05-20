@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { render, screen } from '@testing-library/react';
-import { LayersAffectedBadges, LayerMismatchBadge, type LayerSummary } from './LayersAffectedBadges';
+import { LayersAffectedBadges, LayerDefenseCountsBadge, LayerMismatchBadge, UntargetedLayersBadge, type LayerSummary } from './LayersAffectedBadges';
 
 const summary = (overrides: Partial<LayerSummary> = {}): LayerSummary => ({
   cross_layer: false,
@@ -94,6 +94,79 @@ describe('LayersAffectedBadges', () => {
       />,
     );
     expect(screen.getByTestId('layer-badge-UNKNOWN_LAYER')).toHaveTextContent('UNKNOWN_LAYER · 1');
+  });
+});
+
+describe('UntargetedLayersBadge', () => {
+  it('renders nothing when untargeted_layers is null or undefined', () => {
+    const { container } = render(<UntargetedLayersBadge untargeted_layers={null} />);
+    expect(container.firstChild).toBeNull();
+    const undef = render(<UntargetedLayersBadge />);
+    expect(undef.container.firstChild).toBeNull();
+  });
+
+  it('renders nothing when all canonical layers are untargeted (no fix history)', () => {
+    const allLayers = ['CI_WORKFLOW', 'AGENT_VM', 'AGENT_VERB', 'BASELINE_GATE', 'REVIEWER_PASS'];
+    const { container } = render(<UntargetedLayersBadge untargeted_layers={allLayers} />);
+    expect(container.firstChild).toBeNull();
+  });
+
+  it('renders nothing when untargeted_layers is empty (full coverage)', () => {
+    const { container } = render(<UntargetedLayersBadge untargeted_layers={[]} />);
+    expect(container.firstChild).toBeNull();
+  });
+
+  it('renders badge with short labels when some layers are untargeted', () => {
+    render(<UntargetedLayersBadge untargeted_layers={['AGENT_VM', 'REVIEWER_PASS']} />);
+    const badge = screen.getByTestId('untargeted-layers-badge');
+    expect(badge).toHaveTextContent('never defended in: VM, REVIEWER');
+    expect(badge.getAttribute('title')).toBe('Layers no prior fix has targeted: AGENT_VM, REVIEWER_PASS');
+  });
+
+  it('uses full layer name for unrecognized layers', () => {
+    render(<UntargetedLayersBadge untargeted_layers={['CUSTOM_LAYER', 'AGENT_VM']} />);
+    const badge = screen.getByTestId('untargeted-layers-badge');
+    expect(badge).toHaveTextContent('never defended in: CUSTOM_LAYER, VM');
+  });
+});
+
+describe('LayerDefenseCountsBadge', () => {
+  it('renders nothing when layer_defense_counts is null or undefined', () => {
+    const { container } = render(<LayerDefenseCountsBadge />);
+    expect(container.firstChild).toBeNull();
+    const n = render(<LayerDefenseCountsBadge layer_defense_counts={null} />);
+    expect(n.container.firstChild).toBeNull();
+  });
+
+  it('renders nothing when all canonical layer counts are zero', () => {
+    const { container } = render(
+      <LayerDefenseCountsBadge
+        layer_defense_counts={{ CI_WORKFLOW: 0, AGENT_VM: 0, AGENT_VERB: 0, BASELINE_GATE: 0, REVIEWER_PASS: 0, VIEWPORT: 0 }}
+      />,
+    );
+    expect(container.firstChild).toBeNull();
+  });
+
+  it('shows only defended layers with short label and count', () => {
+    render(
+      <LayerDefenseCountsBadge
+        layer_defense_counts={{ CI_WORKFLOW: 3, AGENT_VM: 0, AGENT_VERB: 1, BASELINE_GATE: 0, REVIEWER_PASS: 0, VIEWPORT: 0 }}
+      />,
+    );
+    const badge = screen.getByTestId('layer-defense-counts-badge');
+    expect(badge).toHaveTextContent('defended: CI×3, VERB×1');
+  });
+
+  it('includes all canonical layers in tooltip regardless of count', () => {
+    render(
+      <LayerDefenseCountsBadge
+        layer_defense_counts={{ CI_WORKFLOW: 2, AGENT_VM: 0, AGENT_VERB: 0, BASELINE_GATE: 0, REVIEWER_PASS: 0, VIEWPORT: 1 }}
+      />,
+    );
+    const badge = screen.getByTestId('layer-defense-counts-badge');
+    expect(badge.getAttribute('title')).toContain('CI_WORKFLOW:2');
+    expect(badge.getAttribute('title')).toContain('VIEWPORT:1');
+    expect(badge.getAttribute('title')).toContain('AGENT_VM:0');
   });
 });
 

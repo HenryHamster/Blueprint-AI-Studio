@@ -1,0 +1,183 @@
+"""Unit tests for filter_scope_empty in orchestrator_filters."""
+
+import uuid
+import pytest
+from unittest.mock import AsyncMock, MagicMock
+
+from app.models import TaskStatus
+from app.orchestrator_filters import filter_scope_empty
+from testing.factories import make_task
+
+
+def _task(project_id, parent_id, status, files=None, auto_decomposed=True):
+    ctx = {"related_files": files or []}
+    if auto_decomposed:
+        ctx["auto_decomposed"] = True
+    return make_task(
+        project_id=project_id,
+        parent_task_id=parent_id,
+        status=status,
+        context=ctx,
+        payloads=[{"type": "create"}],
+    )
+
+
+def _mock_session(completed_siblings):
+    session = MagicMock()
+    result = MagicMock()
+    scalars = MagicMock()
+    scalars.all.return_value = completed_siblings
+    result.scalars.return_value = scalars
+    session.execute = AsyncMock(return_value=result)
+    return session
+
+
+class TestFilterScopeEmpty:
+    @pytest.mark.asyncio
+    async def test_pre_empts_when_all_files_covered(self):
+        pid = uuid.uuid4()
+        parent_id = uuid.uuid4()
+        files = ["backend/app/foo.py"]
+        sibling = _task(pid, parent_id, TaskStatus.COMPLETED, files=files)
+        candidate = _task(pid, parent_id, TaskStatus.QUEUED, files=files)
+
+        session = _mock_session([sibling])
+        broadcast = AsyncMock()
+
+        result = await filter_scope_empty(
+            [candidate.id], [candidate], session, broadcast
+        )
+
+        assert result == []
+        assert candidate.status == TaskStatus.FAILED
+        assert "SCOPE_EMPTY" in (candidate.latest_status_message or "")
+        assert (candidate.context or {}).get("failure_category") == "SCOPE_EMPTY"
+        broadcast.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_passes_through_when_not_fully_covered(self):
+        pid = uuid.uuid4()
+        parent_id = uuid.uuid4()
+        sibling = _task(
+            pid, parent_id, TaskStatus.COMPLETED, files=["backend/app/foo.py"]
+        )
+        candidate = _task(
+            pid,
+            parent_id,
+            TaskStatus.QUEUED,
+            files=["backend/app/foo.py", "backend/app/bar.py"],
+        )
+
+        session = _mock_session([sibling])
+        broadcast = AsyncMock()
+
+        result = await filter_scope_empty(
+            [candidate.id], [candidate], session, broadcast
+        )
+
+        assert result == [candidate.id]
+        assert candidate.status == TaskStatus.QUEUED
+        broadcast.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_completed_siblings_passes_through(self):
+        pid = uuid.uuid4()
+        parent_id = uuid.uuid4()
+        candidate = _task(
+            pid, parent_id, TaskStatus.QUEUED, files=["backend/app/foo.py"]
+        )
+
+        session = _mock_session([])
+        broadcast = AsyncMock()
+
+        result = await filter_scope_empty(
+            [candidate.id], [candidate], session, broadcast
+        )
+
+        assert result == [candidate.id]
+
+    @pytest.mark.asyncio
+    async def test_non_auto_decomposed_not_checked(self):
+        pid = uuid.uuid4()
+        parent_id = uuid.uuid4()
+        sibling = _task(
+            pid, parent_id, TaskStatus.COMPLETED, files=["backend/app/foo.py"]
+        )
+        candidate = _task(
+            pid,
+            parent_id,
+            TaskStatus.QUEUED,
+            files=["backend/app/foo.py"],
+            auto_decomposed=False,
+        )
+
+        session = _mock_session([sibling])
+        broadcast = AsyncMock()
+
+        result = await filter_scope_empty(
+            [candidate.id], [candidate], session, broadcast
+        )
+
+        # No DB query should happen for non-auto-decomposed tasks
+        assert result == [candidate.id]
+        session.execute.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_task_without_parent_not_checked(self):
+        pid = uuid.uuid4()
+        candidate = make_task(
+            project_id=pid,
+            status=TaskStatus.QUEUED,
+            context={"auto_decomposed": True, "related_files": ["backend/app/foo.py"]},
+            payloads=[{"type": "create"}],
+        )
+        # parent_task_id is None (not set)
+
+        session = _mock_session([])
+        broadcast = AsyncMock()
+
+        result = await filter_scope_empty(
+            [candidate.id], [candidate], session, broadcast
+        )
+
+        assert result == [candidate.id]
+        session.execute.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_test_files_excluded_from_overlap_check(self):
+        pid = uuid.uuid4()
+        parent_id = uuid.uuid4()
+        # Sibling covers only a test file; prod file not covered
+        sibling = _task(
+            pid,
+            parent_id,
+            TaskStatus.COMPLETED,
+            files=["backend/testing/test_foo.py"],
+        )
+        candidate = _task(
+            pid,
+            parent_id,
+            TaskStatus.QUEUED,
+            files=["backend/app/foo.py"],
+        )
+
+        session = _mock_session([sibling])
+        broadcast = AsyncMock()
+
+        result = await filter_scope_empty(
+            [candidate.id], [candidate], session, broadcast
+        )
+
+        # test files excluded → candidate's prod file not covered → passes through
+        assert result == [candidate.id]
+        assert candidate.status == TaskStatus.QUEUED
+
+    @pytest.mark.asyncio
+    async def test_empty_eligible_ids_returns_empty(self):
+        session = _mock_session([])
+        broadcast = AsyncMock()
+
+        result = await filter_scope_empty([], [], session, broadcast)
+
+        assert result == []
+        session.execute.assert_not_called()

@@ -15,25 +15,49 @@ vi.mock('recharts', () => ({
 }));
 
 vi.mock('../api', () => ({
+  CANONICAL_LAYER_NAMES: ['CI_WORKFLOW', 'AGENT_VM', 'AGENT_VERB', 'BASELINE_GATE', 'REVIEWER_PASS', 'VIEWPORT'] as const,
+  fetchCanonicalRegressionLayers: vi.fn(async () => ({ layers: [] })),
   apiFetch: vi.fn(async (url: string) => {
     if (url.includes('regression-dispatcher/health')) {
       return new Response(JSON.stringify({
-        cycles_last_24h: 47,
-        signals_tripped_last_24h: 12,
-        spawns_last_24h: 4,
-        cooldown_blocks_last_24h: 8,
-        cap_blocks_last_24h: 0,
-        classes: [
+        window_hours: 24,
+        aggregate: {
+          cycles: 47,
+          signals_evaluated: 50,
+          signals_tripped: 12,
+          spawns: 4,
+          mttd_p50_sec: 150.5,
+          recoveries: {
+            marginal: 2,
+            confirmed: 3,
+          },
+          rejections: {
+            cooldown: 8,
+            dedup: 1,
+            system_cap: 0,
+            manual_intervention_suppressed: 0,
+          },
+        },
+        spawns_sparkline: Array.from({ length: 24 }, (_, i) => ({
+          hour_start: new Date(Date.now() - (23 - i) * 3600_000).toISOString(),
+          spawns: Math.floor(Math.random() * 5),
+          cycles: Math.floor(Math.random() * 10),
+        })),
+        per_class: [
           {
+            project_id: 'project-123',
             regression_class: 'sr_regression_pipeline_success_rate',
-            last_spawn_at: new Date(Date.now() - 3600_000).toISOString(),
-            last_rejection_reason: null,
+            status: 'ACTIVE',
+            last_seen_at: new Date(Date.now() - 3600_000).toISOString(),
+            attempts: 2,
             in_cooldown_until: new Date(Date.now() + 3600_000).toISOString(),
           },
           {
+            project_id: 'project-123',
             regression_class: 'sr_regression_first_attempt_success',
-            last_spawn_at: new Date(Date.now() - 7200_000).toISOString(),
-            last_rejection_reason: 'cooldown',
+            status: 'ACTIVE',
+            last_seen_at: new Date(Date.now() - 7200_000).toISOString(),
+            attempts: 1,
             in_cooldown_until: null,
           },
         ],
@@ -89,6 +113,7 @@ vi.mock('../api', () => ({
       return new Response(JSON.stringify({
         by_reason: {
           escalated_cross_layer: { merged_count: 3, retripped_within_30d_count: 1, durable_resolution_rate: 0.67, median_hold_days: 12.5, in_flight_excluded_count: 0 },
+          compliance_followup: { merged_count: 2, retripped_within_30d_count: 0, durable_resolution_rate: 1.0, median_hold_days: 18.3, in_flight_excluded_count: 0, prevention_rate_30d: 0.85 },
           escalated_layer_concentration: { merged_count: 2, retripped_within_30d_count: 0, durable_resolution_rate: 1.0, median_hold_days: 8.0, in_flight_excluded_count: 0 },
           escalated_cross_case_fingerprint: { merged_count: 1, retripped_within_30d_count: 0, durable_resolution_rate: 1.0, median_hold_days: null, in_flight_excluded_count: 0 },
           escalated_recurrence: { merged_count: 0, retripped_within_30d_count: 0, durable_resolution_rate: null, median_hold_days: null, in_flight_excluded_count: 1 },
@@ -150,12 +175,30 @@ describe('DispatcherHealthPanel — viewport regression', () => {
     const { apiFetch } = await import('../api');
     vi.mocked(apiFetch).mockResolvedValueOnce(
       new Response(JSON.stringify({
-        cycles_last_24h: 0,
-        signals_tripped_last_24h: 0,
-        spawns_last_24h: 0,
-        cooldown_blocks_last_24h: 0,
-        cap_blocks_last_24h: 0,
-        classes: [],
+        window_hours: 24,
+        aggregate: {
+          cycles: 0,
+          signals_evaluated: 0,
+          signals_tripped: 0,
+          spawns: 0,
+          mttd_p50_sec: null,
+          recoveries: {
+            marginal: 0,
+            confirmed: 0,
+          },
+          rejections: {
+            cooldown: 0,
+            dedup: 0,
+            system_cap: 0,
+            manual_intervention_suppressed: 0,
+          },
+        },
+        spawns_sparkline: Array.from({ length: 24 }, (_, i) => ({
+          hour_start: new Date(Date.now() - (23 - i) * 3600_000).toISOString(),
+          spawns: 0,
+          cycles: 0,
+        })),
+        per_class: [],
       }), { status: 200 })
     );
     await expectNoOverflowAt(375, async () => {
@@ -340,5 +383,37 @@ describe('EscalationOutcomePanel — viewport regression', () => {
     await act(async () => { await new Promise((resolve) => setTimeout(resolve, 50)); });
     const panel = host.querySelector('[data-testid="escalation-outcome-panel"]');
     if (panel) throw new Error('panel should not render when all merged_count are zero');
+  });
+});
+
+describe('ManualInterventionPanel — viewport_regression baseline disclosure', () => {
+  let root: Root | null = null;
+  let host: HTMLDivElement | null = null;
+  afterEach(() => { if (root) act(() => root?.unmount()); root = null; host?.remove(); host = null; });
+  test('renders viewport_regression case with baseline disclosure without overflow at 375px', async () => {
+    const { apiFetch } = await import('../api');
+    vi.mocked(apiFetch).mockImplementation(async (url: string) => {
+      if (url.includes('/manual-intervention')) {
+        return new Response(JSON.stringify({ cases: [{
+          id: 'vp-case-1', regression_class: 'viewport_regression:MessagesPanel@375',
+          signal_name: 'viewport_regression', status: 'NEEDS_ATTENTION', attempts: 2,
+          last_remediation_pr_number: null, last_failure_class: null,
+          signal_snapshot_at_spawn: null, signal_snapshot_at_merge: null,
+          fingerprint_to_fix_log: [],
+          last_seen_at: '2026-05-09T10:00:00Z', needs_manual_intervention_at: '2026-05-09T10:00:00Z',
+          first_seen_at: '2026-05-09T09:00:00Z', signal_first_crossed_at: '2026-05-09T09:00:00Z',
+          time_to_detect_sec: 3600,
+        }] }), { status: 200 });
+      }
+      return new Response('{}', { status: 404 });
+    });
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      root = createRoot(host);
+      await act(async () => { root?.render(<ManualInterventionPanel projectId="project-123" />); });
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 50)); });
+    });
   });
 });

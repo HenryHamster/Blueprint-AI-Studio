@@ -1,7 +1,7 @@
 """Layer classifier for pipeline regression symptoms.
 
 Pure-function module — no DB, no session, no side effects.
-Returns a subset of the five canonical layer tags based on fingerprint
+Returns a subset of the six canonical layer tags based on fingerprint
 heuristics applied to failure_class, message text, and optional stage name.
 
 Layer tags:
@@ -10,11 +10,13 @@ Layer tags:
   AGENT_VERB    — agent/src/handlers/ (what gates fire, scope enforcement)
   BASELINE_GATE — lint/test/typecheck baselines, scope rules, strictness
   REVIEWER_PASS — fresh-reviewer pass, build-gate disagreement detection
+  VIEWPORT      — client-rendering / 375px viewport regressions in admin-ui components
 """
 
 from __future__ import annotations
 
 import re
+from typing import Any
 
 # ---------------------------------------------------------------------------
 # Canonical layer tags
@@ -25,6 +27,7 @@ LAYER_AGENT_VM = "AGENT_VM"
 LAYER_AGENT_VERB = "AGENT_VERB"
 LAYER_BASELINE_GATE = "BASELINE_GATE"
 LAYER_REVIEWER_PASS = "REVIEWER_PASS"
+LAYER_VIEWPORT = "VIEWPORT"
 
 ALL_LAYERS: frozenset[str] = frozenset(
     [
@@ -33,6 +36,7 @@ ALL_LAYERS: frozenset[str] = frozenset(
         LAYER_AGENT_VERB,
         LAYER_BASELINE_GATE,
         LAYER_REVIEWER_PASS,
+        LAYER_VIEWPORT,
     ]
 )
 
@@ -115,6 +119,13 @@ _BASELINE_GATE_PATTERNS: list[re.Pattern] = [
     # Broad lint failures that cascade beyond the changed files
     re.compile(r"(ruff|mypy|eslint).*E\d{3,}", re.IGNORECASE),
     re.compile(r"module.size.limit", re.IGNORECASE),
+    # Viewport regression gate — viewport.test.tsx failures and coverage drops
+    re.compile(r"viewport.*test.*\.tsx", re.IGNORECASE),
+    re.compile(r"expect(?:NoOverflow|MinTouchTarget)At", re.IGNORECASE),
+    re.compile(
+        r"viewport.{0,30}(?:overflow|regression|baseline|coverage)", re.IGNORECASE
+    ),
+    re.compile(r"check-viewport\.sh", re.IGNORECASE),
 ]
 
 _BASELINE_GATE_FAILURE_CLASSES: frozenset[str] = frozenset(
@@ -128,6 +139,7 @@ _BASELINE_GATE_STAGE_KEYWORDS: list[str] = [
     "eslint",
     "ruff",
     "mypy",
+    "viewport",
 ]
 
 # REVIEWER_PASS: fresh-reviewer disagreement, build-gate conflicts
@@ -149,6 +161,21 @@ _REVIEWER_PASS_STAGE_KEYWORDS: list[str] = [
     "review_pipeline",
 ]
 
+# VIEWPORT: client-rendering / 375px viewport regressions in admin-ui components
+_VIEWPORT_PATTERNS: list[re.Pattern] = [
+    re.compile(r"viewport.{0,20}regression", re.IGNORECASE),
+    re.compile(r"expectNoOverflowAt", re.IGNORECASE),
+    re.compile(r"expectMinTouchTargetAt", re.IGNORECASE),
+    re.compile(r"expectNoTextTruncationAt", re.IGNORECASE),
+    re.compile(r"\.viewport\.test\.tsx", re.IGNORECASE),
+    re.compile(r"375px", re.IGNORECASE),
+    re.compile(r"mobile.{0,20}width.{0,20}overflow", re.IGNORECASE),
+]
+
+_VIEWPORT_FAILURE_CLASSES: frozenset[str] = frozenset(["VIEWPORT_REGRESSION"])
+
+_VIEWPORT_STAGE_KEYWORDS: list[str] = ["viewport"]
+
 # ---------------------------------------------------------------------------
 # Layer descriptions (used by meta-investigation prompt builders)
 # ---------------------------------------------------------------------------
@@ -159,15 +186,17 @@ LAYER_DESCRIPTIONS: dict[str, str] = {
     LAYER_AGENT_VERB: "agent/src/handlers/ — gate scope enforcement, handler invocations",
     LAYER_BASELINE_GATE: "lint/typecheck baselines, scope rules, module size limits",
     LAYER_REVIEWER_PASS: "fresh-reviewer pass, build-gate disagreement detection",
+    LAYER_VIEWPORT: "client-rendering / 375px viewport regressions in admin-ui components",
 }
 
 # Stable display order for meta-investigation prompts.
-_LAYER_DISPLAY_ORDER: tuple[str, ...] = (
+LAYER_DISPLAY_ORDER: tuple[str, ...] = (
     LAYER_CI_WORKFLOW,
     LAYER_AGENT_VM,
     LAYER_AGENT_VERB,
     LAYER_BASELINE_GATE,
     LAYER_REVIEWER_PASS,
+    LAYER_VIEWPORT,
 )
 
 
@@ -183,7 +212,7 @@ def build_layer_meta_block(
     """
     targeted = frozenset(targeted_layers or [])
     lines: list[str] = ["Canonical defense layers:"]
-    for layer in _LAYER_DISPLAY_ORDER:
+    for layer in LAYER_DISPLAY_ORDER:
         status = "targeted" if layer in targeted else "UNTARGETED"
         desc = LAYER_DESCRIPTIONS.get(layer, "")
         lines.append(f"  {layer} [{status}]: {desc}")
@@ -247,15 +276,25 @@ def classify_layers(
     ):
         tags.append(LAYER_AGENT_VERB)
 
-    # --- BASELINE_GATE ---
-    if _matches_any(message, _BASELINE_GATE_PATTERNS) or any(
-        kw in _stage for kw in _BASELINE_GATE_STAGE_KEYWORDS
+    # --- VIEWPORT ---
+    # Checked before BASELINE_GATE so viewport inputs are never also tagged BASELINE_GATE.
+    if (
+        _fc in _VIEWPORT_FAILURE_CLASSES
+        or _matches_any(message, _VIEWPORT_PATTERNS)
+        or any(kw in _stage for kw in _VIEWPORT_STAGE_KEYWORDS)
     ):
-        tags.append(LAYER_BASELINE_GATE)
-    elif _fc in _BASELINE_GATE_FAILURE_CLASSES and any(
-        kw in _stage for kw in ("lint", "typecheck", "ruff", "mypy", "eslint")
-    ):
-        tags.append(LAYER_BASELINE_GATE)
+        tags.append(LAYER_VIEWPORT)
+
+    # --- BASELINE_GATE --- (skipped when VIEWPORT already matched)
+    if LAYER_VIEWPORT not in tags:
+        if _matches_any(message, _BASELINE_GATE_PATTERNS) or any(
+            kw in _stage for kw in _BASELINE_GATE_STAGE_KEYWORDS
+        ):
+            tags.append(LAYER_BASELINE_GATE)
+        elif _fc in _BASELINE_GATE_FAILURE_CLASSES and any(
+            kw in _stage for kw in ("lint", "typecheck", "ruff", "mypy", "eslint")
+        ):
+            tags.append(LAYER_BASELINE_GATE)
 
     # --- REVIEWER_PASS ---
     if _matches_any(message, _REVIEWER_PASS_PATTERNS) or any(
@@ -266,9 +305,164 @@ def classify_layers(
     return tags
 
 
+def aggregate_targeted_layers(entries: list[dict]) -> set[str]:
+    """Return the set of canonical layers targeted across all fix-log entries.
+
+    Accepts the ``fingerprint_to_fix_log`` list format.  Entries missing
+    ``layers_targeted`` or with an empty list contribute nothing to the union.
+    Unknown layer names (not in ``ALL_LAYERS``) are silently dropped.
+    """
+    targeted: set[str] = set()
+    for entry in entries or []:
+        if not isinstance(entry, dict):
+            continue
+        for layer in entry.get("layers_targeted") or []:
+            if isinstance(layer, str) and layer in ALL_LAYERS:
+                targeted.add(layer)
+    return targeted
+
+
+def is_recurring_cross_layer_class(
+    entries: list[dict],
+    min_cycles: int = 3,
+    min_layers: int = 2,
+) -> bool:
+    """Return True when fix-log history qualifies as a recurring cross-layer class.
+
+    A class qualifies when its combined fix-log entries span at least
+    ``min_cycles`` cycles AND collectively targeted at least ``min_layers``
+    distinct canonical layers.  Identifies regression classes where single-layer
+    fixes repeatedly fail to hold, signalling a shared root cause across layers.
+
+    Parameters
+    ----------
+    entries:
+        Combined ``fingerprint_to_fix_log`` entries across all
+        RegressionRemediationCase records for this regression class.
+    min_cycles:
+        Minimum number of fix cycles required.  Defaults to 3.
+    min_layers:
+        Minimum number of distinct canonical layers that must have been targeted.
+        Defaults to 2.
+    """
+    if not entries or len(entries) < min_cycles:
+        return False
+    return len(aggregate_targeted_layers(entries)) >= min_layers
+
+
+def compute_layer_defense_counts(fix_log: list[dict]) -> dict[str, int]:
+    """Per-canonical-layer fix counts across a list of fix-log entries.
+
+    Returns one entry per canonical layer in stable display order, including
+    layers with zero fixes, so callers can render a stable six-column table.
+    Unknown layer names in ``layers_targeted`` are silently ignored.
+    """
+    counts: dict[str, int] = {layer: 0 for layer in LAYER_DISPLAY_ORDER}
+    for entry in fix_log or []:
+        if not isinstance(entry, dict):
+            continue
+        for layer in entry.get("layers_targeted") or []:
+            if layer in counts:
+                counts[layer] += 1
+    return counts
+
+
+def compute_untargeted_layers(fix_log: list[dict]) -> list[str]:
+    """Return canonical layer names that have zero targeted fixes in fix_log.
+
+    Scans each entry's ``layers_targeted`` field (a list of layer name strings).
+    Entries missing the field, or with an empty list, contribute nothing to the
+    "targeted" set — they are treated as unclassified, not as targeting all layers.
+    Unknown layer names are silently ignored.
+
+    Returns a sorted list of layer names from ``ALL_LAYERS`` that appear in no
+    fix entry's ``layers_targeted``.  Returns all five layers when fix_log is
+    empty or no entry carries a ``layers_targeted`` field.
+    """
+    targeted: set[str] = set()
+    for entry in fix_log:
+        for layer in entry.get("layers_targeted") or []:
+            if layer in ALL_LAYERS:
+                targeted.add(layer)
+    return sorted(ALL_LAYERS - targeted)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def parse_viewport_regression_class(regression_class: str) -> dict[str, str | None]:
+    """Parse a viewport_regression: class string into component, assertion type, and width.
+
+    Handles both formats:
+    - Old: ``viewport_regression:<Component>@<width>`` (assertion_type → None)
+    - New: ``viewport_regression:<Component>:<assertion_type>@<width>``
+
+    Returns a dict with keys ``component``, ``assertion_type``, and ``width``.
+    All values are ``None`` for strings that don't start with ``viewport_regression:``.
+    """
+    _empty: dict[str, str | None] = {
+        "component": None,
+        "assertion_type": None,
+        "width": None,
+    }
+    prefix = "viewport_regression:"
+    if not regression_class.startswith(prefix):
+        return _empty
+    inner = regression_class[len(prefix) :]
+    at_parts = inner.split("@", 1)
+    if len(at_parts) != 2:
+        return _empty
+    left, width = at_parts
+    colon_parts = left.split(":", 1)
+    assertion_type: str | None
+    if len(colon_parts) == 2:
+        component, assertion_type = colon_parts
+    else:
+        component, assertion_type = left, None
+    return {"component": component, "assertion_type": assertion_type, "width": width}
+
+
+def compute_recovery_layer_mismatch(
+    fix_log: list[dict] | None,
+    symptoms_by_layer: dict[str, Any] | None,
+    *,
+    evaluated_at: str,
+) -> dict[str, Any] | None:
+    """Return a mismatch record when the fix didn't cover all symptom layers.
+
+    Compares the union of ``layers_targeted`` across fix-log entries against
+    the canonical layer keys present in ``symptoms_by_layer``.  Returns None
+    when either side is empty or when all symptom layers were addressed.
+
+    Parameters
+    ----------
+    fix_log:
+        List of fix-log entry dicts (each may carry ``layers_targeted``).
+    symptoms_by_layer:
+        Per-layer observation dict populated by the dispatcher during the
+        case lifecycle.  Only keys that are canonical layer names (``ALL_LAYERS``)
+        are considered — unknown keys are silently ignored.
+    evaluated_at:
+        ISO-format timestamp string to stamp the returned record.
+    """
+    fix_layers = aggregate_targeted_layers(fix_log or [])
+    symptom_layers = {
+        k for k in (symptoms_by_layer or {}) if isinstance(k, str) and k in ALL_LAYERS
+    }
+    if not fix_layers or not symptom_layers:
+        return None
+    unaddressed = symptom_layers - fix_layers
+    if not unaddressed:
+        return None
+    return {
+        "type": "recovery_layer_mismatch",
+        "evaluated_at": evaluated_at,
+        "fix_layers": sorted(fix_layers),
+        "symptom_layers": sorted(symptom_layers),
+        "unaddressed_layers": sorted(unaddressed),
+    }
 
 
 def _matches_any(text: str, patterns: list[re.Pattern]) -> bool:

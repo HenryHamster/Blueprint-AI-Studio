@@ -315,6 +315,18 @@ def _build_outcome_evaluation(
             outcome["proposed"] = proposed[:10]
         if failed_approaches:
             outcome["failed_approaches"] = failed_approaches[:10]
+        # Include recent diagnosis if available
+        diagnosis_summary = (d.get("diagnosis_summary") or "").strip()
+        if diagnosis_summary:
+            diagnosis_at = d.get("diagnosis_completed_at")
+            recent_diagnosis = {"summary": diagnosis_summary[:500]}
+            if diagnosis_at:
+                recent_diagnosis["diagnosed_at"] = diagnosis_at
+            if d.get("diagnosed_affected_files"):
+                recent_diagnosis["affected_files"] = d.get("diagnosed_affected_files")[
+                    :5
+                ]
+            outcome["recent_diagnosis"] = recent_diagnosis
         raw_evidence = d.get("recent_findings_evidence") or []
         if raw_evidence:
             from app.research_context import filter_direction_evidence

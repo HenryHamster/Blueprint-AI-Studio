@@ -128,6 +128,14 @@ MIGRATION_ERROR = "MIGRATION_ERROR"
 # 79a4a5ec each consumed a retry slot on a missing-on-main dispatcher file
 # that was waiting on an upstream rollup PR (#3768) to land.
 BLOCKED_PRECONDITION = "BLOCKED_PRECONDITION"
+# Cluster sibling pre-emption — the agent's declared related_files were already
+# covered by a sibling cluster's merged PR before this task ran. The agent did
+# the right thing by detecting the overlap and exiting cleanly; this is NOT a
+# code defect and must NOT consume the retry budget or penalize direction health.
+# Agent emits a "SCOPE_EMPTY: <reason>" status message (or calls ./blocked with
+# that prefix) and exits; the classifier routes to this class exactly as it does
+# for BLOCKED_PRECONDITION / "BLOCKER:" prefix detection.
+SCOPE_EMPTY = "SCOPE_EMPTY"
 # Agent process is alive (fresh heartbeat) but has made no tool or LLM progress
 # for longer than the scope-aware threshold (8 min small / 12 min medium /
 # 18 min large). Detected by the reaper's progress-staleness sweep, which
@@ -155,6 +163,14 @@ VIEWPORT_COVERAGE_DROP = "viewport_coverage_drop"
 _VIEWPORT_PATTERNS: tuple[str, ...] = (
     "expectnooverflowat(",
     "expectmintouchtargetat(",
+)
+
+# Sentinel emitted by check-viewport.sh when the viewport gate cannot bootstrap
+# (Chromium missing, Docker fallback unavailable). Must be distinct from
+# _VIEWPORT_PATTERNS so infra shortfalls route to PROVISION_FAILURE rather
+# than VIEWPORT_REGRESSION or CODE_ERROR.
+_VIEWPORT_INFRA_UNAVAILABLE_PATTERNS: tuple[str, ...] = (
+    "viewport_gate_infra_unavailable",
 )
 
 
@@ -206,6 +222,7 @@ INFRA_CLASSES: frozenset[str] = frozenset(
         SCOPE_OVERFLOW,
         BLOCKED_PRECONDITION,
         AGENT_STALLED,
+        SCOPE_EMPTY,
     }
 )
 
@@ -221,6 +238,7 @@ ALL_FAILURE_CLASSES: tuple[str, ...] = (
     AGENT_STALLED,
     SCOPE_OVERFLOW,
     BLOCKED_PRECONDITION,
+    SCOPE_EMPTY,
 )
 
 
@@ -429,6 +447,9 @@ _AGENT_CATEGORY_TO_CLASS: dict[str, str] = {
     # progress for longer than the scope-aware threshold. Written as lowercase by
     # the reaper; fast-path maps it to the canonical AGENT_STALLED constant.
     "agent_stalled": AGENT_STALLED,
+    # ``scope_empty`` — agent-emitted when declared related_files were already
+    # covered by a sibling cluster's merged PR; exits cleanly without retries.
+    "scope_empty": SCOPE_EMPTY,
 }
 
 
@@ -522,6 +543,7 @@ _SEVERITY: dict[str, int] = {
     EXTERNAL_API: 1,
     RATE_LIMIT: 1,
     SCOPE_OVERFLOW: 1,
+    SCOPE_EMPTY: 1,
 }
 
 
@@ -1373,6 +1395,9 @@ def classify_failure_with_confidence(
     if failure_class == BLOCKED_PRECONDITION:
         # The "BLOCKER:" prefix is a deliberate agent signal — match is high-signal.
         return FailureClassification(failure_class=failure_class, confidence=0.9)
+    if failure_class == SCOPE_EMPTY:
+        # The "SCOPE_EMPTY:" prefix is a deliberate agent signal — match is high-signal.
+        return FailureClassification(failure_class=failure_class, confidence=0.9)
     if failure_class == CODE_ERROR:
         return FailureClassification(failure_class=failure_class, confidence=0.5)
     return FailureClassification(failure_class=failure_class, confidence=0.7)
@@ -1383,13 +1408,13 @@ def _classify_failure_class(task: "Task", logs: str | None = None) -> str:
     Returns: CODE_ERROR, PROVISION_FAILURE, AGENT_TIMEOUT, EXTERNAL_API,
     RATE_LIMIT, SCOPE_OVERFLOW, MIGRATION_ERROR, BLOCKED_PRECONDITION."""
 
-    # BLOCKER: prefix — agent surfaced a precondition gap and paused per task
-    # instructions. Checked BEFORE the agent_category fast-path because the
-    # agent currently emits ``agent_self_failed`` / generic ``CODE_ERROR``
-    # alongside a "BLOCKER:" status message; the prefix is the deliberate
-    # signal that the task is held on an upstream, not broken. Routing here
-    # bypasses the clone-and-retry budget burn in _requeue_parent_task.
+    # BLOCKER: / SCOPE_EMPTY: prefixes — deliberate agent signals. Checked BEFORE
+    # the agent_category fast-path because the agent may emit ``agent_self_failed``
+    # / generic ``CODE_ERROR`` alongside these status messages; the prefix is the
+    # authoritative routing signal.
     _status_msg_raw = (task.latest_status_message or "").lstrip()
+    if _status_msg_raw[:12].lower().startswith("scope_empty:"):
+        return SCOPE_EMPTY
     if _status_msg_raw[:8].lower().startswith("blocker:"):
         return BLOCKED_PRECONDITION
 
@@ -1680,6 +1705,11 @@ def _classify_failure_class(task: "Task", logs: str | None = None) -> str:
     # "Superseded by fix on PR #N: ...". Same family as "cancelled:" above.
     if "superseded" in combined:
         return AGENT_TIMEOUT
+
+    # Viewport gate infra-unavailable sentinel — Chromium missing or Docker fallback absent.
+    # Checked before VIEWPORT_REGRESSION so infra shortfalls don't land in CODE_ERROR residuals.
+    if any(kw in combined for kw in _VIEWPORT_INFRA_UNAVAILABLE_PATTERNS):
+        return PROVISION_FAILURE
 
     # Viewport rendering regression — must be checked before the generic CODE_ERROR
     # fallthrough so it doesn't dissolve into residual fingerprints.

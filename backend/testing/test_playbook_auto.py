@@ -4918,6 +4918,100 @@ async def test_compute_sr_catch_rate_trends_by_direction_stores_direction_text(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Tests for select_sr_miss_examples_for_injection
+# ─────────────────────────────────────────────────────────────────────────────
+
+_SAMPLE_TRENDS: dict = {
+    "categories": {
+        "correctness": {
+            "weighted_miss_rate": 0.8,
+            "examples": [{"severity": "MAJOR", "desc": "Global correctness issue"}],
+        },
+        "error-handling": {
+            "weighted_miss_rate": 0.5,
+            "examples": [{"severity": "MINOR", "desc": "Global error handling gap"}],
+        },
+    },
+    "by_direction": {
+        "dir-x": {
+            "categories": {
+                "security": {
+                    "miss_rate": 0.9,
+                    "examples": [
+                        {"severity": "CRITICAL", "desc": "Direction X security miss"}
+                    ],
+                },
+            }
+        },
+        "dir-empty": {
+            "categories": {
+                "correctness": {
+                    "miss_rate": 0.7,
+                    # no examples key → direction has no qualifying examples
+                },
+            }
+        },
+    },
+}
+
+
+def test_select_sr_miss_examples_global_when_no_direction_id():
+    """When direction_id is None, global categories are used."""
+    from app.playbook_learning import select_sr_miss_examples_for_injection
+
+    result = select_sr_miss_examples_for_injection(_SAMPLE_TRENDS, direction_id=None)
+    # Should include global categories ranked by weighted_miss_rate
+    assert "correctness" in result
+    assert any("Global correctness issue" in ex["desc"] for ex in result["correctness"])
+    # Global ranking preserved: correctness (0.8) before error-handling (0.5)
+    keys = list(result.keys())
+    assert keys.index("correctness") < keys.index("error-handling")
+
+
+def test_select_sr_miss_examples_prefers_direction_when_examples_present():
+    """When direction_id is provided and has examples, those are preferred over global."""
+    from app.playbook_learning import select_sr_miss_examples_for_injection
+
+    result = select_sr_miss_examples_for_injection(_SAMPLE_TRENDS, direction_id="dir-x")
+    # Direction-scoped category should be present
+    assert "security" in result
+    assert any("Direction X security miss" in ex["desc"] for ex in result["security"])
+    # Global-only category must not appear (direction slice was used instead)
+    assert "correctness" not in result
+    assert "error-handling" not in result
+
+
+def test_select_sr_miss_examples_falls_back_to_global_when_direction_has_no_examples():
+    """When the direction has no categories with examples, fall back to global."""
+    from app.playbook_learning import select_sr_miss_examples_for_injection
+
+    result = select_sr_miss_examples_for_injection(
+        _SAMPLE_TRENDS, direction_id="dir-empty"
+    )
+    # dir-empty has no examples, so global categories are used
+    assert "correctness" in result
+    assert "security" not in result
+
+
+def test_select_sr_miss_examples_falls_back_to_global_for_unknown_direction():
+    """When direction_id is not found in by_direction, fall back to global."""
+    from app.playbook_learning import select_sr_miss_examples_for_injection
+
+    result = select_sr_miss_examples_for_injection(
+        _SAMPLE_TRENDS, direction_id="dir-unknown"
+    )
+    assert "correctness" in result
+
+
+def test_select_sr_miss_examples_empty_trends_returns_empty():
+    """When sr_catch_rate_trends has no categories, return empty dict."""
+    from app.playbook_learning import select_sr_miss_examples_for_injection
+
+    assert select_sr_miss_examples_for_injection({}) == {}
+    assert select_sr_miss_examples_for_injection({"categories": {}}) == {}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Tests for reasoning engagement in compute_sr_catch_rate_trends
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -7179,6 +7273,132 @@ async def test_previous_fp_rate_uses_reviewer_findings_for_consistency(
 
 
 # ---------------------------------------------------------------------------
+# Tests for loosen-hint data pipeline: fp_count + tp_count >= 10 threshold
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_stores_loosen_hint_threshold_fields(
+    db_session: AsyncSession,
+):
+    """compute_sr_catch_rate_trends stores fp_count, tp_count, and false_positive_rate
+    at values that cross the pre-execution loosen-hint thresholds (fp_rate >= 0.5,
+    fp+tp >= 10). The formatHighFpRateLoosenHintForSrPrompt formatter reads these
+    fields via self_review_catch_rate.categories to build its pre-execution section."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+
+    # Current window: 7 FP + 3 TP tasks for 'correctness'.
+    # FP: SR flags correctness but human flags test-coverage (unrelated).
+    # TP: SR flags correctness AND human flags correctness.
+    # Result: fp_count=7, tp_count=3, false_positive_rate=0.7, sample=10.
+    for _ in range(7):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"test-coverage": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(3):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+
+    # Previous window: 5 tasks where correctness is confirmed (TPs) — needed
+    # for _MIN_SR_SAMPLE (5) so the function doesn't return None.
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    cat = result["categories"]["correctness"]
+
+    # Verify fields needed by formatHighFpRateLoosenHintForSrPrompt (via _cat_entry).
+    assert cat["fp_count"] == 7, f"expected fp_count=7, got {cat['fp_count']}"
+    assert cat["tp_count"] == 3, f"expected tp_count=3, got {cat['tp_count']}"
+    assert cat["false_positive_rate"] == 0.7, (
+        f"fp_rate = 7/(7+3) = 0.7, got {cat['false_positive_rate']}"
+    )
+    # Both loosen-hint thresholds are met: fp_rate >= 0.5 and sample >= 10.
+    sample = cat["fp_count"] + cat["tp_count"]
+    assert sample >= 10, f"loosen-hint needs sample>=10, got {sample}"
+    assert cat["false_positive_rate"] >= 0.5, "loosen-hint needs fp_rate>=0.5"
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_below_loosen_hint_sample_threshold(
+    db_session: AsyncSession,
+):
+    """When sample size (fp+tp) < 10, fp_count and tp_count are stored correctly
+    but the loosen-hint threshold is not crossed — category is not over-flagged."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+
+    # Current window: 4 FP + 2 TP = 6 total, below the sample=10 threshold.
+    for _ in range(4):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"test-coverage": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(2):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+
+    # Previous window: 5 tasks so the function does not return None.
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    cat = result["categories"]["correctness"]
+    assert cat["fp_count"] == 4
+    assert cat["tp_count"] == 2
+    sample = cat["fp_count"] + cat["tp_count"]
+    assert sample == 6 and sample < 10, (
+        "sample below loosen-hint threshold — category should not trigger loosen hint"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Tests for per-severity catch-rate breakdown in compute_sr_catch_rate_trends
 # ---------------------------------------------------------------------------
 
@@ -8786,6 +9006,12 @@ async def test_compute_sr_reviewer_disagreements_counts_disagreements(
     assert entries[0]["category"] == "correctness"
     assert entries[0]["task_type"] == "fix"
     assert entries[0]["count"] == 3
+    # Examples should be included — capped at 3 per bucket by sr_blind_spots
+    assert "examples" in entries[0]
+    assert len(entries[0]["examples"]) >= 1
+    ex = entries[0]["examples"][0]
+    assert ex["severity"] == "HIGH"
+    assert "bug" in ex["description"]
 
 
 @pytest.mark.asyncio
@@ -9422,6 +9648,127 @@ def test_get_sr_alert_drilldown_tasks_reviewer_rescue_still_a_miss():
     assert len(rows) == 1
     assert "correctness" in rows[0]["missed_categories"]
     assert "correctness" not in rows[0]["caught_categories"]
+
+
+def test_get_sr_alert_drilldown_tasks_includes_reviewer_findings():
+    """Each drilldown row includes missed_category_findings with severity and description."""
+    from app.playbook_learning import get_sr_alert_drilldown_tasks
+
+    project_id = uuid.uuid4()
+    ctx = {
+        "_self_review_outcome": {
+            "check_results": {"correctness": {"passed": True}},
+            "verdict": "pass",
+            "reviewer_findings": [
+                {
+                    "category": "correctness",
+                    "severity": "HIGH",
+                    "description": "The null check is missing on the payload field.",
+                }
+            ],
+        },
+        "_first_attempt_rejection_categories": ["correctness"],
+    }
+    task = Task(
+        project_id=project_id,
+        title="missing null check",
+        payloads=[{"type": "create", "prompt": "do something"}],
+        status=TaskStatus.COMPLETED,
+        context=ctx,
+    )
+    task.created_at = _utcnow() - timedelta(days=1)
+
+    rows = get_sr_alert_drilldown_tasks(
+        all_tasks=[task],
+        design_doc={},
+        categories=["correctness"],
+    )
+
+    assert len(rows) == 1
+    findings = rows[0]["missed_category_findings"]
+    assert "correctness" in findings
+    assert findings["correctness"]["severity"] == "HIGH"
+    assert (
+        findings["correctness"]["description"]
+        == "The null check is missing on the payload field."
+    )
+    assert findings["correctness"]["has_more"] is False
+
+
+def test_get_sr_alert_drilldown_tasks_fallback_when_no_reviewer_finding():
+    """When reviewer_findings has no entry for a missed category, a placeholder is used."""
+    from app.playbook_learning import get_sr_alert_drilldown_tasks
+
+    project_id = uuid.uuid4()
+    ctx = {
+        "_self_review_outcome": {
+            "check_results": {"correctness": {"passed": True}},
+            "verdict": "pass",
+            "reviewer_findings": [],
+        },
+        "_first_attempt_rejection_categories": ["correctness"],
+    }
+    task = Task(
+        project_id=project_id,
+        title="no findings task",
+        payloads=[{"type": "create", "prompt": "do something"}],
+        status=TaskStatus.COMPLETED,
+        context=ctx,
+    )
+    task.created_at = _utcnow() - timedelta(days=1)
+
+    rows = get_sr_alert_drilldown_tasks(
+        all_tasks=[task],
+        design_doc={},
+        categories=["correctness"],
+    )
+
+    assert len(rows) == 1
+    findings = rows[0]["missed_category_findings"]
+    assert findings["correctness"]["description"] == "no description recorded"
+    assert findings["correctness"]["severity"] is None
+
+
+def test_get_sr_alert_drilldown_tasks_truncates_long_description():
+    """Descriptions longer than 140 chars are truncated with has_more=True."""
+    from app.playbook_learning import get_sr_alert_drilldown_tasks
+
+    project_id = uuid.uuid4()
+    long_desc = "x" * 200
+    ctx = {
+        "_self_review_outcome": {
+            "check_results": {"security": {"passed": True}},
+            "verdict": "pass",
+            "reviewer_findings": [
+                {
+                    "category": "security",
+                    "severity": "CRITICAL",
+                    "description": long_desc,
+                }
+            ],
+        },
+        "_first_attempt_rejection_categories": ["security"],
+    }
+    task = Task(
+        project_id=project_id,
+        title="long desc task",
+        payloads=[{"type": "create", "prompt": "do something"}],
+        status=TaskStatus.COMPLETED,
+        context=ctx,
+    )
+    task.created_at = _utcnow() - timedelta(days=1)
+
+    rows = get_sr_alert_drilldown_tasks(
+        all_tasks=[task],
+        design_doc={},
+        categories=["security"],
+    )
+
+    assert len(rows) == 1
+    finding = rows[0]["missed_category_findings"]["security"]
+    assert len(finding["description"]) == 140
+    assert finding["has_more"] is True
+    assert finding["full_description"] == long_desc
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -11345,3 +11692,225 @@ async def test_blind_spot_layer_distribution_empty_for_unclassifiable(
     dist = themes[0]["layer_distribution"]
     assert isinstance(dist, dict)
     # May be empty — unclassifiable text produces no layer tags
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests for aggregate_sr_co_failure_pairs
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _make_co_fail_task(project_id, *, age_days: float, failed_cats: list) -> Task:
+    """Build a code-change task with the given SR-failed categories."""
+    check_results = {c: {"passed": False, "issue": "x"} for c in failed_cats}
+    task = Task(
+        project_id=project_id,
+        title="co-fail test",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.COMPLETED,
+        context={
+            "_self_review_outcome": {"check_results": check_results},
+            "_first_attempt_rejection_categories": {},
+        },
+    )
+    task.created_at = _utcnow() - timedelta(days=age_days)
+    return task
+
+
+def test_aggregate_sr_co_failure_pairs_returns_none_below_min_sample():
+    """Returns None when fewer than min_sample qualifying tasks exist."""
+    from app.sr_blind_spots import aggregate_sr_co_failure_pairs
+
+    tasks = [
+        _make_co_fail_task(
+            uuid.uuid4(), age_days=1, failed_cats=["correctness", "style-conventions"]
+        )
+    ]
+    result = aggregate_sr_co_failure_pairs(tasks, min_sample=5)
+    assert result is None
+
+
+def test_aggregate_sr_co_failure_pairs_high_lift_pair_surfaced():
+    """Pair with lift >> 1 appears in output sorted by lift desc.
+
+    Setup: 5 tasks where A+B co-fail, 3 tasks where B fails alone.
+    total=8, miss_A=5, miss_B=8; P(B|A)=5/5=1.0, base_rate(B)=8/8=1.0 — wrong.
+
+    Better: 5 co-fail tasks, 0 B-alone tasks, 3 no-fail tasks.
+    total=8, miss_A=5, miss_B=5; P(B|A)=1.0, base=5/8=0.625 → lift=1.6
+    """
+    from app.sr_blind_spots import aggregate_sr_co_failure_pairs
+
+    project_id = uuid.uuid4()
+    tasks = []
+    # 5 tasks: both A and B fail
+    for _ in range(5):
+        tasks.append(
+            _make_co_fail_task(
+                project_id, age_days=1, failed_cats=["correctness", "security"]
+            )
+        )
+    # 3 tasks: neither fails (qualify for total count)
+    for _ in range(3):
+        tasks.append(_make_co_fail_task(project_id, age_days=1, failed_cats=[]))
+
+    result = aggregate_sr_co_failure_pairs(tasks, min_sample=5, min_co_count=2)
+    assert result is not None
+    pair = next(
+        (p for p in result if p["cat_a"] == "correctness" and p["cat_b"] == "security"),
+        None,
+    )
+    assert pair is not None
+    # P(B|A) = 5/5 = 1.0; base_rate(B) = 5/8 = 0.625; lift ≈ 1.6
+    assert pair["lift"] > 1.0
+    assert pair["co_fail_count"] == 5
+    assert abs(pair["lift"] - pair["p_b_given_a"] / pair["base_rate_b"]) < 0.01
+
+
+def test_aggregate_sr_co_failure_pairs_base_rate_equals_conditional_gives_lift_one():
+    """When P(B|A)==base_rate(B), lift rounds to 1.0."""
+    from app.sr_blind_spots import aggregate_sr_co_failure_pairs
+
+    project_id = uuid.uuid4()
+    tasks = []
+    # 6 tasks: all have both cats failing → P(B|A)=1.0, base_rate(B)=1.0, lift=1.0
+    for _ in range(6):
+        tasks.append(
+            _make_co_fail_task(
+                project_id, age_days=1, failed_cats=["correctness", "security"]
+            )
+        )
+
+    result = aggregate_sr_co_failure_pairs(tasks, min_sample=5, min_co_count=2)
+    assert result is not None
+    pair = next(
+        (p for p in result if p["cat_a"] == "correctness" and p["cat_b"] == "security"),
+        None,
+    )
+    assert pair is not None
+    assert round(pair["lift"], 2) == 1.0
+
+
+def test_aggregate_sr_co_failure_pairs_single_task_miss_filtered_by_min_co_count():
+    """A pair that appears in only 1 task is excluded by default min_co_count=2."""
+    from app.sr_blind_spots import aggregate_sr_co_failure_pairs
+
+    project_id = uuid.uuid4()
+    tasks = []
+    # 5 tasks where only one has co-failure
+    tasks.append(
+        _make_co_fail_task(
+            project_id, age_days=1, failed_cats=["correctness", "security"]
+        )
+    )
+    for _ in range(4):
+        tasks.append(
+            _make_co_fail_task(project_id, age_days=1, failed_cats=["correctness"])
+        )
+
+    result = aggregate_sr_co_failure_pairs(tasks, min_sample=5, min_co_count=2)
+    # The pair exists but co_count=1 < min_co_count=2 → filtered out
+    assert result == []
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_includes_co_failure_pairs(
+    db_session: AsyncSession,
+):
+    """compute_sr_catch_rate_trends writes co_failure_pairs into the result."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+
+    # Build enough tasks for both windows (5+ each)
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=3,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness", "security"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+    assert result is not None
+    assert "co_failure_pairs" in result
+    assert isinstance(result["co_failure_pairs"], list)
+
+
+# ---------------------------------------------------------------------------
+# lone_checker_recovery origin attribution in catch-rate stats
+# ---------------------------------------------------------------------------
+
+
+def test_stats_for_tasks_lone_checker_recovery_is_reviewer_save():
+    """lone_checker_recovery origin counts as reviewer_save, not sr_alone."""
+    import uuid as _uuid
+    from app.playbook_learning import _stats_for_tasks
+
+    project_id = _uuid.uuid4()
+    check_results = {
+        "security": {
+            "passed": False,
+            "origin": "lone_checker_recovery",
+            "issue": "fresh-reviewer caught this",
+        }
+    }
+    ctx = {
+        "_self_review_outcome": {"check_results": check_results},
+        "_first_attempt_rejection_categories": {"security": 1},
+    }
+    t = Task(
+        project_id=project_id,
+        title="lone checker task",
+        payloads=[{"type": "create", "prompt": "p"}],
+        status=TaskStatus.COMPLETED,
+        context=ctx,
+    )
+    _, cat_stats, _, _, _, _ = _stats_for_tasks([t])
+    assert "security" in cat_stats
+    assert cat_stats["security"]["reviewer_save_hit_count"] == 1
+    assert cat_stats["security"]["sr_alone_hit_count"] == 0
+
+
+def test_stats_for_tasks_lone_checker_recovery_excluded_from_sr_failed_author():
+    """lone_checker_recovery findings are not counted as author SR false positives."""
+    import uuid as _uuid
+    from app.playbook_learning import _stats_for_tasks
+
+    project_id = _uuid.uuid4()
+    # SR passed (lone-checker reviewer flagged security), human did NOT reject.
+    check_results = {
+        "security": {
+            "passed": False,
+            "origin": "lone_checker_recovery",
+            "issue": "fresh-reviewer only",
+        }
+    }
+    ctx = {
+        "_self_review_outcome": {"check_results": check_results},
+        "_first_attempt_rejection_categories": {},
+    }
+    t = Task(
+        project_id=project_id,
+        title="lone checker no human rejection",
+        payloads=[{"type": "create", "prompt": "p"}],
+        status=TaskStatus.COMPLETED,
+        context=ctx,
+    )
+    _, cat_stats, _, _, _, _ = _stats_for_tasks([t])
+    # lone_checker_recovery is not an author SR failure, so fp_count must be 0.
+    security = cat_stats.get("security", {})
+    assert security.get("fp_count", 0) == 0

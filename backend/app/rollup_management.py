@@ -2017,6 +2017,24 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                             logger.warning(
                                 f"[NOTIFY] Failed to post PR merged message: {_e}"
                             )
+                        try:
+                            from app.github import get_pull_request_diff
+                            from app.pipeline_regression_dispatcher import (
+                                update_viewport_coverage_snapshot_from_diff,
+                            )
+
+                            _snap_proj = await session.get(Project, parent.project_id)
+                            if _snap_proj is not None:
+                                _diff_text = await get_pull_request_diff(
+                                    gh_token, owner, repo, rollup_pr_number
+                                )
+                                await update_viewport_coverage_snapshot_from_diff(
+                                    session, _snap_proj, rollup_pr_number, _diff_text
+                                )
+                        except Exception as _snap_e:
+                            logger.warning(
+                                f"[ROLLUP] Failed to update viewport_coverage_snapshot: {_snap_e}"
+                            )
                     else:
                         # Merge failed (conflicts) — spawn review/fix cycle instead of giving up
                         merge_msg = merge_result.get("message", "unknown")

@@ -18,6 +18,7 @@ from __future__ import annotations
 import contextvars
 import hashlib
 import logging
+import re
 import time
 import uuid
 from datetime import datetime, timedelta
@@ -45,6 +46,11 @@ from app.models import (
     TaskStatus,
 )
 from app.payload_schemas import validate_internal_payload
+from app.regression_layer_classifier import (
+    LAYER_DISPLAY_ORDER,
+    aggregate_targeted_layers,
+    is_recurring_cross_layer_class,
+)
 import app.shared_state as _shared_state
 from app.shared_state import runtime_config as _runtime_config
 from app.time_utils import _to_naive_utc, _utcnow
@@ -58,6 +64,7 @@ ESCALATION_REASON_ESCALATED_LAYER_CONCENTRATION = "escalated_layer_concentration
 ESCALATION_REASON_ESCALATED_CROSS_CASE_FINGERPRINT = "escalated_cross_case_fingerprint"
 ESCALATION_REASON_ESCALATED_RECURRENCE = "escalated_recurrence"
 ESCALATION_REASON_FRAGILE_RECURRENCE_META = "fragile_recurrence_meta"
+ESCALATION_REASON_RECURRING_CLASS_META = "recurring_class_meta"
 
 # Cooldown between consecutive spawns for the SAME regression_class. Mirrors
 # the self_audit_dispatch cooldown pattern — keeps a noisy regression from
@@ -129,6 +136,16 @@ _AGENT_VM_RESOURCE_WINDOW_HOURS = 24
 _FRAGILE_RECURRENCE_MIN_COUNT = 3
 _FRAGILE_RECURRENCE_SHORT_HOLD_DAYS = 2.0
 
+# Recurring-class proactive meta-signal thresholds.
+# A regression_class trips the signal when its fix-log history across all cases
+# (within the lookback window) spans >= _RECURRING_CLASS_MIN_CYCLES fix cycles AND
+# those cycles have collectively targeted >= _RECURRING_CLASS_MIN_LAYERS distinct
+# canonical layers.  Catches classes that accumulate cross-layer history without
+# any single signal firing all layers simultaneously.
+_RECURRING_CLASS_LOOKBACK = timedelta(days=30)
+_RECURRING_CLASS_MIN_CYCLES = 3
+_RECURRING_CLASS_MIN_LAYERS = 2
+
 # SR blind-spot theme occurrence floor. A blind_spot theme must appear at least
 # this many times across the 14d window before it is considered a structural gap
 # in the self-review prompt rather than a one-off observation from a single task.
@@ -153,6 +170,13 @@ _LAYER_DEFENSE_LEDGER_LOOKBACK_DAYS = 90
 _LAYER_CONCENTRATION_MIN_DISTINCT_CASES = 3
 _LAYER_CONCENTRATION_FRAGILE_AVG_HOLD_DAYS = 7.0
 _LAYER_CONCENTRATION_FRAGILE_RETRIPS = 2
+
+# Prevention-rate signal thresholds. When the 7d unweighted average prevention
+# rate (defenses with complete 30d observation window) drops below this floor
+# AND at least _PREVENTION_RATE_MIN_SAMPLE eligible defenses exist, an
+# investigate task is spawned to diagnose why cross-layer defenses are not holding.
+_PREVENTION_RATE_THRESHOLD = 0.60
+_PREVENTION_RATE_MIN_SAMPLE = 5
 
 # Cross-case error-fingerprint meta-signal thresholds.
 # Trips when the SAME normalized error fingerprint surfaces across at least
@@ -186,13 +210,10 @@ _ACTIVE_INVESTIGATE_STATUSES = (
     TaskStatus.EVALUATING,
 )
 
-_CANONICAL_RECURRENCE_LAYERS = (
-    "CI_WORKFLOW",
-    "AGENT_VM",
-    "AGENT_VERB",
-    "BASELINE_GATE",
-    "REVIEWER_PASS",
-)
+# Canonical layer order is owned by regression_layer_classifier.LAYER_DISPLAY_ORDER;
+# this alias keeps the dispatcher's historical name available to existing
+# callers (tests, admin_digest) without re-introducing a second source tuple.
+_CANONICAL_RECURRENCE_LAYERS = LAYER_DISPLAY_ORDER
 
 # Cycle records moved to durable storage: see ``DispatcherCycleRecord`` in
 # ``backend/app/models.py``. ``run_once()`` inserts one row per tick; the
@@ -398,6 +419,24 @@ async def get_dispatcher_cycle_records(
         }
         for r in rows
     ]
+
+
+def compute_mtti_p50_sec(cases: list) -> float | None:
+    """Return median seconds from escalation to operator acknowledgement.
+
+    Filters to cases where both ``needs_manual_intervention_at`` and
+    ``operator_acknowledged_at`` are set.  Returns ``None`` when no acked
+    cases are present in the input.  Uses ``statistics.median`` — no numpy.
+    """
+    import statistics  # noqa: PLC0415
+
+    deltas = [
+        (c.operator_acknowledged_at - c.needs_manual_intervention_at).total_seconds()
+        for c in cases
+        if c.needs_manual_intervention_at is not None
+        and c.operator_acknowledged_at is not None
+    ]
+    return statistics.median(deltas) if deltas else None
 
 
 async def _prune_old_dispatcher_cycle_records(session: AsyncSession) -> int:
@@ -821,7 +860,7 @@ def compute_layer_defense_density(
             "last_fix_at": None,  # datetime
             "case_contribs": [],  # list[(merged_dt, case_id)] for sampling
         }
-        for layer in _CANONICAL_RECURRENCE_LAYERS
+        for layer in LAYER_DISPLAY_ORDER
     }
 
     for case_id, entry in all_fix_logs_with_case_ids:
@@ -843,7 +882,7 @@ def compute_layer_defense_density(
             s["case_contribs"].append((merged_dt, str(case_id)))
 
     result: list[dict[str, Any]] = []
-    for layer in _CANONICAL_RECURRENCE_LAYERS:
+    for layer in LAYER_DISPLAY_ORDER:
         s = layer_state[layer]
         contribs = sorted(s["case_contribs"], key=lambda p: p[0], reverse=True)
         seen: set[str] = set()
@@ -889,8 +928,12 @@ def _compute_layer_fragility_stats(
             "still_holding_ages": [],
             "retripped_within_48h": 0,
             "held_gt_7d": 0,
+            "single_layer_fix_count": 0,
+            "single_layer_hold_days": [],
+            "multi_layer_fix_count": 0,
+            "multi_layer_hold_days": [],
         }
-        for layer in _CANONICAL_RECURRENCE_LAYERS
+        for layer in LAYER_DISPLAY_ORDER
     }
 
     for entry in all_fix_logs:
@@ -904,15 +947,24 @@ def _compute_layer_fragility_stats(
             continue
         recovered_dt = _parse_dispatcher_dt(entry.get("recovered_at"))
         age_days = (now - merged_dt).total_seconds() / 86400.0
+        is_multi_layer = len(layers_targeted) >= 2
 
         for layer in layers_targeted:
             if layer not in layer_stats:
                 continue
             s = layer_stats[layer]
             s["fix_count"] += 1
+            if is_multi_layer:
+                s["multi_layer_fix_count"] += 1
+            else:
+                s["single_layer_fix_count"] += 1
             if recovered_dt is not None:
                 hold = (recovered_dt - merged_dt).total_seconds() / 86400.0
                 s["hold_days"].append(hold)
+                if is_multi_layer:
+                    s["multi_layer_hold_days"].append(hold)
+                else:
+                    s["single_layer_hold_days"].append(hold)
                 if hold < 2.0:
                     s["retripped_within_48h"] += 1
                 if hold > 7.0:
@@ -922,18 +974,23 @@ def _compute_layer_fragility_stats(
                 if age_days > 7.0:
                     s["held_gt_7d"] += 1
 
+    def _avg_or_none(values: list[float]) -> float | None:
+        return sum(values) / len(values) if values else None
+
     result: dict[str, dict[str, Any]] = {}
-    for layer in _CANONICAL_RECURRENCE_LAYERS:
+    for layer in LAYER_DISPLAY_ORDER:
         s = layer_stats[layer]
         hold_days_list = s["hold_days"]
         result[layer] = {
             "fix_count": s["fix_count"],
-            "avg_hold_days": sum(hold_days_list) / len(hold_days_list)
-            if hold_days_list
-            else None,
+            "avg_hold_days": _avg_or_none(hold_days_list),
             "still_holding_count": len(s["still_holding_ages"]),
             "held_gt_7d_count": s["held_gt_7d"],
             "retripped_within_48h_count": s["retripped_within_48h"],
+            "single_layer_fix_count": s["single_layer_fix_count"],
+            "single_layer_avg_hold_days": _avg_or_none(s["single_layer_hold_days"]),
+            "multi_layer_fix_count": s["multi_layer_fix_count"],
+            "multi_layer_avg_hold_days": _avg_or_none(s["multi_layer_hold_days"]),
         }
     return result
 
@@ -948,14 +1005,35 @@ _META_ESCALATION_REASONS: frozenset[str] = frozenset(
 )
 
 _ESCALATION_BUCKET_ALL_OTHER = "all_other"
+_ESCALATION_BUCKET_COMPLIANCE_FOLLOWUP = "compliance_followup"
 
 _ESCALATION_BUCKET_ORDER: list[str] = [
     ESCALATION_REASON_ESCALATED_CROSS_LAYER,
     ESCALATION_REASON_ESCALATED_LAYER_CONCENTRATION,
     ESCALATION_REASON_ESCALATED_CROSS_CASE_FINGERPRINT,
     ESCALATION_REASON_ESCALATED_RECURRENCE,
+    _ESCALATION_BUCKET_COMPLIANCE_FOLLOWUP,
     _ESCALATION_BUCKET_ALL_OTHER,
 ]
+
+
+def _compliance_followup_fix_idx(raw_log: list) -> int:
+    """Return the 0-based fix-cycle index of the first fix entry after a compliance_followup_spawned marker.
+
+    Returns -1 if no such entry exists (no followup spawned or the spawned task has not yet merged).
+    """
+    saw_spawn = False
+    fix_idx = 0
+    for entry in raw_log:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("type") == "compliance_followup_spawned":
+            saw_spawn = True
+        elif entry.get("fix_pr_number") is not None:
+            if saw_spawn:
+                return fix_idx
+            fix_idx += 1
+    return -1
 
 
 def compute_escalation_outcome_breakdown(
@@ -985,7 +1063,12 @@ def compute_escalation_outcome_breakdown(
     cutoff = now - timedelta(days=lookback_days)
     retrip_window = timedelta(days=30)
 
-    def _bucket_for(reason: str | None) -> str:
+    def _bucket_for(reason: str | None, raw_log: list) -> str:
+        if (
+            reason == ESCALATION_REASON_ESCALATED_CROSS_LAYER
+            and _compliance_followup_fix_idx(raw_log) >= 0
+        ):
+            return _ESCALATION_BUCKET_COMPLIANCE_FOLLOWUP
         if reason in _META_ESCALATION_REASONS:
             return str(reason)
         return _ESCALATION_BUCKET_ALL_OTHER
@@ -996,15 +1079,17 @@ def compute_escalation_outcome_breakdown(
             "retripped_within_30d_count": 0,
             "hold_days": [],
             "in_flight_excluded_count": 0,
+            "prevention_prevented": 0,
+            "prevention_recurred": 0,
         }
         for b in _ESCALATION_BUCKET_ORDER
     }
 
     for case in cases:
-        bucket = _bucket_for(getattr(case, "escalation_reason", None))
+        raw_log = case.fingerprint_to_fix_log or []
+        bucket = _bucket_for(getattr(case, "escalation_reason", None), raw_log)
         st = bucket_state[bucket]
 
-        raw_log = case.fingerprint_to_fix_log or []
         fix_entries = [
             e
             for e in raw_log
@@ -1015,11 +1100,32 @@ def compute_escalation_outcome_breakdown(
             continue
 
         cycles = _extract_recurrence_cycles(case)
-        if not cycles:
+        # For compliance_followup cases, start from the cycle after the followup was spawned
+        # so metrics reflect the compliance followup fix's durability, not the original non-compliant fix.
+        if bucket == _ESCALATION_BUCKET_COMPLIANCE_FOLLOWUP:
+            cf_idx = _compliance_followup_fix_idx(raw_log)
+            effective_cycles = cycles[cf_idx:] if 0 <= cf_idx < len(cycles) else []
+        else:
+            effective_cycles = cycles
+        if not effective_cycles:
             continue
 
-        first = cycles[0]
+        first = effective_cycles[0]
         merged_at = first["merged_at"]
+
+        # Prevention rate: observe defenses with a complete 30d window (merged >= 30d ago).
+        # This is independent of the merged_count lookback filter.
+        if merged_at is not None and merged_at + retrip_window <= now:
+            _retripped = any(
+                c["merged_at"] is not None
+                and c["merged_at"] <= merged_at + retrip_window
+                for c in effective_cycles[1:]
+            )
+            if _retripped:
+                st["prevention_recurred"] += 1
+            else:
+                st["prevention_prevented"] += 1
+
         if merged_at is None or not (cutoff <= merged_at <= now):
             continue
 
@@ -1031,7 +1137,7 @@ def compute_escalation_outcome_breakdown(
             if hold >= 0:
                 st["hold_days"].append(hold)
 
-        for later in cycles[1:]:
+        for later in effective_cycles[1:]:
             next_merged = later["merged_at"]
             if next_merged is not None and next_merged <= merged_at + retrip_window:
                 st["retripped_within_30d_count"] += 1
@@ -1053,12 +1159,17 @@ def compute_escalation_outcome_breakdown(
                 if n % 2 == 1
                 else (sorted_hold[mid - 1] + sorted_hold[mid]) / 2.0
             )
+        _prev = s["prevention_prevented"]
+        _prec = s["prevention_recurred"]
+        _pdenom = _prev + _prec
         result[bucket] = {
             "merged_count": mc,
             "retripped_within_30d_count": rc,
             "durable_resolution_rate": (1.0 - rc / mc) if mc > 0 else None,
             "median_hold_days": median_hold,
             "in_flight_excluded_count": s["in_flight_excluded_count"],
+            "prevention_rate_30d": (_prev / _pdenom) if _pdenom > 0 else None,
+            "recurrences_observed": _prec,
         }
 
     return {
@@ -1066,6 +1177,111 @@ def compute_escalation_outcome_breakdown(
         "lookback_days": lookback_days,
         "generated_at": now.isoformat(),
     }
+
+
+def compute_avg_prevention_rate_7d(
+    cases: list[RegressionRemediationCase],
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Unweighted average prevention rate for defenses whose 30d window closed in the last 7d.
+
+    A defense is eligible when its first cycle's merged_at falls in [now-37d, now-30d]
+    (the 30d observation window opened and closed within the past 7 days).
+    A defense "prevented" when no subsequent cycle occurred within 30d of that merge.
+
+    Returns a dict with keys: avg_rate (float|None), eligible_count, prevented_count,
+    recurred_count.
+    """
+    if now is None:
+        now = _utcnow()
+    window_open = now - timedelta(days=37)
+    window_close = now - timedelta(days=30)
+    retrip_window = timedelta(days=30)
+
+    prevented = 0
+    recurred = 0
+
+    for case in cases:
+        raw_log = case.fingerprint_to_fix_log or []
+        fix_entries = [
+            e
+            for e in raw_log
+            if isinstance(e, dict) and e.get("fix_pr_number") is not None
+        ]
+        if fix_entries and all(e.get("merged_at") is None for e in fix_entries):
+            continue
+        cycles = _extract_recurrence_cycles(case)
+        if not cycles:
+            continue
+        first = cycles[0]
+        merged_at = first["merged_at"]
+        if merged_at is None:
+            continue
+        if not (window_open <= merged_at <= window_close):
+            continue
+        retripped = any(
+            c["merged_at"] is not None and c["merged_at"] <= merged_at + retrip_window
+            for c in cycles[1:]
+        )
+        if retripped:
+            recurred += 1
+        else:
+            prevented += 1
+
+    eligible = prevented + recurred
+    return {
+        "avg_rate": prevented / eligible if eligible > 0 else None,
+        "eligible_count": eligible,
+        "prevented_count": prevented,
+        "recurred_count": recurred,
+    }
+
+
+async def _evaluate_low_prevention_rate_signal(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    spawn_budget_left: int,
+) -> int:
+    """Fire a research signal when the 7d average defense prevention rate drops below threshold."""
+    if spawn_budget_left <= 0:
+        return 0
+
+    cases = list(
+        (
+            await session.execute(
+                select(RegressionRemediationCase).where(
+                    RegressionRemediationCase.project_id == project_id
+                )
+            )
+        ).scalars()
+    )
+
+    result = compute_avg_prevention_rate_7d(cases)
+    avg_rate = result["avg_rate"]
+    eligible_count = result["eligible_count"]
+
+    if avg_rate is None or avg_rate >= _PREVENTION_RATE_THRESHOLD:
+        return 0
+    if eligible_count < _PREVENTION_RATE_MIN_SAMPLE:
+        return 0
+
+    spawn = await _maybe_spawn(
+        session,
+        project_id,
+        signal_name="low_prevention_rate_7d",
+        regression_class="cross_layer_defense_prevention_low",
+        prior_rate=_PREVENTION_RATE_THRESHOLD,
+        current_rate=avg_rate,
+        sample_size=eligible_count,
+        magnitude=_PREVENTION_RATE_THRESHOLD - avg_rate,
+        title_hint=f"Low cross-layer defense prevention rate ({avg_rate:.0%})",
+        extra_context_fields={
+            "prevention_rate_7d": avg_rate,
+            "eligible_defenses": eligible_count,
+            "recurred_count": result["recurred_count"],
+        },
+    )
+    return 1 if spawn is not None else 0
 
 
 def _build_layer_defense_ledger(
@@ -1076,7 +1292,7 @@ def _build_layer_defense_ledger(
 
     Aggregates fingerprint_to_fix_log entries from all RegressionRemediationCase rows
     for a project, filters to merged_at within lookback_days, and computes per-layer
-    statistics. All five canonical layers always appear. Returns empty string when
+    statistics. All six canonical layers always appear. Returns empty string when
     all_fix_logs is empty.
     """
     if not all_fix_logs:
@@ -1088,7 +1304,7 @@ def _build_layer_defense_ledger(
         "",
         f"RECENT DEFENSE ACTIVITY BY LAYER (last {lookback_days} days)",
     ]
-    for layer in _CANONICAL_RECURRENCE_LAYERS:
+    for layer in LAYER_DISPLAY_ORDER:
         s = stats[layer]
         if s["fix_count"] == 0:
             lines.append(
@@ -1112,31 +1328,82 @@ def _build_layer_defense_ledger(
 
 
 def _layers_targeted_union(entries: list[dict[str, Any]] | None) -> set[str]:
-    """Union of ``layers_targeted`` across entries that have the key populated.
+    """Union of canonical ``layers_targeted`` across fix-log / cycle entries.
 
-    Accepts both the raw ``fingerprint_to_fix_log`` shape (entries with
-    ``"layers_targeted" in entry``) and the ``_extract_recurrence_cycles``
-    shape (cycles with ``layers_targeted_present`` flagged True). Entries
-    awaiting backfill — those without the key / flag — are skipped, matching
-    the existing semantics in ``_format_recurrence_meta_prompt`` and
-    ``_compute_layer_coverage_by_class``.
+    Backwards-compatible name for callers (tests, admin_digest); the actual
+    aggregation is owned by ``regression_layer_classifier.aggregate_targeted_layers``.
+    Entries from ``_extract_recurrence_cycles`` carry an empty ``layers_targeted``
+    list when ``layers_targeted_present`` is False, so the classifier's
+    canonical-layer filter yields the same result as the prior dispatcher
+    implementation.
     """
-    out: set[str] = set()
-    for entry in entries or []:
+    return aggregate_targeted_layers(entries or [])
+
+
+def _compute_recovery_layer_mismatch(
+    fix_log: list[dict[str, Any]] | None,
+    symptoms_by_layer: dict[str, Any] | None,
+    now: datetime,
+) -> dict[str, Any] | None:
+    """Return a recovery_layer_mismatch entry when fix didn't cover all symptom layers.
+
+    Compares the union of layers_targeted across fix-log entries against the
+    layers that fired symptoms during the case lifecycle.  Returns None when
+    there is no data to compare or when all symptom layers were addressed.
+    """
+    fix_layers = _layers_targeted_union(fix_log)
+    symptom_layers = set((symptoms_by_layer or {}).keys())
+    if not fix_layers or not symptom_layers:
+        return None
+    unaddressed = symptom_layers - fix_layers
+    if not unaddressed:
+        return None
+    return {
+        "type": "recovery_layer_mismatch",
+        "evaluated_at": now.isoformat(),
+        "fix_layers": sorted(fix_layers),
+        "symptom_layers": sorted(symptom_layers),
+        "unaddressed_layers": sorted(unaddressed),
+    }
+
+
+def compute_untargeted_layers(
+    fingerprint_to_fix_log: list[dict[str, Any]] | None,
+) -> list[str]:
+    """Canonical layers never targeted by any prior fix in this case's history.
+
+    Returns layers from ``LAYER_DISPLAY_ORDER`` (in canonical order)
+    that do not appear in any entry's ``layers_targeted`` list. Unrecognized
+    layer names in the fix-log are silently dropped so a typo or future-added
+    layer never crashes the read path. Empty / missing / non-list fix-log
+    yields the full canonical tuple — everything is untargeted by default.
+    """
+    if not isinstance(fingerprint_to_fix_log, list):
+        return list(LAYER_DISPLAY_ORDER)
+    targeted = _layers_targeted_union(fingerprint_to_fix_log)
+    canonical = set(LAYER_DISPLAY_ORDER)
+    targeted &= canonical
+    return [layer for layer in LAYER_DISPLAY_ORDER if layer not in targeted]
+
+
+def compute_class_layer_defense_counts(
+    fix_logs: list[dict[str, Any]] | None,
+) -> dict[str, int]:
+    """Per-canonical-layer fix counts across a list of fix-log entries.
+
+    Caller should pass the aggregated fix-log entries for all cases that share
+    the same regression_class.  Returns one entry per canonical layer in
+    canonical order (including layers with zero fixes) so the UI renders a
+    stable six-row table.
+    """
+    counts: dict[str, int] = {layer: 0 for layer in LAYER_DISPLAY_ORDER}
+    for entry in fix_logs or []:
         if not isinstance(entry, dict):
             continue
-        if "layers_targeted_present" in entry:
-            if not entry.get("layers_targeted_present"):
-                continue
-        elif "layers_targeted" not in entry:
-            continue
-        raw = entry.get("layers_targeted") or []
-        if not isinstance(raw, list):
-            continue
-        for layer in raw:
-            if isinstance(layer, str) and layer:
-                out.add(layer)
-    return out
+        for layer in entry.get("layers_targeted") or []:
+            if layer in counts:
+                counts[layer] += 1
+    return counts
 
 
 def _format_recurrence_meta_prompt(
@@ -1221,8 +1488,8 @@ def _format_recurrence_meta_prompt(
     lines.extend(
         [
             "",
-            "Enumerate ALL FIVE canonical layers explicitly:",
-            ", ".join(_CANONICAL_RECURRENCE_LAYERS),
+            "Enumerate ALL SIX canonical layers explicitly:",
+            ", ".join(LAYER_DISPLAY_ORDER),
             (
                 "For each layer answer: is it involved? if yes, what defense "
                 "should we add? if no, why is it ruled out?"
@@ -1268,14 +1535,8 @@ def _format_fragile_recurrence_meta_prompt(
         attempts
     )
 
-    all_targeted: set[str] = set()
-    for attempt in attempts:
-        if attempt.get("layers_targeted_present"):
-            all_targeted.update(attempt.get("layers_targeted") or [])
-
-    untargeted = [
-        layer for layer in _CANONICAL_RECURRENCE_LAYERS if layer not in all_targeted
-    ]
+    all_targeted = _layers_targeted_union(attempts) & set(LAYER_DISPLAY_ORDER)
+    untargeted = compute_untargeted_layers(attempts)
 
     lines: list[str] = [
         "FRAGILE-RECURRENCE META-INVESTIGATION",
@@ -1287,10 +1548,11 @@ def _format_fragile_recurrence_meta_prompt(
         ),
         (
             "Single-layer fixes have not held. This meta-investigation must enumerate "
-            "ALL canonical layers and propose a defense in at least one untargeted layer."
+            "ALL canonical layers and propose defenses in AT LEAST TWO distinct layers, "
+            "OR provide explicit written justification for why a single-layer defense is sufficient."
         ),
         "",
-        f"Canonical defense layers: {', '.join(_CANONICAL_RECURRENCE_LAYERS)}",
+        f"Canonical defense layers: {', '.join(LAYER_DISPLAY_ORDER)}",
         (
             f"Layers already targeted by prior fixes: "
             f"{', '.join(sorted(all_targeted)) if all_targeted else 'none recorded'}"
@@ -1327,8 +1589,8 @@ def _format_theme_layer_meta_prompt(
             "have not extinguished the pattern."
         ),
         "",
-        "Enumerate ALL FIVE canonical layers explicitly:",
-        ", ".join(_CANONICAL_RECURRENCE_LAYERS),
+        "Enumerate ALL SIX canonical layers explicitly:",
+        ", ".join(LAYER_DISPLAY_ORDER),
         (
             "For each layer answer: is it involved? if yes, what defense "
             "should we add? if no, why is it ruled out?"
@@ -1893,11 +2155,14 @@ async def _collect_fix_loop_divergence_fingerprints(
 def _extract_failure_type(msg: str) -> str:
     """Extract failure type from viewport test error message.
 
-    Returns 'overflow' for expectNoOverflowAt, 'touch_target' for expectMinTouchTargetAt,
-    or 'unknown' if neither is found.
+    Returns 'overflow' for expectNoOverflowAt, 'text_truncation' for
+    expectNoTextTruncationAt, 'touch_target' for expectMinTouchTargetAt,
+    or 'unknown' if none is found.
     """
     if "expectNoOverflowAt" in msg:
         return "overflow"
+    if "expectNoTextTruncationAt" in msg:
+        return "text_truncation"
     if "expectMinTouchTargetAt" in msg:
         return "touch_target"
     return "unknown"
@@ -1939,7 +2204,8 @@ async def _collect_viewport_failures(
     )
 
     _width_re = re.compile(
-        r"expect(?:NoOverflow|MinTouchTarget)At\((\d+)\)", re.IGNORECASE
+        r"expect(?:NoOverflow|NoTextTruncation|MinTouchTarget)At\((\d+)\)",
+        re.IGNORECASE,
     )
     _component_re = re.compile(r"(\w+)\.viewport\.test\.tsx", re.IGNORECASE)
 
@@ -1958,12 +2224,24 @@ async def _collect_viewport_failures(
 
         key = (component, width)
         item = grouped.setdefault(
-            key, {"tasks": set(), "samples": [], "failure_types": set()}
+            key,
+            {
+                "tasks": set(),
+                "samples": [],
+                "failure_types": set(),
+                "earliest_task": None,
+            },
         )
         item["tasks"].add(str(task.id))
         item["failure_types"].add(_extract_failure_type(msg))
         if msg and len(item["samples"]) < 2:
             item["samples"].append(msg[:240])
+        # Track the earliest failing task for introducing-PR attribution.
+        if (
+            item["earliest_task"] is None
+            or task.updated_at < item["earliest_task"].updated_at
+        ):
+            item["earliest_task"] = task
 
     trips: list[dict[str, Any]] = []
     for (component, width), item in grouped.items():
@@ -1978,6 +2256,23 @@ async def _collect_viewport_failures(
             failure_type = types.pop()
         else:
             failure_type = "mixed"
+        # Derive introducing-PR / introducing-commit from the earliest failing task.
+        earliest_task = item.get("earliest_task")
+        introducing_pr_number: int | None = None
+        introducing_commit_sha: str | None = None
+        if earliest_task is not None:
+            pr_num = earliest_task.first_payload.get("pr_number")
+            if pr_num is not None:
+                try:
+                    introducing_pr_number = int(pr_num)
+                except (TypeError, ValueError):
+                    pass
+            if introducing_pr_number is None:
+                head_sha = (earliest_task.context or {}).get(
+                    "head_sha"
+                ) or earliest_task.first_payload.get("head_sha")
+                if head_sha:
+                    introducing_commit_sha = str(head_sha)
         trips.append(
             {
                 "component": component,
@@ -1985,6 +2280,8 @@ async def _collect_viewport_failures(
                 "count": count,
                 "samples": item["samples"],
                 "failure_type": failure_type,
+                "introducing_pr_number": introducing_pr_number,
+                "introducing_commit_sha": introducing_commit_sha,
             }
         )
     return sorted(trips, key=lambda x: (-x["count"], x["component"], x["width"]))
@@ -2031,7 +2328,7 @@ def _derive_observation_for_layer_classify(
     elif regression_class.startswith("background_service_crash"):
         stage = "provision"
     elif regression_class.startswith("viewport_regression:"):
-        stage = "baseline"
+        stage = "viewport"
     elif signal_name in ("sr_catch_rate", "sr_blind_spot", "sr_false_positive"):
         stage = "review"
     elif signal_name == "pipeline_success_rate":
@@ -2201,10 +2498,11 @@ def _format_cross_layer_prompt(
             f"infrastructure layer(s) within the last 48h: {layer_names}."
         ),
         (
-            "Diagnose the SHARED root cause and propose a coordinated fix that "
-            "addresses all of the layers below — do NOT bias toward whichever "
-            "layer surfaced most recently. Each layer below shows one "
-            "representative fingerprint + sample from this window."
+            "Diagnose the SHARED root cause and propose defenses in AT LEAST TWO distinct "
+            "infrastructure layers, OR provide explicit written justification for why a "
+            "single-layer defense is sufficient. Do NOT bias toward whichever layer "
+            "surfaced most recently. Each layer below shows one representative fingerprint "
+            "+ sample from this window."
         ),
         "",
         "PER-LAYER EVIDENCE",
@@ -2296,10 +2594,11 @@ def _format_layer_concentration_prompt(
             "have a systemic gap that point-fixes cannot close."
         ),
         (
-            f"  2. Should additional defenses be added at OTHER layers to compensate "
-            f"for {layer}'s fragility? E.g. if {layer} is chronically fragile, "
-            "hardening adjacent layers (pre-flight checks, gate policies) may provide "
-            "defense-in-depth that reduces blast radius when this layer fails."
+            f"  2. Propose defenses in AT LEAST ONE OTHER layer to compensate for "
+            f"{layer}'s fragility, OR provide written justification for why {layer}-only "
+            "defense is sufficient. Defense-in-depth strategies (pre-flight checks, gate "
+            "policies, observation thresholds in adjacent layers) may reduce blast radius "
+            "when this layer fails."
         ),
         "",
         "Produce the structured diagnosis JSON "
@@ -2344,6 +2643,22 @@ _PATH_CLASSIFIER_COVERAGE_TOP_PATHS = 10
 # does not pile up duplicate alerts each cycle.
 _PATH_CLASSIFIER_COVERAGE_ALERT_TITLE = "Path-layer classifier coverage stale"
 
+# Awaiting-backfill backlog alert thresholds. Cross-layer compliance buckets
+# fix-log entries with spawn_was_cross_layer=True and merged_at set but no
+# layers_targeted into ``awaiting_backfill``. The 24h grace inside
+# ``compute_cross_layer_compliance`` already separates transient (recent
+# merges, backfill not yet retried) from systemic backlog. The thresholds
+# below trip the operator alert when EITHER signal indicates the backlog has
+# stopped draining: 5 entries past the 24h grace, OR an oldest entry older
+# than 3 days. Both point at the same likely causes — GitHub auth failures in
+# ``_backfill_layers_targeted_once`` (which logs and continues silently) or
+# path-classifier coverage gaps that yield empty layer assignments.
+_AWAITING_BACKFILL_COUNT_THRESHOLD = 5
+_AWAITING_BACKFILL_AGE_THRESHOLD = timedelta(days=3)
+# Window mirrors the GET /regression-cases/cross-layer-compliance default.
+_AWAITING_BACKFILL_WINDOW = timedelta(days=30)
+_AWAITING_BACKFILL_ALERT_TITLE = "Cross-layer awaiting_backfill backlog stuck"
+
 
 def _classify_layers_from_paths(paths: list[str]) -> list[str]:
     """Map a list of changed file paths to canonical infrastructure-layer tags.
@@ -2372,6 +2687,7 @@ def _classify_layers_from_paths(paths: list[str]) -> list[str]:
         LAYER_BASELINE_GATE,
         LAYER_CI_WORKFLOW,
         LAYER_REVIEWER_PASS,
+        LAYER_VIEWPORT,
     )
 
     tags: set[str] = set()
@@ -2433,9 +2749,16 @@ def _classify_layers_from_paths(paths: list[str]) -> list[str]:
             or p == "backend/app/source_ref_validation.py"
             or p == "backend/app/fix_loop_telemetry.py"
             or p == "check"
-            or p == "check-viewport.sh"
         ):
             tags.add(LAYER_BASELINE_GATE)
+
+        # VIEWPORT — viewport test infrastructure and check script
+        if (
+            p == "check-viewport.sh"
+            or p == "admin-ui/src/test/viewport.ts"
+            or (p.startswith("admin-ui/src/") and p.endswith(".viewport.test.tsx"))
+        ):
+            tags.add(LAYER_VIEWPORT)
 
     return sorted(tags)
 
@@ -2710,6 +3033,107 @@ async def _evaluate_path_classifier_coverage(
         f"unmatched paths:\n{path_lines}\n"
         f"Update _classify_layers_from_paths or extend the canonical layer "
         f"list to cover these paths."
+    )
+    session.add(
+        Alert(
+            project_id=project_id,
+            severity=AlertSeverity.WARNING,
+            title=title,
+            message=message[:1000],
+        )
+    )
+    await session.commit()
+
+
+async def _evaluate_awaiting_backfill_alert(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> None:
+    """Open a project-scoped Alert when cross-layer awaiting_backfill backlog is stuck.
+
+    Non-spawning observation step — never spawns investigate tasks or consumes
+    spawn budget. Wrapped by callers in try/except so a transient failure here
+    cannot break the rest of the recovery scan.
+
+    Trips when EITHER:
+      * ``awaiting_backfill_over_threshold_count >= _AWAITING_BACKFILL_COUNT_THRESHOLD``
+      * ``awaiting_backfill_oldest_merged_at`` is older than ``_AWAITING_BACKFILL_AGE_THRESHOLD``
+
+    Dedup mirrors ``_evaluate_path_classifier_coverage`` — skip insertion when
+    an open Alert with the same project_id, no task_id, WARNING severity, and
+    matching title already exists.
+    """
+    # Lazy import: admin_digest imports from this module at function scope
+    # (compute_pipeline_health_summary), so importing it at module-level here
+    # would create a load-time cycle.
+    from app.routers.admin_digest import compute_cross_layer_compliance
+
+    cutoff = _utcnow() - _AWAITING_BACKFILL_WINDOW
+    cases = (
+        (
+            await session.execute(
+                select(RegressionRemediationCase).where(
+                    RegressionRemediationCase.project_id == project_id,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    metrics = compute_cross_layer_compliance(list(cases), cutoff)
+
+    awaiting_count = int(metrics.get("awaiting_backfill_count") or 0)
+    over_threshold = int(metrics.get("awaiting_backfill_over_threshold_count") or 0)
+    oldest_iso = metrics.get("awaiting_backfill_oldest_merged_at")
+    oldest_dt: datetime | None = None
+    if oldest_iso:
+        try:
+            oldest_dt = _to_naive_utc(
+                datetime.fromisoformat(str(oldest_iso).replace("Z", "+00:00"))
+            )
+        except (ValueError, TypeError):
+            oldest_dt = None
+
+    age_trip = (
+        oldest_dt is not None
+        and (_utcnow() - oldest_dt) >= _AWAITING_BACKFILL_AGE_THRESHOLD
+    )
+    count_trip = over_threshold >= _AWAITING_BACKFILL_COUNT_THRESHOLD
+    if not (age_trip or count_trip):
+        return
+
+    title = _AWAITING_BACKFILL_ALERT_TITLE
+    existing = (
+        (
+            await session.execute(
+                select(Alert).where(
+                    Alert.project_id == project_id,
+                    Alert.task_id.is_(None),
+                    Alert.severity == AlertSeverity.WARNING,
+                    Alert.dismissed_at.is_(None),
+                    Alert.title == title,
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if existing is not None:
+        return
+
+    oldest_str = oldest_iso if oldest_iso else "(none)"
+    message = (
+        f"Cross-layer awaiting_backfill backlog is not draining: "
+        f"{awaiting_count} entries total, {over_threshold} older than 24h, "
+        f"oldest merged_at={oldest_str}. Likely causes: (1) GitHub auth "
+        f"failures in _backfill_layers_targeted_once (which logs and "
+        f"continues silently — check logs for token/installation errors), "
+        f"(2) path-classifier coverage gaps in _classify_layers_from_paths "
+        f"that yield empty layer assignments and never advance to a "
+        f"layers_targeted value. Backlog growth corrupts the "
+        f"cross-layer-compliance numerator/denominator surfaced at "
+        f"GET /api/regression-cases/cross-layer-compliance."
     )
     session.add(
         Alert(
@@ -3174,7 +3598,7 @@ async def _maybe_spawn(
 
     # SR blind-spot theme regressions already represent 5+ recurrences of the same
     # pattern; force the layer-enumeration meta block on every first dispatch so the
-    # agent enumerates all five canonical layers rather than doing single-symptom triage.
+    # agent enumerates all six canonical layers rather than doing single-symptom triage.
     # Recurrence meta (above) already includes layer enumeration; cross-layer and
     # recurrence may both fire together; this only fires when neither path ran.
     if (
@@ -3204,6 +3628,10 @@ async def _maybe_spawn(
         )
     elif signal_name == "cross_case_fingerprint":
         case_escalation_reason = ESCALATION_REASON_ESCALATED_CROSS_CASE_FINGERPRINT
+    elif signal_name == "recurring_class":
+        # Proactive recurring-class meta-spawns get their own audit-trail reason
+        # so operators can distinguish them from generic cross-layer escalations.
+        case_escalation_reason = ESCALATION_REASON_RECURRING_CLASS_META
     elif is_cross_layer:
         case_escalation_reason = ESCALATION_REASON_ESCALATED_CROSS_LAYER
     elif _fragile_recurrence:
@@ -3658,7 +4086,7 @@ async def _evaluate_viewport_regression_signal(
     project_id: uuid.UUID,
     spawn_budget_left: int,
 ) -> int:
-    """Trip viewport_regression:<Component>@<width> when ≥2 viewport-test failures recur."""
+    """Trip viewport_regression:<Component>:<AssertionType>@<width> when ≥2 viewport-test failures recur."""
     if spawn_budget_left <= 0:
         return 0
     trips = await _collect_viewport_failures(session, project_id)
@@ -3669,7 +4097,7 @@ async def _evaluate_viewport_regression_signal(
         component = trip["component"]
         width = trip["width"]
         failure_type = trip.get("failure_type", "unknown")
-        regression_class = f"viewport_regression:{component}@{width}"
+        regression_class = f"viewport_regression:{component}:{failure_type}@{width}"
         prompt = _format_signal_lines(
             signal_name="viewport_regression",
             regression_class=regression_class,
@@ -3697,7 +4125,126 @@ async def _evaluate_viewport_regression_signal(
         )
         if spawn is not None:
             spawned += 1
+            if hasattr(RegressionRemediationCase, "introducing_pr_number"):
+                case = await _get_remediation_case(
+                    session, project_id, regression_class
+                )
+                if case is not None:
+                    setattr(
+                        case, "introducing_pr_number", trip.get("introducing_pr_number")
+                    )
+                    setattr(
+                        case,
+                        "introducing_commit_sha",
+                        trip.get("introducing_commit_sha"),
+                    )
+                    session.add(case)
     return spawned
+
+
+_VIEWPORT_ASSERTION_RE = re.compile(
+    r"(expectNoOverflowAt|expectNoTextTruncationAt|expectMinTouchTargetAt)\s*\("
+)
+_VIEWPORT_ESCAPE_HATCH_RE = re.compile(
+    r"data-viewport-allow-(overflow|truncation|small-target)"
+)
+_VIEWPORT_TEST_PATH_RE = re.compile(r"^admin-ui/src/.+\.viewport\.test\.[tj]sx?$")
+_COMPONENT_PATH_RE = re.compile(r"^admin-ui/src/components/[^/]+\.tsx$")
+
+
+def compute_viewport_coverage_snapshot(
+    diff_text: str, pr_number: int | None = None
+) -> dict:
+    """Compute a viewport_coverage_snapshot dict from a PR unified diff.
+
+    Counts expectNoOverflowAt / expectNoTextTruncationAt / expectMinTouchTargetAt
+    call sites in *.viewport.test.{ts,tsx} files, new data-viewport-allow-*
+    escape-hatch attributes in component files, and deleted component files.
+    Returns a dict suitable for project.design_doc["viewport_coverage_snapshot"].
+    """
+    assertion_before = 0
+    assertion_after = 0
+    escape_hatches = 0
+    removed_components: list[str] = []
+
+    in_viewport_test = False
+    in_component = False
+    current_path = ""
+
+    for line in diff_text.splitlines():
+        if line.startswith("diff --git "):
+            parts = line.split(" ")
+            # parts: ["diff", "--git", "a/path", "b/path"]
+            raw = parts[3] if len(parts) >= 4 else ""
+            current_path = raw[2:] if raw.startswith("b/") else raw
+            in_viewport_test = bool(_VIEWPORT_TEST_PATH_RE.match(current_path))
+            in_component = bool(_COMPONENT_PATH_RE.match(current_path))
+            continue
+
+        if line.startswith("deleted file mode") and _COMPONENT_PATH_RE.match(
+            current_path
+        ):
+            removed_components.append(current_path)
+            continue
+
+        if in_viewport_test:
+            if line.startswith("-") and not line.startswith("---"):
+                if _VIEWPORT_ASSERTION_RE.search(line):
+                    assertion_before += 1
+            elif line.startswith("+") and not line.startswith("+++"):
+                if _VIEWPORT_ASSERTION_RE.search(line):
+                    assertion_after += 1
+            else:
+                # context line — present on both sides
+                if _VIEWPORT_ASSERTION_RE.search(line):
+                    assertion_before += 1
+                    assertion_after += 1
+
+        if in_component and line.startswith("+") and not line.startswith("+++"):
+            if _VIEWPORT_ESCAPE_HATCH_RE.search(line):
+                escape_hatches += 1
+
+    return {
+        "assertion_count_before": assertion_before,
+        "assertion_count_after": assertion_after,
+        "new_escape_hatch_count": escape_hatches,
+        "removed_component_files": removed_components[:50],
+        "merged_pr": pr_number,
+    }
+
+
+async def update_viewport_coverage_snapshot_from_diff(
+    session: AsyncSession,
+    project: Any,
+    pr_number: int,
+    diff_text: str,
+) -> None:
+    """Write viewport_coverage_snapshot to project.design_doc.
+
+    Called by the PR-merge hook (rollup_management) each time a PR merges.
+    Skips silently when the project has no admin-ui directory in the diff.
+    """
+    from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
+
+    if "admin-ui/" not in diff_text:
+        return
+
+    snap = compute_viewport_coverage_snapshot(diff_text, pr_number=pr_number)
+    doc = dict(project.design_doc or {})
+    doc["viewport_coverage_snapshot"] = snap
+    project.design_doc = doc
+    flag_modified(project, "design_doc")
+    session.add(project)
+    logger.info(
+        "[REGRESSION_DISPATCHER] viewport_coverage_snapshot updated "
+        "project=%s pr=%s before=%d after=%d escape_hatches=%d removed=%d",
+        project.id,
+        pr_number,
+        snap["assertion_count_before"],
+        snap["assertion_count_after"],
+        snap["new_escape_hatch_count"],
+        len(snap["removed_component_files"]),
+    )
 
 
 def _probe_viewport_coverage_drop(project_design_doc: dict | None) -> bool:
@@ -4431,6 +4978,230 @@ async def _evaluate_cross_case_fingerprint_signal(
     return spawned
 
 
+def _classify_cycle_compliance(row: dict) -> str:
+    """Return the compliance label for a single PER-CYCLE LAYER HISTORY row.
+
+    Labels:
+      - ``compliant``         — mandate True AND >=2 distinct canonical layers targeted
+      - ``non-compliant``     — mandate True AND layers_targeted recorded but <2 canonical layers
+      - ``awaiting-backfill`` — mandate True AND layers_targeted not yet present (do NOT accuse)
+      - ``not-mandated``      — mandate False or absent
+    """
+    if not row.get("spawn_was_cross_layer"):
+        return "not-mandated"
+    if not row.get("layers_targeted_present"):
+        return "awaiting-backfill"
+    canonical = set(LAYER_DISPLAY_ORDER)
+    distinct_canonical = {
+        layer for layer in (row.get("layers_targeted") or []) if layer in canonical
+    }
+    if len(distinct_canonical) >= 2:
+        return "compliant"
+    return "non-compliant"
+
+
+def _format_recurring_class_prompt(
+    *,
+    regression_class: str,
+    targeted_layers: list[str],
+    cycle_rows: list[dict],
+    layer_defense_block: str = "",
+) -> str:
+    """Build the recurring-class proactive meta-investigation prompt."""
+    cycle_count = len(cycle_rows)
+    layer_list = ", ".join(targeted_layers)
+    lines = [
+        f"RECURRING CROSS-LAYER CLASS META-INVESTIGATION (recurring_class:{regression_class})",
+        (
+            f"Regression class '{regression_class}' has accumulated {cycle_count} fix cycles "
+            f"across {len(targeted_layers)} distinct canonical layers ({layer_list}). "
+            "Each cycle applied a single-layer fix that held temporarily, then re-tripped "
+            "on a different layer — a pattern indicating an unaddressed shared root cause."
+        ),
+        "",
+        "PER-CYCLE LAYER HISTORY",
+    ]
+    non_compliant_targeted: set[str] = set()
+    canonical_set = set(LAYER_DISPLAY_ORDER)
+    for row in cycle_rows:
+        layers = (
+            ", ".join(row["layers_targeted"]) if row["layers_targeted"] else "unknown"
+        )
+        compliance = _classify_cycle_compliance(row)
+        mandate = "yes" if row.get("spawn_was_cross_layer") else "no"
+        lines.append(
+            f"  Cycle {row['cycle']}: layers={layers}  merged_at={row['merged_at']}"
+            f"  cross_layer_mandate={mandate}  compliance={compliance}"
+        )
+        if compliance == "non-compliant":
+            for layer in row.get("layers_targeted") or []:
+                if layer in canonical_set:
+                    non_compliant_targeted.add(layer)
+
+    if non_compliant_targeted:
+        # Reuse compute_untargeted_layers over the same per-row layers_targeted
+        # data the cycle history was built from — equivalent to running it over
+        # the project's full aggregated fix-log entries for this class.
+        untargeted = compute_untargeted_layers(cycle_rows)
+        targeted_str = ", ".join(sorted(non_compliant_targeted))
+        untargeted_str = (
+            ", ".join(untargeted)
+            if untargeted
+            else "(none — every layer has a prior fix)"
+        )
+        lines += [
+            "",
+            "PRIOR MANDATE NON-COMPLIANCE",
+            (
+                f"At least one prior cycle was spawned with the cross-layer mandate "
+                f"but shipped a single-layer fix targeting only: {targeted_str}. "
+                "That fix did NOT comply with the multi-layer requirement."
+            ),
+            (
+                f"Canonical layers still UNTARGETED across this class's full fix history: "
+                f"{untargeted_str}. "
+                "Steer the new defense toward these untargeted layers."
+            ),
+        ]
+
+    lines += [
+        "",
+        "REQUIRED: propose defenses in AT LEAST 2 distinct canonical layers.",
+        f"Canonical layers: {', '.join(LAYER_DISPLAY_ORDER)}",
+        (
+            "A single-layer fix has already been tried multiple times — "
+            "a multi-layer defense is mandatory."
+        ),
+        "",
+        (
+            ".github/workflows/ files cannot be modified by the agent; "
+            "treat workflow findings as notes in the diagnosis report."
+        ),
+    ]
+    if layer_defense_block:
+        lines.append("")
+        lines.append(layer_defense_block)
+    return "\n".join(lines)
+
+
+async def _evaluate_recurring_class_signal(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    spawn_budget_left: int,
+) -> int:
+    """Proactively escalate when a regression class spans 2+ layers across 3+ cycles.
+
+    Unlike the inline cross-layer detection in _maybe_spawn (which only fires when
+    the current signal also trips), this evaluator scans historical case records so
+    a class that accumulated cross-layer history without concurrent signals is caught.
+
+    Uses regression_class="recurring_class:<original_class>" for dedup/cooldown.
+    """
+    if spawn_budget_left <= 0:
+        return 0
+
+    cutoff = _utcnow() - _RECURRING_CLASS_LOOKBACK
+    all_cases = (
+        (
+            await session.execute(
+                select(RegressionRemediationCase).where(
+                    RegressionRemediationCase.project_id == project_id,
+                    RegressionRemediationCase.first_seen_at >= cutoff,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not all_cases:
+        return 0
+
+    # Group fix-log entries by regression_class, skipping meta-investigation classes.
+    _META_PREFIXES = (
+        "layer_concentration:",
+        "cross_case_fingerprint:",
+        "recurring_class:",
+        "anomaly:",
+    )
+    by_class: dict[str, list[dict]] = {}
+    for case in all_cases:
+        rc = case.regression_class or ""
+        if any(rc.startswith(p) for p in _META_PREFIXES):
+            continue
+        fix_log = case.fingerprint_to_fix_log or []
+        if not isinstance(fix_log, list):
+            continue
+        entries = [e for e in fix_log if isinstance(e, dict) and "layers_targeted" in e]
+        if entries:
+            by_class.setdefault(rc, []).extend(entries)
+
+    if not by_class:
+        return 0
+
+    # Compute layer defense block once (only if at least one class will trip).
+    _layer_defense_block: str | None = None
+
+    spawned = 0
+    for regression_class, all_entries in sorted(by_class.items()):
+        if spawned >= spawn_budget_left:
+            break
+        if not is_recurring_cross_layer_class(
+            all_entries,
+            min_cycles=_RECURRING_CLASS_MIN_CYCLES,
+            min_layers=_RECURRING_CLASS_MIN_LAYERS,
+        ):
+            continue
+        targeted = aggregate_targeted_layers(all_entries)
+
+        if _layer_defense_block is None:
+            all_fix_logs_with_case_ids: list[tuple[str, dict]] = [
+                (str(c.id), entry)
+                for c in all_cases
+                for entry in (c.fingerprint_to_fix_log or [])
+                if isinstance(entry, dict)
+            ]
+            _layer_defense_block = _build_layer_defense_ledger(
+                all_fix_logs_with_case_ids
+            )
+
+        cycle_rows = [
+            {
+                "cycle": i + 1,
+                "layers_targeted": e.get("layers_targeted") or [],
+                "merged_at": e.get("merged_at") or "unknown",
+                "spawn_was_cross_layer": bool(e.get("spawn_was_cross_layer")),
+                "layers_targeted_present": "layers_targeted" in e,
+            }
+            for i, e in enumerate(all_entries)
+        ]
+        prompt = _format_recurring_class_prompt(
+            regression_class=regression_class,
+            targeted_layers=sorted(targeted),
+            cycle_rows=cycle_rows,
+            layer_defense_block=_layer_defense_block or "",
+        )
+        meta_class = f"recurring_class:{regression_class}"
+        spawn = await _maybe_spawn(
+            session,
+            project_id,
+            signal_name="recurring_class",
+            regression_class=meta_class,
+            prior_rate=None,
+            current_rate=None,
+            sample_size=len(all_entries),
+            magnitude=float(len(all_entries)),
+            title_hint=(
+                f"Recurring cross-layer class: {regression_class} "
+                f"({len(all_entries)} cycles, {len(targeted)} layers)"
+            )[:80],
+            prompt_override=prompt,
+        )
+        if spawn is not None:
+            spawned += 1
+
+    return spawned
+
+
 def _get_staleness_raw_ts(
     signal_name: str,
     doc: dict,
@@ -4712,18 +5483,26 @@ async def run_recovery_once(session: AsyncSession, project_id: uuid.UUID) -> int
         if state is None:
             continue
         if not state["tripped"]:
+            mismatch_entry = _compute_recovery_layer_mismatch(
+                case.fingerprint_to_fix_log, case.symptoms_by_layer, now
+            )
             case.mark_closed()
             # Reset the recovery clock so a future re-escalation does not
             # pick up a stale healthy_since on the same row (mirrors the
             # prior process-local ``_signal_healthy_since.pop`` semantics).
             case.signal_healthy_since_at = None
-            case.fingerprint_to_fix_log = list(case.fingerprint_to_fix_log or []) + [
+            new_entries: list[dict[str, Any]] = [
                 {
                     "fingerprint": case.regression_class,
                     "recovered_at": now.isoformat(),
                     "post_merge_value": state["current_rate"],
                 }
             ]
+            if mismatch_entry:
+                new_entries.append(mismatch_entry)
+            case.fingerprint_to_fix_log = (
+                list(case.fingerprint_to_fix_log or []) + new_entries
+            )
         else:
             last_spawn = await _last_spawn_for_class(
                 session, project_id, case.regression_class
@@ -4779,6 +5558,60 @@ async def run_recovery_once(session: AsyncSession, project_id: uuid.UUID) -> int
         logger.warning(
             "[REGRESSION_DISPATCHER] path-classifier coverage evaluation raised "
             "for project=%s: %s",
+            project_id,
+            exc,
+        )
+
+    # Non-spawning observation: open a WARNING alert when the cross-layer
+    # awaiting_backfill backlog stops draining (count past 24h grace exceeds
+    # threshold OR the oldest entry is older than age threshold). Wrapped in
+    # try/except so a transient failure here cannot break the rest of the
+    # recovery scan.
+    try:
+        await _evaluate_awaiting_backfill_alert(session, project_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[REGRESSION_DISPATCHER] awaiting_backfill alert evaluation raised "
+            "for project=%s: %s",
+            project_id,
+            exc,
+        )
+
+    # Non-spawning observation: open a WARNING alert when >=2 SR categories
+    # have entered lone-checker state (SR is the only reviewer, catch-rate
+    # unmeasurable). Wrapped in try/except for the same reason as above.
+    try:
+        from app.routers.admin_digest import _evaluate_lone_checker_alert
+
+        await _evaluate_lone_checker_alert(session, project_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[REGRESSION_DISPATCHER] lone-checker alert evaluation raised "
+            "for project=%s: %s",
+            project_id,
+            exc,
+        )
+
+    # Non-spawning observation: emit/dismiss WARNING alerts when SR catch-rate
+    # for any configured category falls below the project's per-category target
+    # for >=2 consecutive windows. Same try/except pattern.
+    try:
+        from app.routers.admin_digest import _evaluate_sr_catch_rate_targets
+
+        await _evaluate_sr_catch_rate_targets(session, project_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[REGRESSION_DISPATCHER] sr_catch_rate_targets alert evaluation "
+            "raised for project=%s: %s",
+            project_id,
+            exc,
+        )
+
+    try:
+        await _run_compliance_followup_once(session, project_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[REGRESSION_DISPATCHER] compliance-followup raised for project=%s: %s",
             project_id,
             exc,
         )
@@ -5490,9 +6323,12 @@ async def _auto_close_recovered_manual_intervention(
                 CLOSE_REASON_RECOVERED_UNATTENDED,
             )
 
+        watchdog_mismatch = _compute_recovery_layer_mismatch(
+            locked.fingerprint_to_fix_log, locked.symptoms_by_layer, now
+        )
         locked.mark_closed()
         locked.last_remediation_result = close_reason
-        locked.fingerprint_to_fix_log = list(locked.fingerprint_to_fix_log or []) + [
+        watchdog_entries: list[dict[str, Any]] = [
             {
                 "fingerprint": locked.regression_class,
                 "recovered_at": now.isoformat(),
@@ -5500,6 +6336,11 @@ async def _auto_close_recovered_manual_intervention(
                 "reason": close_reason,
             }
         ]
+        if watchdog_mismatch:
+            watchdog_entries.append(watchdog_mismatch)
+        locked.fingerprint_to_fix_log = (
+            list(locked.fingerprint_to_fix_log or []) + watchdog_entries
+        )
         # Cleared on close so the column never carries a stale value across
         # case lifecycles — mirrors the prior process-local ``.pop()`` calls.
         locked.signal_healthy_since_at = None
@@ -5653,6 +6494,163 @@ async def _auto_close_recovered_manual_intervention(
     if marginal_closed or confirmed_closed or mutated_rows:
         await session.commit()
     return marginal_closed, confirmed_closed
+
+
+async def _run_compliance_followup_once(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> int:
+    """Spawn compliance follow-up tasks for non-compliant cross-layer fixes.
+
+    Scans MERGED/CLOSED cases for fix-log entries where spawn_was_cross_layer
+    is True and layers_targeted (post-backfill) covers <2 distinct canonical
+    layers. Entries that include recommended_unmodifiable_layers (e.g. CI_WORKFLOW
+    documented in the diagnosis report) count toward the effective layer total so
+    that a fix that correctly documented an unmodifiable layer is not penalized.
+    Gated by runtime config and a per-case cooldown column.
+    """
+    from app.regression_layer_classifier import ALL_LAYERS
+
+    if not bool(_runtime_config.get("regression_compliance_followup_enabled", True)):
+        return 0
+
+    cooldown_hours = int(
+        _runtime_config.get("regression_compliance_followup_cooldown_hours", 72) or 72
+    )
+    now = _utcnow()
+    _all_layers = set(ALL_LAYERS)
+
+    rows = (
+        (
+            await session.execute(
+                select(RegressionRemediationCase).where(
+                    RegressionRemediationCase.project_id == project_id,
+                    RegressionRemediationCase.status.in_(
+                        [RegressionCaseStatus.MERGED, RegressionCaseStatus.CLOSED]
+                    ),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    spawned = 0
+    for case in rows:
+        last_at = getattr(case, "compliance_followup_spawned_at", None)
+        if last_at is not None:
+            if last_at.tzinfo is not None:
+                last_at = last_at.replace(tzinfo=None)
+            if now - last_at < timedelta(hours=cooldown_hours):
+                continue
+
+        # Only the most-recent classified cross-layer-mandated entry decides
+        # compliance for the case. If that entry is compliant, do not look further
+        # back: an older non-compliant entry has already been superseded by a
+        # newer compliant fix and re-spawning would be a permanent loop, since
+        # the spawned compliance_followup's own merged fix is recorded with
+        # spawn_was_cross_layer=False and never displaces the older entry.
+        non_compliant_entry = None
+        for entry in reversed(case.fingerprint_to_fix_log or []):
+            if not isinstance(entry, dict):
+                continue
+            if not entry.get("spawn_was_cross_layer"):
+                continue
+            if "layers_targeted" not in entry:
+                continue  # awaiting_backfill — not yet classified
+            targeted = set(entry.get("layers_targeted") or []) & _all_layers
+            recommended_unmod = (
+                set(entry.get("recommended_unmodifiable_layers") or []) & _all_layers
+            )
+            if len(targeted | recommended_unmod) < 2:
+                non_compliant_entry = entry
+            break
+
+        if non_compliant_entry is None:
+            continue
+
+        targeted = set(non_compliant_entry.get("layers_targeted") or []) & _all_layers
+        spawn_layers = list(non_compliant_entry.get("spawn_layers_enumerated") or [])
+        missing = [la for la in spawn_layers if la not in targeted]
+
+        _prompt = (
+            f"Cross-layer investigation for '{case.regression_class}' required "
+            f"defenses in >=2 distinct canonical layers, but PR #"
+            f"{non_compliant_entry.get('fix_pr_number', 'unknown')} only targeted: "
+            f"{sorted(targeted) or ['(none)']}. "
+            f"Layers seen in symptoms but not yet defended: {missing or ['(unknown)']}. "
+            "Propose a defense in a distinct canonical layer not yet addressed.\n\n"
+            "Note: .github/workflows/ cannot be modified by the agent. A CI_WORKFLOW "
+            "recommendation belongs in the diagnosis report (set "
+            "'recommended_unmodifiable_layers': ['CI_WORKFLOW'] in context), not the diff."
+        )
+        _payload = validate_internal_payload(
+            {
+                "type": "investigate",
+                "prompt": _prompt,
+                "base_branch": "main",
+                "effort": "low",
+            },
+            "pipeline_regression_dispatcher:compliance_followup",
+        )
+        _task = Task(
+            project_id=project_id,
+            title=f"Compliance follow-up: {case.regression_class}"[:200],
+            description=(
+                "Auto-spawned: cross-layer fix targeted <2 canonical layers — "
+                "compliance follow-up required."
+            )[:500],
+            payloads=[_payload],
+            context={
+                "spawned_by": "pipeline_regression_dispatcher_compliance_followup",
+                "regression_class": case.regression_class,
+                "signal_name": "compliance_followup",
+                "targeted_layers": sorted(targeted),
+                "missing_layers": missing,
+                "remediation_case_id": str(case.id),
+            },
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+            status=TaskStatus.QUEUED,
+            created_by="ORCHESTRATOR",
+        )
+        session.add(_task)
+        await session.flush()
+        session.add(
+            TaskHistory(
+                task_id=_task.id,
+                action="SPAWNED",
+                details={
+                    "spawned_by": "PIPELINE_REGRESSION_DISPATCHER_COMPLIANCE_FOLLOWUP",
+                    "regression_class": case.regression_class,
+                    "signal_name": "compliance_followup",
+                },
+            )
+        )
+        case.compliance_followup_spawned_at = now
+        case.fingerprint_to_fix_log = list(case.fingerprint_to_fix_log or []) + [
+            {
+                "type": "compliance_followup_spawned",
+                "spawned_at": now.isoformat(),
+                "task_id": str(_task.id),
+                "targeted_layers": sorted(targeted),
+                "missing_layers": missing,
+            }
+        ]
+        session.add(case)
+        spawned += 1
+        logger.info(
+            "[REGRESSION_WATCHDOG] compliance-followup-spawned project=%s "
+            "class=%s task_id=%s targeted=%s missing=%s",
+            project_id,
+            case.regression_class,
+            _task.id,
+            sorted(targeted),
+            missing,
+        )
+
+    if spawned:
+        await session.commit()
+    return spawned
 
 
 async def _any_signal_would_trip(
@@ -6163,6 +7161,11 @@ async def run_once(session: AsyncSession, project_id: uuid.UUID) -> int:
             project_id,
             spawn_budget - _spawned,
         )
+        _spawned += await _evaluate_recurring_class_signal(
+            session,
+            project_id,
+            spawn_budget - _spawned,
+        )
         _spawned += await _evaluate_strategic_cycle_stall_signal(
             session,
             project_id,
@@ -6191,6 +7194,11 @@ async def run_once(session: AsyncSession, project_id: uuid.UUID) -> int:
             spawn_budget - _spawned,
         )
         _spawned += await _evaluate_agent_vm_resource_signal(
+            session,
+            project_id,
+            spawn_budget - _spawned,
+        )
+        _spawned += await _evaluate_low_prevention_rate_signal(
             session,
             project_id,
             spawn_budget - _spawned,
@@ -6418,3 +7426,37 @@ async def get_regression_mtta_data(
         "classes": rows,
         "recovery_cooldown_sec": int(_REGRESSION_RECOVERY_COOLDOWN.total_seconds()),
     }
+
+
+async def get_sr_persistent_blind_spot_hint(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    days: int = 14,
+) -> dict[str, Any] | None:
+    """Return the persistent SR blind-spot hint for agent task context injection.
+
+    Queries the last *days* of completed tasks and calls
+    ``sr_blind_spots.compute_persistent_sr_blind_spot_hint`` to identify
+    categories whose reviewer-disagreement rate exceeds the threshold in >=2
+    consecutive 7-day windows.  Returns None when no persistent categories
+    exist (i.e. below-threshold or insufficient sample size).
+    """
+    from app.sr_blind_spots import compute_persistent_sr_blind_spot_hint  # noqa: PLC0415
+
+    now = _utcnow()
+    tasks = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.project_id == project_id,
+                    Task.status == TaskStatus.COMPLETED,
+                    Task.created_at >= now - timedelta(days=days),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    result = compute_persistent_sr_blind_spot_hint(tasks, now=now)
+    return result if result.get("categories") else None

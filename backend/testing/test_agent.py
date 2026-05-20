@@ -9281,3 +9281,359 @@ def test_claim_sr_recent_miss_examples_fixture_parity():
         f"Backend: {backend_copy}\nAgent:   {agent_copy}\n"
         "Both must be updated together."
     )
+
+
+@pytest.mark.asyncio
+async def test_claim_sr_recent_miss_examples_global_unchanged_without_direction_id(
+    client: AsyncClient, db_session
+):
+    """(a) Global ranking is unchanged when the task has no direction_id."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    design_doc = {
+        "sr_catch_rate_trends": {
+            "categories": {
+                "correctness": {
+                    "miss_rate": 0.50,
+                    "weighted_miss_rate": 0.55,
+                    "examples": [
+                        {"severity": "CRITICAL", "desc": "Global correctness issue"}
+                    ],
+                },
+                "security": {
+                    "miss_rate": 0.40,
+                    "weighted_miss_rate": 0.42,
+                    "examples": [
+                        {"severity": "MAJOR", "desc": "Global security issue"}
+                    ],
+                },
+            },
+            "by_direction": {
+                "dir-xyz": {
+                    "categories": {
+                        "scope-drift": {
+                            "miss_rate": 0.80,
+                            "examples": [
+                                {"severity": "MINOR", "desc": "Direction-only example"}
+                            ],
+                        }
+                    }
+                }
+            },
+        }
+    }
+    project = Project(
+        name="SR Miss Examples No Direction",
+        user_id="test-user-123",
+        design_doc=design_doc,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    flag_modified(project, "design_doc")
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "No direction task"}],
+        vm_instance_id="agent-vm-no-dir-1",
+        # no direction_id in context
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-no-dir-1")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    miss_ex = resp.json().get("project_context", {}).get("sr_recent_miss_examples", {})
+    # Global categories served — direction-only category NOT present
+    assert "correctness" in miss_ex
+    assert "security" in miss_ex
+    assert "scope-drift" not in miss_ex
+
+
+@pytest.mark.asyncio
+async def test_claim_sr_recent_miss_examples_prefers_direction_examples(
+    client: AsyncClient, db_session
+):
+    """(b) Per-direction examples are preferred over global when the task has direction_id."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    direction_id = "dir-abc"
+    design_doc = {
+        "sr_catch_rate_trends": {
+            "categories": {
+                "correctness": {
+                    "miss_rate": 0.50,
+                    "weighted_miss_rate": 0.55,
+                    "examples": [
+                        {"severity": "CRITICAL", "desc": "Global correctness example"}
+                    ],
+                },
+            },
+            "by_direction": {
+                direction_id: {
+                    "categories": {
+                        "scope-drift": {
+                            "miss_rate": 0.80,
+                            "examples": [
+                                {
+                                    "severity": "MAJOR",
+                                    "desc": "Direction scope-drift example",
+                                }
+                            ],
+                        },
+                        "architecture": {
+                            "miss_rate": 0.60,
+                            "examples": [
+                                {
+                                    "severity": "MINOR",
+                                    "desc": "Direction architecture example",
+                                }
+                            ],
+                        },
+                    }
+                }
+            },
+        }
+    }
+    project = Project(
+        name="SR Miss Examples With Direction",
+        user_id="test-user-123",
+        design_doc=design_doc,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    flag_modified(project, "design_doc")
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "Direction-scoped task"}],
+        vm_instance_id="agent-vm-dir-pref-1",
+        context={"direction_id": direction_id},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-dir-pref-1")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    miss_ex = resp.json().get("project_context", {}).get("sr_recent_miss_examples", {})
+    # Direction-specific categories present; global-only category NOT present
+    assert "scope-drift" in miss_ex
+    assert "architecture" in miss_ex
+    assert "correctness" not in miss_ex
+    # scope-drift ranked first (miss_rate 0.80 > 0.60)
+    assert list(miss_ex.keys())[0] == "scope-drift"
+    assert "Direction scope-drift example" in miss_ex["scope-drift"][0]["desc"]
+
+
+@pytest.mark.asyncio
+async def test_claim_sr_recent_miss_examples_falls_back_to_global_when_direction_empty(
+    client: AsyncClient, db_session
+):
+    """(c) Falls back to global examples when the direction has no qualifying examples."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    direction_id = "dir-no-examples"
+    design_doc = {
+        "sr_catch_rate_trends": {
+            "categories": {
+                "correctness": {
+                    "miss_rate": 0.50,
+                    "weighted_miss_rate": 0.55,
+                    "examples": [
+                        {"severity": "CRITICAL", "desc": "Global fallback example"}
+                    ],
+                },
+            },
+            "by_direction": {
+                direction_id: {
+                    "categories": {
+                        # Categories exist but none have examples
+                        "scope-drift": {"miss_rate": 0.80},
+                        "architecture": {"miss_rate": 0.60, "examples": []},
+                    }
+                }
+            },
+        }
+    }
+    project = Project(
+        name="SR Miss Examples Direction Empty",
+        user_id="test-user-123",
+        design_doc=design_doc,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    flag_modified(project, "design_doc")
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "Fallback direction task"}],
+        vm_instance_id="agent-vm-dir-fallback-1",
+        context={"direction_id": direction_id},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-dir-fallback-1")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    miss_ex = resp.json().get("project_context", {}).get("sr_recent_miss_examples", {})
+    # Global fallback: correctness present; direction categories (no examples) absent
+    assert "correctness" in miss_ex
+    assert "Global fallback example" in miss_ex["correctness"][0]["desc"]
+    assert "scope-drift" not in miss_ex
+    assert "architecture" not in miss_ex
+
+
+# ── Efficiency-direction (d-91d8dede) foundational instrumentation ───────────
+
+
+@pytest.mark.asyncio
+async def test_claim_records_vm_cold_start_ms_once(client: AsyncClient, db_session):
+    """The first /claim sets vm_cold_start_ms from (last_heartbeat - vm_provisioned_at);
+    a re-provision restamp of vm_provisioned_at must NOT clobber that measurement."""
+    project = Project(name="Cold Start Claim", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    provisioned = datetime.utcnow() - timedelta(seconds=12)
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "ls"}],
+        vm_instance_id="agent-vm-cold-start",
+        status=TaskStatus.QUEUED,
+        vm_provisioned_at=provisioned,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    assert task.vm_cold_start_ms is None
+
+    token = create_agent_token(str(task.id), "agent-vm-cold-start")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    assert task.vm_cold_start_ms is not None
+    # ~12s elapsed, so cold-start should be ≥10s and ≤30s (test slack).
+    assert 10_000 <= task.vm_cold_start_ms <= 30_000
+    initial_cold_start = task.vm_cold_start_ms
+
+    # Simulate a re-provision restamp of vm_provisioned_at, then heartbeat.
+    # The IS NULL guard must prevent vm_cold_start_ms from being overwritten.
+    task.vm_provisioned_at = datetime.utcnow()
+    db_session.add(task)
+    await db_session.commit()
+
+    hb_resp = await client.post(
+        "/api/agent/heartbeat",
+        json={"task_id": str(task.id), "status_message": "tick"},
+        headers={"x-agent-token": token},
+    )
+    assert hb_resp.status_code == 200
+    await db_session.refresh(task)
+    assert task.vm_cold_start_ms == initial_cold_start
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_persists_api_call_summary(client: AsyncClient, db_session):
+    """Heartbeat persists llm_call_count + token totals into Task.api_call_summary."""
+    project = Project(name="API Call Summary", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-api-summary",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    assert task.api_call_summary is None
+
+    token = create_agent_token(str(task.id), "agent-vm-api-summary")
+    resp = await client.post(
+        "/api/agent/heartbeat",
+        json={
+            "task_id": str(task.id),
+            "llm_call_count": 3,
+            "total_input_tokens": 12345,
+            "total_output_tokens": 678,
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    summary = task.api_call_summary
+    assert summary is not None
+    assert summary["llm_call_count"] == 3
+    assert summary["total_input_tokens"] == 12345
+    assert summary["total_output_tokens"] == 678
+    assert "last_updated_at" in summary
+
+    # Subsequent heartbeat with higher cumulative counts overwrites.
+    resp2 = await client.post(
+        "/api/agent/heartbeat",
+        json={
+            "task_id": str(task.id),
+            "llm_call_count": 5,
+            "total_input_tokens": 20000,
+            "total_output_tokens": 999,
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp2.status_code == 200
+    await db_session.refresh(task)
+    assert task.api_call_summary["llm_call_count"] == 5
+    assert task.api_call_summary["total_input_tokens"] == 20000
+    assert task.api_call_summary["total_output_tokens"] == 999
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_omits_api_call_summary_when_fields_absent(
+    client: AsyncClient, db_session
+):
+    """Backwards-compat: older agents that don't ship LLM telemetry leave
+    api_call_summary untouched (NULL) — heartbeat still succeeds."""
+    project = Project(name="Backcompat Heartbeat", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-backcompat",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-backcompat")
+    resp = await client.post(
+        "/api/agent/heartbeat",
+        json={"task_id": str(task.id), "status_message": "ok"},
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    assert task.api_call_summary is None

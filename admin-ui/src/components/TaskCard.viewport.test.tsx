@@ -157,4 +157,35 @@ describe('TaskCard — viewport regression', () => {
       });
     }, { selector: 'button[title]' });
   });
+
+  test('FAILED task with SR badge and direction button meet 44px touch target at 375px', async () => {
+    await expectMinTouchTargetAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <TaskCard
+            task={makeTask({
+              status: 'FAILED',
+              failure_class: 'CODE_ERROR',
+              context: {
+                direction_id: 'd-e337d3b2',
+                _self_review_outcome: {
+                  verdict: 'pass',
+                  fixes_applied: false,
+                  check_results: { correctness: { passed: true } },
+                },
+              },
+            })}
+            {...defaultProps}
+            onTrack={noop}
+            onDirectionClick={noop}
+          />
+        );
+      });
+    }, { selector: 'button' });
+  });
 });

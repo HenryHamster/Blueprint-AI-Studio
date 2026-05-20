@@ -84,7 +84,14 @@ export function ProblemModelEditor({
   }
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
+    // Dense admin-only modal: close glyph, constraint remove buttons, and the
+    // compact Cancel/Save row are intentionally below 44px. Mirrors the
+    // existing eslint-disable-next-line viewport/min-touch-target comments on
+    // the buttons below.
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
+      data-viewport-allow-small-target
+    >
       <div className="bg-neutral-950 border border-neutral-800 rounded-lg w-full max-w-2xl max-h-[90vh] flex flex-col">
         <div className="flex items-center justify-between px-5 py-3 border-b border-neutral-800">
           <h3 className="text-sm font-semibold text-neutral-100">Edit intent & constraints</h3>

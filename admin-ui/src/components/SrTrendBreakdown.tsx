@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { TrendingUp, TrendingDown, Minus, ChevronRight, ChevronDown, AlertTriangle } from 'lucide-react';
+import { TrendingUp, TrendingDown, Minus, ChevronRight, ChevronDown, AlertTriangle, ArrowDownRight, ArrowUpRight } from 'lucide-react';
 
 export interface SrMissExample {
   severity: 'CRITICAL' | 'MAJOR' | 'MINOR';
@@ -126,6 +126,31 @@ export interface ExecutionEvidenceMissRate {
   sample_count?: number | null;
 }
 
+export interface SrCoFailurePair {
+  cat_a: string;
+  cat_b: string;
+  co_fail_count: number;
+  p_b_given_a: number;
+  base_rate_b: number;
+  lift: number;
+}
+
+// eslint-disable-next-line react-refresh/only-export-components
+export const SR_CANONICAL_CATEGORIES: { id: string; label: string }[] = [
+  { id: 'correctness', label: 'Correctness' },
+  { id: 'error-handling', label: 'Error Handling' },
+  { id: 'security', label: 'Security' },
+  { id: 'style-conventions', label: 'Style Conventions' },
+  { id: 'type-safety', label: 'Type Safety' },
+  { id: 'documentation', label: 'Documentation' },
+  { id: 'performance', label: 'Performance' },
+  { id: 'architecture', label: 'Architecture' },
+  { id: 'test-coverage', label: 'Test Coverage' },
+  { id: 'scope-drift', label: 'Scope Drift' },
+  { id: 'regression_risk', label: 'Regression Risk' },
+  { id: 'cross-system-contract', label: 'Cross-System Contract' },
+];
+
 export interface SrTrendData {
   computed_at?: string | null;
   bucket_mode?: 'cycle' | 'calendar' | null;
@@ -147,6 +172,7 @@ export interface SrTrendData {
   by_direction?: Record<string, Record<string, DirectionSrCatStat>> | null;
   execution_evidence_miss_rates?: Record<string, ExecutionEvidenceMissRate> | null;
   edges_considered_stats?: Record<string, number> | null;
+  co_failure_pairs?: SrCoFailurePair[] | null;
 }
 
 const SKIP_RATE_AMBER_THRESHOLD = 0.25;
@@ -255,12 +281,14 @@ export function MissRateSparkline({
   height,
   stroke,
   title,
+  target,
 }: {
   history: number[];
   width: number;
   height: number;
   stroke: string;
   title?: string;
+  target?: number | null;
 }) {
   if (!history || history.length < 2) {
     return <span className="inline-block" style={{ width, height }} aria-hidden="true" />;
@@ -275,6 +303,19 @@ export function MissRateSparkline({
       return `${x.toFixed(1)},${y.toFixed(1)}`;
     })
     .join(' ');
+
+  const targetMissRate = target != null ? 1 - target : null;
+  const targetY = targetMissRate != null ? height - Math.max(0, Math.min(1, targetMissRate)) * height : null;
+  const targetPercent = target != null ? Math.round(target * 100) : null;
+
+  const combinedTitle = title
+    ? targetPercent != null
+      ? `${title} — target: ${targetPercent}% hit rate`
+      : title
+    : targetPercent != null
+      ? `target: ${targetPercent}% hit rate`
+      : undefined;
+
   return (
     <svg
       width={width}
@@ -282,11 +323,14 @@ export function MissRateSparkline({
       viewBox={`0 0 ${width} ${height}`}
       className="inline-block align-middle"
       aria-hidden="true"
-      role={title ? 'img' : undefined}
-      aria-label={title}
+      role={combinedTitle ? 'img' : undefined}
+      aria-label={combinedTitle}
     >
-      {title && <title>{title}</title>}
+      {combinedTitle && <title>{combinedTitle}</title>}
       <polyline fill="none" stroke={stroke} strokeWidth="1" points={points} />
+      {targetY != null && (
+        <line x1="0" y1={targetY} x2={width} y2={targetY} stroke="rgb(64, 64, 64)" strokeWidth="1" strokeDasharray="2,2" />
+      )}
     </svg>
   );
 }
@@ -615,7 +659,7 @@ export function FreshReviewerTrendBreakdown({ trend }: { trend: FreshReviewerTre
         <div className="flex flex-col gap-0.5 mb-1">
           <p className="text-[9px] text-neutral-600">Hit rate by category</p>
           {Object.entries(cats).map(([cat, m]) => (
-            <div key={cat} className="flex items-center gap-2 text-[10px]">
+            <div key={cat} className="flex items-center gap-2 text-[10px] min-w-0">
               <span className="text-neutral-300 flex-1 truncate">{cat}</span>
               <span className={`font-mono tabular-nums ${frTrendColor(m.trend)}`}>
                 {m.current != null ? `${Math.round(m.current * 100)}%` : '–'}
@@ -925,10 +969,109 @@ export interface SrMissedTask {
   reviewer_findings?: SrReviewerFinding[];
 }
 
+// eslint-disable-next-line react-refresh/only-export-components
+export interface TargetHealthStats {
+  configured: number;
+  belowTarget: number;
+  newlyMissed: number;
+  newlyRecovered: number;
+  hasCycleData: boolean;
+}
+
+// eslint-disable-next-line react-refresh/only-export-components
+export function computeTargetHealth(
+  categories: Record<string, SrCategoryTrend> | null | undefined,
+  targets: Record<string, number> | null | undefined,
+): TargetHealthStats | null {
+  if (!targets || Object.keys(targets).length === 0) return null;
+  const configured = Object.keys(targets).length;
+  let belowTarget = 0;
+  let newlyMissed = 0;
+  let newlyRecovered = 0;
+  let hasCycleData = false;
+
+  for (const [cat, target] of Object.entries(targets)) {
+    const c = categories?.[cat];
+    if (!c) continue;
+    const cur = c.current_hit_rate;
+    const prev = c.previous_hit_rate;
+    if (cur == null) continue;
+    const nowBelow = cur < target;
+    if (nowBelow) belowTarget++;
+    if (prev != null) {
+      hasCycleData = true;
+      const wasBelow = prev < target;
+      if (nowBelow && !wasBelow) newlyMissed++;
+      if (!nowBelow && wasBelow) newlyRecovered++;
+    }
+  }
+
+  return { configured, belowTarget, newlyMissed, newlyRecovered, hasCycleData };
+}
+
+function TargetHealthSummaryCard({ stats }: { stats: TargetHealthStats }) {
+  const allHealthy = stats.belowTarget === 0;
+  return (
+    <div
+      data-testid="target-health-summary"
+      className={`flex items-center gap-3 px-2 py-1 rounded mb-1.5 text-[10px] font-mono border ${
+        allHealthy
+          ? 'bg-emerald-950/40 border-emerald-800/30 text-emerald-400'
+          : 'bg-red-950/30 border-red-800/30 text-red-400'
+      }`}
+    >
+      <span title={`${stats.configured} categories have a configured target`}>
+        {stats.configured} configured
+      </span>
+      <span className="text-neutral-600">·</span>
+      <span
+        title={`${stats.belowTarget} of ${stats.configured} categories are currently below their target hit rate`}
+        className={stats.belowTarget > 0 ? 'text-red-400' : 'text-emerald-400'}
+      >
+        {stats.belowTarget} below target
+      </span>
+      {stats.hasCycleData && (
+        <>
+          {stats.newlyMissed > 0 && (
+            <>
+              <span className="text-neutral-600">·</span>
+              <span
+                data-testid="newly-missed-indicator"
+                title={`${stats.newlyMissed} categories crossed below their target this cycle`}
+                className="flex items-center gap-0.5 text-red-400"
+              >
+                <ArrowDownRight className="w-2.5 h-2.5" />
+                {stats.newlyMissed} new miss
+              </span>
+            </>
+          )}
+          {stats.newlyRecovered > 0 && (
+            <>
+              <span className="text-neutral-600">·</span>
+              <span
+                data-testid="newly-recovered-indicator"
+                title={`${stats.newlyRecovered} categories recovered above their target this cycle`}
+                className="flex items-center gap-0.5 text-emerald-400"
+              >
+                <ArrowUpRight className="w-2.5 h-2.5" />
+                {stats.newlyRecovered} recovered
+              </span>
+            </>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
 interface SrTrendBreakdownProps {
   trends: SrTrendData | null | undefined;
   variant: 'card' | 'inline';
   onCategoryClick?: (category: string) => void;
+  /** Per-category minimum hit-rate targets configured by the operator. When unset, falls back to the default 50% floor. */
+  srCatchRateTargets?: Record<string, number> | null;
+  /** Callback invoked when the user clicks the "configure targets" CTA. Parent is responsible for routing to the settings destination. */
+  onConfigureTargets?: () => void;
 }
 
 function CategoryRow({
@@ -936,10 +1079,12 @@ function CategoryRow({
   c,
   variant,
   onCategoryClick,
+  targetHitRate,
 }: {
   cat: string;
   c: SrCategoryTrend;
   variant: 'card' | 'inline';
+  targetHitRate?: number | null;
   onCategoryClick?: (category: string) => void;
 }) {
   const [open, setOpen] = useState(false);
@@ -951,8 +1096,9 @@ function CategoryRow({
   const color = trendColorClass(c.trend);
   const delta = calculateMissRateDelta(c);
   const deltaColor = delta != null ? deltaColorClass(delta) : '';
+  const effectiveFloor = targetHitRate ?? FLOOR_HIT_RATE;
   // Use backend below_floor if provided; fall back to local derivation for backward compat
-  const belowFloor = c.below_floor != null ? c.below_floor : isBelowFloor(c);
+  const belowFloor = c.below_floor != null ? c.below_floor : isBelowFloor(c, effectiveFloor);
   const quadrant = c.precision_recall_quadrant;
   const quadrantBadge = (() => {
     if (!quadrant || quadrant === 'healthy' || quadrant === 'mixed' || quadrant === 'flat') return null;
@@ -1068,11 +1214,25 @@ function CategoryRow({
             {`t95:${formatLatencySec(c.time_to_miss_detect_p95_sec)}`}
           </span>
         )}
+        {targetHitRate != null && c.current_hit_rate != null && (() => {
+          const gap = (targetHitRate - c.current_hit_rate) * 100;
+          const isMissing = gap > 0;
+          const gapColor = isMissing ? 'text-red-400' : 'text-neutral-400';
+          const gapSign = gap > 0 ? '−' : '';
+          return (
+            <span
+              className={`font-mono tabular-nums text-xs ${gapColor}`}
+              title={`Target: ${Math.round(targetHitRate * 100)}% hit rate — gap: ${gapSign}${Math.abs(Math.round(gap))}pp`}
+            >
+              {`target ${Math.round(targetHitRate * 100)}% (${gapSign}${Math.abs(Math.round(gap))}pp)`}
+            </span>
+          );
+        })()}
         {!sampleTooSmall && <TrendIcon trend={c.trend} />}
         {belowFloor && (
           <span
             className="shrink-0"
-            title={`Hit rate stuck below ${Math.round(FLOOR_HIT_RATE * 100)}% for ${FLOOR_MIN_WINDOWS}+ windows`}
+            title={`Hit rate stuck below ${Math.round(effectiveFloor * 100)}%${targetHitRate != null ? ' (configured target)' : ''} for ${FLOOR_MIN_WINDOWS}+ windows`}
             aria-label="below floor"
           >
             <AlertTriangle className="w-3 h-3 text-orange-400" />
@@ -1094,22 +1254,23 @@ function CategoryRow({
           height={12}
           stroke={trendStroke(c.trend, c.prompt_version_changed)}
           title={sparklineTitle}
+          target={targetHitRate}
         />
       </>
     );
     return (
       <div>
-        <div className="flex items-center gap-2 text-[10px]">
+        <div className="flex items-center gap-2 text-[10px] min-w-0">
           {chevron}
           {clickable ? (
             <div
-              className="flex items-center gap-2 flex-1 rounded px-0.5 cursor-pointer hover:bg-neutral-800/60"
+              className="flex items-center gap-2 flex-1 rounded px-0.5 cursor-pointer hover:bg-neutral-800/60 min-w-0"
               {...interactiveProps}
             >
               {rowBody}
             </div>
           ) : (
-            <div className="flex items-center gap-2 flex-1 rounded px-0.5">
+            <div className="flex items-center gap-2 flex-1 rounded px-0.5 min-w-0">
               {rowBody}
             </div>
           )}
@@ -1201,6 +1362,20 @@ function CategoryRow({
           {`t95:${formatLatencySec(c.time_to_miss_detect_p95_sec)}`}
         </span>
       )}
+      {targetHitRate != null && c.current_hit_rate != null && (() => {
+        const gap = (targetHitRate - c.current_hit_rate) * 100;
+        const isMissing = gap > 0;
+        const gapColor = isMissing ? 'text-red-400' : 'text-neutral-400';
+        const gapSign = gap > 0 ? '−' : '';
+        return (
+          <span
+            className={`font-mono text-xs ${gapColor}`}
+            title={`Target: ${Math.round(targetHitRate * 100)}% hit rate — gap: ${gapSign}${Math.abs(Math.round(gap))}pp`}
+          >
+            {`target ${Math.round(targetHitRate * 100)}% (${gapSign}${Math.abs(Math.round(gap))}pp)`}
+          </span>
+        );
+      })()}
       {!sampleTooSmall && <TrendIcon trend={c.trend} />}
       {belowFloor && (
         <span
@@ -1227,6 +1402,7 @@ function CategoryRow({
         height={10}
         stroke={trendStroke(c.trend, c.prompt_version_changed)}
         title={sparklineTitle}
+        target={targetHitRate}
       />
     </>
   );
@@ -1254,7 +1430,7 @@ function CategoryRow({
   );
 }
 
-export function SrTrendBreakdown({ trends, variant, onCategoryClick }: SrTrendBreakdownProps) {
+export function SrTrendBreakdown({ trends, variant, onCategoryClick, srCatchRateTargets, onConfigureTargets }: SrTrendBreakdownProps) {
   const categories = trends?.categories;
   if (!categories || Object.keys(categories).length === 0) return null;
   const entries = sortedEntries(categories);
@@ -1312,6 +1488,20 @@ export function SrTrendBreakdown({ trends, variant, onCategoryClick }: SrTrendBr
             </span>
           )}
         </div>
+        {!srCatchRateTargets || Object.keys(srCatchRateTargets).length === 0 ? (
+          <p className="text-[11px] text-neutral-400 hover:text-neutral-200 mb-1">
+            <button
+              onClick={onConfigureTargets}
+              className="hover:underline cursor-pointer"
+              data-testid="configure-targets-cta"
+            >
+              Configure SR catch-rate targets →
+            </button>
+          </p>
+        ) : (() => {
+          const healthStats = computeTargetHealth(categories, srCatchRateTargets);
+          return healthStats ? <TargetHealthSummaryCard stats={healthStats} /> : null;
+        })()}
         {skipRate != null && (
           <p
             data-testid="sr-skip-rate-line"
@@ -1331,7 +1521,7 @@ export function SrTrendBreakdown({ trends, variant, onCategoryClick }: SrTrendBr
             <>
               <div className="flex flex-col gap-0.5">
                 {regularEntries.map(([cat, c]) => (
-                  <CategoryRow key={cat} cat={cat} c={c} variant="card" onCategoryClick={onCategoryClick} />
+                  <CategoryRow key={cat} cat={cat} c={c} variant="card" onCategoryClick={onCategoryClick} targetHitRate={srCatchRateTargets?.[cat] ?? null} />
                 ))}
               </div>
               {execEntries.length > 0 && (
@@ -1339,7 +1529,7 @@ export function SrTrendBreakdown({ trends, variant, onCategoryClick }: SrTrendBr
                   <p className="text-[9px] text-neutral-500 uppercase tracking-wide mb-0.5">Execution Evidence</p>
                   <div className="flex flex-col gap-0.5">
                     {execEntries.map(([cat, c]) => (
-                      <CategoryRow key={cat} cat={cat} c={c} variant="card" onCategoryClick={onCategoryClick} />
+                      <CategoryRow key={cat} cat={cat} c={c} variant="card" onCategoryClick={onCategoryClick} targetHitRate={srCatchRateTargets?.[cat] ?? null} />
                     ))}
                   </div>
                 </div>
@@ -1356,6 +1546,9 @@ export function SrTrendBreakdown({ trends, variant, onCategoryClick }: SrTrendBr
         {trends?.by_fix_iteration && Object.keys(trends.by_fix_iteration).length > 0 && (
           <ByFixIterationSection byFixIteration={trends.by_fix_iteration} />
         )}
+        {trends?.co_failure_pairs && trends.co_failure_pairs.length > 0 && (
+          <CoFailurePairsSection pairs={trends.co_failure_pairs} />
+        )}
       </div>
     );
   }
@@ -1366,7 +1559,7 @@ export function SrTrendBreakdown({ trends, variant, onCategoryClick }: SrTrendBr
         <SeveritySection bySeverity={trends.by_severity} inline />
       )}
       {entries.map(([cat, c]) => (
-        <CategoryRow key={cat} cat={cat} c={c} variant="inline" onCategoryClick={onCategoryClick} />
+        <CategoryRow key={cat} cat={cat} c={c} variant="inline" onCategoryClick={onCategoryClick} targetHitRate={srCatchRateTargets?.[cat] ?? null} />
       ))}
     </div>
   );
@@ -1489,6 +1682,43 @@ export function SrScopeDriftVsExpansionCard({ data }: { data: SrScopeDriftVsExpa
         {(data.gray_zone ?? 0) > 0 && (
           <span title="SR passed + 1.5 < ratio < 2.0 (ambiguous)">gray: {data.gray_zone}</span>
         )}
+      </div>
+    </div>
+  );
+}
+
+const CO_FAILURE_LIFT_THRESHOLD = 1.5;
+const CO_FAILURE_TOP_N = 5;
+
+function CoFailurePairsSection({ pairs }: { pairs: SrCoFailurePair[] }) {
+  const top = pairs
+    .filter(p => p.lift >= CO_FAILURE_LIFT_THRESHOLD)
+    .sort((a, b) => b.lift - a.lift)
+    .slice(0, CO_FAILURE_TOP_N);
+  if (top.length === 0) return null;
+  return (
+    <div className="mt-1.5 pt-1.5 border-t border-neutral-800/60" data-testid="sr-co-failure-pairs">
+      <p className="text-[9px] text-neutral-500 uppercase tracking-wide mb-1">Co-failures</p>
+      <div className="flex flex-col gap-0.5">
+        {top.map((p, i) => {
+          const liftColor = p.lift >= 2.5 ? 'text-red-400' : p.lift >= 1.8 ? 'text-amber-400' : 'text-neutral-400';
+          return (
+            <div key={i} className="flex items-center gap-1.5 text-[10px] min-w-0">
+              <span className="text-neutral-300 truncate flex-1" title={`${p.cat_a} + ${p.cat_b} co-fail`}>
+                <span className="font-medium">{p.cat_a}</span>
+                <span className="text-neutral-600 mx-0.5">+</span>
+                <span className="font-medium">{p.cat_b}</span>
+              </span>
+              <span
+                className={`font-mono tabular-nums shrink-0 ${liftColor}`}
+                title={`lift=${p.lift.toFixed(2)}: P(${p.cat_b}|${p.cat_a})=${Math.round(p.p_b_given_a * 100)}% vs base ${Math.round(p.base_rate_b * 100)}%`}
+              >
+                {`×${p.lift.toFixed(1)}`}
+              </span>
+              <span className="font-mono tabular-nums text-neutral-600 shrink-0 text-[9px]">n={p.co_fail_count}</span>
+            </div>
+          );
+        })}
       </div>
     </div>
   );
@@ -1620,6 +1850,108 @@ export function SrMissedRetrospective({ tasks, onTaskClick, initialCategory }: S
                       </div>
                     );
                   })}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+export interface SrUnhandledEdge {
+  case: string;
+  handled: boolean;
+  blind_spot?: string | null;
+  origin?: string | null;
+}
+
+export interface SrUnhandledEdgesTask {
+  task_id: string;
+  title: string;
+  task_type?: string | null;
+  scope?: string | null;
+  created_at?: string | null;
+  unhandled_edges: SrUnhandledEdge[];
+  pr_url?: string | null;
+}
+
+interface SrUnhandledEdgesRetrospectiveProps {
+  tasks: SrUnhandledEdgesTask[];
+  onTaskClick?: (taskId: string) => void;
+}
+
+export function SrUnhandledEdgesRetrospective({ tasks, onTaskClick }: SrUnhandledEdgesRetrospectiveProps) {
+  const [typeFilter, setTypeFilter] = useState('');
+  const [windowDays, setWindowDays] = useState(14);
+  const [openTaskIds, setOpenTaskIds] = useState<Set<string>>(() => new Set());
+  const [mountedAt] = useState(() => Date.now());
+
+  const allTypes = Array.from(new Set(tasks.map(t => t.task_type).filter(Boolean) as string[])).sort();
+
+  const cutoff = mountedAt - windowDays * 86400_000;
+  const visible = tasks.filter(t => {
+    if (t.created_at && new Date(t.created_at).getTime() < cutoff) return false;
+    if (typeFilter && t.task_type !== typeFilter) return false;
+    return true;
+  });
+  const toggleTask = (taskId: string) => setOpenTaskIds(prev => {
+    const next = new Set(prev);
+    if (next.has(taskId)) next.delete(taskId); else next.add(taskId);
+    return next;
+  });
+
+  return (
+    <div data-testid="sr-unhandled-edges-retrospective" className="flex flex-col gap-2">
+      <div className="flex flex-wrap items-center gap-2 text-[10px]">
+        <span className="text-neutral-500 uppercase tracking-wide">Time</span>
+        {WINDOW_OPTIONS.map(w => (
+          // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
+          <button
+            key={w.days}
+            onClick={() => setWindowDays(w.days)}
+            className={`px-1.5 py-0.5 rounded border ${windowDays === w.days ? 'border-blue-500 text-blue-300' : 'border-neutral-700 text-neutral-400 hover:border-neutral-500'}`}
+          >{w.label}</button>
+        ))}
+        {allTypes.length > 0 && (
+          <select
+            value={typeFilter}
+            onChange={e => setTypeFilter(e.target.value)}
+            className="bg-neutral-900 border border-neutral-700 rounded px-1 py-0.5 text-neutral-300"
+          >
+            <option value="">All types</option>
+            {allTypes.map(t => <option key={t} value={t}>{t}</option>)}
+          </select>
+        )}
+        <span className="text-neutral-600">{visible.length} task{visible.length !== 1 ? 's' : ''}</span>
+      </div>
+      {visible.length === 0 ? (
+        <p className="text-[10px] text-neutral-600 italic">No tasks with unhandled edges for this filter.</p>
+      ) : (
+        <div className="flex flex-col gap-1">
+          {visible.map(t => (
+            // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
+            <div key={t.task_id} className={`bg-neutral-900/50 border border-neutral-800/50 rounded px-2 py-1.5 text-[10px] ${onTaskClick ? 'cursor-pointer hover:border-neutral-600' : ''}`} onClick={() => onTaskClick?.(t.task_id)}>
+              <div className="flex items-center gap-1.5 mb-0.5">
+                <button type="button" className="text-neutral-500 hover:text-neutral-300 shrink-0" aria-label={`${openTaskIds.has(t.task_id) ? 'collapse' : 'expand'} ${t.title}`} aria-expanded={openTaskIds.has(t.task_id)} onClick={e => { e.stopPropagation(); toggleTask(t.task_id); }}>
+                  {openTaskIds.has(t.task_id) ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
+                </button>
+                <span className="text-neutral-200 truncate flex-1 font-medium" title={t.title}>{t.title}</span>
+                {t.task_type && <span className="text-neutral-500 shrink-0">{t.task_type}</span>}
+                {t.scope && <span className="text-neutral-600 shrink-0">{t.scope}</span>}
+                {t.created_at && <span className="text-neutral-600 shrink-0" title={t.created_at}>{new Date(t.created_at).toLocaleDateString()}</span>}
+                {t.pr_url && <a href={t.pr_url} target="_blank" rel="noopener noreferrer" onClick={e => e.stopPropagation()} className="text-blue-400 hover:underline shrink-0" title={t.pr_url}>PR</a>}
+              </div>
+              {openTaskIds.has(t.task_id) && (
+                <div className="mt-1.5 flex flex-col gap-1">
+                  {t.unhandled_edges.map((edge, i) => (
+                    <div key={i} className="rounded border border-neutral-800/60 bg-neutral-950/50 p-1.5">
+                      <div className="mb-1 text-neutral-400 font-medium text-[10px]">{edge.case}</div>
+                      {edge.blind_spot && <div className="text-neutral-500 text-[9px]">{edge.blind_spot}</div>}
+                      {edge.origin && <div className="text-neutral-600 text-[9px]">source: {edge.origin}</div>}
+                    </div>
+                  ))}
                 </div>
               )}
             </div>

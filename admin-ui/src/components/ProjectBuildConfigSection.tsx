@@ -1,6 +1,8 @@
 import { useState, useEffect } from 'react';
 import { Plus, Trash2, RefreshCw } from 'lucide-react';
 import type { BuildConfig, BuildConfigDirectory } from '../types/project';
+import { apiFetch } from '../api';
+import { SR_CANONICAL_CATEGORIES } from './SrTrendBreakdown';
 
 interface ProjectBuildConfigSectionProps {
   githubOwner: string | null;
@@ -10,6 +12,7 @@ interface ProjectBuildConfigSectionProps {
   onSave: (config: BuildConfig) => Promise<void>;
   onDetect: () => Promise<void>;
   detectAvailable: boolean;
+  projectId?: string | null;
 }
 
 const EMPTY_DIR: BuildConfigDirectory = {
@@ -32,6 +35,7 @@ export function ProjectBuildConfigSection({
   onSave,
   onDetect,
   detectAvailable,
+  projectId,
 }: ProjectBuildConfigSectionProps) {
   const hasConfig = buildConfig && (
     (buildConfig.directories?.length ?? 0) > 0 ||
@@ -53,6 +57,7 @@ export function ProjectBuildConfigSection({
   );
   const [saving, setSaving] = useState(false);
   const [detecting, setDetecting] = useState(false);
+  const [srTargets, setSrTargets] = useState<Record<string, number>>({});
 
   // Sync state when buildConfig prop changes (e.g. after detect or project switch)
   useEffect(() => {
@@ -61,6 +66,18 @@ export function ProjectBuildConfigSection({
     setGitName(buildConfig?.git_user_name ?? 'Blueprint Agent');
     setEnableFreshReviewer(buildConfig?.enable_fresh_reviewer ?? false);
   }, [buildConfig]);
+
+  // Load SR catch-rate targets from the project when projectId changes
+  useEffect(() => {
+    if (!projectId) { setSrTargets({}); return; }
+    apiFetch('/api/admin/projects')
+      .then(r => r.json())
+      .then((projects: { id: string; sr_catch_rate_targets?: Record<string, number> }[]) => {
+        const p = projects.find(p => p.id === projectId);
+        setSrTargets(p?.sr_catch_rate_targets ?? {});
+      })
+      .catch(() => {});
+  }, [projectId]);
 
   const handleSave = async () => {
     setSaving(true);
@@ -72,6 +89,12 @@ export function ProjectBuildConfigSection({
         git_user_name: gitName,
         enable_fresh_reviewer: enableFreshReviewer,
       });
+      if (projectId) {
+        await apiFetch(`/api/admin/projects/${projectId}`, {
+          method: 'PATCH',
+          body: JSON.stringify({ sr_catch_rate_targets: srTargets }),
+        });
+      }
     } finally {
       setSaving(false);
     }
@@ -318,6 +341,44 @@ export function ProjectBuildConfigSection({
               )}
             </div>
           </label>
+        </div>
+      )}
+
+      {/* SR Catch-Rate Targets */}
+      {hasConfig && projectId && (
+        <div>
+          <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-1">Self-Review Catch-Rate Targets</h3>
+          <p className="text-[11px] text-neutral-600 mb-3">
+            Set a minimum hit-rate (%) per SR category. An alert fires when a category stays below target for ≥2 consecutive windows. Leave blank for no target.
+          </p>
+          <div className="grid grid-cols-3 gap-2">
+            {SR_CANONICAL_CATEGORIES.map(({ id, label }) => (
+              <div key={id}>
+                <label className="block text-[10px] text-neutral-500 mb-0.5 uppercase">{label}</label>
+                <div className="flex items-center gap-1">
+                  <input
+                    type="number"
+                    min="0"
+                    max="100"
+                    step="5"
+                    value={srTargets[id] !== undefined ? Math.round(srTargets[id] * 100) : ''}
+                    onChange={e => {
+                      const raw = e.target.value;
+                      setSrTargets(prev => {
+                        if (raw === '') {
+                          return Object.fromEntries(Object.entries(prev).filter(([k]) => k !== id));
+                        }
+                        return { ...prev, [id]: Math.min(100, Math.max(0, Number(raw))) / 100 };
+                      });
+                    }}
+                    placeholder="—"
+                    className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-base md:text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+                  />
+                  <span className="text-[10px] text-neutral-500 shrink-0">%</span>
+                </div>
+              </div>
+            ))}
+          </div>
         </div>
       )}
 

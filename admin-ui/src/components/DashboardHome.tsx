@@ -11,7 +11,8 @@ import {
   Search,
 } from 'lucide-react';
 import { ResponsiveContainer, AreaChart, Area } from 'recharts';
-import { apiFetch, type PromptFingerprintAnalyticsResponse } from '../api';
+import { apiFetch, fetchSrUnhandledEdgesRetrospectives, type PromptFingerprintAnalyticsResponse, type SrUnhandledEdgesTask } from '../api';
+import { useEfficiencySnapshot, fmtEffSecs, fmtEffRate, fmtEffIter } from '../hooks/useEfficiencySnapshot';
 import { timeAgo, formatDurationSec, parseTimestamp } from '../utils/time';
 import { isSafeUrl } from './TaskCard';
 import { RecentErrorsWidget } from './RecentErrorsWidget';
@@ -30,12 +31,14 @@ import { DriftSignalsCard } from './DriftSignalsCard';
 import { PoolAccountHealthPanel, type AccountHealthEntry } from './PoolAccountHealthPanel';
 import { SystemMaturityCard, type SystemMaturityRow } from './SystemMaturityCard';
 import { DirectionPortfolioSection, type DirectionProgress } from './DirectionPortfolioSection';
-import { SrTrendBreakdown, SrMissedRetrospective, SrReviewerDisagreementsPanel, EdgesTrendBreakdown, DirectionSrBreakdownPanel, type SrTrendData, type SrMissedTask, type SrReviewerDisagreementsData, type EdgesTrend, type DirectionSrEntry } from './SrTrendBreakdown'; // EdgesTrend used in DigestData
+import { SrTrendBreakdown, SrMissedRetrospective, SrReviewerDisagreementsPanel, SrUnhandledEdgesRetrospective, EdgesTrendBreakdown, DirectionSrBreakdownPanel, type SrTrendData, type SrMissedTask, type SrReviewerDisagreementsData, type EdgesTrend, type DirectionSrEntry } from './SrTrendBreakdown'; // EdgesTrend used in DigestData
 import { TAXONOMY_COLORS, TAXONOMY_LABELS, TAXONOMY_ORDER } from './dashboardConstants';
 import { ManualInterventionPanel, AutoRecoveredPanel, AnomalyTrackerPanel } from './PipelineRegressionsPanel';
 import { RecentlyResolvedRegressionsPanel } from './RecentlyResolvedRegressionsPanel';
+import { ViewportDebtPanel } from './ViewportDebtPanel';
 import type { Task } from '../types/task';
 import type { ProjectDiagnostics } from '../types/diagnostics';
+import type { Project } from '../types/project';
 
 // ---------- local types ----------
 
@@ -262,6 +265,12 @@ interface DigestData {
     sample_size: number;
     by_task_type: Record<string, { rate: number; skipped_count: number; sample_size: number }>;
   } | null;
+  sr_disallowed_blind_spot_rate?: {
+    overall_rate: number;
+    violation_count: number;
+    sample_size: number;
+    by_task_type: Record<string, { rate: number; violation_count: number; sample_size: number }>;
+  } | null;
   fresh_reviewer_effectiveness?: {
     fresh_reviewer_sample_size: number;
     fresh_reviewer_first_attempt_approval_rate: number | null;
@@ -396,11 +405,51 @@ interface SparkPoint {
   failed: number;
 }
 
+// ---------- Pipeline Efficiency Panel ----------
+
+function EffDelta({ delta, lowerIsBetter }: { delta: number | null | undefined; lowerIsBetter: boolean }) {
+  if (delta === null || delta === undefined || delta === 0) return null;
+  const improving = lowerIsBetter ? delta < 0 : delta > 0;
+  return <span className={`ml-0.5 ${improving ? 'text-emerald-400' : 'text-red-400'}`}>{delta > 0 ? '↑' : '↓'}</span>;
+}
+
+function PipelineEfficiencyPanel({ projectId }: { projectId: string | null }) {
+  const data = useEfficiencySnapshot(projectId);
+  if (!data) return null;
+
+  const w24 = data.window_24h;
+  const w7 = data.window_7d;
+
+  return (
+    <section>
+      <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Pipeline Efficiency</h2>
+      <div className="bg-neutral-900 border border-neutral-800 rounded-lg p-3 flex flex-wrap gap-x-4 gap-y-1 text-[10px] text-neutral-400">
+        <span>
+          <span className="text-neutral-500">cold-start p50</span>{': '}
+          <span className="font-mono text-neutral-300">{fmtEffSecs(w24?.setup_p50_secs)}</span>
+          <EffDelta delta={w24?.vs_prior_setup_p50_delta} lowerIsBetter />
+        </span>
+        <span>
+          <span className="text-neutral-500">reuse rate</span>{': '}
+          <span className="font-mono text-neutral-300">{fmtEffRate(w24?.warm_reuse_rate)}</span>
+          <EffDelta delta={w24?.vs_prior_warm_reuse_rate_delta} lowerIsBetter={false} />
+        </span>
+        <span>
+          <span className="text-neutral-500">review cycles p50</span>{': '}
+          <span className="font-mono text-neutral-300">{fmtEffIter(w7?.review_iter_median)}</span>
+          <EffDelta delta={w7?.vs_prior_review_iter_median_delta} lowerIsBetter />
+        </span>
+      </div>
+    </section>
+  );
+}
+
 // ---------- props ----------
 
 export interface DashboardHomeProps {
   tasks: Task[];
   selectedProjectId: string | null;
+  projects?: Project[];
   onViewTask: (task: Task) => void;
   onDirectionClick?: (directionId: string) => void;
   onCategoryClick?: (category: string) => void;
@@ -646,7 +695,7 @@ const WINDOW_OPTIONS = [
   { label: '7d', value: 168 },
 ];
 
-export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectionClick, onCategoryClick }: DashboardHomeProps) {
+export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, onDirectionClick, onCategoryClick }: DashboardHomeProps) {
   const [digest, setDigest] = useState<DigestData | null>(null);
   const [diagnostics, setDiagnostics] = useState<ProjectDiagnostics | null>(null);
   const [openPRs, setOpenPRs] = useState<OpenPR[]>([]);
@@ -659,6 +708,7 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
   const [blindSpots, setBlindSpots] = useState<BlindSpotsData | null>(null);
   const [srRecentMisses, setSrRecentMisses] = useState<SrMissedTask[] | null>(null);
   const [srRecentMissesTotal, setSrRecentMissesTotal] = useState<number>(0);
+  const [srUnhandledEdgesTasks, setSrUnhandledEdgesTasks] = useState<SrUnhandledEdgesTask[] | null>(null);
   const [srReviewerDisagreements, setSrReviewerDisagreements] = useState<SrReviewerDisagreementsData | null>(null);
   const [directionSrBreakdown, setDirectionSrBreakdown] = useState<DirectionSrBreakdownData | null>(null);
   const [fingerprintAnalytics, setFingerprintAnalytics] = useState<PromptFingerprintAnalyticsResponse | null>(null);
@@ -674,6 +724,10 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
   const [selectedSrCategory, setSelectedSrCategory] = useState<string>('');
   const sparkRef = useRef<SparkPoint[]>([]);
   const [sparkData, setSparkData] = useState<SparkPoint[]>([]);
+  const reviewQualitySectionRef = useRef<HTMLElement>(null);
+
+  const selectedProject = projects?.find(p => p.id === selectedProjectId);
+  const srCatchRateTargets = selectedProject?.sr_catch_rate_targets;
 
   // Fetch open PRs only — used by manual refresh button
   const fetchOpenPRs = useCallback(async () => {
@@ -695,6 +749,15 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
     setSelectedSrCategory(category);
     onCategoryClick?.(category);
   }, [onCategoryClick]);
+
+  const handleScrollToReviewQuality = useCallback(() => {
+    reviewQualitySectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }, []);
+
+  const handleConfigureTargets = useCallback(() => {
+    // Parent (App.tsx) is responsible for implementing the navigation to settings
+    // For now, this is a no-op callback that can be enhanced to navigate or show a modal
+  }, []);
 
   // Fetch data
   const fetchData = useCallback(async () => {
@@ -798,6 +861,12 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
               setSrRecentMisses(data.misses ?? []);
               setSrRecentMissesTotal(data.total ?? (data.misses ?? []).length);
             }
+          } catch { /* silent */ }
+        })(),
+        (async () => {
+          try {
+            const data = await fetchSrUnhandledEdgesRetrospectives(selectedProjectId);
+            setSrUnhandledEdgesTasks(data.items ?? []);
           } catch { /* silent */ }
         })(),
         (async () => {
@@ -938,6 +1007,12 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
       {/* Recently Resolved Regressions */}
       {selectedProjectId && <RecentlyResolvedRegressionsPanel projectId={selectedProjectId} />}
 
+      {/* Viewport Debt */}
+      {selectedProjectId && <ViewportDebtPanel projectId={selectedProjectId} />}
+
+      {/* Pipeline Efficiency */}
+      <PipelineEfficiencyPanel projectId={selectedProjectId} />
+
       {/* System Status */}
       <SystemStatusCard digest={digest} loading={loading} />
 
@@ -959,6 +1034,7 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
               <ConversionRateCard rate={digest?.pipeline_conversion_rate} loading={loading} />
               <AcceptanceRateCard rate={digest?.pipeline_acceptance_rate} loading={loading} />
               <CostCard totalCost={digest?.total_estimated_cost_usd} trendHistory={digest?.trend_history} loading={loading} />
+              <SrCatchRateCard rate={digest?.self_review_prediction_accuracy?.prediction_hit_rate} trends={digest?.self_review_prediction_accuracy_trends} sampleSize={digest?.self_review_prediction_accuracy?.sample_size} loading={loading} onScrollToReviewQuality={handleScrollToReviewQuality} />
             </div>
           </section>
 
@@ -1078,8 +1154,8 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
           })()}
 
           {/* Section 1d3: Review Quality */}
-          {!loading && (digest?.review_accuracy != null || digest?.self_review_effectiveness != null || digest?.self_review_prediction_accuracy != null || digest?.self_review_prediction_accuracy_trends != null || digest?.self_review_skip_rate != null || digest?.fresh_reviewer_effectiveness != null || digest?.sr_false_attestation_trends != null) && (
-            <section>
+          {!loading && (digest?.review_accuracy != null || digest?.self_review_effectiveness != null || digest?.self_review_prediction_accuracy != null || digest?.self_review_prediction_accuracy_trends != null || digest?.self_review_skip_rate != null || digest?.sr_disallowed_blind_spot_rate != null || digest?.fresh_reviewer_effectiveness != null || digest?.sr_false_attestation_trends != null) && (
+            <section ref={reviewQualitySectionRef}>
               <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-2">Review Quality</p>
               <div className="flex flex-wrap gap-3">
                 {digest?.review_accuracy?.precision != null && (
@@ -1243,6 +1319,33 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
                     </div>
                   );
                 })()}
+                {digest?.sr_disallowed_blind_spot_rate != null && (() => {
+                  const dbs = digest.sr_disallowed_blind_spot_rate!;
+                  const rate = dbs.overall_rate;
+                  const color = rate <= 0.05 ? 'text-emerald-400' : rate <= 0.15 ? 'text-amber-400' : 'text-red-400';
+                  const byTypeEntries = Object.entries(dbs.by_task_type ?? {});
+                  // Cross-reference: backend/app/sr_blind_spots.py DISALLOWED_BLIND_SPOT_EXAMPLES
+                  const categoryLabels = 'full backend test suite, docker pytest, viewport tests';
+                  const tooltip = [
+                    `Disallowed patterns: ${categoryLabels}`,
+                    ...(byTypeEntries.length
+                      ? byTypeEntries.map(([t, b]) => `${t}: ${Math.round(b.rate * 100)}% (n=${b.sample_size})`)
+                      : []),
+                  ].join('\n');
+                  return (
+                    <div
+                      className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[110px]"
+                      title={tooltip}
+                      data-testid="sr-disallowed-blind-spot-tile"
+                    >
+                      <p className="text-[9px] text-neutral-500 uppercase tracking-wide mb-0.5">SR Disallowed</p>
+                      <p className={`text-xl font-bold font-mono ${color}`}>
+                        {Math.round(rate * 100)}%
+                      </p>
+                      <p className="text-[9px] text-neutral-600 mt-0.5">n={dbs.sample_size}</p>
+                    </div>
+                  );
+                })()}
                 {digest?.sr_false_attestation_trends?.per_category != null && (() => {
                   const cats = digest.sr_false_attestation_trends!.per_category!;
                   const entries = Object.entries(cats).filter(([, v]) => v.false_attestation_rate != null);
@@ -1291,6 +1394,8 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
                   trends={digest?.self_review_prediction_accuracy_trends}
                   variant="card"
                   onCategoryClick={handleCategoryClick}
+                  srCatchRateTargets={srCatchRateTargets}
+                  onConfigureTargets={handleConfigureTargets}
                 />
                 <FixIterationBreakdown trends={digest?.self_review_prediction_accuracy_trends} />
                 <EdgesTrendBreakdown trend={digest?.edges_trend} />
@@ -1374,6 +1479,23 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
               <SrMissedRetrospective
                 tasks={srRecentMisses}
                 initialCategory={selectedSrCategory}
+                onTaskClick={(taskId) => {
+                  const task = tasks.find(t => t.id === taskId);
+                  if (task) onViewTask(task);
+                }}
+              />
+            </section>
+          )}
+
+          {/* SR Unhandled Edges */}
+          {!loading && srUnhandledEdgesTasks && srUnhandledEdgesTasks.length > 0 && (
+            <section>
+              <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-2">
+                Unhandled Edge Cases
+                <span className="ml-1 text-neutral-600 font-normal normal-case tracking-normal">· {srUnhandledEdgesTasks.length} task{srUnhandledEdgesTasks.length !== 1 ? 's' : ''}</span>
+              </p>
+              <SrUnhandledEdgesRetrospective
+                tasks={srUnhandledEdgesTasks}
                 onTaskClick={(taskId) => {
                   const task = tasks.find(t => t.id === taskId);
                   if (task) onViewTask(task);
@@ -2228,6 +2350,54 @@ function CostCard({ totalCost, trendHistory, loading }: {
           </ResponsiveContainer>
         </div>
       )}
+    </div>
+  );
+}
+
+function SrCatchRateCard({ rate, trends, sampleSize, loading, onScrollToReviewQuality }: {
+  rate?: number | null;
+  trends?: SrTrendWithFixIterations | null;
+  sampleSize?: number | null;
+  loading: boolean;
+  onScrollToReviewQuality?: () => void;
+}) {
+  if (loading) return <Skeleton className="h-20" />;
+  if (rate == null || sampleSize == null || (sampleSize ?? 0) < 5) {
+    return (
+      <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 sm:p-4 cursor-pointer hover:border-neutral-700/80 transition-colors" onClick={onScrollToReviewQuality}>
+        <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">SR Catch Rate</p>
+        <p className="text-2xl font-bold font-mono text-neutral-500">too small</p>
+        <p className="text-[10px] text-neutral-600 mt-1">n={sampleSize ?? 0}</p>
+      </div>
+    );
+  }
+
+  const cats = trends?.categories || {};
+  const categoryDeltas = Object.values(cats)
+    .map(c => {
+      const curr = c.current_hit_rate ?? 0;
+      const prev = c.previous_hit_rate ?? 0;
+      return curr - prev;
+    })
+    .filter(d => d !== 0 || Object.keys(cats).length > 0);
+  const avgDelta = categoryDeltas.length > 0 ? categoryDeltas.reduce((a, b) => a + b, 0) / categoryDeltas.length : 0;
+
+  const pct = Math.round(rate * 100);
+  const color = rate >= 0.7 ? 'text-emerald-400' : rate >= 0.4 ? 'text-amber-400' : 'text-red-400';
+  const deltaPp = Math.round(avgDelta * 100);
+  const deltaColor = avgDelta > 0.01 ? 'text-emerald-500' : avgDelta < -0.01 ? 'text-red-500' : 'text-neutral-500';
+  const deltaIcon = avgDelta > 0.01 ? '↑' : avgDelta < -0.01 ? '↓' : '→';
+
+  return (
+    <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 sm:p-4 cursor-pointer hover:border-neutral-700/80 transition-colors" onClick={onScrollToReviewQuality}>
+      <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">SR Catch Rate</p>
+      <div className="flex items-center gap-2">
+        <p className={`text-2xl font-bold font-mono ${color}`}>{pct}%</p>
+        <span className={`text-sm font-semibold ${deltaColor}`}>
+          {deltaIcon} {deltaPp >= 0 ? '+' : ''}{deltaPp}pp
+        </span>
+      </div>
+      <p className="text-[10px] text-neutral-600 mt-1">n={sampleSize}</p>
     </div>
   );
 }

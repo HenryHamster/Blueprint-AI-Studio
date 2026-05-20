@@ -3,7 +3,7 @@ import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { KanbanBoard, type KanbanColumn } from './KanbanBoard';
 import type { Task } from '../types/task';
-import { expectNoOverflowAt, expectMinTouchTargetAt } from '../test/viewport';
+import { expectNoOverflowAt, expectMinTouchTargetAt, expectNoTextTruncationAt } from '../test/viewport';
 
 vi.mock('../api', () => ({
   apiFetch: vi.fn(async () => new Response('{}', { status: 200 })),
@@ -168,6 +168,30 @@ describe('KanbanBoard — viewport regression', () => {
     ];
 
     await expectMinTouchTargetAt(375, async () => {
+      host = document.createElement('div');
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <KanbanBoard
+            {...BASE_PROPS}
+            tasks={tasks}
+            columns={COLUMNS}
+          />,
+        );
+      });
+    });
+  });
+
+  test('task titles and column labels are not silently clipped at 375px mobile width', async () => {
+    const tasks = [
+      makeTask({ id: 't1', status: 'QUEUED', title: 'feat: add mobile-responsive layout to operator dashboard' }),
+      makeTask({ id: 't2', status: 'IN_PROGRESS', title: 'fix: resolve viewport overflow in pipeline regression panel' }),
+      makeTask({ id: 't3', status: 'COMPLETED', title: 'chore: update dependency versions across admin-ui package' }),
+    ];
+
+    await expectNoTextTruncationAt(375, async () => {
       host = document.createElement('div');
       document.body.appendChild(host);
       const r = createRoot(host);

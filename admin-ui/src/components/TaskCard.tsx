@@ -28,7 +28,16 @@ interface SelfReviewOutcome {
   check_results?: Record<string, SelfReviewCheckResult>;
   blind_spots?: string[];
   skip_reason?: string;
+  _filtered_blind_spots_count?: number;
 }
+
+// Human-readable labels for disallowed blind-spot categories.
+// Cross-reference: backend/app/sr_blind_spots.py DISALLOWED_BLIND_SPOT_EXAMPLES
+const DISALLOWED_BLIND_SPOT_LABELS = [
+  'full backend test suite',
+  'docker pytest',
+  'viewport tests',
+];
 
 interface SrBadgeState {
   label: string;
@@ -135,12 +144,11 @@ function SrBadge({ task, onClick }: { task: Task; onClick?: () => void }) {
 
   if (onClick) {
     return (
-      // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
       <button
         type="button"
         title={state.tooltip}
         onClick={(e) => { e.stopPropagation(); onClick(); }}
-        className={`inline-flex items-center text-[10px] font-medium border px-1.5 py-0.5 rounded ${colorClass} hover:opacity-80 transition-opacity`}
+        className={`inline-flex items-center text-[10px] font-medium border px-1.5 py-0.5 rounded min-h-[44px] min-w-[44px] sm:min-h-auto sm:min-w-auto ${colorClass} hover:opacity-80 transition-opacity`}
       >
         {state.label}
       </button>
@@ -153,6 +161,106 @@ function SrBadge({ task, onClick }: { task: Task; onClick?: () => void }) {
       className={`inline-flex items-center text-[10px] font-medium border px-1.5 py-0.5 rounded ${colorClass}`}
     >
       {state.label}
+    </span>
+  );
+}
+
+function SrDisallowedBadge({ task }: { task: Task }) {
+  const ctx = task.context as Record<string, unknown> | undefined;
+  const outcome = ctx?._self_review_outcome as SelfReviewOutcome | undefined;
+  const count = outcome?._filtered_blind_spots_count ?? 0;
+  if (count === 0) return null;
+
+  const tooltip = `Agent emitted ${count} disallowed blind-spot pattern${count !== 1 ? 's' : ''} (filtered before aggregation)\nDisallowed categories: ${DISALLOWED_BLIND_SPOT_LABELS.join(', ')}`;
+  return (
+    <span
+      title={tooltip}
+      className="inline-flex items-center gap-0.5 text-[10px] font-medium border px-1.5 py-0.5 rounded bg-amber-500/10 border-amber-500/20 text-amber-400"
+    >
+      <AlertTriangle className="w-3 h-3 shrink-0" />
+      {count} disallowed
+    </span>
+  );
+}
+
+interface SrDivergenceState {
+  variant: 'missed' | 'over-flagged';
+  category: string;
+  allDivergences: { variant: 'missed' | 'over-flagged'; category: string }[];
+}
+
+function getSrDivergenceBadgeState(task: Task): SrDivergenceState | null {
+  const ctx = task.context as Record<string, unknown> | undefined;
+  const outcome = ctx?._self_review_outcome as SelfReviewOutcome | undefined;
+  const humanCategories = ctx?._first_attempt_rejection_categories as Record<string, unknown> | undefined;
+
+  if (!outcome || !humanCategories) return null;
+  const checkResults = outcome.check_results ?? {};
+
+  const divergences: SrDivergenceState['allDivergences'] = [];
+
+  // Find SR missed categories (reviewer flagged, SR passed or didn't check)
+  for (const cat of Object.keys(humanCategories)) {
+    const srResult = checkResults[cat] as SelfReviewCheckResult | undefined;
+    if (!srResult || srResult.passed) {
+      divergences.push({ variant: 'missed', category: cat });
+    }
+  }
+
+  // Find over-flagged categories (SR failed, reviewer didn't flag)
+  for (const cat of Object.keys(checkResults)) {
+    const srResult = checkResults[cat] as SelfReviewCheckResult;
+    if (!srResult.passed && !(cat in humanCategories)) {
+      divergences.push({ variant: 'over-flagged', category: cat });
+    }
+  }
+
+  if (divergences.length === 0) return null;
+
+  // Sort: misses first (higher severity), then lexically
+  const sorted = divergences.sort((a, b) => {
+    if (a.variant !== b.variant) return a.variant === 'missed' ? -1 : 1;
+    return a.category.localeCompare(b.category);
+  });
+
+  return {
+    variant: sorted[0].variant,
+    category: sorted[0].category,
+    allDivergences: sorted,
+  };
+}
+
+function SrDivergenceBadge({ task, onClick }: { task: Task; onClick?: () => void }) {
+  const state = getSrDivergenceBadgeState(task);
+  if (!state) return null;
+
+  const isMissed = state.variant === 'missed';
+  const colorClass = isMissed ? 'bg-red-500/10 border-red-500/20 text-red-400' : 'bg-amber-500/10 border-amber-500/20 text-amber-400';
+  const label = isMissed ? `SR missed ${state.category}` : `SR over-flagged ${state.category}`;
+  const allLabels = state.allDivergences.map(d => `${d.variant === 'missed' ? 'missed' : 'over-flagged'} ${d.category}`).join(', ');
+  const tooltip = state.allDivergences.length > 1
+    ? `${label}; all divergences: ${allLabels}`
+    : label;
+
+  if (onClick) {
+    return (
+      <button
+        type="button"
+        title={tooltip}
+        onClick={(e) => { e.stopPropagation(); onClick(); }}
+        className={`inline-flex items-center text-[10px] font-medium border px-1.5 py-0.5 rounded min-h-[44px] min-w-[44px] sm:min-h-auto sm:min-w-auto ${colorClass} hover:opacity-80 transition-opacity`}
+      >
+        {label}
+      </button>
+    );
+  }
+
+  return (
+    <span
+      title={tooltip}
+      className={`inline-flex items-center text-[10px] font-medium border px-1.5 py-0.5 rounded ${colorClass}`}
+    >
+      {label}
     </span>
   );
 }
@@ -732,11 +840,10 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
         )}
         {directionId && (
           onDirectionClick ? (
-            // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
             <button
               type="button"
               onClick={(e) => { e.stopPropagation(); onDirectionClick(directionId); }}
-              className="inline-flex items-center gap-0.5 text-[10px] text-neutral-500 font-mono hover:text-neutral-200 hover:bg-neutral-800 rounded px-1 -mx-1 transition-colors cursor-pointer"
+              className="inline-flex items-center gap-0.5 text-[10px] text-neutral-500 font-mono hover:text-neutral-200 hover:bg-neutral-800 rounded px-1 -mx-1 transition-colors cursor-pointer min-h-[44px] sm:min-h-auto"
               title={`Filter by direction: ${directionId}`}
             >
               <Compass className="w-3 h-3" />
@@ -754,6 +861,12 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
         )}
         {(isTerminal || task.status === 'EVALUATING') && (
           <SrBadge task={task} onClick={onOpenSelfReview} />
+        )}
+        {(isTerminal || task.status === 'EVALUATING') && (
+          <SrDisallowedBadge task={task} />
+        )}
+        {(isTerminal || task.status === 'EVALUATING') && (
+          <SrDivergenceBadge task={task} onClick={onOpenSelfReview} />
         )}
       </div>
 
@@ -780,7 +893,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
           {task.description.length > 80 && (
             <button
               onClick={(e) => { e.stopPropagation(); setDescExpanded(!descExpanded); }}
-              className="text-xs text-gray-400 hover:text-gray-600 cursor-pointer flex items-center gap-0.5 mt-0.5"
+              className="text-xs text-gray-400 hover:text-gray-600 cursor-pointer flex items-center gap-0.5 mt-0.5 min-h-[44px] sm:min-h-auto"
             >
               {descExpanded ? <>Show less <ChevronUp className="w-3 h-3" /></> : <>Show more <ChevronDown className="w-3 h-3" /></>}
             </button>
@@ -791,6 +904,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
       {!compact && task.latest_status_message ? (
         <div className="bg-neutral-950 text-neutral-400 text-[11px] rounded-lg mb-2 border border-neutral-800/50 font-mono">
           <button
+            data-viewport-allow-small-target
             onClick={() => setStatusExpanded(!statusExpanded)}
             className="w-full flex items-center gap-1.5 p-2.5 text-left hover:text-neutral-300 transition-colors"
           >
@@ -917,10 +1031,9 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
           ) : null}
 
           {task.status !== 'QUEUED' && onTrack ? (
-            // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
             <button
               onClick={(e) => { e.stopPropagation(); onTrack(task); }}
-              className={`flex items-center gap-1 px-1.5 py-0.5 rounded transition-colors text-[10px] ${isTracked ? 'bg-blue-500/20 text-blue-400 hover:bg-blue-500/30' : 'text-neutral-500 hover:text-neutral-300 hover:bg-neutral-800'}`}
+              className={`flex items-center gap-1 px-1.5 py-0.5 rounded transition-colors text-[10px] min-h-[44px] sm:min-h-auto ${isTracked ? 'bg-blue-500/20 text-blue-400 hover:bg-blue-500/30' : 'text-neutral-500 hover:text-neutral-300 hover:bg-neutral-800'}`}
               title={isTracked ? 'Tracking live' : 'Track task'}
             >
               <Radio className="w-3 h-3" />
@@ -962,24 +1075,21 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
                 rows={3}
               />
               <div className="flex gap-2">
-                {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                 <button
                   onClick={() => { onRequestChanges(task.id, changesFeedback, 'fix'); setShowChangesForm(false); setChangesFeedback(''); }}
                   disabled={!changesFeedback.trim() || !!actionLoading}
-                  className="flex-1 bg-amber-500/10 hover:bg-amber-500/20 text-amber-400 border border-amber-500/20 py-1.5 rounded text-xs font-medium transition-colors disabled:opacity-30 disabled:cursor-not-allowed flex items-center justify-center gap-1.5"
+                  className="flex-1 bg-amber-500/10 hover:bg-amber-500/20 text-amber-400 border border-amber-500/20 py-1.5 rounded text-xs font-medium transition-colors disabled:opacity-30 disabled:cursor-not-allowed flex items-center justify-center gap-1.5 min-h-[44px] sm:min-h-auto"
                 >
                   {actionLoading === 'request-changes' ? <Activity className="w-3 h-3 animate-spin" /> : <RotateCcw className="w-3 h-3" />} Send Fix
                 </button>
-                {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                 <button
                   onClick={() => { onRequestChanges(task.id, changesFeedback || 'Re-review requested', 'review'); setShowChangesForm(false); setChangesFeedback(''); }}
                   disabled={!!actionLoading}
-                  className="flex-1 bg-blue-500/10 hover:bg-blue-500/20 text-blue-400 border border-blue-500/20 py-1.5 rounded text-xs font-medium transition-colors flex items-center justify-center gap-1.5"
+                  className="flex-1 bg-blue-500/10 hover:bg-blue-500/20 text-blue-400 border border-blue-500/20 py-1.5 rounded text-xs font-medium transition-colors flex items-center justify-center gap-1.5 min-h-[44px] sm:min-h-auto"
                 >
                   <Search className="w-3 h-3" /> Re-review
                 </button>
-                {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
-                <button onClick={() => { setShowChangesForm(false); setChangesFeedback(''); }} className="px-2 py-1.5 text-neutral-500 hover:text-neutral-300 text-xs">
+                <button onClick={() => { setShowChangesForm(false); setChangesFeedback(''); }} className="px-2 py-1.5 text-neutral-500 hover:text-neutral-300 text-xs min-h-[44px] sm:min-h-auto">
                   Cancel
                 </button>
               </div>
@@ -1000,45 +1110,38 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
                 className={`w-full bg-neutral-950 text-neutral-100 rounded px-2 py-1.5 text-xs resize-y focus:outline-none focus:ring-1 focus:ring-blue-500/50 min-h-[80px] font-mono border ${editPrompt.trim() === '' ? 'border-red-500/70' : 'border-neutral-700'}`}
               />
               <div className="flex gap-1.5">
-                {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                 <button onClick={() => { onEditPrompt(task.id, editPrompt); setEditing(false); }}
                   disabled={!!actionLoading || editPrompt.trim() === ''}
-                  className={`flex-1 border py-1 rounded text-xs font-medium transition-colors flex items-center justify-center gap-1 ${editPrompt.trim() === '' ? 'bg-neutral-800 text-neutral-600 border-neutral-700 cursor-not-allowed' : 'bg-blue-500/10 hover:bg-blue-500/20 text-blue-400 border-blue-500/20'} ${actionLoading ? 'opacity-50 cursor-not-allowed' : ''}`}>
+                  className={`flex-1 border py-1 rounded text-xs font-medium transition-colors flex items-center justify-center gap-1 min-h-[44px] sm:min-h-auto ${editPrompt.trim() === '' ? 'bg-neutral-800 text-neutral-600 border-neutral-700 cursor-not-allowed' : 'bg-blue-500/10 hover:bg-blue-500/20 text-blue-400 border-blue-500/20'} ${actionLoading ? 'opacity-50 cursor-not-allowed' : ''}`}>
                   {actionLoading === 'edit' && <Activity className="w-3 h-3 animate-spin" />}Save
                 </button>
-                {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                 <button onClick={() => { setEditing(false); setEditPrompt(task.description || ''); }}
-                  className="px-2 bg-neutral-800 hover:bg-neutral-700 text-neutral-400 border border-neutral-700 py-1 rounded text-xs transition-colors">
+                  className="px-2 bg-neutral-800 hover:bg-neutral-700 text-neutral-400 border border-neutral-700 py-1 rounded text-xs transition-colors min-h-[44px] sm:min-h-auto">
                   Cancel
                 </button>
               </div>
             </div>
           ) : (
           <div className="mt-2" ref={overflowMenuRef}>
-            {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
             <button
               onClick={() => setShowOverflowMenu(v => !v)}
-              className="p-1 rounded text-neutral-500 hover:text-neutral-300 hover:bg-neutral-800 transition-colors"
+              className="p-1 rounded text-neutral-500 hover:text-neutral-300 hover:bg-neutral-800 transition-colors min-h-[44px] min-w-[44px] sm:min-h-auto sm:min-w-auto"
               title="More actions"
             >
               <MoreHorizontal className="w-3.5 h-3.5" />
             </button>
             {showOverflowMenu && (
               <div className="mt-1 flex gap-1.5">
-                {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
-                <button onClick={() => { if (task.failure_class === 'CODE_ERROR') { setEditing(true); setShowOverflowMenu(false); } else { onRetry(task.id); setShowOverflowMenu(false); } }} disabled={!!actionLoading} className={`flex-1 bg-blue-500/10 hover:bg-blue-500/20 text-blue-400 border border-blue-500/20 py-1 rounded text-xs font-medium transition-colors flex items-center justify-center gap-1 ${actionLoading && actionLoading !== 'retry' ? 'opacity-50 pointer-events-none' : ''} ${actionLoading ? 'cursor-not-allowed' : ''}`}>
+                <button onClick={() => { if (task.failure_class === 'CODE_ERROR') { setEditing(true); setShowOverflowMenu(false); } else { onRetry(task.id); setShowOverflowMenu(false); } }} disabled={!!actionLoading} className={`flex-1 bg-blue-500/10 hover:bg-blue-500/20 text-blue-400 border border-blue-500/20 py-1 rounded text-xs font-medium transition-colors flex items-center justify-center gap-1 min-h-[44px] sm:min-h-auto ${actionLoading && actionLoading !== 'retry' ? 'opacity-50 pointer-events-none' : ''} ${actionLoading ? 'cursor-not-allowed' : ''}`}>
                   {actionLoading === 'retry' ? <Activity className="w-3 h-3 animate-spin" /> : <RotateCcw className="w-3 h-3" />} {task.failure_class && FAILURE_CLASS_CONFIG[task.failure_class] ? FAILURE_CLASS_CONFIG[task.failure_class].retryLabel : 'Retry'}
                 </button>
-                {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
-                <button onClick={() => { setEditing(true); setShowOverflowMenu(false); }} disabled={!!actionLoading} className={`py-1 px-2 rounded text-xs font-medium transition-colors flex items-center justify-center gap-1 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 border border-neutral-700 ${actionLoading ? 'opacity-50 pointer-events-none cursor-not-allowed' : ''}`} title="Edit prompt">
+                <button onClick={() => { setEditing(true); setShowOverflowMenu(false); }} disabled={!!actionLoading} className={`py-1 px-2 rounded text-xs font-medium transition-colors flex items-center justify-center gap-1 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 border border-neutral-700 min-h-[44px] sm:min-h-auto ${actionLoading ? 'opacity-50 pointer-events-none cursor-not-allowed' : ''}`} title="Edit prompt">
                   <Pencil className="w-3 h-3" />
                 </button>
-                {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
-                <button onClick={() => { handleDestructiveClick('dismiss', () => { onDismiss(task.id); setShowOverflowMenu(false); }); }} disabled={!!actionLoading} className={`py-1 px-2 rounded text-xs transition-all duration-300 flex items-center justify-center gap-1 border ${confirmAction === 'dismiss' ? 'bg-amber-500/20 text-amber-400 border-amber-500/40' : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-500 border-neutral-700'} ${actionLoading && actionLoading !== 'dismiss' ? 'opacity-50 pointer-events-none' : ''} ${actionLoading ? 'cursor-not-allowed' : ''}`} title="Dismiss">
+                <button onClick={() => { handleDestructiveClick('dismiss', () => { onDismiss(task.id); setShowOverflowMenu(false); }); }} disabled={!!actionLoading} className={`py-1 px-2 rounded text-xs transition-all duration-300 flex items-center justify-center gap-1 border min-h-[44px] sm:min-h-auto ${confirmAction === 'dismiss' ? 'bg-amber-500/20 text-amber-400 border-amber-500/40' : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-500 border-neutral-700'} ${actionLoading && actionLoading !== 'dismiss' ? 'opacity-50 pointer-events-none' : ''} ${actionLoading ? 'cursor-not-allowed' : ''}`} title="Dismiss">
                   {actionLoading === 'dismiss' ? <Activity className="w-3 h-3 animate-spin" /> : <X className="w-3 h-3" />}{confirmAction === 'dismiss' ? ` (${confirmCountdown}s)` : ''}
                 </button>
-                {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
-                <button onClick={() => { handleDestructiveClick('archive', () => { onArchive(task.id); setShowOverflowMenu(false); }); }} disabled={!!actionLoading} className={`py-1 px-2 rounded text-xs transition-all duration-300 flex items-center justify-center gap-1 border ${confirmAction === 'archive' ? 'bg-amber-500/20 text-amber-400 border-amber-500/40' : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-500 border-neutral-700'} ${actionLoading && actionLoading !== 'archive' ? 'opacity-50 pointer-events-none' : ''} ${actionLoading ? 'cursor-not-allowed' : ''}`} title="Archive">
+                <button onClick={() => { handleDestructiveClick('archive', () => { onArchive(task.id); setShowOverflowMenu(false); }); }} disabled={!!actionLoading} className={`py-1 px-2 rounded text-xs transition-all duration-300 flex items-center justify-center gap-1 border min-h-[44px] sm:min-h-auto ${confirmAction === 'archive' ? 'bg-amber-500/20 text-amber-400 border-amber-500/40' : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-500 border-neutral-700'} ${actionLoading && actionLoading !== 'archive' ? 'opacity-50 pointer-events-none' : ''} ${actionLoading ? 'cursor-not-allowed' : ''}`} title="Archive">
                   {actionLoading === 'archive' ? <Activity className="w-3 h-3 animate-spin" /> : <Archive className="w-3 h-3" />}{confirmAction === 'archive' ? ` (${confirmCountdown}s)` : ''}
                 </button>
               </div>
@@ -1056,10 +1159,9 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
                 />
                 <div className="text-[10px] text-neutral-500">{editPrompt.length} characters</div>
                 <div className="flex gap-2">
-                  {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                   <button onClick={() => { onEditPrompt(task.id, editPrompt); setEditing(false); }}
                     disabled={!!actionLoading || editPrompt.trim() === ''}
-                    className={`flex-1 border py-1.5 rounded text-xs font-medium transition-colors flex items-center justify-center gap-1.5 ${editPrompt.trim() === '' ? 'bg-neutral-800 text-neutral-600 border-neutral-700 cursor-not-allowed' : 'bg-blue-500/10 hover:bg-blue-500/20 text-blue-400 border-blue-500/20'} ${actionLoading ? 'opacity-50 cursor-not-allowed' : ''}`}>
+                    className={`flex-1 border py-1.5 rounded text-xs font-medium transition-colors flex items-center justify-center gap-1.5 min-h-[44px] sm:min-h-auto ${editPrompt.trim() === '' ? 'bg-neutral-800 text-neutral-600 border-neutral-700 cursor-not-allowed' : 'bg-blue-500/10 hover:bg-blue-500/20 text-blue-400 border-blue-500/20'} ${actionLoading ? 'opacity-50 cursor-not-allowed' : ''}`}>
                     {actionLoading === 'edit' && <Activity className="w-3.5 h-3.5 animate-spin" />}Save
                   </button>
                   <button onClick={() => { setEditing(false); setEditPrompt(task.description || ''); }}
@@ -1071,20 +1173,17 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
             ) : (
               <>
                 <div className="flex gap-2">
-                  {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
-                  <button onClick={() => onRetry(task.id)} disabled={!!actionLoading} className={`flex-1 bg-blue-500/10 hover:bg-blue-500/20 text-blue-400 border border-blue-500/20 py-1.5 rounded text-xs font-medium transition-colors flex items-center justify-center gap-1.5 ${actionLoading && actionLoading !== 'retry' ? 'opacity-50 pointer-events-none' : ''} ${actionLoading ? 'cursor-not-allowed' : ''}`}>
+                  <button onClick={() => onRetry(task.id)} disabled={!!actionLoading} className={`flex-1 bg-blue-500/10 hover:bg-blue-500/20 text-blue-400 border border-blue-500/20 py-1.5 rounded text-xs font-medium transition-colors flex items-center justify-center gap-1.5 min-h-[44px] sm:min-h-auto ${actionLoading && actionLoading !== 'retry' ? 'opacity-50 pointer-events-none' : ''} ${actionLoading ? 'cursor-not-allowed' : ''}`}>
                     {actionLoading === 'retry' ? <Activity className="w-3.5 h-3.5 animate-spin" /> : <RotateCcw className="w-3.5 h-3.5" />} Retry
                   </button>
-                  {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
-                  <button onClick={() => setEditing(true)} disabled={!!actionLoading} className={`flex-1 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 border border-neutral-700 py-1.5 rounded text-xs font-medium transition-colors flex items-center justify-center gap-1.5 ${actionLoading ? 'opacity-50 pointer-events-none' : ''}`}>
+                  <button onClick={() => setEditing(true)} disabled={!!actionLoading} className={`flex-1 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 border border-neutral-700 py-1.5 rounded text-xs font-medium transition-colors flex items-center justify-center gap-1.5 min-h-[44px] sm:min-h-auto ${actionLoading ? 'opacity-50 pointer-events-none' : ''}`}>
                     <Pencil className="w-3.5 h-3.5" /> Edit
                   </button>
-                  <button onClick={() => handleDestructiveClick('dismiss', () => onDismiss(task.id))} disabled={!!actionLoading} className={`py-1.5 px-2.5 rounded text-xs transition-all duration-300 flex items-center justify-center gap-1 border ${confirmAction === 'dismiss' ? 'bg-amber-500/20 text-amber-400 border-amber-500/40' : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-500 border-neutral-700'} ${actionLoading && actionLoading !== 'dismiss' ? 'opacity-50 pointer-events-none' : ''} ${actionLoading ? 'cursor-not-allowed' : ''}`} title="Dismiss">
+                  <button onClick={() => handleDestructiveClick('dismiss', () => onDismiss(task.id))} disabled={!!actionLoading} className={`py-1.5 px-2.5 rounded text-xs transition-all duration-300 flex items-center justify-center gap-1 border min-h-[44px] min-w-[44px] sm:min-h-auto sm:min-w-auto ${confirmAction === 'dismiss' ? 'bg-amber-500/20 text-amber-400 border-amber-500/40' : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-500 border-neutral-700'} ${actionLoading && actionLoading !== 'dismiss' ? 'opacity-50 pointer-events-none' : ''} ${actionLoading ? 'cursor-not-allowed' : ''}`} title="Dismiss">
                     {actionLoading === 'dismiss' ? <Activity className="w-3.5 h-3.5 animate-spin" /> : <X className="w-3.5 h-3.5" />}{confirmAction === 'dismiss' ? ` (${confirmCountdown}s)` : ''}
                   </button>
                 </div>
-                {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
-                <button onClick={() => handleDestructiveClick('archive', () => onArchive(task.id))} disabled={!!actionLoading} className={`w-full py-1.5 rounded text-xs font-medium transition-all duration-300 flex items-center justify-center gap-1.5 border ${confirmAction === 'archive' ? 'bg-amber-500/20 text-amber-400 border-amber-500/40' : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-500 border-neutral-700'} ${actionLoading && actionLoading !== 'archive' ? 'opacity-50 pointer-events-none' : ''} ${actionLoading ? 'cursor-not-allowed' : ''}`}>
+                <button onClick={() => handleDestructiveClick('archive', () => onArchive(task.id))} disabled={!!actionLoading} className={`w-full py-1.5 rounded text-xs font-medium transition-all duration-300 flex items-center justify-center gap-1.5 border min-h-[44px] sm:min-h-auto ${confirmAction === 'archive' ? 'bg-amber-500/20 text-amber-400 border-amber-500/40' : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-500 border-neutral-700'} ${actionLoading && actionLoading !== 'archive' ? 'opacity-50 pointer-events-none' : ''} ${actionLoading ? 'cursor-not-allowed' : ''}`}>
                   {actionLoading === 'archive' ? <Activity className="w-3.5 h-3.5 animate-spin" /> : <Archive className="w-3.5 h-3.5" />}
                   {confirmAction === 'archive' ? `Click again to archive (${confirmCountdown}s)` : 'Archive'}
                 </button>

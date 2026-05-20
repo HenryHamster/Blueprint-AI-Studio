@@ -119,10 +119,18 @@ build {
       "# instead of pinning a manual apt list — manual lists rot when upstream",
       "# package names change (t64 transition, package renames, etc.). The",
       "# agent user has passwordless sudo, so --with-deps' internal apt-get",
-      "# install runs cleanly. Failures are non-fatal so a transient download",
-      "# error doesn't sink the build, but emit a serial-output marker the",
-      "# orchestrator can grep for — silent || true masked broken images before.",
-      "sudo -u agent bash -c '/opt/agent/node_modules/.bin/playwright install --with-deps chromium' || { echo 'PACKER_CHROMIUM_PREFETCH_FAILED: chromium prefetch failed; agent will fall back to runtime install'; true; }"
+      "# install runs cleanly. Failures are fatal: a broken image must not be",
+      "# tagged, as silent failures caused CODE_ERROR regressions at runtime.",
+      "sudo -u agent bash -c '/opt/agent/node_modules/.bin/playwright install --with-deps chromium'"
+    ]
+  }
+
+  provisioner "shell" {
+    inline = [
+      "# Smoke-check: verify Playwright CLI and Chromium binary exist before tagging image.",
+      "# Hard-fail here prevents shipping a broken VM that causes CODE_ERROR at runtime.",
+      "sudo -u agent bash -c '/opt/agent/node_modules/.bin/playwright --version'",
+      "CHROMIUM=$(find /home/agent/.cache/ms-playwright -name 'chrome' -type f 2>/dev/null | head -1) && [ -n \"$CHROMIUM\" ] && echo \"Chromium binary found: $CHROMIUM\" || { echo 'PACKER_SMOKE_FAIL: Chromium binary not found after playwright install'; exit 1; }"
     ]
   }
 }

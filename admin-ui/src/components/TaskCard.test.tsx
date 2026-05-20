@@ -210,3 +210,188 @@ describe('TaskCard SR badge', () => {
     expect(screen.queryByText('SR skipped')).toBeNull();
   });
 });
+
+describe('TaskCard SrDisallowedBadge', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('renders disallowed badge when _filtered_blind_spots_count > 0', () => {
+    const task = makeTask({
+      context: {
+        _self_review_outcome: {
+          verdict: 'pass',
+          check_results: { correctness: { passed: true } },
+          _filtered_blind_spots_count: 2,
+        },
+      },
+    });
+    render(<TaskCard task={task} {...baseProps} />);
+    expect(screen.getByText('2 disallowed')).toBeTruthy();
+  });
+
+  it('renders no disallowed badge when _filtered_blind_spots_count is 0', () => {
+    const task = makeTask({
+      context: {
+        _self_review_outcome: {
+          verdict: 'pass',
+          check_results: { correctness: { passed: true } },
+          _filtered_blind_spots_count: 0,
+        },
+      },
+    });
+    render(<TaskCard task={task} {...baseProps} />);
+    expect(screen.queryByText(/disallowed/)).toBeNull();
+  });
+
+  it('renders no disallowed badge when _filtered_blind_spots_count is absent', () => {
+    const task = makeTask({
+      context: {
+        _self_review_outcome: {
+          verdict: 'pass',
+          check_results: { correctness: { passed: true } },
+        },
+      },
+    });
+    render(<TaskCard task={task} {...baseProps} />);
+    expect(screen.queryByText(/disallowed/)).toBeNull();
+  });
+});
+
+describe('TaskCard SrDivergenceBadge', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('renders no divergence badge when no human categories', () => {
+    const task = makeTask({
+      context: {
+        _self_review_outcome: {
+          verdict: 'pass',
+          check_results: { correctness: { passed: true } },
+        },
+      },
+    });
+    render(<TaskCard task={task} {...baseProps} />);
+    expect(screen.queryByText(/SR missed|SR over-flagged/)).toBeNull();
+  });
+
+  it('renders "SR missed" badge when reviewer flagged category that SR passed', () => {
+    const task = makeTask({
+      context: {
+        _self_review_outcome: {
+          verdict: 'pass',
+          check_results: { correctness: { passed: true } },
+        },
+        _first_attempt_rejection_categories: { security: {} },
+      },
+    });
+    render(<TaskCard task={task} {...baseProps} />);
+    expect(screen.getByText('SR missed security')).toBeInTheDocument();
+  });
+
+  it('renders "SR over-flagged" badge when SR failed category that reviewer did not flag', () => {
+    const task = makeTask({
+      context: {
+        _self_review_outcome: {
+          verdict: 'fail',
+          check_results: { 'error-handling': { passed: false } },
+        },
+        _first_attempt_rejection_categories: {},
+      },
+    });
+    render(<TaskCard task={task} {...baseProps} />);
+    expect(screen.getByText('SR over-flagged error-handling')).toBeInTheDocument();
+  });
+
+  it('prioritizes "missed" over "over-flagged" when both exist', () => {
+    const task = makeTask({
+      context: {
+        _self_review_outcome: {
+          verdict: 'pass',
+          check_results: { 'error-handling': { passed: false } },
+        },
+        _first_attempt_rejection_categories: { security: {} },
+      },
+    });
+    render(<TaskCard task={task} {...baseProps} />);
+    expect(screen.getByText('SR missed security')).toBeInTheDocument();
+    expect(screen.queryByText(/over-flagged/)).toBeNull();
+  });
+
+  it('does not render divergence badge when SR and reviewer agree on all categories', () => {
+    const task = makeTask({
+      context: {
+        _self_review_outcome: {
+          verdict: 'pass',
+          check_results: { security: { passed: false } },
+        },
+        _first_attempt_rejection_categories: { security: {} },
+      },
+    });
+    render(<TaskCard task={task} {...baseProps} />);
+    expect(screen.queryByText(/SR missed|SR over-flagged/)).toBeNull();
+  });
+
+  it('does not render divergence badge for IN_PROGRESS status', () => {
+    const task = makeTask({
+      status: 'IN_PROGRESS',
+      context: {
+        _self_review_outcome: {
+          verdict: 'pass',
+          check_results: { correctness: { passed: true } },
+        },
+        _first_attempt_rejection_categories: { security: {} },
+      },
+    });
+    render(<TaskCard task={task} {...baseProps} />);
+    expect(screen.queryByText(/SR missed|SR over-flagged/)).toBeNull();
+  });
+
+  it('renders divergence badge for EVALUATING status', () => {
+    const task = makeTask({
+      status: 'EVALUATING',
+      context: {
+        _self_review_outcome: {
+          verdict: 'pass',
+          check_results: { correctness: { passed: true } },
+        },
+        _first_attempt_rejection_categories: { security: {} },
+      },
+    });
+    render(<TaskCard task={task} {...baseProps} />);
+    expect(screen.getByText('SR missed security')).toBeInTheDocument();
+  });
+
+  it('divergence badge click calls onOpenSelfReview', async () => {
+    const user = userEvent.setup();
+    const onOpenSelfReview = vi.fn();
+    const task = makeTask({
+      context: {
+        _self_review_outcome: {
+          verdict: 'pass',
+          check_results: { correctness: { passed: true } },
+        },
+        _first_attempt_rejection_categories: { security: {} },
+      },
+    });
+    render(<TaskCard task={task} {...baseProps} onOpenSelfReview={onOpenSelfReview} />);
+    await user.click(screen.getByText('SR missed security'));
+    expect(onOpenSelfReview).toHaveBeenCalledOnce();
+  });
+
+  it('shows tooltip with all divergences when multiple exist', () => {
+    const task = makeTask({
+      context: {
+        _self_review_outcome: {
+          verdict: 'pass',
+          check_results: { 'error-handling': { passed: false } },
+        },
+        _first_attempt_rejection_categories: { security: {}, performance: {} },
+      },
+    });
+    render(<TaskCard task={task} {...baseProps} />);
+    const badge = screen.getByText('SR missed performance');
+    expect(badge).toHaveAttribute('title', expect.stringContaining('all divergences'));
+  });
+});

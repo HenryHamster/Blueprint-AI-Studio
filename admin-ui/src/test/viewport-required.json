@@ -1,0 +1,21 @@
+{
+  "components": [
+    "DashboardHome",
+    "ProjectDashboard",
+    "DirectionsPanel",
+    "TaskDetailDrawer",
+    "ResearchBrowser",
+    "PipelineView",
+    "KanbanBoard",
+    "MessagesPanel",
+    "ArchiveView",
+    "AlertsBanner",
+    "HeaderBar",
+    "NewTaskModal",
+    "NewProjectModal",
+    "MetricsDashboard",
+    "OrchestratorHealthBar",
+    "PipelineRegressionsPanel",
+    "SearchFilterBar"
+  ]
+}

@@ -8,6 +8,8 @@ import {
   EdgesTrendBreakdown,
   SrScopeDriftVsExpansionCard,
   SrReviewerDisagreementsPanel,
+  MissRateSparkline,
+  computeTargetHealth,
   type SrTrendData,
   type DirectionSrEntry,
   type EdgesTrend,
@@ -795,6 +797,83 @@ describe('SrTrendBreakdown below_floor from backend', () => {
   });
 });
 
+describe('SrTrendBreakdown srCatchRateTargets per-category floor', () => {
+  it('shows below-floor icon when category is below configured target (no backend below_floor)', () => {
+    const trends: SrTrendData = {
+      categories: {
+        security: {
+          current_hit_rate: 0.72,
+          trend: 'stable',
+          rate_history: [0.72, 0.74],  // above default 50% floor, but below configured 0.80
+        },
+      },
+    };
+    render(<SrTrendBreakdown trends={trends} variant="card" srCatchRateTargets={{ security: 0.80 }} />);
+    const alertSpan = screen.getByLabelText(/below floor/i);
+    expect(alertSpan).toBeInTheDocument();
+    expect(alertSpan.querySelector('svg')).toBeInTheDocument();
+  });
+
+  it('tooltip shows configured target percentage when srCatchRateTargets is set', () => {
+    const trends: SrTrendData = {
+      categories: {
+        security: {
+          current_hit_rate: 0.72,
+          trend: 'stable',
+          rate_history: [0.72, 0.74],
+        },
+      },
+    };
+    render(<SrTrendBreakdown trends={trends} variant="card" srCatchRateTargets={{ security: 0.80 }} />);
+    const alertSpan = screen.getByLabelText(/below floor/i);
+    expect(alertSpan.getAttribute('title')).toContain('80%');
+    expect(alertSpan.getAttribute('title')).toContain('configured target');
+  });
+
+  it('does not show below-floor icon when category is above configured target', () => {
+    const trends: SrTrendData = {
+      categories: {
+        security: {
+          current_hit_rate: 0.85,
+          trend: 'stable',
+          rate_history: [0.85, 0.87],  // above both default 50% and configured 0.80 target
+        },
+      },
+    };
+    render(<SrTrendBreakdown trends={trends} variant="card" srCatchRateTargets={{ security: 0.80 }} />);
+    expect(screen.queryByLabelText(/below floor/i)).not.toBeInTheDocument();
+  });
+
+  it('falls back to default 50% floor when srCatchRateTargets is not set', () => {
+    const trends: SrTrendData = {
+      categories: {
+        correctness: {
+          current_hit_rate: 0.6,
+          trend: 'stable',
+          rate_history: [0.6, 0.62],  // above 50% floor — should NOT trigger
+        },
+      },
+    };
+    render(<SrTrendBreakdown trends={trends} variant="card" />);
+    expect(screen.queryByLabelText(/below floor/i)).not.toBeInTheDocument();
+  });
+
+  it('backend below_floor overrides srCatchRateTargets local derivation', () => {
+    const trends: SrTrendData = {
+      categories: {
+        correctness: {
+          current_hit_rate: 0.72,
+          trend: 'stable',
+          rate_history: [0.72, 0.74],
+          below_floor: true,  // backend forces the flag regardless of target
+        },
+      },
+    };
+    render(<SrTrendBreakdown trends={trends} variant="card" srCatchRateTargets={{ correctness: 0.80 }} />);
+    expect(screen.getByLabelText(/below floor/i)).toBeInTheDocument();
+  });
+});
+
 describe('SrTrendBreakdown by_fix_iteration section', () => {
   function makeIterTrends(byFixIteration: SrTrendData['by_fix_iteration']): SrTrendData {
     return {
@@ -1455,5 +1534,404 @@ describe('SrTrendBreakdown by_scope section', () => {
     if (!button) throw new Error('expected at least one clickable category cell');
     await user.click(button);
     expect(section).toHaveTextContent('large-scope miss example');
+  });
+});
+
+describe('SrTrendBreakdown with srCatchRateTargets', () => {
+  it('renders with srCatchRateTargets prop passed through correctly', () => {
+    const trends: SrTrendData = {
+      categories: {
+        security: {
+          current_hit_rate: 0.65,
+          miss_rate: 0.35,
+          trend: 'stable',
+        },
+        correctness: {
+          current_hit_rate: 0.8,
+          miss_rate: 0.2,
+          trend: 'stable',
+        },
+      },
+    };
+    const targets = { security: 0.7, correctness: 0.75 };
+    const { container } = render(<SrTrendBreakdown trends={trends} variant="card" srCatchRateTargets={targets} />);
+    // Verify that the component renders successfully with targets
+    expect(container).toBeInTheDocument();
+    // Verify the categories are rendered
+    expect(screen.getByText(/security/i)).toBeInTheDocument();
+    expect(screen.getByText(/correctness/i)).toBeInTheDocument();
+  });
+
+  it('shows target and gap inline when category is below target', () => {
+    const trends: SrTrendData = {
+      categories: {
+        security: {
+          current_hit_rate: 0.72,
+          miss_rate: 0.28,
+          trend: 'stable',
+        },
+      },
+    };
+    render(<SrTrendBreakdown trends={trends} variant="card" srCatchRateTargets={{ security: 0.80 }} />);
+    const targetSpan = screen.getByTitle(/Target: 80% hit rate/);
+    expect(targetSpan).toBeInTheDocument();
+    expect(targetSpan).toHaveTextContent('target 80%');
+    expect(targetSpan).toHaveTextContent('−8pp');
+  });
+
+  it('applies warning color (red) when gap is negative (below target)', () => {
+    const trends: SrTrendData = {
+      categories: {
+        security: {
+          current_hit_rate: 0.72,
+          miss_rate: 0.28,
+          trend: 'stable',
+        },
+      },
+    };
+    render(<SrTrendBreakdown trends={trends} variant="card" srCatchRateTargets={{ security: 0.80 }} />);
+    const targetSpan = screen.getByTitle(/Target: 80% hit rate/);
+    expect(targetSpan.className).toContain('text-red-400');
+  });
+
+  it('applies neutral color when target is met (gap is zero or positive)', () => {
+    const trends: SrTrendData = {
+      categories: {
+        security: {
+          current_hit_rate: 0.85,
+          miss_rate: 0.15,
+          trend: 'stable',
+        },
+      },
+    };
+    render(<SrTrendBreakdown trends={trends} variant="card" srCatchRateTargets={{ security: 0.80 }} />);
+    const targetSpan = screen.getByTitle(/Target: 80% hit rate/);
+    expect(targetSpan.className).toContain('text-neutral-400');
+    expect(targetSpan).toHaveTextContent('target 80%');
+    expect(targetSpan).toHaveTextContent('5pp');
+  });
+
+  it('does not show target display when no target is configured', () => {
+    const trends: SrTrendData = {
+      categories: {
+        security: {
+          current_hit_rate: 0.72,
+          miss_rate: 0.28,
+          trend: 'stable',
+        },
+      },
+    };
+    render(<SrTrendBreakdown trends={trends} variant="card" />);
+    expect(screen.queryByTitle(/Target:/)).not.toBeInTheDocument();
+  });
+
+  it('does not show target display when current_hit_rate is null', () => {
+    const trends: SrTrendData = {
+      categories: {
+        security: {
+          miss_rate: 0.28,
+          trend: 'stable',
+        },
+      },
+    };
+    render(<SrTrendBreakdown trends={trends} variant="card" srCatchRateTargets={{ security: 0.80 }} />);
+    expect(screen.queryByTitle(/Target:/)).not.toBeInTheDocument();
+  });
+
+  it('shows target display in inline variant when target is configured', () => {
+    const trends: SrTrendData = {
+      categories: {
+        security: {
+          current_hit_rate: 0.72,
+          miss_rate: 0.28,
+          trend: 'stable',
+        },
+      },
+    };
+    render(<SrTrendBreakdown trends={trends} variant="inline" srCatchRateTargets={{ security: 0.80 }} />);
+    const targetSpan = screen.getByTitle(/Target: 80% hit rate/);
+    expect(targetSpan).toBeInTheDocument();
+    expect(targetSpan).toHaveTextContent('target 80%');
+    expect(targetSpan).toHaveTextContent('−8pp');
+  });
+});
+
+describe('SrTrendBreakdown onConfigureTargets CTA', () => {
+  const makeTrendsWithCategories = (): SrTrendData => ({
+    categories: {
+      correctness: {
+        miss_rate: 0.2,
+        trend: 'stable',
+      },
+    },
+  });
+
+  it('shows configure targets CTA when srCatchRateTargets is undefined', () => {
+    render(<SrTrendBreakdown trends={makeTrendsWithCategories()} variant="card" />);
+    expect(screen.getByTestId('configure-targets-cta')).toBeInTheDocument();
+    expect(screen.getByText(/Configure SR catch-rate targets/)).toBeInTheDocument();
+  });
+
+  it('shows configure targets CTA when srCatchRateTargets is empty object', () => {
+    render(<SrTrendBreakdown trends={makeTrendsWithCategories()} variant="card" srCatchRateTargets={{}} />);
+    expect(screen.getByTestId('configure-targets-cta')).toBeInTheDocument();
+  });
+
+  it('shows configure targets CTA when srCatchRateTargets is null', () => {
+    render(<SrTrendBreakdown trends={makeTrendsWithCategories()} variant="card" srCatchRateTargets={null} />);
+    expect(screen.getByTestId('configure-targets-cta')).toBeInTheDocument();
+  });
+
+  it('hides configure targets CTA when srCatchRateTargets has at least one entry', () => {
+    render(<SrTrendBreakdown trends={makeTrendsWithCategories()} variant="card" srCatchRateTargets={{ correctness: 0.8 }} />);
+    expect(screen.queryByTestId('configure-targets-cta')).not.toBeInTheDocument();
+  });
+
+  it('invokes onConfigureTargets callback when CTA is clicked', async () => {
+    const onConfigureTargets = vi.fn();
+    render(
+      <SrTrendBreakdown
+        trends={makeTrendsWithCategories()}
+        variant="card"
+        onConfigureTargets={onConfigureTargets}
+      />,
+    );
+    const button = screen.getByTestId('configure-targets-cta');
+    await userEvent.click(button);
+    expect(onConfigureTargets).toHaveBeenCalledOnce();
+  });
+
+  it('does not show CTA in inline variant even when targets are empty', () => {
+    render(<SrTrendBreakdown trends={makeTrendsWithCategories()} variant="inline" />);
+    expect(screen.queryByTestId('configure-targets-cta')).not.toBeInTheDocument();
+  });
+});
+
+describe('MissRateSparkline target reference line', () => {
+  it('renders a dashed horizontal line when target is provided', () => {
+    const { container } = render(
+      <MissRateSparkline
+        history={[0.9, 0.8, 0.75, 0.7]}
+        width={100}
+        height={50}
+        stroke="rgb(100, 200, 255)"
+        target={0.8}
+      />
+    );
+    const line = container.querySelector('line');
+    expect(line).toBeInTheDocument();
+    expect(line).toHaveAttribute('stroke', 'rgb(64, 64, 64)');
+    expect(line).toHaveAttribute('stroke-dasharray', '2,2');
+    expect(line).toHaveAttribute('x1', '0');
+    expect(line).toHaveAttribute('x2', '100');
+  });
+
+  it('does not render a dashed line when target is null or undefined', () => {
+    const { container: containerNull } = render(
+      <MissRateSparkline
+        history={[0.9, 0.8, 0.75, 0.7]}
+        width={100}
+        height={50}
+        stroke="rgb(100, 200, 255)"
+        target={null}
+      />
+    );
+    expect(containerNull.querySelector('line')).not.toBeInTheDocument();
+
+    const { container: containerUndefined } = render(
+      <MissRateSparkline
+        history={[0.9, 0.8, 0.75, 0.7]}
+        width={100}
+        height={50}
+        stroke="rgb(100, 200, 255)"
+      />
+    );
+    expect(containerUndefined.querySelector('line')).not.toBeInTheDocument();
+  });
+
+  it('includes target in aria-label when provided', () => {
+    const targetHitRate = 0.75;
+    const { container } = render(
+      <MissRateSparkline
+        history={[0.9, 0.8, 0.75, 0.7]}
+        width={100}
+        height={50}
+        stroke="rgb(100, 200, 255)"
+        target={targetHitRate}
+        title="miss rate trend"
+      />
+    );
+    const svg = container.querySelector('svg');
+    const expectedPercent = Math.round(targetHitRate * 100);
+    expect(svg).toHaveAttribute('aria-label', `miss rate trend — target: ${expectedPercent}% hit rate`);
+  });
+});
+
+describe('computeTargetHealth', () => {
+  it('returns null when no targets are configured', () => {
+    const categories = { correctness: { current_hit_rate: 0.7 } };
+    expect(computeTargetHealth(categories, null)).toBeNull();
+    expect(computeTargetHealth(categories, {})).toBeNull();
+  });
+
+  it('returns healthy stats when all categories are above target', () => {
+    const categories = {
+      correctness: { current_hit_rate: 0.9, previous_hit_rate: 0.85 },
+      security: { current_hit_rate: 0.8, previous_hit_rate: 0.75 },
+    };
+    const targets = { correctness: 0.8, security: 0.7 };
+    const stats = computeTargetHealth(categories, targets);
+    expect(stats).not.toBeNull();
+    expect(stats!.configured).toBe(2);
+    expect(stats!.belowTarget).toBe(0);
+    expect(stats!.newlyMissed).toBe(0);
+    expect(stats!.newlyRecovered).toBe(0);
+    expect(stats!.hasCycleData).toBe(true);
+  });
+
+  it('counts categories below their target', () => {
+    const categories = {
+      correctness: { current_hit_rate: 0.6, previous_hit_rate: 0.65 },
+      security: { current_hit_rate: 0.9, previous_hit_rate: 0.85 },
+    };
+    const targets = { correctness: 0.8, security: 0.8 };
+    const stats = computeTargetHealth(categories, targets);
+    expect(stats!.belowTarget).toBe(1);
+    expect(stats!.configured).toBe(2);
+  });
+
+  it('detects newly missed category (was above, now below)', () => {
+    const categories = {
+      correctness: { current_hit_rate: 0.6, previous_hit_rate: 0.85 },
+    };
+    const targets = { correctness: 0.8 };
+    const stats = computeTargetHealth(categories, targets);
+    expect(stats!.newlyMissed).toBe(1);
+    expect(stats!.newlyRecovered).toBe(0);
+    expect(stats!.belowTarget).toBe(1);
+  });
+
+  it('detects newly recovered category (was below, now above)', () => {
+    const categories = {
+      correctness: { current_hit_rate: 0.85, previous_hit_rate: 0.6 },
+    };
+    const targets = { correctness: 0.8 };
+    const stats = computeTargetHealth(categories, targets);
+    expect(stats!.newlyRecovered).toBe(1);
+    expect(stats!.newlyMissed).toBe(0);
+    expect(stats!.belowTarget).toBe(0);
+  });
+
+  it('reports hasCycleData=false when no previous_hit_rate is available', () => {
+    const categories = {
+      correctness: { current_hit_rate: 0.6 },
+    };
+    const targets = { correctness: 0.8 };
+    const stats = computeTargetHealth(categories, targets);
+    expect(stats!.hasCycleData).toBe(false);
+    expect(stats!.newlyMissed).toBe(0);
+    expect(stats!.newlyRecovered).toBe(0);
+    expect(stats!.belowTarget).toBe(1);
+  });
+});
+
+describe('TargetHealthSummaryCard in SrTrendBreakdown', () => {
+  function makeTrendsWithTargets(overrides?: Partial<SrTrendData>): SrTrendData {
+    return {
+      categories: {
+        correctness: { current_hit_rate: 0.9, previous_hit_rate: 0.85, trend: 'stable' },
+        security: { current_hit_rate: 0.75, previous_hit_rate: 0.8, trend: 'stable' },
+      },
+      ...overrides,
+    };
+  }
+
+  it('renders target health summary card when targets are configured', () => {
+    render(
+      <SrTrendBreakdown
+        trends={makeTrendsWithTargets()}
+        variant="card"
+        srCatchRateTargets={{ correctness: 0.8, security: 0.7 }}
+      />
+    );
+    expect(screen.getByTestId('target-health-summary')).toBeInTheDocument();
+    expect(screen.getByText('2 configured')).toBeInTheDocument();
+  });
+
+  it('does not render target health summary when no targets are configured', () => {
+    render(
+      <SrTrendBreakdown
+        trends={makeTrendsWithTargets()}
+        variant="card"
+        srCatchRateTargets={{}}
+      />
+    );
+    expect(screen.queryByTestId('target-health-summary')).not.toBeInTheDocument();
+  });
+
+  it('shows zero below-target when all categories meet their target', () => {
+    render(
+      <SrTrendBreakdown
+        trends={makeTrendsWithTargets()}
+        variant="card"
+        srCatchRateTargets={{ correctness: 0.8, security: 0.7 }}
+      />
+    );
+    expect(screen.getByText('0 below target')).toBeInTheDocument();
+    expect(screen.queryByTestId('newly-missed-indicator')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('newly-recovered-indicator')).not.toBeInTheDocument();
+  });
+
+  it('shows below-target count and newly-missed indicator when category crosses below target', () => {
+    render(
+      <SrTrendBreakdown
+        trends={makeTrendsWithTargets({
+          categories: {
+            correctness: { current_hit_rate: 0.6, previous_hit_rate: 0.85, trend: 'decreasing' },
+            security: { current_hit_rate: 0.9, previous_hit_rate: 0.85, trend: 'stable' },
+          },
+        })}
+        variant="card"
+        srCatchRateTargets={{ correctness: 0.8, security: 0.8 }}
+      />
+    );
+    expect(screen.getByText('1 below target')).toBeInTheDocument();
+    expect(screen.getByTestId('newly-missed-indicator')).toBeInTheDocument();
+    expect(screen.queryByTestId('newly-recovered-indicator')).not.toBeInTheDocument();
+  });
+
+  it('shows newly-recovered indicator when category crosses above target', () => {
+    render(
+      <SrTrendBreakdown
+        trends={makeTrendsWithTargets({
+          categories: {
+            correctness: { current_hit_rate: 0.85, previous_hit_rate: 0.6, trend: 'increasing' },
+          },
+        })}
+        variant="card"
+        srCatchRateTargets={{ correctness: 0.8 }}
+      />
+    );
+    expect(screen.getByText('0 below target')).toBeInTheDocument();
+    expect(screen.getByTestId('newly-recovered-indicator')).toBeInTheDocument();
+    expect(screen.queryByTestId('newly-missed-indicator')).not.toBeInTheDocument();
+  });
+
+  it('does not show cycle-delta indicators when only one rate_history window exists (no previous_hit_rate)', () => {
+    render(
+      <SrTrendBreakdown
+        trends={makeTrendsWithTargets({
+          categories: {
+            correctness: { current_hit_rate: 0.6, trend: 'stable' },
+          },
+        })}
+        variant="card"
+        srCatchRateTargets={{ correctness: 0.8 }}
+      />
+    );
+    expect(screen.getByTestId('target-health-summary')).toBeInTheDocument();
+    expect(screen.getByText('1 below target')).toBeInTheDocument();
+    expect(screen.queryByTestId('newly-missed-indicator')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('newly-recovered-indicator')).not.toBeInTheDocument();
   });
 });

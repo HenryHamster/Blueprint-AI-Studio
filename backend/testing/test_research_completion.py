@@ -879,3 +879,167 @@ class TestQueryFindingsIndex:
             query_findings_index(session, "proj-1")
         )
         assert rows == []
+
+
+class TestFindingsDocumentedOutcome:
+    """completion_outcome='findings_documented' terminal pathway for metadata-only research."""
+
+    def _detect_outcome(
+        self, direction_notes, direction_proposals, type_filtered_count, child_tasks
+    ):
+        """Mirrors the logic in research_direction_state.apply_post_spawn_state."""
+        if child_tasks:
+            return None  # implementation children → not findings_documented
+        _has_metadata = bool(
+            direction_notes or direction_proposals or type_filtered_count > 0
+        )
+        return "findings_documented" if _has_metadata else None
+
+    def test_direction_notes_only_triggers_findings_documented(self):
+        """direction_notes with no children → findings_documented."""
+        outcome = self._detect_outcome(
+            direction_notes=[{"type": "direction_note", "title": "note"}],
+            direction_proposals=[],
+            type_filtered_count=0,
+            child_tasks=[],
+        )
+        assert outcome == "findings_documented"
+
+    def test_direction_proposals_only_triggers_findings_documented(self):
+        """direction_proposals with no children → findings_documented."""
+        outcome = self._detect_outcome(
+            direction_notes=[],
+            direction_proposals=[{"type": "direction_proposal", "title": "proposal"}],
+            type_filtered_count=0,
+            child_tasks=[],
+        )
+        assert outcome == "findings_documented"
+
+    def test_design_doc_observations_type_filtered_triggers_findings_documented(self):
+        """design_doc_observation findings counted in type_filtered_count → findings_documented."""
+        outcome = self._detect_outcome(
+            direction_notes=[],
+            direction_proposals=[],
+            type_filtered_count=2,
+            child_tasks=[],
+        )
+        assert outcome == "findings_documented"
+
+    def test_no_metadata_no_children_no_findings_documented(self):
+        """No metadata findings, no children → None (existing dedup/empty-prompt path)."""
+        outcome = self._detect_outcome(
+            direction_notes=[],
+            direction_proposals=[],
+            type_filtered_count=0,
+            child_tasks=[],
+        )
+        assert outcome is None
+
+    def test_mixed_with_child_tasks_no_findings_documented(self):
+        """When implementation child tasks exist, no findings_documented outcome."""
+        outcome = self._detect_outcome(
+            direction_notes=[{"type": "direction_note", "title": "note"}],
+            direction_proposals=[],
+            type_filtered_count=0,
+            child_tasks=[object()],  # non-empty → implementation path
+        )
+        assert outcome is None
+
+
+class TestRecordResearchTaskFailureScopeEmpty:
+    """_record_research_task_failure: SCOPE_EMPTY is benign and must not penalize direction health."""
+
+    def _make_task(self, failure_category, direction_id="d-test"):
+        task = MagicMock()
+        task.id = uuid.uuid4()
+        task.project_id = uuid.uuid4()
+        task.context = {
+            "failure_category": failure_category,
+            "direction_id": direction_id,
+        }
+        task.latest_status_message = (
+            f"{failure_category}: sibling already covered scope"
+        )
+        task.first_payload = {"type": "research"}
+        return task
+
+    def _make_session(self, project):
+        session = AsyncMock()
+        session.get.return_value = project
+        session.add = MagicMock()
+        return session
+
+    def _make_project(self, direction_id="d-test", consecutive_unproductive=0):
+        project = MagicMock()
+        project.directions = [
+            {
+                "id": direction_id,
+                "research_history": [],
+                "consecutive_unproductive_cycles": consecutive_unproductive,
+            }
+        ]
+        return project
+
+    def test_scope_empty_marks_cycle_productive(self):
+        import asyncio
+        from app.research_completion import _record_research_task_failure
+
+        task = self._make_task("SCOPE_EMPTY")
+        project = self._make_project()
+        session = self._make_session(project)
+
+        asyncio.get_event_loop().run_until_complete(
+            _record_research_task_failure(task, session)
+        )
+
+        direction = project.directions[0]
+        assert direction["last_cycle_productive"] is True
+
+    def test_scope_empty_resets_unproductive_counter(self):
+        import asyncio
+        from app.research_completion import _record_research_task_failure
+
+        task = self._make_task("SCOPE_EMPTY")
+        project = self._make_project(consecutive_unproductive=3)
+        session = self._make_session(project)
+
+        asyncio.get_event_loop().run_until_complete(
+            _record_research_task_failure(task, session)
+        )
+
+        direction = project.directions[0]
+        assert direction.get("consecutive_unproductive_cycles", 0) == 0
+
+    def test_code_error_marks_cycle_unproductive(self):
+        import asyncio
+        from app.research_completion import _record_research_task_failure
+
+        task = self._make_task("CODE_ERROR")
+        project = self._make_project(consecutive_unproductive=1)
+        session = self._make_session(project)
+
+        asyncio.get_event_loop().run_until_complete(
+            _record_research_task_failure(task, session)
+        )
+
+        direction = project.directions[0]
+        assert direction["last_cycle_productive"] is False
+        assert direction.get("consecutive_unproductive_cycles", 0) == 2
+
+    def test_scope_empty_history_entry_has_failure_category(self):
+        import asyncio
+        from app.research_completion import _record_research_task_failure
+
+        task = self._make_task("SCOPE_EMPTY")
+        project = self._make_project()
+        session = self._make_session(project)
+
+        asyncio.get_event_loop().run_until_complete(
+            _record_research_task_failure(task, session)
+        )
+
+        direction = project.directions[0]
+        history = direction.get("research_history", [])
+        assert len(history) == 1
+        assert history[0]["research_task_failed"] is True
+        assert history[0]["failure_category"] == "SCOPE_EMPTY"

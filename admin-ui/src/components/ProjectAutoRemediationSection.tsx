@@ -102,7 +102,9 @@ export function ProjectAutoRemediationSection({
         </p>
         <div className="bg-neutral-900 border border-neutral-800 rounded-lg px-4 py-3 flex items-center justify-between">
           <span className="text-xs text-neutral-300">Enable auto-remediation</span>
+          {/* reason: dense-UI toggle (h-5 w-9) — operator-density convention for settings panels */}
           <button
+            data-viewport-allow-small-target
             onClick={() => setEnabled(v => !v)}
             className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors shrink-0 ${enabled ? 'bg-emerald-600' : 'bg-neutral-700'}`}
           >
@@ -121,7 +123,9 @@ export function ProjectAutoRemediationSection({
           {branchWhitelist.map(branch => (
             <div key={branch} className="flex items-center gap-2 bg-neutral-900 border border-neutral-800 rounded px-3 py-1.5">
               <span className="text-xs font-mono text-neutral-200 flex-1">{branch}</span>
+              {/* reason: small icon-only delete button — operator-density convention for settings panels */}
               <button
+                data-viewport-allow-small-target
                 onClick={() => removeBranch(branch)}
                 className="text-neutral-600 hover:text-red-400 transition-colors"
                 title="Remove branch"
@@ -140,7 +144,9 @@ export function ProjectAutoRemediationSection({
             placeholder="branch-name"
             className="flex-1 bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
           />
+          {/* reason: dense-UI inline +Add control — operator-density convention for settings panels */}
           <button
+            data-viewport-allow-small-target
             onClick={addBranch}
             disabled={!newBranch.trim()}
             className="flex items-center gap-1 text-xs text-neutral-500 hover:text-neutral-300 transition-colors disabled:opacity-40"
@@ -188,7 +194,9 @@ export function ProjectAutoRemediationSection({
             <span className="text-xs text-neutral-300">Require human review before merge</span>
             <p className="text-[11px] text-neutral-600 mt-0.5">Auto-remediation PRs will wait for approval before auto-merging.</p>
           </div>
+          {/* reason: dense-UI toggle (h-5 w-9) — operator-density convention for settings panels */}
           <button
+            data-viewport-allow-small-target
             onClick={() => setRequireReview(v => !v)}
             className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors shrink-0 ml-4 ${requireReview ? 'bg-emerald-600' : 'bg-neutral-700'}`}
           >
@@ -237,7 +245,9 @@ export function ProjectAutoRemediationSection({
 
       {/* Save button */}
       <div className="flex justify-end pt-2">
+        {/* reason: dense-UI Save button (text-xs py-2) — operator-density convention for settings panels */}
         <button
+          data-viewport-allow-small-target
           onClick={handleSave}
           disabled={saving}
           className="bg-neutral-700 hover:bg-neutral-600 text-neutral-100 rounded-lg px-5 py-2 text-xs font-medium transition-colors disabled:opacity-50"

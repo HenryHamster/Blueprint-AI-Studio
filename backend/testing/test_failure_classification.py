@@ -11,6 +11,7 @@ from app.failure_classification import (
     ALL_FAILURE_CLASSES,
     CODE_ERROR,
     EXTERNAL_API,
+    VIEWPORT_REGRESSION,
     EXTERNAL_API_SUBTYPE_DB_CONNECTIVITY,
     EXTERNAL_API_SUBTYPE_GITHUB_PR_CREATE,
     EXTERNAL_API_SUBTYPE_NETWORK_TRANSIENT,
@@ -22,6 +23,7 @@ from app.failure_classification import (
     PROVISION_FAILURE,
     RATE_LIMIT,
     BLOCKED_PRECONDITION,
+    SCOPE_EMPTY,
     SCOPE_OVERFLOW,
     _external_api_subtype_from_message,
     _fingerprint_message,
@@ -297,6 +299,42 @@ class TestClassifyFailureWithConfidence:
             classify_failure(task)
             == classify_failure_with_confidence(task).failure_class
         )
+
+
+class TestClassifyFailureViewportGateInfra:
+    """VIEWPORT_GATE_INFRA_UNAVAILABLE sentinel routes to PROVISION_FAILURE,
+    not CODE_ERROR or VIEWPORT_REGRESSION, so infra shortfalls don't penalize
+    direction health or create spurious residual-fingerprint remediation tasks."""
+
+    def test_sentinel_routes_to_provision_failure(self):
+        t = _task("VIEWPORT_GATE_INFRA_UNAVAILABLE: chromium not found on PATH")
+        assert classify_failure(t) == PROVISION_FAILURE
+
+    def test_sentinel_not_code_error(self):
+        t = _task("VIEWPORT_GATE_INFRA_UNAVAILABLE: docker fallback also unavailable")
+        result = classify_failure(t)
+        assert result != CODE_ERROR
+
+    def test_sentinel_not_viewport_regression(self):
+        t = _task("VIEWPORT_GATE_INFRA_UNAVAILABLE: sudo required for os deps")
+        result = classify_failure(t)
+        assert result != VIEWPORT_REGRESSION
+
+    def test_sentinel_in_logs_routes_to_provision_failure(self):
+        t = _task("")
+        result = classify_failure(
+            t, logs="VIEWPORT_GATE_INFRA_UNAVAILABLE: libnspr missing"
+        )
+        assert result == PROVISION_FAILURE
+
+    def test_provision_failure_is_infra_class(self):
+        from app.failure_classification import INFRA_CLASSES
+
+        assert PROVISION_FAILURE in INFRA_CLASSES
+
+    def test_regular_viewport_failure_still_routes_to_viewport_regression(self):
+        t = _task("expectnooverflowat( failed at 375px width")
+        assert classify_failure(t) == VIEWPORT_REGRESSION
 
 
 class TestClassifyFailureProvision:
@@ -621,6 +659,49 @@ class TestClassifyFailureBlockedPrecondition:
         from app.failure_classification import INFRA_CLASSES
 
         assert BLOCKED_PRECONDITION in INFRA_CLASSES
+
+
+class TestClassifyFailureScopeEmpty:
+    """SCOPE_EMPTY sentinel routes to SCOPE_EMPTY, not CODE_ERROR, so cluster
+    sibling pre-emptions don't penalize direction health or consume retry budget."""
+
+    def test_prefix_routes_to_scope_empty(self):
+        t = _task(
+            "SCOPE_EMPTY: sibling cluster 2/5 (PR #4646) already merged these files"
+        )
+        assert classify_failure(t) == SCOPE_EMPTY
+
+    def test_lowercase_prefix_routes_to_scope_empty(self):
+        t = _task("scope_empty: related_files fully covered by sibling PR")
+        assert classify_failure(t) == SCOPE_EMPTY
+
+    def test_context_fast_path_scope_empty(self):
+        t = _task("", {"failure_category": "scope_empty"})
+        assert classify_failure(t) == SCOPE_EMPTY
+
+    def test_canonical_uppercase_context_routes(self):
+        t = _task("", {"failure_category": "SCOPE_EMPTY"})
+        assert classify_failure(t) == SCOPE_EMPTY
+
+    def test_scope_empty_not_code_error(self):
+        t = _task("SCOPE_EMPTY: backend/app/models.py already on main via PR #4650")
+        assert classify_failure(t) != CODE_ERROR
+
+    def test_high_confidence_for_scope_empty(self):
+        t = _task("SCOPE_EMPTY: sibling cluster merged the declared files")
+        result = classify_failure_with_confidence(t)
+        assert result.failure_class == SCOPE_EMPTY
+        assert result.confidence >= 0.9
+
+    def test_in_all_failure_classes(self):
+        assert SCOPE_EMPTY in ALL_FAILURE_CLASSES
+
+    def test_in_infra_classes(self):
+        """SCOPE_EMPTY is infra-class so direction-health analytics don't penalize
+        the agent for correctly detecting and exiting a pre-empted cluster."""
+        from app.failure_classification import INFRA_CLASSES
+
+        assert SCOPE_EMPTY in INFRA_CLASSES
 
 
 class TestClassifyFailureFastPath:

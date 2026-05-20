@@ -50,6 +50,7 @@ export interface Project {
   my_role?: 'owner' | 'member' | 'viewer';
   build_config?: BuildConfig | null;
   is_self_repo?: boolean;
+  sr_catch_rate_targets?: Record<string, number>;
 }
 
 export interface AutoRemediationConfig {

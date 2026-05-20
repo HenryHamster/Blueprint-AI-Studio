@@ -1,10 +1,12 @@
 """Catch-up digest and pipeline health summary endpoints."""
 
 import asyncio
+import re as _re
 import uuid
 import logging
 import statistics
 from collections import defaultdict
+from pathlib import Path as _Path
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
 
@@ -80,6 +82,150 @@ _REGRESSION_STALL_THRESHOLD_HOURS = (
     4  # ACTIVE case without PR older than this → stalled
 )
 _SIGNAL_STALENESS_TITLE_PREFIX = "Signal staleness: "
+_SR_CATCH_RATE_TARGET_ALERT_PREFIX = "SR catch-rate below target: "
+_SR_CATCH_RATE_TARGET_MIN_WINDOWS = 2
+_LONE_CHECKER_ALERT_TITLE = "SR lone-checker blind spot: ≥2 categories uncorroborated"
+_LONE_CHECKER_MIN_CATEGORIES = 2
+
+
+async def _evaluate_sr_catch_rate_targets(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> None:
+    """Emit/dismiss WARNING Alerts for per-category SR catch-rate targets.
+
+    For each category in project.sr_catch_rate_targets, emits a WARNING Alert
+    when rate_history shows >=2 consecutive windows below the configured target.
+    Dismisses existing alerts when the category recovers. Suppressed when
+    prompt_version_changed is True (avoids false alarms during prompt rollouts).
+    """
+    project = await session.get(Project, project_id)
+    if not project:
+        return
+    targets: Dict[str, Any] = project.sr_catch_rate_targets or {}
+    if not targets:
+        return
+    doc = project.design_doc or {}
+    sr_trends = doc.get("sr_catch_rate_trends") or {}
+    if sr_trends.get("prompt_version_changed"):
+        return
+    categories = sr_trends.get("categories") or {}
+    for cat, target in targets.items():
+        try:
+            target_float = float(target)
+        except (TypeError, ValueError):
+            continue
+        cat_data = categories.get(cat) or {}
+        current_hit_rate = cat_data.get("current_hit_rate")
+        title = f"{_SR_CATCH_RATE_TARGET_ALERT_PREFIX}{cat}"
+
+        existing = (
+            (
+                await session.execute(
+                    select(Alert).where(
+                        Alert.project_id == project_id,
+                        Alert.task_id.is_(None),
+                        Alert.severity == AlertSeverity.WARNING,
+                        Alert.dismissed_at.is_(None),
+                        Alert.title == title,
+                    )
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if current_hit_rate is not None and current_hit_rate >= target_float:
+            if existing is not None:
+                existing.dismissed_at = _utcnow()
+                await session.commit()
+            continue
+        rate_history = cat_data.get("rate_history") or []
+        if len(rate_history) < _SR_CATCH_RATE_TARGET_MIN_WINDOWS:
+            continue
+        if not all(
+            r < target_float for r in rate_history[-_SR_CATCH_RATE_TARGET_MIN_WINDOWS:]
+        ):
+            continue
+        if existing is not None:
+            continue
+        trend = cat_data.get("trend") or "unknown"
+        curr_str = f"{current_hit_rate:.0%}" if current_hit_rate is not None else "n/a"
+        message = (
+            f"Self-review catch-rate for '{cat}' has been below the configured target "
+            f"({target_float:.0%}) for the last {_SR_CATCH_RATE_TARGET_MIN_WINDOWS} "
+            f"measurement windows. Current: {curr_str}. Trend: {trend}. "
+            f"Review the SR Trend Breakdown in the admin dashboard."
+        )
+        session.add(
+            Alert(
+                project_id=project_id,
+                severity=AlertSeverity.WARNING,
+                title=title,
+                message=message[:1000],
+            )
+        )
+        await session.commit()
+
+
+async def _evaluate_lone_checker_alert(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> None:
+    """Open a WARNING Alert when >=2 categories are in lone-checker state.
+
+    Lone-checker means SR is the only reviewer for a category, so an SR PASS
+    is uncorroborated and catch-rate measurement is unreliable.  Dedup mirrors
+    _evaluate_sr_catch_rate_targets — skip if an open Alert with the same title
+    already exists.
+    """
+    project = await session.get(Project, project_id)
+    if not project:
+        return
+    doc = project.design_doc or {}
+    categories = (doc.get("sr_catch_rate_trends") or {}).get("categories") or {}
+    lone_cats = [
+        cat
+        for cat, data in categories.items()
+        if (data or {}).get("time_to_miss_detect_lone_checker")
+    ]
+    if len(lone_cats) < _LONE_CHECKER_MIN_CATEGORIES:
+        return
+
+    existing = (
+        (
+            await session.execute(
+                select(Alert).where(
+                    Alert.project_id == project_id,
+                    Alert.task_id.is_(None),
+                    Alert.severity == AlertSeverity.WARNING,
+                    Alert.dismissed_at.is_(None),
+                    Alert.title == _LONE_CHECKER_ALERT_TITLE,
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if existing is not None:
+        return
+
+    cats_str = ", ".join(sorted(lone_cats))
+    message = (
+        f"{len(lone_cats)} categories have entered lone-checker state "
+        f"(SR is the only reviewer, catch-rate unmeasurable): {cats_str}. "
+        f"Fresh-reviewer is auto-enabled for tasks whose risk surface overlaps "
+        f"these categories. Operator action: arrange human review coverage or "
+        f"adjust category scope to exit lone-checker state."
+    )
+    session.add(
+        Alert(
+            project_id=project_id,
+            severity=AlertSeverity.WARNING,
+            title=_LONE_CHECKER_ALERT_TITLE,
+            message=message[:1000],
+        )
+    )
+    await session.commit()
 
 
 def _stash_projected_task_fields(
@@ -193,6 +339,55 @@ def _compute_sr_skip_rate(terminal_tasks: List[Task]) -> "Dict[str, Any] | None"
     return {
         "overall_rate": round(skipped_count / sample_size, 3),
         "skipped_count": skipped_count,
+        "sample_size": sample_size,
+        "by_task_type": by_task_type,
+    }
+
+
+def _compute_sr_disallowed_blind_spot_rate(
+    terminal_tasks: List[Task],
+) -> "Dict[str, Any] | None":
+    """Share of code-change tasks where the agent emitted at least one disallowed
+    blind-spot phrase (captured as ``_filtered_blind_spots_count > 0`` by
+    ``filter_disallowed_blind_spots``). Returns None when sample size < 5.
+    """
+    code_change_tasks: List[Task] = []
+    for t in terminal_tasks:
+        ttype = (t.first_payload or {}).get("type")
+        if ttype in _SR_CODE_CHANGE_TYPES:
+            code_change_tasks.append(t)
+
+    if len(code_change_tasks) < 5:
+        return None
+
+    violation_count = 0
+    by_type: Dict[str, Dict[str, int]] = {}
+    for t in code_change_tasks:
+        ttype = (t.first_payload or {}).get("type")
+        ctx = t.context or {}
+        sro = ctx.get("_self_review_outcome") or {}
+        has_violation = (sro.get("_filtered_blind_spots_count") or 0) > 0
+        bucket = by_type.setdefault(ttype, {"violations": 0, "total": 0})
+        bucket["total"] += 1
+        if has_violation:
+            violation_count += 1
+            bucket["violations"] += 1
+
+    by_task_type: Dict[str, Dict[str, Any]] = {}
+    for ttype, counts in by_type.items():
+        total = counts["total"]
+        if total < 5:
+            continue
+        by_task_type[ttype] = {
+            "rate": round(counts["violations"] / total, 3),
+            "violation_count": counts["violations"],
+            "sample_size": total,
+        }
+
+    sample_size = len(code_change_tasks)
+    return {
+        "overall_rate": round(violation_count / sample_size, 3),
+        "violation_count": violation_count,
         "sample_size": sample_size,
         "by_task_type": by_task_type,
     }
@@ -871,7 +1066,28 @@ def _compute_symptom_layers_by_class(
     return {cls: sorted(layers) for cls, layers in sorted(by_class.items())}
 
 
-def _compute_cross_layer_compliance(
+def _compute_recovery_mismatches_by_class(
+    rows: List[RegressionRemediationCase],
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Recovery-layer-mismatch events from fix logs, keyed by regression class.
+
+    Scans fingerprint_to_fix_log for entries of type 'recovery_layer_mismatch'
+    (written by _compute_recovery_layer_mismatch at case closure).  Used by
+    the pipeline health summary so operators can see which closed cases had
+    fix/symptom layer divergence.
+    """
+    by_class: Dict[str, List[Dict[str, Any]]] = {}
+    for case in rows:
+        for entry in case.fingerprint_to_fix_log or []:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("type") != "recovery_layer_mismatch":
+                continue
+            by_class.setdefault(case.regression_class, []).append(entry)
+    return by_class
+
+
+def compute_cross_layer_compliance(
     rows: List[RegressionRemediationCase],
     cutoff: datetime,
     over_threshold_hours: int = 24,
@@ -1085,9 +1301,9 @@ def _compute_regression_case_summary(
                     ).total_seconds()
                 )
     layer_coverage_by_class = _compute_layer_coverage_by_class(rows)
-    symptom_layers_by_class = _compute_symptom_layers_by_class(
-        list(all_rows) if all_rows is not None else rows
-    )
+    all_rows_list = list(all_rows) if all_rows is not None else rows
+    symptom_layers_by_class = _compute_symptom_layers_by_class(all_rows_list)
+    recovery_mismatches_by_class = _compute_recovery_mismatches_by_class(all_rows_list)
 
     def _entry(regression_class: str, bucket: Dict[str, List[float]]) -> Dict[str, Any]:
         out: Dict[str, Any] = {
@@ -1125,6 +1341,8 @@ def _compute_regression_case_summary(
         response["layer_coverage_by_class"] = layer_coverage_by_class
     if symptom_layers_by_class:
         response["symptom_layers_by_class"] = symptom_layers_by_class
+    if recovery_mismatches_by_class:
+        response["recovery_mismatches_by_class"] = recovery_mismatches_by_class
     return response
 
 
@@ -2488,6 +2706,11 @@ async def list_regression_cases(
     rows = (await session.execute(query)).scalars().all()
     now = _utcnow()
     stall_threshold = now - timedelta(hours=_REGRESSION_STALL_THRESHOLD_HOURS)
+    from app.pipeline_regression_dispatcher import (  # noqa: PLC0415
+        compute_class_layer_defense_counts,
+        compute_untargeted_layers,
+    )
+
     closed_rows = (
         (
             await session.execute(
@@ -2502,6 +2725,12 @@ async def list_regression_cases(
         .scalars()
         .all()
     )
+    # Aggregate fix-log entries by regression_class across all open+closed cases
+    # so each case row can show class-level defense counts (not just its own log).
+    fix_logs_by_class: dict[str, list] = {}
+    for c in list(rows) + list(closed_rows):
+        bucket = fix_logs_by_class.setdefault(c.regression_class, [])
+        bucket.extend(c.fingerprint_to_fix_log or [])
     return {
         "count": len(rows),
         "status_filter": status_filter,
@@ -2550,6 +2779,12 @@ async def list_regression_cases(
                     now=now,
                     fingerprint_to_fix_log=c.fingerprint_to_fix_log,
                 ),
+                "untargeted_layers": compute_untargeted_layers(
+                    fix_logs_by_class.get(c.regression_class)
+                ),
+                "layer_defense_counts_by_class": compute_class_layer_defense_counts(
+                    fix_logs_by_class.get(c.regression_class)
+                ),
             }
             for c in rows
         ],
@@ -2568,8 +2803,8 @@ async def regression_cases_layer_defense_density(
     Loads every ``RegressionRemediationCase`` for the project, walks each
     case's ``fingerprint_to_fix_log`` entries, and returns one row per
     canonical infrastructure layer (CI_WORKFLOW, AGENT_VM, AGENT_VERB,
-    BASELINE_GATE, REVIEWER_PASS) — including layers with zero defenses —
-    so the UI can render a stable five-row table.
+    BASELINE_GATE, REVIEWER_PASS, VIEWPORT) — including layers with zero
+    defenses — so the UI can render a stable six-row table.
     """
     from app.pipeline_regression_dispatcher import (
         _compute_layer_fragility_stats,
@@ -2600,6 +2835,10 @@ async def regression_cases_layer_defense_density(
         row["still_holding_count"] = frag.get("still_holding_count", 0)
         row["held_gt_7d_count"] = frag.get("held_gt_7d_count", 0)
         row["retripped_within_48h_count"] = frag.get("retripped_within_48h_count", 0)
+        row["single_layer_fix_count"] = frag.get("single_layer_fix_count", 0)
+        row["single_layer_avg_hold_days"] = frag.get("single_layer_avg_hold_days")
+        row["multi_layer_fix_count"] = frag.get("multi_layer_fix_count", 0)
+        row["multi_layer_avg_hold_days"] = frag.get("multi_layer_avg_hold_days")
     return {
         "days": days,
         "generated_at": _utcnow().isoformat(),
@@ -2651,6 +2890,38 @@ async def clear_regression_manual_intervention(
         "status": RegressionCaseStatus.ACTIVE,
         "attempts": case.attempts,
         "needs_manual_intervention_at": None,
+    }
+
+
+@router.post("/regression-cases/{case_id}/acknowledge")
+async def acknowledge_regression_case(
+    case_id: uuid.UUID,
+    project_id: uuid.UUID = Query(...),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),  # noqa: ARG001
+):
+    """Stamp operator_acknowledged_at on a RegressionRemediationCase.
+
+    Idempotent: if the case is already acknowledged the existing timestamp is
+    returned unchanged. Returns 404 if no matching case exists for this project.
+    """
+    result = await session.execute(
+        select(RegressionRemediationCase).where(
+            RegressionRemediationCase.id == case_id,
+            RegressionRemediationCase.project_id == project_id,
+        )
+    )
+    case = result.scalar_one_or_none()
+    if case is None:
+        raise HTTPException(status_code=404, detail="Regression case not found")
+    if case.operator_acknowledged_at is None:
+        case.operator_acknowledged_at = _utcnow()
+        case.updated_at = _utcnow()
+        session.add(case)
+        await session.commit()
+    return {
+        "id": str(case.id),
+        "operator_acknowledged_at": case.operator_acknowledged_at.isoformat(),
     }
 
 
@@ -2737,6 +3008,10 @@ async def list_regression_manual_intervention_cases(
 ):
     """List regression cases escalated to manual intervention."""
     now = _utcnow()
+    from app.pipeline_regression_dispatcher import (  # noqa: PLC0415
+        compute_untargeted_layers,
+    )
+
     rows = (
         (
             await session.execute(
@@ -2788,10 +3063,16 @@ async def list_regression_manual_intervention_cases(
                 else None,
                 "time_to_investigate_sec": c.time_to_investigate_sec,
                 "escalation_reason": c.escalation_reason,
+                "operator_acknowledged_at": c.operator_acknowledged_at.isoformat()
+                if c.operator_acknowledged_at
+                else None,
                 "layer_summary": _summarize_symptoms_by_layer(
                     c.symptoms_by_layer,
                     now=now,
                     fingerprint_to_fix_log=c.fingerprint_to_fix_log,
+                ),
+                "untargeted_layers": compute_untargeted_layers(
+                    c.fingerprint_to_fix_log
                 ),
             }
             for c in rows
@@ -2814,6 +3095,10 @@ async def list_regression_auto_recovered_cases(
     log entry and an ``updated_at`` field so operators can sort by close time.
     """
     now = _utcnow()
+    from app.pipeline_regression_dispatcher import (  # noqa: PLC0415
+        compute_untargeted_layers,
+    )
+
     rows = (
         (
             await session.execute(
@@ -2871,6 +3156,9 @@ async def list_regression_auto_recovered_cases(
                     c.symptoms_by_layer,
                     now=now,
                     fingerprint_to_fix_log=c.fingerprint_to_fix_log,
+                ),
+                "untargeted_layers": compute_untargeted_layers(
+                    c.fingerprint_to_fix_log
                 ),
             }
         )
@@ -2956,6 +3244,7 @@ async def list_recently_closed_regression_cases(
 
     from app.pipeline_regression_dispatcher import (  # noqa: PLC0415
         _extract_recurrence_cycles,
+        compute_untargeted_layers,
     )
 
     cases = []
@@ -3042,6 +3331,9 @@ async def list_recently_closed_regression_cases(
                     now=now,
                     fingerprint_to_fix_log=c.fingerprint_to_fix_log,
                 ),
+                "untargeted_layers": compute_untargeted_layers(
+                    c.fingerprint_to_fix_log
+                ),
             }
         )
 
@@ -3078,7 +3370,7 @@ async def get_cross_layer_compliance(
         .scalars()
         .all()
     )
-    return _compute_cross_layer_compliance(rows, cutoff)
+    return compute_cross_layer_compliance(rows, cutoff)
 
 
 @router.get("/regression-class-kpis")
@@ -5351,6 +5643,24 @@ async def _compute_digest(
                 "by_path": _by_path,
             }
 
+    # --- Prevention-rate 7d aggregate ---
+    avg_prevention_rate_7d: Optional[Dict[str, Any]] = None
+    if project_id:
+        from app.pipeline_regression_dispatcher import (  # noqa: PLC0415
+            compute_avg_prevention_rate_7d,
+        )
+
+        _prev_cases = list(
+            (
+                await session.execute(
+                    select(RegressionRemediationCase).where(
+                        RegressionRemediationCase.project_id == project_id
+                    )
+                )
+            ).scalars()
+        )
+        avg_prevention_rate_7d = compute_avg_prevention_rate_7d(_prev_cases)
+
     # --- Prevention efficacy summary ---
     # Aggregate preventive-context outcomes across recent research_history
     # entries so operators can see whether proactive context injection actually
@@ -6290,6 +6600,9 @@ async def _compute_digest(
 
     _review_quality = _compute_review_quality_metrics(completed_tasks + failed_tasks)
     _self_review_skip_rate = _compute_sr_skip_rate(completed_tasks + failed_tasks)
+    _sr_disallowed_blind_spot_rate = _compute_sr_disallowed_blind_spot_rate(
+        completed_tasks + failed_tasks
+    )
     _first_attempt_success_rate = _compute_first_attempt_breakdowns(
         completed_tasks + failed_tasks,
         prev_terminal_tasks=prev_completed_tasks + prev_failed_tasks,
@@ -6353,6 +6666,7 @@ async def _compute_digest(
         "self_review_prediction_accuracy_trends": self_review_prediction_accuracy_trends,
         "sr_regression_risk_test_signal_trends": sr_regression_risk_test_signal_trends,
         "self_review_skip_rate": _self_review_skip_rate,
+        "sr_disallowed_blind_spot_rate": _sr_disallowed_blind_spot_rate,
         "review_accuracy": _review_quality["review_accuracy"],
         "fresh_reviewer_effectiveness": _review_quality["fresh_reviewer_effectiveness"],
         "fresh_reviewer_trend": fresh_reviewer_trend,
@@ -6422,6 +6736,7 @@ async def _compute_digest(
         "pipeline_filter_funnel": pipeline_filter_funnel or None,
         "scope_mismatch_summary": scope_mismatch_summary,
         "escalation_outcome_summary": escalation_outcome_summary,
+        "avg_prevention_rate_7d": avg_prevention_rate_7d,
         "prevention_efficacy": prevention_efficacy,
         "rejection_pattern_summary": rejection_pattern_summary,
         "retry_pattern_summary": retry_pattern_summary,
@@ -7247,6 +7562,114 @@ async def list_sr_missed_retrospectives(
     return {"items": items, "total": total_matched}
 
 
+@router.get("/projects/{project_id}/sr-unhandled-edges-retrospectives")
+async def list_sr_unhandled_edges_retrospectives(
+    project_id: uuid.UUID,
+    days: int = Query(14, ge=1, le=90),
+    task_type: Optional[str] = Query(None),
+    page: int = Query(0, ge=0),
+    page_size: int = Query(50, ge=1, le=200),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),  # noqa: ARG001
+) -> Dict[str, Any]:
+    """List code-change tasks with unhandled edge cases flagged by the agent.
+
+    Surfaces which specific recent tasks shipped with unhandled-edge admissions
+    (handled: false in edges_considered), enabling audit of whether these
+    correlate with later reviewer rejections and spot patterns.
+    """
+    cutoff = datetime.utcnow() - timedelta(days=days)
+    page_start = page * page_size
+    page_end = page_start + page_size
+
+    stmt = (
+        select(Task)
+        .where(
+            Task.project_id == project_id,
+            Task.status == TaskStatus.COMPLETED,
+            Task.created_at >= cutoff,
+        )
+        .options(
+            load_only(
+                Task.id,
+                Task.title,
+                Task.created_at,
+                Task.context,
+                Task.project_id,
+                Task.payloads,
+            )
+        )
+        .order_by(Task.created_at.desc())
+    )
+
+    page_items = []
+    total_matched = 0
+    task_stream = await session.stream(stmt)
+    async for t in task_stream.scalars():
+        ctx = t.context or {}
+        sr_outcome = ctx.get("_self_review_outcome") or {}
+        edges = sr_outcome.get("edges_considered") or []
+        if not isinstance(edges, list):
+            edges = []
+
+        # Find unhandled edges
+        unhandled_edges = [
+            e for e in edges if isinstance(e, dict) and not e.get("handled", True)
+        ]
+        if not unhandled_edges:
+            continue
+
+        t_type = (t.first_payload or {}).get("type")
+        if task_type and t_type != task_type:
+            continue
+
+        current_index = total_matched
+        total_matched += 1
+        if current_index < page_start or current_index >= page_end:
+            continue
+
+        page_items.append(
+            {
+                "task_id": str(t.id),
+                "title": t.title or "",
+                "task_type": t_type,
+                "scope": ctx.get("scope"),
+                "created_at": t.created_at.isoformat() if t.created_at else None,
+                "unhandled_edges": unhandled_edges,
+            }
+        )
+
+    # Batch-fetch PR artifacts for items on this page
+    page_task_ids = [uuid.UUID(m["task_id"]) for m in page_items]
+    pr_map: Dict[str, str] = {}
+    if page_task_ids:
+        art_result = await session.execute(
+            select(Artifact.task_id, Artifact.pr_url).where(
+                Artifact.task_id.in_(page_task_ids),
+                Artifact.artifact_type == ArtifactType.PULL_REQUEST,
+            )
+        )
+        for row in art_result.all():
+            if row.pr_url:
+                pr_map[str(row.task_id)] = row.pr_url
+
+    items = []
+    for m in page_items:
+        items.append(
+            {
+                "task_id": m["task_id"],
+                "title": m["title"],
+                "task_type": m["task_type"],
+                "scope": m["scope"],
+                "created_at": m["created_at"],
+                "unhandled_edges": m["unhandled_edges"],
+                "pr_url": pr_map.get(m["task_id"]),
+            }
+        )
+
+    return {"items": items, "total": total_matched}
+
+
 @router.get("/projects/{project_id}/sr-alert-drilldown")
 async def get_sr_alert_drilldown(
     project_id: uuid.UUID,
@@ -7315,8 +7738,39 @@ async def get_sr_alert_drilldown(
             if art_row.pr_url:
                 pr_map[str(art_row.task_id)] = art_row.pr_url
 
+    task_map = {str(t.id): t for t in all_tasks}
+
     for r in rows:
         r["pr_url"] = pr_map.get(r["task_id"])
+
+        task = task_map.get(r["task_id"])
+        ctx = (task.context or {}) if task else {}
+        sr_outcome = ctx.get("_self_review_outcome") or {}
+        findings_list = sr_outcome.get("reviewer_findings") or []
+        findings_by_cat = {
+            f["category"]: f
+            for f in findings_list
+            if isinstance(f, dict) and "category" in f
+        }
+        missed_findings: Dict[str, Any] = {}
+        for cat in r.get("missed_categories", []):
+            finding = findings_by_cat.get(cat)
+            if finding:
+                desc = finding.get("description") or ""
+                missed_findings[cat] = {
+                    "severity": finding.get("severity"),
+                    "description": desc[:140],
+                    "has_more": len(desc) > 140,
+                    "full_description": desc if len(desc) > 140 else None,
+                }
+            else:
+                missed_findings[cat] = {
+                    "severity": None,
+                    "description": "no description recorded",
+                    "has_more": False,
+                    "full_description": None,
+                }
+        r["missed_category_findings"] = missed_findings
 
     return {
         "items": rows,
@@ -7504,6 +7958,8 @@ async def get_pipeline_regressions(
                 "prior_rate": None,
                 "resolved": False,
                 "resolved_at": None,
+                "introducing_pr_number": getattr(case, "introducing_pr_number", None),
+                "introducing_commit_sha": getattr(case, "introducing_commit_sha", None),
             }
         )
 
@@ -8004,6 +8460,7 @@ async def get_regression_dispatcher_health(
     rather than crashing.
     """
     from app.pipeline_regression_dispatcher import (  # noqa: PLC0415
+        compute_mtti_p50_sec,
         get_dispatcher_cycle_records,
     )
 
@@ -8035,6 +8492,20 @@ async def get_regression_dispatcher_health(
     total_mi_suppressed = sum(
         r.get("rejections_by_reason", {}).get("manual_intervention_suppressed", 0)
         for r in cycles
+    )
+
+    # Compute mttd_p50_sec as mean of non-None values
+    mttd_values = [
+        r.get("mttd_p50_sec") for r in cycles if r.get("mttd_p50_sec") is not None
+    ]
+    mttd_p50_sec = sum(mttd_values) / len(mttd_values) if mttd_values else None
+
+    # Sum recovery counts across cycles
+    total_marginal_recoveries = sum(
+        r.get("marginal_recoveries_count", 0) for r in cycles
+    )
+    total_confirmed_recoveries = sum(
+        r.get("confirmed_recoveries_count", 0) for r in cycles
     )
 
     # Per-hour sparkline: count spawns_emitted in each 1-hour bucket
@@ -8080,6 +8551,25 @@ async def get_regression_dispatcher_health(
 
     from app.pipeline_regression_dispatcher import _REGRESSION_COOLDOWN  # noqa: PLC0415
 
+    # Compute MTTI: query cases acknowledged within the window
+    cutoff = datetime.utcnow() - timedelta(hours=window_hours)
+    mtti_where = [
+        RegressionRemediationCase.operator_acknowledged_at >= cutoff,
+        RegressionRemediationCase.needs_manual_intervention_at.is_not(None),
+    ]
+    if project_id is not None:
+        mtti_where.append(RegressionRemediationCase.project_id == project_id)
+    acked_cases = (
+        (
+            await session.execute(
+                select(RegressionRemediationCase).where(*mtti_where).limit(1000)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    mtti_p50_sec = compute_mtti_p50_sec(list(acked_cases))
+
     per_class: List[Dict[str, Any]] = []
     for case in cases:
         last_seen = case.last_seen_at
@@ -8106,6 +8596,12 @@ async def get_regression_dispatcher_health(
             "signals_evaluated": total_signals_evaluated,
             "signals_tripped": total_signals_tripped,
             "spawns": total_spawns,
+            "mttd_p50_sec": mttd_p50_sec,
+            "mtti_p50_sec": mtti_p50_sec,
+            "recoveries": {
+                "marginal": total_marginal_recoveries,
+                "confirmed": total_confirmed_recoveries,
+            },
             "rejections": {
                 "cooldown": total_cooldown,
                 "dedup": total_dedup,
@@ -8393,6 +8889,229 @@ async def get_regression_mtta(
     }
 
 
+# ---------------------------------------------------------------------------
+# Viewport Debt Endpoint
+# ---------------------------------------------------------------------------
+
+_VIEWPORT_DEBT_CACHE: Optional[
+    tuple[datetime, List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]
+] = None
+_VIEWPORT_DEBT_CACHE_TTL = 300  # 5 minutes
+_VIEWPORT_DEBT_UNTESTED_CAP = 30
+
+_ESLINT_VIEWPORT_RE = _re.compile(
+    r"eslint-disable(?:-next-line)?.*viewport/(?:min-touch-target|no-fixed-width)"
+)
+_DATA_SMALL_TARGET_RE = _re.compile(r"data-viewport-allow-small-target")
+_DATA_OVERFLOW_RE = _re.compile(r"data-viewport-allow-overflow")
+_DATA_TRUNCATION_RE = _re.compile(r"data-viewport-allow-truncation")
+
+
+def _find_components_dir() -> Optional[_Path]:
+    here = _Path(__file__).resolve().parent
+    for _ in range(6):
+        candidate = here / "admin-ui" / "src" / "components"
+        if candidate.is_dir():
+            return candidate
+        here = here.parent
+    return None
+
+
+def _scan_viewport_debt_rows() -> tuple[
+    List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]
+]:
+    global _VIEWPORT_DEBT_CACHE
+    now = datetime.utcnow()
+    if _VIEWPORT_DEBT_CACHE is not None:
+        cached_at, cached_rows, cached_untested, cached_summary = _VIEWPORT_DEBT_CACHE
+        if (now - cached_at).total_seconds() < _VIEWPORT_DEBT_CACHE_TTL:
+            return cached_rows, cached_untested, cached_summary
+
+    components_dir = _find_components_dir()
+    if components_dir is None:
+        empty_summary: Dict[str, Any] = {
+            "total_components": 0,
+            "untested_count": 0,
+            "untested_components": [],
+        }
+        return [], [], empty_summary
+
+    rows = []
+    untested_rows: List[Dict[str, Any]] = []
+    untested_paths: List[str] = []
+    total_components = 0
+    for tsx_file in sorted(components_dir.glob("*.tsx")):
+        name = tsx_file.name
+        if ".test." in name or ".spec." in name:
+            continue
+        try:
+            content = tsx_file.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+
+        total_components += 1
+        eslint_count = len(_ESLINT_VIEWPORT_RE.findall(content))
+        small_target = len(_DATA_SMALL_TARGET_RE.findall(content))
+        overflow = len(_DATA_OVERFLOW_RE.findall(content))
+        truncation = len(_DATA_TRUNCATION_RE.findall(content))
+        total = eslint_count + small_target + overflow + truncation
+
+        stem = tsx_file.stem  # e.g. "MessagesPanel"
+        vp_test = (tsx_file.parent / f"{stem}.viewport.test.tsx").exists()
+        rel_path = f"admin-ui/src/components/{name}"
+
+        if not vp_test:
+            untested_paths.append(rel_path)
+
+        if total == 0:
+            if not vp_test:
+                untested_rows.append(
+                    {
+                        "component": rel_path,
+                        "eslint_disable_count": 0,
+                        "data_viewport_allow_small_target": 0,
+                        "data_viewport_allow_overflow": 0,
+                        "data_viewport_allow_truncation": 0,
+                        "total_opt_outs": 0,
+                        "has_viewport_test": False,
+                        "regression_case_count": 0,
+                        "source_url": None,
+                    }
+                )
+            continue
+
+        rows.append(
+            {
+                "component": rel_path,
+                "eslint_disable_count": eslint_count,
+                "data_viewport_allow_small_target": small_target,
+                "data_viewport_allow_overflow": overflow,
+                "data_viewport_allow_truncation": truncation,
+                "total_opt_outs": total,
+                "has_viewport_test": vp_test,
+                "regression_case_count": 0,
+                "source_url": None,
+            }
+        )
+
+    rows.sort(key=lambda r: r["total_opt_outs"], reverse=True)
+    untested_rows.sort(key=lambda r: r["component"])
+
+    coverage_summary: Dict[str, Any] = {
+        "total_components": total_components,
+        "untested_count": len(untested_paths),
+        "untested_components": sorted(untested_paths)[:50],
+    }
+
+    rows = rows[:15]
+    untested_rows = untested_rows[:_VIEWPORT_DEBT_UNTESTED_CAP]
+    _VIEWPORT_DEBT_CACHE = (now, rows, untested_rows, coverage_summary)
+    return rows, untested_rows, coverage_summary
+
+
+@router.get("/projects/{project_id}/viewport-debt")
+async def get_viewport_debt(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),  # noqa: ARG001
+) -> Dict[str, Any]:
+    """Per-component viewport opt-out debt summary.
+
+    Scans admin-ui/src/components/*.tsx for eslint-disable viewport/* lines
+    and data-viewport-allow-* attributes.  Returns top-15 components sorted
+    by total opt-out count, with a flag indicating whether a .viewport.test.tsx
+    companion exists and a count of viewport_regression dispatcher cases in the
+    last 30 days.  Result is cached in-process for 5 minutes.
+    """
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, min_role="viewer"
+    )
+
+    # Shallow-copy cached rows: the scan result is a process-wide cache and
+    # we annotate per-project below. Without the copy, concurrent requests
+    # for different projects would race on regression_case_count / source_url.
+    top_rows, top_untested, coverage_summary = _scan_viewport_debt_rows()
+    rows = [dict(r) for r in top_rows]
+    untested_rows = [dict(r) for r in top_untested]
+
+    if rows or untested_rows:
+        cutoff = datetime.utcnow() - timedelta(days=30)
+        stmt = select(RegressionRemediationCase).where(
+            RegressionRemediationCase.project_id == project_id,
+            RegressionRemediationCase.regression_class.startswith(
+                "viewport_regression:"
+            ),
+            RegressionRemediationCase.first_seen_at >= cutoff,
+        )
+        vp_cases = (await session.execute(stmt)).scalars().all()
+
+        # Map component stem → case count
+        case_counts: Dict[str, int] = {}
+        for c in vp_cases:
+            cls = c.regression_class  # e.g. "viewport_regression:MessagesPanel.tsx@375"
+            # Extract component name between ":" and "@"
+            inner = cls[len("viewport_regression:") :]
+            comp = inner.split("@")[0]  # e.g. "MessagesPanel.tsx"
+            case_counts[comp] = case_counts.get(comp, 0) + 1
+
+        project = await session.get(Project, project_id)
+        gh_owner = project.github_owner if project else None
+        gh_repo = project.github_repo if project else None
+
+        for row in (*rows, *untested_rows):
+            stem_tsx = _Path(row["component"]).name  # e.g. "MessagesPanel.tsx"
+            row["regression_case_count"] = case_counts.get(stem_tsx, 0)
+            if gh_owner and gh_repo:
+                row["source_url"] = (
+                    f"https://github.com/{gh_owner}/{gh_repo}/blob/main/{row['component']}"
+                )
+
+    return {
+        "rows": rows,
+        "untested_rows": untested_rows,
+        "scanned_at": datetime.utcnow().isoformat(),
+        "coverage_summary": coverage_summary,
+    }
+
+
+@router.get("/projects/{project_id}/efficiency-axes")
+async def get_efficiency_axes(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Return per-axis current/baseline/drift for the project's efficiency baseline.
+
+    Reads ``project.design_doc["efficiency_baseline"]`` (populated weekly by
+    the ``_efficiency_snapshot_service``) and returns each of the five
+    foundational axes — ``cost_per_merged_pr``, ``vm_cold_start_p50_ms``,
+    ``vm_reuse_rate``, ``median_api_calls_per_task``,
+    ``median_review_iterations`` — with the latest snapshot value, the
+    immutable baseline value, and percentage drift from baseline.
+
+    Response shape::
+
+        {
+          "axes": {
+            "<axis>": {"current": float|None, "baseline": float|None, "drift_pct": float|None},
+            ...
+          },
+          "baseline_captured_at": iso8601|None,
+          "last_snapshot_at": iso8601|None
+        }
+
+    ``drift_pct`` is None whenever either side is missing or baseline is 0.
+    Before the first snapshot fires, all axis values are None and both
+    timestamps are None.
+    """
+    from app.efficiency_snapshot import read_baseline_with_drift  # noqa: PLC0415
+
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, min_role="viewer"
+    )
+    return await read_baseline_with_drift(session, project_id)
+
+
 @router.get("/regression-dispatcher/escalation-outcomes")
 async def get_regression_escalation_outcomes(
     project_id: Optional[uuid.UUID] = Query(default=None),
@@ -8402,11 +9121,15 @@ async def get_regression_escalation_outcomes(
 ) -> Dict[str, Any]:
     """Aggregate case outcomes by escalation_reason bucket.
 
-    Groups RegressionRemediationCase rows into five buckets — one per
-    meta-escalation reason plus 'all_other' — and returns per-bucket
-    merged_count, retripped_within_30d_count, durable_resolution_rate,
-    median_hold_days, and in_flight_excluded_count so operators can
-    compare meta-escalation durability against ordinary investigations.
+    Groups RegressionRemediationCase rows into six buckets: four meta-escalation
+    reasons (escalated_cross_layer, escalated_layer_concentration,
+    escalated_cross_case_fingerprint, escalated_recurrence), one
+    compliance_followup bucket for cross-layer cases where a followup fix was
+    spawned and merged, and all_other.  Returns per-bucket merged_count,
+    retripped_within_30d_count, durable_resolution_rate, median_hold_days,
+    prevention_rate_30d, recurrences_observed, and in_flight_excluded_count.
+    Cross-layer cases with a compliance followup fix are re-bucketed into
+    compliance_followup so operators can compare the loop's lift against baseline.
     """
     from app.pipeline_regression_dispatcher import (  # noqa: PLC0415
         compute_escalation_outcome_breakdown,
@@ -8433,3 +9156,116 @@ async def get_regression_escalation_outcomes(
     return compute_escalation_outcome_breakdown(
         list(cases), lookback_days=lookback_days
     )
+
+
+@router.get("/pipeline-efficiency")
+async def get_pipeline_efficiency(
+    project_id: Optional[uuid.UUID] = Query(default=None),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),  # noqa: ARG001
+) -> Dict[str, Any]:
+    """Aggregate VM cold-start latency, warm reuse rate, and review iterations.
+
+    Returns p50/p95 of cold-start setup_secs, warm VM reuse fraction, and
+    review-iteration median/p95 for the last 24h and 7d windows, each with a
+    14-day-prior delta for trend comparison.
+    """
+    now = _utcnow()
+    filters = [
+        Task.created_at >= now - timedelta(days=21),
+        Task.status == TaskStatus.COMPLETED,
+    ]
+    if project_id:
+        filters.append(Task.project_id == project_id)
+    tasks = (
+        (
+            await session.execute(
+                select(Task)
+                .where(*filters)
+                .options(load_only(Task.id, Task.status, Task.context, Task.created_at))
+                .limit(5000)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    def _pct(values: list, p: int):
+        if not values:
+            return None
+        s = sorted(values)
+        return s[min(int(len(s) * p / 100), len(s) - 1)]
+
+    def _metrics(bucket: list) -> Dict[str, Any]:
+        timing_list = [(t.context or {}).get("_timing") or {} for t in bucket]
+        cold = [
+            float(tm["setup_secs"])
+            for tm in timing_list
+            if isinstance(tm.get("setup_secs"), (int, float))
+            and not tm.get("warm_start")
+        ]
+        warm_n = sum(1 for tm in timing_list if tm.get("warm_start") is True)
+        timed_n = sum(1 for tm in timing_list if tm)
+        iters = [
+            int((t.context or {}).get("review_loop", {}).get("iteration") or 0)
+            for t in bucket
+            if (t.context or {}).get("review_loop")
+        ]
+        return {
+            "setup_p50_secs": _pct(cold, 50),
+            "setup_p95_secs": _pct(cold, 95),
+            "setup_sample_n": len(cold),
+            "warm_reuse_rate": round(warm_n / timed_n, 3) if timed_n else None,
+            "warm_reuse_sample_n": timed_n,
+            "review_iter_median": _pct(iters, 50),
+            "review_iter_p95": _pct(iters, 95),
+            "review_iter_sample_n": len(iters),
+        }
+
+    def _in(start, end):
+        return [t for t in tasks if start <= (t.created_at or now) < end]
+
+    prior_end = now - timedelta(days=14)
+    cur_24h = _metrics(_in(now - timedelta(hours=24), now))
+    cur_7d = _metrics(_in(now - timedelta(days=7), now))
+    pri_24h = _metrics(_in(now - timedelta(hours=24) - timedelta(days=14), prior_end))
+    pri_7d = _metrics(_in(now - timedelta(days=21), prior_end))
+
+    def _delta(a, b, k):
+        av, bv = a.get(k), b.get(k)
+        return round(av - bv, 4) if av is not None and bv is not None else None
+
+    def _augment(cur, pri):
+        return {
+            **cur,
+            "vs_prior_setup_p50_delta": _delta(cur, pri, "setup_p50_secs"),
+            "vs_prior_warm_reuse_rate_delta": _delta(cur, pri, "warm_reuse_rate"),
+            "vs_prior_review_iter_median_delta": _delta(cur, pri, "review_iter_median"),
+        }
+
+    return {
+        "computed_at": now.isoformat(),
+        "window_24h": _augment(cur_24h, pri_24h),
+        "window_7d": _augment(cur_7d, pri_7d),
+    }
+
+
+@router.get("/canonical-regression-layers")
+async def get_canonical_regression_layers(
+    current_user: dict = Depends(get_current_user),  # noqa: ARG001
+):
+    """Return the canonical regression layers with descriptions and display order."""
+    from app.regression_layer_classifier import (  # noqa: PLC0415
+        LAYER_DISPLAY_ORDER,
+        LAYER_DESCRIPTIONS,
+    )
+
+    return {
+        "layers": [
+            {
+                "name": layer,
+                "description": LAYER_DESCRIPTIONS.get(layer, ""),
+            }
+            for layer in LAYER_DISPLAY_ORDER
+        ]
+    }

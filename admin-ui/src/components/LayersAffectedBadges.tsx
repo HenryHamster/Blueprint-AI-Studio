@@ -1,3 +1,5 @@
+import { CANONICAL_LAYER_NAMES } from '../api';
+
 export interface LayerSummaryEntry {
   layer: string;
   count: number;
@@ -27,15 +29,18 @@ export const LAYER_SHORT_LABELS: Record<string, string> = {
   AGENT_VERB: 'VERB',
   BASELINE_GATE: 'BASELINE',
   REVIEWER_PASS: 'REVIEWER',
+  VIEWPORT: 'VPORT',
 };
 
-// eslint-disable-next-line react-refresh/only-export-components
-export const CANONICAL_LAYERS = ['CI_WORKFLOW', 'AGENT_VM', 'AGENT_VERB', 'BASELINE_GATE', 'REVIEWER_PASS'] as const;
-export type CanonicalLayer = typeof CANONICAL_LAYERS[number];
+export type CanonicalLayer = 'CI_WORKFLOW' | 'AGENT_VM' | 'AGENT_VERB' | 'BASELINE_GATE' | 'REVIEWER_PASS' | 'VIEWPORT';
 
 export interface LayerCoverageCombo { layers: string[]; count: number; }
 export interface LayerCoverageEntry { total_fixes_with_layers: number; combinations: LayerCoverageCombo[]; }
 export type LayerCoverageByClass = Record<string, LayerCoverageEntry>;
+
+// Per-canonical-layer fix counts for a single regression class.
+// Matches the shape returned by compute_class_layer_defense_counts on the backend.
+export type LayerDefenseCounts = Record<string, number>;
 
 function shortLabel(layer: string): string {
   return LAYER_SHORT_LABELS[layer] ?? layer;
@@ -45,6 +50,49 @@ interface LayerMismatchProps {
   layer_mismatch?: boolean | null;
   prior_fix_layers?: string[] | null;
   current_symptom_layers?: string[] | null;
+}
+
+interface UntargetedLayersProps {
+  untargeted_layers?: string[] | null;
+}
+
+export function UntargetedLayersBadge({ untargeted_layers }: UntargetedLayersProps) {
+  const layers = untargeted_layers ?? [];
+  // Suppress when all layers are untargeted (no fix history yet) or none are
+  // (full coverage) — both extremes are noise.
+  if (layers.length === 0 || layers.length >= CANONICAL_LAYER_NAMES.length) return null;
+  const labels = layers.map((l) => shortLabel(l));
+  return (
+    <span
+      data-testid="untargeted-layers-badge"
+      className="text-[10px] px-1.5 py-0.5 rounded bg-neutral-500/10 text-neutral-400 border border-neutral-500/20"
+      title={`Layers no prior fix has targeted: ${layers.join(', ')}`}
+    >
+      never defended in: {labels.join(', ')}
+    </span>
+  );
+}
+
+interface LayerDefenseCountsProps {
+  layer_defense_counts?: LayerDefenseCounts | null;
+}
+
+export function LayerDefenseCountsBadge({ layer_defense_counts }: LayerDefenseCountsProps) {
+  if (!layer_defense_counts) return null;
+  const defended = CANONICAL_LAYER_NAMES
+    .filter((l) => (layer_defense_counts[l] ?? 0) > 0)
+    .map((l) => `${shortLabel(l)}×${layer_defense_counts[l]}`);
+  if (defended.length === 0) return null;
+  const tip = `Canonical layers defended and fix counts: ${CANONICAL_LAYER_NAMES.map((l) => `${l}:${layer_defense_counts[l] ?? 0}`).join(', ')}`;
+  return (
+    <span
+      data-testid="layer-defense-counts-badge"
+      className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20"
+      title={tip}
+    >
+      defended: {defended.join(', ')}
+    </span>
+  );
 }
 
 export function LayerMismatchBadge({ layer_mismatch, prior_fix_layers, current_symptom_layers }: LayerMismatchProps) {

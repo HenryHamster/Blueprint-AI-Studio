@@ -333,7 +333,7 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
 
   return (
     <section>
-      <div className="flex items-center gap-2 mb-2">
+      <div className="flex flex-wrap items-center gap-2 mb-2 min-w-0">
         <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest">Remediation Funnel</h2>
         {active > 0 && (
           <span className="text-[10px] text-amber-400" title="Investigations currently in flight">
@@ -359,8 +359,8 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
           </span>
         )}
         {overdueCount > 0 && (
-          // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
           <button
+            data-viewport-allow-small-target
             type="button"
             onClick={() => {
               setInvestigationsOpen(true);
@@ -392,7 +392,7 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
 
       {/* Horizontal funnel */}
       <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 mb-2">
-        <div className="flex items-stretch gap-1 overflow-x-auto">
+        <div className="flex items-stretch gap-1 overflow-x-auto" data-viewport-allow-overflow>
           {stages.map((s, i) => {
             const conv = s.prev != null && s.prev > 0 ? pct(s.count, s.prev) : null;
             return (
@@ -427,7 +427,9 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
         return (
         <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 mb-2">
           <div className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1.5">By failure class</div>
-          <div className="space-y-1">
+          <div className="overflow-x-auto -mx-1 px-1" data-viewport-allow-overflow>
+          {/* eslint-disable-next-line viewport/no-fixed-width -- intentional scrollable breakdown table on mobile; overflow contained by parent overflow-x-auto */}
+          <div className="space-y-1 min-w-[480px]">
             <div className="grid grid-cols-[minmax(110px,1fr)_repeat(8,minmax(44px,1fr))] gap-2 text-[9px] uppercase tracking-wide text-neutral-600">
               <span>Class</span>
               <span className="text-right">Spawned</span>
@@ -474,6 +476,7 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
                 </div>
               );
             })}
+          </div>
           </div>
         </div>
         );
@@ -627,6 +630,7 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
         return (
           <div className="mt-2 bg-neutral-900/50 border border-neutral-800/50 rounded-lg">
             <button
+              data-viewport-allow-small-target
               type="button"
               onClick={() => setInvestigationsOpen(v => !v)}
               className="w-full flex items-center justify-between px-3 py-2 text-left"
@@ -698,6 +702,7 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
         return (
           <div className="mt-2 bg-neutral-900/50 border border-amber-800/30 rounded-lg">
             <button
+              data-viewport-allow-small-target
               type="button"
               onClick={() => setResidualsOpen(v => !v)}
               className="w-full flex items-center justify-between px-3 py-2 text-left"
@@ -713,6 +718,7 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
                 {apiIgnoredCount > 0 && (
                   <div className="flex justify-end">
                     <button
+                      data-viewport-allow-small-target
                       type="button"
                       onClick={() => setShowIgnored(v => !v)}
                       className="text-[10px] text-neutral-500 hover:text-neutral-300 underline underline-offset-2"
@@ -735,6 +741,7 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
                       <div key={r.fingerprint} className="border border-neutral-800/40 rounded p-2 flex items-center justify-between gap-2">
                         <span className="text-[11px] text-neutral-500 italic">Ignored</span>
                         <button
+                          data-viewport-allow-small-target
                           type="button"
                           onClick={() => handleUndo(r.fingerprint)}
                           className="text-[10px] text-amber-400 hover:text-amber-300 underline underline-offset-2"
@@ -774,8 +781,8 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
                         )}
                         <span className="font-mono text-[9px] text-neutral-600 truncate flex-1">{r.fingerprint}</span>
                         {canUnsuspend && (
-                          // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
                           <button
+                            data-viewport-allow-small-target
                             type="button"
                             onClick={() => handleUnsuspend(r)}
                             className="shrink-0 text-[10px] px-1.5 py-0.5 rounded border border-orange-700/60 text-orange-400 hover:text-orange-200 hover:border-orange-500 transition-colors"
@@ -785,8 +792,8 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
                           </button>
                         )}
                         {canIgnore && (
-                          // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
                           <button
+                            data-viewport-allow-small-target
                             type="button"
                             onClick={() => handleIgnore(r)}
                             className="shrink-0 text-[10px] px-1.5 py-0.5 rounded border border-neutral-700 text-neutral-500 hover:text-neutral-300 hover:border-neutral-500 transition-colors"

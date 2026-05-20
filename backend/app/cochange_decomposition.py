@@ -270,7 +270,9 @@ def auto_decompose_findings_by_cochange(
                         "files from the original finding and will be handled "
                         "by separate tasks. "
                         "Do not modify files outside this cluster — edits to "
-                        "other files belong to the sibling tasks.\n\n"
+                        "other files belong to the sibling tasks. "
+                        "If your declared files were already merged by a sibling cluster, "
+                        "exit cleanly via SCOPE_EMPTY rather than retrying.\n\n"
                     )
                     if sub.get("prompt"):
                         sub["prompt"] = preamble + sub["prompt"]

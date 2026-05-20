@@ -64,7 +64,10 @@ from app.github import (
     create_check_run,
 )
 from app.broadcast import broadcast_to_project
-from app.sr_blind_spots import aggregate_sr_blind_spot_themes
+from app.sr_blind_spots import (
+    aggregate_sr_blind_spot_themes,
+    aggregate_sr_co_failure_pairs,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -889,6 +892,12 @@ async def claim_task(
                 **(task.context or {}),
                 "claim_latency_secs": round(claim_latency, 1),
             }
+            # Promote claim_latency to the dedicated vm_cold_start_ms column
+            # for the efficiency direction (d-91d8dede). Guarded by IS NULL
+            # so re-provision restamps of vm_provisioned_at (orchestrator.py
+            # ~line 3240) cannot clobber the genuine first-claim measurement.
+            if task.vm_cold_start_ms is None:
+                task.vm_cold_start_ms = max(0, int(claim_latency * 1000))
         session.add(task)
         await session.commit()
         await session.refresh(task)
@@ -1548,6 +1557,44 @@ async def claim_task(
             except Exception:
                 logger.exception(
                     "[AGENT] Failed to compute sr_catch_rate_trends (non-critical)"
+                )
+            try:
+                from app.playbook_learning import compute_sr_false_attestation_trends
+
+                await compute_sr_false_attestation_trends(
+                    project_id=task.project_id,
+                    session=session,
+                    all_tasks=list(high_iter_rows),
+                )
+            except Exception:
+                logger.exception(
+                    "[AGENT] Failed to compute sr_false_attestation_trends (non-critical)"
+                )
+            try:
+                from app.playbook_learning import (
+                    compute_sr_regression_risk_test_signal_trends,
+                )
+
+                await compute_sr_regression_risk_test_signal_trends(
+                    project_id=task.project_id,
+                    session=session,
+                    all_tasks=list(high_iter_rows),
+                )
+            except Exception:
+                logger.exception(
+                    "[AGENT] Failed to compute sr_regression_risk_test_signal_trends (non-critical)"
+                )
+            try:
+                from app.playbook_learning import compute_fresh_reviewer_trend
+
+                await compute_fresh_reviewer_trend(
+                    project_id=task.project_id,
+                    session=session,
+                    all_tasks=list(high_iter_rows),
+                )
+            except Exception:
+                logger.exception(
+                    "[AGENT] Failed to compute fresh_reviewer_trend (non-critical)"
                 )
             try:
                 from app.playbook_learning import compute_edges_trend
@@ -2442,6 +2489,46 @@ async def claim_task(
                         "[AGENT] Failed to compute research sr_catch_rate_trends (non-critical)"
                     )
                 try:
+                    from app.playbook_learning import (
+                        compute_sr_false_attestation_trends,
+                    )
+
+                    await compute_sr_false_attestation_trends(
+                        project_id=task.project_id,
+                        session=session,
+                        all_tasks=list(high_iter_rows),
+                    )
+                except Exception:
+                    logger.exception(
+                        "[AGENT] Failed to compute research sr_false_attestation_trends (non-critical)"
+                    )
+                try:
+                    from app.playbook_learning import (
+                        compute_sr_regression_risk_test_signal_trends,
+                    )
+
+                    await compute_sr_regression_risk_test_signal_trends(
+                        project_id=task.project_id,
+                        session=session,
+                        all_tasks=list(high_iter_rows),
+                    )
+                except Exception:
+                    logger.exception(
+                        "[AGENT] Failed to compute research sr_regression_risk_test_signal_trends (non-critical)"
+                    )
+                try:
+                    from app.playbook_learning import compute_fresh_reviewer_trend
+
+                    await compute_fresh_reviewer_trend(
+                        project_id=task.project_id,
+                        session=session,
+                        all_tasks=list(high_iter_rows),
+                    )
+                except Exception:
+                    logger.exception(
+                        "[AGENT] Failed to compute research fresh_reviewer_trend (non-critical)"
+                    )
+                try:
                     from app.playbook_learning import compute_edges_trend
 
                     await compute_edges_trend(
@@ -2676,6 +2763,9 @@ async def claim_task(
                     tp_count = data.get("tp_count")
                     if isinstance(fp_count, int) and isinstance(tp_count, int):
                         entry["sr_flag_sample_size"] = fp_count + tp_count
+                    sev_cal = data.get("severity_calibration")
+                    if isinstance(sev_cal, dict):
+                        entry["severity_calibration"] = sev_cal
                     return entry
 
                 cats = {
@@ -2770,22 +2860,92 @@ async def claim_task(
                 "[AGENT] Failed to inject sr_blind_spot_themes (non-critical)"
             )
 
+    # Inject SR co-failure pairs (top 5 pairs, lift >= 1.5). When categories A and B
+    # miss together at a significantly higher rate than by chance, fixing A requires
+    # re-checking B. Shape: project_context.sr_co_failure_pairs =
+    #   [{"cat_a": str, "cat_b": str, "lift": float}, ...]
+    # Scans last 14 days of tasks; returns None when sample < min_sample threshold.
+    if task_type in ("create", "fix", "refactor", "migrate") and project_for_playbook:
+        try:
+            high_iter_tasks = await session.scalars(
+                select(Task)
+                .where(
+                    Task.project_id == project_for_playbook.id,
+                    Task.status == TaskStatus.COMPLETED,
+                    Task.completed_at > _utcnow() - timedelta(days=14),
+                )
+                .order_by(Task.completed_at.desc())
+                .limit(2000)
+            )
+            pairs = aggregate_sr_co_failure_pairs(high_iter_tasks)
+            if pairs:
+                if "project_context" not in response:
+                    response["project_context"] = {}
+                response["project_context"]["sr_co_failure_pairs"] = [
+                    {"cat_a": p["cat_a"], "cat_b": p["cat_b"], "lift": p["lift"]}
+                    for p in pairs
+                ]
+        except Exception:
+            logger.exception(
+                "[AGENT] Failed to inject sr_co_failure_pairs (non-critical)"
+            )
+
+    # Inject persistent SR blind-spot hint for categories exceeding disagreement threshold
+    # across >=2 consecutive 7-day windows. Shape: project_context.persistent_blind_spots
+    if task_type in ("create", "fix", "refactor", "migrate") and project_for_playbook:
+        try:
+            from app.pipeline_regression_dispatcher import (
+                get_sr_persistent_blind_spot_hint,
+            )  # noqa: PLC0415
+
+            _pbs = await get_sr_persistent_blind_spot_hint(
+                session, project_for_playbook.id
+            )
+            if _pbs:
+                if "project_context" not in response:
+                    response["project_context"] = {}
+                response["project_context"]["persistent_blind_spots"] = _pbs
+        except Exception:
+            logger.exception(
+                "[AGENT] Failed to inject persistent_blind_spots (non-critical)"
+            )
+
     # Inject concrete recent miss examples for the worst-performing SR categories.
     # Unlike sr_blind_spot_themes (aggregated keyword patterns), these are verbatim
     # reviewer findings that SR missed in the most recent window — giving the agent
     # specific "this exact thing slipped past last time" examples to act on.
     # Shape: project_context.sr_recent_miss_examples = {cat: [{severity, desc}, ...]}
     # Bounded: top 3 categories by weighted_miss_rate, ≤3 examples each, ≤1200 chars total.
+    # When the task has a direction_id, prefer per-direction examples; fall back to global
+    # when the direction has no qualifying data in by_direction.
     if task_type in ("create", "fix", "refactor", "migrate") and project_for_playbook:
         try:
             _miss_trends = (project_for_playbook.design_doc or {}).get(
                 "sr_catch_rate_trends"
             )
             if _miss_trends and isinstance(_miss_trends.get("categories"), dict):
+                # Resolve candidate categories: prefer direction-scoped when available.
+                _direction_id = (task.context or {}).get("direction_id")
+                _candidate_cats: dict | None = None
+                if _direction_id:
+                    _dir_entry = (_miss_trends.get("by_direction") or {}).get(
+                        str(_direction_id)
+                    ) or {}
+                    _dir_cats = _dir_entry.get("categories")
+                    if isinstance(_dir_cats, dict) and any(
+                        isinstance(v, dict)
+                        and isinstance(v.get("examples"), list)
+                        and v["examples"]
+                        for v in _dir_cats.values()
+                    ):
+                        _candidate_cats = _dir_cats
+                if _candidate_cats is None:
+                    _candidate_cats = _miss_trends["categories"]
+
                 _ranked = sorted(
                     [
                         (cat, data)
-                        for cat, data in _miss_trends["categories"].items()
+                        for cat, data in _candidate_cats.items()
                         if isinstance(data, dict)
                         and isinstance(data.get("examples"), list)
                         and data["examples"]
@@ -3033,6 +3193,17 @@ async def agent_heartbeat(
     task.last_heartbeat = _utcnow()
     if task.vm_started_at is None:
         task.vm_started_at = _utcnow()
+
+    # Cold-start fallback: /claim is the canonical first-contact site that
+    # writes vm_cold_start_ms, but if a heartbeat ever lands before a claim
+    # row was committed (or for the warm-VM continuity path), derive it here
+    # too. Guard with IS NULL so a re-provision restamp of vm_provisioned_at
+    # cannot overwrite a real first-heartbeat measurement.
+    if task.vm_cold_start_ms is None and task.vm_provisioned_at is not None:
+        cold_start_ms = (
+            task.last_heartbeat - task.vm_provisioned_at
+        ).total_seconds() * 1000
+        task.vm_cold_start_ms = max(0, int(cold_start_ms))
     if req.status_message:
         task.latest_status_message = req.status_message
         # Log interesting lifecycle beacons so they're visible in Cloud
@@ -3182,6 +3353,23 @@ async def agent_heartbeat(
             ctx = dict(task.context or {})
             ctx["prompt_fingerprint"] = req.prompt_fingerprint
             task.context = ctx
+
+    # Per-task LLM telemetry (efficiency direction d-91d8dede). Cumulative
+    # counters posted on every heartbeat — last write wins. Backwards-
+    # compatible: older agents that don't ship these fields leave the column
+    # untouched. Mirrors the every-heartbeat cadence of last_metrics_json so
+    # downstream aggregations always see the freshest snapshot.
+    if (
+        req.llm_call_count is not None
+        or req.total_input_tokens is not None
+        or req.total_output_tokens is not None
+    ):
+        task.api_call_summary = {
+            "llm_call_count": int(req.llm_call_count or 0),
+            "total_input_tokens": int(req.total_input_tokens or 0),
+            "total_output_tokens": int(req.total_output_tokens or 0),
+            "last_updated_at": _utcnow().isoformat(),
+        }
 
     # Record VM image identity so the orchestrator can detect stale Packer images.
     # Called on every heartbeat that carries image fields; no-ops when both are None.

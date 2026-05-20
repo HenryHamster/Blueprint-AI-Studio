@@ -35,5 +35,8 @@ export default defineConfig({
     'import.meta.env.VITE_FIREBASE_API_KEY': JSON.stringify('test'),
     'import.meta.env.VITE_FIREBASE_AUTH_DOMAIN': JSON.stringify('test.firebaseapp.com'),
     'import.meta.env.VITE_FIREBASE_PROJECT_ID': JSON.stringify('test'),
+    // Set a stable test SHA so VersionMismatchBanner's useEffect can be exercised.
+    // Tests stub fetch to return either the same SHA (no mismatch) or a different one.
+    'import.meta.env.VITE_EXPECTED_BACKEND_SHA': JSON.stringify('test-expected-sha'),
   },
 });

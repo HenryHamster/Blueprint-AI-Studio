@@ -1239,6 +1239,7 @@ class TestFailureClassificationInvariants:
             INFRA_CLASSES,
             PROVISION_FAILURE,
             RATE_LIMIT,
+            SCOPE_EMPTY,
             SCOPE_OVERFLOW,
         )
 
@@ -1251,6 +1252,7 @@ class TestFailureClassificationInvariants:
                 EXTERNAL_API,
                 SCOPE_OVERFLOW,
                 BLOCKED_PRECONDITION,
+                SCOPE_EMPTY,
             }
         ), (
             "INFRA_CLASSES membership changed — direction_outcomes and "
@@ -1304,6 +1306,7 @@ AGENT_SELF_REVIEW_CATEGORIES = frozenset(
         "test-coverage",
         "scope-drift",
         "regression_risk",
+        "cross-system-contract",
     }
 )
 

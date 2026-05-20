@@ -9,6 +9,19 @@ function _callerTestFile(): string {
   return m ? m[1] : '';
 }
 
+// When VITE_CAPTURE_BASELINES=true (set on main-branch CI runs), save a PNG
+// of the component after each passing assertion. One file per component per
+// width — overwriting keeps storage bounded to one baseline per slot.
+async function _captureBaselineIfEnabled(callerFile: string, width: number): Promise<void> {
+  if (import.meta.env.VITE_CAPTURE_BASELINES !== 'true') return;
+  const name = callerFile.replace(/\.viewport\.test\.tsx$/i, '') || 'unknown';
+  try {
+    await page.screenshot({ path: `viewport-baselines/${name}-${width}px.png` });
+  } catch {
+    // Never fail a passing test because of screenshot I/O
+  }
+}
+
 /**
  * Options for `expectNoOverflowAt`.
  *
@@ -71,7 +84,7 @@ export async function expectNoOverflowAt(
   if (docScrollWidth > limit) {
     const fileTag = callerFile ? ` [${callerFile}]` : '';
     throw new Error(
-      `expectNoOverflowAt(${width})${fileTag}: document.documentElement.scrollWidth=${docScrollWidth}px > ${limit}px`,
+      `expectNoOverflowAt(${width})${fileTag} [assertion_type:overflow]: document.documentElement.scrollWidth=${docScrollWidth}px > ${limit}px`,
     );
   }
 
@@ -100,9 +113,11 @@ export async function expectNoOverflowAt(
     const more = overflowing.length > 5 ? `\n  ... and ${overflowing.length - 5} more` : '';
     const fileTag = callerFile ? ` [${callerFile}]` : '';
     throw new Error(
-      `expectNoOverflowAt(${width})${fileTag}: ${overflowing.length} element(s) overflow at width=${width}px:\n${lines}${more}`,
+      `expectNoOverflowAt(${width})${fileTag} [assertion_type:overflow]: ${overflowing.length} element(s) overflow at width=${width}px:\n${lines}${more}`,
     );
   }
+
+  await _captureBaselineIfEnabled(callerFile, width);
 }
 
 /**
@@ -188,9 +203,11 @@ export async function expectNoTextTruncationAt(
     const more = truncated.length > 5 ? `\n  ... and ${truncated.length - 5} more` : '';
     const fileTag = callerFile ? ` [${callerFile}]` : '';
     throw new Error(
-      `expectNoTextTruncationAt(${width})${fileTag}: ${truncated.length} element(s) have text clipped without ellipsis at width=${width}px:\n${lines}${more}`,
+      `expectNoTextTruncationAt(${width})${fileTag} [assertion_type:text_truncation]: ${truncated.length} element(s) have text clipped without ellipsis at width=${width}px:\n${lines}${more}`,
     );
   }
+
+  await _captureBaselineIfEnabled(callerFile, width);
 }
 
 /**
@@ -266,7 +283,61 @@ export async function expectMinTouchTargetAt(
     const more = undersized.length > 5 ? `\n  ... and ${undersized.length - 5} more` : '';
     const fileTag = callerFile ? ` [${callerFile}]` : '';
     throw new Error(
-      `expectMinTouchTargetAt(${width})${fileTag}: ${undersized.length} element(s) below ${minSize}px touch target:\n${lines}${more}`,
+      `expectMinTouchTargetAt(${width})${fileTag} [assertion_type:touch_target]: ${undersized.length} element(s) below ${minSize}px touch target:\n${lines}${more}`,
     );
   }
+
+  await _captureBaselineIfEnabled(callerFile, width);
+}
+
+/**
+ * Options for `expectFullViewportAt`.
+ *
+ * Merges the options of all three sub-checks. Per-check overrides (selector,
+ * minTouchSize, tolerance) let callers tune individual assertions without
+ * giving up the convenience of a single call site.
+ *
+ * - `tolerance`: overflow tolerance in px (default 1).
+ * - `textSelector`: CSS selector for the text-truncation check (default 'body *').
+ * - `touchSelector`: CSS selector for the touch-target check (default 'button').
+ * - `minTouchSize`: minimum touch target in px (default 44).
+ * - `height`: viewport height in px (default 800).
+ * - `waitMs`: extra ms to pause after `render()` before each sub-check.
+ */
+export interface ExpectFullViewportOptions {
+  tolerance?: number;
+  textSelector?: string;
+  touchSelector?: string;
+  minTouchSize?: number;
+  height?: number;
+  waitMs?: number;
+}
+
+/**
+ * Run all three viewport assertions — overflow, text-truncation, and touch
+ * target — in a single call.
+ *
+ * Use this for components that show operator-facing text AND interactive
+ * controls. When one check is intentionally inapplicable (e.g. a read-only
+ * panel with no buttons), use the individual helpers and add a one-line
+ * comment explaining the omission so reviewers don't flag it as missing.
+ *
+ * Opt individual nodes out of specific checks via:
+ *   `data-viewport-allow-overflow`       — skips the overflow check for that subtree
+ *   `data-viewport-allow-truncation`     — skips text-truncation for that subtree
+ *   `data-viewport-allow-small-target`   — skips touch-target for that subtree
+ */
+export async function expectFullViewportAt(
+  width: number,
+  render: () => Promise<void> | void,
+  options?: ExpectFullViewportOptions,
+): Promise<void> {
+  const shared = { height: options?.height, waitMs: options?.waitMs };
+  await expectNoOverflowAt(width, render, { ...shared, tolerance: options?.tolerance });
+  await expectNoTextTruncationAt(width, render, { ...shared, selector: options?.textSelector });
+  await expectMinTouchTargetAt(width, render, {
+    ...shared,
+    selector: options?.touchSelector,
+    minSize: options?.minTouchSize,
+  });
 }

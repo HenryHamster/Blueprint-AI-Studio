@@ -1,6 +1,7 @@
 """Tests for the disallowed-blind-spot filter and contract parity."""
 
 import uuid
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -9,6 +10,8 @@ from app.sr_blind_spots import (
     DISALLOWED_BLIND_SPOT_EXAMPLES,
     DISALLOWED_BLIND_SPOT_PATTERNS,
     aggregate_sr_false_attestation_rates,
+    compute_persistent_sr_blind_spot_hint,
+    count_reviewer_disagreements_in_tasks,
     filter_disallowed_blind_spots,
     is_disallowed_blind_spot,
     triage_sr_blind_spot_theme,
@@ -308,3 +311,485 @@ def test_false_attestation_non_code_change_tasks_excluded():
         for _ in range(5)
     ]
     assert aggregate_sr_false_attestation_rates(tasks, min_sample=1) is None
+
+
+# ---------------------------------------------------------------------------
+# Unit: _count_reviewer_disagreement_directions — examples capture
+# ---------------------------------------------------------------------------
+
+
+def _make_disagreement_task(
+    project_id,
+    *,
+    task_type: str = "create",
+    check_results: dict | None = None,
+    reviewer_findings: list | None = None,
+):
+    """Build a task for reviewer-disagreement example-capture tests."""
+    return make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": task_type, "prompt": "x"}],
+        context={
+            "_self_review_outcome": {
+                "check_results": check_results or {},
+                "reviewer_findings": reviewer_findings or [],
+            }
+        },
+    )
+
+
+def test_disagreement_directions_captures_verbatim_examples():
+    """Missed reviewer findings are stored as {severity, description} examples."""
+    from app.sr_blind_spots import _count_reviewer_disagreement_directions
+
+    pid = uuid.uuid4()
+    task = _make_disagreement_task(
+        pid,
+        reviewer_findings=[
+            {
+                "category": "correctness",
+                "severity": "HIGH",
+                "description": "Missing null check on return value",
+            }
+        ],
+    )
+    counts = _count_reviewer_disagreement_directions([task])
+    bucket = counts[("correctness", "create")]
+    assert bucket["miss"] == 1
+    assert len(bucket["examples"]) == 1
+    ex = bucket["examples"][0]
+    assert ex["severity"] == "HIGH"
+    assert ex["description"] == "Missing null check on return value"
+
+
+def test_disagreement_directions_truncates_long_descriptions():
+    """Descriptions longer than _REVIEWER_EXAMPLE_CHAR_CAP are truncated."""
+    from app.sr_blind_spots import (
+        _REVIEWER_EXAMPLE_CHAR_CAP,
+        _count_reviewer_disagreement_directions,
+    )
+
+    pid = uuid.uuid4()
+    long_desc = "x" * (_REVIEWER_EXAMPLE_CHAR_CAP + 50)
+    task = _make_disagreement_task(
+        pid,
+        reviewer_findings=[
+            {"category": "correctness", "severity": "HIGH", "description": long_desc}
+        ],
+    )
+    counts = _count_reviewer_disagreement_directions([task])
+    stored = counts[("correctness", "create")]["examples"][0]["description"]
+    assert len(stored) == _REVIEWER_EXAMPLE_CHAR_CAP
+
+
+def test_disagreement_directions_caps_examples_per_bucket():
+    """At most _REVIEWER_EXAMPLE_CAP examples are stored per (category, task_type) bucket."""
+    from app.sr_blind_spots import (
+        _REVIEWER_EXAMPLE_CAP,
+        _count_reviewer_disagreement_directions,
+    )
+
+    pid = uuid.uuid4()
+    tasks = [
+        _make_disagreement_task(
+            pid,
+            reviewer_findings=[
+                {
+                    "category": "correctness",
+                    "severity": "MEDIUM",
+                    "description": f"Issue {i}",
+                }
+            ],
+        )
+        for i in range(_REVIEWER_EXAMPLE_CAP + 2)
+    ]
+    counts = _count_reviewer_disagreement_directions(tasks)
+    bucket = counts[("correctness", "create")]
+    assert bucket["miss"] == _REVIEWER_EXAMPLE_CAP + 2
+    assert len(bucket["examples"]) == _REVIEWER_EXAMPLE_CAP
+
+
+def test_disagreement_directions_no_example_when_description_empty():
+    """A reviewer finding with empty description is counted as a miss but adds no example."""
+    from app.sr_blind_spots import _count_reviewer_disagreement_directions
+
+    pid = uuid.uuid4()
+    task = _make_disagreement_task(
+        pid,
+        reviewer_findings=[
+            {"category": "correctness", "severity": "HIGH", "description": ""}
+        ],
+    )
+    counts = _count_reviewer_disagreement_directions([task])
+    bucket = counts[("correctness", "create")]
+    assert bucket["miss"] == 1
+    assert bucket["examples"] == []
+
+
+def test_disagreement_directions_defaults_severity_to_low():
+    """A finding without a recognised severity value is stored with severity='LOW'."""
+    from app.sr_blind_spots import _count_reviewer_disagreement_directions
+
+    pid = uuid.uuid4()
+    task = _make_disagreement_task(
+        pid,
+        reviewer_findings=[
+            {"category": "correctness", "description": "Some issue without severity"}
+        ],
+    )
+    counts = _count_reviewer_disagreement_directions([task])
+    assert counts[("correctness", "create")]["examples"][0]["severity"] == "LOW"
+
+
+# ---------------------------------------------------------------------------
+# Unit: aggregate_sr_co_failure_pairs
+# ---------------------------------------------------------------------------
+
+
+def _make_co_fail_task(
+    project_id, *, failed_cats: list[str], task_type: str = "create"
+):
+    """Build a task where the given SR categories are all marked failed."""
+    check_results = {cat: {"passed": False} for cat in failed_cats}
+    return make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": task_type, "prompt": "x"}],
+        context={"_self_review_outcome": {"check_results": check_results}},
+    )
+
+
+def test_co_failure_returns_none_below_min_sample():
+    """Fewer than min_sample qualifying tasks → None."""
+    from app.sr_blind_spots import aggregate_sr_co_failure_pairs
+
+    pid = uuid.uuid4()
+    tasks = [_make_co_fail_task(pid, failed_cats=["correctness", "error-handling"])]
+    assert aggregate_sr_co_failure_pairs(tasks, min_sample=5) is None
+
+
+def test_co_failure_returns_none_for_empty_tasks():
+    """Empty task list → None."""
+    from app.sr_blind_spots import aggregate_sr_co_failure_pairs
+
+    assert aggregate_sr_co_failure_pairs([], min_sample=1) is None
+
+
+def test_co_failure_lift_calculation():
+    """High co-occurrence produces lift > 1; values match the manual formula."""
+    from app.sr_blind_spots import aggregate_sr_co_failure_pairs
+
+    pid = uuid.uuid4()
+    # 10 qualifying tasks: 5 fail both "correctness" and "error-handling",
+    # 5 fail neither.  Expected lift = (5/5) / (5/10) = 2.0
+    tasks = [
+        _make_co_fail_task(pid, failed_cats=["correctness", "error-handling"])
+        for _ in range(5)
+    ] + [_make_co_fail_task(pid, failed_cats=[]) for _ in range(5)]
+    result = aggregate_sr_co_failure_pairs(tasks, min_sample=5, min_co_count=2)
+    assert result is not None
+    pair = next(
+        (
+            p
+            for p in result
+            if p["cat_a"] == "correctness" and p["cat_b"] == "error-handling"
+        ),
+        None,
+    )
+    assert pair is not None
+    assert pair["co_fail_count"] == 5
+    assert pair["p_b_given_a"] == 1.0
+    assert pair["base_rate_b"] == 0.5
+    assert pair["lift"] == 2.0
+
+
+def test_co_failure_filters_below_min_co_count():
+    """Pairs with co_count < min_co_count are excluded from results."""
+    from app.sr_blind_spots import aggregate_sr_co_failure_pairs
+
+    pid = uuid.uuid4()
+    # Only 1 task co-fails "correctness" and "error-handling".
+    tasks = [_make_co_fail_task(pid, failed_cats=["correctness", "error-handling"])] + [
+        _make_co_fail_task(pid, failed_cats=[]) for _ in range(4)
+    ]
+    # min_co_count=2 should filter out the single co-failure pair.
+    result = aggregate_sr_co_failure_pairs(tasks, min_sample=5, min_co_count=2)
+    assert result == []
+
+
+def test_co_failure_returns_top_n_sorted_by_lift():
+    """Returns at most top_n pairs, sorted highest lift first."""
+    from app.sr_blind_spots import aggregate_sr_co_failure_pairs
+
+    pid = uuid.uuid4()
+    # 10 tasks: all 10 co-fail A+B; only 5 co-fail A+C.
+    # lift(A→B) = (10/10)/(10/10) = 1.0; lift(A→C) = (5/10)/(5/10) = 1.0
+    # Let's make a clearer divergence: 10 tasks all fail A+B, 5 extra fail C alone.
+    # total=15; miss_a=10, miss_b=10, co_ab=10 → lift=1.5
+    # miss_c=5, co_ac=0 → no A+C pair
+    tasks = [
+        _make_co_fail_task(pid, failed_cats=["cat_a", "cat_b"]) for _ in range(10)
+    ] + [_make_co_fail_task(pid, failed_cats=["cat_c"]) for _ in range(5)]
+    result = aggregate_sr_co_failure_pairs(tasks, min_sample=5, min_co_count=2, top_n=1)
+    assert result is not None
+    assert len(result) <= 1
+
+
+def test_co_failure_excludes_non_code_change_tasks():
+    """Tasks of type 'review' or 'plan' are excluded from the sample."""
+    from app.sr_blind_spots import aggregate_sr_co_failure_pairs
+
+    pid = uuid.uuid4()
+    # 5 review tasks that would otherwise qualify.
+    tasks = [
+        _make_co_fail_task(
+            pid, failed_cats=["correctness", "error-handling"], task_type="review"
+        )
+        for _ in range(5)
+    ]
+    assert aggregate_sr_co_failure_pairs(tasks, min_sample=5) is None
+
+
+def test_co_failure_lift_near_one_when_independent():
+    """When co-failure matches the base-rate product, lift is ~1."""
+    from app.sr_blind_spots import aggregate_sr_co_failure_pairs
+
+    pid = uuid.uuid4()
+    # 9 tasks: 3 miss only A, 3 miss only B, 1 misses both A+B, 2 miss neither.
+    # miss_a=4, miss_b=4, co_ab=1, total=9
+    # p_b_given_a = 1/4 = 0.25; base_rate_b = 4/9 ≈ 0.444; lift ≈ 0.5625 (below 1)
+    # This demonstrates lift < 1 for weak co-occurrence (no strong shared signal).
+    tasks = (
+        [_make_co_fail_task(pid, failed_cats=["cat_a"]) for _ in range(3)]
+        + [_make_co_fail_task(pid, failed_cats=["cat_b"]) for _ in range(3)]
+        + [_make_co_fail_task(pid, failed_cats=["cat_a", "cat_b"])]
+        + [_make_co_fail_task(pid, failed_cats=[]) for _ in range(2)]
+    )
+    result = aggregate_sr_co_failure_pairs(tasks, min_sample=5, min_co_count=1)
+    assert result is not None
+    pair = next(
+        (p for p in result if p["cat_a"] == "cat_a" and p["cat_b"] == "cat_b"), None
+    )
+    assert pair is not None
+    assert pair["lift"] < 1.0
+
+
+def test_co_failure_result_keys_present():
+    """Each result entry has all required keys."""
+    from app.sr_blind_spots import aggregate_sr_co_failure_pairs
+
+    pid = uuid.uuid4()
+    tasks = [
+        _make_co_fail_task(pid, failed_cats=["correctness", "error-handling"])
+        for _ in range(5)
+    ]
+    result = aggregate_sr_co_failure_pairs(tasks, min_sample=5, min_co_count=2)
+    assert result is not None and len(result) > 0
+    entry = result[0]
+    for key in (
+        "cat_a",
+        "cat_b",
+        "co_fail_count",
+        "p_b_given_a",
+        "base_rate_b",
+        "lift",
+    ):
+        assert key in entry, f"Missing key: {key}"
+
+
+# ---------------------------------------------------------------------------
+# Unit: compute_persistent_sr_blind_spot_hint
+# ---------------------------------------------------------------------------
+
+
+def _make_reviewer_miss_task(
+    project_id,
+    *,
+    created_at: datetime,
+    category: str = "correctness",
+    task_type: str = "create",
+):
+    """Task where the reviewer caught *category* but SR passed it."""
+    return make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": task_type, "prompt": "x"}],
+        created_at=created_at,
+        context={
+            "_self_review_outcome": {
+                "check_results": {category: {"passed": True}},
+                "reviewer_findings": [
+                    {
+                        "category": category,
+                        "severity": "HIGH",
+                        "description": "missed by SR",
+                    }
+                ],
+            }
+        },
+    )
+
+
+def _make_clean_task(
+    project_id,
+    *,
+    created_at: datetime,
+    task_type: str = "create",
+):
+    """Task with no reviewer disagreement (SR and reviewer agree)."""
+    return make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": task_type, "prompt": "x"}],
+        created_at=created_at,
+        context={
+            "_self_review_outcome": {
+                "check_results": {"correctness": {"passed": True}},
+                "reviewer_findings": [],
+            }
+        },
+    )
+
+
+def test_persistent_hint_empty_below_threshold_in_one_window():
+    """Rate below threshold in window 0 → no persistent categories."""
+    now = datetime(2026, 1, 14, 12, 0, 0)
+    pid = uuid.uuid4()
+    # Window 0 (0-7 days ago): 1 miss / 5 tasks = 0.20 — below 0.25
+    tasks = [_make_reviewer_miss_task(pid, created_at=now - timedelta(days=2))] + [
+        _make_clean_task(pid, created_at=now - timedelta(days=2)) for _ in range(4)
+    ]
+    # Window 1 (7-14 days ago): 2 misses / 5 tasks = 0.40 — above 0.25
+    tasks += [
+        _make_reviewer_miss_task(pid, created_at=now - timedelta(days=10))
+        for _ in range(2)
+    ] + [_make_clean_task(pid, created_at=now - timedelta(days=10)) for _ in range(3)]
+    result = compute_persistent_sr_blind_spot_hint(
+        tasks, threshold=0.25, min_sample=3, now=now
+    )
+    assert result["categories"] == []
+    assert result["hint"] is None
+
+
+def test_persistent_hint_populated_when_above_threshold_both_windows():
+    """Rate exceeds threshold in both windows → hint names the category."""
+    now = datetime(2026, 1, 14, 12, 0, 0)
+    pid = uuid.uuid4()
+    tasks = []
+    # Both windows: 2 misses / 4 tasks = 0.50 — above 0.25
+    for days_ago in (3, 10):
+        tasks += [
+            _make_reviewer_miss_task(pid, created_at=now - timedelta(days=days_ago))
+            for _ in range(2)
+        ]
+        tasks += [
+            _make_clean_task(pid, created_at=now - timedelta(days=days_ago))
+            for _ in range(2)
+        ]
+    result = compute_persistent_sr_blind_spot_hint(
+        tasks, threshold=0.25, min_sample=3, now=now
+    )
+    assert len(result["categories"]) == 1
+    assert result["categories"][0]["category"] == "correctness"
+    assert result["categories"][0]["task_type"] == "create"
+    assert result["categories"][0]["rate"] == pytest.approx(0.5, abs=0.01)
+    assert result["hint"] is not None
+    assert "correctness" in result["hint"]
+    assert "50%" in result["hint"]
+
+
+def test_persistent_hint_empty_when_window_below_min_sample():
+    """A window with fewer than min_sample qualifying tasks does not block but does not count."""
+    now = datetime(2026, 1, 14, 12, 0, 0)
+    pid = uuid.uuid4()
+    # Window 0 (0-7 days ago): only 2 qualifying tasks — below min_sample=3
+    tasks = [
+        _make_reviewer_miss_task(pid, created_at=now - timedelta(days=2))
+        for _ in range(2)
+    ]
+    # Window 1 (7-14 days ago): 3/4 tasks disagree (above threshold)
+    tasks += [
+        _make_reviewer_miss_task(pid, created_at=now - timedelta(days=10))
+        for _ in range(3)
+    ] + [_make_clean_task(pid, created_at=now - timedelta(days=10))]
+    result = compute_persistent_sr_blind_spot_hint(
+        tasks, threshold=0.25, min_sample=3, now=now
+    )
+    # Window 0 has too few samples → its rates dict is empty → key missing → not persistent
+    assert result["categories"] == []
+    assert result["hint"] is None
+
+
+def test_persistent_hint_no_double_counting_with_catch_rate():
+    """Running compute_persistent_sr_blind_spot_hint does not alter count_reviewer_disagreements_in_tasks."""
+    now = datetime(2026, 1, 14, 12, 0, 0)
+    pid = uuid.uuid4()
+    tasks = [
+        _make_reviewer_miss_task(pid, created_at=now - timedelta(days=3))
+        for _ in range(3)
+    ] + [_make_clean_task(pid, created_at=now - timedelta(days=3)) for _ in range(2)]
+
+    counts_before = count_reviewer_disagreements_in_tasks(tasks)
+    compute_persistent_sr_blind_spot_hint(tasks, threshold=0.25, min_sample=3, now=now)
+    counts_after = count_reviewer_disagreements_in_tasks(tasks)
+
+    assert counts_before == counts_after
+
+
+def test_persistent_hint_multiple_categories_listed_in_hint():
+    """When two categories exceed the threshold, the hint names both."""
+    now = datetime(2026, 1, 14, 12, 0, 0)
+    pid = uuid.uuid4()
+    tasks = []
+    for days_ago in (3, 10):
+        # 2 correctness misses + 2 scope-drift misses + 4 clean → each at 0.25 rate
+        tasks += [
+            _make_reviewer_miss_task(
+                pid, created_at=now - timedelta(days=days_ago), category="correctness"
+            )
+            for _ in range(2)
+        ]
+        tasks += [
+            _make_reviewer_miss_task(
+                pid, created_at=now - timedelta(days=days_ago), category="scope-drift"
+            )
+            for _ in range(2)
+        ]
+        tasks += [
+            _make_clean_task(pid, created_at=now - timedelta(days=days_ago))
+            for _ in range(4)
+        ]
+    result = compute_persistent_sr_blind_spot_hint(
+        tasks, threshold=0.25, min_sample=3, now=now
+    )
+    cats = {c["category"] for c in result["categories"]}
+    assert "correctness" in cats
+    assert "scope-drift" in cats
+    assert result["hint"] is not None
+    assert "correctness" in result["hint"]
+    assert "scope-drift" in result["hint"]
+
+
+def test_persistent_hint_fix_task_type_tracked_separately():
+    """Reviewer-disagreement rates for 'fix' task type are tracked separately from 'create'."""
+    now = datetime(2026, 1, 14, 12, 0, 0)
+    pid = uuid.uuid4()
+    tasks = []
+    for days_ago in (3, 10):
+        tasks += [
+            _make_reviewer_miss_task(
+                pid, created_at=now - timedelta(days=days_ago), task_type="fix"
+            )
+            for _ in range(2)
+        ]
+        tasks += [
+            _make_clean_task(pid, created_at=now - timedelta(days=days_ago))
+            for _ in range(2)
+        ]
+    result = compute_persistent_sr_blind_spot_hint(
+        tasks, threshold=0.25, min_sample=3, now=now
+    )
+    task_types = {c["task_type"] for c in result["categories"]}
+    assert "fix" in task_types
+    assert "create" not in task_types

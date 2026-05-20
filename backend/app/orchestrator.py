@@ -43,6 +43,7 @@ from app.orchestrator_filters import (
     filter_held_directions,
     filter_pipeline_duplicates,
     filter_migration_serialization,
+    filter_scope_empty,
 )
 from app.storage import upload_json_payload
 import app.shared_state as _shared_state
@@ -2158,6 +2159,14 @@ async def orchestrator_worker():
                     eligible_ids, candidate_tasks, session, broadcast_to_project
                 )
 
+                # Step 2.76: SCOPE_EMPTY pre-flight — pre-empt auto-decomposed
+                # cluster siblings whose related_files are fully covered by a
+                # completed sibling. Transitions directly to FAILED/SCOPE_EMPTY
+                # (an INFRA_CLASS) so the retry budget is NOT consumed.
+                eligible_ids = await filter_scope_empty(
+                    eligible_ids, candidate_tasks, session, broadcast_to_project
+                )
+
                 # Step 2.8: Health-aware reordering — boost small/low-risk tasks when degraded.
                 # Only activates under degradation so normal priority ordering is preserved.
                 # Degradation signals: any zone in cooldown, failure rate > 30%, or slots < 50% of max.
@@ -3069,6 +3078,12 @@ async def orchestrator_worker():
                     task.status = TaskStatus.PROVISIONING
                     task.started_at = _utcnow()
                     task.vm_provisioned_at = _utcnow()
+                    # Foundational scaffolding for vm_reuse_rate (efficiency
+                    # direction d-91d8dede). There is no warm pool today, so
+                    # every dispatch is a cold provision — TODO(warm-pool):
+                    # flip to True at the reuse path once pooling lands. See
+                    # compute.provision_agent_vm for the corresponding marker.
+                    task.vm_warm_start = False
                     # vm_spot must be written here — it's read by ~30 cost-rate sites
                     # (admin_digest, ci_completion, task_completion, etc.) gating
                     # SPOT_RATE vs ON_DEMAND_RATE. Without this write every cost
@@ -4747,9 +4762,11 @@ async def orchestrator_worker():
                             if status_code == 404:
                                 ci_task.status = TaskStatus.FAILED
                                 ci_task.latest_status_message = "CI polling failed: PR not found (404) — PR may have been deleted"
-                                _pr_num_404 = (ci_task.context or {}).get(
-                                    "review_loop", {}
-                                ).get("pr_number")
+                                _pr_num_404 = (
+                                    (ci_task.context or {})
+                                    .get("review_loop", {})
+                                    .get("pr_number")
+                                )
                                 logger.exception(
                                     f"[CI] PR #{_pr_num_404} returned 404 — marking task {ci_task_id} FAILED"
                                 )

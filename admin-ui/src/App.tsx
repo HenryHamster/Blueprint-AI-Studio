@@ -74,9 +74,25 @@ export default function App() {
     localStorage.setItem(SORT_KEY, sortBy);
   }, [sortBy]);
 
+  // Update browser tab title with unread message count
+  useEffect(() => {
+    if (openMessageCount > 0) {
+      document.title = `(${openMessageCount}) Blueprint AI Studio`;
+    } else {
+      document.title = 'Blueprint AI Studio';
+    }
+  }, [openMessageCount]);
+
   // Fetch open message count periodically (when panel is closed the callback won't fire)
   const selectedProjectId = s.selectedProjectId;
   const showMessages = s.showMessages;
+
+  // Clear message count when panel opens
+  useEffect(() => {
+    if (showMessages) {
+      setOpenMessageCount(0);
+    }
+  }, [showMessages]);
   useEffect(() => {
     if (!selectedProjectId || showMessages) return;
     const pid = selectedProjectId; // narrowed to string
@@ -484,6 +500,7 @@ export default function App() {
             tasks={s.tasks}
             metricsWindow={s.metricsWindow}
             onWindowChange={s.setMetricsWindow}
+            projectId={s.selectedProjectId ?? undefined}
           />
         </ErrorBoundary>
       </div>
@@ -541,6 +558,7 @@ export default function App() {
       {!s.showArchive && !s.showUserManagement && (
         <CatchUpPanel
           selectedProjectId={s.selectedProjectId}
+          projects={s.projects}
           lastVisitTimestamp={s.lastVisitTimestamp}
           refreshInterval={s.refreshInterval}
           needsAttentionCount={s.needsAttentionCount}
@@ -591,6 +609,7 @@ export default function App() {
       ) : s.showMessages ? (
         <MessagesPanel
           selectedProjectId={s.selectedProjectId}
+          githubRepo={selectedProject ? `${selectedProject.github_owner}/${selectedProject.github_repo}` : undefined}
           onClose={() => s.setShowMessages(false)}
           addToast={s.addToast}
           onMessageCountChange={handleMessageCountChange}
@@ -704,7 +723,7 @@ export default function App() {
 
           {s.viewMode === 'home' ? (
             <>
-              <ErrorBoundary level="panel"><DashboardHome tasks={s.tasks} selectedProjectId={s.selectedProjectId} onViewTask={s.handleViewLogs} onDirectionClick={(dirId) => { setResearchBrowserDirectionId(dirId); s.setShowResearchBrowser(true); }} onCategoryClick={(cat) => { setSrMissedCategory(cat); setShowSrMissed(true); setTimeout(() => srMissedRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 50); }} /></ErrorBoundary>
+              <ErrorBoundary level="panel"><DashboardHome tasks={s.tasks} selectedProjectId={s.selectedProjectId} projects={s.projects} onViewTask={s.handleViewLogs} onDirectionClick={(dirId) => { setResearchBrowserDirectionId(dirId); s.setShowResearchBrowser(true); }} onCategoryClick={(cat) => { setSrMissedCategory(cat); setShowSrMissed(true); setTimeout(() => srMissedRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 50); }} /></ErrorBoundary>
               <PlaybookPanel selectedProjectId={s.selectedProjectId} />
               {s.selectedProjectId && (
                 <div ref={srMissedRef} className="shrink-0 mt-2 bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3">

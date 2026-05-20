@@ -2,7 +2,8 @@ import { afterEach, describe, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { CatchUpPanel } from './CatchUpPanel';
-import { expectNoOverflowAt } from '../test/viewport';
+import { expectNoOverflowAt, expectNoTextTruncationAt } from '../test/viewport';
+import { apiFetch } from '../api';
 
 // Mock the api module so CatchUpPanel doesn't try to fetch real data.
 // Use a partial mock (vi.importActual) so transitively-imported helpers
@@ -106,6 +107,117 @@ describe('CatchUpPanel — viewport regression', () => {
       host.remove();
       host = null;
     }
+  });
+
+  test('task titles, error snippets, and direction text are not silently clipped at 375px', async () => {
+    vi.mocked(apiFetch).mockImplementationOnce(async (url: string) => {
+      if (url.includes('/digest')) {
+        return new Response(
+          JSON.stringify({
+            window_hours: 24,
+            generated_at: '2026-05-06T00:00:00Z',
+            completed_count: 8,
+            failed_count: 3,
+            pending_approval_count: 2,
+            research_cycles: 2,
+            prs_opened: 5,
+            active_count: 1,
+            running_count: 1,
+            needs_attention: [
+              {
+                task_id: 'task-fail-1',
+                title: 'feat(auth): implement token-refresh flow with sliding expiry and cross-tab sync for long-running operator sessions',
+                reason: 'failed',
+                error_snippet: 'backend/testing/test_pipeline_regression_dispatcher.py::TestDispatcher::test_emit_duplicate_escalation_reason_on_retry FAILED',
+                pr_url: null,
+                failure_class: 'CODE_ERROR',
+              },
+              {
+                task_id: 'task-fail-2',
+                title: 'fix(backend): handle edge case where pipeline_regression_dispatcher emits duplicate escalation_reason labels on retry loops',
+                reason: 'failed',
+                error_snippet: 'AssertionError: Expected labels to be unique but found [\'escalated_cross_layer\', \'escalated_cross_layer\'] — dedup guard not applied in dispatch_single_signal',
+                pr_url: null,
+                failure_class: 'TEST_FAILURE',
+              },
+            ],
+            recent_failures: [
+              {
+                task_id: 'task-fail-3',
+                title: 'refactor: extract shared viewport-assertion helpers from per-component test files into admin-ui/src/test/viewport.ts',
+                failed_at: '2026-05-05T12:30:00Z',
+                error_snippet: 'Module import failed: admin-ui/src/test/viewport.ts not found at resolution path',
+                failure_class: 'IMPORT_ERROR',
+              },
+            ],
+            failure_groups: [
+              {
+                failure_class: 'CODE_ERROR',
+                label: 'Code Error',
+                count: 1,
+                tasks: [],
+              },
+            ],
+            recent_completions: [
+              {
+                task_id: 'task-complete-1',
+                title: 'feat: add mobile-responsive layout for core operator-facing panels including kanban board and task detail drawer',
+                completed_at: '2026-05-06T00:00:00Z',
+                pr_url: 'https://github.com/example/repo/pull/4600',
+                task_type: 'create',
+                direction_id: 'd-001',
+                direction_text: 'Improve admin UI mobile responsiveness',
+                duration_seconds: 3600,
+              },
+            ],
+            direction_progress: [
+              {
+                id: 'd-001',
+                text: 'Improve admin UI mobile responsiveness across all operator-facing panels including kanban board, task detail drawer, and metrics dashboard',
+                priority: 'high',
+                findings: 12,
+                latest_status: 'in-progress',
+                matching_tasks: 7,
+                task_completion_rate: 0.57,
+                current_effort_points: 16,
+                target_effort_points: 28,
+              },
+            ],
+            active_tasks: [],
+            fresh_reviewer_effectiveness: null,
+          }),
+          { status: 200 },
+        );
+      }
+      return new Response('{}', { status: 200 });
+    });
+
+    await expectNoTextTruncationAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <CatchUpPanel
+            selectedProjectId="project-123"
+            lastVisitTimestamp={Date.now() - 24 * 60 * 60 * 1000}
+            refreshInterval={60000}
+            onSelectTask={() => {}}
+            onOpenActivityFeed={() => {}}
+            needsAttentionCount={2}
+            onApprove={() => {}}
+            onRetry={() => {}}
+            onBulkApprove={() => {}}
+            onBulkRetry={() => {}}
+          />,
+        );
+      });
+      await act(async () => {
+        await new Promise<void>((resolve) => setTimeout(resolve, 50));
+      });
+    }, { waitMs: 50 });
   });
 
   test('renders without horizontal overflow at 375px', async () => {

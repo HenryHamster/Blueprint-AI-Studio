@@ -9,6 +9,15 @@ VPORT_ARGS=(
   VITE_FIREBASE_PROJECT_ID=ci
 )
 
+# Capture baseline screenshots on main-branch runs (or explicit opt-in via CAPTURE_BASELINES=true).
+# viewport.ts writes PNGs to admin-ui/viewport-baselines/<component>-<width>px.png when this is set.
+CURRENT_BRANCH=$(git -C /tmp/workspace rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+DOCKER_BASELINE_ARGS=()
+if [ "${CAPTURE_BASELINES:-}" = "true" ] || [ "$CURRENT_BRANCH" = "main" ]; then
+  VPORT_ARGS+=(VITE_CAPTURE_BASELINES=true)
+  DOCKER_BASELINE_ARGS=(-e VITE_CAPTURE_BASELINES=true)
+fi
+
 BOOTSTRAP_PATTERNS="libatk|libxcomposite|libgbm|libnss3|libasound|cannot open shared object file|executable doesn|host system is missing|please install|npx playwright install|run: playwright install|missing browser|missing chromium|eacces.*unlink.*vite|permission denied.*unlink"
 
 cd /tmp/workspace/admin-ui
@@ -31,8 +40,8 @@ echo "[check] admin-ui viewport: Chromium bootstrap failure detected."
 
 # Try Docker fallback (matches agent harness runViewportSuiteWithFallback behavior)
 if ! docker info >/dev/null 2>&1; then
-  echo "[check] WARNING: admin-ui viewport skipped (Chromium bootstrap failure, Docker unavailable). CI will enforce coverage."
-  exit 0
+  echo "VIEWPORT_GATE_INFRA_UNAVAILABLE: Chromium bootstrap failure detected, Docker unavailable"
+  exit 75
 fi
 
 PLAYWRIGHT_IMAGE=mcr.microsoft.com/playwright:v1.59.1-jammy
@@ -45,6 +54,7 @@ DOCKER_OUT=$(docker run --rm \
   -e VITE_FIREBASE_API_KEY=ci \
   -e VITE_FIREBASE_AUTH_DOMAIN=ci.firebaseapp.com \
   -e VITE_FIREBASE_PROJECT_ID=ci \
+  "${DOCKER_BASELINE_ARGS[@]}" \
   "$PLAYWRIGHT_IMAGE" npm run test:viewport 2>&1)
 DOCKER_STATUS=$?
 echo "$DOCKER_OUT"
@@ -58,6 +68,12 @@ fi
 if echo "$DOCKER_OUT" | grep -qE "Tests +[0-9]+ failed"; then
   echo "[check] admin-ui viewport: Docker run has test assertion failures — blocking."
   exit 1
+fi
+
+# Docker failed without test assertions — check if bootstrap errors persisted into Docker
+if echo "$DOCKER_OUT" | grep -qiE "$BOOTSTRAP_PATTERNS"; then
+  echo "VIEWPORT_GATE_INFRA_UNAVAILABLE: Chromium bootstrap failure persists in Docker fallback"
+  exit 75
 fi
 
 echo "[check] WARNING: admin-ui viewport has file-import errors in Docker (pre-existing env issue); no test assertions failed. CI will enforce full coverage."

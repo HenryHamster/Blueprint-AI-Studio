@@ -3,6 +3,7 @@ import { ChevronDown, ChevronUp, Server, Flame, AlertTriangle, Clock } from 'luc
 import { API_BASE_URL, apiFetch, authGet } from '../api';
 import { parseTimestamp } from '../utils/time';
 import type { WarmVmStateResponse, WarmVmRow } from '../types/warmVm';
+import { useEfficiencySnapshot, fmtEffSecs, fmtEffRate, fmtEffIter } from '../hooks/useEfficiencySnapshot';
 
 const POLL_INTERVAL_MS = 10_000;
 const STORAGE_KEY = 'blueprint-admin:warmVmPanelCollapsed';
@@ -46,6 +47,7 @@ export function WarmVmPanel({ onViewTask }: Props) {
   const [data, setData] = useState<WarmVmStateResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [flipping, setFlipping] = useState(false);
+  const efficiency = useEfficiencySnapshot();
 
   const load = useCallback(async () => {
     try {
@@ -186,6 +188,15 @@ export function WarmVmPanel({ onViewTask }: Props) {
                 <span><span className="text-neutral-500">poll timeout</span>: <span className="font-mono text-neutral-300">{data.next_role_poll_timeout_secs}s</span></span>
               </div>
 
+              {efficiency && (
+                <div className="mb-3 flex flex-wrap gap-x-4 gap-y-1 text-[10px] text-neutral-400 pt-2 border-t border-neutral-800/60">
+                  <span className="text-neutral-500 font-bold uppercase tracking-widest w-full">Pipeline Efficiency</span>
+                  <EffMetric label="cold-start p50" value={fmtEffSecs(efficiency.window_24h?.setup_p50_secs)} delta={efficiency.window_24h?.vs_prior_setup_p50_delta} lowerIsBetter />
+                  <EffMetric label="reuse rate" value={fmtEffRate(efficiency.window_24h?.warm_reuse_rate)} delta={efficiency.window_24h?.vs_prior_warm_reuse_rate_delta} lowerIsBetter={false} />
+                  <EffMetric label="review cycles" value={fmtEffIter(efficiency.window_7d?.review_iter_median)} delta={efficiency.window_7d?.vs_prior_review_iter_median_delta} lowerIsBetter />
+                </div>
+              )}
+
               {overThreshold && (
                 <div className="mb-3 px-2 py-1.5 rounded border border-red-500/40 bg-red-500/10 text-red-400 text-[11px] flex items-center gap-2">
                   <AlertTriangle className="w-3 h-3 shrink-0" />
@@ -323,5 +334,20 @@ function VmRow({ vm, onViewTask }: { vm: WarmVmRow; onViewTask?: (taskId: string
         )}
       </td>
     </tr>
+  );
+}
+
+function EffMetric({ label, value, delta, lowerIsBetter }: {
+  label: string; value: string; delta: number | null | undefined; lowerIsBetter: boolean;
+}) {
+  const arrow = delta === null || delta === undefined || delta === 0 ? null : delta > 0 ? '↑' : '↓';
+  const improving = delta === null || delta === undefined ? null : lowerIsBetter ? delta < 0 : delta > 0;
+  const cls = improving === null ? 'text-neutral-500' : improving ? 'text-emerald-400' : 'text-red-400';
+  return (
+    <span>
+      <span className="text-neutral-500">{label}</span>:{' '}
+      <span className="font-mono text-neutral-300">{value}</span>
+      {arrow && <span className={`ml-0.5 ${cls}`}>{arrow}</span>}
+    </span>
   );
 }

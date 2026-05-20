@@ -149,15 +149,15 @@ export function DirectionProgressSection({ directions, medianCostPerMergedPr }: 
           <div key={dp.direction_id}>
             {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
             <button
-              className="flex items-center gap-2 text-xs bg-neutral-950 border border-neutral-800/80 px-2 py-1.5 rounded cursor-pointer hover:bg-neutral-800/30 w-full text-left"
+              className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs bg-neutral-950 border border-neutral-800/80 px-2 py-1.5 rounded cursor-pointer hover:bg-neutral-800/30 w-full text-left min-w-0"
               onClick={() => toggleDirection(dp.direction_id)}
               aria-expanded={isExpanded}
             >
               {isExpanded ? <ChevronUp className="w-3 h-3 shrink-0 text-neutral-600" /> : <ChevronDown className="w-3 h-3 shrink-0 text-neutral-600" />}
-              <span className="flex-1 truncate text-neutral-400">
+              <span className="flex-1 min-w-0 truncate text-neutral-400">
                 {(dp.direction_text || dp.direction_id).slice(0, 50)}
               </span>
-              <div className="shrink-0 flex items-center gap-1">
+              <div className="flex flex-wrap items-center gap-1 min-w-0">
                 {dp.cycles_in_window > 0 && (
                   <span className="text-[9px] bg-neutral-700/30 text-neutral-500 border border-neutral-700/30 px-1.5 py-0.5 rounded">
                     {dp.cycles_in_window} cycle{dp.cycles_in_window !== 1 ? 's' : ''}

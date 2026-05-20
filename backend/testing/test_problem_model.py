@@ -580,6 +580,31 @@ def test_append_self_reflection_handles_none_input():
 # for the current payload shape.
 
 
+def test_project_append_routine_digest_creates_entry():
+    """Project.append_routine_digest writes a formatted digest line to running_update."""
+    from app.models import Project
+
+    p = Project(name="test", user_id="u1")
+    assert p.running_update is None
+    p.append_routine_digest("pr_merged", "PR #42 merged into main")
+    assert p.running_update is not None
+    assert "pr_merged" in p.running_update
+    assert "PR #42 merged into main" in p.running_update
+
+
+def test_project_append_routine_digest_appends_additional_lines():
+    """Each call appends a new line; existing running_update content is preserved."""
+    from app.models import Project
+
+    p = Project(name="test", user_id="u1")
+    p.append_routine_digest("pr_merged", "PR #1 merged")
+    p.append_routine_digest("auto_fix_result", "Fix passed CI")
+    lines = p.running_update.splitlines()
+    assert len(lines) == 2
+    assert "pr_merged" in lines[0]
+    assert "auto_fix_result" in lines[1]
+
+
 def test_source_is_reusable_across_model_elements():
     """Source is a generic citation — the same type applies on Gap,
     Intent, Capability, Friction."""

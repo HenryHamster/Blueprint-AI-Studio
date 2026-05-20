@@ -17,7 +17,11 @@ export function VersionMismatchBanner() {
     <div className="mx-4 mb-2 p-3 bg-yellow-900/50 border border-yellow-700 rounded-lg text-yellow-200 text-sm flex items-center gap-2">
       <AlertCircle size={16} />
       <span>Backend version mismatch — some features may not work as expected. Try refreshing the page.</span>
-      <button onClick={() => setMismatch(false)} className="ml-auto text-yellow-400 hover:text-yellow-200">&times;</button>
+      <button
+        onClick={() => setMismatch(false)}
+        aria-label="Dismiss version mismatch warning"
+        className="ml-auto text-yellow-400 hover:text-yellow-200 min-w-[44px] min-h-[44px] flex items-center justify-center"
+      >&times;</button>
     </div>
   );
 }

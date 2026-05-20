@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import { apiFetch } from '../api';
+import { useEfficiencySnapshot, fmtEffSecs, fmtEffRate, fmtEffIter } from '../hooks/useEfficiencySnapshot';
 
 interface ProviderCostRow {
   provider: string;
@@ -26,6 +27,7 @@ export function ProviderCostPanel({
   windowHours: number;
 }) {
   const [data, setData] = useState<ProviderCostSummary | null>(null);
+  const efficiency = useEfficiencySnapshot(selectedProjectId);
 
   useEffect(() => {
     let cancelled = false;
@@ -44,9 +46,20 @@ export function ProviderCostPanel({
 
   if (!data || data.rows.length === 0) return null;
 
+  const w24 = efficiency?.window_24h;
+  const w7 = efficiency?.window_7d;
+
   return (
     <section>
       <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Provider Cost &amp; Success</h2>
+      {efficiency && (
+        <div className="mb-2 flex flex-wrap gap-x-4 gap-y-1 text-[10px] text-neutral-400 px-1">
+          <span className="text-neutral-500 font-bold uppercase tracking-widest w-full">Pipeline Efficiency</span>
+          <EffMetric label="cold-start p50" value={fmtEffSecs(w24?.setup_p50_secs)} delta={w24?.vs_prior_setup_p50_delta} lowerIsBetter />
+          <EffMetric label="reuse rate" value={fmtEffRate(w24?.warm_reuse_rate)} delta={w24?.vs_prior_warm_reuse_rate_delta} lowerIsBetter={false} />
+          <EffMetric label="review cycles" value={fmtEffIter(w7?.review_iter_median)} delta={w7?.vs_prior_review_iter_median_delta} lowerIsBetter />
+        </div>
+      )}
       {/* Horizontal-scrollable provider table: columns overflow on narrow viewports to keep section in-bounds */}
       <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg overflow-x-auto" data-viewport-allow-overflow>
         <table className="w-full text-xs">
@@ -92,5 +105,20 @@ export function ProviderCostPanel({
         </table>
       </div>
     </section>
+  );
+}
+
+function EffMetric({ label, value, delta, lowerIsBetter }: {
+  label: string; value: string; delta: number | null | undefined; lowerIsBetter: boolean;
+}) {
+  const arrow = delta === null || delta === undefined || delta === 0 ? null : delta > 0 ? '↑' : '↓';
+  const improving = delta === null || delta === undefined ? null : lowerIsBetter ? delta < 0 : delta > 0;
+  const cls = improving === null ? 'text-neutral-500' : improving ? 'text-emerald-400' : 'text-red-400';
+  return (
+    <span>
+      <span className="text-neutral-500">{label}</span>:{' '}
+      <span className="font-mono text-neutral-300">{value}</span>
+      {arrow && <span className={`ml-0.5 ${cls}`}>{arrow}</span>}
+    </span>
   );
 }

@@ -112,7 +112,7 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports under test ────────────────────────────────────────────────────────
-import { handleCreate, handleRefactor, handleDocs, handleQA, handleDeps, extractSelfReviewJson, needsMigrationGeneration, buildSmallScopeCallerNote, runFreshReviewerPass, SR_SKIP_REASONS, computeRegressionRiskHeuristic } from './standard.js';
+import { handleCreate, handleRefactor, handleDocs, handleQA, handleDeps, extractSelfReviewJson, needsMigrationGeneration, buildSmallScopeCallerNote, runFreshReviewerPass, SR_SKIP_REASONS, computeRegressionRiskHeuristic, loneCheckerCategoriesForTask } from './standard.js';
 import { setupWorkspace, captureTestBaseline, runClaudeCode } from '../index.js';
 import { extractModuleInterfaces, discoverAffectedConsumers, parseAnalysisPlanFiles, parseAnalysisPlanTestFiles, parseAnalysisPlanVerifyFiles, buildAnalysisPrompt } from '../prompt.js';
 import { runCodeChangeTask } from './code-change.js';
@@ -335,6 +335,28 @@ describe('execution-evidence SR categories in prompt', () => {
     expect(prompt).toContain('tests_executed_cleanly');
     expect(prompt).toContain('lint_executed_cleanly');
     expect(prompt).toContain('typecheck_executed_cleanly');
+  });
+});
+
+// ── Viewport infra skip guidance ──────────────────────────────────────────────
+describe('viewport infra skip guidance in prompt', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('includes VIEWPORT_GATE_INFRA_UNAVAILABLE sentinel guidance in handleCreate prompt', async () => {
+    const task = { title: 'Task', description: '' };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt = capturedPrompt();
+    expect(prompt).toContain('VIEWPORT_GATE_INFRA_UNAVAILABLE');
+    expect(prompt).toContain('./blocked');
+  });
+
+  it('includes viewport infra skip guidance in handleRefactor prompt', async () => {
+    const task = { title: 'Refactor task', description: '' };
+    await handleRefactor(TASK_ID, { prompt: 'Improve it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt = capturedPrompt();
+    expect(prompt).toContain('VIEWPORT_GATE_INFRA_UNAVAILABLE');
   });
 });
 
@@ -2205,6 +2227,65 @@ describe('code-change handler structural prompt invariants', () => {
   });
 });
 
+// ── Pre-execution FP-rate loosen hint wiring ─────────────────────────────────
+describe('pre-execution FP-rate loosen hint in prompt', () => {
+  beforeEach(() => { vi.clearAllMocks(); });
+
+  it('emits loosen hint when a category has fp_rate >= 0.5 and sample_size >= 10', async () => {
+    const task = {
+      title: 'T', description: '', context: {},
+      project_context: {
+        self_review_catch_rate: {
+          categories: {
+            correctness: { false_positive_rate: 0.7, sr_flag_sample_size: 15 },
+          },
+        },
+      },
+    };
+    await handleCreate(TASK_ID, { prompt: 'do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const p = capturedPrompt();
+    expect(p).toContain('Over-flagged categories');
+    expect(p).toContain('correctness');
+    expect(p).toContain('70% false-positive rate');
+  });
+
+  it('omits loosen hint when fp_rate is below 0.5', async () => {
+    const task = {
+      title: 'T', description: '', context: {},
+      project_context: {
+        self_review_catch_rate: {
+          categories: {
+            correctness: { false_positive_rate: 0.4, sr_flag_sample_size: 20 },
+          },
+        },
+      },
+    };
+    await handleCreate(TASK_ID, { prompt: 'do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(capturedPrompt()).not.toContain('Over-flagged categories');
+  });
+
+  it('omits loosen hint when sample_size is below 10', async () => {
+    const task = {
+      title: 'T', description: '', context: {},
+      project_context: {
+        self_review_catch_rate: {
+          categories: {
+            correctness: { false_positive_rate: 0.8, sr_flag_sample_size: 9 },
+          },
+        },
+      },
+    };
+    await handleCreate(TASK_ID, { prompt: 'do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(capturedPrompt()).not.toContain('Over-flagged categories');
+  });
+
+  it('omits loosen hint when project_context has no self_review_catch_rate', async () => {
+    const task = { title: 'T', description: '', context: {}, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(capturedPrompt()).not.toContain('Over-flagged categories');
+  });
+});
+
 // ── Task-type-specific self-review focus blocks ───────────────────────────────
 describe('task-type self-review focus blocks', () => {
   const TASK = { title: 'T', description: '', context: {}, project_context: {} };
@@ -2706,6 +2787,202 @@ describe('maybeRunIncompleteReviewRecovery', () => {
   });
 });
 
+// ── loneCheckerCategoriesForTask unit tests ───────────────────────────────────
+describe('loneCheckerCategoriesForTask', () => {
+  it('returns empty array when no categories have lone-checker set', () => {
+    const ctx = { self_review_catch_rate: { categories: { security: { miss_rate: 0.1 } } } };
+    expect(loneCheckerCategoriesForTask(ctx, ['backend/app/foo.py'])).toEqual([]);
+  });
+
+  it('returns overlapping lone-checker categories for backend task', () => {
+    const ctx = {
+      self_review_catch_rate: {
+        categories: {
+          security: { time_to_miss_detect_lone_checker: true },
+          documentation: { time_to_miss_detect_lone_checker: true },
+        },
+      },
+    };
+    const result = loneCheckerCategoriesForTask(ctx, ['backend/app/foo.py']);
+    expect(result).toContain('security');
+    expect(result).not.toContain('documentation');
+  });
+
+  it('returns empty array when lone-checker categories do not overlap task risk surface', () => {
+    const ctx = {
+      self_review_catch_rate: {
+        categories: { documentation: { time_to_miss_detect_lone_checker: true } },
+      },
+    };
+    expect(loneCheckerCategoriesForTask(ctx, ['backend/app/foo.py'])).toEqual([]);
+  });
+
+  it('returns all lone-checker categories for unknown task type', () => {
+    const ctx = {
+      self_review_catch_rate: {
+        categories: {
+          security: { time_to_miss_detect_lone_checker: true },
+          documentation: { time_to_miss_detect_lone_checker: true },
+        },
+      },
+    };
+    const result = loneCheckerCategoriesForTask(ctx, ['some/other/file.ts']);
+    expect(result).toContain('security');
+    expect(result).toContain('documentation');
+  });
+
+  it('returns overlapping lone-checker categories for agent/ task', () => {
+    const ctx = {
+      self_review_catch_rate: {
+        categories: {
+          security: { time_to_miss_detect_lone_checker: true },
+          'type-safety': { time_to_miss_detect_lone_checker: true },
+          documentation: { time_to_miss_detect_lone_checker: true },
+        },
+      },
+    };
+    const result = loneCheckerCategoriesForTask(ctx, ['agent/src/handlers/standard.ts']);
+    expect(result).toContain('security');
+    expect(result).toContain('type-safety');
+    expect(result).not.toContain('documentation');
+  });
+
+  it('returns overlapping lone-checker categories for admin-ui/ task', () => {
+    const ctx = {
+      self_review_catch_rate: {
+        categories: {
+          'type-safety': { time_to_miss_detect_lone_checker: true },
+          correctness: { time_to_miss_detect_lone_checker: true },
+          documentation: { time_to_miss_detect_lone_checker: true },
+        },
+      },
+    };
+    const result = loneCheckerCategoriesForTask(ctx, ['admin-ui/src/components/Foo.tsx']);
+    expect(result).toContain('type-safety');
+    expect(result).toContain('correctness');
+    expect(result).not.toContain('documentation');
+  });
+});
+
+// ── lone-checker auto-trigger fresh-reviewer integration ──────────────────────
+describe('handleCreate — lone-checker auto-trigger', () => {
+  const BIG_DIFF = Array.from({ length: 25 }, (_, i) => `+line ${i}`).join('\n');
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    // Reset readFileSync to empty so no stale incomplete_review state leaks in
+    const { default: fs } = await import('fs');
+    vi.mocked(fs.readFileSync).mockReturnValue('');
+  });
+
+  it('auto-triggers fresh-reviewer when a lone-checker category overlaps task risk surface', async () => {
+    const idx = await import('../index.js');
+    vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
+    vi.mocked(idx.runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '{"reviewer_findings":[]}' });
+    vi.mocked(idx.setupWorkspace).mockResolvedValue({ workBranch: 'task-lc1', shortId: 'lc1' });
+
+    const task = {
+      title: 'Backend fix', description: '',
+      context: { related_files: ['backend/app/foo.py'] },
+      project_context: {
+        self_review_catch_rate: {
+          categories: { security: { time_to_miss_detect_lone_checker: true } },
+        },
+      },
+      project_metadata: { enable_fresh_reviewer: false, is_self_repo: false },
+    };
+    await handleCreate(TASK_ID, { prompt: 'Fix it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const reviewerCall = vi.mocked(idx.runClaudeCode).mock.calls.find(
+      call => typeof call[0] === 'string' && call[0].includes('You are reviewing a PR'),
+    );
+    expect(reviewerCall).toBeDefined();
+  });
+
+  it('does NOT auto-trigger fresh-reviewer when no lone-checker categories are present', async () => {
+    const idx = await import('../index.js');
+    vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
+    vi.mocked(idx.runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+    vi.mocked(idx.setupWorkspace).mockResolvedValue({ workBranch: 'task-lc2', shortId: 'lc2' });
+
+    const task = {
+      title: 'Backend fix', description: '',
+      context: { related_files: ['backend/app/foo.py'] },
+      project_context: {
+        self_review_catch_rate: { categories: { security: { miss_rate: 0.1 } } },
+      },
+      project_metadata: { enable_fresh_reviewer: false, is_self_repo: false },
+    };
+    await handleCreate(TASK_ID, { prompt: 'Fix it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const reviewerCall = vi.mocked(idx.runClaudeCode).mock.calls.find(
+      call => typeof call[0] === 'string' && call[0].includes('You are reviewing a PR'),
+    );
+    expect(reviewerCall).toBeUndefined();
+  });
+
+  it('does NOT run lone-checker fresh-reviewer when enable_fresh_reviewer already triggered it', async () => {
+    const idx = await import('../index.js');
+    vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
+    vi.mocked(idx.runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '{"reviewer_findings":[]}' });
+    vi.mocked(idx.setupWorkspace).mockResolvedValue({ workBranch: 'task-lc3', shortId: 'lc3' });
+
+    // enable_fresh_reviewer=true: normal path runs, freshReviewerAlreadyRan=true.
+    // Lone-checker path should be skipped (only one reviewer pass total).
+    const task = {
+      title: 'Backend fix', description: '',
+      context: { related_files: ['backend/app/foo.py'] },
+      project_context: {
+        self_review_catch_rate: {
+          categories: { security: { time_to_miss_detect_lone_checker: true } },
+        },
+      },
+      project_metadata: { enable_fresh_reviewer: true, is_self_repo: false },
+    };
+    await handleCreate(TASK_ID, { prompt: 'Fix it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const reviewerCalls = vi.mocked(idx.runClaudeCode).mock.calls.filter(
+      call => typeof call[0] === 'string' && call[0].includes('You are reviewing a PR'),
+    );
+    // Only one reviewer pass (the normal enable_fresh_reviewer path), not two
+    expect(reviewerCalls.length).toBe(1);
+  });
+});
+
+// ── origin=lone_checker_recovery tagging ──────────────────────────────────────
+describe('runFreshReviewerPass lone_checker_recovery origin', () => {
+  const BIG_DIFF = Array.from({ length: 25 }, (_, i) => `+line ${i}`).join('\n');
+  let fsModule: typeof import('fs');
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    fsModule = await import('fs');
+  });
+
+  it('tags findings with origin=lone_checker_recovery when loneCheckerRecovery=true', async () => {
+    const idx = await import('../index.js');
+    vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
+    vi.mocked(fsModule.readFileSync).mockReturnValue(JSON.stringify({
+      verdict: 'pass',
+      check_results: {},
+    }));
+    let captured: Record<string, unknown> | null = null;
+    vi.mocked(fsModule.writeFileSync).mockImplementation((_p: unknown, data: unknown) => {
+      captured = JSON.parse(data as string) as Record<string, unknown>;
+    });
+    vi.mocked(idx.runClaudeCode).mockResolvedValue({
+      exitCode: 0,
+      allOutput: '',
+      lastResultText: '{"reviewer_findings":[{"category":"security","severity":"HIGH","description":"Missing auth check"}]}',
+    });
+
+    await runFreshReviewerPass('lc-origin', 'Title', 'Desc', [], null, { value: '' }, undefined, undefined, false, true);
+
+    expect(captured).not.toBeNull();
+    const json = captured as unknown as Record<string, unknown>;
+    const checkResults = json.check_results as Record<string, Record<string, unknown>>;
+    expect(checkResults.security.origin).toBe('lone_checker_recovery');
+    expect(json.reviewer_recovery_origin).toBe('lone_checker_recovery');
+  });
+});
+
 // ── Engagement gap tracking (regressing categories missing SR reasoning) ──────
 describe('runFreshReviewerPass engagement_gaps', () => {
   const BIG_DIFF = Array.from({ length: 25 }, (_, i) => `+line ${i}`).join('\n');
@@ -2777,5 +3054,148 @@ describe('runFreshReviewerPass engagement_gaps', () => {
     await runFreshReviewerPass('eg-2', 'Title', 'Desc', [], null, { value: '' });
     expect(captured).not.toBeNull();
     expect((captured as unknown as Record<string, unknown>).engagement_gaps).toBeUndefined();
+  });
+});
+
+// ── SCOPE_EMPTY pre-flight guard ──────────────────────────────────────────────
+// When an auto-decomposed cluster task's declared related_files are fully
+// covered by completed sibling tasks, the handler should emit SCOPE_EMPTY
+// and return early (no LLM call, no retry budget consumed).
+describe('handleCreate — SCOPE_EMPTY pre-flight guard', () => {
+  beforeEach(() => { vi.clearAllMocks(); });
+
+  it('exits with SCOPE_EMPTY when all related_files are covered by completed siblings', async () => {
+    const idx = await import('../index.js');
+    const task = {
+      title: 'Cluster 2/3',
+      description: '',
+      context: {
+        auto_decomposed: true,
+        related_files: ['agent/src/handlers/standard.ts'],
+      },
+      project_context: {
+        sibling_tasks: [
+          {
+            status: 'COMPLETED',
+            title: 'Cluster 1/3',
+            files: ['agent/src/handlers/standard.ts'],
+          },
+        ],
+      },
+    };
+    await handleCreate(
+      TASK_ID,
+      { prompt: 'Do something', related_files: ['agent/src/handlers/standard.ts'] },
+      task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+    expect(vi.mocked(runCodeChangeTask)).not.toHaveBeenCalled();
+    expect(vi.mocked(idx.persistAndPostStatus)).toHaveBeenCalledWith(
+      TASK_ID,
+      expect.objectContaining({
+        status: 'BLOCKED_PRECONDITION',
+        failure_category: 'SCOPE_EMPTY',
+      }),
+    );
+    const call = vi.mocked(idx.persistAndPostStatus).mock.calls.find(
+      ([, body]) => body.failure_category === 'SCOPE_EMPTY',
+    );
+    expect(call?.[1].logs).toContain('agent/src/handlers/standard.ts');
+    expect(call?.[1].logs).toContain('Cluster 1/3');
+  });
+
+  it('proceeds normally when some related_files are NOT covered by completed siblings', async () => {
+    const task = {
+      title: 'Cluster 2/3',
+      description: '',
+      context: {
+        auto_decomposed: true,
+        related_files: ['agent/src/handlers/standard.ts', 'agent/src/handlers/code-change.ts'],
+      },
+      project_context: {
+        sibling_tasks: [
+          {
+            status: 'COMPLETED',
+            title: 'Cluster 1/3',
+            files: ['agent/src/handlers/standard.ts'],
+          },
+        ],
+      },
+    };
+    await handleCreate(
+      TASK_ID,
+      { prompt: 'Do something', related_files: ['agent/src/handlers/standard.ts', 'agent/src/handlers/code-change.ts'] },
+      task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+    expect(vi.mocked(runCodeChangeTask)).toHaveBeenCalled();
+  });
+
+  it('proceeds normally when auto_decomposed is false even if sibling files match', async () => {
+    const task = {
+      title: 'Regular task',
+      description: '',
+      context: {
+        auto_decomposed: false,
+        related_files: ['agent/src/handlers/standard.ts'],
+      },
+      project_context: {
+        sibling_tasks: [
+          {
+            status: 'COMPLETED',
+            title: 'Sibling',
+            files: ['agent/src/handlers/standard.ts'],
+          },
+        ],
+      },
+    };
+    await handleCreate(
+      TASK_ID,
+      { prompt: 'Do something', related_files: ['agent/src/handlers/standard.ts'] },
+      task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+    expect(vi.mocked(runCodeChangeTask)).toHaveBeenCalled();
+  });
+
+  it('proceeds normally when sibling tasks list is empty', async () => {
+    const task = {
+      title: 'Cluster 2/3',
+      description: '',
+      context: {
+        auto_decomposed: true,
+        related_files: ['agent/src/handlers/standard.ts'],
+      },
+      project_context: { sibling_tasks: [] },
+    };
+    await handleCreate(
+      TASK_ID,
+      { prompt: 'Do something', related_files: ['agent/src/handlers/standard.ts'] },
+      task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+    expect(vi.mocked(runCodeChangeTask)).toHaveBeenCalled();
+  });
+
+  it('proceeds normally when no siblings are in COMPLETED status', async () => {
+    const task = {
+      title: 'Cluster 2/3',
+      description: '',
+      context: {
+        auto_decomposed: true,
+        related_files: ['agent/src/handlers/standard.ts'],
+      },
+      project_context: {
+        sibling_tasks: [
+          {
+            status: 'IN_PROGRESS',
+            title: 'Cluster 1/3',
+            files: ['agent/src/handlers/standard.ts'],
+          },
+        ],
+      },
+    };
+    await handleCreate(
+      TASK_ID,
+      { prompt: 'Do something', related_files: ['agent/src/handlers/standard.ts'] },
+      task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+    expect(vi.mocked(runCodeChangeTask)).toHaveBeenCalled();
   });
 });

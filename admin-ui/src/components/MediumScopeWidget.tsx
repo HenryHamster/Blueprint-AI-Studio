@@ -74,8 +74,8 @@ export function MediumScopeWidget({ data, loading }: { data: MediumScopeMeasurem
       ) : (
         <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-4 space-y-4">
           {/* Headline rate */}
-          <div className="flex items-center gap-4">
-            <div>
+          <div className="flex flex-wrap items-center gap-4 min-w-0">
+            <div className="min-w-0">
               <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-0.5">Overall Rate</p>
               <p className={`text-3xl font-bold font-mono ${rateColor}`}>{Math.round(rate * 100)}%</p>
               <p className="text-[10px] text-neutral-500 mt-0.5">{data.total_merged} merged / {data.total_created} created</p>
@@ -89,7 +89,7 @@ export function MediumScopeWidget({ data, loading }: { data: MediumScopeMeasurem
                 ? 'text-neutral-400'
                 : Math.abs(deltaPp) <= 3 ? 'text-neutral-400' : deltaPp > 0 ? 'text-emerald-400' : 'text-red-400';
               return (
-                <div className="flex gap-4 ml-4 items-center">
+                <div className="flex flex-wrap gap-4 items-center min-w-0">
                   {data.pre_investment && (
                     <div className="text-center">
                       <p className="text-[10px] text-neutral-500 mb-0.5">Pre-investment</p>

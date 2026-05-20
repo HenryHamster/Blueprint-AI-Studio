@@ -601,6 +601,9 @@ _REVIEWER_ORIGINS = frozenset(
 
 _SEVERITY_LEVELS = ("CRITICAL", "HIGH", "MEDIUM", "LOW")
 
+_REVIEWER_EXAMPLE_CAP = 3
+_REVIEWER_EXAMPLE_CHAR_CAP = 200
+
 
 def _max_severity(sev_counts: Dict[str, int]) -> str | None:
     for s in _SEVERITY_LEVELS:
@@ -616,6 +619,7 @@ def _count_reviewer_disagreement_directions(tasks) -> Dict[tuple, dict]:
             "tp": 0,
             "fp": 0,
             "severity": {s: 0 for s in _SEVERITY_LEVELS},
+            "examples": [],
         }
     )
     for t in tasks:
@@ -663,17 +667,28 @@ def _count_reviewer_disagreement_directions(tasks) -> Dict[tuple, dict]:
 
         for cat in missed_cats:
             counts[(cat, task_type)]["miss"] += 1
-            sev = next(
+            matching_finding = next(
                 (
-                    f.get("severity")
+                    f
                     for f in reviewer_findings
-                    if isinstance(f, dict)
-                    and f.get("category") == cat
-                    and f.get("severity") in _SEVERITY_LEVELS
+                    if isinstance(f, dict) and f.get("category") == cat
                 ),
-                "LOW",
+                None,
+            )
+            sev = (
+                matching_finding.get("severity")
+                if matching_finding
+                and matching_finding.get("severity") in _SEVERITY_LEVELS
+                else "LOW"
             )
             counts[(cat, task_type)]["severity"][sev] += 1
+            bucket_examples = counts[(cat, task_type)]["examples"]
+            if len(bucket_examples) < _REVIEWER_EXAMPLE_CAP and matching_finding:
+                desc = (matching_finding.get("description") or "")[
+                    :_REVIEWER_EXAMPLE_CHAR_CAP
+                ]
+                if desc:
+                    bucket_examples.append({"severity": sev, "description": desc})
         for cat in sr_failed:
             bucket = counts[(cat, task_type)]
             if cat in reviewer_cats:
@@ -846,6 +861,81 @@ def aggregate_sr_false_attestation_rates(
     return result or None
 
 
+def aggregate_sr_co_failure_pairs(
+    tasks,
+    *,
+    min_sample: int = _SR_MIN_SAMPLE,
+    min_co_count: int = 2,
+    top_n: int = 5,
+) -> List[Dict[str, Any]] | None:
+    """Pairwise co-failure rates for SR check_result categories.
+
+    For each ordered pair (cat_a, cat_b), computes:
+        lift = P(cat_b miss | cat_a miss) / P(cat_b miss)
+
+    High lift signals that cat_a and cat_b share a reasoning gap addressable
+    by a single prompt-level fix.  Qualifying tasks: code-change type,
+    non-skip SR outcome.  Returns ``None`` when fewer than ``min_sample``
+    qualifying tasks exist.
+
+    Each entry:
+        {"cat_a": str, "cat_b": str, "co_fail_count": int,
+         "p_b_given_a": float, "base_rate_b": float, "lift": float}
+    """
+    total = 0
+    cat_miss_counts: Dict[str, int] = defaultdict(int)
+    pair_counts: Dict[tuple, int] = defaultdict(int)
+
+    for t in tasks:
+        if (t.first_payload or {}).get("type") not in _SR_CODE_CHANGE_TYPES:
+            continue
+        ctx = t.context or {}
+        sro = ctx.get("_self_review_outcome")
+        if not sro or is_skipped_sr_outcome(sro):
+            continue
+        total += 1
+        check_results = sro.get("check_results") or {}
+        failed = {
+            c
+            for c, r in check_results.items()
+            if isinstance(r, dict) and not r.get("passed", True)
+        }
+        for cat in failed:
+            cat_miss_counts[cat] += 1
+        for cat_a in failed:
+            for cat_b in failed:
+                if cat_a != cat_b:
+                    pair_counts[(cat_a, cat_b)] += 1
+
+    if total < min_sample:
+        return None
+
+    pairs = []
+    for (cat_a, cat_b), co_count in pair_counts.items():
+        if co_count < min_co_count:
+            continue
+        miss_a = cat_miss_counts[cat_a]
+        miss_b = cat_miss_counts[cat_b]
+        if miss_a == 0 or miss_b == 0:
+            continue
+        p_b_given_a = co_count / miss_a
+        base_rate_b = miss_b / total
+        lift = p_b_given_a / base_rate_b
+        pairs.append(
+            {
+                "cat_a": cat_a,
+                "cat_b": cat_b,
+                "co_fail_count": co_count,
+                "p_b_given_a": round(p_b_given_a, 4),
+                "base_rate_b": round(base_rate_b, 4),
+                "lift": round(lift, 4),
+            }
+        )
+
+    pairs.sort(key=lambda x: -x["lift"])
+    return pairs[:top_n]
+
+
 def classify_theme_example_layers(examples: list) -> list:
     """Return layer tags derived from verbatim blind-spot example texts.
 
@@ -867,6 +957,101 @@ def classify_theme_example_layers(examples: list) -> list:
         if text:
             layers.update(classify_layers("SR_BLIND_SPOT", text, None))
     return sorted(layers)
+
+
+_PERSISTENT_BLIND_SPOT_THRESHOLD = 0.25
+_PERSISTENT_BLIND_SPOT_MIN_SAMPLE = 3
+
+
+def compute_persistent_sr_blind_spot_hint(
+    tasks,
+    *,
+    threshold: float = _PERSISTENT_BLIND_SPOT_THRESHOLD,
+    min_sample: int = _PERSISTENT_BLIND_SPOT_MIN_SAMPLE,
+    window_count: int = 2,
+    window_days: int = 7,
+    now: datetime | None = None,
+) -> Dict[str, Any]:
+    """Return a persistent_blind_spots hint for injection into the SR prompt.
+
+    Splits *tasks* into *window_count* consecutive *window_days*-day buckets
+    (most-recent-first).  A category is 'persistent' when its reviewer-disagreement
+    rate (reviewer_misses / qualifying_tasks_in_window) exceeds *threshold* in
+    every bucket that has at least *min_sample* qualifying tasks.
+
+    Returns::
+
+        {
+            "categories": [{"category": str, "task_type": str, "rate": float}, ...],
+            "hint": str | None,
+        }
+
+    Empty ``categories`` and ``hint=None`` when no persistent categories exist.
+    Pass *now* in tests to pin the clock.
+    """
+    _now = now or datetime.utcnow()
+
+    def _qualifying(window_tasks):
+        out = []
+        for t in window_tasks:
+            if (t.first_payload or {}).get("type") not in _SR_CODE_CHANGE_TYPES:
+                continue
+            sro = (t.context or {}).get("_self_review_outcome")
+            if not sro or is_skipped_sr_outcome(sro):
+                continue
+            out.append(t)
+        return out
+
+    window_results: List[Dict[tuple, float]] = []
+    for i in range(window_count):
+        cutoff_end = _now - timedelta(days=i * window_days)
+        cutoff_start = _now - timedelta(days=(i + 1) * window_days)
+        bucket = [
+            t
+            for t in tasks
+            if t.created_at is not None and cutoff_start <= t.created_at < cutoff_end
+        ]
+        qual = _qualifying(bucket)
+        if len(qual) < min_sample:
+            window_results.append({})
+            continue
+        counts = _count_reviewer_disagreement_directions(qual)
+        total = len(qual)
+        rates: Dict[tuple, float] = {}
+        for key, data in counts.items():
+            miss = data["miss"]
+            if miss > 0:
+                rates[key] = round(miss / total, 4)
+        window_results.append(rates)
+
+    all_keys: set = set()
+    for wr in window_results:
+        all_keys.update(wr.keys())
+
+    persistent: List[Dict[str, Any]] = []
+    for key in all_keys:
+        per_window = [wr.get(key) for wr in window_results]
+        if all(r is not None and r >= threshold for r in per_window):
+            cat, ttype = key
+            avg_rate = sum(per_window) / len(per_window)  # type: ignore[arg-type]
+            persistent.append(
+                {"category": cat, "task_type": ttype, "rate": round(avg_rate, 4)}
+            )
+
+    if not persistent:
+        return {"categories": [], "hint": None}
+
+    persistent.sort(key=lambda x: -x["rate"])
+    cat_phrases = ", ".join(
+        f"{p['category']} ({p['rate'] * 100:.0f}%)" for p in persistent
+    )
+    hint = (
+        f"Persistent self-review blind spots (reviewer-disagreement rate over"
+        f" {window_count} x {window_days}-day windows): {cat_phrases}."
+        " Spend extra attention on these categories — reviewers have consistently"
+        " flagged issues the self-review pass missed."
+    )
+    return {"categories": persistent, "hint": hint}
 
 
 def count_reviewer_disagreements_in_tasks(tasks) -> Dict[tuple, int]:
@@ -938,6 +1123,7 @@ async def aggregate_sr_reviewer_disagreements(
             )
             if (bucket["fp"] + bucket["tp"]) > 0
             else None,
+            "examples": bucket["examples"],
         }
         for (cat, ttype), bucket in top
     ]

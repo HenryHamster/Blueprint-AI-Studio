@@ -3,7 +3,7 @@ import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { TaskDetailDrawer } from './TaskDetailDrawer';
 import type { Task } from '../types/task';
-import { expectNoOverflowAt, expectMinTouchTargetAt } from '../test/viewport';
+import { expectNoOverflowAt, expectMinTouchTargetAt, expectNoTextTruncationAt } from '../test/viewport';
 
 // Stub firebase before any module that transitively imports it.
 // Browser-mode vitest validates ESM exports statically, so the mock must
@@ -59,6 +59,34 @@ describe('TaskDetailDrawer — viewport regression', () => {
         r.render(
           <TaskDetailDrawer
             task={makeTask()}
+            logLines={[]}
+            onClose={() => {}}
+            onApprove={() => {}}
+            onRequestChanges={() => {}}
+            onCancel={() => {}}
+            onRetry={() => {}}
+            onEditPrompt={() => {}}
+            onDismiss={() => {}}
+          />,
+        );
+      });
+    });
+  });
+
+  test('long task title and description are not silently clipped at 375px', async () => {
+    await expectNoTextTruncationAt(375, async () => {
+      host = document.createElement('div');
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <TaskDetailDrawer
+            task={makeTask({
+              title: 'feat(regression): classify viewport-test failures as a distinct regression class with per-layer escalation_reason metadata attached to each pipeline case',
+              description: 'fix(backend): handle the edge case where pipeline_regression_dispatcher emits duplicate escalation_reason labels on retry loops — add dedup guard in dispatch_single_signal and update test_pipeline_regression_dispatcher.py to cover the retry path',
+              latest_status_message: 'backend/testing/test_pipeline_regression_dispatcher.py — 47 tests passing; admin-ui/src/components/PipelineRegressionsPanel.viewport.test.tsx — building at 375px mobile viewport',
+            })}
             logLines={[]}
             onClose={() => {}}
             onApprove={() => {}}

@@ -289,6 +289,25 @@ class Project(SQLModel, table=True):
         default_factory=dict,
         sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
     )
+    # Per-category self-review catch-rate targets set by the operator.
+    # Shape: {category_id: float} e.g. {'security': 0.80, 'regression_risk': 0.75}.
+    # Absent key = no target configured for that category (default: no alerting).
+    sr_catch_rate_targets: Dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
+    )
+
+    def append_routine_digest(self, event_type: str, summary: str) -> None:
+        """Append a one-line digest entry for a routine event to running_update.
+
+        Canonical home for this logic — callers (notification_dispatch, admin_notifications,
+        strategic_completion) mutate running_update through this method so the format stays
+        consistent. Does NOT commit — caller is responsible for session.add(project).
+        """
+        now_str = _utcnow().strftime("%Y-%m-%d %H:%M")
+        line = f"- [{now_str}] **{event_type}**: {summary[:200]}"
+        current = (self.running_update or "").rstrip()
+        self.running_update = f"{current}\n{line}" if current else line
 
     tasks: List["Task"] = Relationship(
         back_populates="project",
@@ -311,6 +330,33 @@ class ProjectMember(SQLModel, table=True):
     created_at: datetime = Field(
         default_factory=_utcnow,
         sa_column=Column(NaiveUTCDateTime, nullable=False),
+    )
+
+
+class MessagesLastSeen(SQLModel, table=True):
+    """Per-operator, per-project last-seen timestamp for the messages panel divider.
+
+    Enables cross-device persistence of the since-last-visit divider position.
+    localStorage remains the offline fallback; this table is the authoritative
+    source when the backend is reachable.
+    """
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    user_id: str = Field(index=True, max_length=128)
+    project_id: uuid.UUID = Field(foreign_key="project.id", index=True)
+    last_seen_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False),
+    )
+    updated_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, onupdate=_utcnow),
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id", "project_id", name="uq_messageslastseen_user_project"
+        ),
     )
 
 
@@ -477,6 +523,32 @@ class Task(SQLModel, table=True):
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
     vm_spot: bool = Field(default=False)
+
+    # Efficiency-direction (d-91d8dede) foundational instrumentation.
+    # vm_cold_start_ms = (first agent heartbeat - vm_provisioned_at) in ms.
+    # Recorded once per VM lifecycle and guarded by IS NULL so a re-provision
+    # restamp of vm_provisioned_at (orchestrator.py line ~3240) does not
+    # overwrite the genuine cold-start measurement.
+    vm_cold_start_ms: Optional[int] = Field(
+        default=None,
+        sa_column=Column(Integer, nullable=True),
+    )
+    # vm_warm_start is True when the VM was reused from a warm pool / cached
+    # image rather than freshly provisioned. There is no warm pool today, so
+    # all provisions write False — the column is foundational scaffolding so
+    # that vm_reuse_rate has a real signal once warm pooling lands.
+    vm_warm_start: Optional[bool] = Field(
+        default=False,
+        sa_column=Column(Boolean, nullable=True, server_default=text("false")),
+    )
+    # Cumulative per-task LLM telemetry posted by the agent on every heartbeat.
+    # Shape: {"llm_call_count": int, "total_input_tokens": int,
+    # "total_output_tokens": int, "last_updated_at": iso8601}.
+    # Backwards-compatible — older agents that don't ship these fields leave
+    # this column NULL.
+    api_call_summary: Optional[Dict[str, Any]] = Field(
+        default=None, sa_column=Column(JSONB, nullable=True)
+    )
 
     # Lifecycle flags promoted from JSONB context (audit 2026-04-25 W1).
     # Reading these via SELECT FOR UPDATE returns DB-fresh values without
@@ -1562,6 +1634,15 @@ class RegressionRemediationCase(SQLModel, table=True):
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
+    # Timestamp when an operator first acknowledged the manual-intervention
+    # escalation. NULL for unacknowledged cases and for historical cases
+    # predating this column. Set once via the acknowledge endpoint; idempotent
+    # (never overwritten once stamped). Enables MTTI metric:
+    # needs_manual_intervention_at → operator_acknowledged_at.
+    operator_acknowledged_at: Optional[datetime] = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
     # Timestamp when the underlying signal first crossed its threshold during
     # the most recent dispatcher pass. Separate from first_seen_at (case
     # creation) and last_remediation_task_id spawn time. Enables time-to-detect
@@ -1655,6 +1736,23 @@ class RegressionRemediationCase(SQLModel, table=True):
     marginal_followup_spawned_at: Optional[datetime] = Field(
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+    # Timestamp when the most recent compliance follow-up investigate task was
+    # spawned for this case. Acts as a durable cooldown anchor: the dispatcher
+    # skips spawning a new compliance follow-up if now − compliance_followup_spawned_at
+    # is within the configured cooldown window (default 72 h). Null for cases that
+    # have never triggered a compliance follow-up or pre-date this column.
+    compliance_followup_spawned_at: Optional[datetime] = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+    # Attribution for the PR/commit that introduced this regression. Set when
+    # a new case is first created or re-tripped after CLOSED. Null for legacy
+    # rows and cases where attribution could not be determined.
+    introducing_pr_number: Optional[int] = Field(default=None)
+    introducing_commit_sha: Optional[str] = Field(
+        default=None,
+        sa_column=Column(String(40), nullable=True),
     )
     created_at: datetime = Field(
         default_factory=_utcnow,
@@ -2019,4 +2117,8 @@ class DispatcherCycleRecord(SQLModel, table=True):
     confirmed_recoveries_count: int = Field(
         default=0,
         sa_column=Column(Integer, nullable=False, server_default=text("0")),
+    )
+    avg_prevention_rate_7d: Optional[float] = Field(
+        default=None,
+        sa_column=Column(Float, nullable=True),
     )

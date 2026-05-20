@@ -1,0 +1,8 @@
+{
+  "_doc": "Canonical shape of project_context.sr_co_failure_pairs. Producer: backend/app/routers/agent.py (response['project_context']['sr_co_failure_pairs']). Consumer: agent/src/prompts/self-review.ts -> formatSrCoFailurePairsForSrPrompt. Contract tests on both sides load this file; if the shape diverges, both tests must be updated. A byte-identical copy is kept at backend/testing/__fixtures__/sr_co_failure_pairs_contract.json so the backend Docker test (which has no access to agent/) can read it; contract parity test asserts the two files match when both are reachable.",
+  "sr_co_failure_pairs": [
+    { "cat_a": "correctness", "cat_b": "test-coverage", "lift": 2.3 },
+    { "cat_a": "type-safety", "cat_b": "error-handling", "lift": 1.8 },
+    { "cat_a": "security", "cat_b": "correctness", "lift": 1.6 }
+  ]
+}

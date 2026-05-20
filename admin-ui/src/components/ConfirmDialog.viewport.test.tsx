@@ -2,7 +2,7 @@ import { afterEach, describe, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { ConfirmDialog } from './ConfirmDialog';
-import { expectNoOverflowAt } from '../test/viewport';
+import { expectNoOverflowAt, expectNoTextTruncationAt } from '../test/viewport';
 
 vi.mock('../api', () => ({
   apiFetch: vi.fn(async () => new Response('{}', { status: 200 })),
@@ -60,6 +60,27 @@ describe('ConfirmDialog — viewport regression', () => {
             title="Disable Auto-Remediation for this Project"
             message="Disabling auto-remediation means that CI failures on your default branch will no longer automatically trigger fix PRs. You can re-enable this feature at any time from the project settings. Are you sure you want to proceed?"
             confirmLabel="Disable Feature"
+            onConfirm={() => {}}
+            onCancel={() => {}}
+          />,
+        );
+      });
+    });
+  });
+
+  test('long title and message are not silently clipped at 375px', async () => {
+    await expectNoTextTruncationAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <ConfirmDialog
+            title="Are you sure you want to permanently delete this research direction and all its associated findings, audit history, and strategic decisions?"
+            message="This action cannot be undone. All research findings, cycle history, and strategic decisions tied to direction 'd-003: improve admin UI mobile responsiveness across all operator-facing panels' will be permanently removed from the system. Active tasks referencing this direction will be orphaned and must be manually reassigned."
+            confirmLabel="Delete Permanently"
             onConfirm={() => {}}
             onCancel={() => {}}
           />,

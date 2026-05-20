@@ -11,6 +11,11 @@ from app.research_context import (
     _parse_eviction_counts,
     _format_eviction_body,
     build_recent_findings_evidence,
+    extract_diagnosis_from_context,
+)
+from app.finding_deduplication import (
+    extract_archived_diagnoses,
+    _find_archived_diagnosis_match,
 )
 
 
@@ -568,3 +573,122 @@ class TestEvictedOutRecords:
             history_entry={},
         )
         assert "## Eviction Summary" in result
+
+
+class TestExtractDiagnosisFromContext:
+    """extract_diagnosis_from_context: diagnosis archive functionality."""
+
+    def test_extracts_eviction_summary_when_present(self):
+        context = (
+            "## Eviction Summary\n"
+            "3 established, 2 failed evicted\n"
+            "Failed: Approach A; Approach B\n"
+            "\n"
+            "## Established Findings\n"
+            "- Finding 1\n"
+        )
+        diagnosis = extract_diagnosis_from_context(context)
+        assert "3 established" in diagnosis
+        assert "2 failed" in diagnosis
+        assert "Approach A" in diagnosis
+
+    def test_returns_empty_when_no_eviction_summary(self):
+        context = "## Established Findings\n- Finding 1\n## Failed Approaches\n"
+        diagnosis = extract_diagnosis_from_context(context)
+        assert diagnosis == ""
+
+    def test_returns_empty_for_none_context(self):
+        diagnosis = extract_diagnosis_from_context(None)
+        assert diagnosis == ""
+
+    def test_returns_empty_for_empty_string(self):
+        diagnosis = extract_diagnosis_from_context("")
+        assert diagnosis == ""
+
+
+class TestArchivedDiagnosesExtraction:
+    """extract_archived_diagnoses: pulling diagnoses from design_doc archive."""
+
+    def test_extracts_diagnoses_from_archive(self):
+        design_doc = {
+            "retired_diagnoses_archive": [
+                {
+                    "direction_id": "d-1",
+                    "diagnosis": "3 established, 2 failed evicted",
+                    "archived_at": "2026-05-01T00:00:00",
+                },
+                {
+                    "direction_id": "d-2",
+                    "diagnosis": "1 established evicted",
+                    "archived_at": "2026-05-02T00:00:00",
+                },
+            ]
+        }
+        diagnoses = extract_archived_diagnoses(design_doc)
+        assert len(diagnoses) == 2
+        assert "3 established, 2 failed evicted" in diagnoses
+        assert "1 established evicted" in diagnoses
+
+    def test_returns_empty_when_no_archive(self):
+        design_doc = {}
+        diagnoses = extract_archived_diagnoses(design_doc)
+        assert diagnoses == []
+
+    def test_returns_empty_for_none_design_doc(self):
+        diagnoses = extract_archived_diagnoses(None)
+        assert diagnoses == []
+
+    def test_filters_empty_diagnoses(self):
+        design_doc = {
+            "retired_diagnoses_archive": [
+                {"direction_id": "d-1", "diagnosis": "valid diagnosis"},
+                {"direction_id": "d-2", "diagnosis": ""},
+                {"direction_id": "d-3", "diagnosis": "   "},
+            ]
+        }
+        diagnoses = extract_archived_diagnoses(design_doc)
+        assert len(diagnoses) == 1
+        assert diagnoses[0] == "valid diagnosis"
+
+
+class TestArchivedDiagnosisMatching:
+    """_find_archived_diagnosis_match: word-overlap matching for diagnoses."""
+
+    def test_matches_diagnosis_with_word_overlap(self):
+        # Need ≥3 non-stopword overlap (see _find_archived_diagnosis_match
+        # docstring): caching, approach, database — three shared content words.
+        archived = [
+            "3 established, 2 failed evicted from caching approach against database",
+            "1 established evicted from authentication layer",
+        ]
+        title = "caching approach against database tuning"
+        match = _find_archived_diagnosis_match(title, archived)
+        assert match is not None
+        assert "caching" in match.lower()
+
+    def test_returns_none_when_no_overlap(self):
+        archived = ["3 established evicted from database pooling"]
+        title = "add new authentication mechanism"
+        match = _find_archived_diagnosis_match(title, archived)
+        assert match is None
+
+    def test_requires_3_word_overlap_threshold(self):
+        archived = [
+            "approach to improve system performance in database",
+        ]
+        # Only 2 shared words: "system" and "database" — below threshold
+        title = "system database optimization"
+        match = _find_archived_diagnosis_match(title, archived)
+        # This should match because shared non-stopwords are: system, database, improve → 3
+        # Actually: "improve system database" vs "approach improve system performance database"
+        # Shared: system, database = 2 words. Should NOT match.
+        # Let me adjust the test...
+        assert match is None
+
+    def test_handles_case_insensitivity(self):
+        # Need ≥3 non-stopword overlap: caching, approach, database (after
+        # _STOPWORDS removes "add"/"to" etc.).
+        archived = ["FAILED Caching APPROACH AGAINST DATABASE"]
+        title = "caching approach against database"
+        match = _find_archived_diagnosis_match(title, archived)
+        assert match is not None

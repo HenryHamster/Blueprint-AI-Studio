@@ -23,6 +23,9 @@ from app.pipeline_regression_dispatcher import (
     _REGRESSION_COOLDOWN,
     _WATCHDOG_ACTIVE_STALE_THRESHOLD,
     _WATCHDOG_MERGED_STALE_THRESHOLD,
+    _format_cross_layer_prompt,
+    _format_fragile_recurrence_meta_prompt,
+    _format_layer_concentration_prompt,
     get_dispatcher_cycle_records,
     get_regression_mtta_data,
     run_dispatcher_watchdog_alarms,
@@ -30,6 +33,7 @@ from app.pipeline_regression_dispatcher import (
     run_recovery_once,
     run_watchdog_once,
 )
+from app.regression_layer_classifier import LAYER_DISPLAY_ORDER
 from app.time_utils import _utcnow
 
 from testing.factories import make_project, make_task, make_task_history
@@ -3748,6 +3752,10 @@ async def test_fragile_recurrence_meta_on_third_recurrence(db_session):
     assert "FRAGILE-RECURRENCE META-INVESTIGATION" in prompt
     assert "meta-investigation" in prompt.lower()
 
+    # Prompt must require >=2 layer defenses or explicit justification.
+    assert "AT LEAST TWO distinct" in prompt
+    assert "justification" in prompt.lower()
+
     # Must reference at least 2 distinct canonical layer classes.
     layer_mentions = [
         layer
@@ -4228,13 +4236,14 @@ async def test_sr_blind_spot_theme_prompt_has_layer_enumeration_block(db_session
     assert task is not None
     prompt = (task.first_payload or {}).get("prompt", "")
     assert "META-INVESTIGATION" in prompt
-    assert "Enumerate ALL FIVE canonical layers explicitly" in prompt
+    assert "Enumerate ALL SIX canonical layers explicitly" in prompt
     for layer in (
         "CI_WORKFLOW",
         "AGENT_VM",
         "AGENT_VERB",
         "BASELINE_GATE",
         "REVIEWER_PASS",
+        "VIEWPORT",
     ):
         assert layer in prompt
 
@@ -6560,7 +6569,7 @@ async def test_cross_layer_with_recurrence_blends_prompts(db_session):
 
         # Recurrence details should be present.
         assert "4321" in prompt
-        assert "Enumerate ALL FIVE canonical layers explicitly:" in prompt
+        assert "Enumerate ALL SIX canonical layers explicitly:" in prompt
     finally:
         import app.shared_state as _ss
 
@@ -7841,6 +7850,9 @@ def test_format_cross_layer_prompt_includes_layer_defense_block():
     assert "CROSS-LAYER REGRESSION DETECTED" in result
     assert "RECENT DEFENSE ACTIVITY BY LAYER" in result
     assert "base prompt" in result
+    # Verify the prompt requires >=2 layer defenses or explicit justification.
+    assert "AT LEAST TWO distinct" in result
+    assert "justification" in result
 
 
 def test_format_theme_layer_meta_prompt_includes_layer_defense_block():
@@ -8966,6 +8978,120 @@ def test_compute_layer_fragility_stats_durable_long_hold_not_fragile():
     assert s["avg_hold_days"] > 7.0
 
 
+def test_compute_layer_fragility_stats_empty_cohort_fields_zeroed():
+    """Empty input yields zeroed cohort counts and None cohort averages."""
+    from app.pipeline_regression_dispatcher import _compute_layer_fragility_stats
+
+    stats = _compute_layer_fragility_stats([])
+    for s in stats.values():
+        assert s["single_layer_fix_count"] == 0
+        assert s["single_layer_avg_hold_days"] is None
+        assert s["multi_layer_fix_count"] == 0
+        assert s["multi_layer_avg_hold_days"] is None
+
+
+def test_compute_layer_fragility_stats_all_single_layer():
+    """All-single-layer entries → multi cohort empty/None, single cohort populated."""
+    from app.pipeline_regression_dispatcher import _compute_layer_fragility_stats
+
+    now = _utcnow()
+    entries = [
+        {
+            "merged_at": (now - timedelta(days=10)).isoformat(),
+            "recovered_at": (now - timedelta(days=6)).isoformat(),  # hold=4d
+            "layers_targeted": ["CI_WORKFLOW"],
+        },
+        {
+            "merged_at": (now - timedelta(days=20)).isoformat(),
+            "recovered_at": (now - timedelta(days=14)).isoformat(),  # hold=6d
+            "layers_targeted": ["CI_WORKFLOW"],
+        },
+    ]
+    stats = _compute_layer_fragility_stats(entries)
+    s = stats["CI_WORKFLOW"]
+    assert s["fix_count"] == 2
+    assert s["single_layer_fix_count"] == 2
+    assert s["multi_layer_fix_count"] == 0
+    assert s["multi_layer_avg_hold_days"] is None
+    assert s["single_layer_avg_hold_days"] is not None
+    assert abs(s["single_layer_avg_hold_days"] - 5.0) < 0.1
+
+
+def test_compute_layer_fragility_stats_all_multi_layer():
+    """All-multi-layer entries → single cohort empty/None, multi cohort populated for each layer."""
+    from app.pipeline_regression_dispatcher import _compute_layer_fragility_stats
+
+    now = _utcnow()
+    entries = [
+        {
+            "merged_at": (now - timedelta(days=20)).isoformat(),
+            "recovered_at": (now - timedelta(days=10)).isoformat(),  # hold=10d
+            "layers_targeted": ["CI_WORKFLOW", "AGENT_VM"],
+        },
+    ]
+    stats = _compute_layer_fragility_stats(entries)
+    for layer in ("CI_WORKFLOW", "AGENT_VM"):
+        s = stats[layer]
+        assert s["fix_count"] == 1
+        assert s["single_layer_fix_count"] == 0
+        assert s["single_layer_avg_hold_days"] is None
+        assert s["multi_layer_fix_count"] == 1
+        assert s["multi_layer_avg_hold_days"] is not None
+        assert abs(s["multi_layer_avg_hold_days"] - 10.0) < 0.1
+
+
+def test_compute_layer_fragility_stats_mixed_cohorts_and_still_holding():
+    """Mixed entries (single/multi, recovered/still-holding) split correctly per cohort."""
+    from app.pipeline_regression_dispatcher import _compute_layer_fragility_stats
+
+    now = _utcnow()
+    entries = [
+        # single-layer, recovered, hold=2d
+        {
+            "merged_at": (now - timedelta(days=10)).isoformat(),
+            "recovered_at": (now - timedelta(days=8)).isoformat(),
+            "layers_targeted": ["BASELINE_GATE"],
+        },
+        # single-layer, still holding (no recovered_at)
+        {
+            "merged_at": (now - timedelta(days=4)).isoformat(),
+            "layers_targeted": ["BASELINE_GATE"],
+        },
+        # multi-layer including BASELINE_GATE, recovered, hold=20d
+        {
+            "merged_at": (now - timedelta(days=25)).isoformat(),
+            "recovered_at": (now - timedelta(days=5)).isoformat(),
+            "layers_targeted": ["BASELINE_GATE", "REVIEWER_PASS"],
+        },
+        # multi-layer including BASELINE_GATE, still holding
+        {
+            "merged_at": (now - timedelta(days=2)).isoformat(),
+            "layers_targeted": ["BASELINE_GATE", "AGENT_VM"],
+        },
+    ]
+    stats = _compute_layer_fragility_stats(entries)
+    bg = stats["BASELINE_GATE"]
+    # Blended totals preserved.
+    assert bg["fix_count"] == 4
+    assert bg["avg_hold_days"] is not None
+    assert abs(bg["avg_hold_days"] - 11.0) < 0.1  # avg of 2d, 20d
+    # Single cohort: 2 entries (one recovered hold=2d, one still holding).
+    assert bg["single_layer_fix_count"] == 2
+    assert bg["single_layer_avg_hold_days"] is not None
+    assert abs(bg["single_layer_avg_hold_days"] - 2.0) < 0.1
+    # Multi cohort: 2 entries (one recovered hold=20d, one still holding).
+    assert bg["multi_layer_fix_count"] == 2
+    assert bg["multi_layer_avg_hold_days"] is not None
+    assert abs(bg["multi_layer_avg_hold_days"] - 20.0) < 0.1
+    # REVIEWER_PASS only saw the multi-layer recovered entry.
+    rp = stats["REVIEWER_PASS"]
+    assert rp["single_layer_fix_count"] == 0
+    assert rp["single_layer_avg_hold_days"] is None
+    assert rp["multi_layer_fix_count"] == 1
+    assert rp["multi_layer_avg_hold_days"] is not None
+    assert abs(rp["multi_layer_avg_hold_days"] - 20.0) < 0.1
+
+
 def test_build_layer_defense_ledger_unchanged_after_refactor():
     """String output after helper refactor matches pre-refactor fixture."""
     from app.pipeline_regression_dispatcher import (
@@ -9035,6 +9161,9 @@ def test_format_layer_concentration_prompt_content():
     assert "STRUCTURAL QUESTIONS" in prompt
     assert ".github/workflows/" in prompt
     assert "RECENT DEFENSE ACTIVITY BY LAYER" in prompt
+    # Verify the prompt requires defenses in at least one other layer or justification.
+    assert "AT LEAST ONE OTHER layer" in prompt
+    assert "justification" in prompt.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -9768,6 +9897,246 @@ def test_compute_unclassified_fix_coverage_excludes_pre_classification_entries()
 
 
 # ---------------------------------------------------------------------------
+# Awaiting-backfill alert evaluator tests
+# ---------------------------------------------------------------------------
+
+
+def _make_awaiting_backfill_case(
+    project_id,
+    regression_class: str,
+    *,
+    awaiting_merged_ages_hours: list[float] | None = None,
+    classified_layers: list[list[str]] | None = None,
+):
+    """Construct a RegressionRemediationCase with cross-layer fix-log entries
+    in the awaiting_backfill bucket (spawn_was_cross_layer=True, merged_at
+    set, no layers_targeted) and optionally fully-classified entries."""
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+
+    now = _utcnow()
+    log: list[dict] = []
+    pr = 2000
+    for age_hours in awaiting_merged_ages_hours or []:
+        merged_at = (now - timedelta(hours=age_hours)).isoformat()
+        log.append(
+            {
+                "fingerprint": regression_class,
+                "fix_pr_number": pr,
+                "merged_at": merged_at,
+                "spawn_was_cross_layer": True,
+                # Intentionally no layers_targeted — backfill not yet run.
+            }
+        )
+        pr += 1
+    for layers in classified_layers or []:
+        log.append(
+            {
+                "fingerprint": regression_class,
+                "fix_pr_number": pr,
+                "merged_at": now.isoformat(),
+                "spawn_was_cross_layer": True,
+                "layers_targeted": list(layers),
+            }
+        )
+        pr += 1
+
+    return RegressionRemediationCase(
+        project_id=project_id,
+        regression_class=regression_class,
+        status=RegressionCaseStatus.MERGED,
+        fingerprint_to_fix_log=log,
+    )
+
+
+@pytest.mark.asyncio
+async def test_awaiting_backfill_alert_fires_on_count_threshold(db_session):
+    """≥ 5 awaiting entries past the 24h grace → exactly one WARNING alert."""
+    from app.models import Alert, AlertSeverity
+    from app.pipeline_regression_dispatcher import (
+        _AWAITING_BACKFILL_ALERT_TITLE,
+        _evaluate_awaiting_backfill_alert,
+    )
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # 5 entries each ~36h old — past the 24h grace, so all count toward
+    # over_threshold. Oldest is 36h, below the 3-day age trigger.
+    case = _make_awaiting_backfill_case(
+        project.id,
+        "sr_catch_rate",
+        awaiting_merged_ages_hours=[36.0, 36.5, 37.0, 37.5, 38.0],
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    await _evaluate_awaiting_backfill_alert(db_session, project.id)
+
+    alerts = (
+        (await db_session.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+    alert = alerts[0]
+    assert alert.title == _AWAITING_BACKFILL_ALERT_TITLE
+    assert alert.severity == AlertSeverity.WARNING
+    assert alert.task_id is None
+    assert "5 entries total" in alert.message
+    assert "older than 24h" in alert.message
+
+
+@pytest.mark.asyncio
+async def test_awaiting_backfill_alert_fires_on_age_threshold(db_session):
+    """A single entry older than 3 days trips the age signal independent of count."""
+    from app.models import Alert
+    from app.pipeline_regression_dispatcher import (
+        _AWAITING_BACKFILL_ALERT_TITLE,
+        _evaluate_awaiting_backfill_alert,
+    )
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # 1 entry, 4 days old — count below threshold (5) but age trips.
+    case = _make_awaiting_backfill_case(
+        project.id,
+        "sr_catch_rate",
+        awaiting_merged_ages_hours=[4 * 24.0],
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    await _evaluate_awaiting_backfill_alert(db_session, project.id)
+
+    alerts = (
+        (await db_session.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+    assert alerts[0].title == _AWAITING_BACKFILL_ALERT_TITLE
+
+
+@pytest.mark.asyncio
+async def test_awaiting_backfill_alert_dedups_across_runs(db_session):
+    """Running the evaluator twice produces only one open alert."""
+    from app.models import Alert
+    from app.pipeline_regression_dispatcher import _evaluate_awaiting_backfill_alert
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    case = _make_awaiting_backfill_case(
+        project.id,
+        "sr_catch_rate",
+        awaiting_merged_ages_hours=[36.0, 36.0, 36.0, 36.0, 36.0],
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    await _evaluate_awaiting_backfill_alert(db_session, project.id)
+    await _evaluate_awaiting_backfill_alert(db_session, project.id)
+
+    alerts = (
+        (await db_session.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+
+
+@pytest.mark.asyncio
+async def test_awaiting_backfill_alert_no_alert_below_thresholds(db_session):
+    """Healthy backlog — recent awaiting entries plus classified entries → no alert."""
+    from app.models import Alert
+    from app.pipeline_regression_dispatcher import _evaluate_awaiting_backfill_alert
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # 3 awaiting entries all <24h old (under grace), plus a classified entry.
+    # Neither count nor age trigger fires.
+    case = _make_awaiting_backfill_case(
+        project.id,
+        "sr_catch_rate",
+        awaiting_merged_ages_hours=[1.0, 2.0, 3.0],
+        classified_layers=[["CI_WORKFLOW", "AGENT_VM"]],
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    await _evaluate_awaiting_backfill_alert(db_session, project.id)
+
+    alerts = (
+        (await db_session.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert alerts == []
+
+
+@pytest.mark.asyncio
+async def test_awaiting_backfill_alert_evaluator_failure_does_not_break_recovery(
+    db_session, monkeypatch
+):
+    """Transient failure in awaiting-backfill evaluator does not break sibling
+    path-classifier-coverage evaluator running alongside in run_recovery_once."""
+    from app.models import Alert
+    from app.pipeline_regression_dispatcher import (
+        _PATH_CLASSIFIER_COVERAGE_ALERT_TITLE,
+    )
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Set up data that would trip the path-classifier coverage alert so we
+    # can confirm it still fires when the sibling raises.
+    case = _make_classified_case(
+        project.id,
+        "sr_catch_rate",
+        layers_entries=[["CI_WORKFLOW"], ["CI_WORKFLOW"], ["AGENT_VM"], ["AGENT_VM"]],
+        unmatched_entries=[
+            ["docs/a.md"],
+            ["docs/b.md"],
+            ["scripts/foo.sh"],
+            ["scripts/foo.sh"],
+        ],
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    async def _boom(session, project_id):
+        raise RuntimeError("simulated transient failure")
+
+    monkeypatch.setattr(
+        "app.pipeline_regression_dispatcher._evaluate_awaiting_backfill_alert",
+        _boom,
+    )
+
+    await run_recovery_once(db_session, project.id)
+
+    alerts = (
+        (await db_session.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    titles = [a.title for a in alerts]
+    # Path-classifier evaluator still ran and created its alert.
+    assert _PATH_CLASSIFIER_COVERAGE_ALERT_TITLE in titles
+
+
+# ---------------------------------------------------------------------------
 # Viewport regression evaluator tests
 # ---------------------------------------------------------------------------
 
@@ -9839,7 +10208,7 @@ class TestViewportRegressionEvaluator:
                     select(RegressionRemediationCase).where(
                         RegressionRemediationCase.project_id == project.id,
                         RegressionRemediationCase.regression_class
-                        == "viewport_regression:MessagesPanel@375",
+                        == "viewport_regression:MessagesPanel:overflow@375",
                     )
                 )
             )
@@ -10046,6 +10415,204 @@ class TestViewportRegressionEvaluator:
         assert len(trips) == 1
         assert trips[0]["failure_type"] == "mixed"
 
+    def test_extract_failure_type_text_truncation(self):
+        """_extract_failure_type returns 'text_truncation' for expectNoTextTruncationAt messages."""
+        from app.pipeline_regression_dispatcher import _extract_failure_type
+
+        msg = "expectNoTextTruncationAt(375): 1 element(s) truncated at width=375px"
+        assert _extract_failure_type(msg) == "text_truncation"
+
+    def test_extract_failure_type_overflow(self):
+        """_extract_failure_type returns 'overflow' for expectNoOverflowAt messages."""
+        from app.pipeline_regression_dispatcher import _extract_failure_type
+
+        msg = "expectNoOverflowAt(375): 2 element(s) overflow at width=375px"
+        assert _extract_failure_type(msg) == "overflow"
+
+    def test_extract_failure_type_unknown(self):
+        """_extract_failure_type returns 'unknown' when no known assertion is in the message."""
+        from app.pipeline_regression_dispatcher import _extract_failure_type
+
+        assert _extract_failure_type("some generic failure") == "unknown"
+
+    @pytest.mark.asyncio
+    async def test_regression_class_includes_assertion_type(self, db_session):
+        """Emitted regression_class includes assertion type: viewport_regression:<C>:<type>@<w>."""
+        from app.models import RegressionRemediationCase
+        from app.pipeline_regression_dispatcher import (
+            _VIEWPORT_REGRESSION_MIN_FAILURES,
+            _evaluate_viewport_regression_signal,
+        )
+
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        msg = (
+            "expectMinTouchTargetAt(375): 1 element(s) below 44px touch target\n"
+            "Found in TaskCard.viewport.test.tsx"
+        )
+        for _ in range(_VIEWPORT_REGRESSION_MIN_FAILURES):
+            db_session.add(_make_viewport_task(project.id, status_message=msg))
+        await db_session.commit()
+
+        spawned = await _evaluate_viewport_regression_signal(
+            db_session, project.id, spawn_budget_left=2
+        )
+        assert spawned == 1
+        await db_session.commit()
+
+        cases = (
+            (
+                await db_session.execute(
+                    select(RegressionRemediationCase).where(
+                        RegressionRemediationCase.project_id == project.id,
+                        RegressionRemediationCase.regression_class
+                        == "viewport_regression:TaskCard:touch_target@375",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(cases) == 1
+
+    @pytest.mark.asyncio
+    async def test_introducing_pr_number_in_trip_dict(self, db_session):
+        """Trip dict includes introducing_pr_number when earliest task has pr_number in payload."""
+        from app.pipeline_regression_dispatcher import (
+            _VIEWPORT_REGRESSION_MIN_FAILURES,
+            _collect_viewport_failures,
+        )
+
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        msg = (
+            "expectNoOverflowAt(375): overflow detected\n"
+            "Found in MessagesPanel.viewport.test.tsx"
+        )
+        now = _utcnow()
+        for i in range(_VIEWPORT_REGRESSION_MIN_FAILURES):
+            task = make_task(
+                project_id=project.id,
+                status=TaskStatus.FAILED,
+                payloads=[{"type": "review", "pr_number": 1234}],
+                created_at=now - timedelta(hours=i + 1),
+                updated_at=now - timedelta(hours=i + 1),
+            )
+            task.latest_status_message = msg
+            db_session.add(task)
+        await db_session.commit()
+
+        trips = await _collect_viewport_failures(db_session, project.id)
+        assert len(trips) == 1
+        assert trips[0]["introducing_pr_number"] == 1234
+        assert trips[0]["introducing_commit_sha"] is None
+
+    @pytest.mark.asyncio
+    async def test_introducing_commit_sha_in_trip_dict_when_no_pr(self, db_session):
+        """Trip dict includes introducing_commit_sha from context head_sha when no pr_number."""
+        from app.pipeline_regression_dispatcher import (
+            _VIEWPORT_REGRESSION_MIN_FAILURES,
+            _collect_viewport_failures,
+        )
+
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        msg = (
+            "expectNoOverflowAt(375): overflow detected\n"
+            "Found in KanbanBoard.viewport.test.tsx"
+        )
+        sha = "abc123def456789"
+        now = _utcnow()
+        for i in range(_VIEWPORT_REGRESSION_MIN_FAILURES):
+            task = make_task(
+                project_id=project.id,
+                status=TaskStatus.FAILED,
+                context={"head_sha": sha},
+                created_at=now - timedelta(hours=i + 1),
+                updated_at=now - timedelta(hours=i + 1),
+            )
+            task.latest_status_message = msg
+            db_session.add(task)
+        await db_session.commit()
+
+        trips = await _collect_viewport_failures(db_session, project.id)
+        assert len(trips) == 1
+        assert trips[0]["introducing_pr_number"] is None
+        assert trips[0]["introducing_commit_sha"] == sha
+
+    @pytest.mark.asyncio
+    async def test_introducing_attribution_none_when_no_signals(self, db_session):
+        """Trip dict has both attribution fields as None when task has no pr_number or head_sha."""
+        from app.pipeline_regression_dispatcher import (
+            _VIEWPORT_REGRESSION_MIN_FAILURES,
+            _collect_viewport_failures,
+        )
+
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        msg = (
+            "expectNoOverflowAt(375): overflow detected\n"
+            "Found in DirectionsPanel.viewport.test.tsx"
+        )
+        for _ in range(_VIEWPORT_REGRESSION_MIN_FAILURES):
+            db_session.add(_make_viewport_task(project.id, status_message=msg))
+        await db_session.commit()
+
+        trips = await _collect_viewport_failures(db_session, project.id)
+        assert len(trips) == 1
+        assert trips[0]["introducing_pr_number"] is None
+        assert trips[0]["introducing_commit_sha"] is None
+
+    @pytest.mark.asyncio
+    async def test_earliest_task_used_for_attribution(self, db_session):
+        """The earliest failing task's pr_number is used, not the most recent."""
+        from app.pipeline_regression_dispatcher import (
+            _VIEWPORT_REGRESSION_MIN_FAILURES,
+            _collect_viewport_failures,
+        )
+
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        msg = (
+            "expectNoOverflowAt(375): overflow detected\n"
+            "Found in ResearchBrowser.viewport.test.tsx"
+        )
+        now = _utcnow()
+        # Create tasks from newest to oldest; the oldest (highest offset) has pr_number=100.
+        # All other (newer) tasks have pr_number=999.
+        for i in range(_VIEWPORT_REGRESSION_MIN_FAILURES):
+            pr_num = 100 if i == _VIEWPORT_REGRESSION_MIN_FAILURES - 1 else 999
+            task = make_task(
+                project_id=project.id,
+                status=TaskStatus.FAILED,
+                payloads=[{"type": "review", "pr_number": pr_num}],
+                created_at=now - timedelta(hours=i + 1),
+                updated_at=now - timedelta(hours=i + 1),
+            )
+            task.latest_status_message = msg
+            db_session.add(task)
+        await db_session.commit()
+
+        trips = await _collect_viewport_failures(db_session, project.id)
+        assert len(trips) == 1
+        # The oldest task (pr_number=100) should determine attribution
+        assert trips[0]["introducing_pr_number"] == 100
+
 
 # ---------------------------------------------------------------------------
 # viewport_coverage_drop signal tests
@@ -10164,6 +10731,197 @@ async def test_viewport_coverage_drop_no_signal_on_component_removal(db_session)
         .all()
     )
     assert tasks == []
+
+
+# ---------------------------------------------------------------------------
+# viewport_coverage_snapshot producer tests
+# ---------------------------------------------------------------------------
+
+
+class TestComputeViewportCoverageSnapshot:
+    """Unit tests for compute_viewport_coverage_snapshot (pure function)."""
+
+    def _make_diff(
+        self,
+        *,
+        removed_assertions: int = 0,
+        added_assertions: int = 0,
+        context_assertions: int = 0,
+        escape_hatches: int = 0,
+        deleted_component: str | None = None,
+    ) -> str:
+        lines = []
+        if deleted_component:
+            lines.append(f"diff --git a/{deleted_component} b/{deleted_component}")
+            lines.append("deleted file mode 100644")
+            lines.append(f"--- a/{deleted_component}")
+            lines.append("+++ /dev/null")
+
+        lines.append(
+            "diff --git a/admin-ui/src/components/Foo.viewport.test.tsx"
+            " b/admin-ui/src/components/Foo.viewport.test.tsx"
+        )
+        lines.append("--- a/admin-ui/src/components/Foo.viewport.test.tsx")
+        lines.append("+++ b/admin-ui/src/components/Foo.viewport.test.tsx")
+        for _ in range(context_assertions):
+            lines.append(" expectNoOverflowAt(container, 375);")
+        for _ in range(removed_assertions):
+            lines.append("-expectNoOverflowAt(container, 375);")
+        for _ in range(added_assertions):
+            lines.append("+expectNoTextTruncationAt(container, 375);")
+
+        if escape_hatches:
+            lines.append(
+                "diff --git a/admin-ui/src/components/Bar.tsx"
+                " b/admin-ui/src/components/Bar.tsx"
+            )
+            lines.append("--- a/admin-ui/src/components/Bar.tsx")
+            lines.append("+++ b/admin-ui/src/components/Bar.tsx")
+            for _ in range(escape_hatches):
+                lines.append("+  <div data-viewport-allow-overflow>")
+
+        return "\n".join(lines)
+
+    def test_happy_path_drop(self):
+        from app.pipeline_regression_dispatcher import (
+            compute_viewport_coverage_snapshot,
+        )
+
+        diff = self._make_diff(
+            context_assertions=5, removed_assertions=3, added_assertions=0
+        )
+        snap = compute_viewport_coverage_snapshot(diff, pr_number=42)
+        # before = 5 context + 3 removed = 8
+        assert snap["assertion_count_before"] == 8
+        # after = 5 context + 0 added = 5
+        assert snap["assertion_count_after"] == 5
+        assert snap["new_escape_hatch_count"] == 0
+        assert snap["removed_component_files"] == []
+        assert snap["merged_pr"] == 42
+
+    def test_escape_hatch_addition(self):
+        from app.pipeline_regression_dispatcher import (
+            compute_viewport_coverage_snapshot,
+        )
+
+        diff = self._make_diff(
+            context_assertions=4,
+            removed_assertions=0,
+            added_assertions=0,
+            escape_hatches=2,
+        )
+        snap = compute_viewport_coverage_snapshot(diff, pr_number=99)
+        assert snap["assertion_count_before"] == snap["assertion_count_after"] == 4
+        assert snap["new_escape_hatch_count"] == 2
+
+    def test_legitimate_component_removal_suppresses(self):
+        from app.pipeline_regression_dispatcher import (
+            compute_viewport_coverage_snapshot,
+            _probe_viewport_coverage_drop,
+        )
+
+        diff = self._make_diff(
+            context_assertions=5,
+            removed_assertions=3,
+            deleted_component="admin-ui/src/components/OldWidget.tsx",
+        )
+        snap = compute_viewport_coverage_snapshot(diff, pr_number=77)
+        assert snap["removed_component_files"] == [
+            "admin-ui/src/components/OldWidget.tsx"
+        ]
+        # Probe should suppress when a component was legitimately removed
+        assert not _probe_viewport_coverage_drop({"viewport_coverage_snapshot": snap})
+
+    def test_no_admin_ui_files_skipped(self):
+        from app.pipeline_regression_dispatcher import (
+            compute_viewport_coverage_snapshot,
+        )
+
+        diff = "diff --git a/backend/app/foo.py b/backend/app/foo.py\n-old\n+new\n"
+        snap = compute_viewport_coverage_snapshot(diff, pr_number=1)
+        assert snap["assertion_count_before"] == 0
+        assert snap["assertion_count_after"] == 0
+        assert snap["new_escape_hatch_count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_update_writes_to_design_doc(self, db_session):
+        """update_viewport_coverage_snapshot_from_diff writes to project.design_doc."""
+        from app.pipeline_regression_dispatcher import (
+            update_viewport_coverage_snapshot_from_diff,
+        )
+
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        diff = self._make_diff(context_assertions=6, removed_assertions=2)
+        await update_viewport_coverage_snapshot_from_diff(
+            db_session, project, 123, diff
+        )
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        snap = (project.design_doc or {}).get("viewport_coverage_snapshot")
+        assert snap is not None
+        assert snap["assertion_count_before"] == 8
+        assert snap["assertion_count_after"] == 6
+        assert snap["merged_pr"] == 123
+
+    @pytest.mark.asyncio
+    async def test_update_skips_when_no_admin_ui(self, db_session):
+        """update_viewport_coverage_snapshot_from_diff is a no-op when no admin-ui in diff."""
+        from app.pipeline_regression_dispatcher import (
+            update_viewport_coverage_snapshot_from_diff,
+        )
+
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        diff = "diff --git a/backend/app/foo.py b/backend/app/foo.py\n+pass\n"
+        await update_viewport_coverage_snapshot_from_diff(db_session, project, 99, diff)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        snap = (project.design_doc or {}).get("viewport_coverage_snapshot")
+        assert snap is None
+
+    @pytest.mark.asyncio
+    async def test_round_trip_triggers_dispatcher(self, db_session):
+        """Producer write + dispatcher read + run_once spawns a case end-to-end."""
+        from app.pipeline_regression_dispatcher import (
+            update_viewport_coverage_snapshot_from_diff,
+        )
+
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        # Diff that drops 3 assertions: before=8, after=5
+        diff = self._make_diff(context_assertions=5, removed_assertions=3)
+        await update_viewport_coverage_snapshot_from_diff(
+            db_session, project, 555, diff
+        )
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        spawned = await run_once(db_session, project.id)
+        assert spawned == 1
+
+        task = (
+            (
+                await db_session.execute(
+                    select(Task).where(Task.project_id == project.id)
+                )
+            )
+            .scalars()
+            .first()
+        )
+        assert task is not None
+        assert (task.context or {}).get("regression_class") == "viewport_coverage_drop"
 
 
 # ---------------------------------------------------------------------------
@@ -11339,7 +12097,7 @@ def _make_escalation_case(
 
 
 def test_escalation_outcome_breakdown_empty_cases():
-    """Empty input returns all five buckets with merged_count=0 and durable_resolution_rate=None."""
+    """Empty input returns all buckets (one per _ESCALATION_BUCKET_ORDER entry) with merged_count=0 and durable_resolution_rate=None."""
     from app.pipeline_regression_dispatcher import (
         _ESCALATION_BUCKET_ALL_OTHER,
         _ESCALATION_BUCKET_ORDER,
@@ -11725,6 +12483,437 @@ async def test_marginal_followup_disabled_by_config(db_session):
 
 
 # ---------------------------------------------------------------------------
+# compliance_followup spawning tests
+# ---------------------------------------------------------------------------
+
+
+def _cross_layer_fix_log_entry(
+    *,
+    pr_number: int = 42,
+    merged_at_offset_hours: int = 2,
+    layers_targeted: list[str] | None = None,
+    spawn_layers: list[str] | None = None,
+    recommended_unmodifiable: list[str] | None = None,
+) -> dict:
+    """Build a synthetic fix-log entry with spawn_was_cross_layer=True."""
+    from app.time_utils import _utcnow
+
+    entry: dict = {
+        "fix_pr_number": pr_number,
+        "merged_at": (_utcnow() - timedelta(hours=merged_at_offset_hours)).isoformat(),
+        "spawn_was_cross_layer": True,
+        "spawn_layers_enumerated": spawn_layers or ["AGENT_VM", "CI_WORKFLOW"],
+        "layers_targeted": layers_targeted
+        if layers_targeted is not None
+        else ["AGENT_VM"],
+    }
+    if recommended_unmodifiable is not None:
+        entry["recommended_unmodifiable_layers"] = recommended_unmodifiable
+    return entry
+
+
+async def _make_merged_case_with_fix_log(
+    db_session,
+    project_id,
+    fix_log: list[dict],
+    *,
+    regression_class: str = "sr_catch_rate:correctness",
+) -> object:
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+
+    case = RegressionRemediationCase(
+        project_id=project_id,
+        regression_class=regression_class,
+        status=RegressionCaseStatus.MERGED,
+        fingerprint_to_fix_log=fix_log,
+        signal_snapshot_at_merge={"current_rate": 0.80},
+    )
+    db_session.add(case)
+    await db_session.commit()
+    await db_session.refresh(case)
+    return case
+
+
+@pytest.mark.asyncio
+async def test_compliance_followup_spawns_for_noncompliant_fix(db_session):
+    """One-layer cross-layer fix spawns a compliance_followup investigate task."""
+    from app.pipeline_regression_dispatcher import _run_compliance_followup_once
+
+    project = make_project(design_doc=_design_doc_no_sr_regression())
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    case = await _make_merged_case_with_fix_log(
+        db_session,
+        project.id,
+        [_cross_layer_fix_log_entry(layers_targeted=["AGENT_VM"])],
+    )
+
+    spawned = await _run_compliance_followup_once(db_session, project.id)
+    assert spawned == 1
+
+    tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    followup_tasks = [
+        t
+        for t in tasks
+        if (t.context or {}).get("signal_name") == "compliance_followup"
+    ]
+    assert len(followup_tasks) == 1
+    ft = followup_tasks[0]
+    prompt = ft.first_payload.get("prompt", "")
+    assert "AGENT_VM" in prompt
+    assert "CI_WORKFLOW" in prompt or "not yet defended" in prompt
+
+    await db_session.refresh(case)
+    log_entries = case.fingerprint_to_fix_log or []
+    audit = [
+        e
+        for e in log_entries
+        if isinstance(e, dict) and e.get("type") == "compliance_followup_spawned"
+    ]
+    assert len(audit) == 1
+    assert audit[0].get("task_id") == str(ft.id)
+
+
+@pytest.mark.asyncio
+async def test_compliance_followup_cooldown_blocks_repeat_spawn(db_session):
+    """compliance_followup_spawned_at within cooldown window blocks re-spawn."""
+    from app.pipeline_regression_dispatcher import _run_compliance_followup_once
+    from app.shared_state import runtime_config
+
+    project = make_project(design_doc=_design_doc_no_sr_regression())
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    case = await _make_merged_case_with_fix_log(
+        db_session,
+        project.id,
+        [_cross_layer_fix_log_entry(layers_targeted=["AGENT_VM"])],
+    )
+    # Pre-seed cooldown anchor (1h ago → within 72h window)
+    case.compliance_followup_spawned_at = _utcnow() - timedelta(hours=1)
+    db_session.add(case)
+    await db_session.commit()
+
+    orig = runtime_config.get("regression_compliance_followup_cooldown_hours")
+    runtime_config["regression_compliance_followup_cooldown_hours"] = 72
+    try:
+        spawned = await _run_compliance_followup_once(db_session, project.id)
+    finally:
+        if orig is None:
+            runtime_config.pop("regression_compliance_followup_cooldown_hours", None)
+        else:
+            runtime_config["regression_compliance_followup_cooldown_hours"] = orig
+
+    assert spawned == 0
+
+
+@pytest.mark.asyncio
+async def test_compliance_followup_disabled_by_config(db_session):
+    """regression_compliance_followup_enabled=False suppresses all spawning."""
+    from app.pipeline_regression_dispatcher import _run_compliance_followup_once
+    from app.shared_state import runtime_config
+
+    project = make_project(design_doc=_design_doc_no_sr_regression())
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _make_merged_case_with_fix_log(
+        db_session,
+        project.id,
+        [_cross_layer_fix_log_entry(layers_targeted=["AGENT_VM"])],
+    )
+
+    orig = runtime_config.get("regression_compliance_followup_enabled")
+    runtime_config["regression_compliance_followup_enabled"] = False
+    try:
+        spawned = await _run_compliance_followup_once(db_session, project.id)
+    finally:
+        if orig is None:
+            runtime_config.pop("regression_compliance_followup_enabled", None)
+        else:
+            runtime_config["regression_compliance_followup_enabled"] = orig
+
+    assert spawned == 0
+
+
+@pytest.mark.asyncio
+async def test_compliance_followup_skips_awaiting_backfill(db_session):
+    """Entries without layers_targeted key (awaiting backfill) do not trigger spawn."""
+    from app.pipeline_regression_dispatcher import _run_compliance_followup_once
+
+    project = make_project(design_doc=_design_doc_no_sr_regression())
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Fix log entry is cross-layer but missing layers_targeted (awaiting backfill)
+    entry = {
+        "fix_pr_number": 99,
+        "merged_at": (_utcnow() - timedelta(hours=2)).isoformat(),
+        "spawn_was_cross_layer": True,
+        "spawn_layers_enumerated": ["AGENT_VM", "CI_WORKFLOW"],
+        # NO "layers_targeted" key — awaiting backfill
+    }
+    await _make_merged_case_with_fix_log(db_session, project.id, [entry])
+
+    spawned = await _run_compliance_followup_once(db_session, project.id)
+    assert spawned == 0, (
+        "awaiting_backfill entries must not trigger compliance_followup"
+    )
+
+
+@pytest.mark.asyncio
+async def test_compliance_followup_skips_two_layer_fix(db_session):
+    """A fix that targeted 2+ canonical layers is compliant — no spawn."""
+    from app.pipeline_regression_dispatcher import _run_compliance_followup_once
+
+    project = make_project(design_doc=_design_doc_no_sr_regression())
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _make_merged_case_with_fix_log(
+        db_session,
+        project.id,
+        [_cross_layer_fix_log_entry(layers_targeted=["AGENT_VM", "BASELINE_GATE"])],
+    )
+
+    spawned = await _run_compliance_followup_once(db_session, project.id)
+    assert spawned == 0, "two-layer compliant fix must not trigger compliance_followup"
+
+
+@pytest.mark.asyncio
+async def test_compliance_followup_skips_older_noncompliant_when_newest_is_compliant(
+    db_session,
+):
+    """Older non-compliant cross-layer entry must not re-trigger spawn when the
+    most-recent cross-layer-mandated entry is itself compliant.
+
+    Without this guard the loop walks past the newer compliant entry, finds
+    the old non-compliant one, and re-spawns a compliance_followup every
+    72h cooldown forever — even after the case is CLOSED — because the
+    spawned follow-up's own merged fix is recorded with
+    spawn_was_cross_layer=False and never displaces the old entry.
+    """
+    from app.pipeline_regression_dispatcher import _run_compliance_followup_once
+
+    project = make_project(design_doc=_design_doc_no_sr_regression())
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    older_noncompliant = _cross_layer_fix_log_entry(
+        pr_number=100,
+        merged_at_offset_hours=48,
+        layers_targeted=["AGENT_VM"],
+    )
+    newer_compliant = _cross_layer_fix_log_entry(
+        pr_number=101,
+        merged_at_offset_hours=2,
+        layers_targeted=["AGENT_VM", "BASELINE_GATE"],
+    )
+    await _make_merged_case_with_fix_log(
+        db_session,
+        project.id,
+        [older_noncompliant, newer_compliant],
+    )
+
+    spawned = await _run_compliance_followup_once(db_session, project.id)
+    assert spawned == 0, (
+        "older non-compliant entry must not re-trigger spawn once a newer "
+        "cross-layer-mandated fix in the same case is compliant"
+    )
+
+
+@pytest.mark.asyncio
+async def test_compliance_followup_recommended_unmodifiable_counts_as_compliant(
+    db_session,
+):
+    """A fix that documented CI_WORKFLOW as unmodifiable + targeted 1 other layer is compliant."""
+    from app.pipeline_regression_dispatcher import _run_compliance_followup_once
+
+    project = make_project(design_doc=_design_doc_no_sr_regression())
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _make_merged_case_with_fix_log(
+        db_session,
+        project.id,
+        [
+            _cross_layer_fix_log_entry(
+                layers_targeted=["AGENT_VM"],
+                recommended_unmodifiable=["CI_WORKFLOW"],
+            )
+        ],
+    )
+
+    spawned = await _run_compliance_followup_once(db_session, project.id)
+    assert spawned == 0, (
+        "fix with recommended_unmodifiable_layers CI_WORKFLOW + 1 targeted layer "
+        "should be treated as compliant"
+    )
+
+
+# ---------------------------------------------------------------------------
+# compute_mtti_p50_sec unit tests
+# ---------------------------------------------------------------------------
+
+
+def _make_case(needs_at, acked_at):
+    """Return a SimpleNamespace mimicking RegressionRemediationCase timestamps."""
+    return SimpleNamespace(
+        needs_manual_intervention_at=needs_at,
+        operator_acknowledged_at=acked_at,
+    )
+
+
+def test_compute_mtti_p50_sec_no_rows():
+    """Returns None when no cases are provided."""
+    from app.pipeline_regression_dispatcher import compute_mtti_p50_sec
+
+    assert compute_mtti_p50_sec([]) is None
+
+
+def test_compute_mtti_p50_sec_no_acked_cases():
+    """Returns None when cases exist but none are acknowledged."""
+    from datetime import datetime, timezone
+    from app.pipeline_regression_dispatcher import compute_mtti_p50_sec
+
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    cases = [
+        _make_case(now - timedelta(hours=1), None),
+        _make_case(now - timedelta(hours=2), None),
+    ]
+    assert compute_mtti_p50_sec(cases) is None
+
+
+def test_compute_mtti_p50_sec_median_two_rows():
+    """Returns median seconds for two acked cases; unacked cases excluded."""
+    from datetime import datetime, timezone
+    from app.pipeline_regression_dispatcher import compute_mtti_p50_sec
+
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    cases = [
+        _make_case(
+            now - timedelta(hours=2), now - timedelta(hours=2) + timedelta(seconds=600)
+        ),
+        _make_case(
+            now - timedelta(hours=1), now - timedelta(hours=1) + timedelta(seconds=1200)
+        ),
+        _make_case(now - timedelta(minutes=30), None),  # unacked — excluded
+    ]
+    result = compute_mtti_p50_sec(cases)
+    assert result == 900.0
+
+
+def test_compute_mtti_p50_sec_idempotent():
+    """Repeated calls with the same input return the same value."""
+    from datetime import datetime, timezone
+    from app.pipeline_regression_dispatcher import compute_mtti_p50_sec
+
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    cases = [
+        _make_case(
+            now - timedelta(hours=1), now - timedelta(hours=1) + timedelta(seconds=300)
+        ),
+    ]
+    assert compute_mtti_p50_sec(cases) == compute_mtti_p50_sec(cases)
+
+
+# ---------------------------------------------------------------------------
+# compute_untargeted_layers unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_compute_untargeted_layers_empty_or_invalid_returns_all_canonical():
+    """Empty / None / non-list fix-log → every canonical layer is untargeted."""
+    from app.pipeline_regression_dispatcher import (
+        _CANONICAL_RECURRENCE_LAYERS,
+        compute_untargeted_layers,
+    )
+
+    expected = list(_CANONICAL_RECURRENCE_LAYERS)
+    assert compute_untargeted_layers(None) == expected
+    assert compute_untargeted_layers([]) == expected
+    assert compute_untargeted_layers("not-a-list") == expected  # type: ignore[arg-type]
+    assert compute_untargeted_layers({}) == expected  # type: ignore[arg-type]
+
+
+def test_compute_untargeted_layers_single_layer_history():
+    """A single-layer fix history returns the other four layers."""
+    from app.pipeline_regression_dispatcher import (
+        _CANONICAL_RECURRENCE_LAYERS,
+        compute_untargeted_layers,
+    )
+
+    fix_log = [{"fix_pr_number": 1, "layers_targeted": ["AGENT_VM"]}]
+    out = compute_untargeted_layers(fix_log)
+    assert out == [
+        layer for layer in _CANONICAL_RECURRENCE_LAYERS if layer != "AGENT_VM"
+    ]
+
+
+def test_compute_untargeted_layers_full_coverage_returns_empty():
+    """All five canonical layers targeted at least once → empty list."""
+    from app.pipeline_regression_dispatcher import (
+        _CANONICAL_RECURRENCE_LAYERS,
+        compute_untargeted_layers,
+    )
+
+    fix_log = [
+        {"fix_pr_number": idx, "layers_targeted": [layer]}
+        for idx, layer in enumerate(_CANONICAL_RECURRENCE_LAYERS)
+    ]
+    assert compute_untargeted_layers(fix_log) == []
+
+
+def test_compute_untargeted_layers_drops_unrecognized_layers():
+    """Unrecognized layer names are silently dropped, not counted as targeted."""
+    from app.pipeline_regression_dispatcher import (
+        _CANONICAL_RECURRENCE_LAYERS,
+        compute_untargeted_layers,
+    )
+
+    fix_log = [
+        {"fix_pr_number": 1, "layers_targeted": ["AGENT_VM", "NOT_A_REAL_LAYER", 42]},
+        {"fix_pr_number": 2},  # backfill-pending entry: no key, contributes nothing
+    ]
+    out = compute_untargeted_layers(fix_log)
+    # AGENT_VM is recognized; the bogus name + non-string are dropped.
+    assert out == [
+        layer for layer in _CANONICAL_RECURRENCE_LAYERS if layer != "AGENT_VM"
+    ]
+
+
+def test_compute_untargeted_layers_canonical_order():
+    """Result order follows the canonical tuple, not insertion order in fix_log."""
+    from app.pipeline_regression_dispatcher import (
+        _CANONICAL_RECURRENCE_LAYERS,
+        compute_untargeted_layers,
+    )
+
+    # Target REVIEWER_PASS and CI_WORKFLOW; the remaining three should come back
+    # in canonical order, not the order they happened to appear here.
+    fix_log = [{"layers_targeted": ["REVIEWER_PASS", "CI_WORKFLOW"]}]
+    out = compute_untargeted_layers(fix_log)
+    expected = [
+        layer
+        for layer in _CANONICAL_RECURRENCE_LAYERS
+        if layer not in {"REVIEWER_PASS", "CI_WORKFLOW"}
+    ]
+    assert out == expected
+
+
+# ---------------------------------------------------------------------------
 # FALSE_POSITIVE suppression tests
 # ---------------------------------------------------------------------------
 
@@ -11747,7 +12936,9 @@ async def test_false_positive_status_suppresses_spawn_within_ttl(db_session):
         project_id=project.id,
         regression_class="sr_catch_rate",
         status=RegressionCaseStatus.FALSE_POSITIVE,
-        false_positive_until_at=now + _REGRESSION_FALSE_POSITIVE_TTL - timedelta(hours=1),
+        false_positive_until_at=now
+        + _REGRESSION_FALSE_POSITIVE_TTL
+        - timedelta(hours=1),
         false_positive_reason="documented design — partial backend test run",
         hit_count=1,
     )
@@ -11868,3 +13059,1259 @@ async def test_dispatcher_prompt_documents_verdict_triage(db_session):
     assert "intentional" in prompt or "intended" in prompt
     assert "known-incomplete pipeline step" in prompt
     assert "verdict_reason" in prompt
+
+
+# ---------------------------------------------------------------------------
+# compute_escalation_outcome_breakdown — prevention_rate_30d new fields
+# ---------------------------------------------------------------------------
+
+
+def test_escalation_outcome_breakdown_has_prevention_rate_fields():
+    """All buckets in the breakdown include prevention_rate_30d and recurrences_observed."""
+    from app.pipeline_regression_dispatcher import (
+        _ESCALATION_BUCKET_ORDER,
+        compute_escalation_outcome_breakdown,
+    )
+
+    out = compute_escalation_outcome_breakdown([])
+    for bucket_name in _ESCALATION_BUCKET_ORDER:
+        b = out["by_reason"][bucket_name]
+        assert "prevention_rate_30d" in b
+        assert "recurrences_observed" in b
+        assert b["prevention_rate_30d"] is None
+        assert b["recurrences_observed"] == 0
+
+
+def test_escalation_outcome_breakdown_prevention_rate_single_durable():
+    """Defense merged 35d ago with no recurrence → prevention_rate_30d = 1.0, recurrences_observed = 0."""
+    from app.pipeline_regression_dispatcher import (
+        ESCALATION_REASON_ESCALATED_CROSS_LAYER,
+        compute_escalation_outcome_breakdown,
+    )
+
+    now = _utcnow()
+    merged_at = (now - timedelta(days=35)).isoformat()
+
+    case = _make_escalation_case(
+        ESCALATION_REASON_ESCALATED_CROSS_LAYER,
+        fix_log=[{"fix_pr_number": 1, "merged_at": merged_at}],
+    )
+
+    out = compute_escalation_outcome_breakdown([case], now=now)
+    b = out["by_reason"][ESCALATION_REASON_ESCALATED_CROSS_LAYER]
+    assert b["prevention_rate_30d"] == 1.0
+    assert b["recurrences_observed"] == 0
+
+
+def test_escalation_outcome_breakdown_prevention_rate_single_recurred():
+    """Defense merged 35d ago with a recurrence within 30d → prevention_rate_30d = 0.0, recurrences_observed = 1."""
+    from app.pipeline_regression_dispatcher import (
+        ESCALATION_REASON_ESCALATED_RECURRENCE,
+        compute_escalation_outcome_breakdown,
+    )
+
+    now = _utcnow()
+    merged1 = (now - timedelta(days=35)).isoformat()
+    merged2 = (now - timedelta(days=20)).isoformat()  # within 30d of merged1
+
+    case = _make_escalation_case(
+        ESCALATION_REASON_ESCALATED_RECURRENCE,
+        fix_log=[
+            {"fix_pr_number": 1, "merged_at": merged1},
+            {"fix_pr_number": 2, "merged_at": merged2},
+        ],
+    )
+
+    out = compute_escalation_outcome_breakdown([case], now=now)
+    b = out["by_reason"][ESCALATION_REASON_ESCALATED_RECURRENCE]
+    assert b["prevention_rate_30d"] == 0.0
+    assert b["recurrences_observed"] == 1
+
+
+def test_escalation_outcome_breakdown_prevention_rate_mixed():
+    """3 defenses ≥30d old: 2 prevented, 1 recurred → prevention_rate_30d = 2/3."""
+    from app.pipeline_regression_dispatcher import (
+        _ESCALATION_BUCKET_ALL_OTHER,
+        compute_escalation_outcome_breakdown,
+    )
+
+    now = _utcnow()
+    old = (now - timedelta(days=35)).isoformat()
+    retrip = (now - timedelta(days=20)).isoformat()  # within 30d of old
+
+    case_durable1 = _make_escalation_case(
+        None, fix_log=[{"fix_pr_number": 1, "merged_at": old}]
+    )
+    case_durable2 = _make_escalation_case(
+        None, fix_log=[{"fix_pr_number": 2, "merged_at": old}]
+    )
+    case_recurred = _make_escalation_case(
+        None,
+        fix_log=[
+            {"fix_pr_number": 3, "merged_at": old},
+            {"fix_pr_number": 4, "merged_at": retrip},
+        ],
+    )
+
+    out = compute_escalation_outcome_breakdown(
+        [case_durable1, case_durable2, case_recurred], now=now
+    )
+    b = out["by_reason"][_ESCALATION_BUCKET_ALL_OTHER]
+    assert abs(b["prevention_rate_30d"] - 2.0 / 3.0) < 1e-9
+    assert b["recurrences_observed"] == 1
+
+
+def test_escalation_outcome_breakdown_prevention_rate_excludes_recent_defense():
+    """Defense merged 10d ago is excluded from prevention_rate_30d but still counted in merged_count."""
+    from app.pipeline_regression_dispatcher import (
+        _ESCALATION_BUCKET_ALL_OTHER,
+        compute_escalation_outcome_breakdown,
+    )
+
+    now = _utcnow()
+    recent = (now - timedelta(days=10)).isoformat()
+
+    case = _make_escalation_case(
+        None, fix_log=[{"fix_pr_number": 1, "merged_at": recent}]
+    )
+
+    out = compute_escalation_outcome_breakdown([case], now=now)
+    b = out["by_reason"][_ESCALATION_BUCKET_ALL_OTHER]
+    assert b["merged_count"] == 1
+    assert b["prevention_rate_30d"] is None
+    assert b["recurrences_observed"] == 0
+
+
+# ---------------------------------------------------------------------------
+# compute_escalation_outcome_breakdown — compliance_followup bucket
+# ---------------------------------------------------------------------------
+
+
+def test_escalation_outcome_compliance_followup_bucket_exists():
+    """compliance_followup bucket is present in all outputs."""
+    from app.pipeline_regression_dispatcher import (
+        _ESCALATION_BUCKET_COMPLIANCE_FOLLOWUP,
+        _ESCALATION_BUCKET_ORDER,
+        compute_escalation_outcome_breakdown,
+    )
+
+    assert _ESCALATION_BUCKET_COMPLIANCE_FOLLOWUP in _ESCALATION_BUCKET_ORDER
+    out = compute_escalation_outcome_breakdown([])
+    assert _ESCALATION_BUCKET_COMPLIANCE_FOLLOWUP in out["by_reason"]
+
+
+def test_escalation_outcome_compliance_followup_baseline_durable():
+    """Baseline cross-layer fix (no compliance followup) stays in escalated_cross_layer bucket with durable prevention."""
+    from app.pipeline_regression_dispatcher import (
+        ESCALATION_REASON_ESCALATED_CROSS_LAYER,
+        compute_escalation_outcome_breakdown,
+    )
+
+    now = _utcnow()
+    merged_at = (now - timedelta(days=35)).isoformat()
+
+    case = _make_escalation_case(
+        ESCALATION_REASON_ESCALATED_CROSS_LAYER,
+        fix_log=[
+            {
+                "fix_pr_number": 100,
+                "merged_at": merged_at,
+                "spawn_was_cross_layer": True,
+            }
+        ],
+    )
+
+    # Use lookback_days=60 so the 35d-old merge falls within the window
+    out = compute_escalation_outcome_breakdown([case], now=now, lookback_days=60)
+    b_cross = out["by_reason"][ESCALATION_REASON_ESCALATED_CROSS_LAYER]
+    assert b_cross["merged_count"] == 1
+    assert b_cross["prevention_rate_30d"] == 1.0
+
+
+def test_escalation_outcome_compliance_followup_held():
+    """Compliance-followup fix that held 35d → prevention_rate_30d=1.0 in compliance_followup bucket; cross_layer baseline is empty."""
+    from app.pipeline_regression_dispatcher import (
+        ESCALATION_REASON_ESCALATED_CROSS_LAYER,
+        _ESCALATION_BUCKET_COMPLIANCE_FOLLOWUP,
+        compute_escalation_outcome_breakdown,
+    )
+
+    now = _utcnow()
+    original_merged = (now - timedelta(days=50)).isoformat()
+    cf_merged = (now - timedelta(days=35)).isoformat()
+
+    case = _make_escalation_case(
+        ESCALATION_REASON_ESCALATED_CROSS_LAYER,
+        fix_log=[
+            {
+                "fix_pr_number": 200,
+                "merged_at": original_merged,
+                "spawn_was_cross_layer": True,
+            },
+            {
+                "type": "compliance_followup_spawned",
+                "spawned_at": original_merged,
+                "task_id": "t1",
+            },
+            {"fix_pr_number": 201, "merged_at": cf_merged},
+        ],
+    )
+
+    # lookback_days=60 so both the original (50d) and cf fix (35d) are in the window
+    out = compute_escalation_outcome_breakdown([case], now=now, lookback_days=60)
+    b_cf = out["by_reason"][_ESCALATION_BUCKET_COMPLIANCE_FOLLOWUP]
+    b_cross = out["by_reason"][ESCALATION_REASON_ESCALATED_CROSS_LAYER]
+    # compliance followup fix is durable — no retrip within 30d of cf_merged
+    assert b_cf["merged_count"] == 1
+    assert b_cf["prevention_rate_30d"] == 1.0
+    # baseline cross-layer bucket is empty (this case moved to compliance_followup)
+    assert b_cross["merged_count"] == 0
+
+
+def test_escalation_outcome_compliance_followup_separate_prevention_rates():
+    """Baseline and compliance-followup fixes bucket separately with independent prevention rates."""
+    from app.pipeline_regression_dispatcher import (
+        ESCALATION_REASON_ESCALATED_CROSS_LAYER,
+        _ESCALATION_BUCKET_COMPLIANCE_FOLLOWUP,
+        compute_escalation_outcome_breakdown,
+    )
+
+    now = _utcnow()
+    old = (now - timedelta(days=50)).isoformat()
+    cf_merged = (now - timedelta(days=35)).isoformat()
+    retrip = (now - timedelta(days=20)).isoformat()  # within 30d of cf_merged
+
+    # baseline case: cross-layer fix held without needing a compliance followup
+    case_baseline = _make_escalation_case(
+        ESCALATION_REASON_ESCALATED_CROSS_LAYER,
+        fix_log=[
+            {"fix_pr_number": 300, "merged_at": old, "spawn_was_cross_layer": True}
+        ],
+    )
+    # compliance followup case: original non-compliant, then followup fix that retripped within 30d
+    case_cf = _make_escalation_case(
+        ESCALATION_REASON_ESCALATED_CROSS_LAYER,
+        fix_log=[
+            {"fix_pr_number": 301, "merged_at": old, "spawn_was_cross_layer": True},
+            {"type": "compliance_followup_spawned", "spawned_at": old, "task_id": "t2"},
+            {"fix_pr_number": 302, "merged_at": cf_merged},
+            {"fix_pr_number": 303, "merged_at": retrip},
+        ],
+    )
+
+    # lookback_days=60 so 50d-old and 35d-old merges are in the window
+    out = compute_escalation_outcome_breakdown(
+        [case_baseline, case_cf], now=now, lookback_days=60
+    )
+    b_cross = out["by_reason"][ESCALATION_REASON_ESCALATED_CROSS_LAYER]
+    b_cf = out["by_reason"][_ESCALATION_BUCKET_COMPLIANCE_FOLLOWUP]
+    # baseline: 1 durable fix → prevention_rate = 1.0
+    assert b_cross["merged_count"] == 1
+    assert b_cross["prevention_rate_30d"] == 1.0
+    # compliance followup: retripped within 30d of cf fix → prevention_rate = 0.0
+    assert b_cf["merged_count"] == 1
+    assert b_cf["prevention_rate_30d"] == 0.0
+    assert b_cf["recurrences_observed"] == 1
+
+
+# ---------------------------------------------------------------------------
+# compute_avg_prevention_rate_7d — pure-function unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_compute_avg_prevention_rate_7d_empty():
+    """Empty cases list returns avg_rate=None and eligible_count=0."""
+    from app.pipeline_regression_dispatcher import compute_avg_prevention_rate_7d
+
+    result = compute_avg_prevention_rate_7d([])
+    assert result["avg_rate"] is None
+    assert result["eligible_count"] == 0
+    assert result["prevented_count"] == 0
+    assert result["recurred_count"] == 0
+
+
+def test_compute_avg_prevention_rate_7d_in_window_excluded():
+    """Defense merged 15d ago (window not yet closed) is excluded."""
+    from app.pipeline_regression_dispatcher import compute_avg_prevention_rate_7d
+
+    now = _utcnow()
+    recent = (now - timedelta(days=15)).isoformat()  # < 30d old — window still open
+
+    case = _make_escalation_case(
+        None, fix_log=[{"fix_pr_number": 1, "merged_at": recent}]
+    )
+
+    result = compute_avg_prevention_rate_7d([case], now=now)
+    assert result["avg_rate"] is None
+    assert result["eligible_count"] == 0
+
+
+def test_compute_avg_prevention_rate_7d_too_old_excluded():
+    """Defense merged 40d ago (window closed >7d ago) is excluded."""
+    from app.pipeline_regression_dispatcher import compute_avg_prevention_rate_7d
+
+    now = _utcnow()
+    old = (
+        now - timedelta(days=40)
+    ).isoformat()  # > 37d old — outside 7d collection window
+
+    case = _make_escalation_case(None, fix_log=[{"fix_pr_number": 1, "merged_at": old}])
+
+    result = compute_avg_prevention_rate_7d([case], now=now)
+    assert result["avg_rate"] is None
+    assert result["eligible_count"] == 0
+
+
+def test_compute_avg_prevention_rate_7d_perfect_prevention():
+    """All eligible defenses prevented → avg_rate = 1.0."""
+    from app.pipeline_regression_dispatcher import compute_avg_prevention_rate_7d
+
+    now = _utcnow()
+    # merged_at in [now-37d, now-30d] — window closed within last 7d
+    merged_at = (now - timedelta(days=33)).isoformat()
+
+    case1 = _make_escalation_case(
+        None, fix_log=[{"fix_pr_number": 1, "merged_at": merged_at}]
+    )
+    case2 = _make_escalation_case(
+        None, fix_log=[{"fix_pr_number": 2, "merged_at": merged_at}]
+    )
+
+    result = compute_avg_prevention_rate_7d([case1, case2], now=now)
+    assert result["avg_rate"] == 1.0
+    assert result["eligible_count"] == 2
+    assert result["prevented_count"] == 2
+    assert result["recurred_count"] == 0
+
+
+def test_compute_avg_prevention_rate_7d_mixed_rate():
+    """2 prevented, 1 recurred in eligible window → avg_rate = 2/3."""
+    from app.pipeline_regression_dispatcher import compute_avg_prevention_rate_7d
+
+    now = _utcnow()
+    merged_at_str = (now - timedelta(days=33)).isoformat()
+    retrip_str = (now - timedelta(days=15)).isoformat()  # within 30d of merged_at
+
+    case_good1 = _make_escalation_case(
+        None, fix_log=[{"fix_pr_number": 1, "merged_at": merged_at_str}]
+    )
+    case_good2 = _make_escalation_case(
+        None, fix_log=[{"fix_pr_number": 2, "merged_at": merged_at_str}]
+    )
+    case_bad = _make_escalation_case(
+        None,
+        fix_log=[
+            {"fix_pr_number": 3, "merged_at": merged_at_str},
+            {"fix_pr_number": 4, "merged_at": retrip_str},
+        ],
+    )
+
+    result = compute_avg_prevention_rate_7d([case_good1, case_good2, case_bad], now=now)
+    assert abs(result["avg_rate"] - 2.0 / 3.0) < 1e-9
+    assert result["eligible_count"] == 3
+    assert result["prevented_count"] == 2
+    assert result["recurred_count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# _evaluate_low_prevention_rate_signal — threshold + spawn behaviour
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_low_prevention_rate_signal_fires_when_threshold_crossed(db_session):
+    """Signal spawns investigate task when avg_rate < 0.60 and eligible_count >= 5."""
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+    from app.pipeline_regression_dispatcher import (
+        _PREVENTION_RATE_MIN_SAMPLE,
+        _evaluate_low_prevention_rate_signal,
+    )
+
+    project = make_project(design_doc=_design_doc_no_sr_regression())
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    merged_at_str = (now - timedelta(days=33)).isoformat()
+    retrip_str = (now - timedelta(days=15)).isoformat()
+
+    # Create 5 cases where each recurred (rate = 0.0 < 0.60)
+    for i in range(_PREVENTION_RATE_MIN_SAMPLE):
+        case = RegressionRemediationCase(
+            project_id=project.id,
+            regression_class=f"sr_catch_rate:cls{i}",
+            status=RegressionCaseStatus.CLOSED,
+            fingerprint_to_fix_log=[
+                {"fix_pr_number": i * 10 + 1, "merged_at": merged_at_str},
+                {"fix_pr_number": i * 10 + 2, "merged_at": retrip_str},
+            ],
+            signal_snapshot_at_spawn={},
+        )
+        db_session.add(case)
+    await db_session.commit()
+
+    spawned = await _evaluate_low_prevention_rate_signal(db_session, project.id, 1)
+    assert spawned == 1
+
+    task = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .first()
+    )
+    assert task is not None
+    assert (task.context or {}).get(
+        "regression_class"
+    ) == "cross_layer_defense_prevention_low"
+
+
+@pytest.mark.asyncio
+async def test_low_prevention_rate_signal_suppressed_when_rate_ok(db_session):
+    """Signal does not fire when prevention rate is above threshold."""
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+    from app.pipeline_regression_dispatcher import (
+        _PREVENTION_RATE_MIN_SAMPLE,
+        _evaluate_low_prevention_rate_signal,
+    )
+
+    project = make_project(design_doc=_design_doc_no_sr_regression())
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    merged_at_str = (now - timedelta(days=33)).isoformat()
+
+    # Create 5 cases where none recurred (rate = 1.0 >= 0.60)
+    for i in range(_PREVENTION_RATE_MIN_SAMPLE):
+        case = RegressionRemediationCase(
+            project_id=project.id,
+            regression_class=f"sr_catch_rate:cls{i}",
+            status=RegressionCaseStatus.CLOSED,
+            fingerprint_to_fix_log=[
+                {"fix_pr_number": i + 1, "merged_at": merged_at_str},
+            ],
+            signal_snapshot_at_spawn={},
+        )
+        db_session.add(case)
+    await db_session.commit()
+
+    spawned = await _evaluate_low_prevention_rate_signal(db_session, project.id, 1)
+    assert spawned == 0
+
+
+@pytest.mark.asyncio
+async def test_low_prevention_rate_signal_suppressed_when_below_min_sample(db_session):
+    """Signal does not fire when eligible count is below min sample."""
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+    from app.pipeline_regression_dispatcher import _evaluate_low_prevention_rate_signal
+
+    project = make_project(design_doc=_design_doc_no_sr_regression())
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    merged_at_str = (now - timedelta(days=33)).isoformat()
+    retrip_str = (now - timedelta(days=15)).isoformat()
+
+    # Only 3 cases (below min sample of 5) even though rate is low
+    for i in range(3):
+        case = RegressionRemediationCase(
+            project_id=project.id,
+            regression_class=f"sr_catch_rate:cls{i}",
+            status=RegressionCaseStatus.CLOSED,
+            fingerprint_to_fix_log=[
+                {"fix_pr_number": i * 10 + 1, "merged_at": merged_at_str},
+                {"fix_pr_number": i * 10 + 2, "merged_at": retrip_str},
+            ],
+            signal_snapshot_at_spawn={},
+        )
+        db_session.add(case)
+    await db_session.commit()
+
+    spawned = await _evaluate_low_prevention_rate_signal(db_session, project.id, 1)
+    assert spawned == 0
+
+
+# ---------------------------------------------------------------------------
+# _evaluate_recurring_class_signal integration tests
+# ---------------------------------------------------------------------------
+
+
+def _make_rc_fix_log_entry(layer: str, merged_days_ago: float) -> dict:
+    """Build a fix-log entry targeting ``layer``, merged ``merged_days_ago`` days ago."""
+    merged = (_utcnow() - timedelta(days=merged_days_ago)).isoformat()
+    return {"merged_at": merged, "layers_targeted": [layer]}
+
+
+@pytest.mark.asyncio
+async def test_recurring_class_trips_when_class_spans_2_layers_across_3_cycles(
+    db_session,
+):
+    """Class with 3 fix-log entries across CI_WORKFLOW + AGENT_VM → spawns recurring_class meta."""
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="fix_loop_divergence:lint",
+        status=RegressionCaseStatus.ACTIVE,
+        signal_snapshot_at_spawn={"signal_name": "fix_loop_divergence"},
+        first_seen_at=now - timedelta(days=20),
+        hit_count=3,
+        fingerprint_to_fix_log=[
+            _make_rc_fix_log_entry("CI_WORKFLOW", merged_days_ago=15),
+            _make_rc_fix_log_entry("AGENT_VM", merged_days_ago=10),
+            _make_rc_fix_log_entry("CI_WORKFLOW", merged_days_ago=5),
+        ],
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned >= 1
+
+    tasks = (
+        (
+            await db_session.execute(
+                select(Task)
+                .where(Task.project_id == project.id)
+                .order_by(Task.created_at.desc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    rc_tasks = [
+        t
+        for t in tasks
+        if (t.context or {}).get("regression_class", "").startswith("recurring_class:")
+    ]
+    assert len(rc_tasks) >= 1
+
+    task = rc_tasks[0]
+    ctx = task.context or {}
+    assert ctx["regression_class"] == "recurring_class:fix_loop_divergence:lint"
+    assert ctx["signal_name"] == "recurring_class"
+
+    prompt = (task.first_payload or {}).get("prompt", "")
+    assert "RECURRING CROSS-LAYER CLASS META-INVESTIGATION" in prompt
+    assert "fix_loop_divergence:lint" in prompt
+    assert "AT LEAST 2 distinct canonical layers" in prompt
+    assert "PER-CYCLE LAYER HISTORY" in prompt
+
+    # Recurring-class meta-spawns get a dedicated escalation_reason so
+    # operators can distinguish them from generic cross-layer escalations.
+    from app.pipeline_regression_dispatcher import (  # noqa: PLC0415
+        ESCALATION_REASON_RECURRING_CLASS_META,
+    )
+
+    rc_case = (
+        (
+            await db_session.execute(
+                select(RegressionRemediationCase).where(
+                    RegressionRemediationCase.project_id == project.id,
+                    RegressionRemediationCase.regression_class
+                    == "recurring_class:fix_loop_divergence:lint",
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    assert rc_case is not None
+    assert rc_case.escalation_reason == ESCALATION_REASON_RECURRING_CLASS_META
+
+
+@pytest.mark.asyncio
+async def test_recurring_class_does_not_trip_when_single_layer(db_session):
+    """Class with 3+ cycles all on the same layer does NOT spawn."""
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="fix_loop_divergence:test",
+        status=RegressionCaseStatus.ACTIVE,
+        signal_snapshot_at_spawn={"signal_name": "fix_loop_divergence"},
+        first_seen_at=now - timedelta(days=20),
+        hit_count=3,
+        fingerprint_to_fix_log=[
+            _make_rc_fix_log_entry("CI_WORKFLOW", merged_days_ago=15),
+            _make_rc_fix_log_entry("CI_WORKFLOW", merged_days_ago=10),
+            _make_rc_fix_log_entry("CI_WORKFLOW", merged_days_ago=5),
+        ],
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    await run_once(db_session, project.id)
+
+    tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    rc_tasks = [
+        t
+        for t in tasks
+        if (t.context or {}).get("regression_class", "").startswith("recurring_class:")
+    ]
+    assert len(rc_tasks) == 0
+
+
+@pytest.mark.asyncio
+async def test_recurring_class_deduplicates_within_cooldown(db_session):
+    """Second run_once within cooldown does not re-spawn the same recurring_class meta."""
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="fix_loop_divergence:lint",
+        status=RegressionCaseStatus.ACTIVE,
+        signal_snapshot_at_spawn={"signal_name": "fix_loop_divergence"},
+        first_seen_at=now - timedelta(days=20),
+        hit_count=3,
+        fingerprint_to_fix_log=[
+            _make_rc_fix_log_entry("CI_WORKFLOW", merged_days_ago=15),
+            _make_rc_fix_log_entry("AGENT_VM", merged_days_ago=10),
+            _make_rc_fix_log_entry("CI_WORKFLOW", merged_days_ago=5),
+        ],
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    first = await run_once(db_session, project.id)
+    assert first >= 1
+
+    await run_once(db_session, project.id)
+
+    tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    rc_tasks = [
+        t
+        for t in tasks
+        if (t.context or {}).get("regression_class", "")
+        == "recurring_class:fix_loop_divergence:lint"
+    ]
+    # Only one spawn despite two run_once calls — cooldown deduplicates.
+    assert len(rc_tasks) == 1
+
+
+# ---------------------------------------------------------------------------
+# Per-cycle compliance annotations in the recurring-class prompt
+# ---------------------------------------------------------------------------
+
+
+def _make_rc_fix_log_entry_with_mandate(
+    *,
+    layers: list[str] | None,
+    merged_days_ago: float,
+    spawn_was_cross_layer: bool,
+) -> dict:
+    """Build a fix-log entry with optional layers + explicit cross-layer mandate flag.
+
+    When ``layers`` is None, the ``layers_targeted`` key is omitted entirely
+    (simulates the awaiting-backfill state where the path-based backfill has
+    not yet classified this fix).
+    """
+    merged = (_utcnow() - timedelta(days=merged_days_ago)).isoformat()
+    entry: dict = {
+        "merged_at": merged,
+        "spawn_was_cross_layer": spawn_was_cross_layer,
+    }
+    if layers is not None:
+        entry["layers_targeted"] = layers
+    return entry
+
+
+async def _spawn_recurring_class_prompt(
+    db_session, fix_log: list[dict], regression_class: str = "fix_loop_divergence:lint"
+) -> str:
+    """Drive run_once with a single case carrying ``fix_log`` and return the spawned prompt."""
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class=regression_class,
+        status=RegressionCaseStatus.ACTIVE,
+        signal_snapshot_at_spawn={"signal_name": "fix_loop_divergence"},
+        first_seen_at=now - timedelta(days=20),
+        hit_count=len(fix_log),
+        fingerprint_to_fix_log=fix_log,
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned >= 1
+
+    tasks = (
+        (
+            await db_session.execute(
+                select(Task)
+                .where(Task.project_id == project.id)
+                .order_by(Task.created_at.desc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    rc_tasks = [
+        t
+        for t in tasks
+        if (t.context or {}).get("regression_class", "").startswith("recurring_class:")
+    ]
+    assert rc_tasks, "expected at least one recurring_class meta task"
+    return (rc_tasks[0].first_payload or {}).get("prompt", "")
+
+
+@pytest.mark.asyncio
+async def test_recurring_class_prompt_annotates_compliant_cycle(db_session):
+    """Mandated cycles with >=2 canonical layers render compliance=compliant; no guidance."""
+    fix_log = [
+        _make_rc_fix_log_entry_with_mandate(
+            layers=["CI_WORKFLOW", "AGENT_VM"],
+            merged_days_ago=15,
+            spawn_was_cross_layer=True,
+        ),
+        _make_rc_fix_log_entry_with_mandate(
+            layers=["AGENT_VERB", "BASELINE_GATE"],
+            merged_days_ago=10,
+            spawn_was_cross_layer=True,
+        ),
+        _make_rc_fix_log_entry_with_mandate(
+            layers=["CI_WORKFLOW", "REVIEWER_PASS"],
+            merged_days_ago=5,
+            spawn_was_cross_layer=True,
+        ),
+    ]
+    prompt = await _spawn_recurring_class_prompt(db_session, fix_log)
+    assert "PER-CYCLE LAYER HISTORY" in prompt
+    assert "cross_layer_mandate=yes" in prompt
+    assert "compliance=compliant" in prompt
+    assert "compliance=non-compliant" not in prompt
+    # No guidance section because no cycle is non-compliant.
+    assert "PRIOR MANDATE NON-COMPLIANCE" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_recurring_class_prompt_annotates_non_compliant_cycle(db_session):
+    """Mandated cycle with single canonical layer → compliance=non-compliant + guidance."""
+    fix_log = [
+        _make_rc_fix_log_entry_with_mandate(
+            layers=["CI_WORKFLOW"],
+            merged_days_ago=15,
+            spawn_was_cross_layer=True,
+        ),
+        _make_rc_fix_log_entry_with_mandate(
+            layers=["AGENT_VM"],
+            merged_days_ago=10,
+            spawn_was_cross_layer=False,
+        ),
+        _make_rc_fix_log_entry_with_mandate(
+            layers=["CI_WORKFLOW"],
+            merged_days_ago=5,
+            spawn_was_cross_layer=False,
+        ),
+    ]
+    prompt = await _spawn_recurring_class_prompt(db_session, fix_log)
+    assert "compliance=non-compliant" in prompt
+    assert "PRIOR MANDATE NON-COMPLIANCE" in prompt
+    # Single-layer fix's targeted layer is named in the guidance.
+    assert "CI_WORKFLOW" in prompt
+    # At least one canonical layer untargeted across the full history is named.
+    from app.regression_layer_classifier import LAYER_DISPLAY_ORDER  # noqa: PLC0415
+
+    # CI_WORKFLOW + AGENT_VM are targeted; the remaining canonical layers are untargeted.
+    expected_untargeted = [
+        layer
+        for layer in LAYER_DISPLAY_ORDER
+        if layer not in {"CI_WORKFLOW", "AGENT_VM"}
+    ]
+    assert any(layer in prompt for layer in expected_untargeted)
+
+
+@pytest.mark.asyncio
+async def test_recurring_class_prompt_annotates_awaiting_backfill_cycle():
+    """Mandated entry without layers_targeted → compliance=awaiting-backfill, no false accusation."""
+    from app.pipeline_regression_dispatcher import _format_recurring_class_prompt
+
+    cycle_rows = [
+        {
+            "cycle": 1,
+            "layers_targeted": [],
+            "merged_at": "2026-04-01T00:00:00+00:00",
+            "spawn_was_cross_layer": True,
+            "layers_targeted_present": False,
+        },
+        {
+            "cycle": 2,
+            "layers_targeted": ["CI_WORKFLOW"],
+            "merged_at": "2026-04-15T00:00:00+00:00",
+            "spawn_was_cross_layer": True,
+            "layers_targeted_present": True,
+        },
+        {
+            "cycle": 3,
+            "layers_targeted": ["AGENT_VM"],
+            "merged_at": "2026-05-01T00:00:00+00:00",
+            "spawn_was_cross_layer": False,
+            "layers_targeted_present": True,
+        },
+    ]
+    prompt = _format_recurring_class_prompt(
+        regression_class="fix_loop_divergence:lint",
+        targeted_layers=["AGENT_VM", "CI_WORKFLOW"],
+        cycle_rows=cycle_rows,
+    )
+    assert "compliance=awaiting-backfill" in prompt
+    # Cycle 2 is non-compliant so guidance still appears — but NOT due to cycle 1's
+    # awaiting-backfill row alone. Verify by re-running with only the awaiting + not-mandated rows.
+    cycle_rows_no_noncompliant = [
+        cycle_rows[0],
+        cycle_rows[2],
+    ]
+    prompt2 = _format_recurring_class_prompt(
+        regression_class="fix_loop_divergence:lint",
+        targeted_layers=["AGENT_VM"],
+        cycle_rows=cycle_rows_no_noncompliant,
+    )
+    assert "compliance=awaiting-backfill" in prompt2
+    assert "PRIOR MANDATE NON-COMPLIANCE" not in prompt2
+
+
+@pytest.mark.asyncio
+async def test_recurring_class_prompt_annotates_no_mandate_cycle(db_session):
+    """No entry mandated → compliance=not-mandated everywhere, no guidance section."""
+    fix_log = [
+        _make_rc_fix_log_entry_with_mandate(
+            layers=["CI_WORKFLOW"],
+            merged_days_ago=15,
+            spawn_was_cross_layer=False,
+        ),
+        _make_rc_fix_log_entry_with_mandate(
+            layers=["AGENT_VM"],
+            merged_days_ago=10,
+            spawn_was_cross_layer=False,
+        ),
+        _make_rc_fix_log_entry_with_mandate(
+            layers=["CI_WORKFLOW"],
+            merged_days_ago=5,
+            spawn_was_cross_layer=False,
+        ),
+    ]
+    prompt = await _spawn_recurring_class_prompt(db_session, fix_log)
+    assert "compliance=not-mandated" in prompt
+    assert "compliance=non-compliant" not in prompt
+    assert "PRIOR MANDATE NON-COMPLIANCE" not in prompt
+
+
+# ---------------------------------------------------------------------------
+# get_sr_persistent_blind_spot_hint — DB-backed integration tests
+# ---------------------------------------------------------------------------
+
+
+def _make_sr_miss_task(project_id, *, created_at, category="correctness"):
+    """Task where reviewer caught *category* but SR marked it passed."""
+    return make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "x"}],
+        created_at=created_at,
+        context={
+            "_self_review_outcome": {
+                "check_results": {category: {"passed": True}},
+                "reviewer_findings": [
+                    {"category": category, "severity": "HIGH", "description": "missed"}
+                ],
+            }
+        },
+    )
+
+
+def _make_sr_clean_task(project_id, *, created_at):
+    """Task with no reviewer disagreement."""
+    return make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "x"}],
+        created_at=created_at,
+        context={
+            "_self_review_outcome": {
+                "check_results": {"correctness": {"passed": True}},
+                "reviewer_findings": [],
+            }
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_sr_persistent_blind_spot_hint_returns_none_below_threshold(
+    db_session,
+):
+    """Returns None when miss rate is below threshold in one of the two windows."""
+    from app.pipeline_regression_dispatcher import get_sr_persistent_blind_spot_hint
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    # Window 0 (0-7 days): 1 miss / 5 tasks = 0.20 — below 0.25 threshold
+    tasks_w0 = [_make_sr_miss_task(project.id, created_at=now - timedelta(days=2))] + [
+        _make_sr_clean_task(project.id, created_at=now - timedelta(days=2))
+        for _ in range(4)
+    ]
+    # Window 1 (7-14 days): 3 misses / 4 tasks = 0.75 — above 0.25 threshold
+    tasks_w1 = [
+        _make_sr_miss_task(project.id, created_at=now - timedelta(days=10))
+        for _ in range(3)
+    ] + [_make_sr_clean_task(project.id, created_at=now - timedelta(days=10))]
+    for t in tasks_w0 + tasks_w1:
+        db_session.add(t)
+    await db_session.commit()
+
+    result = await get_sr_persistent_blind_spot_hint(db_session, project.id)
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_get_sr_persistent_blind_spot_hint_returns_categories_above_threshold(
+    db_session,
+):
+    """Returns hint dict with categories when miss rate exceeds threshold in both windows."""
+    from app.pipeline_regression_dispatcher import get_sr_persistent_blind_spot_hint
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    # Both windows: 3 misses / 4 tasks = 0.75 — above 0.25 threshold
+    tasks = []
+    for days_ago in (3, 10):
+        tasks += [
+            _make_sr_miss_task(project.id, created_at=now - timedelta(days=days_ago))
+            for _ in range(3)
+        ] + [_make_sr_clean_task(project.id, created_at=now - timedelta(days=days_ago))]
+    for t in tasks:
+        db_session.add(t)
+    await db_session.commit()
+
+    result = await get_sr_persistent_blind_spot_hint(db_session, project.id)
+    assert result is not None
+    assert len(result["categories"]) >= 1
+    cats = [c["category"] for c in result["categories"]]
+    assert "correctness" in cats
+    assert result["hint"] is not None
+    assert "correctness" in result["hint"]
+
+
+# ---------------------------------------------------------------------------
+# Tests for meta-prompt builders (cross-layer, layer-concentration, fragile-recurrence)
+# ---------------------------------------------------------------------------
+
+
+class TestMetaPromptBuilders:
+    """Pin structural contracts for meta-investigation prompt builders."""
+
+    def test_format_cross_layer_prompt_includes_all_canonical_layers(self):
+        """Cross-layer prompt enumerates all canonical layers."""
+        layers_evidence = [
+            {
+                "layer": "CI_WORKFLOW",
+                "fingerprint": "test fp 1",
+                "sample": "test sample 1",
+            },
+            {
+                "layer": "AGENT_VM",
+                "fingerprint": "test fp 2",
+                "sample": "test sample 2",
+            },
+        ]
+        prompt = _format_cross_layer_prompt(
+            signal_name="test_signal",
+            regression_class="test_class",
+            layers_evidence=layers_evidence,
+            base_lines="Test base content",
+        )
+        # All canonical layers should be mentioned in evidence section
+        assert "Layer: CI_WORKFLOW" in prompt
+        assert "Layer: AGENT_VM" in prompt
+
+    def test_format_cross_layer_prompt_requires_multi_layer_defense(self):
+        """Cross-layer prompt mandates AT LEAST TWO distinct layers in defense."""
+        layers_evidence = [
+            {"layer": "CI_WORKFLOW", "fingerprint": "fp1", "sample": "sample1"},
+            {"layer": "AGENT_VM", "fingerprint": "fp2", "sample": "sample2"},
+        ]
+        prompt = _format_cross_layer_prompt(
+            signal_name="test_signal",
+            regression_class="test_class",
+            layers_evidence=layers_evidence,
+            base_lines="Test base content",
+        )
+        # Pin the defensive mandate language (allow fuzzy rewording)
+        assert "AT LEAST TWO" in prompt or "at least two" in prompt
+        assert "layer" in prompt.lower()
+
+    def test_format_cross_layer_prompt_injects_samples_when_present(self):
+        """Samples and fingerprints are injected into prompt when provided."""
+        layers_evidence = [
+            {
+                "layer": "CI_WORKFLOW",
+                "fingerprint": "unique_fingerprint_123",
+                "sample": "unique_sample_456",
+            }
+        ]
+        prompt = _format_cross_layer_prompt(
+            signal_name="test_signal",
+            regression_class="test_class",
+            layers_evidence=layers_evidence,
+            base_lines="Test base content",
+        )
+        assert "unique_fingerprint_123" in prompt
+        assert "unique_sample_456" in prompt
+
+    def test_format_cross_layer_prompt_omits_empty_samples(self):
+        """Empty samples are gracefully omitted from prompt."""
+        layers_evidence = [
+            {"layer": "CI_WORKFLOW", "fingerprint": "", "sample": ""},
+            {"layer": "AGENT_VM", "sample": None},
+        ]
+        prompt = _format_cross_layer_prompt(
+            signal_name="test_signal",
+            regression_class="test_class",
+            layers_evidence=layers_evidence,
+            base_lines="Test base content",
+        )
+        # Should not crash and should contain layer names
+        assert "Layer: CI_WORKFLOW" in prompt
+        assert "Layer: AGENT_VM" in prompt
+
+    def test_format_fragile_recurrence_meta_prompt_includes_canonical_layers(self):
+        """Fragile-recurrence prompt lists canonical layers for enumeration."""
+        case = SimpleNamespace(
+            _recurrence_count=3,
+            _recurrence_attempts=[
+                {"layers_targeted": ["CI_WORKFLOW"]},
+                {"layers_targeted": ["AGENT_VM"]},
+            ],
+        )
+        prompt = _format_fragile_recurrence_meta_prompt(
+            case=case,
+            base_lines="Test base content",
+        )
+        # Should enumerate all canonical layers
+        for layer in LAYER_DISPLAY_ORDER:
+            assert layer in prompt
+
+    def test_fragile_recurrence_meta_prompt_requires_multi_layer_defense(self):
+        """Fragile-recurrence prompt mandates AT LEAST TWO distinct layers."""
+        case = SimpleNamespace(
+            _recurrence_count=3,
+            _recurrence_attempts=[{"layers_targeted": ["CI_WORKFLOW"]}],
+        )
+        prompt = _format_fragile_recurrence_meta_prompt(
+            case=case,
+            base_lines="Test base content",
+        )
+        # Pin the defensive mandate
+        assert "AT LEAST TWO" in prompt
+        assert (
+            "distinguish" not in prompt
+            or "defense across" in prompt
+            or "distinct layers" in prompt.lower()
+        )
+
+    def test_fragile_recurrence_meta_prompt_flags_untargeted_layers(self):
+        """Untargeted layers are marked as candidates for defense."""
+        case = SimpleNamespace(
+            _recurrence_count=3,
+            _recurrence_attempts=[
+                {"layers_targeted": ["CI_WORKFLOW"]},
+                {"layers_targeted": ["AGENT_VM"]},
+            ],
+        )
+        prompt = _format_fragile_recurrence_meta_prompt(
+            case=case,
+            base_lines="Test base content",
+        )
+        # Untargeted layers section should exist
+        assert "Untargeted layers" in prompt or "untargeted" in prompt.lower()
+        # The untargeted layers should be called out (at least some of them)
+        # CI_WORKFLOW and AGENT_VM are targeted, so BASELINE_GATE, REVIEWER_PASS, VIEWPORT should be untargeted
+        assert (
+            "BASELINE_GATE" in prompt
+            or "REVIEWER_PASS" in prompt
+            or "VIEWPORT" in prompt
+        )
+
+    def test_fragile_recurrence_meta_prompt_handles_empty_attempts(self):
+        """Empty recurrence attempts list is handled gracefully."""
+        case = SimpleNamespace(
+            _recurrence_count=0,
+            _recurrence_attempts=[],
+        )
+        prompt = _format_fragile_recurrence_meta_prompt(
+            case=case,
+            base_lines="Test base content",
+        )
+        # Should not crash and should still list canonical layers
+        for layer in LAYER_DISPLAY_ORDER:
+            assert layer in prompt
+
+    def test_format_layer_concentration_prompt_enumerates_case_ids(self):
+        """Layer-concentration prompt enumerates distinct case IDs."""
+        sample_case_ids = ["case-1", "case-2", "case-3"]
+        all_fix_logs = [
+            ("case-1", {"layers_targeted": ["CI_WORKFLOW"], "merged_at": "2026-01-01"}),
+            ("case-2", {"layers_targeted": ["CI_WORKFLOW"], "merged_at": "2026-01-02"}),
+            ("case-3", {"layers_targeted": ["CI_WORKFLOW"], "merged_at": "2026-01-03"}),
+        ]
+        prompt = _format_layer_concentration_prompt(
+            layer="CI_WORKFLOW",
+            sample_case_ids=sample_case_ids,
+            all_fix_logs_with_case_ids=all_fix_logs,
+        )
+        # All case IDs should appear
+        for case_id in sample_case_ids:
+            assert case_id in prompt
+
+    def test_layer_concentration_prompt_requires_multi_layer_defense(self):
+        """Layer-concentration prompt mandates defense in AT LEAST ONE OTHER layer."""
+        sample_case_ids = ["case-1"]
+        all_fix_logs = [
+            ("case-1", {"layers_targeted": ["CI_WORKFLOW"], "merged_at": "2026-01-01"}),
+        ]
+        prompt = _format_layer_concentration_prompt(
+            layer="CI_WORKFLOW",
+            sample_case_ids=sample_case_ids,
+            all_fix_logs_with_case_ids=all_fix_logs,
+        )
+        # Should mandate multi-layer thinking
+        assert "AT LEAST ONE OTHER" in prompt or "at least one other" in prompt
+        assert "layer" in prompt.lower()
+
+    def test_layer_concentration_prompt_names_focal_layer(self):
+        """Layer-concentration prompt explicitly names the focal layer."""
+        sample_case_ids = []
+        all_fix_logs = []
+        prompt = _format_layer_concentration_prompt(
+            layer="REVIEWER_PASS",
+            sample_case_ids=sample_case_ids,
+            all_fix_logs_with_case_ids=all_fix_logs,
+        )
+        # Focal layer should be named
+        assert "REVIEWER_PASS" in prompt
+
+    def test_layer_concentration_prompt_handles_empty_case_list(self):
+        """Empty case list is handled gracefully."""
+        prompt = _format_layer_concentration_prompt(
+            layer="AGENT_VM",
+            sample_case_ids=[],
+            all_fix_logs_with_case_ids=[],
+        )
+        # Should not crash and should still contain structural elements
+        assert "AGENT_VM" in prompt
+
+
+# ---------------------------------------------------------------------------
+# _compute_recovery_layer_mismatch unit tests
+# ---------------------------------------------------------------------------
+
+
+class TestComputeRecoveryLayerMismatch:
+    """Unit tests for the recovery-layer-mismatch detection helper."""
+
+    def setup_method(self):
+        from app.pipeline_regression_dispatcher import _compute_recovery_layer_mismatch
+        from app.time_utils import _utcnow
+
+        self._fn = _compute_recovery_layer_mismatch
+        self._now = _utcnow()
+
+    def test_mismatch_detected_when_symptom_layer_not_fixed(self):
+        """Symptom fired from layer Y while fix only targeted layer X → mismatch."""
+        fix_log = [{"layers_targeted": ["CI_WORKFLOW"], "fix_pr_number": 1}]
+        symptoms = {
+            "AGENT_VM": [{"fingerprint": "fp1", "observed_at": "2026-01-01T00:00:00"}]
+        }
+        result = self._fn(fix_log, symptoms, self._now)
+        assert result is not None
+        assert result["type"] == "recovery_layer_mismatch"
+        assert "AGENT_VM" in result["unaddressed_layers"]
+        assert "CI_WORKFLOW" in result["fix_layers"]
+        assert result["evaluated_at"] is not None
+
+    def test_no_mismatch_when_layers_aligned(self):
+        """Fix targeted the same layer as symptoms → no mismatch entry."""
+        fix_log = [{"layers_targeted": ["CI_WORKFLOW"], "fix_pr_number": 1}]
+        symptoms = {
+            "CI_WORKFLOW": [
+                {"fingerprint": "fp1", "observed_at": "2026-01-01T00:00:00"}
+            ]
+        }
+        result = self._fn(fix_log, symptoms, self._now)
+        assert result is None
+
+    def test_no_mismatch_when_no_symptom_data(self):
+        """Empty symptoms_by_layer → no mismatch (nothing to compare)."""
+        fix_log = [{"layers_targeted": ["CI_WORKFLOW"], "fix_pr_number": 1}]
+        result = self._fn(fix_log, {}, self._now)
+        assert result is None
+
+    def test_no_mismatch_when_no_fix_layer_data(self):
+        """Fix log without layers_targeted → no mismatch (no fix data)."""
+        fix_log = [{"fix_pr_number": 1}]
+        symptoms = {
+            "AGENT_VM": [{"fingerprint": "fp1", "observed_at": "2026-01-01T00:00:00"}]
+        }
+        result = self._fn(fix_log, symptoms, self._now)
+        assert result is None
+
+    def test_partial_mismatch_captures_only_unaddressed(self):
+        """Fix covered one of two symptom layers → only unaddressed layer listed."""
+        fix_log = [
+            {"layers_targeted": ["CI_WORKFLOW", "REVIEWER_PASS"], "fix_pr_number": 1}
+        ]
+        symptoms = {
+            "CI_WORKFLOW": [
+                {"fingerprint": "fp1", "observed_at": "2026-01-01T00:00:00"}
+            ],
+            "AGENT_VM": [{"fingerprint": "fp2", "observed_at": "2026-01-01T00:00:00"}],
+        }
+        result = self._fn(fix_log, symptoms, self._now)
+        assert result is not None
+        assert result["unaddressed_layers"] == ["AGENT_VM"]
+        assert set(result["fix_layers"]) == {"CI_WORKFLOW", "REVIEWER_PASS"}
+        assert set(result["symptom_layers"]) == {"CI_WORKFLOW", "AGENT_VM"}

@@ -646,6 +646,35 @@ if admin_ui_runtime_touched; then
   #    tree untouched.
   ADMIN_UI_CHANGED=$(printf '%s\\n' "$CHANGED" | grep -E '^admin-ui/' || true)
   NON_COMPONENT=$(printf '%s\\n' "$ADMIN_UI_CHANGED" | grep -vE '^admin-ui/src/components/[^/]+\\.(viewport\\.test\\.tsx|tsx)$' || true)
+
+  # Check for new admin-ui components without viewport tests.
+  # Uses process substitution (\`done < <(...)\`) so the loop runs in the
+  # current shell — a piped \`while\` would run in a subshell and any
+  # FAILED+= or flag set inside would be lost, leaving the gate
+  # advisory-only.
+  if [ "$FULL_SCOPE" = "0" ] && [ -n "$ADMIN_UI_CHANGED" ]; then
+    NEW_COMPONENTS=$(printf '%s\\n' "$ADMIN_UI_CHANGED" | grep -E '^admin-ui/src/components/[^/]+\\.tsx$' | grep -vE '\\.test\\.tsx$|\\.viewport\\.test\\.tsx$' || true)
+    if [ -n "$NEW_COMPONENTS" ]; then
+      MISSING_VIEWPORT_TESTS=()
+      while IFS= read -r comp; do
+        [ -z "$comp" ] && continue
+        [ -f "\${comp%.tsx}.viewport.test.tsx" ] && continue
+        basename "$comp" .tsx | grep -qE '^[a-z]' && continue
+        grep -q '@viewport-test-exempt' "$comp" 2>/dev/null && continue
+        MISSING_VIEWPORT_TESTS+=("$comp")
+      done < <(printf '%s\\n' "$NEW_COMPONENTS")
+      if [ \${#MISSING_VIEWPORT_TESTS[@]} -gt 0 ]; then
+        echo "[check] ERROR: New component(s) without viewport test:" >&2
+        for comp in "\${MISSING_VIEWPORT_TESTS[@]}"; do
+          echo "  $comp" >&2
+          echo "  Expected test file: \${comp%.tsx}.viewport.test.tsx" >&2
+        done
+        echo "  See admin-ui/src/test/viewport.ts for examples" >&2
+        FAILED+=("admin-ui new component viewport test")
+      fi
+    fi
+  fi
+
   : > /tmp/check_viewport_tests.txt
   if [ "$FULL_SCOPE" = "0" ] && [ -z "$NON_COMPONENT" ]; then
     printf '%s\\n' "$ADMIN_UI_CHANGED" | grep -E '^admin-ui/src/components/[^/]+\\.viewport\\.test\\.tsx$' | while IFS= read -r f; do
@@ -670,7 +699,20 @@ if admin_ui_runtime_touched; then
     # first and fall through to the bare install, with --with-deps as a
     # last-resort fallback for fresh local machines.
     # See admin-ui/CONTRIBUTING.md for developer-machine setup.
-    run "admin-ui playwright chromium" bash -c 'cd admin-ui && { [ -d "$HOME/.cache/ms-playwright" ] && ls "$HOME/.cache/ms-playwright"/chromium-* >/dev/null 2>&1 || npx playwright install chromium || npx playwright install --with-deps chromium; } 2>&1'
+    run "admin-ui playwright chromium" bash -c '
+      cd admin-ui || exit 1
+      if [ -d "$HOME/.cache/ms-playwright" ] && ls "$HOME/.cache/ms-playwright"/chromium-* >/dev/null 2>&1; then
+        exit 0
+      fi
+      if npx playwright install chromium 2>&1; then
+        exit 0
+      fi
+      if npx playwright install --with-deps chromium 2>&1; then
+        exit 0
+      fi
+      echo "[check] Retrying inside Docker container..." >&2
+      docker run --rm -v "$PWD:/work" -w /work mcr.microsoft.com/playwright:v1.59.1-jammy npx playwright install chromium 2>&1 || exit 1
+    ' 2>&1
   fi
 
   if [ "$FULL_SCOPE" = "1" ]; then
@@ -1355,6 +1397,36 @@ if [ "\${#MISSING_REASONING[@]}" -gt 0 ]; then
 fi`
   : '# No regressing categories for this task type — reasoning check skipped.'}
 
+# High-stakes-category evidence-anchor gate: require concrete evidence anchors for PASS verdicts
+# on correctness, error-handling, security, regression_risk. Anchors must be file:line or >=10
+# char quoted snippet. If any are missing, print the gap and exit so Claude can fix the SR JSON.
+HIGH_STAKES_CATS=("correctness" "error-handling" "security" "regression_risk")
+MISSING_EVIDENCE=()
+for _CAT in "\${HIGH_STAKES_CATS[@]}"; do
+  _PASSED=$(printf '%s' "$SELF_REVIEW_JSON" | jq -r --arg c "$_CAT" '.check_results[$c].passed // false' 2>/dev/null || echo "false")
+  _REASONING=$(printf '%s' "$SELF_REVIEW_JSON" | jq -r --arg c "$_CAT" '.check_results[$c].reasoning // ""' 2>/dev/null || echo "")
+
+  if [ "$_PASSED" = "true" ]; then
+    # Check if reasoning has evidence anchor: file:line format or quoted code (10+ chars)
+    _HAS_ANCHOR=0
+    if printf '%s' "$_REASONING" | grep -E '[a-zA-Z0-9._/-]+[.][a-z]+:[0-9]+' > /dev/null 2>&1; then
+      _HAS_ANCHOR=1
+    elif printf '%s' "$_REASONING" | grep '.' > /dev/null 2>&1 && [ "\${#_REASONING}" -ge 20 ]; then
+      # Heuristic: if reasoning is substantial (20+ chars), assume it contains evidence
+      _HAS_ANCHOR=1
+    fi
+    if [ "\${_HAS_ANCHOR}" = "0" ]; then
+      MISSING_EVIDENCE+=("$_CAT")
+    fi
+  fi
+done
+if [ "\${#MISSING_EVIDENCE[@]}" -gt 0 ]; then
+  echo "[done] PASS verdicts on high-stakes categories must include evidence anchors (file:line or code reference):" >&2
+  for _CAT in "\${MISSING_EVIDENCE[@]}"; do echo "  - $_CAT" >&2; done
+  echo "Update /tmp/self_review_${cfg.taskId}.json with evidence anchors in reasoning and re-run ./done." >&2
+  exit 1
+fi
+
 # Optional enrichment: changed_files from git diff — review-pipeline scope
 # analysis, direction credit, rollup management all read this from
 # task.context._pr_changed_files. Without it those signals degrade.
@@ -1761,7 +1833,13 @@ the declared scope. Apply these additional checks before \`./done\`:
    modified file outside \`related_files\` and outside the allowlist is off-scope —
    record under \`scope-drift\` with \`passed: false\` and list the off-scope files
    (e.g. "modified files outside declared scope: backend/app/foo.py — declared related_files: [agent/src/baz.ts]").
-3. **Caller compatibility** — grep for callers of any function or export you
+3. **Cross-file consistency** — when the diff touches multiple files, identify the dominant
+   pattern introduced or modified (e.g., 'added null guard before .map calls', 'switched
+   timestamps to UTC-aware', 'added try/except around external HTTP call'). Enumerate every
+   touched file and attest that the pattern is applied consistently. If the pattern is
+   inconsistently applied across files, record under \`correctness\` with \`passed: false\`
+   and the issue: "pattern X inconsistently applied: present in [files], missing/divergent in [files]".
+4. **Caller compatibility** — grep for callers of any function or export you
    added or modified; confirm their call sites still compile and behave correctly.
 `;
 
@@ -1790,6 +1868,11 @@ failing, and scope creep into unrelated files. Apply these additional checks:
    as \`_self_review_outcome\` in context) is reference material, not a template to copy.
    Write to \`/tmp/self_review_<YOUR_task_id>.json\` using the CURRENT task ID from the
    ORCHESTRATOR env — never a prior task's ID.
+5. **Cross-file consistency** — when the fix touches multiple files, confirm the fix pattern
+   is applied consistently across all affected files. Identify the primary fix pattern and
+   verify it is applied in all relevant locations. If the fix is incomplete across files,
+   record under \`correctness\` with \`passed: false\` and the issue: "fix pattern inconsistency:
+   [description of where pattern is/isn't applied]".
 `;
 
 export const DOCS_TASK_FOCUS = `
@@ -1965,6 +2048,7 @@ backend review vocabulary — must match exactly):
 - \`test-coverage\` — missing tests for new behavior, untested edge cases
 - \`scope-drift\` — diff materially exceeds the declared task scope (see thresholds below)
 - \`regression_risk\` — previously-passing test now fails after changes (omit if no baseline available)
+- \`cross-system-contract\` — URL path, DTO field, or shared type referenced on one side has no matching definition on the other (see check below)
 
 **Scope-drift check (required for code-change tasks):**
 The \`scope-drift\` category has TWO triggers that both feed the SAME \`scope-drift\` entry
@@ -2040,6 +2124,27 @@ regressions. Compare this list against any test failures surfaced by your most r
 Like \`scope-drift\`, this check does NOT block \`./done\` — it is informational and feeds
 the catch-rate dashboard.
 
+**Cross-system-contract check (fires when diff is cross-system):**
+This check is REQUIRED when the diff touches ≥2 of {admin-ui, backend, agent} OR when it adds or
+changes HTTP route paths, FastAPI router decorators (\`@router.get\`, \`@router.post\`, etc.), or
+fetch/axios call sites.
+
+Steps:
+1. Enumerate every new or changed URL path string, DTO field name, and shared TypeScript/Python
+   type name in the diff (look for string literals like \`'/api/...'\`, decorator paths like
+   \`@router.get('/...')\`, and \`fetch('/...')\` / \`axios.get('/...')\` calls).
+2. For each URL path found on one side, grep the *other* side's tree for a matching route
+   definition or call site (e.g., if admin-ui calls \`/api/admin/foo\`, grep backend for \`/foo\`
+   in router files; if backend adds \`@router.post('/bar')\`, grep admin-ui for \`/bar\`).
+3. For each DTO field name or shared type name, grep the other side for its definition or usage.
+4. Record \`passed: false\` with \`severity: "major"\` for URL/route mismatches (these break
+   runtime), or \`severity: "minor"\` for type-name drift where runtime is unaffected.
+   Include the path string and the side that is missing the definition in the \`issue\` field.
+5. If the diff is not cross-system and contains no HTTP path changes, record \`passed: true\`
+   with \`issue: "diff does not cross system boundaries"\`.
+
+This check does NOT block \`./done\` — it is informational and feeds the catch-rate dashboard.
+
 Schema:
 
 \`\`\`json
@@ -2064,6 +2169,14 @@ describing exactly what you inspected and what evidence supports the pass/fail c
 required for BOTH pass and fail outcomes. Non-regressing categories keep the existing optional
 schema (no \`reasoning\` required). If \`./done\` exits with a "Regressing categories need a
 reasoning field" error, update the SR JSON and re-run \`./done\`.
+
+**Evidence anchors for PASS verdicts on high-stakes categories:**
+When you mark any of these four categories as \`"passed": true\` — \`correctness\`, \`error-handling\`, \`security\`, or \`regression_risk\` — your \`reasoning\` field MUST include a concrete evidence anchor. Valid anchors are:
+- A file reference with line number: \`path/to/file.ts:42\`
+- A backtick-quoted code snippet ≥10 characters from the diff: \`\`\`const result = validate(...)\`\`\`
+- A named test file: \`testing/test_security.py\` with the assertion that proved the claim
+
+For example: \`"reasoning": "Checked \`path/to/foo.ts:89\` — the null guard handles undefined payload fields, verified in test_agent.py:156"\`. PASS without an anchor on these high-stakes categories is unsubstantiated — downgrade to FAIL or \`unknown\` instead. This requirement does not apply to lower-stakes categories (style-conventions, documentation, performance, architecture).
 
 \`fixes_applied: true\` means YOU caught something during self-review and
 fixed it before pushing. A degraded \`{"verdict":"unknown","check_results":{},"blind_spots":["..."]}\`

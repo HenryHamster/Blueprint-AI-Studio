@@ -4,6 +4,7 @@ import logging
 import re
 import uuid
 import json
+from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -14,7 +15,15 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.database import get_session
-from app.models import Alert, ProjectMember, ProjectMessage, MessageType, _utcnow
+from app.models import (
+    Alert,
+    Project,
+    ProjectMember,
+    ProjectMessage,
+    MessageType,
+    MessagesLastSeen,
+    _utcnow,
+)
 from app.auth import get_current_user
 from app.shared_state import limiter
 from app.admin import _get_user_project, _get_user_project_with_role, _user_project_ids
@@ -44,6 +53,11 @@ class MessageResolve(BaseModel):
     resolution: Optional[str] = None
 
 
+class LastSeenUpdate(BaseModel):
+    project_id: str
+    timestamp: int  # Unix ms epoch
+
+
 class AdminPlaybookSet(BaseModel):
     key: str = Field(
         ..., description="Playbook key: alphanumeric + hyphens, max 50 chars"
@@ -57,6 +71,36 @@ class AdminPlaybookSet(BaseModel):
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 _ADMIN_PLAYBOOK_KEY_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9\-]{0,49}$")
+
+# Mirrors ROUTINE_EVENT_LABELS keys in admin-ui/src/components/MessagesPanel.utils.ts.
+# Events in this set trigger a one-line digest appended to project.running_update.
+ROUTINE_EVENT_TYPES: frozenset = frozenset(
+    {
+        "pr_merged",
+        "direction_milestone",
+        "cycle_summary",
+        "account_model_regression_quarantined",
+        "account_model_regression_recovered",
+        "auto_fix_spawned",
+        "auto_fix_result",
+        "residual_fix_spawned",
+        "residual_fix_result",
+        "residual_fix_unsuspended",
+        "residual_case_auto_resolved",
+        "issue_implementation_spawned",
+        "review_feedback",
+        "feedback_acknowledgment",
+    }
+)
+
+
+def append_routine_digest(project: Project, event_type: str, summary: str) -> None:
+    """Append a one-line digest entry for a routine event to project.running_update."""
+    now_str = _utcnow().strftime("%Y-%m-%d %H:%M")
+    line = f"- [{now_str}] **{event_type}**: {summary[:200]}"
+    current = (project.running_update or "").rstrip()
+    project.running_update = f"{current}\n{line}" if current else line
+
 
 from app.payload_schemas import ALL_TASK_TYPES as _VALID_TASK_TYPES  # noqa: E402
 
@@ -327,7 +371,7 @@ async def create_message(
     except (ValueError, TypeError):
         raise HTTPException(status_code=400, detail="Invalid project_id format")
     # Verify user has access
-    await _get_user_project(project_id, current_user["user_id"], session)
+    project = await _get_user_project(project_id, current_user["user_id"], session)
 
     valid_types = {t.value for t in MessageType}
     msg_type = payload.message_type.upper()
@@ -351,6 +395,9 @@ async def create_message(
         context=ctx,
     )
     session.add(msg)
+    event_type = ctx.get("event_type")
+    if event_type and event_type in ROUTINE_EVENT_TYPES:
+        append_routine_digest(project, event_type, payload.content.strip())
     await session.commit()
     await session.refresh(msg)
     return {"id": str(msg.id), "status": "created"}
@@ -394,6 +441,78 @@ async def delete_message(
     await session.delete(msg)
     await session.commit()
     return {"deleted": True}
+
+
+# ── Messages Last-Seen Endpoints ─────────────────────────────────────────────
+
+
+@router.get("/messages/last-seen")
+async def get_messages_last_seen(
+    project_id: str = Query(...),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return the operator's last-seen timestamp (ms epoch) for the messages panel divider."""
+    try:
+        pid = uuid.UUID(project_id)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid project_id format")
+    await _get_user_project(pid, current_user["user_id"], session)
+
+    row = (
+        await session.execute(
+            select(MessagesLastSeen).where(
+                MessagesLastSeen.user_id == current_user["user_id"],
+                MessagesLastSeen.project_id == pid,
+            )
+        )
+    ).scalar_one_or_none()
+
+    if row is None:
+        return {"last_seen_at": None}
+    return {"last_seen_at": int(row.last_seen_at.timestamp() * 1000)}
+
+
+@router.put("/messages/last-seen")
+async def put_messages_last_seen(
+    payload: LastSeenUpdate,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Upsert the operator's last-seen timestamp (ms epoch) for the messages panel divider."""
+    try:
+        pid = uuid.UUID(payload.project_id)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid project_id format")
+    await _get_user_project(pid, current_user["user_id"], session)
+
+    new_ts = datetime.fromtimestamp(
+        payload.timestamp / 1000.0, tz=timezone.utc
+    ).replace(tzinfo=None)
+
+    row = (
+        await session.execute(
+            select(MessagesLastSeen).where(
+                MessagesLastSeen.user_id == current_user["user_id"],
+                MessagesLastSeen.project_id == pid,
+            )
+        )
+    ).scalar_one_or_none()
+
+    if row is None:
+        row = MessagesLastSeen(
+            user_id=current_user["user_id"],
+            project_id=pid,
+            last_seen_at=new_ts,
+            updated_at=new_ts,
+        )
+    else:
+        row.last_seen_at = new_ts
+        row.updated_at = _utcnow()
+
+    session.add(row)
+    await session.commit()
+    return {"status": "ok", "last_seen_at": int(new_ts.timestamp() * 1000)}
 
 
 # ── Admin Playbook Endpoints ──────────────────────────────────────────────────

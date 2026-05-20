@@ -217,6 +217,112 @@ describe('formatProjectContext — SR Recent Miss Examples', () => {
   });
 });
 
+describe('formatProjectContext — SR vs Fresh-Reviewer Disagreements with examples', () => {
+  it('renders verbatim examples nested under each disagreement entry', () => {
+    const ctx = {
+      sr_reviewer_disagreements: {
+        window_days: 30,
+        disagreements: [
+          {
+            category: 'correctness',
+            task_type: 'create',
+            count: 3,
+            examples: [
+              { severity: 'HIGH', description: 'Off-by-one error in loop boundary' },
+              { severity: 'MEDIUM', description: 'Null pointer not checked before dereference' },
+            ],
+          },
+          {
+            category: 'security',
+            task_type: 'create',
+            count: 1,
+            examples: [
+              { severity: 'CRITICAL', description: 'User input passed directly to SQL query' },
+            ],
+          },
+        ],
+      },
+    };
+    const result = formatProjectContext(ctx, 'create');
+    expect(result).toContain('### SR vs Fresh-Reviewer Disagreements');
+    expect(result).toContain('**correctness**: 3 disagreements');
+    expect(result).toContain('[HIGH] Off-by-one error in loop boundary');
+    expect(result).toContain('[MEDIUM] Null pointer not checked before dereference');
+    expect(result).toContain('**security**: 1 disagreement');
+    expect(result).toContain('[CRITICAL] User input passed directly to SQL query');
+  });
+
+  it('renders count-only when entries have no examples', () => {
+    const ctx = {
+      sr_reviewer_disagreements: {
+        window_days: 14,
+        disagreements: [
+          { category: 'type-safety', task_type: 'create', count: 2 },
+        ],
+      },
+    };
+    const result = formatProjectContext(ctx, 'create');
+    expect(result).toContain('**type-safety**: 2 disagreements');
+  });
+
+  it('caps examples at 3 per entry', () => {
+    const ctx = {
+      sr_reviewer_disagreements: {
+        window_days: 30,
+        disagreements: [
+          {
+            category: 'correctness',
+            task_type: 'create',
+            count: 5,
+            examples: [
+              { severity: 'HIGH', description: 'Example one' },
+              { severity: 'HIGH', description: 'Example two' },
+              { severity: 'MEDIUM', description: 'Example three' },
+              { severity: 'LOW', description: 'Example four — should not appear' },
+            ],
+          },
+        ],
+      },
+    };
+    const result = formatProjectContext(ctx, 'create');
+    expect(result).toContain('Example one');
+    expect(result).toContain('Example two');
+    expect(result).toContain('Example three');
+    expect(result).not.toContain('Example four — should not appear');
+  });
+
+  it('adds task-type scope note to section header', () => {
+    const ctx = {
+      sr_reviewer_disagreements: {
+        window_days: 14,
+        disagreements: [{ category: 'correctness', task_type: 'create', count: 2 }],
+      },
+    };
+    const result = formatProjectContext(ctx, 'create');
+    expect(result).toContain('especially in create tasks');
+  });
+
+  it('appends task-type suffix on cross-type entries', () => {
+    const ctx = {
+      sr_reviewer_disagreements: {
+        window_days: 14,
+        disagreements: [
+          { category: 'correctness', task_type: 'fix', count: 1 },
+        ],
+      },
+    };
+    const result = formatProjectContext(ctx, 'create');
+    expect(result).toContain('**correctness**: 1 disagreement (fix tasks)');
+  });
+
+  it('omits the section when sr_reviewer_disagreements is absent or empty', () => {
+    expect(formatProjectContext({}, 'create')).not.toContain('SR vs Fresh-Reviewer Disagreements');
+    expect(
+      formatProjectContext({ sr_reviewer_disagreements: { disagreements: [] } }, 'create'),
+    ).not.toContain('SR vs Fresh-Reviewer Disagreements');
+  });
+});
+
 describe('formatSrCatchRateForSrPrompt', () => {
   it('renders miss-rate categories with percentages', () => {
     const ctx = {

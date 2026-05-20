@@ -67,7 +67,14 @@ export function ProjectMembers({ members, myRole, onAdd, onUpdateRole, onRemove 
   };
 
   return (
-    <div className="bg-neutral-900 border border-neutral-800 rounded-xl overflow-hidden">
+    // Dense admin-only UI: invite form, role selects, and per-row remove
+    // controls are intentionally below the 44px touch-target heuristic so the
+    // member list stays scannable on desktop. Mirrors the eslint exemption
+    // already on the trash button below.
+    <div
+      className="bg-neutral-900 border border-neutral-800 rounded-xl overflow-hidden"
+      data-viewport-allow-small-target
+    >
       <div className="px-4 py-3 border-b border-neutral-800">
         <h3 className="text-sm font-semibold text-neutral-100">Project Members</h3>
       </div>

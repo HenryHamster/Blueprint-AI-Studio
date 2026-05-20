@@ -8838,6 +8838,92 @@ async def test_digest_self_review_skip_rate_by_task_type_breakdown(
 
 
 # ---------------------------------------------------------------------------
+# SR disallowed blind-spot rate metric
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_digest_sr_disallowed_blind_spot_rate_below_min_sample(
+    client: AsyncClient, db_session
+):
+    """Fewer than 5 code-change tasks → sr_disallowed_blind_spot_rate is None."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    for _ in range(4):
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create"}],
+                context={
+                    "_self_review_outcome": {
+                        **_sr_valid_outcome(),
+                        "_filtered_blind_spots_count": 1,
+                    }
+                },
+            )
+        )
+    await db_session.commit()
+
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    assert response.json()["sr_disallowed_blind_spot_rate"] is None
+
+
+@pytest.mark.asyncio
+async def test_digest_sr_disallowed_blind_spot_rate_basic(
+    client: AsyncClient, db_session
+):
+    """Tasks with _filtered_blind_spots_count > 0 produce a correct violation rate."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # 2 violators + 3 clean = 5 code-change tasks → rate = 0.4
+    for _ in range(2):
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create"}],
+                context={
+                    "_self_review_outcome": {
+                        **_sr_valid_outcome(),
+                        "_filtered_blind_spots_count": 2,
+                    }
+                },
+            )
+        )
+    for _ in range(3):
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "fix"}],
+                context={
+                    "_self_review_outcome": {
+                        **_sr_valid_outcome(),
+                        "_filtered_blind_spots_count": 0,
+                    }
+                },
+            )
+        )
+    await db_session.commit()
+
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    rate = response.json()["sr_disallowed_blind_spot_rate"]
+    assert rate is not None
+    assert rate["violation_count"] == 2
+    assert rate["sample_size"] == 5
+    assert rate["overall_rate"] == 0.4
+
+
+# ---------------------------------------------------------------------------
 # Fresh-reviewer effectiveness metric
 # ---------------------------------------------------------------------------
 
@@ -10301,6 +10387,56 @@ async def test_digest_sr_trends_full_fidelity_passthrough(
     assert trends["categories"]["correctness"]["fp_count"] == 1
     assert trends["by_scope"]["large"]["correctness"]["miss_rate"] == 0.6
     assert trends["by_scope"]["large"]["correctness"]["sample_count"] == 5
+
+
+@pytest.mark.asyncio
+async def test_digest_sr_trends_co_failure_pairs_passthrough(
+    client: AsyncClient, db_session
+):
+    """Digest passes co_failure_pairs from sr_catch_rate_trends in design_doc."""
+    project = make_project()
+    project.design_doc = {
+        "sr_catch_rate_trends": {
+            "computed_at": "2026-05-01T00:00:00",
+            "signal_last_computed_at": "2026-05-01T00:00:00",
+            "categories": {},
+            "by_task_type": {},
+            "co_failure_pairs": [
+                {
+                    "cat_a": "correctness",
+                    "cat_b": "test-coverage",
+                    "co_fail_count": 5,
+                    "p_b_given_a": 0.8333,
+                    "base_rate_b": 0.4167,
+                    "lift": 2.0,
+                },
+                {
+                    "cat_a": "test-coverage",
+                    "cat_b": "correctness",
+                    "co_fail_count": 5,
+                    "p_b_given_a": 1.0,
+                    "base_rate_b": 0.5,
+                    "lift": 2.0,
+                },
+            ],
+        }
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    trends = response.json().get("self_review_prediction_accuracy_trends")
+    assert trends is not None
+    pairs = trends.get("co_failure_pairs")
+    assert isinstance(pairs, list)
+    assert len(pairs) == 2
+    first = pairs[0]
+    assert first["cat_a"] == "correctness"
+    assert first["cat_b"] == "test-coverage"
+    assert first["co_fail_count"] == 5
+    assert first["lift"] == 2.0
 
 
 @pytest.mark.asyncio
@@ -12656,6 +12792,8 @@ async def test_regression_dispatcher_health_empty(client: AsyncClient, db_sessio
     assert agg["cycles"] == 0
     assert agg["spawns"] == 0
     assert agg["signals_tripped"] == 0
+    assert agg["mttd_p50_sec"] is None
+    assert agg["recoveries"] == {"marginal": 0, "confirmed": 0}
     assert data["per_class"] == []
     assert len(data["spawns_sparkline"]) == 24
 
@@ -12695,6 +12833,22 @@ async def test_regression_dispatcher_health_with_cycle_and_case(
             spawns_emitted=1,
             rejections_by_reason={"cooldown": 0, "dedup": 1},
             mttd_p50_sec=120.0,
+            marginal_recoveries_count=1,
+            confirmed_recoveries_count=2,
+        )
+    )
+    db_session.add(
+        DispatcherCycleRecord(
+            project_id=project.id,
+            cycle_started_at=now - timedelta(minutes=3),
+            cycle_finished_at=now - timedelta(minutes=2),
+            signals_evaluated=2,
+            signals_tripped=0,
+            spawns_emitted=0,
+            rejections_by_reason={"cooldown": 0, "dedup": 0},
+            mttd_p50_sec=180.0,
+            marginal_recoveries_count=0,
+            confirmed_recoveries_count=1,
         )
     )
     await db_session.commit()
@@ -12707,15 +12861,177 @@ async def test_regression_dispatcher_health_with_cycle_and_case(
     assert response.status_code == 200
     data = response.json()
     agg = data["aggregate"]
-    assert agg["cycles"] == 1
+    assert agg["cycles"] == 2
     assert agg["signals_tripped"] == 1
     assert agg["spawns"] == 1
     assert agg["rejections"]["dedup"] == 1
+    # mttd_p50_sec should be mean of 120.0 and 180.0
+    assert agg["mttd_p50_sec"] == 150.0
+    # recoveries should sum across both cycles
+    assert agg["recoveries"]["marginal"] == 1
+    assert agg["recoveries"]["confirmed"] == 3
 
     assert len(data["per_class"]) == 1
     cls = data["per_class"][0]
     assert cls["regression_class"] == "sr_catch_rate:correctness"
     assert cls["status"] == RegressionCaseStatus.ACTIVE
+
+
+@pytest.mark.asyncio
+async def test_regression_dispatcher_health_mttd_with_none_values(
+    client: AsyncClient, db_session
+):
+    """mttd_p50_sec aggregates only non-None values; None cycles are skipped."""
+    from app.models import DispatcherCycleRecord
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    db_session.add(
+        DispatcherCycleRecord(
+            project_id=project.id,
+            cycle_started_at=now - timedelta(minutes=5),
+            cycle_finished_at=now - timedelta(minutes=4),
+            signals_evaluated=1,
+            signals_tripped=0,
+            spawns_emitted=0,
+            rejections_by_reason={},
+            mttd_p50_sec=100.0,
+        )
+    )
+    db_session.add(
+        DispatcherCycleRecord(
+            project_id=project.id,
+            cycle_started_at=now - timedelta(minutes=3),
+            cycle_finished_at=now - timedelta(minutes=2),
+            signals_evaluated=1,
+            signals_tripped=0,
+            spawns_emitted=0,
+            rejections_by_reason={},
+            mttd_p50_sec=None,
+        )
+    )
+    await db_session.commit()
+
+    response = await client.get(
+        "/api/admin/regression-dispatcher/health",
+        params={"project_id": str(project.id), "window_hours": 24},
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    agg = data["aggregate"]
+    assert agg["cycles"] == 2
+    # mttd_p50_sec should be 100.0 (only non-None value)
+    assert agg["mttd_p50_sec"] == 100.0
+    assert agg["recoveries"] == {"marginal": 0, "confirmed": 0}
+
+
+@pytest.mark.asyncio
+async def test_regression_dispatcher_health_mtti_null_when_no_acked_cases(
+    client: AsyncClient, db_session
+):
+    """mtti_p50_sec is None when no cases have operator_acknowledged_at set."""
+    from app.models import DispatcherCycleRecord
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    # Case escalated but not yet acknowledged
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate:mtti_test",
+        status=RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION,
+        needs_manual_intervention_at=now - timedelta(hours=1),
+        operator_acknowledged_at=None,
+    )
+    db_session.add(case)
+    db_session.add(
+        DispatcherCycleRecord(
+            project_id=project.id,
+            cycle_started_at=now - timedelta(minutes=5),
+            cycle_finished_at=now - timedelta(minutes=4),
+            signals_evaluated=1,
+            signals_tripped=1,
+            spawns_emitted=1,
+            rejections_by_reason={},
+            mttd_p50_sec=60.0,
+        )
+    )
+    await db_session.commit()
+
+    response = await client.get(
+        "/api/admin/regression-dispatcher/health",
+        params={"project_id": str(project.id), "window_hours": 24},
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["aggregate"]["mtti_p50_sec"] is None
+
+
+@pytest.mark.asyncio
+async def test_regression_dispatcher_health_mtti_p50_with_acked_cases(
+    client: AsyncClient, db_session
+):
+    """mtti_p50_sec is the median seconds from escalation to acknowledgement."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    # Case 1: 600s MTTI (10 minutes)
+    db_session.add(
+        RegressionRemediationCase(
+            project_id=project.id,
+            regression_class="sr_catch_rate:mtti_case1",
+            status=RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION,
+            needs_manual_intervention_at=now - timedelta(hours=2),
+            operator_acknowledged_at=now - timedelta(hours=2) + timedelta(seconds=600),
+        )
+    )
+    # Case 2: 1200s MTTI (20 minutes)
+    db_session.add(
+        RegressionRemediationCase(
+            project_id=project.id,
+            regression_class="sr_catch_rate:mtti_case2",
+            status=RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION,
+            needs_manual_intervention_at=now - timedelta(hours=1),
+            operator_acknowledged_at=now - timedelta(hours=1) + timedelta(seconds=1200),
+        )
+    )
+    # Case 3: not acknowledged — must be excluded from MTTI
+    db_session.add(
+        RegressionRemediationCase(
+            project_id=project.id,
+            regression_class="sr_catch_rate:mtti_unacked",
+            status=RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION,
+            needs_manual_intervention_at=now - timedelta(minutes=30),
+            operator_acknowledged_at=None,
+        )
+    )
+    await db_session.commit()
+
+    response = await client.get(
+        "/api/admin/regression-dispatcher/health",
+        params={"project_id": str(project.id), "window_hours": 24},
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    agg = data["aggregate"]
+    # Median of [600, 1200] = 900
+    assert agg["mtti_p50_sec"] == 900.0
+
+
+# test: compute_mtti_p50_sec helper directly (unit tests in test_pipeline_regression_dispatcher.py)
 
 
 # ---------------------------------------------------------------------------
@@ -13180,6 +13496,58 @@ async def test_list_regression_manual_intervention_includes_layer_summary(
 
 
 @pytest.mark.asyncio
+async def test_list_regression_cases_includes_untargeted_layers(
+    client: AsyncClient, db_session
+):
+    """GET /regression-cases includes untargeted_layers from the dispatcher helper."""
+    from app.pipeline_regression_dispatcher import (
+        _CANONICAL_RECURRENCE_LAYERS,
+        compute_untargeted_layers,
+    )
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    fix_log = [
+        {"fingerprint": "abc", "fix_pr_number": 1, "layers_targeted": ["AGENT_VM"]},
+        {
+            "fingerprint": "abc",
+            "fix_pr_number": 2,
+            "layers_targeted": ["REVIEWER_PASS"],
+        },
+    ]
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate:correctness",
+        status=RegressionCaseStatus.ACTIVE,
+        fingerprint_to_fix_log=fix_log,
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    response = await client.get(
+        "/api/admin/regression-cases",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["count"] == 1
+    untargeted = data["cases"][0]["untargeted_layers"]
+    # Helper-produced answer is the source of truth.
+    expected = compute_untargeted_layers(fix_log)
+    assert untargeted == expected
+    # Sanity: AGENT_VM and REVIEWER_PASS were targeted; the other three remain
+    # in canonical order.
+    assert untargeted == [
+        layer
+        for layer in _CANONICAL_RECURRENCE_LAYERS
+        if layer not in {"AGENT_VM", "REVIEWER_PASS"}
+    ]
+
+
+@pytest.mark.asyncio
 async def test_list_recently_closed_includes_layer_summary(
     client: AsyncClient, db_session
 ):
@@ -13558,7 +13926,7 @@ async def test_regression_case_trend_counts_opened_and_closed(
 async def test_layer_defense_density_endpoint_returns_canonical_layers_with_counts(
     client: AsyncClient, db_session
 ):
-    """Endpoint returns all five canonical layers with correct counts and sample case ids."""
+    """Endpoint returns all six canonical layers with correct counts and sample case ids."""
     project = make_project()
     db_session.add(project)
     await db_session.commit()
@@ -13614,6 +13982,7 @@ async def test_layer_defense_density_endpoint_returns_canonical_layers_with_coun
         "AGENT_VERB",
         "BASELINE_GATE",
         "REVIEWER_PASS",
+        "VIEWPORT",
     ]
     by_layer = {r["layer"]: r for r in layers}
     assert by_layer["BASELINE_GATE"]["fix_count"] == 2
@@ -13678,7 +14047,7 @@ async def test_layer_defense_density_endpoint_respects_days_param(
 async def test_layer_defense_density_endpoint_no_cases_returns_zeroed_layers(
     client: AsyncClient, db_session
 ):
-    """Project with no regression cases returns five zero-row layers."""
+    """Project with no regression cases returns six zero-row layers."""
     project = make_project()
     db_session.add(project)
     await db_session.commit()
@@ -13691,7 +14060,7 @@ async def test_layer_defense_density_endpoint_no_cases_returns_zeroed_layers(
     assert response.status_code == 200
     body = response.json()
     layers = body["layers"]
-    assert len(layers) == 5
+    assert len(layers) == 6
     for row in layers:
         assert row["fix_count"] == 0
         assert row["last_fix_at"] is None
@@ -13788,6 +14157,80 @@ async def test_layer_defense_density_endpoint_includes_fragility_stats(
     assert av["still_holding_count"] == 0
     assert av["held_gt_7d_count"] == 0
     assert av["retripped_within_48h_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_layer_defense_density_endpoint_includes_single_vs_multi_cohort_stats(
+    client: AsyncClient, db_session
+):
+    """Endpoint forwards single_layer_* / multi_layer_* cohort fields per row."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="rc:cohort",
+        status=RegressionCaseStatus.ACTIVE,
+        fingerprint_to_fix_log=[
+            # single-layer CI_WORKFLOW fix, recovered hold=2d
+            {
+                "fingerprint": "fp-single",
+                "merged_at": (now - timedelta(days=10)).isoformat(),
+                "recovered_at": (now - timedelta(days=8)).isoformat(),
+                "layers_targeted": ["CI_WORKFLOW"],
+            },
+            # multi-layer CI_WORKFLOW + BASELINE_GATE fix, recovered hold=10d
+            {
+                "fingerprint": "fp-multi",
+                "merged_at": (now - timedelta(days=20)).isoformat(),
+                "recovered_at": (now - timedelta(days=10)).isoformat(),
+                "layers_targeted": ["CI_WORKFLOW", "BASELINE_GATE"],
+            },
+        ],
+    )
+    db_session.add(case)
+    await db_session.commit()
+    await db_session.refresh(case)
+
+    response = await client.get(
+        "/api/admin/regression-cases/layer-defense-density",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    by_layer = {r["layer"]: r for r in body["layers"]}
+
+    for row in body["layers"]:
+        assert "single_layer_fix_count" in row
+        assert "single_layer_avg_hold_days" in row
+        assert "multi_layer_fix_count" in row
+        assert "multi_layer_avg_hold_days" in row
+
+    ci = by_layer["CI_WORKFLOW"]
+    assert ci["fix_count"] == 2
+    assert ci["single_layer_fix_count"] == 1
+    assert ci["single_layer_avg_hold_days"] is not None
+    assert abs(ci["single_layer_avg_hold_days"] - 2.0) < 0.1
+    assert ci["multi_layer_fix_count"] == 1
+    assert ci["multi_layer_avg_hold_days"] is not None
+    assert abs(ci["multi_layer_avg_hold_days"] - 10.0) < 0.1
+
+    bg = by_layer["BASELINE_GATE"]
+    assert bg["fix_count"] == 1
+    assert bg["single_layer_fix_count"] == 0
+    assert bg["single_layer_avg_hold_days"] is None
+    assert bg["multi_layer_fix_count"] == 1
+    assert bg["multi_layer_avg_hold_days"] is not None
+    assert abs(bg["multi_layer_avg_hold_days"] - 10.0) < 0.1
+
+    av = by_layer["AGENT_VM"]
+    assert av["single_layer_fix_count"] == 0
+    assert av["single_layer_avg_hold_days"] is None
+    assert av["multi_layer_fix_count"] == 0
+    assert av["multi_layer_avg_hold_days"] is None
 
 
 @pytest.mark.asyncio
@@ -14289,3 +14732,602 @@ async def test_cross_layer_compliance_new_additive_fields(
     oldest_dt = datetime.fromisoformat(body["awaiting_backfill_oldest_merged_at"])
     expected_oldest = now - timedelta(days=3)
     assert abs((oldest_dt - expected_oldest).total_seconds()) < 5
+
+
+# ---------------------------------------------------------------------------
+# Viewport-debt coverage_summary tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_viewport_debt_coverage_summary_in_response(
+    client: AsyncClient, db_session
+):
+    """GET /viewport-debt returns coverage_summary with correct shape."""
+    from unittest.mock import patch
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    membership = make_membership(project.id, user_id="test-user-123", role="owner")
+    db_session.add(membership)
+    await db_session.commit()
+
+    fake_rows = [
+        {
+            "component": f"admin-ui/src/components/Comp{i}.tsx",
+            "eslint_disable_count": 1,
+            "data_viewport_allow_small_target": 0,
+            "data_viewport_allow_overflow": 0,
+            "data_viewport_allow_truncation": 0,
+            "total_opt_outs": 20 - i,
+            "has_viewport_test": (i % 5 == 0),
+            "regression_case_count": 0,
+            "source_url": None,
+        }
+        for i in range(20)
+    ]
+    top_rows = fake_rows[:15]
+    # 4 rows have viewport tests (i=0,5,10,15); 16 do not
+    untested_paths = [r["component"] for r in fake_rows if not r["has_viewport_test"]]
+    expected_summary = {
+        "total_components": 20,
+        "untested_count": 16,
+        "untested_components": untested_paths,
+    }
+
+    with patch(
+        "app.routers.admin_digest._scan_viewport_debt_rows",
+        return_value=(top_rows, [], expected_summary),
+    ):
+        response = await client.get(f"/api/admin/projects/{project.id}/viewport-debt")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert "rows" in body
+    assert "untested_rows" in body
+    assert "scanned_at" in body
+    assert "coverage_summary" in body
+    cs = body["coverage_summary"]
+    assert cs["total_components"] == 20
+    assert cs["untested_count"] == 16
+    assert len(cs["untested_components"]) == 16
+
+
+@pytest.mark.asyncio
+async def test_viewport_debt_coverage_summary_counts_full_set(
+    client: AsyncClient, db_session
+):
+    """coverage_summary reflects pre-truncation totals; untested_components capped at 50."""
+    from unittest.mock import patch
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    membership = make_membership(project.id, user_id="test-user-123", role="owner")
+    db_session.add(membership)
+    await db_session.commit()
+
+    # 60 components all untested — verifies the 50-cap on untested_components
+    fake_rows_all = [
+        {
+            "component": f"admin-ui/src/components/Big{i}.tsx",
+            "eslint_disable_count": 1,
+            "data_viewport_allow_small_target": 0,
+            "data_viewport_allow_overflow": 0,
+            "data_viewport_allow_truncation": 0,
+            "total_opt_outs": 60 - i,
+            "has_viewport_test": False,
+            "regression_case_count": 0,
+            "source_url": None,
+        }
+        for i in range(60)
+    ]
+    top_rows = fake_rows_all[:15]
+    untested_paths = [r["component"] for r in fake_rows_all]
+    expected_summary = {
+        "total_components": 60,
+        "untested_count": 60,
+        "untested_components": untested_paths[:50],
+    }
+
+    with patch(
+        "app.routers.admin_digest._scan_viewport_debt_rows",
+        return_value=(top_rows, [], expected_summary),
+    ):
+        response = await client.get(f"/api/admin/projects/{project.id}/viewport-debt")
+
+    assert response.status_code == 200
+    body = response.json()
+    cs = body["coverage_summary"]
+    assert cs["total_components"] == 60
+    assert cs["untested_count"] == 60
+    # top_rows are the truncated 15; rows in response should be 15
+    assert len(body["rows"]) == 15
+    # untested_components capped at 50
+    assert len(cs["untested_components"]) == 50
+
+
+# ---------------------------------------------------------------------------
+# Acknowledge endpoint
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_acknowledge_regression_case_stamps_timestamp(
+    client: AsyncClient, db_session
+):
+    """POST /regression-cases/{case_id}/acknowledge stamps operator_acknowledged_at."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate:correctness",
+        status=RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION,
+        needs_manual_intervention_at=_utcnow(),
+    )
+    db_session.add(case)
+    await db_session.commit()
+    await db_session.refresh(case)
+
+    assert case.operator_acknowledged_at is None
+
+    response = await client.post(
+        f"/api/admin/regression-cases/{case.id}/acknowledge",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["id"] == str(case.id)
+    assert body["operator_acknowledged_at"] is not None
+
+    await db_session.refresh(case)
+    assert case.operator_acknowledged_at is not None
+
+
+@pytest.mark.asyncio
+async def test_acknowledge_regression_case_idempotent(client: AsyncClient, db_session):
+    """POST /regression-cases/{case_id}/acknowledge is idempotent — second call preserves original timestamp."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    original_ack = _utcnow() - timedelta(hours=1)
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate:architecture",
+        status=RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION,
+        needs_manual_intervention_at=_utcnow() - timedelta(hours=2),
+        operator_acknowledged_at=original_ack,
+    )
+    db_session.add(case)
+    await db_session.commit()
+    await db_session.refresh(case)
+
+    response = await client.post(
+        f"/api/admin/regression-cases/{case.id}/acknowledge",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    returned_at = datetime.fromisoformat(body["operator_acknowledged_at"])
+    assert abs((returned_at - original_ack).total_seconds()) < 2
+
+
+@pytest.mark.asyncio
+async def test_acknowledge_regression_case_not_found(client: AsyncClient, db_session):
+    """POST /regression-cases/{case_id}/acknowledge returns 404 for unknown case."""
+    import uuid
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    response = await client.post(
+        f"/api/admin/regression-cases/{uuid.uuid4()}/acknowledge",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# /api/admin/regression-dispatcher/escalation-outcomes
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_regression_escalation_outcomes_baseline_vs_compliance_followup(
+    client: AsyncClient, db_session
+):
+    """Baseline cross-layer fix and compliance-followup fix bucket separately with independent prevention rates."""
+    from app.pipeline_regression_dispatcher import (
+        ESCALATION_REASON_ESCALATED_CROSS_LAYER,
+        _ESCALATION_BUCKET_COMPLIANCE_FOLLOWUP,
+    )
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    baseline_merged = (now - timedelta(days=35)).isoformat()
+    cf_original_merged = (now - timedelta(days=50)).isoformat()
+    cf_followup_merged = (now - timedelta(days=35)).isoformat()
+
+    # Baseline: compliant multi-layer fix, no compliance-followup marker → escalated_cross_layer bucket
+    baseline_case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate:correctness",
+        status=RegressionCaseStatus.ACTIVE,
+        escalation_reason=ESCALATION_REASON_ESCALATED_CROSS_LAYER,
+        first_seen_at=now - timedelta(days=55),
+        fingerprint_to_fix_log=[
+            {
+                "fix_pr_number": 1,
+                "merged_at": baseline_merged,
+                "layers_targeted": ["BACKEND", "FRONTEND"],
+            },
+        ],
+    )
+    db_session.add(baseline_case)
+
+    # Compliance-followup: original non-compliant fix + spawned marker + followup fix → compliance_followup bucket
+    cf_case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate:architecture",
+        status=RegressionCaseStatus.ACTIVE,
+        escalation_reason=ESCALATION_REASON_ESCALATED_CROSS_LAYER,
+        first_seen_at=now - timedelta(days=55),
+        fingerprint_to_fix_log=[
+            {
+                "fix_pr_number": 2,
+                "merged_at": cf_original_merged,
+                "layers_targeted": ["BACKEND"],
+            },
+            {
+                "type": "compliance_followup_spawned",
+                "spawned_at": (now - timedelta(days=42)).isoformat(),
+            },
+            {
+                "fix_pr_number": 3,
+                "merged_at": cf_followup_merged,
+                "layers_targeted": ["BACKEND", "FRONTEND"],
+            },
+        ],
+    )
+    db_session.add(cf_case)
+    await db_session.commit()
+
+    response = await client.get(
+        "/api/admin/regression-dispatcher/escalation-outcomes",
+        params={"project_id": str(project.id), "lookback_days": 60},
+    )
+    assert response.status_code == 200
+    by = response.json()["by_reason"]
+
+    # Baseline fix stays in cross_layer bucket with durable prevention
+    b_cross = by[ESCALATION_REASON_ESCALATED_CROSS_LAYER]
+    assert b_cross["merged_count"] == 1
+    assert (
+        b_cross["prevention_rate_30d"] == 1.0
+    )  # no retrip within 30d of baseline merge
+
+    # Compliance-followup fix lands in its own bucket with independent prevention rate
+    b_cf = by[_ESCALATION_BUCKET_COMPLIANCE_FOLLOWUP]
+    assert b_cf["merged_count"] == 1
+    assert b_cf["prevention_rate_30d"] == 1.0  # cf fix held, no retrip within 30d
+
+
+# ---------------------------------------------------------------------------
+# _evaluate_sr_catch_rate_targets tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_evaluate_sr_catch_rate_targets_fires_after_2_windows(db_session):
+    """Alert fires when >=2 consecutive windows are below the configured target."""
+    from app.routers.admin_digest import _evaluate_sr_catch_rate_targets
+    from app.models import Alert, AlertSeverity
+
+    project = make_project()
+    project.sr_catch_rate_targets = {"correctness": 0.80}
+    project.design_doc = {
+        "sr_catch_rate_trends": {
+            "categories": {
+                "correctness": {
+                    "current_hit_rate": 0.60,
+                    "rate_history": [0.62, 0.60],
+                    "trend": "decreasing",
+                }
+            }
+        }
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _evaluate_sr_catch_rate_targets(db_session, project.id)
+
+    alerts = (
+        (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.severity == AlertSeverity.WARNING,
+                    Alert.title == "SR catch-rate below target: correctness",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+    assert "0.80" in alerts[0].message or "80%" in alerts[0].message
+
+
+@pytest.mark.asyncio
+async def test_evaluate_sr_catch_rate_targets_suppressed_on_1_window(db_session):
+    """Alert is NOT emitted when only 1 window is below target."""
+    from app.routers.admin_digest import _evaluate_sr_catch_rate_targets
+    from app.models import Alert
+
+    project = make_project()
+    project.sr_catch_rate_targets = {"security": 0.75}
+    project.design_doc = {
+        "sr_catch_rate_trends": {
+            "categories": {
+                "security": {
+                    "current_hit_rate": 0.60,
+                    "rate_history": [0.60],
+                    "trend": "stable",
+                }
+            }
+        }
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _evaluate_sr_catch_rate_targets(db_session, project.id)
+
+    alerts = (
+        (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.title == "SR catch-rate below target: security",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 0
+
+
+@pytest.mark.asyncio
+async def test_evaluate_sr_catch_rate_targets_resolves_on_recovery(db_session):
+    """Existing alert is dismissed when category recovers above target."""
+    from app.routers.admin_digest import _evaluate_sr_catch_rate_targets
+    from app.models import Alert, AlertSeverity
+
+    project = make_project()
+    project.sr_catch_rate_targets = {"regression_risk": 0.70}
+    project.design_doc = {
+        "sr_catch_rate_trends": {
+            "categories": {
+                "regression_risk": {
+                    "current_hit_rate": 0.85,
+                    "rate_history": [0.85],
+                    "trend": "increasing",
+                }
+            }
+        }
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Seed an existing undismissed alert.
+    existing_alert = Alert(
+        project_id=project.id,
+        severity=AlertSeverity.WARNING,
+        title="SR catch-rate below target: regression_risk",
+        message="old alert",
+    )
+    db_session.add(existing_alert)
+    await db_session.commit()
+    await db_session.refresh(existing_alert)
+
+    await _evaluate_sr_catch_rate_targets(db_session, project.id)
+
+    await db_session.refresh(existing_alert)
+    assert existing_alert.dismissed_at is not None
+
+
+@pytest.mark.asyncio
+async def test_evaluate_sr_catch_rate_targets_no_fire_when_unset(db_session):
+    """No alert fires when sr_catch_rate_targets is empty."""
+    from app.routers.admin_digest import _evaluate_sr_catch_rate_targets
+    from app.models import Alert
+
+    project = make_project()
+    project.sr_catch_rate_targets = {}
+    project.design_doc = {
+        "sr_catch_rate_trends": {
+            "categories": {
+                "correctness": {
+                    "current_hit_rate": 0.30,
+                    "rate_history": [0.30, 0.35],
+                    "trend": "stable",
+                }
+            }
+        }
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _evaluate_sr_catch_rate_targets(db_session, project.id)
+
+    count = len(
+        (await db_session.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert count == 0
+
+
+@pytest.mark.asyncio
+async def test_evaluate_sr_catch_rate_targets_prompt_version_changed_suppression(
+    db_session,
+):
+    """Alert is suppressed when prompt_version_changed is True."""
+    from app.routers.admin_digest import _evaluate_sr_catch_rate_targets
+    from app.models import Alert
+
+    project = make_project()
+    project.sr_catch_rate_targets = {"correctness": 0.80}
+    project.design_doc = {
+        "sr_catch_rate_trends": {
+            "prompt_version_changed": True,
+            "categories": {
+                "correctness": {
+                    "current_hit_rate": 0.50,
+                    "rate_history": [0.50, 0.48],
+                    "trend": "decreasing",
+                }
+            },
+        }
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _evaluate_sr_catch_rate_targets(db_session, project.id)
+
+    alerts = (
+        (await db_session.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 0
+
+
+# ---------------------------------------------------------------------------
+# _evaluate_lone_checker_alert tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_evaluate_lone_checker_alert_fires_on_2_lone_checker_categories(
+    db_session,
+):
+    """Alert fires when >=2 categories have time_to_miss_detect_lone_checker=True."""
+    from app.routers.admin_digest import _evaluate_lone_checker_alert
+    from app.models import Alert, AlertSeverity
+
+    project = make_project()
+    project.design_doc = {
+        "sr_catch_rate_trends": {
+            "categories": {
+                "security": {"time_to_miss_detect_lone_checker": True},
+                "regression_risk": {"time_to_miss_detect_lone_checker": True},
+                "correctness": {"time_to_miss_detect_lone_checker": False},
+            }
+        }
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _evaluate_lone_checker_alert(db_session, project.id)
+
+    alerts = (
+        (await db_session.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.WARNING
+    assert "lone-checker" in alerts[0].title.lower()
+    assert "security" in alerts[0].message
+    assert "regression_risk" in alerts[0].message
+
+
+@pytest.mark.asyncio
+async def test_evaluate_lone_checker_alert_no_fire_on_1_category(db_session):
+    """Alert does not fire when only one category is in lone-checker state."""
+    from app.routers.admin_digest import _evaluate_lone_checker_alert
+    from app.models import Alert
+
+    project = make_project()
+    project.design_doc = {
+        "sr_catch_rate_trends": {
+            "categories": {
+                "security": {"time_to_miss_detect_lone_checker": True},
+                "correctness": {"time_to_miss_detect_lone_checker": False},
+            }
+        }
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _evaluate_lone_checker_alert(db_session, project.id)
+
+    count = len(
+        (await db_session.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert count == 0
+
+
+@pytest.mark.asyncio
+async def test_evaluate_lone_checker_alert_dedup(db_session):
+    """Alert is not duplicated if an open alert with the same title already exists."""
+    from app.routers.admin_digest import (
+        _evaluate_lone_checker_alert,
+        _LONE_CHECKER_ALERT_TITLE,
+    )
+    from app.models import Alert, AlertSeverity
+
+    project = make_project()
+    project.design_doc = {
+        "sr_catch_rate_trends": {
+            "categories": {
+                "security": {"time_to_miss_detect_lone_checker": True},
+                "regression_risk": {"time_to_miss_detect_lone_checker": True},
+            }
+        }
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    existing = Alert(
+        project_id=project.id,
+        severity=AlertSeverity.WARNING,
+        title=_LONE_CHECKER_ALERT_TITLE,
+        message="existing",
+    )
+    db_session.add(existing)
+    await db_session.commit()
+
+    await _evaluate_lone_checker_alert(db_session, project.id)
+
+    all_alerts = (
+        (await db_session.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert len(all_alerts) == 1

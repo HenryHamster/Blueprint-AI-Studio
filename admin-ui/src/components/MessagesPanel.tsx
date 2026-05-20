@@ -1,32 +1,34 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { X, MessageSquare, Send, Check, AlertTriangle, HelpCircle, Bug, StickyNote, ChevronDown, PlusCircle, Trash2, CheckSquare, ArrowDown, Reply, Settings, ChevronUp, BellOff, Save, MoreVertical, Pencil } from 'lucide-react';
 import { auth } from '../firebase';
-import { apiFetch, API_BASE_URL } from '../api';
+import { apiFetch, API_BASE_URL, authHeaders } from '../api';
 import { parseTimestamp } from '../utils/time';
-import { routineSummary, effectiveSignal, loadEventPrefs, saveEventPrefs, type EventPref, groupRoutineMessages, collapseStaleRoutineRows, formatDailyDigestSummary, outcomeBreakdown, isFailingGroup, getToastSeverity, type RoutineRow, loadLastSeen, saveLastSeen, formatTimestamp, insertTimeDividers, type MessageWithDivider, ESCALATION_BADGE_LABELS, isCriticalSeverity, type MuteWindow, loadMuteWindow, saveMuteWindow, clearMuteWindow, isMuteWindowActive, formatMuteCountdown, type SavedView, loadSavedViews, saveSavedViews, SAVED_VIEWS_CAP } from './MessagesPanel.utils';
+import { routineSummary, effectiveSignal, loadEventPrefs, saveEventPrefs, type EventPref, groupRoutineMessages, collapseStaleRoutineRows, formatDailyDigestSummary, outcomeBreakdown, isFailingGroup, getToastSeverity, type RoutineRow, loadLastSeen, saveLastSeen, formatTimestamp, formatSinceTimestamp, insertTimeDividers, type MessageWithDivider, ESCALATION_BADGE_LABELS, isCriticalSeverity, type MuteWindow, loadMuteWindow, saveMuteWindow, clearMuteWindow, isMuteWindowActive, formatMuteCountdown, type SavedView, loadSavedViews, saveSavedViews, SAVED_VIEWS_CAP, type TemporaryMutes, loadTemporaryMutes, saveTemporaryMutes, ROUTINE_EVENT_LABELS } from './MessagesPanel.utils';
 
 const DEFAULT_VIEW_ID = '__default__';
 
-function viewSummaryLine(query: string, prefs: Record<string, EventPref>, sort: 'importance' | 'recent', showResolved: boolean): string {
+function viewSummaryLine(query: string, prefs: Record<string, EventPref>, sort: 'importance' | 'recent', showResolved: boolean, showOnlyNew?: boolean): string {
   const parts: string[] = [];
   parts.push(query.trim() ? `Search: ${query.trim().slice(0, 40)}` : 'No search');
   const muted = Object.values(prefs).filter(v => v === 'mute').length;
   const surfaced = Object.values(prefs).filter(v => v === 'surfaced').length;
   if (muted > 0) parts.push(`${muted} muted`);
   if (surfaced > 0) parts.push(`${surfaced} surfaced`);
+  if (showOnlyNew) parts.push('only new');
   parts.push(`sort: ${sort}`);
   parts.push(showResolved ? 'resolved shown' : 'resolved hidden');
   return parts.join(' · ');
 }
 
 function viewMatches(
-  view: { query: string; prefs: Record<string, EventPref>; sort: 'importance' | 'recent'; showResolved: boolean; routineExpanded: boolean },
-  state: { query: string; prefs: Record<string, EventPref>; sort: 'importance' | 'recent'; showResolved: boolean; routineExpanded: boolean },
+  view: { query: string; prefs: Record<string, EventPref>; sort: 'importance' | 'recent'; showResolved: boolean; routineExpanded: boolean; showOnlyNew: boolean },
+  state: { query: string; prefs: Record<string, EventPref>; sort: 'importance' | 'recent'; showResolved: boolean; routineExpanded: boolean; showOnlyNew: boolean },
 ): boolean {
   if (view.query !== state.query) return false;
   if (view.sort !== state.sort) return false;
   if (view.showResolved !== state.showResolved) return false;
   if (view.routineExpanded !== state.routineExpanded) return false;
+  if (view.showOnlyNew !== state.showOnlyNew) return false;
   const aKeys = Object.keys(view.prefs);
   const bKeys = Object.keys(state.prefs);
   if (aKeys.length !== bKeys.length) return false;
@@ -61,6 +63,7 @@ interface WebhookStats {
 
 interface MessagesPanelProps {
   selectedProjectId: string | null;
+  githubRepo?: string | null;
   onClose: () => void;
   addToast: (message: string, type: 'success' | 'error' | 'info') => void;
   onMessageCountChange?: (count: number) => void;
@@ -221,7 +224,28 @@ function ContextBadges({ context, fromType }: { context: Record<string, unknown>
 }
 
 
-export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageCountChange, onOpenTask }: MessagesPanelProps) {
+async function fetchBackendLastSeen(projectId: string): Promise<number | null> {
+  try {
+    const res = await apiFetch(`${API_BASE_URL}/api/admin/messages/last-seen?project_id=${encodeURIComponent(projectId)}`);
+    if (!res.ok) return null;
+    const data = await res.json() as { last_seen_at?: number | null };
+    const val = data.last_seen_at;
+    return typeof val === 'number' && val > 0 ? val : null;
+  } catch {
+    return null;
+  }
+}
+
+async function postBackendLastSeen(projectId: string, timestamp: number): Promise<void> {
+  try {
+    await apiFetch(`${API_BASE_URL}/api/admin/messages/last-seen`, {
+      method: 'PUT',
+      body: JSON.stringify({ project_id: projectId, timestamp }),
+    });
+  } catch { /* ignore — localStorage already saved */ }
+}
+
+export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast, onMessageCountChange, onOpenTask }: MessagesPanelProps) {
   const [messages, setMessages] = useState<ProjectMessage[]>([]);
   const [loading, setLoading] = useState(true);
   // Compose
@@ -236,6 +260,8 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
   const [resolveInput, setResolveInput] = useState('');
   const [deletingIds, setDeletingIds] = useState<Set<string>>(new Set());
   const [creatingDirectionIds, setCreatingDirectionIds] = useState<Set<string>>(new Set());
+  const [investigatingId, setInvestigatingId] = useState<string | null>(null);
+  const [investigatingIds, setInvestigatingIds] = useState<Set<string>>(new Set());
 
   // Batch selection
   const [selectMode, setSelectMode] = useState(false);
@@ -266,6 +292,10 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
   const [showWebhookDetail, setShowWebhookDetail] = useState(false);
   const [muteWindow, setMuteWindow] = useState<MuteWindow | null>(() => loadMuteWindow(auth.currentUser?.email, selectedProjectId));
   const [showMuteMenu, setShowMuteMenu] = useState(false);
+  const [tempMutes, setTempMutes] = useState<TemporaryMutes>(() =>
+    loadTemporaryMutes(auth.currentUser?.email, selectedProjectId),
+  );
+  const [showTempMuteMenu, setShowTempMuteMenu] = useState(false);
 
   // Saved views — named filter combos persisted per-user-per-project. activeViewId
   // tracks which tab is currently applied; when the operator mutates any underlying
@@ -287,6 +317,8 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
   const [dividerTime, setDividerTime] = useState<number | null>(null);
   const dividerTimeRef = useRef<number | null>(null);
   const dividerDismissedRef = useRef(false);
+  // Toggle to show only messages newer than the divider time
+  const [showOnlyNew, setShowOnlyNew] = useState(false);
 
   const dismissDivider = useCallback(() => {
     if (!dividerDismissedRef.current && selectedProjectId) {
@@ -294,9 +326,25 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
       setDividerTime(now);
       dividerTimeRef.current = now;
       saveLastSeen(auth.currentUser?.email, selectedProjectId, now);
+      void postBackendLastSeen(selectedProjectId, now);
       dividerDismissedRef.current = true;
     }
   }, [selectedProjectId]);
+
+  const handleShowOnlyNew = useCallback(() => {
+    setShowOnlyNew(true);
+    // Scroll to first new message on next render
+    setTimeout(() => {
+      const msgBubbles = scrollRef.current?.querySelectorAll('[data-testid="message-bubble"]');
+      if (msgBubbles && msgBubbles.length > 0) {
+        (msgBubbles[0] as HTMLElement).scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }
+    }, 100);
+  }, []);
+
+  // Refs for scrolling to sections from summary card
+  const blockersRefEl = useRef<HTMLDivElement>(null);
+  const routineRefEl = useRef<HTMLDivElement>(null);
 
   // Stable ref for addToast
   const addToastRef = useRef(addToast);
@@ -308,6 +356,8 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
   const seenPromotedGroupKeysRef = useRef<Set<string>>(new Set());
   const eventPrefsRef = useRef(eventPrefs);
   eventPrefsRef.current = eventPrefs;
+  const tempMutesRef = useRef(tempMutes);
+  tempMutesRef.current = tempMutes;
 
   // Reset toast suppression state when switching projects so that the next
   // fetch is treated as an initial load for the new project (avoids a flood
@@ -318,12 +368,23 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
     seenPromotedGroupKeysRef.current = new Set();
     hasInitiallyLoadedRef.current = false;
     setEventPrefs(loadEventPrefs(auth.currentUser?.email, selectedProjectId));
+    setTempMutes(loadTemporaryMutes(auth.currentUser?.email, selectedProjectId));
     setWebhookStats(null);
     setMuteWindow(loadMuteWindow(auth.currentUser?.email, selectedProjectId));
     const lastSeen = loadLastSeen(auth.currentUser?.email, selectedProjectId);
     setDividerTime(lastSeen);
     dividerTimeRef.current = lastSeen;
     dividerDismissedRef.current = false;
+    // Prefer backend last-seen over localStorage — if backend has a more recent
+    // timestamp (e.g. dismissed on another device), update the divider position.
+    if (selectedProjectId) {
+      fetchBackendLastSeen(selectedProjectId).then(backendTs => {
+        if (backendTs !== null && backendTs > (dividerTimeRef.current ?? 0)) {
+          setDividerTime(backendTs);
+          dividerTimeRef.current = backendTs;
+        }
+      });
+    }
     // Reload saved views for the new project — views never bleed across projects.
     setSavedViews(loadSavedViews(auth.currentUser?.email, selectedProjectId));
     setActiveViewId(DEFAULT_VIEW_ID);
@@ -364,10 +425,17 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
   };
 
   const SEVERITY_RANK: Record<string, number> = { BLOCKER: 0, BUG_REPORT: 1, FEEDBACK: 2, NOTE: 3 };
+  const CONTEXT_SEVERITY_RANK: Record<string, number> = { high: 0, medium: 1, low: 2 };
   const bySeverity = (a: ProjectMessage, b: ProjectMessage) => {
     const ra = SEVERITY_RANK[a.message_type] ?? 3;
     const rb = SEVERITY_RANK[b.message_type] ?? 3;
     if (ra !== rb) return ra - rb;
+    // Same message_type, compare by context.severity
+    const sa = (a.context.severity as string | undefined) ?? 'undefined';
+    const sb = (b.context.severity as string | undefined) ?? 'undefined';
+    const sa_rank = CONTEXT_SEVERITY_RANK[sa] ?? 3;
+    const sb_rank = CONTEXT_SEVERITY_RANK[sb] ?? 3;
+    if (sa_rank !== sb_rank) return sa_rank - sb_rank;
     return byTimeDesc(a, b);
   };
 
@@ -375,21 +443,56 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
   const resolvedMessages = messages.filter(m => m.status === 'resolved');
   const openFeedbackMessages = openMessages.filter(m => m.message_type === 'FEEDBACK' && matchesSearch(m));
 
+  // Filter to only new messages when showOnlyNew is enabled
+  const isNewMessage = (m: ProjectMessage): boolean => {
+    if (!showOnlyNew || !dividerTime || !m.created_at) return true;
+    return parseTimestamp(m.created_at).getTime() > dividerTime;
+  };
+
   // Count new high-signal messages (created after divider time)
   const newHighSignalCount = dividerTime
     ? openMessages.filter(m =>
         m.created_at &&
-        effectiveSignal(m, eventPrefs) === 'high' &&
+        effectiveSignal(m, eventPrefs, tempMutes) === 'high' &&
         parseTimestamp(m.created_at).getTime() > dividerTime
       ).length
     : 0;
 
-  // Split open messages by signal level, respecting per-event-type prefs, then filter by search
+  // Count new messages by type for the summary card (respecting mute prefs and criticalOnly)
+  const newMessageCounts = dividerTime
+    ? {
+        blockers: openMessages.filter(m =>
+          m.message_type === 'BLOCKER' &&
+          m.created_at &&
+          parseTimestamp(m.created_at).getTime() > dividerTime &&
+          effectiveSignal(m, eventPrefs, tempMutes) !== 'mute'
+        ).length,
+        feedback: openMessages.filter(m =>
+          m.message_type === 'FEEDBACK' &&
+          m.created_at &&
+          parseTimestamp(m.created_at).getTime() > dividerTime &&
+          effectiveSignal(m, eventPrefs, tempMutes) !== 'mute'
+        ).length,
+        bugReports: openMessages.filter(m =>
+          m.message_type === 'BUG_REPORT' &&
+          m.created_at &&
+          parseTimestamp(m.created_at).getTime() > dividerTime &&
+          effectiveSignal(m, eventPrefs, tempMutes) !== 'mute'
+        ).length,
+        routine: openMessages.filter(m =>
+          effectiveSignal(m, eventPrefs, tempMutes) === 'routine' &&
+          m.created_at &&
+          parseTimestamp(m.created_at).getTime() > dividerTime
+        ).length,
+      }
+    : { blockers: 0, feedback: 0, bugReports: 0, routine: 0 };
+
+  // Split open messages by signal level, respecting per-event-type prefs and temp mutes, then filter by search
   const muteActive = isMuteWindowActive(muteWindow);
-  const highSignalOpen = [...openMessages.filter(m => effectiveSignal(m, eventPrefs) === 'high' && matchesSearch(m))]
+  const highSignalOpen = [...openMessages.filter(m => effectiveSignal(m, eventPrefs, tempMutes) === 'high' && matchesSearch(m) && isNewMessage(m))]
     .sort(sortMode === 'importance' ? bySeverity : byTimeDesc);
   // Always compute routine messages; mute only filters them from the non-promoted routine section
-  const routineOpen = [...openMessages.filter(m => effectiveSignal(m, eventPrefs) === 'routine' && matchesSearch(m))].sort(byTimeDesc);
+  const routineOpen = [...openMessages.filter(m => effectiveSignal(m, eventPrefs, tempMutes) === 'routine' && matchesSearch(m) && isNewMessage(m))].sort(byTimeDesc);
 
   // In importance mode, pin BLOCKERs at the top with a visual divider
   const pinnedBlockers = sortMode === 'importance' ? highSignalOpen.filter(m => m.message_type === 'BLOCKER') : [];
@@ -461,6 +564,29 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
     });
   }
 
+  function addTemporaryMute(eventType: string, durationMs: number) {
+    setTempMutes(prev => {
+      const next = { ...prev, [eventType]: Date.now() + durationMs };
+      saveTemporaryMutes(auth.currentUser?.email, selectedProjectId, next);
+      return next;
+    });
+    setShowTempMuteMenu(false);
+  }
+
+  function getTop3NoisyEventTypes(): Array<[string, number]> {
+    if (routineOpen.length === 0) return [];
+    const now = Date.now();
+    const oneHourAgo = now - 3600000;
+    const eventTypeCounts: Record<string, number> = {};
+    for (const msg of routineOpen) {
+      const et = msg.context.event_type as string | undefined;
+      if (et && msg.created_at && parseTimestamp(msg.created_at).getTime() > oneHourAgo) {
+        eventTypeCounts[et] = (eventTypeCounts[et] || 0) + 1;
+      }
+    }
+    return Object.entries(eventTypeCounts).sort((a, b) => b[1] - a[1]).slice(0, 3);
+  }
+
   const activeView = useMemo(
     () => savedViews.find(v => v.id === activeViewId) ?? null,
     [savedViews, activeViewId],
@@ -469,16 +595,16 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
   // Active tab is "modified" when current panel state diverges from its saved
   // snapshot. For Default the baseline is the empty/initial state.
   const activeTabModified = useMemo(() => {
-    const current = { query: searchQuery, prefs: eventPrefs, sort: sortMode, showResolved, routineExpanded };
+    const current = { query: searchQuery, prefs: eventPrefs, sort: sortMode, showResolved, routineExpanded, showOnlyNew };
     if (activeViewId === DEFAULT_VIEW_ID) {
       return !viewMatches(
-        { query: '', prefs: {}, sort: 'importance', showResolved: false, routineExpanded: false },
+        { query: '', prefs: {}, sort: 'importance', showResolved: false, routineExpanded: false, showOnlyNew: false },
         current,
       );
     }
     if (!activeView) return false;
     return !viewMatches(activeView, current);
-  }, [activeView, activeViewId, searchQuery, eventPrefs, sortMode, showResolved, routineExpanded]);
+  }, [activeView, activeViewId, searchQuery, eventPrefs, sortMode, showResolved, routineExpanded, showOnlyNew]);
 
   function applyView(viewId: string) {
     setOpenKebabId(null);
@@ -490,6 +616,7 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
       setSortMode('importance');
       setShowResolved(false);
       setRoutineExpanded(false);
+      setShowOnlyNew(false);
       return;
     }
     const view = savedViews.find(v => v.id === viewId);
@@ -501,6 +628,7 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
     setSortMode(view.sort);
     setShowResolved(view.showResolved);
     setRoutineExpanded(view.routineExpanded);
+    setShowOnlyNew(view.showOnlyNew);
   }
 
   function openSaveDialog() {
@@ -547,6 +675,7 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
         sort: sortMode,
         showResolved,
         routineExpanded,
+        showOnlyNew,
         createdAt: Date.now(),
       };
       const next = [...savedViews, view];
@@ -590,6 +719,18 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
     return () => clearInterval(interval);
   }, [muteExpiresAt, selectedProjectId]);
 
+  // Auto-clean expired temporary mutes
+  useEffect(() => {
+    const now = Date.now();
+    const cleaned = Object.fromEntries(
+      Object.entries(tempMutes).filter(([, expiresAt]) => expiresAt > now)
+    );
+    if (Object.keys(cleaned).length !== Object.keys(tempMutes).length) {
+      setTempMutes(cleaned);
+      saveTemporaryMutes(auth.currentUser?.email, selectedProjectId, cleaned);
+    }
+  }, [selectedProjectId]);
+
   // Resolved: show last 5 by default, toggle to show all, filtered by search
   const RECENT_RESOLVED = 5;
   const sortedResolved = [...resolvedMessages.filter(m => matchesSearch(m))].sort(byTime);
@@ -609,7 +750,7 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
       if (hasInitiallyLoadedRef.current) {
         const newHighSignal = msgs.filter(m =>
           m.status === 'open' &&
-          effectiveSignal(m, eventPrefs) === 'high' &&
+          effectiveSignal(m, eventPrefsRef.current, tempMutesRef.current) === 'high' &&
           !seenMessageIdsRef.current.has(m.id)
         );
 
@@ -626,7 +767,7 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
 
       // Detect + toast for newly promoted failing routine groups
       const wasLoaded = hasInitiallyLoadedRef.current;
-      const routineMsgs = msgs.filter(m => m.status === 'open' && effectiveSignal(m, eventPrefsRef.current) === 'routine');
+      const routineMsgs = msgs.filter(m => m.status === 'open' && effectiveSignal(m, eventPrefsRef.current, tempMutesRef.current) === 'routine');
       for (const row of groupRoutineMessages(routineMsgs)) {
         if (row.kind === 'group' && isFailingGroup(row.msgs) && eventPrefsRef.current[row.event_type] !== 'mute') {
           if (wasLoaded && !seenPromotedGroupKeysRef.current.has(row.key)) {
@@ -687,6 +828,11 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
     prevMessageCountRef.current = currentCount;
   }, [highSignalOpen, routineOpen, visibleResolved]);
 
+  // Update parent with new high-signal message count (for tab title badge)
+  useEffect(() => {
+    onMessageCountChange?.(newHighSignalCount);
+  }, [newHighSignalCount, onMessageCountChange]);
+
   // Track scroll position for "scroll to bottom" button
   useEffect(() => {
     const el = scrollRef.current;
@@ -700,12 +846,6 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
     return () => el.removeEventListener('scroll', onScroll);
   }, []);
 
-  // Auto-dismiss divider after 5 seconds of panel being visible
-  useEffect(() => {
-    if (!dividerTime || dividerDismissedRef.current) return;
-    const timer = setTimeout(dismissDivider, 5000);
-    return () => clearTimeout(timer);
-  }, [dividerTime, selectedProjectId, dismissDivider]);
 
   // Scroll-based divider dismissal: detect when user scrolls past the divider
   useEffect(() => {
@@ -824,6 +964,39 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
       return false;
     } finally {
       setCreatingDirectionIds(prev => { const next = new Set(prev); next.delete(msg.id); return next; });
+    }
+  }
+
+  async function handleCreateInvestigation(msg: ProjectMessage): Promise<boolean> {
+    if (!selectedProjectId || !githubRepo) return false;
+    setInvestigatingIds(prev => new Set(prev).add(msg.id));
+    try {
+      const lines = msg.content.split('\n');
+      const title = lines[0].slice(0, 100);
+      const prompt = `${msg.content}\n\nOriginal message: ${msg.id}`;
+      const res = await fetch(`${API_BASE_URL}/api/admin/tasks`, {
+        method: 'POST',
+        headers: await authHeaders(),
+        body: JSON.stringify({
+          github_repo: githubRepo,
+          title,
+          prompt,
+          base_branch: 'main',
+          task_type: 'investigate',
+        }),
+      });
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData?.detail || errData?.error?.message || `HTTP ${res.status}`);
+      }
+      setInvestigatingId(null);
+      addToast('Investigation task created', 'success');
+      return true;
+    } catch (err) {
+      addToast(`Failed to create investigation: ${err instanceof Error ? err.message : 'Unknown error'}`, 'error');
+      return false;
+    } finally {
+      setInvestigatingIds(prev => { const next = new Set(prev); next.delete(msg.id); return next; });
     }
   }
 
@@ -991,6 +1164,36 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
                   <PlusCircle className="w-3.5 h-3.5" />
                 </button>
               )}
+              {(msg.message_type === 'BLOCKER' || msg.message_type === 'BUG_REPORT') && investigatingId !== msg.id && !investigatingIds.has(msg.id) && (
+                <button
+                  onClick={() => setInvestigatingId(msg.id)}
+                  disabled={investigatingIds.has(msg.id)}
+                  title="Investigate"
+                  className="text-amber-500/70 hover:text-amber-400 p-2.5 md:p-1.5 rounded transition-colors disabled:opacity-30 min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center"
+                >
+                  <AlertTriangle className="w-3.5 h-3.5" />
+                </button>
+              )}
+              {investigatingId === msg.id && (
+                <div className="flex items-center gap-1 bg-neutral-900 border border-neutral-700 rounded-lg px-2 py-1 ml-1">
+                  <span className="text-xs text-neutral-400 whitespace-nowrap">Spawn investigation?</span>
+                  <button
+                    onClick={() => handleCreateInvestigation(msg)}
+                    disabled={investigatingIds.has(msg.id)}
+                    className="text-amber-400 hover:text-amber-300 p-1 rounded transition-colors disabled:opacity-30 min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center"
+                    title="Confirm investigation"
+                  >
+                    <Check className="w-3 h-3" />
+                  </button>
+                  <button
+                    onClick={() => setInvestigatingId(null)}
+                    className="text-neutral-500 hover:text-neutral-400 p-1 rounded transition-colors min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center"
+                    title="Cancel"
+                  >
+                    <X className="w-3 h-3" />
+                  </button>
+                </div>
+              )}
               {!isResolving ? (
                 <button
                   onClick={() => { setResolvingId(msg.id); setResolveInput(''); }}
@@ -1045,6 +1248,17 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
     <div className="flex-1 overflow-hidden flex flex-col min-h-0">
       {/* Header */}
       <div className="px-4 md:px-6 py-3 border-b border-neutral-800 flex flex-col gap-2 shrink-0">
+        {/* Persistent last-visit anchor */}
+        {dividerTime && (
+          <div className="flex items-center gap-2 text-xs text-neutral-500 px-1">
+            <span>Last visit: {formatTimestamp(dividerTime)}</span>
+            {newHighSignalCount + newMessageCounts.blockers + newMessageCounts.feedback + newMessageCounts.bugReports + newMessageCounts.routine > 0 && (
+              <span className="text-blue-400 font-medium">
+                ({newHighSignalCount + newMessageCounts.blockers + newMessageCounts.feedback + newMessageCounts.bugReports + newMessageCounts.routine} new)
+              </span>
+            )}
+          </div>
+        )}
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
             <MessageSquare className="w-4 h-4 text-neutral-400" />
@@ -1071,11 +1285,10 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
             )}
             {webhookStats && webhookStats.total_dispatched > 0 && (
               <div className="relative">
-                {/* eslint-disable-next-line viewport/min-touch-target -- badge-row in dense header; same pattern as other header chips */}
                 <button
                   onClick={() => setShowWebhookDetail(v => !v)}
                   title="Webhook delivery health"
-                  className={`text-[11px] px-2 py-0.5 rounded-full border font-semibold transition-colors ${
+                  className={`text-[11px] px-2 py-0.5 rounded-full border font-semibold transition-colors min-h-[44px] md:min-h-[28px] flex items-center ${
                     webhookStats.total_failed > 0
                       ? 'bg-amber-500/20 text-amber-400 border-amber-500/40'
                       : 'bg-emerald-500/20 text-emerald-400 border-emerald-500/40'
@@ -1118,6 +1331,18 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
             }`}
           >
             <AlertTriangle className="w-3.5 h-3.5" />
+          </button>
+          <button
+            onClick={() => setShowOnlyNew(v => !v)}
+            disabled={!dividerTime}
+            title={!dividerTime ? 'No messages to filter (visit first)' : showOnlyNew ? 'Show all messages' : 'Only new since last visit'}
+            className={`text-xs px-2 py-1 rounded-lg transition-colors border min-h-[44px] min-w-[44px] md:min-h-[36px] md:min-w-auto flex items-center justify-center disabled:opacity-40 disabled:cursor-not-allowed ${
+              showOnlyNew && dividerTime
+                ? 'text-blue-400 bg-blue-500/10 border-blue-500/30'
+                : 'text-neutral-500 hover:text-neutral-300 border-neutral-800/60'
+            }`}
+          >
+            <ChevronUp className="w-3.5 h-3.5" />
           </button>
           {openFeedbackMessages.length > 1 && (
             <button
@@ -1218,10 +1443,9 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
                           )}
                         </div>
                         {(['surfaced', 'routine', 'mute'] as EventPref[]).map(p => (
-                          // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
                           <button key={p} onClick={() => updatePref(et, p)}
                             title={p}
-                            className={`text-[10px] px-1.5 py-0.5 rounded border transition-colors ${pref === p ? (p === 'mute' ? 'border-red-500/50 text-red-400 bg-red-500/10' : p === 'surfaced' ? 'border-amber-500/50 text-amber-400 bg-amber-500/10' : 'border-neutral-600 text-neutral-300 bg-neutral-800') : 'border-transparent text-neutral-600 hover:text-neutral-400'}`}>
+                            className={`text-[10px] px-1.5 py-0.5 rounded border transition-colors min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center ${pref === p ? (p === 'mute' ? 'border-red-500/50 text-red-400 bg-red-500/10' : p === 'surfaced' ? 'border-amber-500/50 text-amber-400 bg-amber-500/10' : 'border-neutral-600 text-neutral-300 bg-neutral-800') : 'border-transparent text-neutral-600 hover:text-neutral-400'}`}>
                             {p === 'surfaced' ? '↑' : p === 'mute' ? '✕' : '·'}
                           </button>
                         ))}
@@ -1270,11 +1494,10 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
               const showModified = isActive && activeTabModified;
               return (
                 <div key={tab.id} className="relative shrink-0 flex items-center">
-                  {/* eslint-disable-next-line viewport/min-touch-target -- compact tab; matches density of header chips */}
                   <button
                     onClick={() => applyView(tab.id)}
                     title={tab.view?.description || tab.name}
-                    className={`flex items-center gap-1 px-2.5 py-1 rounded-md text-xs transition-colors border ${
+                    className={`flex items-center gap-1 px-2.5 py-1 rounded-md text-xs transition-colors border min-h-[44px] md:min-h-[36px] ${
                       isActive
                         ? 'bg-blue-500/15 text-blue-300 border-blue-500/40'
                         : 'text-neutral-500 hover:text-neutral-300 border-transparent hover:border-neutral-800/60'
@@ -1287,12 +1510,11 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
                   </button>
                   {!tab.isDefault && tab.view && (
                     <div ref={openKebabId === tab.id ? kebabRef : undefined} className="relative">
-                      {/* eslint-disable-next-line viewport/min-touch-target -- kebab in dense tab strip; matches existing chip density */}
                       <button
                         onClick={() => setOpenKebabId(prev => (prev === tab.id ? null : tab.id))}
                         title="Manage view"
                         aria-label={`Manage view ${tab.name}`}
-                        className="text-neutral-600 hover:text-neutral-300 p-1 rounded transition-colors"
+                        className="text-neutral-600 hover:text-neutral-300 p-1 rounded transition-colors min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center"
                       >
                         <MoreVertical className="w-3.5 h-3.5" />
                       </button>
@@ -1336,8 +1558,7 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
               <h3 className="text-sm font-semibold text-neutral-100">
                 {saveDialogMode === 'rename' ? 'Rename view' : 'Save view'}
               </h3>
-              {/* eslint-disable-next-line viewport/min-touch-target -- close button in dense modal header */}
-              <button onClick={closeSaveDialog} className="text-neutral-500 hover:text-neutral-300 p-1">
+              <button onClick={closeSaveDialog} className="text-neutral-500 hover:text-neutral-300 p-1 min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center">
                 <X className="w-4 h-4" />
               </button>
             </div>
@@ -1367,7 +1588,7 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
             {saveDialogMode === 'create' && (
               <div className="text-[11px] text-neutral-500 bg-neutral-950/50 border border-neutral-800/60 rounded-md px-3 py-2">
                 <span className="text-neutral-400">Saving:</span>{' '}
-                {viewSummaryLine(searchQuery, eventPrefs, sortMode, showResolved)}
+                {viewSummaryLine(searchQuery, eventPrefs, sortMode, showResolved, showOnlyNew)}
               </div>
             )}
             {saveDialogError && (
@@ -1395,6 +1616,50 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
 
       {/* Messages list — chat-style scroll area */}
       <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 md:px-6 py-4 space-y-3 relative">
+        {/* Prominent banner: X new since {time} with action buttons */}
+        {dividerTime && newHighSignalCount > 0 && !dividerDismissedRef.current && (
+          <div className="mb-3 p-3 md:p-4 rounded-lg bg-gradient-to-r from-blue-600/20 to-blue-500/10 border border-blue-500/50 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+            <div className="flex-1 min-w-0">
+              <div className="text-sm font-semibold text-blue-300 truncate">
+                {newHighSignalCount} new since {formatSinceTimestamp(dividerTime)}
+              </div>
+            </div>
+            <div className="flex items-center gap-2 flex-wrap">
+              <button
+                onClick={handleShowOnlyNew}
+                className="shrink-0 px-3 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-xs font-medium transition-colors min-h-[44px] md:min-h-auto"
+              >
+                Show only new
+              </button>
+              <button
+                onClick={dismissDivider}
+                className="shrink-0 px-3 py-2 rounded-lg border border-blue-500/60 text-blue-300 hover:bg-blue-500/10 text-xs font-medium transition-colors min-h-[44px] md:min-h-auto"
+              >
+                Mark all read
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Caught-up indicator: when divider is set, not dismissed, and zero new messages of any kind */}
+        {dividerTime && !dividerDismissedRef.current && newHighSignalCount === 0 && newMessageCounts.blockers === 0 && newMessageCounts.feedback === 0 && newMessageCounts.bugReports === 0 && newMessageCounts.routine === 0 && !showOnlyNew && (
+          <div className="mb-3 p-3 md:p-4 rounded-lg bg-gradient-to-r from-emerald-600/20 to-emerald-500/10 border border-emerald-500/50 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+            <div className="flex-1 min-w-0">
+              <div className="text-sm font-semibold text-emerald-300 truncate">
+                No new since {formatSinceTimestamp(dividerTime)}
+              </div>
+            </div>
+            <div className="flex items-center gap-2 flex-wrap">
+              <button
+                onClick={dismissDivider}
+                className="shrink-0 px-3 py-2 rounded-lg border border-emerald-500/60 text-emerald-300 hover:bg-emerald-500/10 text-xs font-medium transition-colors min-h-[44px] md:min-h-auto"
+              >
+                Reset baseline
+              </button>
+            </div>
+          </div>
+        )}
+
         {loading ? (
           <p className="text-xs text-neutral-500 text-center py-8">Loading...</p>
         ) : messages.length === 0 ? (
@@ -1402,6 +1667,12 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
             <MessageSquare className="w-8 h-8 mb-3 opacity-40" />
             <p className="text-sm">No messages yet</p>
             <p className="text-xs mt-1 opacity-70">Send feedback, report bugs, or ask questions</p>
+          </div>
+        ) : showOnlyNew && dividerTime && highSignalOpen.length === 0 && routineOpen.length === 0 && visibleResolved.length === 0 ? (
+          <div className="flex flex-col items-center justify-center py-16 text-neutral-500">
+            <MessageSquare className="w-8 h-8 mb-3 opacity-40" />
+            <p className="text-sm">No new messages since {formatTimestamp(dividerTime)}</p>
+            <p className="text-xs mt-1 opacity-70">You're all caught up!</p>
           </div>
         ) : searchQuery.trim() && highSignalOpen.length === 0 && routineOpen.length === 0 && visibleResolved.length === 0 ? (
           <div className="flex flex-col items-center justify-center py-16 text-neutral-500">
@@ -1437,25 +1708,90 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
             {dividerTime && newHighSignalCount > 0 && !dividerDismissedRef.current && (
               <div data-divider-marker className="flex items-center gap-2 px-2 py-3 text-[11px] text-blue-300/70">
                 <div className="flex-1 border-t border-blue-500/40" />
-                <span className="whitespace-nowrap font-medium flex items-center gap-1">
-                  <ChevronUp className="w-3 h-3" />
-                  NEW since {formatTimestamp(dividerTime)}
-                </span>
+                <div className="flex items-center gap-2 whitespace-nowrap font-medium">
+                  <span className="flex items-center gap-1">
+                    <ChevronUp className="w-3 h-3" />
+                    NEW since {formatTimestamp(dividerTime)}
+                  </span>
+                  <button
+                    onClick={dismissDivider}
+                    className="px-2 py-0.5 text-xs bg-blue-600/50 hover:bg-blue-600/70 rounded border border-blue-500/60 text-blue-200 transition-colors min-h-[44px] md:min-h-[28px] flex items-center"
+                    title="Mark all caught up and dismiss this divider"
+                  >
+                    All caught up
+                  </button>
+                </div>
                 <div className="flex-1 border-t border-blue-500/40" />
               </div>
             )}
-            {/* Other high-signal open messages */}
-            {insertTimeDividers(otherHighSignal).map((item, idx) =>
-              item.kind === 'divider' ? (
-                <div key={`divider-high-${idx}`} className="flex items-center gap-1.5 text-[11px] text-neutral-600 font-semibold uppercase tracking-wide px-1 mt-2">
-                  <div className="flex-1 border-t border-neutral-800/60" />
-                  <span className="shrink-0">{item.label}</span>
-                  <div className="flex-1 border-t border-neutral-800/60" />
+
+            {/* Summary card: show counts of new messages if divider is active */}
+            {dividerTime && !dividerDismissedRef.current && (newMessageCounts.blockers > 0 || newMessageCounts.feedback > 0 || newMessageCounts.bugReports > 0 || newMessageCounts.routine > 0) && (
+              <div className="mx-2 my-3 p-3 rounded-lg bg-gradient-to-r from-blue-950/40 to-blue-900/30 border border-blue-800/40 text-[11px] text-blue-200/90">
+                <div className="font-semibold mb-2 text-blue-300">Since you last looked</div>
+                <div className="space-y-1.5">
+                  {newMessageCounts.blockers > 0 && (
+                    <button
+                      onClick={() => {
+                        blockersRefEl.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                      }}
+                      className="block w-full text-left hover:text-blue-100 transition-colors"
+                      data-testid="summary-card-blockers"
+                    >
+                      <span className="font-medium text-amber-300">{newMessageCounts.blockers}</span> new blocker{newMessageCounts.blockers !== 1 ? 's' : ''}
+                    </button>
+                  )}
+                  {newMessageCounts.bugReports > 0 && (
+                    <button
+                      onClick={() => {
+                        blockersRefEl.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                      }}
+                      className="block w-full text-left hover:text-blue-100 transition-colors"
+                      data-testid="summary-card-bugs"
+                    >
+                      <span className="font-medium text-red-300">{newMessageCounts.bugReports}</span> new bug{newMessageCounts.bugReports !== 1 ? 's' : ''}
+                    </button>
+                  )}
+                  {newMessageCounts.feedback > 0 && (
+                    <button
+                      onClick={() => {
+                        blockersRefEl.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                      }}
+                      className="block w-full text-left hover:text-blue-100 transition-colors"
+                      data-testid="summary-card-feedback"
+                    >
+                      <span className="font-medium text-purple-300">{newMessageCounts.feedback}</span> new feedback
+                    </button>
+                  )}
+                  {newMessageCounts.routine > 0 && (
+                    <button
+                      onClick={() => {
+                        routineRefEl.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                      }}
+                      className="block w-full text-left hover:text-blue-100 transition-colors"
+                      data-testid="summary-card-routine"
+                    >
+                      <span className="font-medium text-neutral-300">{newMessageCounts.routine}</span> routine ops
+                    </button>
+                  )}
                 </div>
-              ) : (
-                renderBubble(item.msg, false, false, messages)
-              )
+              </div>
             )}
+
+            {/* Other high-signal open messages */}
+            <div ref={blockersRefEl}>
+              {insertTimeDividers(otherHighSignal).map((item, idx) =>
+                item.kind === 'divider' ? (
+                  <div key={`divider-high-${idx}`} className="flex items-center gap-1.5 text-[11px] text-neutral-600 font-semibold uppercase tracking-wide px-1 mt-2">
+                    <div className="flex-1 border-t border-neutral-800/60" />
+                    <span className="shrink-0">{item.label}</span>
+                    <div className="flex-1 border-t border-neutral-800/60" />
+                  </div>
+                ) : (
+                  renderBubble(item.msg, false, false, messages)
+                )
+              )}
+            </div>
 
             {/* Auto-promoted failing routine groups */}
             {promotedGroups.map(row => {
@@ -1472,8 +1808,7 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
                       <span className="text-xs text-red-300 font-medium">{row.msgs.length} {row.label}</span>
                       {bd && <span className="text-xs text-red-400">{bd}</span>}
                     </button>
-                    {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
-                    <button onClick={() => handleResolveGroup(row.msgs)} title="Resolve all" className="text-emerald-500/70 hover:text-emerald-400 p-1 rounded transition-colors">
+                    <button onClick={() => handleResolveGroup(row.msgs)} title="Resolve all" className="text-emerald-500/70 hover:text-emerald-400 p-1 rounded transition-colors min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center">
                       <Check className="w-3 h-3" />
                     </button>
                   </div>
@@ -1488,15 +1823,67 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
 
             {/* Routine ops group — collapsed by default */}
             {routineOpen.length > 0 && (
-              <div className="border border-neutral-800/50 rounded-xl overflow-hidden">
-                <button
-                  onClick={() => setRoutineExpanded(e => !e)}
-                  className="w-full flex items-center gap-2 px-4 py-2.5 bg-neutral-900/40 hover:bg-neutral-900/70 transition-colors text-left min-h-[44px]"
-                >
-                  <ChevronDown className={`w-3.5 h-3.5 text-neutral-600 shrink-0 transition-transform ${routineExpanded ? 'rotate-180' : ''}`} />
-                  <span className="text-xs text-neutral-500 font-medium shrink-0">{routineOpen.length} routine ops</span>
-                  <span className="text-[11px] text-neutral-600 truncate">{routineSummary(routineOpen)}</span>
-                </button>
+              <div ref={routineRefEl} className="border border-neutral-800/50 rounded-xl overflow-hidden">
+                <div className="flex items-center bg-neutral-900/40 hover:bg-neutral-900/70 transition-colors min-h-[44px]">
+                  <button
+                    onClick={() => setRoutineExpanded(e => !e)}
+                    className="flex-1 flex items-center gap-2 px-4 py-2.5 text-left"
+                  >
+                    <ChevronDown className={`w-3.5 h-3.5 text-neutral-600 shrink-0 transition-transform ${routineExpanded ? 'rotate-180' : ''}`} />
+                    <span className="text-xs text-neutral-500 font-medium shrink-0">{routineOpen.length} routine ops</span>
+                    <span className="text-[11px] text-neutral-600 truncate">{routineSummary(routineOpen)}</span>
+                  </button>
+                  <div className="relative shrink-0 px-2">
+                    <button
+                      onClick={() => setShowTempMuteMenu(v => !v)}
+                      className="text-neutral-500 hover:text-neutral-300 p-1.5 rounded transition-colors min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center"
+                      title="Temporarily mute event types"
+                    >
+                      <MoreVertical className="w-4 h-4" />
+                    </button>
+                    {showTempMuteMenu && (
+                      <>
+                        <div className="fixed inset-0 z-40" onClick={() => setShowTempMuteMenu(false)} />
+                        <div className="absolute right-0 top-full mt-1 z-50 bg-neutral-900 border border-neutral-700 rounded-lg shadow-xl p-2 space-y-1 min-w-48">
+                          {getTop3NoisyEventTypes().length > 0 ? (
+                            <>
+                              <p className="text-[10px] text-neutral-500 px-2 py-1">Mute for</p>
+                              {getTop3NoisyEventTypes().map(([eventType, count]) => {
+                                const label = ROUTINE_EVENT_LABELS[eventType] ?? eventType.replace(/_/g, ' ');
+                                const isActive = tempMutes[eventType] && tempMutes[eventType] > Date.now();
+                                return (
+                                  <div key={eventType} className="text-xs px-2 py-1 text-neutral-400">
+                                    <div className="font-medium mb-1">{label} ({count})</div>
+                                    <div className="flex gap-1 flex-wrap">
+                                      {(
+                                        [
+                                          ['30m', 1800000, 'Mute 30m'] as const,
+                                          ['1h', 3600000, 'Mute 1h'] as const,
+                                          ['Tomorrow', 86400000, 'Mute until tomorrow'] as const,
+                                        ]
+                                      ).map(([shortLabel, ms, title]) => (
+                                        <button
+                                          key={shortLabel}
+                                          onClick={() => addTemporaryMute(eventType, ms)}
+                                          title={title}
+                                          className={`text-[11px] px-2 py-1 rounded transition-colors min-h-[44px] md:min-h-auto flex items-center ${isActive ? 'bg-amber-500/20 text-amber-400' : 'bg-neutral-800 text-neutral-300 hover:bg-neutral-700'}`}
+                                        >
+                                          {shortLabel}
+                                        </button>
+                                      ))}
+                                    </div>
+                                  </div>
+                                );
+                              })}
+                            </>
+                          ) : (
+                            <p className="text-[10px] text-neutral-500 px-2 py-2">No recent events to mute</p>
+                          )}
+                        </div>
+                      </>
+                    )}
+                  </div>
+                </div>
                 {muteActive && (
                   <div className="px-4 py-2 bg-amber-950/30 border-t border-amber-800/30 text-[11px] text-amber-400">
                     🔕 Mute active, but failing groups still surface
@@ -1560,11 +1947,10 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
                                     <ChevronDown className={`w-3 h-3 text-neutral-600 shrink-0 transition-transform ${isGroupExpanded ? 'rotate-180' : ''}`} />
                                     <span className="text-xs text-neutral-500 font-medium">{row.msgs.length} {row.label}{bd ? ` ${bd}` : ''}</span>
                                   </button>
-                                  {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                                   <button
                                     onClick={() => handleResolveGroup(row.msgs)}
                                     title="Resolve all"
-                                    className="text-emerald-500/70 hover:text-emerald-400 p-1 rounded transition-colors"
+                                    className="text-emerald-500/70 hover:text-emerald-400 p-1 rounded transition-colors min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center"
                                   >
                                     <Check className="w-3 h-3" />
                                   </button>
@@ -1646,10 +2032,9 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
             {/* Resolved toggle + clear */}
             {hiddenResolvedCount > 0 && (
               <div className="flex justify-center gap-3 pt-1">
-                {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                 <button
                   onClick={() => setShowResolved(true)}
-                  className="text-[11px] text-neutral-600 hover:text-neutral-400 transition-colors px-2 py-1"
+                  className="text-[11px] text-neutral-600 hover:text-neutral-400 transition-colors px-2 py-1 min-h-[44px] md:min-h-auto flex items-center"
                 >
                   Show {hiddenResolvedCount} older resolved
                 </button>
@@ -1657,17 +2042,15 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
             )}
             {showResolved && resolvedMessages.length > 0 && (
               <div className="flex justify-center gap-3 pt-1">
-                {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                 <button
                   onClick={() => setShowResolved(false)}
-                  className="text-[11px] text-neutral-600 hover:text-neutral-400 transition-colors px-2 py-1"
+                  className="text-[11px] text-neutral-600 hover:text-neutral-400 transition-colors px-2 py-1 min-h-[44px] md:min-h-auto flex items-center"
                 >
                   Hide older resolved
                 </button>
-                {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                 <button
                   onClick={handleBulkDeleteResolved}
-                  className="text-[11px] text-neutral-600 hover:text-red-400 transition-colors px-2 py-1"
+                  className="text-[11px] text-neutral-600 hover:text-red-400 transition-colors px-2 py-1 min-h-[44px] md:min-h-auto flex items-center"
                 >
                   Clear all resolved
                 </button>
@@ -1678,10 +2061,9 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
 
         {/* Scroll to bottom button */}
         {showScrollDown && (
-          // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
           <button
             onClick={scrollToBottom}
-            className="sticky bottom-2 left-1/2 -translate-x-1/2 bg-neutral-800 border border-neutral-700 text-neutral-400 hover:text-neutral-200 p-2 rounded-full shadow-lg transition-colors z-10"
+            className="sticky bottom-2 left-1/2 -translate-x-1/2 bg-neutral-800 border border-neutral-700 text-neutral-400 hover:text-neutral-200 p-2 rounded-full shadow-lg transition-colors z-10 min-h-[44px] min-w-[44px] flex items-center justify-center"
           >
             <ArrowDown className="w-4 h-4" />
           </button>
@@ -1711,8 +2093,7 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
             <span className="text-xs text-neutral-400 truncate flex-1">
               Replying to <span className="text-neutral-300">{replyTo.from}</span>: {replyTo.content.slice(0, 80)}{replyTo.content.length > 80 ? '...' : ''}
             </span>
-            {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
-            <button onClick={() => setReplyTo(null)} className="text-neutral-500 hover:text-neutral-300 p-0.5 shrink-0">
+            <button onClick={() => setReplyTo(null)} className="text-neutral-500 hover:text-neutral-300 p-0.5 shrink-0 min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center">
               <X className="w-3 h-3" />
             </button>
           </div>

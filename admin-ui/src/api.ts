@@ -239,6 +239,44 @@ export async function fetchSrRecentMisses(
   return res.json();
 }
 
+export interface SrUnhandledEdge {
+  case: string;
+  handled: boolean;
+  blind_spot?: string | null;
+  origin?: string | null;
+}
+
+export interface SrUnhandledEdgesTask {
+  task_id: string;
+  title: string;
+  task_type?: string | null;
+  scope?: string | null;
+  created_at?: string | null;
+  unhandled_edges: SrUnhandledEdge[];
+  pr_url?: string | null;
+}
+
+export interface SrUnhandledEdgesRetrospectiveResponse {
+  items: SrUnhandledEdgesTask[];
+  total: number;
+}
+
+export async function fetchSrUnhandledEdgesRetrospectives(
+  projectId: string,
+  params?: { task_type?: string; days?: number; page?: number; page_size?: number },
+): Promise<SrUnhandledEdgesRetrospectiveResponse> {
+  const searchParams = new URLSearchParams();
+  if (params?.task_type) searchParams.set('task_type', params.task_type);
+  if (params?.days !== undefined) searchParams.set('days', String(params.days));
+  if (params?.page !== undefined) searchParams.set('page', String(params.page));
+  if (params?.page_size !== undefined) searchParams.set('page_size', String(params.page_size));
+  const query = searchParams.toString();
+  const url = `/api/admin/projects/${encodeURIComponent(projectId)}/sr-unhandled-edges-retrospectives${query ? `?${query}` : ''}`;
+  const res = await apiFetch(url);
+  if (!res.ok) throw new Error(`Failed to fetch SR unhandled edges: ${res.status}`);
+  return res.json();
+}
+
 export interface DirectionSrCatStat {
   sample_count: number;
   hit_rate?: number | null;
@@ -527,6 +565,25 @@ export async function fetchLayerCoverageByClass(
   return (data.summary?.layer_coverage_by_class as LayerCoverageByClass) ?? null;
 }
 
+export interface CanonicalRegressionLayer {
+  name: string;
+  description: string;
+}
+
+export interface CanonicalRegressionLayersResponse {
+  layers: CanonicalRegressionLayer[];
+}
+
+// Canonical regression layers in stable display order (single source of truth from backend)
+export const CANONICAL_LAYER_NAMES = ['CI_WORKFLOW', 'AGENT_VM', 'AGENT_VERB', 'BASELINE_GATE', 'REVIEWER_PASS', 'VIEWPORT'] as const;
+export type CanonicalLayerName = typeof CANONICAL_LAYER_NAMES[number];
+
+export async function fetchCanonicalRegressionLayers(): Promise<CanonicalRegressionLayersResponse> {
+  const res = await apiFetch('/api/admin/canonical-regression-layers');
+  if (!res.ok) throw new Error(`Failed to fetch canonical regression layers: ${res.status}`);
+  return res.json();
+}
+
 export interface CrossLayerComplianceByClass {
   compliant: number;
   non_compliant: number;
@@ -627,5 +684,23 @@ export async function onboardProject(
     const msg = (data?.error?.message) || (data?.detail) || `Error ${res.status}`;
     throw new Error(msg);
   }
+  return res.json();
+}
+
+export interface EfficiencyAxis {
+  current: number | null;
+  baseline: number | null;
+  drift_pct: number | null;
+}
+
+export interface EfficiencyAxesResponse {
+  axes: Record<string, EfficiencyAxis>;
+  baseline_captured_at: string | null;
+  last_snapshot_at: string | null;
+}
+
+export async function fetchEfficiencyAxes(projectId: string): Promise<EfficiencyAxesResponse> {
+  const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(projectId)}/efficiency-axes`);
+  if (!res.ok) throw new Error(`Failed to fetch efficiency axes: ${res.status}`);
   return res.json();
 }

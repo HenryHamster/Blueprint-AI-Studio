@@ -114,6 +114,7 @@ export type SavedView = {
   sort: 'importance' | 'recent';
   showResolved: boolean;
   routineExpanded: boolean;
+  showOnlyNew: boolean;
   createdAt: number;
 };
 
@@ -143,6 +144,7 @@ function sanitizeSavedView(raw: unknown): SavedView | null {
     sort: r.sort === 'recent' ? 'recent' : 'importance',
     showResolved: r.showResolved === true,
     routineExpanded: r.routineExpanded === true,
+    showOnlyNew: r.showOnlyNew === true,
     createdAt: typeof r.createdAt === 'number' ? r.createdAt : Date.now(),
   };
 }
@@ -186,8 +188,10 @@ export function saveSavedViews(
 export function effectiveSignal(
   msg: { message_type: string; from_type: string; context: Record<string, unknown> },
   prefs: Record<string, EventPref>,
+  tempMutes?: TemporaryMutes,
 ): 'high' | 'routine' | 'mute' {
   const et = msg.context.event_type as string | undefined;
+  if (tempMutes && isEventTypeTemporarilyMuted(et, tempMutes)) return 'mute';
   const pref = et ? prefs[et] : undefined;
   if (pref === 'mute') return 'mute';
   if (pref === 'routine') return 'routine';
@@ -366,6 +370,14 @@ export function saveLastSeen(userId: string | null | undefined, projectId: strin
   } catch { /* ignore */ }
 }
 
+// Merges a localStorage timestamp with a backend timestamp, preferring the more recent value.
+// Returns null when both are absent. Use this to implement the offline fallback: pass backend
+// result (or null if the fetch failed) and let the function select the correct source.
+export function resolveLastSeen(localTs: number | null, backendTs: number | null): number | null {
+  if (localTs !== null && backendTs !== null) return Math.max(localTs, backendTs);
+  return backendTs ?? localTs;
+}
+
 // ── Time-window mute (hides routine ops for a chosen duration) ────────────────
 
 export type MuteWindow = { expiresAt: number };
@@ -431,6 +443,25 @@ export function formatTimestamp(timestamp: number): string {
   return `${days}d ago`;
 }
 
+export function formatSinceTimestamp(timestamp: number): string {
+  const date = new Date(timestamp);
+  const now = new Date();
+  const dayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  const isToday = date.toDateString() === now.toDateString();
+  const isYesterday = new Date(date.getTime() + 86400000).toDateString() === now.toDateString();
+
+  const day = dayNames[date.getDay()];
+  const hour = date.getHours();
+  const min = date.getMinutes().toString().padStart(2, '0');
+  const ampm = hour >= 12 ? 'pm' : 'am';
+  const displayHour = hour % 12 || 12;
+
+  const time = `${displayHour}:${min}${ampm}`;
+  if (isToday) return `Today ${time}`;
+  if (isYesterday) return `Yesterday ${time}`;
+  return `${day} ${time}`;
+}
+
 export type MessageWithDivider<T> =
   | { kind: 'divider'; label: string }
   | { kind: 'message'; msg: T };
@@ -486,6 +517,54 @@ export function isCriticalSeverity(msg: {
   return false;
 }
 
+// ── Temporary event-type mutes (short-duration silence for noisy types) ────────
+
+export type TemporaryMutes = Record<string, number>; // event_type -> expiresAt (ms)
+
+export function temporaryMutesKey(userId: string | undefined, projectId: string | undefined): string {
+  return `messages_panel_temp_mutes:${userId || 'anonymous'}:${projectId || 'default'}`;
+}
+
+export function loadTemporaryMutes(userId?: string | null, projectId?: string | null): TemporaryMutes {
+  try {
+    const key = temporaryMutesKey(userId || undefined, projectId || undefined);
+    const raw = localStorage.getItem(key);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    const now = Date.now();
+    const mutes: TemporaryMutes = {};
+    for (const [et, expiresAt] of Object.entries(parsed)) {
+      if (typeof expiresAt === 'number' && expiresAt > now) {
+        mutes[et] = expiresAt;
+      }
+    }
+    return mutes;
+  } catch {
+    return {};
+  }
+}
+
+export function saveTemporaryMutes(
+  userId: string | undefined | null,
+  projectId: string | undefined | null,
+  mutes: TemporaryMutes,
+): void {
+  try {
+    const key = temporaryMutesKey(userId || undefined, projectId || undefined);
+    if (Object.keys(mutes).length === 0) {
+      localStorage.removeItem(key);
+    } else {
+      localStorage.setItem(key, JSON.stringify(mutes));
+    }
+  } catch { /* ignore */ }
+}
+
+export function isEventTypeTemporarilyMuted(eventType: string | undefined, tempMutes: TemporaryMutes): boolean {
+  if (!eventType) return false;
+  const expiresAt = tempMutes[eventType];
+  return expiresAt !== undefined && expiresAt > Date.now();
+}
+
 // Collapses stale routine rows (older than STALE_ROUTINE_COLLAPSE_AGE_MS) into per-day digest
 // entries. Failing groups and high-signal events are never collapsed.
 export function collapseStaleRoutineRows<T extends { id: string; context: Record<string, unknown>; created_at?: string | null }>(
@@ -518,6 +597,7 @@ export function collapseStaleRoutineRows<T extends { id: string; context: Record
         output.push(day);
         digestBuckets.set(day, { msgs: [], breakdown: {} });
       }
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
       const bucket = digestBuckets.get(day)!;
       for (const m of rowMsgs) {
         bucket.msgs.push(m);
@@ -531,6 +611,7 @@ export function collapseStaleRoutineRows<T extends { id: string; context: Record
 
   return output.map(item => {
     if (typeof item !== 'string') return item;
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
     const b = digestBuckets.get(item)!;
     return { kind: 'daily_digest' as const, day: item, count: b.msgs.length, breakdown: b.breakdown, msgs: b.msgs };
   });

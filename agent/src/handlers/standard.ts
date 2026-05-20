@@ -18,7 +18,7 @@ import {
 import { resolveBuildConfig } from '../build-config.js';
 import { SCOPE_OVERFLOW_THRESHOLDS, MEDIUM_ANALYSIS_PLAN_FILE_LIMIT } from '../constants.js';
 import { runCodeChangeTask } from './code-change.js';
-import { formatExecutionEvidenceForSrPrompt } from '../prompts/self-review.js';
+import { formatExecutionEvidenceForSrPrompt, formatHighFpRateLoosenHintForSrPrompt, formatSrCoFailurePairsForSrPrompt, formatSeverityCalibrationHintForSrPrompt } from '../prompts/self-review.js';
 
 // ── Standard Handler Helper ───────────────────────────────────────────────
 
@@ -165,6 +165,17 @@ export function buildSmallScopeCallerNote(relatedFiles: string[]): string {
 
 const FRESH_REVIEWER_MIN_LINES = 20;
 
+const VIEWPORT_INFRA_SKIP_GUIDANCE = `## Viewport gate: infra-skip sentinel
+
+If \`./check\` output contains \`VIEWPORT_GATE_INFRA_UNAVAILABLE:\` OR the
+"admin-ui playwright chromium" bootstrap step fails AND \`docker info\` also
+errors (Docker unavailable), this is an infrastructure shortfall — NOT a code
+defect. Chromium and its system-library dependencies cannot be installed by a
+code edit on this VM. Call \`./blocked "VIEWPORT_GATE_INFRA_UNAVAILABLE: <reason>"\`
+immediately. Do NOT attempt to install Chromium, modify viewport tests to bypass
+the browser requirement, or weaken test assertions to work around the missing runtime.
+`;
+
 export const SR_SKIP_REASONS = {
   DIFF_TOO_SMALL: 'diff_too_small',
   REVIEWER_SESSION_FAILED: 'reviewer_session_failed',
@@ -187,6 +198,7 @@ type SRCatchRateCategory = {
   precision?: number;
   sr_flag_sample_size?: number;
   examples?: SRCatchRateExample[];
+  time_to_miss_detect_lone_checker?: boolean;
 };
 
 function formatFreshReviewerCalibrationSection(
@@ -244,6 +256,35 @@ function getRegressingCategories(
 }
 
 /**
+ * Returns lone-checker categories from project_context that overlap with the
+ * task's expected risk surface (derived from related_files path prefixes).
+ * Used to auto-trigger a fresh-reviewer pass when SR is the sole corroborator
+ * for a high-risk category.
+ */
+export function loneCheckerCategoriesForTask(
+  projectContext: Record<string, unknown> | undefined,
+  relatedFiles: string[],
+): string[] {
+  const srCatchRate = projectContext?.self_review_catch_rate as {
+    categories?: Record<string, SRCatchRateCategory>;
+  } | null | undefined;
+  const categories = srCatchRate?.categories;
+  if (!categories) return [];
+  const loneCheckers = Object.entries(categories)
+    .filter(([, data]) => data.time_to_miss_detect_lone_checker === true)
+    .map(([cat]) => cat);
+  if (loneCheckers.length === 0) return [];
+  const riskSurface = relatedFiles.some(f => f.startsWith('backend/'))
+    ? new Set(['security', 'regression_risk', 'correctness', 'error-handling'])
+    : relatedFiles.some(f => f.startsWith('admin-ui/'))
+    ? new Set(['security', 'correctness', 'type-safety', 'regression_risk'])
+    : relatedFiles.some(f => f.startsWith('agent/'))
+    ? new Set(['security', 'regression_risk', 'correctness', 'error-handling', 'type-safety'])
+    : null;
+  return riskSurface ? loneCheckers.filter(cat => riskSurface.has(cat)) : loneCheckers;
+}
+
+/**
  * Augments check_results entries with fp_rate_hint when a category has reliable
  * false-positive rate data (fp_rate >= 50% and sample_size >= 10). The hint is used
  * by sr-pr-section.js to annotate findings when rendered in the PR body.
@@ -289,6 +330,7 @@ export async function runFreshReviewerPass(
   model?: string,
   projectContext?: Record<string, unknown>,
   incompleteSrRecovery?: boolean,
+  loneCheckerRecovery?: boolean,
 ): Promise<void> {
   let baseCommit = '';
   try { baseCommit = fs.readFileSync(`/tmp/base_commit_${taskId}`, 'utf-8').trim(); } catch { /* ok */ }
@@ -330,6 +372,7 @@ Check specifically for:
 - type-safety: unsafe casts, any-typed externals, missing null guards in TypeScript
 - architecture: boundary violations, coupling regressions, abstraction leaks
 - test-coverage: new behavior without tests, untested edge cases or error paths
+- test_assertion_quality: for each test added or modified, does the assertion verify the specific behavior changed (a particular output value, side-effect, error type/message), or is it smoke-only ("returns something", "no exception", truthiness)? Flag tests that mock the unit under test so thoroughly that the changed logic is effectively unverified.
 
 Also enumerate edge cases YOU spot from a fresh read of the diff. Use the SAME shape the
 implementing author uses for their \`edges_considered\` field — \`{case, handled, evidence?, blind_spot?}\`.
@@ -340,7 +383,7 @@ cases. Cite file + line in \`evidence\` when claiming an edge is handled.
 Output ONLY a JSON object:
 {"reviewer_findings": [{"category": "<id>", "severity": "CRITICAL|HIGH|MEDIUM|LOW", "description": "..."}],
  "reviewer_edges_considered": [{"case": "...", "handled": true|false, "evidence": "...", "blind_spot": "..."}]}
-Category IDs: correctness, error-handling, security, type-safety, scope-drift, regression_risk, architecture, test-coverage
+Category IDs: correctness, error-handling, security, type-safety, scope-drift, regression_risk, architecture, test-coverage, test_assertion_quality
 If no issues found: {"reviewer_findings": [], "reviewer_edges_considered": []}`;
 
   const { exitCode, lastResultText } = await runClaudeCode(
@@ -402,6 +445,8 @@ If no issues found: {"reviewer_findings": [], "reviewer_edges_considered": []}`;
       const entry: Record<string, unknown> = { passed: false, issue: `[reviewer] ${f.description}` };
       if (incompleteSrRecovery) {
         entry.origin = 'reviewer_recovery_after_incomplete_sr';
+      } else if (loneCheckerRecovery) {
+        entry.origin = 'lone_checker_recovery';
       } else if (existing?.passed === true) {
         entry.origin = 'reviewer_disagreement';
       } else {
@@ -414,6 +459,8 @@ If no issues found: {"reviewer_findings": [], "reviewer_edges_considered": []}`;
   sr.check_results = checkResults;
   if (incompleteSrRecovery) {
     sr.reviewer_recovery_origin = 'reviewer_recovery_after_incomplete_sr';
+  } else if (loneCheckerRecovery) {
+    sr.reviewer_recovery_origin = 'lone_checker_recovery';
   }
 
   // Merge reviewer-enumerated edges. Filter defensively to entries with a
@@ -639,12 +686,64 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   const firstTaskSection = task.first_task_on_repo ? FIRST_TASK_GUIDANCE : '';
   const taskTypeFocusBlock = getTaskTypeFocusBlock(taskTypeKey);
   const executionEvidenceSection = formatExecutionEvidenceForSrPrompt();
-  const finalPrompt = claudeMdPrefix + playbookSection + retryContext + buildPrompt({ contextPrefix, parentCtx, rawPrompt }) + taskTypeHint + firstTaskSection + CODE_CHANGE_HELPER_GUIDANCE + taskTypeFocusBlock + executionEvidenceSection + PLAYBOOK_GUIDANCE + `\nNote: If lint or test fixes required non-obvious steps, save them to the playbook (e.g., ./playbook set "lint-gotcha" "description").\n` + assembleFailureGuidanceBlocks() + `\n\n${DEFAULT_TOOL_GUIDANCE}` + promptSuffix;
+  const projectCtxForSr = task.project_context as Record<string, unknown> | undefined;
+  const srCategories = (projectCtxForSr?.self_review_catch_rate as { categories?: Record<string, { false_positive_rate?: number; precision?: number; sr_flag_sample_size?: number; severity_calibration?: Record<string, unknown> }> } | null | undefined)?.categories;
+  const loosenHintSection = formatHighFpRateLoosenHintForSrPrompt(srCategories);
+  const coFailurePairs = projectCtxForSr?.sr_co_failure_pairs as Array<{ cat_a: string; cat_b: string; lift: number }> | null | undefined;
+  const coFailurePairsSection = formatSrCoFailurePairsForSrPrompt(coFailurePairs);
+  const severityCalibrationHintSection = formatSeverityCalibrationHintForSrPrompt(srCategories);
+  const finalPrompt = claudeMdPrefix + playbookSection + retryContext + buildPrompt({ contextPrefix, parentCtx, rawPrompt }) + taskTypeHint + firstTaskSection + CODE_CHANGE_HELPER_GUIDANCE + taskTypeFocusBlock + loosenHintSection + coFailurePairsSection + severityCalibrationHintSection + executionEvidenceSection + PLAYBOOK_GUIDANCE + `\nNote: If lint or test fixes required non-obvious steps, save them to the playbook (e.g., ./playbook set "lint-gotcha" "description").\n` + assembleFailureGuidanceBlocks() + VIEWPORT_INFRA_SKIP_GUIDANCE + `\n\n${DEFAULT_TOOL_GUIDANCE}` + promptSuffix;
 
   const { workBranch } = await setupWorkspace(owner, repo, ghToken, baseBranch, branchPrefix, taskId, ws, statusRef, buildConfig);
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);
   const disallowedTools = configureAgentPermissions(taskTypeKey);
+
+  // ── SCOPE_EMPTY pre-flight (auto-decomposed cluster siblings) ────────────
+  // When all declared related_files were already shipped by completed sibling
+  // cluster PRs, exit cleanly rather than burning retries on CODE_ERROR.
+  if (ctx.auto_decomposed) {
+    const guardFiles = (
+      (payload.related_files as string[] | undefined) ||
+      (ctx.related_files as string[] | undefined) ||
+      []
+    );
+    if (guardFiles.length > 0) {
+      const projectCtxForGuard = task.project_context as Record<string, unknown> | undefined;
+      const siblingTasksRaw = projectCtxForGuard?.sibling_tasks as Array<Record<string, unknown>> | undefined;
+      if (Array.isArray(siblingTasksRaw)) {
+        const completedSiblingFiles = new Set<string>();
+        const coveringTitles: string[] = [];
+        for (const sibling of siblingTasksRaw) {
+          if (sibling.status !== 'COMPLETED') continue;
+          const sFiles = sibling.files as string[] | undefined;
+          if (!Array.isArray(sFiles)) continue;
+          const overlaps = sFiles.filter(f => guardFiles.includes(f));
+          if (overlaps.length > 0) {
+            for (const f of sFiles) completedSiblingFiles.add(f);
+            const rawTitle = sibling.title;
+          const rawId = sibling.id;
+          const title = typeof rawTitle === 'string' && rawTitle ? rawTitle
+            : typeof rawId === 'string' && rawId ? rawId
+            : 'sibling task';
+            if (!coveringTitles.includes(title)) coveringTitles.push(title);
+          }
+        }
+        if (completedSiblingFiles.size > 0 && guardFiles.every(f => completedSiblingFiles.has(f))) {
+          const scopeEmptyMsg = `SCOPE_EMPTY: All declared related_files [${guardFiles.join(', ')}] were already covered by completed sibling tasks (${coveringTitles.join(', ')}). Exiting cleanly — no retry needed.`;
+          sendLog(ws, `[ScopeGuard] ${scopeEmptyMsg}\n`);
+          await persistAndPostStatus(taskId, {
+            task_id: taskId,
+            status: 'BLOCKED_PRECONDITION',
+            artifact_type: 'ERROR_LOG',
+            logs: scopeEmptyMsg,
+            failure_category: 'SCOPE_EMPTY',
+          });
+          return;
+        }
+      }
+    }
+  }
 
   // Capture test baseline on main branch so the test fix loop can distinguish
   // pre-existing failures from newly-broken tests. Scoped to related_files to stay fast.
@@ -885,6 +984,30 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
       model,
       task.project_context as Record<string, unknown> | undefined,
     );
+  }
+
+  // Auto-trigger fresh-reviewer when lone-checker categories overlap this task's
+  // risk surface. SR is the sole corroborator for these categories, so a PASS is
+  // uncorroborated. Fires regardless of enable_fresh_reviewer / is_self_repo.
+  if (!isAutoRemediation && !freshReviewerAlreadyRan) {
+    const loneCheckerRelatedFiles = (
+      (payload.related_files as string[] | undefined) ||
+      ((task.context as Record<string, unknown> | undefined)?.related_files as string[] | undefined) ||
+      []
+    );
+    const loneCheckerCats = loneCheckerCategoriesForTask(
+      task.project_context as Record<string, unknown> | undefined,
+      loneCheckerRelatedFiles,
+    );
+    if (loneCheckerCats.length > 0) {
+      sendLog(ws, `[FreshReview] Lone-checker categories detected (${loneCheckerCats.join(', ')}) — auto-triggering fresh-reviewer pass.\n`);
+      freshReviewerAlreadyRan = true;
+      await runFreshReviewerPass(
+        taskId, taskTitle, rawPrompt, loneCheckerRelatedFiles, ws, statusRef, model,
+        task.project_context as Record<string, unknown> | undefined,
+        false, true,
+      );
+    }
   }
 
   // Auto-trigger fresh-reviewer recovery when SR admits incomplete_review and

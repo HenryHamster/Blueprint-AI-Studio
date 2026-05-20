@@ -1748,6 +1748,21 @@ async def _process_post_commit(
             _timing_payload["handler_duration_secs"] = float(
                 payload.handler_duration_secs
             )
+        # Fallback: derive setup_secs from VM timestamps when the agent exits
+        # before computing it (timeout, pre-tool crash). vm_provisioned_at is
+        # set at orchestrator cold-provision time and reset to "now" on warm
+        # claim, so the difference approximates cold-start boot latency without
+        # polluting warm-start buckets. Only writes when not already present.
+        if "setup_secs" not in _timing_payload:
+            _prior_timing = dict((task.context or {}).get("_timing") or {})
+            if (
+                "setup_secs" not in _prior_timing
+                and task.vm_provisioned_at is not None
+                and task.vm_started_at is not None
+            ):
+                _derived = (task.vm_started_at - task.vm_provisioned_at).total_seconds()
+                if _derived >= 0:
+                    _timing_payload["setup_secs"] = round(_derived, 1)
         if _timing_payload:
             ctx = dict(task.context or {})
             existing = dict(ctx.get("_timing") or {})

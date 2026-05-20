@@ -85,6 +85,7 @@ vi.mock('../api', () => ({
   })),
   fetchSrMissedRetrospectives: vi.fn(async () => ({ items: [], total: 0 })),
   fetchSrRecentMisses: vi.fn(async () => ({ items: [] })),
+  fetchSrUnhandledEdgesRetrospectives: vi.fn(async () => ({ items: [], total: 0 })),
   fetchDirectionSrBreakdown: vi.fn(async () => ({ directions: [] })),
   fetchCrossLayerCompliance: vi.fn(async () => ({
     total_classified: 0,
@@ -96,6 +97,8 @@ vi.mock('../api', () => ({
     by_class: {},
   })),
   onboardProject: vi.fn(async () => ({})),
+  CANONICAL_LAYER_NAMES: ['CI_WORKFLOW', 'AGENT_VM', 'AGENT_VERB', 'BASELINE_GATE', 'REVIEWER_PASS', 'VIEWPORT'] as const,
+  fetchCanonicalRegressionLayers: vi.fn(async () => ({ layers: [] })),
 }));
 
 describe('DashboardHome — viewport regression', () => {

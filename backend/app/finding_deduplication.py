@@ -228,6 +228,21 @@ def extract_retired_failed_approaches(retired_context: list[dict]) -> list[str]:
     return approaches
 
 
+def extract_archived_diagnoses(design_doc: dict) -> list[str]:
+    """Extract diagnosis strings from retired_diagnoses_archive.
+
+    Each archived diagnosis is a summary of why a direction was retired, capturing
+    evicted findings counts and failed approach titles. Used for deduplication to
+    avoid re-exploring approaches the system has already determined don't work.
+    """
+    diagnoses: list[str] = []
+    for entry in (design_doc or {}).get("retired_diagnoses_archive", []):
+        diagnosis = entry.get("diagnosis", "")
+        if isinstance(diagnosis, str) and diagnosis.strip():
+            diagnoses.append(diagnosis)
+    return diagnoses
+
+
 def _find_retired_approach_match(
     finding_title: str,
     retired_failed_approaches: list[str],
@@ -242,6 +257,23 @@ def _find_retired_approach_match(
         overlap = words & (set(approach.lower().split()) - _STOPWORDS)
         if len(overlap) >= 3:
             return approach[:60]
+    return None
+
+
+def _find_archived_diagnosis_match(
+    finding_title: str,
+    archived_diagnoses: list[str],
+) -> Optional[str]:
+    """Return the first archived diagnosis whose content overlaps finding_title.
+
+    Uses the same 3-word threshold as retired approaches because diagnoses
+    represent previously explored territory.
+    """
+    words = set(finding_title.lower().split()) - _STOPWORDS
+    for diagnosis in archived_diagnoses:
+        overlap = words & (set(diagnosis.lower().split()) - _STOPWORDS)
+        if len(overlap) >= 3:
+            return diagnosis[:80]
     return None
 
 
@@ -381,6 +413,7 @@ def deduplicate_findings(
     existing_tasks_with_dirs: list[tuple],
     open_pr_files: set[str],
     retired_failed_approaches: Optional[list[str]] = None,
+    archived_diagnoses: Optional[list[str]] = None,
 ) -> DedupOutcome:
     """Apply hash, word-overlap, file-overlap, and evidence-overlap dedup to ``findings``.
 
@@ -449,6 +482,25 @@ def deduplicate_findings(
                 )
                 outcome.retired_approach_count += 1
                 reason = f"retired approach: {matched_approach}"
+                outcome.filtered.append(
+                    {
+                        "title": title[:120],
+                        "direction_id": finding_dir_id,
+                        "reason": reason[:80],
+                    }
+                )
+                continue
+
+        if archived_diagnoses:
+            matched_diagnosis = _find_archived_diagnosis_match(
+                title, archived_diagnoses
+            )
+            if matched_diagnosis is not None:
+                logger.info(
+                    f"[RESEARCH] Skipping finding '{title}' — matches archived diagnosis"
+                )
+                outcome.retired_approach_count += 1
+                reason = f"archived diagnosis: {matched_diagnosis[:60]}"
                 outcome.filtered.append(
                     {
                         "title": title[:120],

@@ -877,6 +877,28 @@ class TestMessages:
         assert resp.status_code == 400
 
     @pytest.mark.asyncio
+    async def test_create_routine_message_appends_running_update(
+        self, client: AsyncClient, db_session
+    ):
+        """Creating a NOTE with a routine event_type appends a digest to running_update."""
+        project = await _make_project(db_session)
+
+        resp = await client.post(
+            "/api/admin/messages",
+            json={
+                "project_id": str(project.id),
+                "message_type": "NOTE",
+                "content": "PR #123 merged into main",
+                "context": {"event_type": "pr_merged"},
+            },
+        )
+        assert resp.status_code == 200
+        await db_session.refresh(project)
+        assert project.running_update is not None
+        assert "pr_merged" in project.running_update
+        assert "PR #123 merged into main" in project.running_update
+
+    @pytest.mark.asyncio
     async def test_resolve_message(self, client: AsyncClient, db_session):
         """An open message can be resolved."""
         project = await _make_project(db_session)
@@ -986,6 +1008,71 @@ class TestMessages:
             f"/api/admin/messages?project_id={project.id}&status=pending"
         )
         assert resp.status_code == 400
+
+
+class TestMessagesLastSeen:
+    @pytest.mark.asyncio
+    async def test_get_last_seen_empty(self, client: AsyncClient, db_session):
+        """Returns null when no last-seen record exists for the operator."""
+        project = await _make_project(db_session)
+        resp = await client.get(
+            f"/api/admin/messages/last-seen?project_id={project.id}"
+        )
+        assert resp.status_code == 200
+        assert resp.json()["last_seen_at"] is None
+
+    @pytest.mark.asyncio
+    async def test_round_trip(self, client: AsyncClient, db_session):
+        """PUT stores the timestamp; subsequent GET returns the same value."""
+        project = await _make_project(db_session)
+        ts = 1_700_000_000_000  # arbitrary ms epoch
+
+        put_resp = await client.put(
+            "/api/admin/messages/last-seen",
+            json={"project_id": str(project.id), "timestamp": ts},
+        )
+        assert put_resp.status_code == 200
+        assert put_resp.json()["last_seen_at"] == ts
+
+        get_resp = await client.get(
+            f"/api/admin/messages/last-seen?project_id={project.id}"
+        )
+        assert get_resp.status_code == 200
+        assert get_resp.json()["last_seen_at"] == ts
+
+    @pytest.mark.asyncio
+    async def test_update_advances_timestamp(self, client: AsyncClient, db_session):
+        """A second PUT overwrites the previous value."""
+        project = await _make_project(db_session)
+        ts1, ts2 = 1_700_000_000_000, 1_700_000_060_000
+
+        await client.put(
+            "/api/admin/messages/last-seen",
+            json={"project_id": str(project.id), "timestamp": ts1},
+        )
+        await client.put(
+            "/api/admin/messages/last-seen",
+            json={"project_id": str(project.id), "timestamp": ts2},
+        )
+        get_resp = await client.get(
+            f"/api/admin/messages/last-seen?project_id={project.id}"
+        )
+        assert get_resp.json()["last_seen_at"] == ts2
+
+    @pytest.mark.asyncio
+    async def test_no_access_returns_404(self, client: AsyncClient, db_session):
+        """Cannot read or write last-seen for a project the user is not a member of."""
+        random_pid = str(uuid.uuid4())
+        get_resp = await client.get(
+            f"/api/admin/messages/last-seen?project_id={random_pid}"
+        )
+        assert get_resp.status_code == 404
+
+        put_resp = await client.put(
+            "/api/admin/messages/last-seen",
+            json={"project_id": random_pid, "timestamp": 1_700_000_000_000},
+        )
+        assert put_resp.status_code == 404
 
 
 class TestPlaybook:
@@ -2252,3 +2339,335 @@ class TestViewportRegressionDigest:
         # The existing class' opened count must not be polluted
         assert by_class["fix_loop_divergence:lint"]["cases_opened"] == 1
         assert by_class["viewport_regression:AlertsBanner@375"]["cases_opened"] == 1
+
+
+class TestSrCatchRateTrendsDirectionExamples:
+    """Admin digest exposes by_direction examples in the shape needed for SR-prompt injection."""
+
+    @pytest.mark.asyncio
+    async def test_digest_passes_through_direction_examples(
+        self, client: AsyncClient, db_session
+    ):
+        """(a/b) by_direction categories with examples are serialized correctly by the digest."""
+        from sqlalchemy.orm.attributes import flag_modified
+
+        project = await _make_project(db_session)
+        project.design_doc = {
+            "sr_catch_rate_trends": {
+                "computed_at": "2026-05-01T00:00:00",
+                "categories": {
+                    "correctness": {
+                        "miss_rate": 0.5,
+                        "examples": [{"severity": "MAJOR", "desc": "Global issue"}],
+                    }
+                },
+                "by_direction": {
+                    "dir-x": {
+                        "categories": {
+                            "security": {
+                                "miss_rate": 0.9,
+                                "examples": [
+                                    {
+                                        "severity": "CRITICAL",
+                                        "desc": "Direction X security miss",
+                                    }
+                                ],
+                            }
+                        }
+                    }
+                },
+            }
+        }
+        flag_modified(project, "design_doc")
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/digest?project_id={project.id}")
+        assert resp.status_code == 200
+        trends = resp.json().get("self_review_prediction_accuracy_trends")
+        assert trends is not None
+
+        by_dir = trends.get("by_direction", {})
+        assert "dir-x" in by_dir
+        dir_cats = by_dir["dir-x"].get("categories", {})
+        assert "security" in dir_cats
+        examples = dir_cats["security"].get("examples", [])
+        assert len(examples) >= 1
+        assert examples[0]["severity"] == "CRITICAL"
+        assert examples[0]["desc"] == "Direction X security miss"
+
+    @pytest.mark.asyncio
+    async def test_digest_direction_without_examples_does_not_mask_global(
+        self, client: AsyncClient, db_session
+    ):
+        """(c) by_direction entry with no examples is passed through; global categories still present."""
+        from sqlalchemy.orm.attributes import flag_modified
+
+        project = await _make_project(db_session)
+        project.design_doc = {
+            "sr_catch_rate_trends": {
+                "computed_at": "2026-05-01T00:00:00",
+                "categories": {
+                    "correctness": {
+                        "miss_rate": 0.5,
+                        "examples": [{"severity": "MAJOR", "desc": "Global fallback"}],
+                    }
+                },
+                "by_direction": {
+                    "dir-empty": {"categories": {"scope-drift": {"miss_rate": 0.7}}}
+                },
+            }
+        }
+        flag_modified(project, "design_doc")
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/digest?project_id={project.id}")
+        assert resp.status_code == 200
+        trends = resp.json().get("self_review_prediction_accuracy_trends")
+        assert trends is not None
+
+        assert "correctness" in trends.get("categories", {})
+        by_dir = trends.get("by_direction", {})
+        assert "dir-empty" in by_dir
+        dir_cats = by_dir["dir-empty"].get("categories", {})
+        assert "scope-drift" in dir_cats
+        assert "examples" not in dir_cats["scope-drift"]
+
+
+# ---------------------------------------------------------------------------
+# Viewport debt endpoint tests
+# ---------------------------------------------------------------------------
+
+
+class TestViewportDebt:
+    """Tests for GET /api/admin/projects/{project_id}/viewport-debt."""
+
+    @pytest.mark.asyncio
+    async def test_returns_rows_and_scanned_at(self, client: AsyncClient, db_session):
+        """Happy path: returns rows list and scanned_at timestamp."""
+        from unittest.mock import patch
+
+        project = await _make_project(db_session)
+        fake_rows = [
+            {
+                "component": "admin-ui/src/components/MessagesPanel.tsx",
+                "eslint_disable_count": 3,
+                "data_viewport_allow_small_target": 2,
+                "data_viewport_allow_overflow": 1,
+                "data_viewport_allow_truncation": 0,
+                "total_opt_outs": 6,
+                "has_viewport_test": True,
+                "regression_case_count": 0,
+                "source_url": None,
+            }
+        ]
+        fake_summary = {
+            "total_components": 1,
+            "untested_count": 0,
+            "untested_components": [],
+        }
+        with patch(
+            "app.routers.admin_digest._scan_viewport_debt_rows",
+            return_value=(fake_rows, [], fake_summary),
+        ):
+            resp = await client.get(f"/api/admin/projects/{project.id}/viewport-debt")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "rows" in data
+        assert "scanned_at" in data
+        assert len(data["rows"]) == 1
+        row = data["rows"][0]
+        assert row["component"] == "admin-ui/src/components/MessagesPanel.tsx"
+        assert row["eslint_disable_count"] == 3
+        assert row["total_opt_outs"] == 6
+        assert row["has_viewport_test"] is True
+
+    @pytest.mark.asyncio
+    async def test_regression_cases_annotated(self, client: AsyncClient, db_session):
+        """Viewport regression cases are counted and annotated on matching rows."""
+        from unittest.mock import patch
+        from app.models import RegressionRemediationCase, RegressionCaseStatus
+
+        project = await _make_project(db_session)
+
+        case = RegressionRemediationCase(
+            project_id=project.id,
+            regression_class="viewport_regression:MessagesPanel.tsx@375",
+            signal_name="viewport_regression",
+            status=RegressionCaseStatus.ACTIVE,
+            first_seen_at=__import__("datetime").datetime.utcnow(),
+        )
+        db_session.add(case)
+        await db_session.commit()
+
+        fake_rows = [
+            {
+                "component": "admin-ui/src/components/MessagesPanel.tsx",
+                "eslint_disable_count": 1,
+                "data_viewport_allow_small_target": 0,
+                "data_viewport_allow_overflow": 0,
+                "data_viewport_allow_truncation": 0,
+                "total_opt_outs": 1,
+                "has_viewport_test": True,
+                "regression_case_count": 0,
+                "source_url": None,
+            }
+        ]
+        fake_summary = {
+            "total_components": 1,
+            "untested_count": 0,
+            "untested_components": [],
+        }
+        with patch(
+            "app.routers.admin_digest._scan_viewport_debt_rows",
+            return_value=(fake_rows, [], fake_summary),
+        ):
+            resp = await client.get(f"/api/admin/projects/{project.id}/viewport-debt")
+
+        assert resp.status_code == 200
+        rows = resp.json()["rows"]
+        assert rows[0]["regression_case_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_rows_when_no_debt(
+        self, client: AsyncClient, db_session
+    ):
+        """Returns empty rows list when no components have opt-outs."""
+        from unittest.mock import patch
+
+        project = await _make_project(db_session)
+        empty_summary = {
+            "total_components": 0,
+            "untested_count": 0,
+            "untested_components": [],
+        }
+        with patch(
+            "app.routers.admin_digest._scan_viewport_debt_rows",
+            return_value=([], [], empty_summary),
+        ):
+            resp = await client.get(f"/api/admin/projects/{project.id}/viewport-debt")
+
+        assert resp.status_code == 200
+        assert resp.json()["rows"] == []
+
+    @pytest.mark.asyncio
+    async def test_non_member_project_returns_404(
+        self, client: AsyncClient, db_session
+    ):
+        """Project the user is not a member of returns 404."""
+        project = Project(name="Other Project", user_id="other-owner")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        resp = await client.get(f"/api/admin/projects/{project.id}/viewport-debt")
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_endpoint_does_not_mutate_cached_rows(
+        self, client: AsyncClient, db_session
+    ):
+        """Per-project annotations must not mutate the shared cache rows.
+
+        Regression: the endpoint annotates regression_case_count and source_url
+        on each row. Without a copy, those values would leak across concurrent
+        requests for different projects.
+        """
+        from unittest.mock import patch
+
+        project = await _make_project(db_session)
+        cached_rows = [
+            {
+                "component": "admin-ui/src/components/MessagesPanel.tsx",
+                "eslint_disable_count": 1,
+                "data_viewport_allow_small_target": 0,
+                "data_viewport_allow_overflow": 0,
+                "data_viewport_allow_truncation": 0,
+                "total_opt_outs": 1,
+                "has_viewport_test": True,
+                "regression_case_count": 0,
+                "source_url": None,
+            }
+        ]
+        # Snapshot the cached row so we can compare after the request.
+        snapshot = dict(cached_rows[0])
+
+        cached_summary = {
+            "total_components": 1,
+            "untested_count": 0,
+            "untested_components": [],
+        }
+        with patch(
+            "app.routers.admin_digest._scan_viewport_debt_rows",
+            return_value=(cached_rows, [], cached_summary),
+        ):
+            resp = await client.get(f"/api/admin/projects/{project.id}/viewport-debt")
+
+        assert resp.status_code == 200
+        # The shared cached row must remain identical to its pre-request state.
+        assert cached_rows[0] == snapshot
+
+    @pytest.mark.asyncio
+    async def test_untested_rows_returned_with_source_url(
+        self, client: AsyncClient, db_session
+    ):
+        """Untested-no-debt rows are returned and annotated with source_url."""
+        from unittest.mock import patch
+
+        project = Project(
+            name="Annotated",
+            user_id=TEST_USER_ID,
+            github_owner="acme",
+            github_repo="repo",
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        member = ProjectMember(
+            project_id=project.id, user_id=TEST_USER_ID, role="owner"
+        )
+        db_session.add(member)
+        await db_session.commit()
+
+        fake_untested = [
+            {
+                "component": "admin-ui/src/components/QuickFilterPresets.tsx",
+                "eslint_disable_count": 0,
+                "data_viewport_allow_small_target": 0,
+                "data_viewport_allow_overflow": 0,
+                "data_viewport_allow_truncation": 0,
+                "total_opt_outs": 0,
+                "has_viewport_test": False,
+                "regression_case_count": 0,
+                "source_url": None,
+            }
+        ]
+        fake_summary = {
+            "total_components": 1,
+            "untested_count": 1,
+            "untested_components": [
+                "admin-ui/src/components/QuickFilterPresets.tsx",
+            ],
+        }
+        with patch(
+            "app.routers.admin_digest._scan_viewport_debt_rows",
+            return_value=([], fake_untested, fake_summary),
+        ):
+            resp = await client.get(f"/api/admin/projects/{project.id}/viewport-debt")
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["rows"] == []
+        assert "untested_rows" in body
+        assert len(body["untested_rows"]) == 1
+        ut = body["untested_rows"][0]
+        assert ut["component"] == "admin-ui/src/components/QuickFilterPresets.tsx"
+        assert ut["has_viewport_test"] is False
+        assert ut["total_opt_outs"] == 0
+        assert ut["regression_case_count"] == 0
+        assert ut["source_url"] == (
+            "https://github.com/acme/repo/blob/main/"
+            "admin-ui/src/components/QuickFilterPresets.tsx"
+        )

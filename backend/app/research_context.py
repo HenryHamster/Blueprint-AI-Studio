@@ -428,6 +428,18 @@ def filter_direction_evidence(
     return result
 
 
+def extract_diagnosis_from_context(research_context_str: Optional[str]) -> str:
+    """Extract diagnosis summary from research context eviction section.
+
+    Returns the eviction summary text (counts + failed titles) which represents
+    the diagnosis of why a direction's research was curtailed.
+    """
+    if not research_context_str:
+        return ""
+    parsed = _parse_research_context(research_context_str)
+    return parsed.get("eviction_summary") or ""
+
+
 def build_recent_findings_evidence(
     finding_titles: list,
     finding_claims: Optional[list] = None,

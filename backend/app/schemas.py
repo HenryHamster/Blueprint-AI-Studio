@@ -125,6 +125,14 @@ class HeartbeatRequest(BaseModel):
     # Unix timestamp (seconds) extracted from the image name suffix, e.g.
     # "blueprint-agent-v2-1730000000" → 1730000000. None when unparseable.
     vm_image_build_ts: int | None = None
+    # Cumulative per-task LLM telemetry. Optional/backwards-compatible — older
+    # agents that don't yet emit these fields silently skip persistence; newer
+    # agents send running totals on every heartbeat. Persisted into
+    # Task.api_call_summary so the orchestrator can aggregate
+    # api-calls-per-task and total-tokens-per-task across the fleet.
+    llm_call_count: int | None = Field(None, ge=0)
+    total_input_tokens: int | None = Field(None, ge=0)
+    total_output_tokens: int | None = Field(None, ge=0)
 
 
 class SpawnTaskRequest(BaseModel):
@@ -252,3 +260,31 @@ class OnboardPayload(BaseModel):
     github_repo: str = Field(..., min_length=1, pattern="^[a-zA-Z0-9_.-]+$")
     name: str | None = None
     build_config_override: Dict[str, Any] | None = None
+
+
+# --- Pipeline Efficiency ---
+
+
+class PipelineEfficiencyWindow(BaseModel):
+    """Per-time-window metrics for the pipeline-efficiency endpoint."""
+
+    model_config = ConfigDict(extra="ignore")
+    setup_p50_secs: float | None = None
+    setup_p95_secs: float | None = None
+    setup_sample_n: int = 0
+    warm_reuse_rate: float | None = None
+    warm_reuse_sample_n: int = 0
+    review_iter_median: float | None = None
+    review_iter_p95: float | None = None
+    review_iter_sample_n: int = 0
+    vs_prior_setup_p50_delta: float | None = None
+    vs_prior_warm_reuse_rate_delta: float | None = None
+    vs_prior_review_iter_median_delta: float | None = None
+
+
+class PipelineEfficiencyResponse(BaseModel):
+    """Response schema for GET /api/admin/pipeline-efficiency."""
+
+    computed_at: str
+    window_24h: PipelineEfficiencyWindow
+    window_7d: PipelineEfficiencyWindow

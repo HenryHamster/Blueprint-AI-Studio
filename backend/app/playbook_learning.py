@@ -43,6 +43,12 @@ from app.models import (
 )
 from app.sr_blind_spots import _REVIEWER_ORIGINS
 
+# lone_checker_recovery is set by the fresh-reviewer pass when it runs because SR
+# is the sole checker for a category.  Extend the reviewer-origin set locally so
+# catch-rate attribution treats these findings as reviewer saves, not author SR hits.
+_LONE_CHECKER_RECOVERY_ORIGIN = "lone_checker_recovery"
+_ALL_REVIEWER_ORIGINS = _REVIEWER_ORIGINS | frozenset({_LONE_CHECKER_RECOVERY_ORIGIN})
+
 # In-app Alert row title prefixes for SR catch-rate alerts. The router that
 # powers AlertsBanner returns Alert rows verbatim; we use these prefixes both
 # to format new rows and to find/dismiss prior matching rows on clear-transition.
@@ -278,6 +284,22 @@ _REVIEW_CATEGORIES: dict[str, list[str]] = {
         "scope creep",
         "too broad",
         "unrelated files",
+    ],
+    "cross-system-contract": [
+        "url mismatch",
+        "route mismatch",
+        "endpoint mismatch",
+        "path mismatch",
+        "dto mismatch",
+        "cross-system",
+        "cross system",
+        "missing route",
+        "missing endpoint",
+        "api contract",
+        "contract drift",
+        "unmatched path",
+        "frontend calls",
+        "backend exposes",
     ],
 }
 
@@ -2562,7 +2584,7 @@ def _stats_for_tasks(
         entry: dict[str, Any] | None,
     ) -> Literal["sr_alone", "reviewer_save"]:
         origin = entry.get("origin") if isinstance(entry, dict) else None
-        if isinstance(origin, str) and origin.startswith("reviewer"):
+        if isinstance(origin, str) and origin in _ALL_REVIEWER_ORIGINS:
             return "reviewer_save"
         return "sr_alone"
 
@@ -2587,7 +2609,7 @@ def _stats_for_tasks(
         sr_failed_author = {
             c
             for c in sr_failed
-            if (check_results.get(c) or {}).get("origin") not in _REVIEWER_ORIGINS
+            if (check_results.get(c) or {}).get("origin") not in _ALL_REVIEWER_ORIGINS
         }
         rev_hist = (ctx.get("review_loop") or {}).get("review_history") or []
         cat_weights: dict[str, int] = {}
@@ -2982,6 +3004,73 @@ def compute_direction_sr_breakdown_for_endpoint(
     return out
 
 
+def select_sr_miss_examples_for_injection(
+    sr_catch_rate_trends: dict,
+    direction_id: Optional[str] = None,
+    *,
+    max_cats: int = 3,
+    max_examples_per_cat: int = 3,
+    max_total_chars: int = 1200,
+) -> dict[str, list[dict]]:
+    """Select miss examples for agent SR-prompt injection.
+
+    When *direction_id* is provided and the per-direction snapshot in
+    ``by_direction`` contains at least one category with non-empty examples,
+    those direction-scoped categories are used as candidates.  Falls back to
+    the global top categories when the direction has no qualifying examples.
+
+    Returns ``{category: [{severity, desc}, ...]}`` bounded by *max_cats*,
+    *max_examples_per_cat*, and *max_total_chars*.
+    """
+    global_cats = sr_catch_rate_trends.get("categories") or {}
+    if not isinstance(global_cats, dict):
+        return {}
+
+    candidate_cats: dict = global_cats
+    if direction_id:
+        dir_entry = (sr_catch_rate_trends.get("by_direction") or {}).get(
+            str(direction_id)
+        ) or {}
+        dir_cats = dir_entry.get("categories")
+        if isinstance(dir_cats, dict) and any(
+            isinstance(v, dict)
+            and isinstance(v.get("examples"), list)
+            and v["examples"]
+            for v in dir_cats.values()
+        ):
+            candidate_cats = dir_cats
+
+    ranked = sorted(
+        [
+            (cat, data)
+            for cat, data in candidate_cats.items()
+            if isinstance(data, dict)
+            and isinstance(data.get("examples"), list)
+            and data["examples"]
+        ],
+        key=lambda x: x[1].get("weighted_miss_rate") or x[1].get("miss_rate") or 0.0,
+        reverse=True,
+    )[:max_cats]
+
+    result: dict[str, list[dict]] = {}
+    total_chars = 0
+    for cat, data in ranked:
+        cat_exs: list[dict] = []
+        for ex in data["examples"][:max_examples_per_cat]:
+            desc = (str(ex.get("desc") or ""))[:200]
+            if not desc:
+                continue
+            if total_chars + len(desc) > max_total_chars:
+                break
+            total_chars += len(desc)
+            cat_exs.append({"severity": ex.get("severity", "MINOR"), "desc": desc})
+        if cat_exs:
+            result[cat] = cat_exs
+        if total_chars >= max_total_chars:
+            break
+    return result
+
+
 def _compute_cat_fp_stats(
     tasks: list,
 ) -> tuple[
@@ -3016,7 +3105,7 @@ def _compute_cat_fp_stats(
             for c, r in check_results.items()
             if isinstance(r, dict)
             and not r.get("passed", True)
-            and r.get("origin") not in _REVIEWER_ORIGINS
+            and r.get("origin") not in _ALL_REVIEWER_ORIGINS
         }
         if not sr_failed:
             continue
@@ -3086,7 +3175,7 @@ def _compute_cat_severity_calibration(
                 continue
             if cr.get("passed", True):
                 continue
-            if cr.get("origin") in _REVIEWER_ORIGINS:
+            if cr.get("origin") in _ALL_REVIEWER_ORIGINS:
                 continue
             agent_sev = (cr.get("severity") or "").upper()
             if agent_sev not in _sw:
@@ -3165,7 +3254,7 @@ def compute_sr_quality_by_fingerprint(
             for cat, result in check_results.items()
             if isinstance(result, dict)
             and not result.get("passed", True)
-            and result.get("origin") not in _REVIEWER_ORIGINS
+            and result.get("origin") not in _ALL_REVIEWER_ORIGINS
         }
         reviewer_cats = {
             finding.get("category")
@@ -4185,6 +4274,11 @@ async def compute_sr_catch_rate_trends(
     exec_evidence = _compute_execution_evidence_miss_rates(current_window_tasks)
     result["execution_evidence_miss_rates"] = exec_evidence or {}
 
+    from app.sr_blind_spots import aggregate_sr_co_failure_pairs  # noqa: PLC0415
+
+    co_pairs = aggregate_sr_co_failure_pairs(current_window_tasks)
+    result["co_failure_pairs"] = co_pairs or []
+
     doc["sr_catch_rate_trends"] = result
     project.design_doc = doc
     flag_modified(project, "design_doc")
@@ -4291,6 +4385,16 @@ async def compute_sr_catch_rate_trends(
                         )
                 description = "\n".join(lines)
 
+                # Add caveat if SR prompt changed during this window
+                if result.get("prompt_version_changed") or result.get(
+                    "mixed_prompt_versions"
+                ):
+                    description = (
+                        description
+                        + "\n\nNote: SR prompt version changed during this window — "
+                        + "attribution may be partly due to the prompt update"
+                    )
+
                 await post_failure_alert_message(session, project_id, description)
 
                 # Surface the regression in AlertsBanner as a real Alert row.
@@ -4370,6 +4474,13 @@ async def compute_sr_catch_rate_trends(
                         for sev in current_regressing_sevs
                     ],
                 }
+                if result.get("prompt_version_changed") or result.get(
+                    "mixed_prompt_versions"
+                ):
+                    webhook_payload["prompt_version_caveat"] = (
+                        "SR prompt version changed during this window — "
+                        + "attribution may be partly due to the prompt update"
+                    )
                 asyncio.ensure_future(
                     dispatch_external_notification(
                         project_id,
@@ -4492,6 +4603,16 @@ async def compute_sr_catch_rate_trends(
                     )
                 description = "\n".join(lines)
 
+                # Add caveat if SR prompt changed during this window
+                if result.get("prompt_version_changed") or result.get(
+                    "mixed_prompt_versions"
+                ):
+                    description = (
+                        description
+                        + "\n\nNote: SR prompt version changed during this window — "
+                        + "attribution may be partly due to the prompt update"
+                    )
+
                 await post_failure_alert_message(session, project_id, description)
 
                 # Surface as ERROR Alert row in AlertsBanner (stricter than the
@@ -4547,6 +4668,13 @@ async def compute_sr_catch_rate_trends(
                         for cat in current_floor_cats
                     ],
                 }
+                if result.get("prompt_version_changed") or result.get(
+                    "mixed_prompt_versions"
+                ):
+                    floor_payload["prompt_version_caveat"] = (
+                        "SR prompt version changed during this window — "
+                        + "attribution may be partly due to the prompt update"
+                    )
                 asyncio.ensure_future(
                     dispatch_external_notification(
                         project_id,
@@ -4652,6 +4780,16 @@ async def compute_sr_catch_rate_trends(
                     )
                 description = "\n".join(lines)
 
+                # Add caveat if SR prompt changed during this window
+                if result.get("prompt_version_changed") or result.get(
+                    "mixed_prompt_versions"
+                ):
+                    description = (
+                        description
+                        + "\n\nNote: SR prompt version changed during this window — "
+                        + "attribution may be partly due to the prompt update"
+                    )
+
                 await post_failure_alert_message(session, project_id, description)
 
                 new_quadrant_title = _format_sr_alert_title(
@@ -4702,6 +4840,13 @@ async def compute_sr_catch_rate_trends(
                         for cat in current_quadrant_cats
                     ],
                 }
+                if result.get("prompt_version_changed") or result.get(
+                    "mixed_prompt_versions"
+                ):
+                    q_payload["prompt_version_caveat"] = (
+                        "SR prompt version changed during this window — "
+                        + "attribution may be partly due to the prompt update"
+                    )
                 asyncio.ensure_future(
                     dispatch_external_notification(
                         project_id,
@@ -4819,6 +4964,16 @@ async def compute_sr_catch_rate_trends(
                     )
                 description = "\n".join(lines)
 
+                # Add caveat if SR prompt changed during this window
+                if result.get("prompt_version_changed") or result.get(
+                    "mixed_prompt_versions"
+                ):
+                    description = (
+                        description
+                        + "\n\nNote: SR prompt version changed during this window — "
+                        + "attribution may be partly due to the prompt update"
+                    )
+
                 await post_failure_alert_message(session, project_id, description)
 
                 new_eng_title = _format_sr_alert_title(
@@ -4871,6 +5026,13 @@ async def compute_sr_catch_rate_trends(
                         for cat in current_thinning_cats
                     ],
                 }
+                if result.get("prompt_version_changed") or result.get(
+                    "mixed_prompt_versions"
+                ):
+                    thinning_payload["prompt_version_caveat"] = (
+                        "SR prompt version changed during this window — "
+                        + "attribution may be partly due to the prompt update"
+                    )
                 asyncio.ensure_future(
                     dispatch_external_notification(
                         project_id,
@@ -5138,7 +5300,7 @@ async def compute_fresh_reviewer_trend(
                 for c, r in check_results.items()
                 if isinstance(r, dict)
                 and not r.get("passed", True)
-                and r.get("origin") not in _REVIEWER_ORIGINS
+                and r.get("origin") not in _ALL_REVIEWER_ORIGINS
             }
             for finding in findings:
                 cat = finding.get("category") if isinstance(finding, dict) else None
@@ -5352,7 +5514,7 @@ async def compute_sr_reviewer_disagreements(
 
     Returns the result dict, or ``None`` when no disagreements are found.
     """
-    from app.sr_blind_spots import count_reviewer_disagreements_in_tasks  # noqa: PLC0415
+    from app.sr_blind_spots import _count_reviewer_disagreement_directions  # noqa: PLC0415
 
     now = _utcnow()
     cutoff = now - timedelta(days=window_days)
@@ -5368,14 +5530,23 @@ async def compute_sr_reviewer_disagreements(
         if t.status == TaskStatus.COMPLETED
         and (not t.created_at or _naive(t.created_at) >= cutoff_naive)
     ]
-    disagreement_counts = count_reviewer_disagreements_in_tasks(eligible)
+    direction_counts = _count_reviewer_disagreement_directions(eligible)
 
-    if not disagreement_counts:
+    if not any(bucket["miss"] > 0 for bucket in direction_counts.values()):
         return None
 
-    top = sorted(disagreement_counts.items(), key=lambda x: -x[1])[:limit]
+    top = sorted(
+        [(k, v) for k, v in direction_counts.items() if v["miss"] > 0],
+        key=lambda x: -x[1]["miss"],
+    )[:limit]
     entries = [
-        {"category": cat, "task_type": ttype, "count": cnt} for (cat, ttype), cnt in top
+        {
+            "category": cat,
+            "task_type": ttype,
+            "count": bucket["miss"],
+            "examples": bucket["examples"],
+        }
+        for (cat, ttype), bucket in top
     ]
     result: dict[str, Any] = {
         "computed_at": now.isoformat(),
@@ -6079,7 +6250,7 @@ def get_sr_alert_drilldown_tasks(
             for c, r in check_results.items()
             if isinstance(r, dict)
             and not r.get("passed", True)
-            and r.get("origin") not in _REVIEWER_ORIGINS
+            and r.get("origin") not in _ALL_REVIEWER_ORIGINS
         }
         human_cats = set(ctx.get("_first_attempt_rejection_categories") or [])
         missed_in_target = (human_cats & target_cats) - sr_failed
@@ -6087,6 +6258,30 @@ def get_sr_alert_drilldown_tasks(
             continue
         caught_in_target = human_cats & target_cats & sr_failed
         payload = t.first_payload or {}
+        findings_list = ctx["_self_review_outcome"].get("reviewer_findings") or []
+        findings_by_cat = {
+            f["category"]: f
+            for f in findings_list
+            if isinstance(f, dict) and "category" in f
+        }
+        missed_category_findings: dict[str, Any] = {}
+        for cat in missed_in_target:
+            finding = findings_by_cat.get(cat)
+            if finding:
+                desc = finding.get("description") or ""
+                missed_category_findings[cat] = {
+                    "severity": finding.get("severity"),
+                    "description": desc[:140],
+                    "has_more": len(desc) > 140,
+                    "full_description": desc if len(desc) > 140 else None,
+                }
+            else:
+                missed_category_findings[cat] = {
+                    "severity": None,
+                    "description": "no description recorded",
+                    "has_more": False,
+                    "full_description": None,
+                }
         results.append(
             {
                 "task_id": str(t.id),
@@ -6097,6 +6292,7 @@ def get_sr_alert_drilldown_tasks(
                 "missed_categories": sorted(missed_in_target),
                 "caught_categories": sorted(caught_in_target),
                 "sr_verdict": ctx["_self_review_outcome"].get("verdict"),
+                "missed_category_findings": missed_category_findings,
             }
         )
 

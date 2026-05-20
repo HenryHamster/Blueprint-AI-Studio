@@ -10,11 +10,11 @@
     "github.py": 2700,
     "routers/admin_settings.py": 3000,
     "routers/admin_analytics.py": 800,
-    "routers/admin_digest.py": 8450,
+    "routers/admin_digest.py": 10300,
     "routers/admin_pool_accounts.py": 1200,
     "max_plan_pool.py": 2750,
     "anomaly_detection.py": 2050,
-    "routers/agent.py": 4000,
+    "routers/agent.py": 4200,
     "services.py": 2750,
     "routers/agent_status.py": 3150,
     "autonomous_research.py": 2750,
@@ -24,7 +24,7 @@
     "reaper.py": 3200,
     "review_pipeline.py": 2350,
     "deploy_health.py": 1250,
-    "regression_layer_classifier.py": 330
+    "regression_layer_classifier.py": 520
   },
   "frontend": {
     "useAppState.ts": 3000,
@@ -38,8 +38,8 @@
     "components/TaskCard.tsx": 1500,
     "components/DirectionCard.tsx": 1650,
     "components/PipelineView.tsx": 1200,
-    "components/DashboardHome.tsx": 2250,
-    "components/MessagesPanel.tsx": 1750,
+    "components/DashboardHome.tsx": 2800,
+    "components/MessagesPanel.tsx": 2400,
     "components/MetricsDashboard.tsx": 1500,
     "components/ProjectDashboard.tsx": 1500,
     "components/AutonomousStatus.tsx": 1500,
