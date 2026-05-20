@@ -7,7 +7,7 @@ import json
 import logging
 import re
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 TASK_PRIORITY_MAP: Dict[str, int] = {"high": 100, "medium": 50, "low": 0}
 
 
-def _parse_plan_output(text: str) -> Optional[Dict[str, Any]]:
+def _parse_plan_output(text: str) -> Dict[str, Any] | None:
     """Extract structured plan JSON from agent output text.
 
     Uses string-aware bracket counting so braces inside JSON string values
@@ -139,8 +139,8 @@ def _inject_file_overlap_deps(subtasks: List[Dict], label: str = "PLAN") -> None
 
 async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
     """Parse plan output and create child tasks with dependency tracking."""
-    from app.main import _maybe_create_failure_alert  # noqa: PLC0415
-    from app.task_completion import _ensure_branch  # noqa: PLC0415
+    from app.main import _maybe_create_failure_alert
+    from app.task_completion import _ensure_branch
 
     plan_data = _parse_plan_output(logs)
     if not plan_data or not plan_data.get("subtasks"):
@@ -149,8 +149,8 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
         from app.failure_classification import (
             classify_failure,
             persist_failure_category,
-        )  # noqa: PLC0415
-        from app.routers.agent_status import record_task_result  # noqa: PLC0415
+        )
+        from app.routers.agent_status import record_task_result
 
         _fc = classify_failure(task)
         persist_failure_category(task, _fc)
@@ -181,8 +181,8 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
         from app.failure_classification import (
             classify_failure,
             persist_failure_category,
-        )  # noqa: PLC0415
-        from app.routers.agent_status import record_task_result  # noqa: PLC0415
+        )
+        from app.routers.agent_status import record_task_result
 
         _fc = classify_failure(task)
         persist_failure_category(task, _fc)
@@ -204,6 +204,7 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
     session.add(task)
 
     parent_base = (task.first_payload).get("base_branch", "main")
+    parent_hotfix = bool(task.first_payload.get("hotfix"))
     short_id = str(task.id).replace("-", "")[:8]
     plan_branch = f"plan/{short_id}"
 
@@ -254,6 +255,8 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
         subtask_priority = TASK_PRIORITY_MAP.get(
             subtask_def.get("priority", "medium"), 50
         )
+        if parent_hotfix:
+            subtask_priority = max(subtask_priority, 90)
         subtask_effort = subtask_def.get("effort") or effort
         child_scope = subtask_def.get("scope", "small")
         # Scope-aware effort floor: small subtasks run cheaper, large subtasks
@@ -293,6 +296,7 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
                         **({"model": subtask_model} if subtask_model else {}),
                         **({"effort": subtask_effort} if subtask_effort else {}),
                         **({"prompt_suffix": create_suffix} if create_suffix else {}),
+                        **({"hotfix": True} if parent_hotfix else {}),
                     },
                     f"task_completion:plan_subtask:{subtask_type}",
                 )
@@ -317,6 +321,7 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
                     if parent_research_task_id
                     else {}
                 ),
+                **({"hotfix": True} if parent_hotfix else {}),
             },
             vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
             status=TaskStatus.QUEUED,

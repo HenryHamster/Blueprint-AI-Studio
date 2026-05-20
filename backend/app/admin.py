@@ -1380,6 +1380,11 @@ class CreateTaskPayload(BaseModel):
     )
     model: str | None = Field(default=None, min_length=1)
     effort: str | None = Field(default=None, pattern=r"^(low|medium|high|max)$")
+    # Hotfix path (Phase 5 / automain-LTS): set hotfix=True together with
+    # base_branch="main" to mark a plan task as an expedited fix off main.
+    # The agent handler branches hotfix/* off main and the orchestrator
+    # back-merges main → automain after the hotfix lands.
+    hotfix: bool = False
 
     @field_validator("base_branch", "branch")
     @classmethod
@@ -1414,6 +1419,12 @@ async def create_task_manually(
 ):
     """
     Create a Claude Code task. Auto-creates a project for the repo if one doesn't exist.
+
+    Hotfix path: submit task_type="plan", base_branch="main", hotfix=true to
+    launch an expedited fix off main (Phase 5 / automain-LTS).  The hotfix
+    flag is stored in the task payload and picked up by the agent handler,
+    which branches hotfix/* off main; the orchestrator back-merges
+    main → automain after the hotfix lands.
     """
     # Parse owner/repo
     github_owner, github_repo = payload.github_repo.split("/", 1)
@@ -1457,6 +1468,8 @@ async def create_task_manually(
         task_payload["model"] = payload.model
     if payload.effort is not None:
         task_payload["effort"] = payload.effort
+    if payload.hotfix:
+        task_payload["hotfix"] = True
     # Review/fix tasks need pr_number and branch
     if payload.task_type in ("review", "fix") and payload.pr_number:
         task_payload["pr_number"] = payload.pr_number

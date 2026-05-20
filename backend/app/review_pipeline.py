@@ -1549,6 +1549,10 @@ async def _spawn_pipeline_task(
             f"[PIPELINE] Could not inherit properties from original task {resolved_original_id[:8] if resolved_original_id else '?'}"
         )
 
+    # Propagate hotfix marker from the original task's payload.
+    _orig_payload = (orig.first_payload if orig is not None else source_task.first_payload) or {}
+    orig_hotfix = bool(_orig_payload.get("hotfix"))
+
     # Cross-cutting safeguard gate: on the first review spawn for a PR that spans
     # multiple top-level modules, is large-scope, or has an overflow warning on a
     # large diff, spawn a security_audit safeguard task and block auto-merge until
@@ -1578,6 +1582,7 @@ async def _spawn_pipeline_task(
             "original_prompt": original_prompt,
             "original_task_id": resolved_original_id,
             "original_task_type": source_task.first_payload.get("type", ""),
+            **({"hotfix": True} if orig_hotfix else {}),
             **({"model": type_model} if type_model else {}),
             **({"effort": type_effort} if type_effort else {}),
         }
@@ -1594,6 +1599,7 @@ async def _spawn_pipeline_task(
             "prompt": fix_prompt,
             "original_prompt": original_prompt,
             "original_task_id": resolved_original_id,
+            **({"hotfix": True} if orig_hotfix else {}),
             **({"model": type_model} if type_model else {}),
             **({"effort": type_effort} if type_effort else {}),
         }

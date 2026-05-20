@@ -1229,6 +1229,7 @@ async def update_agent_status(
                         )
                     else:
                         base_branch = (task.first_payload).get("base_branch", "main")
+                        is_post_promotion = base_branch == "main"
                         failure_summary = "\n".join(
                             f"- {t['name']}: {t.get('message', 'no details')}"
                             for t in failed_tests
@@ -1243,6 +1244,11 @@ async def update_agent_status(
                         else:
                             fix_priority = 50  # Regression-only failure — normal
 
+                        # Post-promotion (production) smoketest failures are urgent:
+                        # override suite-based ladder so priority is always >= 90.
+                        if is_post_promotion:
+                            fix_priority = max(fix_priority, 90)
+
                         type_model = (
                             _runtime_config.get("task_type_models", {}).get("plan")
                             or None
@@ -1253,7 +1259,11 @@ async def update_agent_status(
                         )
                         plan_task = Task(
                             project_id=task.project_id,
-                            title=f"Fix smoketest failures on {base_branch}",
+                            title=(
+                                f"[HOTFIX] Fix post-promotion smoketest failures on {base_branch}"
+                                if is_post_promotion
+                                else f"Fix smoketest failures on {base_branch}"
+                            ),
                             description=f"{len(failed_tests)} smoke test(s) failed after merge to {base_branch}",
                             parent_task_id=task.id,
                             priority=fix_priority,
@@ -1276,6 +1286,7 @@ async def update_agent_status(
                                             f"and produce subtasks to fix them."
                                         ),
                                         "base_branch": base_branch,
+                                        **({"hotfix": True} if is_post_promotion else {}),
                                         **({"model": type_model} if type_model else {}),
                                         **(
                                             {"effort": type_effort}
@@ -1302,6 +1313,7 @@ async def update_agent_status(
                                     ]
                                 ),
                                 "failed_count": len(failed_tests),
+                                **({"hotfix": True} if is_post_promotion else {}),
                             },
                             vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
                             status=TaskStatus.QUEUED,
@@ -1340,8 +1352,17 @@ async def update_agent_status(
                         alert = Alert(
                             project_id=task.project_id,
                             severity=AlertSeverity.ERROR,
-                            title=f"Smoke tests failed on {base_branch}",
-                            message=f"{len(failed_tests)} test(s) failed: {', '.join(t['name'] for t in failed_tests[:5])}"
+                            title=(
+                                f"[HOTFIX] Post-promotion smoke tests failed on {base_branch}"
+                                if is_post_promotion
+                                else f"Smoke tests failed on {base_branch}"
+                            ),
+                            message=(
+                                "[POST-PROMOTION PRODUCTION FAILURE] "
+                                if is_post_promotion
+                                else ""
+                            )
+                            + f"{len(failed_tests)} test(s) failed: {', '.join(t['name'] for t in failed_tests[:5])}"
                             + (
                                 f" (+{len(failed_tests) - 5} more)"
                                 if len(failed_tests) > 5
@@ -1367,7 +1388,7 @@ async def update_agent_status(
                             },
                         )
                         logger.error(
-                            f"[SMOKETEST] Spawned plan task {plan_task.id} (priority={fix_priority}) + alert for {len(failed_tests)} failed smoke tests"
+                            f"[SMOKETEST] Spawned {'hotfix ' if is_post_promotion else ''}plan task {plan_task.id} (priority={fix_priority}) + alert for {len(failed_tests)} failed smoke tests"
                         )
         except Exception as e:
             # Audit W5/A6: smoketest plan-task spawn used to silently log-and-continue.
