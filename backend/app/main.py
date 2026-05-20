@@ -3120,7 +3120,7 @@ async def strategic_operation(
             "type": spawn_type,
             "prompt": prompt,
             "title": title,
-            "base_branch": "main",
+            "base_branch": _runtime_config.get("integration_branch", "main"),
         }
         if direction_id:
             spawn_payload["direction_id"] = direction_id

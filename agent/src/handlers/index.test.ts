@@ -77,8 +77,8 @@ import { handlers } from './index.js';
 describe('handlers registry', () => {
   const EXPECTED_TYPES = ALL_AGENT_TASK_TYPES;
 
-  it('has exactly 18 handler entries', () => {
-    expect(Object.keys(handlers)).toHaveLength(18);
+  it('has exactly 19 handler entries', () => {
+    expect(Object.keys(handlers)).toHaveLength(19);
   });
 
   it.each(EXPECTED_TYPES)('contains handler for task type "%s"', (taskType) => {

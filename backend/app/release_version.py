@@ -34,6 +34,7 @@ from typing import Any
 from sqlalchemy import cast, func, select
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql import ColumnElement
 
 from app.models import ReleaseVersion, Task, TaskStatus
 from app.time_utils import _utcnow
@@ -111,6 +112,29 @@ async def current_open_version(
     return rows[0]
 
 
+def _pr_merged_predicate(session: AsyncSession) -> ColumnElement[bool]:
+    """Return a dialect-appropriate ``task.context['pr_merged'] is true`` filter.
+
+    ``Task.context`` is already a JSONB column (see ``models.py``), so the
+    predicate never casts the column — only the literal, matching the codebase
+    pattern in ``anomaly_detection.py``.
+
+    - Postgres: ``context @> '{"pr_merged": true}'::jsonb`` — index-friendly
+      containment that ``ix_task_context_gin`` can serve.
+    - SQLite (test fixtures): ``json_extract(context, '$.pr_merged')`` reads
+      the boolean as a primitive (``1`` for ``true``), so an equality check
+      against ``True`` matches the Python-written boolean value.
+
+    Only the canonical boolean ``True`` is matched — the convention
+    throughout admin.py / rollup_management.py is ``context["pr_merged"] = True``;
+    there is no string ``"true"`` form to accommodate.
+    """
+    dialect_name = session.bind.dialect.name if session.bind else "postgresql"
+    if dialect_name == "sqlite":
+        return func.json_extract(Task.context, "$.pr_merged") == True  # noqa: E712
+    return Task.context.op("@>")(cast({"pr_merged": True}, JSONB))
+
+
 async def count_merged_since(
     session: AsyncSession,
     project_id: uuid.UUID,
@@ -119,54 +143,32 @@ async def count_merged_since(
     """Count tasks for ``project_id`` whose PR was merged at or after ``since``.
 
     "Merged" is defined as ``task.status = COMPLETED`` AND
-    ``task.context->>'pr_merged' = 'true'`` AND
-    ``task.updated_at >= since``.  This mirrors the convention established
-    throughout admin.py and rollup_management.py where a successful merge
-    sets ``task.context["pr_merged"] = True``.
+    ``task.context['pr_merged'] is true`` AND ``task.updated_at >= since``.
+    This mirrors the convention established throughout admin.py and
+    rollup_management.py where a successful merge sets
+    ``task.context["pr_merged"] = True``.
+
+    The ``pr_merged`` filter is applied on both Postgres and SQLite via
+    :func:`_pr_merged_predicate` — a COMPLETED task without ``pr_merged``
+    is never counted on either dialect.
 
     ``updated_at`` is used as a proxy for merge time because no dedicated
     merged-at column exists on Task.  It is set via ``onupdate`` so it
     reflects the last status transition, which for a newly-merged task is
     the merge itself.
     """
-    # Cast context JSONB boolean to text for portable equality check.
-    # ``context @> '{"pr_merged": true}'::jsonb`` is the canonical Postgres
-    # JSONB containment query — simpler and index-friendly when a GIN index
-    # exists.  Use the containment operator so the query works with both
-    # boolean ``true`` (Python writes) and potential legacy string ``"true"``
-    # gracefully.  Fall back to text comparison for SQLite test fixtures
-    # (containment is Postgres-only).
-    try:
-        # Postgres path: JSONB @> containment
-        stmt = (
-            select(func.count())
-            .select_from(Task)
-            .where(
-                Task.project_id == project_id,
-                Task.status == TaskStatus.COMPLETED,
-                Task.updated_at >= since,
-                cast(Task.context, JSONB).contains({"pr_merged": True}),
-            )
+    stmt = (
+        select(func.count())
+        .select_from(Task)
+        .where(
+            Task.project_id == project_id,
+            Task.status == TaskStatus.COMPLETED,
+            Task.updated_at >= since,
+            _pr_merged_predicate(session),
         )
-        result = await session.execute(stmt)
-        return int(result.scalar() or 0)
-    except Exception:  # noqa: BLE001
-        # Fallback for SQLite (test) or unexpected dialect issues: text match.
-        logger.debug(
-            "[RELEASE_VERSION] count_merged_since falling back to text match",
-            exc_info=True,
-        )
-        stmt_fallback = (
-            select(func.count())
-            .select_from(Task)
-            .where(
-                Task.project_id == project_id,
-                Task.status == TaskStatus.COMPLETED,
-                Task.updated_at >= since,
-            )
-        )
-        result = await session.execute(stmt_fallback)
-        return int(result.scalar() or 0)
+    )
+    result = await session.execute(stmt)
+    return int(result.scalar() or 0)
 
 
 def to_phase_block(version: ReleaseVersion) -> dict[str, Any]:

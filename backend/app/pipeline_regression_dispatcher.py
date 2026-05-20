@@ -3644,7 +3644,7 @@ async def _maybe_spawn(
     payload_dict: dict[str, Any] = {
         "type": "investigate",
         "prompt": prompt,
-        "base_branch": "main",
+        "base_branch": _runtime_config.get("integration_branch", "main"),
         "effort": "low",
     }
     if is_cross_layer:
@@ -5884,7 +5884,7 @@ async def _spawn_auto_escalation_meta_investigate(
         {
             "type": "investigate",
             "prompt": prompt,
-            "base_branch": "main",
+            "base_branch": _runtime_config.get("integration_branch", "main"),
             "effort": "low",
         },
         "pipeline_regression_dispatcher:auto_escalation_meta_investigate",
@@ -6412,7 +6412,9 @@ async def _auto_close_recovered_manual_intervention(
                     {
                         "type": "investigate",
                         "prompt": _followup_prompt,
-                        "base_branch": "main",
+                        "base_branch": _runtime_config.get(
+                            "integration_branch", "main"
+                        ),
                         "effort": "low",
                     },
                     "pipeline_regression_dispatcher:marginal_followup",
@@ -6588,7 +6590,7 @@ async def _run_compliance_followup_once(
             {
                 "type": "investigate",
                 "prompt": _prompt,
-                "base_branch": "main",
+                "base_branch": _runtime_config.get("integration_branch", "main"),
                 "effort": "low",
             },
             "pipeline_regression_dispatcher:compliance_followup",

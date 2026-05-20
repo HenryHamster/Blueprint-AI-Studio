@@ -1173,29 +1173,32 @@ async def update_agent_status(
                 exc_info=True,
             )
 
-    # 3b-ii. Qualifier-smoketest hook — fires for ALL smoketest results (pass or
-    # fail) when the task carries context["qualifier_smoketest"]=True.  A
-    # qualifier-smoketest is a pre-promotion qualifier input: its outcome feeds
-    # the composite qualification score, not the production fix-spawn loop.
-    # maybe_finalize_qualification is idempotent — safe to call unconditionally.
-    if payload.artifact_type == ArtifactType.SMOKETEST_RESULT and (
-        task.context or {}
-    ).get("qualifier_smoketest"):
-        try:
-            from app import release_qualifier
-
-            await release_qualifier.maybe_finalize_qualification(session, task)
-        except Exception as _qe:
-            logger.error(
-                "[RELEASE_QUALIFIER] maybe_finalize_qualification failed for "
-                "qualifier smoketest task %s: %s",
-                _task_id_str,
-                _qe,
-                exc_info=True,
-            )
+    # 3b-ii. Qualifier-smoketest finalization is intentionally NOT done here.
+    #
+    # It used to live here, gated on ``artifact_type == SMOKETEST_RESULT``, and
+    # had two bugs that wedged the ReleaseVersion at ``{status:"pending"}``:
+    #   (1) a qualifier-smoketest that failed WITHOUT posting a SMOKETEST_RESULT
+    #       (harness ERROR_LOG, VM crash, reaper kill) never reached the hook,
+    #       so finalization never fired when it was the last child to go
+    #       terminal; and
+    #   (2) even on the happy path the SMOKETEST_RESULT Artifact was only
+    #       ``session.add(...)``-ed (~30 lines up) and NOT flushed — and
+    #       autoflush is disabled for this whole handler (see :859). The
+    #       finalize SELECT (``_latest_artifact_logs``) therefore could not see
+    #       the pending Artifact → ``_score_smoketest(None)`` → hard blocker →
+    #       a passing candidate recorded ``not_promoted``.
+    #
+    # Both are fixed by relocating finalization into ``_process_post_commit``
+    # (task_lifecycle.py), which runs AFTER the early commit on a fresh session
+    # — so the Artifact and the task's terminal status are already committed and
+    # visible to the finalize SELECT — and runs for COMPLETED / FAILED /
+    # CANCELLED alike, regardless of ``artifact_type``.
 
     # 3b-iii. On smoketest failure, spawn a plan task and create a persistent
-    # alert — skipped for qualifier smoketests (handled above via the qualifier).
+    # alert — skipped for qualifier smoketests. A qualifier-smoketest is a
+    # pre-promotion qualifier input: its outcome feeds the composite
+    # qualification score (finalized in _process_post_commit), NOT the
+    # production fix-spawn loop, so it must not spawn a fix plan here.
     if (
         payload.artifact_type == ArtifactType.SMOKETEST_RESULT
         and payload.status == TaskStatus.FAILED

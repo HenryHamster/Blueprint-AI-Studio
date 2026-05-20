@@ -3098,9 +3098,29 @@ async def _process_post_commit(
                             await session.commit()
                             raise ValueError(f"Branch mismatch: {branch} vs {pr_head}")
 
-                        # Check CI status before merging (only for PRs targeting main)
+                        # Check CI status before merging the integration trunk.
+                        #
+                        # Pre-Phase-1 the integration branch IS "main", so this
+                        # was historically written as `base_branch == "main"`.
+                        # After the automain/LTS Phase 1 cutover rollup PRs
+                        # target `automain` (the resolved integration branch),
+                        # and a hard-coded "main" check would skip the pre-merge
+                        # CI gate for every rollup — the orchestrator would merge
+                        # rollups without waiting for CI.
+                        #
+                        # Gate on the resolved integration branch so the CI
+                        # check runs for whichever branch the pipeline currently
+                        # integrates onto. "main" is ALSO kept gated regardless:
+                        # post-cutover it is the promotion / hotfix-rollup
+                        # target, and a merge to main must never bypass CI.
                         head_sha = pr_data.get("head", {}).get("sha", "")
-                        is_main_merge = base_branch == "main"
+                        _integration_branch = _runtime_config.get(
+                            "integration_branch", "main"
+                        )
+                        is_ci_gated_merge = base_branch in (
+                            _integration_branch,
+                            "main",
+                        )
                         ci_status = (
                             await get_check_runs_cached(
                                 gh_token,
@@ -3109,7 +3129,7 @@ async def _process_post_commit(
                                 head_sha,
                                 project_id=str(task.project_id),
                             )
-                            if (head_sha and is_main_merge)
+                            if (head_sha and is_ci_gated_merge)
                             else None
                         )
 
@@ -4496,17 +4516,6 @@ async def _process_post_commit(
                     self_audit_logs = payload.logs or task.latest_status_message or ""
                     await _handle_self_audit_completion(task, self_audit_logs, session)
 
-                elif task_type == "release_audit":
-                    # Advance the release qualification when both children (this
-                    # release_audit and the qualifier-smoketest) have terminated.
-                    # maybe_finalize_qualification is idempotent and a cheap no-op
-                    # for tasks whose version is not awaiting qualification.
-                    from app import release_qualifier
-
-                    await release_qualifier.maybe_finalize_qualification(
-                        session, task
-                    )
-
                 elif payload.artifact_type == ArtifactType.INVESTIGATION_REPORT:
                     await _handle_investigation_completion(task, payload, session)
             except Exception as handler_exc:
@@ -4607,6 +4616,58 @@ async def _process_post_commit(
         await _record_remediation_if_terminal(task, payload.status, session)
         await _record_regression_signal_if_matching(task, payload.status, session)
         await _handle_investigation_terminal_failure(task, payload.status, session)
+
+        # Release-qualifier finalization — fires from EVERY terminal path
+        # (COMPLETED / FAILED / CANCELLED) for BOTH a release_audit task and a
+        # qualifier-smoketest task. This deliberately lives in the terminal
+        # section (not the COMPLETED-only review-pipeline block above): a
+        # qualifier child that fails/cancels must still advance qualification,
+        # or the ReleaseVersion stays {status:"pending"} forever and the
+        # version is wedged.
+        #
+        # Why here and not in agent_status.py: this runs after the status
+        # endpoint's early commit, on a fresh post-commit session. The task's
+        # terminal status AND any SMOKETEST_RESULT / RELEASE_AUDIT_REPORT
+        # Artifact the agent posted are therefore already committed and visible
+        # to the finalize SELECT (_latest_artifact_logs). The old
+        # agent_status.py hook ran pre-flush with autoflush disabled and could
+        # not see its own just-added Artifact.
+        #
+        # maybe_finalize_qualification is idempotent (it FOR UPDATE-locks the
+        # version and no-ops unless last_qualification.status == "pending" and
+        # BOTH children are terminal) and a cheap O(1) no-op for the
+        # overwhelming majority of tasks (those with no release_version_id in
+        # context). The qualifier degrades a missing-artifact child to a hard
+        # blocker, so finalizing on a failed/cancelled child only ever blocks
+        # promotion — which is safe. Keyed on context["release_version_id"]
+        # and/or task_type == "release_audit" / context["qualifier_smoketest"],
+        # regardless of artifact_type.
+        if payload.status in (
+            TaskStatus.COMPLETED,
+            TaskStatus.FAILED,
+            TaskStatus.CANCELLED,
+        ):
+            _qual_ctx = task.context or {}
+            _qual_first_payload = task.first_payload or {}
+            _is_qualifier_child = bool(
+                _qual_ctx.get("release_version_id")
+                or _qual_first_payload.get("type") == "release_audit"
+                or _qual_ctx.get("qualifier_smoketest")
+            )
+            if _is_qualifier_child:
+                try:
+                    from app import release_qualifier
+
+                    await release_qualifier.maybe_finalize_qualification(
+                        session, task
+                    )
+                except Exception as _qual_exc:
+                    logger.error(
+                        f"[RELEASE_QUALIFIER] maybe_finalize_qualification failed "
+                        f"for terminal task {task.id} (status={payload.status}): "
+                        f"{_qual_exc!r}",
+                        exc_info=True,
+                    )
 
         # 7. Project State Aggregation
         # Only consider executable tasks (those with a VM) for aggregation.

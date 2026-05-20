@@ -1080,10 +1080,136 @@ describe('buildVersionPhaseSection', () => {
     expect(result).toContain('Tasks merged this version');
   });
 
-  it('includes last_qualification when present', () => {
-    const result = buildVersionPhaseSection({ version_number: 2, phase: 'stabilize', last_qualification: '2026-05-15T08:00:00Z' });
-    expect(result).toContain('Last qualification check');
-    expect(result).toContain('2026-05-15T08:00:00Z');
+  it('renders last_qualification object as a compact summary line (status/confidence/sha/blocker)', () => {
+    // The backend ALWAYS sends last_qualification as an object (the structured
+    // qualification record) or null — never a string. The summary must surface
+    // status, confidence, candidate_sha, and blocker.
+    const result = buildVersionPhaseSection({
+      version_number: 2,
+      phase: 'stabilize',
+      last_qualification: {
+        status: 'not_promoted',
+        confidence: 0.61,
+        candidate_sha: 'abcdef0123456789',
+        blocker: 'test_file_deleted',
+      },
+    });
+    expect(result).toContain('Last qualification:');
+    expect(result).toContain('status=not_promoted');
+    expect(result).toContain('confidence=0.61');
+    // candidate_sha is truncated to 12 chars
+    expect(result).toContain('candidate_sha=abcdef012345');
+    expect(result).toContain('blocker=test_file_deleted');
+  });
+
+  it('renders a pending last_qualification and instructs the agent NOT to re-emit qualify_request', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 4,
+      phase: 'stabilize',
+      last_qualification: { status: 'pending', candidate_sha: 'deadbeefcafe0000' },
+    });
+    expect(result).toContain('status=pending');
+    // Inline guidance next to the pending status line.
+    expect(result).toContain('PENDING');
+    expect(result).toMatch(/do NOT emit `?qualify_request`?/i);
+  });
+
+  it('omits the pending warning when last_qualification is finalized (not pending)', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 4,
+      phase: 'stabilize',
+      last_qualification: { status: 'promoted', candidate_sha: 'feedface00000000' },
+    });
+    expect(result).toContain('status=promoted');
+    expect(result).not.toContain('currently **PENDING**');
+  });
+
+  it('renders a dry_run last_qualification and instructs the agent NOT to re-emit qualify_request', () => {
+    // A finalized dry-run already fully evaluated its candidate. Re-emitting
+    // qualify_request for the SAME candidate re-spawns agent VMs for nothing
+    // (the orchestrator's already_dry_run guard ignores it) — the prompt must
+    // discourage it. H1: extends the pending-only guard to dry_run.
+    const result = buildVersionPhaseSection({
+      version_number: 6,
+      phase: 'stabilize',
+      last_qualification: {
+        status: 'dry_run',
+        candidate_sha: 'abcdef0123456789',
+        confidence: 0.91,
+        would_promote: true,
+      },
+    });
+    expect(result).toContain('status=dry_run');
+    // Surfaces would_promote so the agent sees the candidate passed.
+    expect(result).toContain('would_promote=true');
+    // Inline guidance next to the dry_run status line, with the SHA rendered.
+    expect(result).toContain('DRY RUN');
+    expect(result).toContain('abcdef012345');
+    expect(result).toMatch(/do NOT emit `?qualify_request`?/i);
+    // The instruction is conditional on the candidate being unchanged.
+    expect(result).toMatch(/UNLESS new work has since merged|candidate commit has changed/i);
+  });
+
+  it('does not render the pending warning for a dry_run last_qualification', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 6,
+      phase: 'stabilize',
+      last_qualification: { status: 'dry_run', candidate_sha: 'abcdef0123456789' },
+    });
+    expect(result).not.toContain('currently **PENDING**');
+    // ...but the dry_run-specific guidance IS present.
+    expect(result).toContain('DRY RUN');
+  });
+
+  it('includes prompt-level guidance not to re-request after a dry-run of the same candidate', () => {
+    // Prompt-level guidance (independent of whether a dry_run record is passed).
+    const result = buildVersionPhaseSection({ version_number: 1, phase: 'stabilize' });
+    expect(result).toContain('Do NOT re-request after a dry-run of the same candidate');
+    expect(result).toContain('status=dry_run');
+  });
+
+  it('does not emit the dry_run guidance for a finalized non-dry_run qualification', () => {
+    // not_promoted is finalized but not a dry_run — the inline dry_run line
+    // must not appear (the bottom-of-prompt static guidance still mentions it).
+    const result = buildVersionPhaseSection({
+      version_number: 7,
+      phase: 'stabilize',
+      last_qualification: { status: 'not_promoted', candidate_sha: 'cafe000011112222', blocker: 'ci_red' },
+    });
+    expect(result).toContain('status=not_promoted');
+    expect(result).not.toContain('The last qualification was a **DRY RUN**');
+  });
+
+  it('ignores a non-object last_qualification (string/array) without crashing', () => {
+    // Defensive: even though the backend never sends a string, a malformed
+    // payload must not throw or render a garbage line.
+    const strForm = buildVersionPhaseSection({
+      version_number: 2,
+      phase: 'stabilize',
+      last_qualification: '2026-05-15T08:00:00Z',
+    });
+    expect(strForm).toContain('## Version Phase');
+    expect(strForm).not.toContain('Last qualification:');
+    const arrForm = buildVersionPhaseSection({
+      version_number: 2,
+      phase: 'stabilize',
+      last_qualification: ['x'],
+    });
+    expect(arrForm).not.toContain('Last qualification:');
+  });
+
+  it('omits the Last qualification line entirely when last_qualification is absent/null', () => {
+    const absent = buildVersionPhaseSection({ version_number: 2, phase: 'build' });
+    expect(absent).not.toContain('Last qualification:');
+    const nullForm = buildVersionPhaseSection({ version_number: 2, phase: 'build', last_qualification: null });
+    expect(nullForm).not.toContain('Last qualification:');
+  });
+
+  it('instructs agent NOT to re-request qualification while one is in flight', () => {
+    // Prompt-level guidance (independent of whether a pending record is passed).
+    const result = buildVersionPhaseSection({ version_number: 1, phase: 'stabilize' });
+    expect(result).toContain('Do NOT re-request while a qualification is in flight');
+    expect(result).toContain('status=pending');
   });
 
   it('explains both phase meanings', () => {

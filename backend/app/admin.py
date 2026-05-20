@@ -1426,6 +1426,21 @@ async def create_task_manually(
     which branches hotfix/* off main; the orchestrator back-merges
     main → automain after the hotfix lands.
     """
+    # Guard: hotfix is only meaningful for `plan` tasks. The Phase 5 back-merge
+    # trigger (task_lifecycle.py) only fires for a hotfix ROLLUP merge of a
+    # `plan` task → main. A create/fix hotfix has no plan and thus no rollup,
+    # so its PR would merge straight to main with NO back-merge — silently
+    # diverging `automain` from `main` and breaking the next promotion.
+    if payload.hotfix and payload.task_type != TaskType.plan:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "hotfix=true is only supported for task_type='plan' "
+                f"(got '{payload.task_type.value}'); a non-plan hotfix would "
+                "merge to main without the automain back-merge."
+            ),
+        )
+
     # Parse owner/repo
     github_owner, github_repo = payload.github_repo.split("/", 1)
 

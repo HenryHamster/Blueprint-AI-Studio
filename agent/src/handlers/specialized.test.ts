@@ -115,6 +115,8 @@ import {
   handleInvestigate,
   handleMigrate,
   handleSelfAudit,
+  handleReleaseAudit,
+  resolveCandidateSha,
 } from './specialized.js';
 import {
   persistAndPostStatus, readHandlerOutput, runClaudeCode,
@@ -122,6 +124,7 @@ import {
 } from '../index.js';
 import { runCodeChangeTask } from './code-change.js';
 import { execFileSync } from 'child_process';
+import { prepareWorkspaceForRole } from '../workspacePrep.js';
 
 // ── Shared test helpers ───────────────────────────────────────────────────────
 const TASK_ID = 'task-abc123';
@@ -1141,5 +1144,372 @@ describe('specialized handler task-specific content contracts', () => {
       // Run order
       expect(p).toContain('IN ORDER');
     });
+  });
+});
+
+// ── handleReleaseAudit — pinned-candidate clone + diff-range pre-flight ───────
+//
+// C2/C4: a release audit must score ONE PINNED candidate commit. The bare
+// branch name `automain` does NOT resolve as a revision after cloning `main`
+// (`git fetch origin automain` only updates FETCH_HEAD, never a local ref), so
+// a `main...automain` range can never resolve and the audit would ALWAYS fail.
+// The fix: the backend passes a full 40-char `candidate_sha` in the task
+// payload; the handler (1) clones `main` with FULL history (depth 0), (2)
+// fetches the EXACT candidate commit (`git fetch origin <sha>`), (3) pre-flight
+// `git rev-parse --verify <sha>^{commit}` + `git rev-list --count
+// main...<sha>` and FAILS LOUD if the range does not resolve.
+describe('handleReleaseAudit — pinned candidate + diff-range pre-flight', () => {
+  // A full 40-char hex SHA (the backend pins automain HEAD this way).
+  const CANDIDATE_SHA = 'a1b2c3d4e5f60718293a4b5c6d7e8f9012345678';
+  const DIFF_RANGE = `main...${CANDIDATE_SHA}`;
+  const RELEASE_PAYLOAD = { base_branch: 'main', candidate_sha: CANDIDATE_SHA };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+    // git() mock returns '' (success) by default — rev-parse + rev-list pass.
+    vi.mocked(git).mockReturnValue('');
+    vi.mocked(readHandlerOutput).mockReturnValue(null);
+    // execFileSync (child_process) — git fetch succeeds by default.
+    vi.mocked(execFileSync).mockReturnValue(Buffer.from(''));
+  });
+
+  it('clones main with FULL history (depth 0), not a shallow DEFAULT_CLONE_DEPTH clone', async () => {
+    await handleReleaseAudit(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    expect(vi.mocked(prepareWorkspaceForRole)).toHaveBeenCalledTimes(1);
+    const opts = vi.mocked(prepareWorkspaceForRole).mock.calls[0][0];
+    expect(opts.branch).toBe('main');
+    expect(opts.baseBranch).toBe('main');
+    // depth 0 → full clone (no --depth flag). A shallow clone would leave the
+    // merge-base unreachable for a long-diverged candidate.
+    expect(opts.depth).toBe(0);
+  });
+
+  it('fetches the EXACT candidate SHA — not the bare `automain` branch name', async () => {
+    await handleReleaseAudit(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const fetchCalls = vi.mocked(execFileSync).mock.calls.filter(
+      c => c[0] === 'git' && Array.isArray(c[1]) && (c[1] as string[])[0] === 'fetch',
+    );
+    expect(fetchCalls.length).toBeGreaterThan(0);
+    const fetchArgs = fetchCalls[0][1] as string[];
+    // `git fetch origin <candidate_sha>` — a SHA fetch leaves a real commit
+    // object behind, which `main...<sha>` can resolve. A bare-branch fetch
+    // (`git fetch origin automain`) only updates FETCH_HEAD and is the bug.
+    expect(fetchArgs).toEqual(['fetch', 'origin', CANDIDATE_SHA]);
+    expect(fetchArgs).not.toContain('automain');
+  });
+
+  it('reads candidate_sha from task.context as a fallback when absent from the payload', async () => {
+    // The backend may stamp candidate_sha under task.context; the handler must
+    // still resolve it (the contract is "from the payload", context is a
+    // defensive fallback so the handler keeps working either way).
+    const payloadNoSha = { base_branch: 'main' };
+    const taskWithCtx = { ...BASE_TASK, context: { candidate_sha: CANDIDATE_SHA } };
+
+    await handleReleaseAudit(TASK_ID, payloadNoSha, taskWithCtx, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const fetchCalls = vi.mocked(execFileSync).mock.calls.filter(
+      c => c[0] === 'git' && Array.isArray(c[1]) && (c[1] as string[])[0] === 'fetch',
+    );
+    expect((fetchCalls[0][1] as string[])).toEqual(['fetch', 'origin', CANDIDATE_SHA]);
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(1);
+  });
+
+  it('runs the agent when the diff range resolves (rev-parse + rev-list succeed)', async () => {
+    vi.mocked(git).mockImplementation((args: string[]) => {
+      if (args[0] === 'rev-list') return '137'; // range resolves: 137 commits
+      return '';
+    });
+
+    await handleReleaseAudit(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    // Pre-flight verified the candidate SHA is a reachable commit object.
+    const revParseCall = vi.mocked(git).mock.calls.find(c => c[0][0] === 'rev-parse');
+    expect(revParseCall).toBeDefined();
+    expect(revParseCall?.[0]).toContain(`${CANDIDATE_SHA}^{commit}`);
+    // Pre-flight ran `git rev-list --count main...<candidate_sha>`.
+    const revListCall = vi.mocked(git).mock.calls.find(c => c[0][0] === 'rev-list');
+    expect(revListCall).toBeDefined();
+    expect(revListCall?.[0]).toContain('--count');
+    expect(revListCall?.[0]).toContain(DIFF_RANGE);
+    // Agent runs and a RELEASE_AUDIT_REPORT is emitted.
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(1);
+  });
+
+  it('interpolates main...<candidate_sha> into the agent prompt — never the bare automain name', async () => {
+    await handleReleaseAudit(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    // The diff commands the agent is told to run must use the pinned SHA.
+    expect(prompt).toContain(`git diff ${DIFF_RANGE}`);
+    expect(prompt).toContain(`git diff --stat ${DIFF_RANGE}`);
+    expect(prompt).toContain(CANDIDATE_SHA);
+    // The prompt must NOT instruct the agent to diff the bare branch name.
+    expect(prompt).not.toContain('git diff main...automain');
+  });
+
+  it('FAILS LOUD with diff_range_unresolvable when no valid candidate_sha is supplied', async () => {
+    // Missing candidate_sha is a real contract bug — there is no commit to
+    // diff. The handler must not fall back to the bare `automain` name.
+    await handleReleaseAudit(TASK_ID, { base_branch: 'main' }, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    expect(vi.mocked(prepareWorkspaceForRole)).not.toHaveBeenCalled();
+    expect(vi.mocked(runClaudeCode)).not.toHaveBeenCalled();
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('FAILED');
+    expect(call.artifact_type).toBe('ERROR_LOG');
+    expect(call.failure_category).toBe('diff_range_unresolvable');
+    expect(call.logs).toContain('candidate_sha');
+  });
+
+  it('FAILS LOUD with diff_range_unresolvable when candidate_sha is malformed (not 40-char hex)', async () => {
+    // A truncated SHA, branch name, or garbage value must be rejected — only a
+    // full 40-char hex SHA is a valid pinned candidate.
+    await handleReleaseAudit(
+      TASK_ID, { base_branch: 'main', candidate_sha: 'automain' }, BASE_TASK,
+      GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+
+    expect(vi.mocked(runClaudeCode)).not.toHaveBeenCalled();
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('FAILED');
+    expect(call.failure_category).toBe('diff_range_unresolvable');
+    // The rejected value is surfaced for debuggability.
+    expect(call.logs).toContain('automain');
+  });
+
+  it('FAILS LOUD with diff_range_unresolvable when git rev-list does not resolve the range', async () => {
+    // Merge-base unreachable → `git rev-list --count main...<sha>` errors.
+    vi.mocked(git).mockImplementation((args: string[]) => {
+      if (args[0] === 'rev-list') {
+        throw new Error(`fatal: Invalid symmetric difference expression ${DIFF_RANGE}`);
+      }
+      return '';
+    });
+
+    await handleReleaseAudit(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    // The agent must NOT run — it could misread a diff error as "empty diff"
+    // and emit a false audit_score:1.0.
+    expect(vi.mocked(runClaudeCode)).not.toHaveBeenCalled();
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('FAILED');
+    expect(call.artifact_type).toBe('ERROR_LOG');
+    expect(call.failure_category).toBe('diff_range_unresolvable');
+    expect(call.logs).toContain(DIFF_RANGE);
+    expect(call.logs).toContain('merge-base');
+  });
+
+  it('FAILS LOUD with diff_range_unresolvable when rev-parse cannot verify the candidate commit', async () => {
+    // The SHA fetch reported success but the object is not actually a reachable
+    // commit → `git rev-parse --verify <sha>^{commit}` errors. Fail loud.
+    vi.mocked(git).mockImplementation((args: string[]) => {
+      if (args[0] === 'rev-parse') {
+        throw new Error('fatal: Needed a single revision');
+      }
+      return '';
+    });
+
+    await handleReleaseAudit(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    expect(vi.mocked(runClaudeCode)).not.toHaveBeenCalled();
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('FAILED');
+    expect(call.failure_category).toBe('diff_range_unresolvable');
+  });
+
+  it('FAILS LOUD when the candidate-SHA fetch fails', async () => {
+    // The candidate commit cannot be fetched → range cannot resolve. The
+    // handler must fail loud, not run the agent.
+    vi.mocked(execFileSync).mockImplementation((_cmd: unknown, args: unknown) => {
+      const a = args as string[];
+      if (Array.isArray(a) && a[0] === 'fetch') {
+        throw new Error('fatal: could not read from remote repository');
+      }
+      return Buffer.from('');
+    });
+
+    await handleReleaseAudit(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    expect(vi.mocked(runClaudeCode)).not.toHaveBeenCalled();
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('FAILED');
+    expect(call.failure_category).toBe('diff_range_unresolvable');
+  });
+
+  it('does not run the rev-list pre-flight at all when the candidate fetch failed', async () => {
+    vi.mocked(execFileSync).mockImplementation((_cmd: unknown, args: unknown) => {
+      const a = args as string[];
+      if (Array.isArray(a) && a[0] === 'fetch') throw new Error('network down');
+      return Buffer.from('');
+    });
+
+    await handleReleaseAudit(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    // No rev-list call — the fetch already failed so there is nothing to check.
+    const revListCall = vi.mocked(git).mock.calls.find(c => c[0][0] === 'rev-list');
+    expect(revListCall).toBeUndefined();
+  });
+
+  it('emits RELEASE_AUDIT_REPORT preserving the audit_score/test_erosion artifact contract on success', async () => {
+    // The qualifier's _score_audit reads audit_score + test_erosion.{deleted_test_files,
+    // assertion_delta, test_count_delta}. The handler must pass that shape through.
+    const report = {
+      audit_score: 0.82,
+      test_erosion: { deleted_test_files: [], assertion_delta: 9, test_count_delta: 2 },
+      findings: [{ severity: 'medium', summary: 'x', file: 'a.py' }],
+    };
+    vi.mocked(readHandlerOutput).mockReturnValue(report);
+
+    await handleReleaseAudit(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('COMPLETED');
+    expect(call.artifact_type).toBe('RELEASE_AUDIT_REPORT');
+    const stored = JSON.parse(call.logs as string) as typeof report;
+    expect(stored.audit_score).toBe(0.82);
+    expect(stored.test_erosion.deleted_test_files).toEqual([]);
+    expect(stored.test_erosion.assertion_delta).toBe(9);
+    expect(stored.test_erosion.test_count_delta).toBe(2);
+  });
+});
+
+// ── resolveCandidateSha — payload/context SHA resolution + validation ─────────
+describe('resolveCandidateSha', () => {
+  const FULL_SHA = 'a1b2c3d4e5f60718293a4b5c6d7e8f9012345678';
+
+  it('reads a full 40-char SHA from the payload', () => {
+    expect(resolveCandidateSha({ candidate_sha: FULL_SHA }, {})).toBe(FULL_SHA);
+  });
+
+  it('falls back to task.context.candidate_sha when the payload lacks it', () => {
+    expect(resolveCandidateSha({}, { context: { candidate_sha: FULL_SHA } })).toBe(FULL_SHA);
+  });
+
+  it('prefers the payload SHA over the context SHA', () => {
+    const other = 'ffffffffffffffffffffffffffffffffffffffff';
+    expect(
+      resolveCandidateSha({ candidate_sha: FULL_SHA }, { context: { candidate_sha: other } }),
+    ).toBe(FULL_SHA);
+  });
+
+  it('lowercases and trims an uppercase / padded SHA', () => {
+    expect(resolveCandidateSha({ candidate_sha: `  ${FULL_SHA.toUpperCase()}  ` }, {})).toBe(FULL_SHA);
+  });
+
+  it('returns null for a short SHA, a branch name, or garbage', () => {
+    expect(resolveCandidateSha({ candidate_sha: 'a1b2c3d' }, {})).toBeNull();
+    expect(resolveCandidateSha({ candidate_sha: 'automain' }, {})).toBeNull();
+    expect(resolveCandidateSha({ candidate_sha: 'z'.repeat(40) }, {})).toBeNull(); // non-hex
+    expect(resolveCandidateSha({ candidate_sha: '' }, {})).toBeNull();
+  });
+
+  it('returns null when neither payload nor context carries a SHA', () => {
+    expect(resolveCandidateSha({}, {})).toBeNull();
+    expect(resolveCandidateSha({}, { context: {} })).toBeNull();
+    expect(resolveCandidateSha({ candidate_sha: 123 }, { context: 'not-an-object' })).toBeNull();
+  });
+});
+
+// ── handleSmoketest — qualifier-smoketest candidate-SHA pinning (C4) ──────────
+//
+// The qualifier-smoketest must run against ONE pinned candidate commit, not
+// whatever `automain` has drifted to by the time the agent VM starts. The
+// backend passes the snapshotted `candidate_sha` in the task payload. Since
+// `git clone --branch <X>` cannot accept a SHA, the handler clones the branch
+// normally then `git fetch origin <sha>` + `git checkout --detach <sha>`.
+describe('handleSmoketest — candidate-SHA pinning', () => {
+  const CANDIDATE_SHA = 'b2c3d4e5f60718293a4b5c6d7e8f901234567890';
+  const QUALIFIER_PAYLOAD = { base_branch: 'automain', candidate_sha: CANDIDATE_SHA };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+    vi.mocked(git).mockReturnValue('');
+    vi.mocked(execFileSync).mockReturnValue(Buffer.from(''));
+    vi.mocked(readHandlerOutput).mockReturnValue({ passed: true, tests: [] });
+  });
+
+  it('clones with FULL history (depth 0) when a candidate_sha is pinned', async () => {
+    await handleSmoketest(TASK_ID, QUALIFIER_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const opts = vi.mocked(prepareWorkspaceForRole).mock.calls[0][0];
+    expect(opts.branch).toBe('automain');
+    // depth 0 → full clone; the snapshotted commit may predate a shallow depth.
+    expect(opts.depth).toBe(0);
+  });
+
+  it('fetches and detaches onto the EXACT candidate commit', async () => {
+    await handleSmoketest(TASK_ID, QUALIFIER_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const gitExec = vi.mocked(execFileSync).mock.calls.filter(c => c[0] === 'git');
+    const fetchCall = gitExec.find(c => (c[1] as string[])[0] === 'fetch');
+    const checkoutCall = gitExec.find(c => (c[1] as string[])[0] === 'checkout');
+    expect(fetchCall?.[1]).toEqual(['fetch', 'origin', CANDIDATE_SHA]);
+    // Detached checkout pins the working tree onto the exact commit.
+    expect(checkoutCall?.[1]).toEqual(['checkout', '--detach', CANDIDATE_SHA]);
+    // The smoketest still runs after pinning.
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(1);
+  });
+
+  it('reads candidate_sha from task.context as a fallback', async () => {
+    const taskWithCtx = { ...BASE_TASK, context: { candidate_sha: CANDIDATE_SHA } };
+    await handleSmoketest(
+      TASK_ID, { base_branch: 'automain' }, taskWithCtx, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+
+    const checkoutCall = vi.mocked(execFileSync).mock.calls.find(
+      c => c[0] === 'git' && (c[1] as string[])[0] === 'checkout',
+    );
+    expect(checkoutCall?.[1]).toEqual(['checkout', '--detach', CANDIDATE_SHA]);
+  });
+
+  it('does NOT fetch/checkout a SHA for a plain post-merge smoketest (no candidate_sha)', async () => {
+    // BASE_PAYLOAD carries no candidate_sha — the plain post-merge smoketest
+    // path must be untouched: a shallow clone and no SHA pinning.
+    await handleSmoketest(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const opts = vi.mocked(prepareWorkspaceForRole).mock.calls[0][0];
+    expect(opts.depth).toBe(100); // unchanged shallow clone
+    const checkoutCall = vi.mocked(execFileSync).mock.calls.find(
+      c => c[0] === 'git' && (c[1] as string[])[0] === 'checkout',
+    );
+    expect(checkoutCall).toBeUndefined();
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(1);
+  });
+
+  it('FAILS LOUD when the candidate-SHA fetch fails — does not run the smoketest', async () => {
+    vi.mocked(execFileSync).mockImplementation((_cmd: unknown, args: unknown) => {
+      const a = args as string[];
+      if (Array.isArray(a) && a[0] === 'fetch') throw new Error('fatal: remote unreachable');
+      return Buffer.from('');
+    });
+
+    await handleSmoketest(TASK_ID, QUALIFIER_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    // A smoketest of the wrong commit is meaningless — the handler must abort.
+    expect(vi.mocked(runClaudeCode)).not.toHaveBeenCalled();
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('FAILED');
+    expect(call.artifact_type).toBe('ERROR_LOG');
+    expect(call.failure_category).toBe('clone_failed');
+    expect(call.logs).toContain(CANDIDATE_SHA);
+  });
+
+  it('FAILS LOUD when the candidate-SHA checkout fails', async () => {
+    vi.mocked(execFileSync).mockImplementation((_cmd: unknown, args: unknown) => {
+      const a = args as string[];
+      if (Array.isArray(a) && a[0] === 'checkout') throw new Error('fatal: reference is not a tree');
+      return Buffer.from('');
+    });
+
+    await handleSmoketest(TASK_ID, QUALIFIER_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    expect(vi.mocked(runClaudeCode)).not.toHaveBeenCalled();
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('FAILED');
+    expect(call.failure_category).toBe('clone_failed');
   });
 });

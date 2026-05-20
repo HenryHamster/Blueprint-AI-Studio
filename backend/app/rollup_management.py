@@ -52,11 +52,15 @@ MAX_REVIEW_RESPAWNS = 5
 def _review_respawn_count(task: Task) -> int:
     """Times the stale-PR rollup recovery has respawned a review for *task*.
 
-    Stored in ``context.review_respawn_count``; capped by ``MAX_REVIEW_RESPAWNS``.
+    Stored in ``context._review_respawn_count``; capped by ``MAX_REVIEW_RESPAWNS``.
+    The key is underscore-prefixed so ``_spawn_pipeline_task``'s context
+    propagation (which copies all non-underscore keys onto the spawned review
+    task) drops it — a non-prefixed key would leak a stale count onto every
+    review task spawned for this PR.
     Tolerates a missing/None context or a non-numeric value (-> 0).
     """
     try:
-        return int((task.context or {}).get("review_respawn_count", 0) or 0)
+        return int((task.context or {}).get("_review_respawn_count", 0) or 0)
     except (TypeError, ValueError):
         return 0
 
@@ -335,8 +339,11 @@ async def _dispatch_rollup_approval_alert(
             or ""
         )
         scope = parent_ctx.get("scope") or parent_payload.get("scope") or ""
-        _asyncio.ensure_future(
-            dispatch_external_notification(  # noqa: RUF006
+        # Fire-and-forget best-effort external notification; losing the task
+        # on GC is acceptable and the call is already try/except-wrapped, so
+        # RUF006 (store-a-reference) is intentionally suppressed below.
+        _asyncio.ensure_future(  # noqa: RUF006
+            dispatch_external_notification(
                 parent.project_id,
                 "APPROVAL_NEEDED",
                 {
@@ -1058,7 +1065,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                     if was_spawned:
                         c.context = {
                             **(c.context or {}),
-                            "review_respawn_count": respawn_count + 1,
+                            "_review_respawn_count": respawn_count + 1,
                         }
                         session.add(c)
                     logger.warning(

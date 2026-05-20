@@ -374,10 +374,13 @@ async def _apply_qualify_request(
 ) -> None:
     """Parse and apply an optional ``qualify_request`` from the strategic agent.
 
-    ``request`` is the raw {reason: str} value from the API path
-    (``task.context[QUALIFY_REQUEST_CONTEXT_KEY]``) — the agent's signal that an
-    ``open`` version in ``stabilize`` is release-ready (automain-lts-plan-v1.md
-    Phase 3). When valid, looks up the open ``ReleaseVersion``, gates on
+    ``request`` is the raw {reason: str} value from either:
+      - the API path: ``task.context[QUALIFY_REQUEST_CONTEXT_KEY]``
+      - the fallback / log-parse path: ``parsed.get("qualify_request")``
+
+    It is the agent's signal that an ``open`` version in ``stabilize`` is
+    release-ready (automain-lts-plan-v1.md Phase 3). When valid, looks up the
+    open ``ReleaseVersion``, gates on
     ``phase == "stabilize"``, and calls ``release_qualifier.run_qualification``
     (which snapshots the candidate SHA + spawns the audit/smoketest children;
     the caller's surrounding commit persists its version-row writes).
@@ -1854,11 +1857,20 @@ async def _handle_strategic_completion(
             project.directions = directions
             flag_modified(project, "directions")
 
-    # Apply version_phase_decision from the parsed output (fallback path).
-    # Shape: {phase: "build"|"stabilize", reasoning: str}
+    # Apply version_phase_decision + qualify_request from the parsed output
+    # (fallback / log-parse path). In practice the agent emits both fields
+    # only through the set_problem_model API (which forces the API path
+    # above), so this fallback is effectively unreached today — but the two
+    # paths are kept symmetric so a future fallback-only emission path can't
+    # silently drop one signal. Shapes: version_phase_decision = {phase:
+    # "build"|"stabilize", reasoning: str}; qualify_request = {reason: str}.
     _vpd_parsed = parsed.get("version_phase_decision")
     await _apply_version_phase_decision(
         _vpd_parsed, task, project, session, path="fallback"
+    )
+    _qr_parsed = parsed.get("qualify_request")
+    await _apply_qualify_request(
+        _qr_parsed, task, project, session, path="fallback"
     )
 
     # Update cycle history with final outcome

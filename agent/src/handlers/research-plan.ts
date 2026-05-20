@@ -634,8 +634,26 @@ export function buildVersionPhaseSection(versionPhase: Record<string, unknown> |
   const phaseChangedAt = typeof versionPhase.phase_changed_at === 'string' ? versionPhase.phase_changed_at : null;
   const tasksMergedThisVersion = typeof versionPhase.tasks_merged_this_version === 'number'
     ? versionPhase.tasks_merged_this_version : null;
-  const lastQualification = typeof versionPhase.last_qualification === 'string'
-    ? versionPhase.last_qualification : null;
+  // The backend always sends last_qualification as an object (the structured
+  // qualification record: {status, candidate_sha, confidence, blocker, ...}) or
+  // null — never a string. Render a compact summary line so the agent can see
+  // when a qualification is pending / finalized.
+  const lastQualRaw = versionPhase.last_qualification;
+  const lastQualification = lastQualRaw && typeof lastQualRaw === 'object' && !Array.isArray(lastQualRaw)
+    ? lastQualRaw as Record<string, unknown>
+    : null;
+  const qualStatus = lastQualification && typeof lastQualification.status === 'string'
+    ? lastQualification.status
+    : null;
+  const qualificationPending = qualStatus === 'pending';
+  // A finalized dry-run already fully evaluated the candidate it scored. In the
+  // shipped-dark default (promotion_enabled=False) a passing candidate records
+  // status='dry_run' and the version stays open + stabilize. Re-emitting
+  // `qualify_request` for the SAME candidate just re-spawns two agent VMs for
+  // an identical, already-scored commit — the orchestrator's already_dry_run
+  // guard ignores it. Only a candidate change (new work merged onto the
+  // integration branch) makes a fresh qualification meaningful.
+  const qualificationDryRun = qualStatus === 'dry_run';
 
   const parts: string[] = [];
   parts.push(`\n## Version Phase`);
@@ -648,7 +666,41 @@ export function buildVersionPhaseSection(versionPhase: Record<string, unknown> |
     parts.push(`Tasks merged this version: ${tasksMergedThisVersion}`);
   }
   if (lastQualification) {
-    parts.push(`Last qualification check: ${lastQualification}`);
+    // Compact one-line summary: status, then confidence / candidate_sha /
+    // blocker when present. Keeps the prompt small while surfacing whether a
+    // qualification is already running (status='pending').
+    const qualBits: string[] = [];
+    qualBits.push(`status=${qualStatus ?? 'unknown'}`);
+    if (typeof lastQualification.confidence === 'number') {
+      qualBits.push(`confidence=${lastQualification.confidence}`);
+    }
+    if (typeof lastQualification.candidate_sha === 'string' && lastQualification.candidate_sha) {
+      qualBits.push(`candidate_sha=${lastQualification.candidate_sha.slice(0, 12)}`);
+    }
+    if (typeof lastQualification.blocker === 'string' && lastQualification.blocker) {
+      qualBits.push(`blocker=${lastQualification.blocker}`);
+    }
+    if (qualificationDryRun && lastQualification.would_promote === true) {
+      qualBits.push(`would_promote=true`);
+    }
+    parts.push(`Last qualification: ${qualBits.join(', ')}`);
+    if (qualificationPending) {
+      parts.push(
+        `A qualification is currently **PENDING** (running now). Do NOT emit ` +
+        `\`qualify_request\` this cycle — wait for it to finalize.`,
+      );
+    } else if (qualificationDryRun) {
+      const dryRunSha = typeof lastQualification.candidate_sha === 'string' && lastQualification.candidate_sha
+        ? ` (commit ${lastQualification.candidate_sha.slice(0, 12)})`
+        : '';
+      parts.push(
+        `The last qualification was a **DRY RUN**${dryRunSha} — it already ` +
+        `fully evaluated that candidate. Do NOT emit \`qualify_request\` ` +
+        `again UNLESS new work has since merged onto the integration branch ` +
+        `(i.e. the candidate commit has changed). Re-qualifying the same ` +
+        `already-scored candidate just re-spawns agent VMs and is ignored.`,
+      );
+    }
   }
 
   parts.push(`
@@ -683,7 +735,11 @@ When the version is in **stabilize** and you judge it ready for release — hard
   }
 }
 \`\`\`
-Only request qualification from the **stabilize** phase — it is ignored in **build**. If the version is not yet release-ready, do NOT emit \`qualify_request\` — omitting it means "not ready." \`version_phase_decision\` and \`qualify_request\` are independent: you may emit either, both, or neither.`);
+Only request qualification from the **stabilize** phase — it is ignored in **build**. If the version is not yet release-ready, do NOT emit \`qualify_request\` — omitting it means "not ready." \`version_phase_decision\` and \`qualify_request\` are independent: you may emit either, both, or neither.
+
+**Do NOT re-request while a qualification is in flight.** If the "Last qualification" line above shows \`status=pending\`, a qualification is already running for this version — the orchestrator has snapshotted a candidate and spawned the audit + smoketest. Do NOT emit \`qualify_request\` again; wait for the in-flight run to finalize (its status will change to \`promoted\`, \`not_promoted\`, \`dry_run\`, or an error). Re-requesting while \`status=pending\` is wasted work and is ignored.
+
+**Do NOT re-request after a dry-run of the same candidate.** If the "Last qualification" line shows \`status=dry_run\`, the qualifier already ran end-to-end (CI, test-erosion, audit, smoketest) on that candidate commit and recorded the result — a dry-run means the candidate would promote but promotion currently ships dark, so the version stays open in \`stabilize\`. Re-emitting \`qualify_request\` for the SAME candidate re-spawns two agent VMs to re-score an identical, already-evaluated commit; the orchestrator's already-dry-run guard ignores it. Only emit \`qualify_request\` again once new work has merged onto the integration branch since that dry-run — i.e. the candidate commit has actually changed. If nothing has merged since the \`dry_run\` line above, do NOT re-request.`);
 
   return parts.join('\n');
 }

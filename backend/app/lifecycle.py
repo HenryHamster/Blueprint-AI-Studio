@@ -150,7 +150,13 @@ async def _spawn_crash_investigations(
                 continue
 
             payload = validate_internal_payload(
-                {"type": "investigate", "prompt": prompt, "base_branch": "main"},
+                {
+                    "type": "investigate",
+                    "prompt": prompt,
+                    "base_branch": _shared_state.runtime_config.get(
+                        "integration_branch", "main"
+                    ),
+                },
                 "lifecycle:crash_investigation",
             )
             new_task = Task(

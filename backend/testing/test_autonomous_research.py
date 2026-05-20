@@ -2973,6 +2973,120 @@ def test_auto_decompose_falls_back_to_path_when_cochange_empty():
     }
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 9. integration_branch routing — autonomous spawns must branch from the
+#    runtime_config integration branch (automain after the cutover), never a
+#    hardcoded "main", or they bypass the automain release-qualifier flow.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_autonomous_research_spawn_uses_integration_branch(
+    db_session, monkeypatch
+):
+    """When integration_branch is flipped to 'automain', an autonomous research
+    spawn must set base_branch='automain' (not the hardcoded 'main' default).
+
+    This exercises the shared _runtime_config.get("integration_branch", "main")
+    routing contract that every autonomous spawn-time base_branch default
+    relies on. A regression here would silently route autonomous tasks at the
+    frozen LTS main after the Phase-1 cutover."""
+    monkeypatch.setitem(
+        _shared_state.runtime_config, "integration_branch", "automain"
+    )
+    project = Project(
+        name="Integration Branch Routing",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-intbr01")],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(
+        select(Task).where(Task.project_id == project.id)
+    )
+    spawned = result.scalars().all()
+    assert spawned, "expected an autonomous task to be spawned"
+    for t in spawned:
+        assert (t.payloads or [{}])[0].get("base_branch") == "automain", (
+            f"task {t.id} ({(t.payloads or [{}])[0].get('type')}) bypassed the "
+            f"integration_branch knob"
+        )
+
+
+@pytest.mark.asyncio
+async def test_autonomous_research_spawn_defaults_to_main(db_session, monkeypatch):
+    """With integration_branch at its default 'main' value, autonomous spawns
+    branch from 'main' — preserving pre-cutover behavior."""
+    monkeypatch.setitem(_shared_state.runtime_config, "integration_branch", "main")
+    project = Project(
+        name="Integration Branch Default",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-intbr02")],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(
+        select(Task).where(Task.project_id == project.id)
+    )
+    spawned = result.scalars().all()
+    assert spawned, "expected an autonomous task to be spawned"
+    for t in spawned:
+        assert (t.payloads or [{}])[0].get("base_branch") == "main"
+
+
+def test_no_hardcoded_main_base_branch_in_autonomous_spawns():
+    """Static guard: autonomous spawn payloads in the spawn-routing modules must
+    never hardcode {"base_branch": "main"} — they must route through
+    _runtime_config.get("integration_branch", "main") so the Phase-1 automain
+    cutover takes effect everywhere.
+
+    Inheritance reads of the form `.get("base_branch", "main")` (a child task
+    inheriting its parent's already-routed branch) are a different, correct
+    pattern and are explicitly allowed.
+    """
+    import re
+    from pathlib import Path
+
+    app_dir = Path(__file__).resolve().parents[1] / "app"
+    modules = [
+        "autonomous_research.py",
+        "task_completion.py",
+        "pipeline_regression_dispatcher.py",
+        "autonomous_research_diagnosis.py",
+        "anomaly_detection.py",
+        "direction_lifecycle.py",
+        "lifecycle.py",
+        "main.py",
+    ]
+    # Matches the hardcoded dict-literal form `"base_branch": "main"` but NOT
+    # `.get("base_branch", "main")` (which has a "(" or "," before the key).
+    hardcoded = re.compile(r'(?<![(,]\s)"base_branch":\s*"main"')
+    offenders: list[str] = []
+    for mod in modules:
+        path = app_dir / mod
+        for lineno, line in enumerate(
+            path.read_text(encoding="utf-8").splitlines(), start=1
+        ):
+            if hardcoded.search(line):
+                offenders.append(f"{mod}:{lineno}: {line.strip()}")
+    assert not offenders, (
+        "autonomous spawn payloads hardcode base_branch='main' instead of "
+        "routing through integration_branch:\n" + "\n".join(offenders)
+    )
+
+
 def test_auto_decompose_keeps_two_module_medium_finding_intact():
     """2-module medium findings pass through without decomposition.
 

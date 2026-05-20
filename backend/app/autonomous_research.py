@@ -1693,7 +1693,11 @@ async def _spawn_direction_hold_investigation(
         )
 
         payload = validate_internal_payload(
-            {"type": "investigate", "prompt": prompt, "base_branch": "main"},
+            {
+                "type": "investigate",
+                "prompt": prompt,
+                "base_branch": _runtime_config.get("integration_branch", "main"),
+            },
             "autonomous_research:direction_hold_investigation",
         )
         new_task = Task(
@@ -2007,7 +2011,11 @@ async def _spawn_task_failure_investigation(
     prompt = "\n".join(prompt_lines)
 
     inv_payload = validate_internal_payload(
-        {"type": "investigate", "prompt": prompt, "base_branch": "main"},
+        {
+            "type": "investigate",
+            "prompt": prompt,
+            "base_branch": _runtime_config.get("integration_branch", "main"),
+        },
         "autonomous_research:task_failure_investigation",
     )
     new_task = Task(
@@ -2163,7 +2171,11 @@ async def _spawn_review_convergence_investigation(
     )
 
     inv_payload = validate_internal_payload(
-        {"type": "investigate", "prompt": prompt, "base_branch": "main"},
+        {
+            "type": "investigate",
+            "prompt": prompt,
+            "base_branch": _runtime_config.get("integration_branch", "main"),
+        },
         "autonomous_research:review_convergence_investigation",
     )
     new_task = Task(
@@ -2474,7 +2486,11 @@ async def _spawn_residual_fingerprint_remediation(
             f"Open a fix PR that resolves the underlying code defect."
         )
         payload = validate_internal_payload(
-            {"type": "create", "prompt": prompt, "base_branch": "main"},
+            {
+                "type": "create",
+                "prompt": prompt,
+                "base_branch": _runtime_config.get("integration_branch", "main"),
+            },
             "autonomous_research:residual_fingerprint_remediation",
         )
         primary_sample = sample_messages[0] if sample_messages else ""

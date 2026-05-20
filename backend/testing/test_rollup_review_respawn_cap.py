@@ -5,10 +5,36 @@ in ``_check_and_trigger_rollup`` respawned a review for the same unmerged PR
 795 times in 9.5h because nothing capped the respawns. ``MAX_REVIEW_RESPAWNS``
 and ``_review_respawn_count`` bound the loop so it escalates to manual approval
 instead of looping unbounded.
+
+These tests exercise the actual circuit-breaker in ``_check_and_trigger_rollup``
+end-to-end against a real DB session — not just the trivial counter accessor:
+
+  - at-cap → parent escalated to ``requires_approval``, NO review respawned
+  - below-cap → counter increments by exactly 1 after a real spawn
+  - below-cap + dedup hit → counter does NOT increment
 """
 
+import uuid
+from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock
+
+import pytest
+import pytest_asyncio
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
+from sqlmodel import SQLModel
+
+from app.models import Artifact, ArtifactType, Project, Task, TaskStatus
 from app.rollup_management import MAX_REVIEW_RESPAWNS, _review_respawn_count
 from testing.factories import make_task
+
+
+# ── Counter-accessor unit tests ───────────────────────────────────────────────
+# These pin genuine edge cases of ``_review_respawn_count`` — a missing/None
+# context or a corrupt non-numeric value must not crash the rollup recovery
+# loop. They are NOT tautologies: each would fail if the helper's try/except
+# or the ``or 0`` fallback were removed.
 
 
 def _child(**ctx):
@@ -26,24 +52,241 @@ class TestReviewRespawnCount:
         assert _review_respawn_count(t) == 0
 
     def test_reads_stored_count(self):
-        assert _review_respawn_count(_child(review_respawn_count=3)) == 3
+        assert _review_respawn_count(_child(_review_respawn_count=3)) == 3
 
     def test_tolerates_non_numeric_value(self):
         # A corrupt context value must not crash the rollup recovery loop.
-        assert _review_respawn_count(_child(review_respawn_count="oops")) == 0
+        assert _review_respawn_count(_child(_review_respawn_count="oops")) == 0
 
     def test_tolerates_none_value(self):
-        assert _review_respawn_count(_child(review_respawn_count=None)) == 0
+        assert _review_respawn_count(_child(_review_respawn_count=None)) == 0
 
-    def test_below_cap_not_reached(self):
-        t = _child(review_respawn_count=MAX_REVIEW_RESPAWNS - 1)
-        assert _review_respawn_count(t) < MAX_REVIEW_RESPAWNS
-
-    def test_at_cap_reached(self):
-        t = _child(review_respawn_count=MAX_REVIEW_RESPAWNS)
-        assert _review_respawn_count(t) >= MAX_REVIEW_RESPAWNS
+    def test_ignores_legacy_unprefixed_key(self):
+        # The key was renamed to underscore-prefixed so it does not leak
+        # through _spawn_pipeline_task's non-underscore context propagation.
+        # A stale unprefixed value from before the rename must read as 0.
+        assert _review_respawn_count(_child(review_respawn_count=4)) == 0
 
 
 def test_max_review_respawns_is_a_sane_positive_int():
     assert isinstance(MAX_REVIEW_RESPAWNS, int)
     assert 1 <= MAX_REVIEW_RESPAWNS <= 20
+
+
+# ── Circuit-breaker integration tests ─────────────────────────────────────────
+
+
+def _naive_utc_ago(**kwargs) -> datetime:
+    """Naive UTC datetime ``kwargs`` in the past (matches _utcnow() semantics)."""
+    return (datetime.now(timezone.utc) - timedelta(**kwargs)).replace(tzinfo=None)
+
+
+@pytest_asyncio.fixture()
+async def rollup_db():
+    """Isolated in-memory SQLite session for circuit-breaker tests."""
+    from sqlalchemy.dialects.sqlite.base import SQLiteTypeCompiler
+
+    if not hasattr(SQLiteTypeCompiler, "visit_JSONB"):
+        SQLiteTypeCompiler.visit_JSONB = lambda self, type_, **kw: self.visit_JSON(
+            type_, **kw
+        )
+
+    engine = create_async_engine(
+        "sqlite+aiosqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    async with engine.begin() as conn:
+        await conn.run_sync(SQLModel.metadata.create_all)
+
+    Session = sessionmaker(
+        bind=engine,
+        class_=AsyncSession,
+        autocommit=False,
+        autoflush=False,
+        expire_on_commit=False,
+    )
+    async with Session() as session:
+        yield session
+
+    async with engine.begin() as conn:
+        await conn.run_sync(SQLModel.metadata.drop_all)
+    await engine.dispose()
+
+
+async def _make_respawn_scenario(session, *, child_respawn_count):
+    """Build an EVALUATING parent with one stale, unmerged COMPLETED child.
+
+    The child has a PR artifact and an ``updated_at`` 30 min in the past so it
+    lands in the ``unmerged`` stale-respawn list of ``_check_and_trigger_rollup``.
+    ``child._review_respawn_count`` context key is seeded so the cap check can
+    be exercised on either side of ``MAX_REVIEW_RESPAWNS``.
+
+    Returns ``(parent, child)``.
+    """
+    project = Project(name="Respawn Cap Test", user_id="user1")
+    session.add(project)
+    await session.commit()
+    await session.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "parent"}],
+        status=TaskStatus.EVALUATING,
+        context={"research_branch": "research/respawn", "parent_base": "main"},
+        requires_approval=False,
+    )
+    session.add(parent)
+    await session.commit()
+    await session.refresh(parent)
+
+    child = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "create", "prompt": "child"}],
+        status=TaskStatus.COMPLETED,
+        context={"_review_respawn_count": child_respawn_count},
+        requires_approval=False,
+        # Stale: older than the 10-min threshold so the respawn loop engages.
+        updated_at=_naive_utc_ago(minutes=30),
+    )
+    session.add(child)
+    await session.commit()
+    await session.refresh(child)
+
+    session.add(
+        Artifact(
+            task_id=child.id,
+            artifact_type=ArtifactType.PULL_REQUEST,
+            pr_url="https://github.com/owner/repo/pull/321",
+        )
+    )
+    await session.commit()
+    return parent, child
+
+
+@pytest.mark.asyncio
+async def test_at_cap_escalates_parent_and_does_not_respawn(rollup_db, mocker):
+    """A child whose review has been respawned MAX_REVIEW_RESPAWNS times must
+    NOT spawn another review — the parent is escalated to requires_approval."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mock_alert = mocker.patch(
+        "app.main._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    # PR is genuinely not merged so the child stays in the unmerged list.
+    mocker.patch(
+        "app.rollup_management._verify_pr_merged",
+        new=AsyncMock(return_value=False),
+    )
+    mock_spawn = mocker.patch(
+        "app.rollup_management._spawn_pipeline_task",
+        new_callable=AsyncMock,
+        return_value=(None, None),
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    parent, child = await _make_respawn_scenario(
+        rollup_db, child_respawn_count=MAX_REVIEW_RESPAWNS
+    )
+
+    await _check_and_trigger_rollup(child, rollup_db)
+
+    # Circuit-breaker fired: no further review spawned for the wedged PR.
+    mock_spawn.assert_not_called()
+    # Parent escalated to manual approval instead of looping forever.
+    await rollup_db.refresh(parent)
+    assert parent.requires_approval is True
+    assert parent.status == TaskStatus.EVALUATING
+    # Operator alert raised so the escalation is visible.
+    mock_alert.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_below_cap_increments_counter_by_one_on_real_spawn(rollup_db, mocker):
+    """Below the cap, a real respawn (was_spawned=True) increments the child's
+    _review_respawn_count by exactly 1 and leaves the parent un-escalated."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.rollup_management._verify_pr_merged",
+        new=AsyncMock(return_value=False),
+    )
+
+    start = 2
+    assert start < MAX_REVIEW_RESPAWNS, "test fixture must start below the cap"
+
+    # A real, freshly-created review task: distinct id, was_spawned=True.
+    spawned_review = Task(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        payloads=[{"type": "review", "prompt": "review"}],
+        status=TaskStatus.QUEUED,
+    )
+    mock_spawn = mocker.patch(
+        "app.rollup_management._spawn_pipeline_task",
+        new_callable=AsyncMock,
+        return_value=(spawned_review, True),
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    parent, child = await _make_respawn_scenario(
+        rollup_db, child_respawn_count=start
+    )
+
+    await _check_and_trigger_rollup(child, rollup_db)
+
+    mock_spawn.assert_awaited_once()
+    await rollup_db.refresh(child)
+    # Exactly one increment — not zero, not two.
+    assert (child.context or {}).get("_review_respawn_count") == start + 1
+    # Below cap → parent stays un-escalated.
+    await rollup_db.refresh(parent)
+    assert parent.requires_approval is False
+
+
+@pytest.mark.asyncio
+async def test_dedup_hit_does_not_increment_counter(rollup_db, mocker):
+    """When _spawn_pipeline_task returns was_spawned=False (an idempotency
+    dedup hit — an existing review task was reused, not created), the
+    respawn counter must NOT advance. Otherwise a dedup-stable PR would
+    still burn through the cap and false-escalate."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.rollup_management._verify_pr_merged",
+        new=AsyncMock(return_value=False),
+    )
+
+    start = 2
+    assert start < MAX_REVIEW_RESPAWNS, "test fixture must start below the cap"
+
+    # An EXISTING review task returned by the dedup path: distinct id,
+    # was_spawned=False (no new row created).
+    existing_review = Task(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        payloads=[{"type": "review", "prompt": "review"}],
+        status=TaskStatus.IN_PROGRESS,
+    )
+    mock_spawn = mocker.patch(
+        "app.rollup_management._spawn_pipeline_task",
+        new_callable=AsyncMock,
+        return_value=(existing_review, False),
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    parent, child = await _make_respawn_scenario(
+        rollup_db, child_respawn_count=start
+    )
+
+    await _check_and_trigger_rollup(child, rollup_db)
+
+    mock_spawn.assert_awaited_once()
+    await rollup_db.refresh(child)
+    # Dedup hit → counter unchanged.
+    assert (child.context or {}).get("_review_respawn_count") == start
+    await rollup_db.refresh(parent)
+    assert parent.requires_approval is False

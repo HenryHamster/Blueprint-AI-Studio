@@ -3075,6 +3075,43 @@ async def reaper_service():
                         logger.error(
                             f"[REAPER] Regression scan error: {e}", exc_info=True
                         )
+
+                # Step 9: Finalize release qualifications stuck "pending".
+                # The reaper's own task-kill path (Step 5) can mark a
+                # release_audit / qualifier-smoketest child FAILED directly,
+                # without routing through the task-completion handler that
+                # normally calls maybe_finalize_qualification. A reaper-killed
+                # qualifier child therefore leaves its ReleaseVersion wedged at
+                # last_qualification.status == "pending" forever. This sweep is
+                # the defense-in-depth backstop: it finds every version stuck
+                # pending (children all terminal, OR pending past the
+                # qualification timeout) and finalizes each. Idempotent and
+                # safe every cycle.
+                #
+                # Audit H5: sweep_stuck_qualifications commits internally after
+                # EACH version it finalizes — a real promotion lands a GitHub
+                # merge on `main`, and a per-version commit makes that
+                # status="promoted" + N+1 row durable before the next version
+                # is touched, so a later version raising can't roll it back.
+                # No end-of-step commit is needed here (the sweep already
+                # persisted everything); the surrounding try/except still
+                # contains any unexpected sweep-level error.
+                try:
+                    from app import release_qualifier
+
+                    _finalized = await release_qualifier.sweep_stuck_qualifications(
+                        session
+                    )
+                    if _finalized:
+                        logger.info(
+                            f"[REAPER] Finalized {_finalized} stuck release "
+                            f"qualification(s)"
+                        )
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Stuck qualification sweep error: {e}",
+                        exc_info=True,
+                    )
             consecutive_errors = 0
             # Liveness telemetry: only bump on the success path. If the
             # cycle body raised above, neither this counter nor the

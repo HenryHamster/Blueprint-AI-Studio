@@ -1103,7 +1103,11 @@ async def _maybe_spawn_followup_investigation(
     )
     prompt = "\n".join(prompt_parts)[:20000]
     payload = validate_internal_payload(
-        {"type": "investigate", "prompt": prompt, "base_branch": "main"},
+        {
+            "type": "investigate",
+            "prompt": prompt,
+            "base_branch": _runtime_config.get("integration_branch", "main"),
+        },
         "task_completion:remediation_failure_followup",
     )
     task_context = {
@@ -1365,7 +1369,11 @@ async def _maybe_spawn_low_confidence_followup(
         )[:500],
         payloads=[
             validate_internal_payload(
-                {"type": "investigate", "prompt": prompt, "base_branch": "main"},
+                {
+                    "type": "investigate",
+                    "prompt": prompt,
+                    "base_branch": _runtime_config.get("integration_branch", "main"),
+                },
                 "task_completion:low_confidence_followup",
             )
         ],
@@ -1555,7 +1563,11 @@ async def _maybe_spawn_reinvestigation_after_failure(
         )[:500],
         payloads=[
             validate_internal_payload(
-                {"type": "investigate", "prompt": prompt, "base_branch": "main"},
+                {
+                    "type": "investigate",
+                    "prompt": prompt,
+                    "base_branch": _runtime_config.get("integration_branch", "main"),
+                },
                 "task_completion:investigation_failure_followup",
             )
         ],
@@ -3557,7 +3569,7 @@ async def _spawn_investigation_remediation(
     payload_dict: Dict[str, Any] = {
         "type": "create",
         "prompt": full_prompt,
-        "base_branch": "main",
+        "base_branch": _runtime_config.get("integration_branch", "main"),
         "effort": scope_to_effort(scope),
     }
     if create_suffix:
