@@ -187,6 +187,104 @@ def _normalize_recommended_mode(value: object) -> str | None:
     return None
 
 
+_VALID_VERSION_PHASES = frozenset({"build", "stabilize"})
+
+
+def _normalize_version_phase(value: object) -> str | None:
+    """Return a canonical version phase string or None.
+
+    Lower-cases and trims input; rejects values outside _VALID_VERSION_PHASES
+    so storage stays bounded to the documented set (build | stabilize).
+    """
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip().lower()
+    if cleaned in _VALID_VERSION_PHASES:
+        return cleaned
+    return None
+
+
+async def _apply_version_phase_decision(
+    decision: object,
+    task: Task,
+    project: Project,
+    session: AsyncSession,
+    *,
+    path: str,
+) -> None:
+    """Parse and apply an optional ``version_phase_decision`` from the strategic agent.
+
+    ``decision`` is the raw value from either:
+      - the fallback parse path: ``parsed.get("version_phase_decision")``
+      - the API path: ``task.context.get("_strategic_version_phase_decision")``
+
+    Expected shape: ``{phase: "build"|"stabilize", reasoning: str}``.
+
+    When a valid decision is present:
+      1. Looks up the project's current open ``ReleaseVersion``.
+      2. Calls ``release_version.set_version_phase`` which stamps ``phase``,
+         ``phase_changed_at``, and ``phase_reasoning`` on the row.
+      3. ``session.add``s the row — caller's surrounding ``await session.commit()``
+         persists it.
+
+    Silently no-ops when:
+      - ``decision`` is None / not a dict
+      - ``phase`` is missing or not in ``{build, stabilize}``
+      - The project has no open ``ReleaseVersion`` (pre-Phase-2a, or no version opened yet)
+
+    All errors are logged and swallowed — a bad or absent phase decision must never
+    block vision/direction writes.
+    """
+    if not decision or not isinstance(decision, dict):
+        return
+    phase = _normalize_version_phase(decision.get("phase"))
+    if not phase:
+        raw = decision.get("phase")
+        logger.warning(
+            "[STRATEGIC] Task %s (%s path): version_phase_decision has invalid/missing "
+            "phase=%r — skipping",
+            task.id,
+            path,
+            raw,
+        )
+        return
+    reasoning_raw = decision.get("reasoning")
+    reasoning: str | None = (
+        reasoning_raw.strip() or None if isinstance(reasoning_raw, str) else None
+    )
+    try:
+        from app import release_version as _rv
+
+        open_ver = await _rv.current_open_version(session, project.id)
+        if open_ver is None:
+            logger.debug(
+                "[STRATEGIC] Task %s (%s path): no open ReleaseVersion for project %s "
+                "— skipping version_phase_decision",
+                task.id,
+                path,
+                project.id,
+            )
+            return
+        _rv.set_version_phase(open_ver, phase, reasoning=reasoning)
+        session.add(open_ver)
+        logger.info(
+            "[STRATEGIC] Task %s (%s path): applied version_phase_decision "
+            "phase=%s for project %s version v%d",
+            task.id,
+            path,
+            phase,
+            project.id,
+            open_ver.version_number,
+        )
+    except Exception:
+        logger.exception(
+            "[STRATEGIC] Task %s (%s path): failed to apply version_phase_decision "
+            "(non-fatal)",
+            task.id,
+            path,
+        )
+
+
 def _extract_rationale_from_notes(direction: dict | None, prefix: str) -> str | None:
     """Return the latest note rationale matching prefix, or None."""
     if not direction:
@@ -313,7 +411,7 @@ def _build_retirement_metrics(direction: dict) -> Dict[str, Any]:
 def _collect_creation_predictions(
     project: Project, direction_ids: list
 ) -> Dict[str, Dict[str, Any]]:
-    from app.strategic_analysis import _compute_prediction_calibration_factor  # noqa: PLC0415
+    from app.strategic_analysis import _compute_prediction_calibration_factor
 
     calibration_factor = _compute_prediction_calibration_factor(project)
     by_id = {d.get("id"): d for d in (project.directions or []) if d.get("id")}
@@ -712,7 +810,7 @@ async def _check_direction_starvation(
                 if fallback_category:
                     fallback_dir["category"] = fallback_category
 
-                updated_directions = list(directions) + [fallback_dir]
+                updated_directions = [*list(directions), fallback_dir]
                 project.directions = updated_directions
                 flag_modified(project, "directions")
 
@@ -878,7 +976,7 @@ async def _handle_strategic_completion(
             if _retirement_critiques is not None:
                 _extra["retirement_critiques"] = _retirement_critiques
             try:
-                from app.research_completion import query_findings_index  # noqa: PLC0415
+                from app.research_completion import query_findings_index
 
                 _finding_rows = await query_findings_index(
                     session, project.id, limit=20, days=30
@@ -888,7 +986,7 @@ async def _handle_strategic_completion(
                     _extra["recent_research_findings_prompt"] = (
                         format_findings_for_prompt(_finding_rows)
                     )
-            except Exception:
+            except Exception:  # noqa: BLE001
                 logger.warning(
                     f"[STRATEGIC] Task {task.id}: failed to fetch findings index (non-fatal)",
                     exc_info=True,
@@ -929,6 +1027,14 @@ async def _handle_strategic_completion(
                 session,
                 f"{open_feedback_count} FEEDBACK message(s) remain unaddressed after strategic review — agent may be ignoring user requests",
             )
+        # Apply version_phase_decision if the agent supplied one via context.
+        # The incremental API can store it in task.context under the key
+        # ``_strategic_version_phase_decision``; shape: {phase, reasoning}.
+        _vpd_ctx = (task.context or {}).get("_strategic_version_phase_decision")
+        await _apply_version_phase_decision(
+            _vpd_ctx, task, project, session, path="api"
+        )
+
         # Per-cycle message post removed: the strategic agent now maintains
         # project.running_update as a living markdown document it rewrites
         # each cycle. Replaces the previous one-message-per-cycle noise.
@@ -1026,7 +1132,7 @@ async def _handle_strategic_completion(
     # Audit W2/D7: full 3-way merge (user-bias, keep-both via _rejected_agent_edits ledger)
     # extends to systems/priorities/context lists, not just purpose/success_criteria.
     if new_vision and isinstance(new_vision, dict):
-        from app.vision_merge import append_rejected_edits, merge_vision  # noqa: PLC0415
+        from app.vision_merge import append_rejected_edits, merge_vision
 
         current_vision = dict(project.vision or {})
         payload_vision_rev = (task.first_payload.get("vision") or {}).get("revision", 0)
@@ -1586,6 +1692,13 @@ async def _handle_strategic_completion(
             project.directions = directions
             flag_modified(project, "directions")
 
+    # Apply version_phase_decision from the parsed output (fallback path).
+    # Shape: {phase: "build"|"stabilize", reasoning: str}
+    _vpd_parsed = parsed.get("version_phase_decision")
+    await _apply_version_phase_decision(
+        _vpd_parsed, task, project, session, path="fallback"
+    )
+
     # Update cycle history with final outcome
     # Audit W2: cycle outcome lives on the StrategicCycle row.
     cycle_id = task.strategic_cycle_id or (task.context or {}).get("strategic_cycle_id")
@@ -1672,7 +1785,7 @@ async def _handle_strategic_completion(
         session.add(new_msg)
         _event_type = _msg_ctx.get("event_type") if isinstance(_msg_ctx, dict) else None
         if _event_type:
-            from app.routers.admin_notifications import (  # noqa: PLC0415
+            from app.routers.admin_notifications import (
                 ROUTINE_EVENT_TYPES as _ROUTINE_EVENT_TYPES,
                 append_routine_digest as _append_routine_digest,
             )
@@ -1726,11 +1839,11 @@ async def _handle_strategic_completion(
                             msg.resolution or "Addressed by strategic review",
                             task.id,
                         )
-                    except Exception as _e:
+                    except Exception as _e:  # noqa: BLE001
                         logger.warning(
                             f"[NOTIFY] Failed to post feedback acknowledgment: {_e}"
                         )
-        except (ValueError, TypeError):
+        except (ValueError, TypeError):  # noqa: PERF203
             pass
 
     # Audit: check for unaddressed FEEDBACK messages

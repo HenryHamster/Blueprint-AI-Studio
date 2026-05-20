@@ -17,6 +17,11 @@ Public API:
 
   count_merged_since(session, project_id, since)
       Count tasks whose PR was merged after ``since`` for a project.
+
+  set_version_phase(session, version, phase, *, reasoning)
+      Update the phase on an open version row (build ↔ stabilize).
+      Stamps ``phase_changed_at`` to now and records the agent's reasoning.
+      Caller must commit.
 """
 
 from __future__ import annotations
@@ -34,6 +39,9 @@ from app.models import ReleaseVersion, Task, TaskStatus
 from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
+
+_VALID_PHASES = frozenset({"build", "stabilize"})
+_PHASE_REASONING_MAX = 500
 
 
 async def open_version(
@@ -175,3 +183,49 @@ def to_phase_block(version: ReleaseVersion) -> dict[str, Any]:
         else None,
         "last_qualification": version.last_qualification,
     }
+
+
+def set_version_phase(
+    version: ReleaseVersion,
+    phase: str,
+    *,
+    reasoning: str | None = None,
+) -> None:
+    """Update the phase on an open ``ReleaseVersion`` row.
+
+    Stamps ``phase_changed_at`` to now and records ``reasoning`` in
+    ``phase_reasoning``.  No-ops silently when ``phase`` is already set
+    to the requested value (idempotent).
+
+    Caller is responsible for ``session.add(version)`` and committing.
+
+    Raises ``ValueError`` when ``phase`` is not in the allowed set
+    (``build`` | ``stabilize``).
+    """
+    if phase not in _VALID_PHASES:
+        raise ValueError(
+            f"[RELEASE_VERSION] Invalid phase {phase!r}; "
+            f"must be one of {sorted(_VALID_PHASES)}"
+        )
+    if version.phase == phase:
+        logger.debug(
+            "[RELEASE_VERSION] set_version_phase: version v%d project=%s "
+            "already in phase=%s — no-op",
+            version.version_number,
+            version.project_id,
+            phase,
+        )
+        return
+    old_phase = version.phase
+    version.phase = phase
+    version.phase_changed_at = _utcnow()
+    if reasoning is not None:
+        truncated = reasoning[:_PHASE_REASONING_MAX]
+        version.phase_reasoning = truncated
+    logger.info(
+        "[RELEASE_VERSION] phase transition %s→%s for version v%d project=%s",
+        old_phase,
+        phase,
+        version.version_number,
+        version.project_id,
+    )
