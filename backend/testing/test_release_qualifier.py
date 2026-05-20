@@ -953,3 +953,231 @@ async def test_promote_empty_diff_is_noop_success(db_session, mocker):
     merge_mock.assert_not_called()
     await db_session.refresh(version)
     assert version.status == "promoted"
+
+
+# ===========================================================================
+# maybe_finalize_qualification — task-completion coordination glue
+# ===========================================================================
+
+
+async def _make_task_with_context(
+    db_session,
+    project,
+    *,
+    status: TaskStatus,
+    context: dict,
+) -> Task:
+    """Create a minimal Task with the given status and context."""
+    task = Task(
+        project_id=project.id,
+        title="test-task",
+        payloads=[{"type": "release_audit", "base_branch": "main"}],
+        vm_instance_id=f"vm-{id(context)}",
+        status=status,
+        context=context,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    return task
+
+
+async def _seed_pending_qualification(
+    db_session,
+    project,
+    version,
+    *,
+    audit_status: TaskStatus = TaskStatus.COMPLETED,
+    smoke_status: TaskStatus = TaskStatus.COMPLETED,
+) -> tuple[Task, Task]:
+    """Create the two child tasks in the requested statuses and stamp
+    version.last_qualification as 'pending' pointing to them.
+
+    Both child tasks carry ``context["release_version_id"]`` so that
+    maybe_finalize_qualification recognises them as qualifier children —
+    matching the real spawn path in run_qualification.
+    """
+    audit_task = Task(
+        project_id=project.id,
+        title="audit-child",
+        payloads=[{"type": "release_audit", "base_branch": "main"}],
+        vm_instance_id="vm-audit-child",
+        status=audit_status,
+        context={"release_version_id": str(version.id)},
+    )
+    smoke_task = Task(
+        project_id=project.id,
+        title="smoke-child",
+        payloads=[{"type": "smoketest", "base_branch": "automain"}],
+        vm_instance_id="vm-smoke-child",
+        status=smoke_status,
+        context={"release_version_id": str(version.id)},
+    )
+    db_session.add(audit_task)
+    db_session.add(smoke_task)
+    await db_session.commit()
+    await db_session.refresh(audit_task)
+    await db_session.refresh(smoke_task)
+
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": "abcd" * 10,
+        "ci_green": True,
+        "started_at": "2026-05-20T00:00:00",
+        "audit_task_id": str(audit_task.id),
+        "smoketest_task_id": str(smoke_task.id),
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+    return audit_task, smoke_task
+
+
+@pytest.mark.asyncio
+async def test_maybe_finalize_non_qualifier_task_returns_none(db_session):
+    """A task with no release_version_id in its context must return None
+    immediately — cheap fast path for the overwhelmingly common non-qualifier
+    case."""
+    project, _version = await _make_project_and_version(db_session)
+    task = await _make_task_with_context(
+        db_session,
+        project,
+        status=TaskStatus.COMPLETED,
+        context={"some_other_key": "value"},
+    )
+
+    result = await rq.maybe_finalize_qualification(db_session, task)
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_maybe_finalize_only_one_child_terminal_returns_none(db_session):
+    """When only one of the two qualifier children has terminated,
+    maybe_finalize_qualification returns None and does NOT call
+    _finalize_qualification."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session)
+
+    # audit child is COMPLETED, smoketest is still IN_PROGRESS.
+    audit_task, _smoke_task = await _seed_pending_qualification(
+        db_session,
+        project,
+        version,
+        audit_status=TaskStatus.COMPLETED,
+        smoke_status=TaskStatus.IN_PROGRESS,
+    )
+
+    result = await rq.maybe_finalize_qualification(db_session, audit_task)
+
+    assert result is None
+
+    # Version must still be pending — finalize must NOT have run.
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_maybe_finalize_both_children_terminal_calls_finalize(
+    db_session, mocker
+):
+    """When both children are in terminal states, maybe_finalize_qualification
+    calls _finalize_qualification and returns its result dict."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session)
+
+    audit_task, smoke_task = await _seed_pending_qualification(
+        db_session,
+        project,
+        version,
+        audit_status=TaskStatus.COMPLETED,
+        smoke_status=TaskStatus.COMPLETED,
+    )
+
+    # Seed RELEASE_AUDIT_REPORT and SMOKETEST_RESULT artifacts so that
+    # _finalize_qualification can compute a real composite.
+    db_session.add(
+        Artifact(
+            task_id=audit_task.id,
+            artifact_type=ArtifactType.RELEASE_AUDIT_REPORT,
+            logs=json.dumps(
+                {
+                    "audit_score": 1.0,
+                    "test_erosion": {
+                        "deleted_test_files": [],
+                        "assertion_delta": 2,
+                        "test_count_delta": 1,
+                    },
+                }
+            ),
+        )
+    )
+    db_session.add(
+        Artifact(
+            task_id=smoke_task.id,
+            artifact_type=ArtifactType.SMOKETEST_RESULT,
+            logs=json.dumps(
+                {
+                    "passed": True,
+                    "tests": [{"name": "a", "status": "pass"}],
+                    "suites": {"startup": {"passed": True}},
+                }
+            ),
+        )
+    )
+    await db_session.commit()
+
+    # Use the smoke_task as the "just completed" trigger.
+    result = await rq.maybe_finalize_qualification(db_session, smoke_task)
+    await db_session.commit()
+
+    # _finalize_qualification ran and returned a result dict.
+    assert result is not None
+    # With promotion_enabled=False and a high-confidence candidate: dry_run.
+    assert result["status"] == "dry_run"
+    assert result["would_promote"] is True
+
+    # Version is no longer pending.
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "dry_run"
+
+
+@pytest.mark.asyncio
+async def test_maybe_finalize_already_finalized_version_returns_none(db_session):
+    """If the version's last_qualification.status is not 'pending' (e.g.
+    'dry_run', 'promoted', 'not_promoted'), a second call returns None
+    without re-running _finalize_qualification (idempotent guard)."""
+    project, version = await _make_project_and_version(db_session)
+
+    audit_task, _smoke_task = await _seed_pending_qualification(
+        db_session,
+        project,
+        version,
+        audit_status=TaskStatus.COMPLETED,
+        smoke_status=TaskStatus.COMPLETED,
+    )
+
+    # Simulate the version already having been finalized.
+    version.last_qualification = {
+        **version.last_qualification,
+        "status": "dry_run",
+        "confidence": 0.9,
+        "would_promote": True,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    result = await rq.maybe_finalize_qualification(db_session, audit_task)
+
+    assert result is None
+
+    # Status must not have changed — still dry_run.
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "dry_run"

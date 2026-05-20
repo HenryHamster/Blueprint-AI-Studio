@@ -32,8 +32,9 @@ Ships dark: actual promotion runs only when ``runtime_config["promotion_enabled"
 is True.  Otherwise the composite is computed and logged (dry-run) but no PR is
 opened.
 
-Public API: ``run_qualification``, ``_finalize_qualification``,
-``compute_composite``, ``_load_policy``, ``promote``.
+Public API: ``run_qualification``, ``maybe_finalize_qualification``,
+``_finalize_qualification``, ``compute_composite``, ``_load_policy``,
+``promote``.
 """
 
 from __future__ import annotations
@@ -900,6 +901,156 @@ async def _finalize_qualification(
         composite=composite,
         base_record=base_record,
     )
+
+
+# ---------------------------------------------------------------------------
+# maybe_finalize_qualification — task-completion hook (coordination glue).
+# ---------------------------------------------------------------------------
+
+
+_TERMINAL_STATUSES: frozenset[TaskStatus] = frozenset(
+    {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
+)
+
+
+async def maybe_finalize_qualification(
+    session: AsyncSession,
+    completed_task: Task,
+) -> dict[str, Any] | None:
+    """Called from a task-completion handler whenever ANY task terminates.
+
+    This is the coordination glue between ``run_qualification`` (which spawns
+    the two qualifier children and returns immediately) and
+    ``_finalize_qualification`` (which computes the composite and decides).
+
+    Fast path: if ``completed_task.context`` has no ``release_version_id``,
+    return ``None`` immediately.  The overwhelming majority of tasks are not
+    qualifier children and this must be a cheap no-op.
+
+    When a ``release_version_id`` is present:
+
+    1. Load the ``ReleaseVersion`` with ``SELECT ... FOR UPDATE``.  This lock
+       is the critical race guard: the ``release_audit`` and qualifier
+       ``smoketest`` children can terminate near-simultaneously, and without
+       it two concurrent completion handlers could both finalize → a double
+       promotion.
+
+    2. If the version is None, or
+       ``version.last_qualification.get("status") != "pending"``, return
+       ``None``.  The version was already finalized (or was never mid-
+       qualification).  The lock + this guard make a second call a safe no-op
+       (idempotent).
+
+    3. Read ``audit_task_id`` and ``smoketest_task_id`` from
+       ``version.last_qualification``.  Load both ``Task`` rows.  If either
+       is missing or has not yet reached a terminal state (``COMPLETED``,
+       ``FAILED``, ``CANCELLED``), return ``None`` — the sibling child is
+       still running.
+
+    4. When BOTH children are terminal, delegate to
+       ``_finalize_qualification(session, version)`` and return its result.
+
+    The caller is responsible for committing the session.
+
+    Returns ``None`` when this task is not a qualifier child, when the
+    sibling is still running, or when the version is already finalized.
+    Returns the ``_finalize_qualification`` result dict when finalization runs.
+    """
+    context = completed_task.context or {}
+    version_id_raw = context.get("release_version_id")
+    if not version_id_raw:
+        # Fast path — not a qualifier child.  Must be O(1).
+        return None
+
+    # Parse the version id.
+    try:
+        version_id = uuid.UUID(str(version_id_raw))
+    except (ValueError, AttributeError):
+        logger.warning(
+            "[RELEASE_QUALIFIER] maybe_finalize_qualification: invalid "
+            "release_version_id %r on task %s — skipping",
+            version_id_raw,
+            completed_task.id,
+        )
+        return None
+
+    # 1. Lock the version row to prevent a double-finalize race.
+    version: release_version.ReleaseVersion | None = (
+        await session.execute(
+            select(release_version.ReleaseVersion)
+            .where(release_version.ReleaseVersion.id == version_id)
+            .with_for_update()
+        )
+    ).scalars().first()
+
+    # 2. Guard: already finalized or never mid-qualification.
+    if version is None:
+        logger.debug(
+            "[RELEASE_QUALIFIER] maybe_finalize_qualification: version %s "
+            "not found — skipping",
+            version_id,
+        )
+        return None
+
+    qual = version.last_qualification or {}
+    if qual.get("status") != "pending":
+        # Either not yet started, or already finalized — idempotent no-op.
+        return None
+
+    # 3. Check that both children are terminal.
+    audit_task_id_raw = qual.get("audit_task_id")
+    smoketest_task_id_raw = qual.get("smoketest_task_id")
+
+    if not audit_task_id_raw or not smoketest_task_id_raw:
+        logger.warning(
+            "[RELEASE_QUALIFIER] maybe_finalize_qualification: version v%d "
+            "has pending qualification but missing child task ids — skipping",
+            version.version_number,
+        )
+        return None
+
+    try:
+        audit_task_id = uuid.UUID(str(audit_task_id_raw))
+        smoketest_task_id = uuid.UUID(str(smoketest_task_id_raw))
+    except (ValueError, AttributeError):
+        logger.warning(
+            "[RELEASE_QUALIFIER] maybe_finalize_qualification: version v%d "
+            "has unparseable child task ids (%r, %r) — skipping",
+            version.version_number,
+            audit_task_id_raw,
+            smoketest_task_id_raw,
+        )
+        return None
+
+    audit_task: Task | None = await session.get(Task, audit_task_id)
+    smoketest_task: Task | None = await session.get(Task, smoketest_task_id)
+
+    if audit_task is None or smoketest_task is None:
+        logger.debug(
+            "[RELEASE_QUALIFIER] maybe_finalize_qualification: version v%d "
+            "child tasks not yet persisted — skipping",
+            version.version_number,
+        )
+        return None
+
+    if (
+        audit_task.status not in _TERMINAL_STATUSES
+        or smoketest_task.status not in _TERMINAL_STATUSES
+    ):
+        # Sibling is still running — not time to finalize yet.
+        return None
+
+    # 4. Both children are terminal — finalize.
+    logger.info(
+        "[RELEASE_QUALIFIER] maybe_finalize_qualification: both children "
+        "terminal for version v%d (audit=%s/%s smoke=%s/%s) — finalizing",
+        version.version_number,
+        audit_task.id,
+        audit_task.status,
+        smoketest_task.id,
+        smoketest_task.status,
+    )
+    return await _finalize_qualification(session, version)
 
 
 # ---------------------------------------------------------------------------
