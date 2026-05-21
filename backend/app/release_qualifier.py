@@ -84,7 +84,10 @@ from app.models import (
     TaskHistory,
     TaskStatus,
 )
-from app.notification_dispatch import post_event_message
+from app.notification_dispatch import (
+    post_event_message,
+    post_version_calcification_message,
+)
 from app.payload_schemas import PayloadTooLargeError, validate_internal_payload
 from app.shared_state import runtime_config as _runtime_config
 from app.time_utils import _utcnow
@@ -153,8 +156,7 @@ def _load_policy() -> dict[str, Any]:
         weight_sum = weights["audit"] + weights["test_erosion"] + weights["smoketest"]
         if abs(weight_sum - 1.0) > 0.01:
             raise ValueError(
-                f"promotion_policy.yaml weights sum to {weight_sum:.4f}, "
-                f"expected ~1.0"
+                f"promotion_policy.yaml weights sum to {weight_sum:.4f}, expected ~1.0"
             )
 
         return {"weights": weights, "threshold": threshold}
@@ -202,6 +204,11 @@ _TERMINAL_STATUSES: frozenset[TaskStatus] = frozenset(
 # progressing two-task pipeline (including retries) to finish, short enough
 # that a wedged qualification surfaces within a useful operator window.
 _MAX_QUALIFICATION_DURATION_SECONDS = 6 * 60 * 60
+
+# Minimum consecutive hard-blocker failures before raising a calcification
+# alert.  Conservative: three failures on the same blocker strongly suggest
+# the issue is not transient and the version is genuinely stuck.
+_MIN_CALCIFICATION_ATTEMPTS = 3
 
 
 async def _qualification_in_flight(
@@ -482,12 +489,16 @@ async def _resolve_github_with_session(
         from app.secrets_manager import get_user_secret
 
         integration = (
-            await session.execute(
-                select(UserIntegration).where(
-                    UserIntegration.user_id == project.user_id
+            (
+                await session.execute(
+                    select(UserIntegration).where(
+                        UserIntegration.user_id == project.user_id
+                    )
                 )
             )
-        ).scalars().first()
+            .scalars()
+            .first()
+        )
         if integration and integration.github_installation_id:
             try:
                 token = await generate_installation_access_token(
@@ -495,8 +506,7 @@ async def _resolve_github_with_session(
                 )
             except Exception:  # noqa: BLE001
                 logger.debug(
-                    "[RELEASE_QUALIFIER] stored installation token failed for "
-                    "%s/%s",
+                    "[RELEASE_QUALIFIER] stored installation token failed for %s/%s",
                     owner,
                     repo,
                 )
@@ -704,12 +714,16 @@ async def run_qualification(
     #    second caller blocks here until the first commits, then sees the
     #    pending record and short-circuits at the in-flight guard below.
     locked_version = (
-        await session.execute(
-            select(release_version.ReleaseVersion)
-            .where(release_version.ReleaseVersion.id == version.id)
-            .with_for_update()
+        (
+            await session.execute(
+                select(release_version.ReleaseVersion)
+                .where(release_version.ReleaseVersion.id == version.id)
+                .with_for_update()
+            )
         )
-    ).scalars().first()
+        .scalars()
+        .first()
+    )
     if locked_version is None:
         logger.warning(
             "[RELEASE_QUALIFIER] run_qualification: version row %s vanished "
@@ -982,27 +996,21 @@ async def _spawn_qualifier_smoketest_task(
     type_model = (_runtime_config.get("task_type_models", {}) or {}).get("smoketest")
     if type_model:
         payload["model"] = type_model
-    type_effort = (_runtime_config.get("task_type_efforts", {}) or {}).get(
-        "smoketest"
-    )
+    type_effort = (_runtime_config.get("task_type_efforts", {}) or {}).get("smoketest")
     if type_effort:
         payload["effort"] = type_effort
     health_check_urls = _runtime_config.get("health_check_urls") or []
     if health_check_urls:
         payload["health_check_urls"] = health_check_urls
     try:
-        payload = validate_internal_payload(
-            payload, "release_qualifier:smoketest"
-        )
+        payload = validate_internal_payload(payload, "release_qualifier:smoketest")
     except PayloadTooLargeError:
         raise
 
     task = Task(
         project_id=project_id,
         title=f"Qualifier smoketest: candidate {candidate_sha[:8]}",
-        description=(
-            f"Qualify-time smoketest of release candidate {candidate_sha}"
-        ),
+        description=(f"Qualify-time smoketest of release candidate {candidate_sha}"),
         payloads=[payload],
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
         status=TaskStatus.QUEUED,
@@ -1049,16 +1057,20 @@ async def _latest_artifact_logs(
     import json
 
     artifact = (
-        await session.execute(
-            select(Artifact)
-            .where(
-                Artifact.task_id == task_id,
-                Artifact.artifact_type == artifact_type,
+        (
+            await session.execute(
+                select(Artifact)
+                .where(
+                    Artifact.task_id == task_id,
+                    Artifact.artifact_type == artifact_type,
+                )
+                .order_by(Artifact.created_at.desc())
+                .limit(1)
             )
-            .order_by(Artifact.created_at.desc())
-            .limit(1)
         )
-    ).scalars().first()
+        .scalars()
+        .first()
+    )
     if artifact is None or not artifact.logs:
         return None
     try:
@@ -1152,9 +1164,7 @@ def _score_smoketest(result: dict[str, Any] | None) -> float | None:
     # status) contributes 0.  This is intentionally conservative: a skipped
     # qualifier test is unverified coverage, so it should pull the score down
     # rather than be treated as a pass.
-    passed = sum(
-        1 for t in tests if isinstance(t, dict) and t.get("status") == "pass"
-    )
+    passed = sum(1 for t in tests if isinstance(t, dict) and t.get("status") == "pass")
     return _clamp01(passed / total) if total else 0.0
 
 
@@ -1614,9 +1624,7 @@ async def _maybe_reconcile_after_promotion_conflict(
 
         factory = session_factory or AsyncSessionLocal
         async with factory() as session:
-            version = await session.get(
-                release_version.ReleaseVersion, version_id
-            )
+            version = await session.get(release_version.ReleaseVersion, version_id)
             if version is None:
                 return
             recon = await hotfix_backmerge.reconcile_main_into_automain(
@@ -1705,9 +1713,7 @@ async def _finalize_in_dedicated_session(
     factory = session_factory or AsyncSessionLocal
     async with factory() as session:
         try:
-            result = await _finalize_locked_version(
-                session, version_id, timeout_now
-            )
+            result = await _finalize_locked_version(session, version_id, timeout_now)
         except Exception:
             # Roll back this dedicated session's partial work before unwinding.
             # In production each dedicated session is independent and the
@@ -1719,8 +1725,7 @@ async def _finalize_in_dedicated_session(
                 await session.rollback()
             except Exception:
                 logger.exception(
-                    "[RELEASE_QUALIFIER] finalize: rollback failed for "
-                    "version %s",
+                    "[RELEASE_QUALIFIER] finalize: rollback failed for version %s",
                     version_id,
                 )
             raise
@@ -1752,12 +1757,16 @@ async def _finalize_locked_version(
     # Lock the version row — the single serialization point for the whole
     # finalize→promote critical section (concern d).
     version: release_version.ReleaseVersion | None = (
-        await session.execute(
-            select(release_version.ReleaseVersion)
-            .where(release_version.ReleaseVersion.id == version_id)
-            .with_for_update()
+        (
+            await session.execute(
+                select(release_version.ReleaseVersion)
+                .where(release_version.ReleaseVersion.id == version_id)
+                .with_for_update()
+            )
         )
-    ).scalars().first()
+        .scalars()
+        .first()
+    )
 
     if version is None:
         logger.debug(
@@ -1802,9 +1811,7 @@ async def _finalize_locked_version(
             # fallbacks.  A corrupt started_at must never defeat the backstop
             # (audit R4-H5).
             timeout_clock = (
-                version.updated_at
-                or version.phase_changed_at
-                or version.opened_at
+                version.updated_at or version.phase_changed_at or version.opened_at
             )
             if timeout_clock is not None:
                 logger.warning(
@@ -1999,9 +2006,7 @@ async def _force_finalize_timed_out_qualification(
         Alert(
             project_id=version.project_id,
             severity=AlertSeverity.WARNING,
-            title=(
-                f"Release qualification v{version.version_number} timed out"
-            ),
+            title=(f"Release qualification v{version.version_number} timed out"),
             message=(
                 f"Qualification for release v{version.version_number} was "
                 f"stuck pending for {age_minutes:.0f} minutes — a qualifier "
@@ -2018,6 +2023,104 @@ async def _force_finalize_timed_out_qualification(
         version.version_number,
         age_minutes,
     )
+
+
+async def _check_version_calcification(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+) -> bool:
+    """Post a deduplicated calcification alert when a version is stuck.
+
+    A version calcifies when it has accumulated ``_MIN_CALCIFICATION_ATTEMPTS``
+    or more qualification attempts in the stabilize phase, all failing on the
+    same hard blocker, with no indication it will self-heal.
+
+    CRITICAL: a version whose last qualification is ``status="dry_run"`` is a
+    PASSING candidate held back only by ``promotion_enabled=False`` — that is
+    healthy operation and must NOT trigger this alert.  Only repeated hard-blocker
+    failures (``status="not_promoted"`` with a non-None blocker) qualify.
+
+    Deduplication: compares the version's durable
+    ``calcification_alerted_blocker`` column against the current blocker.  If
+    they match, the alert has already been posted for this stall and is
+    skipped; a new alert is posted only when the blocker changes or the field
+    is NULL.  Storing the dedup anchor on the version (rather than relying on
+    Alert-row existence) keeps the once-per-stall guarantee even after an
+    operator clears alerts.
+
+    Does NOT commit the session — the caller must commit after a ``True`` return.
+    """
+    if version.status != "open" or version.phase != "stabilize":
+        return False
+
+    attempts = version.qualification_attempts or 0
+    if attempts < _MIN_CALCIFICATION_ATTEMPTS:
+        return False
+
+    qual = version.last_qualification or {}
+    qual_status = qual.get("status")
+    blocker = qual.get("blocker")
+
+    # A dry-run hold is healthy — the version passed and is waiting for
+    # promotion_enabled.  Do not alert.
+    if qual_status == "dry_run":
+        return False
+
+    # Only alert for hard-blocker failures (not below-threshold near-misses,
+    # which have blocker=None and may self-correct without intervention).
+    if qual_status != "not_promoted" or not blocker:
+        return False
+
+    # Durable dedup: the version remembers the blocker it last alerted on.
+    # Same blocker → already notified for this stall; skip.
+    if version.calcification_alerted_blocker == blocker:
+        return False
+
+    alert_title = f"Release v{version.version_number} calcifying: {blocker}"
+
+    age_days: int = 0
+    ref_time = version.phase_changed_at or version.opened_at
+    if ref_time is not None:
+        age_days = max(0, (_utcnow() - ref_time).days)
+
+    blocker_label = _BLOCKER_LABELS.get(blocker, blocker)
+    session.add(
+        Alert(
+            project_id=version.project_id,
+            severity=AlertSeverity.WARNING,
+            title=alert_title,
+            message=(
+                f"Release v{version.version_number} has been stuck in the "
+                f"stabilize phase for {age_days} day(s) with {attempts} "
+                f"qualification attempt(s), each blocked by: {blocker_label}. "
+                f"The integration trunk may be drifting from the deployed "
+                f"branch. Resolve the blocker to restore promotion."
+            ),
+        )
+    )
+    await post_version_calcification_message(
+        session,
+        version.project_id,
+        version_number=version.version_number,
+        version_id=str(version.id),
+        qualification_attempts=attempts,
+        blocker=blocker,
+        blocker_label=blocker_label,
+        age_days=age_days,
+    )
+    # Record the durable dedup anchor so subsequent sweeps don't re-alert for
+    # the same stall (survives an operator clearing the Alert row).
+    version.calcification_alerted_blocker = blocker
+    session.add(version)
+    logger.warning(
+        "[RELEASE_QUALIFIER] calcification alert for v%d: %d attempts "
+        "blocked by %s over %d day(s)",
+        version.version_number,
+        attempts,
+        blocker,
+        age_days,
+    )
+    return True
 
 
 async def sweep_stuck_qualifications(
@@ -2113,6 +2216,26 @@ async def sweep_stuck_qualifications(
             "[RELEASE_QUALIFIER] sweep finalized %d stuck qualification(s)",
             finalized,
         )
+
+    # Calcification check: alert when an open version has accumulated enough
+    # hard-blocker failures to be considered stuck.  Each version gets its own
+    # dedicated session (same isolation pattern as the finalize loop above) so
+    # a messaging failure on one version can't affect another.
+    factory = session_factory or AsyncSessionLocal
+    for version in open_versions:
+        try:
+            async with factory() as alert_session:
+                v = await alert_session.get(release_version.ReleaseVersion, version.id)
+                if v is not None and await _check_version_calcification(
+                    alert_session, v
+                ):
+                    await alert_session.commit()
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] calcification check failed for version %s",
+                version.id,
+            )
+
     return finalized
 
 
@@ -2256,9 +2379,7 @@ async def _promotion_pr_landed(
     )
     if not candidate_sha:
         return False
-    return await _candidate_already_on_main(
-        token, owner, repo, candidate_sha, version
-    )
+    return await _candidate_already_on_main(token, owner, repo, candidate_sha, version)
 
 
 def _idempotent_pr_url(base_record: dict[str, Any] | None) -> str:
@@ -2344,13 +2465,17 @@ async def _relock_version_for_promotion_write(
     # lock_released=True — re-read + re-lock from authoritative DB state.
     session.expire(version)
     relocked = (
-        await session.execute(
-            select(release_version.ReleaseVersion)
-            .where(release_version.ReleaseVersion.id == version.id)
-            .with_for_update()
-            .execution_options(populate_existing=True)
+        (
+            await session.execute(
+                select(release_version.ReleaseVersion)
+                .where(release_version.ReleaseVersion.id == version.id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
         )
-    ).scalars().first()
+        .scalars()
+        .first()
+    )
     if relocked is None:
         logger.warning(
             "[RELEASE_QUALIFIER] promote: version row %s vanished before the "
@@ -2462,7 +2587,10 @@ async def promote(
         # This runs BEFORE the intermediate commit, so the version row is still
         # locked by this transaction — write directly (lock_released=False).
         return await _record_promotion_failure(
-            session, version, base_record, "project_not_found",
+            session,
+            version,
+            base_record,
+            "project_not_found",
             lock_released=False,
         )
 
@@ -2499,8 +2627,12 @@ async def promote(
             )
         # The rollback released the lock — the failure record must re-lock.
         return await _record_promotion_failure(
-            session, version, base_record, "lock_release_failed",
-            detail=str(exc)[:300], lock_released=True,
+            session,
+            version,
+            base_record,
+            "lock_release_failed",
+            detail=str(exc)[:300],
+            lock_released=True,
         )
 
     # The row lock is now released — all the I/O below runs unlocked.
@@ -2508,7 +2640,10 @@ async def promote(
         resolved = await _resolve_github_with_session(session, project)
         if resolved is None:
             return await _record_promotion_failure(
-                session, version, base_record, "no_credentials",
+                session,
+                version,
+                base_record,
+                "no_credentials",
                 lock_released=True,
             )
         token, owner, repo = resolved
@@ -2599,8 +2734,7 @@ async def promote(
             owner,
             repo,
             title=(
-                f"Release v{version.version_number}: promote "
-                f"{release_branch} → main"
+                f"Release v{version.version_number}: promote {release_branch} → main"
             ),
             head=release_branch,
             base="main",
@@ -2696,8 +2830,12 @@ async def promote(
             token, owner, repo, release_branch, version
         )
         return await _record_promotion_failure(
-            session, version, base_record, "pr_missing_number",
-            pr_url=pr_url, lock_released=True,
+            session,
+            version,
+            base_record,
+            "pr_missing_number",
+            pr_url=pr_url,
+            lock_released=True,
         )
 
     # 2. Merge the PR — merge_method="merge" preserves integration history.
@@ -2955,8 +3093,7 @@ async def _record_promotion_failure(
         existing = version.last_qualification or {}
         return {
             "status": existing.get("status", version.status),
-            "promoted_sha": existing.get("promoted_sha")
-            or version.promoted_sha,
+            "promoted_sha": existing.get("promoted_sha") or version.promoted_sha,
             "next_version_number": None,
             "already_promoted": True,
         }
@@ -3183,4 +3320,41 @@ async def _record_promotion_success(
         "status": "promoted",
         "promoted_sha": effective_sha,
         "next_version_number": next_version.version_number,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Public display helpers — stable API for the operator lifecycle panel.
+# ---------------------------------------------------------------------------
+
+# Maps the internal last_qualification status code to a human-readable label
+# for the version-lifecycle panel.
+_OUTCOME_LABELS: dict[str, str] = {
+    "pending": "In progress",
+    "dry_run": "Dry-run (would promote)",
+    "promoted": "Promoted",
+    "not_promoted": "Below threshold",
+    "error": "Error",
+}
+
+
+def format_qualification_for_api(qual: dict[str, Any]) -> dict[str, Any]:
+    """Return an operator-facing summary of a ``last_qualification`` record.
+
+    Normalizes the raw qualification dict stored on ``ReleaseVersion`` into
+    a stable shape suitable for the version-lifecycle panel.  Adds a
+    human-readable ``outcome`` label alongside the raw ``status`` code.
+
+    Safe to call with an empty dict — all fields default to ``None``.
+    """
+    status = qual.get("status")
+    return {
+        "status": status,
+        "outcome": _OUTCOME_LABELS.get(status, status),
+        "confidence": qual.get("confidence"),
+        "threshold": qual.get("threshold"),
+        "sub_scores": qual.get("sub_scores"),
+        "blocker": qual.get("blocker"),
+        "started_at": qual.get("started_at"),
+        "finalized_at": qual.get("finalized_at"),
     }

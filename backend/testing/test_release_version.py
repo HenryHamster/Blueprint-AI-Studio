@@ -424,3 +424,97 @@ def test_to_phase_block_handles_none_phase_changed_at():
     )
     block = rv.to_phase_block(version)
     assert block["phase_changed_at"] is None
+
+
+# ===========================================================================
+# recent_closed_versions
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_recent_closed_versions_returns_empty_for_no_history(db_session):
+    """A project with only an open version (no closed history) returns []."""
+    project = await _make_project(db_session)
+    await rv.open_version(db_session, project.id, version_number=1)
+    await db_session.commit()
+
+    rows = await rv.recent_closed_versions(db_session, project.id)
+    assert rows == []
+
+
+@pytest.mark.asyncio
+async def test_recent_closed_versions_returns_closed_rows_newest_first(db_session):
+    """Closed versions are returned newest-first, open version is excluded."""
+    project = await _make_project(db_session)
+
+    older = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        phase="build",
+        status="promoted",
+        opened_at=_utcnow() - timedelta(hours=4),
+    )
+    newer = ReleaseVersion(
+        project_id=project.id,
+        version_number=2,
+        phase="stabilize",
+        status="promoted",
+        opened_at=_utcnow() - timedelta(hours=2),
+    )
+    open_v = ReleaseVersion(
+        project_id=project.id,
+        version_number=3,
+        phase="build",
+        status="open",
+        opened_at=_utcnow(),
+    )
+    for v in (older, newer, open_v):
+        db_session.add(v)
+    await db_session.commit()
+
+    rows = await rv.recent_closed_versions(db_session, project.id)
+    assert len(rows) == 2
+    assert rows[0].version_number == 2
+    assert rows[1].version_number == 1
+
+
+@pytest.mark.asyncio
+async def test_recent_closed_versions_respects_limit(db_session):
+    """Passing limit=2 returns at most 2 rows even with more history."""
+    project = await _make_project(db_session)
+
+    for i in range(1, 5):
+        db_session.add(
+            ReleaseVersion(
+                project_id=project.id,
+                version_number=i,
+                phase="build",
+                status="promoted",
+                opened_at=_utcnow() - timedelta(hours=10 - i),
+            )
+        )
+    await db_session.commit()
+
+    rows = await rv.recent_closed_versions(db_session, project.id, limit=2)
+    assert len(rows) == 2
+
+
+@pytest.mark.asyncio
+async def test_recent_closed_versions_scoped_to_project(db_session):
+    """Closed versions belonging to another project are not returned."""
+    project_a = await _make_project(db_session, name="RV-A")
+    project_b = await _make_project(db_session, name="RV-B")
+
+    db_session.add(
+        ReleaseVersion(
+            project_id=project_a.id,
+            version_number=1,
+            phase="build",
+            status="promoted",
+            opened_at=_utcnow(),
+        )
+    )
+    await db_session.commit()
+
+    assert await rv.recent_closed_versions(db_session, project_a.id) != []
+    assert await rv.recent_closed_versions(db_session, project_b.id) == []

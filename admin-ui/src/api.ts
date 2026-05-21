@@ -710,3 +710,48 @@ export async function fetchEfficiencyAxes(projectId: string): Promise<Efficiency
   if (!res.ok) throw new Error(`Failed to fetch efficiency axes: ${res.status}`);
   return res.json();
 }
+
+export interface VersionQualificationSubScores {
+  audit: number;
+  test_erosion: number;
+  smoketest: number;
+}
+
+export interface VersionQualification {
+  status: string | null;
+  confidence: number | null;
+  threshold: number | null;
+  sub_scores: VersionQualificationSubScores | null;
+  blocker: string | null;
+  finalized_at: string | null;
+}
+
+export interface CurrentVersion {
+  version_number: number;
+  phase: string;
+  phase_changed_at: string | null;
+  opened_at: string;
+  qualification_attempts: number;
+  merged_task_count: number;
+  last_qualification: VersionQualification | null;
+}
+
+export interface RecentVersion {
+  version_number: number;
+  status: string;
+  opened_at: string;
+  promoted_at: string | null;
+  qualification_attempts: number;
+  last_qualification: VersionQualification | null;
+}
+
+export interface VersionLifecycleResponse {
+  current_version: CurrentVersion | null;
+  recent_versions: RecentVersion[];
+}
+
+export async function fetchVersionLifecycle(projectId: string): Promise<VersionLifecycleResponse> {
+  const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(projectId)}/version-lifecycle`);
+  if (!res.ok) throw new Error(`Failed to fetch version lifecycle: ${res.status}`);
+  return res.json();
+}

@@ -38,6 +38,7 @@ from app.models import (
     ResidualRemediationCaseStatus,
     RegressionRemediationCase,
     RegressionCaseStatus,
+    ReleaseVersion,
     StrategicCycle,
     Alert,
     AlertSeverity,
@@ -9475,3 +9476,105 @@ async def get_sr_investigation_task_ids(
             task_ids[str(cat)] = str(t.id)
 
     return {"task_ids": task_ids}
+
+
+# ---------------------------------------------------------------------------
+# /projects/{project_id}/version-lifecycle
+# ---------------------------------------------------------------------------
+
+
+def _format_qualification(qual: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract operator-facing fields from a last_qualification record."""
+    return {
+        "status": qual.get("status"),
+        "confidence": qual.get("confidence"),
+        "threshold": qual.get("threshold"),
+        "sub_scores": qual.get("sub_scores"),
+        "blocker": qual.get("blocker"),
+        "finalized_at": qual.get("finalized_at"),
+    }
+
+
+@router.get("/projects/{project_id}/version-lifecycle")
+async def get_version_lifecycle(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Return the release version lifecycle state for a project.
+
+    Exposes the current open version (phase, qualification verdicts, merged-task
+    count) and a short history of recent closed versions for calibration.
+    Projects with no version lifecycle return ``null`` for ``current_version``
+    and an empty ``recent_versions`` list.
+    """
+    from app.release_version import count_merged_since  # noqa: PLC0415
+
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, min_role="viewer"
+    )
+
+    open_row = (
+        (
+            await session.execute(
+                select(ReleaseVersion)
+                .where(
+                    ReleaseVersion.project_id == project_id,
+                    ReleaseVersion.status == "open",
+                )
+                .order_by(ReleaseVersion.opened_at.desc())
+                .limit(1)
+            )
+        )
+        .scalars()
+        .first()
+    )
+
+    current_version_out: Optional[Dict[str, Any]] = None
+    if open_row is not None:
+        merged_count = await count_merged_since(session, project_id, open_row.opened_at)
+        qual = open_row.last_qualification or {}
+        current_version_out = {
+            "version_number": open_row.version_number,
+            "phase": open_row.phase,
+            "phase_changed_at": open_row.phase_changed_at.isoformat()
+            if open_row.phase_changed_at
+            else None,
+            "opened_at": open_row.opened_at.isoformat(),
+            "qualification_attempts": open_row.qualification_attempts,
+            "merged_task_count": merged_count,
+            "last_qualification": _format_qualification(qual) if qual else None,
+        }
+
+    history_rows = (
+        (
+            await session.execute(
+                select(ReleaseVersion)
+                .where(
+                    ReleaseVersion.project_id == project_id,
+                    ReleaseVersion.status != "open",
+                )
+                .order_by(ReleaseVersion.opened_at.desc())
+                .limit(5)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    return {
+        "current_version": current_version_out,
+        "recent_versions": [
+            {
+                "version_number": v.version_number,
+                "status": v.status,
+                "opened_at": v.opened_at.isoformat(),
+                "promoted_at": v.promoted_at.isoformat() if v.promoted_at else None,
+                "qualification_attempts": v.qualification_attempts,
+                "last_qualification": _format_qualification(v.last_qualification)
+                if v.last_qualification
+                else None,
+            }
+            for v in history_rows
+        ],
+    }

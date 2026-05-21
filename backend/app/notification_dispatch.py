@@ -1448,6 +1448,61 @@ async def post_feedback_acknowledgment(
     )
 
 
+async def post_version_calcification_message(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    version_number: int,
+    version_id: str,
+    qualification_attempts: int,
+    blocker: str,
+    blocker_label: str,
+    age_days: int,
+) -> ProjectMessage:
+    """Post a calcification alert when a release version is repeatedly stuck.
+
+    Called when a version in the stabilize phase has accumulated enough
+    hard-blocker failures to be considered calcifying (promotion is stalled).
+    Also fires RELEASE_VERSION_CALCIFYING external webhook so operators can
+    route the alert to their incident channel.
+
+    Does NOT commit — the caller owns the transaction.
+    """
+    summary = (
+        f"v{version_number} is calcifying — {qualification_attempts} "
+        f"qualification attempt(s) blocked by {blocker_label} over "
+        f"{age_days} day(s). Resolve the blocker to restore promotion."
+    )
+    msg = await post_event_message(
+        session,
+        project_id,
+        event_type="release_calcifying",
+        summary=summary,
+        context={
+            "version_number": version_number,
+            "version_id": version_id,
+            "qualification_attempts": qualification_attempts,
+            "blocker": blocker,
+            "age_days": age_days,
+        },
+    )
+    asyncio.ensure_future(
+        dispatch_external_notification(
+            project_id,
+            "RELEASE_VERSION_CALCIFYING",
+            {
+                "version_number": version_number,
+                "version_id": version_id,
+                "qualification_attempts": qualification_attempts,
+                "blocker": blocker,
+                "age_days": age_days,
+                "summary": summary,
+            },
+        )
+    )
+    return msg
+
+
 async def post_fix_loop_divergence_regression_message(
     session: AsyncSession,
     project_id: uuid.UUID,

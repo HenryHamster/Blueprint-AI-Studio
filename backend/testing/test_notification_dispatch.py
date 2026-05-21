@@ -31,6 +31,7 @@ from app.notification_dispatch import (
     post_residual_fix_result_message,
     post_residual_fix_spawned_message,
     post_review_feedback_message,
+    post_version_calcification_message,
 )
 from app.models import (
     MessageType,
@@ -1717,3 +1718,118 @@ async def test_post_residual_fix_audit_deferred_escalation_threshold_from_runtim
     assert msg.context["threshold"] == custom_threshold
     args = dispatch_mock.call_args.args
     assert args[2]["threshold"] == custom_threshold
+
+
+# ---------------------------------------------------------------------------
+# post_version_calcification_message
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_post_version_calcification_message_creates_release_calcifying_message(
+    db_session,
+):
+    """post_version_calcification_message posts a ProjectMessage with
+    event_type 'release_calcifying' and the correct context fields."""
+    project = Project(name="Calcification Test", user_id="u1")
+    db_session.add(project)
+    await db_session.commit()
+
+    version_id = str(uuid.uuid4())
+    msg = await post_version_calcification_message(
+        db_session,
+        project.id,
+        version_number=3,
+        version_id=version_id,
+        qualification_attempts=5,
+        blocker="ci_not_green",
+        blocker_label="CI not green",
+        age_days=7,
+    )
+    await db_session.commit()
+
+    assert msg.context["event_type"] == "release_calcifying"
+    assert msg.context["version_number"] == 3
+    assert msg.context["version_id"] == version_id
+    assert msg.context["qualification_attempts"] == 5
+    assert msg.context["blocker"] == "ci_not_green"
+    assert msg.context["age_days"] == 7
+    assert "calcifying" in msg.content
+    assert "ci_not_green" not in msg.content  # summary uses blocker_label
+    assert "CI not green" in msg.content
+
+
+@pytest.mark.asyncio
+async def test_post_version_calcification_message_fires_external_webhook(
+    db_session,
+):
+    """post_version_calcification_message fires RELEASE_VERSION_CALCIFYING
+    external webhook with the correct payload so external subscribers can act."""
+    project = Project(name="Calcification Webhook", user_id="u1")
+    db_session.add(project)
+    await db_session.commit()
+
+    dispatch_mock = AsyncMock()
+    with patch(
+        "app.notification_dispatch.dispatch_external_notification", new=dispatch_mock
+    ):
+        await post_version_calcification_message(
+            db_session,
+            project.id,
+            version_number=2,
+            version_id="vid-123",
+            qualification_attempts=4,
+            blocker="audit_missing",
+            blocker_label="Audit task missing",
+            age_days=3,
+        )
+        import asyncio as _asyncio
+
+        await _asyncio.sleep(0)
+
+    dispatch_mock.assert_called_once()
+    args = dispatch_mock.call_args.args
+    assert args[0] == project.id
+    assert args[1] == "RELEASE_VERSION_CALCIFYING"
+    payload = args[2]
+    assert payload["version_number"] == 2
+    assert payload["version_id"] == "vid-123"
+    assert payload["qualification_attempts"] == 4
+    assert payload["blocker"] == "audit_missing"
+    assert payload["age_days"] == 3
+    assert "summary" in payload and "calcifying" in payload["summary"]
+
+
+@pytest.mark.asyncio
+async def test_post_version_calcification_message_not_fired_for_dry_run(
+    db_session,
+):
+    """post_version_calcification_message is a low-level builder — the
+    deduplication and dry-run guard live in _check_version_calcification.
+    Verify the builder creates a message when called (the caller ensures it
+    is only invoked for genuine hard-blocker stalls)."""
+    project = Project(name="Dry Run Guard", user_id="u1")
+    db_session.add(project)
+    await db_session.commit()
+
+    dispatch_mock = AsyncMock()
+    with patch(
+        "app.notification_dispatch.dispatch_external_notification", new=dispatch_mock
+    ):
+        msg = await post_version_calcification_message(
+            db_session,
+            project.id,
+            version_number=1,
+            version_id="vid-dry",
+            qualification_attempts=3,
+            blocker="ci_not_green",
+            blocker_label="CI not green",
+            age_days=0,
+        )
+        import asyncio as _asyncio
+
+        await _asyncio.sleep(0)
+
+    # Builder always creates the message; caller is responsible for the guard
+    assert msg is not None
+    dispatch_mock.assert_called_once()

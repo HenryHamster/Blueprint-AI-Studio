@@ -65,6 +65,32 @@ vi.mock('../api', () => ({
         { status: 200 },
       );
     }
+    if (url.includes('/version-lifecycle')) {
+      return new Response(
+        JSON.stringify({
+          current_version: {
+            version_number: 42,
+            phase: 'stabilize',
+            phase_changed_at: '2026-05-20T12:00:00Z',
+            opened_at: '2026-05-15T00:00:00Z',
+            qualification_attempts: 2,
+            merged_task_count: 15,
+            last_qualification: {
+              status: 'dry_run',
+              confidence: 0.78,
+              threshold: 0.80,
+              sub_scores: { audit: 0.85, test_erosion: 0.70, smoketest: 0.90 },
+              blocker: null,
+              finalized_at: '2026-05-20T11:00:00Z',
+            },
+          },
+          recent_versions: [
+            { version_number: 41, status: 'promoted', opened_at: '2026-05-10T00:00:00Z', promoted_at: '2026-05-15T00:00:00Z', qualification_attempts: 1, last_qualification: { status: 'promoted', confidence: 0.85, threshold: 0.80, sub_scores: null, blocker: null, finalized_at: null } },
+          ],
+        }),
+        { status: 200 },
+      );
+    }
     // All other endpoints return 404 so sub-components see their `if (!res.ok)`
     // / `if (!data)` early-exits and render their idle/empty states. Returning
     // `{}` with 200 instead causes widgets that destructure specific shapes
@@ -138,6 +164,28 @@ describe('DashboardHome — viewport regression', () => {
         );
       });
       // Allow async state updates (mock fetches resolve) to settle.
+      await act(async () => {
+        await new Promise<void>((resolve) => setTimeout(resolve, 50));
+      });
+    });
+  });
+
+  test('version lifecycle panel renders without overflow at 375px', async () => {
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <DashboardHome
+            tasks={[]}
+            selectedProjectId="proj-abc"
+            onViewTask={() => {}}
+          />,
+        );
+      });
       await act(async () => {
         await new Promise<void>((resolve) => setTimeout(resolve, 50));
       });

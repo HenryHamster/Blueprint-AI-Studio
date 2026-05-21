@@ -3893,9 +3893,7 @@ async def test_step9_sweep_times_out_qualification_with_unparseable_started_at(
             "Step 9 timeout must force-finalize a pending qualification with "
             "an unparseable started_at — falling back to updated_at"
         )
-        assert (
-            version.last_qualification.get("blocker") == "qualification_timeout"
-        )
+        assert version.last_qualification.get("blocker") == "qualification_timeout"
         assert version.phase == "stabilize"
         assert version.status == "open"
     finally:
@@ -3903,3 +3901,88 @@ async def test_step9_sweep_times_out_qualification_with_unparseable_started_at(
             shared_state.runtime_config.pop("promotion_enabled", None)
         else:
             shared_state.runtime_config["promotion_enabled"] = _original_promotion
+
+
+# ── Step 9: calcification alerting ────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_step9_calcification_alert_fires_for_repeated_hard_blockers(
+    reaper_db, stop_after_one_cycle, reaper_side_effects
+):
+    """A version stuck in stabilize with >= _MIN_CALCIFICATION_ATTEMPTS hard-blocker
+    failures gets a calcification alert posted by the reaper's Step 9 sweep."""
+    from app import release_qualifier as _rq
+    from app.models import Alert as _Alert
+
+    project = await _make_project(reaper_db)
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        phase="stabilize",
+        status="open",
+        qualification_attempts=_rq._MIN_CALCIFICATION_ATTEMPTS,
+        last_qualification={
+            "status": "not_promoted",
+            "blocker": "ci_not_green",
+            "candidate_sha": "abc" * 13 + "a",
+        },
+    )
+    reaper_db.add(version)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(version)
+
+    alerts = (
+        (
+            await reaper_db.execute(
+                _select(_Alert).where(_Alert.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+    assert "calcifying" in alerts[0].title
+    assert "ci_not_green" in alerts[0].title
+
+
+@pytest.mark.asyncio
+async def test_step9_calcification_alert_not_fired_for_dry_run_hold(
+    reaper_db, stop_after_one_cycle, reaper_side_effects
+):
+    """A version whose last qualification is a dry_run (passed but promotion
+    disabled) must NOT trigger a calcification alert — that is healthy operation."""
+    from app import release_qualifier as _rq
+    from app.models import Alert as _Alert
+
+    project = await _make_project(reaper_db)
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        phase="stabilize",
+        status="open",
+        qualification_attempts=_rq._MIN_CALCIFICATION_ATTEMPTS + 5,
+        last_qualification={
+            "status": "dry_run",
+            "would_promote": True,
+            "confidence": 0.95,
+            "blocker": None,
+        },
+    )
+    reaper_db.add(version)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+
+    alerts = (
+        (
+            await reaper_db.execute(
+                _select(_Alert).where(_Alert.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 0

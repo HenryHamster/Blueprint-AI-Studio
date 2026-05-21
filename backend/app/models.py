@@ -2280,6 +2280,18 @@ class ReleaseVersion(SQLModel, table=True):
         sa_column=Column(Text, nullable=True),
     )
 
+    # Durable deduplication anchor for calcification alerting.
+    # Set to the blocker code when _check_version_calcification posts an alert.
+    # The next sweep compares this field against the current blocker: if they
+    # match, the alert has already been posted for this stall and is skipped;
+    # if they differ (or the field is NULL), a new alert is warranted.
+    # Storing the dedup state here avoids relying solely on Alert row existence
+    # (which can be lost when an operator clears alerts).
+    calcification_alerted_blocker: str | None = Field(
+        default=None,
+        sa_column=Column(String(128), nullable=True),
+    )
+
     created_at: datetime = Field(
         default_factory=_utcnow,
         sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),

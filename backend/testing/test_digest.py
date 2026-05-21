@@ -15624,3 +15624,116 @@ async def test_evaluate_lone_checker_alert_dedup(db_session):
         .all()
     )
     assert len(all_alerts) == 1
+
+
+# ---------------------------------------------------------------------------
+# /api/admin/projects/{project_id}/version-lifecycle
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_version_lifecycle_no_versions(client: AsyncClient, db_session):
+    """Project with no release versions returns null current_version and empty history."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(make_membership(project.id))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/projects/{project.id}/version-lifecycle")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["current_version"] is None
+    assert data["recent_versions"] == []
+
+
+@pytest.mark.asyncio
+async def test_version_lifecycle_with_open_version(client: AsyncClient, db_session):
+    """Open version fields are surfaced including qualification data."""
+    from app.models import ReleaseVersion
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(make_membership(project.id))
+
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=3,
+        phase="stabilize",
+        status="open",
+        qualification_attempts=2,
+        last_qualification={
+            "status": "dry_run",
+            "confidence": 0.92,
+            "threshold": 0.90,
+            "sub_scores": {"audit": 0.95, "test_erosion": 0.88, "smoketest": 0.90},
+            "blocker": None,
+            "finalized_at": "2026-01-01T00:00:00",
+        },
+    )
+    db_session.add(version)
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/projects/{project.id}/version-lifecycle")
+    assert response.status_code == 200
+    data = response.json()
+
+    cv = data["current_version"]
+    assert cv is not None
+    assert cv["version_number"] == 3
+    assert cv["phase"] == "stabilize"
+    assert cv["qualification_attempts"] == 2
+    assert cv["merged_task_count"] == 0
+
+    qual = cv["last_qualification"]
+    assert qual["status"] == "dry_run"
+    assert qual["confidence"] == 0.92
+    assert qual["threshold"] == 0.90
+    assert qual["sub_scores"]["audit"] == 0.95
+    assert qual["blocker"] is None
+
+    assert data["recent_versions"] == []
+
+
+@pytest.mark.asyncio
+async def test_version_lifecycle_history(client: AsyncClient, db_session):
+    """Closed versions appear in recent_versions, open version in current_version."""
+    from app.models import ReleaseVersion
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(make_membership(project.id))
+
+    closed = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        phase="stabilize",
+        status="promoted",
+        qualification_attempts=1,
+        last_qualification={"status": "promoted", "confidence": 0.95},
+    )
+    open_v = ReleaseVersion(
+        project_id=project.id,
+        version_number=2,
+        phase="build",
+        status="open",
+        qualification_attempts=0,
+    )
+    db_session.add(closed)
+    db_session.add(open_v)
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/projects/{project.id}/version-lifecycle")
+    assert response.status_code == 200
+    data = response.json()
+
+    assert data["current_version"]["version_number"] == 2
+    assert len(data["recent_versions"]) == 1
+    assert data["recent_versions"][0]["version_number"] == 1
+    assert data["recent_versions"][0]["status"] == "promoted"
+    assert data["recent_versions"][0]["last_qualification"]["confidence"] == 0.95

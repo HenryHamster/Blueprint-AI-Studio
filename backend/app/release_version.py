@@ -18,6 +18,10 @@ Public API:
   count_merged_since(session, project_id, since)
       Count tasks whose PR was merged after ``since`` for a project.
 
+  recent_closed_versions(session, project_id, limit=5)
+      Return the most recently closed/promoted versions for a project,
+      newest first.  Used by the operator version-lifecycle panel.
+
   set_version_phase(session, version, phase, *, reasoning)
       Update the phase on an open version row (build ↔ stabilize).
       Stamps ``phase_changed_at`` to now and records the agent's reasoning.
@@ -169,6 +173,30 @@ async def count_merged_since(
     )
     result = await session.execute(stmt)
     return int(result.scalar() or 0)
+
+
+async def recent_closed_versions(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    limit: int = 5,
+) -> list[ReleaseVersion]:
+    """Return the most recently closed (non-open) ``ReleaseVersion`` rows.
+
+    Results are ordered newest-first by ``opened_at``.  Returns at most
+    ``limit`` rows (default 5).  Projects with no version history return an
+    empty list.  Used by the operator version-lifecycle panel to show the
+    confidence trend over recent versions.
+    """
+    stmt = (
+        select(ReleaseVersion)
+        .where(
+            ReleaseVersion.project_id == project_id,
+            ReleaseVersion.status != "open",
+        )
+        .order_by(ReleaseVersion.opened_at.desc())
+        .limit(limit)
+    )
+    return list((await session.execute(stmt)).scalars().all())
 
 
 def to_phase_block(version: ReleaseVersion) -> dict[str, Any]:

@@ -11,7 +11,7 @@ import {
   Search,
 } from 'lucide-react';
 import { ResponsiveContainer, AreaChart, Area } from 'recharts';
-import { apiFetch, fetchSrUnhandledEdgesRetrospectives, type PromptFingerprintAnalyticsResponse, type SrUnhandledEdgesTask } from '../api';
+import { apiFetch, fetchSrUnhandledEdgesRetrospectives, type PromptFingerprintAnalyticsResponse, type SrUnhandledEdgesTask, type VersionLifecycleResponse, type VersionQualification } from '../api';
 import { useEfficiencySnapshot, fmtEffSecs, fmtEffRate, fmtEffIter } from '../hooks/useEfficiencySnapshot';
 import { timeAgo, formatDurationSec, parseTimestamp } from '../utils/time';
 import { isSafeUrl } from './TaskCard';
@@ -407,6 +407,80 @@ interface SparkPoint {
   failed: number;
 }
 
+// ---------- Version Lifecycle Panel ----------
+
+const QUAL_VERDICT_COLOR: Record<string, string> = {
+  promoted: 'text-emerald-400',
+  dry_run: 'text-blue-400',
+  below_threshold: 'text-amber-400',
+  error: 'text-red-400',
+};
+
+function QualSummary({ q }: { q: VersionQualification | null }) {
+  if (!q || q.confidence == null) return <span className="text-neutral-500 text-[10px]">—</span>;
+  const conf = `${Math.round(q.confidence * 100)}%`;
+  const thr = q.threshold != null ? `/${Math.round(q.threshold * 100)}%` : '';
+  const status = q.status ?? 'unknown';
+  return (
+    <span className={`font-mono text-[10px] ${QUAL_VERDICT_COLOR[status] ?? 'text-neutral-400'}`}>
+      {conf}{thr} {status.replace(/_/g, '-')}
+    </span>
+  );
+}
+
+function VersionLifecyclePanel({ data, loading }: { data: VersionLifecycleResponse | null; loading: boolean }) {
+  if (loading || !data || (!data.current_version && data.recent_versions.length === 0)) return null;
+  const cv = data.current_version;
+  const recent = data.recent_versions;
+  return (
+    <section data-testid="version-lifecycle-panel">
+      <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Version Lifecycle</h2>
+      <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 space-y-2 text-xs">
+        {cv && (
+          <div className="space-y-1">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="font-bold text-neutral-200">v{cv.version_number}</span>
+              <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border ${cv.phase === 'stabilize' ? 'bg-amber-500/10 border-amber-500/30 text-amber-400' : 'bg-blue-500/10 border-blue-500/30 text-blue-400'}`}>{cv.phase}</span>
+              {cv.phase_changed_at && <span className="text-[10px] text-neutral-500">{timeAgo(cv.phase_changed_at)}</span>}
+              <span className="text-[10px] text-neutral-500">{cv.merged_task_count} tasks merged</span>
+              {cv.qualification_attempts > 0 && <span className="text-[10px] text-neutral-500">{cv.qualification_attempts} qual{cv.qualification_attempts !== 1 ? 's' : ''}</span>}
+            </div>
+            {cv.last_qualification && (
+              <div className="pl-2 border-l border-neutral-700/50 space-y-0.5">
+                <QualSummary q={cv.last_qualification} />
+                {cv.last_qualification.sub_scores && (
+                  <div className="flex flex-wrap gap-x-2 text-[10px] text-neutral-500">
+                    <span>audit {Math.round(cv.last_qualification.sub_scores.audit * 100)}%</span>
+                    <span>erosion {Math.round(cv.last_qualification.sub_scores.test_erosion * 100)}%</span>
+                    <span>smoke {Math.round(cv.last_qualification.sub_scores.smoketest * 100)}%</span>
+                  </div>
+                )}
+                {cv.last_qualification.blocker && (
+                  <p className="text-[10px] text-red-400 truncate">{cv.last_qualification.blocker}</p>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+        {recent.length > 0 && (
+          <div>
+            <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">History</p>
+            <div className="space-y-0.5">
+              {recent.slice(0, 4).map(v => (
+                <div key={v.version_number} className="flex flex-wrap items-center gap-2 text-[10px]">
+                  <span className="text-neutral-400 font-mono w-8">v{v.version_number}</span>
+                  <span className="text-neutral-500">{v.status}</span>
+                  <QualSummary q={v.last_qualification} />
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
 // ---------- Pipeline Efficiency Panel ----------
 
 function EffDelta({ delta, lowerIsBetter }: { delta: number | null | undefined; lowerIsBetter: boolean }) {
@@ -707,6 +781,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
   const [accountHealth, setAccountHealth] = useState<AccountHealthEntry[] | null>(null);
   const [systemMaturity, setSystemMaturity] = useState<SystemMaturityRow[] | null>(null);
   const [taskDurationStats, setTaskDurationStats] = useState<TaskDurationStats | null>(null);
+  const [versionLifecycle, setVersionLifecycle] = useState<VersionLifecycleResponse | null>(null);
   const [blindSpots, setBlindSpots] = useState<BlindSpotsData | null>(null);
   const [srRecentMisses, setSrRecentMisses] = useState<SrMissedTask[] | null>(null);
   const [srRecentMissesTotal, setSrRecentMissesTotal] = useState<number>(0);
@@ -902,6 +977,12 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
         })(),
         (async () => {
           try {
+            const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(selectedProjectId)}/version-lifecycle`);
+            if (res.ok) setVersionLifecycle(await res.json());
+          } catch { /* silent */ }
+        })(),
+        (async () => {
+          try {
             const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(selectedProjectId)}/sr-investigation-task-ids`);
             if (res.ok) {
               const data = (await res.json()) as { task_ids?: Record<string, string> };
@@ -1037,6 +1118,9 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
 
       {/* Viewport Debt */}
       {selectedProjectId && <ViewportDebtPanel projectId={selectedProjectId} />}
+
+      {/* Version Lifecycle */}
+      {selectedProjectId && <VersionLifecyclePanel data={versionLifecycle} loading={loading} />}
 
       {/* Pipeline Efficiency */}
       <PipelineEfficiencyPanel projectId={selectedProjectId} />
