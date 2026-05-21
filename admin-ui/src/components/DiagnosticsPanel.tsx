@@ -53,7 +53,7 @@ export function DiagnosticsPanel({ diagnostics, onViewTask }: DiagnosticsPanelPr
       <div className="flex items-center gap-2">
         <button
           onClick={toggle}
-          className="flex items-center gap-2 text-[11px] font-bold text-neutral-400 uppercase tracking-widest hover:text-neutral-300 transition-colors"
+          className="flex items-center gap-2 text-[11px] font-bold text-neutral-400 uppercase tracking-widest hover:text-neutral-300 transition-colors min-h-[44px] px-1"
         >
           {collapsed ? <ChevronDown className="w-3 h-3" /> : <ChevronUp className="w-3 h-3" />}
           <Stethoscope className="w-3 h-3" />
@@ -96,7 +96,7 @@ export function DiagnosticsPanel({ diagnostics, onViewTask }: DiagnosticsPanelPr
                     <div className="flex items-start gap-2 flex-wrap">
                       <button
                         onClick={() => onViewTask(task.task_id)}
-                        className="text-neutral-300 hover:text-blue-400 transition-colors truncate max-w-[200px] text-left"
+                        className="text-neutral-300 hover:text-blue-400 transition-colors truncate max-w-[200px] text-left min-h-[44px]"
                         title={task.title}
                       >
                         {task.title}
@@ -110,7 +110,7 @@ export function DiagnosticsPanel({ diagnostics, onViewTask }: DiagnosticsPanelPr
                         <span className="text-neutral-600 shrink-0">×{task.attempt_count}</span>
                       )}
                       {task.stuck_reason === 'stuck_deps' && task.unresolvable_deps?.length > 0 && (
-                        <span className="text-neutral-600 font-mono shrink-0">
+                        <span className="text-neutral-600 font-mono">
                           deps: {task.unresolvable_deps.map(d => d.slice(0, 8)).join(', ')}
                         </span>
                       )}
@@ -142,7 +142,7 @@ export function DiagnosticsPanel({ diagnostics, onViewTask }: DiagnosticsPanelPr
               </div>
               <div className="space-y-1 ml-4">
                 {failingTypes.gated_types.map((g) => (
-                  <div key={g.task_type} className="flex items-center gap-2">
+                  <div key={g.task_type} className="flex flex-wrap items-center gap-2">
                     <span className="text-neutral-300 font-mono">{g.task_type}</span>
                     <span className="text-neutral-500">—</span>
                     <span className="text-amber-400">
@@ -156,7 +156,7 @@ export function DiagnosticsPanel({ diagnostics, onViewTask }: DiagnosticsPanelPr
           )}
 
           {/* Zone Health */}
-          <div className="flex items-center gap-1.5">
+          <div className="flex flex-wrap items-center gap-1.5">
             <span className={`w-1.5 h-1.5 rounded-full ${exhaustedZones.length === 0 ? 'bg-emerald-500' : 'bg-red-500'}`} />
             <span className="text-neutral-400">
               Zones: <span className={`font-medium ${exhaustedZones.length === 0 ? 'text-emerald-400' : 'text-neutral-300'}`}>{zonesAvailable} available</span>

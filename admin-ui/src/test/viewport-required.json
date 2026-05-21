@@ -19,6 +19,7 @@
     "PipelineRegressionsPanel",
     "SearchFilterBar",
     "PlaybookPanel",
-    "CatchUpPanel"
+    "CatchUpPanel",
+    "DiagnosticsPanel"
   ]
 }

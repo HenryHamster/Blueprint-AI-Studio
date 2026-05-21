@@ -2,7 +2,7 @@ import { afterEach, describe, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { DiagnosticsPanel } from './DiagnosticsPanel';
-import { expectNoOverflowAt } from '../test/viewport';
+import { expectNoOverflowAt, expectFullViewportAt } from '../test/viewport';
 import type { ProjectDiagnostics } from '../types/diagnostics';
 
 // DiagnosticsPanel polls /api/admin/failing-task-types via authGet on mount.
@@ -11,11 +11,14 @@ vi.mock('../api', () => ({
   apiFetch: vi.fn(async () => new Response('{}', { status: 200 })),
   authGet: vi.fn(async () => new Response(
     JSON.stringify({
-      gated_types: [],
+      gated_types: [
+        { task_type: 'create', failure_rate: 0.72, sample_size: 18, threshold: 0.5 },
+        { task_type: 'fix', failure_rate: 0.61, sample_size: 11, threshold: 0.5 },
+      ],
       global_failure_threshold: 0.5,
-      anomaly_tightened: false,
+      anomaly_tightened: true,
       window_minutes: 60,
-      generated_at: '2026-05-06T00:00:00Z',
+      generated_at: '2026-05-21T00:00:00Z',
     }),
     { status: 200 },
   )),
@@ -85,8 +88,8 @@ describe('DiagnosticsPanel — viewport regression', () => {
     });
   });
 
-  test('populated diagnostics — stuck tasks + zone exhaustion fit at 375px', async () => {
-    await expectNoOverflowAt(375, async () => {
+  test('fully-populated state — overflow, text truncation, and touch targets pass at 375px', async () => {
+    await expectFullViewportAt(375, async () => {
       host = document.createElement('div');
       host.style.padding = '12px';
       document.body.appendChild(host);
@@ -96,6 +99,6 @@ describe('DiagnosticsPanel — viewport regression', () => {
         r.render(<DiagnosticsPanel diagnostics={populated} onViewTask={() => {}} />);
       });
       await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
-    });
+    }, { waitMs: 50 });
   });
 });

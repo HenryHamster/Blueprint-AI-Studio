@@ -131,4 +131,59 @@ exemptFromViewportTest Set in this file with a code comment justifying why.
 
     expect(missingTests, errorMessage).toEqual([]);
   });
+
+  it('fails CI when an operator component lacks a 375px overflow assertion', () => {
+    const componentsDir = path.join(__dirname, '../components');
+    const files = fs.readdirSync(componentsDir);
+
+    // All .tsx component files (exclude test files)
+    const components = files
+      .filter(f => f.endsWith('.tsx') && !f.endsWith('.test.tsx') && !f.endsWith('.viewport.test.tsx'))
+      .map(f => f.replace('.tsx', ''))
+      .sort();
+
+    // Exempt components (same list as above)
+    const exemptFromViewportTest = new Set([
+      'ErrorBoundary',
+      'MarkdownContent',
+      'ColumnsPicker',
+      'Toasts',
+      'catchupRows',
+      'regressionPhaseChips',
+    ]);
+
+    const missing: string[] = [];
+
+    for (const component of components) {
+      if (exemptFromViewportTest.has(component)) {
+        continue;
+      }
+
+      const testFile = path.join(componentsDir, `${component}.viewport.test.tsx`);
+      if (!fs.existsSync(testFile)) {
+        continue; // Already caught by the previous test
+      }
+
+      const content = fs.readFileSync(testFile, 'utf-8');
+      // Check if the test file asserts overflow at 375px
+      const hasOverflowAssertion = new RegExp(`expectNoOverflowAt\\s*\\(\\s*375[^\\d]|expectFullViewportAt\\s*\\(\\s*375[^\\d]`).test(content);
+
+      if (!hasOverflowAssertion) {
+        missing.push(`${component} — missing 375px overflow assertion in ${component}.viewport.test.tsx`);
+      }
+    }
+
+    const errorMessage =
+      missing.length > 0
+        ? `
+The following operator components are missing a 375px horizontal-overflow assertion.
+Every non-exempt component must assert that it renders without overflow at 375px mobile width.
+Use expectNoOverflowAt(375, ...) or expectFullViewportAt(375, ...) in each viewport test.
+
+${missing.map(m => `  ${m}`).join('\n')}
+        `.trim()
+        : '';
+
+    expect(missing, errorMessage).toEqual([]);
+  });
 });
