@@ -40,6 +40,7 @@ import json
 from unittest.mock import AsyncMock
 
 import pytest
+from sqlalchemy import select
 
 from app import release_qualifier as rq
 from app import release_version as rv
@@ -47,11 +48,14 @@ from app.models import (
     Artifact,
     ArtifactType,
     Project,
+    ProjectMessage,
     Task,
     TaskStatus,
 )
 
-# Canonical default policy used throughout — mirrors promotion_policy.yaml.
+# Fixed test policy for the compute_composite scoring-math tests.  Weights
+# mirror promotion_policy.yaml; the threshold is pinned at 0.75 here so the
+# threshold-boundary tests stay deterministic regardless of the shipped value.
 _POLICY = {
     "weights": {"audit": 0.40, "test_erosion": 0.30, "smoketest": 0.30},
     "threshold": 0.75,
@@ -465,7 +469,7 @@ class TestLoadPolicy:
         assert policy["weights"]["audit"] == pytest.approx(0.40)
         assert policy["weights"]["test_erosion"] == pytest.approx(0.30)
         assert policy["weights"]["smoketest"] == pytest.approx(0.30)
-        assert policy["threshold"] == pytest.approx(0.75)
+        assert policy["threshold"] == pytest.approx(0.90)
 
     def test_fallback_on_missing_file(self, mocker, tmp_path):
         """A missing policy file falls back to hardcoded defaults, no raise."""
@@ -476,13 +480,13 @@ class TestLoadPolicy:
             "test_erosion": 0.30,
             "smoketest": 0.30,
         }
-        assert policy["threshold"] == 0.75
+        assert policy["threshold"] == 0.90
 
     def test_fallback_on_malformed_yaml(self, mocker, tmp_path):
         """Malformed YAML falls back to defaults instead of raising."""
         _point_policy_at(mocker, tmp_path, "weights: {unterminated: [1, 2")
         policy = rq._load_policy()
-        assert policy["threshold"] == 0.75
+        assert policy["threshold"] == 0.90
         assert policy["weights"]["audit"] == 0.40
 
     def test_fallback_on_missing_weights_key(self, mocker, tmp_path):
@@ -490,7 +494,7 @@ class TestLoadPolicy:
         _point_policy_at(mocker, tmp_path, "threshold: 0.9\n")
         policy = rq._load_policy()
         assert policy["weights"]["audit"] == 0.40
-        assert policy["threshold"] == 0.75
+        assert policy["threshold"] == 0.90
 
     def test_fallback_on_non_numeric_weight(self, mocker, tmp_path):
         """A non-numeric weight value triggers the fallback."""
@@ -509,7 +513,7 @@ class TestLoadPolicy:
         _point_policy_at(mocker, tmp_path, "just-a-string\n")
         policy = rq._load_policy()
         assert policy["weights"]["audit"] == 0.40
-        assert policy["threshold"] == 0.75
+        assert policy["threshold"] == 0.90
 
     def test_fallback_when_weights_sum_above_one(self, mocker, tmp_path):
         """Weights summing to >1.0 saturate confidence and disable the gate —
@@ -527,7 +531,7 @@ class TestLoadPolicy:
             "test_erosion": 0.30,
             "smoketest": 0.30,
         }
-        assert policy["threshold"] == 0.75
+        assert policy["threshold"] == 0.90
 
     def test_fallback_when_weights_sum_below_one(self, mocker, tmp_path):
         """Weights summing to <1.0 mean nothing can clear the threshold — that
@@ -581,7 +585,7 @@ class TestLoadPolicy:
         # A fresh fallback must still see the real defaults.
         fresh = rq._load_policy()
         assert fresh["weights"]["audit"] == 0.40
-        assert fresh["threshold"] == 0.75
+        assert fresh["threshold"] == 0.90
 
     def test_parses_custom_valid_yaml(self, mocker, tmp_path):
         """A well-formed custom policy is parsed (not just the fallback)."""
@@ -5288,3 +5292,284 @@ async def test_promote_idempotent_success_records_meaningful_pr_url(
     # Not a bare empty string — an explicit, human-readable label.
     assert recorded != ""
     assert "already merged" in recorded.lower()
+
+
+# ===========================================================================
+# Operator notifications — the qualifier posts a ProjectMessage at every verdict
+# (promoted / blocked / below-threshold / dry-run / promotion-failed) so the
+# operator sees release outcomes without polling.
+# ===========================================================================
+
+
+async def _messages_for(db_session, project_id, event_type=None):
+    """ProjectMessage rows for a project, optionally filtered by the context
+    event_type the qualifier stamps."""
+    result = await db_session.execute(
+        select(ProjectMessage).where(ProjectMessage.project_id == project_id)
+    )
+    rows = list(result.scalars().all())
+    if event_type is not None:
+        rows = [
+            m for m in rows if (m.context or {}).get("event_type") == event_type
+        ]
+    return rows
+
+
+class TestFmtSubScores:
+    """_fmt_sub_scores renders a composite's sub-scores for operator messages."""
+
+    def test_renders_all_three_dimensions(self):
+        out = rq._fmt_sub_scores(
+            {"audit": 0.95, "test_erosion": 1.0, "smoketest": 0.8}
+        )
+        assert out == "audit 0.95 · test 1.00 · smoke 0.80"
+
+    def test_omits_smoke_when_subsystem_disabled(self):
+        out = rq._fmt_sub_scores(
+            {"audit": 0.95, "test_erosion": 1.0, "smoketest": 0.0},
+            smoketest_enabled=False,
+        )
+        assert out == "audit 0.95 · test 1.00"
+        assert "smoke" not in out
+
+    def test_empty_or_none_returns_na(self):
+        assert rq._fmt_sub_scores(None) == "n/a"
+        assert rq._fmt_sub_scores({}) == "n/a"
+
+
+@pytest.mark.asyncio
+async def test_finalize_dry_run_posts_operator_message(db_session, mocker):
+    """A dry-run verdict (promotion disabled) posts a release_dry_run message."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 5,
+                "test_count_delta": 2,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+    mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    msgs = await _messages_for(db_session, project.id, "release_dry_run")
+    assert len(msgs) == 1
+    assert msgs[0].from_type == "system"
+    assert "would promote" in msgs[0].content
+    assert msgs[0].context["version_number"] == version.version_number
+
+
+@pytest.mark.asyncio
+async def test_finalize_blocked_posts_operator_message(db_session):
+    """A hard blocker posts a release_blocked message naming the blocker."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": ["testing/test_gone.py"],
+                "assertion_delta": 0,
+                "test_count_delta": -2,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    msgs = await _messages_for(db_session, project.id, "release_blocked")
+    assert len(msgs) == 1
+    assert "blocked from promotion" in msgs[0].content
+    assert "deleted a test file" in msgs[0].content
+    assert msgs[0].context["blocker"] == "test_file_deleted"
+
+
+@pytest.mark.asyncio
+async def test_finalize_below_threshold_posts_operator_message(db_session):
+    """A non-blocked candidate scoring under the threshold posts a
+    release_below_threshold message carrying the sub-scores."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session)
+    # audit 0.5 + a half-passing smoketest → composite well under the 0.90 bar,
+    # but no hard blocker (audit present, no test deletion, CI green).
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 0.5,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [
+                {"name": "a", "status": "pass"},
+                {"name": "b", "status": "fail"},
+            ],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    assert result["status"] == "not_promoted"
+    assert result["blocker"] is None
+    msgs = await _messages_for(
+        db_session, project.id, "release_below_threshold"
+    )
+    assert len(msgs) == 1
+    assert "below the" in msgs[0].content
+    assert "Sub-scores:" in msgs[0].content
+
+
+@pytest.mark.asyncio
+async def test_promote_success_posts_operator_message(db_session, mocker):
+    """A successful promotion posts a release_promoted message."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 10,
+                "test_count_delta": 4,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock())
+    _patch_promote_github_defaults(mocker)
+    mocker.patch("app.github.create_branch", new=_create_branch_mock())
+    mocker.patch(
+        "app.github.create_pull_request",
+        new=AsyncMock(return_value={"number": 55, "html_url": "http://pr/55"}),
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        new=AsyncMock(return_value={"merged": True, "message": "Merged"}),
+    )
+    mocker.patch(
+        "app.github.create_tag",
+        new=AsyncMock(return_value={"ref": "refs/tags/v1"}),
+    )
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    assert result["status"] == "promoted"
+    msgs = await _messages_for(db_session, project.id, "release_promoted")
+    assert len(msgs) == 1
+    assert "promoted" in msgs[0].content.lower()
+    assert msgs[0].context["next_version_number"] == 2
+
+
+@pytest.mark.asyncio
+async def test_promote_failure_posts_operator_message(db_session, mocker):
+    """A failed promotion (non-merged merge result) posts a
+    release_promotion_failed message."""
+    project, version = await _make_project_and_version(db_session)
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock())
+    _patch_promote_github_defaults(mocker)
+    mocker.patch("app.github.create_branch", new=_create_branch_mock())
+    mocker.patch(
+        "app.github.create_pull_request",
+        new=AsyncMock(return_value={"number": 92, "html_url": "http://pr/92"}),
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        new=AsyncMock(
+            return_value={
+                "merged": False,
+                "conflict": True,
+                "message": "merge conflict",
+            }
+        ),
+    )
+
+    result = await rq.promote(
+        db_session,
+        version,
+        "abcd" * 10,
+        composite={"confidence": 0.95},
+        base_record={"candidate_sha": "abcd" * 10},
+    )
+    await db_session.commit()
+
+    assert result["status"] == "promotion_failed"
+    msgs = await _messages_for(
+        db_session, project.id, "release_promotion_failed"
+    )
+    assert len(msgs) == 1
+    assert "merge failed" in msgs[0].content
+    assert msgs[0].context["error"] == "merge_blocked"
+
+
+@pytest.mark.asyncio
+async def test_notify_operator_swallows_failure(db_session, mocker):
+    """A messaging failure inside _notify_operator must never propagate — the
+    release verdict is already decided by the time it runs."""
+    _project, version = await _make_project_and_version(db_session)
+    mocker.patch(
+        "app.release_qualifier.post_event_message",
+        new=AsyncMock(side_effect=RuntimeError("messaging is down")),
+    )
+    # Must return normally despite post_event_message raising.
+    await rq._notify_operator(
+        db_session, version, "release_promoted", "summary text"
+    )

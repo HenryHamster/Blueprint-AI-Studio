@@ -84,6 +84,7 @@ from app.models import (
     TaskHistory,
     TaskStatus,
 )
+from app.notification_dispatch import post_event_message
 from app.payload_schemas import PayloadTooLargeError, validate_internal_payload
 from app.shared_state import runtime_config as _runtime_config
 from app.time_utils import _utcnow
@@ -99,7 +100,7 @@ logger = logging.getLogger(__name__)
 # parse failure degrades to the intended rubric rather than a silent surprise.
 _DEFAULT_POLICY: dict[str, Any] = {
     "weights": {"audit": 0.40, "test_erosion": 0.30, "smoketest": 0.30},
-    "threshold": 0.75,
+    "threshold": 0.90,
 }
 
 # promotion_policy.yaml lives at backend/promotion_policy.yaml — two parents up
@@ -1162,6 +1163,84 @@ def _score_smoketest(result: dict[str, Any] | None) -> float | None:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Operator notifications — the calibration instrument.  Every qualifier verdict
+# posts a system ProjectMessage so the operator sees promotions, blocks and
+# below-threshold near-misses without polling, and can tune promotion_policy.yaml
+# from real outcomes.  Best-effort: a messaging failure never affects a release.
+# ---------------------------------------------------------------------------
+
+# Human-readable rendering of the compute_composite() hard-blocker codes.
+_BLOCKER_LABELS: dict[str, str] = {
+    "ci_not_green": "CI is not green on the candidate",
+    "smoketest_startup_failed": "the smoketest startup suite failed",
+    "audit_missing": "the release audit produced no usable report",
+    "test_file_deleted": "the diff deleted a test file",
+}
+
+
+def _fmt_sub_scores(
+    sub_scores: dict[str, Any] | None,
+    *,
+    smoketest_enabled: bool = True,
+) -> str:
+    """Render sub-scores as ``audit 0.95 · test 1.00 · smoke 0.80`` for messages.
+
+    The smoketest term is omitted when the subsystem was disabled for the run —
+    its sub-score is a meaningless 0.0 placeholder in that case.
+    """
+    if not sub_scores:
+        return "n/a"
+    parts = [
+        f"audit {float(sub_scores.get('audit', 0.0)):.2f}",
+        f"test {float(sub_scores.get('test_erosion', 0.0)):.2f}",
+    ]
+    if smoketest_enabled:
+        parts.append(f"smoke {float(sub_scores.get('smoketest', 0.0)):.2f}")
+    return " · ".join(parts)
+
+
+async def _notify_operator(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+    event_type: str,
+    summary: str,
+    extra: dict[str, Any] | None = None,
+) -> None:
+    """Best-effort operator notification for a release-qualifier verdict.
+
+    Posts a system ``ProjectMessage`` so the operator sees every promotion
+    outcome without polling.  Does not commit — the message rides the caller's
+    commit, the same one that persists ``last_qualification``.
+
+    A messaging failure must NEVER abort or fail qualification/promotion: the
+    verdict is already decided and recorded by the time this runs.  Mirrors the
+    best-effort ``create_tag`` pattern — wrapped in try/except, logs a warning
+    and never propagates.
+    """
+    try:
+        context: dict[str, Any] = {
+            "version_number": version.version_number,
+            "version_id": str(version.id),
+        }
+        if extra:
+            context.update(extra)
+        await post_event_message(
+            session,
+            version.project_id,
+            event_type,
+            summary,
+            context=context,
+        )
+    except Exception as exc:  # noqa: BLE001 — notifications must never break a release
+        logger.warning(
+            "[RELEASE_QUALIFIER] failed to post operator notification %s "
+            "(non-fatal): %s",
+            event_type,
+            exc,
+        )
+
+
 async def _finalize_qualification(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
@@ -1302,6 +1381,38 @@ async def _finalize_qualification(
             )
         release_version.set_version_phase(version, "stabilize", reasoning=reason)
         session.add(version)
+        scores_str = _fmt_sub_scores(
+            composite["sub_scores"], smoketest_enabled=smoketest_enabled
+        )
+        if composite["blocker"]:
+            blocker_label = _BLOCKER_LABELS.get(
+                composite["blocker"], composite["blocker"]
+            )
+            notify_event = "release_blocked"
+            notify_summary = (
+                f"v{version.version_number} blocked from promotion — "
+                f"{blocker_label}. Not promoted; staying in stabilize."
+            )
+        else:
+            notify_event = "release_below_threshold"
+            notify_summary = (
+                f"v{version.version_number} qualified at confidence "
+                f"{composite['confidence']:.2f}, below the "
+                f"{policy.get('threshold')} promotion bar — not promoted, "
+                f"staying in stabilize. Sub-scores: {scores_str}."
+            )
+        await _notify_operator(
+            session,
+            version,
+            notify_event,
+            notify_summary,
+            extra={
+                "confidence": composite["confidence"],
+                "threshold": policy.get("threshold"),
+                "sub_scores": composite["sub_scores"],
+                "blocker": composite["blocker"],
+            },
+        )
         return {
             "status": "not_promoted",
             "confidence": composite["confidence"],
@@ -1322,6 +1433,21 @@ async def _finalize_qualification(
             version.version_number,
             composite["confidence"],
         )
+        await _notify_operator(
+            session,
+            version,
+            "release_dry_run",
+            (
+                f"v{version.version_number} would promote (confidence "
+                f"{composite['confidence']:.2f}) but promotion is disabled — "
+                f"dry-run only, main not advanced."
+            ),
+            extra={
+                "confidence": composite["confidence"],
+                "threshold": policy.get("threshold"),
+                "sub_scores": composite["sub_scores"],
+            },
+        )
         return {
             "status": "dry_run",
             "confidence": composite["confidence"],
@@ -1341,6 +1467,16 @@ async def _finalize_qualification(
             reasoning=f"qualification v{version.version_number}: missing SHA",
         )
         session.add(version)
+        await _notify_operator(
+            session,
+            version,
+            "release_error",
+            (
+                f"v{version.version_number} qualification could not complete "
+                f"— candidate SHA missing. Returned to stabilize."
+            ),
+            extra={"error": "missing_candidate_sha"},
+        )
         return {"status": "error", "error": "missing_candidate_sha"}
 
     # Delegate to promote().  Credentials are NOT pre-resolved here on purpose
@@ -2788,6 +2924,24 @@ async def _record_promotion_failure(
         version.version_number,
         error,
     )
+    failure_detail = f": {detail}" if detail else ""
+    await _notify_operator(
+        session,
+        version,
+        "release_promotion_failed",
+        (
+            f"Promotion of v{version.version_number} failed — it cleared the "
+            f"qualifier but the automain → main merge failed "
+            f"({error}{failure_detail}). main was NOT advanced; the version "
+            f"stays open and returns to stabilize."
+        ),
+        extra={
+            "error": error,
+            "detail": detail,
+            "pr_url": pr_url,
+            "conflict": conflict,
+        },
+    )
     return {"status": "promotion_failed", "error": error}
 
 
@@ -2939,6 +3093,24 @@ async def _record_promotion_success(
                 exc,
             )
 
+    await _notify_operator(
+        session,
+        version,
+        "release_promoted",
+        (
+            f"Released v{version.version_number} — automain → main promoted "
+            f"(confidence {float(base_record.get('confidence') or 0.0):.2f}). "
+            f"Production deploy is running; v{next_version.version_number} is "
+            f"now open for build."
+        ),
+        extra={
+            "confidence": base_record.get("confidence"),
+            "sub_scores": base_record.get("sub_scores"),
+            "promoted_sha": effective_sha,
+            "pr_url": pr_url,
+            "next_version_number": next_version.version_number,
+        },
+    )
     return {
         "status": "promoted",
         "promoted_sha": effective_sha,

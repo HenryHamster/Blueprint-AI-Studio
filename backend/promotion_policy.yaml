@@ -18,4 +18,7 @@ weights:
   test_erosion: 0.30   # did automain delete tests or weaken coverage vs main
   smoketest: 0.30      # qualify-time smoketest pass ratio
 
-threshold: 0.75        # composite confidence required to promote
+threshold: 0.90        # composite confidence required to promote.
+# Calibration-period bar: deliberately conservative so only landslide-confident
+# versions auto-promote.  Tune down toward the 0.75 design target as
+# auto-promotions prove out against operator review.
