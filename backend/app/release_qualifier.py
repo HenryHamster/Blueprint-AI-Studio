@@ -1581,6 +1581,63 @@ async def _required_children_terminal(
     return True
 
 
+async def _maybe_reconcile_after_promotion_conflict(
+    version_id: uuid.UUID,
+    result: dict[str, Any] | None,
+    *,
+    session_factory=None,
+) -> None:
+    """Best-effort: when a promotion failed on a merge CONFLICT, kick off a
+    ``main → automain`` reconciliation so the version self-heals.
+
+    A promotion conflict (``automain → main`` will not merge) always means
+    ``main`` advanced past ``automain`` with conflicting content — a back-merge
+    that should have happened did not.  Triggering the reconciler resolves
+    ``main`` into ``automain`` (raising a conflict-resolution plan when the
+    merge itself conflicts); once ``automain`` absorbs ``main`` the next
+    qualify cycle promotes cleanly instead of dead-ending in stabilize.
+
+    Runs AFTER the dedicated finalize session has committed and closed — never
+    under the ``ReleaseVersion`` row lock, and never inside the dedicated
+    session whose commit semantics ``promote()`` depends on.  A failure here
+    never propagates: the promotion-failure record is already committed, and
+    the periodic branch reconciler is the backstop if this best-effort call
+    does not land.  ``session_factory`` is threaded through for test injection.
+    """
+    if not result or result.get("status") != "promotion_failed":
+        return
+    if not result.get("conflict"):
+        return
+    try:
+        # Lazy import — release_qualifier <-> hotfix_backmerge is otherwise circular.
+        from app import hotfix_backmerge
+
+        factory = session_factory or AsyncSessionLocal
+        async with factory() as session:
+            version = await session.get(
+                release_version.ReleaseVersion, version_id
+            )
+            if version is None:
+                return
+            recon = await hotfix_backmerge.reconcile_main_into_automain(
+                session, version.project_id
+            )
+            await session.commit()
+            logger.info(
+                "[RELEASE_QUALIFIER] promotion of v%d conflicted — triggered a "
+                "main -> automain reconciliation: %s",
+                version.version_number,
+                recon.get("status"),
+            )
+    except Exception as exc:  # noqa: BLE001 — best-effort; the periodic reconciler backstops
+        logger.warning(
+            "[RELEASE_QUALIFIER] post-promotion-conflict reconciliation failed "
+            "for version %s (non-fatal — periodic reconciler will retry): %s",
+            version_id,
+            exc,
+        )
+
+
 async def _finalize_in_dedicated_session(
     version_id: uuid.UUID,
     *,
@@ -1648,7 +1705,7 @@ async def _finalize_in_dedicated_session(
     factory = session_factory or AsyncSessionLocal
     async with factory() as session:
         try:
-            return await _finalize_locked_version(
+            result = await _finalize_locked_version(
                 session, version_id, timeout_now
             )
         except Exception:
@@ -1667,6 +1724,17 @@ async def _finalize_in_dedicated_session(
                     version_id,
                 )
             raise
+
+    # The dedicated finalize session has now committed + closed.  When the
+    # finalize ran a promotion that failed on a merge CONFLICT, kick off a
+    # main -> automain reconciliation HERE — outside the dedicated session and
+    # the ReleaseVersion row lock — so the version self-heals instead of
+    # dead-ending in stabilize (automain/LTS promotion-conflict recovery).
+    # Best-effort: a failure never propagates and never alters ``result``.
+    await _maybe_reconcile_after_promotion_conflict(
+        version_id, result, session_factory=session_factory
+    )
+    return result
 
 
 async def _finalize_locked_version(
@@ -2865,7 +2933,7 @@ async def _record_promotion_failure(
     )
     if locked is None:
         # Row vanished (project deleted mid-promotion) — nothing to record.
-        return {"status": "promotion_failed", "error": error}
+        return {"status": "promotion_failed", "error": error, "conflict": conflict}
     version = locked
     # Re-check under the re-lock (Round 9 — data integrity): a concurrent
     # finalize / crash-retry may have already PROMOTED this version while this
@@ -2942,7 +3010,7 @@ async def _record_promotion_failure(
             "conflict": conflict,
         },
     )
-    return {"status": "promotion_failed", "error": error}
+    return {"status": "promotion_failed", "error": error, "conflict": conflict}
 
 
 async def _record_promotion_success(
