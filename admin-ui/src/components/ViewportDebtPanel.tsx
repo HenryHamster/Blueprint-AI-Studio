@@ -201,10 +201,10 @@ export function ViewportDebtPanel({ projectId }: { projectId: string }) {
             <thead>
               <tr className="border-b border-neutral-800/50 text-neutral-500">
                 <th className="text-left px-3 py-1.5 font-medium">Component</th>
-                <th className="text-right px-2 py-1.5 font-medium" title="eslint-disable viewport/min-touch-target lines">eslint</th>
-                <th className="text-right px-2 py-1.5 font-medium" title="data-viewport-allow-small-target attributes">target</th>
-                <th className="text-right px-2 py-1.5 font-medium" title="data-viewport-allow-overflow attributes">overflow</th>
-                <th className="text-right px-2 py-1.5 font-medium" title="data-viewport-allow-truncation attributes">trunc</th>
+                <th className="text-right px-2 py-1.5 font-medium" title="viewport/* rule suppression count (eslint-disable lines)">eslint</th>
+                <th className="text-right px-2 py-1.5 font-medium" title="viewport small-target override count">target</th>
+                <th className="text-right px-2 py-1.5 font-medium" title="viewport overflow override count">overflow</th>
+                <th className="text-right px-2 py-1.5 font-medium" title="viewport truncation override count">trunc</th>
                 <th className="text-right px-2 py-1.5 font-medium" title="Total opt-out count">total</th>
                 <th className="text-center px-2 py-1.5 font-medium">test</th>
                 <th className="text-right px-2 py-1.5 font-medium" title="Viewport regression dispatcher cases (30d)">cases</th>

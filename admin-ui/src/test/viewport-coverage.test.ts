@@ -186,4 +186,61 @@ ${missing.map(m => `  ${m}`).join('\n')}
 
     expect(missing, errorMessage).toEqual([]);
   });
+
+  it('fails CI when escape-hatch debt exceeds the per-component or total budget', () => {
+    const budgetPath = path.join(__dirname, 'viewport-escape-hatch-budget.json');
+    const { total: totalBudget, perComponent } = JSON.parse(fs.readFileSync(budgetPath, 'utf-8')) as {
+      total: number;
+      perComponent: Record<string, number>;
+    };
+
+    const componentsDir = path.join(__dirname, '../components');
+    const files = fs.readdirSync(componentsDir).filter(
+      f => f.endsWith('.tsx') && !f.endsWith('.test.tsx') && !f.endsWith('.viewport.test.tsx')
+    );
+
+    // Matches all three escape-hatch data attributes and eslint-disable viewport/* comments.
+    const escapeHatchPattern =
+      /data-viewport-allow-overflow|data-viewport-allow-truncation|data-viewport-allow-small-target|eslint-disable[^\n]*viewport/g;
+
+    const violations: string[] = [];
+    let grandTotal = 0;
+
+    for (const file of files) {
+      const component = file.replace('.tsx', '');
+      const content = fs.readFileSync(path.join(componentsDir, file), 'utf-8');
+      const count = (content.match(escapeHatchPattern) ?? []).length;
+      grandTotal += count;
+
+      const budget = perComponent[component];
+      if (budget !== undefined && count > budget) {
+        violations.push(
+          `  ${component}: ${count} escape hatches (budget: ${budget}, over by ${count - budget})`
+        );
+      }
+    }
+
+    if (grandTotal > totalBudget) {
+      violations.push(
+        `  [total]: ${grandTotal} escape hatches (budget: ${totalBudget}, over by ${grandTotal - totalBudget})`
+      );
+    }
+
+    const errorMessage =
+      violations.length > 0
+        ? `
+Viewport escape-hatch debt exceeds the budget in admin-ui/src/test/viewport-escape-hatch-budget.json.
+Escape hatches are: data-viewport-allow-overflow, data-viewport-allow-truncation,
+data-viewport-allow-small-target, and eslint-disable viewport/* comments.
+
+${violations.join('\n')}
+
+To fix: bump the per-component limit (and "total") in viewport-escape-hatch-budget.json in the same PR
+that adds the new escape hatch. The budget is a visible, reviewable signal — not a ratchet.
+A single justified opt-out can raise a component's budget by 1; a cluster requires a larger bump.
+        `.trim()
+        : '';
+
+    expect(violations, errorMessage).toEqual([]);
+  });
 });
