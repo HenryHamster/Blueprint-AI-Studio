@@ -1,6 +1,7 @@
 import pytest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, create_autospec
 
+from app.github import get_branch_sha as _real_get_branch_sha
 from app.models import TaskStatus
 from testing.test_rollup_cleanup import (
     _make_project,
@@ -42,9 +43,14 @@ async def test_premerge_behind_check_requires_current_tip(
             {"mergeable_state": "unknown", "head": {"sha": head_sha}},
         ],
     )
-    mock_tip = mocker.patch(
-        "app.github.get_branch_sha", new_callable=AsyncMock, return_value=target_tip
-    )
+    # Build the get_branch_sha mock from the REAL function (captured at import,
+    # before _mock_rollup_merge_conflict_deps patches it) so it enforces the
+    # (token, owner, repo, branch) signature. A plain AsyncMock silently
+    # accepts any kwargs, which let the get_branch_sha(project_id=...)
+    # regression (PR #4777 rollup loop 2026-05-21; introduced 2026-05-07 in
+    # 9cfa3788) slip past this very test — the bad kwarg now raises TypeError.
+    mock_tip = create_autospec(_real_get_branch_sha, return_value=target_tip)
+    mocker.patch("app.github.get_branch_sha", new=mock_tip)
     mock_update = mocker.patch(
         "app.github.update_branch_with_sha_retry",
         new_callable=AsyncMock,
