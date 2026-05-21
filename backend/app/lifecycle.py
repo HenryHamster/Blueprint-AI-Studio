@@ -493,6 +493,7 @@ async def lifespan(app):
                                     changed,
                                 )
                         except Exception as proj_exc:
+                            await scan_session.rollback()
                             logger.warning(
                                 "[RECOVERY_SCAN] project=%s error=%s",
                                 project.id,
@@ -540,6 +541,7 @@ async def lifespan(app):
                                     escalated,
                                 )
                         except Exception as proj_exc:
+                            await scan_session.rollback()
                             logger.warning(
                                 "[REGRESSION_WATCHDOG] project=%s error=%s",
                                 project.id,
@@ -593,6 +595,7 @@ async def lifespan(app):
                                     project.id,
                                 )
                         except Exception as proj_exc:
+                            await scan_session.rollback()
                             logger.warning(
                                 "[EFFICIENCY_SNAPSHOT] project=%s error=%s",
                                 project.id,

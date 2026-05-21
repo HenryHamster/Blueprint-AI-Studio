@@ -12072,6 +12072,78 @@ async def test_list_regression_cases_summary_uses_latest_merge_before_recovery(
 
 
 @pytest.mark.asyncio
+async def test_list_regression_cases_summary_per_episode_anchoring_on_re_armed_case(
+    client: AsyncClient, db_session
+):
+    """Re-armed case: second cycle durations are anchored to first cycle's recovery, not first_seen_at.
+
+    A case that trips, gets fixed+recovered, then re-trips and is fixed again should
+    report per-episode metrics.  Without per-episode anchoring the second cycle's
+    time-to-merge would be inflated by the entire case lifetime.
+
+    Timeline:
+      09:00  first_seen_at
+      11:00  cycle-1 fix merged   (2h from episode start → 7200s)
+      12:00  cycle-1 recovered    (1h from merge → 3600s)
+      14:00  cycle-2 fix merged   (2h from cycle-1 recovery → 7200s, NOT 5h from first_seen)
+      15:00  cycle-2 recovered    (1h from merge → 3600s)
+
+    Expected per-episode summary: count=2, median_to_merged=7200s, median_to_recovered=3600s.
+    """
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate:correctness",
+        status=RegressionCaseStatus.CLOSED,
+        first_seen_at=datetime(2026, 5, 1, 9, 0, 0),
+        fingerprint_to_fix_log=[
+            {
+                "fingerprint": "sr_catch_rate:correctness",
+                "fix_pr_number": 101,
+                "merged_at": "2026-05-01T11:00:00Z",
+            },
+            {
+                "fingerprint": "sr_catch_rate:correctness",
+                "recovered_at": "2026-05-01T12:00:00Z",
+                "post_merge_value": 0.65,
+            },
+            {
+                "fingerprint": "sr_catch_rate:correctness",
+                "fix_pr_number": 202,
+                "merged_at": "2026-05-01T14:00:00Z",
+            },
+            {
+                "fingerprint": "sr_catch_rate:correctness",
+                "recovered_at": "2026-05-01T15:00:00Z",
+                "post_merge_value": 0.72,
+            },
+        ],
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    response = await client.get(
+        "/api/admin/regression-cases",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 200
+    summary = response.json()["summary"]["by_regression_class"]
+    assert len(summary) == 1
+    entry = summary[0]
+    assert entry["regression_class"] == "sr_catch_rate:correctness"
+    # Two full fix-recovery cycles → count=2
+    assert entry["count"] == 2
+    # Both cycles took 2h from episode start to merge → median 7200s
+    assert entry["median_time_from_first_seen_to_merged_seconds"] == 7200.0
+    # Both cycles took 1h from merge to recovery → median 3600s
+    assert entry["median_time_from_merged_to_recovered_seconds"] == 3600.0
+
+
+@pytest.mark.asyncio
 async def test_list_regression_cases_summary_includes_time_to_detect(
     client: AsyncClient, db_session
 ):

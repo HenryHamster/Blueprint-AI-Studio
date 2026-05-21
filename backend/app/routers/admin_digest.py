@@ -1292,8 +1292,13 @@ def _compute_regression_case_summary(
 ) -> Dict[str, Any]:
     by_class: Dict[str, Dict[str, List[float]]] = {}
     for case in rows:
+        if not case.first_seen_at:
+            continue
+        # episode_start advances to each cycle's recovered_at so re-armed cases
+        # report per-episode durations rather than lifetime spans.
+        episode_start = _to_naive_utc(case.first_seen_at)
         latest_merged_at = None
-        merged_at = recovered_at = None
+        bucket_written = False
         for entry in case.fingerprint_to_fix_log or []:
             if entry.get("merged_at"):
                 latest_merged_at = _to_naive_utc(
@@ -1302,30 +1307,31 @@ def _compute_regression_case_summary(
                     )
                 )
             if entry.get("recovered_at") and latest_merged_at is not None:
-                merged_at = latest_merged_at
-                recovered_at = _to_naive_utc(
+                recovered_dt = _to_naive_utc(
                     datetime.fromisoformat(
                         str(entry["recovered_at"]).replace("Z", "+00:00")
                     )
                 )
-        if case.first_seen_at and merged_at and recovered_at:
-            bucket = by_class.setdefault(
-                case.regression_class,
-                {"to_merged": [], "to_recovered": [], "to_detect": []},
-            )
-            bucket["to_merged"].append(
+                bucket = by_class.setdefault(
+                    case.regression_class,
+                    {"to_merged": [], "to_recovered": [], "to_detect": []},
+                )
+                bucket["to_merged"].append(
+                    (latest_merged_at - episode_start).total_seconds()
+                )
+                bucket["to_recovered"].append(
+                    (recovered_dt - latest_merged_at).total_seconds()
+                )
+                episode_start = recovered_dt
+                latest_merged_at = None
+                bucket_written = True
+        if bucket_written and case.signal_first_crossed_at:
+            by_class[case.regression_class]["to_detect"].append(
                 (
-                    _to_naive_utc(merged_at) - _to_naive_utc(case.first_seen_at)
+                    _to_naive_utc(case.first_seen_at)
+                    - _to_naive_utc(case.signal_first_crossed_at)
                 ).total_seconds()
             )
-            bucket["to_recovered"].append((recovered_at - merged_at).total_seconds())
-            if case.signal_first_crossed_at:
-                bucket["to_detect"].append(
-                    (
-                        _to_naive_utc(case.first_seen_at)
-                        - _to_naive_utc(case.signal_first_crossed_at)
-                    ).total_seconds()
-                )
     layer_coverage_by_class = _compute_layer_coverage_by_class(rows)
     all_rows_list = list(all_rows) if all_rows is not None else rows
     symptom_layers_by_class = _compute_symptom_layers_by_class(all_rows_list)
@@ -3505,6 +3511,8 @@ async def get_regression_class_kpis(
         if case.time_to_detect_sec is not None:
             b["mttd"].append(case.time_to_detect_sec)
         if case.fingerprint_to_fix_log and first:
+            ep_start = first
+            latest_merged_ep: Optional[datetime] = None
             for entry in case.fingerprint_to_fix_log:
                 if entry.get("merged_at"):
                     try:
@@ -3513,7 +3521,18 @@ async def get_regression_class_kpis(
                                 str(entry["merged_at"]).replace("Z", "+00:00")
                             )
                         )
-                        b["mttr"].append((merged - first).total_seconds())
+                        b["mttr"].append((merged - ep_start).total_seconds())
+                        latest_merged_ep = merged
+                    except (ValueError, TypeError):
+                        pass
+                if entry.get("recovered_at") and latest_merged_ep is not None:
+                    try:
+                        ep_start = _to_naive_utc(
+                            datetime.fromisoformat(
+                                str(entry["recovered_at"]).replace("Z", "+00:00")
+                            )
+                        )
+                        latest_merged_ep = None
                     except (ValueError, TypeError):
                         pass
 
@@ -8901,19 +8920,27 @@ async def get_regression_mtta(
             tti = c.time_to_investigate_sec
             if tti is not None and tti >= 0:
                 investigate_s.append(float(tti))
+            # inv_anchor advances to recovered_dt after each cycle so
+            # re-armed cases report per-episode investigate→merge durations.
+            inv_anchor: Optional[datetime] = c.investigate_spawned_at
+            latest_merged_fix: Optional[datetime] = None
             for entry in c.fingerprint_to_fix_log or []:
                 if not isinstance(entry, dict):
                     continue
                 merged_dt = _parse_dt(entry.get("merged_at"))
                 recovered_dt = _parse_dt(entry.get("recovered_at"))
-                if merged_dt and c.investigate_spawned_at:
-                    d = (merged_dt - c.investigate_spawned_at).total_seconds()
+                if merged_dt and inv_anchor:
+                    d = (merged_dt - inv_anchor).total_seconds()
                     if d >= 0:
                         inv_to_merge_s.append(d)
+                    latest_merged_fix = merged_dt
                 if merged_dt and recovered_dt:
                     d2 = (recovered_dt - merged_dt).total_seconds()
                     if d2 >= 0:
                         merge_to_rec_s.append(d2)
+                if recovered_dt and latest_merged_fix is not None and not merged_dt:
+                    inv_anchor = recovered_dt
+                    latest_merged_fix = None
 
             if c.status != RegressionCaseStatus.CLOSED:
                 anchor = (

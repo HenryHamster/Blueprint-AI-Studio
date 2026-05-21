@@ -1027,6 +1027,9 @@ class TestBackendModuleSizeGuardrails:
     def test_deploy_health(self):
         self._check_module("deploy_health.py")
 
+    def test_pipeline_regression_dispatcher(self):
+        self._check_module("pipeline_regression_dispatcher.py")
+
 
 # ── Frontend File Size Guardrails ─────────────────────────────────────────────
 

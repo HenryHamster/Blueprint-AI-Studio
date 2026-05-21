@@ -577,14 +577,6 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
     () => (digest?.needs_attention ?? []).filter(item => !isHidden(item.task_id)),
     [digest?.needs_attention, isHidden]
   );
-  const approvalItems = useMemo(
-    () => visibleItems.filter(i => i.reason === 'approval_required'),
-    [visibleItems]
-  );
-  const failedItems = useMemo(
-    () => visibleItems.filter(i => i.reason === 'failed'),
-    [visibleItems]
-  );
 
   const toggle = () => {
     const next = !collapsed;

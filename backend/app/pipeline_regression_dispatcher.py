@@ -7641,6 +7641,7 @@ async def run_once(session: AsyncSession, project_id: uuid.UUID) -> int:
     _ledger_cache_init: dict = {}
     _ledger_token = _cycle_layer_ledger_var.set(_ledger_cache_init)
     _spawned = 0
+    _se_count = 0
     try:
         # Force a full SELECT rather than session.get(): a caller that left a
         # partial Project (e.g. via ``load_only(Project.id)``) in the session
@@ -7717,114 +7718,135 @@ async def run_once(session: AsyncSession, project_id: uuid.UUID) -> int:
             project.design_doc,
             spawn_budget - _spawned,
         )
+        _se_count += 1
         _spawned += await _evaluate_sr_false_positive_signal(
             session,
             project_id,
             project.design_doc,
             spawn_budget - _spawned,
         )
+        _se_count += 1
         _spawned += await _evaluate_sr_catch_rate_direction_signals(
             session,
             project_id,
             project.design_doc,
             spawn_budget - _spawned,
         )
+        _se_count += 1
         _spawned += await _evaluate_fix_loop_divergence_signal(
             session,
             project_id,
             spawn_budget - _spawned,
         )
+        _se_count += 1
         _spawned += await _evaluate_fix_loop_divergence_fingerprint_signal(
             session,
             project_id,
             spawn_budget - _spawned,
         )
+        _se_count += 1
         _spawned += await _evaluate_pipeline_success_signal(
             session,
             project_id,
             spawn_budget - _spawned,
         )
+        _se_count += 1
         _spawned += await _evaluate_anomaly_signal(
             session,
             project_id,
             spawn_budget - _spawned,
         )
+        _se_count += 1
         _spawned += await _evaluate_sr_blind_spot_signal(
             session,
             project_id,
             spawn_budget - _spawned,
         )
+        _se_count += 1
         _spawned += await _evaluate_layer_concentration_signal(
             session,
             project_id,
             spawn_budget - _spawned,
         )
+        _se_count += 1
         _spawned += await _evaluate_cross_case_fingerprint_signal(
             session,
             project_id,
             spawn_budget - _spawned,
         )
+        _se_count += 1
         _spawned += await _evaluate_recurring_class_signal(
             session,
             project_id,
             spawn_budget - _spawned,
         )
+        _se_count += 1
         _spawned += await _evaluate_strategic_cycle_stall_signal(
             session,
             project_id,
             spawn_budget - _spawned,
             project.vision,
         )
+        _se_count += 1
         _spawned += await _evaluate_telemetry_staleness_signal(
             session,
             project_id,
             project.design_doc,
             spawn_budget - _spawned,
         )
+        _se_count += 1
         _spawned += await _evaluate_viewport_regression_signal(
             session,
             project_id,
             spawn_budget - _spawned,
         )
+        _se_count += 1
         _spawned += await _evaluate_viewport_coverage_drop_signal(
             session,
             project_id,
             project.design_doc,
             spawn_budget - _spawned,
         )
+        _se_count += 1
         _spawned += await _evaluate_reviewer_sla_signal(
             session,
             project_id,
             spawn_budget - _spawned,
         )
+        _se_count += 1
         _spawned += await _evaluate_agent_vm_resource_signal(
             session,
             project_id,
             spawn_budget - _spawned,
         )
+        _se_count += 1
         _spawned += await _evaluate_low_prevention_rate_signal(
             session,
             project_id,
             spawn_budget - _spawned,
         )
+        _se_count += 1
         _spawned += await _evaluate_sr_below_floor_signal(
             session,
             project_id,
             project.design_doc,
             spawn_budget - _spawned,
         )
+        _se_count += 1
         _spawned += await _evaluate_sr_pass_engagement_thinning_signal(
             session,
             project_id,
             project.design_doc,
             spawn_budget - _spawned,
         )
+        _se_count += 1
         _spawned += await _evaluate_sr_false_attestation_signal(
             session,
             project_id,
             project.design_doc,
             spawn_budget - _spawned,
         )
+        _se_count += 1
 
         if _spawned or stale_alerts_created:
             await session.commit()
@@ -7847,7 +7869,7 @@ async def run_once(session: AsyncSession, project_id: uuid.UUID) -> int:
                     project_id=project_id,
                     cycle_started_at=cycle_started_at,
                     cycle_finished_at=_utcnow(),
-                    signals_evaluated=0,
+                    signals_evaluated=_se_count,
                     signals_tripped=_st_counter[0],
                     spawns_emitted=_spawned,
                     rejections_by_reason=dict(_rj),
@@ -7932,19 +7954,29 @@ async def get_regression_mtta_data(
                 detect_s.append(ttd)
             if (tti := c.time_to_investigate_sec) is not None and tti >= 0:
                 invest_s.append(float(tti))
+            # ep_investigate_start tracks the per-episode investigation anchor.
+            # Starts at the lifetime investigate_spawned_at; advances to each
+            # cycle's recovered_at so re-armed cases report per-episode durations
+            # rather than inflated lifetime spans (mirrors the approach in
+            # admin_digest._compute_regression_case_summary).
+            ep_investigate_start = c.investigate_spawned_at
             for entry in c.fingerprint_to_fix_log or []:
                 if not isinstance(entry, dict):
                     continue
                 merged_dt = _parse_dt(entry.get("merged_at"))
                 recovered_dt = _parse_dt(entry.get("recovered_at"))
-                if merged_dt and c.investigate_spawned_at:
-                    d = (merged_dt - c.investigate_spawned_at).total_seconds()
+                if merged_dt and ep_investigate_start:
+                    d = (merged_dt - ep_investigate_start).total_seconds()
                     if d >= 0:
                         itom_s.append(d)
                 if merged_dt and recovered_dt:
                     d2 = (recovered_dt - merged_dt).total_seconds()
                     if d2 >= 0:
                         mtor_s.append(d2)
+                # Advance anchor so the next episode is measured from when
+                # the previous cycle resolved, not the case's original spawn.
+                if recovered_dt is not None:
+                    ep_investigate_start = recovered_dt
 
             if c.status == RegressionCaseStatus.CLOSED:
                 continue
@@ -7952,9 +7984,12 @@ async def get_regression_mtta_data(
                 c.signal_first_crossed_at or c.signal_first_seen_at or c.first_seen_at
             )
             live_elapsed = round((now - anchor).total_seconds()) if anchor else None
+            # ep_investigate_start now reflects the latest episode's anchor
+            # (last recovered_at, or the original investigate_spawned_at when
+            # there have been no recoveries yet).
             live_inv = (
-                round((now - c.investigate_spawned_at).total_seconds())
-                if c.investigate_spawned_at
+                round((now - ep_investigate_start).total_seconds())
+                if ep_investigate_start
                 else None
             )
             rec_check_in: int | None = None

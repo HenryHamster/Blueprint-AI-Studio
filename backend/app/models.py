@@ -1906,6 +1906,30 @@ class RegressionRemediationCase(SQLModel, table=True):
         delta = int((self.investigate_spawned_at - self.first_seen_at).total_seconds())
         return delta if delta >= 0 else None
 
+    def _current_episode_investigate_start(self) -> datetime | None:
+        """Return the investigation-start anchor for the current fix episode.
+
+        For the first episode this equals investigate_spawned_at.  After each
+        completed recovery cycle (mark_closed writes a recovered_at entry) the
+        anchor advances to that cycle's recovered_at, so per-episode
+        investigate→merge durations are not inflated by earlier cycles.
+        This mirrors the ep_investigate_start advancement applied by
+        get_regression_mtta / get_regression_mtta_data.
+        """
+        anchor = self.investigate_spawned_at
+        for entry in self.fingerprint_to_fix_log or []:
+            if not isinstance(entry, dict):
+                continue
+            recovered_raw = entry.get("recovered_at")
+            if recovered_raw:
+                try:
+                    anchor = datetime.fromisoformat(
+                        str(recovered_raw).replace("Z", "+00:00")
+                    ).replace(tzinfo=None)
+                except (ValueError, TypeError):
+                    pass
+        return anchor
+
     def mark_merged(
         self,
         pr_number: int,
@@ -1946,11 +1970,14 @@ class RegressionRemediationCase(SQLModel, table=True):
         self.signal_snapshot_at_merge = signal_snapshot
         self.last_remediation_pr_number = pr_number
         self.last_remediation_result = "merged"
+        ep_start = self._current_episode_investigate_start()
         log_entry: Dict[str, Any] = {
             "fingerprint": self.regression_class,
             "fix_pr_number": pr_number,
             "merged_at": _utcnow().isoformat(),
         }
+        if ep_start is not None:
+            log_entry["episode_investigate_started_at"] = ep_start.isoformat()
         if layers_targeted:
             log_entry["layers_targeted"] = list(layers_targeted)
         if recommended_unmodifiable_layers:

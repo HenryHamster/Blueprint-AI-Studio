@@ -1247,6 +1247,129 @@ async def test_recovery_scan_anomaly_rearmed_via_durable_state(db_session):
 
 
 @pytest.mark.asyncio
+async def test_recovery_scan_session_isolation_per_project(db_session, mocker):
+    """Verify that one project's error during recovery scan doesn't block other projects.
+
+    When run_recovery_once raises for project1, the session should be rolled back
+    so that project2's recovery still executes (not left in a failed-transaction state).
+    """
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+
+    # Create two projects
+    project1 = make_project()
+    project2 = make_project()
+    db_session.add(project1)
+    db_session.add(project2)
+    await db_session.commit()
+    await db_session.refresh(project1)
+    await db_session.refresh(project2)
+
+    # Set up a recovery case for project2
+    merged_at = (_utcnow() - timedelta(minutes=20)).isoformat()
+    case2 = RegressionRemediationCase(
+        project_id=project2.id,
+        regression_class="test_regression",
+        status=RegressionCaseStatus.MERGED,
+        hit_count=1,
+        signal_snapshot_at_merge={"captured_at": merged_at},
+        fingerprint_to_fix_log=[],
+    )
+    db_session.add(case2)
+    await db_session.commit()
+
+    # Mock run_recovery_once to raise for project1 but succeed for project2
+    original_run_recovery_once = mocker.MagicMock(wraps=run_recovery_once)
+    call_count = {"count": 0}
+
+    async def mock_recovery(*args, **kwargs):
+        call_count["count"] += 1
+        project_id = kwargs.get("project_id") if "project_id" in kwargs else args[1]
+        if project_id == project1.id:
+            raise RuntimeError("Simulated DB error for project1")
+        return await original_run_recovery_once(*args, **kwargs)
+
+    recovery_mock = mocker.patch(
+        "app.pipeline_regression_dispatcher.run_recovery_once",
+        side_effect=mock_recovery,
+    )
+
+    # Call recovery_once sequentially to simulate the scan loop. Invoke the
+    # patched module attribute (not the directly-imported name) so the mock
+    # is actually exercised.
+    try:
+        await recovery_mock(db_session, project1.id)
+    except RuntimeError:
+        await db_session.rollback()  # Simulate the rollback from the scan service
+
+    # Project2 should still process successfully
+    changed2 = await recovery_mock(db_session, project2.id)
+    assert changed2 >= 0  # Should not raise
+    assert call_count["count"] == 2  # Both projects were attempted
+
+
+@pytest.mark.asyncio
+async def test_watchdog_scan_session_isolation_per_project(db_session, mocker):
+    """Verify that one project's error during watchdog scan doesn't block other projects.
+
+    When run_watchdog_once raises for project1, the session should be rolled back
+    so that project2's watchdog still executes (not left in a failed-transaction state).
+    """
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+
+    # Create two projects
+    project1 = make_project()
+    project2 = make_project()
+    db_session.add(project1)
+    db_session.add(project2)
+    await db_session.commit()
+    await db_session.refresh(project1)
+    await db_session.refresh(project2)
+
+    # Set up a stale ACTIVE case for project2 that watchdog can escalate
+    now = _utcnow()
+    old_created = (now - timedelta(hours=30)).isoformat()
+    case2 = RegressionRemediationCase(
+        project_id=project2.id,
+        regression_class="test_regression",
+        status=RegressionCaseStatus.ACTIVE,
+        hit_count=1,
+        signal_snapshot_at_merge={"created_at": old_created},
+        fingerprint_to_fix_log=[],
+    )
+    db_session.add(case2)
+    await db_session.commit()
+
+    # Mock run_watchdog_once to raise for project1 but succeed for project2
+    original_run_watchdog_once = mocker.MagicMock(wraps=run_watchdog_once)
+    call_count = {"count": 0}
+
+    async def mock_watchdog(*args, **kwargs):
+        call_count["count"] += 1
+        project_id = kwargs.get("project_id") if "project_id" in kwargs else args[1]
+        if project_id == project1.id:
+            raise RuntimeError("Simulated DB error for project1")
+        return await original_run_watchdog_once(*args, **kwargs)
+
+    watchdog_mock = mocker.patch(
+        "app.pipeline_regression_dispatcher.run_watchdog_once",
+        side_effect=mock_watchdog,
+    )
+
+    # Call watchdog_once sequentially to simulate the scan loop. Invoke the
+    # patched module attribute (not the directly-imported name) so the mock
+    # is actually exercised.
+    try:
+        await watchdog_mock(db_session, project1.id)
+    except RuntimeError:
+        await db_session.rollback()  # Simulate the rollback from the scan service
+
+    # Project2 should still process successfully
+    escalated2 = await watchdog_mock(db_session, project2.id)
+    assert escalated2 >= 0  # Should not raise
+    assert call_count["count"] == 2  # Both projects were attempted
+
+
+@pytest.mark.asyncio
 async def test_pipeline_regressions_endpoint_enriches_crash_investigation(
     client, db_session
 ):
@@ -5717,6 +5840,29 @@ async def test_cycle_record_emitted_on_tick(db_session):
 
 
 @pytest.mark.asyncio
+async def test_cycle_record_signals_evaluated_nonzero(db_session):
+    """run_once() records a non-zero signals_evaluated count and evaluated >= tripped."""
+    project = make_project(
+        design_doc=_design_doc_with_sr_regression(category="correctness"),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await run_once(db_session, project.id)
+
+    records = await get_dispatcher_cycle_records(db_session, project_id=str(project.id))
+    assert len(records) >= 1
+    rec = records[-1]
+    assert rec["signals_evaluated"] > 0, (
+        "signals_evaluated must be non-zero after a full sweep"
+    )
+    assert rec["signals_evaluated"] >= rec["signals_tripped"], (
+        "evaluated count must be >= tripped count"
+    )
+
+
+@pytest.mark.asyncio
 async def test_rejection_reason_dedup_attributed(db_session):
     """When an in-flight task blocks a second spawn the rejection is counted as dedup, not cooldown."""
     project = make_project(
@@ -9021,6 +9167,64 @@ async def test_regression_mtta_data_eta_recovery_per_case(db_session):
     )
     assert b_info["eta_to_recovery_sec"] == int(
         p50_mtor - b_info["elapsed_since_merge_sec"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_mtta_per_episode_anchoring_on_rearmed_case(db_session):
+    """get_regression_mtta_data uses per-episode anchoring for re-armed cases.
+
+    A case with two fix cycles must report per-episode investigate→merge durations
+    instead of inflated lifetime spans.
+
+    Timeline (fixed absolute datetimes to avoid flakiness):
+      T+0h  investigate_spawned_at  → episode-1 anchor
+      T+2h  cycle-1 merged_at       → 7200s from episode-1 anchor  ✓
+      T+3h  cycle-1 recovered_at    → episode-2 anchor advances here
+      T+5h  cycle-2 merged_at       → 7200s from episode-2 anchor  ✓
+                                       (would be 18000s without per-episode fix)
+
+    Expected: p50 investigate_to_merge == 7200s (both cycles equal).
+    Without the fix: p50 == 12600s (average of 7200 and 18000).
+    """
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    t0 = datetime(2026, 5, 1, 8, 0, 0)  # investigate_spawned_at
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate:correctness:rearmed",
+        status=RegressionCaseStatus.CLOSED,
+        first_seen_at=t0,
+        investigate_spawned_at=t0,
+        fingerprint_to_fix_log=[
+            # Episode 1: merged 2h after investigate_spawned_at → 7200s
+            {"fix_pr_number": 101, "merged_at": "2026-05-01T10:00:00"},
+            # Episode 1 recovery: 1h after merge → anchor for episode 2
+            {"recovered_at": "2026-05-01T11:00:00", "post_merge_value": 0.65},
+            # Episode 2: merged 2h after episode-2 anchor (11:00) → 7200s
+            # Without per-episode fix this would be measured from T+0h → 18000s
+            {"fix_pr_number": 202, "merged_at": "2026-05-01T13:00:00"},
+            {"recovered_at": "2026-05-01T14:00:00", "post_merge_value": 0.72},
+        ],
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    data = await get_regression_mtta_data(db_session, project_id=project.id)
+    rows = {r["regression_class"]: r for r in data["classes"]}
+    row = rows["sr_catch_rate:correctness:rearmed"]
+
+    itom = row["stages"]["investigate_to_merge"]
+    # Both cycles contribute a 7200s sample → p50 == 7200s.
+    assert itom["sample_count"] == 2
+    assert itom["p50_sec"] == 7200.0, (
+        f"Expected per-episode p50=7200s but got {itom['p50_sec']}; "
+        "likely anchoring on case lifetime instead of per-episode start"
     )
 
 

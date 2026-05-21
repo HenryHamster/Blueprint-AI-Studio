@@ -110,7 +110,7 @@ export function DispatcherHealthPanel({ projectId }: Props) {
         <div className="space-y-2">
           <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 text-xs text-neutral-400 flex flex-wrap gap-x-4 gap-y-1">
             <span><span className="text-white font-medium">{data.aggregate.cycles}</span> cycles</span>
-            <span><span className="text-white font-medium">{data.aggregate.signals_tripped}</span> signals tripped</span>
+            <span>signals: <span className="text-white font-medium">{data.aggregate.signals_evaluated}</span> checked, <span className="text-white font-medium">{data.aggregate.signals_tripped}</span> tripped</span>
             <span><span className="text-emerald-400 font-medium">{data.aggregate.spawns}</span> spawns</span>
             <span><span className="text-amber-400 font-medium">{data.aggregate.rejections.cooldown}</span> cooldown</span>
             <span><span className="text-red-400 font-medium">{data.aggregate.rejections.system_cap}</span> cap</span>
