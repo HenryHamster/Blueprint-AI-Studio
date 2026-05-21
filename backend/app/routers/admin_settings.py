@@ -414,6 +414,20 @@ async def _apply_settings(
                 detail="ci_backstop_timeout_minutes must be between 1 and 1440",
             )
         _runtime_config["ci_backstop_timeout_minutes"] = val
+    # automain/LTS — release-qualifier control flags (Phase 0/1). Persisted to
+    # runtime_config_json below and synced back into runtime_config every ~15s.
+    if "integration_branch" in payload:
+        val = str(payload["integration_branch"] or "").strip()
+        if not val or len(val) > 200 or any(c.isspace() for c in val):
+            raise HTTPException(
+                status_code=400,
+                detail="integration_branch must be a non-empty branch name",
+            )
+        _runtime_config["integration_branch"] = val
+    if "promotion_enabled" in payload:
+        _runtime_config["promotion_enabled"] = bool(payload["promotion_enabled"])
+    if "smoketest_enabled" in payload:
+        _runtime_config["smoketest_enabled"] = bool(payload["smoketest_enabled"])
     if "evaluating_fail_hours" in payload:
         try:
             val = int(payload["evaluating_fail_hours"])
@@ -1435,6 +1449,15 @@ async def _apply_settings(
                             ],
                             "throttle_seconds": 30,
                         },
+                    ),
+                    "integration_branch": _runtime_config.get(
+                        "integration_branch", "main"
+                    ),
+                    "promotion_enabled": bool(
+                        _runtime_config.get("promotion_enabled", False)
+                    ),
+                    "smoketest_enabled": bool(
+                        _runtime_config.get("smoketest_enabled", False)
                     ),
                 }
             except AttributeError:
