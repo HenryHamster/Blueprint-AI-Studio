@@ -1067,19 +1067,35 @@ async def _process_direction_lifecycle(
             logger.info(f"[AUTONOMOUS] Auto-paused direction {did}: {pause_reason}")
             auto_paused_any = True
             try:
-                from app.notification_dispatch import post_direction_milestone_message  # noqa: PLC0415
+                if pause_reason.startswith("Lifetime burn backstop:"):
+                    from app.notification_dispatch import (
+                        post_direction_burn_pause_message,
+                    )  # noqa: PLC0415
 
-                await post_direction_milestone_message(
-                    session,
-                    project.id,
-                    direction_text=d.get("text", ""),
-                    milestone="auto-paused",
-                    reason=pause_reason,
-                    direction_id=did,
-                )
+                    await post_direction_burn_pause_message(
+                        session,
+                        project.id,
+                        direction_text=d.get("text", ""),
+                        reason=pause_reason,
+                        direction_id=did,
+                        evidence=d.get("lifetime_burn_pause_evidence"),
+                    )
+                else:
+                    from app.notification_dispatch import (
+                        post_direction_milestone_message,
+                    )  # noqa: PLC0415
+
+                    await post_direction_milestone_message(
+                        session,
+                        project.id,
+                        direction_text=d.get("text", ""),
+                        milestone="auto-paused",
+                        reason=pause_reason,
+                        direction_id=did,
+                    )
             except Exception as _notify_exc:
                 logger.warning(
-                    f"[NOTIFY] Failed to post direction milestone message: {_notify_exc}"
+                    f"[NOTIFY] Failed to post direction pause notification: {_notify_exc}"
                 )
             try:
                 if _is_code_failure_pause_reason(pause_reason):

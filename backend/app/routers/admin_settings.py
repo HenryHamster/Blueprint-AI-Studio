@@ -86,6 +86,7 @@ def _build_notification_config_response(config: dict, *, is_admin: bool) -> dict
                 "REMEDIATION_ESCALATED",
                 "DIRECTION_MILESTONE",
                 "RESIDUAL_FIX_ESCALATED",
+                "DIRECTION_BURN_PAUSE",
             ],
         ),
         "throttle_seconds": config.get("throttle_seconds", 30),
@@ -188,12 +189,8 @@ async def get_settings(
         # automain/LTS release-qualifier control flags — kept in sync with the
         # _apply_settings write path and the runtime_config_json persistence.
         "integration_branch": _runtime_config.get("integration_branch", "main"),
-        "promotion_enabled": bool(
-            _runtime_config.get("promotion_enabled", False)
-        ),
-        "smoketest_enabled": bool(
-            _runtime_config.get("smoketest_enabled", False)
-        ),
+        "promotion_enabled": bool(_runtime_config.get("promotion_enabled", False)),
+        "smoketest_enabled": bool(_runtime_config.get("smoketest_enabled", False)),
         "warm_continuity_enabled": bool(
             _runtime_config.get("warm_continuity_enabled", False)
         ),
@@ -246,6 +243,7 @@ async def get_settings(
                         "REMEDIATION_ESCALATED",
                         "DIRECTION_MILESTONE",
                         "RESIDUAL_FIX_ESCALATED",
+                        "DIRECTION_BURN_PAUSE",
                     ],
                     "throttle_seconds": 30,
                 },
@@ -1243,6 +1241,10 @@ async def _apply_settings(
                 "RESIDUAL_FIX_UNSUSPENDED",
                 # Escalation fired when a case is deferred by audit too many times.
                 "RESIDUAL_FIX_AUDIT_DEFERRED",
+                # Direction auto-paused for lifetime burn (non-merging finished
+                # tasks beyond the rolling-window threshold). BLOCKER severity /
+                # manual-intervention-required, so it joins the default-on list.
+                "DIRECTION_BURN_PAUSE",
             ]
         )
         enabled_events = val.get(
@@ -1254,6 +1256,7 @@ async def _apply_settings(
                 "REMEDIATION_ESCALATED",
                 "DIRECTION_MILESTONE",
                 "RESIDUAL_FIX_ESCALATED",
+                "DIRECTION_BURN_PAUSE",
             ],
         )
         if not isinstance(enabled_events, list):
@@ -1474,6 +1477,7 @@ async def _apply_settings(
                                 "DEPLOY_HEALTH_ALERT",
                                 "REMEDIATION_ESCALATED",
                                 "RESIDUAL_FIX_ESCALATED",
+                                "DIRECTION_BURN_PAUSE",
                             ],
                             "throttle_seconds": 30,
                         },

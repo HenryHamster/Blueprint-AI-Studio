@@ -618,10 +618,17 @@ function DirectionCardImpl({
                   <AlertTriangle className="w-3 h-3 text-red-400 shrink-0 mt-0.5" />
                   <div className="flex-1 min-w-0">
                     <p className="text-[11px] text-red-300 font-medium leading-tight">Manual intervention needed</p>
-                    <p className="text-[10px] text-red-400/80 leading-relaxed mt-0.5">
-                      Auto-remediation escalated after {d.remediation_attempts ?? 0} failed attempt{(d.remediation_attempts ?? 0) !== 1 ? 's' : ''}.
-                      {d.diagnosis_summary && <span className="block mt-0.5 text-neutral-400 italic">{d.diagnosis_summary}</span>}
-                    </p>
+                    {d.paused_reason?.startsWith('Lifetime burn backstop:') && d.lifetime_burn_pause_evidence ? (
+                      <p className="text-[10px] text-red-400/80 leading-relaxed mt-0.5">
+                        Direction has accumulated {d.lifetime_burn_pause_evidence.lifetime_non_merge_finished} non-merging tasks with only {d.lifetime_burn_pause_evidence.lifetime_merged} merged ({Math.round(d.lifetime_burn_pause_evidence.lifetime_merge_rate * 100)}% lifetime rate).
+                        <span className="block mt-0.5">Operator decision required: retire this direction or reset its accumulated history.</span>
+                      </p>
+                    ) : (
+                      <p className="text-[10px] text-red-400/80 leading-relaxed mt-0.5">
+                        Auto-remediation escalated after {d.remediation_attempts ?? 0} failed attempt{(d.remediation_attempts ?? 0) !== 1 ? 's' : ''}.
+                        {d.diagnosis_summary && <span className="block mt-0.5 text-neutral-400 italic">{d.diagnosis_summary}</span>}
+                      </p>
+                    )}
                   </div>
                 </div>
               ) : (

@@ -851,3 +851,119 @@ async def test_process_lifecycle_cpm_unchanged_for_fully_autonomous_direction(
     assert by_id["d-fa-expensive"].get("retirement_consideration_needed") is True
     assert "retirement_consideration_needed" not in by_id["d-fa-cheap-1"]
     assert "retirement_consideration_needed" not in by_id["d-fa-cheap-2"]
+
+
+@pytest.mark.asyncio
+async def test_process_lifecycle_lifetime_burn_pause_via_aggregate(db_session, mocker):
+    """Lifetime burn backstop pauses direction + sets evidence + flags manual-intervention.
+
+    Tests the aggregate-driven slow burn: a direction whose recent rolling window
+    would NOT trip the churn guardrail, but whose lifetime aggregate (trimmed old
+    cycles) carries enough accumulated non-merge volume to trip the lifetime
+    backstop threshold. Asserts the direction is paused with 'Lifetime burn backstop'
+    reason, the stored evidence matches the computed metrics, and the
+    manual-intervention flag is set with its timestamp.
+    """
+    now = datetime.utcnow()
+
+    direction = {
+        "id": "d-lifetime-burn",
+        "text": "Direction with aggregate slow burn",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        # Recent rolling window: 3 cycles, each with 10 completed tasks
+        # and 2 merges = 8 non-merge per cycle, 20% merge rate.
+        # Total window: 24 non-merge, 6 merged, 20% merge rate.
+        # Rule 5 doesn't fire: although 24 >= 15, merge_rate is 20% > 10% minimum.
+        "research_history": [
+            {
+                "timestamp": (now - timedelta(days=3)).isoformat(),
+                "tasks_created": 10,
+                "tasks_completed": 10,
+                "tasks_failed": 0,
+                "tasks_failed_infra": 0,
+                "prs_merged": 2,
+            },
+            {
+                "timestamp": (now - timedelta(days=2)).isoformat(),
+                "tasks_created": 10,
+                "tasks_completed": 10,
+                "tasks_failed": 0,
+                "tasks_failed_infra": 0,
+                "prs_merged": 2,
+            },
+            {
+                "timestamp": now.isoformat(),
+                "tasks_created": 10,
+                "tasks_completed": 10,
+                "tasks_failed": 0,
+                "tasks_failed_infra": 0,
+                "prs_merged": 2,
+            },
+        ],
+        # Trimmed history aggregate: 136 completed, 0 failed, 10 merged
+        # Non-merge in aggregate: 126. Combined with window's 24 = 150 total,
+        # lifetime merge rate = 16/(150+16) ≈ 9.6%, which is below 10% threshold.
+        # This should trip the lifetime backstop (Rule 6).
+        "history_aggregate": {
+            "total_cycles": 10,
+            "total_tasks_created": 136,
+            "total_tasks_completed": 136,
+            "total_tasks_failed": 0,
+            "total_tasks_failed_infra": 0,
+            "total_prs_merged": 10,
+        },
+    }
+
+    project = Project(
+        name="Lifetime Burn Test",
+        user_id="u-lifetime",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    _ss.circuit_breakers.pop(str(project.id), None)
+
+    await _process_direction_lifecycle(
+        project,
+        db_session,
+        cooldown_minutes=0.0,
+        busy_direction_ids=set(),
+        now=now,
+    )
+    await db_session.refresh(project)
+
+    d = project.directions[0]
+    # Direction should be paused with lifetime burn reason
+    assert d["status"] == "paused", (
+        "direction should be auto-paused when lifetime burn threshold exceeded"
+    )
+    assert d.get("auto_paused") is True
+    reason = d.get("paused_reason", "")
+    assert reason.startswith("Lifetime burn backstop:"), (
+        f"paused_reason should start with 'Lifetime burn backstop:', got: {reason!r}"
+    )
+    # Verify evidence is stored and matches computed metrics
+    evidence = d.get("lifetime_burn_pause_evidence", {})
+    assert isinstance(evidence, dict), "lifetime_burn_pause_evidence should be a dict"
+    assert evidence.get("lifetime_merged") == 16, (
+        f"expected lifetime_merged=16, got {evidence.get('lifetime_merged')}"
+    )
+    assert evidence.get("lifetime_non_merge_finished") == 150, (
+        f"expected lifetime_non_merge_finished=150, got {evidence.get('lifetime_non_merge_finished')}"
+    )
+    assert 0.095 < evidence.get("lifetime_merge_rate", 0) < 0.098, (
+        f"expected lifetime_merge_rate ~0.0964, got {evidence.get('lifetime_merge_rate')}"
+    )
+    # Manual-intervention flag should be set
+    assert d.get("needs_manual_intervention") is True, (
+        "direction should be flagged for manual intervention on lifetime burn pause"
+    )
+    assert d.get("needs_manual_intervention_at"), (
+        "needs_manual_intervention_at timestamp should be set"
+    )

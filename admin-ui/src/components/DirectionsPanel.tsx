@@ -134,6 +134,11 @@ export interface Direction {
     threshold: number;
     min_merge_rate: number;
   } | null;
+  lifetime_burn_pause_evidence?: {
+    lifetime_merged: number;
+    lifetime_non_merge_finished: number;
+    lifetime_merge_rate: number;
+  } | null;
 }
 
 

@@ -104,6 +104,11 @@
       "name": "fix_loop_divergence_regressed",
       "classification": "high_signal",
       "source_fn": "post_fix_loop_divergence_regression_message"
+    },
+    {
+      "name": "direction_burn_pause",
+      "classification": "escalation",
+      "source_fn": "post_direction_burn_pause_message"
     }
   ]
 }
