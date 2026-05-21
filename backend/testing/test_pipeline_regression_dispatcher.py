@@ -6966,6 +6966,55 @@ def test_mark_merged_omits_layers_targeted_when_not_provided():
     assert "layers_targeted" not in entry
 
 
+def test_mark_merged_persists_recommended_unmodifiable_layers():
+    """recommended_unmodifiable_layers is written into the fix-log entry by mark_merged."""
+    from app.models import RegressionRemediationCase
+
+    case = RegressionRemediationCase(
+        project_id=uuid.uuid4(),
+        regression_class="sr_catch_rate",
+        signal_snapshot_at_spawn={"prior_rate": 0.8, "current_rate": 0.5},
+    )
+    case.mark_merged(
+        101,
+        {"current_rate": 0.7},
+        layers_targeted=["AGENT_VM"],
+        recommended_unmodifiable_layers=["CI_WORKFLOW"],
+        spawn_was_cross_layer=True,
+        spawn_layers_enumerated=["AGENT_VM", "CI_WORKFLOW"],
+    )
+    assert len(case.fingerprint_to_fix_log) == 1
+    entry = case.fingerprint_to_fix_log[0]
+    assert entry["layers_targeted"] == ["AGENT_VM"]
+    assert entry["recommended_unmodifiable_layers"] == ["CI_WORKFLOW"]
+    assert entry["spawn_was_cross_layer"] is True
+
+
+def test_mark_merged_omits_recommended_unmodifiable_layers_when_not_provided():
+    """Backward-compat: omitting recommended_unmodifiable_layers leaves key absent."""
+    from app.models import RegressionRemediationCase
+
+    case = RegressionRemediationCase(
+        project_id=uuid.uuid4(),
+        regression_class="sr_catch_rate",
+        signal_snapshot_at_spawn={"prior_rate": 0.8, "current_rate": 0.5},
+    )
+    case.mark_merged(102, {}, layers_targeted=["AGENT_VM"])
+    assert len(case.fingerprint_to_fix_log) == 1
+    assert "recommended_unmodifiable_layers" not in case.fingerprint_to_fix_log[0]
+
+
+def test_compliance_followup_count_defaults_to_zero():
+    """New RegressionRemediationCase instances start with compliance_followup_count=0."""
+    from app.models import RegressionRemediationCase
+
+    case = RegressionRemediationCase(
+        project_id=uuid.uuid4(),
+        regression_class="sr_catch_rate",
+    )
+    assert case.compliance_followup_count == 0
+
+
 @pytest.mark.asyncio
 async def test_backfill_layers_targeted_populates_missing_entries(
     db_session, monkeypatch
@@ -12763,6 +12812,51 @@ async def test_compliance_followup_recommended_unmodifiable_counts_as_compliant(
     )
 
 
+@pytest.mark.asyncio
+async def test_compliance_followup_count_cap_blocks_respawn(db_session):
+    """compliance_followup_count >= max_spawns prevents further spawning."""
+    from app.pipeline_regression_dispatcher import _run_compliance_followup_once
+    from app.pipeline_regression_dispatcher import _runtime_config as runtime_config
+
+    project = make_project(design_doc=_design_doc_no_sr_regression())
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    case = await _make_merged_case_with_fix_log(
+        db_session,
+        project.id,
+        [_cross_layer_fix_log_entry(layers_targeted=["AGENT_VM"])],
+    )
+    case.compliance_followup_count = 3
+    db_session.add(case)
+    await db_session.commit()
+
+    orig = runtime_config.get("regression_compliance_followup_max_spawns")
+    runtime_config["regression_compliance_followup_max_spawns"] = 3
+    try:
+        spawned = await _run_compliance_followup_once(db_session, project.id)
+        assert spawned == 0, "case at max_spawns cap must not spawn another followup"
+    finally:
+        if orig is None:
+            runtime_config.pop("regression_compliance_followup_max_spawns", None)
+        else:
+            runtime_config["regression_compliance_followup_max_spawns"] = orig
+
+
+def test_classify_cycle_compliance_recommended_unmodifiable_counts_as_compliant():
+    """_classify_cycle_compliance treats 1 targeted + 1 unmodifiable as compliant."""
+    from app.pipeline_regression_dispatcher import _classify_cycle_compliance
+
+    row = {
+        "spawn_was_cross_layer": True,
+        "layers_targeted_present": True,
+        "layers_targeted": ["AGENT_VM"],
+        "recommended_unmodifiable_layers": ["CI_WORKFLOW"],
+    }
+    assert _classify_cycle_compliance(row) == "compliant"
+
+
 # ---------------------------------------------------------------------------
 # compute_mtti_p50_sec unit tests
 # ---------------------------------------------------------------------------
@@ -14528,3 +14622,130 @@ async def test_sr_false_attestation_no_spawn_below_threshold(db_session):
 
     spawned = await run_once(db_session, project.id)
     assert spawned == 0
+
+
+# ---------------------------------------------------------------------------
+# compute_first_attempt_compliance_trend
+# ---------------------------------------------------------------------------
+
+
+def _make_cross_layer_case(fix_log: list):
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+
+    return RegressionRemediationCase(
+        project_id="00000000-0000-0000-0000-000000000002",
+        regression_class="test_class",
+        status=RegressionCaseStatus.MERGED,
+        hit_count=1,
+        attempts=0,
+        escalation_reason="escalated_cross_layer",
+        signal_snapshot_at_merge={},
+        signal_snapshot_at_spawn={},
+        fingerprint_to_fix_log=fix_log,
+    )
+
+
+def test_first_attempt_compliance_trend_empty():
+    """Empty input returns num_windows windows all zeros, rate=None."""
+    from app.pipeline_regression_dispatcher import (
+        compute_first_attempt_compliance_trend,
+    )
+
+    out = compute_first_attempt_compliance_trend([], num_windows=3, window_days=7)
+    assert len(out["windows"]) == 3
+    for w in out["windows"]:
+        assert w["first_attempt_compliant"] == 0
+        assert w["followup_rescued"] == 0
+        assert w["awaiting_backfill"] == 0
+        assert w["rate"] is None
+    assert out["num_windows"] == 3
+    assert out["window_days"] == 7
+
+
+def test_first_attempt_compliance_trend_compliant():
+    """Case with >=2 canonical layers on first mandated fix → first_attempt_compliant."""
+    from app.pipeline_regression_dispatcher import (
+        compute_first_attempt_compliance_trend,
+    )
+    from app.time_utils import _utcnow
+
+    now = _utcnow()
+    merged_at = (now - timedelta(days=3)).isoformat()
+    fix_log = [
+        {
+            "fix_pr_number": 42,
+            "merged_at": merged_at,
+            "spawn_was_cross_layer": True,
+            "layers_targeted": ["CI_WORKFLOW", "AGENT_VM"],
+        }
+    ]
+    case = _make_cross_layer_case(fix_log)
+    out = compute_first_attempt_compliance_trend(
+        [case], num_windows=2, window_days=7, now=now
+    )
+    last_window = out["windows"][-1]
+    assert last_window["first_attempt_compliant"] == 1
+    assert last_window["followup_rescued"] == 0
+    assert last_window["rate"] == 1.0
+
+
+def test_first_attempt_compliance_trend_followup_rescued():
+    """First fix had <2 layers; compliance_followup_spawned + subsequent fix → followup_rescued."""
+    from app.pipeline_regression_dispatcher import (
+        compute_first_attempt_compliance_trend,
+    )
+    from app.time_utils import _utcnow
+
+    now = _utcnow()
+    merged_at = (now - timedelta(days=3)).isoformat()
+    fix_log = [
+        {
+            "fix_pr_number": 10,
+            "merged_at": merged_at,
+            "spawn_was_cross_layer": True,
+            "layers_targeted": ["CI_WORKFLOW"],  # only 1 layer — non-compliant
+        },
+        {"type": "compliance_followup_spawned"},
+        {
+            "fix_pr_number": 11,
+            "merged_at": (now - timedelta(days=1)).isoformat(),
+            "spawn_was_cross_layer": False,
+            "layers_targeted": ["CI_WORKFLOW", "AGENT_VM"],
+        },
+    ]
+    case = _make_cross_layer_case(fix_log)
+    out = compute_first_attempt_compliance_trend(
+        [case], num_windows=2, window_days=7, now=now
+    )
+    last_window = out["windows"][-1]
+    assert last_window["first_attempt_compliant"] == 0
+    assert last_window["followup_rescued"] == 1
+    assert last_window["rate"] == 0.0
+
+
+def test_first_attempt_compliance_trend_awaiting_backfill():
+    """First fix lacks layers_targeted → awaiting_backfill, excluded from rate."""
+    from app.pipeline_regression_dispatcher import (
+        compute_first_attempt_compliance_trend,
+    )
+    from app.time_utils import _utcnow
+
+    now = _utcnow()
+    merged_at = (now - timedelta(days=3)).isoformat()
+    fix_log = [
+        {
+            "fix_pr_number": 99,
+            "merged_at": merged_at,
+            "spawn_was_cross_layer": True,
+            # layers_targeted intentionally absent
+        }
+    ]
+    case = _make_cross_layer_case(fix_log)
+    out = compute_first_attempt_compliance_trend(
+        [case], num_windows=2, window_days=7, now=now
+    )
+    last_window = out["windows"][-1]
+    assert last_window["awaiting_backfill"] == 1
+    assert last_window["first_attempt_compliant"] == 0
+    assert last_window["followup_rescued"] == 0
+    assert last_window["rate"] is None

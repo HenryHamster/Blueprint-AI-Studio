@@ -1557,14 +1557,75 @@ async def _close_loop_regression_case_on_merge(
     ctx = task.context or {}
     spawn_was_cross_layer = bool(ctx.get("cross_layer"))
     spawn_layers_enumerated = list(ctx.get("cross_layer_layers") or [])
+
+    # Classify layers from PR changed files synchronously at merge time so
+    # the compliance watchdog has layers_targeted immediately rather than
+    # waiting for the async backfill (which can lag hours or fail silently).
+    # Falls back gracefully; _backfill_layers_targeted_once remains as a net.
+    layers_targeted: list[str] | None = None
+    if spawn_was_cross_layer:
+        try:
+            from app.github import get_pr_files, get_repo_installation_token
+            from app.models import Project
+            from app.pipeline_regression_dispatcher import _classify_layers_from_paths
+
+            project = await session.get(Project, task.project_id)
+            if project and project.github_owner and project.github_repo:
+                token = await get_repo_installation_token(
+                    project.github_owner, project.github_repo
+                )
+                if token:
+                    files = await get_pr_files(
+                        token,
+                        project.github_owner,
+                        project.github_repo,
+                        pr_number,
+                        project_id=str(task.project_id),
+                    )
+                    paths = [
+                        str(f.get("filename") or "")
+                        for f in files
+                        if isinstance(f, dict)
+                    ]
+                    layers_targeted = _classify_layers_from_paths(paths)
+        except Exception as exc:
+            logger.warning(
+                "[REGRESSION-CASE] Synchronous layer classification failed for "
+                "PR #%s project=%s: %s — backfill will retry",
+                pr_number,
+                task.project_id,
+                exc,
+            )
+
     case.mark_merged(
         pr_number,
         snapshot,
+        layers_targeted=layers_targeted,
         spawn_was_cross_layer=spawn_was_cross_layer,
         spawn_layers_enumerated=spawn_layers_enumerated
         if spawn_was_cross_layer
         else None,
     )
+
+    # Persist recommended_unmodifiable_layers from task context into the
+    # fix-log entry so compliance accounting can credit documented
+    # unmodifiable layers (e.g. CI_WORKFLOW) toward the >=2-layer mandate.
+    if spawn_was_cross_layer:
+        recommended_unmod = [
+            layer
+            for layer in (ctx.get("recommended_unmodifiable_layers") or [])
+            if isinstance(layer, str)
+        ]
+        if recommended_unmod:
+            log = list(case.fingerprint_to_fix_log or [])
+            if (
+                log
+                and isinstance(log[-1], dict)
+                and log[-1].get("fix_pr_number") == pr_number
+            ):
+                log[-1]["recommended_unmodifiable_layers"] = recommended_unmod
+                case.fingerprint_to_fix_log = log
+
     session.add(case)
 
 

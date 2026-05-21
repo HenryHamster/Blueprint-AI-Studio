@@ -1246,6 +1246,79 @@ export function EscalationOutcomePanel({ projectId }: Props) {
   );
 }
 
+interface ComplianceTrendWindow {
+  window_start: string;
+  window_end: string;
+  first_attempt_compliant: number;
+  followup_rescued: number;
+  awaiting_backfill: number;
+  rate: number | null;
+}
+
+interface FirstAttemptComplianceTrendData {
+  windows: ComplianceTrendWindow[];
+  num_windows: number;
+  window_days: number;
+  generated_at: string;
+}
+
+export function FirstAttemptComplianceTrendPanel({ projectId }: Props) {
+  const [data, setData] = useState<FirstAttemptComplianceTrendData | null>(null);
+  const [loaded, setLoaded] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    apiFetch(`/api/admin/regression-cases/first-attempt-compliance-trend?project_id=${encodeURIComponent(projectId)}`)
+      .then(async (res) => { if (!cancelled && res.ok) setData(await res.json()); })
+      .catch(() => {})
+      .finally(() => { if (!cancelled) setLoaded(true); });
+    return () => { cancelled = true; };
+  }, [projectId]);
+
+  if (!loaded || !data || !Array.isArray(data.windows)) return null;
+  if (!data.windows.some(w => w.first_attempt_compliant + w.followup_rescued + w.awaiting_backfill > 0)) return null;
+
+  return (
+    <section data-testid="first-attempt-compliance-trend-panel" className="mb-4">
+      <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2 flex items-center gap-1.5">
+        <Shield className="w-3 h-3" />
+        Cross-Layer First-Attempt Rate ({data.window_days}d windows)
+      </h2>
+      <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg overflow-hidden">
+        <table className="w-full text-[10px]">
+          <thead>
+            <tr className="border-b border-neutral-800/50 text-neutral-500">
+              <th className="text-left px-3 py-1.5 font-medium">Window end</th>
+              <th className="text-right px-2 py-1.5 font-medium">1st-ok</th>
+              <th className="text-right px-2 py-1.5 font-medium">rescued</th>
+              <th className="text-right px-2 py-1.5 font-medium">pending</th>
+              <th className="text-right px-3 py-1.5 font-medium">Rate</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-neutral-800/30">
+            {data.windows.map((w) => {
+              const label = new Date(w.window_end).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+              const rateColor = w.rate === null ? 'text-neutral-600' : w.rate >= 0.8 ? 'text-emerald-400' : w.rate >= 0.5 ? 'text-amber-400' : 'text-red-400';
+              const anyData = w.first_attempt_compliant + w.followup_rescued + w.awaiting_backfill > 0;
+              return (
+                <tr key={w.window_end} className={anyData ? '' : 'opacity-30'}>
+                  <td className="px-3 py-1.5 text-neutral-400">{label}</td>
+                  <td className="px-2 py-1.5 text-right text-emerald-400">{w.first_attempt_compliant > 0 ? w.first_attempt_compliant : <span className="text-neutral-700">—</span>}</td>
+                  <td className="px-2 py-1.5 text-right text-amber-400">{w.followup_rescued > 0 ? w.followup_rescued : <span className="text-neutral-700">—</span>}</td>
+                  <td className="px-2 py-1.5 text-right text-neutral-500">{w.awaiting_backfill > 0 ? w.awaiting_backfill : <span className="text-neutral-700">—</span>}</td>
+                  <td className={`px-3 py-1.5 text-right font-medium ${rateColor}`}>
+                    {w.rate !== null ? `${Math.round(w.rate * 100)}%` : '—'}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  );
+}
+
 export function AutoRecoveredPanel({ projectId }: Props) {
   const [cases, setCases] = useState<ManualInterventionCase[]>([]);
   const [loaded, setLoaded] = useState(false);

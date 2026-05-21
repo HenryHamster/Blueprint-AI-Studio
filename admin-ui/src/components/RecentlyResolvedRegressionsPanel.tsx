@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { CheckCircle, Minus, Shield } from 'lucide-react';
 import { apiFetch, fetchCrossLayerCompliance, type CrossLayerComplianceResponse } from '../api';
-import { EscalationOutcomePanel } from './PipelineRegressionsPanel';
+import { EscalationOutcomePanel, FirstAttemptComplianceTrendPanel } from './PipelineRegressionsPanel';
 import { timeAgo, formatDurationSec, parseTimestamp, formatTimeToDetect, formatTimeToInvestigate } from '../utils/time';
 import { parseViewportSubkey } from '../utils/viewportRegression';
 import { LayersAffectedBadges, UntargetedLayersBadge, type LayerSummary } from './LayersAffectedBadges';
@@ -406,6 +406,7 @@ export function RecentlyResolvedRegressionsPanel({ projectId }: Props) {
         </div>
       )}
       <div className="mt-4">
+        <FirstAttemptComplianceTrendPanel projectId={projectId} />
         <EscalationOutcomePanel projectId={projectId} />
       </div>
     </section>

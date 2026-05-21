@@ -14735,6 +14735,129 @@ async def test_cross_layer_compliance_new_additive_fields(
 
 
 # ---------------------------------------------------------------------------
+# GET /regression-cases/first-attempt-compliance-trend
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_first_attempt_compliance_trend_first_attempt_compliant(
+    client: AsyncClient, db_session
+):
+    """First fix touches >=2 canonical layers => first_attempt_compliant incremented."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    case = _make_cross_layer_case(
+        project.id,
+        "sr_catch_rate",
+        [_cross_layer_entry(layers_targeted=["CI_WORKFLOW", "AGENT_VM"], days_ago=3)],
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    response = await client.get(
+        "/api/admin/regression-cases/first-attempt-compliance-trend",
+        params={"project_id": str(project.id), "num_windows": 6, "window_days": 7},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert "windows" in body
+    assert body["num_windows"] == 6
+    assert body["window_days"] == 7
+    total_fa = sum(w["first_attempt_compliant"] for w in body["windows"])
+    total_fr = sum(w["followup_rescued"] for w in body["windows"])
+    assert total_fa == 1
+    assert total_fr == 0
+    # Rate should be 1.0 for the window containing this case
+    rates = [w["rate"] for w in body["windows"] if w["rate"] is not None]
+    assert any(r == 1.0 for r in rates)
+
+
+@pytest.mark.asyncio
+async def test_first_attempt_compliance_trend_followup_rescued(
+    client: AsyncClient, db_session
+):
+    """First fix has <2 layers but followup spawned+merged => followup_rescued."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    fix_log = [
+        # First fix: only 1 layer (non-compliant)
+        {
+            "fix_pr_number": 1,
+            "merged_at": (now - timedelta(days=3)).isoformat(),
+            "spawn_was_cross_layer": True,
+            "spawn_layers_enumerated": ["CI_WORKFLOW", "AGENT_VM"],
+            "layers_targeted": ["CI_WORKFLOW"],
+        },
+        # Compliance followup marker
+        {
+            "type": "compliance_followup_spawned",
+            "spawned_at": (now - timedelta(days=2)).isoformat(),
+        },
+        # Subsequent fix after followup
+        {
+            "fix_pr_number": 2,
+            "merged_at": (now - timedelta(days=1)).isoformat(),
+            "layers_targeted": ["CI_WORKFLOW", "AGENT_VM"],
+        },
+    ]
+    case = _make_cross_layer_case(project.id, "sr_catch_rate", fix_log)
+    db_session.add(case)
+    await db_session.commit()
+
+    response = await client.get(
+        "/api/admin/regression-cases/first-attempt-compliance-trend",
+        params={"project_id": str(project.id), "num_windows": 6, "window_days": 7},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    total_fa = sum(w["first_attempt_compliant"] for w in body["windows"])
+    total_fr = sum(w["followup_rescued"] for w in body["windows"])
+    assert total_fa == 0
+    assert total_fr == 1
+
+
+@pytest.mark.asyncio
+async def test_first_attempt_compliance_trend_awaiting_backfill_excluded(
+    client: AsyncClient, db_session
+):
+    """Entry without layers_targeted is awaiting_backfill and excluded from rate."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    case = _make_cross_layer_case(
+        project.id,
+        "sr_catch_rate",
+        [_cross_layer_entry(layers_targeted=None, days_ago=3)],
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    response = await client.get(
+        "/api/admin/regression-cases/first-attempt-compliance-trend",
+        params={"project_id": str(project.id), "num_windows": 6, "window_days": 7},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    total_fa = sum(w["first_attempt_compliant"] for w in body["windows"])
+    total_fr = sum(w["followup_rescued"] for w in body["windows"])
+    total_ab = sum(w["awaiting_backfill"] for w in body["windows"])
+    assert total_fa == 0
+    assert total_fr == 0
+    assert total_ab == 1
+    # Rate is None when denominator is 0
+    assert all(w["rate"] is None for w in body["windows"])
+
+
+# ---------------------------------------------------------------------------
 # Viewport-debt coverage_summary tests
 # ---------------------------------------------------------------------------
 

@@ -1179,6 +1179,118 @@ def compute_escalation_outcome_breakdown(
     }
 
 
+def compute_first_attempt_compliance_trend(
+    cases: list[RegressionRemediationCase],
+    *,
+    num_windows: int = 6,
+    window_days: int = 7,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Per-window first-attempt cross-layer compliance rate.
+
+    For each cross-layer-mandated case (first fix-log entry with
+    spawn_was_cross_layer=True), classifies the outcome of that first attempt:
+
+    - ``first_attempt_compliant``: layers_targeted present and >=2 distinct
+      canonical layers (including recommended_unmodifiable_layers).
+    - ``followup_rescued``: first fix had <2 canonical layers AND a
+      compliance_followup_spawned marker with a subsequent merged fix exists.
+    - ``awaiting_backfill``: layers_targeted absent, or non-compliant without a
+      merged followup yet; excluded from the rate denominator.
+
+    Cases are bucketed by merged_at of the first cross-layer fix entry into
+    ``num_windows`` rolling ``window_days``-wide windows ending at ``now``
+    (oldest window first). ``rate`` = first_attempt_compliant /
+    (first_attempt_compliant + followup_rescued), or None when denominator is 0.
+    """
+    if now is None:
+        now = _utcnow()
+    canonical = set(LAYER_DISPLAY_ORDER)
+
+    # Build window boundaries oldest-first
+    windows: list[dict[str, Any]] = []
+    for i in range(num_windows - 1, -1, -1):
+        w_end = now - timedelta(days=i * window_days)
+        w_start = w_end - timedelta(days=window_days)
+        windows.append(
+            {
+                "_w_start": w_start,
+                "_w_end": w_end,
+                "window_start": w_start.isoformat(),
+                "window_end": w_end.isoformat(),
+                "first_attempt_compliant": 0,
+                "followup_rescued": 0,
+                "awaiting_backfill": 0,
+            }
+        )
+
+    for case in cases:
+        raw_log = case.fingerprint_to_fix_log or []
+        if not isinstance(raw_log, list):
+            continue
+
+        # Find the first fix entry carrying the cross-layer mandate
+        first_entry: dict[str, Any] | None = None
+        for entry in raw_log:
+            if (
+                isinstance(entry, dict)
+                and entry.get("fix_pr_number") is not None
+                and entry.get("spawn_was_cross_layer")
+            ):
+                first_entry = entry
+                break
+        if first_entry is None:
+            continue
+
+        merged_at = _parse_dispatcher_dt(first_entry.get("merged_at"))
+        if merged_at is None:
+            continue
+
+        bucket: dict[str, Any] | None = None
+        for w in windows:
+            if w["_w_start"] <= merged_at < w["_w_end"]:
+                bucket = w
+                break
+        if bucket is None:
+            continue
+
+        if "layers_targeted" not in first_entry:
+            bucket["awaiting_backfill"] += 1
+            continue
+
+        layers = set(first_entry.get("layers_targeted") or []) & canonical
+        unmodifiable = (
+            set(first_entry.get("recommended_unmodifiable_layers") or []) & canonical
+        )
+        if len(layers | unmodifiable) >= 2:
+            bucket["first_attempt_compliant"] += 1
+        elif _compliance_followup_fix_idx(raw_log) >= 0:
+            bucket["followup_rescued"] += 1
+        else:
+            bucket["awaiting_backfill"] += 1
+
+    result_windows = []
+    for w in windows:
+        denom = w["first_attempt_compliant"] + w["followup_rescued"]
+        result_windows.append(
+            {
+                "window_start": w["window_start"],
+                "window_end": w["window_end"],
+                "first_attempt_compliant": w["first_attempt_compliant"],
+                "followup_rescued": w["followup_rescued"],
+                "awaiting_backfill": w["awaiting_backfill"],
+                "rate": w["first_attempt_compliant"] / denom if denom > 0 else None,
+            }
+        )
+
+    return {
+        "windows": result_windows,
+        "num_windows": num_windows,
+        "window_days": window_days,
+        "generated_at": now.isoformat(),
+    }
+
+
 def compute_avg_prevention_rate_7d(
     cases: list[RegressionRemediationCase],
     now: datetime | None = None,
@@ -5410,6 +5522,7 @@ def _classify_cycle_compliance(row: dict) -> str:
 
     Labels:
       - ``compliant``         — mandate True AND >=2 distinct canonical layers targeted
+                                (recommended_unmodifiable_layers count toward the total)
       - ``non-compliant``     — mandate True AND layers_targeted recorded but <2 canonical layers
       - ``awaiting-backfill`` — mandate True AND layers_targeted not yet present (do NOT accuse)
       - ``not-mandated``      — mandate False or absent
@@ -5422,7 +5535,12 @@ def _classify_cycle_compliance(row: dict) -> str:
     distinct_canonical = {
         layer for layer in (row.get("layers_targeted") or []) if layer in canonical
     }
-    if len(distinct_canonical) >= 2:
+    distinct_unmodifiable = {
+        layer
+        for layer in (row.get("recommended_unmodifiable_layers") or [])
+        if layer in canonical
+    }
+    if len(distinct_canonical | distinct_unmodifiable) >= 2:
         return "compliant"
     return "non-compliant"
 
@@ -5595,6 +5713,10 @@ async def _evaluate_recurring_class_signal(
             {
                 "cycle": i + 1,
                 "layers_targeted": e.get("layers_targeted") or [],
+                "recommended_unmodifiable_layers": e.get(
+                    "recommended_unmodifiable_layers"
+                )
+                or [],
                 "merged_at": e.get("merged_at") or "unknown",
                 "spawn_was_cross_layer": bool(e.get("spawn_was_cross_layer")),
                 "layers_targeted_present": "layers_targeted" in e,
@@ -6977,8 +7099,16 @@ async def _run_compliance_followup_once(
         .all()
     )
 
+    max_spawns = int(
+        _runtime_config.get("regression_compliance_followup_max_spawns", 3) or 3
+    )
+
     spawned = 0
     for case in rows:
+        followup_count = getattr(case, "compliance_followup_count", 0) or 0
+        if followup_count >= max_spawns:
+            continue
+
         last_at = getattr(case, "compliance_followup_spawned_at", None)
         if last_at is not None:
             if last_at.tzinfo is not None:
@@ -7069,6 +7199,7 @@ async def _run_compliance_followup_once(
             )
         )
         case.compliance_followup_spawned_at = now
+        case.compliance_followup_count = followup_count + 1
         case.fingerprint_to_fix_log = list(case.fingerprint_to_fix_log or []) + [
             {
                 "type": "compliance_followup_spawned",

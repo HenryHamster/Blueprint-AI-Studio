@@ -3387,6 +3387,43 @@ async def get_cross_layer_compliance(
     return compute_cross_layer_compliance(rows, cutoff)
 
 
+@router.get("/regression-cases/first-attempt-compliance-trend")
+async def get_first_attempt_compliance_trend(
+    project_id: uuid.UUID = Query(..., description="Project to query (required)"),
+    num_windows: int = Query(6, ge=1, le=12, description="Number of rolling windows"),
+    window_days: int = Query(
+        7, ge=1, le=30, description="Width of each window in days"
+    ),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),  # noqa: ARG001
+) -> Dict[str, Any]:
+    """First-attempt cross-layer compliance trend over rolling weekly windows.
+
+    Distinguishes whether the original meta-investigation produced a >=2-layer
+    defense (first_attempt_compliant) vs. only the corrective compliance-followup
+    did (followup_rescued). Cases awaiting layers_targeted backfill are excluded
+    from the rate denominator and reported in awaiting_backfill.
+    """
+    from app.pipeline_regression_dispatcher import (  # noqa: PLC0415
+        compute_first_attempt_compliance_trend,
+    )
+
+    rows = (
+        (
+            await session.execute(
+                select(RegressionRemediationCase).where(
+                    RegressionRemediationCase.project_id == project_id,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return compute_first_attempt_compliance_trend(
+        list(rows), num_windows=num_windows, window_days=window_days
+    )
+
+
 @router.get("/regression-class-kpis")
 async def get_regression_class_kpis(
     project_id: uuid.UUID = Query(..., description="Project to query (required)"),

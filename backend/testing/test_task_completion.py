@@ -6178,3 +6178,98 @@ class TestConfirmAppliedPlaybookEntries:
 
         await confirm_applied_playbook_entries(task, db_session)
         # no exception raised, no changes
+
+
+# ── cross-layer remediation prompt ──────────────────────────────────────────
+
+
+class TestCrossLayerRemediationPrompt:
+    """_spawn_investigation_remediation emits the correct unmodifiable-layer
+    declaration instruction for cross-layer mandated remediations."""
+
+    @pytest.mark.asyncio
+    async def test_cross_layer_prompt_includes_recommended_unmodifiable_layers_instruction(
+        self, db_session
+    ):
+        """The cross-layer prompt tells agents to set recommended_unmodifiable_layers
+        in context rather than the old 'capture as finding/note' instruction."""
+        from app.task_completion import _spawn_investigation_remediation
+
+        project = make_project(
+            directions=[{"id": "dir-cl", "status": "active", "text": "demo"}]
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        parent = make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            context={
+                "direction_id": "dir-cl",
+                "cross_layer": True,
+                "regression_class": "test_flap",
+            },
+            payloads=[{"type": "investigate", "prompt": "x"}],
+        )
+        db_session.add(parent)
+        await db_session.commit()
+        await db_session.refresh(parent)
+
+        task = await _spawn_investigation_remediation(
+            task=parent,
+            direction_id="dir-cl",
+            summary="cross-layer fix needed",
+            root_cause="rc",
+            recommended_fix="rf",
+            severity="high",
+            confidence="high",
+            affected_paths=["backend/app/foo.py"],
+            remediation_attempts=0,
+            session=db_session,
+        )
+        assert task is not None
+        prompt = task.first_payload["prompt"]
+        assert "recommended_unmodifiable_layers" in prompt
+        assert "CI_WORKFLOW" in prompt
+        # old conflicting instruction must be gone
+        assert "capture it as a finding/note" not in prompt
+
+    @pytest.mark.asyncio
+    async def test_non_cross_layer_prompt_omits_unmodifiable_layer_block(
+        self, db_session
+    ):
+        """Non-cross-layer remediations do not include the unmodifiable-layer block."""
+        from app.task_completion import _spawn_investigation_remediation
+
+        project = make_project(
+            directions=[{"id": "dir-nc", "status": "active", "text": "demo"}]
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        parent = make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            context={"direction_id": "dir-nc"},
+            payloads=[{"type": "investigate", "prompt": "x"}],
+        )
+        db_session.add(parent)
+        await db_session.commit()
+        await db_session.refresh(parent)
+
+        task = await _spawn_investigation_remediation(
+            task=parent,
+            direction_id="dir-nc",
+            summary="simple fix",
+            root_cause="rc",
+            recommended_fix="rf",
+            severity="medium",
+            confidence="high",
+            affected_paths=["backend/app/bar.py"],
+            remediation_attempts=0,
+            session=db_session,
+        )
+        assert task is not None
+        prompt = task.first_payload["prompt"]
+        assert "CROSS-LAYER REMEDIATION" not in prompt
+        assert "recommended_unmodifiable_layers" not in prompt

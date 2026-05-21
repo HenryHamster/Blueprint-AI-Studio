@@ -1748,6 +1748,16 @@ class RegressionRemediationCase(SQLModel, table=True):
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
+    # Running count of compliance follow-up tasks spawned for this case.
+    # The dispatcher compares this against a max cap to prevent a cross-layer
+    # mandate that is permanently unsatisfiable (e.g. requires unmodifiable
+    # CI_WORKFLOW layer) from re-spawning a compliance-followup indefinitely.
+    # Incremented each time _run_compliance_followup_once spawns a task for
+    # this case; never decremented. Migration: alembic 0102.
+    compliance_followup_count: int = Field(
+        default=0,
+        sa_column=Column(Integer, nullable=False, server_default=text("0")),
+    )
     # Attribution for the PR/commit that introduced this regression. Set when
     # a new case is first created or re-tripped after CLOSED. Null for legacy
     # rows and cases where attribution could not be determined.
@@ -1814,6 +1824,7 @@ class RegressionRemediationCase(SQLModel, table=True):
         pr_number: int,
         signal_snapshot: Dict[str, Any],
         layers_targeted: List[str] | None = None,
+        recommended_unmodifiable_layers: List[str] | None = None,
         *,
         spawn_was_cross_layer: bool = False,
         spawn_layers_enumerated: List[str] | None = None,
@@ -1833,6 +1844,11 @@ class RegressionRemediationCase(SQLModel, table=True):
         "unclassified", not "no layers". Existing fix-log entries written
         before this field existed remain readable everywhere.
 
+        ``recommended_unmodifiable_layers`` (optional) records layers the agent
+        identified as needing changes but could not modify (e.g. CI_WORKFLOW).
+        Credited toward the >=2-layer compliance total by the watchdog so a fix
+        that correctly documents an unmodifiable layer is not flagged non-compliant.
+
         ``spawn_was_cross_layer`` / ``spawn_layers_enumerated`` record the
         dispatcher's cross-layer escalation context at spawn time so the
         compliance metric can compare layers observed vs layers touched.
@@ -1850,6 +1866,10 @@ class RegressionRemediationCase(SQLModel, table=True):
         }
         if layers_targeted:
             log_entry["layers_targeted"] = list(layers_targeted)
+        if recommended_unmodifiable_layers:
+            log_entry["recommended_unmodifiable_layers"] = list(
+                recommended_unmodifiable_layers
+            )
         if spawn_was_cross_layer:
             log_entry["spawn_was_cross_layer"] = True
             log_entry["spawn_layers_enumerated"] = list(spawn_layers_enumerated or [])

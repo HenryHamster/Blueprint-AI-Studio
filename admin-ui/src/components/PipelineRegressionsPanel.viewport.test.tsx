@@ -1,7 +1,7 @@
 import { afterEach, describe, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
-import { DispatcherHealthPanel, LayerCoverageHistogramPanel, ManualInterventionPanel, RegressionRateTrendPanel, LayerDefenseDensityPanel, EscalationOutcomePanel } from './PipelineRegressionsPanel';
+import { DispatcherHealthPanel, LayerCoverageHistogramPanel, ManualInterventionPanel, RegressionRateTrendPanel, LayerDefenseDensityPanel, EscalationOutcomePanel, FirstAttemptComplianceTrendPanel } from './PipelineRegressionsPanel';
 import { expectNoOverflowAt, expectMinTouchTargetAt, expectNoTextTruncationAt } from '../test/viewport';
 
 vi.mock('recharts', () => ({
@@ -121,6 +121,28 @@ vi.mock('../api', () => ({
         },
         lookback_days: 30,
         generated_at: new Date().toISOString(),
+      }), { status: 200 });
+    }
+    if (url.includes('first-attempt-compliance-trend')) {
+      const now = new Date('2026-05-21T00:00:00Z');
+      return new Response(JSON.stringify({
+        windows: Array.from({ length: 6 }, (_, i) => {
+          const end = new Date(now);
+          end.setDate(end.getDate() - (5 - i) * 7);
+          const start = new Date(end);
+          start.setDate(start.getDate() - 7);
+          return {
+            window_start: start.toISOString(),
+            window_end: end.toISOString(),
+            first_attempt_compliant: i < 2 ? 0 : i,
+            followup_rescued: i < 2 ? 0 : Math.max(0, 2 - i),
+            awaiting_backfill: i === 5 ? 1 : 0,
+            rate: i < 2 ? null : i / (i + Math.max(0, 2 - i)),
+          };
+        }),
+        num_windows: 6,
+        window_days: 7,
+        generated_at: now.toISOString(),
       }), { status: 200 });
     }
     if (url.includes('/manual-intervention')) {
@@ -383,6 +405,47 @@ describe('EscalationOutcomePanel — viewport regression', () => {
     await act(async () => { await new Promise((resolve) => setTimeout(resolve, 50)); });
     const panel = host.querySelector('[data-testid="escalation-outcome-panel"]');
     if (panel) throw new Error('panel should not render when all merged_count are zero');
+  });
+});
+
+describe('FirstAttemptComplianceTrendPanel — viewport regression', () => {
+  let root: Root | null = null;
+  let host: HTMLDivElement | null = null;
+  afterEach(() => { if (root) act(() => root?.unmount()); root = null; host?.remove(); host = null; });
+  test('renders populated trend without overflow at 375px', async () => {
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      root = createRoot(host);
+      await act(async () => { root?.render(<FirstAttemptComplianceTrendPanel projectId="project-123" />); });
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 50)); });
+    });
+  });
+  test('does not render when all windows are empty', async () => {
+    const { apiFetch } = await import('../api');
+    vi.mocked(apiFetch).mockResolvedValueOnce(
+      new Response(JSON.stringify({
+        windows: Array.from({ length: 6 }, (_, i) => ({
+          window_start: new Date(Date.now() - (6 - i) * 7 * 86400_000).toISOString(),
+          window_end: new Date(Date.now() - (5 - i) * 7 * 86400_000).toISOString(),
+          first_attempt_compliant: 0,
+          followup_rescued: 0,
+          awaiting_backfill: 0,
+          rate: null,
+        })),
+        num_windows: 6,
+        window_days: 7,
+        generated_at: new Date().toISOString(),
+      }), { status: 200 })
+    );
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    root = createRoot(host);
+    await act(async () => { root?.render(<FirstAttemptComplianceTrendPanel projectId="project-123" />); });
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 50)); });
+    const panel = host.querySelector('[data-testid="first-attempt-compliance-trend-panel"]');
+    if (panel) throw new Error('panel should not render when all windows are empty');
   });
 });
 

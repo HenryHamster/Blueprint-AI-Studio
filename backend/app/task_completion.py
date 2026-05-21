@@ -3696,9 +3696,12 @@ async def _spawn_investigation_remediation(
             "\nCROSS-LAYER REMEDIATION: this regression class surfaced across "
             f"{layers_phrase}. Plan a coordinated change that touches all affected "
             "layers in a single cluster rather than serializing one PR per layer. "
-            "Note: .github/workflows/ files cannot be edited by the agent — if a "
-            "fix would target workflow YAML, capture it as a finding/note in the "
-            "remediation rather than a direct edit."
+            "Note: .github/workflows/ files cannot be edited by the agent. If a "
+            "defense would target workflow YAML or another unmodifiable layer, declare "
+            "it by setting 'recommended_unmodifiable_layers': ['CI_WORKFLOW'] (or the "
+            "appropriate layer name) in the task context — do NOT attempt a direct "
+            "edit. The compliance checker credits documented unmodifiable layers toward "
+            "the >=2-layer mandate."
         )
     prompt_parts.append(
         f"\nThis task was spawned from investigation {task.id} to remediate a "
