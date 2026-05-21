@@ -1052,6 +1052,54 @@ class TestMessages:
         returned_ids = {m["id"] for m in resp.json()["messages"]}
         assert str(blocker.id) in returned_ids
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "high_signal_event_type",
+        ["failure_alert", "rollback_recommended", "fix_loop_divergence_regressed"],
+    )
+    async def test_list_messages_guarantees_high_signal_notes_with_routine_flood(
+        self, client: AsyncClient, db_session, high_signal_event_type: str
+    ):
+        """System NOTE alerts classified as high-signal always survive a routine flood."""
+        from datetime import datetime, timedelta, timezone
+
+        project = await _make_project(db_session)
+        now = datetime.now(timezone.utc)
+
+        # High-signal NOTE is the OLDEST message so it would be evicted by paging
+        # alone without the guaranteed-query logic.
+        alert = ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.NOTE,
+            from_type="system",
+            content=f"system alert: {high_signal_event_type}",
+            context={"event_type": high_signal_event_type},
+        )
+        alert.created_at = now - timedelta(hours=10)
+        db_session.add(alert)
+        for i in range(5):
+            routine = ProjectMessage(
+                project_id=project.id,
+                message_type=MessageType.NOTE,
+                from_type="system",
+                content=f"routine {i}",
+                context={"event_type": "pr_merged"},
+            )
+            routine.created_at = now - timedelta(minutes=5 * (5 - i))
+            db_session.add(routine)
+        await db_session.commit()
+
+        # limit=3 would normally cut off the alert if 5 newer routine messages exist
+        resp = await client.get(
+            f"/api/admin/messages?project_id={project.id}&status=open&limit=3"
+        )
+        assert resp.status_code == 200
+        returned_ids = {m["id"] for m in resp.json()["messages"]}
+        assert str(alert.id) in returned_ids, (
+            f"high-signal NOTE with event_type={high_signal_event_type!r} was evicted "
+            "by routine flood — guaranteed-query logic did not include it"
+        )
+
 
 class TestMessagesLastSeen:
     @pytest.mark.asyncio
@@ -1116,6 +1164,86 @@ class TestMessagesLastSeen:
             json={"project_id": random_pid, "timestamp": 1_700_000_000_000},
         )
         assert put_resp.status_code == 404
+
+
+class TestMessagesSavedViews:
+    @pytest.mark.asyncio
+    async def test_get_saved_views_empty(self, client: AsyncClient, db_session):
+        """Returns empty list when no saved-views record exists for the operator."""
+        project = await _make_project(db_session)
+        resp = await client.get(
+            f"/api/admin/messages/saved-views?project_id={project.id}"
+        )
+        assert resp.status_code == 200
+        assert resp.json()["saved_views"] == []
+
+    @pytest.mark.asyncio
+    async def test_round_trip(self, client: AsyncClient, db_session):
+        """PUT stores saved views; subsequent GET returns the same value."""
+        project = await _make_project(db_session)
+        views = [{"name": "Blockers only", "query": "", "sort": "desc"}]
+
+        put_resp = await client.put(
+            "/api/admin/messages/saved-views",
+            json={"project_id": str(project.id), "saved_views": views},
+        )
+        assert put_resp.status_code == 200
+        assert put_resp.json()["status"] == "ok"
+
+        get_resp = await client.get(
+            f"/api/admin/messages/saved-views?project_id={project.id}"
+        )
+        assert get_resp.status_code == 200
+        assert get_resp.json()["saved_views"] == views
+
+    @pytest.mark.asyncio
+    async def test_update_replaces_views(self, client: AsyncClient, db_session):
+        """A second PUT replaces the previous saved views."""
+        project = await _make_project(db_session)
+        views1 = [{"name": "First view"}]
+        views2 = [{"name": "Second view"}, {"name": "Third view"}]
+
+        await client.put(
+            "/api/admin/messages/saved-views",
+            json={"project_id": str(project.id), "saved_views": views1},
+        )
+        await client.put(
+            "/api/admin/messages/saved-views",
+            json={"project_id": str(project.id), "saved_views": views2},
+        )
+        get_resp = await client.get(
+            f"/api/admin/messages/saved-views?project_id={project.id}"
+        )
+        assert get_resp.json()["saved_views"] == views2
+
+    @pytest.mark.asyncio
+    async def test_no_access_returns_404(self, client: AsyncClient, db_session):
+        """Cannot read or write saved-views for a project the user is not a member of."""
+        random_pid = str(uuid.uuid4())
+        get_resp = await client.get(
+            f"/api/admin/messages/saved-views?project_id={random_pid}"
+        )
+        assert get_resp.status_code == 404
+
+        put_resp = await client.put(
+            "/api/admin/messages/saved-views",
+            json={"project_id": random_pid, "saved_views": []},
+        )
+        assert put_resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_oversize_payload_returns_400(self, client: AsyncClient, db_session):
+        """Payload exceeding 50 KB is rejected with 400."""
+        project = await _make_project(db_session)
+        # Each view is ~1KB; 60 of them easily exceeds 50KB
+        large_views = [{"name": f"view-{i}", "data": "x" * 900} for i in range(60)]
+
+        put_resp = await client.put(
+            "/api/admin/messages/saved-views",
+            json={"project_id": str(project.id), "saved_views": large_views},
+        )
+        assert put_resp.status_code == 400
+        assert "50" in put_resp.json()["error"]["message"]
 
 
 class TestPlaybook:

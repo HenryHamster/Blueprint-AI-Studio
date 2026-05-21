@@ -55,6 +55,20 @@ _PERMANENT_FAILURE_CODES: frozenset[int] = frozenset({401, 403, 404})
 # Retry delays in seconds: attempt 1 → 30s, attempt 2 → 120s, attempt 3 → 600s
 _RETRY_DELAYS: tuple[int, ...] = (30, 120, 600)
 
+# System-emitted NOTE event types classified as high_signal in event_type_snapshot.json.
+# These must always survive paging regardless of routine message volume (see
+# admin_notifications.list_messages guaranteed-query logic). Escalation types
+# (auto_fix_escalated, residual_fix_escalated, etc.) are already safe because they emit
+# as BLOCKER messages — not NOTE — so they don't belong here.
+# Source of truth: backend/testing/event_type_snapshot.json (classification=high_signal).
+HIGH_SIGNAL_NOTE_EVENT_TYPES: frozenset[str] = frozenset(
+    {
+        "failure_alert",  # post_failure_alert_message
+        "rollback_recommended",  # post_rollback_recommendation_message
+        "fix_loop_divergence_regressed",  # post_fix_loop_divergence_regression_message
+    }
+)
+
 
 @dataclasses.dataclass
 class _RetryEntry:

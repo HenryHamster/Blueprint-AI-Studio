@@ -31,6 +31,10 @@ import {
   resolveNoisePrefs,
   fetchServerNoisePrefs,
   saveServerNoisePrefs,
+  fetchServerSavedViews,
+  saveServerSavedViews,
+  resolveServerSavedViews,
+  countHighSignalMessages,
 } from './MessagesPanel.utils';
 
 vi.mock('../api', () => ({
@@ -249,6 +253,7 @@ describe('escalation event invariants', () => {
     const base = { from_type: 'system', message_type: 'NOTE' as const };
     expect(classifySignalLevel({ ...base, context: { event_type: 'failure_alert' } })).toBe('high');
     expect(classifySignalLevel({ ...base, context: { event_type: 'rollback_recommended' } })).toBe('high');
+    expect(classifySignalLevel({ ...base, context: { event_type: 'fix_loop_divergence_regressed' } })).toBe('high');
     expect(classifySignalLevel({ ...base, context: { event_type: 'pr_merged' } })).toBe('routine');
   });
 
@@ -823,5 +828,151 @@ describe('saveServerNoisePrefs', () => {
   test('silently swallows network errors', async () => {
     vi.mocked(apiFetch).mockRejectedValue(new Error('network'));
     await expect(saveServerNoisePrefs('proj-123', {})).resolves.toBeUndefined();
+  });
+});
+
+// ── Server-side saved views ───────────────────────────────────────────────────
+
+describe('resolveServerSavedViews', () => {
+  const view: SavedView = {
+    id: 'v1', name: 'Blockers', query: 'blocker', prefs: {},
+    sort: 'importance', showResolved: false, routineExpanded: false,
+    showOnlyNew: false, createdAt: 1000,
+  };
+
+  test('returns server views when server result is present', () => {
+    const local = [{ ...view, id: 'local' }];
+    const server = [view];
+    expect(resolveServerSavedViews(local, server)).toEqual(server);
+  });
+
+  test('falls back to local when server is null (offline)', () => {
+    const local = [view];
+    expect(resolveServerSavedViews(local, null)).toEqual(local);
+  });
+
+  test('returns empty array when server returns empty views', () => {
+    expect(resolveServerSavedViews([view], [])).toEqual([]);
+  });
+});
+
+describe('fetchServerSavedViews', () => {
+  beforeEach(() => { vi.resetAllMocks(); });
+
+  test('returns sanitized views on successful response', async () => {
+    const raw = { id: 'v1', name: 'All', query: '', prefs: { pr_merged: 'mute' }, sort: 'importance', showResolved: false, routineExpanded: false, showOnlyNew: false, createdAt: 1000 };
+    vi.mocked(apiFetch).mockResolvedValue({
+      ok: true,
+      json: async () => ({ saved_views: [raw, { bad: true }] }),
+    } as Response);
+    const result = await fetchServerSavedViews('project-uuid');
+    expect(result).toHaveLength(1);
+    expect(result![0].id).toBe('v1');
+    expect(result![0].prefs).toEqual({ pr_merged: 'mute' });
+  });
+
+  test('returns null on non-ok response', async () => {
+    vi.mocked(apiFetch).mockResolvedValue({ ok: false } as Response);
+    expect(await fetchServerSavedViews('project-uuid')).toBeNull();
+  });
+
+  test('returns null on network error', async () => {
+    vi.mocked(apiFetch).mockRejectedValue(new Error('network'));
+    expect(await fetchServerSavedViews('project-uuid')).toBeNull();
+  });
+
+  test('returns empty array when server returns no views', async () => {
+    vi.mocked(apiFetch).mockResolvedValue({
+      ok: true,
+      json: async () => ({ saved_views: [] }),
+    } as Response);
+    expect(await fetchServerSavedViews('project-uuid')).toEqual([]);
+  });
+});
+
+describe('saveServerSavedViews', () => {
+  beforeEach(() => { vi.resetAllMocks(); });
+
+  test('calls PUT with the correct project_id and saved_views', async () => {
+    vi.mocked(apiFetch).mockResolvedValue({ ok: true } as Response);
+    const views: SavedView[] = [{
+      id: 'v1', name: 'Blockers', query: 'blocker', prefs: {},
+      sort: 'importance', showResolved: false, routineExpanded: false,
+      showOnlyNew: false, createdAt: 1000,
+    }];
+    await saveServerSavedViews('proj-123', views);
+    expect(vi.mocked(apiFetch)).toHaveBeenCalledWith(
+      expect.stringContaining('/api/admin/messages/saved-views'),
+      expect.objectContaining({ method: 'PUT', body: JSON.stringify({ project_id: 'proj-123', saved_views: views }) }),
+    );
+  });
+
+  test('silently swallows network errors', async () => {
+    vi.mocked(apiFetch).mockRejectedValue(new Error('network'));
+    const views: SavedView[] = [];
+    await expect(saveServerSavedViews('proj-123', views)).resolves.toBeUndefined();
+  });
+});
+
+// ── High-signal NOTE flood survival ──────────────────────────────────────────
+// Regression guard: countHighSignalMessages must count each of the three
+// high-signal system NOTE event types (failure_alert, rollback_recommended,
+// fix_loop_divergence_regressed) correctly even when buried under a routine
+// flood of messages that would exceed a typical page limit.
+
+describe('countHighSignalMessages — high-signal NOTE flood survival', () => {
+  const makeRoutineFlood = (n: number) =>
+    Array.from({ length: n }, (_, i) => ({
+      id: `routine-${i}`,
+      message_type: 'NOTE' as const,
+      from_type: 'system',
+      status: 'open',
+      context: { event_type: 'pr_merged' },
+    }));
+
+  const makeHighSignalNote = (et: string, status = 'open') => ({
+    id: `hs-${et}`,
+    message_type: 'NOTE' as const,
+    from_type: 'system',
+    status,
+    context: { event_type: et },
+  });
+
+  test('failure_alert is counted amid routine flood exceeding page limit', () => {
+    const messages = [...makeRoutineFlood(100), makeHighSignalNote('failure_alert')];
+    expect(countHighSignalMessages(messages)).toBe(1);
+  });
+
+  test('rollback_recommended is counted amid routine flood exceeding page limit', () => {
+    const messages = [...makeRoutineFlood(100), makeHighSignalNote('rollback_recommended')];
+    expect(countHighSignalMessages(messages)).toBe(1);
+  });
+
+  test('fix_loop_divergence_regressed is counted amid routine flood exceeding page limit', () => {
+    const messages = [...makeRoutineFlood(100), makeHighSignalNote('fix_loop_divergence_regressed')];
+    expect(countHighSignalMessages(messages)).toBe(1);
+  });
+
+  test('all three high-signal NOTE types are counted independently amid routine flood', () => {
+    const messages = [
+      ...makeRoutineFlood(100),
+      makeHighSignalNote('failure_alert'),
+      makeHighSignalNote('rollback_recommended'),
+      makeHighSignalNote('fix_loop_divergence_regressed'),
+    ];
+    expect(countHighSignalMessages(messages)).toBe(3);
+  });
+
+  test('resolved high-signal NOTEs are excluded from count', () => {
+    const messages = [
+      ...makeRoutineFlood(50),
+      makeHighSignalNote('failure_alert', 'resolved'),
+      makeHighSignalNote('rollback_recommended'),
+    ];
+    expect(countHighSignalMessages(messages)).toBe(1);
+  });
+
+  test('routine flood alone counts zero', () => {
+    expect(countHighSignalMessages(makeRoutineFlood(100))).toBe(0);
   });
 });

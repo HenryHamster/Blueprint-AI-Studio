@@ -396,6 +396,37 @@ class MessagesNoisePrefs(SQLModel, table=True):
     )
 
 
+class MessagesSavedViews(SQLModel, table=True):
+    """Per-operator, per-project saved views for the messages panel.
+
+    Persists named filter/sort combinations (saved views) server-side so they
+    follow the operator across devices. localStorage remains the offline fallback;
+    this table is the authoritative source when the backend is reachable.
+
+    saved_views shape (stored as JSONB, validated by the admin_notifications router):
+      [{"name": str, "query": str, "event_prefs": {...}, "sort_mode": str,
+        "show_resolved": bool, "show_routine": bool, "only_new": bool}, ...]
+    """
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    user_id: str = Field(index=True, max_length=128)
+    project_id: uuid.UUID = Field(foreign_key="project.id", index=True)
+    saved_views: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'[]'")),
+    )
+    updated_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, onupdate=_utcnow),
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id", "project_id", name="uq_messagessavedviews_user_project"
+        ),
+    )
+
+
 class Task(SQLModel, table=True):
     """
     Extensible Task model. The 'payloads' JSONB column holds a flexible list

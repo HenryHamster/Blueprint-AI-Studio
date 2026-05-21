@@ -10,7 +10,7 @@ from typing import Optional, Dict, Any, List
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import func, update, or_
+from sqlalchemy import func, update, or_, and_
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
@@ -23,6 +23,7 @@ from app.models import (
     MessageType,
     MessagesLastSeen,
     MessagesNoisePrefs,
+    MessagesSavedViews,
     _utcnow,
 )
 from app.auth import get_current_user
@@ -64,6 +65,11 @@ class NoisePrefUpdate(BaseModel):
     prefs: Dict[str, Any] = Field(default_factory=dict)
 
 
+class SavedViewsUpdate(BaseModel):
+    project_id: str
+    saved_views: List[Dict[str, Any]] = Field(default_factory=list)
+
+
 class AdminPlaybookSet(BaseModel):
     key: str = Field(
         ..., description="Playbook key: alphanumeric + hyphens, max 50 chars"
@@ -96,6 +102,19 @@ ROUTINE_EVENT_TYPES: frozenset = frozenset(
         "issue_implementation_spawned",
         "review_feedback",
         "feedback_acknowledgment",
+    }
+)
+
+
+# System-emitted NOTE event types classified as high_signal in event_type_snapshot.json.
+# These must always survive paging regardless of routine message volume, identical to
+# how BLOCKER/FEEDBACK/BUG_REPORT are guaranteed.  Escalation types (auto_fix_escalated,
+# residual_fix_escalated, etc.) are already safe because they emit as BLOCKER messages.
+HIGH_SIGNAL_NOTE_EVENT_TYPES: frozenset = frozenset(
+    {
+        "failure_alert",
+        "rollback_recommended",
+        "fix_loop_divergence_regressed",
     }
 )
 
@@ -335,8 +354,9 @@ async def list_messages(
         )
     ).scalar() or 0
 
-    # Guarantee open high-signal messages (user-authored or BLOCKER/FEEDBACK/BUG_REPORT)
-    # are always returned, regardless of how much routine volume fills the paged window.
+    # Guarantee open high-signal messages are always returned regardless of routine volume.
+    # Covers: user-authored, BLOCKER/FEEDBACK/BUG_REPORT, and system NOTE messages whose
+    # event_type is classified as high_signal in the event-type snapshot.
     guaranteed_msgs: list = []
     if status != "resolved":
         pid_uuid = uuid.UUID(project_id) if project_id else None
@@ -346,6 +366,13 @@ async def list_messages(
             or_(
                 ProjectMessage.from_type == "user",
                 ProjectMessage.message_type.in_(["FEEDBACK", "BLOCKER", "BUG_REPORT"]),
+                and_(
+                    ProjectMessage.message_type == MessageType.NOTE,
+                    ProjectMessage.from_type == "system",
+                    ProjectMessage.context["event_type"]
+                    .as_string()
+                    .in_(list(HIGH_SIGNAL_NOTE_EVENT_TYPES)),
+                ),
             ),
             *([ProjectMessage.project_id == pid_uuid] if pid_uuid else []),
         )
@@ -601,6 +628,74 @@ async def put_messages_noise_prefs(
     else:
         row.prefs = payload.prefs
         flag_modified(row, "prefs")
+
+    session.add(row)
+    await session.commit()
+    return {"status": "ok"}
+
+
+# ── Messages Saved-Views Endpoints ──────────────────────────────────────────
+
+
+@router.get("/messages/saved-views")
+async def get_messages_saved_views(
+    project_id: str = Query(...),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return the operator's saved views for the messages panel."""
+    try:
+        pid = uuid.UUID(project_id)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid project_id format")
+    await _get_user_project(pid, current_user["user_id"], session)
+
+    row = (
+        await session.execute(
+            select(MessagesSavedViews).where(
+                MessagesSavedViews.user_id == current_user["user_id"],
+                MessagesSavedViews.project_id == pid,
+            )
+        )
+    ).scalar_one_or_none()
+
+    return {"saved_views": row.saved_views if row is not None else []}
+
+
+@router.put("/messages/saved-views")
+async def put_messages_saved_views(
+    payload: SavedViewsUpdate,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Upsert the operator's saved views for the messages panel."""
+    try:
+        pid = uuid.UUID(payload.project_id)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid project_id format")
+    await _get_user_project(pid, current_user["user_id"], session)
+
+    if len(json.dumps(payload.saved_views)) > 50_000:
+        raise HTTPException(status_code=400, detail="Saved views too large (max 50KB)")
+
+    row = (
+        await session.execute(
+            select(MessagesSavedViews).where(
+                MessagesSavedViews.user_id == current_user["user_id"],
+                MessagesSavedViews.project_id == pid,
+            )
+        )
+    ).scalar_one_or_none()
+
+    if row is None:
+        row = MessagesSavedViews(
+            user_id=current_user["user_id"],
+            project_id=pid,
+            saved_views=payload.saved_views,
+        )
+    else:
+        row.saved_views = payload.saved_views
+        flag_modified(row, "saved_views")
 
     session.add(row)
     await session.commit()

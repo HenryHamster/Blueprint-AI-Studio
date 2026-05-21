@@ -684,3 +684,45 @@ export function resolveNoisePrefs(
 ): Record<string, EventPref> {
   return serverPrefs ?? localPrefs;
 }
+
+// ── Server-side saved views (per-operator, per-project) ──────────────────────
+// Mirrors the noise-prefs server persistence pattern. localStorage remains the
+// offline fallback; on successful fetch the server value wins.
+
+export async function fetchServerSavedViews(
+  projectId: string,
+): Promise<SavedView[] | null> {
+  try {
+    const res = await apiFetch(`${API_BASE_URL}/api/admin/messages/saved-views?project_id=${encodeURIComponent(projectId)}`);
+    if (!res.ok) return null;
+    const data = await res.json() as { saved_views?: unknown[] };
+    if (!Array.isArray(data.saved_views)) return [];
+    const out: SavedView[] = [];
+    for (const item of data.saved_views) {
+      const v = sanitizeSavedView(item);
+      if (v) out.push(v);
+    }
+    return out;
+  } catch {
+    return null;
+  }
+}
+
+export async function saveServerSavedViews(
+  projectId: string,
+  views: SavedView[],
+): Promise<void> {
+  try {
+    await apiFetch(`${API_BASE_URL}/api/admin/messages/saved-views`, {
+      method: 'PUT',
+      body: JSON.stringify({ project_id: projectId, saved_views: views }),
+    });
+  } catch { /* ignore — localStorage copy remains authoritative offline */ }
+}
+
+export function resolveServerSavedViews(
+  localViews: SavedView[],
+  serverViews: SavedView[] | null,
+): SavedView[] {
+  return serverViews ?? localViews;
+}

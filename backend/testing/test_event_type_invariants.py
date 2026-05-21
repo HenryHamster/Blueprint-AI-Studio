@@ -90,3 +90,86 @@ def test_snapshot_has_required_fields():
             f"Event type '{entry['name']}' has invalid classification '{classification}'. "
             f"Must be one of: {valid_classifications}"
         )
+
+
+def test_high_signal_note_set_matches_snapshot():
+    """Cross-layer invariant: HIGH_SIGNAL_NOTE_EVENT_TYPES must equal the snapshot's
+    high_signal NOTE entries — in both notification_dispatch and admin_notifications.
+
+    Drift between these three sources is what caused the original bug (high-signal NOTEs
+    silently evicted by routine flood because the guaranteed-query set was stale).
+    """
+    snapshot_path = Path(__file__).parent / "event_type_snapshot.json"
+
+    with open(snapshot_path) as f:
+        snapshot = json.load(f)
+
+    # Derive expected set from snapshot: classification=high_signal, message_type=NOTE
+    expected: set[str] = {
+        et["name"]
+        for et in snapshot["event_types"]
+        if et.get("classification") == "high_signal"
+        and et.get("message_type") == "NOTE"
+    }
+
+    # Verify escalation types use BLOCKER (not NOTE) so they are already guaranteed
+    # via message_type and do not need to appear in HIGH_SIGNAL_NOTE_EVENT_TYPES.
+    escalation_notes = {
+        et["name"]
+        for et in snapshot["event_types"]
+        if et.get("classification") == "escalation"
+        and et.get("message_type") != "BLOCKER"
+    }
+    assert not escalation_notes, (
+        f"Escalation event types must emit as BLOCKER, not NOTE: {sorted(escalation_notes)}\n"
+        "  → Update snapshot message_type or the source function's message_type argument."
+    )
+
+    # Import the backend constant from notification_dispatch (canonical source of truth)
+    import importlib
+
+    nd = importlib.import_module("app.notification_dispatch")
+    nd_set: frozenset[str] = nd.HIGH_SIGNAL_NOTE_EVENT_TYPES
+
+    # Import from admin_notifications (must mirror notification_dispatch)
+    an = importlib.import_module("app.routers.admin_notifications")
+    an_set: frozenset[str] = an.HIGH_SIGNAL_NOTE_EVENT_TYPES
+
+    drift_parts = []
+    if set(nd_set) != expected:
+        missing = expected - set(nd_set)
+        extra = set(nd_set) - expected
+        drift_parts.append(
+            "notification_dispatch.HIGH_SIGNAL_NOTE_EVENT_TYPES does not match snapshot:\n"
+            + (
+                f"  missing (in snapshot but not in set): {sorted(missing)}\n"
+                if missing
+                else ""
+            )
+            + (
+                f"  extra (in set but not in snapshot): {sorted(extra)}\n"
+                if extra
+                else ""
+            )
+            + "  → Update HIGH_SIGNAL_NOTE_EVENT_TYPES in backend/app/notification_dispatch.py"
+        )
+    if set(an_set) != expected:
+        missing = expected - set(an_set)
+        extra = set(an_set) - expected
+        drift_parts.append(
+            "admin_notifications.HIGH_SIGNAL_NOTE_EVENT_TYPES does not match snapshot:\n"
+            + (
+                f"  missing (in snapshot but not in set): {sorted(missing)}\n"
+                if missing
+                else ""
+            )
+            + (
+                f"  extra (in set but not in snapshot): {sorted(extra)}\n"
+                if extra
+                else ""
+            )
+            + "  → Update HIGH_SIGNAL_NOTE_EVENT_TYPES in backend/app/routers/admin_notifications.py"
+        )
+
+    if drift_parts:
+        raise AssertionError("\n\n".join(drift_parts))

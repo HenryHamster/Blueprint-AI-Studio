@@ -3,7 +3,7 @@ import { X, MessageSquare, Send, Check, AlertTriangle, HelpCircle, Bug, StickyNo
 import { auth } from '../firebase';
 import { apiFetch, API_BASE_URL, authHeaders } from '../api';
 import { parseTimestamp } from '../utils/time';
-import { routineSummary, effectiveSignal, loadEventPrefs, saveEventPrefs, type EventPref, groupRoutineMessages, collapseStaleRoutineRows, formatDailyDigestSummary, outcomeBreakdown, isFailingGroup, getToastSeverity, type RoutineRow, loadLastSeen, saveLastSeen, formatTimestamp, formatSinceTimestamp, insertTimeDividers, type MessageWithDivider, ESCALATION_BADGE_LABELS, isCriticalSeverity, type MuteWindow, loadMuteWindow, saveMuteWindow, clearMuteWindow, isMuteWindowActive, formatMuteCountdown, type SavedView, loadSavedViews, saveSavedViews, SAVED_VIEWS_CAP, type TemporaryMutes, loadTemporaryMutes, saveTemporaryMutes, ROUTINE_EVENT_LABELS, countHighSignalMessages, fetchServerNoisePrefs, saveServerNoisePrefs } from './MessagesPanel.utils';
+import { routineSummary, effectiveSignal, loadEventPrefs, saveEventPrefs, type EventPref, groupRoutineMessages, collapseStaleRoutineRows, formatDailyDigestSummary, outcomeBreakdown, isFailingGroup, getToastSeverity, type RoutineRow, loadLastSeen, saveLastSeen, formatTimestamp, formatSinceTimestamp, insertTimeDividers, type MessageWithDivider, ESCALATION_BADGE_LABELS, isCriticalSeverity, type MuteWindow, loadMuteWindow, saveMuteWindow, clearMuteWindow, isMuteWindowActive, formatMuteCountdown, type SavedView, loadSavedViews, saveSavedViews, SAVED_VIEWS_CAP, type TemporaryMutes, loadTemporaryMutes, saveTemporaryMutes, ROUTINE_EVENT_LABELS, countHighSignalMessages, fetchServerNoisePrefs, saveServerNoisePrefs, fetchServerSavedViews, saveServerSavedViews } from './MessagesPanel.utils';
 
 const DEFAULT_VIEW_ID = '__default__';
 
@@ -397,6 +397,15 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
     setSavedViews(loadSavedViews(auth.currentUser?.email, selectedProjectId));
     setActiveViewId(DEFAULT_VIEW_ID);
     setOpenKebabId(null);
+    if (selectedProjectId) {
+      // Prefer server saved views over localStorage — picks up views created on another device.
+      fetchServerSavedViews(selectedProjectId).then(serverViews => {
+        if (serverViews !== null) {
+          setSavedViews(serverViews);
+          saveSavedViews(auth.currentUser?.email, selectedProjectId, serverViews);
+        }
+      });
+    }
   }, [selectedProjectId]);
 
   // Close kebab menu on outside click — same pattern as MessageTypeDropdown.
@@ -698,6 +707,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
       const next = [...savedViews, view];
       setSavedViews(next);
       saveSavedViews(auth.currentUser?.email, selectedProjectId, next);
+      if (selectedProjectId) void saveServerSavedViews(selectedProjectId, next);
       setActiveViewId(view.id);
     } else if (saveDialogTargetId) {
       const next = savedViews.map(v =>
@@ -707,6 +717,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
       );
       setSavedViews(next);
       saveSavedViews(auth.currentUser?.email, selectedProjectId, next);
+      if (selectedProjectId) void saveServerSavedViews(selectedProjectId, next);
     }
     closeSaveDialog();
   }
@@ -715,6 +726,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
     const next = savedViews.filter(v => v.id !== viewId);
     setSavedViews(next);
     saveSavedViews(auth.currentUser?.email, selectedProjectId, next);
+    if (selectedProjectId) void saveServerSavedViews(selectedProjectId, next);
     setOpenKebabId(null);
     if (activeViewId === viewId) setActiveViewId(DEFAULT_VIEW_ID);
   }
