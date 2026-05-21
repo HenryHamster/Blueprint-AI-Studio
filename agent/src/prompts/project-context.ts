@@ -1,6 +1,6 @@
 import { strVal } from '../prompt.js';
 import { MEDIUM_ANALYSIS_PLAN_FILE_LIMIT } from '../constants.js';
-import { formatProjectBlindSpotSummary, formatSrRecentMissExamplesForSrPrompt, formatFailureModeHintForSrPrompt } from './self-review.js';
+import { formatProjectBlindSpotSummary, formatSrRecentMissExamplesForSrPrompt, formatFailureModeHintForSrPrompt, formatPersistentBlindSpotHintForSrPrompt } from './self-review.js';
 
 type SRCatData = {
   miss_rate: number;
@@ -518,6 +518,24 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
     }
   }
 
+  // Build persistent blind-spot hint block — highest-priority signal (chronic misses across ≥2 windows).
+  // Surfaces categories where fresh/human reviewer has consistently caught issues the agent's SR missed.
+  // Only included if budget allows.
+  const persistentBlindSpots = ctx.persistent_blind_spots as {
+    categories: Array<{ category: string; task_type: string; rate: number }>;
+    hint: string | null;
+  } | null | undefined;
+  let persistentBlindSpotLines: string[] = [];
+  if (persistentBlindSpots) {
+    const rendered = formatPersistentBlindSpotHintForSrPrompt(persistentBlindSpots);
+    if (rendered) {
+      if (rendered.length <= budget) {
+        persistentBlindSpotLines = rendered.split('\n');
+        budget -= rendered.length;
+      }
+    }
+  }
+
   // Build direction-scoped SR calibration block — sibling to the project-wide
   // Self-Review Blind Spots section. Backend (agent.py) only injects this field
   // when task has direction_id and there is enough signal for that direction.
@@ -778,6 +796,6 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
     footerLines.push('');
   }
 
-  const allLines = [...header, ...activeLines, ...lessonsLines, ...queuedLines, ...directionRecentLines, ...recentLines, ...healthLines, ...reviewIssueLines, ...srBlindSpotLines, ...failureModeHintLines, ...srForDirectionLines, ...srFPCalibrationLines, ...srReviewerDisagreementLines, ...srBlindSpotThemesLines, ...srRecentMissLines, ...moduleFeedbackLines, ...dirQualityLines, ...prLines, ...siblingLines, ...cochangeLines, ...footerLines];
+  const allLines = [...header, ...activeLines, ...lessonsLines, ...queuedLines, ...directionRecentLines, ...recentLines, ...healthLines, ...reviewIssueLines, ...srBlindSpotLines, ...failureModeHintLines, ...persistentBlindSpotLines, ...srForDirectionLines, ...srFPCalibrationLines, ...srReviewerDisagreementLines, ...srBlindSpotThemesLines, ...srRecentMissLines, ...moduleFeedbackLines, ...dirQualityLines, ...prLines, ...siblingLines, ...cochangeLines, ...footerLines];
   return allLines.join('\n');
 }

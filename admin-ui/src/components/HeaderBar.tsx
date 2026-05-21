@@ -3,7 +3,7 @@ import { useMemo, useState, useRef, useEffect } from 'react';
 import { Activity, Network, Compass, Microscope, Archive, Plus, MoreHorizontal, Settings, LayoutGrid, LayoutDashboard, MessageSquare } from 'lucide-react';
 import { MetricsBar } from './MetricsBar';
 import { AutonomousStatus } from './AutonomousStatus';
-import { SettingsDropdown, type MaxPlanAccount } from './SettingsDropdown';
+import { SettingsDropdown, type MaxPlanAccount, type SectionId } from './SettingsDropdown';
 import type { AuthMode, CategoryRoutingEntry, DeployState, ModelPreference, ProviderCatalogEntry, ProviderName, ProviderSettingsByEffort, ProviderSettingsDefaults, TaskTypeProviderOverrides, TaskTypeRoutingEntry } from '../types/settings';
 import type { Task } from '../types/task';
 import type { BuildConfig, AutoRemediationConfig, AutoRemediationStats, IssueImplementationConfig, AutoReviewConfig } from '../types/project';
@@ -41,6 +41,7 @@ export interface HeaderBarProps {
   showSettings: boolean;
   onToggleSettings: () => void;
   settingsRef: RefObject<HTMLDivElement | null>;
+  settingsInitialSection?: SectionId | null;
   defaultTaskType: UserLaunchableTaskType;
   onUpdateDefaultTaskType: (value: UserLaunchableTaskType) => void;
   notifyOnComplete: boolean;
@@ -194,6 +195,7 @@ export function HeaderBar(props: HeaderBarProps) {
     showSettings,
     onToggleSettings,
     settingsRef,
+    settingsInitialSection,
     defaultTaskType,
     onUpdateDefaultTaskType,
     notifyOnComplete,
@@ -405,6 +407,7 @@ export function HeaderBar(props: HeaderBarProps) {
           showSettings={showSettings}
           onToggleSettings={onToggleSettings}
           settingsRef={settingsRef}
+          initialSection={settingsInitialSection ?? null}
           defaultTaskType={defaultTaskType}
           onUpdateDefaultTaskType={onUpdateDefaultTaskType}
           viewMode={viewMode}

@@ -22,6 +22,9 @@ interface SettingsDropdownProps {
   showSettings: boolean;
   onToggleSettings: () => void;
   settingsRef: React.RefObject<HTMLDivElement | null>;
+  // When the panel is opened via a deep-link CTA, jump straight to this section
+  // instead of the default General tab.
+  initialSection?: SectionId | null;
   // Defaults
   defaultTaskType: UserLaunchableTaskType;
   onUpdateDefaultTaskType: (value: UserLaunchableTaskType) => void;
@@ -239,7 +242,7 @@ const CREDENTIAL_GUIDES: Record<string, CredentialGuide> = {
   },
 };
 
-type SectionId = 'general' | 'provider-routing' | 'provider-settings' | 'orchestrator' | 'deploy' | 'accounts' | 'notifications' | 'advanced' | 'build-config' | 'auto-remediation' | 'issue-implementation' | 'auto-review';
+export type SectionId = 'general' | 'provider-routing' | 'provider-settings' | 'orchestrator' | 'deploy' | 'accounts' | 'notifications' | 'advanced' | 'build-config' | 'auto-remediation' | 'issue-implementation' | 'auto-review';
 
 const SECTIONS: { id: SectionId; label: string; icon: typeof Settings; adminOnly?: boolean; projectOnly?: boolean }[] = [
   { id: 'general', label: 'General', icon: Sliders },
@@ -271,6 +274,7 @@ export function SettingsDropdown({
   showSettings,
   onToggleSettings,
   settingsRef,
+  initialSection,
   defaultTaskType,
   onUpdateDefaultTaskType,
   viewMode,
@@ -439,6 +443,11 @@ export function SettingsDropdown({
       setNewAccountAuthMode(availableAuthModes[0]);
     }
   }, [newAccountAuthMode, newAccountProvider, providers, setNewAccountAuthMode]);
+
+  // Jump to a requested section when the panel is opened via a deep-link CTA.
+  useEffect(() => {
+    if (showSettings && initialSection) setActiveSection(initialSection);
+  }, [showSettings, initialSection]);
 
   // Close on Escape
   useEffect(() => {

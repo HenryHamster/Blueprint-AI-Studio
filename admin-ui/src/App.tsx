@@ -19,6 +19,7 @@ import { AlertsBanner } from './components/AlertsBanner';
 import { NewTaskModal } from './components/NewTaskModal';
 import { NewProjectModal } from './components/NewProjectModal';
 import { HeaderBar } from './components/HeaderBar';
+import type { SectionId } from './components/SettingsDropdown';
 import { TaskLaunchFAB } from './components/TaskLaunchFAB';
 import MetricsDashboard from './components/MetricsDashboard';
 import { SearchFilterBar, SingleSelectDropdown } from './components/SearchFilterBar';
@@ -208,6 +209,23 @@ export default function App() {
       return null;
     }
   }, [selectedProjectId]);
+
+  const [settingsInitialSection, setSettingsInitialSection] = useState<SectionId | null>(null);
+
+  const handleConfigureTargets = useCallback(() => {
+    setSettingsInitialSection('build-config');
+    s.handleToggleSettings();
+    setTimeout(() => {
+      const element = document.getElementById('sr-catch-rate-targets');
+      element?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }, 100);
+  }, [s]);
+
+  // Clear the deep-link section once Settings closes, so a subsequent plain
+  // Settings open is not forced back to the build-config tab.
+  useEffect(() => {
+    if (!s.showSettings) setSettingsInitialSection(null);
+  }, [s.showSettings]);
 
   const zoneHealthAlerts = useMemo(() => {
     if (!s.zoneHealth) return [];
@@ -408,6 +426,7 @@ export default function App() {
         showSettings={s.showSettings}
         onToggleSettings={s.handleToggleSettings}
         settingsRef={s.settingsRef}
+        settingsInitialSection={settingsInitialSection}
         maxRetries={s.maxRetries}
         maxAutonomousTasksPerHour={s.maxAutonomousTasksPerHour}
         requireApprovalGates={s.requireApprovalGates}
@@ -761,7 +780,7 @@ export default function App() {
 
           {s.viewMode === 'home' ? (
             <>
-              <ErrorBoundary level="panel"><DashboardHome tasks={s.tasks} selectedProjectId={s.selectedProjectId} projects={s.projects} onViewTask={s.handleViewLogs} onDirectionClick={(dirId) => { setResearchBrowserDirectionId(dirId); s.setShowResearchBrowser(true); }} onCategoryClick={(cat) => { setSrMissedCategory(cat); setShowSrMissed(true); setTimeout(() => srMissedRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 50); }} /></ErrorBoundary>
+              <ErrorBoundary level="panel"><DashboardHome tasks={s.tasks} selectedProjectId={s.selectedProjectId} projects={s.projects} onViewTask={s.handleViewLogs} onDirectionClick={(dirId) => { setResearchBrowserDirectionId(dirId); s.setShowResearchBrowser(true); }} onCategoryClick={(cat) => { setSrMissedCategory(cat); setShowSrMissed(true); setTimeout(() => srMissedRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 50); }} onConfigureTargets={handleConfigureTargets} /></ErrorBoundary>
               <PlaybookPanel selectedProjectId={s.selectedProjectId} />
               {s.selectedProjectId && (
                 <div ref={srMissedRef} className="shrink-0 mt-2 bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3">

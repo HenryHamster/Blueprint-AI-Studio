@@ -453,6 +453,7 @@ export interface DashboardHomeProps {
   onViewTask: (task: Task) => void;
   onDirectionClick?: (directionId: string) => void;
   onCategoryClick?: (category: string) => void;
+  onConfigureTargets?: () => void;
 }
 
 // ---------- helpers ----------
@@ -695,7 +696,7 @@ const WINDOW_OPTIONS = [
   { label: '7d', value: 168 },
 ];
 
-export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, onDirectionClick, onCategoryClick }: DashboardHomeProps) {
+export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, onDirectionClick, onCategoryClick, onConfigureTargets }: DashboardHomeProps) {
   const [digest, setDigest] = useState<DigestData | null>(null);
   const [diagnostics, setDiagnostics] = useState<ProjectDiagnostics | null>(null);
   const [openPRs, setOpenPRs] = useState<OpenPR[]>([]);
@@ -756,9 +757,8 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
   }, []);
 
   const handleConfigureTargets = useCallback(() => {
-    // Parent (App.tsx) is responsible for implementing the navigation to settings
-    // For now, this is a no-op callback that can be enhanced to navigate or show a modal
-  }, []);
+    onConfigureTargets?.();
+  }, [onConfigureTargets]);
 
   const handleSpawnSrInvestigation = useCallback(async (signal: SrInvestigationSignal): Promise<string | null> => {
     if (!selectedProjectId) return null;

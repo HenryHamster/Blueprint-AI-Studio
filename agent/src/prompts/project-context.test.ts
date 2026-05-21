@@ -456,3 +456,80 @@ describe('formatProjectContext — Failure-Mode Hints', () => {
     expect(hintIdx).toBeGreaterThan(blindIdx);
   });
 });
+
+describe('formatProjectContext — Persistent Self-Review Blind Spots', () => {
+  it('renders persistent blind-spot section when data is present', () => {
+    const ctx = {
+      persistent_blind_spots: {
+        categories: [
+          { category: 'correctness', task_type: 'create', rate: 0.15 },
+          { category: 'error-handling', task_type: 'create', rate: 0.12 },
+        ],
+        hint: 'Fresh reviewer has caught issues in these categories across 2+ consecutive windows. Apply extra scrutiny.',
+      },
+    };
+    const result = formatProjectContext(ctx, 'create');
+    expect(result).toContain('## Persistent Self-Review Blind Spots');
+    expect(result).toContain('Fresh reviewer has caught issues in these categories across 2+ consecutive windows');
+  });
+
+  it('omits persistent blind-spot section when hint is absent', () => {
+    const ctx = {
+      persistent_blind_spots: {
+        categories: [
+          { category: 'correctness', task_type: 'create', rate: 0.15 },
+        ],
+        hint: null,
+      },
+    };
+    const result = formatProjectContext(ctx, 'create');
+    expect(result).not.toContain('## Persistent Self-Review Blind Spots');
+  });
+
+  it('omits persistent blind-spot section when persistent_blind_spots is absent', () => {
+    const ctx = {};
+    const result = formatProjectContext(ctx, 'create');
+    expect(result).not.toContain('## Persistent Self-Review Blind Spots');
+  });
+
+  it('omits persistent blind-spot section when categories array is empty', () => {
+    const ctx = {
+      persistent_blind_spots: {
+        categories: [],
+        hint: 'Some hint text',
+      },
+    };
+    const result = formatProjectContext(ctx, 'create');
+    expect(result).not.toContain('## Persistent Self-Review Blind Spots');
+  });
+
+  it('places persistent blind-spot section after failure-mode hints', () => {
+    const ctx = {
+      self_review_catch_rate: {
+        categories: {
+          correctness: {
+            miss_rate: 0.4,
+            trend: 'decreasing',
+            miss_mode_breakdown: {
+              reading_gap: 5,
+              judgment_gap: 1,
+              coverage_gap: 0,
+              dominant_mode: 'reading_gap',
+            },
+          },
+        },
+      },
+      persistent_blind_spots: {
+        categories: [
+          { category: 'security', task_type: 'create', rate: 0.10 },
+        ],
+        hint: 'Persistent security issues detected',
+      },
+    };
+    const result = formatProjectContext(ctx, 'create');
+    const failureModeIdx = result.indexOf('Failure-mode hints');
+    const persistentIdx = result.indexOf('## Persistent Self-Review Blind Spots');
+    expect(failureModeIdx).toBeGreaterThanOrEqual(0);
+    expect(persistentIdx).toBeGreaterThan(failureModeIdx);
+  });
+});

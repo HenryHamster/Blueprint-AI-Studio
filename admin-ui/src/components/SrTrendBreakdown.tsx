@@ -1125,7 +1125,12 @@ function CategoryRow({
     const cls = quadrant === 'both_declining' ? 'text-red-400' : 'text-amber-500';
     const pdStr = c.precision_delta != null ? formatDelta(c.precision_delta) : 'N/A';
     const rdStr = c.recall_delta != null ? formatDelta(c.recall_delta) : 'N/A';
-    const tip = `precision ${pdStr} / recall ${rdStr}`;
+    const numericDelta = `precision ${pdStr} / recall ${rdStr}`;
+    const explanation =
+      quadrant === 'conservative_shift' ? 'Self-review is catching fewer real issues while maintaining accuracy (under-flagging). Consider loosening criteria or investigating why issues are missed.'
+      : quadrant === 'noisy_shift' ? 'Self-review is flagging more things reviewers don\'t confirm, indicating over-flagging. Review false-positive patterns or tighten flagging criteria.'
+      : 'Both precision and recall have degraded, indicating the category needs recalibration. Investigate root cause of accuracy loss.';
+    const tip = `${explanation}\n\n${numericDelta}`;
     return <span className={`font-mono text-[9px] ${cls}`} title={tip}>{label}</span>;
   })();
   const examples = c.examples ?? [];
