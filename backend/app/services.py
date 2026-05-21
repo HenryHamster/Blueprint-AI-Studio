@@ -1459,8 +1459,8 @@ async def _check_evaluating_timeouts():
                         gh_pr_state = "open"
                         gh_pr_merged = False
                         try:
-                            from app.routers.agent import get_github_token_for_task  # noqa: PLC0415
-                            from app.github import get_pull_request  # noqa: PLC0415
+                            from app.routers.agent import get_github_token_for_task
+                            from app.github import get_pull_request
 
                             gh_token, owner, repo = await get_github_token_for_task(
                                 task.id, session
@@ -1493,7 +1493,7 @@ async def _check_evaluating_timeouts():
                             task.vm_instance_id = None
                             task.last_heartbeat = None
                             try:
-                                from app.review_pipeline import _spawn_pipeline_task  # noqa: PLC0415
+                                from app.review_pipeline import _spawn_pipeline_task
 
                                 short_id = str(task.id).replace("-", "")[:8]
                                 task_type_str = (task.first_payload or {}).get(
@@ -2128,6 +2128,13 @@ async def _sweep_post_commit_pending():
     Audit W1 (A2/A5): post_commit_pending is a real column now; the scan
     filter and clear go through the column instead of JSONB.
 
+    Write-ahead markers (reason="inline_running", 2026-05-21): agent_status
+    sets the marker BEFORE _process_post_commit runs, so a hard instance kill
+    that bypasses the except handler still leaves a retry trail. Such a marker
+    is age-gated below — a recent one may belong to a live inline run, so it
+    is only retried once provably orphaned (older than the 240s post-commit
+    budget plus the Cloud Run request ceiling).
+
     This runs every 60s.  For each pending task:
       - Reconstruct AgentStatusPayload from the saved dict.
       - Call _process_post_commit on a fresh session.
@@ -2139,6 +2146,11 @@ async def _sweep_post_commit_pending():
     from app.schemas import AgentStatusPayload
 
     MAX_ATTEMPTS = 5
+    # A write-ahead "inline_running" marker younger than this may still be a
+    # live _process_post_commit pass (240s budget, 300s Cloud Run ceiling) —
+    # retrying it would double-process. Past this age a still-"inline_running"
+    # marker is provably orphaned (the inline pass was killed mid-flight).
+    INLINE_RUNNING_GRACE_S = 600
     try:
         async with AsyncSessionLocal() as session:
             # Status filter: COMPLETED / FAILED only. Tasks that an admin
@@ -2213,6 +2225,24 @@ async def _sweep_post_commit_pending():
             for task in tasks:
                 ctx = task.context or {}
                 pending_meta = ctx.get("_post_commit_pending_meta") or {}
+                # Write-ahead markers are persisted BEFORE _process_post_commit
+                # runs, so a recent one may be a live inline pass rather than a
+                # dead one — skip until provably orphaned. Failure-set markers
+                # (post_commit_timeout/error/locked) carry a different reason
+                # and retry immediately, as before. If the age can't be
+                # determined, fall through and retry (safer than skip-forever).
+                if pending_meta.get("reason") == "inline_running":
+                    _at = pending_meta.get("at")
+                    _age = None
+                    if _at:
+                        try:
+                            _age = (
+                                _utcnow() - datetime.fromisoformat(_at)
+                            ).total_seconds()
+                        except (ValueError, TypeError):
+                            _age = None
+                    if _age is not None and _age < INLINE_RUNNING_GRACE_S:
+                        continue
                 attempts = int(pending_meta.get("attempts", 0) or 0)
                 payload_dump = pending_meta.get("payload")
 
