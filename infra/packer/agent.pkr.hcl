@@ -88,7 +88,9 @@ build {
       "echo 'agent ALL=(ALL) NOPASSWD: ALL' | sudo tee /etc/sudoers.d/agent",
       "sudo chmod 440 /etc/sudoers.d/agent",
       "sudo visudo -cf /etc/sudoers.d/agent",
-      "cd /opt/agent && npm ci",
+      "# npm ci wrapped in a single retry: esbuild's postinstall writes its native",
+      "# binary then immediately execs it, which can intermittently race to ETXTBSY.",
+      "cd /opt/agent && (npm ci || (sleep 5 && npm ci))",
       "sudo chown -R agent:agent /opt/agent",
       "sudo touch /etc/agent.env",
       "sudo chmod 644 /etc/agent.env",
@@ -121,7 +123,9 @@ build {
       "# agent user has passwordless sudo, so --with-deps' internal apt-get",
       "# install runs cleanly. Failures are fatal: a broken image must not be",
       "# tagged, as silent failures caused CODE_ERROR regressions at runtime.",
-      "sudo -u agent bash -c '/opt/agent/node_modules/.bin/playwright install --with-deps chromium'"
+      "# playwright is not an agent dependency, so fetch the CLI via npx; pin the",
+      "# version to admin-ui's playwright (keep in sync with check-viewport.sh).",
+      "sudo -u agent bash -c 'npx --yes playwright@1.59.1 install --with-deps chromium'"
     ]
   }
 
@@ -129,7 +133,7 @@ build {
     inline = [
       "# Smoke-check: verify Playwright CLI and Chromium binary exist before tagging image.",
       "# Hard-fail here prevents shipping a broken VM that causes CODE_ERROR at runtime.",
-      "sudo -u agent bash -c '/opt/agent/node_modules/.bin/playwright --version'",
+      "sudo -u agent bash -c 'npx --yes playwright@1.59.1 --version'",
       "CHROMIUM=$(find /home/agent/.cache/ms-playwright -name 'chrome' -type f 2>/dev/null | head -1) && [ -n \"$CHROMIUM\" ] && echo \"Chromium binary found: $CHROMIUM\" || { echo 'PACKER_SMOKE_FAIL: Chromium binary not found after playwright install'; exit 1; }"
     ]
   }
