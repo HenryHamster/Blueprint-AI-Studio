@@ -3161,3 +3161,283 @@ async def test_drift_signals_survives_budget_pressure(db_session):
     assert "drift_signals" not in dropped_keys, (
         f"drift_signals should not be dropped; dropped={dropped_keys}"
     )
+
+
+# ── version_phase: promotion_readiness + recent_versions enrichment ───────────
+
+
+async def _ensure_verdict_table(session):
+    """Create qualificationverdict table idempotently (mirrors test_release_qualifier pattern)."""
+    from app.models import QualificationVerdict as _QV
+
+    conn = await session.connection()
+    await conn.run_sync(lambda c: _QV.__table__.create(c, checkfirst=True))
+    await session.commit()
+
+
+async def _ensure_releaseversion_table(session):
+    """Create releaseversion table idempotently."""
+    from app.models import ReleaseVersion as _RV
+
+    conn = await session.connection()
+    await conn.run_sync(lambda c: _RV.__table__.create(c, checkfirst=True))
+    await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_version_phase_includes_promotion_readiness(db_session, mocker):
+    """When is_self_repo=True and QualificationVerdict rows exist, the strategic
+    payload's version_phase block carries promotion_readiness with ready,
+    would_promote_rate, and recurring_blockers keys."""
+    from datetime import datetime
+    from app.models import ReleaseVersion, QualificationVerdict
+
+    await _ensure_releaseversion_table(db_session)
+    await _ensure_verdict_table(db_session)
+
+    project = _make_project(
+        is_self_repo=True,
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Open version in stabilize phase
+    now = datetime.utcnow().replace(tzinfo=None)
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=2,
+        phase="stabilize",
+        status="open",
+        opened_at=now,
+    )
+    db_session.add(version)
+    await db_session.commit()
+
+    await db_session.refresh(version)
+
+    # Seed QualificationVerdict rows (promotion_enabled=False = dry-run regime)
+    for i in range(3):
+        db_session.add(
+            QualificationVerdict(
+                project_id=project.id,
+                release_version_id=version.id,
+                would_promote=True,
+                blocker=None,
+                confidence=0.85 + i * 0.01,
+                promotion_enabled=False,
+            )
+        )
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks, "Expected a strategic_review task"
+    payload = tasks[0].payloads[0]
+
+    vp = payload.get("version_phase")
+    assert vp is not None, "version_phase block should be present for is_self_repo=True"
+    pr = vp.get("promotion_readiness")
+    assert pr is not None, "promotion_readiness should be present when verdicts exist"
+    assert "ready" in pr, "promotion_readiness must have 'ready' key"
+    assert "would_promote_rate" in pr, (
+        "promotion_readiness must have 'would_promote_rate' key"
+    )
+    assert "recurring_blockers" in pr, (
+        "promotion_readiness must have 'recurring_blockers' key"
+    )
+
+
+@pytest.mark.asyncio
+async def test_version_phase_includes_recent_versions(db_session, mocker):
+    """When is_self_repo=True and closed ReleaseVersion rows exist, version_phase
+    carries a recent_versions list."""
+    from datetime import datetime, timedelta
+    from app.models import ReleaseVersion
+
+    await _ensure_releaseversion_table(db_session)
+
+    project = _make_project(
+        is_self_repo=True,
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = datetime.utcnow().replace(tzinfo=None)
+
+    # One closed (promoted) version
+    closed = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        phase="stabilize",
+        status="promoted",
+        opened_at=now - timedelta(days=10),
+        promoted_at=now - timedelta(days=2),
+    )
+    db_session.add(closed)
+
+    # One open version
+    open_v = ReleaseVersion(
+        project_id=project.id,
+        version_number=2,
+        phase="build",
+        status="open",
+        opened_at=now,
+    )
+    db_session.add(open_v)
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks
+    payload = tasks[0].payloads[0]
+
+    vp = payload.get("version_phase")
+    assert vp is not None
+    rv = vp.get("recent_versions")
+    assert rv is not None, (
+        "recent_versions should be present when closed versions exist"
+    )
+    assert isinstance(rv, list)
+    assert len(rv) >= 1
+    # Each entry should have version_number and status
+    for entry in rv:
+        assert "version_number" in entry
+        assert "status" in entry
+
+
+# ── stabilize-stall strategic nudge ──────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_stabilize_stall_hint_fires_for_old_stabilize_version(db_session, mocker):
+    """An open stabilize-phase version older than _STABILIZE_STALL_AGE_DAYS with
+    no qualification attempt gets a STALLED nudge in the strategic prompt_suffix
+    and a stabilize_stall block in version_phase."""
+    from datetime import timedelta
+    from app.models import ReleaseVersion
+    from app.release_qualifier import _STABILIZE_STALL_AGE_DAYS
+
+    await _ensure_releaseversion_table(db_session)
+
+    project = _make_project(
+        is_self_repo=True,
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Version stuck in stabilize well past the age threshold
+    now = datetime.utcnow().replace(tzinfo=None)
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=3,
+        phase="stabilize",
+        status="open",
+        opened_at=now - timedelta(days=_STABILIZE_STALL_AGE_DAYS + 5),
+        phase_changed_at=now - timedelta(days=_STABILIZE_STALL_AGE_DAYS + 5),
+        last_qualification=None,
+    )
+    db_session.add(version)
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks, "Expected a strategic_review task"
+    payload = tasks[0].payloads[0]
+
+    suffix = payload.get("prompt_suffix", "")
+    assert "STALLED" in suffix, (
+        f"Expected STALLED nudge in prompt_suffix; got: {suffix}"
+    )
+    assert "stabilize" in suffix.lower()
+
+    vp = payload.get("version_phase")
+    assert vp is not None
+    stall_block = vp.get("stabilize_stall")
+    assert stall_block is not None, (
+        "stabilize_stall block should appear in version_phase"
+    )
+    assert stall_block.get("age_days", 0) >= _STABILIZE_STALL_AGE_DAYS
+
+
+@pytest.mark.asyncio
+async def test_stabilize_stall_hint_suppressed_for_dry_run(db_session, mocker):
+    """A dry-run hold (passing candidate, promotion_enabled=False) is healthy
+    and must NOT trigger the stalled nudge."""
+    from datetime import timedelta
+    from app.models import ReleaseVersion
+    from app.release_qualifier import _STABILIZE_STALL_AGE_DAYS
+
+    await _ensure_releaseversion_table(db_session)
+
+    project = _make_project(
+        is_self_repo=True,
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = datetime.utcnow().replace(tzinfo=None)
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=4,
+        phase="stabilize",
+        status="open",
+        opened_at=now - timedelta(days=_STABILIZE_STALL_AGE_DAYS + 5),
+        phase_changed_at=now - timedelta(days=_STABILIZE_STALL_AGE_DAYS + 5),
+        last_qualification={"status": "dry_run", "candidate_sha": "abc123"},
+    )
+    db_session.add(version)
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks
+    payload = tasks[0].payloads[0]
+
+    suffix = payload.get("prompt_suffix", "")
+    assert "STALLED" not in suffix, (
+        "dry_run hold should suppress the stabilize-stall nudge"
+    )
+    vp = payload.get("version_phase") or {}
+    assert "stabilize_stall" not in vp, (
+        "stabilize_stall block must not appear for dry_run hold"
+    )

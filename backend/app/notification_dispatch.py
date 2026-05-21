@@ -1695,6 +1695,60 @@ async def post_version_build_stalled_message(
     return msg
 
 
+async def post_version_stabilize_stalled_message(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    version_number: int,
+    version_id: str,
+    age_days: int,
+    tasks_merged: int,
+) -> ProjectMessage:
+    """Post a stabilize-stall alert when a release version sits too long in stabilize.
+
+    Called when an open version has been in the ``stabilize`` phase well past a
+    healthy window without making qualification progress (stabilize→qualify is
+    agent-driven and has no automatic cadence, so a version can sit in stabilize
+    indefinitely without ever reaching qualify/promote).  Also fires the
+    RELEASE_VERSION_STABILIZE_STALLED external webhook so operators can route
+    the alert to their incident channel.
+
+    Does NOT commit — the caller owns the transaction.
+    """
+    summary = (
+        f"v{version_number} has been in the stabilize phase for {age_days} day(s) "
+        f"with {tasks_merged} merged task(s) and has not been qualified. "
+        f"Consider requesting qualification now or addressing what is preventing "
+        f"readiness."
+    )
+    msg = await post_event_message(
+        session,
+        project_id,
+        event_type="release_stabilize_stalled",
+        summary=summary,
+        context={
+            "version_number": version_number,
+            "version_id": version_id,
+            "age_days": age_days,
+            "tasks_merged": tasks_merged,
+        },
+    )
+    asyncio.ensure_future(
+        dispatch_external_notification(
+            project_id,
+            "RELEASE_VERSION_STABILIZE_STALLED",
+            {
+                "version_number": version_number,
+                "version_id": version_id,
+                "age_days": age_days,
+                "tasks_merged": tasks_merged,
+                "summary": summary,
+            },
+        )
+    )
+    return msg
+
+
 async def post_fix_loop_divergence_regression_message(
     session: AsyncSession,
     project_id: uuid.UUID,

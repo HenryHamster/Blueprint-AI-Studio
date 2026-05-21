@@ -2363,6 +2363,19 @@ class ReleaseVersion(SQLModel, table=True):
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
 
+    # Durable deduplication anchor for stabilize-stall alerting.
+    # Set to the stabilize-phase START reference time (phase_changed_at,
+    # falling back to opened_at) when the stabilize-stall sweep posts an
+    # alert for a version sitting too long in 'stabilize' without requesting
+    # qualification.  Same dedup semantics as build_stall_alerted_at: storing
+    # the reference time lets the dedup reset naturally when a fresh stabilize
+    # phase begins (phase_changed_at re-stamped) while never re-firing for the
+    # same stall.
+    stabilize_stall_alerted_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+
     created_at: datetime = Field(
         default_factory=_utcnow,
         sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),

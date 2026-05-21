@@ -1232,6 +1232,90 @@ describe('buildVersionPhaseSection', () => {
     const result = buildVersionPhaseSection({ version_number: 1, phase: 'build' });
     expect(result).toMatch(/omit|no change|do NOT emit/i);
   });
+
+  it('renders promotion_readiness block when present', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 3,
+      phase: 'stabilize',
+      promotion_readiness: {
+        ready: true,
+        would_promote_rate: 0.9,
+        consecutive_clean_passes: 4,
+        verdicts_evaluated: 5,
+        reason: 'qualifier looks trustworthy',
+        recurring_blockers: {},
+        confidence: { mean: 0.87, stdev: 0.03, stable: true },
+      },
+    });
+    expect(result).toContain('Promotion readiness');
+    expect(result).toContain('ready=YES');
+    expect(result).toContain('would_promote_rate=0.9');
+    expect(result).toContain('consecutive_clean_passes=4');
+    expect(result).toContain('verdicts_evaluated=5');
+    expect(result).toContain('qualifier looks trustworthy');
+    expect(result).toContain('confidence_mean=0.87');
+    expect(result).toContain('stable');
+  });
+
+  it('renders recurring_blockers in promotion_readiness when present', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 3,
+      phase: 'stabilize',
+      promotion_readiness: {
+        ready: false,
+        would_promote_rate: 0.3,
+        consecutive_clean_passes: 0,
+        verdicts_evaluated: 5,
+        reason: 'recurring hard blocker: ci_red',
+        recurring_blockers: { ci_red: 3 },
+        confidence: { mean: 0.5, stdev: 0.1, stable: false },
+      },
+    });
+    expect(result).toContain('ready=NO');
+    expect(result).toContain('Recurring blockers');
+    expect(result).toContain('ci_redx3');
+  });
+
+  it('omits promotion_readiness block gracefully when absent', () => {
+    const result = buildVersionPhaseSection({ version_number: 1, phase: 'build' });
+    expect(result).not.toContain('Promotion readiness');
+    expect(result).not.toContain('Recurring blockers');
+    expect(result).toContain('Version Phase');
+  });
+
+  it('renders recent_versions list when present', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 3,
+      phase: 'stabilize',
+      recent_versions: [
+        { version_number: 2, status: 'promoted', last_qualification: { status: 'promoted', confidence: 0.91 } },
+        { version_number: 1, status: 'promoted', last_qualification: { status: 'promoted', confidence: 0.85 } },
+      ],
+    });
+    expect(result).toContain('Recent versions');
+    expect(result).toContain('v2');
+    expect(result).toContain('promoted');
+    expect(result).toContain('qual=promoted');
+    expect(result).toContain('confidence=0.91');
+    expect(result).toContain('v1');
+  });
+
+  it('omits recent_versions gracefully when absent', () => {
+    const result = buildVersionPhaseSection({ version_number: 2, phase: 'stabilize' });
+    expect(result).not.toContain('Recent versions');
+    expect(result).toContain('Version Phase');
+  });
+
+  it('renders recent_versions blocker when present', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 4,
+      phase: 'stabilize',
+      recent_versions: [
+        { version_number: 3, status: 'promoted', last_qualification: { status: 'not_promoted', confidence: 0.5, blocker: 'ci_red' } },
+      ],
+    });
+    expect(result).toContain('blocker=ci_red');
+  });
 });
 
 describe('buildMemoCitationsSection', () => {

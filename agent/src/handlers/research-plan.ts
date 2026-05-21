@@ -703,6 +703,64 @@ export function buildVersionPhaseSection(versionPhase: Record<string, unknown> |
     }
   }
 
+  // Promotion-readiness trend (cross-version aggregation).
+  const promotionReadinessRaw = versionPhase.promotion_readiness;
+  if (promotionReadinessRaw && typeof promotionReadinessRaw === 'object' && !Array.isArray(promotionReadinessRaw)) {
+    const pr = promotionReadinessRaw as Record<string, unknown>;
+    const prReady = pr.ready === true ? 'YES' : 'NO';
+    const prRate = typeof pr.would_promote_rate === 'number' ? pr.would_promote_rate : null;
+    const prStreak = typeof pr.consecutive_clean_passes === 'number' ? pr.consecutive_clean_passes : null;
+    const prEvaluated = typeof pr.verdicts_evaluated === 'number' ? pr.verdicts_evaluated : null;
+    const prReason = typeof pr.reason === 'string' ? pr.reason : null;
+    const prConf = pr.confidence && typeof pr.confidence === 'object' && !Array.isArray(pr.confidence)
+      ? pr.confidence as Record<string, unknown> : null;
+    const prRecurring = pr.recurring_blockers && typeof pr.recurring_blockers === 'object' && !Array.isArray(pr.recurring_blockers)
+      ? pr.recurring_blockers as Record<string, unknown> : null;
+
+    const prBits: string[] = [`ready=${prReady}`];
+    if (prRate !== null) prBits.push(`would_promote_rate=${prRate}`);
+    if (prStreak !== null) prBits.push(`consecutive_clean_passes=${prStreak}`);
+    if (prEvaluated !== null) prBits.push(`verdicts_evaluated=${prEvaluated}`);
+    if (prConf) {
+      const confMean = typeof prConf.mean === 'number' ? prConf.mean : null;
+      const confStdev = typeof prConf.stdev === 'number' ? prConf.stdev : null;
+      const confStable = prConf.stable === true ? 'stable' : (prConf.stable === false ? 'volatile' : null);
+      if (confMean !== null) prBits.push(`confidence_mean=${confMean}`);
+      if (confStdev !== null) prBits.push(`confidence_stdev=${confStdev}`);
+      if (confStable !== null) prBits.push(`confidence=${confStable}`);
+    }
+    parts.push(`Promotion readiness: ${prBits.join(', ')}`);
+    if (prReason) parts.push(`  Readiness reason: ${prReason}`);
+    if (prRecurring && Object.keys(prRecurring).length > 0) {
+      const blockerStr = Object.entries(prRecurring).map(([code, n]) => `${code}x${String(n)}`).join(', ');
+      parts.push(`  Recurring blockers: ${blockerStr}`);
+    }
+  }
+
+  // Recent closed versions (newest-first, up to 3).
+  const recentVersionsRaw = versionPhase.recent_versions;
+  if (Array.isArray(recentVersionsRaw) && recentVersionsRaw.length > 0) {
+    const rvLines: string[] = ['Recent versions (newest-first):'];
+    for (const rv of recentVersionsRaw) {
+      if (!rv || typeof rv !== 'object' || Array.isArray(rv)) continue;
+      const rvRec = rv as Record<string, unknown>;
+      const rvNum = typeof rvRec.version_number === 'number' ? rvRec.version_number : '?';
+      const rvStatus = typeof rvRec.status === 'string' ? rvRec.status : '?';
+      const lq = rvRec.last_qualification;
+      const lqRec = lq && typeof lq === 'object' && !Array.isArray(lq) ? lq as Record<string, unknown> : null;
+      const lqStatus = lqRec && typeof lqRec.status === 'string' ? lqRec.status : null;
+      const lqConf = lqRec && typeof lqRec.confidence === 'number' ? lqRec.confidence : null;
+      const lqBlocker = lqRec && typeof lqRec.blocker === 'string' && lqRec.blocker ? lqRec.blocker : null;
+      const lqBits: string[] = [];
+      if (lqStatus) lqBits.push(`qual=${lqStatus}`);
+      if (lqConf !== null) lqBits.push(`confidence=${lqConf}`);
+      if (lqBlocker) lqBits.push(`blocker=${lqBlocker}`);
+      const lqSuffix = lqBits.length > 0 ? ` [${lqBits.join(', ')}]` : '';
+      rvLines.push(`  - v${rvNum} (${rvStatus})${lqSuffix}`);
+    }
+    if (rvLines.length > 1) parts.push(rvLines.join('\n'));
+  }
+
   parts.push(`
 **Phase meanings:**
 - **build** — pursue the version's feature and improvement work at full pace. The version is actively developing; continue creating and executing directions that advance the intent.

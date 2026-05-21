@@ -190,6 +190,40 @@ def _summarize_efficiency_snapshot(snapshot: dict) -> dict:
     }
 
 
+_VERSION_PHASE_RECENT_VERSIONS_CAP = 3
+
+
+def _summarize_version_phase(block: dict) -> dict:
+    """Trim version_phase for inclusion under budget pressure.
+
+    Drops ``thresholds`` from ``promotion_readiness`` (verbose config), trims
+    ``confidence`` to {mean, stdev, stable}, and caps ``recent_versions`` to
+    the 3 most recent entries so the agent sees the trend without dragging full
+    verdict history through the payload.
+    """
+    if not block:
+        return {}
+    out = dict(block)
+    pr = block.get("promotion_readiness")
+    if isinstance(pr, dict):
+        conf = pr.get("confidence") or {}
+        out["promotion_readiness"] = {
+            k: v
+            for k, v in pr.items()
+            if k not in {"thresholds", "blocker_counts", "confidence"}
+        }
+        if isinstance(conf, dict):
+            out["promotion_readiness"]["confidence"] = {
+                "mean": conf.get("mean"),
+                "stdev": conf.get("stdev"),
+                "stable": conf.get("stable"),
+            }
+    rv = block.get("recent_versions")
+    if isinstance(rv, list):
+        out["recent_versions"] = rv[:_VERSION_PHASE_RECENT_VERSIONS_CAP]
+    return out
+
+
 def _summarize_drift_signals(drift: dict) -> dict:
     """Return a payload-friendly subset of drift_detection.compute_direction_drift.
 
@@ -404,7 +438,7 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     "retired_directions_summary": {"priority": "low"},
     # LTS version/phase context — present only on self-repo projects. High priority
     # so it survives budget pressure (the agent needs it for phase-transition decisions).
-    "version_phase": {"priority": "high"},
+    "version_phase": {"priority": "high", "summarize": _summarize_version_phase},
     # Citable memo digest — supplementary context, dropped first under budget pressure.
     "memo_citations": {"priority": "low"},
     # Per-axis efficiency axes with drift vs baseline. Medium priority so it
@@ -1535,6 +1569,7 @@ async def _spawn_strategic_review(
             from app.release_version import (
                 count_merged_since,
                 current_open_version,
+                recent_closed_versions,
                 to_phase_block,
             )
 
@@ -1547,6 +1582,40 @@ async def _spawn_strategic_review(
                     **to_phase_block(_open_version),
                     "tasks_merged_this_version": _tasks_merged,
                 }
+            # Enrich with cross-version promotion-readiness trend.  Best-effort:
+            # absent when no QualificationVerdict rows exist yet.
+            try:
+                from app.release_qualifier import compute_promotion_readiness
+
+                _readiness = await compute_promotion_readiness(session, project.id)
+                if _readiness.get("verdicts_evaluated", 0) > 0:
+                    if _version_phase_block is None:
+                        _version_phase_block = {}
+                    _version_phase_block["promotion_readiness"] = _readiness
+            except Exception:
+                logger.exception(
+                    "[STRATEGIC] promotion_readiness fetch failed; continuing"
+                )
+            try:
+                _closed = await recent_closed_versions(
+                    session, project.id, limit=_VERSION_PHASE_RECENT_VERSIONS_CAP
+                )
+                if _closed:
+                    if _version_phase_block is None:
+                        _version_phase_block = {}
+                    _version_phase_block["recent_versions"] = [
+                        {
+                            "version_number": v.version_number,
+                            "status": v.status,
+                            "phase": v.phase,
+                            "last_qualification": v.last_qualification,
+                        }
+                        for v in _closed
+                    ]
+            except Exception:
+                logger.exception(
+                    "[STRATEGIC] recent_closed_versions fetch failed; continuing"
+                )
         except Exception:
             logger.exception("[STRATEGIC] version_phase block build failed; continuing")
     # Citable memo digest: terminal reasoning artifacts spawned from dropped
@@ -1588,6 +1657,67 @@ async def _spawn_strategic_review(
         prompt_suffix = (
             f"{prompt_suffix}\n{_stabilize_hint}" if prompt_suffix else _stabilize_hint
         )
+        # Stabilize-stall directive — when the version has been in stabilize too
+        # long without progress toward qualification (zero attempts or only soft
+        # near-misses), explicitly prompt the agent to emit qualify_request or
+        # resolve whatever is blocking readiness.  Skips a dry-run hold (passing
+        # candidate waiting for promotion_enabled) and hard-blocker stalls (covered
+        # by the calcification alert).  Best-effort — never block the payload build.
+        try:
+            from app.release_qualifier import (
+                _STABILIZE_STALL_AGE_DAYS,
+                _STABILIZE_STALL_MERGED_TASKS,
+            )
+            from app.release_version import count_merged_since
+
+            _stab_qual = _open_version.last_qualification or {}
+            _stab_qual_status = _stab_qual.get("status")
+            _stab_is_healthy = _stab_qual_status == "dry_run" or (
+                _stab_qual_status == "not_promoted" and _stab_qual.get("blocker")
+            )
+            if not _stab_is_healthy:
+                _stab_ref = _open_version.phase_changed_at or _open_version.opened_at
+                _stab_age_days = (
+                    max(0, (_utcnow() - _stab_ref).days) if _stab_ref else 0
+                )
+                # Stabilize-phase-scoped merged-task count, mirroring the
+                # qualifier backstop _check_version_stabilize_stall (which counts
+                # count_merged_since(..., phase_changed_at or opened_at)).  Using
+                # the version-lifetime count from _version_phase_block here would
+                # include build-phase merges and misreport the stall in prompt
+                # text on the common age-triggered path.
+                _stab_merged = (
+                    await count_merged_since(session, project.id, _stab_ref)
+                    if _stab_ref
+                    else 0
+                )
+                if (
+                    _stab_age_days >= _STABILIZE_STALL_AGE_DAYS
+                    or _stab_merged >= _STABILIZE_STALL_MERGED_TASKS
+                ):
+                    _stab_stall_hint = (
+                        f"Version phase: STABILIZE — STALLED. "
+                        f"v{_open_version.version_number} has been in the stabilize "
+                        f"phase for {_stab_age_days} day(s) with {_stab_merged} merged "
+                        f"task(s) without making progress toward qualification. "
+                        f"stabilize→qualify is agent-driven — consider emitting a "
+                        f"qualify_request now, or identifying and resolving whatever "
+                        f"is preventing qualification readiness."
+                    )
+                    prompt_suffix = (
+                        f"{prompt_suffix}\n{_stab_stall_hint}"
+                        if prompt_suffix
+                        else _stab_stall_hint
+                    )
+                    if _version_phase_block is not None:
+                        _version_phase_block["stabilize_stall"] = {
+                            "age_days": _stab_age_days,
+                            "tasks_merged": _stab_merged,
+                        }
+        except Exception:
+            logger.exception(
+                "[STRATEGIC] stabilize-stall hint build failed; continuing"
+            )
     # Build-stall directive — when the open version is in build and has stalled
     # past the same threshold the qualifier backstop uses, explicitly tell the
     # strategic agent the version has been building for N days / M merged tasks

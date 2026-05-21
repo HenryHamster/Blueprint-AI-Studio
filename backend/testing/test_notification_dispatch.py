@@ -33,6 +33,7 @@ from app.notification_dispatch import (
     post_review_feedback_message,
     post_version_build_stalled_message,
     post_version_calcification_message,
+    post_version_stabilize_stalled_message,
 )
 from app.models import (
     MessageType,
@@ -1908,3 +1909,78 @@ async def test_post_version_build_stalled_message_fires_external_webhook(
     assert payload["age_days"] == 15
     assert payload["tasks_merged"] == 42
     assert "summary" in payload and "building" in payload["summary"]
+
+
+# ---------------------------------------------------------------------------
+# post_version_stabilize_stalled_message
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_post_version_stabilize_stalled_message_creates_message(
+    db_session,
+):
+    """post_version_stabilize_stalled_message posts a ProjectMessage with
+    event_type 'release_stabilize_stalled' and the correct context fields."""
+    project = Project(name="Stabilize Stall Test", user_id="u1")
+    db_session.add(project)
+    await db_session.commit()
+
+    version_id = str(uuid.uuid4())
+    msg = await post_version_stabilize_stalled_message(
+        db_session,
+        project.id,
+        version_number=5,
+        version_id=version_id,
+        age_days=18,
+        tasks_merged=45,
+    )
+    await db_session.commit()
+
+    assert msg.context["event_type"] == "release_stabilize_stalled"
+    assert msg.context["version_number"] == 5
+    assert msg.context["version_id"] == version_id
+    assert msg.context["age_days"] == 18
+    assert msg.context["tasks_merged"] == 45
+    assert "stabilize" in msg.content
+    assert "18 day(s)" in msg.content
+    assert "45 merged task(s)" in msg.content
+    assert "qualified" in msg.content
+
+
+@pytest.mark.asyncio
+async def test_post_version_stabilize_stalled_message_fires_external_webhook(
+    db_session,
+):
+    """post_version_stabilize_stalled_message fires RELEASE_VERSION_STABILIZE_STALLED
+    external webhook with the correct payload so external subscribers can act."""
+    project = Project(name="Stabilize Stall Webhook", user_id="u1")
+    db_session.add(project)
+    await db_session.commit()
+
+    dispatch_mock = AsyncMock()
+    with patch(
+        "app.notification_dispatch.dispatch_external_notification", new=dispatch_mock
+    ):
+        await post_version_stabilize_stalled_message(
+            db_session,
+            project.id,
+            version_number=3,
+            version_id="vid-stabilize-001",
+            age_days=16,
+            tasks_merged=38,
+        )
+        import asyncio as _asyncio
+
+        await _asyncio.sleep(0)
+
+    dispatch_mock.assert_called_once()
+    args = dispatch_mock.call_args.args
+    assert args[0] == project.id
+    assert args[1] == "RELEASE_VERSION_STABILIZE_STALLED"
+    payload = args[2]
+    assert payload["version_number"] == 3
+    assert payload["version_id"] == "vid-stabilize-001"
+    assert payload["age_days"] == 16
+    assert payload["tasks_merged"] == 38
+    assert "summary" in payload and "stabilize" in payload["summary"]

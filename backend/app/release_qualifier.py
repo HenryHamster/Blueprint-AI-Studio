@@ -89,6 +89,7 @@ from app.notification_dispatch import (
     post_event_message,
     post_version_build_stalled_message,
     post_version_calcification_message,
+    post_version_stabilize_stalled_message,
 )
 from app.payload_schemas import PayloadTooLargeError, validate_internal_payload
 from app.shared_state import runtime_config as _runtime_config
@@ -224,6 +225,15 @@ _MIN_CALCIFICATION_ATTEMPTS = 3
 # not nag a normally-progressing build.
 _BUILD_STALL_AGE_DAYS = 14
 _BUILD_STALL_MERGED_TASKS = 40
+
+# Stabilize-phase stall thresholds — the backstop for the stabilize→qualify
+# edge of the lifecycle.  A version that enters stabilize but never gets
+# qualified falls through both the build-stall guard (wrong phase) and the
+# calcification guard (requires repeated hard-blocker failures).  These
+# conservative thresholds catch a genuine stall without nagging a normally-
+# progressing stabilize phase.  EITHER trigger fires the alert.
+_STABILIZE_STALL_AGE_DAYS = 14
+_STABILIZE_STALL_MERGED_TASKS = 40
 
 
 def _is_build_stalled(age_days: int, merged_count: int) -> bool:
@@ -2371,6 +2381,128 @@ async def _check_version_build_stall(
     return True
 
 
+async def _check_version_stabilize_stall(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+) -> bool:
+    """Post a deduplicated stabilize-stall alert when a version sits too long
+    in the ``stabilize`` phase without making progress toward qualification.
+
+    This is the third lifecycle backstop alongside ``_check_version_build_stall``
+    and ``_check_version_calcification``:
+      * build-stall: ``build`` phase too long without advancing to stabilize.
+      * stabilize-stall (this): ``stabilize`` phase too long without a
+        qualify_request — covers zero-attempt or soft-near-miss stalls that the
+        calcification guard ignores (it requires repeated hard-blocker failures).
+      * calcification: repeated hard-blocker failures blocking the qualify step.
+
+    After this backstop lands, no lifecycle transition (build→stabilize,
+    stabilize→qualify, qualify→promote) can stall unseen.
+
+    Fires when an open stabilize-phase version's phase age OR its merged-task
+    count crosses the conservative threshold AND neither the calcification guard
+    (hard-blocker stall already covered) nor a dry-run hold (healthy pass
+    waiting for promotion_enabled) applies.
+
+    Deduplication: compares the version's durable ``stabilize_stall_alerted_at``
+    column against the current stabilize-phase reference time.  Same reference →
+    already notified for this stall; new reference (phase re-entered, so
+    phase_changed_at re-stamped) → fresh stall can alert again.
+
+    All messaging is best-effort wrapped so it can NEVER break the qualifier
+    sweep.  Does NOT commit the session — the caller must commit after a True return.
+    """
+    if version.status != "open" or version.phase != "stabilize":
+        return False
+
+    qual = version.last_qualification or {}
+    qual_status = qual.get("status")
+
+    # A dry-run hold is a passing candidate waiting for promotion_enabled —
+    # healthy, not stalled.
+    if qual_status == "dry_run":
+        return False
+
+    # A version with repeated hard-blocker failures is covered by the
+    # calcification alert — don't double-alert on the same stall.
+    if qual_status == "not_promoted" and qual.get("blocker"):
+        return False
+
+    ref_time = version.phase_changed_at or version.opened_at
+    if ref_time is None:
+        return False
+
+    age_days = max(0, (_utcnow() - ref_time).days)
+
+    try:
+        merged_count = await release_version.count_merged_since(
+            session, version.project_id, ref_time
+        )
+    except Exception as exc:  # noqa: BLE001 — a count failure must not break the sweep
+        logger.warning(
+            "[RELEASE_QUALIFIER] stabilize-stall merged-task count failed for v%d "
+            "(non-fatal): %s",
+            version.version_number,
+            exc,
+        )
+        merged_count = 0
+
+    if not (
+        age_days >= _STABILIZE_STALL_AGE_DAYS
+        or merged_count >= _STABILIZE_STALL_MERGED_TASKS
+    ):
+        return False
+
+    # Durable dedup: the version remembers the stabilize-phase reference time it
+    # last alerted on.  Same reference → already notified for this stall; skip.
+    if version.stabilize_stall_alerted_at == ref_time:
+        return False
+
+    session.add(
+        Alert(
+            project_id=version.project_id,
+            severity=AlertSeverity.WARNING,
+            title=f"Release v{version.version_number} stalled in stabilize phase",
+            message=(
+                f"Release v{version.version_number} has been in the stabilize "
+                f"phase for {age_days} day(s) with {merged_count} merged task(s) "
+                f"but has not been qualified. stabilize→qualify requires a "
+                f"qualify_request from the strategic agent — consider requesting "
+                f"qualification now or addressing what is preventing readiness."
+            ),
+        )
+    )
+    try:
+        await post_version_stabilize_stalled_message(
+            session,
+            version.project_id,
+            version_number=version.version_number,
+            version_id=str(version.id),
+            age_days=age_days,
+            tasks_merged=merged_count,
+        )
+    except Exception as exc:  # noqa: BLE001 — messaging must never break the sweep
+        logger.warning(
+            "[RELEASE_QUALIFIER] failed to post stabilize-stall message for v%d "
+            "(non-fatal): %s",
+            version.version_number,
+            exc,
+        )
+
+    # Record the durable dedup anchor so subsequent sweeps don't re-alert for
+    # the same stall (survives an operator clearing the Alert row).
+    version.stabilize_stall_alerted_at = ref_time
+    session.add(version)
+    logger.warning(
+        "[RELEASE_QUALIFIER] stabilize-stall alert for v%d: %d day(s), %d merged "
+        "task(s) in stabilize phase without qualifying",
+        version.version_number,
+        age_days,
+        merged_count,
+    )
+    return True
+
+
 async def sweep_stuck_qualifications(
     session: AsyncSession,
     *,
@@ -2481,6 +2613,9 @@ async def sweep_stuck_qualifications(
                     continue
                 alerted = await _check_version_calcification(alert_session, v)
                 alerted = await _check_version_build_stall(alert_session, v) or alerted
+                alerted = (
+                    await _check_version_stabilize_stall(alert_session, v) or alerted
+                )
                 if alerted:
                     await alert_session.commit()
         except Exception:

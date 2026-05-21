@@ -6023,6 +6023,268 @@ async def test_sweep_triggers_build_stall_check(db_session):
     assert "build phase" in alerts[0].title
 
 
+@pytest.mark.asyncio
+async def test_stabilize_stall_alert_fires_for_old_stabilize_version(db_session):
+    """An open stabilize-phase version older than _STABILIZE_STALL_AGE_DAYS posts
+    one Alert and one release_stabilize_stalled message."""
+    from datetime import timedelta
+
+    from app.models import Alert as _Alert
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    # Phase started well beyond the healthy window.
+    version.phase_changed_at = rq._utcnow() - timedelta(
+        days=rq._STABILIZE_STALL_AGE_DAYS + 6
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    alerted = await rq._check_version_stabilize_stall(db_session, version)
+    await db_session.commit()
+
+    assert alerted is True
+    alerts = (
+        (
+            await db_session.execute(
+                select(_Alert).where(_Alert.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+    assert "stabilize phase" in alerts[0].title
+    assert "qualify" in alerts[0].message
+
+    msgs = await _messages_for(db_session, project.id, "release_stabilize_stalled")
+    assert len(msgs) == 1
+
+
+@pytest.mark.asyncio
+async def test_stabilize_stall_alert_fires_for_high_merged_count(db_session, mocker):
+    """An open stabilize-phase version that has accumulated merged tasks past the
+    threshold fires even when the phase age is young."""
+    from app.models import Alert as _Alert
+
+    mocker.patch.object(rq, "_STABILIZE_STALL_AGE_DAYS", 365)
+    mocker.patch.object(rq, "_STABILIZE_STALL_MERGED_TASKS", 2)
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    now = rq._utcnow()
+    await _make_merged_task(db_session, project.id, updated_at=now)
+    await _make_merged_task(db_session, project.id, updated_at=now)
+    await db_session.refresh(version)
+
+    alerted = await rq._check_version_stabilize_stall(db_session, version)
+    await db_session.commit()
+
+    assert alerted is True
+    alerts = (
+        (
+            await db_session.execute(
+                select(_Alert).where(_Alert.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+    assert "stabilize phase" in alerts[0].title
+
+
+@pytest.mark.asyncio
+async def test_stabilize_stall_alert_not_fired_for_young_stabilize_version(db_session):
+    """A freshly-entered stabilize version with no merged tasks does not alert —
+    a normally-progressing stabilize must not be nagged."""
+    from app.models import Alert as _Alert
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    alerted = await rq._check_version_stabilize_stall(db_session, version)
+    assert alerted is False
+    alerts = (
+        (
+            await db_session.execute(
+                select(_Alert).where(_Alert.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 0
+
+
+@pytest.mark.asyncio
+async def test_stabilize_stall_alert_not_fired_for_build_version(db_session):
+    """A build-phase version is never a stabilize stall — wrong phase, no-op."""
+    from datetime import timedelta
+
+    project, version = await _make_project_and_version(db_session, phase="build")
+    version.phase_changed_at = rq._utcnow() - timedelta(
+        days=rq._STABILIZE_STALL_AGE_DAYS + 30
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    alerted = await rq._check_version_stabilize_stall(db_session, version)
+    assert alerted is False
+
+
+@pytest.mark.asyncio
+async def test_stabilize_stall_not_fired_for_dry_run_hold(db_session):
+    """A version that passed qualification but is held by promotion_enabled=False
+    (dry_run) must NOT trigger a stabilize-stall alert — it is healthy."""
+    from datetime import timedelta
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.phase_changed_at = rq._utcnow() - timedelta(
+        days=rq._STABILIZE_STALL_AGE_DAYS + 10
+    )
+    version.last_qualification = {"status": "dry_run", "candidate_sha": "abc123"}
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    alerted = await rq._check_version_stabilize_stall(db_session, version)
+    assert alerted is False
+
+
+@pytest.mark.asyncio
+async def test_stabilize_stall_not_fired_when_calcification_covers_it(db_session):
+    """A version with a hard-blocker not_promoted status is already covered by
+    the calcification alert — stabilize-stall must not double-alert."""
+    from datetime import timedelta
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.phase_changed_at = rq._utcnow() - timedelta(
+        days=rq._STABILIZE_STALL_AGE_DAYS + 10
+    )
+    version.last_qualification = {
+        "status": "not_promoted",
+        "blocker": "ci_not_green",
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    alerted = await rq._check_version_stabilize_stall(db_session, version)
+    assert alerted is False
+
+
+@pytest.mark.asyncio
+async def test_stabilize_stall_alert_deduplicated(db_session):
+    """A second call for the same stabilize-phase stall is a no-op — the alert
+    is posted only once per distinct stabilize phase."""
+    from datetime import timedelta
+
+    from app.models import Alert as _Alert
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.phase_changed_at = rq._utcnow() - timedelta(
+        days=rq._STABILIZE_STALL_AGE_DAYS + 6
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    first = await rq._check_version_stabilize_stall(db_session, version)
+    await db_session.commit()
+    second = await rq._check_version_stabilize_stall(db_session, version)
+    await db_session.commit()
+
+    assert first is True
+    assert second is False
+    alerts = (
+        (
+            await db_session.execute(
+                select(_Alert).where(_Alert.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+
+
+@pytest.mark.asyncio
+async def test_stabilize_stall_alert_refires_after_stabilize_phase_restarts(db_session):
+    """When the version re-enters stabilize (phase_changed_at re-stamped), the
+    dedup resets and a fresh stall can alert again."""
+    from datetime import timedelta
+
+    from app.models import Alert as _Alert
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.phase_changed_at = rq._utcnow() - timedelta(
+        days=rq._STABILIZE_STALL_AGE_DAYS + 16
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    first = await rq._check_version_stabilize_stall(db_session, version)
+    await db_session.commit()
+    assert first is True
+
+    # Simulate a stabilize → qualify → stabilize round-trip: phase_changed_at
+    # is re-stamped to a newer (but still stalled) reference time.
+    version.phase_changed_at = rq._utcnow() - timedelta(
+        days=rq._STABILIZE_STALL_AGE_DAYS + 1
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    second = await rq._check_version_stabilize_stall(db_session, version)
+    await db_session.commit()
+    assert second is True
+
+    alerts = (
+        (
+            await db_session.execute(
+                select(_Alert).where(_Alert.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 2
+
+
+@pytest.mark.asyncio
+async def test_sweep_triggers_stabilize_stall_check(db_session):
+    """The sweep runs the stabilize-stall check — an open stabilize version old
+    enough to be stalled gets an alert."""
+    from datetime import timedelta
+
+    from app.models import Alert as _Alert
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.phase_changed_at = rq._utcnow() - timedelta(
+        days=rq._STABILIZE_STALL_AGE_DAYS + 6
+    )
+    db_session.add(version)
+    await db_session.commit()
+
+    await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    alerts = (
+        (
+            await db_session.execute(
+                select(_Alert).where(_Alert.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+    assert "stabilize phase" in alerts[0].title
+
+
 class TestFormatQualificationForApi:
     """format_qualification_for_api returns a normalized, operator-facing dict."""
 
