@@ -390,7 +390,9 @@ class TestGetAllProjects:
 
         resp = await client.get("/api/admin/projects")
         assert resp.status_code == 200
-        ids = [p["id"] for p in resp.json()]
+        data = resp.json()
+        assert "items" in data
+        ids = [p["id"] for p in data["items"]]
         assert str(project.id) in ids
 
     @pytest.mark.asyncio
@@ -407,7 +409,7 @@ class TestGetAllProjects:
 
         resp = await client.get("/api/admin/projects")
         assert resp.status_code == 200
-        ids = [p["id"] for p in resp.json()]
+        ids = [p["id"] for p in resp.json()["items"]]
         assert str(other.id) not in ids
 
     @pytest.mark.asyncio
@@ -417,7 +419,7 @@ class TestGetAllProjects:
 
         resp = await client.get("/api/admin/projects")
         assert resp.status_code == 200
-        assert all("my_role" in p for p in resp.json())
+        assert all("my_role" in p for p in resp.json()["items"])
 
 
 class TestUpdateProject:
@@ -2233,7 +2235,7 @@ class TestProjectEndpointsSurfaceProblemModel:
         resp = await client.get("/api/admin/projects")
         assert resp.status_code == 200
         data = resp.json()
-        our = next((p for p in data if p["id"] == str(project.id)), None)
+        our = next((p for p in data["items"] if p["id"] == str(project.id)), None)
         assert our is not None
         assert "problem_model" not in our
         assert "running_update" not in our
@@ -2270,7 +2272,10 @@ class TestGetAllProjectsPagination:
 
         resp = await client.get("/api/admin/projects?limit=2")
         assert resp.status_code == 200
-        assert len(resp.json()) <= 2
+        data = resp.json()
+        assert "items" in data
+        assert "has_more" in data
+        assert len(data["items"]) <= 2
 
     @pytest.mark.asyncio
     async def test_offset_parameter(self, client: AsyncClient, db_session):
@@ -2279,14 +2284,28 @@ class TestGetAllProjectsPagination:
 
         resp_all = await client.get("/api/admin/projects?limit=100")
         resp_offset = await client.get("/api/admin/projects?limit=100&offset=2")
-        all_ids = [p["id"] for p in resp_all.json()]
-        offset_ids = [p["id"] for p in resp_offset.json()]
+        all_ids = [p["id"] for p in resp_all.json()["items"]]
+        offset_ids = [p["id"] for p in resp_offset.json()["items"]]
         assert offset_ids == all_ids[2:]
 
     @pytest.mark.asyncio
     async def test_limit_max_enforced(self, client: AsyncClient, db_session):
         resp = await client.get("/api/admin/projects?limit=200")
         assert resp.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_has_more_flag(self, client: AsyncClient, db_session):
+        """has_more is True when there are more results beyond the page."""
+        for i in range(3):
+            await _make_project(db_session, name=f"HM Project {i}")
+
+        resp_page = await client.get("/api/admin/projects?limit=2")
+        assert resp_page.status_code == 200
+        data_page = resp_page.json()
+        assert data_page["has_more"] is True
+
+        resp_all = await client.get("/api/admin/projects?limit=100")
+        assert resp_all.json()["has_more"] is False
 
 
 class TestPatchProblemModel:
@@ -3052,3 +3071,85 @@ class TestIntegrationBranchValidation:
         assert resp.status_code == 400, (
             f"Expected 400 for branch {bad_branch!r}, got {resp.status_code}"
         )
+
+
+class TestResetIterationCap:
+    """POST /api/admin/tasks/{task_id}/reset-iteration-cap — archives FAILED
+    review/fix tasks for the PR. The archive filter pushes pr_number into SQL;
+    on SQLite the naive .as_string() form double-quotes the int and matches
+    nothing, so this test guards against that dialect breakage by asserting
+    matching tasks are actually archived."""
+
+    async def _make_failed(self, db_session, project_id, pr_number, task_type="review"):
+        t = Task(
+            project_id=project_id,
+            status=TaskStatus.FAILED,
+            payloads=[{"type": task_type, "pr_number": pr_number, "branch": "feat/x"}],
+            archived=False,
+        )
+        db_session.add(t)
+        return t
+
+    @pytest.mark.asyncio
+    async def test_archives_only_matching_pr_failed_review_fix_tasks(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+
+        parking = Task(
+            project_id=project.id,
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "review", "pr_number": 777, "branch": "feat/x"}],
+            context={"review_loop": {"iteration": 5, "pr_number": 777}},
+        )
+        db_session.add(parking)
+
+        # FAILED review/fix tasks on PR #777 — these must be archived.
+        match_review = await self._make_failed(db_session, project.id, 777, "review")
+        match_fix = await self._make_failed(db_session, project.id, 777, "fix")
+        # FAILED on a different PR — must NOT be archived.
+        other_pr = await self._make_failed(db_session, project.id, 888, "review")
+        # FAILED on PR #777 but not a review/fix type — must NOT be archived.
+        wrong_type = await self._make_failed(db_session, project.id, 777, "create")
+        await db_session.commit()
+        for t in (parking, match_review, match_fix, other_pr, wrong_type):
+            await db_session.refresh(t)
+
+        resp = await client.post(f"/api/admin/tasks/{parking.id}/reset-iteration-cap")
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        # The two FAILED review/fix tasks on PR #777 must be counted — if the
+        # SQL pr_number filter silently matched zero rows (SQLite .as_string()
+        # bug), this would be 0.
+        assert body["archived_count"] == 2
+        assert body["pr_number"] == 777
+        assert body["previous_per_chain_iteration"] == 5
+
+        for t in (match_review, match_fix, other_pr, wrong_type):
+            await db_session.refresh(t)
+        assert match_review.archived is True
+        assert match_fix.archived is True
+        assert other_pr.archived is False
+        assert wrong_type.archived is False
+
+        # Per-chain iteration counter reset to 0 on the parking task.
+        await db_session.refresh(parking)
+        assert parking.context["review_loop"]["iteration"] == 0
+
+    @pytest.mark.asyncio
+    async def test_no_pr_number_in_context_returns_400(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        parking = Task(
+            project_id=project.id,
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "review"}],
+            context={"review_loop": {"iteration": 3}},
+        )
+        db_session.add(parking)
+        await db_session.commit()
+        await db_session.refresh(parking)
+
+        resp = await client.post(f"/api/admin/tasks/{parking.id}/reset-iteration-cap")
+        assert resp.status_code == 400

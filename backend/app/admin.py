@@ -11,6 +11,7 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 from sqlalchemy import func, update
 from sqlalchemy.orm.attributes import flag_modified
+from sqlalchemy.orm import load_only
 
 from app.database import get_session
 from app.shared_state import limiter
@@ -557,6 +558,7 @@ async def bulk_archive_tasks(
                 Task.status.in_(statuses),
                 Task.project_id.in_(user_project_ids),
             )
+            .limit(5000)
             .with_for_update(skip_locked=True)
         )
     else:
@@ -581,7 +583,7 @@ async def bulk_archive_tasks(
         )
     )
     await session.commit()
-    return {"archived_count": len(lockable_ids)}
+    return {"archived_count": len(lockable_ids), "has_more": len(lockable_ids) == 5000}
 
 
 class BulkActionRequest(BaseModel):
@@ -1840,18 +1842,26 @@ async def reset_iteration_cap(
             detail="Task has no PR number in context.review_loop.pr_number or context.rollup_pr_number",
         )
 
-    # Archive FAILED review/fix tasks on this PR so they drop from the global count
+    # Archive FAILED review/fix tasks on this PR so they drop from the global count.
+    # _pr_number_match is dialect-conditional: on SQLite, .as_string() JSON_QUOTE-
+    # double-quotes the int and never matches, so reuse the shared helper which
+    # falls back to func.json_extract for SQLite.
+    from app.ci_completion import _pr_number_match
+
     failed_result = await session.execute(
-        select(Task).where(
+        select(Task)
+        .where(
             Task.project_id == task.project_id,
             Task.status == TaskStatus.FAILED,
             Task.archived.is_(False),
+            _pr_number_match(session, pr_number),
         )
+        .options(load_only(Task.id, Task.archived, Task.payloads))
     )
     archived_count = 0
     for t in failed_result.scalars().all():
         fp = t.first_payload
-        if fp.get("pr_number") != pr_number or fp.get("type") not in ("review", "fix"):
+        if fp.get("type") not in ("review", "fix"):
             continue
         t.archived = True
         session.add(t)

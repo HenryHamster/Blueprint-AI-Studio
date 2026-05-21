@@ -577,6 +577,14 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
     () => (digest?.needs_attention ?? []).filter(item => !isHidden(item.task_id)),
     [digest?.needs_attention, isHidden]
   );
+  const approvalItems = useMemo(
+    () => visibleItems.filter(i => i.reason === 'approval_required'),
+    [visibleItems]
+  );
+  const failedItems = useMemo(
+    () => visibleItems.filter(i => i.reason === 'failed'),
+    [visibleItems]
+  );
 
   const toggle = () => {
     const next = !collapsed;
@@ -1152,8 +1160,6 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
                 const countLabel = hiddenItems.length > 0
                   ? `${visibleItems.length} visible / ${digest.needs_attention.length} total`
                   : String(digest.needs_attention.length);
-                const approvalItems = visibleItems.filter(i => i.reason === 'approval_required');
-                const failedItems = visibleItems.filter(i => i.reason === 'failed');
                 return (
                   <div className="border border-amber-500/30 rounded-lg p-3 flex flex-col gap-2">
                     <div className="flex items-center gap-1.5 text-[11px] font-bold text-amber-400 uppercase tracking-widest">

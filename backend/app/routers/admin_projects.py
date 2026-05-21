@@ -56,33 +56,38 @@ async def get_all_projects(
         .join(ProjectMember, ProjectMember.project_id == Project.id)
         .where(ProjectMember.user_id == current_user["user_id"])
         .order_by(Project.created_at.desc())
-        .limit(limit)
+        .limit(limit + 1)
         .offset(offset)
     )
     rows = (await session.execute(stmt)).all()
-    return [
-        {
-            "id": str(row.id),
-            "name": row.name,
-            "created_at": row.created_at.isoformat() if row.created_at else None,
-            "status": row.status,
-            "user_id": row.user_id,
-            "github_owner": row.github_owner,
-            "github_repo": row.github_repo,
-            "is_self_repo": row.is_self_repo,
-            "autonomous_enabled": row.autonomous_enabled,
-            "build_config": row.build_config or {},
-            "sr_catch_rate_targets": row.sr_catch_rate_targets or {},
-            "running_update_acknowledged_at": (
-                row.running_update_acknowledged_at.isoformat()
-                if row.running_update_acknowledged_at
-                else None
-            ),
-            "directions_count": row.directions_count,
-            "my_role": row.my_role,
-        }
-        for row in rows
-    ]
+    has_more = len(rows) > limit
+    page_rows = rows[:limit]
+    return {
+        "items": [
+            {
+                "id": str(row.id),
+                "name": row.name,
+                "created_at": row.created_at.isoformat() if row.created_at else None,
+                "status": row.status,
+                "user_id": row.user_id,
+                "github_owner": row.github_owner,
+                "github_repo": row.github_repo,
+                "is_self_repo": row.is_self_repo,
+                "autonomous_enabled": row.autonomous_enabled,
+                "build_config": row.build_config or {},
+                "sr_catch_rate_targets": row.sr_catch_rate_targets or {},
+                "running_update_acknowledged_at": (
+                    row.running_update_acknowledged_at.isoformat()
+                    if row.running_update_acknowledged_at
+                    else None
+                ),
+                "directions_count": row.directions_count,
+                "my_role": row.my_role,
+            }
+            for row in page_rows
+        ],
+        "has_more": has_more,
+    }
 
 
 @router.get("/projects/{project_id}")

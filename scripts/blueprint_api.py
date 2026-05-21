@@ -121,7 +121,8 @@ def get_project_id(project_id: str | None = None) -> str:
         return cfg["project_id"]
     if _project_id_cache:
         return _project_id_cache
-    projects = api("GET", "/api/admin/projects")
+    resp = api("GET", "/api/admin/projects")
+    projects = resp.get("items", []) if isinstance(resp, dict) else resp
     if not projects:
         print("ERROR: No projects found.")
         sys.exit(1)

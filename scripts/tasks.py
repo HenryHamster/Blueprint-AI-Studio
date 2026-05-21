@@ -285,7 +285,7 @@ def cmd_cancel_all(args):
     project_id = None
     if project_filter:
         projects = api("GET", "/api/admin/projects")
-        for p in projects:
+        for p in (projects.get("items", []) if isinstance(projects, dict) else projects):
             if p["id"].startswith(project_filter) or project_filter.lower() in p.get("name", "").lower():
                 project_id = p["id"]
                 print(f"Filtering to project: {p.get('name', p['id'][:8])}")

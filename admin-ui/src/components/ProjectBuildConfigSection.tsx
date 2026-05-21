@@ -72,8 +72,8 @@ export function ProjectBuildConfigSection({
     if (!projectId) { setSrTargets({}); return; }
     apiFetch('/api/admin/projects')
       .then(r => r.json())
-      .then((projects: { id: string; sr_catch_rate_targets?: Record<string, number> }[]) => {
-        const p = projects.find(p => p.id === projectId);
+      .then((resp: { items: { id: string; sr_catch_rate_targets?: Record<string, number> }[] }) => {
+        const p = (resp.items ?? []).find(p => p.id === projectId);
         setSrTargets(p?.sr_catch_rate_targets ?? {});
       })
       .catch(() => {});
