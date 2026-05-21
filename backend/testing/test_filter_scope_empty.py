@@ -10,11 +10,19 @@ from testing.factories import make_task
 
 
 def _task(
-    project_id, parent_id, status, files=None, auto_decomposed=True, ptype="create"
+    project_id,
+    parent_id,
+    status,
+    files=None,
+    auto_decomposed=True,
+    ptype="create",
+    finding_index=0,
 ):
     ctx = {"related_files": files or []}
     if auto_decomposed:
         ctx["auto_decomposed"] = True
+    if finding_index is not None:
+        ctx["finding_index"] = finding_index
     return make_task(
         project_id=project_id,
         parent_task_id=parent_id,
@@ -211,3 +219,90 @@ class TestFilterScopeEmpty:
 
         assert result == []
         session.execute.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_not_pre_empted_by_sibling_from_different_finding(self):
+        """Regression (2026-05-21): SCOPE_EMPTY pre-emption must scope
+        'sibling' to the same decomposition cluster — (parent_task_id,
+        finding_index) — not the whole research parent. A completed task
+        from a *different finding* under the same research parent that
+        happens to touch an overlapping file does NOT make this cluster's
+        work redundant (finding-#1 'fix(digest)' touching admin_digest.py
+        wrongly pre-empted a finding-#2 cluster declaring the same file)."""
+        pid = uuid.uuid4()
+        parent_id = uuid.uuid4()
+        files = ["backend/app/foo.py"]
+        sibling = _task(
+            pid, parent_id, TaskStatus.COMPLETED, files=files, finding_index=1
+        )
+        candidate = _task(
+            pid, parent_id, TaskStatus.QUEUED, files=files, finding_index=2
+        )
+
+        session = _mock_session([sibling])
+        broadcast = AsyncMock()
+
+        result = await filter_scope_empty(
+            [candidate.id], [candidate], session, broadcast
+        )
+
+        assert result == [candidate.id], (
+            "cross-finding file overlap must not pre-empt"
+        )
+        assert candidate.status == TaskStatus.QUEUED
+        broadcast.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_pre_empted_by_sibling_from_same_finding(self):
+        """Within one finding's decomposition (same finding_index), a
+        completed sibling cluster covering all the candidate's files still
+        pre-empts it — the fix narrows the match, it does not disable it."""
+        pid = uuid.uuid4()
+        parent_id = uuid.uuid4()
+        files = ["backend/app/foo.py"]
+        sibling = _task(
+            pid, parent_id, TaskStatus.COMPLETED, files=files, finding_index=2
+        )
+        candidate = _task(
+            pid, parent_id, TaskStatus.QUEUED, files=files, finding_index=2
+        )
+
+        session = _mock_session([sibling])
+        broadcast = AsyncMock()
+
+        result = await filter_scope_empty(
+            [candidate.id], [candidate], session, broadcast
+        )
+
+        assert result == []
+        assert candidate.status == TaskStatus.FAILED
+        assert (candidate.context or {}).get("failure_category") == "SCOPE_EMPTY"
+
+    @pytest.mark.asyncio
+    async def test_not_pre_empted_when_finding_index_missing(self):
+        """A candidate with no finding_index cannot be placed in a cluster
+        group, so it must not be pre-empted — coincidental file overlap is
+        not proof of redundant work."""
+        pid = uuid.uuid4()
+        parent_id = uuid.uuid4()
+        files = ["backend/app/foo.py"]
+        sibling = _task(
+            pid, parent_id, TaskStatus.COMPLETED, files=files, finding_index=1
+        )
+        candidate = _task(
+            pid,
+            parent_id,
+            TaskStatus.QUEUED,
+            files=files,
+            finding_index=None,
+        )
+
+        session = _mock_session([sibling])
+        broadcast = AsyncMock()
+
+        result = await filter_scope_empty(
+            [candidate.id], [candidate], session, broadcast
+        )
+
+        assert result == [candidate.id]
+        assert candidate.status == TaskStatus.QUEUED
