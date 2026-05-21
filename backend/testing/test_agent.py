@@ -986,6 +986,67 @@ async def test_recently_completed_tasks_include_outcome_context(
 
 
 @pytest.mark.asyncio
+async def test_agent_claim_injects_sr_co_failure_pairs(
+    client: AsyncClient, db_session
+):
+    """The claim response injects sr_co_failure_pairs from recent completed tasks.
+
+    Regression: the scan once filtered + ordered by a non-existent
+    ``Task.completed_at`` column (that name is a property on the strategic-cycle
+    model, not Task). The query raised AttributeError on every code-change
+    claim; the catch-all swallowed it, so the injection silently produced
+    nothing — 11x ERROR-log noise and a 100%-dead feature.
+    """
+    project = Project(name="SR Co-Failure", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # >= _SR_MIN_SAMPLE (5) completed code-change tasks whose self-review failed
+    # the same two categories together → a clear co-failure pair.
+    for i in range(6):
+        db_session.add(
+            Task(
+                project_id=project.id,
+                title=f"Completed {i}",
+                payloads=[{"type": "create", "prompt": "x"}],
+                status=TaskStatus.COMPLETED,
+                context={
+                    "_self_review_outcome": {
+                        "check_results": {
+                            "correctness": {"passed": False},
+                            "error-handling": {"passed": False},
+                        }
+                    }
+                },
+            )
+        )
+    await db_session.commit()
+
+    claim_task = Task(
+        project_id=project.id,
+        title="Claimer",
+        payloads=[{"type": "create", "prompt": "Build a thing"}],
+        vm_instance_id="agent-vm-cofail-claimer",
+    )
+    db_session.add(claim_task)
+    await db_session.commit()
+    await db_session.refresh(claim_task)
+
+    token = create_agent_token(str(claim_task.id), "agent-vm-cofail-claimer")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    pairs = resp.json()["project_context"].get("sr_co_failure_pairs")
+    assert pairs, "sr_co_failure_pairs missing — the completed-task scan failed"
+    cats = {p["cat_a"] for p in pairs} | {p["cat_b"] for p in pairs}
+    assert "correctness" in cats
+    assert "error-handling" in cats
+    for p in pairs:
+        assert {"cat_a", "cat_b", "lift"} <= set(p)
+
+
+@pytest.mark.asyncio
 async def test_lessons_include_first_feedback_when_distinct(
     client: AsyncClient, db_session
 ):
