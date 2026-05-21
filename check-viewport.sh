@@ -9,15 +9,6 @@ VPORT_ARGS=(
   VITE_FIREBASE_PROJECT_ID=ci
 )
 
-# Capture baseline screenshots on main-branch runs (or explicit opt-in via CAPTURE_BASELINES=true).
-# viewport.ts writes PNGs to admin-ui/viewport-baselines/<component>-<width>px.png when this is set.
-CURRENT_BRANCH=$(git -C /tmp/workspace rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
-DOCKER_BASELINE_ARGS=()
-if [ "${CAPTURE_BASELINES:-}" = "true" ] || [ "$CURRENT_BRANCH" = "main" ]; then
-  VPORT_ARGS+=(VITE_CAPTURE_BASELINES=true)
-  DOCKER_BASELINE_ARGS=(-e VITE_CAPTURE_BASELINES=true)
-fi
-
 BOOTSTRAP_PATTERNS="libatk|libxcomposite|libgbm|libnss3|libasound|cannot open shared object file|executable doesn|host system is missing|please install|npx playwright install|run: playwright install|missing browser|missing chromium|eacces.*unlink.*vite|permission denied.*unlink"
 
 cd /tmp/workspace/admin-ui
@@ -54,7 +45,6 @@ DOCKER_OUT=$(docker run --rm \
   -e VITE_FIREBASE_API_KEY=ci \
   -e VITE_FIREBASE_AUTH_DOMAIN=ci.firebaseapp.com \
   -e VITE_FIREBASE_PROJECT_ID=ci \
-  "${DOCKER_BASELINE_ARGS[@]}" \
   "$PLAYWRIGHT_IMAGE" npm run test:viewport 2>&1)
 DOCKER_STATUS=$?
 echo "$DOCKER_OUT"

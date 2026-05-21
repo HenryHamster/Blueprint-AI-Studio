@@ -1689,6 +1689,52 @@ async def get_version():
     return {"sha": _current_sha, "revision": _current_revision}
 
 
+@app.get("/api/admin/viewport-failures/download-url")
+async def get_viewport_failure_screenshot_download_url(
+    project_id: uuid.UUID,
+    component: str,
+    width: int,
+    current_user: dict = Depends(get_current_user),
+):
+    """Generate a 1-hour signed download URL for a viewport failure screenshot.
+
+    The GCS object path is reconstructed to exactly mirror what the agent
+    uploads via POST /api/agent/viewport/failure-screenshot-upload-url
+    (viewport-failures/{project_id}/{component}-{width}.png), so the regression
+    panel can display screenshots from the stable per-project/component/width
+    path without a per-task DB lookup. The component is sanitized with the same
+    rule the upload endpoint applies so the two paths always agree.
+    """
+    import datetime as _dt
+    import re as _re
+
+    from google.cloud import storage as _gcs
+
+    from app.storage import ARTIFACT_BUCKET_NAME, GCP_PROJECT_ID
+
+    safe_component = _re.sub(r"[^A-Za-z0-9._-]", "_", component)[:100]
+    object_name = f"viewport-failures/{project_id}/{safe_component}-{width}.png"
+
+    def _generate() -> str:
+        blob = (
+            _gcs.Client(project=GCP_PROJECT_ID)
+            .bucket(ARTIFACT_BUCKET_NAME)
+            .blob(object_name)
+        )
+        return blob.generate_signed_url(
+            version="v4", expiration=_dt.timedelta(hours=1), method="GET"
+        )
+
+    try:
+        url = await asyncio.to_thread(_generate)
+    except Exception as exc:
+        logger.warning(
+            "[VIEWPORT] signed download URL failed for %s: %s", object_name, exc
+        )
+        raise HTTPException(status_code=503, detail="Artifact storage unavailable")
+    return {"url": url}
+
+
 @app.get("/health")
 async def health_check():
     """Unauthenticated health endpoint for external monitoring (Cloud Function, load balancer)."""

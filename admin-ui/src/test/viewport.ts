@@ -9,19 +9,6 @@ function _callerTestFile(): string {
   return m ? m[1] : '';
 }
 
-// When VITE_CAPTURE_BASELINES=true (set on main-branch CI runs), save a PNG
-// of the component after each passing assertion. One file per component per
-// width — overwriting keeps storage bounded to one baseline per slot.
-async function _captureBaselineIfEnabled(callerFile: string, width: number): Promise<void> {
-  if (import.meta.env.VITE_CAPTURE_BASELINES !== 'true') return;
-  const name = callerFile.replace(/\.viewport\.test\.tsx$/i, '') || 'unknown';
-  try {
-    await page.screenshot({ path: `viewport-baselines/${name}-${width}px.png` });
-  } catch {
-    // Never fail a passing test because of screenshot I/O
-  }
-}
-
 /**
  * Internal guard: if an ErrorBoundary fallback is present in the rendered tree,
  * throw immediately with a descriptive [assertion_type:error_boundary] message.
@@ -139,7 +126,6 @@ export async function expectNoOverflowAt(
     );
   }
 
-  await _captureBaselineIfEnabled(callerFile, width);
 }
 
 /**
@@ -231,7 +217,6 @@ export async function expectNoTextTruncationAt(
     );
   }
 
-  await _captureBaselineIfEnabled(callerFile, width);
 }
 
 /**
@@ -313,7 +298,6 @@ export async function expectMinTouchTargetAt(
     );
   }
 
-  await _captureBaselineIfEnabled(callerFile, width);
 }
 
 /**

@@ -242,28 +242,25 @@ describe('ManualInterventionPanel — viewport failure screenshot disclosure', (
     regression_class: 'viewport_regression:MessagesPanel@375',
   };
 
-  it('shows failure image alongside baseline when failure_screenshot_url is set', async () => {
+  it('shows failure screenshot when failure_screenshot_url is set', async () => {
     apiFetchMock.mockResolvedValueOnce(response([{
       ...viewportCase,
       failure_screenshot_url: '/uploads/viewport-failures/MessagesPanel-375px-abc.png',
     }]));
     render(<ManualInterventionPanel projectId="proj-1" />);
     await screen.findByText('viewport regression');
-    const toggle = screen.getByRole('button', { name: /images/ });
+    const toggle = screen.getByRole('button', { name: /failure screenshot/ });
     fireEvent.click(toggle);
-    expect(screen.getByAltText('MessagesPanel baseline at 375px')).toBeInTheDocument();
+    expect(screen.queryByAltText('MessagesPanel baseline at 375px')).toBeNull();
     expect(screen.getByAltText('MessagesPanel failure at 375px')).toBeInTheDocument();
     expect(screen.getByText('Latest failure')).toBeInTheDocument();
   });
 
-  it('shows only baseline when failure_screenshot_url is null', async () => {
+  it('hides the disclosure button when failure_screenshot_url is null', async () => {
     apiFetchMock.mockResolvedValueOnce(response([{ ...viewportCase, failure_screenshot_url: null }]));
     render(<ManualInterventionPanel projectId="proj-1" />);
     await screen.findByText('viewport regression');
-    const toggle = screen.getByRole('button', { name: /images/ });
-    fireEvent.click(toggle);
-    expect(screen.getByAltText('MessagesPanel baseline at 375px')).toBeInTheDocument();
-    expect(screen.queryByText('Latest failure')).toBeNull();
+    expect(screen.queryByRole('button', { name: /failure screenshot/ })).toBeNull();
   });
 });
 
@@ -295,43 +292,39 @@ describe('EscalationOutcomePanel — compliance_followup bucket', () => {
   });
 });
 
-describe('ManualInterventionPanel — viewport baseline disclosure', () => {
-  it('renders correct baseline image URL for new-format viewport regression (Component:assertion_type@Width)', async () => {
+describe('ManualInterventionPanel — viewport regression class parsing', () => {
+  it('parses component name correctly for new-format regression (Component:assertion_type@Width)', async () => {
     apiFetchMock.mockResolvedValueOnce(response([
       {
         ...baseCase,
         id: 'vp-1',
         regression_class: 'viewport_regression:MessagesPanel:overflow@375',
         signal_name: 'viewport overflow',
+        failure_screenshot_url: '/uploads/viewport-failures/MessagesPanel-375px-abc.png',
       },
     ]));
     render(<ManualInterventionPanel projectId="proj-1" />);
     await waitFor(() => expect(screen.getByText('viewport overflow')).toBeInTheDocument());
-    // Click images disclosure button
-    const button = screen.getAllByRole('button', { name: /images/ })[0];
+    const button = screen.getAllByRole('button', { name: /failure screenshot/ })[0];
     fireEvent.click(button);
-    // Verify that the image URL does NOT include the assertion_type in the filename
-    const img = screen.getByAltText(/MessagesPanel baseline at 375px/) as HTMLImageElement;
-    expect(img.src).toContain('/viewport-baselines/MessagesPanel-375px.png');
-    expect(img.src).not.toContain('overflow');
+    // Alt text uses component name without the assertion_type segment
+    expect(screen.getByAltText('MessagesPanel failure at 375px')).toBeInTheDocument();
   });
 
-  it('renders correct baseline image URL for legacy-format viewport regression (Component@Width)', async () => {
+  it('parses component name correctly for legacy-format regression (Component@Width)', async () => {
     apiFetchMock.mockResolvedValueOnce(response([
       {
         ...baseCase,
         id: 'vp-2',
         regression_class: 'viewport_regression:TaskCard@768',
         signal_name: 'viewport legacy',
+        failure_screenshot_url: '/uploads/viewport-failures/TaskCard-768px-xyz.png',
       },
     ]));
     render(<ManualInterventionPanel projectId="proj-1" />);
     await waitFor(() => expect(screen.getByText('viewport legacy')).toBeInTheDocument());
-    // Click images disclosure button
-    const button = screen.getAllByRole('button', { name: /images/ })[0];
+    const button = screen.getAllByRole('button', { name: /failure screenshot/ })[0];
     fireEvent.click(button);
-    // Verify that the image URL is correct for legacy format
-    const img = screen.getByAltText(/TaskCard baseline at 768px/) as HTMLImageElement;
-    expect(img.src).toContain('/viewport-baselines/TaskCard-768px.png');
+    expect(screen.getByAltText('TaskCard failure at 768px')).toBeInTheDocument();
   });
 });

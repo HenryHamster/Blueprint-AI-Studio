@@ -5,6 +5,8 @@ import { OrchestratorHealthBar } from '../components/OrchestratorHealthBar';
 import { ProjectDashboard } from '../components/ProjectDashboard';
 import { CatchUpPanel } from '../components/CatchUpPanel';
 import { DiagnosticsPanel } from '../components/DiagnosticsPanel';
+import { DashboardHome } from '../components/DashboardHome';
+import { PlaybookPanel } from '../components/PlaybookPanel';
 import { expectNoOverflowAt } from './viewport';
 import type { ProjectDiagnostics } from '../types/diagnostics';
 import type { Project } from '../types/project';
@@ -91,7 +93,11 @@ vi.mock('../api', async () => {
       if (url.includes('/api/admin/digest')) {
         return new Response(JSON.stringify(digestPayload), { status: 200 });
       }
-      return new Response('{}', { status: 200 });
+      // Return 404 for all other URLs so widgets that destructure specific
+      // shapes (DashboardHome, PlaybookPanel sub-sections) hit their
+      // `if (res.ok)` / `if (!data)` early-exits instead of crashing on
+      // undefined properties of an empty `{}` body.
+      return new Response('not found', { status: 404 });
     }),
     // DiagnosticsPanel polls /api/admin/failing-task-types via authGet on mount.
     authGet: vi.fn(async () =>
@@ -285,6 +291,14 @@ describe('operator home — composed viewport regression', () => {
               onBulkRetry={() => {}}
             />
             <DiagnosticsPanel diagnostics={diagnosticsData} onViewTask={() => {}} />
+            {/* Home body panels — rendered beneath the chrome to cover the highest-traffic landing page */}
+            <DashboardHome
+              tasks={[]}
+              selectedProjectId="p1"
+              projects={projects}
+              onViewTask={() => {}}
+            />
+            <PlaybookPanel selectedProjectId="p1" />
           </>,
         );
       });
@@ -304,6 +318,8 @@ describe('operator home — composed viewport regression', () => {
     // A silent crash would fail both the error-boundary sentinel above and these checks.
     expect(host!.textContent).toContain('fix: resolve viewport overflow issue on dashboard');
     expect(host!.textContent).toContain('feat: a sufficiently long stuck-task title');
+    // Confirm DashboardHome body rendered: direction from digestPayload should appear.
+    expect(host!.textContent).toContain('Improve admin UI mobile responsiveness');
 
     localStorage.removeItem('projectDashboardCollapsed');
   });

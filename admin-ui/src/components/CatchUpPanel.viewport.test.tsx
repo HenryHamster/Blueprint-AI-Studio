@@ -135,8 +135,12 @@ describe('CatchUpPanel — viewport regression', () => {
                 title: 'fix(backend): handle edge case where pipeline_regression_dispatcher emits duplicate escalation_reason labels on retry loops',
                 reason: 'failed',
                 error_snippet: 'AssertionError: Expected labels to be unique but found [\'escalated_cross_layer\', \'escalated_cross_layer\'] — dedup guard not applied in dispatch_single_signal',
-                pr_url: null,
+                pr_url: 'https://github.com/HenryHamster/BlueprintAIStudio/pull/4923',
                 failure_class: 'TEST_FAILURE',
+                scope: 'small',
+                direction_text: 'Improve test infrastructure and coverage for edge cases',
+                merge_retries_saved: 3,
+                waiting_hours: 2,
               },
             ],
             recent_failures: [

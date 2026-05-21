@@ -377,57 +377,37 @@ function snapshotSummary(snap: Record<string, unknown> | null): string {
   return entries.length ? entries.join(', ') : '—';
 }
 
-/** Collapsible image disclosure for viewport_regression cases. Shows the saved
- * baseline PNG (written by viewport.ts when VITE_CAPTURE_BASELINES=true) and,
- * when available, the most-recent failure PNG side by side so the operator can
- * eyeball the diff without leaving the admin UI. */
+/** Collapsible failure-screenshot disclosure for viewport_regression cases.
+ * Shows the GCS-stored failure PNG so the operator can inspect it without
+ * leaving the admin UI. Hidden when no screenshot URL is available (baselines
+ * were never persisted or served, so only the actual failure image is shown). */
 function ViewportBaselineDisclosure({ regressionClass, failureScreenshotUrl }: {
   regressionClass: string;
   failureScreenshotUrl?: string | null;
 }) {
   const [open, setOpen] = useState(false);
-  const [missing, setMissing] = useState(false);
   const [failureMissing, setFailureMissing] = useState(false);
 
-  // regression_class format: "viewport_regression:ComponentName@375" or
-  // "viewport_regression:ComponentName:assertion_type@375"
+  if (!failureScreenshotUrl) return null;
+
   const inner = regressionClass.slice('viewport_regression:'.length);
   const { component, width = '375' } = parseViewportSubkey(inner);
-  // viewport.ts strips ".viewport.test.tsx" suffix when naming the file
   const stem = component.replace(/\.viewport\.test\.tsx$/i, '');
-  const baselineUrl = `/viewport-baselines/${stem}-${width}px.png`;
 
   return (
     <div className="mt-1.5">
       <button type="button" onClick={() => setOpen(v => !v)}
         className="flex items-center gap-1 text-[10px] text-violet-400 hover:text-violet-300 transition-colors">
         {open ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
-        images
+        failure screenshot
       </button>
-      {open && (
-        <div className="mt-1 flex gap-4 flex-wrap">
-          <div className="space-y-1">
-            <div className="text-[9px] text-neutral-500 font-medium uppercase tracking-wide">Baseline (passing at {width}px)</div>
-            {missing ? (
-              <div className="text-[9px] text-neutral-600 italic">
-                no baseline yet — captured on main when VITE_CAPTURE_BASELINES=true
-              </div>
-            ) : (
-              <img src={baselineUrl} alt={`${stem} baseline at ${width}px`}
-                style={{ maxWidth: `${width}px` }}
-                className="rounded border border-neutral-700/50 max-w-full"
-                onError={() => setMissing(true)} />
-            )}
-          </div>
-          {failureScreenshotUrl && !failureMissing && (
-            <div className="space-y-1">
-              <div className="text-[9px] text-red-400 font-medium uppercase tracking-wide">Latest failure</div>
-              <img src={failureScreenshotUrl} alt={`${stem} failure at ${width}px`}
-                style={{ maxWidth: `${width}px` }}
-                className="rounded border border-red-900/40 max-w-full"
-                onError={() => setFailureMissing(true)} />
-            </div>
-          )}
+      {open && !failureMissing && (
+        <div className="mt-1 space-y-1">
+          <div className="text-[9px] text-red-400 font-medium uppercase tracking-wide">Latest failure</div>
+          <img src={failureScreenshotUrl} alt={`${stem} failure at ${width}px`}
+            style={{ maxWidth: `${width}px` }}
+            className="rounded border border-red-900/40 max-w-full"
+            onError={() => setFailureMissing(true)} />
         </div>
       )}
     </div>

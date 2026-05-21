@@ -1179,7 +1179,7 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
                           <div
                             role="button"
                             tabIndex={0}
-                            className="flex items-center gap-2 text-xs bg-neutral-950 border border-neutral-800/80 px-2 py-1.5 rounded cursor-pointer hover:bg-neutral-800/50"
+                            className="flex flex-wrap items-center gap-2 text-xs bg-neutral-950 border border-neutral-800/80 px-2 py-1.5 rounded cursor-pointer hover:bg-neutral-800/50"
                             onClick={() => onSelectTask({ id: item.task_id })}
                             onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onSelectTask({ id: item.task_id }); } }}
                           >

@@ -10934,3 +10934,155 @@ async def test_review_spawned_for_normal_subtask_has_no_hotfix(db_session, mocke
     assert was_created is True
     assert review_task is not None
     assert "hotfix" not in review_task.first_payload
+
+
+@pytest.mark.asyncio
+async def test_viewport_failure_screenshot_upload_url(
+    client: AsyncClient, db_session, mocker
+):
+    """Viewport failure screenshot endpoint returns stable GCS path and stamps task context."""
+    import asyncio
+
+    project = Project(name="Viewport Screenshot Test", user_id="user-viewport-001")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix", "prompt": "fix viewport overflow"}],
+        vm_instance_id="vm-viewport-001",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    fake_url = "https://storage.googleapis.com/bucket/viewport-failures/signed?X-Goog-Signature=abc"
+    mocker.patch.object(asyncio, "to_thread", new=AsyncMock(return_value=fake_url))
+
+    token = create_agent_token(str(task.id), "vm-viewport-001")
+    resp = await client.post(
+        "/api/agent/viewport/failure-screenshot-upload-url",
+        json={"task_id": str(task.id), "component": "MessagesPanel", "width": 375},
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["upload_url"] == fake_url
+    # Stable path is keyed by project_id/component-width — not task-scoped
+    assert (
+        f"viewport-failures/{project.id}/MessagesPanel-375.png" in body["storage_uri"]
+    )
+
+    await db_session.refresh(task)
+    assert task.context["viewport_failure_screenshot_uri"] == body["storage_uri"]
+
+
+@pytest.mark.asyncio
+async def test_viewport_failure_screenshot_upload_url_rejects_wrong_task(
+    client: AsyncClient, db_session
+):
+    """Endpoint rejects requests where task_id doesn't match the agent token."""
+    project = Project(name="Viewport Screenshot Auth Test", user_id="user-viewport-002")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task1 = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix"}],
+        vm_instance_id="vm-viewport-002",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    task2 = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix"}],
+        vm_instance_id="vm-viewport-003",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task1)
+    db_session.add(task2)
+    await db_session.commit()
+    await db_session.refresh(task1)
+    await db_session.refresh(task2)
+
+    # Token for task1 but request uses task2's ID
+    token = create_agent_token(str(task1.id), "vm-viewport-002")
+    resp = await client.post(
+        "/api/agent/viewport/failure-screenshot-upload-url",
+        json={"task_id": str(task2.id), "component": "MessagesPanel", "width": 375},
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_viewport_failure_screenshot_download_url(
+    client: AsyncClient, db_session, mocker
+):
+    """Download endpoint reconstructs the exact GCS path the agent uploads to."""
+    project = Project(name="Viewport Download Test", user_id="user-viewport-dl-001")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    captured = {}
+    fake_url = (
+        "https://storage.googleapis.com/bucket/signed-download?X-Goog-Signature=xyz"
+    )
+
+    def _fake_blob(object_name):
+        captured["object_name"] = object_name
+        blob = mocker.MagicMock()
+        blob.generate_signed_url.return_value = fake_url
+        return blob
+
+    fake_client = mocker.MagicMock()
+    fake_client.bucket.return_value.blob.side_effect = _fake_blob
+    mocker.patch("google.cloud.storage.Client", return_value=fake_client)
+
+    resp = await client.get(
+        "/api/admin/viewport-failures/download-url",
+        params={
+            "project_id": str(project.id),
+            "component": "MessagesPanel",
+            "width": 375,
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["url"] == fake_url
+    # Path must exactly mirror the agent upload endpoint's object path
+    # (viewport-failures/{project_id}/{component}-{width}.png) so the download
+    # endpoint can actually serve the screenshot the agent uploaded.
+    assert (
+        captured["object_name"]
+        == f"viewport-failures/{project.id}/MessagesPanel-375.png"
+    )
+
+
+@pytest.mark.asyncio
+async def test_viewport_failure_screenshot_download_url_storage_failure(
+    client: AsyncClient, db_session, mocker
+):
+    """A GCS failure surfaces as a 503, not an unhandled 500."""
+    project = Project(
+        name="Viewport Download Failure Test", user_id="user-viewport-dl-002"
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    mocker.patch(
+        "google.cloud.storage.Client", side_effect=RuntimeError("gcs unavailable")
+    )
+
+    resp = await client.get(
+        "/api/admin/viewport-failures/download-url",
+        params={
+            "project_id": str(project.id),
+            "component": "MessagesPanel",
+            "width": 375,
+        },
+    )
+    assert resp.status_code == 503
