@@ -158,6 +158,38 @@ async def _build_system_maturity_payload(
     return out
 
 
+_EFFICIENCY_SNAPSHOT_HISTORY_TAIL = 3
+
+
+def _summarize_efficiency_snapshot(snapshot: dict) -> dict:
+    """Trim efficiency_snapshot for inclusion in strategic-agent payloads.
+
+    Strips full history arrays down to a 3-point tail per axis so the agent
+    can read a trend without dragging months of weekly history through the
+    payload budget.
+    """
+    if not snapshot:
+        return {}
+    axes = snapshot.get("axes") or {}
+    trimmed_axes: dict = {}
+    for axis, data in axes.items():
+        if not isinstance(data, dict):
+            trimmed_axes[axis] = data
+            continue
+        history = data.get("history") or []
+        trimmed_axes[axis] = {
+            "current": data.get("current"),
+            "baseline": data.get("baseline"),
+            "drift_pct": data.get("drift_pct"),
+            "history_tail": history[-_EFFICIENCY_SNAPSHOT_HISTORY_TAIL:],
+        }
+    return {
+        "axes": trimmed_axes,
+        "baseline_captured_at": snapshot.get("baseline_captured_at"),
+        "last_snapshot_at": snapshot.get("last_snapshot_at"),
+    }
+
+
 def _summarize_drift_signals(drift: dict) -> dict:
     """Return a payload-friendly subset of drift_detection.compute_direction_drift.
 
@@ -375,6 +407,13 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     "version_phase": {"priority": "high"},
     # Citable memo digest — supplementary context, dropped first under budget pressure.
     "memo_citations": {"priority": "low"},
+    # Per-axis efficiency axes with drift vs baseline. Medium priority so it
+    # survives typical payload pressure; the summarize_fn trims history tails
+    # so it degrades gracefully before being dropped entirely.
+    "efficiency_snapshot": {
+        "priority": "medium",
+        "summarize": _summarize_efficiency_snapshot,
+    },
 }
 
 
@@ -1500,6 +1539,21 @@ async def _spawn_strategic_review(
     except Exception:
         logger.exception("[STRATEGIC] memo citation fetch failed; continuing")
         memo_citations = []
+    # Efficiency axes + drift vs baseline. Best-effort: absent when no snapshot
+    # data has been written yet (cold-start projects). The summarize_fn trims
+    # history tails before the packer drops it entirely under budget pressure.
+    _efficiency_snapshot: dict | None = None
+    try:
+        from app.efficiency_snapshot import read_baseline_with_drift
+
+        _raw_snapshot = await read_baseline_with_drift(session, project.id)
+        axes = (_raw_snapshot or {}).get("axes") or {}
+        if any(
+            v.get("current") is not None for v in axes.values() if isinstance(v, dict)
+        ):
+            _efficiency_snapshot = _summarize_efficiency_snapshot(_raw_snapshot)
+    except Exception:
+        logger.exception("[STRATEGIC] efficiency snapshot fetch failed; continuing")
     # Stabilize phase directive — when the open version is in stabilize, bias the
     # strategic agent's work-mix toward audit/cleanup/hardening so the version
     # converges toward qualification rather than accumulating net-new feature work.
@@ -1589,6 +1643,11 @@ async def _spawn_strategic_review(
             **(
                 {"retired_directions_summary": _retired_summary}
                 if _retired_summary
+                else {}
+            ),
+            **(
+                {"efficiency_snapshot": _efficiency_snapshot}
+                if _efficiency_snapshot
                 else {}
             ),
             "base_branch": _runtime_config.get("integration_branch", "main"),

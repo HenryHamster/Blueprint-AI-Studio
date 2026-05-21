@@ -21,6 +21,9 @@ export interface SrCategoryTrend {
   sr_alone_hit_rate?: number | null;
   reviewer_save_rate?: number | null;
   trend?: 'increasing' | 'decreasing' | 'stable';
+  /** True when the trend direction is statistically significant (z-test passed).
+   *  False = adequate data but change is within noise; null = insufficient data. */
+  trend_significant?: boolean | null;
   rate_history?: number[];
   /** True when the SR prompt version changed within the rate_history window — attribution breaks here. */
   prompt_version_changed?: boolean | null;

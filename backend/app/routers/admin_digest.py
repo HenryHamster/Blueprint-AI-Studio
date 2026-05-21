@@ -43,6 +43,8 @@ from app.models import (
     Alert,
     AlertSeverity,
     CLOSE_REASON_RECOVERED_UNATTENDED,
+    CYCLE_META_MEMOS_AVAILABLE,
+    CYCLE_META_MEMOS_CITED,
 )
 from app.auth import get_current_user, require_admin
 from app.admin import _get_user_project_with_role
@@ -5796,8 +5798,12 @@ async def _compute_digest(
     edges_trend: Optional[Dict[str, Any]] = None
     self_review_prediction_accuracy_trends: Optional[Dict[str, Any]] = None
     sr_regression_risk_test_signal_trends: Optional[Dict[str, Any]] = None
+    memo_pathway_exits: int = 0
     if project_id:
         _proj = await session.get(Project, project_id)
+        memo_pathway_exits = await _strategic_cycle.count_memo_exits(
+            session, project_id
+        )
         if _proj:
             _sr_trends = (_proj.design_doc or {}).get("sr_catch_rate_trends") or {}
             if _sr_trends:
@@ -5827,6 +5833,17 @@ async def _compute_digest(
                     "vision_updated": last.get("vision_updated", False),
                     "summary_text": last.get("summary_text"),
                 }
+                _cycle_id = last.get("cycle_id")
+                if _cycle_id:
+                    _sc_row = await session.get(StrategicCycle, _cycle_id)
+                    if _sc_row is not None:
+                        _ms = _sc_row.memo_stats()
+                        latest_cycle[CYCLE_META_MEMOS_AVAILABLE] = _ms[
+                            CYCLE_META_MEMOS_AVAILABLE
+                        ]
+                        latest_cycle[CYCLE_META_MEMOS_CITED] = _ms[
+                            CYCLE_META_MEMOS_CITED
+                        ]
             _sc_history = await _strategic_cycle.recent_for_agent_context(
                 session,
                 project_id,
@@ -6787,6 +6804,7 @@ async def _compute_digest(
         "trend": trend,
         "trend_history": trend_history,
         "latest_cycle": latest_cycle,
+        "memo_pathway_exits": memo_pathway_exits,
         "scope_conversion_rates": scope_conversion_rates or None,
         "prev_scope_conversion_rates": prev_scope_conversion_rates or None,
         "pipeline_acceptance_rate": pipeline_acceptance_rate,

@@ -109,6 +109,12 @@ _RETIRE_MAX_SUCCESS_RATE = 0.20
 # EXEMPT — only entries with source == 'auto-generated' decay on idleness.
 _IDLE_RETIRE_DAYS = 30
 
+# Cooldown window (days) during which a recently-archived auto-playbook entry
+# cannot be re-created.  Prevents "resurrection" of entries pruned for capacity,
+# idle decay, or low success rate.  Configurable via
+# runtime_config["auto_playbook_resurrection_cooldown_days"].
+_AUTO_PLAYBOOK_RESURRECTION_COOLDOWN_DAYS = 30
+
 # Review-extracted playbook entries are refreshed in-place when their
 # updated_at exceeds _REVIEW_PLAYBOOK_REFRESH_DAYS, and flagged
 # potentially_stale once they exceed _REVIEW_PLAYBOOK_STALE_DAYS without
@@ -568,6 +574,55 @@ def maybe_archive_for_capacity(doc: dict, new_entry_estimate: int = 0) -> dict:
     return doc
 
 
+def _get_prior_archive_entry(doc: dict, full_key: str) -> dict | None:
+    """Return the most recent ``playbook_archive`` entry for *full_key*, or None."""
+    for entry in reversed(list(doc.get("playbook_archive") or [])):
+        if entry.get("_archived_key") == full_key:
+            return entry
+    return None
+
+
+def _is_auto_playbook_suppressed(doc: dict, full_key: str) -> bool:
+    """Return True when *full_key* must not be re-created.
+
+    Checks (in priority order):
+
+    1. ``playbook_deleted_keys`` — keys explicitly deleted by an operator.
+       These are suppressed until they age off the 200-entry cap.
+    2. ``playbook_archive`` — keys retired for capacity, idle decay, or low
+       success rate whose ``_archived_at`` is within the cooldown window
+       (``auto_playbook_resurrection_cooldown_days``, default 30 days).
+    """
+    import app.shared_state as _ss  # noqa: PLC0415
+
+    if full_key in (doc.get("playbook_deleted_keys") or []):
+        return True
+
+    cooldown_days: int = _ss.runtime_config.get(
+        "auto_playbook_resurrection_cooldown_days",
+        _AUTO_PLAYBOOK_RESURRECTION_COOLDOWN_DAYS,
+    )
+    if cooldown_days <= 0:
+        return False
+
+    cutoff = _utcnow() - timedelta(days=cooldown_days)
+    for entry in reversed(list(doc.get("playbook_archive") or [])):
+        if entry.get("_archived_key") != full_key:
+            continue
+        archived_at_str = entry.get("_archived_at", "")
+        if not archived_at_str:
+            return True  # Archived but no timestamp: suppress conservatively
+        try:
+            archived_at = datetime.fromisoformat(archived_at_str.replace("Z", "+00:00"))
+            if archived_at.tzinfo is not None:
+                archived_at = archived_at.replace(tzinfo=None)
+        except (ValueError, TypeError):
+            return True  # Can't parse: suppress conservatively
+        if archived_at >= cutoff:
+            return True
+    return False
+
+
 def record_playbook_applied(doc: dict, key: str) -> None:
     """Increment followed_count when a playbook entry is applied to a task prompt.
 
@@ -1000,6 +1055,16 @@ async def _maybe_auto_playbook(
         )
         return None
 
+    # ── 3b. Suppression check (recently pruned / operator-deleted) ────────────
+    prior = _get_prior_archive_entry(doc, playbook_full_key)
+    if _is_auto_playbook_suppressed(doc, playbook_full_key):
+        logger.debug(
+            "[AUTO_PLAYBOOK] project=%s key='%s' suppressed (pruned within cooldown) — skipping",
+            task.project_id,
+            key,
+        )
+        return None
+
     # ── 4. Create auto-generated playbook entry ─────────────────────────────
     recent_ids = [str(t.id) for t in matching[-2:]] + [str(task.id)]
     hint = _hint_for_failure_class(failure_class)
@@ -1032,23 +1097,31 @@ async def _maybe_auto_playbook(
         entry_scope = "universal"
         learned_from_direction = None
 
+    # Carry forward confirmed_count and retirement reason from prior archive entry
+    # (only reached when cooldown has elapsed — prior may be None for first-ever creation)
+    prior_confirmed: int = (prior or {}).get("confirmed_count", 0)
+    prior_retirement_reason: Optional[str] = (prior or {}).get("_retirement_reason")
+
     new_entry = {
         "content": content,
         "source_task_id": str(task.id),
         "updated_at": _utcnow().isoformat(),
-        "confirmed_count": 0,
+        "confirmed_count": prior_confirmed,
         "source": "auto-generated",
     }
     doc = maybe_archive_for_capacity(doc, len(json.dumps(new_entry).encode()))
-    doc[playbook_full_key] = {
+    recreated_entry: dict = {
         "content": content,
         "source_task_id": str(task.id),
         "updated_at": _utcnow().isoformat(),
-        "confirmed_count": 0,
+        "confirmed_count": prior_confirmed,
         "source": "auto-generated",
         "scope": entry_scope,
         "learned_from_direction": learned_from_direction,
     }
+    if prior_retirement_reason:
+        recreated_entry["prior_retirement_reason"] = prior_retirement_reason
+    doc[playbook_full_key] = recreated_entry
 
     meta = dict(doc.get("_meta", {"revision": 0}))
     meta["revision"] = meta.get("revision", 0) + 1
@@ -1875,7 +1948,7 @@ def _maybe_auto_playbook_from_first_attempt(
         dir_slug = direction_key[:8].replace("-", "").replace("_", "") or "proj"
         key = f"first-attempt-{dir_slug}-{cat}"
         full_key = f"playbook/{key}"
-        if full_key in doc:
+        if full_key in doc or _is_auto_playbook_suppressed(doc, full_key):
             continue
         content = (
             f"First-attempt rejection pattern (direction {direction_key[:16]}): "
@@ -2079,6 +2152,10 @@ _MIN_REVIEW_SAMPLE = 10
 # Rate-of-change threshold below which a category is considered "stable" vs
 # "decreasing" / "increasing".  A 5pp shift is distinguishable from noise.
 _TREND_DELTA_THRESHOLD = 0.05
+# Minimum z-score (two-proportion z-test) required to assert a trend direction.
+# z=1.28 ≈ 80% CI two-tailed; gates directional labels against sampling noise
+# while preserving large genuine shifts even at small sample sizes.
+_TREND_Z_MIN = 1.28
 # Threshold for precision/recall quadrant classification (5pp absolute change).
 _PRECISION_RECALL_QUADRANT_THRESHOLD = 0.05
 _SR_SEVERITY_DELTA_THRESHOLDS: dict[str, float] = {
@@ -3626,6 +3703,25 @@ def _compute_miss_latency_stats(tasks: list) -> dict:
     return result
 
 
+def _is_trend_significant(p1: float, n1: int, p2: float, n2: int) -> bool:
+    """Two-proportion z-test: return True when the observed difference exceeds
+    what sampling noise alone predicts at the _TREND_Z_MIN threshold.
+
+    Uses a pooled proportion under H0 (no real difference).  Falls back to the
+    raw delta >= _TREND_DELTA_THRESHOLD when the pooled SE is degenerate (both
+    rates are 0 or 1 and the standard error collapses to zero).
+    """
+    if n1 < 1 or n2 < 1:
+        return False
+    pooled_p = (p1 * n1 + p2 * n2) / (n1 + n2)
+    if pooled_p <= 0 or pooled_p >= 1:
+        return abs(p1 - p2) >= _TREND_DELTA_THRESHOLD
+    se = (pooled_p * (1 - pooled_p) * (1 / n1 + 1 / n2)) ** 0.5
+    if se == 0:
+        return False
+    return abs(p1 - p2) / se >= _TREND_Z_MIN
+
+
 async def compute_sr_catch_rate_trends(
     project_id: uuid.UUID,
     session: AsyncSession,
@@ -3809,23 +3905,38 @@ async def compute_sr_catch_rate_trends(
 
         # Only compute trend when both windows have enough findings for the
         # delta to be meaningful; fewer findings make the delta pure noise.
+        # A two-proportion z-test additionally gates directional labels: even
+        # with _MIN_SR_FINDINGS samples a delta near the floor threshold can
+        # be pure sampling noise, so we require statistical significance before
+        # asserting "increasing" / "decreasing".
         _curr_findings = curr.get("human_count", 0)
         _prev_findings = prev.get("human_count", 0)
-        if (
+        _has_trend_data = (
             current_hit_rate is not None
             and previous_hit_rate is not None
             and _curr_findings >= _MIN_SR_FINDINGS
             and _prev_findings >= _MIN_SR_FINDINGS
-        ):
+        )
+        if _has_trend_data:
             delta = current_hit_rate - previous_hit_rate
-            if delta >= _TREND_DELTA_THRESHOLD:
+            _sig = _is_trend_significant(
+                current_hit_rate,
+                _curr_findings,
+                previous_hit_rate,
+                _prev_findings,
+            )
+            if _sig and delta >= _TREND_DELTA_THRESHOLD:
                 trend = "increasing"
-            elif delta <= -_TREND_DELTA_THRESHOLD:
+            elif _sig and delta <= -_TREND_DELTA_THRESHOLD:
                 trend = "decreasing"
             else:
                 trend = "stable"
+            trend_significant: Optional[bool] = (
+                _sig and abs(delta) >= _TREND_DELTA_THRESHOLD
+            )
         else:
             trend = "stable"
+            trend_significant = None
 
         w_total = curr.get("w_total", 0.0)
         weighted_miss_rate = (
@@ -3917,6 +4028,7 @@ async def compute_sr_catch_rate_trends(
             "miss_rate": miss_rate,
             "weighted_miss_rate": weighted_miss_rate,
             "trend": trend,
+            "trend_significant": trend_significant,
             "false_positive_rate": current_fp_rate,
             "previous_fp_rate": previous_fp_rate,
             "fp_trend": fp_trend,

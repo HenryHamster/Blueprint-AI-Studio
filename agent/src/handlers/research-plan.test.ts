@@ -72,6 +72,7 @@ import {
   buildPortfolioComposition,
   buildVersionPhaseSection,
   buildMemoCitationsSection,
+  buildEfficiencySnapshotSection,
   buildThinkerPrompt,
   runThinkerWithGate,
   type ThinkerPromptParams,
@@ -1276,6 +1277,61 @@ describe('buildMemoCitationsSection', () => {
   });
 });
 
+describe('buildEfficiencySnapshotSection', () => {
+  it('returns data-unavailable marker when called with null', () => {
+    const result = buildEfficiencySnapshotSection(null);
+    expect(result).toContain('Pipeline Efficiency Axes');
+    expect(result).toContain('data unavailable');
+  });
+
+  it('returns data-unavailable marker when axes is empty', () => {
+    const result = buildEfficiencySnapshotSection({ axes: {} });
+    expect(result).toContain('data unavailable');
+  });
+
+  it('renders axis table with current, baseline, and drift when data is present', () => {
+    const snapshot = {
+      axes: {
+        cost_per_merged_pr: { current: 1.5, baseline: 2.0, drift_pct: -25.0 },
+        median_api_calls_per_task: { current: 40, baseline: 50, drift_pct: -20.0 },
+      },
+      baseline_captured_at: '2026-04-05T00:00:00',
+      last_snapshot_at: '2026-05-01T00:00:00',
+    };
+    const result = buildEfficiencySnapshotSection(snapshot);
+    expect(result).toContain('Pipeline Efficiency Axes');
+    expect(result).toContain('Cost/merged PR');
+    expect(result).toContain('1.5');
+    expect(result).toContain('| 2 |');
+    expect(result).toContain('-25.0%');
+    expect(result).toContain('2026-04-05');
+    expect(result).toContain('2026-05-01');
+  });
+
+  it('formats null current/baseline as n/a and null drift_pct as n/a', () => {
+    const snapshot = {
+      axes: {
+        vm_reuse_rate: { current: null, baseline: null, drift_pct: null },
+      },
+      baseline_captured_at: null,
+      last_snapshot_at: null,
+    };
+    const result = buildEfficiencySnapshotSection(snapshot);
+    expect(result).toContain('VM reuse rate');
+    expect(result).toMatch(/n\/a.*n\/a/);
+  });
+
+  it('renders positive drift with + sign', () => {
+    const snapshot = {
+      axes: {
+        vm_cold_start_p50_ms: { current: 600, baseline: 500, drift_pct: 20.0 },
+      },
+    };
+    const result = buildEfficiencySnapshotSection(snapshot);
+    expect(result).toContain('+20.0%');
+  });
+});
+
 describe('buildThinkerPrompt', () => {
   const base: ThinkerPromptParams = {
     contextPrefix: '',
@@ -1308,6 +1364,7 @@ describe('buildThinkerPrompt', () => {
     taskId: 'test-task-123',
     versionPhaseSection: '',
     memoCitationsSection: '',
+    efficiencySnapshotSection: '',
   };
 
   it('includes required structural headers when inputs are populated', () => {
@@ -1376,6 +1433,13 @@ describe('buildThinkerPrompt', () => {
 
     const without = buildThinkerPrompt({ ...base, driftSection: '' });
     expect(without).not.toContain('## Drift Signals');
+  });
+
+  it('efficiency snapshot section rendered when efficiencySnapshotSection is non-empty', () => {
+    const section = '\n## Pipeline Efficiency Axes\nsome data\n';
+    const prompt = buildThinkerPrompt({ ...base, efficiencySnapshotSection: section });
+    expect(prompt).toContain('## Pipeline Efficiency Axes');
+    expect(prompt).toContain('some data');
   });
 
   it('self-improvement block rendered only when isSelfRepo=true', () => {

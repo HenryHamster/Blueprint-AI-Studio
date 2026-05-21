@@ -269,3 +269,72 @@ async def test_cycle_row_created_on_phase1_spawn(db_session, mocker):
 
     # Verify baseline_vision snapshot
     assert strategic_cycle.baseline_vision(cycle).get("purpose") == "test purpose"
+
+
+# --- memo exit counting + citation tracking ------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_count_memo_exits_counts_completed_memo_tasks(db_session):
+    project = await _make_project(db_session)
+    # Two completed memo tasks
+    for _ in range(2):
+        t = Task(
+            project_id=project.id,
+            payloads=[{"type": "memo"}],
+            status=TaskStatus.COMPLETED,
+        )
+        db_session.add(t)
+    # One completed non-memo task — should not count
+    db_session.add(
+        Task(
+            project_id=project.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.COMPLETED,
+        )
+    )
+    # One in-progress memo task — should not count
+    db_session.add(
+        Task(
+            project_id=project.id,
+            payloads=[{"type": "memo"}],
+            status=TaskStatus.IN_PROGRESS,
+        )
+    )
+    await db_session.commit()
+    count = await strategic_cycle.count_memo_exits(db_session, project.id)
+    assert count == 2
+
+
+def test_count_cited_memos_finds_task_ids_in_text():
+    citations = [
+        {"task_id": "abc-123", "summary_excerpt": "foo"},
+        {"task_id": "def-456", "summary_excerpt": "bar"},
+        {"task_id": "ghi-789", "summary_excerpt": "baz"},
+    ]
+    text = "Based on findings from task abc-123 and def-456, we recommend..."
+    assert strategic_cycle.count_cited_memos(citations, text) == 2
+
+
+def test_count_cited_memos_empty_inputs():
+    assert strategic_cycle.count_cited_memos([], "some text") == 0
+    assert strategic_cycle.count_cited_memos([{"task_id": "x"}], "") == 0
+
+
+@pytest.mark.asyncio
+async def test_mark_phase2_completed_stores_memo_counts(db_session):
+    project = await _make_project(db_session)
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    await db_session.commit()
+
+    updated = await strategic_cycle.mark_phase2_completed(
+        db_session,
+        cycle.id,
+        memos_available=5,
+        memos_cited=2,
+    )
+    await db_session.commit()
+    assert updated is not None
+    assert updated.cycle_metadata["memos_available"] == 5
+    assert updated.cycle_metadata["memos_cited"] == 2
+    assert updated.outcome == strategic_cycle.OUTCOME_COMPLETED

@@ -4589,3 +4589,70 @@ class TestRule6LifetimeBurnBackstop:
         assert reason is not None
         assert "Lifetime burn backstop" in reason
         assert _is_code_failure_pause_reason(reason) is False
+
+
+@pytest.mark.asyncio
+async def test_memo_available_and_cited_counts_persisted(db_session, mocker):
+    """memos_available and memos_cited are computed and stored in cycle_metadata.
+
+    memos_available == number of memo tasks returned by query_recent_memo_citations.
+    memos_cited == how many of those task_ids appear in the cycle reasoning text.
+    """
+    from unittest.mock import AsyncMock
+    from app.models import TaskStatus
+    from app.strategic_completion import _handle_strategic_completion
+    from app import strategic_cycle
+
+    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="MemoCount",
+        user_id="u-memo",
+        vision={"purpose": "test", "revision": 1},
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    memo_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "memo", "topic": "Cache strategy analysis"}],
+        status=TaskStatus.COMPLETED,
+        plan_output={"memo": {"summary": "Cache strategy reasoning.", "citations": []}},
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(memo_task)
+    await db_session.commit()
+    await db_session.refresh(memo_task)
+
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    await db_session.commit()
+
+    memo_id = str(memo_task.id)
+    sr_task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={
+            "_strategic_vision_set": True,
+            "strategic_cycle_id": cycle.id,
+        },
+        strategic_cycle_id=cycle.id,
+        plan_output={"reasoning": f"Referenced memo {memo_id} for cache strategy."},
+    )
+    db_session.add(sr_task)
+    await db_session.commit()
+    await db_session.refresh(sr_task)
+
+    await _handle_strategic_completion(sr_task, "", db_session)
+
+    await db_session.refresh(cycle)
+    meta = cycle.cycle_metadata or {}
+    assert meta.get("memos_available") == 1, (
+        f"memos_available should be 1 (one memo task), got {meta.get('memos_available')}"
+    )
+    assert meta.get("memos_cited") == 1, (
+        f"memos_cited should be 1 (memo_id appears in reasoning), got {meta.get('memos_cited')}"
+    )

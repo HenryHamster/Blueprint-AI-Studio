@@ -15780,3 +15780,116 @@ async def test_version_lifecycle_history(client: AsyncClient, db_session):
     assert data["recent_versions"][0]["version_number"] == 1
     assert data["recent_versions"][0]["status"] == "promoted"
     assert data["recent_versions"][0]["last_qualification"]["confidence"] == 0.95
+
+
+# ---------------------------------------------------------------------------
+# Memo-pathway exit count in digest
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_digest_memo_pathway_exits_zero_without_project(client: AsyncClient):
+    """Without project_id, memo_pathway_exits is 0."""
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    assert response.json()["memo_pathway_exits"] == 0
+
+
+@pytest.mark.asyncio
+async def test_digest_memo_pathway_exits_counts_completed_memo_tasks(
+    client: AsyncClient, db_session
+):
+    """Digest surfaces completed memo tasks count via memo_pathway_exits."""
+    project = make_project()
+    db_session.add(project)
+    db_session.add(make_membership(project.id))
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Two completed memo tasks
+    for _ in range(2):
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "memo"}],
+            )
+        )
+    # One completed non-memo task — should not count
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+        )
+    )
+    # One in-progress memo task — should not count
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "memo"}],
+        )
+    )
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["memo_pathway_exits"] == 2
+
+
+@pytest.mark.asyncio
+async def test_digest_latest_cycle_includes_memo_stats(client: AsyncClient, db_session):
+    """When a completed cycle has memo counts in cycle_metadata, they appear in latest_cycle."""
+    from app import strategic_cycle as _sc
+
+    project = make_project()
+    db_session.add(project)
+    db_session.add(make_membership(project.id))
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Create a completed strategic cycle with memo counts
+    cycle = await _sc.create(db_session, project_id=project.id)
+    await db_session.commit()
+    await _sc.mark_phase1_completed(db_session, cycle.id)
+    await db_session.commit()
+    await _sc.mark_phase2_completed(
+        db_session, cycle.id, memos_available=4, memos_cited=1
+    )
+    await db_session.commit()
+
+    # Wire the cycle into project.vision._strategic_cycle_history so the
+    # digest's legacy-JSONB path can find it.
+    from sqlalchemy.orm.attributes import flag_modified
+
+    await db_session.refresh(cycle)
+    vision = dict(project.vision or {})
+    vision["_strategic_cycle_history"] = [
+        {
+            "cycle_id": cycle.id,
+            "started_at": cycle.phase1_started_at.isoformat()
+            if cycle.phase1_started_at
+            else None,
+            "phase2_completed_at": cycle.phase2_completed_at.isoformat()
+            if cycle.phase2_completed_at
+            else None,
+            "outcome": cycle.outcome,
+            "directions_created": 0,
+            "directions_retired": 0,
+            "vision_updated": False,
+        }
+    ]
+    project.vision = vision
+    flag_modified(project, "vision")
+    db_session.add(project)
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    data = response.json()
+    lc = data.get("latest_cycle")
+    assert lc is not None
+    assert lc["memos_available"] == 4
+    assert lc["memos_cited"] == 1

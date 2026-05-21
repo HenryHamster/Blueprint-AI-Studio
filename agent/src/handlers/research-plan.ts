@@ -770,6 +770,64 @@ export function buildMemoCitationsSection(memoCitations: unknown): string {
   return lines.join('\n');
 }
 
+/**
+ * Builds the efficiency-axes section for the strategic thinker prompt.
+ * Shows per-axis current value, baseline, and drift_pct so the strategic
+ * agent can track whether pipeline efficiency is improving or regressing.
+ * Returns a 'data unavailable' marker (not empty string) when absent so the
+ * agent is never left guessing whether efficiency was intentionally omitted.
+ */
+export function buildEfficiencySnapshotSection(efficiencySnapshot: unknown): string {
+  const AXIS_LABELS: Record<string, string> = {
+    cost_per_merged_pr: 'Cost/merged PR (USD)',
+    vm_cold_start_p50_ms: 'VM cold-start p50 (ms)',
+    vm_reuse_rate: 'VM reuse rate',
+    median_api_calls_per_task: 'Median API calls/task',
+    median_review_iterations: 'Median review iterations',
+  };
+
+  if (!efficiencySnapshot || typeof efficiencySnapshot !== 'object') {
+    return '\n## Pipeline Efficiency Axes\n_data unavailable — no snapshot recorded yet_\n';
+  }
+  const snap = efficiencySnapshot as Record<string, unknown>;
+  const axes = snap.axes && typeof snap.axes === 'object' ? snap.axes as Record<string, unknown> : {};
+  const axisKeys = Object.keys(axes);
+  if (axisKeys.length === 0) {
+    return '\n## Pipeline Efficiency Axes\n_data unavailable — no snapshot recorded yet_\n';
+  }
+
+  const fmt = (v: unknown): string => {
+    if (v === null || v === undefined) return 'n/a';
+    if (typeof v === 'number') return v.toString();
+    if (typeof v === 'string' || typeof v === 'boolean') return String(v);
+    return 'n/a';
+  };
+  const fmtDrift = (v: unknown): string => {
+    if (v === null || v === undefined) return 'n/a';
+    if (typeof v !== 'number') return typeof v === 'string' ? v : 'n/a';
+    const sign = v > 0 ? '+' : '';
+    return `${sign}${v.toFixed(1)}%`;
+  };
+
+  const lines: string[] = ['\n## Pipeline Efficiency Axes'];
+  const lastAt = typeof snap.last_snapshot_at === 'string' ? snap.last_snapshot_at.slice(0, 10) : 'unknown';
+  const baseAt = typeof snap.baseline_captured_at === 'string' ? snap.baseline_captured_at.slice(0, 10) : 'unknown';
+  lines.push(`Baseline: ${baseAt}  |  Last snapshot: ${lastAt}`);
+  lines.push('');
+  lines.push('axis | current | baseline | drift');
+  lines.push('--- | --- | --- | ---');
+  for (const key of axisKeys) {
+    const data = axes[key] as Record<string, unknown> | undefined;
+    if (!data || typeof data !== 'object') continue;
+    const label = AXIS_LABELS[key] ?? key;
+    const cur = fmt(data.current);
+    const base = fmt(data.baseline);
+    const drift = fmtDrift(data.drift_pct);
+    lines.push(`${label} | ${cur} | ${base} | ${drift}`);
+  }
+  return lines.join('\n') + '\n';
+}
+
 // Portfolio-level view computed from per-direction data — surfaces imbalances
 // (category skew, system coverage gaps, concentration, age) as explicit
 // decision inputs for the strategic thinker.
@@ -1055,6 +1113,7 @@ export interface ThinkerPromptParams {
   taskId: string;
   versionPhaseSection: string;
   memoCitationsSection: string;
+  efficiencySnapshotSection: string;
 }
 
 export function buildThinkerPrompt(p: ThinkerPromptParams): string {
@@ -1087,7 +1146,7 @@ ${p.dirHealthSummary}
 ${p.userPausedSection}${p.rejectedProposalsSection}
 ## Portfolio Composition
 ${p.portfolioCompositionText}
-${p.systemMaturitySection}${p.driftSection}
+${p.systemMaturitySection}${p.driftSection}${p.efficiencySnapshotSection}
 ${p.recentWorkSection}${p.feedbackSection}${p.threadSection}${p.versionPhaseSection}${p.memoCitationsSection}
 # Your job
 
@@ -1630,6 +1689,8 @@ ${hotspotsSection}
         driftSection = lines.join('\n');
       }
     }
+
+    const efficiencySnapshotSection = buildEfficiencySnapshotSection(payload.efficiency_snapshot);
 
     // Build outcome evaluation section
     const outcomeEval = payload.outcome_evaluation as Record<string, unknown> | undefined;
@@ -2275,6 +2336,7 @@ point of self-repo. Just do it and tell the user in whats_changed.` : '';
       taskId,
       versionPhaseSection: buildVersionPhaseSection(versionPhase),
       memoCitationsSection: buildMemoCitationsSection(payload.memo_citations),
+      efficiencySnapshotSection,
     });
 
     const thinkerGateResult = await runThinkerWithGate(

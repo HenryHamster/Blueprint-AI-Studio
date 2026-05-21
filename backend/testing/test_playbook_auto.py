@@ -4249,6 +4249,235 @@ async def test_compute_sr_catch_rate_trends_trend_classification(
 
     assert result is not None
     assert result["categories"]["test-coverage"]["trend"] == "decreasing"
+    assert result["categories"]["test-coverage"]["trend_significant"] is True
+
+
+@pytest.mark.asyncio
+async def test_trend_small_sample_swing_suppressed(db_session: AsyncSession):
+    """n=5 per window with a 1-finding delta (0.2 hit-rate diff) is sampling noise.
+
+    The two-proportion z-test (z≈0.63 < _TREND_Z_MIN=1.28) must suppress the
+    directional label even though delta (0.2) exceeds _TREND_DELTA_THRESHOLD (0.05).
+    trend_significant must be False to distinguish this from 'not enough data'.
+    """
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    # Current window: 2/5 = 0.4 hit_rate
+    for _ in range(2):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"test-coverage": 1},
+            sr_failed_cats=["test-coverage"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(3):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"test-coverage": 1},
+            sr_failed_cats=[],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    # Previous window: 3/5 = 0.6 hit_rate (delta=−0.2, z≈0.63)
+    for _ in range(3):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"test-coverage": 1},
+            sr_failed_cats=["test-coverage"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(2):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"test-coverage": 1},
+            sr_failed_cats=[],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    cat = result["categories"]["test-coverage"]
+    # delta=−0.2 exceeds the raw threshold but is not statistically significant
+    assert cat["trend"] == "stable"
+    assert cat["trend_significant"] is False
+
+
+@pytest.mark.asyncio
+async def test_trend_large_consistent_shift_reported(db_session: AsyncSession):
+    """Large n with a 0.3 hit-rate drop is statistically significant and reported.
+
+    n=30 per window, delta=−0.3 → z≈2.74 >> _TREND_Z_MIN=1.28; trend='decreasing'.
+    """
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    # Current window: 12/30 = 0.4 hit_rate
+    for _ in range(12):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(18):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=[],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    # Previous window: 21/30 = 0.7 hit_rate (delta=−0.3, significant)
+    for _ in range(21):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(9):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=[],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    cat = result["categories"]["correctness"]
+    assert cat["trend"] == "decreasing"
+    assert cat["trend_significant"] is True
+
+
+@pytest.mark.asyncio
+async def test_trend_significance_scales_with_sample_size(db_session: AsyncSession):
+    """The same delta (0.2) reports 'stable' at n=5 but 'decreasing' at n=30.
+
+    This validates the significance boundary: a fixed raw threshold is insufficient
+    because the same rate change means very different things at different sample sizes.
+    """
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    # --- Small n: n=5, delta=0.2 → NOT significant ---
+    project_small = await _make_project(db_session)
+    tasks_small = []
+    for _ in range(2):  # current 2/5 = 0.4
+        t = _make_sr_task(
+            project_small.id,
+            age_days=2,
+            human_cats={"error-handling": 1},
+            sr_failed_cats=["error-handling"],
+        )
+        db_session.add(t)
+        tasks_small.append(t)
+    for _ in range(3):
+        t = _make_sr_task(
+            project_small.id,
+            age_days=2,
+            human_cats={"error-handling": 1},
+            sr_failed_cats=[],
+        )
+        db_session.add(t)
+        tasks_small.append(t)
+    for _ in range(3):  # previous 3/5 = 0.6
+        t = _make_sr_task(
+            project_small.id,
+            age_days=20,
+            human_cats={"error-handling": 1},
+            sr_failed_cats=["error-handling"],
+        )
+        db_session.add(t)
+        tasks_small.append(t)
+    for _ in range(2):
+        t = _make_sr_task(
+            project_small.id,
+            age_days=20,
+            human_cats={"error-handling": 1},
+            sr_failed_cats=[],
+        )
+        db_session.add(t)
+        tasks_small.append(t)
+
+    # --- Large n: n=30, delta=0.2 → significant ---
+    project_large = await _make_project(db_session)
+    tasks_large = []
+    for _ in range(12):  # current 12/30 = 0.4
+        t = _make_sr_task(
+            project_large.id,
+            age_days=2,
+            human_cats={"error-handling": 1},
+            sr_failed_cats=["error-handling"],
+        )
+        db_session.add(t)
+        tasks_large.append(t)
+    for _ in range(18):
+        t = _make_sr_task(
+            project_large.id,
+            age_days=2,
+            human_cats={"error-handling": 1},
+            sr_failed_cats=[],
+        )
+        db_session.add(t)
+        tasks_large.append(t)
+    for _ in range(18):  # previous 18/30 = 0.6
+        t = _make_sr_task(
+            project_large.id,
+            age_days=20,
+            human_cats={"error-handling": 1},
+            sr_failed_cats=["error-handling"],
+        )
+        db_session.add(t)
+        tasks_large.append(t)
+    for _ in range(12):
+        t = _make_sr_task(
+            project_large.id,
+            age_days=20,
+            human_cats={"error-handling": 1},
+            sr_failed_cats=[],
+        )
+        db_session.add(t)
+        tasks_large.append(t)
+
+    await db_session.flush()
+
+    result_small = await compute_sr_catch_rate_trends(
+        project_small.id, db_session, tasks_small
+    )
+    result_large = await compute_sr_catch_rate_trends(
+        project_large.id, db_session, tasks_large
+    )
+
+    assert result_small is not None
+    assert result_large is not None
+    small_cat = result_small["categories"]["error-handling"]
+    large_cat = result_large["categories"]["error-handling"]
+    # Same delta, different sample sizes → different significance outcomes
+    assert small_cat["trend"] == "stable"
+    assert small_cat["trend_significant"] is False
+    assert large_cat["trend"] == "decreasing"
+    assert large_cat["trend_significant"] is True
 
 
 @pytest.mark.asyncio
@@ -8110,12 +8339,14 @@ async def test_categorize_review_issues_llm_returns_correct_buckets():
 
     import os
 
-    with patch.dict(
-        os.environ,
-        {"ANTHROPIC_API_KEY": "test-key", "DISABLE_LLM_REVIEW_CATEGORIZATION": ""},
+    with (
+        patch.dict(
+            os.environ,
+            {"ANTHROPIC_API_KEY": "test-key", "DISABLE_LLM_REVIEW_CATEGORIZATION": ""},
+        ),
+        patch("anthropic.AsyncAnthropic", mock_client_cls),
     ):
-        with patch("anthropic.AsyncAnthropic", mock_client_cls):
-            result = await categorize_review_issues_llm(issues)
+        result = await categorize_review_issues_llm(issues)
 
     assert "test-coverage" in result
     assert result["test-coverage"][0]["desc"] == "missing unit tests"
@@ -8135,15 +8366,17 @@ async def test_categorize_review_issues_llm_falls_back_on_api_error():
 
     import os
 
-    with patch.dict(
-        os.environ,
-        {"ANTHROPIC_API_KEY": "test-key", "DISABLE_LLM_REVIEW_CATEGORIZATION": ""},
-    ):
-        with patch(
+    with (
+        patch.dict(
+            os.environ,
+            {"ANTHROPIC_API_KEY": "test-key", "DISABLE_LLM_REVIEW_CATEGORIZATION": ""},
+        ),
+        patch(
             "anthropic.AsyncAnthropic",
             MagicMock(side_effect=Exception("network error")),
-        ):
-            result = await categorize_review_issues_llm(issues)
+        ),
+    ):
+        result = await categorize_review_issues_llm(issues)
 
     expected = _keyword_from_flat(issues)
     assert result == expected
@@ -11394,7 +11627,7 @@ def _make_latency_task(
     # SR marks all miss_cats as passed=True
     check_results = {cat: {"passed": True, "issue": ""} for cat in miss_cats}
     # human cats contains all miss_cats
-    human_cats = {cat: 1 for cat in miss_cats}
+    human_cats = dict.fromkeys(miss_cats, 1)
     sr_outcome = {
         "check_results": check_results,
         "completed_at": sr_completed_at.isoformat(),
@@ -12589,3 +12822,348 @@ async def test_engagement_thinning_honors_design_doc_overrides(
     assert cat["reasoning_engagement_rate"] == 0.0
     # With overrides: threshold=0.8, min_passes=5 → 5 passes at 0.0 qualifies
     assert cat["engagement_thinning"] is True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests for anti-resurrection suppression helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_is_auto_playbook_suppressed_archive_within_cooldown():
+    """Entry archived within cooldown window is suppressed."""
+    from app.playbook_learning import _is_auto_playbook_suppressed
+    from app.models import _utcnow
+
+    now_str = _utcnow().isoformat()
+    doc = {
+        "playbook_archive": [
+            {
+                "_archived_key": "playbook/auto-test-pattern",
+                "_archived_at": now_str,
+                "_retirement_reason": "idle_auto_entry:30d",
+            }
+        ]
+    }
+    assert _is_auto_playbook_suppressed(doc, "playbook/auto-test-pattern") is True
+
+
+def test_is_auto_playbook_suppressed_archive_after_cooldown():
+    """Entry archived beyond cooldown window is NOT suppressed."""
+    from app.playbook_learning import (
+        _is_auto_playbook_suppressed,
+        _AUTO_PLAYBOOK_RESURRECTION_COOLDOWN_DAYS,
+    )
+    from app.models import _utcnow
+
+    old_str = (
+        _utcnow() - timedelta(days=_AUTO_PLAYBOOK_RESURRECTION_COOLDOWN_DAYS + 1)
+    ).isoformat()
+    doc = {
+        "playbook_archive": [
+            {
+                "_archived_key": "playbook/auto-test-pattern",
+                "_archived_at": old_str,
+                "_retirement_reason": "idle_auto_entry:30d",
+            }
+        ]
+    }
+    assert _is_auto_playbook_suppressed(doc, "playbook/auto-test-pattern") is False
+
+
+def test_is_auto_playbook_suppressed_operator_deleted_key():
+    """Key in playbook_deleted_keys is suppressed regardless of archive."""
+    from app.playbook_learning import _is_auto_playbook_suppressed
+
+    doc = {
+        "playbook_deleted_keys": ["playbook/auto-test-pattern"],
+    }
+    assert _is_auto_playbook_suppressed(doc, "playbook/auto-test-pattern") is True
+
+
+def test_is_auto_playbook_suppressed_never_seen():
+    """Key with no archive entry and not in deleted_keys is NOT suppressed."""
+    from app.playbook_learning import _is_auto_playbook_suppressed
+
+    doc: dict = {}
+    assert _is_auto_playbook_suppressed(doc, "playbook/auto-test-pattern") is False
+
+
+def test_get_prior_archive_entry_returns_most_recent():
+    """_get_prior_archive_entry returns the most recent (last) archive entry."""
+    from app.playbook_learning import _get_prior_archive_entry
+
+    doc = {
+        "playbook_archive": [
+            {
+                "_archived_key": "playbook/k",
+                "_archived_at": "2026-01-01T00:00:00",
+                "confirmed_count": 3,
+            },
+            {
+                "_archived_key": "playbook/k",
+                "_archived_at": "2026-02-01T00:00:00",
+                "confirmed_count": 7,
+            },
+            {"_archived_key": "playbook/other", "_archived_at": "2026-03-01T00:00:00"},
+        ]
+    }
+    entry = _get_prior_archive_entry(doc, "playbook/k")
+    assert entry is not None
+    assert entry["confirmed_count"] == 7
+
+
+def test_get_prior_archive_entry_returns_none_when_missing():
+    """_get_prior_archive_entry returns None when no matching archive entry."""
+    from app.playbook_learning import _get_prior_archive_entry
+
+    doc: dict = {"playbook_archive": [{"_archived_key": "playbook/other"}]}
+    assert _get_prior_archive_entry(doc, "playbook/missing") is None
+
+
+def test_first_attempt_skips_suppressed_key():
+    """_maybe_auto_playbook_from_first_attempt skips keys in playbook_deleted_keys."""
+    from app.playbook_learning import (
+        _maybe_auto_playbook_from_first_attempt,
+        _DIRECTION_FIRST_ATTEMPT_KEY,
+        _FIRST_ATTEMPT_PLAYBOOK_THRESHOLD,
+    )
+
+    direction_key = "dir-abc123"
+    dir_slug = direction_key[:8].replace("-", "").replace("_", "")
+    suppressed_key = f"playbook/first-attempt-{dir_slug}-test-coverage"
+
+    doc: dict = {
+        _DIRECTION_FIRST_ATTEMPT_KEY: {
+            direction_key: {
+                "test-coverage": _FIRST_ATTEMPT_PLAYBOOK_THRESHOLD + 2,
+            }
+        },
+        "playbook_deleted_keys": [suppressed_key],
+    }
+    created = _maybe_auto_playbook_from_first_attempt(
+        doc, direction_key, "create", "task-id"
+    )
+    assert created == []
+
+
+@pytest.mark.asyncio
+async def test_auto_playbook_skips_if_archived_within_cooldown(
+    db_session: AsyncSession,
+):
+    """_maybe_auto_playbook does not recreate entry archived within cooldown."""
+    from app.playbook_learning import (
+        _maybe_auto_playbook,
+        _signature_to_key,
+        _extract_failure_signature,
+    )
+    from app.models import _utcnow
+
+    project = await _make_project(db_session)
+    msg = "vm failed to start after provision attempt"
+
+    # Compute the key that would be generated for this failure pattern
+    sig = _extract_failure_signature("PROVISION_FAILURE", msg, "create", "small")
+    key = _signature_to_key(sig)
+    full_key = f"playbook/{key}"
+
+    # Pre-populate archive with a recently-retired entry
+    now_str = _utcnow().isoformat()
+    project.design_doc = {
+        "playbook_archive": [
+            {
+                "_archived_key": full_key,
+                "_archived_at": now_str,
+                "_retirement_reason": "idle_auto_entry:30d",
+                "confirmed_count": 4,
+            }
+        ]
+    }
+    from sqlalchemy.orm.attributes import flag_modified
+
+    flag_modified(project, "design_doc")
+    db_session.add(project)
+    await db_session.flush()
+
+    # Two prior tasks with pre-set signature
+    expected_sig = sig
+    t1 = Task(
+        project_id=project.id,
+        title="T1",
+        payloads=[{"type": "create", "prompt": "x"}],
+        status=TaskStatus.FAILED,
+        latest_status_message=msg,
+        context={"_failure_signature": expected_sig},
+    )
+    t2 = Task(
+        project_id=project.id,
+        title="T2",
+        payloads=[{"type": "create", "prompt": "x"}],
+        status=TaskStatus.FAILED,
+        latest_status_message=msg,
+        context={"_failure_signature": expected_sig},
+    )
+    db_session.add(t1)
+    db_session.add(t2)
+    await db_session.flush()
+
+    # Current task — should be suppressed
+    t3 = Task(
+        project_id=project.id,
+        title="T3",
+        payloads=[{"type": "create", "prompt": "x"}],
+        status=TaskStatus.FAILED,
+        latest_status_message=msg,
+        context={},
+    )
+    db_session.add(t3)
+    await db_session.flush()
+
+    result = await _maybe_auto_playbook(t3, "PROVISION_FAILURE", msg, db_session)
+    assert result is None, "Entry should be suppressed within cooldown"
+    doc = project.design_doc or {}
+    assert full_key not in doc
+
+
+@pytest.mark.asyncio
+async def test_auto_playbook_skips_if_operator_deleted(db_session: AsyncSession):
+    """_maybe_auto_playbook does not recreate operator-deleted entries."""
+    from app.playbook_learning import (
+        _maybe_auto_playbook,
+        _signature_to_key,
+        _extract_failure_signature,
+    )
+
+    project = await _make_project(db_session)
+    msg = "vm failed to start after provision attempt"
+
+    sig = _extract_failure_signature("PROVISION_FAILURE", msg, "create", "small")
+    key = _signature_to_key(sig)
+    full_key = f"playbook/{key}"
+
+    # Operator deleted this key
+    project.design_doc = {"playbook_deleted_keys": [full_key]}
+    from sqlalchemy.orm.attributes import flag_modified
+
+    flag_modified(project, "design_doc")
+    db_session.add(project)
+    await db_session.flush()
+
+    expected_sig = sig
+    t1 = Task(
+        project_id=project.id,
+        title="T1",
+        payloads=[{"type": "create", "prompt": "x"}],
+        status=TaskStatus.FAILED,
+        latest_status_message=msg,
+        context={"_failure_signature": expected_sig},
+    )
+    t2 = Task(
+        project_id=project.id,
+        title="T2",
+        payloads=[{"type": "create", "prompt": "x"}],
+        status=TaskStatus.FAILED,
+        latest_status_message=msg,
+        context={"_failure_signature": expected_sig},
+    )
+    db_session.add(t1)
+    db_session.add(t2)
+    await db_session.flush()
+
+    t3 = Task(
+        project_id=project.id,
+        title="T3",
+        payloads=[{"type": "create", "prompt": "x"}],
+        status=TaskStatus.FAILED,
+        latest_status_message=msg,
+        context={},
+    )
+    db_session.add(t3)
+    await db_session.flush()
+
+    result = await _maybe_auto_playbook(t3, "PROVISION_FAILURE", msg, db_session)
+    assert result is None, "Operator-deleted entry should be suppressed"
+    doc = project.design_doc or {}
+    assert full_key not in doc
+
+
+@pytest.mark.asyncio
+async def test_auto_playbook_recreates_after_cooldown_carries_prior_data(
+    db_session: AsyncSession,
+):
+    """_maybe_auto_playbook re-creates entry after cooldown and carries prior confirmed_count."""
+    from app.playbook_learning import (
+        _maybe_auto_playbook,
+        _signature_to_key,
+        _extract_failure_signature,
+        _AUTO_PLAYBOOK_RESURRECTION_COOLDOWN_DAYS,
+    )
+    from app.models import _utcnow
+
+    project = await _make_project(db_session)
+    msg = "vm failed to start after provision attempt"
+
+    sig = _extract_failure_signature("PROVISION_FAILURE", msg, "create", "small")
+    key = _signature_to_key(sig)
+    full_key = f"playbook/{key}"
+
+    # Archive entry is OLDER than cooldown → should be recreatable
+    old_str = (
+        _utcnow() - timedelta(days=_AUTO_PLAYBOOK_RESURRECTION_COOLDOWN_DAYS + 1)
+    ).isoformat()
+    project.design_doc = {
+        "playbook_archive": [
+            {
+                "_archived_key": full_key,
+                "_archived_at": old_str,
+                "_retirement_reason": "low_success_rate:0.10",
+                "confirmed_count": 6,
+            }
+        ]
+    }
+    from sqlalchemy.orm.attributes import flag_modified
+
+    flag_modified(project, "design_doc")
+    db_session.add(project)
+    await db_session.flush()
+
+    expected_sig = sig
+    t1 = Task(
+        project_id=project.id,
+        title="T1",
+        payloads=[{"type": "create", "prompt": "x"}],
+        status=TaskStatus.FAILED,
+        latest_status_message=msg,
+        context={"_failure_signature": expected_sig},
+    )
+    t2 = Task(
+        project_id=project.id,
+        title="T2",
+        payloads=[{"type": "create", "prompt": "x"}],
+        status=TaskStatus.FAILED,
+        latest_status_message=msg,
+        context={"_failure_signature": expected_sig},
+    )
+    db_session.add(t1)
+    db_session.add(t2)
+    await db_session.flush()
+
+    t3 = Task(
+        project_id=project.id,
+        title="T3",
+        payloads=[{"type": "create", "prompt": "x"}],
+        status=TaskStatus.FAILED,
+        latest_status_message=msg,
+        context={},
+    )
+    db_session.add(t3)
+    await db_session.flush()
+
+    result = await _maybe_auto_playbook(t3, "PROVISION_FAILURE", msg, db_session)
+    assert result is not None, "Entry should be recreated after cooldown elapsed"
+    doc = project.design_doc or {}
+    entry = doc.get(full_key)
+    assert entry is not None
+    # Prior confirmed_count carried forward
+    assert entry["confirmed_count"] == 6
+    # Prior retirement reason preserved
+    assert entry.get("prior_retirement_reason") == "low_success_rate:0.10"

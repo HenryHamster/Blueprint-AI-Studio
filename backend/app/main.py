@@ -121,7 +121,7 @@ from app.strategic_constants import (
 
 # Expected schema revision — must match the latest alembic migration.
 # Update this when adding new migrations.
-EXPECTED_SCHEMA_REVISION = "0105"
+EXPECTED_SCHEMA_REVISION = "0106"
 
 # --- Task Priority Map ---
 # Maps priority string labels to integer values stored on Task.priority.
@@ -1029,22 +1029,24 @@ async def _create_rollback_alerts(
         f"to {rolled_back_to[:8]}."
     )
     projects = (await session.execute(select(Project))).scalars().all()
-    for project in projects:
-        existing = (
-            (
-                await session.execute(
-                    select(Alert).where(
-                        Alert.project_id == project.id,
-                        Alert.task_id.is_(None),
-                        Alert.dismissed_at.is_(None),
-                        Alert.title.contains("Automatic rollback"),
-                    )
+    project_ids = [p.id for p in projects]
+    existing_rows = (
+        (
+            await session.execute(
+                select(Alert.project_id).where(
+                    Alert.project_id.in_(project_ids),
+                    Alert.task_id.is_(None),
+                    Alert.dismissed_at.is_(None),
+                    Alert.title.contains("Automatic rollback"),
                 )
             )
-            .scalars()
-            .first()
-        )
-        if existing is not None:
+        ).all()
+        if project_ids
+        else []
+    )
+    projects_with_alert = {row[0] for row in existing_rows}
+    for project in projects:
+        if project.id in projects_with_alert:
             continue
         alert = Alert(
             project_id=project.id,
@@ -1065,23 +1067,28 @@ async def _create_halted_recovery_alerts(session: AsyncSession) -> None:
     recovery_title = "Deployment auto-recovered from HALTED state after 1h cooldown"
     now = _utcnow()
     projects = (await session.execute(select(Project))).scalars().all()
-    for project in projects:
-        # Dismiss existing HALTED ERROR alerts for this project
-        existing_halted = (
-            (
-                await session.execute(
-                    select(Alert).where(
-                        Alert.project_id == project.id,
-                        Alert.severity == AlertSeverity.ERROR,
-                        Alert.dismissed_at.is_(None),
-                        Alert.title.contains("HALTED"),
-                    )
+    project_ids = [p.id for p in projects]
+    # Single batched query for all undismissed HALTED ERROR alerts across all projects
+    halted_alerts = (
+        (
+            await session.execute(
+                select(Alert).where(
+                    Alert.project_id.in_(project_ids),
+                    Alert.severity == AlertSeverity.ERROR,
+                    Alert.dismissed_at.is_(None),
+                    Alert.title.contains("HALTED"),
                 )
             )
-            .scalars()
-            .all()
         )
-        for h in existing_halted:
+        .scalars()
+        .all()
+    )
+    halted_by_project: dict = {}
+    for h in halted_alerts:
+        halted_by_project.setdefault(h.project_id, []).append(h)
+    for project in projects:
+        # Dismiss existing HALTED ERROR alerts for this project
+        for h in halted_by_project.get(project.id, []):
             h.dismissed_at = now
             session.add(h)
         # Create INFO recovery alert

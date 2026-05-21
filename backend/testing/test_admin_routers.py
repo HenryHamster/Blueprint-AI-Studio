@@ -1397,6 +1397,37 @@ class TestPlaybook:
         assert resp.status_code == 404
 
     @pytest.mark.asyncio
+    async def test_admin_playbook_delete_writes_tombstone(
+        self, client: AsyncClient, db_session
+    ):
+        """Deleting a playbook entry records a tombstone in playbook_archive and playbook_deleted_keys."""
+        project = await _make_project(db_session)
+        await client.put(
+            f"/api/admin/projects/{project.id}/playbook",
+            json={"key": "tombstone-test", "value": "To be deleted"},
+        )
+
+        resp = await client.delete(
+            f"/api/admin/projects/{project.id}/playbook/tombstone-test"
+        )
+        assert resp.status_code == 200
+        assert resp.json()["deleted"] is True
+
+        # Verify the tombstone was written to the design_doc
+        await db_session.refresh(project)
+        doc = project.design_doc or {}
+        archive = doc.get("playbook_archive", [])
+        tombstones = [
+            e for e in archive if e.get("_archived_key") == "playbook/tombstone-test"
+        ]
+        assert len(tombstones) == 1
+        assert tombstones[0]["_retirement_reason"] == "operator_deleted"
+        assert "_archived_at" in tombstones[0]
+
+        deleted_keys = doc.get("playbook_deleted_keys", [])
+        assert "playbook/tombstone-test" in deleted_keys
+
+    @pytest.mark.asyncio
     async def test_playbook_seed_creates_default_entries(
         self, client: AsyncClient, db_session
     ):

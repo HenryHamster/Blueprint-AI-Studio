@@ -954,7 +954,17 @@ class Alert(SQLModel, table=True):
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
 
-    __table_args__ = (Index("ix_alert_task_id_dismissed", "task_id", "dismissed_at"),)
+    __table_args__ = (
+        Index("ix_alert_task_id_dismissed", "task_id", "dismissed_at"),
+        Index("ix_alert_project_id_dismissed", "project_id", "dismissed_at"),
+    )
+
+
+# Keys used in StrategicCycle.cycle_metadata for per-cycle memo-pathway tracking.
+# Stored as plain integers so operators and digest endpoints can read them without
+# knowing the exact key strings.
+CYCLE_META_MEMOS_AVAILABLE = "memos_available"
+CYCLE_META_MEMOS_CITED = "memos_cited"
 
 
 class StrategicCycle(SQLModel, table=True):
@@ -1065,6 +1075,18 @@ class StrategicCycle(SQLModel, table=True):
             "completed_at": self.completed_at.isoformat()
             if self.completed_at
             else None,
+        }
+
+    def memo_stats(self) -> Dict[str, int]:
+        """Return per-cycle memo counts from cycle_metadata.
+
+        Keys match CYCLE_META_MEMOS_AVAILABLE / CYCLE_META_MEMOS_CITED constants.
+        Returns zeros when not yet recorded (cycle in progress or pre-feature rows).
+        """
+        meta = self.cycle_metadata or {}
+        return {
+            CYCLE_META_MEMOS_AVAILABLE: int(meta.get(CYCLE_META_MEMOS_AVAILABLE) or 0),
+            CYCLE_META_MEMOS_CITED: int(meta.get(CYCLE_META_MEMOS_CITED) or 0),
         }
 
 

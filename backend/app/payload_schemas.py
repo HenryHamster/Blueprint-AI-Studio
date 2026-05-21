@@ -239,6 +239,11 @@ class StrategicReviewPayload(_SystemPopulated):
     # existing consumers and tests are unaffected. Each entry:
     # {task_id, summary_excerpt}. The reviewer prompt can cite memos by task_id.
     memo_citations: list[dict[str, Any]] | None = None
+    # Per-axis efficiency snapshot with drift vs baseline. Keys: axes (dict of
+    # axis_name → {current, baseline, drift_pct, history_tail}),
+    # baseline_captured_at, last_snapshot_at. Optional; absent when no snapshot
+    # data exists yet (cold-start projects).
+    efficiency_snapshot: dict[str, Any] | None = None
 
 
 class DesignDocUpdatePayload(_SystemPopulated):

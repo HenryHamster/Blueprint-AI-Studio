@@ -1258,6 +1258,7 @@ async def _handle_strategic_completion(
                     f"[STRATEGIC] Task {task.id}: failed to fetch findings index (non-fatal)",
                     exc_info=True,
                 )
+            _memo_citations: list = []
             try:
                 _memo_citations = await strategic_cycle.query_recent_memo_citations(
                     session, project.id
@@ -1269,15 +1270,22 @@ async def _handle_strategic_completion(
                     f"[STRATEGIC] Task {task.id}: failed to fetch memo citations (non-fatal)",
                     exc_info=True,
                 )
+            _cycle_reasoning = _extract_cycle_reasoning(task)
+            _memos_available = len(_memo_citations)
+            _memos_cited = strategic_cycle.count_cited_memos(
+                _memo_citations, _cycle_reasoning
+            )
             await strategic_cycle.mark_phase2_completed(
                 session,
                 cycle_id,
                 summary_text=_summary,
-                cycle_reasoning=_extract_cycle_reasoning(task),
+                cycle_reasoning=_cycle_reasoning,
                 directions_created=dirs_created,
                 directions_retired=dirs_retired,
                 tasks_spawned=tasks_spawned,
                 vision_updated=_vision_updated,
+                memos_available=_memos_available,
+                memos_cited=_memos_cited,
                 extra_metadata=_extra,
             )
         await _check_direction_starvation(project, dirs_created, session)

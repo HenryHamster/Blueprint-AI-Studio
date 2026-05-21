@@ -2571,6 +2571,157 @@ async def test_strategic_review_payload_documents_recommended_mode(db_session):
 
 
 # ---------------------------------------------------------------------------
+# efficiency_snapshot in strategic payload
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_strategic_review_includes_efficiency_snapshot_when_data_present(
+    db_session,
+):
+    """efficiency_snapshot is present in the payload when baseline data exists."""
+    from unittest.mock import AsyncMock, patch
+
+    project = _make_project(
+        directions=[
+            {"id": "d-eff01", "status": "active", "text": "x", "priority": "medium"}
+        ],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    _sample_snapshot = {
+        "axes": {
+            "cost_per_merged_pr": {
+                "current": 1.5,
+                "baseline": 2.0,
+                "drift_pct": -25.0,
+                "history": [],
+            },
+            "vm_reuse_rate": {
+                "current": 0.6,
+                "baseline": 0.5,
+                "drift_pct": 20.0,
+                "history": [],
+            },
+            "vm_cold_start_p50_ms": {
+                "current": 500.0,
+                "baseline": 600.0,
+                "drift_pct": -16.67,
+                "history": [],
+            },
+            "median_api_calls_per_task": {
+                "current": 40.0,
+                "baseline": 50.0,
+                "drift_pct": -20.0,
+                "history": [],
+            },
+            "median_review_iterations": {
+                "current": 1.5,
+                "baseline": 2.0,
+                "drift_pct": -25.0,
+                "history": [],
+            },
+        },
+        "baseline_captured_at": "2026-04-05T00:00:00",
+        "last_snapshot_at": "2026-05-01T00:00:00",
+    }
+
+    with patch(
+        "app.efficiency_snapshot.read_baseline_with_drift",
+        new=AsyncMock(return_value=_sample_snapshot),
+    ):
+        spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks
+    payload = tasks[0].payloads[0]
+    assert "efficiency_snapshot" in payload
+    snap = payload["efficiency_snapshot"]
+    assert "axes" in snap
+    assert "cost_per_merged_pr" in snap["axes"]
+    assert snap["axes"]["cost_per_merged_pr"]["drift_pct"] == -25.0
+
+
+@pytest.mark.asyncio
+async def test_strategic_review_omits_efficiency_snapshot_when_no_data(db_session):
+    """efficiency_snapshot is omitted when all current axis values are None."""
+    from unittest.mock import AsyncMock, patch
+
+    project = _make_project(
+        directions=[
+            {"id": "d-eff02", "status": "active", "text": "x", "priority": "medium"}
+        ],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    _empty_snapshot = {
+        "axes": {
+            "cost_per_merged_pr": {
+                "current": None,
+                "baseline": None,
+                "drift_pct": None,
+                "history": [],
+            },
+            "vm_reuse_rate": {
+                "current": None,
+                "baseline": None,
+                "drift_pct": None,
+                "history": [],
+            },
+            "vm_cold_start_p50_ms": {
+                "current": None,
+                "baseline": None,
+                "drift_pct": None,
+                "history": [],
+            },
+            "median_api_calls_per_task": {
+                "current": None,
+                "baseline": None,
+                "drift_pct": None,
+                "history": [],
+            },
+            "median_review_iterations": {
+                "current": None,
+                "baseline": None,
+                "drift_pct": None,
+                "history": [],
+            },
+        },
+        "baseline_captured_at": None,
+        "last_snapshot_at": None,
+    }
+
+    with patch(
+        "app.efficiency_snapshot.read_baseline_with_drift",
+        new=AsyncMock(return_value=_empty_snapshot),
+    ):
+        spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks
+    payload = tasks[0].payloads[0]
+    assert "efficiency_snapshot" not in payload
+
+
+# ---------------------------------------------------------------------------
 # _build_failure_feedback_mitigation unit tests
 # ---------------------------------------------------------------------------
 

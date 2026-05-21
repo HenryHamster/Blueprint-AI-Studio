@@ -890,6 +890,29 @@ async def admin_playbook_delete(
 
     del doc[playbook_key]
 
+    # Record a tombstone so _is_auto_playbook_suppressed can prevent re-creation
+    tombstone = {
+        "_archived_key": playbook_key,
+        "_archived_at": _utcnow().isoformat(),
+        "_retirement_reason": "operator_deleted",
+    }
+    archive = list(doc.get("playbook_archive") or [])
+    archive.append(tombstone)
+    import app.shared_state as _ss  # noqa: PLC0415
+
+    archive_max = _ss.runtime_config.get("playbook_archive_max", 50)
+    if archive_max > 0 and len(archive) > archive_max:
+        archive = archive[-archive_max:]
+    doc["playbook_archive"] = archive
+
+    # Also track in deleted_keys for durability against archive rotation
+    deleted_keys = list(doc.get("playbook_deleted_keys") or [])
+    if playbook_key not in deleted_keys:
+        deleted_keys.append(playbook_key)
+    if len(deleted_keys) > 200:
+        deleted_keys = deleted_keys[-200:]
+    doc["playbook_deleted_keys"] = deleted_keys
+
     meta = doc.get("_meta", {"revision": 0})
     meta["revision"] = meta.get("revision", 0) + 1
     meta["last_updated"] = _utcnow().isoformat()
