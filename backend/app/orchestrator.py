@@ -2667,12 +2667,16 @@ async def orchestrator_worker():
                         else:
                             _warm_expired = True
 
-                        if not _warm_expired and _shared_state.is_vm_alive(
-                            _warm_target_vm_id
+                        _cb_suppressed = _shared_state.is_warm_continuity_suppressed()
+                        if (
+                            not _warm_expired
+                            and not _cb_suppressed
+                            and _shared_state.is_vm_alive(_warm_target_vm_id)
                         ):
-                            # (b) Skip provision: the warm VM is alive. Leave
-                            # the task QUEUED — the agent's /next-role poll
-                            # will claim it without a fresh provision.
+                            # (b) Skip provision: the warm VM is alive and the
+                            # circuit breaker is not tripped. Leave the task
+                            # QUEUED — the agent's /next-role poll will claim it
+                            # without a fresh provision.
                             logger.info(
                                 f"[ORCHESTRATOR] Warm-pin skip-provision for task {task.id}: "
                                 f"target_vm={_warm_target_vm_id} (heartbeat fresh, deadline {_warm_deadline_iso})"
@@ -2680,7 +2684,7 @@ async def orchestrator_worker():
                             await session.rollback()
                             continue
 
-                        # (a) or (c): clear warm fields and fall through.
+                        # (a), (c), or (d): clear warm fields and fall through.
                         _new_ctx = {
                             k: v
                             for k, v in _warm_ctx.items()
@@ -2695,9 +2699,12 @@ async def orchestrator_worker():
                         from sqlalchemy.orm.attributes import flag_modified
 
                         flag_modified(task, "context")
-                        _clear_reason = (
-                            "deadline_expired" if _warm_expired else "vm_unresponsive"
-                        )
+                        if _cb_suppressed:
+                            _clear_reason = "circuit_breaker"
+                        elif _warm_expired:
+                            _clear_reason = "deadline_expired"
+                        else:
+                            _clear_reason = "vm_unresponsive"
                         # Phase 2e observability: track clear-out rate so we
                         # can detect warm-VM instability. Sustained >5/hour
                         # means the warm chain is failing more than expected.
@@ -2705,9 +2712,12 @@ async def orchestrator_worker():
                         # that persists the warm-field clear lands — if the
                         # commit fails and we retry next cycle we'd otherwise
                         # double-count the metric (Issue 11).
+                        # Circuit-breaker suppressions are not counted as pin-clear
+                        # events to avoid a feedback loop that deepens suppression.
                         _pending_warm_pin_clear: tuple[str, str] | None = (
-                            _warm_target_vm_id,
-                            _clear_reason,
+                            None
+                            if _clear_reason == "circuit_breaker"
+                            else (_warm_target_vm_id, _clear_reason)
                         )
                         logger.info(
                             f"[ORCHESTRATOR] Warm-pin cleared for task {task.id}: "

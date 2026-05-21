@@ -390,9 +390,14 @@ runtime_config: Dict = {
     # warm_target_vm_id`) and the orchestrator's provisioning loop skips
     # cold-provisioning a fresh VM as long as the target VM has heartbeated
     # within the last 90s. The agent on that VM picks the task up via
-    # /api/agent/next-role. Defaults to False — feature ships dark and is
-    # only enabled per-deployment via runtime_config_json.
-    "warm_continuity_enabled": False,
+    # /api/agent/next-role. Guarded by is_warm_continuity_suppressed() circuit
+    # breaker which auto-disables warm pinning when pin-clear rate is elevated.
+    "warm_continuity_enabled": True,
+    # Circuit-breaker thresholds for warm-pin continuity. When pin-clear events
+    # in the last hour exceed warm_pin_clear_rate_threshold, warm pinning is
+    # auto-suppressed for warm_continuity_cooldown_seconds before resuming.
+    "warm_pin_clear_rate_threshold": 10,
+    "warm_continuity_cooldown_seconds": 1800,
     # Phase 2 backlog reuse (efficiency direction d-91d8dede): when True, an
     # agent VM that just went idle (its task reached a terminal state with no
     # chain follow-on) may claim the next eligible QUEUED task from the SAME
@@ -683,6 +688,8 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     "direction_churn_window_cycles",
                     "direction_churn_non_merge_threshold",
                     "direction_lifetime_non_merge_threshold",
+                    "warm_pin_clear_rate_threshold",
+                    "warm_continuity_cooldown_seconds",
                 ):
                     if int_key in config_json:
                         _set(int_key, int(config_json[int_key]))
@@ -1066,6 +1073,40 @@ def count_recent_warm_pin_clears(window_seconds: int = 3600) -> int:
     """Distinct clear-out events in the trailing window."""
     cutoff = _utcnow() - timedelta(seconds=window_seconds)
     return sum(1 for ts, _, _ in warm_pin_clear_events if ts >= cutoff)
+
+
+# Auto-suppression deadline set by is_warm_continuity_suppressed() when the
+# pin-clear rate exceeds warm_pin_clear_rate_threshold. None means not suppressed.
+warm_continuity_suppressed_until: datetime | None = None
+
+
+def is_warm_continuity_suppressed() -> bool:
+    """True iff warm continuity is auto-suppressed by the pin-clear circuit breaker.
+
+    Checks the recent pin-clear rate against the configured threshold. When the
+    rate exceeds the threshold, sets a suppression window so callers fall back to
+    cold provisioning until the cooldown expires and the rate normalises.
+    """
+    global warm_continuity_suppressed_until
+    now = _utcnow()
+    if (
+        warm_continuity_suppressed_until is not None
+        and now < warm_continuity_suppressed_until
+    ):
+        return True
+    threshold = runtime_config.get("warm_pin_clear_rate_threshold", 10)
+    recent_clears = count_recent_warm_pin_clears(3600)
+    if recent_clears >= threshold:
+        cooldown = runtime_config.get("warm_continuity_cooldown_seconds", 1800)
+        warm_continuity_suppressed_until = now + timedelta(seconds=cooldown)
+        logger.warning(
+            f"[WARM_CONTINUITY] Circuit breaker tripped: {recent_clears} pin-clear events "
+            f"in last hour (threshold {threshold}). Suppressed until "
+            f"{warm_continuity_suppressed_until.isoformat()}."
+        )
+        return True
+    warm_continuity_suppressed_until = None
+    return False
 
 
 # --- Warm backlog-reuse first-refusal (efficiency direction d-91d8dede) ---

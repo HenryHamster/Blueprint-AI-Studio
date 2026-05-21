@@ -7844,6 +7844,60 @@ async def test_next_role_claims_warm_pinned_queued_task(
 
 
 @pytest.mark.asyncio
+async def test_next_role_returns_204_when_warm_continuity_suppressed(
+    client: AsyncClient, db_session, mocker
+):
+    """Circuit breaker: next-role returns 204 (skipping warm claim) when
+    is_warm_continuity_suppressed() returns True, even if a pinned QUEUED task exists."""
+    from datetime import timedelta
+
+    project = Project(name="Next-Role CB Suppressed", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    prior_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "review"}],
+        vm_instance_id="agent-vm-cb-suppressed",
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(prior_task)
+    deadline = (datetime.utcnow() + timedelta(seconds=240)).isoformat()
+    pinned_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix", "pr_number": 9999}],
+        status=TaskStatus.QUEUED,
+        context={
+            "warm_target_vm_id": "agent-vm-cb-suppressed",
+            "warm_handoff_deadline": deadline,
+        },
+    )
+    db_session.add(pinned_task)
+    await db_session.commit()
+    await db_session.refresh(prior_task)
+    await db_session.refresh(pinned_task)
+
+    mocker.patch("app.shared_state.is_warm_continuity_suppressed", return_value=True)
+
+    token = create_agent_token(str(prior_task.id), "agent-vm-cb-suppressed")
+    resp = await client.post(
+        "/api/agent/next-role",
+        json={
+            "vm_instance_id": "agent-vm-cb-suppressed",
+            "prior_task_id": str(prior_task.id),
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 204
+
+    await db_session.refresh(pinned_task)
+    assert pinned_task.status == TaskStatus.QUEUED, (
+        "Circuit breaker must not claim the pinned task"
+    )
+
+
+@pytest.mark.asyncio
 async def test_next_role_refuses_warm_claim_on_doomed_vm(
     client: AsyncClient, db_session
 ):

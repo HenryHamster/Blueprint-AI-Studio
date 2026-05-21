@@ -21,7 +21,10 @@ from sqlmodel import select
 from app.github import post_pipeline_merge_summary_comment as post_merge_summary_comment  # noqa: F401
 from app.models import Task, TaskHistory, TaskStatus
 from app.payload_schemas import validate_internal_payload
-from app.shared_state import runtime_config as _runtime_config
+from app.shared_state import (
+    runtime_config as _runtime_config,
+    is_warm_continuity_suppressed,
+)
 from app.broadcast import broadcast_to_project
 from app.time_utils import _utcnow
 from app.spawn_calibration import (
@@ -1550,7 +1553,9 @@ async def _spawn_pipeline_task(
         )
 
     # Propagate hotfix marker from the original task's payload.
-    _orig_payload = (orig.first_payload if orig is not None else source_task.first_payload) or {}
+    _orig_payload = (
+        orig.first_payload if orig is not None else source_task.first_payload
+    ) or {}
     orig_hotfix = bool(_orig_payload.get("hotfix"))
 
     # Cross-cutting safeguard gate: on the first review spawn for a PR that spans
@@ -2165,12 +2170,11 @@ async def _spawn_pipeline_task(
     # expires or the VM dies before pickup, the orchestrator clears the
     # warm fields and provisions normally.
     spawn_vm_instance_id: str | None = vm_name
-    warm_continuity_enabled = bool(
-        _runtime_config.get("warm_continuity_enabled", False)
-    )
+    warm_continuity_enabled = bool(_runtime_config.get("warm_continuity_enabled", True))
     if (
         warm_continuity_enabled
         and not suppress_warm_handoff
+        and not is_warm_continuity_suppressed()
         and source_task.vm_instance_id
     ):
         # Source task is eligible if it's currently running OR completed

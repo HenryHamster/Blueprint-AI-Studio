@@ -242,8 +242,10 @@ async def test_subsequent_snapshots_do_not_clobber_baseline(db_session):
 @pytest.mark.asyncio
 async def test_write_snapshot_migrates_stale_cold_start_baseline(db_session):
     """Existing baselines without _schema_version had cold-start captured from
-    boot beacons (pre-fix). write_snapshot must clear that axis and mark the
-    baseline as schema_version=1 so the next snapshot re-seeds with honest data.
+    boot beacons (pre-fix). write_snapshot must clear that axis and migrate the
+    baseline to the current schema head so the next snapshot re-seeds with
+    honest data. A v0 baseline chains through every migration in one call
+    (v0 -> v1 cold-start, v1 -> v2 review-iterations), landing at v2.
     """
     stale_cold_start = 500  # artificially low — was a beacon time, not claim latency
     project = make_project(
@@ -278,8 +280,8 @@ async def test_write_snapshot_migrates_stale_cold_start_baseline(db_session):
     # Old stale value must be gone; re-seeded from the new snapshot.
     assert baseline[AXIS_VM_COLD_START_P50_MS] != stale_cold_start
     assert baseline[AXIS_VM_COLD_START_P50_MS] == 15000.0
-    # Migration marker applied.
-    assert baseline["_schema_version"] == 1
+    # Migration marker applied — a v0 baseline chains to the current head (v2).
+    assert baseline["_schema_version"] == 2
     # Other baseline axes must not be clobbered.
     assert baseline[AXIS_COST_PER_MERGED_PR] == 0.01
 
@@ -570,3 +572,78 @@ async def test_cancelled_task_with_vm_cost_included_in_cost_per_merged_pr(db_ses
     expected_cost = 5 * 60 * ON_DEMAND_RATE + 3 * 60 * SPOT_RATE
     expected_cpm = round(expected_cost / 1, 4)
     assert axes[AXIS_COST_PER_MERGED_PR] == expected_cpm
+
+
+@pytest.mark.asyncio
+async def test_review_skipped_tasks_count_as_zero_iterations(db_session):
+    """Regression: a task that was auto-approved (pr_merged=True, no review_loop)
+    must count as 0 review iterations instead of being excluded from the sample.
+    Excluding auto-approved tasks inflates the median whenever the pipeline
+    gets more efficient by skipping review, inverting the signal.
+    """
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Task that went through review: 4 iterations.
+    db_session.add(
+        _make_efficient_task(
+            project.id, context={"pr_merged": True, "review_loop": {"iteration": 4}}
+        )
+    )
+    # Task whose review was skipped (auto-approved small diff): no review_loop.
+    db_session.add(_make_efficient_task(project.id, context={"pr_merged": True}))
+    await db_session.commit()
+
+    axes = await compute_current_axes(db_session, project.id)
+
+    # Median of [4, 0] = 2.0. Without the fix this would be 4.0 (only the
+    # reviewed task is counted, the auto-approved one is silently excluded).
+    assert axes[AXIS_MEDIAN_REVIEW_ITERATIONS] == 2.0
+
+
+@pytest.mark.asyncio
+async def test_write_snapshot_migrates_review_iterations_baseline(db_session):
+    """schema_version 1 baselines must have median_review_iterations cleared
+    so the next snapshot re-seeds under the corrected (review-skipped) definition.
+    """
+    project = make_project(
+        design_doc={
+            DESIGN_DOC_KEY: {
+                "baseline": {
+                    "captured_at": "2026-01-01T00:00:00",
+                    AXIS_MEDIAN_REVIEW_ITERATIONS: 4.0,  # stale — excluded auto-approved
+                    AXIS_COST_PER_MERGED_PR: 0.01,
+                    "_schema_version": 1,
+                },
+                "snapshots": [{"captured_at": "2026-01-01T00:00:00"}],
+                "last_run_at": "2026-01-01T00:00:00",
+            }
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Add a task so the snapshot has real review-iteration data.
+    db_session.add(
+        _make_efficient_task(
+            project.id, context={"pr_merged": True, "review_loop": {"iteration": 2}}
+        )
+    )
+    await db_session.commit()
+
+    await write_snapshot(db_session, project.id)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    container = project.design_doc[DESIGN_DOC_KEY]
+    baseline = container["baseline"]
+
+    # Stale value replaced by the corrected snapshot value.
+    assert baseline[AXIS_MEDIAN_REVIEW_ITERATIONS] != 4.0
+    assert baseline[AXIS_MEDIAN_REVIEW_ITERATIONS] == 2.0
+    assert baseline["_schema_version"] == 2
+    # Other axes must not be clobbered.
+    assert baseline[AXIS_COST_PER_MERGED_PR] == 0.01

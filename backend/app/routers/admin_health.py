@@ -347,6 +347,34 @@ async def _compute_health_overview(
             }
         )
 
+    # --- 4b. Warm-VM continuity circuit breaker ---
+    if _shared_state.runtime_config.get("warm_continuity_enabled", False):
+        if _shared_state.is_warm_continuity_suppressed():
+            sup_until = _shared_state.warm_continuity_suppressed_until
+            clears = _shared_state.count_recent_warm_pin_clears(3600)
+            threshold = _shared_state.runtime_config.get(
+                "warm_pin_clear_rate_threshold", 10
+            )
+            cooldown_min = (
+                _shared_state.runtime_config.get(
+                    "warm_continuity_cooldown_seconds", 1800
+                )
+                // 60
+            )
+            sup_str = sup_until.strftime("%H:%M UTC") if sup_until else "unknown"
+            actionable_issues.append(
+                {
+                    "severity": "warning",
+                    "title": "Warm-VM continuity circuit breaker open — falling back to cold provisioning",
+                    "hint": (
+                        f"{clears} pin-clear events in last hour exceeded threshold ({threshold}). "
+                        f"Auto-resumes at {sup_str} (~{cooldown_min} min cooldown)."
+                    ),
+                    "task_ids": [],
+                    "category": "warm_vm_circuit_breaker",
+                }
+            )
+
     # --- 5. External dependency health ---
     failed_deps = external_health.get("failed_deps", [])
     if failed_deps:
@@ -740,6 +768,8 @@ async def _compute_warm_vm_state(*, session: AsyncSession) -> Dict[str, Any]:
     )
     active_chain_continuity_claims = active_warm_chains - active_backlog_reuse_claims
 
+    cb_suppressed = _shared_state.is_warm_continuity_suppressed()
+    suppressed_until = _shared_state.warm_continuity_suppressed_until
     return {
         "active_vms": active_vms_out,
         "warm_pin_metrics": {
@@ -749,6 +779,13 @@ async def _compute_warm_vm_state(*, session: AsyncSession) -> Dict[str, Any]:
             "active_warm_chains": active_warm_chains,
             "active_backlog_reuse_claims": active_backlog_reuse_claims,
             "active_chain_continuity_claims": active_chain_continuity_claims,
+            "circuit_breaker_suppressed": cb_suppressed,
+            "suppressed_until": suppressed_until.isoformat()
+            if suppressed_until
+            else None,
+            "clear_rate_threshold": int(
+                _shared_state.runtime_config.get("warm_pin_clear_rate_threshold", 10)
+            ),
         },
         "warm_continuity_enabled": bool(
             _shared_state.runtime_config.get("warm_continuity_enabled", False)

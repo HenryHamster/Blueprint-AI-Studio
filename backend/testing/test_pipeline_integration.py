@@ -95,6 +95,17 @@ async def test_full_review_fix_cycle(client: AsyncClient, db_session, mocker):
         "app.routers.agent.get_github_token_for_task",
         return_value=("fake-token", "owner", "repo"),
     )
+    # Warm-VM continuity (default-on) would leave spawned tasks with
+    # vm_instance_id=None plus a warm_target_vm_id context pin, to be claimed
+    # via /next-role. This test exercises the cold-provision claim flow of the
+    # review/fix state machine, so pin the flag off for determinism. Warm
+    # continuity has dedicated coverage in test_review_pipeline.py /
+    # test_warm_vm_integration.py.
+    mocker.patch.dict(
+        "app.review_pipeline._runtime_config",
+        {"warm_continuity_enabled": False},
+        clear=False,
+    )
 
     # ------------------------------------------------------------------
     # Step 1: Create project + create-type task (QUEUED)
@@ -287,6 +298,13 @@ async def test_create_task_spawns_review_on_pr_completion(
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         return_value=("fake-token", "owner", "repo"),
+    )
+    # Cold-provision claim flow — pin warm-VM continuity off (see
+    # test_full_review_fix_cycle for rationale).
+    mocker.patch.dict(
+        "app.review_pipeline._runtime_config",
+        {"warm_continuity_enabled": False},
+        clear=False,
     )
 
     project = Project(name="Spawn Review Test", user_id="test-user-123")

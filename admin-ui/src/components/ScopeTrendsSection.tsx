@@ -1,3 +1,4 @@
+import { useMemo } from 'react';
 import { ResponsiveContainer, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend } from 'recharts';
 
 const SCOPE_ORDER = ['small', 'medium', 'large'];
@@ -44,6 +45,22 @@ export function ScopeTrendsSection({
   open: boolean;
   onToggle: () => void;
 }) {
+  const { scopes, chartData, summary } = useMemo(() => {
+    const series = data?.series ?? [];
+    const summary = data?.summary ?? {};
+    const scopes = SCOPE_ORDER.filter(s => summary[s] != null);
+    const weeks = Array.from(new Set(series.map(p => p.week))).sort();
+    const chartData = weeks.map(week => {
+      const row: Record<string, string | number | null> = { week };
+      for (const scope of scopes) {
+        const pt = series.find(p => p.week === week && p.scope === scope);
+        row[scope] = pt?.merge_rate != null ? Math.round(pt.merge_rate * 100) : null;
+      }
+      return row;
+    });
+    return { scopes, weeks, chartData, summary };
+  }, [data]);
+
   if (loading && !data) {
     return (
       <section>
@@ -52,20 +69,6 @@ export function ScopeTrendsSection({
       </section>
     );
   }
-  const series = data?.series ?? [];
-  const summary = data?.summary ?? {};
-  const scopes = SCOPE_ORDER.filter(s => summary[s] != null);
-
-  // Pivot into chart rows: one row per week, one key per scope.
-  const weeks = Array.from(new Set(series.map(p => p.week))).sort();
-  const chartData = weeks.map(week => {
-    const row: Record<string, string | number | null> = { week };
-    for (const scope of scopes) {
-      const pt = series.find(p => p.week === week && p.scope === scope);
-      row[scope] = pt && pt.merge_rate != null ? Math.round(pt.merge_rate * 100) : null;
-    }
-    return row;
-  });
 
   return (
     <section>

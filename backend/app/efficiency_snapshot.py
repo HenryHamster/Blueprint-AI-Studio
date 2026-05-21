@@ -171,6 +171,11 @@ def _compute_median_review_iterations(tasks: list[Task]) -> Optional[float]:
             n = loop.get("iteration")
             if isinstance(n, int) and n >= 0:
                 iters.append(n)
+        elif ctx.get("pr_merged"):
+            # Review was skipped (e.g. auto-approved small diff) — counts as 0 iterations.
+            # Excluding these tasks inflates the median whenever the pipeline gets more
+            # efficient by skipping review, inverting the signal.
+            iters.append(0)
     if not iters:
         return None
     return round(float(statistics.median(iters)), 2)
@@ -221,6 +226,12 @@ async def write_snapshot(
         if not baseline.get("_schema_version"):
             baseline[AXIS_VM_COLD_START_P50_MS] = None
             baseline["_schema_version"] = 1
+        # One-time migration: baselines captured before review-skipped tasks
+        # counted as 0 iterations (schema_version 1) excluded auto-approved
+        # tasks, biasing the median upward. Clear and re-seed.
+        if baseline.get("_schema_version") == 1:
+            baseline[AXIS_MEDIAN_REVIEW_ITERATIONS] = None
+            baseline["_schema_version"] = 2
         # Re-seed any individual axes that were cleared (e.g. by the migration
         # above) once a valid current value is available.
         for axis in ALL_AXES:

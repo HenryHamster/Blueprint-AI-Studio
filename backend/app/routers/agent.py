@@ -3687,43 +3687,63 @@ async def next_role(
         )
         return Response(status_code=204)
 
-    # Look up a QUEUED task pinned to this VM.
-    #
-    # On Postgres, lead with ``has_key`` so the JSONB ``?`` operator can use
-    # ``ix_task_context_gin`` before the ``->>`` equality cast. SQLite lacks
-    # that operator, so test runs fall back to the portable JSON-extract form.
-    # Optional prior_pr_number filter narrows further so a stray pin from an
-    # unrelated chain doesn't get claimed.
+    # Postgres can use the JSONB ``?`` operator (``has_key``) against
+    # ``ix_task_context_gin``; SQLite test runs fall back to the portable
+    # JSON-extract form. Computed once here because both the chain-continuity
+    # lookup and the chain-fork exit below need it.
     use_jsonb_has_key = session.get_bind().dialect.name == "postgresql"
-    warm_vm_filters = [Task.status == TaskStatus.QUEUED]
-    if use_jsonb_has_key:
-        warm_vm_filters.append(Task.context.has_key("warm_target_vm_id"))
-    warm_vm_filters.append(
-        Task.context["warm_target_vm_id"].as_string() == req.vm_instance_id
+
+    # Circuit-breaker / feature-flag gate: if warm continuity is disabled or
+    # auto-suppressed (pin-clear rate exceeded the threshold), skip the warm-
+    # chain-continuity lookup so no new warm chains start. The orchestrator's
+    # provisioning loop clears outstanding warm pins when the breaker is active;
+    # skipping the lookup here closes the brief race window between the breaker
+    # tripping and the next orchestrator cycle. This gate governs ONLY
+    # chain-continuity claims — backlog-reuse (its own ``warm_backlog_reuse_enabled``
+    # flag) and the chain-fork exit below still run.
+    warm_continuity_active = (
+        _shared_state.runtime_config.get("warm_continuity_enabled", True)
+        and not _shared_state.is_warm_continuity_suppressed()
     )
-    stmt = select(Task).where(*warm_vm_filters)
-    if req.prior_pr_number is not None:
-        prior_pr_filters = []
+    if warm_continuity_active:
+        # Look up a QUEUED task pinned to this VM. Optional prior_pr_number
+        # filter narrows further so a stray pin from an unrelated chain
+        # doesn't get claimed.
+        warm_vm_filters = [Task.status == TaskStatus.QUEUED]
         if use_jsonb_has_key:
-            prior_pr_filters.append(Task.context.has_key("warm_target_pr"))
-        prior_pr_filters.append(
-            Task.context["warm_target_pr"].as_string() == str(req.prior_pr_number)
+            warm_vm_filters.append(Task.context.has_key("warm_target_vm_id"))
+        warm_vm_filters.append(
+            Task.context["warm_target_vm_id"].as_string() == req.vm_instance_id
         )
-        stmt = stmt.where(*prior_pr_filters)
-    stmt = stmt.with_for_update(skip_locked=True)
+        stmt = select(Task).where(*warm_vm_filters)
+        if req.prior_pr_number is not None:
+            prior_pr_filters = []
+            if use_jsonb_has_key:
+                prior_pr_filters.append(Task.context.has_key("warm_target_pr"))
+            prior_pr_filters.append(
+                Task.context["warm_target_pr"].as_string() == str(req.prior_pr_number)
+            )
+            stmt = stmt.where(*prior_pr_filters)
+        stmt = stmt.with_for_update(skip_locked=True)
 
-    task = (await session.execute(stmt)).scalars().first()
+        task = (await session.execute(stmt)).scalars().first()
 
-    if task is not None:
-        result = await _finalize_warm_claim(
-            session, task, req.vm_instance_id, origin="next_role_endpoint"
-        )
+        if task is not None:
+            result = await _finalize_warm_claim(
+                session, task, req.vm_instance_id, origin="next_role_endpoint"
+            )
+            logger.info(
+                f"[NEXT-ROLE] Warm-start claim (chain): task={result['task_id']} "
+                f"vm={req.vm_instance_id} prior_task={req.prior_task_id} "
+                f"prior_pr={req.prior_pr_number}"
+            )
+            return result
+    else:
         logger.info(
-            f"[NEXT-ROLE] Warm-start claim (chain): task={result['task_id']} "
-            f"vm={req.vm_instance_id} prior_task={req.prior_task_id} "
-            f"prior_pr={req.prior_pr_number}"
+            "[NEXT-ROLE] Warm continuity disabled/suppressed (circuit breaker) — "
+            "skipping chain-continuity claim for VM %s",
+            req.vm_instance_id,
         )
-        return result
 
     # Backlog-reuse branch (efficiency direction d-91d8dede). When the flag is
     # enabled an idle VM with no chain-pinned follow-on may claim the next
