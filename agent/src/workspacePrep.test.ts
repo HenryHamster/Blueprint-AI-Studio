@@ -258,4 +258,217 @@ describe('prepareWorkspaceForRole', () => {
     expect(checkoutB).toBeDefined();
     expect((checkoutB?.[1] as string[]).join(' ')).toContain('-B feature/y origin/feature/y');
   });
+
+  // ── Warm path: full-clone request unshallows a shallow workspace ────────────
+  //
+  // R4-H4: release_audit / qualifier-smoketest pass depth 0 (a FULL-clone
+  // request) so the merge-base of `main...<candidate_sha>` is reachable. The
+  // cold path honors depth 0 by omitting --depth; the warm path's plain
+  // `git fetch origin <branch>` did NOT — it kept role 1's shallow boundary.
+  // The fix: when a full clone is requested AND the warm workspace is shallow
+  // (a `.git/shallow` file exists) the warm path runs
+  // `git fetch --unshallow origin <branch>`. Shallow (depth > 0) requests and
+  // already-complete repos are untouched.
+  describe('warm path: full-clone request unshallows a shallow workspace', () => {
+    /**
+     * Drives fs.existsSync so `.git` reports present (warm detection) and
+     * `.git/shallow` reports present iff `shallow` is true. Path separators
+     * differ by OS, so match on the path tail rather than an exact string.
+     */
+    function setExistsSync(opts: { gitDir: boolean; shallow: boolean }): void {
+      fsMocks.existsSync.mockImplementation((p: unknown) => {
+        const s = String(p).replace(/\\/g, '/');
+        if (s.endsWith('/.git/shallow')) return opts.shallow;
+        if (s.endsWith('/.git')) return opts.gitDir;
+        return false;
+      });
+    }
+
+    it('depth=0 + shallow repo → runs git fetch --unshallow, no cold clone', async () => {
+      process.env.BLUEPRINT_WARM_HANDOFF = '1';
+      setExistsSync({ gitDir: true, shallow: true });
+
+      await prepareWorkspaceForRole({
+        workspace: '/ws',
+        repoUrl: 'https://x-access-token:tok@github.com/o/r.git',
+        githubToken: 'tok',
+        branch: 'main',
+        baseBranch: 'main',
+        depth: 0,
+      });
+
+      // The warm path ran an --unshallow fetch scoped to the branch.
+      const unshallow = execFileSyncMock.mock.calls.find(c =>
+        c[0] === 'git' && Array.isArray(c[1])
+        && (c[1] as string[]).includes('fetch')
+        && (c[1] as string[]).includes('--unshallow'),
+      );
+      expect(unshallow).toBeDefined();
+      expect((unshallow?.[1] as string[]).join(' ')).toBe(
+        '-C /ws fetch --unshallow origin main',
+      );
+      // Warm path completed — no cold rm/clone fallback.
+      expect(cloneWithRetryMock).not.toHaveBeenCalled();
+      const rmCalls = execFileSyncMock.mock.calls.filter(
+        c => c[0] === 'rm' && Array.isArray(c[1]) && (c[1] as string[]).includes('-rf'),
+      );
+      expect(rmCalls.length).toBe(0);
+    });
+
+    it('depth=0 + NON-shallow repo → does NOT run --unshallow (already complete)', async () => {
+      process.env.BLUEPRINT_WARM_HANDOFF = '1';
+      // .git exists (warm) but no .git/shallow → repo is already complete.
+      setExistsSync({ gitDir: true, shallow: false });
+
+      await prepareWorkspaceForRole({
+        workspace: '/ws',
+        repoUrl: 'https://x-access-token:tok@github.com/o/r.git',
+        githubToken: 'tok',
+        branch: 'main',
+        depth: 0,
+      });
+
+      const unshallow = execFileSyncMock.mock.calls.find(c =>
+        c[0] === 'git' && Array.isArray(c[1]) && (c[1] as string[]).includes('--unshallow'),
+      );
+      expect(unshallow).toBeUndefined();
+      // Warm path still succeeded.
+      expect(cloneWithRetryMock).not.toHaveBeenCalled();
+    });
+
+    it('shallow depth (depth > 0) → does NOT unshallow even if .git/shallow exists', async () => {
+      process.env.BLUEPRINT_WARM_HANDOFF = '1';
+      // Repo IS shallow, but the caller asked for a shallow (depth 50) clone —
+      // a shallow request must be left exactly as-is.
+      setExistsSync({ gitDir: true, shallow: true });
+
+      await prepareWorkspaceForRole({
+        workspace: '/ws',
+        repoUrl: 'https://x-access-token:tok@github.com/o/r.git',
+        githubToken: 'tok',
+        branch: 'feature/x',
+        depth: 50,
+      });
+
+      const unshallow = execFileSyncMock.mock.calls.find(c =>
+        c[0] === 'git' && Array.isArray(c[1]) && (c[1] as string[]).includes('--unshallow'),
+      );
+      expect(unshallow).toBeUndefined();
+    });
+
+    it('depth omitted (defaults to DEFAULT_CLONE_DEPTH, a shallow request) → does NOT unshallow', async () => {
+      process.env.BLUEPRINT_WARM_HANDOFF = '1';
+      setExistsSync({ gitDir: true, shallow: true });
+
+      await prepareWorkspaceForRole({
+        workspace: '/ws',
+        repoUrl: 'https://x-access-token:tok@github.com/o/r.git',
+        githubToken: 'tok',
+        branch: 'feature/x',
+        // depth omitted → DEFAULT_CLONE_DEPTH (> 0): a shallow request.
+      });
+
+      const unshallow = execFileSyncMock.mock.calls.find(c =>
+        c[0] === 'git' && Array.isArray(c[1]) && (c[1] as string[]).includes('--unshallow'),
+      );
+      expect(unshallow).toBeUndefined();
+    });
+
+    it('depth=0 + --unshallow errors "complete repository" → tolerated, warm path succeeds', async () => {
+      process.env.BLUEPRINT_WARM_HANDOFF = '1';
+      setExistsSync({ gitDir: true, shallow: true });
+
+      // The .git/shallow check passed but the repo became complete before the
+      // fetch (e.g. a concurrent fetch). git errors with the benign
+      // "--unshallow on a complete repository does not make sense" — the warm
+      // path must swallow exactly that error and continue (the repo already
+      // has full history, which is what the full-clone request wanted).
+      execFileSyncMock.mockImplementation((cmd: string, args: string[]) => {
+        if (cmd === 'git' && args.includes('--unshallow')) {
+          throw new Error('fatal: --unshallow on a complete repository does not make sense');
+        }
+        return '';
+      });
+
+      await prepareWorkspaceForRole({
+        workspace: '/ws',
+        repoUrl: 'https://x-access-token:tok@github.com/o/r.git',
+        githubToken: 'tok',
+        branch: 'main',
+        depth: 0,
+      });
+
+      // Benign error swallowed → NO cold fallback.
+      expect(cloneWithRetryMock).not.toHaveBeenCalled();
+      const rmCalls = execFileSyncMock.mock.calls.filter(
+        c => c[0] === 'rm' && Array.isArray(c[1]) && (c[1] as string[]).includes('-rf'),
+      );
+      expect(rmCalls.length).toBe(0);
+      // The warm path still ran reset --hard (i.e. it continued past the fetch).
+      const resetCall = execFileSyncMock.mock.calls.find(c =>
+        c[0] === 'git' && Array.isArray(c[1]) && (c[1] as string[]).includes('reset'),
+      );
+      expect(resetCall).toBeDefined();
+    });
+
+    it('depth=0 + --unshallow fails with a REAL error → falls through to cold clone', async () => {
+      process.env.BLUEPRINT_WARM_HANDOFF = '1';
+      setExistsSync({ gitDir: true, shallow: true });
+
+      // A genuine fetch failure (network) must NOT be swallowed — handing the
+      // handler a still-shallow repo would non-deterministically break the
+      // qualifier. It must propagate so we fall back to a cold full clone.
+      execFileSyncMock.mockImplementation((cmd: string, args: string[]) => {
+        if (cmd === 'git' && args.includes('--unshallow')) {
+          throw new Error('fatal: unable to access remote: network unreachable');
+        }
+        return '';
+      });
+
+      await prepareWorkspaceForRole({
+        workspace: '/ws',
+        repoUrl: 'https://x-access-token:tok@github.com/o/r.git',
+        githubToken: 'tok',
+        branch: 'main',
+        depth: 0,
+      });
+
+      // Cold path taken: rm -rf + cloneWithRetry, and the cold clone honors
+      // the depth-0 full-clone request (no --depth flag).
+      const rmCall = execFileSyncMock.mock.calls.find(
+        c => c[0] === 'rm' && Array.isArray(c[1]) && (c[1] as string[]).includes('-rf'),
+      );
+      expect(rmCall).toBeDefined();
+      expect(cloneWithRetryMock).toHaveBeenCalledTimes(1);
+      expect(cloneWithRetryMock).toHaveBeenCalledWith([
+        'clone', '--branch', 'main',
+        'https://x-access-token:tok@github.com/o/r.git', '/ws',
+      ]);
+      // The warm-path failure was logged.
+      const logged = logMock.mock.calls.map(c => String(c[0])).join('\n');
+      expect(logged).toMatch(/warm path failed/i);
+    });
+
+    it('cold path (warm handoff unset) + depth=0 + shallow file present → unaffected, plain cold full clone', async () => {
+      // No BLUEPRINT_WARM_HANDOFF → cold path. Even with a stray .git/shallow,
+      // the cold path just rm+clone (full, depth 0) — the unshallow logic is
+      // warm-path-only and must never run here.
+      setExistsSync({ gitDir: true, shallow: true });
+
+      await prepareWorkspaceForRole({
+        workspace: '/ws',
+        repoUrl: 'https://x-access-token:tok@github.com/o/r.git',
+        githubToken: 'tok',
+        branch: 'main',
+        depth: 0,
+      });
+
+      const gitCalls = execFileSyncMock.mock.calls.filter(c => c[0] === 'git');
+      expect(gitCalls.length).toBe(0); // no git fetch/unshallow on the cold path
+      expect(cloneWithRetryMock).toHaveBeenCalledWith([
+        'clone', '--branch', 'main',
+        'https://x-access-token:tok@github.com/o/r.git', '/ws',
+      ]);
+    });
+  });
 });

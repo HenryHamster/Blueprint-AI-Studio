@@ -42,7 +42,12 @@ export interface PrepareWorkspaceOptions {
    * DEFAULT_CLONE_DEPTH; a few used 100 directly. The cold path falls back
    * to DEFAULT_CLONE_DEPTH when depth is omitted. Pass `0` (or any non-
    * positive number) to perform a FULL clone (no --depth flag) — the
-   * research handler relies on full git history.
+   * research handler relies on full git history, and the release qualifier
+   * (release_audit / qualifier-smoketest) needs the merge-base reachable.
+   * A non-positive depth is also honored on the WARM path: if the reused
+   * workspace is shallow (a `.git/shallow` left by an earlier role's shallow
+   * clone) the helper runs `git fetch --unshallow` so full history is
+   * present. Shallow (depth > 0) requests never trigger the unshallow.
    */
   depth?: number;
 }
@@ -72,6 +77,40 @@ export async function prepareWorkspaceForRole(opts: PrepareWorkspaceOptions): Pr
       execFileSync('git', ['-C', workspace, 'fetch', 'origin', branch], {
         encoding: 'utf-8', timeout: 120_000,
       });
+      // Full-clone request on a shallow warm workspace: the cold path honors
+      // `depthOpt <= 0` by omitting --depth, but the warm path's plain
+      // `git fetch origin <branch>` keeps whatever shallow boundary role 1's
+      // clone left behind (a `.git/shallow` file). Callers that pass depth 0
+      // (release_audit's `main...<candidate_sha>` three-dot diff,
+      // qualifier-smoketest's candidate-SHA fetch+checkout) need the merge-base
+      // reachable, so unshallow the repo here. We only do this when the request
+      // is a full clone AND the repo is actually shallow — a non-positive depth
+      // on an already-complete repo is a no-op, and shallow (depth > 0) requests
+      // are untouched, so the cold path and every shallow handler are
+      // unaffected.
+      if (depthOpt <= 0 && fs.existsSync(path.join(workspace, '.git', 'shallow'))) {
+        try {
+          execFileSync('git', ['-C', workspace, 'fetch', '--unshallow', 'origin', branch], {
+            encoding: 'utf-8', timeout: 300_000,
+          });
+          log(`prepareWorkspaceForRole: unshallowed warm workspace (branch=${branch}) for full-clone request`);
+        } catch (e) {
+          // `git fetch --unshallow` errors "fatal: --unshallow on a complete
+          // repository does not make sense" if the repo became complete
+          // between the .git/shallow check and the fetch (e.g. a concurrent
+          // fetch). That specific case is benign — the repo already has full
+          // history, which is exactly what a full-clone request wants — so
+          // swallow it. Any other failure is a real warm-path failure and
+          // must propagate to the outer catch so we fall back to a cold full
+          // clone rather than handing the handler a still-shallow repo.
+          const msg = String(e);
+          if (/--unshallow on a complete repository/i.test(msg)) {
+            log(`prepareWorkspaceForRole: warm workspace already complete (branch=${branch}); --unshallow skipped`);
+          } else {
+            throw e;
+          }
+        }
+      }
       if (baseBranch && baseBranch !== branch) {
         try {
           execFileSync('git', ['-C', workspace, 'fetch', 'origin', baseBranch], {

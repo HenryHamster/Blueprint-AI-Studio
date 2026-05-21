@@ -6237,3 +6237,200 @@ async def test_tiered_unproductive_cooldown_escalates_with_consecutive_failures(
     assert "d-tier-3rd-fail" not in active_ids, (
         "3+ consecutive unproductive cycles should use full base cooldown"
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# integration_branch routing — manual operator endpoints (R4-MEDIUM)
+#
+# The manual /research and /strategic-cycle endpoints produce the SAME task
+# types as the autonomous strategic/research spawns. Their spawn-time
+# base_branch default MUST route through runtime_config["integration_branch"]
+# so that after the automain Phase-1 cutover an operator-triggered cycle
+# drives the version lifecycle from automain, not the frozen LTS main.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+async def _make_strategic_project(db_session, name: str):
+    """Project with owner membership so trigger_strategic_cycle's role check
+    (_get_user_project_with_role, min_role='member') passes."""
+    from app.models import ProjectMember
+
+    project = Project(
+        name=name,
+        user_id="test-user-123",
+        vision={"purpose": "test"},
+        design_doc={"proposed_changes": []},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(
+        ProjectMember(project_id=project.id, user_id="test-user-123", role="owner")
+    )
+    await db_session.commit()
+    return project
+
+
+@pytest.mark.asyncio
+async def test_research_endpoint_uses_integration_branch(
+    client: AsyncClient, db_session, mocker, monkeypatch
+):
+    """When integration_branch is flipped to 'automain', the manual direction
+    /research endpoint must spawn with base_branch='automain'."""
+    import app.shared_state as _shared_state
+
+    monkeypatch.setitem(_shared_state.runtime_config, "integration_branch", "automain")
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id, text="Routed research")
+    direction_id = direction["id"]
+
+    resp = await client.post(
+        f"/api/admin/projects/{project_id}/directions/{direction_id}/research"
+    )
+    assert resp.status_code == 200, resp.text
+
+    # _deploy_project also creates a payload-less "Deploy ..." parent task with
+    # created_by="USER", so filter down to the research task by payload type.
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == uuid.UUID(project_id),
+            Task.created_by == "USER",
+        )
+    )
+    research_tasks = [
+        t for t in result.scalars().all()
+        if t.first_payload.get("type") == "research"
+    ]
+    assert len(research_tasks) == 1, "expected exactly one research task to be created"
+    for t in research_tasks:
+        assert t.first_payload.get("base_branch") == "automain", (
+            "manual /research endpoint bypassed the integration_branch knob"
+        )
+
+
+@pytest.mark.asyncio
+async def test_research_endpoint_defaults_to_main(
+    client: AsyncClient, db_session, mocker, monkeypatch
+):
+    """With integration_branch at its default 'main', the manual /research
+    endpoint spawns from 'main' — preserving pre-cutover behavior."""
+    import app.shared_state as _shared_state
+
+    monkeypatch.setitem(_shared_state.runtime_config, "integration_branch", "main")
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id, text="Default research")
+    direction_id = direction["id"]
+
+    resp = await client.post(
+        f"/api/admin/projects/{project_id}/directions/{direction_id}/research"
+    )
+    assert resp.status_code == 200, resp.text
+
+    # _deploy_project also creates a payload-less "Deploy ..." parent task with
+    # created_by="USER", so filter down to the research task by payload type.
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == uuid.UUID(project_id),
+            Task.created_by == "USER",
+        )
+    )
+    research_tasks = [
+        t for t in result.scalars().all()
+        if t.first_payload.get("type") == "research"
+    ]
+    assert len(research_tasks) == 1, "expected exactly one research task to be created"
+    for t in research_tasks:
+        assert t.first_payload.get("base_branch") == "main"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "phase,expected_type",
+    [
+        ("design_doc", "design_doc_update"),
+        ("strategic_review", "strategic_review"),
+    ],
+)
+async def test_strategic_cycle_endpoint_uses_integration_branch(
+    client: AsyncClient, db_session, monkeypatch, phase, expected_type
+):
+    """When integration_branch is flipped to 'automain', both phases of the
+    manual /strategic-cycle endpoint must spawn with base_branch='automain'."""
+    import app.shared_state as _shared_state
+
+    monkeypatch.setitem(_shared_state.runtime_config, "integration_branch", "automain")
+    project = await _make_strategic_project(
+        db_session, f"automain strategic {phase}"
+    )
+
+    resp = await client.post(
+        f"/api/admin/projects/{project.id}/strategic-cycle",
+        params={"phase": phase},
+    )
+    assert resp.status_code == 200, resp.text
+
+    result = await db_session.execute(
+        select(Task).where(Task.project_id == project.id)
+    )
+    tasks = result.scalars().all()
+    assert tasks, "expected a strategic task to be created"
+    for t in tasks:
+        assert t.first_payload.get("type") == expected_type
+        assert t.first_payload.get("base_branch") == "automain", (
+            f"manual /strategic-cycle ({phase}) bypassed the "
+            f"integration_branch knob"
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["design_doc", "strategic_review"])
+async def test_strategic_cycle_endpoint_defaults_to_main(
+    client: AsyncClient, db_session, monkeypatch, phase
+):
+    """With integration_branch at its default 'main', both phases of the
+    manual /strategic-cycle endpoint spawn from 'main'."""
+    import app.shared_state as _shared_state
+
+    monkeypatch.setitem(_shared_state.runtime_config, "integration_branch", "main")
+    project = await _make_strategic_project(db_session, f"main strategic {phase}")
+
+    resp = await client.post(
+        f"/api/admin/projects/{project.id}/strategic-cycle",
+        params={"phase": phase},
+    )
+    assert resp.status_code == 200, resp.text
+
+    result = await db_session.execute(
+        select(Task).where(Task.project_id == project.id)
+    )
+    tasks = result.scalars().all()
+    assert tasks, "expected a strategic task to be created"
+    for t in tasks:
+        assert t.first_payload.get("base_branch") == "main"
+
+
+def test_no_hardcoded_main_base_branch_in_directions_router():
+    """Static guard: spawn payloads in routers/directions.py must never
+    hardcode {"base_branch": "main"} — they must route through
+    runtime_config.get("integration_branch", "main") so the automain cutover
+    takes effect. Inheritance reads `.get("base_branch", "main")` (a "(" or
+    "," precedes the key) are a different, correct pattern and are allowed.
+    """
+    import re
+    from pathlib import Path
+
+    path = (
+        Path(__file__).resolve().parents[1] / "app" / "routers" / "directions.py"
+    )
+    hardcoded = re.compile(r'(?<![(,]\s)"base_branch":\s*"main"')
+    offenders = [
+        f"routers/directions.py:{lineno}: {line.strip()}"
+        for lineno, line in enumerate(
+            path.read_text(encoding="utf-8").splitlines(), start=1
+        )
+        if hardcoded.search(line)
+    ]
+    assert not offenders, (
+        "routers/directions.py spawn payloads hardcode base_branch='main' "
+        "instead of routing through integration_branch:\n" + "\n".join(offenders)
+    )

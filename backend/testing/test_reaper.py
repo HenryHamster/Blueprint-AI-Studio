@@ -3509,12 +3509,17 @@ async def test_step9_sweep_finalizes_qualification_stuck_pending_after_reaper_ki
         await reaper_db.refresh(smoke_task)
 
         # Version wedged 'pending' — its completion handler never ran because
-        # the reaper killed the children directly.
+        # the reaper killed the children directly. started_at is FRESH (now)
+        # so this test exercises the both-children-terminal finalize path, not
+        # the 6h qualification-timeout backstop (which would also finalize but
+        # via a different code path and blocker).
+        from app.time_utils import _utcnow as _now_for_seed
+
         version.last_qualification = {
             "status": "pending",
             "candidate_sha": "abcd" * 10,
             "ci_green": False,
-            "started_at": "2026-05-20T00:00:00",
+            "started_at": _now_for_seed().isoformat(),
             "audit_task_id": str(audit_task.id),
             "smoketest_task_id": str(smoke_task.id),
         }
@@ -3554,8 +3559,20 @@ async def test_step9_sweep_skips_qualification_with_running_child(
 
     Guards against the sweep firing prematurely and finalizing on incomplete
     child results.
+
+    **Positive control (Round 9).**  "Stays pending" is only meaningful if the
+    sweep's finalize machinery is genuinely *running* against the test engine.
+    The Round 7 dedicated-finalize-session change briefly made the sweep open
+    its DB session against an unpatched engine: every finalize then errored and
+    was swallowed by the per-version try/except, so EVERY version trivially
+    "stayed pending" and this assertion passed for the wrong reason.  To make
+    the test prove a *deliberate* skip, a second version (its own project, both
+    children terminal) is seeded in the SAME cycle and MUST be finalized.  Now
+    the test fails on either fault: a broken finalize path fails the positive
+    control; a premature sweep wrongly finalizes the running-child version.
     """
     from app import shared_state
+    from app.time_utils import _utcnow as _now_for_seed
 
     _original_promotion = shared_state.runtime_config.get("promotion_enabled")
     shared_state.runtime_config["promotion_enabled"] = False
@@ -3600,25 +3617,203 @@ async def test_step9_sweep_skips_qualification_with_running_child(
         await reaper_db.refresh(audit_task)
         await reaper_db.refresh(smoke_task)
 
+        # started_at is FRESH (now) so the 6h qualification-timeout backstop
+        # in sweep_stuck_qualifications does NOT fire — this test exercises the
+        # running-child skip path, not the timeout force-finalize path. A stale
+        # timestamp here would let the timeout finalize the version as
+        # not_promoted and mask the running-child skip behaviour being tested.
         version.last_qualification = {
             "status": "pending",
             "candidate_sha": "abcd" * 10,
             "ci_green": False,
-            "started_at": "2026-05-20T00:00:00",
+            "started_at": _now_for_seed().isoformat(),
             "audit_task_id": str(audit_task.id),
             "smoketest_task_id": str(smoke_task.id),
         }
         reaper_db.add(version)
         await reaper_db.commit()
 
+        # Positive control: a SECOND version (own project — ReleaseVersion is
+        # unique on (project_id, version_number)) whose audit + smoketest are
+        # BOTH terminal. The same sweep cycle MUST finalize this one. If the
+        # sweep's dedicated finalize session were opened against the wrong
+        # engine (Round 7 regression), this finalize would silently fail and
+        # the control assertion below would catch it — so "stays pending" for
+        # the running-child version can no longer pass for the wrong reason.
+        control_project = await _make_project(reaper_db)
+        control_version = ReleaseVersion(
+            project_id=control_project.id,
+            version_number=1,
+            phase="build",
+            status="open",
+        )
+        reaper_db.add(control_version)
+        await reaper_db.commit()
+        await reaper_db.refresh(control_version)
+        control_audit = Task(
+            project_id=control_project.id,
+            title="Release audit: main...automain diff",
+            payloads=[{"type": "release_audit", "base_branch": "main"}],
+            vm_instance_id=None,
+            status=TaskStatus.FAILED,
+            context={"release_version_id": str(control_version.id)},
+        )
+        control_smoke = Task(
+            project_id=control_project.id,
+            title="Qualifier smoketest: automain candidate",
+            payloads=[{"type": "smoketest", "base_branch": "automain"}],
+            vm_instance_id=None,
+            status=TaskStatus.FAILED,
+            context={
+                "release_version_id": str(control_version.id),
+                "qualifier_smoketest": True,
+            },
+        )
+        reaper_db.add(control_audit)
+        reaper_db.add(control_smoke)
+        await reaper_db.commit()
+        await reaper_db.refresh(control_audit)
+        await reaper_db.refresh(control_smoke)
+        control_version.last_qualification = {
+            "status": "pending",
+            "candidate_sha": "ef01" * 10,
+            "ci_green": False,
+            "started_at": _now_for_seed().isoformat(),
+            "audit_task_id": str(control_audit.id),
+            "smoketest_task_id": str(control_smoke.id),
+        }
+        reaper_db.add(control_version)
+        await reaper_db.commit()
+
         await _run_reaper_once()
         await reaper_db.refresh(version)
+        await reaper_db.refresh(control_version)
 
         # One child still non-terminal — the version stays 'pending'.
         assert version.last_qualification is not None
         assert version.last_qualification.get("status") == "pending", (
             "Step 9 must not finalize while a qualifier child is non-terminal"
         )
+        # Positive control: both-children-terminal version WAS finalized in the
+        # same cycle — proves the skip above is a deliberate decision by a
+        # working sweep, not the side effect of a silently-broken finalize.
+        assert control_version.last_qualification is not None
+        assert control_version.last_qualification.get("status") == "not_promoted", (
+            "Step 9 sweep must finalize a both-children-terminal version — if "
+            "this fails the sweep's finalize path is broken and the "
+            "running-child 'stays pending' assertion proves nothing"
+        )
+        assert control_version.phase == "stabilize"
+    finally:
+        if _original_promotion is None:
+            shared_state.runtime_config.pop("promotion_enabled", None)
+        else:
+            shared_state.runtime_config["promotion_enabled"] = _original_promotion
+
+
+@pytest.mark.asyncio
+async def test_step9_sweep_times_out_qualification_with_unparseable_started_at(
+    reaper_db, stop_after_one_cycle, reaper_side_effects
+):
+    """Audit R4-H5: the reaper's Step 9 sweep must STILL force-finalize a
+    qualification that is past the timeout when its started_at is corrupt /
+    unparseable — the timeout backstop falls back to version.updated_at as the
+    clock.  A bad started_at string must never wedge a qualification forever.
+
+    Seeds a pending qualification with a hung (IN_PROGRESS) child, a corrupt
+    started_at, and an updated_at forced far into the past so the fallback
+    clock exceeds the qualification timeout.  After one reaper cycle the
+    version is force-finalized as a qualification_timeout.
+    """
+    from datetime import timedelta
+
+    from app import release_qualifier as _rq
+    from app import shared_state
+    from app.time_utils import _utcnow
+
+    _original_promotion = shared_state.runtime_config.get("promotion_enabled")
+    shared_state.runtime_config["promotion_enabled"] = False
+    try:
+        project = await _make_project(reaper_db)
+
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="stabilize",
+            status="open",
+        )
+        reaper_db.add(version)
+        await reaper_db.commit()
+        await reaper_db.refresh(version)
+
+        # Audit COMPLETED, smoketest hung IN_PROGRESS — without the timeout
+        # this would never finalize.
+        audit_task = Task(
+            project_id=project.id,
+            title="Release audit: main...automain diff",
+            payloads=[{"type": "release_audit", "base_branch": "main"}],
+            vm_instance_id=None,
+            status=TaskStatus.FAILED,
+            context={"release_version_id": str(version.id)},
+        )
+        smoke_task = Task(
+            project_id=project.id,
+            title="Qualifier smoketest: automain candidate",
+            payloads=[{"type": "smoketest", "base_branch": "automain"}],
+            vm_instance_id=None,
+            status=TaskStatus.IN_PROGRESS,  # hung — never reaches terminal
+            context={
+                "release_version_id": str(version.id),
+                "qualifier_smoketest": True,
+            },
+        )
+        reaper_db.add(audit_task)
+        reaper_db.add(smoke_task)
+        await reaper_db.commit()
+        await reaper_db.refresh(audit_task)
+        await reaper_db.refresh(smoke_task)
+
+        # CORRUPT started_at — _parse_started_at returns None for this.
+        version.last_qualification = {
+            "status": "pending",
+            "candidate_sha": "abcd" * 10,
+            "ci_green": False,
+            "started_at": "this-is-not-a-timestamp",
+            "audit_task_id": str(audit_task.id),
+            "smoketest_task_id": str(smoke_task.id),
+        }
+        reaper_db.add(version)
+        await reaper_db.commit()
+
+        # Force updated_at far into the past (bypassing the onupdate hook) so
+        # the timeout's updated_at fallback clock exceeds the limit.
+        from sqlalchemy import update as _sa_update
+
+        old_ts = _utcnow() - timedelta(
+            seconds=_rq._MAX_QUALIFICATION_DURATION_SECONDS + 3600
+        )
+        await reaper_db.execute(
+            _sa_update(ReleaseVersion)
+            .where(ReleaseVersion.id == version.id)
+            .values(updated_at=old_ts)
+        )
+        await reaper_db.commit()
+
+        await _run_reaper_once()
+        await reaper_db.refresh(version)
+
+        # The timeout backstop fired via the updated_at fallback, even though
+        # started_at was unparseable.
+        assert version.last_qualification is not None
+        assert version.last_qualification.get("status") == "not_promoted", (
+            "Step 9 timeout must force-finalize a pending qualification with "
+            "an unparseable started_at — falling back to updated_at"
+        )
+        assert (
+            version.last_qualification.get("blocker") == "qualification_timeout"
+        )
+        assert version.phase == "stabilize"
+        assert version.status == "open"
     finally:
         if _original_promotion is None:
             shared_state.runtime_config.pop("promotion_enabled", None)

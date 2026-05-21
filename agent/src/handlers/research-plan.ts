@@ -2346,7 +2346,7 @@ ${analysisText.slice(0, 50_000)}
 
 # Instructions
 
-1. **Problem model (REQUIRED).** Primary path: pass \`"$(cat /tmp/problem_model_${taskId}.json)"\` to \`./strategic set-problem-model\`. Don't summarize or re-emit — read-and-pass.
+1. **Problem model (REQUIRED).** First do step 5 below: if the Thinker emitted \`version_phase_decision\` and/or \`qualify_request\`, edit \`/tmp/problem_model_${taskId}.json\` IN PLACE to add those top-level sibling fields. Then pass \`"$(cat /tmp/problem_model_${taskId}.json)"\` to \`./strategic set-problem-model\` — the \`cat\` re-reads the file, so the sibling fields you added in step 5 are included. Don't summarize or re-emit the model's own content — read-and-pass; the only edit permitted is step 5's sibling fields.
 
    Fallback (use judgment): if the file is missing, empty, or the JSON is malformed, you may construct a corrected problem_model yourself — but ground it STRICTLY in the thinker's analysis below (Sections 1-6) and in the project described by CLAUDE.md. Verify findings against the analysis before writing. If even the analysis is insufficient, call \`./strategic pending-confirm\` with type "major_decision" to surface the gap rather than ship bad state. NEVER describe this execution environment, this prompt, your role, or the ./strategic / ./design-doc commands — the problem_model describes the managed project from CLAUDE.md.
 
@@ -2371,13 +2371,15 @@ ${analysisText.slice(0, 50_000)}
 
 4. **Retired-direction critique (REQUIRED).** From Section 3.5, call \`./strategic set-retirement-critiques\` with a JSON array of critique objects. If the Thinker wrote "No eligible retirements", pass \`'{"no_eligible_retirements": true}'\`. Never skip this call.
 
-5. **Version phase decision (conditional).** If the Thinker's analysis includes a \`version_phase_decision\` field (look in Section 6 and throughout the analysis), extract it and embed it as a top-level sibling in the problem_model JSON before calling \`./strategic set-problem-model\`:
+5. **Version phase / qualify siblings (conditional — do this BEFORE step 1's \`set-problem-model\` call).** If the Thinker's analysis includes a \`version_phase_decision\` field (look in Section 6 and throughout the analysis), edit \`/tmp/problem_model_${taskId}.json\` IN PLACE to add it as a top-level sibling key, so the file becomes:
    \`{"version_phase_decision": {"phase": "build" or "stabilize", "reasoning": "..."}, ...rest_of_problem_model}\`
-   If the Thinker did NOT emit \`version_phase_decision\`, SKIP — do not fabricate one, and do not include the field. Absence means "no phase change this cycle."
+   If the Thinker did NOT emit \`version_phase_decision\`, SKIP — do not fabricate one, and do not add the field. Absence means "no phase change this cycle."
 
-   Likewise, if the Thinker's analysis includes a \`qualify_request\` field (look in Section 6 and throughout the analysis), extract it and embed it as a top-level sibling in the same problem_model JSON before calling \`./strategic set-problem-model\`:
+   Likewise, if the Thinker's analysis includes a \`qualify_request\` field (look in Section 6 and throughout the analysis), edit \`/tmp/problem_model_${taskId}.json\` IN PLACE to add it as a top-level sibling key too:
    \`{"qualify_request": {"reason": "..."}, ...rest_of_problem_model}\`
-   If the Thinker did NOT emit \`qualify_request\`, SKIP — do not fabricate one, and do not include the field. Absence means "do not qualify this cycle." \`version_phase_decision\` and \`qualify_request\` are independent siblings; embed whichever the Thinker emitted (either, both, or neither).
+   If the Thinker did NOT emit \`qualify_request\`, SKIP — do not fabricate one, and do not add the field. Absence means "do not qualify this cycle." \`version_phase_decision\` and \`qualify_request\` are independent siblings; add whichever the Thinker emitted (either, both, or neither).
+
+   Because step 1 passes \`"$(cat /tmp/problem_model_${taskId}.json)"\` to \`./strategic set-problem-model\`, editing the file here is what carries these siblings through — step 1 will re-read the file and the fields will be included. If the file is missing/malformed and you took step 1's fallback (constructing the model inline), include these siblings in that inline JSON instead.
 
 6. **Self-reflection (optional).** If Section 5 has non-empty content, emit via \`./strategic reflect\`. If the Thinker wrote nothing (or wrote "none" / "N/A" / empty), SKIP — do not fabricate.
 

@@ -31,6 +31,19 @@ Two-phase flow:
       into ``main`` and merges it.  Promotes the EXACT qualified commit, so
       ``automain`` advancing during qualification is harmless.
 
+Session ownership (the merge→main transaction boundary).  ``promote()`` merges
+to production ``main``; it MUST never commit a caller's unrelated transaction.
+``maybe_finalize_qualification`` therefore opens its OWN dedicated session (via
+``AsyncSessionLocal``) for the whole finalize→promote chain — fully decoupled
+from whatever session the task-completion handler / reaper passed.  Inside that
+dedicated session ``promote()``'s intermediate ``commit()`` (which releases the
+row lock before the 30-120s of GitHub I/O) only ever flushes qualifier state,
+because the dedicated session has nothing else dirty.  A fresh session also
+cannot self-deadlock: the completion handler holds a lock on the *Task* row, not
+the ``ReleaseVersion`` row, and the reaper sweep takes no lock on the version
+before delegating — so the dedicated session's ``SELECT ... FOR UPDATE`` on the
+version row can never wait on a lock the caller still holds.
+
 Hard blockers (CI red, smoketest startup-suite failure when the subsystem is
 enabled, any deleted test file) force confidence to 0.0 — those candidates
 never promote regardless of the other sub-scores.  When the smoketest
@@ -54,11 +67,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func as sa_func
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
 from app import github, release_version
+from app.database import AsyncSessionLocal
 from app.models import (
     Alert,
     AlertSeverity,
@@ -249,6 +264,46 @@ async def _qualification_in_flight(
             return True
     # status == "pending" but every child already terminated → not in flight.
     return False
+
+
+async def _increment_qualification_attempts(
+    session: AsyncSession,
+    version_id: uuid.UUID,
+) -> None:
+    """Atomically bump ``qualification_attempts`` on a ReleaseVersion row.
+
+    Audit R4 MEDIUM — the ``no_credentials`` / ``sha_error`` early-return
+    paths in ``run_qualification`` run BEFORE the ``ReleaseVersion`` FOR UPDATE
+    lock is taken, so a read-modify-write
+    (``version.qualification_attempts = (version.qualification_attempts or 0) + 1``)
+    is vulnerable to a lost update: two concurrent callers (strategic
+    ``qualify_request`` + admin ``POST /qualify``) both read the same value and
+    write back the same ``+1``.
+
+    This issues a single atomic SQL ``UPDATE ... SET qualification_attempts =
+    qualification_attempts + 1`` — the increment happens in the database
+    relative to the row's current value, so concurrent callers can never lose
+    an increment.  ``COALESCE`` is used so a (defensively) NULL counter still
+    increments cleanly to 1.  Dialect-agnostic: works on both Postgres and the
+    SQLite test fixtures.
+
+    The caller's later ``session.commit()`` persists this; the in-memory
+    instance's ``qualification_attempts`` attribute is expired by the
+    ``update()`` statement's session synchronization and lazily reloads on next
+    access (the early-return callers do not read it back).
+    """
+    await session.execute(
+        update(release_version.ReleaseVersion)
+        .where(release_version.ReleaseVersion.id == version_id)
+        .values(
+            qualification_attempts=(
+                sa_func.coalesce(
+                    release_version.ReleaseVersion.qualification_attempts, 0
+                )
+                + 1
+            )
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -502,14 +557,19 @@ async def run_qualification(
         fresh qualification is allowed.
 
     Concurrency (audit C3): two callers can race here — the strategic
-    ``qualify_request`` path (holds the Project row lock) and the admin
-    ``POST /qualify`` endpoint (holds no lock).  Both would otherwise pass the
-    in-flight guard and each spawn an audit+smoketest pair (4 children, one
-    orphaned pair) and clobber each other's ``last_qualification`` write.  To
-    serialize them this function takes ``SELECT ... FOR UPDATE`` on the
-    ``ReleaseVersion`` row and holds it across the in-flight check, the child
-    spawns, and the ``last_qualification`` write.  The GitHub I/O that resolves
-    ``candidate_sha`` runs BEFORE the lock to keep the locked window short.
+    ``qualify_request`` path and the admin ``POST /qualify`` endpoint.  Neither
+    caller holds a lock that serializes THIS function: the strategic path holds
+    the *Project* row lock (``lock_project_then_task`` in the post-commit
+    chain) but that does NOT cover the ``ReleaseVersion`` row, and the admin
+    endpoint holds no lock at all.  Without serialization both callers would
+    pass the in-flight guard and each spawn an audit+smoketest pair (4
+    children, one orphaned pair) and clobber each other's
+    ``last_qualification`` write.  So this function takes its OWN
+    ``SELECT ... FOR UPDATE`` on the ``ReleaseVersion`` row and holds it across
+    the in-flight check, the child spawns, and the ``last_qualification``
+    write — that ReleaseVersion lock (not the strategic path's Project lock) is
+    what serializes the race.  The GitHub I/O that resolves ``candidate_sha``
+    runs BEFORE the lock to keep the locked window short.
 
     Steps (none of which block on the spawned children):
       1. Resolve the project's owner/repo/GitHub token.
@@ -579,9 +639,15 @@ async def run_qualification(
             "error": "no_credentials",
             "started_at": _utcnow().isoformat(),
         }
-        version.qualification_attempts = (version.qualification_attempts or 0) + 1
         flag_modified(version, "last_qualification")
         session.add(version)
+        # Audit R4 MEDIUM: increment the counter with an atomic SQL UPDATE
+        # rather than a read-modify-write.  This early-return path runs BEFORE
+        # the ReleaseVersion FOR UPDATE lock, so two concurrent callers
+        # (strategic qualify_request + admin POST /qualify) could otherwise
+        # both read the same attempts value and write back the same +1,
+        # losing one increment.
+        await _increment_qualification_attempts(session, version.id)
         return {"status": "no_credentials"}
     token, owner, repo = resolved
 
@@ -603,9 +669,12 @@ async def run_qualification(
             "detail": str(exc)[:300],
             "started_at": _utcnow().isoformat(),
         }
-        version.qualification_attempts = (version.qualification_attempts or 0) + 1
         flag_modified(version, "last_qualification")
         session.add(version)
+        # Audit R4 MEDIUM: atomic SQL increment — see the no_credentials path
+        # above.  This early return is also pre-lock, so a read-modify-write
+        # would be vulnerable to a lost update under concurrent callers.
+        await _increment_qualification_attempts(session, version.id)
         return {"status": "sha_error"}
 
     # 3. CI check on the candidate SHA (cheap, orchestrator-side).  Also done
@@ -747,6 +816,11 @@ async def run_qualification(
             "ci_green": ci_green,
             "started_at": started_at,
         }
+        # Read-modify-write is safe here (unlike the no_credentials / sha_error
+        # early returns, which run pre-lock and use the atomic
+        # _increment_qualification_attempts): this site runs UNDER the
+        # ReleaseVersion FOR UPDATE row lock taken above, so no concurrent
+        # caller can interleave a lost update.
         version.qualification_attempts = (version.qualification_attempts or 0) + 1
         flag_modified(version, "last_qualification")
         session.add(version)
@@ -765,6 +839,11 @@ async def run_qualification(
         "audit_task_id": audit_task_id,
         "smoketest_task_id": smoketest_task_id,
     }
+    # Read-modify-write is safe here (unlike the no_credentials / sha_error
+    # early returns, which run pre-lock and use the atomic
+    # _increment_qualification_attempts): this site runs UNDER the
+    # ReleaseVersion FOR UPDATE row lock taken above, so no concurrent caller
+    # can interleave a lost update.
     version.qualification_attempts = (version.qualification_attempts or 0) + 1
     flag_modified(version, "last_qualification")
     session.add(version)
@@ -1107,7 +1186,11 @@ async def _finalize_qualification(
     ``compute_composite`` renormalizes the audit + test-erosion weights with no
     smoketest hard blocker.
 
-    The caller commits the session.  Returns a result dict.
+    Runs on whatever ``session`` it is given and does NOT commit it (the
+    non-promote paths just mutate ``version.last_qualification``); the promote
+    path delegates to ``promote()``, which issues its own intermediate commit.
+    The caller (``_finalize_in_dedicated_session``) commits the dedicated
+    session afterwards.  Returns a result dict.
     """
     qual = dict(version.last_qualification or {})
     candidate_sha = qual.get("candidate_sha")
@@ -1260,26 +1343,11 @@ async def _finalize_qualification(
         session.add(version)
         return {"status": "error", "error": "missing_candidate_sha"}
 
-    # Resolve credentials now so promote() can pass them to _record_promotion_success
-    # for tagging.  promote() would resolve them itself if omitted, but resolving here
-    # avoids a second round-trip and lets the tag share the same token.
-    project = await session.get(Project, version.project_id)
-    resolved_creds: tuple[str, str, str] | None = None
-    if project is not None:
-        resolved_creds = await _resolve_github_with_session(session, project)
-
-    if resolved_creds is not None:
-        _token, _owner, _repo = resolved_creds
-        return await promote(
-            session,
-            version,
-            candidate_sha,
-            composite=composite,
-            base_record=base_record,
-            token=_token,
-            owner=_owner,
-            repo=_repo,
-        )
+    # Delegate to promote().  Credentials are NOT pre-resolved here on purpose
+    # (concern 2): credential resolution is GitHub I/O, and at this point the
+    # dedicated session still holds the ReleaseVersion FOR UPDATE lock.
+    # promote() releases that lock via its intermediate commit and then resolves
+    # the token unlocked — so no GitHub round-trip ever runs under the row lock.
     return await promote(
         session,
         version,
@@ -1294,9 +1362,282 @@ async def _finalize_qualification(
 # ---------------------------------------------------------------------------
 
 
-async def maybe_finalize_qualification(
+async def _required_children_terminal(
     session: AsyncSession,
+    version: release_version.ReleaseVersion,
+) -> bool:
+    """Return True iff every required qualifier child of ``version`` is terminal.
+
+    The audit child is always required; the qualifier-smoketest child is
+    required only when the qualifying run had the smoketest subsystem enabled
+    (audit H3) — legacy records that predate the ``smoketest_enabled`` flag
+    default to "required".  Returns False (not ready) when a required child id
+    is missing/unparseable, the row is not yet persisted, or any required child
+    is still non-terminal — i.e. a conservative "not ready to finalize" answer.
+    """
+    qual = version.last_qualification or {}
+    smoketest_required = bool(qual.get("smoketest_enabled", True))
+    audit_task_id_raw = qual.get("audit_task_id")
+    smoketest_task_id_raw = qual.get("smoketest_task_id")
+
+    if not audit_task_id_raw or (smoketest_required and not smoketest_task_id_raw):
+        logger.warning(
+            "[RELEASE_QUALIFIER] finalize-gate: version v%d has pending "
+            "qualification but missing required child task ids "
+            "(audit=%r smoke=%r smoketest_required=%s) — not ready",
+            version.version_number,
+            audit_task_id_raw,
+            smoketest_task_id_raw,
+            smoketest_required,
+        )
+        return False
+
+    try:
+        audit_task_id = uuid.UUID(str(audit_task_id_raw))
+        smoketest_task_id = (
+            uuid.UUID(str(smoketest_task_id_raw))
+            if smoketest_required and smoketest_task_id_raw
+            else None
+        )
+    except (ValueError, AttributeError):
+        logger.warning(
+            "[RELEASE_QUALIFIER] finalize-gate: version v%d has unparseable "
+            "child task ids (%r, %r) — not ready",
+            version.version_number,
+            audit_task_id_raw,
+            smoketest_task_id_raw,
+        )
+        return False
+
+    audit_task: Task | None = await session.get(Task, audit_task_id)
+    smoketest_task: Task | None = (
+        await session.get(Task, smoketest_task_id)
+        if smoketest_task_id is not None
+        else None
+    )
+
+    if audit_task is None or (smoketest_required and smoketest_task is None):
+        logger.debug(
+            "[RELEASE_QUALIFIER] finalize-gate: version v%d required child "
+            "tasks not yet persisted — not ready",
+            version.version_number,
+        )
+        return False
+
+    if audit_task.status not in _TERMINAL_STATUSES or (
+        smoketest_required
+        and smoketest_task is not None
+        and smoketest_task.status not in _TERMINAL_STATUSES
+    ):
+        # A required child is still running — not time to finalize yet.
+        return False
+
+    logger.info(
+        "[RELEASE_QUALIFIER] finalize-gate: required children terminal for "
+        "version v%d (audit=%s/%s smoke=%s)",
+        version.version_number,
+        audit_task.id,
+        audit_task.status,
+        f"{smoketest_task.id}/{smoketest_task.status}"
+        if smoketest_task is not None
+        else "disabled",
+    )
+    return True
+
+
+async def _finalize_in_dedicated_session(
+    version_id: uuid.UUID,
+    *,
+    session_factory=None,
+    timeout_now: datetime | None = None,
+) -> dict[str, Any] | None:
+    """Run the finalize→promote chain for ``version_id`` on a DEDICATED session.
+
+    This is the single chokepoint through which BOTH the task-completion path
+    (``maybe_finalize_qualification``) and the reaper sweep
+    (``sweep_stuck_qualifications``) reach ``_finalize_qualification`` /
+    ``promote()``.
+
+    **Why a dedicated session.**  ``promote()`` merges to production ``main``
+    and issues an intermediate ``session.commit()`` to release the
+    ``ReleaseVersion`` row lock before its 30-120s of GitHub I/O.  If that
+    commit ran on a caller's session it would prematurely commit the caller's
+    UNRELATED dirty work (a completed task's terminal status, its TaskHistory /
+    Artifacts / remediation+regression records) — destroying the completion
+    handler's atomicity.  So this function opens its OWN session via
+    ``AsyncSessionLocal``; the finalize chain has nothing else dirty in it, so
+    ``promote()``'s commit only ever flushes qualifier state.  ``session_factory``
+    is injectable for tests (defaults to ``AsyncSessionLocal``).
+
+    **Why it cannot self-deadlock.**  The dedicated session takes
+    ``SELECT ... FOR UPDATE`` on the ``ReleaseVersion`` row.  The
+    task-completion caller holds a lock on the *Task* row, not the
+    ``ReleaseVersion`` row; the reaper sweep takes NO lock on the version row
+    before calling here.  So a fresh session can never block on a version-row
+    lock held by the same logical caller — concern (c).
+
+    **Why concurrent calls cannot double-promote (concern d).**  This function
+    ``SELECT ... FOR UPDATE``-locks the version row at the very top and holds it
+    across the readiness check and the decision.  For the NON-promote outcomes
+    (``dry_run`` / ``not_promoted``) the lock is held until commit, so a second
+    concurrent call blocks until the first commits, then re-reads
+    ``last_qualification.status``, sees it is no longer ``"pending"``, and bails
+    at the pending guard — the pending guard alone serializes those paths.
+
+    The PROMOTE path is different and the pending guard is NOT what protects it:
+    ``promote()`` issues an intermediate ``commit()`` that releases this row
+    lock BEFORE its 30-120s of GitHub I/O, and at that commit
+    ``last_qualification.status`` is still ``"pending"`` (it is only moved to
+    ``promoted`` / ``promotion_failed`` at the very end).  So a genuinely
+    concurrent second caller can acquire the freed lock, pass the pending guard,
+    and enter its own ``promote()``.  What actually serializes two overlapping
+    promotions is the idempotency machinery (``_candidate_already_on_main`` /
+    ``_promotion_pr_landed`` — an already-landed candidate routes straight to
+    success without a second merge) PLUS the ``version.status != "open"``
+    re-check that BOTH ``_record_promotion_success`` and
+    ``_record_promotion_failure`` perform under the re-lock before the final
+    state write (the loser sees ``status="promoted"`` and bails as
+    already-promoted, opening no duplicate vN+1 and writing no contradictory
+    ``last_qualification``).
+
+    Returns the ``_finalize_qualification`` / ``_force_finalize_*`` result dict
+    when a finalize ran, or ``None`` when the version was not ready / already
+    finalized / gone.
+
+    ``timeout_now`` — when set (the reaper sweep passes ``_utcnow()``), the
+    age-bound qualification-timeout backstop (audit H2) is evaluated under the
+    lock and takes priority over the children-terminal path.  When ``None``
+    (the normal task-completion path) only the children-terminal path applies.
+    """
+    factory = session_factory or AsyncSessionLocal
+    async with factory() as session:
+        try:
+            return await _finalize_locked_version(
+                session, version_id, timeout_now
+            )
+        except Exception:
+            # Roll back this dedicated session's partial work before unwinding.
+            # In production each dedicated session is independent and the
+            # ``async with`` __aexit__ would roll back anyway; the explicit
+            # rollback makes the contract obvious and leaves the session clean
+            # for any caller (e.g. the sweep) that reuses the same factory for
+            # the next version.
+            try:
+                await session.rollback()
+            except Exception:
+                logger.exception(
+                    "[RELEASE_QUALIFIER] finalize: rollback failed for "
+                    "version %s",
+                    version_id,
+                )
+            raise
+
+
+async def _finalize_locked_version(
+    session: AsyncSession,
+    version_id: uuid.UUID,
+    timeout_now: datetime | None,
+) -> dict[str, Any] | None:
+    """Lock + finalize one version within an already-open dedicated session.
+
+    The body of ``_finalize_in_dedicated_session`` (which owns the session and
+    its rollback-on-error contract).  Split out so the locking + decision logic
+    reads as a flat sequence.  Commits the dedicated session on every path that
+    actually wrote something; returns ``None`` for the read-only no-op paths.
+    """
+    # Lock the version row — the single serialization point for the whole
+    # finalize→promote critical section (concern d).
+    version: release_version.ReleaseVersion | None = (
+        await session.execute(
+            select(release_version.ReleaseVersion)
+            .where(release_version.ReleaseVersion.id == version_id)
+            .with_for_update()
+        )
+    ).scalars().first()
+
+    if version is None:
+        logger.debug(
+            "[RELEASE_QUALIFIER] finalize: version %s not found — skipping",
+            version_id,
+        )
+        return None
+
+    # Defensive (audit R4 MEDIUM): only an ``open`` version can be
+    # mid-qualification — a ``promoted`` / ``abandoned`` version is terminal.
+    # Checked under the FOR UPDATE lock, so authoritative.
+    if version.status != "open":
+        logger.info(
+            "[RELEASE_QUALIFIER] finalize: version v%d is status=%s (not "
+            "open) — skipping finalize",
+            version.version_number,
+            version.status,
+        )
+        return None
+
+    qual = version.last_qualification or {}
+    if qual.get("status") != "pending":
+        # Not yet started, or already finalized (possibly by the call that held
+        # this lock just before us) — idempotent no-op.  For the non-promote
+        # outcomes (dry_run / not_promoted) this guard fully serializes
+        # concurrent finalize calls: the loser blocked on the row lock and sees
+        # the winner's non-pending status here.  It does NOT cover an
+        # overlapping promote — promote() commits with the status still
+        # "pending", so a concurrent caller can pass this guard mid-promotion;
+        # the promote path is instead serialized by the idempotency checks +
+        # the status!="open" re-check in _record_promotion_{success,failure}
+        # (see this module's _finalize_locked_version docstring).
+        return None
+
+    # --- Path 1: age-bound qualification timeout (reaper sweep only) --------
+    # Checked first and child-state-independent (audit H2).
+    if timeout_now is not None:
+        started_at = _parse_started_at(qual)
+        timeout_clock = started_at
+        if timeout_clock is None:
+            # updated_at is non-null + onupdate-stamped; the others are further
+            # fallbacks.  A corrupt started_at must never defeat the backstop
+            # (audit R4-H5).
+            timeout_clock = (
+                version.updated_at
+                or version.phase_changed_at
+                or version.opened_at
+            )
+            if timeout_clock is not None:
+                logger.warning(
+                    "[RELEASE_QUALIFIER] finalize: version v%d has a "
+                    "missing/unparseable started_at (%r) — using updated_at "
+                    "as the timeout clock so the backstop still fires",
+                    version.version_number,
+                    qual.get("started_at"),
+                )
+        if timeout_clock is not None:
+            age_seconds = (timeout_now - timeout_clock).total_seconds()
+            if age_seconds > _MAX_QUALIFICATION_DURATION_SECONDS:
+                await _force_finalize_timed_out_qualification(
+                    session, version, age_seconds
+                )
+                await session.commit()
+                return {
+                    "status": "not_promoted",
+                    "blocker": "qualification_timeout",
+                }
+
+    # --- Path 2: all required children terminal -----------------------------
+    if not await _required_children_terminal(session, version):
+        return None
+
+    # Finalize on the dedicated session.  _finalize_qualification may call
+    # promote(), whose intermediate commit + re-lock are now safe: this session
+    # holds only qualifier state.
+    result = await _finalize_qualification(session, version)
+    await session.commit()
+    return result
+
+
+async def maybe_finalize_qualification(
     completed_task: Task,
+    *,
+    session_factory=None,
 ) -> dict[str, Any] | None:
     """Called from a task-completion handler whenever ANY task terminates.
 
@@ -1306,46 +1647,60 @@ async def maybe_finalize_qualification(
 
     Fast path: if ``completed_task.context`` has no ``release_version_id``,
     return ``None`` immediately.  The overwhelming majority of tasks are not
-    qualifier children and this must be a cheap no-op.
+    qualifier children and this must be a cheap O(1) no-op — it does no I/O and
+    opens no session.
 
-    When a ``release_version_id`` is present:
+    When a ``release_version_id`` is present, this delegates to
+    ``_finalize_in_dedicated_session``, which:
 
-    1. Load the ``ReleaseVersion`` with ``SELECT ... FOR UPDATE``.  This lock
-       is the critical race guard: the ``release_audit`` and qualifier
-       ``smoketest`` children can terminate near-simultaneously, and without
-       it two concurrent completion handlers could both finalize → a double
-       promotion.
+      1. Opens its OWN dedicated DB session (``AsyncSessionLocal``) — fully
+         decoupled from the caller's session.  This is the fix for the
+         transaction-coupling defect: ``promote()``'s intermediate
+         ``session.commit()`` (which releases the row lock before its GitHub
+         I/O) would otherwise commit the completion handler's unrelated dirty
+         work (the completed task's terminal status, TaskHistory, Artifacts,
+         remediation/regression records).  On the dedicated session that
+         commit only ever flushes qualifier state.
 
-    2. If the version is None, or
-       ``version.last_qualification.get("status") != "pending"``, return
-       ``None``.  The version was already finalized (or was never mid-
-       qualification).  The lock + this guard make a second call a safe no-op
-       (idempotent).
+      2. Takes ``SELECT ... FOR UPDATE`` on the ``ReleaseVersion`` row — the
+         serialization point for the non-promote paths.  The ``release_audit``
+         and qualifier ``smoketest`` children can terminate
+         near-simultaneously, and a reaper sweep can run concurrently; for a
+         ``dry_run`` / ``not_promoted`` outcome the lock makes a second finalize
+         attempt block until the first commits, then bail at the pending guard.
+         A PROMOTE is the exception: ``promote()`` releases this lock via an
+         intermediate commit (with the status still ``"pending"``) before its
+         GitHub I/O, so a concurrent caller can pass the pending guard
+         mid-promotion — overlapping promotions are instead serialized by the
+         idempotency checks plus the ``status != "open"`` re-check in
+         ``_record_promotion_success`` / ``_record_promotion_failure``.  A
+         fresh session cannot self-deadlock: the caller holds the *Task* row
+         lock, not this ``ReleaseVersion`` row lock.
 
-    3. Read ``audit_task_id`` and ``smoketest_task_id`` from
-       ``version.last_qualification``.  Load the recorded ``Task`` rows.  The
-       qualifier-smoketest child is optional (audit H3): when the qualifying
-       run recorded ``smoketest_enabled == False`` there is no smoketest child
-       and only the audit child gates finalization.  If a required child is
-       missing or has not yet reached a terminal state (``COMPLETED``,
-       ``FAILED``, ``CANCELLED``), return ``None`` — a child is still running.
+      3. No-ops when the version is gone, not ``open``, or no longer
+         ``last_qualification.status == "pending"`` (idempotent), or when a
+         required qualifier child is still non-terminal.
 
-    4. When all required children are terminal, delegate to
-       ``_finalize_qualification(session, version)`` and return its result.
+      4. Otherwise runs ``_finalize_qualification`` (→ ``promote()`` when the
+         composite clears + ``promotion_enabled``) and commits the dedicated
+         session.
 
-    The caller is responsible for committing the session.
+    The caller's session is NEVER touched — neither read nor committed.
+    ``session_factory`` is injectable for tests (defaults to
+    ``AsyncSessionLocal``).
 
-    Returns ``None`` when this task is not a qualifier child, when the
-    sibling is still running, or when the version is already finalized.
-    Returns the ``_finalize_qualification`` result dict when finalization runs.
+    Returns ``None`` when this task is not a qualifier child, when a sibling is
+    still running, or when the version is already finalized.  Returns the
+    ``_finalize_qualification`` result dict when finalization runs.
     """
     context = completed_task.context or {}
     version_id_raw = context.get("release_version_id")
     if not version_id_raw:
-        # Fast path — not a qualifier child.  Must be O(1).
+        # Fast path — not a qualifier child.  Must be O(1): no session, no I/O.
         return None
 
-    # Parse the version id.
+    # Parse the version id (a stable identifier — captured before any session
+    # is opened so the dedicated session re-loads it under its own lock).
     try:
         version_id = uuid.UUID(str(version_id_raw))
     except (ValueError, AttributeError):
@@ -1357,101 +1712,9 @@ async def maybe_finalize_qualification(
         )
         return None
 
-    # 1. Lock the version row to prevent a double-finalize race.
-    version: release_version.ReleaseVersion | None = (
-        await session.execute(
-            select(release_version.ReleaseVersion)
-            .where(release_version.ReleaseVersion.id == version_id)
-            .with_for_update()
-        )
-    ).scalars().first()
-
-    # 2. Guard: already finalized or never mid-qualification.
-    if version is None:
-        logger.debug(
-            "[RELEASE_QUALIFIER] maybe_finalize_qualification: version %s "
-            "not found — skipping",
-            version_id,
-        )
-        return None
-
-    qual = version.last_qualification or {}
-    if qual.get("status") != "pending":
-        # Either not yet started, or already finalized — idempotent no-op.
-        return None
-
-    # 3. Check that all required children are terminal.  The audit child is
-    #    always required; the qualifier-smoketest child is required only when
-    #    the qualifying run had the smoketest subsystem enabled (audit H3) —
-    #    legacy records that predate the flag default to "required".
-    smoketest_required = bool(qual.get("smoketest_enabled", True))
-    audit_task_id_raw = qual.get("audit_task_id")
-    smoketest_task_id_raw = qual.get("smoketest_task_id")
-
-    if not audit_task_id_raw or (smoketest_required and not smoketest_task_id_raw):
-        logger.warning(
-            "[RELEASE_QUALIFIER] maybe_finalize_qualification: version v%d "
-            "has pending qualification but missing required child task ids "
-            "(audit=%r smoke=%r smoketest_required=%s) — skipping",
-            version.version_number,
-            audit_task_id_raw,
-            smoketest_task_id_raw,
-            smoketest_required,
-        )
-        return None
-
-    try:
-        audit_task_id = uuid.UUID(str(audit_task_id_raw))
-        smoketest_task_id = (
-            uuid.UUID(str(smoketest_task_id_raw))
-            if smoketest_required and smoketest_task_id_raw
-            else None
-        )
-    except (ValueError, AttributeError):
-        logger.warning(
-            "[RELEASE_QUALIFIER] maybe_finalize_qualification: version v%d "
-            "has unparseable child task ids (%r, %r) — skipping",
-            version.version_number,
-            audit_task_id_raw,
-            smoketest_task_id_raw,
-        )
-        return None
-
-    audit_task: Task | None = await session.get(Task, audit_task_id)
-    smoketest_task: Task | None = (
-        await session.get(Task, smoketest_task_id)
-        if smoketest_task_id is not None
-        else None
+    return await _finalize_in_dedicated_session(
+        version_id, session_factory=session_factory
     )
-
-    if audit_task is None or (smoketest_required and smoketest_task is None):
-        logger.debug(
-            "[RELEASE_QUALIFIER] maybe_finalize_qualification: version v%d "
-            "required child tasks not yet persisted — skipping",
-            version.version_number,
-        )
-        return None
-
-    if audit_task.status not in _TERMINAL_STATUSES or (
-        smoketest_required
-        and smoketest_task is not None
-        and smoketest_task.status not in _TERMINAL_STATUSES
-    ):
-        # A required child is still running — not time to finalize yet.
-        return None
-
-    # 4. All required children are terminal — finalize.
-    logger.info(
-        "[RELEASE_QUALIFIER] maybe_finalize_qualification: required children "
-        "terminal for version v%d (audit=%s/%s smoke=%s) — finalizing",
-        version.version_number,
-        audit_task.id,
-        audit_task.status,
-        f"{smoketest_task.id}/{smoketest_task.status}"
-        if smoketest_task is not None
-        else "disabled",
-    )
-    return await _finalize_qualification(session, version)
 
 
 # ---------------------------------------------------------------------------
@@ -1463,8 +1726,14 @@ def _parse_started_at(qual: dict[str, Any]) -> datetime | None:
     """Parse ``last_qualification["started_at"]`` to a datetime, or None.
 
     ``started_at`` is an ISO-8601 string stamped by ``run_qualification``.
-    Returns None when it is missing or unparseable so the caller can decide
-    whether to treat the age as unknown (never time it out on a bad value).
+    Returns None when it is missing or unparseable.
+
+    Audit R4-H5: a None return must NOT defeat the qualification-timeout
+    backstop — ``_finalize_locked_version`` falls back to a real row timestamp
+    (``version.updated_at``) when this returns None, so a corrupt
+    ``started_at`` string can never wedge a qualification forever.  The
+    fallback lives in the caller (not here) because this helper has no access
+    to the ``ReleaseVersion`` row.
     """
     raw = qual.get("started_at")
     if not isinstance(raw, str) or not raw:
@@ -1547,7 +1816,11 @@ async def _force_finalize_timed_out_qualification(
     )
 
 
-async def sweep_stuck_qualifications(session: AsyncSession) -> int:
+async def sweep_stuck_qualifications(
+    session: AsyncSession,
+    *,
+    session_factory=None,
+) -> int:
     """Finalize qualifications stuck ``pending`` past the normal completion path.
 
     ``maybe_finalize_qualification`` is the normal path: a child terminating
@@ -1563,12 +1836,9 @@ async def sweep_stuck_qualifications(session: AsyncSession) -> int:
     handles two situations:
 
       * **Both required children terminal** (``COMPLETED`` / ``FAILED`` /
-        ``CANCELLED``) — drives the version through
-        ``maybe_finalize_qualification``, which re-checks every guard (row
-        lock, still-pending, children-terminal) and delegates to
-        ``_finalize_qualification``.  The qualifier-smoketest child is optional
-        (audit H3): when the qualifying run recorded ``smoketest_enabled ==
-        False`` only the audit child gates this branch.
+        ``CANCELLED``) — finalizes the version.  The qualifier-smoketest child
+        is optional (audit H3): when the qualifying run recorded
+        ``smoketest_enabled == False`` only the audit child gates this branch.
 
       * **Pending longer than ``_MAX_QUALIFICATION_DURATION_SECONDS``** (audit
         H2) — force-finalizes the qualification as blocked (blocker
@@ -1576,24 +1846,26 @@ async def sweep_stuck_qualifications(session: AsyncSession) -> int:
         Alert.  This is the escape hatch for a child that heartbeats-but-hangs
         and so never reaches a terminal state.
 
-    Audit H5: EACH version's finalize is wrapped in its own try/except and
-    followed by ``await session.commit()`` on success.  Without the per-version
-    commit, version B's iteration raising would unwind version A's already-
-    landed work — and when version A's finalize promoted (a real GitHub merge
-    landed on ``main``), the rolled-back ``status="promoted"`` + N+1 row would
-    leave the DB inconsistent with GitHub.  Committing after each successful
-    finalize makes a landed promotion durable before the next version is
-    touched.
+    **Per-version session isolation (replaces the old per-version commit —
+    audit H5).**  ``session`` is used ONLY for the read-only scan that lists the
+    candidate version ids; the sweep never writes through it.  Each version is
+    then finalized via ``_finalize_in_dedicated_session``, which opens its OWN
+    session, locks that one version, finalizes it, and commits — in complete
+    isolation.  A failure (or a real GitHub merge) on version B therefore
+    cannot roll back version A's already-committed finalization: they were
+    never in the same transaction.  This is strictly stronger than the old
+    "commit after each version on the shared session" pattern and removes the
+    shared-session rollback/expire bookkeeping entirely.
 
-    Idempotent and safe to call repeatedly: a version already finalized (or
-    not actually ready) is skipped by ``maybe_finalize_qualification``'s own
-    guards.  Returns the number of versions that were actually finalized this
-    sweep.
+    Idempotent and safe to call repeatedly: a version already finalized (or not
+    actually ready) is no-op'd by ``_finalize_in_dedicated_session``'s own
+    under-lock guards.  Returns the number of versions actually finalized.
     """
     # Only ``open`` versions can be mid-qualification — a promoted/abandoned
     # version is terminal.  This keeps the scan bounded (≈ one open version per
     # project) and avoids a JSONB-path WHERE clause that differs across the
-    # Postgres / SQLite-test dialects; the pending filter is applied in Python.
+    # Postgres / SQLite-test dialects; the pending filter is applied inside the
+    # per-version dedicated session under the row lock.
     open_versions = list(
         (
             await session.execute(
@@ -1605,57 +1877,31 @@ async def sweep_stuck_qualifications(session: AsyncSession) -> int:
         .scalars()
         .all()
     )
-    # Snapshot just the IDs up front (audit H5).  The per-version commit /
-    # rollback below expires every loaded instance, so iterating the ORM
-    # objects directly would trip a MissingGreenlet on a later version's
-    # expired-attribute access.  _sweep_one_version re-fetches each version
-    # under its own FOR UPDATE lock, so the id is all that is needed here.
+    # Snapshot just the IDs — each version is re-fetched under its own
+    # FOR UPDATE lock in its own dedicated session, so the id is all that is
+    # carried out of the scan.
     version_ids = [v.id for v in open_versions]
 
     now = _utcnow()
     finalized = 0
     for version_id in version_ids:
-        # Audit H5: each version's finalize is isolated in its own
-        # try/except + commit — a failure on one version must NOT roll back
-        # another version's already-committed finalization (a real GitHub
-        # merge may have landed for it).
+        # Each version finalizes in its own dedicated session (concern d + the
+        # audit-H5 isolation guarantee): a failure here is contained and cannot
+        # touch another version's already-committed work.
         try:
-            did_finalize = await _sweep_one_version(session, version_id, now)
+            result = await _finalize_in_dedicated_session(
+                version_id,
+                session_factory=session_factory,
+                timeout_now=now,
+            )
         except Exception:
             logger.exception(
                 "[RELEASE_QUALIFIER] sweep: failed to finalize stuck "
                 "qualification for version %s",
                 version_id,
             )
-            try:
-                await session.rollback()
-            except Exception:
-                logger.exception(
-                    "[RELEASE_QUALIFIER] sweep: rollback failed for version %s",
-                    version_id,
-                )
             continue
-
-        if did_finalize:
-            # Audit H5: commit this version's finalize before touching the
-            # next one, so a landed promotion is durable immediately.
-            try:
-                await session.commit()
-            except Exception:
-                logger.exception(
-                    "[RELEASE_QUALIFIER] sweep: commit failed after "
-                    "finalizing version %s",
-                    version_id,
-                )
-                try:
-                    await session.rollback()
-                except Exception:
-                    logger.exception(
-                        "[RELEASE_QUALIFIER] sweep: rollback failed for "
-                        "version %s",
-                        version_id,
-                    )
-                continue
+        if result is not None:
             finalized += 1
 
     if finalized:
@@ -1666,112 +1912,248 @@ async def sweep_stuck_qualifications(session: AsyncSession) -> int:
     return finalized
 
 
-async def _sweep_one_version(
-    session: AsyncSession,
-    version_id: uuid.UUID,
-    now: datetime,
-) -> bool:
-    """Finalize one stuck pending qualification.  Returns True iff it finalized.
-
-    Helper for ``sweep_stuck_qualifications`` — each call is wrapped by the
-    caller in its own try/except + commit (audit H5).  Two paths, in priority
-    order:
-
-      1. Age-bound timeout (audit H2): if the qualification has been pending
-         longer than ``_MAX_QUALIFICATION_DURATION_SECONDS``, force-finalize it
-         as a ``qualification_timeout`` blocker regardless of child state.
-      2. All required children terminal: drive it through
-         ``maybe_finalize_qualification``.
-
-    Takes ``SELECT ... FOR UPDATE`` on the version row up front so the
-    child-state-independent timeout path can't race a concurrent
-    ``maybe_finalize_qualification`` from a completion handler, and so the
-    qualification is re-read from authoritative locked state (a completion
-    handler may have finalized it since the caller's unlocked scan).  Path 2
-    calls ``maybe_finalize_qualification``, which re-locks the same row — a
-    no-op within this transaction since the lock is already held.
-    """
-    # Lock the version row (audit H2 race safety) and read its qualification
-    # from the locked instance.
-    version = (
-        await session.execute(
-            select(release_version.ReleaseVersion)
-            .where(release_version.ReleaseVersion.id == version_id)
-            .with_for_update()
-        )
-    ).scalars().first()
-    if version is None:
-        return False
-    qual = version.last_qualification or {}
-    if qual.get("status") != "pending":
-        # Not pending (never started, or already finalized under the lock by a
-        # completion handler) — nothing to do.
-        return False
-
-    # Path 1 — age-bound timeout (checked first, child-state-independent).
-    started_at = _parse_started_at(qual)
-    if started_at is not None:
-        age_seconds = (now - started_at).total_seconds()
-        if age_seconds > _MAX_QUALIFICATION_DURATION_SECONDS:
-            await _force_finalize_timed_out_qualification(
-                session, version, age_seconds
-            )
-            return True
-
-    # Path 2 — all required children terminal.  The audit child is always
-    # required; the qualifier-smoketest child is required only when the
-    # qualifying run had the smoketest subsystem enabled (audit H3) — legacy
-    # records that predate the flag default to "required".
-    smoketest_required = bool(qual.get("smoketest_enabled", True))
-    audit_id_raw = qual.get("audit_task_id")
-    smoke_id_raw = qual.get("smoketest_task_id")
-    if not audit_id_raw or (smoketest_required and not smoke_id_raw):
-        return False
-    try:
-        audit_id = uuid.UUID(str(audit_id_raw))
-        smoke_id = (
-            uuid.UUID(str(smoke_id_raw))
-            if smoketest_required and smoke_id_raw
-            else None
-        )
-    except (ValueError, AttributeError):
-        logger.warning(
-            "[RELEASE_QUALIFIER] sweep: version v%d has unparseable child "
-            "task ids (%r, %r) — skipping",
-            version.version_number,
-            audit_id_raw,
-            smoke_id_raw,
-        )
-        return False
-
-    audit_task = await session.get(Task, audit_id)
-    smoke_task = (
-        await session.get(Task, smoke_id) if smoke_id is not None else None
-    )
-    if audit_task is None or (smoketest_required and smoke_task is None):
-        return False
-    if audit_task.status not in _TERMINAL_STATUSES or (
-        smoke_task is not None and smoke_task.status not in _TERMINAL_STATUSES
-    ):
-        return False
-
-    # All required children terminal but the version is still pending — stuck.
-    # Drive it through maybe_finalize_qualification, which re-locks the row and
-    # re-validates every guard before finalizing.  Pass the terminal audit
-    # child as the trigger task (it carries release_version_id in context,
-    # exactly as the normal completion path would).
-    logger.info(
-        "[RELEASE_QUALIFIER] sweep: version v%d stuck pending with required "
-        "children terminal — finalizing",
-        version.version_number,
-    )
-    result = await maybe_finalize_qualification(session, audit_task)
-    return result is not None
-
-
 # ---------------------------------------------------------------------------
 # promote — open + merge the automain → main PR.
 # ---------------------------------------------------------------------------
+
+
+async def _candidate_already_on_main(
+    token: str,
+    owner: str,
+    repo: str,
+    candidate_sha: str,
+    version: release_version.ReleaseVersion,
+) -> bool:
+    """Return True iff ``candidate_sha`` is already reachable from ``main``.
+
+    Audit R4-C1 / R4-H1 — the single idempotency primitive for ``promote()``.
+    A promotion is a multi-step GitHub operation (create release branch, open
+    PR, merge).  If the process crashes between the merge LANDING on ``main``
+    and the DB commit that records ``status="promoted"``, the next finalize /
+    sweep re-enters ``promote()`` with ``last_qualification`` still ``pending``.
+    Without this check the retry would (a) re-merge a closed/merged PR, or
+    (b) hit a 405 "already merged" and misclassify a SUCCESSFUL promotion as a
+    failure — leaving the DB and GitHub permanently divergent.
+
+    This wraps ``github.is_ancestor_of(candidate_sha, "main")``.  It answers
+    the question that covers BOTH retry sub-cases uniformly: "has this exact
+    candidate commit already landed on main?".
+
+    Returns ``False`` (NOT True) when the ancestry check could not be made
+    (``is_ancestor_of`` returned ``None`` — API error, ref missing): a
+    transient GitHub failure must never be read as "already promoted", which
+    would skip a real merge.  A genuinely-already-merged candidate will be
+    re-detected on the next retry once GitHub is reachable again.
+    """
+    try:
+        ancestry = await github.is_ancestor_of(
+            token,
+            owner,
+            repo,
+            candidate_sha,
+            "main",
+            project_id=str(version.project_id),
+        )
+    except Exception as exc:  # noqa: BLE001 — a check failure must not abort promotion
+        logger.warning(
+            "[RELEASE_QUALIFIER] promote: idempotency ancestry check raised "
+            "for v%d candidate %s (%s) — treating as not-yet-merged",
+            version.version_number,
+            (candidate_sha or "")[:8],
+            exc,
+        )
+        return False
+    if ancestry is None:
+        # Indeterminate — degrade to "not merged" so a real merge still runs.
+        logger.warning(
+            "[RELEASE_QUALIFIER] promote: idempotency ancestry check for v%d "
+            "candidate %s was indeterminate — treating as not-yet-merged",
+            version.version_number,
+            (candidate_sha or "")[:8],
+        )
+        return False
+    return ancestry
+
+
+async def _promotion_pr_landed(
+    token: str,
+    owner: str,
+    repo: str,
+    pr_number: int,
+    candidate_sha: str,
+    version: release_version.ReleaseVersion,
+) -> bool:
+    """Return True iff promotion PR ``pr_number`` has in fact already merged.
+
+    Concern 3 — ``github.merge_pull_request`` returns ``{"merged": False}`` for
+    BOTH a genuine merge block (failing checks / required reviews / conflict)
+    AND an already-merged PR (GitHub's merge endpoint returns 405 once a PR has
+    already been merged).  ``promote()`` must NOT record an already-merged PR as
+    a ``merge_blocked`` failure — that permanently diverges the DB from GitHub.
+
+    This disambiguates with TWO signals, strongest first:
+
+      1. **The PR's own ``merged`` boolean** (``get_pull_request_merge_state``).
+         This is a property of the PR resource itself; GitHub flips it to
+         ``true`` synchronously the moment a merge completes.  It is therefore
+         the AUTHORITATIVE answer and — crucially — is NOT subject to the
+         eventual-consistency lag the ``GET /compare`` ancestry API can exhibit
+         immediately after a merge.  A genuinely-successful promotion that the
+         ancestry API would still report as ``diverged`` for a few seconds is
+         correctly seen as merged here, so a real success is never misrecorded
+         as ``merge_blocked``.
+
+      2. **Ancestry fallback** (``_candidate_already_on_main``).  Used ONLY when
+         the PR-state query is indeterminate (API error, PR not found).  Better
+         than nothing: a crash-retry against a PR that merged-then-was-GC'd may
+         no longer be queryable, but the candidate is still on ``main``.
+
+    Returns ``True`` only on a positive merge signal from either tier; ``False``
+    when both are negative or indeterminate — so a genuine merge block (the PR
+    is open + unmerged, the candidate is not on main) is still correctly
+    reported as not-landed and recorded as the failure it is.
+    """
+    try:
+        pr_merged = await github.get_pull_request_merge_state(
+            token, owner, repo, pr_number, project_id=str(version.project_id)
+        )
+    except Exception as exc:  # noqa: BLE001 — a state check must not abort promotion
+        logger.warning(
+            "[RELEASE_QUALIFIER] promote: PR-state merge check raised for "
+            "PR #%s (v%d) (%s) — falling back to the ancestry check",
+            pr_number,
+            version.version_number,
+            exc,
+        )
+        pr_merged = None
+
+    if pr_merged is True:
+        logger.info(
+            "[RELEASE_QUALIFIER] promote: PR #%s for v%d reports merged=True on "
+            "its own resource — the promotion landed",
+            pr_number,
+            version.version_number,
+        )
+        return True
+    if pr_merged is False:
+        # The PR resource itself says it is NOT merged — this is authoritative.
+        # A merged=False merge result on a definitively-unmerged PR is a real
+        # merge block; do not consult the lagging ancestry API to second-guess
+        # it.
+        return False
+
+    # pr_merged is None — the PR state could not be determined.  Fall back to
+    # the ancestry check (eventually-consistent, but the best remaining signal).
+    logger.warning(
+        "[RELEASE_QUALIFIER] promote: PR #%s for v%d merge state "
+        "indeterminate — falling back to the candidate-on-main ancestry check",
+        pr_number,
+        version.version_number,
+    )
+    if not candidate_sha:
+        return False
+    return await _candidate_already_on_main(
+        token, owner, repo, candidate_sha, version
+    )
+
+
+def _idempotent_pr_url(base_record: dict[str, Any] | None) -> str:
+    """Resolve the ``pr_url`` to record on an idempotent-success path.
+
+    Concern 5 — the idempotency success paths (candidate already on ``main``;
+    PR-creation failed on a retry because the prior attempt's PR already merged)
+    have no live PR object of their own to read an ``html_url`` from.  Recording
+    a bare ``""`` is misleading — it reads like "there was no PR".
+
+    When the caller threaded the original promotion attempt's PR URL through
+    ``base_record["pr_url"]`` (a prior ``promotion_failed`` record on the same
+    version carries it), reuse that real URL.  Otherwise return an explicit
+    sentinel string so the recorded value is unambiguous rather than blank.
+    """
+    carried = (base_record or {}).get("pr_url")
+    if isinstance(carried, str) and carried:
+        return carried
+    return "(already merged — no PR opened by this attempt)"
+
+
+async def _relock_version_for_promotion_write(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+    *,
+    lock_released: bool,
+) -> release_version.ReleaseVersion | None:
+    """Resolve the version row, holding ``SELECT ... FOR UPDATE``, for the final write.
+
+    Audit R4-H3 — ``promote()`` releases the ``ReleaseVersion`` row lock (via an
+    intermediate ``session.commit()``) before its 30-120s of GitHub I/O so a
+    concurrent ``run_qualification`` / reaper sweep / strategic completion is
+    not stalled behind network calls.  Every terminal state write in
+    ``promote()`` therefore goes through this helper.
+
+    Returns the version instance with the row ``FOR UPDATE``-locked, or ``None``
+    if the row vanished (project deleted mid-promotion) — the caller treats
+    ``None`` as "nothing to write".
+
+    ``lock_released`` makes the two cases EXPLICIT — this is the fix for the
+    early-return ``expire()`` defect (concern 4):
+
+      * ``lock_released=True`` — ``promote()`` already issued its intermediate
+        commit.  The row lock is gone and the in-memory instance may be stale,
+        so the row must be RE-READ and RE-LOCKED.  ``session.expire`` BEFORE the
+        ``populate_existing`` SELECT mirrors the canonical re-lock pattern
+        (``ci_completion._relock_merge_task`` / ``rollup_management._relock_parent``):
+        ``populate_existing=True`` alone has been observed not to reliably
+        refresh an instance still in the identity map on async sessions.  An
+        ``expire`` here is safe: a just-committed instance has no un-flushed
+        mutations to lose (the commit flushed them).
+
+      * ``lock_released=False`` — an early-return failure path BEFORE the
+        intermediate commit.  In ``promote()`` only the ``project_not_found``
+        return reaches here (it is detected before the commit).  The row is
+        STILL locked by this very transaction, and the live instance is already
+        the authoritative locked row.  Calling ``session.expire`` here would
+        DISCARD any un-flushed in-memory mutation on the version — the bug this
+        parameter removes.  So on this path the helper does NOT expire and does
+        NOT re-SELECT; it just confirms the row still exists and returns the
+        live, already-locked instance for the caller to mutate.
+    """
+    if not lock_released:
+        # The row is still locked by this transaction; the live instance is
+        # authoritative.  A bare existence check (no expire — would drop
+        # pending mutations; no re-SELECT — the lock is already held).
+        still_exists = (
+            await session.execute(
+                select(release_version.ReleaseVersion.id).where(
+                    release_version.ReleaseVersion.id == version.id
+                )
+            )
+        ).first()
+        if still_exists is None:
+            logger.warning(
+                "[RELEASE_QUALIFIER] promote: version row %s vanished before "
+                "the final state write — skipping",
+                version.id,
+            )
+            return None
+        return version
+
+    # lock_released=True — re-read + re-lock from authoritative DB state.
+    session.expire(version)
+    relocked = (
+        await session.execute(
+            select(release_version.ReleaseVersion)
+            .where(release_version.ReleaseVersion.id == version.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalars().first()
+    if relocked is None:
+        logger.warning(
+            "[RELEASE_QUALIFIER] promote: version row %s vanished before the "
+            "final state write — skipping",
+            version.id,
+        )
+    return relocked
 
 
 async def promote(
@@ -1800,15 +2182,43 @@ async def promote(
       2. Open a PR ``release-v{version_number} → main``.
       3. Merge it with ``merge_method="merge"`` (preserves integration
          history; branch protection on ``main`` runs CI as the final gate).
+      4. Best-effort delete the ``release-v{version_number}`` branch (audit
+         R4-H2 — dangling release branches must not accumulate forever).
 
     Because the PR is pinned to ``candidate_sha`` there is NO staleness guard:
     ``automain`` moving on after qualification is expected and harmless — the
     release branch is frozen at the scored commit regardless.
 
+    **Idempotency (audit R4-C1 / R4-H1).**  A promotion is multi-step; a crash
+    or retry between the merge landing on ``main`` and the DB commit would
+    otherwise re-merge a closed PR or misclassify an already-merged PR (405) as
+    a failure — diverging the DB from GitHub permanently.  ``promote()``
+    therefore runs ONE ancestry check (``_candidate_already_on_main`` →
+    ``github.is_ancestor_of``) (a) at the very start — if ``candidate_sha`` is
+    already reachable from ``main`` the promotion already landed, so route
+    straight to success — and (b) again before recording any non-merged result
+    as a failure, so an open-but-already-merged PR is recorded as the success
+    it actually is.
+
+    **Lock safety (audit R4-H3).**  ``promote()``'s GitHub I/O (branch create,
+    optional delete+recreate, PR create, merge, SHA re-resolve, tag, branch
+    delete) is 30-120s of network calls.  The caller
+    (``maybe_finalize_qualification`` / the sweep) holds a ``FOR UPDATE`` lock
+    on the ``ReleaseVersion`` row; holding it across that I/O stalls every
+    concurrent qualifier path.  So ``promote()`` issues an intermediate
+    ``session.commit()`` to RELEASE that lock before the heavy I/O, runs the
+    I/O unlocked, then RE-acquires ``FOR UPDATE`` (via
+    ``_relock_version_for_promotion_write``) only for the final state write —
+    re-checking ``version.status == "open"`` under the re-lock.  The idempotency
+    check PLUS that re-check together keep a crash-retry or a concurrent
+    finalize from double-promoting: if a parallel run already promoted, the
+    re-locked row reads ``status="promoted"`` and this call bails as
+    already-landed instead of opening a duplicate vN+1.
+
     CRITICAL: ``github.merge_pull_request`` does NOT enforce CI and does not
     raise on a 405/409 — it returns ``{"merged": False}``.  This function
     checks ``result.get("merged")`` and treats a non-merged result as a FAILED
-    promotion: it does NOT retry blindly.
+    promotion (after the idempotency re-check): it does NOT retry blindly.
 
     On success: ``version.status = "promoted"``, stamps ``promoted_at`` /
     ``promoted_sha``, opens the next version (``build`` phase) via
@@ -1822,11 +2232,17 @@ async def promote(
     On failure / non-merge: records the outcome in ``version.last_qualification``,
     keeps the version open, and sets ``phase = "stabilize"``.
 
-    ``token``, ``owner``, ``repo`` may be pre-resolved by the caller
-    (``_finalize_qualification`` already holds them); if omitted they are
-    resolved here from the project row.
+    ``token``, ``owner``, ``repo`` are optional; when omitted (the normal
+    finalize path — concern 2: ``_finalize_qualification`` deliberately does NOT
+    pre-resolve them, since credential resolution is GitHub I/O) they are
+    resolved here AFTER the intermediate commit has released the row lock, so no
+    token round-trip ever runs under the lock.
 
-    The caller commits the session.  Returns a result dict.
+    Operates on the ``session`` it is given — which the finalize chain runs as a
+    DEDICATED session, so the intermediate commit only ever flushes qualifier
+    state.  ``promote()`` issues that one intermediate commit itself; the
+    caller (``_finalize_in_dedicated_session``) commits the final state write.
+    Returns a result dict.
     """
     base_record = dict(base_record or {})
     project = await session.get(Project, version.project_id)
@@ -1839,24 +2255,102 @@ async def promote(
         # stabilize state.  A bare error return here would leave
         # last_qualification stuck at status="pending", and every later
         # _finalize_qualification call would re-loop on it forever.
-        return _record_promotion_failure(
-            session, version, base_record, "project_not_found"
+        # This runs BEFORE the intermediate commit, so the version row is still
+        # locked by this transaction — write directly (lock_released=False).
+        return await _record_promotion_failure(
+            session, version, base_record, "project_not_found",
+            lock_released=False,
         )
 
+    release_branch = f"release-v{version.version_number}"
+
+    # --- Release the ReleaseVersion row lock BEFORE any GitHub I/O ----------
+    # Audit R4-H3 + concern 2: the caller-supplied dedicated session holds a
+    # FOR UPDATE lock on this version row (taken by _finalize_in_dedicated_session).
+    # Token resolution AND the idempotency ancestry check are both GitHub I/O —
+    # they must NOT run under that row lock, or every concurrent qualifier path
+    # stalls behind the network.  So the intermediate commit happens HERE,
+    # before token resolution and before the idempotency check — the lock is
+    # released first, then all I/O runs unlocked.  The final state write
+    # re-acquires the lock via _relock_version_for_promotion_write.
+    #
+    # The dedicated session has ONLY qualifier state dirty (concern 1), so this
+    # commit can never prematurely commit a caller's unrelated transaction.
+    try:
+        await session.commit()
+    except Exception as exc:  # noqa: BLE001 — a commit failure here is recoverable
+        logger.warning(
+            "[RELEASE_QUALIFIER] promote: failed to commit before releasing "
+            "the row lock for v%d (%s) — recording failure",
+            version.version_number,
+            exc,
+        )
+        try:
+            await session.rollback()
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] promote: rollback after pre-I/O commit "
+                "failure also failed for v%d",
+                version.version_number,
+            )
+        # The rollback released the lock — the failure record must re-lock.
+        return await _record_promotion_failure(
+            session, version, base_record, "lock_release_failed",
+            detail=str(exc)[:300], lock_released=True,
+        )
+
+    # The row lock is now released — all the I/O below runs unlocked.
     if not token or not owner or not repo:
         resolved = await _resolve_github_with_session(session, project)
         if resolved is None:
-            return _record_promotion_failure(
-                session, version, base_record, "no_credentials"
+            return await _record_promotion_failure(
+                session, version, base_record, "no_credentials",
+                lock_released=True,
             )
         token, owner, repo = resolved
+
+    # --- Idempotency pre-check (audit R4-C1 / R4-H1) ------------------------
+    # If candidate_sha is ALREADY reachable from main, a prior promotion
+    # attempt landed the merge but crashed before the DB commit.  Route
+    # straight to the success path (treat as already-landed) — do NOT re-merge
+    # and do NOT record a failure.  This is a read-only GitHub call and now
+    # runs unlocked (the intermediate commit above released the row lock).
+    if candidate_sha and await _candidate_already_on_main(
+        token, owner, repo, candidate_sha, version
+    ):
+        logger.info(
+            "[RELEASE_QUALIFIER] promote: candidate %s for v%d is already "
+            "reachable from main — a prior promotion landed; recording success "
+            "without re-merging (idempotent retry)",
+            candidate_sha[:8],
+            version.version_number,
+        )
+        # Best-effort: clean up the release branch a prior attempt may have
+        # left behind (audit R4-H2).
+        await _delete_release_branch_best_effort(
+            token, owner, repo, release_branch, version
+        )
+        return await _record_promotion_success(
+            session,
+            version,
+            candidate_sha,
+            base_record,
+            # Concern 5: this idempotent-success path has no PR object of its
+            # own.  Carry forward a pr_url the caller threaded through
+            # base_record (the original promotion attempt's PR) when present;
+            # otherwise label it explicitly rather than recording a bare "".
+            pr_url=_idempotent_pr_url(base_record),
+            token=token,
+            owner=owner,
+            repo=repo,
+            already_landed=True,
+        )
 
     # 0. Create the release branch pinned to the qualified candidate commit
     #    (audit C4).  Deterministic name so a retried promotion is idempotent.
     #    create_branch returns the existing ref on a 422; if that existing ref
     #    points at a different SHA (a stale branch from a failed prior attempt)
     #    delete + recreate it so the PR always carries exactly candidate_sha.
-    release_branch = f"release-v{version.version_number}"
     try:
         branch_ref = await github.create_branch(
             token, owner, repo, release_branch, candidate_sha
@@ -1884,12 +2378,13 @@ async def promote(
             version.version_number,
             exc,
         )
-        return _record_promotion_failure(
+        return await _record_promotion_failure(
             session,
             version,
             base_record,
             "release_branch_failed",
             detail=str(exc)[:300],
+            lock_released=True,
         )
 
     # 1. Open the release-branch → main PR.  The release branch is frozen at
@@ -1918,17 +2413,49 @@ async def promote(
             project_id=str(version.project_id),
         )
     except Exception as exc:  # noqa: BLE001 — a PR-creation failure blocks, never raises
+        # Audit R4-H1: a PR-creation failure on a RETRY is the classic
+        # divergence trap — the prior attempt's PR merged then closed, so
+        # create_pull_request finds nothing open and raises.  Re-run the
+        # idempotency check before recording a failure: if the candidate is
+        # already on main, this is a successful prior promotion, not a failure.
+        if candidate_sha and await _candidate_already_on_main(
+            token, owner, repo, candidate_sha, version
+        ):
+            logger.info(
+                "[RELEASE_QUALIFIER] promote: PR creation failed for v%d but "
+                "candidate %s is already on main — a prior promotion landed; "
+                "recording success (idempotent retry)",
+                version.version_number,
+                candidate_sha[:8],
+            )
+            await _delete_release_branch_best_effort(
+                token, owner, repo, release_branch, version
+            )
+            return await _record_promotion_success(
+                session,
+                version,
+                candidate_sha,
+                base_record,
+                # Concern 5: no live PR object here (creation failed); carry a
+                # caller-threaded pr_url through if present, else label it.
+                pr_url=_idempotent_pr_url(base_record),
+                token=token,
+                owner=owner,
+                repo=repo,
+                already_landed=True,
+            )
         logger.warning(
             "[RELEASE_QUALIFIER] failed to open promotion PR for v%d: %s",
             version.version_number,
             exc,
         )
-        return _record_promotion_failure(
+        return await _record_promotion_failure(
             session,
             version,
             base_record,
             "pr_creation_failed",
             detail=str(exc)[:300],
+            lock_released=True,
         )
 
     pr_number = pr.get("number")
@@ -1941,6 +2468,9 @@ async def promote(
         logger.info(
             "[RELEASE_QUALIFIER] v%d promotion: automain == main (empty diff)",
             version.version_number,
+        )
+        await _delete_release_branch_best_effort(
+            token, owner, repo, release_branch, version
         )
         return await _record_promotion_success(
             session,
@@ -1955,8 +2485,15 @@ async def promote(
         )
 
     if not pr_number:
-        return _record_promotion_failure(
-            session, version, base_record, "pr_missing_number"
+        # Concern 5: a PR with no number cannot be merged — but create_branch
+        # already ran, so the release-v{N} branch exists.  Clean it up
+        # best-effort before recording the failure so it does not dangle.
+        await _delete_release_branch_best_effort(
+            token, owner, repo, release_branch, version
+        )
+        return await _record_promotion_failure(
+            session, version, base_record, "pr_missing_number",
+            pr_url=pr_url, lock_released=True,
         )
 
     # 2. Merge the PR — merge_method="merge" preserves integration history.
@@ -1977,19 +2514,71 @@ async def promote(
             version.version_number,
             exc,
         )
-        return _record_promotion_failure(
+        return await _record_promotion_failure(
             session,
             version,
             base_record,
             "merge_error",
             detail=str(exc)[:300],
             pr_url=pr_url,
+            lock_released=True,
         )
 
     if not merge_result.get("merged"):
-        # Non-merged result (405 = checks/reviews block, 409 = conflict).  This
-        # is a FAILED promotion — do NOT retry blindly.  Branch protection is
-        # the real gate; the version goes back to stabilize.
+        # Concern 3 — disambiguate a merged=False result.  merge_pull_request
+        # collapses TWO different outcomes onto {"merged": False}: a genuine
+        # merge block (failing checks / required reviews / conflict) AND an
+        # already-merged PR (GitHub's merge endpoint returns 405 once a PR is
+        # already merged).  Recording an already-merged PR as merge_blocked
+        # would permanently diverge the DB from GitHub.
+        #
+        # _promotion_pr_landed asks the PR resource itself for its
+        # authoritative ``merged`` boolean — which flips synchronously on a
+        # merge and is NOT subject to the compare API's eventual-consistency
+        # lag that could make a genuinely-successful promotion look like a
+        # merge_blocked failure right after the merge.  It falls back to the
+        # ancestry check only when the PR state is indeterminate.
+        if await _promotion_pr_landed(
+            token, owner, repo, pr_number, candidate_sha, version
+        ):
+            logger.info(
+                "[RELEASE_QUALIFIER] promote: PR #%s for v%d returned "
+                "merged=False but the PR is in fact merged — recording success "
+                "(idempotent retry / eventual-consistency-safe)",
+                pr_number,
+                version.version_number,
+            )
+            await _delete_release_branch_best_effort(
+                token, owner, repo, release_branch, version
+            )
+            merged_sha_retry: str | None = None
+            try:
+                merged_sha_retry = await github.get_branch_sha(
+                    token, owner, repo, "main"
+                )
+            except Exception:  # noqa: BLE001 — best-effort; degrade to candidate
+                logger.warning(
+                    "[RELEASE_QUALIFIER] promote: could not re-resolve main "
+                    "HEAD after detecting an already-merged PR #%s for v%d — "
+                    "recording candidate_sha",
+                    pr_number,
+                    version.version_number,
+                )
+            return await _record_promotion_success(
+                session,
+                version,
+                candidate_sha,
+                base_record,
+                pr_url,
+                token=token,
+                owner=owner,
+                repo=repo,
+                promoted_sha=merged_sha_retry or candidate_sha,
+                already_landed=True,
+            )
+        # A genuine non-merge (checks/reviews block, real conflict).  This is a
+        # FAILED promotion — do NOT retry blindly.  Branch protection is the
+        # real gate; the version goes back to stabilize.
         msg = merge_result.get("message", "merge not completed")
         logger.warning(
             "[RELEASE_QUALIFIER] promotion PR #%s for v%d did not merge: %s",
@@ -1997,7 +2586,7 @@ async def promote(
             version.version_number,
             msg,
         )
-        return _record_promotion_failure(
+        return await _record_promotion_failure(
             session,
             version,
             base_record,
@@ -2005,6 +2594,7 @@ async def promote(
             detail=str(msg)[:300],
             pr_url=pr_url,
             conflict=bool(merge_result.get("conflict")),
+            lock_released=True,
         )
 
     # 3. Success — resolve the REAL merged commit.  merge_method="merge"
@@ -2026,6 +2616,12 @@ async def promote(
             exc,
         )
 
+    # 4. Best-effort: delete the release branch now that the merge has landed
+    #    (audit R4-H2 — release-v{N} branches must not accumulate forever).
+    await _delete_release_branch_best_effort(
+        token, owner, repo, release_branch, version
+    )
+
     logger.info(
         "[RELEASE_QUALIFIER] v%d promoted: automain → main merged via PR #%s "
         "(merge commit=%s)",
@@ -2046,7 +2642,53 @@ async def promote(
     )
 
 
-def _record_promotion_failure(
+async def _delete_release_branch_best_effort(
+    token: str,
+    owner: str,
+    repo: str,
+    release_branch: str,
+    version: release_version.ReleaseVersion,
+) -> None:
+    """Delete the ``release-v{N}`` branch after a promotion — best-effort.
+
+    Audit R4-H2: the release branch is a throwaway pointer at the qualified
+    commit; once the promotion PR has merged (or the candidate is confirmed on
+    main) it serves no purpose.  Left behind, ``release-v1``, ``release-v2``, …
+    accumulate on the repo forever.
+
+    A delete failure must NEVER fail or abort the promotion — the merge has
+    already landed; a dangling branch is cosmetic clutter, not a correctness
+    problem.  Same best-effort contract as the ``v{N}`` tag creation: wrapped
+    in try/except, logs a warning only.
+    """
+    try:
+        deleted = await github.delete_branch(token, owner, repo, release_branch)
+        if deleted:
+            logger.info(
+                "[RELEASE_QUALIFIER] promote: deleted release branch %s for v%d",
+                release_branch,
+                version.version_number,
+            )
+        else:
+            # delete_branch returns False (not raises) on a non-204 — e.g. the
+            # branch is already gone.  Not an error; just note it.
+            logger.info(
+                "[RELEASE_QUALIFIER] promote: release branch %s for v%d not "
+                "deleted (already gone or non-204) — non-fatal",
+                release_branch,
+                version.version_number,
+            )
+    except Exception as exc:  # noqa: BLE001 — branch delete failure must not abort promotion
+        logger.warning(
+            "[RELEASE_QUALIFIER] promote: failed to delete release branch %s "
+            "for v%d (non-fatal): %s",
+            release_branch,
+            version.version_number,
+            exc,
+        )
+
+
+async def _record_promotion_failure(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
     base_record: dict[str, Any],
@@ -2055,13 +2697,65 @@ def _record_promotion_failure(
     detail: str | None = None,
     pr_url: str | None = None,
     conflict: bool = False,
+    lock_released: bool,
 ) -> dict[str, Any]:
     """Record a failed promotion: keep the version open, set phase=stabilize.
 
     A failed promotion only ever *blocks* — the version stays open and goes
     back to stabilize so the next strategic cycle works the blocker.  ``main``
     is untouched, so this is always safe.
+
+    Audit R4-H3: resolves the ``ReleaseVersion`` row (``FOR UPDATE``-locked) via
+    ``_relock_version_for_promotion_write`` before writing.  ``lock_released``
+    tells that helper whether ``promote()`` has already issued its intermediate
+    commit: ``True`` ⇒ re-read + re-lock from the DB; ``False`` ⇒ an early-return
+    path before the commit, the row is still locked by this transaction so the
+    live instance is used directly without an ``expire()`` that would drop
+    pending mutations (concern 4).
+
+    Round 9 (data-integrity): re-checks ``version.status == "open"`` under the
+    re-lock — the SAME guard ``_record_promotion_success`` already has.  Two
+    finalize/promote calls can race (the completion-handler finalize and the
+    reaper-sweep finalize run in separate concurrent transactions); if one
+    promotes successfully while the loser fails transiently, the loser must NOT
+    overwrite ``last_qualification`` with ``{status: "promotion_failed", ...}``
+    on a row that already reads ``status="promoted"`` — that would leave a
+    self-contradictory terminal record.  When the re-locked row is no longer
+    ``open`` this returns an ``already_promoted``-style result WITHOUT touching
+    ``last_qualification``, exactly mirroring ``_record_promotion_success``.
     """
+    locked = await _relock_version_for_promotion_write(
+        session, version, lock_released=lock_released
+    )
+    if locked is None:
+        # Row vanished (project deleted mid-promotion) — nothing to record.
+        return {"status": "promotion_failed", "error": error}
+    version = locked
+    # Re-check under the re-lock (Round 9 — data integrity): a concurrent
+    # finalize / crash-retry may have already PROMOTED this version while this
+    # call's GitHub I/O ran unlocked.  An already-promoted (or abandoned)
+    # version is terminal — overwriting last_qualification with a
+    # promotion_failed record here would contradict version.status="promoted".
+    # Bail to a result that reflects the already-recorded state, leaving
+    # last_qualification untouched.  Mirrors _record_promotion_success.
+    if version.status != "open":
+        logger.info(
+            "[RELEASE_QUALIFIER] promote: v%d is already status=%s under the "
+            "re-lock when recording a '%s' failure — a concurrent "
+            "finalize/retry already promoted it; not overwriting "
+            "last_qualification (idempotent)",
+            version.version_number,
+            version.status,
+            error,
+        )
+        existing = version.last_qualification or {}
+        return {
+            "status": existing.get("status", version.status),
+            "promoted_sha": existing.get("promoted_sha")
+            or version.promoted_sha,
+            "next_version_number": None,
+            "already_promoted": True,
+        }
     record = {
         **base_record,
         "status": "promotion_failed",
@@ -2075,14 +2769,18 @@ def _record_promotion_failure(
         record["conflict"] = True
     version.last_qualification = record
     flag_modified(version, "last_qualification")
-    release_version.set_version_phase(
-        version,
-        "stabilize",
-        reasoning=(
-            f"promotion v{version.version_number} failed ({error}); "
-            f"returning to stabilize"
-        ),
-    )
+    # Defensive (audit R4 MEDIUM): only flip phase on a still-open version.  An
+    # already-promoted/abandoned version is terminal — set_version_phase would
+    # be a meaningless write (and the version should never reach here promoted).
+    if version.status == "open":
+        release_version.set_version_phase(
+            version,
+            "stabilize",
+            reasoning=(
+                f"promotion v{version.version_number} failed ({error}); "
+                f"returning to stabilize"
+            ),
+        )
     session.add(version)
     logger.warning(
         "[RELEASE_QUALIFIER] promotion of v%d failed (%s) — version stays open, "
@@ -2105,6 +2803,8 @@ async def _record_promotion_success(
     repo: str | None = None,
     empty_diff: bool = False,
     promoted_sha: str | None = None,
+    already_landed: bool = False,
+    lock_released: bool = True,
 ) -> dict[str, Any]:
     """Record a successful promotion and open the next version.
 
@@ -2121,11 +2821,59 @@ async def _record_promotion_success(
     version row, the next version's ``base_sha`` and the ``v{N}`` tag all use
     this ``promoted_sha``.
 
+    Audit R4-H3 / R4-C1: resolves the ``ReleaseVersion`` row (``FOR UPDATE``-
+    locked) via ``_relock_version_for_promotion_write`` and RE-CHECKS
+    ``version.status == "open"`` under that lock.  If the row already reads
+    ``status="promoted"`` a concurrent finalize / a crash-retry already promoted
+    this version — bail as already-landed WITHOUT opening a duplicate vN+1,
+    instead of double-promoting.  Every ``promote()`` success path reaches here
+    AFTER the intermediate commit, so ``lock_released`` defaults to ``True``
+    (re-read + re-lock from the DB).  ``already_landed`` is True when
+    ``promote()`` reached here via an idempotency path (the merge was already on
+    ``main``); it only affects logging.
+
     After the version is marked promoted, creates a git tag
     ``v{version.version_number}`` on the promoted SHA.  A tag-creation failure
     is non-fatal — it is wrapped in try/except and only logs a warning.  The
     merge already succeeded; the tag is cosmetic convenience.
     """
+    locked = await _relock_version_for_promotion_write(
+        session, version, lock_released=lock_released
+    )
+    if locked is None:
+        # Row vanished — the merge landed on GitHub but the version row is
+        # gone (project deleted mid-promotion).  Nothing left to write.
+        return {
+            "status": "promoted",
+            "promoted_sha": promoted_sha or candidate_sha,
+            "next_version_number": None,
+        }
+    version = locked
+
+    # Re-check under the re-lock (audit R4-C1 / R4-H3): a concurrent finalize
+    # or a crash-retry may have already promoted this version while promote()'s
+    # GitHub I/O ran unlocked.  An already-promoted (or abandoned) version is
+    # terminal — re-promoting would open a duplicate vN+1.  Bail to a success
+    # return that reflects the already-recorded state.
+    if version.status != "open":
+        logger.info(
+            "[RELEASE_QUALIFIER] promote: v%d is already status=%s under the "
+            "re-lock — a concurrent finalize/retry already promoted it; not "
+            "re-promoting (idempotent)",
+            version.version_number,
+            version.status,
+        )
+        existing = version.last_qualification or {}
+        return {
+            "status": "promoted",
+            "promoted_sha": existing.get("promoted_sha")
+            or version.promoted_sha
+            or promoted_sha
+            or candidate_sha,
+            "next_version_number": None,
+            "already_promoted": True,
+        }
+
     # The commit that is now main HEAD.  Falls back to candidate_sha for the
     # empty-diff path (automain == main, so they are the same commit).
     effective_sha = promoted_sha or candidate_sha
@@ -2139,6 +2887,8 @@ async def _record_promotion_success(
     }
     if empty_diff:
         record["empty_diff"] = True
+    if already_landed:
+        record["already_landed"] = True
     version.last_qualification = record
     flag_modified(version, "last_qualification")
     version.status = "promoted"
@@ -2155,9 +2905,10 @@ async def _record_promotion_success(
         base_sha=effective_sha,
     )
     logger.info(
-        "[RELEASE_QUALIFIER] v%d promoted (sha=%s); opened v%d",
+        "[RELEASE_QUALIFIER] v%d promoted (sha=%s%s); opened v%d",
         version.version_number,
         effective_sha[:8],
+        " — already-landed retry" if already_landed else "",
         next_version.version_number,
     )
 

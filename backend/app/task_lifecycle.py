@@ -1466,7 +1466,7 @@ async def _spawn_ci_auto_remediation_followup(
         {
             "type": "investigate",
             "prompt": "\n".join(prompt_lines)[:20000],
-            "base_branch": "main",
+            "base_branch": _runtime_config.get("integration_branch", "main"),
         },
         "task_lifecycle:ci_auto_remediation_followup",
     )
@@ -3594,6 +3594,30 @@ async def _process_post_commit(
                                                     merged_pr_url=_merged_pr_url,
                                                     hotfix_task_id=orig.id,
                                                 )
+                                                # open_backmerge_pr deliberately
+                                                # does NOT commit (its docstring:
+                                                # "the caller commits the
+                                                # session"). On a back-merge
+                                                # conflict / 405 it session.add +
+                                                # flush()es an operator-facing
+                                                # ERROR Alert and a high-priority
+                                                # conflict-resolution Task. After
+                                                # flush() the session is
+                                                # flushed-but-clean, so the
+                                                # function's final
+                                                # ``if session.dirty or
+                                                # session.new`` commit is SKIPPED
+                                                # and the ``async with`` exit
+                                                # would ROLL BACK that Alert/Task
+                                                # — leaving a back-merge conflict
+                                                # completely unsignalled. Commit
+                                                # here, mirroring the
+                                                # smoketest-spawn block above.
+                                                # The merged-PR work is already
+                                                # committed (~:3470); this commit
+                                                # only flushes the back-merge's
+                                                # own Alert/Task — safe.
+                                                await session.commit()
                                             except Exception as _bm_exc:
                                                 logger.warning(
                                                     f"[HOTFIX_BACKMERGE] Back-merge trigger failed for hotfix task {orig.id}: {_bm_exc!r}",
@@ -4633,15 +4657,22 @@ async def _process_post_commit(
         # agent_status.py hook ran pre-flush with autoflush disabled and could
         # not see its own just-added Artifact.
         #
-        # maybe_finalize_qualification is idempotent (it FOR UPDATE-locks the
-        # version and no-ops unless last_qualification.status == "pending" and
-        # BOTH children are terminal) and a cheap O(1) no-op for the
-        # overwhelming majority of tasks (those with no release_version_id in
-        # context). The qualifier degrades a missing-artifact child to a hard
-        # blocker, so finalizing on a failed/cancelled child only ever blocks
-        # promotion — which is safe. Keyed on context["release_version_id"]
-        # and/or task_type == "release_audit" / context["qualifier_smoketest"],
-        # regardless of artifact_type.
+        # maybe_finalize_qualification opens its OWN dedicated DB session
+        # (AsyncSessionLocal) for the entire finalize→promote chain — it does
+        # NOT use this post-commit ``session``. That decoupling is deliberate:
+        # promote() merges to production main and issues an intermediate
+        # commit() to release its row lock before 30-120s of GitHub I/O; on a
+        # caller's session that commit would prematurely commit this handler's
+        # unrelated dirty work (the completed task's terminal status,
+        # TaskHistory, Artifacts, remediation/regression records). Because it
+        # owns its session, this call also cannot self-deadlock against the
+        # Task-row lock this handler holds (it locks the ReleaseVersion row, a
+        # different row). It is idempotent (it FOR UPDATE-locks the version and
+        # no-ops unless last_qualification.status == "pending" and the required
+        # children are terminal) and a cheap O(1) no-op — no session opened, no
+        # I/O — for the overwhelming majority of tasks (those with no
+        # release_version_id in context). Keyed on context["release_version_id"]
+        # and/or task_type == "release_audit" / context["qualifier_smoketest"].
         if payload.status in (
             TaskStatus.COMPLETED,
             TaskStatus.FAILED,
@@ -4658,8 +4689,19 @@ async def _process_post_commit(
                 try:
                     from app import release_qualifier
 
+                    # maybe_finalize_qualification opens its OWN dedicated
+                    # session (see the comment above) — never this post-commit
+                    # ``session``. ``_session_factory`` is threaded through so
+                    # the dedicated session is opened from the SAME factory
+                    # this handler runs on: in production that is None →
+                    # AsyncSessionLocal (a genuine independent connection,
+                    # preserving the transaction-decoupling); under the test
+                    # harness it is the test-engine factory, so the finalize
+                    # sees the committed seed data and its commit is visible to
+                    # the test's assertions instead of opening an unrelated
+                    # connection on a different event loop.
                     await release_qualifier.maybe_finalize_qualification(
-                        session, task
+                        task, session_factory=_session_factory
                     )
                 except Exception as _qual_exc:
                     logger.error(

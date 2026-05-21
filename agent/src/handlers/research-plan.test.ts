@@ -1683,6 +1683,122 @@ describe('handlePlan / handleResearch task-specific prompt fingerprints', () => 
   });
 });
 
+// ── Strategic executor prompt — step 1 / step 5 consistency (R4-LOW) ──────────
+//
+// R4-LOW: the executor prompt's step 1 ("read-and-pass `$(cat ...problem_model...)`,
+// don't summarize or re-emit") conflicted with step 5 ("embed
+// version_phase_decision / qualify_request as a top-level sibling in the
+// problem_model JSON before ./strategic set-problem-model"). An executor
+// following step 1 literally would never inject the siblings → a phase flip /
+// qualify_request silently dropped. The fix makes the two steps consistent:
+// step 5 edits /tmp/problem_model_<taskId>.json IN PLACE and step 1 explicitly
+// does step 5 first, then `cat`s the (now-edited) file.
+describe('strategic executor prompt — step 1 / step 5 sibling-field consistency', () => {
+  const EX_TASK_ID = 'exec-task-001';
+  const EX_GH_TOKEN = 'gh-token';
+  const EX_OWNER = 'owner';
+  const EX_REPO = 'repo';
+  const EX_WS = null;
+  const EX_STATUS_REF = () => ({ value: '' });
+  const EX_TASK = { title: 'Strategic cycle', description: 'strategic', context: {}, project_context: {} };
+  // research_mode 'strategic' is what routes handleResearch into the
+  // thinker→executor two-pass flow where the executor prompt lives.
+  const EX_PAYLOAD = { base_branch: 'main', research_mode: 'strategic', prompt: 'run the cycle' };
+
+  /**
+   * Drives handleResearch through the strategic two-pass flow and returns the
+   * executor (pass-2) prompt — the SECOND runClaudeCode invocation. The first
+   * is the thinker; we make the thinker exit 0 and report both handoff files
+   * present so runThinkerWithGate passes and the executor runs. The executor's
+   * allOutput carries the three required ./strategic markers so neither
+   * post-check fires a retry — keeping the executor at call index 1.
+   */
+  async function captureExecutorPrompt(): Promise<string> {
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: 'thinker analysis', lastResultText: 'analysis text' })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput:
+          './strategic set-problem-model\n./strategic set-running-update\n./strategic set-retirement-critiques\n',
+        lastResultText: '',
+      });
+    // runThinkerWithGate's gate: thinker exit 0 + both handoff files present.
+    // Returning true for every existsSync keeps the gate happy.
+    vi.mocked(fs.existsSync as (p: string) => boolean).mockReturnValue(true);
+
+    await handleResearch(
+      EX_TASK_ID, EX_PAYLOAD, EX_TASK, EX_GH_TOKEN, EX_OWNER, EX_REPO, EX_WS, EX_STATUS_REF(),
+    );
+
+    const calls = vi.mocked(runClaudeCode).mock.calls;
+    expect(calls.length).toBeGreaterThanOrEqual(2);
+    return calls[1][0];
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(persistAndPostStatus).mockResolvedValue(undefined);
+    vi.mocked(getProviderRunner).mockReturnValue({ displayName: 'claude' } as ReturnType<typeof getProviderRunner>);
+    vi.mocked(fs.readFileSync).mockReturnValue('');
+  });
+
+  it('executor prompt has both step 1 (problem model) and step 5 (sibling fields)', async () => {
+    const p = await captureExecutorPrompt();
+    expect(p).toContain('set-problem-model');
+    expect(p).toContain('version_phase_decision');
+    expect(p).toContain('qualify_request');
+  });
+
+  it('step 5 instructs editing /tmp/problem_model_<taskId>.json IN PLACE (not a separate inline emit)', async () => {
+    // The in-place edit is what carries the siblings through step 1's `cat`.
+    const p = await captureExecutorPrompt();
+    expect(p).toContain(`/tmp/problem_model_${EX_TASK_ID}.json`);
+    // Both sibling fields are added by editing the file in place.
+    expect(p).toMatch(/edit\s+`?\/tmp\/problem_model_[^`]+\.json`?\s+IN PLACE/i);
+  });
+
+  it('step 1 references step 5 so an executor does not call set-problem-model before applying siblings', async () => {
+    // The bug was step 1 saying "read-and-pass" with no mention of step 5 — an
+    // executor following step 1 literally fired set-problem-model immediately.
+    // Step 1 must now tell the executor to do step 5 first.
+    const p = await captureExecutorPrompt();
+    const step1Idx = p.indexOf('1. **Problem model');
+    expect(step1Idx).toBeGreaterThanOrEqual(0);
+    // Slice out step 1's text (up to step 2) and assert it forward-references step 5.
+    const step2Idx = p.indexOf('2. **Running update');
+    expect(step2Idx).toBeGreaterThan(step1Idx);
+    const step1Text = p.slice(step1Idx, step2Idx);
+    expect(step1Text).toMatch(/step 5/i);
+    // Step 1 must still describe the read-and-pass mechanism.
+    expect(step1Text).toContain('set-problem-model');
+    expect(step1Text).toMatch(/read-and-pass/i);
+  });
+
+  it('step 1 no longer tells the executor to pass the file content with no caveat about siblings', async () => {
+    // Regression guard: step 1 must not present an unconditional "just cat and
+    // pass, do not re-emit" instruction that contradicts step 5. It now permits
+    // exactly one edit — step 5's sibling fields.
+    const p = await captureExecutorPrompt();
+    const step1Idx = p.indexOf('1. **Problem model');
+    const step2Idx = p.indexOf('2. **Running update');
+    const step1Text = p.slice(step1Idx, step2Idx);
+    // The caveat phrasing: the only permitted edit is step 5's siblings.
+    expect(step1Text).toMatch(/step 5'?s sibling fields/i);
+  });
+
+  it('step 5 explains the cat re-read carries the siblings into set-problem-model', async () => {
+    const p = await captureExecutorPrompt();
+    const step5Idx = p.indexOf('5. **Version phase');
+    expect(step5Idx).toBeGreaterThanOrEqual(0);
+    const step6Idx = p.indexOf('6. **Self-reflection');
+    expect(step6Idx).toBeGreaterThan(step5Idx);
+    const step5Text = p.slice(step5Idx, step6Idx);
+    // Step 5 cross-references step 1's cat-based set-problem-model call.
+    expect(step5Text).toContain('set-problem-model');
+    expect(step5Text).toMatch(/re-read|cat /i);
+  });
+});
+
 // ── Prompt determinism meta-tests ─────────────────────────────────────────────
 describe('handlePlan / handleResearch prompt determinism', () => {
   const FP_TASK_ID = 'det-task-001';

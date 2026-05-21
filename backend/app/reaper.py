@@ -3088,19 +3088,33 @@ async def reaper_service():
                 # qualification timeout) and finalizes each. Idempotent and
                 # safe every cycle.
                 #
-                # Audit H5: sweep_stuck_qualifications commits internally after
-                # EACH version it finalizes — a real promotion lands a GitHub
-                # merge on `main`, and a per-version commit makes that
-                # status="promoted" + N+1 row durable before the next version
-                # is touched, so a later version raising can't roll it back.
-                # No end-of-step commit is needed here (the sweep already
-                # persisted everything); the surrounding try/except still
+                # Audit H5: sweep_stuck_qualifications finalizes EACH version in
+                # its OWN dedicated DB session — a real promotion lands a GitHub
+                # merge on `main`, and the per-version session makes that
+                # status="promoted" + N+1 row durable in isolation, so a later
+                # version raising can't roll it back. The `session` passed here
+                # is used only for the read-only scan that lists candidate
+                # versions; the sweep never writes through it. No end-of-step
+                # commit is needed here; the surrounding try/except still
                 # contains any unexpected sweep-level error.
+                #
+                # ``session_factory=AsyncSessionLocal`` is passed explicitly:
+                # the per-version dedicated finalize session must open against
+                # the SAME engine as this scan session. Without it the sweep
+                # falls back to ``release_qualifier``'s module-level
+                # ``app.database.AsyncSessionLocal`` — a different binding from
+                # the reaper's own ``app.reaper.AsyncSessionLocal`` that the
+                # ``reaper_db`` test fixture patches. In production both
+                # resolve to the real DB so it happens to work; under the test
+                # harness the unpatched factory points at the wrong engine and
+                # every finalize is silently swallowed by the sweep's
+                # per-version try/except. Passing the reaper's own factory
+                # keeps scan and finalize on one engine in both environments.
                 try:
                     from app import release_qualifier
 
                     _finalized = await release_qualifier.sweep_stuck_qualifications(
-                        session
+                        session, session_factory=AsyncSessionLocal
                     )
                     if _finalized:
                         logger.info(

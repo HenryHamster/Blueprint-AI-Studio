@@ -10200,6 +10200,207 @@ async def test_hotfix_backmerge_runs_for_hotfix_merge_to_main(db_session, mocker
 
 
 @pytest.mark.asyncio
+async def test_hotfix_backmerge_trigger_commits_conflict_alert_and_task(
+    db_session, mocker
+):
+    """CRITICAL: when the back-merge trigger inside _process_post_commit calls
+    open_backmerge_pr and that call takes its CONFLICT path (session.add + flush
+    of an operator-facing ERROR Alert and a high-priority conflict-resolution
+    Task, deliberately NOT committed — its docstring: "the caller commits the
+    session"), the trigger MUST commit so those rows survive.
+
+    The bug: the back-merge block ran after the merged-PR commit, and nothing
+    between it and the function's terminal `if session.dirty or session.new`
+    commit re-dirtied the session. After open_backmerge_pr's flush() the session
+    is flushed-but-clean, so the terminal commit was SKIPPED and the `async
+    with` exit ROLLED BACK the conflict Alert + resolution Task — a back-merge
+    conflict went completely unsignalled. The fix adds an explicit
+    `await session.commit()` after the open_backmerge_pr call, mirroring the
+    sibling smoketest-spawn block.
+
+    This drives a real hotfix rollup-merge through _process_post_commit (a
+    `review` task APPROVE verdict, original hotfix `plan` task EVALUATING so
+    is_rollup_merge is True, base_branch=="main", hotfix:true) with
+    open_backmerge_pr mocked to take the conflict path, then asserts — via a
+    fresh session — that the Alert + Task were COMMITTED. test_hotfix_backmerge.py
+    only tests open_backmerge_pr in isolation (and always commits itself), so
+    nothing else covers the trigger's own commit in _process_post_commit.
+    """
+    from app.task_lifecycle import _process_post_commit
+    from app.schemas import AgentStatusPayload
+    from app.models import Alert, AlertSeverity
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    # _cleanup_branches runs on the merged hotfix task — stub it (pure GitHub I/O,
+    # tangential to the commit contract under test).
+    mocker.patch("app.task_lifecycle._cleanup_branches", new_callable=AsyncMock)
+
+    project = Project(
+        name="Hotfix-Backmerge-Commit",
+        user_id="hotfix-user",
+        github_owner="acme",
+        github_repo="widget",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # The original hotfix task: a `plan` task with hotfix:true targeting main,
+    # parked EVALUATING (the rollup-merge state — is_rollup_merge is
+    # `orig.status == EVALUATING`).
+    orig_task = Task(
+        project_id=project.id,
+        title="Hotfix plan",
+        payloads=[
+            {
+                "type": "plan",
+                "prompt": "expedite the fix",
+                "hotfix": True,
+                "base_branch": "main",
+            }
+        ],
+        vm_instance_id=None,
+        status=TaskStatus.EVALUATING,
+    )
+    db_session.add(orig_task)
+    await db_session.commit()
+    await db_session.refresh(orig_task)
+
+    # The review task whose COMPLETED status drives the merge. Its review_loop
+    # carries the PR coordinates and points back at the hotfix task.
+    pr_number = 7777
+    branch = "blueprint/rollup-hotfix"
+    review_task = Task(
+        project_id=project.id,
+        title="Review of hotfix rollup PR",
+        payloads=[{"type": "review", "base_branch": "main"}],
+        vm_instance_id="agent-vm-review-hotfix",
+        status=TaskStatus.IN_PROGRESS,
+        context={
+            "review_loop": {
+                "iteration": 1,
+                "pr_number": pr_number,
+                "branch": branch,
+                "base_branch": "main",
+                "original_task_id": str(orig_task.id),
+            }
+        },
+    )
+    db_session.add(review_task)
+    await db_session.commit()
+    await db_session.refresh(review_task)
+
+    # GitHub mocks — patched at their source modules (the handler imports them
+    # locally from app.github / app.routers.agent at call time).
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new=AsyncMock(return_value=("gh-token", "acme", "widget")),
+    )
+    # PR head ref matches `branch` (no branch-mismatch abort); no head sha so the
+    # CI gate short-circuits (ci_status stays None) and the merge proceeds.
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={"state": "open", "merged": False, "head": {"ref": branch}}
+        ),
+    )
+    merge_pr = mocker.patch(
+        "app.github.merge_pull_request",
+        new=AsyncMock(return_value={"merged": True}),
+    )
+    mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
+    mocker.patch("app.github.get_pr_files", new=AsyncMock(return_value=[]))
+
+    # open_backmerge_pr mocked to REPLICATE its real conflict path: session.add
+    # an ERROR Alert + a high-priority conflict-resolution Task, then flush() —
+    # and deliberately do NOT commit (its contract: the caller commits).
+    conflict_alert_title = "Hotfix back-merge conflict: main -> automain"
+    resolution_task_title = "Resolve hotfix back-merge conflict (mock)"
+
+    async def _fake_open_backmerge_pr(session, project_id, **kwargs):
+        session.add(
+            Alert(
+                project_id=project_id,
+                severity=AlertSeverity.ERROR,
+                title=conflict_alert_title,
+                message="back-merge hit a merge conflict (test)",
+            )
+        )
+        session.add(
+            Task(
+                project_id=project_id,
+                title=resolution_task_title,
+                payloads=[{"type": "plan", "base_branch": "automain"}],
+                priority=95,
+                vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+                status=TaskStatus.QUEUED,
+                created_by="ORCHESTRATOR",
+                context={"backmerge_conflict": True},
+            )
+        )
+        # Flushed-but-NOT-committed — exactly what the real conflict path does.
+        await session.flush()
+        return {"status": "conflict"}
+
+    mocker.patch(
+        "app.hotfix_backmerge.open_backmerge_pr",
+        new=AsyncMock(side_effect=_fake_open_backmerge_pr),
+    )
+
+    payload = AgentStatusPayload(
+        task_id=review_task.id,
+        status=TaskStatus.COMPLETED,
+        verdict_json='{"verdict": "APPROVE", "feedback": "ok", "issues": []}',
+    )
+    _factory = _process_post_commit_factory(db_session)
+    await _process_post_commit(review_task.id, payload, _session_factory=_factory)
+
+    # The hotfix rollup PR must actually have merged (proves the path reached the
+    # post-merge block where the back-merge trigger lives).
+    merge_pr.assert_awaited()
+
+    # The crux: the conflict Alert + resolution Task must be COMMITTED and
+    # visible from a fresh session. Without the trigger's explicit commit the
+    # `async with` exit rolls them back and a back-merge conflict is silent.
+    async with _factory() as fresh:
+        alert = (
+            (
+                await fresh.execute(
+                    select(Alert).where(
+                        Alert.project_id == project.id,
+                        Alert.title == conflict_alert_title,
+                    )
+                )
+            )
+            .scalars()
+            .first()
+        )
+        resolution_task = (
+            (
+                await fresh.execute(
+                    select(Task).where(
+                        Task.project_id == project.id,
+                        Task.title == resolution_task_title,
+                    )
+                )
+            )
+            .scalars()
+            .first()
+        )
+
+    assert alert is not None, (
+        "back-merge conflict Alert was rolled back — the trigger never "
+        "committed open_backmerge_pr's flushed-but-uncommitted rows"
+    )
+    assert alert.severity == AlertSeverity.ERROR
+    assert resolution_task is not None, (
+        "back-merge conflict-resolution Task was rolled back — the trigger "
+        "never committed open_backmerge_pr's flushed-but-uncommitted rows"
+    )
+    assert resolution_task.status == TaskStatus.QUEUED
+
+
+@pytest.mark.asyncio
 async def test_hotfix_backmerge_gate_distinguishes_hotfix_rollup_and_promotion():
     """The back-merge gate fires ONLY for a hotfix rollup merging to main.
 

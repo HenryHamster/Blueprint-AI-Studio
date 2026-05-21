@@ -1428,6 +1428,79 @@ async def get_commit_date(
         return None
 
 
+async def is_ancestor_of(
+    token: str,
+    owner: str,
+    repo: str,
+    ancestor_sha: str,
+    descendant_ref: str,
+    project_id: str | None = None,
+) -> bool | None:
+    """Return True iff ``ancestor_sha`` is reachable from / merged into ``descendant_ref``.
+
+    Read-only helper built on GitHub's compare API
+    (``GET /repos/{owner}/{repo}/compare/{base}...{head}``).  Comparing
+    ``ancestor_sha...descendant_ref`` returns a ``status`` field:
+
+      * ``"identical"`` — the two refs point at the same commit.
+      * ``"ahead"``     — ``descendant_ref`` is strictly ahead of
+        ``ancestor_sha`` (every commit in ``ancestor_sha`` is also in
+        ``descendant_ref``).
+      * ``"behind"`` / ``"diverged"`` — ``descendant_ref`` does NOT contain
+        ``ancestor_sha``.
+
+    So ``ancestor_sha`` is an ancestor of (or equal to) ``descendant_ref`` iff
+    the status is ``"identical"`` or ``"ahead"``.
+
+    This is the idempotency primitive for the release qualifier's ``promote()``
+    — it answers "has this exact candidate commit already landed on main?"
+    after a crash/retry, so a partially-completed promotion is not re-merged or
+    misclassified as a failure.
+
+    Returns ``True``/``False`` on a definitive answer, or ``None`` when the
+    comparison could not be made (API error, ref not found) so the caller can
+    decide how to degrade — ``None`` deliberately is NOT coerced to a bool, so
+    a transient failure never silently looks like "already merged".
+    """
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    response = await _github_request(
+        "GET",
+        f"https://api.github.com/repos/{owner}/{repo}/compare/"
+        f"{ancestor_sha}...{descendant_ref}",
+        headers,
+        project_id=project_id,
+    )
+    if response.status_code != 200:
+        logger.warning(
+            "[GITHUB] is_ancestor_of: compare %s...%s for %s/%s returned %s — "
+            "cannot determine ancestry",
+            ancestor_sha[:8] if ancestor_sha else ancestor_sha,
+            descendant_ref,
+            owner,
+            repo,
+            response.status_code,
+        )
+        return None
+    try:
+        compare_status = response.json().get("status")
+    except (ValueError, TypeError) as exc:
+        logger.warning(
+            "[GITHUB] is_ancestor_of: unparseable compare response for "
+            "%s/%s: %s",
+            owner,
+            repo,
+            exc,
+        )
+        return None
+    # "identical" (same commit) or "ahead" (descendant strictly contains the
+    # ancestor) both mean ancestor_sha is reachable from descendant_ref.
+    return compare_status in ("identical", "ahead")
+
+
 async def create_pull_request(
     token: str,
     owner: str,
@@ -1672,6 +1745,78 @@ async def merge_pull_request(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         detail=f"Failed to merge PR #{pr_number} (upstream status {response.status_code})",
     )
+
+
+async def get_pull_request_merge_state(
+    token: str,
+    owner: str,
+    repo: str,
+    pr_number: int,
+    project_id: str | None = None,
+) -> bool | None:
+    """Return the PR's authoritative ``merged`` boolean, or ``None`` if unknown.
+
+    ``merge_pull_request`` collapses two genuinely different outcomes onto the
+    same ``{"merged": False}`` result: a real merge block (failing checks,
+    required reviews, a conflict) AND an *already-merged* PR (GitHub's merge
+    endpoint returns 405 "Pull Request is not mergeable" once a PR has already
+    been merged).  The release qualifier's ``promote()`` must not record an
+    already-merged PR as a ``merge_blocked`` failure.
+
+    This helper queries the PR *resource itself* — ``GET /repos/.../pulls/{n}``
+    — and reads its top-level ``merged`` flag.  That flag is a property of the
+    PR object and flips to ``true`` synchronously the moment GitHub completes a
+    merge; it is NOT subject to the eventual-consistency lag that the
+    ``GET /compare`` ancestry API can exhibit immediately after a merge.  So
+    asking the PR directly is the robust disambiguation primitive — a PR that
+    GitHub merged is reported merged here even when a compare call would still
+    say ``diverged`` for a few seconds.
+
+    Returns ``True`` / ``False`` on a definitive answer, or ``None`` when the
+    PR state could not be fetched (API error, PR not found) — ``None`` is
+    deliberately NOT coerced to a bool so a transient failure can never read as
+    "definitely not merged" (which would misclassify a real success as a
+    failure) nor as "merged" (which would skip recording a real block).
+    """
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    response = await _github_request(
+        "GET",
+        f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}",
+        headers,
+        project_id=project_id,
+    )
+    if response.status_code != 200:
+        logger.warning(
+            "[GITHUB] get_pull_request_merge_state: PR #%s for %s/%s returned "
+            "%s — cannot determine merge state",
+            pr_number,
+            owner,
+            repo,
+            response.status_code,
+        )
+        return None
+    try:
+        merged = response.json().get("merged")
+    except (ValueError, TypeError) as exc:
+        logger.warning(
+            "[GITHUB] get_pull_request_merge_state: unparseable PR #%s "
+            "response for %s/%s: %s",
+            pr_number,
+            owner,
+            repo,
+            exc,
+        )
+        return None
+    # GitHub always includes a boolean ``merged`` on a single-PR response; if
+    # it is somehow absent/non-bool, treat that as indeterminate rather than
+    # guessing.
+    if isinstance(merged, bool):
+        return merged
+    return None
 
 
 async def enable_auto_merge(
