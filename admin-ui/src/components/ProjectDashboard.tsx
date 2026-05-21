@@ -197,11 +197,11 @@ export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectP
                     </span>
                   </div>
 
-                  {project.directions?.length > 0 && (
+                  {(project.directions_count ?? project.directions?.length ?? 0) > 0 && (
                     <div className="flex items-center gap-2 mb-2">
                       <span className="text-[10px] text-neutral-500 flex items-center gap-0.5">
                         <Compass className="w-3 h-3" />
-                        {project.directions.length}
+                        {project.directions_count ?? project.directions?.length}
                       </span>
                     </div>
                   )}

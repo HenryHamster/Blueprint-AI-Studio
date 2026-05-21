@@ -238,26 +238,35 @@ Skip full re-analysis of systems with no files in the manifest.
   sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: promptFingerprint });
   let { exitCode } = await runClaudeCode(prompt + designDocFirstTaskSection + `\n\n${PLAYBOOK_GUIDANCE}\n\n${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
 
-  // Post-check: verify the agent actually called ./design-doc
-  try {
-    const projectData = await apiGet(`/api/admin/projects`) as Array<Record<string, unknown>>;
-    const proj = projectData.find(p => p.name === projectName);
-    const doc = (proj?.design_doc || {}) as Record<string, unknown>;
-    const pageCount = Object.keys(doc).filter(k => !k.startsWith('_')).length;
-    if (exitCode === 0 && pageCount === 0) {
-      sendLog(ws, '\n[WARNING] Architecture review completed but no ./design-doc calls were made. Retrying...\n');
-      const retryResult = await runClaudeCode(
-        'You completed your analysis but did NOT call ./design-doc to save any pages. Your text was discarded.\n\n' +
-        'You MUST call ./design-doc set now to save your findings.\n' +
-        'The ./design-doc command is a bash script in the current directory. Run it via Bash.\n' +
-        'Start with: ./design-doc set "summary" \'"Your project summary"\'\n' +
-        'Then save systems, capabilities, and risks.',
-        ws, statusRef, model, effort, disallowedTools
-      );
-      exitCode = retryResult.exitCode;
+  // Post-check: verify the agent actually called ./design-doc.
+  // design_doc lives only on the project detail endpoint — the /api/admin/projects
+  // list payload no longer carries JSONB columns. Skip the check entirely when no
+  // project_id is available, otherwise pageCount would be a false 0 and trigger a
+  // spurious retry of an already-successful task.
+  const projectMetadata = task.project_metadata as Record<string, unknown> | undefined;
+  const projectId = strVal(projectMetadata?.project_id as string | undefined);
+  if (projectId) {
+    try {
+      const detail = await apiGet(`/api/admin/projects/${projectId}`) as Record<string, unknown>;
+      const doc = (detail.design_doc || {}) as Record<string, unknown>;
+      const pageCount = Object.keys(doc).filter(k => !k.startsWith('_')).length;
+      if (exitCode === 0 && pageCount === 0) {
+        sendLog(ws, '\n[WARNING] Architecture review completed but no ./design-doc calls were made. Retrying...\n');
+        const retryResult = await runClaudeCode(
+          'You completed your analysis but did NOT call ./design-doc to save any pages. Your text was discarded.\n\n' +
+          'You MUST call ./design-doc set now to save your findings.\n' +
+          'The ./design-doc command is a bash script in the current directory. Run it via Bash.\n' +
+          'Start with: ./design-doc set "summary" \'"Your project summary"\'\n' +
+          'Then save systems, capabilities, and risks.',
+          ws, statusRef, model, effort, disallowedTools
+        );
+        exitCode = retryResult.exitCode;
+      }
+    } catch (e) {
+      sendLog(ws, `[WARNING] Could not verify design doc API calls: ${String(e)}\n`);
     }
-  } catch (e) {
-    sendLog(ws, `[WARNING] Could not verify design doc API calls: ${String(e)}\n`);
+  } else {
+    sendLog(ws, '[WARNING] No project_id in task metadata — skipping design doc post-check.\n');
   }
 
   // Completion — design doc was updated incrementally via API.

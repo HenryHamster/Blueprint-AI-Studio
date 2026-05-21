@@ -8,7 +8,8 @@ from typing import Dict, Any, List, Tuple
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import text
+from sqlalchemy import text, or_
+from sqlalchemy.orm import load_only
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
@@ -177,7 +178,17 @@ async def get_direction_auto_pause_stats(
             ProjectMessage.created_at >= earliest,
         ]
     else:
-        projects = (await session.execute(select(Project))).scalars().all()
+        projects = (
+            (
+                await session.execute(
+                    select(Project)
+                    .options(load_only(Project.id, Project.directions, Project.status))
+                    .limit(500)
+                )
+            )
+            .scalars()
+            .all()
+        )
         msg_filters = [
             ProjectMessage.from_type == "system",
             ProjectMessage.created_at >= earliest,
@@ -520,9 +531,26 @@ async def get_open_prs(
     active_tasks = (
         (
             await session.execute(
-                select(Task).where(
+                select(Task)
+                .options(
+                    load_only(
+                        Task.id,
+                        Task.context,
+                        Task.status,
+                        Task.title,
+                        Task.payloads,
+                        Task.created_at,
+                    )
+                )
+                .where(
                     Task.project_id == project_id,
                     Task.status.in_(list(_ACTIVE_STATUSES)),
+                    or_(
+                        Task.context["review_loop"]["pr_number"]
+                        .as_integer()
+                        .isnot(None),
+                        Task.context["rollup_pr_number"].as_integer().isnot(None),
+                    ),
                 )
             )
         )

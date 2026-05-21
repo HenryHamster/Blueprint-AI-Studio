@@ -45,7 +45,10 @@ export interface Project {
   github_owner: string;
   github_repo: string;
   autonomous_enabled: boolean;
-  directions: Direction[];
+  /** Full directions array — present on detail endpoint; absent on list endpoint. */
+  directions?: Direction[];
+  /** Count of active directions — present on list endpoint. */
+  directions_count?: number;
   created_at: string;
   my_role?: 'owner' | 'member' | 'viewer';
   build_config?: BuildConfig | null;

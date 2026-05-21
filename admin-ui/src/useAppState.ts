@@ -473,7 +473,7 @@ export function useAppState() {
 
   const fetchProjects = async (silent = false) => {
     try {
-      const res = await authGet(`${API_BASE_URL}/api/admin/projects`);
+      const res = await authGet(`${API_BASE_URL}/api/admin/projects?limit=100`);
       if (res.ok) {
         const data = await res.json();
         setProjects(data || []);

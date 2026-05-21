@@ -60,7 +60,11 @@ const OWNER = 'owner';
 const REPO = 'repo';
 const WS = null;
 const STATUS_REF = () => ({ value: '' });
-const BASE_TASK = { title: 'Test Task', description: '', context: {}, project_context: {} };
+const PROJECT_ID = 'proj-1234';
+const BASE_TASK = {
+  title: 'Test Task', description: '', context: {}, project_context: {},
+  project_metadata: { project_id: PROJECT_ID },
+};
 const PROJECT_NAME = 'TestProject';
 const BASE_PAYLOAD = { base_branch: 'main', project_name: PROJECT_NAME };
 
@@ -68,7 +72,7 @@ describe('handleDesignDocUpdate', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
-    vi.mocked(apiGet).mockResolvedValue([{ name: PROJECT_NAME, design_doc: { summary: 'x' } }]);
+    vi.mocked(apiGet).mockResolvedValue({ design_doc: { summary: 'x' } });
   });
 
   it('writes the ./design-doc helper script to WORKSPACE with mode 0o755', async () => {
@@ -87,9 +91,9 @@ describe('handleDesignDocUpdate', () => {
   });
 
   it('reports COMPLETED when runClaudeCode exits 0 and project has design_doc pages', async () => {
-    vi.mocked(apiGet).mockResolvedValue([
-      { name: PROJECT_NAME, design_doc: { summary: '"proj"', 'systems/sys-auth': {} } },
-    ]);
+    vi.mocked(apiGet).mockResolvedValue({
+      design_doc: { summary: '"proj"', 'systems/sys-auth': {} },
+    });
 
     await handleDesignDocUpdate(
       TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
@@ -103,7 +107,7 @@ describe('handleDesignDocUpdate', () => {
   });
 
   it('triggers a retry with "You MUST call ./design-doc set" when exitCode 0 but zero pages saved', async () => {
-    vi.mocked(apiGet).mockResolvedValue([{ name: PROJECT_NAME, design_doc: {} }]);
+    vi.mocked(apiGet).mockResolvedValue({ design_doc: {} });
 
     await handleDesignDocUpdate(
       TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
@@ -116,9 +120,34 @@ describe('handleDesignDocUpdate', () => {
     expect(call.status).toBe('COMPLETED');
   });
 
+  it('fetches design_doc from the project detail endpoint, not the project list', async () => {
+    vi.mocked(apiGet).mockResolvedValue({ design_doc: { summary: 'x' } });
+
+    await handleDesignDocUpdate(
+      TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+
+    expect(apiGet).toHaveBeenCalledWith(`/api/admin/projects/${PROJECT_ID}`);
+  });
+
+  it('skips the post-check (no spurious retry) when project_metadata has no project_id', async () => {
+    vi.mocked(apiGet).mockResolvedValue({ design_doc: {} });
+    const taskWithoutProjectId = { title: 'Test Task', description: '', context: {} };
+
+    await handleDesignDocUpdate(
+      TASK_ID, BASE_PAYLOAD, taskWithoutProjectId, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+
+    // No project_id -> post-check is skipped entirely: no detail fetch, no retry.
+    expect(apiGet).not.toHaveBeenCalled();
+    expect(runClaudeCode).toHaveBeenCalledTimes(1);
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('COMPLETED');
+  });
+
   it('reports FAILED with failure_category "claude_code_failed" when runClaudeCode exits non-zero', async () => {
     vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 1, allOutput: 'err', lastResultText: '' });
-    vi.mocked(apiGet).mockResolvedValue([{ name: PROJECT_NAME, design_doc: {} }]);
+    vi.mocked(apiGet).mockResolvedValue({ design_doc: {} });
 
     await handleDesignDocUpdate(
       TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
@@ -184,7 +213,7 @@ describe('handleDesignDocUpdate prompt determinism', () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));
     vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
-    vi.mocked(apiGet).mockResolvedValue([{ name: PROJECT_NAME, design_doc: { summary: 'x' } }]);
+    vi.mocked(apiGet).mockResolvedValue({ design_doc: { summary: 'x' } });
   });
 
   afterEach(() => {
@@ -201,7 +230,7 @@ describe('handleDesignDocUpdate prompt determinism', () => {
     const prompt1 = await invoke();
     vi.clearAllMocks();
     vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
-    vi.mocked(apiGet).mockResolvedValue([{ name: PROJECT_NAME, design_doc: { summary: 'x' } }]);
+    vi.mocked(apiGet).mockResolvedValue({ design_doc: { summary: 'x' } });
     const prompt2 = await invoke();
     expect(prompt1).toBe(prompt2);
   });

@@ -1502,11 +1502,27 @@ async def compute_pipeline_health_summary(
         except (ValueError, TypeError):
             return False
 
-    # Query tasks from extended 48h window to compute both current and previous period
+    # Query tasks from extended 48h window to compute both current and previous period.
+    # Status is filtered in SQL to avoid loading IN_PROGRESS/QUEUED tasks; timestamp
+    # window is post-filtered in Python via _derive_completed_at (uses status_log).
     tasks_result = await session.execute(
-        select(Task).where(
+        select(Task)
+        .where(
             Task.project_id == project_id,
             Task.created_at >= prev_window_start,
+            Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
+        )
+        .options(
+            load_only(
+                Task.id,
+                Task.project_id,
+                Task.status,
+                Task.created_at,
+                Task.context,
+                Task.latest_status_message,
+                Task.payloads,
+                Task.status_log,
+            )
         )
     )
     all_tasks = tasks_result.scalars().all()

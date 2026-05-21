@@ -2191,11 +2191,11 @@ class TestDirectionAutoPauseStats:
 
 
 class TestProjectEndpointsSurfaceProblemModel:
-    """Project endpoints expose problem_model + running_update fields so the
-    admin-ui can render the new strategic views."""
+    """Project detail endpoint exposes problem_model + running_update fields so
+    the admin-ui can render the new strategic views."""
 
     @pytest.mark.asyncio
-    async def test_list_projects_includes_new_fields(
+    async def test_detail_endpoint_includes_jsonb_fields(
         self, client: AsyncClient, db_session
     ):
         project = await _make_project(db_session)
@@ -2206,18 +2206,87 @@ class TestProjectEndpointsSurfaceProblemModel:
         db_session.add(project)
         await db_session.commit()
 
+        resp = await client.get(f"/api/admin/projects/{project.id}")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert isinstance(data, dict)
+        assert data["id"] == str(project.id)
+        assert "problem_model" in data
+        assert data["problem_model"]["intent"]["purpose"] == "Build X."
+        assert "running_update" in data
+        assert data["running_update"].startswith("## Current state")
+        assert "running_update_acknowledged_at" in data
+        assert "self_reflection_log" in data
+        assert "my_role" in data
+
+    @pytest.mark.asyncio
+    async def test_list_excludes_large_jsonb_fields(
+        self, client: AsyncClient, db_session
+    ):
+        """List endpoint omits large JSONB columns for performance."""
+        project = await _make_project(db_session)
+        project.problem_model = {"intent": {"purpose": "Build X."}}
+        project.running_update = "## Current state"
+        db_session.add(project)
+        await db_session.commit()
+
         resp = await client.get("/api/admin/projects")
         assert resp.status_code == 200
         data = resp.json()
-        assert isinstance(data, list)
         our = next((p for p in data if p["id"] == str(project.id)), None)
         assert our is not None
-        assert "problem_model" in our
-        assert our["problem_model"]["intent"]["purpose"] == "Build X."
-        assert "running_update" in our
-        assert our["running_update"].startswith("## Current state")
-        assert "running_update_acknowledged_at" in our
-        assert "self_reflection_log" in our
+        assert "problem_model" not in our
+        assert "running_update" not in our
+        assert "vision" not in our
+        assert "design_doc" not in our
+        assert "self_reflection_log" not in our
+        assert "directions" not in our
+        assert "directions_count" in our
+
+    @pytest.mark.asyncio
+    async def test_detail_endpoint_returns_404_for_other_user(
+        self, client: AsyncClient, db_session
+    ):
+        other = Project(name="Other", user_id="other-owner")
+        db_session.add(other)
+        await db_session.commit()
+        await db_session.refresh(other)
+        db_session.add(
+            ProjectMember(project_id=other.id, user_id="other-owner", role="owner")
+        )
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/projects/{other.id}")
+        assert resp.status_code == 404
+
+
+class TestGetAllProjectsPagination:
+    """GET /api/admin/projects supports limit/offset pagination."""
+
+    @pytest.mark.asyncio
+    async def test_limit_parameter(self, client: AsyncClient, db_session):
+        for i in range(5):
+            await _make_project(db_session, name=f"Project {i}")
+
+        resp = await client.get("/api/admin/projects?limit=2")
+        assert resp.status_code == 200
+        assert len(resp.json()) <= 2
+
+    @pytest.mark.asyncio
+    async def test_offset_parameter(self, client: AsyncClient, db_session):
+        for i in range(4):
+            await _make_project(db_session, name=f"Page Project {i}")
+
+        resp_all = await client.get("/api/admin/projects?limit=100")
+        resp_offset = await client.get("/api/admin/projects?limit=100&offset=2")
+        all_ids = [p["id"] for p in resp_all.json()]
+        offset_ids = [p["id"] for p in resp_offset.json()]
+        assert offset_ids == all_ids[2:]
+
+    @pytest.mark.asyncio
+    async def test_limit_max_enforced(self, client: AsyncClient, db_session):
+        resp = await client.get("/api/admin/projects?limit=200")
+        assert resp.status_code == 422
 
 
 class TestPatchProblemModel:
