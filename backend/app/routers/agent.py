@@ -1979,6 +1979,16 @@ async def claim_task(
                     logger.debug(
                         "[AGENT] Idle auto-entry retirement skipped (non-critical)"
                     )
+                # Low-success-rate maintenance: archive auto-generated entries
+                # whose confirmed/followed rate has fallen below threshold.
+                try:
+                    from app.playbook_learning import retire_ineffective_patterns
+
+                    retire_ineffective_patterns(doc)
+                except Exception:  # noqa: BLE001 — best-effort, never block claim
+                    logger.debug(
+                        "[AGENT] Low-success-rate retirement skipped (non-critical)"
+                    )
                 project_for_playbook.design_doc = doc
                 flag_modified(project_for_playbook, "design_doc")
                 session.add(project_for_playbook)

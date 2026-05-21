@@ -2249,10 +2249,17 @@ async def compute_pipeline_health_summary(
     # over-retirement of auto-generated entries whose last_referenced_at
     # crossed the idle threshold (see playbook_learning.retire_idle_auto_entries).
     auto_playbook_idle_retired_24h: Optional[int] = None
+    auto_playbook_low_success_retired_24h: Optional[int] = None
     if project and project.design_doc:
-        from app.playbook_learning import count_idle_auto_retired_within  # noqa: PLC0415
+        from app.playbook_learning import (  # noqa: PLC0415
+            count_idle_auto_retired_within,
+            count_low_success_retired_within,
+        )
 
         auto_playbook_idle_retired_24h = count_idle_auto_retired_within(
+            project.design_doc, hours=24
+        )
+        auto_playbook_low_success_retired_24h = count_low_success_retired_within(
             project.design_doc, hours=24
         )
 
@@ -2338,6 +2345,7 @@ async def compute_pipeline_health_summary(
         "direction_first_attempt_feedback": direction_first_attempt_feedback,
         "medium_scope_measurement": medium_scope_measurement,
         "auto_playbook_idle_retired_24h": auto_playbook_idle_retired_24h,
+        "auto_playbook_low_success_retired_24h": auto_playbook_low_success_retired_24h,
     }
 
 

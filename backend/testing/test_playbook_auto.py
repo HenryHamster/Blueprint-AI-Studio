@@ -1186,6 +1186,7 @@ def test_retire_ineffective_patterns_retires_low_success_rate():
     doc = {
         "playbook/bad": {
             "content": "bad tip",
+            "source": "auto-generated",
             "followed_count": _RETIRE_MIN_FOLLOWED,
             "confirmed_count": 0,  # 0% success rate — below threshold
         },
@@ -1205,6 +1206,7 @@ def test_retire_ineffective_patterns_keeps_sufficient_success_rate():
     doc = {
         "playbook/good": {
             "content": "good tip",
+            "source": "auto-generated",
             "followed_count": _RETIRE_MIN_FOLLOWED,
             "confirmed_count": _RETIRE_MIN_FOLLOWED,  # 100% — well above threshold
         },
@@ -1220,6 +1222,7 @@ def test_retire_ineffective_patterns_skips_entries_below_min_followed():
     doc = {
         "playbook/new": {
             "content": "new tip",
+            "source": "auto-generated",
             "followed_count": _RETIRE_MIN_FOLLOWED - 1,
             "confirmed_count": 0,  # Would retire if followed enough
         },
@@ -1235,6 +1238,7 @@ def test_retire_ineffective_patterns_retirement_reason_includes_rate():
     doc = {
         "playbook/tip": {
             "content": "x",
+            "source": "auto-generated",
             "followed_count": 10,
             "confirmed_count": 1,  # 10% success rate
         },
@@ -1244,6 +1248,83 @@ def test_retire_ineffective_patterns_retirement_reason_includes_rate():
     assert len(archive) == 1
     reason = archive[0]["_retirement_reason"]
     assert "0.10" in reason
+
+
+def test_retire_ineffective_patterns_skips_operator_curated():
+    """Operator-curated entries (non-auto source) must NOT be retired even if low success rate."""
+    from app.playbook_learning import retire_ineffective_patterns, _RETIRE_MIN_FOLLOWED
+
+    doc = {
+        "playbook/operator-tip": {
+            "content": "operator tip",
+            "source": "operator",
+            "followed_count": _RETIRE_MIN_FOLLOWED,
+            "confirmed_count": 0,
+        },
+        "playbook/review-tip": {
+            "content": "review tip",
+            "source": "review-extracted",
+            "followed_count": _RETIRE_MIN_FOLLOWED,
+            "confirmed_count": 0,
+        },
+    }
+    retired = retire_ineffective_patterns(doc)
+    assert retired == []
+    assert "playbook/operator-tip" in doc
+    assert "playbook/review-tip" in doc
+
+
+def test_retire_ineffective_patterns_skips_no_source():
+    """Entries with no source field must NOT be retired (treated as operator-curated)."""
+    from app.playbook_learning import retire_ineffective_patterns, _RETIRE_MIN_FOLLOWED
+
+    doc = {
+        "playbook/legacy": {
+            "content": "legacy tip",
+            "followed_count": _RETIRE_MIN_FOLLOWED,
+            "confirmed_count": 0,
+        },
+    }
+    retired = retire_ineffective_patterns(doc)
+    assert retired == []
+    assert "playbook/legacy" in doc
+
+
+def test_count_low_success_retired_within_window():
+    from app.playbook_learning import count_low_success_retired_within
+
+    now = _utcnow()
+    doc = {
+        "playbook_archive": [
+            # Within 24h, low_success_rate reason → counted
+            {
+                "_archived_key": "playbook/a",
+                "_archived_at": (now - timedelta(hours=2)).isoformat(),
+                "_retirement_reason": "low_success_rate:0.10",
+            },
+            # Within 24h, but idle reason → NOT counted
+            {
+                "_archived_key": "playbook/b",
+                "_archived_at": (now - timedelta(hours=2)).isoformat(),
+                "_retirement_reason": "idle_auto_entry:30d",
+            },
+            # low_success_rate but older than 24h → NOT counted
+            {
+                "_archived_key": "playbook/c",
+                "_archived_at": (now - timedelta(hours=48)).isoformat(),
+                "_retirement_reason": "low_success_rate:0.05",
+            },
+            # Within 24h, low_success_rate → counted
+            {
+                "_archived_key": "playbook/d",
+                "_archived_at": (now - timedelta(hours=23)).isoformat(),
+                "_retirement_reason": "low_success_rate:0.20",
+            },
+        ],
+    }
+    assert count_low_success_retired_within(doc, hours=24) == 2
+    assert count_low_success_retired_within({}, hours=24) == 0
+    assert count_low_success_retired_within({"playbook_archive": []}, hours=24) == 0
 
 
 # ─────────────────────────────────────────────────────────────────────────────

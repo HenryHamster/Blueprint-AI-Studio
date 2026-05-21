@@ -507,8 +507,17 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
           m.created_at &&
           parseTimestamp(m.created_at).getTime() > dividerTime
         ).length,
+        highSignalNotes: openMessages.filter(m =>
+          m.message_type === 'NOTE' &&
+          m.created_at &&
+          parseTimestamp(m.created_at).getTime() > dividerTime &&
+          effectiveSignal(m, eventPrefs, tempMutes) === 'high'
+        ).length,
       }
-    : { blockers: 0, feedback: 0, bugReports: 0, routine: 0 };
+    : { blockers: 0, feedback: 0, bugReports: 0, routine: 0, highSignalNotes: 0 };
+
+  // Total new count: each message counted exactly once (high-signal and routine are disjoint)
+  const totalNewCount = newHighSignalCount + newMessageCounts.routine;
 
   // Split open messages by signal level, respecting per-event-type prefs and temp mutes, then filter by search
   const muteActive = isMuteWindowActive(muteWindow);
@@ -1282,9 +1291,9 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
         {dividerTime && (
           <div className="flex items-center gap-2 text-xs text-neutral-500 px-1">
             <span>Last visit: {formatTimestamp(dividerTime)}</span>
-            {newHighSignalCount + newMessageCounts.blockers + newMessageCounts.feedback + newMessageCounts.bugReports + newMessageCounts.routine > 0 && (
+            {totalNewCount > 0 && (
               <span className="text-blue-400 font-medium">
-                ({newHighSignalCount + newMessageCounts.blockers + newMessageCounts.feedback + newMessageCounts.bugReports + newMessageCounts.routine} new)
+                ({totalNewCount} new)
               </span>
             )}
           </div>
@@ -1647,11 +1656,11 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
       {/* Messages list — chat-style scroll area */}
       <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 md:px-6 py-4 space-y-3 relative">
         {/* Prominent banner: X new since {time} with action buttons */}
-        {dividerTime && newHighSignalCount > 0 && !dividerDismissedRef.current && (
+        {dividerTime && totalNewCount > 0 && !dividerDismissedRef.current && (
           <div className="mb-3 p-3 md:p-4 rounded-lg bg-gradient-to-r from-blue-600/20 to-blue-500/10 border border-blue-500/50 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
             <div className="flex-1 min-w-0">
               <div className="text-sm font-semibold text-blue-300 truncate">
-                {newHighSignalCount} new since {formatSinceTimestamp(dividerTime)}
+                {totalNewCount} new since {formatSinceTimestamp(dividerTime)}
               </div>
             </div>
             <div className="flex items-center gap-2 flex-wrap">
@@ -1672,7 +1681,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
         )}
 
         {/* Caught-up indicator: when divider is set, not dismissed, and zero new messages of any kind */}
-        {dividerTime && !dividerDismissedRef.current && newHighSignalCount === 0 && newMessageCounts.blockers === 0 && newMessageCounts.feedback === 0 && newMessageCounts.bugReports === 0 && newMessageCounts.routine === 0 && !showOnlyNew && (
+        {dividerTime && !dividerDismissedRef.current && totalNewCount === 0 && !showOnlyNew && (
           <div className="mb-3 p-3 md:p-4 rounded-lg bg-gradient-to-r from-emerald-600/20 to-emerald-500/10 border border-emerald-500/50 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
             <div className="flex-1 min-w-0">
               <div className="text-sm font-semibold text-emerald-300 truncate">
@@ -1756,7 +1765,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
             )}
 
             {/* Summary card: show counts of new messages if divider is active */}
-            {dividerTime && !dividerDismissedRef.current && (newMessageCounts.blockers > 0 || newMessageCounts.feedback > 0 || newMessageCounts.bugReports > 0 || newMessageCounts.routine > 0) && (
+            {dividerTime && !dividerDismissedRef.current && (newMessageCounts.blockers > 0 || newMessageCounts.feedback > 0 || newMessageCounts.bugReports > 0 || newMessageCounts.routine > 0 || newMessageCounts.highSignalNotes > 0) && (
               <div className="mx-2 my-3 p-3 rounded-lg bg-gradient-to-r from-blue-950/40 to-blue-900/30 border border-blue-800/40 text-[11px] text-blue-200/90">
                 <div className="font-semibold mb-2 text-blue-300">Since you last looked</div>
                 <div className="space-y-1.5">
@@ -1802,6 +1811,17 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
                       data-testid="summary-card-routine"
                     >
                       <span className="font-medium text-neutral-300">{newMessageCounts.routine}</span> routine ops
+                    </button>
+                  )}
+                  {newMessageCounts.highSignalNotes > 0 && (
+                    <button
+                      onClick={() => {
+                        blockersRefEl.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                      }}
+                      className="block w-full text-left hover:text-blue-100 transition-colors"
+                      data-testid="summary-card-alerts"
+                    >
+                      <span className="font-medium text-orange-300">{newMessageCounts.highSignalNotes}</span> alert{newMessageCounts.highSignalNotes !== 1 ? 's' : ''}
                     </button>
                   )}
                 </div>

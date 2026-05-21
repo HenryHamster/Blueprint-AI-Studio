@@ -675,6 +675,8 @@ def retire_ineffective_patterns(
         if not k.startswith("playbook/") or not isinstance(doc.get(k), dict):
             continue
         entry = doc[k]
+        if entry.get("source") != "auto-generated":
+            continue
         followed = entry.get("followed_count", 0)
         if followed < min_followed:
             continue
@@ -793,6 +795,38 @@ def count_idle_auto_retired_within(doc: dict, *, hours: int = 24) -> int:
             continue
         reason = entry.get("_retirement_reason") or ""
         if not reason.startswith("idle_auto_entry"):
+            continue
+        ts_str = entry.get("_archived_at")
+        if not ts_str:
+            continue
+        try:
+            ts = datetime.fromisoformat(str(ts_str).replace("Z", "+00:00"))
+            if ts.tzinfo is not None:
+                ts = ts.replace(tzinfo=None)
+        except (ValueError, TypeError):
+            continue
+        if ts >= cutoff:
+            count += 1
+    return count
+
+
+def count_low_success_retired_within(doc: dict, *, hours: int = 24) -> int:
+    """Count playbook_archive entries retired by ``retire_ineffective_patterns``
+    within the last ``hours``. Used by admin_digest to surface auto-entry pruning.
+    """
+    if not doc:
+        return 0
+    archive = doc.get("playbook_archive") or []
+    if not archive:
+        return 0
+    now = _utcnow()
+    cutoff = now - timedelta(hours=hours)
+    count = 0
+    for entry in archive:
+        if not isinstance(entry, dict):
+            continue
+        reason = entry.get("_retirement_reason") or ""
+        if not reason.startswith("low_success_rate"):
             continue
         ts_str = entry.get("_archived_at")
         if not ts_str:

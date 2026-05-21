@@ -2835,3 +2835,101 @@ describe('MessagesPanel backend last-seen', () => {
   });
 });
 
+// ── Since-last-visit count accuracy ──────────────────────────────────────────
+
+describe('MessagesPanel since-last-visit count accuracy', () => {
+  let root: Root | null = null;
+  let host: HTMLDivElement | null = null;
+  const LAST_SEEN_KEY = 'messages_panel_last_seen:test-user@example.com:proj-1';
+  const PAST_TIME = Date.now() - 3600000; // 1 hour ago
+
+  beforeEach(() => {
+    localStorage.setItem(LAST_SEEN_KEY, String(PAST_TIME));
+  });
+
+  afterEach(() => {
+    const r = root;
+    if (r) act(() => r.unmount());
+    root = null;
+    host?.remove();
+    host = null;
+    localStorage.clear();
+    vi.clearAllMocks();
+  });
+
+  async function renderPanel(messages: ReturnType<typeof makeMsg>[]) {
+    (apiFetch as ReturnType<typeof vi.fn>).mockImplementation(async () =>
+      new Response(JSON.stringify({ messages }), { status: 200 }),
+    );
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <MessagesPanel
+          selectedProjectId="proj-1"
+          onClose={() => {}}
+          addToast={() => {}}
+          onMessageCountChange={() => {}}
+        />,
+      );
+    });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 100)); });
+    return host as HTMLDivElement;
+  }
+
+  test('single new BLOCKER shows "(1 new)" not "(2 new)" in last-visit anchor', async () => {
+    const blocker = makeMsg({ id: 'b1', message_type: 'BLOCKER', from_type: 'agent', content: 'blocker msg' });
+    const el = await renderPanel([blocker]);
+    const text = el.textContent ?? '';
+    expect(text).toContain('(1 new)');
+    expect(text).not.toContain('(2 new)');
+  });
+
+  test('single new FEEDBACK shows "(1 new)" not "(2 new)"', async () => {
+    const feedback = makeMsg({ id: 'f1', message_type: 'FEEDBACK', from_type: 'user', content: 'feedback msg' });
+    const el = await renderPanel([feedback]);
+    const text = el.textContent ?? '';
+    expect(text).toContain('(1 new)');
+    expect(text).not.toContain('(2 new)');
+  });
+
+  test('banner shows for routine-only new activity', async () => {
+    const routine = makeMsg({ id: 'r1', from_type: 'system', context: { event_type: 'pr_merged' }, content: 'merged pr' });
+    const el = await renderPanel([routine]);
+    // Banner should be visible even with no high-signal new messages
+    const text = el.textContent ?? '';
+    expect(text).toMatch(/\d+ new since/);
+  });
+
+  test('mark-all-read button is present when only routine messages are new', async () => {
+    const routine = makeMsg({ id: 'r1', from_type: 'system', context: { event_type: 'pr_merged' } });
+    const el = await renderPanel([routine]);
+    const markReadBtn = [...el.querySelectorAll('button')].find(b => b.textContent?.trim() === 'Mark all read');
+    expect(markReadBtn).toBeTruthy();
+  });
+
+  test('new high-signal NOTE (failure_alert) appears in summary card breakdown', async () => {
+    const failureAlert = makeMsg({
+      id: 'fa1',
+      message_type: 'NOTE',
+      from_type: 'system',
+      context: { event_type: 'failure_alert' },
+      content: 'failure msg',
+    });
+    const el = await renderPanel([failureAlert]);
+    const alertRow = el.querySelector('[data-testid="summary-card-alerts"]');
+    expect(alertRow).toBeTruthy();
+    expect(alertRow?.textContent).toContain('1');
+  });
+
+  test('routine new messages are represented in the summary card', async () => {
+    const routine = makeMsg({ id: 'r1', from_type: 'system', context: { event_type: 'pr_merged' } });
+    const el = await renderPanel([routine]);
+    const routineRow = el.querySelector('[data-testid="summary-card-routine"]');
+    expect(routineRow).toBeTruthy();
+    expect(routineRow?.textContent).toContain('1');
+  });
+});
+
