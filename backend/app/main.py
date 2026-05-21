@@ -3523,6 +3523,61 @@ async def strategic_operation(
         )
         return _resp({"status": "ok", "op": "set_retirement_critiques", "count": n})
 
+    elif payload.op == "set_evidence_progress":
+        # OPTIONAL refinement of the deterministic outcome-progress (scaffolding)
+        # detector. data is a list of {direction_id, status, rationale} items;
+        # status ∈ {advancing, stalled, met}. advancing/met SUPPRESS the advisory
+        # scaffolding flag, stalled reinforces it. Stashed in task.context for the
+        # completion handler to persist onto directions. Idempotent (last write
+        # wins). Omitting this op entirely leaves the deterministic backstop intact.
+        from app.strategic_completion import (
+            EVIDENCE_PROGRESS_CONTEXT_KEY,
+            _EVIDENCE_PROGRESS_RATIONALE_MAX,
+            _VALID_EVIDENCE_PROGRESS,
+        )
+
+        if not isinstance(data, list):
+            raise HTTPException(
+                status_code=400,
+                detail="set_evidence_progress: data must be a list of {direction_id, status, rationale} objects",
+            )
+        cleaned_ep = []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            direction_id = str(item.get("direction_id", "")).strip()
+            status = str(item.get("status", "")).strip().lower()
+            rationale = str(item.get("rationale", "")).strip()
+            if not direction_id:
+                continue
+            if status not in _VALID_EVIDENCE_PROGRESS:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"set_evidence_progress: invalid status '{status}' (must be one of: advancing, stalled, met)",
+                )
+            cleaned_ep.append(
+                {
+                    "direction_id": direction_id[:64],
+                    "status": status,
+                    "rationale": rationale[:_EVIDENCE_PROGRESS_RATIONALE_MAX],
+                }
+            )
+        ctx = task.context or {}
+        task.context = {
+            **ctx,
+            EVIDENCE_PROGRESS_CONTEXT_KEY: cleaned_ep,
+            "_strategic_api_called": True,
+        }
+        flag_modified(task, "context")
+        session.add(task)
+        await session.commit()
+        logger.info(
+            f"[STRATEGIC API] Stored {len(cleaned_ep)} evidence_progress verdict(s) for task {task.id}"
+        )
+        return _resp(
+            {"status": "ok", "op": "set_evidence_progress", "count": len(cleaned_ep)}
+        )
+
     else:
         raise HTTPException(status_code=400, detail=f"Unknown op: {payload.op}")
 

@@ -559,6 +559,12 @@ function DirectionCardImpl({
               <span className="italic">{d.completion_criteria}</span>
             </p>
           )}
+          {d.context?.success_evidence && (
+            <p className="mt-1.5 text-[11px] text-neutral-500 leading-relaxed">
+              <span className="font-medium text-neutral-600">Success evidence: </span>
+              <span className="italic">{d.context.success_evidence}</span>
+            </p>
+          )}
           {/* Last researched / cooldown subtitle */}
           {key === 'active' && (() => {
             const cooldownStatus = getCooldownStatus(d, cooldownMinutes);
@@ -887,6 +893,24 @@ function DirectionCardImpl({
                   className={`text-[10px] px-1.5 py-0.5 rounded border font-medium bg-${color}-950/40 border-${color}-900/50 text-${color}-400`}
                 >
                   {non_merge_finished}/{threshold} non-merge · {Math.round(merge_rate * 100)}%
+                </span>
+              );
+            })()}
+            {/* Outcome-less scaffolding warning — advisory: long-running direction
+                keeps merging PRs at a healthy rate but shows no progress toward its
+                stated success_evidence. A consideration to surface, not an enforced pause. */}
+            {d.outcome_scaffolding_flagged && (() => {
+              const ev = d.outcome_scaffolding_evidence;
+              const tooltip = ev
+                ? `Possible outcome-less scaffolding: ${ev.total_cycles} cycles, ${ev.lifetime_merged} merges at ${Math.round(ev.lifetime_merge_rate * 100)}% rate, but progress toward success_evidence has been flat for the last ${ev.stall_run_cycles} cycles. Advisory only — consider whether this direction is still advancing its goal.`
+                : 'Possible outcome-less scaffolding: keeps merging PRs but shows no progress toward its stated success_evidence. Advisory only.';
+              return (
+                <span
+                  title={tooltip}
+                  className="text-[10px] px-1.5 py-0.5 rounded border font-medium bg-amber-950/40 border-amber-900/50 text-amber-400"
+                >
+                  Outcome-less scaffolding?
+                  {ev ? ` · ${ev.stall_run_cycles}-cycle stall` : ''}
                 </span>
               );
             })()}

@@ -476,6 +476,7 @@ async def _process_direction_lifecycle(
     from app.strategic_completion import (
         _check_direction_health,
         _check_direction_completion,
+        _check_outcome_scaffolding,
         _compute_churn_metrics,
         _compute_lifetime_burn_metrics,
     )
@@ -1207,6 +1208,53 @@ async def _process_direction_lifecycle(
                 d.pop("possibly_complete", None)
                 d.pop("completion_suggestion", None)
                 directions_modified = True
+        # Advisory outcome-progress (scaffolding) detection — surfacing only, NEVER
+        # auto-pauses. Flags a long-running healthy-merge direction whose outcome
+        # signal has stalled so the strategic agent / operator can decide to retire,
+        # redirect, or redefine it. Notify once per transition into the flagged state.
+        scaffolding_ev = _check_outcome_scaffolding(d)
+        if scaffolding_ev:
+            if not d.get("outcome_scaffolding_flagged"):
+                d["outcome_scaffolding_flagged"] = True
+                d["outcome_scaffolding_flagged_at"] = _utcnow().isoformat()
+                d["outcome_scaffolding_evidence"] = scaffolding_ev
+                directions_modified = True
+                logger.warning(
+                    f"[AUTONOMOUS] Direction {did} flagged outcome-less scaffolding: "
+                    f"{scaffolding_ev['total_cycles']} cycles, "
+                    f"{scaffolding_ev['lifetime_merged']} merged "
+                    f"(rate {scaffolding_ev['lifetime_merge_rate']:.0%}), "
+                    f"progress stalled {scaffolding_ev['stall_run_cycles']} cycles"
+                )
+                try:
+                    from app.notification_dispatch import (
+                        post_direction_outcome_stalled_message,
+                    )  # noqa: PLC0415
+
+                    await post_direction_outcome_stalled_message(
+                        session,
+                        project.id,
+                        direction_text=d.get("text", ""),
+                        evidence=scaffolding_ev,
+                        direction_id=did,
+                    )
+                except Exception as _notify_exc:
+                    logger.warning(
+                        f"[NOTIFY] Failed to post outcome-stalled message for {did}: "
+                        f"{_notify_exc}"
+                    )
+            else:
+                # Keep the evidence fresh while the flag remains set.
+                d["outcome_scaffolding_evidence"] = scaffolding_ev
+        elif d.get("outcome_scaffolding_flagged"):
+            d.pop("outcome_scaffolding_flagged", None)
+            d.pop("outcome_scaffolding_flagged_at", None)
+            d.pop("outcome_scaffolding_evidence", None)
+            directions_modified = True
+            logger.info(
+                f"[AUTONOMOUS] Cleared outcome-scaffolding flag on {did}: "
+                f"condition no longer holds"
+            )
         active_directions.append(d)
     if auto_paused_any or directions_modified:
         flag_modified(project, "directions")

@@ -19,7 +19,7 @@
     "routers/agent_status.py": 3250,
     "autonomous_research.py": 2750,
     "research_completion.py": 2750,
-    "strategic_completion.py": 2200,
+    "strategic_completion.py": 2550,
     "rollup_management.py": 2950,
     "reaper.py": 3280,
     "review_pipeline.py": 2350,

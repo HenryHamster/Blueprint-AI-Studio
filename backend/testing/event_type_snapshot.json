@@ -143,6 +143,12 @@
       "source_fn": "post_direction_burn_pause_message"
     },
     {
+      "name": "direction_outcome_stalled",
+      "classification": "high_signal",
+      "message_type": "NOTE",
+      "source_fn": "post_direction_outcome_stalled_message"
+    },
+    {
       "name": "direction_churn_pause",
       "classification": "escalation",
       "message_type": "BLOCKER",

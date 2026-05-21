@@ -640,6 +640,40 @@ def test_per_direction_velocity_decelerating():
     assert d["velocity"] < 1.0
 
 
+def test_success_evidence_present_in_outcome():
+    directions = [
+        {
+            "id": "dir-1",
+            "status": "active",
+            "context": {
+                "success_evidence": "S" * 700,
+                "retirement_condition": "  retire when done  ",
+            },
+            "research_history": [
+                {"timestamp": "2026-01-01T00:00:00", "prs_merged": 1},
+            ],
+        }
+    ]
+    d = _build_outcome_evaluation(_make_project(directions=directions))["directions"][0]
+    assert d["success_evidence"] == "S" * 500
+    assert d["retirement_condition"] == "retire when done"
+
+
+def test_success_evidence_absent_when_missing():
+    directions = [
+        {
+            "id": "dir-1",
+            "status": "active",
+            "research_history": [
+                {"timestamp": "2026-01-01T00:00:00", "prs_merged": 1},
+            ],
+        }
+    ]
+    d = _build_outcome_evaluation(_make_project(directions=directions))["directions"][0]
+    assert "success_evidence" not in d
+    assert "retirement_condition" not in d
+
+
 def test_confirmed_and_proposed_findings():
     research_ctx = (
         "## Established Findings\n"

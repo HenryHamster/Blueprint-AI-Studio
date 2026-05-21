@@ -309,6 +309,27 @@ def _build_outcome_evaluation(
             outcome["operator_rejection_rate"] = (
                 round(rejected / total_prs, 2) if total_prs > 0 else None
             )
+        # Surface the stated outcome goal alongside the planned-vs-actual metrics
+        # so the strategic agent can judge progress against success_evidence /
+        # retirement_condition. Mirror the write-side cap from main.py.
+        _DIR_FIELD_MAX = 500
+        dir_context = d.get("context") or {}
+        _success_evidence = str(dir_context.get("success_evidence") or "").strip()
+        if _success_evidence:
+            outcome["success_evidence"] = _success_evidence[:_DIR_FIELD_MAX]
+        _retirement_condition = str(
+            dir_context.get("retirement_condition") or ""
+        ).strip()
+        if _retirement_condition:
+            outcome["retirement_condition"] = _retirement_condition[:_DIR_FIELD_MAX]
+        # Advisory outcome-less-scaffolding flag (see _check_outcome_scaffolding):
+        # surface it in the planned-vs-actual output so the strategic cycle treats
+        # it as a first-class signal alongside success_evidence / retirement_condition.
+        if d.get("outcome_scaffolding_flagged"):
+            outcome["outcome_scaffolding_flagged"] = True
+            _osc_ev = d.get("outcome_scaffolding_evidence")
+            if _osc_ev:
+                outcome["outcome_scaffolding_evidence"] = _osc_ev
         if confirmed:
             outcome["confirmed"] = confirmed[:15]
         if proposed:

@@ -1340,6 +1340,27 @@ async def _spawn_strategic_review(
         ctx = d.get("research_context")
         if ctx:
             stat_entry["research_context"] = ctx[:3000]
+        # Surface the direction's stated outcome goal so the strategic agent's
+        # per-cycle review is grounded in success_evidence/retirement_condition,
+        # not just merge/cost metrics. Mirror the write-side cap from main.py.
+        _DIR_FIELD_MAX = 500
+        dir_context = d.get("context") or {}
+        _success_evidence = str(dir_context.get("success_evidence") or "").strip()
+        if _success_evidence:
+            stat_entry["success_evidence"] = _success_evidence[:_DIR_FIELD_MAX]
+        _retirement_condition = str(
+            dir_context.get("retirement_condition") or ""
+        ).strip()
+        if _retirement_condition:
+            stat_entry["retirement_condition"] = _retirement_condition[:_DIR_FIELD_MAX]
+        # Advisory outcome-less-scaffolding flag: surfaces a long-running direction
+        # that keeps merging PRs but never advances its success_evidence, so the
+        # strategic agent sees it as a first-class signal (not just merge/cost metrics).
+        if d.get("outcome_scaffolding_flagged"):
+            stat_entry["outcome_scaffolding_flagged"] = True
+            _osc_ev = d.get("outcome_scaffolding_evidence")
+            if _osc_ev:
+                stat_entry["outcome_scaffolding_evidence"] = _osc_ev
         _rfe = d.get("recent_findings_evidence") or []
         if _rfe:
             from app.research_context import filter_direction_evidence

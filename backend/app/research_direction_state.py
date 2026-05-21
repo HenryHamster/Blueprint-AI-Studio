@@ -458,6 +458,15 @@ async def apply_post_spawn_state(
                     )
                     d["recent_findings_evidence"] = (prior_rfe + cur_rfe)[-5:]
 
+                    # Record the per-cycle outcome-progress snapshot (bounded) so the
+                    # advisory scaffolding detector can spot directions that keep
+                    # merging PRs without advancing their stated success_evidence.
+                    from app.strategic_completion import (
+                        record_outcome_progress_snapshot,
+                    )
+
+                    record_outcome_progress_snapshot(d)
+
                     # Auto-complete direction if saturated with sufficient merged PRs
                     if (
                         d.get("status") == "active"

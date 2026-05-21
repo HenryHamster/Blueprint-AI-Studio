@@ -7,6 +7,7 @@ Covers:
   - _record_strategic_task_failure: circuit-breaker increment and cycle history update
 """
 
+import uuid
 import pytest
 import pytest_asyncio
 from datetime import datetime, timedelta, timezone
@@ -34,6 +35,11 @@ from app.strategic_completion import (
     _extract_rationale_from_notes,
     _compute_churn_metrics,
     _compute_lifetime_burn_metrics,
+    _compute_outcome_progress_signal,
+    record_outcome_progress_snapshot,
+    _check_outcome_scaffolding,
+    _apply_evidence_progress_verdicts,
+    EVIDENCE_PROGRESS_CONTEXT_KEY,
     _CREATED_NOTE_PREFIX,
     _RETIRED_NOTE_PREFIX,
 )
@@ -3359,6 +3365,167 @@ async def test_set_retirement_critiques_invalid_dict_returns_400(
     assert resp.status_code == 400, resp.text
 
 
+# ── set_evidence_progress HTTP API path ────────────────────────────────────────
+
+
+async def _make_strategic_task(db_session, *, name, vm, directions=None):
+    """Build a committed project + cycle + strategic_review task; return the task."""
+    from app.models import TaskStatus
+    from app import strategic_cycle
+
+    project = Project(
+        name=name,
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=directions or [],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id=vm,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={"strategic_cycle_id": cycle.id},
+        strategic_cycle_id=cycle.id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    return task
+
+
+@pytest.mark.asyncio
+async def test_set_evidence_progress_list_via_http(client, db_session):
+    """HTTP API: a valid list payload returns 200 and stashes verdicts in task.context."""
+    from app.auth import create_agent_token
+
+    task = await _make_strategic_task(db_session, name="EP-HTTP", vm="vm-ep")
+    token = create_agent_token(str(task.id), "vm-ep", task_type="strategic_review")
+    verdicts = [
+        {"direction_id": "d-1", "status": "advancing", "rationale": "landed finding F"},
+        {"direction_id": "d-2", "status": "stalled", "rationale": "no new evidence"},
+    ]
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={"task_id": str(task.id), "op": "set_evidence_progress", "data": verdicts},
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["op"] == "set_evidence_progress"
+    assert body["count"] == 2
+
+    await db_session.refresh(task)
+    stored = (task.context or {}).get(EVIDENCE_PROGRESS_CONTEXT_KEY)
+    assert stored == verdicts
+    assert (task.context or {}).get("_strategic_api_called") is True
+
+
+@pytest.mark.asyncio
+async def test_set_evidence_progress_invalid_status_returns_400(client, db_session):
+    """HTTP API: an out-of-enum status rejects the whole payload with 400."""
+    from app.auth import create_agent_token
+
+    task = await _make_strategic_task(db_session, name="EP-BADSTATUS", vm="vm-ep-bs")
+    token = create_agent_token(str(task.id), "vm-ep-bs", task_type="strategic_review")
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "set_evidence_progress",
+            "data": [
+                {"direction_id": "d-1", "status": "progressing", "rationale": "x"}
+            ],
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 400, resp.text
+    await db_session.refresh(task)
+    assert EVIDENCE_PROGRESS_CONTEXT_KEY not in (task.context or {})
+
+
+@pytest.mark.asyncio
+async def test_set_evidence_progress_non_list_returns_400(client, db_session):
+    """HTTP API: a non-list payload (dict) is rejected with 400."""
+    from app.auth import create_agent_token
+
+    task = await _make_strategic_task(db_session, name="EP-NONLIST", vm="vm-ep-nl")
+    token = create_agent_token(str(task.id), "vm-ep-nl", task_type="strategic_review")
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "set_evidence_progress",
+            "data": {"direction_id": "d-1", "status": "advancing"},
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 400, resp.text
+
+
+@pytest.mark.asyncio
+async def test_set_evidence_progress_end_to_end_persists_on_direction(
+    client, db_session, mocker
+):
+    """Smoke: submit verdict via HTTP -> stash -> completion handler persists on direction."""
+    from unittest.mock import AsyncMock
+    from app.auth import create_agent_token
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+
+    task = await _make_strategic_task(
+        db_session,
+        name="EP-E2E",
+        vm="vm-ep-e2e",
+        directions=[
+            {
+                "id": "d-live",
+                "status": "active",
+                "text": "Long runner",
+                "research_history": [{}, {}, {}],
+                "history_aggregate": {"total_cycles": 9},
+            }
+        ],
+    )
+    token = create_agent_token(str(task.id), "vm-ep-e2e", task_type="strategic_review")
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "set_evidence_progress",
+            "data": [
+                {
+                    "direction_id": "d-live",
+                    "status": "met",
+                    "rationale": "evidence satisfied",
+                }
+            ],
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+
+    await db_session.refresh(task)
+    project = await db_session.get(Project, task.project_id)
+    await _handle_strategic_completion(task, "", db_session, project=project)
+
+    await db_session.refresh(project)
+    ep = project.directions[0]["evidence_progress"]
+    assert ep["status"] == "met"
+    assert ep["rationale"] == "evidence satisfied"
+    assert ep["cycle_index"] == 12  # 3 history + 9 aggregate
+    assert ep["cycle_task_id"] == str(task.id)
+
+
 # ── superseded status + successor linkage ─────────────────────────────────────
 
 
@@ -4589,6 +4756,323 @@ class TestRule6LifetimeBurnBackstop:
         assert reason is not None
         assert "Lifetime burn backstop" in reason
         assert _is_code_failure_pause_reason(reason) is False
+
+
+# ── Outcome-progress (scaffolding) detector ───────────────────────────────────
+
+
+def _scaffolding_history(cycles=4, created=3, merged=3, completed=3):
+    """research_history entries for a healthy-merging direction (no failures)."""
+    return [
+        {
+            "tasks_created": created,
+            "tasks_completed": completed,
+            "tasks_failed": 0,
+            "tasks_failed_infra": 0,
+            "prs_merged": merged,
+        }
+        for _ in range(cycles)
+    ]
+
+
+def _scaffolding_direction(progress_window, **overrides):
+    """Long-running healthy-merge direction with a given progress-signal window.
+
+    total_cycles = 4 (history) + 10 (aggregate) = 14 >= default min_cycles (12);
+    lifetime_merged = 12 + 8 = 20 with merge_rate 1.0 (no non-merging finished),
+    so only the outcome-progress window decides whether scaffolding is flagged.
+    """
+    d = {
+        "id": "d-scaffold",
+        "status": "active",
+        "research_history": _scaffolding_history(),
+        "history_aggregate": {
+            "total_cycles": 10,
+            "total_prs_merged": 8,
+            "total_tasks_completed": 8,
+            "total_tasks_failed": 0,
+            "total_tasks_failed_infra": 0,
+        },
+        "outcome_progress_history": [{"progress": p} for p in progress_window],
+    }
+    d.update(overrides)
+    return d
+
+
+class TestComputeOutcomeProgressSignal:
+    def test_counts_confirmed_excludes_proposed(self):
+        ctx = (
+            "## Established Findings\n"
+            "- Finding A\n"
+            "- Finding B (proposed)\n"
+            "- Finding C\n"
+        )
+        d = {"research_context": ctx}
+        assert _compute_outcome_progress_signal(d) == 2
+
+    def test_empty_context_returns_zero(self):
+        assert _compute_outcome_progress_signal({}) == 0
+        assert _compute_outcome_progress_signal({"research_context": ""}) == 0
+
+
+class TestRecordOutcomeProgressSnapshot:
+    def test_appends_snapshot_with_expected_fields(self):
+        d = {
+            "research_history": _scaffolding_history(cycles=2),
+            "history_aggregate": {"total_cycles": 3, "total_prs_merged": 1},
+            "research_context": "## Established Findings\n- A\n",
+        }
+        record_outcome_progress_snapshot(d)
+        snaps = d["outcome_progress_history"]
+        assert len(snaps) == 1
+        snap = snaps[0]
+        assert snap["progress"] == 1
+        assert snap["cycle_index"] == 5  # 2 history + 3 aggregate
+        assert snap["merged"] == 7  # 2*3 history + 1 aggregate
+        assert "timestamp" in snap
+
+    def test_history_capped_at_configured_max(self):
+        d = {"research_history": [], "history_aggregate": {}, "research_context": ""}
+        for _ in range(25):
+            record_outcome_progress_snapshot(d)
+        # default direction_outcome_progress_history_max == 20
+        assert len(d["outcome_progress_history"]) == 20
+
+    def test_latches_ever_met_when_completion_detected(self):
+        # 4 cycles, >=3 merged, last 2 low-yield -> _check_direction_completion fires
+        history = [
+            {
+                "tasks_created": 3,
+                "tasks_completed": 3,
+                "tasks_failed": 0,
+                "prs_merged": 2,
+            },
+            {
+                "tasks_created": 3,
+                "tasks_completed": 3,
+                "tasks_failed": 0,
+                "prs_merged": 2,
+            },
+            {
+                "tasks_created": 1,
+                "tasks_completed": 1,
+                "tasks_failed": 0,
+                "prs_merged": 0,
+            },
+            {
+                "tasks_created": 1,
+                "tasks_completed": 1,
+                "tasks_failed": 0,
+                "prs_merged": 0,
+            },
+        ]
+        d = {
+            "research_history": history,
+            "history_aggregate": {},
+            "research_context": "",
+        }
+        record_outcome_progress_snapshot(d)
+        assert d.get("outcome_progress_ever_met") is True
+
+
+class TestCheckOutcomeScaffolding:
+    def test_fires_on_long_running_healthy_no_progress_direction(self):
+        d = _scaffolding_direction([5, 5, 5, 5, 5, 5])
+        ev = _check_outcome_scaffolding(d)
+        assert ev is not None
+        assert ev["total_cycles"] == 14
+        assert ev["lifetime_merged"] == 20
+        assert ev["lifetime_merge_rate"] == 1.0
+        assert ev["stall_run_cycles"] == 6
+        assert ev["progress_signal"] == 5
+
+    def test_does_not_fire_on_advancing_direction(self):
+        d = _scaffolding_direction([1, 2, 3, 4, 5, 6])
+        assert _check_outcome_scaffolding(d) is None
+
+    def test_does_not_fire_on_churn_burn_low_merge_rate(self):
+        # lifetime_merged still >= floor, but merge_rate is far below the min,
+        # so the churn/burn exclusion (not the progress check) keeps it clear.
+        d = _scaffolding_direction(
+            [5, 5, 5, 5, 5, 5],
+            research_history=_scaffolding_history(
+                cycles=4, created=5, merged=1, completed=5
+            ),
+            history_aggregate={
+                "total_cycles": 10,
+                "total_prs_merged": 8,
+                "total_tasks_completed": 60,
+                "total_tasks_failed": 0,
+                "total_tasks_failed_infra": 0,
+            },
+        )
+        assert _check_outcome_scaffolding(d) is None
+
+    def test_does_not_fire_before_min_cycles(self):
+        d = _scaffolding_direction(
+            [5, 5, 5, 5, 5, 5],
+            history_aggregate={"total_cycles": 2, "total_prs_merged": 8},
+        )
+        # total_cycles = 4 + 2 = 6 < 12
+        assert _check_outcome_scaffolding(d) is None
+
+    def test_single_low_progress_cycle_does_not_trip(self):
+        # Only 3 snapshots recorded; default stall_run is 6 -> not enough history.
+        d = _scaffolding_direction([5, 5, 5])
+        assert _check_outcome_scaffolding(d) is None
+
+    def test_does_not_fire_when_outcome_ever_met(self):
+        d = _scaffolding_direction([5, 5, 5, 5, 5, 5], outcome_progress_ever_met=True)
+        assert _check_outcome_scaffolding(d) is None
+
+    def test_does_not_fire_below_merge_floor(self):
+        d = _scaffolding_direction(
+            [5, 5, 5, 5, 5, 5],
+            research_history=_scaffolding_history(
+                cycles=4, created=1, merged=0, completed=1
+            ),
+            history_aggregate={
+                "total_cycles": 10,
+                "total_prs_merged": 2,
+                "total_tasks_completed": 2,
+                "total_tasks_failed": 0,
+                "total_tasks_failed_infra": 0,
+            },
+        )
+        # lifetime_merged = 0 + 2 = 2 < default merge_floor (8)
+        assert _check_outcome_scaffolding(d) is None
+
+    # ── Agent evidence_progress verdict refinement ──────────────────────────
+    # _scaffolding_direction has total_cycles=14, stall_run=6, so a verdict at
+    # cycle_index >= 9 is "current" (14 - cycle_index < 6) and one at <= 8 is stale.
+
+    def test_advancing_verdict_suppresses_flag(self):
+        d = _scaffolding_direction(
+            [5, 5, 5, 5, 5, 5],
+            evidence_progress={"status": "advancing", "cycle_index": 14},
+        )
+        # Deterministic detector would fire, but the agent confirms advancement.
+        assert _check_outcome_scaffolding(d) is None
+
+    def test_met_verdict_suppresses_flag(self):
+        d = _scaffolding_direction(
+            [5, 5, 5, 5, 5, 5],
+            evidence_progress={"status": "met", "cycle_index": 14},
+        )
+        assert _check_outcome_scaffolding(d) is None
+
+    def test_stalled_verdict_does_not_suppress_flag(self):
+        d = _scaffolding_direction(
+            [5, 5, 5, 5, 5, 5],
+            evidence_progress={"status": "stalled", "cycle_index": 14},
+        )
+        # A stalled verdict reinforces the deterministic signal — flag still fires.
+        assert _check_outcome_scaffolding(d) is not None
+
+    def test_omitted_verdict_lets_detector_fire(self):
+        # No evidence_progress key at all -> deterministic backstop unaffected.
+        d = _scaffolding_direction([5, 5, 5, 5, 5, 5])
+        assert "evidence_progress" not in d
+        assert _check_outcome_scaffolding(d) is not None
+
+    def test_stale_advancing_verdict_does_not_suppress(self):
+        # A verdict recorded a full stall window ago has expired -> detector fires.
+        d = _scaffolding_direction(
+            [5, 5, 5, 5, 5, 5],
+            evidence_progress={"status": "advancing", "cycle_index": 5},
+        )
+        assert _check_outcome_scaffolding(d) is not None
+
+    def test_undated_advancing_verdict_suppresses(self):
+        # No cycle_index -> trust the agent's confirmation as current.
+        d = _scaffolding_direction(
+            [5, 5, 5, 5, 5, 5],
+            evidence_progress={"status": "advancing"},
+        )
+        assert _check_outcome_scaffolding(d) is None
+
+
+class TestApplyEvidenceProgressVerdicts:
+    def _task(self, verdicts):
+        return Task(
+            project_id=uuid.uuid4(),
+            payloads=[{"type": "strategic_review", "prompt": "x"}],
+            context={EVIDENCE_PROGRESS_CONTEXT_KEY: verdicts},
+        )
+
+    def _project(self, directions):
+        return Project(
+            name="EP",
+            user_id="u1",
+            vision={"purpose": "p", "revision": 1},
+            directions=directions,
+        )
+
+    def test_persists_verdict_onto_matching_active_direction(self):
+        project = self._project(
+            [
+                {
+                    "id": "d-1",
+                    "status": "active",
+                    "research_history": [{}, {}],
+                    "history_aggregate": {"total_cycles": 10},
+                }
+            ]
+        )
+        task = self._task(
+            [{"direction_id": "d-1", "status": "advancing", "rationale": "shipped X"}]
+        )
+        applied = _apply_evidence_progress_verdicts(task, project)
+        assert applied == 1
+        ep = project.directions[0]["evidence_progress"]
+        assert ep["status"] == "advancing"
+        assert ep["rationale"] == "shipped X"
+        assert ep["cycle_index"] == 12  # 2 history + 10 aggregate
+        assert ep["cycle_task_id"] == str(task.id)
+        assert "recorded_at" in ep
+
+    def test_skips_inactive_and_unmatched_directions(self):
+        project = self._project(
+            [
+                {"id": "d-1", "status": "expired"},
+                {"id": "d-2", "status": "active"},
+            ]
+        )
+        task = self._task(
+            [
+                {"direction_id": "d-1", "status": "met", "rationale": "done"},
+                {"direction_id": "d-x", "status": "stalled", "rationale": "no match"},
+            ]
+        )
+        applied = _apply_evidence_progress_verdicts(task, project)
+        assert applied == 0
+        assert "evidence_progress" not in project.directions[0]
+        assert "evidence_progress" not in project.directions[1]
+
+    def test_no_verdicts_is_noop(self):
+        project = self._project([{"id": "d-1", "status": "active"}])
+        task = Task(
+            project_id=uuid.uuid4(),
+            payloads=[{"type": "strategic_review", "prompt": "x"}],
+            context={},
+        )
+        assert _apply_evidence_progress_verdicts(task, project) == 0
+        assert "evidence_progress" not in project.directions[0]
+
+    def test_idempotent_last_write_wins(self):
+        project = self._project([{"id": "d-1", "status": "active"}])
+        task = self._task(
+            [{"direction_id": "d-1", "status": "stalled", "rationale": "first"}]
+        )
+        _apply_evidence_progress_verdicts(task, project)
+        task.context = {
+            EVIDENCE_PROGRESS_CONTEXT_KEY: [
+                {"direction_id": "d-1", "status": "advancing", "rationale": "second"}
+            ]
+        }
+        _apply_evidence_progress_verdicts(task, project)
+        assert project.directions[0]["evidence_progress"]["status"] == "advancing"
+        assert project.directions[0]["evidence_progress"]["rationale"] == "second"
 
 
 @pytest.mark.asyncio

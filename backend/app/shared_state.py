@@ -275,6 +275,19 @@ runtime_config: Dict = {
     # (order-of-hundreds) so healthy high-throughput directions are never paused.
     "direction_lifetime_non_merge_threshold": 150,
     "direction_lifetime_min_merge_rate": 0.10,
+    # Outcome-progress (scaffolding) detector — ADVISORY, never auto-pauses.
+    # Surfaces long-running directions that keep merging PRs at a healthy rate but
+    # never advance their stated success_evidence (the "outcome-less scaffolding"
+    # pattern). min_cycles honors the "caught within ~12 cycles" goal; merge_floor +
+    # min_merge_rate exclude churn/burn directions (handled by the churn/lifetime
+    # backstops); stall_run is the consecutive run of no-progress cycles required so
+    # a single low-progress cycle cannot trip the flag; history_max caps the bounded
+    # per-direction snapshot list stored on direction.outcome_progress_history.
+    "direction_outcome_progress_min_cycles": 12,
+    "direction_outcome_progress_merge_floor": 8,
+    "direction_outcome_progress_min_merge_rate": 0.5,
+    "direction_outcome_progress_stall_run": 6,
+    "direction_outcome_progress_history_max": 20,
     "strategic_research_frequency": 6,  # Every Nth research cycle is a strategic vision review
     "architecture_review_frequency": 3,  # Every Nth strategic cycle includes architecture (design doc) review
     "max_active_directions": 10,

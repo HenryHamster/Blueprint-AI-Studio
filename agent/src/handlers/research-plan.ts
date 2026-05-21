@@ -1244,6 +1244,22 @@ If no directions were retired in the last 90 days, write exactly:
 
 The Executor will call \`./strategic set-retirement-critiques\` to persist these. Do not skip this section.
 
+## 3.6. Evidence-progress assessment (long-running active directions, OPTIONAL)
+
+For each ACTIVE direction that is long-running — well past its early cycles (high cumulative cycle count) and especially any direction carrying an \`outcome_scaffolding_flagged\` marker in the direction list — record your read on whether it is genuinely advancing toward its stated \`success_evidence\`:
+
+\`\`\`
+direction_id: d-xxx
+status: advancing | stalled | met
+rationale: 1 sentence — the observable evidence behind this verdict
+\`\`\`
+
+- **advancing** — landing real progress toward \`success_evidence\` (suppresses the advisory scaffolding flag — the agent confirms genuine movement).
+- **met** — \`success_evidence\` is satisfied; the direction is effectively done (suppresses the flag; consider retiring it).
+- **stalled** — still shipping merges but NOT advancing \`success_evidence\` (outcome-less scaffolding; reinforces the flag).
+
+A deterministic detector already flags stalled scaffolding on its own, so this verdict is OPTIONAL precision-tuning — only assess directions you have a genuine read on, and skip the section if none qualify. The Executor persists these via \`./strategic set-evidence-progress\`.
+
 ## 4. Running update document (for the user)
 Write the full refined running_update as markdown to \`/tmp/running_update_${p.taskId}.md\` (also show it as a code block in your analysis for auditability — the file is the authoritative handoff to the Executor). This is the document the user sees as "project current state" — rewrite, don't append. Under 400 words. Follow the section guidance above.
 
@@ -2004,7 +2020,7 @@ ${hotspotsSection}
     const strategicHelper = `#!/bin/bash
 # Strategic review tool — updates problem_model, running_update, directions,
 # messages via API. Reads ORCHESTRATOR_URL and AGENT_API_TOKEN from env.
-OP="\${1:?Usage: strategic set-problem-model|set-running-update|reflect|pending-confirm|set-vision|create-direction|update-direction|retire-direction|create-message|resolve-message|spawn-task|set-retirement-critiques <json-or-file>}"
+OP="\${1:?Usage: strategic set-problem-model|set-running-update|reflect|pending-confirm|set-vision|create-direction|update-direction|retire-direction|create-message|resolve-message|spawn-task|set-retirement-critiques|set-evidence-progress <json-or-file>}"
 shift
 API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
 TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
@@ -2062,6 +2078,7 @@ case "$OP" in
   resolve-message)           _call "resolve_message" ;;
   spawn-task)                _call "spawn_task" ;;
   set-retirement-critiques)  _call "set_retirement_critiques" ;;
+  set-evidence-progress)     _call "set_evidence_progress" ;;
   *) echo "Unknown op: $OP" >&2; exit 1 ;;
 esac
 echo ""
@@ -2409,6 +2426,12 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 # If no retirements in last 90 days:
 ./strategic set-retirement-critiques '{"no_eligible_retirements": true}'
 
+# OPTIONAL: Submit evidence-progress verdicts from Section 3.6 for long-running
+# active directions. status ∈ advancing|stalled|met; advancing/met suppress the
+# advisory scaffolding flag, stalled reinforces it. Omit entirely if Section 3.6
+# assessed no directions — it's an optional precision refinement, never required.
+./strategic set-evidence-progress '[{"direction_id":"d-xxx","status":"advancing","rationale":"..."}]'
+
 # Spawn a targeted investigation task (research or plan only) when something
 # from the Recent Work section needs investigation NOW instead of waiting for
 # the next autonomous cycle.
@@ -2460,6 +2483,8 @@ ${analysisText.slice(0, 50_000)}
    - low: opportunistic
 
 4. **Retired-direction critique (REQUIRED).** From Section 3.5, call \`./strategic set-retirement-critiques\` with a JSON array of critique objects. If the Thinker wrote "No eligible retirements", pass \`'{"no_eligible_retirements": true}'\`. Never skip this call.
+
+   *Optional companion:* If the Thinker's Section 3.6 recorded \`evidence_progress\` verdicts for long-running active directions, persist them with \`./strategic set-evidence-progress '[{"direction_id":"d-xxx","status":"advancing|stalled|met","rationale":"..."}]'\`. Skip entirely when Section 3.6 is empty — this is an optional precision refinement, never a required call.
 
 5. **Version phase / qualify siblings (conditional — do this BEFORE step 1's \`set-problem-model\` call).** If the Thinker's analysis includes a \`version_phase_decision\` field (look in Section 6 and throughout the analysis), edit \`/tmp/problem_model_${taskId}.json\` IN PLACE to add it as a top-level sibling key, so the file becomes:
    \`{"version_phase_decision": {"phase": "build" or "stabilize", "reasoning": "..."}, ...rest_of_problem_model}\`

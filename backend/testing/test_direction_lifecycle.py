@@ -1248,3 +1248,113 @@ async def test_process_lifecycle_churn_pause_emits_blocker_notification(
     assert not d.get("needs_manual_intervention"), (
         "churn pause should NOT set needs_manual_intervention"
     )
+
+
+def _scaffolding_direction_for_lifecycle(progress_window):
+    return {
+        "id": "d-scaffold-lc",
+        "text": "Outcome-less scaffolding direction",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": [
+            {
+                "tasks_created": 3,
+                "tasks_completed": 3,
+                "tasks_failed": 0,
+                "tasks_failed_infra": 0,
+                "prs_merged": 3,
+            }
+            for _ in range(4)
+        ],
+        "history_aggregate": {
+            "total_cycles": 10,
+            "total_prs_merged": 8,
+            "total_tasks_completed": 8,
+            "total_tasks_failed": 0,
+            "total_tasks_failed_infra": 0,
+        },
+        "outcome_progress_history": [{"progress": p} for p in progress_window],
+    }
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_flags_outcome_scaffolding_and_notifies_once(
+    db_session, mocker
+):
+    """Scaffolding direction gets the advisory flag (not paused) and one notification per transition."""
+    notify = mocker.patch(
+        "app.notification_dispatch.post_direction_outcome_stalled_message",
+        new_callable=AsyncMock,
+    )
+    direction = _scaffolding_direction_for_lifecycle([5, 5, 5, 5, 5, 5])
+    project = await _make_cost_project(db_session, direction)
+
+    await _process_direction_lifecycle(
+        project,
+        db_session,
+        cooldown_minutes=0.0,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
+    )
+    await db_session.refresh(project)
+    d = project.directions[0]
+    assert d["status"] == "active", "advisory flag must NOT pause the direction"
+    assert d.get("outcome_scaffolding_flagged") is True
+    assert d.get("outcome_scaffolding_evidence", {}).get("total_cycles") == 14
+    notify.assert_awaited_once()
+
+    # Second pass while still flagged: no second notification (once per transition).
+    await _process_direction_lifecycle(
+        project,
+        db_session,
+        cooldown_minutes=0.0,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
+    )
+    await db_session.refresh(project)
+    assert project.directions[0].get("outcome_scaffolding_flagged") is True
+    notify.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_clears_outcome_scaffolding_when_progress_resumes(
+    db_session, mocker
+):
+    """Once the progress window shows growth, the advisory flag is cleared."""
+    mocker.patch(
+        "app.notification_dispatch.post_direction_outcome_stalled_message",
+        new_callable=AsyncMock,
+    )
+    direction = _scaffolding_direction_for_lifecycle([5, 5, 5, 5, 5, 5])
+    project = await _make_cost_project(db_session, direction)
+    await _process_direction_lifecycle(
+        project,
+        db_session,
+        cooldown_minutes=0.0,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
+    )
+    await db_session.refresh(project)
+    assert project.directions[0].get("outcome_scaffolding_flagged") is True
+
+    # Progress resumes -> window now shows an increase.
+    project.directions[0]["outcome_progress_history"] = [
+        {"progress": p} for p in [5, 5, 5, 5, 5, 7]
+    ]
+    from sqlalchemy.orm.attributes import flag_modified
+
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+
+    await _process_direction_lifecycle(
+        project,
+        db_session,
+        cooldown_minutes=0.0,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
+    )
+    await db_session.refresh(project)
+    assert project.directions[0].get("outcome_scaffolding_flagged") is None

@@ -66,6 +66,7 @@ HIGH_SIGNAL_NOTE_EVENT_TYPES: frozenset[str] = frozenset(
         "failure_alert",  # post_failure_alert_message
         "rollback_recommended",  # post_rollback_recommendation_message
         "fix_loop_divergence_regressed",  # post_fix_loop_divergence_regression_message
+        "direction_outcome_stalled",  # post_direction_outcome_stalled_message
     }
 )
 
@@ -1440,6 +1441,60 @@ async def post_direction_churn_pause_message(
         )
     )
     return msg
+
+
+async def post_direction_outcome_stalled_message(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    direction_text: str,
+    evidence: Optional[dict[str, Any]] = None,
+    direction_id: Optional[str] = None,
+    task_id: Optional[uuid.UUID] = None,
+) -> ProjectMessage:
+    """Post a HIGH-SIGNAL NOTE when a direction is flagged as outcome-less scaffolding.
+
+    Advisory signal — NOT a pause: the direction keeps merging PRs at a healthy
+    rate but its outcome-progress signal has been flat for a sustained run of
+    cycles and it has never met its success_evidence. Emitted once per transition
+    into the flagged state (the caller dedups via the direction's
+    outcome_scaffolding_flagged flag), mirroring the direction burn-pause /
+    milestone one-shot pattern. High-signal NOTE so it survives routine paging.
+    """
+    ev = evidence or {}
+    parts: list[str] = []
+    if "total_cycles" in ev:
+        parts.append(f"cycles={ev['total_cycles']}")
+    if "lifetime_merged" in ev:
+        parts.append(f"merged={ev['lifetime_merged']}")
+    if "lifetime_merge_rate" in ev:
+        rate = ev["lifetime_merge_rate"]
+        parts.append(
+            f"merge_rate={rate:.0%}"
+            if isinstance(rate, float)
+            else f"merge_rate={rate}"
+        )
+    if "stall_run_cycles" in ev:
+        parts.append(f"no_progress_for={ev['stall_run_cycles']} cycles")
+    ev_str = f" ({', '.join(parts)})" if parts else ""
+    summary = (
+        f"Direction shipping merges without outcome progress: "
+        f"'{direction_text[:80]}'{ev_str} — review whether to retire, redirect, "
+        f"or redefine its success_evidence."
+    )
+    context: dict[str, Any] = {
+        "direction_text": direction_text[:120],
+        "direction_id": direction_id,
+    }
+    if evidence:
+        context["evidence"] = evidence
+    return await post_event_message(
+        session,
+        project_id,
+        event_type="direction_outcome_stalled",
+        summary=summary,
+        context=context,
+        task_id=task_id,
+    )
 
 
 async def post_issue_implementation_spawned_message(

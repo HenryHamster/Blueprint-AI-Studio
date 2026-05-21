@@ -1929,6 +1929,35 @@ describe('strategic executor prompt — step 1 / step 5 sibling-field consistenc
     expect(step5Text).toContain('set-problem-model');
     expect(step5Text).toMatch(/re-read|cat /i);
   });
+
+  // ── evidence_progress verdict (OPTIONAL agent refinement) ──────────────────
+  it('thinker prompt has Section 3.6 evidence-progress assessment for long-running directions', async () => {
+    await captureExecutorPrompt();
+    const thinker = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(thinker).toContain('Evidence-progress assessment');
+    expect(thinker).toContain('advancing | stalled | met');
+    // It must point the executor at the persistence command.
+    expect(thinker).toContain('set-evidence-progress');
+  });
+
+  it('executor prompt offers the OPTIONAL set-evidence-progress command', async () => {
+    const p = await captureExecutorPrompt();
+    expect(p).toContain('set-evidence-progress');
+    // Must be marked optional, never folded into the REQUIRED required-call gate.
+    expect(p).toMatch(/OPTIONAL[\s\S]*set-evidence-progress/i);
+  });
+
+  it('strategic helper script maps set-evidence-progress to the set_evidence_progress op', async () => {
+    await captureExecutorPrompt();
+    const writeCalls = vi.mocked(fs.writeFileSync).mock.calls as unknown as [string, string][];
+    const helperCall = writeCalls.find(([path]) => path.endsWith('/strategic'));
+    expect(helperCall).toBeDefined();
+    const script = helperCall ? helperCall[1] : '';
+    expect(script).toContain('set-evidence-progress)');
+    expect(script).toContain('_call "set_evidence_progress"');
+    // Usage string advertises the new op.
+    expect(script).toContain('set-evidence-progress <json-or-file>');
+  });
 });
 
 // ── Prompt determinism meta-tests ─────────────────────────────────────────────

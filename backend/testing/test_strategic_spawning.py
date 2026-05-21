@@ -468,6 +468,79 @@ async def test_operator_rejection_rate_absent_when_no_rejections(db_session):
 
 
 @pytest.mark.asyncio
+async def test_success_evidence_present_in_direction_stats(db_session):
+    """success_evidence/retirement_condition from context reach the direction stat entry, capped."""
+    long_evidence = "E" * 700
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-se01",
+                "status": "active",
+                "text": "Direction with stated outcome",
+                "priority": "medium",
+                "context": {
+                    "success_evidence": long_evidence,
+                    "retirement_condition": "  retire when X happens  ",
+                },
+                "research_history": [{"prs_merged": 1, "prs_rejected": 0}],
+            }
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+    d_stat = next(s for s in payload["directions_summary"] if s["id"] == "d-se01")
+
+    assert d_stat["success_evidence"] == "E" * 500, (
+        "success_evidence should be capped at 500"
+    )
+    assert d_stat["retirement_condition"] == "retire when X happens", (
+        "retirement_condition should be stripped and surfaced"
+    )
+
+
+@pytest.mark.asyncio
+async def test_success_evidence_absent_when_not_in_context(db_session):
+    """success_evidence/retirement_condition are omitted when not set on context."""
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-se02",
+                "status": "active",
+                "text": "Direction without stated outcome",
+                "priority": "medium",
+                "research_history": [{"prs_merged": 1, "prs_rejected": 0}],
+            }
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+    d_stat = next(s for s in payload["directions_summary"] if s["id"] == "d-se02")
+
+    assert "success_evidence" not in d_stat
+    assert "retirement_condition" not in d_stat
+
+
+@pytest.mark.asyncio
 async def test_operator_rejection_rate_uses_history_aggregate(db_session):
     """operator_rejection_rate aggregates from both research_history and history_aggregate."""
     project = _make_project(

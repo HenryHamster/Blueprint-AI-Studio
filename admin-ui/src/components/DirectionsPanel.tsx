@@ -139,6 +139,27 @@ export interface Direction {
     lifetime_non_merge_finished: number;
     lifetime_merge_rate: number;
   } | null;
+  // Direction context captured at creation: the stated outcome (success_evidence),
+  // its retirement condition, and any implementation constraints.
+  context?: {
+    success_evidence?: string;
+    retirement_condition?: string;
+    implementation_constraints?: string;
+    [key: string]: unknown;
+  } | null;
+  // Advisory outcome-less-scaffolding flag: set by the backend detector when a
+  // long-running direction keeps merging PRs at a healthy rate but shows no
+  // progress toward its stated success_evidence. ADVISORY ONLY — never auto-pauses.
+  outcome_scaffolding_flagged?: boolean;
+  outcome_scaffolding_flagged_at?: string | null;
+  outcome_scaffolding_evidence?: {
+    total_cycles: number;
+    lifetime_merged: number;
+    lifetime_merge_rate: number;
+    stall_run_cycles: number;
+    progress_signal: number;
+    outcome_progress_window: number[];
+  } | null;
 }
 
 
