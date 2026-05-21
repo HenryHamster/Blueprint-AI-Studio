@@ -247,13 +247,22 @@ def cmd_cancel(args):
 
 
 def cmd_cancel_all(args):
-    """Cancel all non-terminal tasks, optionally filtered by status or project.
+    """Cancel tasks in bulk, filtered by status, project, and/or category.
 
-    Usage: cancel-all [--status STATUS] [--project PROJECT_ID_OR_NAME]
+    Usage: cancel-all [--status STATUS] [--project PROJECT] [--category CATEGORY]
+
+    Without --status, cancels all non-terminal tasks (QUEUED / PROVISIONING /
+    IN_PROGRESS / EVALUATING). --category restricts to tasks whose
+    context.failure_category matches exactly — e.g.
+    `cancel-all --status FAILED --category SCOPE_EMPTY` clears SCOPE_EMPTY
+    pre-emption artifacts without touching genuine failures. Results are
+    paged (the admin API caps each page at 500), so the whole backlog is
+    covered, not just the first page.
     """
     from blueprint_api import api
     status_filter = None
     project_filter = None
+    category_filter = None
     i = 0
     positional_args = list(args)
     while i < len(positional_args):
@@ -262,6 +271,9 @@ def cmd_cancel_all(args):
             i += 2
         elif positional_args[i] == "--project" and i + 1 < len(positional_args):
             project_filter = positional_args[i + 1]
+            i += 2
+        elif positional_args[i] == "--category" and i + 1 < len(positional_args):
+            category_filter = positional_args[i + 1]
             i += 2
         else:
             # Legacy: first positional arg is status
@@ -284,10 +296,29 @@ def cmd_cancel_all(args):
 
     statuses = [status_filter] if status_filter else ["QUEUED", "PROVISIONING", "IN_PROGRESS", "EVALUATING"]
     cancelled = 0
+    skipped = 0
     for status in statuses:
-        tasks = list_tasks(status=status, limit=200)
+        # Page through every task of this status — the admin API caps each
+        # page at 500, so a single list_tasks call silently drops the tail
+        # of a large backlog.
+        tasks = []
+        offset = 0
+        while True:
+            batch = list_tasks(status=status, limit=500, offset=offset)
+            if not batch:
+                break
+            tasks.extend(batch)
+            offset += len(batch)
+            if len(batch) < 500:
+                break
         for t in tasks:
             if project_id and t.get("project_id") != project_id:
+                continue
+            if (
+                category_filter
+                and (t.get("context") or {}).get("failure_category") != category_filter
+            ):
+                skipped += 1
                 continue
             tid = t["id"]
             title = _safe(t["title"], 50)
@@ -298,7 +329,13 @@ def cmd_cancel_all(args):
                 cancelled += 1
             except Exception as e:
                 print(f"FAILED: {e}")
-    print(f"\nCancelled {cancelled} tasks.")
+    if category_filter:
+        print(
+            f"\nCancelled {cancelled} task(s) with failure_category={category_filter}; "
+            f"left {skipped} non-matching task(s) untouched."
+        )
+    else:
+        print(f"\nCancelled {cancelled} tasks.")
 
 
 def cmd_evaluating(args):

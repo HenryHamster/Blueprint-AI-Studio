@@ -417,6 +417,27 @@ async def filter_migration_serialization(
 _SCOPE_EMPTY_EXEMPT_TASK_TYPES = {"review", "fix", "plan"}
 
 
+def _decomposition_cluster_key(task: Task) -> "tuple[uuid.UUID, int] | None":
+    """Identity of the auto-decomposition cluster group a task belongs to.
+
+    Clusters of ONE finding share ``(parent_task_id, finding_index)``. The
+    ``parent_task_id`` alone is the *research task*, which fans a single
+    research pass out across multiple findings (13 tasks across 5 findings
+    is typical) — so two tasks sharing only ``parent_task_id`` are not
+    necessarily decomposition siblings.
+
+    Returns ``None`` when the task cannot be placed in a cluster group (no
+    parent, or no ``finding_index``); such a task must not be SCOPE_EMPTY
+    pre-empted, because coincidental file overlap with an unrelated finding
+    is not proof of redundant work (2026-05-21 incident: a finding-#1 task
+    touching ``admin_digest.py`` wrongly pre-empted a finding-#2 cluster).
+    """
+    finding_index = (task.context or {}).get("finding_index")
+    if task.parent_task_id is None or finding_index is None:
+        return None
+    return (task.parent_task_id, finding_index)
+
+
 async def filter_scope_empty(
     eligible_ids: list[uuid.UUID],
     candidate_tasks: list[Task],
@@ -428,8 +449,9 @@ async def filter_scope_empty(
     When a QUEUED task carries ``auto_decomposed=True`` and a sibling task
     (same parent_task_id) has already reached COMPLETED status with overlapping
     related_files, the candidate's work was already done by the sibling.
-    Transition the candidate directly to FAILED with SCOPE_EMPTY so it does
-    NOT consume the retry budget and does NOT penalize direction health.
+    Transition the candidate directly to CANCELLED with SCOPE_EMPTY so it
+    does NOT consume the retry budget and does NOT penalize direction health
+    — a no-op exit (work already covered) is not a failure.
 
     Only the *original implementation task* of a cluster is pre-emptible.
     Review and fix tasks inherit ``auto_decomposed`` from the create-task they
@@ -471,13 +493,20 @@ async def filter_scope_empty(
     if not completed_siblings:
         return eligible_ids
 
-    covered_by_parent: dict[uuid.UUID, set[str]] = {}
-    sibling_title_by_parent: dict[uuid.UUID, dict[str, str]] = {}
+    # Group coverage by decomposition-cluster identity — (parent_task_id,
+    # finding_index) — NOT by parent_task_id alone. A completed task from a
+    # *different finding* under the same research parent that happens to
+    # touch an overlapping file does not make this cluster's work redundant.
+    covered_by_cluster: dict[tuple[uuid.UUID, int], set[str]] = {}
+    sibling_title_by_cluster: dict[tuple[uuid.UUID, int], dict[str, str]] = {}
     for sib in completed_siblings:
+        cluster_key = _decomposition_cluster_key(sib)
+        if cluster_key is None:
+            continue
         files = _prod_files((sib.context or {}).get("related_files", []))
         if files:
-            covered_by_parent.setdefault(sib.parent_task_id, set()).update(files)
-            titles = sibling_title_by_parent.setdefault(sib.parent_task_id, {})
+            covered_by_cluster.setdefault(cluster_key, set()).update(files)
+            titles = sibling_title_by_cluster.setdefault(cluster_key, {})
             for f in files:
                 titles.setdefault(f, sib.title or str(sib.id))
 
@@ -485,19 +514,24 @@ async def filter_scope_empty(
 
     pre_empted: set[uuid.UUID] = set()
     for candidate in auto_decomp:
+        cluster_key = _decomposition_cluster_key(candidate)
+        if cluster_key is None:
+            # Cannot place this task in a cluster group — never pre-empt.
+            continue
         cfiles = _prod_files((candidate.context or {}).get("related_files", []))
         if not cfiles:
             continue
-        covered = covered_by_parent.get(candidate.parent_task_id, set())
+        covered = covered_by_cluster.get(cluster_key, set())
         if not cfiles.issubset(covered):
             continue
-        # All declared files already covered by a completed sibling — pre-empt.
-        titles = sibling_title_by_parent.get(candidate.parent_task_id, {})
+        # All declared files already covered by a completed sibling cluster
+        # of the same finding — pre-empt.
+        titles = sibling_title_by_cluster.get(cluster_key, {})
         sibling_title = next((titles[f] for f in cfiles if f in titles), None)
         msg = "SCOPE_EMPTY: all declared files already covered by completed sibling" + (
             f" '{sibling_title[:60]}'" if sibling_title else ""
         )
-        candidate.status = TaskStatus.FAILED
+        candidate.status = TaskStatus.CANCELLED
         candidate.latest_status_message = msg
         persist_failure_category(candidate, SCOPE_EMPTY)
         session.add(candidate)
@@ -506,7 +540,7 @@ async def filter_scope_empty(
             await broadcast_fn(
                 str(candidate.project_id),
                 "task_updated",
-                {"task_id": str(candidate.id), "status": "FAILED", "message": msg},
+                {"task_id": str(candidate.id), "status": "CANCELLED", "message": msg},
             )
         except Exception:
             logger.debug(
@@ -514,7 +548,8 @@ async def filter_scope_empty(
             )
         logger.info(
             f"[DISPATCH] SCOPE_EMPTY: pre-empting task {candidate.id} — "
-            f"all {len(cfiles)} file(s) covered by completed sibling under parent {candidate.parent_task_id}"
+            f"all {len(cfiles)} file(s) covered by a completed sibling cluster "
+            f"of finding {cluster_key[1]} under research parent {cluster_key[0]}"
         )
 
     return [eid for eid in eligible_ids if eid not in pre_empted]

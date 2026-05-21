@@ -2315,10 +2315,16 @@ async def update_agent_status(
                 )
                 return {"status": "accepted_pr_handoff"}
 
+        # SCOPE_EMPTY is a deterministic "work already done" exit — retrying
+        # just burns another VM for the identical result, so it is terminal
+        # on first detection (finalized as CANCELLED in the else-branch).
+        from app.failure_classification import SCOPE_EMPTY, persist_failure_category
+
         # Retry logic for failed tasks
         if (
             payload.status == TaskStatus.FAILED
             and task.attempt_count < _runtime_config["max_retries"]
+            and failure_class != SCOPE_EMPTY
         ):
             task.attempt_count += 1
             task.status = TaskStatus.QUEUED
@@ -2406,8 +2412,18 @@ async def update_agent_status(
             }
 
         else:
-            # Retries exhausted — annotate the final status message with context
-            if payload.status == TaskStatus.FAILED:
+            # Retries exhausted, or a no-retry terminal class (SCOPE_EMPTY).
+            # COMPLETED results also reach this else-branch, and
+            # ``failure_class`` is only bound on the FAILED path — so gate
+            # on payload.status before reading it.
+            if payload.status == TaskStatus.FAILED and failure_class == SCOPE_EMPTY:
+                # Agent found the work already done — a clean no-op, not a
+                # failure. Land it CANCELLED (not FAILED) and skip the retry
+                # annotation, account success-rate ding, and failure alert.
+                task.status = TaskStatus.CANCELLED
+                persist_failure_category(task, SCOPE_EMPTY)
+                session.add(task)
+            elif payload.status == TaskStatus.FAILED:
                 max_r = _runtime_config["max_retries"]
                 existing_msg = task.latest_status_message or ""
                 if "retries exhausted" not in existing_msg:
