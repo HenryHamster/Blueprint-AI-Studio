@@ -1728,8 +1728,13 @@ export const SELF_REVIEW_PROMPT_VERSION = "6";
 
 // Human-readable examples of disallowed blind_spot entries — mirrored in
 // backend/app/sr_blind_spots.py DISALLOWED_BLIND_SPOT_EXAMPLES for contract-test parity.
+// Includes the truncated theme form ("did not run the full backend") and a
+// no-test-noun variant ("did not run the full backend suite") so the disallow
+// filter covers every phrasing of this intended-design pipeline step.
 export const DISALLOWED_BLIND_SPOT_EXAMPLES: readonly string[] = [
   "did not run the full backend test suite",
+  "did not run the full backend",
+  "did not run the full backend suite",
   "did not run docker pytest",
   "did not run viewport tests",
 ] as const;
