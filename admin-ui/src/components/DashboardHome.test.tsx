@@ -1335,4 +1335,108 @@ describe('DashboardHome', () => {
       expect(screen.queryByTestId('sr-false-attestation-tile')).not.toBeInTheDocument();
     });
   });
+
+  it('computes SR Catch Rate delta from overall hit rate, not average category delta', async () => {
+    setupApiMocks({
+      digest: {
+        failed_count: 0,
+        pending_approval_count: 0,
+        completed_count: 5,
+        failure_groups: [],
+        direction_progress: [],
+        recent_completions: [],
+        self_review_prediction_accuracy: {
+          prediction_hit_rate: 0.75,
+          miss_rate: 0.25,
+          false_alarm_rate: 0.1,
+          sample_size: 20,
+        },
+        self_review_prediction_accuracy_trends: {
+          overall_hit_rate: 0.75,
+          previous_overall_hit_rate: 0.70,
+          computed_at: '2026-05-20T00:00:00Z',
+          categories: {
+            correctness: {
+              current_hit_rate: 0.80,
+              previous_hit_rate: 0.60,
+              current_human_count: 10,
+              previous_human_count: 8,
+            },
+            type_safety: {
+              current_hit_rate: 0.70,
+              previous_hit_rate: 0.80,
+              current_human_count: 5,
+              previous_human_count: 6,
+            },
+            error_handling: {
+              current_hit_rate: 0.75,
+              previous_hit_rate: 0.75,
+              current_human_count: 5,
+              previous_human_count: 6,
+            },
+          },
+        },
+      },
+      diagnostics: makeDiagnostics(),
+    });
+
+    render(
+      <DashboardHome
+        tasks={[]}
+        selectedProjectId="proj1"
+        onViewTask={vi.fn()}
+      />,
+    );
+
+    const card = await screen.findByText('SR Catch Rate').then((el) => el.closest('div[class*="rounded-lg"]'));
+    expect(card).toBeInTheDocument();
+    expect(card).toHaveTextContent('75%');
+    expect(card).toHaveTextContent('+5pp');
+  });
+
+  it('SR Unfixed Flags tile shows the self-flagged shipped-unfixed rate, not the catch hit rate', async () => {
+    setupApiMocks({
+      digest: {
+        failed_count: 0,
+        pending_approval_count: 0,
+        completed_count: 5,
+        failure_groups: [],
+        direction_progress: [],
+        recent_completions: [],
+        self_review_prediction_accuracy: {
+          prediction_hit_rate: 0.75,
+          miss_rate: 0.25,
+          false_alarm_rate: 0.1,
+          sample_size: 20,
+          self_flagged_shipped_unfixed_task_rate: 0.5,
+          self_flagged_shipped_unfixed_task_count: 7,
+        },
+        // A high catch hit rate must NOT leak into the high=bad tile.
+        self_review_prediction_accuracy_trends: {
+          overall_hit_rate: 0.9,
+          previous_overall_hit_rate: 0.85,
+          computed_at: '2026-05-20T00:00:00Z',
+          categories: {},
+        },
+      },
+      diagnostics: makeDiagnostics(),
+    });
+
+    render(
+      <DashboardHome
+        tasks={[]}
+        selectedProjectId="proj1"
+        onViewTask={vi.fn()}
+      />,
+    );
+
+    const tile = await screen.findByTestId('sr-self-flagged-unresolved-tile');
+    // Rate comes from self_flagged_shipped_unfixed_task_rate (0.5), not overall_hit_rate (0.9).
+    expect(tile).toHaveTextContent('50%');
+    expect(tile).not.toHaveTextContent('90%');
+    // Adjacent count comes from the same metric.
+    expect(tile).toHaveTextContent('7 tasks');
+    // High unfixed rate renders as red (high=bad).
+    expect(tile.querySelector('.text-red-400')).not.toBeNull();
+  });
 });

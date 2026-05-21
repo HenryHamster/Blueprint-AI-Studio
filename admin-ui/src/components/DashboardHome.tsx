@@ -239,6 +239,8 @@ interface DigestData {
     miss_rate?: number | null;
     false_alarm_rate?: number | null;
     sample_size?: number | null;
+    self_flagged_shipped_unfixed_task_count?: number | null;
+    self_flagged_shipped_unfixed_task_rate?: number | null;
   } | null;
   self_review_prediction_accuracy_trends?: SrTrendWithFixIterations | null;
   sr_regression_risk_test_signal_trends?: {
@@ -305,7 +307,7 @@ interface DigestData {
 }
 
 interface SrFixIterationBucket { hit_rate?: number | null; miss_rate?: number | null; sample_count?: number | null; }
-type SrTrendWithFixIterations = SrTrendData & { by_fix_iteration?: Record<string, SrFixIterationBucket> | null; fix_iteration_breakdown?: Record<string, SrFixIterationBucket> | null; iteration_breakdown?: Record<string, SrFixIterationBucket> | null; };
+type SrTrendWithFixIterations = SrTrendData & { by_fix_iteration?: Record<string, SrFixIterationBucket> | null; fix_iteration_breakdown?: Record<string, SrFixIterationBucket> | null; iteration_breakdown?: Record<string, SrFixIterationBucket> | null; overall_hit_rate?: number | null; previous_overall_hit_rate?: number | null; };
 
 // Per-direction SR catch-rate breakdown (endpoint: GET /projects/{id}/direction-sr-breakdown)
 // DirectionSrEntry is re-exported from SrTrendBreakdown (canonical model)
@@ -1294,6 +1296,32 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
                     )}
                   </div>
                 )}
+                {(() => {
+                  const spa = digest?.self_review_prediction_accuracy;
+                  const rate = spa?.self_flagged_shipped_unfixed_task_rate ?? null;
+                  const taskCount = spa?.self_flagged_shipped_unfixed_task_count;
+                  if (rate == null && taskCount == null) return null;
+                  const color = rate == null ? 'text-neutral-300' : rate <= 0.2 ? 'text-emerald-400' : rate <= 0.4 ? 'text-amber-400' : 'text-red-400';
+                  const tooltip = [
+                    'SR Unfixed Flags: tasks where SR already failed a category but the agent submitted without fixing it and a reviewer confirmed the same category.',
+                    taskCount != null ? `${taskCount} tasks with at least one self-flagged unresolved category` : null,
+                  ].filter(Boolean).join('\n');
+                  return (
+                    <div
+                      className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[130px]"
+                      title={tooltip}
+                      data-testid="sr-self-flagged-unresolved-tile"
+                    >
+                      <p className="text-[9px] text-neutral-500 uppercase tracking-wide mb-0.5">SR Unfixed Flags</p>
+                      <p className={`text-xl font-bold font-mono ${color}`}>
+                        {rate != null ? `${Math.round(rate * 100)}%` : '--'}
+                      </p>
+                      <p className="text-[9px] text-neutral-600 mt-0.5">
+                        {taskCount != null ? `${taskCount} tasks` : ''}
+                      </p>
+                    </div>
+                  );
+                })()}
                 {digest?.sr_regression_risk_test_signal_trends?.current?.miss_by_test_signal_rate != null && (() => {
                   const rrts = digest.sr_regression_risk_test_signal_trends!;
                   const missRate = rrts.current!.miss_by_test_signal_rate!;
@@ -1343,6 +1371,45 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
                         {Math.round(rate * 100)}%
                       </p>
                       <p className="text-[9px] text-neutral-600 mt-0.5">n={skip.sample_size}</p>
+                    </div>
+                  );
+                })()}
+                {digest?.self_review_prediction_accuracy_trends?.reviewer_hallucination_rate != null && (() => {
+                  const hall = digest.self_review_prediction_accuracy_trends.reviewer_hallucination_rate!;
+                  const curr = hall.current_rate;
+                  const prev = hall.previous_rate;
+                  const sample = hall.current_sample ?? 0;
+                  const hasSample = sample >= 5;
+                  const color = !hasSample ? 'text-neutral-500' : curr == null ? 'text-neutral-500' : curr <= 0.05 ? 'text-emerald-400' : curr <= 0.15 ? 'text-amber-400' : 'text-red-400';
+                  const tooltip = [
+                    'Reviewer hallucination rate: share of fresh-reviewer findings that reference non-existent files/lines',
+                    hasSample ? `Current: ${Math.round((curr ?? 0) * 100)}% (n=${sample})` : `Insufficient sample (n=${sample})`,
+                    prev != null ? `Previous: ${Math.round(prev * 100)}%` : null,
+                    hall.delta != null ? `Δ vs previous cycle: ${hall.delta >= 0 ? '+' : ''}${Math.round(hall.delta * 100)}pp` : null,
+                  ].filter(Boolean).join('\n');
+                  return (
+                    <div
+                      className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[140px]"
+                      title={tooltip}
+                      data-testid="reviewer-hallucination-rate-tile"
+                    >
+                      <p className="text-[9px] text-neutral-500 uppercase tracking-wide mb-0.5">Reviewer Hallucination</p>
+                      {hasSample && curr != null ? (
+                        <>
+                          <p className={`text-xl font-bold font-mono ${color}`}>
+                            {Math.round(curr * 100)}%
+                          </p>
+                          {prev != null && hall.delta != null && (
+                            <p className={`text-[9px] mt-0.5 ${hall.delta > 0.005 ? 'text-red-400' : hall.delta < -0.005 ? 'text-emerald-400' : 'text-neutral-600'}`}>
+                              {hall.delta >= 0 ? '+' : ''}
+                              {Math.round(hall.delta * 100)}pp
+                            </p>
+                          )}
+                          <p className="text-[9px] text-neutral-600 mt-0.5">n={sample}</p>
+                        </>
+                      ) : (
+                        <p className="text-[9px] text-neutral-500 mt-2">insufficient sample</p>
+                      )}
                     </div>
                   );
                 })()}
@@ -2401,30 +2468,25 @@ function SrCatchRateCard({ rate, trends, sampleSize, loading, onScrollToReviewQu
     );
   }
 
-  const cats = trends?.categories || {};
-  const categoryDeltas = Object.values(cats)
-    .map(c => {
-      const curr = c.current_hit_rate ?? 0;
-      const prev = c.previous_hit_rate ?? 0;
-      return curr - prev;
-    })
-    .filter(d => d !== 0 || Object.keys(cats).length > 0);
-  const avgDelta = categoryDeltas.length > 0 ? categoryDeltas.reduce((a, b) => a + b, 0) / categoryDeltas.length : 0;
+  const overallPrevRate = trends?.previous_overall_hit_rate ?? null;
+  const delta = overallPrevRate != null ? rate - overallPrevRate : null;
 
   const pct = Math.round(rate * 100);
   const color = rate >= 0.7 ? 'text-emerald-400' : rate >= 0.4 ? 'text-amber-400' : 'text-red-400';
-  const deltaPp = Math.round(avgDelta * 100);
-  const deltaColor = avgDelta > 0.01 ? 'text-emerald-500' : avgDelta < -0.01 ? 'text-red-500' : 'text-neutral-500';
-  const deltaIcon = avgDelta > 0.01 ? '↑' : avgDelta < -0.01 ? '↓' : '→';
+  const deltaPp = delta != null ? Math.round(delta * 100) : 0;
+  const deltaColor = delta != null && delta > 0.01 ? 'text-emerald-500' : delta != null && delta < -0.01 ? 'text-red-500' : 'text-neutral-500';
+  const deltaIcon = delta != null && delta > 0.01 ? '↑' : delta != null && delta < -0.01 ? '↓' : '→';
 
   return (
     <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 sm:p-4 cursor-pointer hover:border-neutral-700/80 transition-colors" onClick={onScrollToReviewQuality}>
       <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">SR Catch Rate</p>
       <div className="flex items-center gap-2">
         <p className={`text-2xl font-bold font-mono ${color}`}>{pct}%</p>
-        <span className={`text-sm font-semibold ${deltaColor}`}>
-          {deltaIcon} {deltaPp >= 0 ? '+' : ''}{deltaPp}pp
-        </span>
+        {delta != null && (
+          <span className={`text-sm font-semibold ${deltaColor}`}>
+            {deltaIcon} {deltaPp >= 0 ? '+' : ''}{deltaPp}pp
+          </span>
+        )}
       </div>
       <p className="text-[10px] text-neutral-600 mt-1">n={sampleSize}</p>
     </div>

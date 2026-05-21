@@ -4232,6 +4232,34 @@ async def compute_sr_catch_rate_trends(
 
     edges_stats = _compute_edges_stats(all_tasks)
 
+    # Compute overall (aggregate) hit rates across all categories, weighted by human_count.
+    # This represents the true cycle-over-cycle change of the headline metric.
+    current_total_hits = 0
+    current_total_humans = 0
+    previous_total_hits = 0
+    previous_total_humans = 0
+    for data in categories.values():
+        curr_hit_rate = data.get("current_hit_rate")
+        curr_human_count = data.get("current_human_count", 0)
+        prev_hit_rate = data.get("previous_hit_rate")
+        prev_human_count = data.get("previous_human_count", 0)
+        if curr_hit_rate is not None and curr_human_count > 0:
+            current_total_hits += round(curr_hit_rate * curr_human_count)
+            current_total_humans += curr_human_count
+        if prev_hit_rate is not None and prev_human_count > 0:
+            previous_total_hits += round(prev_hit_rate * prev_human_count)
+            previous_total_humans += prev_human_count
+    overall_hit_rate = (
+        round(current_total_hits / current_total_humans, 3)
+        if current_total_humans > 0
+        else None
+    )
+    previous_overall_hit_rate = (
+        round(previous_total_hits / previous_total_humans, 3)
+        if previous_total_humans > 0
+        else None
+    )
+
     # Prompt-version awareness: detect mixed-regime windows so the agent can
     # caveat calibration surfaces and avoid mistaking prompt rollouts for regressions.
     pv_counter = _collect_prompt_versions(current_window_tasks)
@@ -4257,6 +4285,8 @@ async def compute_sr_catch_rate_trends(
         "edges_considered_stats": edges_stats,
         "sr_skip_rate": sr_skip_rate,
         "sr_skip_reason_distribution": sr_skip_dist if sr_skip_dist is not None else {},
+        "overall_hit_rate": overall_hit_rate,
+        "previous_overall_hit_rate": previous_overall_hit_rate,
     }
     if current_prompt_version is not None:
         result["prompt_version"] = current_prompt_version

@@ -405,6 +405,8 @@ def _compute_sr_prediction_accuracy(
         return None
     total_human = total_overlap = total_missed = total_false = total_sr_failed = 0
     w_caught = w_missed = 0.0
+    self_flagged_task_count = 0
+    tasks_with_rejections = 0
     for t in tasks_with_both:
         ctx = t.context or {}
         check_results = ctx.get("_self_review_outcome", {}).get("check_results") or {}
@@ -415,6 +417,10 @@ def _compute_sr_prediction_accuracy(
         total_missed += len(human_cats - sr_failed)
         total_false += len(sr_failed - human_cats)
         total_sr_failed += len(sr_failed)
+        if human_cats:
+            tasks_with_rejections += 1
+            if human_cats & sr_failed:
+                self_flagged_task_count += 1
         rev_hist = (ctx.get("review_loop") or {}).get("review_history") or []
         cat_weights: Dict[str, int] = {}
         cached_entry = ctx.get("_first_attempt_categorized_issues")
@@ -449,6 +455,13 @@ def _compute_sr_prediction_accuracy(
         "weighted_hit_rate": round(w_caught / total_w, 3) if total_w > 0 else None,
         "weighted_miss_rate": round(w_missed / total_w, 3) if total_w > 0 else None,
         "sample_size": len(tasks_with_both),
+        # Tasks where SR already flagged the issue but the agent submitted without fixing it.
+        "self_flagged_shipped_unfixed_task_count": self_flagged_task_count,
+        "self_flagged_shipped_unfixed_task_rate": round(
+            self_flagged_task_count / tasks_with_rejections, 3
+        )
+        if tasks_with_rejections > 0
+        else None,
     }
 
 

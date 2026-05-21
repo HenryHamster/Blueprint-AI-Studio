@@ -159,6 +159,14 @@ export const SR_CANONICAL_CATEGORIES: { id: string; label: string }[] = [
   { id: 'cross-system-contract', label: 'Cross-System Contract' },
 ];
 
+export interface ReviewerHallucinationRate {
+  current_rate?: number | null;
+  previous_rate?: number | null;
+  current_sample?: number | null;
+  previous_sample?: number | null;
+  delta?: number | null;
+}
+
 export interface SrTrendData {
   computed_at?: string | null;
   bucket_mode?: 'cycle' | 'calendar' | null;
@@ -181,6 +189,7 @@ export interface SrTrendData {
   execution_evidence_miss_rates?: Record<string, ExecutionEvidenceMissRate> | null;
   edges_considered_stats?: Record<string, number> | null;
   co_failure_pairs?: SrCoFailurePair[] | null;
+  reviewer_hallucination_rate?: ReviewerHallucinationRate | null;
 }
 
 const SKIP_RATE_AMBER_THRESHOLD = 0.25;
