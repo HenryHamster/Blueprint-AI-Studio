@@ -3,7 +3,7 @@ import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { ProjectDashboard } from './ProjectDashboard';
 import type { Project } from '../types/project';
-import { expectNoOverflowAt, expectMinTouchTargetAt } from '../test/viewport';
+import { expectNoOverflowAt, expectMinTouchTargetAt, expectNoTextTruncationAt } from '../test/viewport';
 
 vi.mock('../api', () => ({
   apiFetch: vi.fn(async () => new Response('{}', { status: 200 })),
@@ -106,6 +106,36 @@ describe('ProjectDashboard — viewport regression', () => {
         );
       });
     }, { selector: 'button, a[href]' });
+
+    localStorage.removeItem('projectDashboardCollapsed');
+  });
+
+  test('text labels do not truncate silently at 375px', async () => {
+    localStorage.setItem('projectDashboardCollapsed', 'false');
+
+    const projects = [
+      makeProject({ id: 'p1', name: 'Platform', status: 'active' }),
+      makeProject({ id: 'p2', name: 'Mobile App', status: 'paused', autonomous_enabled: false }),
+      makeProject({ id: 'p3', name: 'Data Pipeline', status: 'active' }),
+    ];
+
+    await expectNoTextTruncationAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <ProjectDashboard
+            projects={projects}
+            tasks={[]}
+            selectedProjectId={null}
+            onSelectProject={() => {}}
+          />,
+        );
+      });
+    });
 
     localStorage.removeItem('projectDashboardCollapsed');
   });

@@ -12,6 +12,7 @@ export interface ViewportDebtRow {
   total_opt_outs: number;
   has_viewport_test: boolean;
   regression_case_count: number;
+  regression_case_breakdown?: Record<string, number>;
   source_url: string | null;
   introducing_pr_number?: number | null;
   introducing_commit_sha?: string | null;
@@ -28,6 +29,13 @@ interface ViewportDebtResponse {
   untested_rows?: ViewportDebtRow[];
   scanned_at: string;
   coverage_summary?: CoverageSummary;
+}
+
+function formatBreakdown(breakdown: Record<string, number>): string {
+  return Object.entries(breakdown)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([type, count]) => count + ' ' + type)
+    .join(', ');
 }
 
 function renderDebtRow(row: ViewportDebtRow) {
@@ -76,6 +84,11 @@ function renderDebtRow(row: ViewportDebtRow) {
         <span className={row.regression_case_count > 0 ? 'text-red-400 font-medium' : 'text-neutral-600'}>
           {row.regression_case_count > 0 ? row.regression_case_count : '—'}
         </span>
+        {row.regression_case_count > 0 && row.regression_case_breakdown && (
+          <span className="block text-[9px] text-neutral-500 leading-tight whitespace-nowrap">
+            {formatBreakdown(row.regression_case_breakdown)}
+          </span>
+        )}
         {row.regression_case_count > 0 && row.introducing_pr_number != null && (
           <span
             className="block text-[9px] text-neutral-500 leading-tight"

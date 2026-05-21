@@ -110,6 +110,7 @@ export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectP
           <div
             className="flex gap-3 overflow-x-auto pb-2 custom-scrollbar"
             data-viewport-allow-overflow
+            data-viewport-allow-truncation
           >
           {/* All Projects option */}
           <button

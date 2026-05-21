@@ -9026,6 +9026,7 @@ def _scan_viewport_debt_rows() -> tuple[
                         "total_opt_outs": 0,
                         "has_viewport_test": False,
                         "regression_case_count": 0,
+                        "regression_case_breakdown": {},
                         "source_url": None,
                     }
                 )
@@ -9041,6 +9042,7 @@ def _scan_viewport_debt_rows() -> tuple[
                 "total_opt_outs": total,
                 "has_viewport_test": vp_test,
                 "regression_case_count": 0,
+                "regression_case_breakdown": {},
                 "source_url": None,
             }
         )
@@ -9100,8 +9102,9 @@ async def get_viewport_debt(
         )
         vp_cases = (await session.execute(stmt)).scalars().all()
 
-        # Map component stem → case count
+        # Map component stem → case count and per-assertion-type breakdown
         case_counts: Dict[str, int] = {}
+        case_breakdown: Dict[str, Dict[str, int]] = {}
         for c in vp_cases:
             parsed = parse_viewport_regression_class(c.regression_class)
             comp = parsed.get("component")
@@ -9110,6 +9113,9 @@ async def get_viewport_debt(
                 if not comp.endswith(".tsx"):
                     comp = f"{comp}.tsx"
                 case_counts[comp] = case_counts.get(comp, 0) + 1
+                atype = parsed.get("assertion_type") or "unknown"
+                bd = case_breakdown.setdefault(comp, {})
+                bd[atype] = bd.get(atype, 0) + 1
 
         project = await session.get(Project, project_id)
         gh_owner = project.github_owner if project else None
@@ -9118,6 +9124,7 @@ async def get_viewport_debt(
         for row in (*rows, *untested_rows):
             stem_tsx = _Path(row["component"]).name  # e.g. "MessagesPanel.tsx"
             row["regression_case_count"] = case_counts.get(stem_tsx, 0)
+            row["regression_case_breakdown"] = case_breakdown.get(stem_tsx, {})
             if gh_owner and gh_repo:
                 row["source_url"] = (
                     f"https://github.com/{gh_owner}/{gh_repo}/blob/main/{row['component']}"

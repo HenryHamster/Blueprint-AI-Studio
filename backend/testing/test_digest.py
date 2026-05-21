@@ -15064,6 +15064,85 @@ async def test_viewport_debt_counts_assertion_type_regressions(
     assert messages_panel_row["regression_case_count"] == 1  # new format
 
 
+@pytest.mark.asyncio
+async def test_viewport_debt_returns_per_assertion_type_breakdown(
+    client: AsyncClient, db_session
+):
+    """GET /viewport-debt includes regression_case_breakdown keyed by assertion type."""
+    from unittest.mock import patch
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    membership = make_membership(project.id, user_id="test-user-123", role="owner")
+    db_session.add(membership)
+    await db_session.commit()
+
+    fake_rows = [
+        {
+            "component": "admin-ui/src/components/TaskCard.tsx",
+            "eslint_disable_count": 0,
+            "data_viewport_allow_small_target": 0,
+            "data_viewport_allow_overflow": 0,
+            "data_viewport_allow_truncation": 0,
+            "total_opt_outs": 1,
+            "has_viewport_test": True,
+            "regression_case_count": 0,
+            "source_url": None,
+        },
+    ]
+
+    with patch(
+        "app.routers.admin_digest._scan_viewport_debt_rows",
+        return_value=(
+            fake_rows,
+            [],
+            {"total_components": 1, "untested_count": 0, "untested_components": []},
+        ),
+    ):
+        # Two overflow cases and one truncation case for TaskCard
+        case1 = RegressionRemediationCase(
+            project_id=project.id,
+            regression_class="viewport_regression:TaskCard:overflow@375",
+            status=RegressionCaseStatus.ACTIVE,
+            first_seen_at=_utcnow(),
+        )
+        case2 = RegressionRemediationCase(
+            project_id=project.id,
+            regression_class="viewport_regression:TaskCard:overflow@768",
+            status=RegressionCaseStatus.ACTIVE,
+            first_seen_at=_utcnow(),
+        )
+        case3 = RegressionRemediationCase(
+            project_id=project.id,
+            regression_class="viewport_regression:TaskCard:truncation@375",
+            status=RegressionCaseStatus.ACTIVE,
+            first_seen_at=_utcnow(),
+        )
+        # Old-format case counts as "unknown" assertion type
+        case4 = RegressionRemediationCase(
+            project_id=project.id,
+            regression_class="viewport_regression:TaskCard.tsx@375",
+            status=RegressionCaseStatus.ACTIVE,
+            first_seen_at=_utcnow(),
+        )
+        db_session.add_all([case1, case2, case3, case4])
+        await db_session.commit()
+
+        response = await client.get(f"/api/admin/projects/{project.id}/viewport-debt")
+
+    assert response.status_code == 200
+    body = response.json()
+    row = next((r for r in body["rows"] if "TaskCard" in r["component"]), None)
+    assert row is not None, "TaskCard row not found"
+    assert row["regression_case_count"] == 4
+    breakdown = row["regression_case_breakdown"]
+    assert breakdown["overflow"] == 2
+    assert breakdown["truncation"] == 1
+    assert breakdown["unknown"] == 1
+
+
 # ---------------------------------------------------------------------------
 # Acknowledge endpoint
 # ---------------------------------------------------------------------------

@@ -3,7 +3,7 @@ import fs from 'fs';
 import path from 'path';
 
 describe('viewport test coverage invariant', () => {
-  it('fails CI when a required component is missing viewport assertions for a required width', () => {
+  it('fails CI when a required component is missing all three viewport assertions at required widths', () => {
     const requiredPath = path.join(__dirname, 'viewport-required.json');
     const { requiredWidths, components } = JSON.parse(fs.readFileSync(requiredPath, 'utf-8')) as {
       requiredWidths: number[];
@@ -13,19 +13,43 @@ describe('viewport test coverage invariant', () => {
     const componentsDir = path.join(__dirname, '../components');
     const missing: string[] = [];
 
+    // Assertion types that must be present at each required width.
+    // A single expectFullViewportAt call counts as all three.
+    const assertionTypes = ['overflow', 'text_truncation', 'touch_target'];
+
     for (const component of components) {
       const testFile = path.join(componentsDir, `${component}.viewport.test.tsx`);
       if (!fs.existsSync(testFile)) {
         for (const width of requiredWidths) {
-          missing.push(`${component} — no viewport test file (needs ${width}px coverage)`);
+          for (const type of assertionTypes) {
+            missing.push(`${component} — no viewport test file (needs ${type} at ${width}px)`);
+          }
         }
         continue;
       }
       const content = fs.readFileSync(testFile, 'utf-8');
       for (const width of requiredWidths) {
-        // Detect any call to an expect*At helper at the required width
-        if (!new RegExp(`At\\s*\\(\\s*${width}[^\\d]`).test(content)) {
-          missing.push(`${component} — missing ${width}px assertion in ${component}.viewport.test.tsx`);
+        // Check if expectFullViewportAt(width) is present — it counts as all three
+        const hasFullViewport = new RegExp(`expectFullViewportAt\\s*\\(\\s*${width}[^\\d]`).test(content);
+
+        if (hasFullViewport) {
+          // Single expectFullViewportAt call satisfies all three assertion types
+          continue;
+        }
+
+        // Otherwise, check for each assertion type individually
+        const overflowRegex = new RegExp(`expectNoOverflowAt\\s*\\(\\s*${width}[^\\d]`);
+        const truncationRegex = new RegExp(`expectNoTextTruncationAt\\s*\\(\\s*${width}[^\\d]`);
+        const touchRegex = new RegExp(`expectMinTouchTargetAt\\s*\\(\\s*${width}[^\\d]`);
+
+        if (!overflowRegex.test(content)) {
+          missing.push(`${component} — missing overflow assertion at ${width}px in ${component}.viewport.test.tsx`);
+        }
+        if (!truncationRegex.test(content)) {
+          missing.push(`${component} — missing text_truncation assertion at ${width}px in ${component}.viewport.test.tsx`);
+        }
+        if (!touchRegex.test(content)) {
+          missing.push(`${component} — missing touch_target assertion at ${width}px in ${component}.viewport.test.tsx`);
         }
       }
     }
@@ -33,10 +57,14 @@ describe('viewport test coverage invariant', () => {
     const errorMessage =
       missing.length > 0
         ? `
-The following required components are missing viewport assertions at required widths.
-Add an expect*At(width, ...) call for each missing entry:
+The following required components are missing one or more viewport assertions at required widths.
+Each component must assert all three: horizontal overflow, silent text truncation, and minimum touch target.
+A single expectFullViewportAt(width, ...) call satisfies all three.
 
 ${missing.map(m => `  ${m}`).join('\n')}
+
+For components with no interactive controls, the touch-target assertion may use a scoped selector
+or a vacuous call like: expectMinTouchTargetAt(375, async () => {...}, { selector: 'none' })
 
 Required widths come from admin-ui/src/test/viewport-required.json.
         `.trim()

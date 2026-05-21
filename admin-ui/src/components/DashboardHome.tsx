@@ -509,9 +509,8 @@ function FailureClassPill({ group, sparkData, cost }: { group: FailureGroup; spa
 
   return (
     <div ref={ref} className="relative">
-      {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
       <button
-        className={`inline-flex items-center gap-1.5 text-[10px] font-semibold px-2 py-0.5 rounded border ${colorClass} cursor-pointer`}
+        className={`inline-flex items-center justify-center gap-1.5 text-[10px] font-semibold px-3 py-2 rounded border min-h-11 ${colorClass} cursor-pointer`}
         onClick={() => setOpen(v => !v)}
         title={`${group.label}: ${group.count} failure${group.count !== 1 ? 's' : ''}`}
       >
@@ -1132,13 +1131,12 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
           {/* Section 1d4: Fix-Loop Convergence */}
           {!loading && (
             <div>
-              <div className="flex justify-end gap-0.5 mb-1">
+              <div className="flex justify-end gap-1 mb-1">
                 {([7, 14, 30] as const).map(d => (
-                  // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
                   <button
                     key={d}
                     onClick={() => setFixLoopTrendDays(d)}
-                    className={`text-[10px] px-2 py-0.5 rounded transition-colors ${fixLoopTrendDays === d ? 'bg-neutral-700 text-neutral-200' : 'text-neutral-500 hover:text-neutral-300'}`}
+                    className={`text-[10px] px-3 py-2 rounded transition-colors min-h-11 min-w-11 ${fixLoopTrendDays === d ? 'bg-neutral-700 text-neutral-200' : 'text-neutral-500 hover:text-neutral-300'}`}
                   >
                     {d}d
                   </button>
@@ -2026,7 +2024,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
                           </div>
                         </div>
                         {ev.pr_url && isSafeUrl(ev.pr_url) && (
-                          <a href={ev.pr_url} target="_blank" rel="noopener noreferrer" className="text-neutral-500 hover:text-neutral-300 shrink-0">
+                          <a href={ev.pr_url} target="_blank" rel="noopener noreferrer" className="text-neutral-500 hover:text-neutral-300 shrink-0" data-viewport-allow-small-target title="View PR on GitHub">
                             <ExternalLink className="w-3.5 h-3.5" />
                           </a>
                         )}

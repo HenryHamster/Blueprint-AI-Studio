@@ -2,7 +2,7 @@ import { afterEach, describe, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { DashboardHome } from './DashboardHome';
-import { expectNoOverflowAt } from '../test/viewport';
+import { expectNoOverflowAt, expectNoTextTruncationAt, expectMinTouchTargetAt } from '../test/viewport';
 
 // DashboardHome (and its sub-components) transitively import apiFetch from
 // '../api', which pulls in Firebase. Mock the module so the test does not
@@ -164,5 +164,49 @@ describe('DashboardHome — viewport regression', () => {
         await new Promise<void>((resolve) => setTimeout(resolve, 50));
       });
     });
+  });
+
+  test('operator-facing text is not silently clipped at 375px', async () => {
+    await expectNoTextTruncationAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <DashboardHome
+            tasks={[]}
+            selectedProjectId={null}
+            onViewTask={() => {}}
+          />,
+        );
+      });
+      await act(async () => {
+        await new Promise<void>((resolve) => setTimeout(resolve, 50));
+      });
+    });
+  });
+
+  test('interactive controls meet 44px touch target at 375px', async () => {
+    await expectMinTouchTargetAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <DashboardHome
+            tasks={[]}
+            selectedProjectId={null}
+            onViewTask={() => {}}
+          />,
+        );
+      });
+      await act(async () => {
+        await new Promise<void>((resolve) => setTimeout(resolve, 50));
+      });
+    }, { selector: 'button, a[href]' });
   });
 });
