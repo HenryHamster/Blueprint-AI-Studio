@@ -137,7 +137,7 @@ async def test_open_backmerge_pr_success(db_session, mocker):
     assert create_mock.call_args.kwargs["base"] == "automain"
     assert (
         create_mock.call_args.kwargs["title"]
-        == "Back-merge: main -> automain after hotfix"
+        == "Back-merge: main -> automain"
     )
 
     # Merge uses merge_method="merge" to preserve the hotfix history.
@@ -228,7 +228,7 @@ async def test_open_backmerge_pr_conflict_raises_alert_and_spawns_plan(
     alerts = await _alerts_for(db_session, project.id)
     assert len(alerts) == 1
     assert alerts[0].severity == AlertSeverity.ERROR
-    assert alerts[0].title == "Hotfix back-merge conflict: main -> automain"
+    assert alerts[0].title == "Back-merge conflict: main -> automain"
 
     # Exactly one plan task was spawned.
     tasks = await _tasks_for(db_session, project.id)
@@ -369,7 +369,7 @@ async def test_open_backmerge_pr_405_non_merge_raises_alert(db_session, mocker):
     alerts = await _alerts_for(db_session, project.id)
     assert len(alerts) == 1
     assert alerts[0].severity == AlertSeverity.ERROR
-    assert alerts[0].title == "Hotfix back-merge failed: main -> automain"
+    assert alerts[0].title == "Back-merge failed: main -> automain"
 
     # No fix task spawned for a 405.
     assert await _tasks_for(db_session, project.id) == []
@@ -450,3 +450,132 @@ async def test_open_backmerge_pr_missing_project_is_blocked(db_session):
     result = await hb.open_backmerge_pr(db_session, uuid.uuid4())
     assert result["status"] == "blocked"
     assert result["error"] == "project_not_found"
+
+
+# ===========================================================================
+# reconcile_main_into_automain — the periodic reconciler
+# ===========================================================================
+
+
+async def test_reconcile_skipped_when_integration_branch_not_automain(
+    db_session, mocker
+):
+    """The reconciler is a no-op when the LTS branch model is not active —
+    integration_branch != "automain" means there is no separate trunk to
+    reconcile, so GitHub is never touched."""
+    project = await _make_project(db_session)
+    mocker.patch.dict(
+        "app.shared_state.runtime_config", {"integration_branch": "main"}
+    )
+    create_mock, merge_mock = _patch_github(
+        mocker,
+        create_return={"number": 1, "html_url": "http://pr/1"},
+        merge_return={"merged": True},
+    )
+
+    result = await hb.reconcile_main_into_automain(db_session, project.id)
+
+    assert result == {"status": "skipped", "reason": "lts_inactive"}
+    create_mock.assert_not_called()
+    merge_mock.assert_not_called()
+
+
+async def test_reconcile_delegates_to_backmerge_when_lts_active(
+    db_session, mocker
+):
+    """With integration_branch == "automain" the reconciler delegates to
+    open_backmerge_pr and back-merges main -> automain."""
+    project = await _make_project(db_session)
+    mocker.patch.dict(
+        "app.shared_state.runtime_config", {"integration_branch": "automain"}
+    )
+    create_mock, _merge_mock = _patch_github(
+        mocker,
+        create_return={"number": 9, "html_url": "http://pr/9"},
+        merge_return={"merged": True},
+    )
+
+    result = await hb.reconcile_main_into_automain(db_session, project.id)
+    await db_session.commit()
+
+    assert result["status"] == "merged"
+    assert create_mock.call_args.kwargs["head"] == "main"
+    assert create_mock.call_args.kwargs["base"] == "automain"
+
+
+async def test_reconcile_empty_diff_is_noop(db_session, mocker):
+    """When main == automain the reconciler is a clean no-op."""
+    project = await _make_project(db_session)
+    mocker.patch.dict(
+        "app.shared_state.runtime_config", {"integration_branch": "automain"}
+    )
+    _patch_github(
+        mocker,
+        create_return={"empty_diff": True, "merged": True, "html_url": ""},
+        merge_return={"merged": True},
+    )
+
+    result = await hb.reconcile_main_into_automain(db_session, project.id)
+
+    assert result["status"] == "noop_empty_diff"
+
+
+# ===========================================================================
+# periodic=True — alert-storm suppression
+# ===========================================================================
+
+
+async def test_periodic_block_raises_no_alert(db_session, mocker):
+    """A periodic back-merge that cannot merge yet (CI pending / 405) must NOT
+    raise an Alert — the reconciler retries every cycle and an Alert per cycle
+    would storm the operator. Contrast test_open_backmerge_pr_405... which
+    expects an Alert for the one-shot (periodic=False) caller."""
+    project = await _make_project(db_session)
+    _patch_github(
+        mocker,
+        create_return={"number": 41, "html_url": "http://pr/41"},
+        merge_return={
+            "merged": False,
+            "conflict": False,
+            "message": "required status check pending",
+        },
+    )
+
+    result = await hb.open_backmerge_pr(db_session, project.id, periodic=True)
+    await db_session.commit()
+
+    assert result["status"] == "blocked"
+    assert result["error"] == "merge_blocked"
+    # The crux: a periodic caller stays quiet on a transient block.
+    assert await _alerts_for(db_session, project.id) == []
+    assert await _tasks_for(db_session, project.id) == []
+
+
+async def test_periodic_conflict_dedupes_alert_and_plan(db_session, mocker):
+    """A periodic back-merge that keeps hitting a conflict raises exactly ONE
+    Alert and spawns exactly ONE resolution plan, no matter how many cycles
+    run — the reconciler must not stack an Alert + plan every cycle."""
+    project = await _make_project(db_session)
+    _patch_github(
+        mocker,
+        create_return={"number": 77, "html_url": "http://pr/77"},
+        merge_return={
+            "merged": False,
+            "conflict": True,
+            "message": "still conflicting",
+        },
+    )
+
+    # Three reconciler cycles, all hitting the same conflict.
+    for _ in range(3):
+        result = await hb.open_backmerge_pr(
+            db_session, project.id, periodic=True
+        )
+        await db_session.commit()
+        assert result["status"] == "conflict"
+
+    # Exactly one Alert and one resolution plan — deduped across all cycles.
+    assert len(await _alerts_for(db_session, project.id)) == 1
+    tasks = await _tasks_for(db_session, project.id)
+    assert len(tasks) == 1
+    assert tasks[0].context["backmerge_conflict"] is True

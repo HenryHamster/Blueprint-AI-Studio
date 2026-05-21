@@ -3049,6 +3049,122 @@ async def test_sweep_force_finalizes_timed_out_qualification(db_session):
     assert "timed out" in alerts[0].title.lower()
 
 
+# ===========================================================================
+# _maybe_reconcile_after_promotion_conflict — promotion-conflict self-heal
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_promotion_conflict_triggers_reconciliation(db_session, mocker):
+    """A promotion that failed on a merge CONFLICT kicks off a main -> automain
+    reconciliation so the version self-heals instead of dead-ending in
+    stabilize until an operator notices."""
+    project, version = await _make_project_and_version(db_session)
+    recon_mock = mocker.patch(
+        "app.hotfix_backmerge.reconcile_main_into_automain",
+        new=AsyncMock(return_value={"status": "merged"}),
+    )
+
+    await rq._maybe_reconcile_after_promotion_conflict(
+        version.id,
+        {
+            "status": "promotion_failed",
+            "error": "merge_blocked",
+            "conflict": True,
+        },
+        session_factory=_shared_session_factory(db_session),
+    )
+
+    recon_mock.assert_awaited_once()
+    # Reconciliation runs for the conflicted version's own project.
+    assert recon_mock.call_args.args[1] == project.id
+
+
+@pytest.mark.asyncio
+async def test_promotion_failure_without_conflict_does_not_reconcile(
+    db_session, mocker
+):
+    """A non-conflict promotion failure (e.g. a 405 checks-block) must NOT
+    trigger a reconciliation — there is no branch divergence to reconcile."""
+    _project, version = await _make_project_and_version(db_session)
+    recon_mock = mocker.patch(
+        "app.hotfix_backmerge.reconcile_main_into_automain",
+        new=AsyncMock(return_value={"status": "merged"}),
+    )
+
+    await rq._maybe_reconcile_after_promotion_conflict(
+        version.id,
+        {
+            "status": "promotion_failed",
+            "error": "merge_blocked",
+            "conflict": False,
+        },
+        session_factory=_shared_session_factory(db_session),
+    )
+
+    recon_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_non_promotion_failure_result_does_not_reconcile(
+    db_session, mocker
+):
+    """A dry_run / not_promoted / None finalize result never triggers a
+    reconciliation — only a conflicted promotion failure does."""
+    _project, version = await _make_project_and_version(db_session)
+    recon_mock = mocker.patch(
+        "app.hotfix_backmerge.reconcile_main_into_automain",
+        new=AsyncMock(return_value={"status": "merged"}),
+    )
+
+    for result in (
+        {"status": "dry_run", "confidence": 0.9},
+        {"status": "not_promoted", "blocker": "below_threshold"},
+        None,
+    ):
+        await rq._maybe_reconcile_after_promotion_conflict(
+            version.id,
+            result,
+            session_factory=_shared_session_factory(db_session),
+        )
+
+    recon_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_finalize_in_dedicated_session_reconciles_on_promotion_conflict(
+    db_session, mocker
+):
+    """End-to-end wiring: when the finalize chain produces a conflicted
+    promotion failure, _finalize_in_dedicated_session triggers the
+    main -> automain reconciliation after its dedicated session has committed
+    and closed."""
+    _project, version = await _make_project_and_version(db_session)
+    # Drive _finalize_locked_version to return a conflicted promotion failure.
+    mocker.patch(
+        "app.release_qualifier._finalize_locked_version",
+        new=AsyncMock(
+            return_value={
+                "status": "promotion_failed",
+                "error": "merge_blocked",
+                "conflict": True,
+            }
+        ),
+    )
+    recon_mock = mocker.patch(
+        "app.hotfix_backmerge.reconcile_main_into_automain",
+        new=AsyncMock(return_value={"status": "conflict"}),
+    )
+
+    result = await rq._finalize_in_dedicated_session(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert result is not None
+    assert result["status"] == "promotion_failed"
+    recon_mock.assert_awaited_once()
+
+
 @pytest.mark.asyncio
 async def test_sweep_does_not_time_out_a_fresh_qualification(db_session):
     """Audit H2: a qualification still within the timeout window with a

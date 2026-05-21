@@ -62,14 +62,14 @@ async def _spawn_crash_investigations(
     reaper_stats_str = ""
     if service_name == "reaper":
         try:
-            from app.reaper import get_reaper_stats  # noqa: PLC0415
+            from app.reaper import get_reaper_stats
 
             stats = get_reaper_stats()
             reaper_stats_str = (
                 f"\nReaper telemetry: cycles_completed={stats['cycles_completed_total']}, "
                 f"last_cycle_age={stats['last_cycle_age_seconds']:.1f}s"
             )
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
 
     prompt = (
@@ -467,7 +467,7 @@ async def lifespan(app):
     # Start the Regression Recovery Scan (closes or re-arms MERGED cases)
     async def _regression_recovery_scan_service():
         """Periodic leader-only scan: re-evaluates MERGED regression cases."""
-        from app.pipeline_regression_dispatcher import run_recovery_once  # noqa: PLC0415
+        from app.pipeline_regression_dispatcher import run_recovery_once
 
         _SCAN_INTERVAL = 300  # 5 minutes
         while True:
@@ -512,7 +512,7 @@ async def lifespan(app):
         ACTIVE thresholds run in 24h and MERGED in 6h, so a 30-minute cadence is
         more than enough to catch staleness without burning DB cycles.
         """
-        from app.pipeline_regression_dispatcher import run_watchdog_once  # noqa: PLC0415
+        from app.pipeline_regression_dispatcher import run_watchdog_once
 
         _SCAN_INTERVAL = 1800  # 30 minutes
         while True:
@@ -563,7 +563,7 @@ async def lifespan(app):
         ``project.design_doc["efficiency_baseline"]``, so the in-instance
         sleep can be coarse without producing duplicate snapshots.
         """
-        from app.efficiency_snapshot import (  # noqa: PLC0415
+        from app.efficiency_snapshot import (
             SNAPSHOT_INTERVAL_SECONDS,
             maybe_write_weekly_snapshot,
         )
@@ -607,6 +607,67 @@ async def lifespan(app):
 
     efficiency_snapshot_task = asyncio.create_task(_efficiency_snapshot_service())
 
+    # Start the Branch Reconciliation service — keeps automain in sync with main.
+    async def _branch_reconciliation_service():
+        """Periodic leader-only scan: back-merge main -> automain for self-repo
+        projects so the integration trunk never silently falls behind the LTS
+        branch.
+
+        A hotfix or a direct push to main otherwise diverges the two branches
+        and the next automain -> main promotion conflicts.  Per project this is
+        a no-op unless integration_branch == "automain" — that gate lives in
+        reconcile_main_into_automain.
+        """
+        from app.hotfix_backmerge import reconcile_main_into_automain
+
+        _SCAN_INTERVAL = 600  # 10 minutes
+        while True:
+            await asyncio.sleep(_SCAN_INTERVAL)
+            try:
+                async with AsyncSessionLocal() as scan_session:
+                    projects = (
+                        (
+                            await scan_session.execute(
+                                select(Project)
+                                .where(Project.is_self_repo.is_(True))
+                                .options(load_only(Project.id))
+                            )
+                        )
+                        .scalars()
+                        .all()
+                    )
+                    for project in projects:
+                        try:
+                            result = await reconcile_main_into_automain(
+                                scan_session, project.id
+                            )
+                            await scan_session.commit()
+                            if result.get("status") not in (
+                                None,
+                                "skipped",
+                                "noop_empty_diff",
+                            ):
+                                logger.info(
+                                    "[BRANCH_RECONCILE] project=%s status=%s",
+                                    project.id,
+                                    result.get("status"),
+                                )
+                        except Exception as proj_exc:
+                            await scan_session.rollback()
+                            logger.warning(
+                                "[BRANCH_RECONCILE] project=%s error=%s",
+                                project.id,
+                                proj_exc,
+                            )
+            except asyncio.CancelledError:
+                raise
+            except Exception as scan_exc:
+                logger.error(
+                    "[BRANCH_RECONCILE] scan error: %s", scan_exc, exc_info=True
+                )
+
+    branch_reconciliation_task = asyncio.create_task(_branch_reconciliation_service())
+
     # Start the Orchestrator Worker background task
     orchestrator_task = asyncio.create_task(orchestrator_worker())
 
@@ -634,6 +695,7 @@ async def lifespan(app):
     _bg_tasks["regression_recovery_scan"] = regression_recovery_task
     _bg_tasks["regression_watchdog_scan"] = regression_watchdog_task
     _bg_tasks["efficiency_snapshot"] = efficiency_snapshot_task
+    _bg_tasks["branch_reconciliation"] = branch_reconciliation_task
     _bg_tasks["config_sync"] = config_sync_task
     _bg_tasks["availability_refresh"] = availability_refresh_task
 
@@ -662,6 +724,7 @@ async def lifespan(app):
             "regression_recovery_scan": _regression_recovery_scan_service,
             "regression_watchdog_scan": _regression_watchdog_scan_service,
             "efficiency_snapshot": _efficiency_snapshot_service,
+            "branch_reconciliation": _branch_reconciliation_service,
             "config_sync": runtime_config_sync_service,
             "availability_refresh": account_availability_refresh_service,
         }
@@ -673,7 +736,7 @@ async def lifespan(app):
                 # `_orchestrator_last_cycle` hasn't advanced in ~120s while the task
                 # is still running, cancel so the normal restart path below kicks in.
                 try:
-                    from app import orchestrator as _orch  # noqa: PLC0415
+                    from app import orchestrator as _orch
 
                     orch_task = tasks.get("orchestrator")
                     if orch_task is not None and not orch_task.done():
@@ -877,6 +940,7 @@ async def lifespan(app):
         auto_archive_task,
         regression_recovery_task,
         regression_watchdog_task,
+        branch_reconciliation_task,
         orchestrator_task,
         config_sync_task,
         monitor_task,
