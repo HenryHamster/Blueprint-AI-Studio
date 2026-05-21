@@ -89,6 +89,7 @@ from app.notification_dispatch import (
     post_event_message,
     post_version_build_stalled_message,
     post_version_calcification_message,
+    post_version_promotion_readiness_message,
     post_version_stabilize_stalled_message,
 )
 from app.payload_schemas import PayloadTooLargeError, validate_internal_payload
@@ -2503,6 +2504,81 @@ async def _check_version_stabilize_stall(
     return True
 
 
+async def _check_version_promotion_readiness(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+) -> bool:
+    """Notify operator once when the dry-run track record first reaches readiness.
+
+    Fires exactly once per not-ready → ready transition while promotion is
+    disabled; resets the dedup flag when readiness lapses so recovery can
+    notify again.  Messaging is best-effort — failure never breaks the sweep.
+    Does NOT commit — caller commits on True return.
+    """
+    if version.status != "open":
+        return False
+    if bool(_runtime_config.get("promotion_enabled")):
+        return False  # promotion already on → operator acted
+
+    try:
+        readiness = await compute_promotion_readiness(session, version.project_id)
+    except Exception as exc:  # noqa: BLE001 — failure must not break the sweep
+        logger.warning(
+            "[RELEASE_QUALIFIER] promotion-readiness check failed for v%d "
+            "(non-fatal): %s",
+            version.version_number,
+            exc,
+        )
+        return False
+
+    if not readiness.get("ready"):
+        # Reset dedup flag so the next not-ready→ready recovery can notify.
+        # Return True when we actually clear the flag so the caller commits the
+        # reset — otherwise the sweep (which only commits on a True return) rolls
+        # it back on session close, leaving the flag True and suppressing the
+        # next ready re-notification.
+        if version.promotion_ready_notified:
+            version.promotion_ready_notified = False
+            session.add(version)
+            return True
+        return False
+
+    if version.promotion_ready_notified:
+        return False  # already notified for this ready window
+
+    try:
+        await post_version_promotion_readiness_message(
+            session,
+            version.project_id,
+            version_number=version.version_number,
+            version_id=str(version.id),
+            verdicts_evaluated=readiness["verdicts_evaluated"],
+            would_promote_rate=readiness["would_promote_rate"],
+            consecutive_clean_passes=readiness["consecutive_clean_passes"],
+            reason=readiness["reason"],
+        )
+    except Exception as exc:  # noqa: BLE001 — messaging must never break the sweep
+        logger.warning(
+            "[RELEASE_QUALIFIER] failed to post promotion-readiness message "
+            "for v%d (non-fatal): %s",
+            version.version_number,
+            exc,
+        )
+        return False
+
+    version.promotion_ready_notified = True
+    session.add(version)
+    logger.info(
+        "[RELEASE_QUALIFIER] promotion-readiness notification sent for v%d: "
+        "%d clean passes, rate %.2f, %d verdict(s)",
+        version.version_number,
+        readiness["consecutive_clean_passes"],
+        readiness["would_promote_rate"],
+        readiness["verdicts_evaluated"],
+    )
+    return True
+
+
 async def sweep_stuck_qualifications(
     session: AsyncSession,
     *,
@@ -2615,6 +2691,10 @@ async def sweep_stuck_qualifications(
                 alerted = await _check_version_build_stall(alert_session, v) or alerted
                 alerted = (
                     await _check_version_stabilize_stall(alert_session, v) or alerted
+                )
+                alerted = (
+                    await _check_version_promotion_readiness(alert_session, v)
+                    or alerted
                 )
                 if alerted:
                     await alert_session.commit()

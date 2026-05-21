@@ -6704,3 +6704,158 @@ async def test_readiness_excludes_promotion_enabled_verdicts(db_session):
 
     assert out["verdicts_evaluated"] == 5
     assert out["ready"] is True, out["reason"]
+
+
+# ===========================================================================
+# _check_version_promotion_readiness — once-per-transition notification
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_check_promotion_readiness_skips_non_open_version(db_session):
+    """A promoted (or otherwise closed) version is skipped immediately — no
+    message posted, no state change."""
+    project, version = await _make_project_and_version(db_session)
+    version.status = "promoted"
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    result = await rq._check_version_promotion_readiness(db_session, version)
+
+    assert result is False
+    assert version.promotion_ready_notified is False
+
+
+@pytest.mark.asyncio
+async def test_check_promotion_readiness_skips_when_promotion_already_enabled(
+    db_session,
+):
+    """When promotion_enabled is True, the operator has already acted — no
+    notification is needed and the function returns False."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session)
+
+    result = await rq._check_version_promotion_readiness(db_session, version)
+
+    assert result is False
+    assert version.promotion_ready_notified is False
+
+
+@pytest.mark.asyncio
+async def test_check_promotion_readiness_fires_on_first_ready_transition(db_session):
+    """On the first not-ready→ready transition the function posts a
+    promotion_readiness_reached message, sets promotion_ready_notified=True,
+    and returns True."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session)
+    await _ensure_verdict_table(db_session)
+    for i in range(5):
+        await _seed_verdict(
+            db_session, project.id, version.id, seq=i, would_promote=True
+        )
+    assert version.promotion_ready_notified is False
+
+    result = await rq._check_version_promotion_readiness(db_session, version)
+    await db_session.commit()
+
+    assert result is True
+    await db_session.refresh(version)
+    assert version.promotion_ready_notified is True
+
+    msgs = await _messages_for(
+        db_session, project.id, event_type="promotion_readiness_reached"
+    )
+    assert len(msgs) == 1
+    assert (msgs[0].context or {}).get("version_number") == version.version_number
+
+
+@pytest.mark.asyncio
+async def test_check_promotion_readiness_deduplicates_within_ready_window(db_session):
+    """Once promotion_ready_notified is True, a second call while readiness still
+    holds returns False without posting a duplicate message."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session)
+    await _ensure_verdict_table(db_session)
+    for i in range(5):
+        await _seed_verdict(
+            db_session, project.id, version.id, seq=i, would_promote=True
+        )
+
+    version.promotion_ready_notified = True
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    result = await rq._check_version_promotion_readiness(db_session, version)
+
+    assert result is False
+    msgs = await _messages_for(
+        db_session, project.id, event_type="promotion_readiness_reached"
+    )
+    assert len(msgs) == 0
+
+
+@pytest.mark.asyncio
+async def test_check_promotion_readiness_resets_dedup_flag_on_lapse(db_session):
+    """When readiness lapses (no verdicts → not-ready) and promotion_ready_notified
+    was True, the flag is reset to False so the next ready transition can notify."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session)
+    await _ensure_verdict_table(db_session)
+    # No verdicts → not ready.
+    version.promotion_ready_notified = True
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # The reset branch returns True so the sweep — which commits only on a True
+    # return — persists the reset. Mirror that caller contract here: commit only
+    # because the function signalled it changed state.
+    result = await rq._check_version_promotion_readiness(db_session, version)
+
+    assert result is True
+    await db_session.commit()
+    await db_session.refresh(version)
+    assert version.promotion_ready_notified is False
+
+
+@pytest.mark.asyncio
+async def test_check_promotion_readiness_messaging_failure_is_nonfatal(
+    db_session, mocker
+):
+    """A failure in post_version_promotion_readiness_message is swallowed — the
+    function returns False without raising and leaves promotion_ready_notified
+    unset so a later cycle can retry."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session)
+    await _ensure_verdict_table(db_session)
+    for i in range(5):
+        await _seed_verdict(
+            db_session, project.id, version.id, seq=i, would_promote=True
+        )
+
+    mocker.patch(
+        "app.release_qualifier.post_version_promotion_readiness_message",
+        new=AsyncMock(side_effect=RuntimeError("messaging down")),
+    )
+
+    result = await rq._check_version_promotion_readiness(db_session, version)
+
+    assert result is False
+    assert version.promotion_ready_notified is False

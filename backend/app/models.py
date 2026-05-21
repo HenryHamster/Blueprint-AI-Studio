@@ -2376,6 +2376,15 @@ class ReleaseVersion(SQLModel, table=True):
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
 
+    # Durable deduplication anchor for promotion-readiness alerting.
+    # Set to True when a promotion_readiness_reached notification fires for
+    # the current ready window. Reset to False when compute_promotion_readiness
+    # returns ready=False so the next not-ready→ready recovery can notify again.
+    promotion_ready_notified: bool = Field(
+        default=False,
+        sa_column=Column(Boolean, nullable=False, server_default=text("false")),
+    )
+
     created_at: datetime = Field(
         default_factory=_utcnow,
         sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),

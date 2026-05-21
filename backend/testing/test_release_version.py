@@ -405,13 +405,27 @@ def test_to_phase_block_shape():
         status="open",
         opened_at=_utcnow(),
         phase_changed_at=_utcnow(),
+        phase_reasoning="ready to qualify",
         last_qualification={"status": "pending"},
     )
     block = rv.to_phase_block(version)
     assert block["version_number"] == 3
     assert block["phase"] == "stabilize"
     assert block["phase_changed_at"] is not None
+    assert block["phase_reasoning"] == "ready to qualify"
     assert block["last_qualification"] == {"status": "pending"}
+
+
+def test_to_phase_block_phase_reasoning_none_when_absent():
+    """A version with no phase_reasoning yields None for that key."""
+    version = ReleaseVersion(
+        version_number=1,
+        phase="build",
+        status="open",
+        opened_at=_utcnow(),
+    )
+    block = rv.to_phase_block(version)
+    assert block["phase_reasoning"] is None
 
 
 def test_to_phase_block_handles_none_phase_changed_at():

@@ -67,6 +67,7 @@ HIGH_SIGNAL_NOTE_EVENT_TYPES: frozenset[str] = frozenset(
         "rollback_recommended",  # post_rollback_recommendation_message
         "fix_loop_divergence_regressed",  # post_fix_loop_divergence_regression_message
         "direction_outcome_stalled",  # post_direction_outcome_stalled_message
+        "promotion_readiness_reached",  # post_version_promotion_readiness_message
     }
 )
 
@@ -1742,6 +1743,62 @@ async def post_version_stabilize_stalled_message(
                 "version_id": version_id,
                 "age_days": age_days,
                 "tasks_merged": tasks_merged,
+                "summary": summary,
+            },
+        )
+    )
+    return msg
+
+
+async def post_version_promotion_readiness_message(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    version_number: int,
+    version_id: str,
+    verdicts_evaluated: int,
+    would_promote_rate: float,
+    consecutive_clean_passes: int,
+    reason: str,
+) -> ProjectMessage:
+    """Notify operator when the dry-run track record first reaches promotion-readiness.
+
+    Fires once per not-ready→ready transition while promotion is disabled.
+    Enable promotion_enabled in settings to act on this signal.
+    Does NOT commit — the caller owns the transaction.
+    """
+    summary = (
+        f"v{version_number} qualifier track record supports autonomous promotion: "
+        f"{consecutive_clean_passes} consecutive clean passes, "
+        f"{would_promote_rate:.0%} would-promote rate "
+        f"({verdicts_evaluated} dry-run verdict(s)). "
+        f"Enable promotion in settings to unlock automain→main autonomy."
+    )
+    msg = await post_event_message(
+        session,
+        project_id,
+        event_type="promotion_readiness_reached",
+        summary=summary,
+        context={
+            "version_number": version_number,
+            "version_id": version_id,
+            "verdicts_evaluated": verdicts_evaluated,
+            "would_promote_rate": would_promote_rate,
+            "consecutive_clean_passes": consecutive_clean_passes,
+            "reason": reason,
+        },
+    )
+    asyncio.ensure_future(
+        dispatch_external_notification(
+            project_id,
+            "PROMOTION_READINESS_REACHED",
+            {
+                "version_number": version_number,
+                "version_id": version_id,
+                "verdicts_evaluated": verdicts_evaluated,
+                "would_promote_rate": would_promote_rate,
+                "consecutive_clean_passes": consecutive_clean_passes,
+                "reason": reason,
                 "summary": summary,
             },
         )

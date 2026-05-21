@@ -116,6 +116,7 @@ HIGH_SIGNAL_NOTE_EVENT_TYPES: frozenset = frozenset(
         "rollback_recommended",
         "fix_loop_divergence_regressed",
         "direction_outcome_stalled",
+        "promotion_readiness_reached",
     }
 )
 

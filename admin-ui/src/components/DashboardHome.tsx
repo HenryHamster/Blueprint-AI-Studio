@@ -410,10 +410,14 @@ interface SparkPoint {
 // ---------- Version Lifecycle Panel ----------
 
 const QUAL_VERDICT_COLOR: Record<string, string> = {
+  pending: 'text-blue-400',
   promoted: 'text-emerald-400',
   dry_run: 'text-blue-400',
-  below_threshold: 'text-amber-400',
+  already_dry_run: 'text-blue-400',
+  not_promoted: 'text-amber-400',
+  promotion_failed: 'text-red-400',
   error: 'text-red-400',
+  sha_error: 'text-red-400',
 };
 
 function QualSummary({ q }: { q: VersionQualification | null }) {
@@ -486,6 +490,9 @@ function VersionLifecyclePanel({ data, loading }: { data: VersionLifecycleRespon
               <span className="text-[10px] text-neutral-500">{cv.merged_task_count} tasks merged</span>
               {cv.qualification_attempts > 0 && <span className="text-[10px] text-neutral-500">{cv.qualification_attempts} qual{cv.qualification_attempts !== 1 ? 's' : ''}</span>}
             </div>
+            {cv.phase_reasoning && (
+              <p className="text-[10px] text-neutral-400 italic truncate" title={cv.phase_reasoning}>{cv.phase_reasoning}</p>
+            )}
             {cv.last_qualification && (
               <div className="pl-2 border-l border-neutral-700/50 space-y-0.5">
                 <QualSummary q={cv.last_qualification} />

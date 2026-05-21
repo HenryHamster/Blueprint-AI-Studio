@@ -9576,6 +9576,7 @@ async def get_version_lifecycle(
             "phase_changed_at": open_row.phase_changed_at.isoformat()
             if open_row.phase_changed_at
             else None,
+            "phase_reasoning": open_row.phase_reasoning,
             "opened_at": open_row.opened_at.isoformat(),
             "qualification_attempts": open_row.qualification_attempts,
             "merged_task_count": merged_count,

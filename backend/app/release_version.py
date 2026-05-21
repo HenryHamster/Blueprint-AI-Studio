@@ -211,6 +211,7 @@ def to_phase_block(version: ReleaseVersion) -> dict[str, Any]:
         "phase_changed_at": version.phase_changed_at.isoformat()
         if version.phase_changed_at
         else None,
+        "phase_reasoning": version.phase_reasoning,
         "last_qualification": version.last_qualification,
     }
 

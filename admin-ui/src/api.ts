@@ -717,8 +717,17 @@ export interface VersionQualificationSubScores {
   smoketest: number;
 }
 
+export type QualificationStatus =
+  | 'not_promoted'
+  | 'dry_run'
+  | 'already_dry_run'
+  | 'promoted'
+  | 'promotion_failed'
+  | 'error'
+  | 'sha_error';
+
 export interface VersionQualification {
-  status: string | null;
+  status: QualificationStatus | null;
   confidence: number | null;
   threshold: number | null;
   sub_scores: VersionQualificationSubScores | null;
@@ -730,6 +739,7 @@ export interface CurrentVersion {
   version_number: number;
   phase: string;
   phase_changed_at: string | null;
+  phase_reasoning: string | null;
   opened_at: string;
   qualification_attempts: number;
   merged_task_count: number;

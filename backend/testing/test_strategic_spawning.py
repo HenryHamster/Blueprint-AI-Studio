@@ -3441,3 +3441,178 @@ async def test_stabilize_stall_hint_suppressed_for_dry_run(db_session, mocker):
     assert "stabilize_stall" not in vp, (
         "stabilize_stall block must not appear for dry_run hold"
     )
+
+
+# ── build-stall strategic nudge ───────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_build_stall_nudge_counts_build_phase_merges_not_version_lifetime(
+    db_session, mocker
+):
+    """A version that cycled build→stabilize→build must NOT fire the build-stall
+    nudge prematurely based on the inflated version-lifetime merge count.
+
+    Setup: version re-entered the build phase recently (phase_changed_at = now).
+    There are many pre-phase-change tasks (version-lifetime count > threshold)
+    but zero post-phase-change tasks (phase-scoped count = 0).  The nudge must
+    NOT fire because neither age nor phase-scoped count exceed the threshold.
+    """
+    from app.models import ReleaseVersion
+    from app.release_qualifier import _BUILD_STALL_MERGED_TASKS
+
+    await _ensure_releaseversion_table(db_session)
+
+    project = _make_project(
+        is_self_repo=True,
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = datetime.utcnow().replace(tzinfo=None)
+    # Version just re-entered build phase (age = 0 days)
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=5,
+        phase="build",
+        status="open",
+        opened_at=now - timedelta(days=60),
+        phase_changed_at=now,  # just re-entered build from stabilize
+    )
+    db_session.add(version)
+    await db_session.commit()
+
+    # Seed tasks merged BEFORE the phase transition (pre-phase-change, version-lifetime)
+    pre_phase_count = _BUILD_STALL_MERGED_TASKS + 5
+    for i in range(pre_phase_count):
+        t = Task(
+            project_id=project.id,
+            title=f"Pre-phase task {i}",
+            description="test",
+            payloads=[{"type": "create"}],
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            context={"pr_merged": True, "direction_id": "d-old"},
+        )
+        t.updated_at = now - timedelta(days=30 + i)
+        db_session.add(t)
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks, "Expected a strategic_review task"
+    payload = tasks[0].payloads[0]
+
+    suffix = payload.get("prompt_suffix", "")
+    assert "BUILD — STALLED" not in suffix, (
+        "build-stall nudge must NOT fire when phase-scoped count is 0 "
+        f"(only version-lifetime count {pre_phase_count} exceeds threshold); got: {suffix}"
+    )
+    vp = payload.get("version_phase") or {}
+    assert "build_stall" not in vp, (
+        "build_stall block must not appear when phase-scoped merge count is below threshold"
+    )
+
+
+@pytest.mark.asyncio
+async def test_build_stall_nudge_tasks_merged_field_is_phase_scoped(db_session, mocker):
+    """When the build-stall nudge fires, version_phase['build_stall']['tasks_merged']
+    must equal only the post-phase_changed_at merge count, not the version-lifetime count.
+    """
+    from app.models import ReleaseVersion
+    from app.release_qualifier import _BUILD_STALL_AGE_DAYS
+
+    await _ensure_releaseversion_table(db_session)
+
+    project = _make_project(
+        is_self_repo=True,
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = datetime.utcnow().replace(tzinfo=None)
+    # Version re-entered build phase past the age threshold
+    phase_entry = now - timedelta(days=_BUILD_STALL_AGE_DAYS + 2)
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=6,
+        phase="build",
+        status="open",
+        opened_at=now - timedelta(days=60),
+        phase_changed_at=phase_entry,
+    )
+    db_session.add(version)
+    await db_session.commit()
+
+    # Tasks merged BEFORE phase re-entry (should NOT be counted by nudge)
+    for i in range(10):
+        t = Task(
+            project_id=project.id,
+            title=f"Pre-entry task {i}",
+            description="test",
+            payloads=[{"type": "create"}],
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            context={"pr_merged": True, "direction_id": "d-old"},
+        )
+        t.updated_at = phase_entry - timedelta(days=1 + i)
+        db_session.add(t)
+
+    # Tasks merged AFTER phase re-entry (should be counted)
+    post_phase_count = 3
+    for i in range(post_phase_count):
+        t = Task(
+            project_id=project.id,
+            title=f"Post-entry task {i}",
+            description="test",
+            payloads=[{"type": "create"}],
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            context={"pr_merged": True, "direction_id": "d-new"},
+        )
+        t.updated_at = phase_entry + timedelta(hours=1 + i)
+        db_session.add(t)
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks, "Expected a strategic_review task"
+    payload = tasks[0].payloads[0]
+
+    # Nudge fires because age threshold is exceeded
+    suffix = payload.get("prompt_suffix", "")
+    assert "BUILD — STALLED" in suffix, (
+        f"Expected build-stall nudge to fire on age; got: {suffix}"
+    )
+
+    vp = payload.get("version_phase") or {}
+    stall_block = vp.get("build_stall")
+    assert stall_block is not None, "build_stall block must appear in version_phase"
+    reported_merged = stall_block.get("tasks_merged")
+    assert reported_merged == post_phase_count, (
+        f"build_stall.tasks_merged should be phase-scoped count {post_phase_count}, "
+        f"not version-lifetime count; got {reported_merged}"
+    )

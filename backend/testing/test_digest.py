@@ -15742,6 +15742,74 @@ async def test_version_lifecycle_with_open_version(client: AsyncClient, db_sessi
 
 
 @pytest.mark.asyncio
+async def test_version_lifecycle_phase_reasoning_surfaced(
+    client: AsyncClient, db_session
+):
+    """phase_reasoning is included in the current_version response when set."""
+    from app.models import ReleaseVersion
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(make_membership(project.id))
+
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=5,
+        phase="stabilize",
+        status="open",
+        qualification_attempts=0,
+        phase_reasoning="Moved to stabilize: 8 tasks merged and build confidence above threshold.",
+    )
+    db_session.add(version)
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/projects/{project.id}/version-lifecycle")
+    assert response.status_code == 200
+    data = response.json()
+
+    cv = data["current_version"]
+    assert cv is not None
+    assert (
+        cv["phase_reasoning"]
+        == "Moved to stabilize: 8 tasks merged and build confidence above threshold."
+    )
+
+
+@pytest.mark.asyncio
+async def test_version_lifecycle_phase_reasoning_null_when_unset(
+    client: AsyncClient, db_session
+):
+    """phase_reasoning is null in the response when no reasoning has been recorded."""
+    from app.models import ReleaseVersion
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(make_membership(project.id))
+
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=6,
+        phase="build",
+        status="open",
+        qualification_attempts=0,
+    )
+    db_session.add(version)
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/projects/{project.id}/version-lifecycle")
+    assert response.status_code == 200
+    data = response.json()
+
+    cv = data["current_version"]
+    assert cv is not None
+    assert cv["phase_reasoning"] is None
+
+
+@pytest.mark.asyncio
 async def test_version_lifecycle_history(client: AsyncClient, db_session):
     """Closed versions appear in recent_versions, open version in current_version."""
     from app.models import ReleaseVersion

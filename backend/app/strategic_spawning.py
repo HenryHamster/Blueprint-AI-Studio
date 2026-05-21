@@ -1728,12 +1728,19 @@ async def _spawn_strategic_review(
     elif _open_version is not None and _open_version.phase == "build":
         try:
             from app.release_qualifier import _is_build_stalled
+            from app.release_version import count_merged_since
 
             _build_ref = _open_version.phase_changed_at or _open_version.opened_at
             _build_age_days = max(0, (_utcnow() - _build_ref).days) if _build_ref else 0
+            # Build-phase-scoped merged-task count, mirroring the qualifier
+            # backstop _check_version_build_stall (which counts
+            # count_merged_since(..., phase_changed_at or opened_at)).  Using
+            # the version-lifetime count from _version_phase_block here would
+            # include earlier build-phase and stabilize-phase merges and
+            # misreport the stall for a version re-entering build from stabilize.
             _build_merged = (
-                _version_phase_block.get("tasks_merged_this_version", 0)
-                if _version_phase_block
+                await count_merged_since(session, project.id, _build_ref)
+                if _build_ref
                 else 0
             )
             if _is_build_stalled(_build_age_days, _build_merged):
