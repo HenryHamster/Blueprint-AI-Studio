@@ -408,6 +408,15 @@ async def filter_migration_serialization(
     return non_blocked
 
 
+# Task types exempt from SCOPE_EMPTY dispatch pre-emption. A review task
+# reviews a concrete PR, a fix task addresses review feedback on one, and a
+# plan task produces a plan — all three inherit ``auto_decomposed`` and
+# ``related_files`` from the create-task they descend from, but a sibling
+# cluster merging the same files does not make their work redundant. Pre-empting
+# them strands the PR and triggers an unbounded review-respawn loop.
+_SCOPE_EMPTY_EXEMPT_TASK_TYPES = {"review", "fix", "plan"}
+
+
 async def filter_scope_empty(
     eligible_ids: list[uuid.UUID],
     candidate_tasks: list[Task],
@@ -421,6 +430,14 @@ async def filter_scope_empty(
     related_files, the candidate's work was already done by the sibling.
     Transition the candidate directly to FAILED with SCOPE_EMPTY so it does
     NOT consume the retry budget and does NOT penalize direction health.
+
+    Only the *original implementation task* of a cluster is pre-emptible.
+    Review and fix tasks inherit ``auto_decomposed`` from the create-task they
+    descend from, but they operate on a concrete PR — a sibling cluster
+    covering the same files does not make a review or fix redundant. Pre-empting
+    them strands the PR with no review and spawns an unbounded review-respawn
+    loop (2026-05-09 incident: 795 SCOPE_EMPTY review tasks in 9.5h), so the
+    task types in ``_SCOPE_EMPTY_EXEMPT_TASK_TYPES`` are exempt.
     """
     if not eligible_ids:
         return eligible_ids
@@ -431,6 +448,9 @@ async def filter_scope_empty(
         if t.id in eligible_ids
         and (t.context or {}).get("auto_decomposed")
         and t.parent_task_id is not None
+        # Exempt review/fix/plan — they inherit auto_decomposed but are not
+        # decomposition clusters; pre-empting them loops (see docstring).
+        and t.first_payload.get("type") not in _SCOPE_EMPTY_EXEMPT_TASK_TYPES
     ]
     if not auto_decomp:
         return eligible_ids

@@ -32,6 +32,7 @@ class TaskType(str, Enum):
     perf = "perf"
     investigate = "investigate"
     self_audit = "self_audit"
+    release_audit = "release_audit"
 
 
 AgentMode = Literal["write", "read_only"]
@@ -180,6 +181,12 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         "Self Audit",
         "read_only",
         description="Score system maturity and recommend operating mode.",
+    ),
+    TaskCapability(
+        TaskType.release_audit,
+        "Release Audit",
+        "read_only",
+        description="Audit the main...automain diff for the release qualifier.",
     ),
 )
 

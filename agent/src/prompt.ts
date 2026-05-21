@@ -98,6 +98,7 @@ export const TASK_TYPE_HINTS: Record<string, string> = {
   'migrate': 'This is a database migration task. Check existing Alembic migrations in backend/alembic/versions/ for naming conventions. Use `alembic revision --autogenerate` as a starting point only — always review and clean up generated migrations.',
   'security_audit': 'Focus on identifying security vulnerabilities. Do not implement fixes — create a detailed findings report as your output.',
   'self_audit': 'Score system maturity on four signals: test_coverage, friction_density, claim_consistency, failure_mix. Each component is 0-100. Pick recommended_mode (audit|fundamentals|ship|pause) from the worst component. Do not modify any files — output is a JSON findings report only.',
+  'release_audit': 'You are running on the LTS branch (main) and reviewing the incoming diff against main\'s standards. Run `git diff <diff_range>` to obtain the diff. Check for test erosion (deleted test files, net assertion/test-count delta). Score findings into audit_score [0,1]. Do not modify any files — output is a JSON release audit report only.',
   'perf': 'Profile before optimizing. Identify the specific bottleneck with measurements before writing any fix.',
   'create': 'Before finishing: edit the files you need to change, run `./check` to validate lint/build, fix any failures, then `./pr open --title "feat/fix/etc: ..." --body "Summary of changes"` to ship and `./done` to mark complete. The `./pr` helper gates on `./check` so broken code can\'t reach a PR. If admin-ui viewport bootstrapping only fails because Chromium deps are missing, `./check` will retry in the Playwright container when Docker is available and otherwise warn without blocking the task. If a library is unfamiliar, fetch its docs first. If you determine the task can\'t be completed (scope wrong, conflicting requirements, blocker found), call `./fail "<reason>"` instead of leaving silently.',
   'fix': 'You are fixing issues from a code review or a pipeline failure. Read ALL feedback carefully and address every point. IMPORTANT: the spawn prompt can be stale — between when this task was queued and when you run, a concurrent rollup may have resolved conflicts, or a new commit may have broken something new. If the prompt includes a "stale-premise notice", trust the latest state. After fixing, run `./check` to verify, then `./pr open --title "fix: ..." --body "..."` to push (it will update the existing PR if there is one), then `./done`. Use `./fail "<reason>"` only if you can\'t reasonably resolve the feedback.',
@@ -1723,7 +1724,7 @@ export function formatPlaybook(
 // across the agent → backend (schemas.SelfReviewOutcome) → frontend
 // (SrTrendData.prompt_version) chain is consistent and string-safe
 // for frontend operations like `.slice(...)`.
-export const SELF_REVIEW_PROMPT_VERSION = "5";
+export const SELF_REVIEW_PROMPT_VERSION = "6";
 
 // Human-readable examples of disallowed blind_spot entries — mirrored in
 // backend/app/sr_blind_spots.py DISALLOWED_BLIND_SPOT_EXAMPLES for contract-test parity.
@@ -2183,7 +2184,11 @@ fixed it before pushing. A degraded \`{"verdict":"unknown","check_results":{},"b
 envelope is acceptable when you have nothing useful to record, but the
 file MUST exist for code-change tasks.
 
-**\`blind_spots\` semantics:** correctness uncertainties about what your changes actually do — not a log of intentional scope decisions. **Do NOT** list things like "did not run the full backend test suite", "did not run docker pytest", "did not run viewport tests" — skipping the full suite is by design (CI runs it; you target only your touched files). Valid blind_spots: "did not re-read c.ts after diff truncated", "unsure whether retry path handles concurrent calls", "no test for the empty-list edge case I added handling for". If you have nothing of that kind, leave the array empty.
+**\`blind_spots\` semantics:** A blind spot is a *specific, unverified risk inside the diff you wrote* — an untested code path, an unhandled edge case, an assumption that may not hold. It is scoped to your change.
+
+What is NOT a blind spot, by design: after \`./pr open\` CI runs the full backend / docker / viewport / playwright suite and gates the merge. CI running the full suite is a *guarantee*, not a gap — your job is the targeted \`./check\` on the files you touched, and CI closes the loop. So "I did not run the full / complete / docker / integration test suite" is never a blind spot, in any phrasing; neither are intentional scope decisions you made deliberately.
+
+Valid blind_spots are uncertainties CI cannot resolve for you: "did not re-read c.ts after diff truncated", "unsure whether the retry path handles concurrent calls", "no test for the empty-list edge case I added handling for". If you have nothing of that kind, leave the array empty.
 
 **Optional verification-coverage fields (advisory — do NOT block \`./done\`):**
 - \`truncated_files_read\`: list the changed file paths you actually re-opened/re-read during self-review for verification. Only include files you re-inspected — it is fine for this list to be a subset of the diff. Reviewers use it to focus on unverified files.

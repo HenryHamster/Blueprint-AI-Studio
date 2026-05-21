@@ -1192,6 +1192,14 @@ COMMANDS = {
 }
 
 if __name__ == '__main__':
+    # Windows consoles default to cp1252; force UTF-8 so non-ASCII glyphs in
+    # status output (arrows, em-dashes) don't crash with UnicodeEncodeError —
+    # e.g. the "Closed: ... -> ..." line in cmd_regression_cases, which
+    # previously made a successful close print a misleading "Error closing".
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    except (AttributeError, ValueError):
+        pass
     if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
         print(__doc__)
         print("Commands:", ', '.join(sorted(COMMANDS)))

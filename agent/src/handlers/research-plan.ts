@@ -620,6 +620,130 @@ export function formatRetiredDirectionsSummary(raw: unknown): string {
   return '\n' + lines.join('\n') + '\n';
 }
 
+/**
+ * Builds the version-phase status block for the strategic thinker prompt.
+ * Explains the current phase, what each phase means, and instructs the agent
+ * to emit version_phase_decision when it decides to flip.
+ */
+export function buildVersionPhaseSection(versionPhase: Record<string, unknown> | undefined): string {
+  if (!versionPhase || typeof versionPhase !== 'object') return '';
+  const versionNumber = typeof versionPhase.version_number === 'number' ? versionPhase.version_number : null;
+  const phase = typeof versionPhase.phase === 'string' ? versionPhase.phase : null;
+  if (versionNumber === null || (phase !== 'build' && phase !== 'stabilize')) return '';
+
+  const phaseChangedAt = typeof versionPhase.phase_changed_at === 'string' ? versionPhase.phase_changed_at : null;
+  const tasksMergedThisVersion = typeof versionPhase.tasks_merged_this_version === 'number'
+    ? versionPhase.tasks_merged_this_version : null;
+  // The backend always sends last_qualification as an object (the structured
+  // qualification record: {status, candidate_sha, confidence, blocker, ...}) or
+  // null — never a string. Render a compact summary line so the agent can see
+  // when a qualification is pending / finalized.
+  const lastQualRaw = versionPhase.last_qualification;
+  const lastQualification = lastQualRaw && typeof lastQualRaw === 'object' && !Array.isArray(lastQualRaw)
+    ? lastQualRaw as Record<string, unknown>
+    : null;
+  const qualStatus = lastQualification && typeof lastQualification.status === 'string'
+    ? lastQualification.status
+    : null;
+  const qualificationPending = qualStatus === 'pending';
+  // A finalized dry-run already fully evaluated the candidate it scored. In the
+  // shipped-dark default (promotion_enabled=False) a passing candidate records
+  // status='dry_run' and the version stays open + stabilize. Re-emitting
+  // `qualify_request` for the SAME candidate just re-spawns two agent VMs for
+  // an identical, already-scored commit — the orchestrator's already_dry_run
+  // guard ignores it. Only a candidate change (new work merged onto the
+  // integration branch) makes a fresh qualification meaningful.
+  const qualificationDryRun = qualStatus === 'dry_run';
+
+  const parts: string[] = [];
+  parts.push(`\n## Version Phase`);
+  parts.push(`Current: **v${versionNumber} — ${phase.toUpperCase()}**`);
+
+  if (phaseChangedAt) {
+    parts.push(`Phase entered: ${phaseChangedAt}`);
+  }
+  if (tasksMergedThisVersion !== null) {
+    parts.push(`Tasks merged this version: ${tasksMergedThisVersion}`);
+  }
+  if (lastQualification) {
+    // Compact one-line summary: status, then confidence / candidate_sha /
+    // blocker when present. Keeps the prompt small while surfacing whether a
+    // qualification is already running (status='pending').
+    const qualBits: string[] = [];
+    qualBits.push(`status=${qualStatus ?? 'unknown'}`);
+    if (typeof lastQualification.confidence === 'number') {
+      qualBits.push(`confidence=${lastQualification.confidence}`);
+    }
+    if (typeof lastQualification.candidate_sha === 'string' && lastQualification.candidate_sha) {
+      qualBits.push(`candidate_sha=${lastQualification.candidate_sha.slice(0, 12)}`);
+    }
+    if (typeof lastQualification.blocker === 'string' && lastQualification.blocker) {
+      qualBits.push(`blocker=${lastQualification.blocker}`);
+    }
+    if (qualificationDryRun && lastQualification.would_promote === true) {
+      qualBits.push(`would_promote=true`);
+    }
+    parts.push(`Last qualification: ${qualBits.join(', ')}`);
+    if (qualificationPending) {
+      parts.push(
+        `A qualification is currently **PENDING** (running now). Do NOT emit ` +
+        `\`qualify_request\` this cycle — wait for it to finalize.`,
+      );
+    } else if (qualificationDryRun) {
+      const dryRunSha = typeof lastQualification.candidate_sha === 'string' && lastQualification.candidate_sha
+        ? ` (commit ${lastQualification.candidate_sha.slice(0, 12)})`
+        : '';
+      parts.push(
+        `The last qualification was a **DRY RUN**${dryRunSha} — it already ` +
+        `fully evaluated that candidate. Do NOT emit \`qualify_request\` ` +
+        `again UNLESS new work has since merged onto the integration branch ` +
+        `(i.e. the candidate commit has changed). Re-qualifying the same ` +
+        `already-scored candidate just re-spawns agent VMs and is ignored.`,
+      );
+    }
+  }
+
+  parts.push(`
+**Phase meanings:**
+- **build** — pursue the version's feature and improvement work at full pace. The version is actively developing; continue creating and executing directions that advance the intent.
+- **stabilize** — shift the work-mix toward audit, cleanup, and hardening. The version is approaching a release-qualifiable state; prioritize directions that reduce risk, fix known issues, and improve test coverage over net-new feature work. New feature directions should be deferred to the next version unless they directly unblock stabilization.
+
+**Your judgment on phase:**
+Assess whether the current phase still fits the project's state. You are not bound to a schedule or a fixed rule — phase transitions are YOUR call, based on what you observe.
+
+- Flip from **build → stabilize** when: enough feature work has landed that further additions would outpace the project's ability to qualify them, or when there are enough known issues, technical debt, or stability concerns that they should be addressed before continuing to build.
+- Flip from **stabilize → build** when: the version has been sufficiently hardened, qualification criteria look achievable, and continued stabilization work has diminishing returns.
+
+If you decide to flip the phase, emit a \`version_phase_decision\` field in your Section 6 problem_model update (as a top-level JSON field alongside the model):
+\`\`\`json
+{
+  "version_phase_decision": {
+    "phase": "build" | "stabilize",
+    "reasoning": "One or two sentences explaining why you're flipping now."
+  }
+}
+\`\`\`
+
+If you are staying in the current phase, do NOT emit \`version_phase_decision\` — omitting it means "no change."
+
+**Requesting qualification (stabilize only):**
+When the version is in **stabilize** and you judge it ready for release — hardening is sufficient, known issues are addressed, and the qualification criteria look achievable — request qualification. The orchestrator then snapshots the integration branch and runs the automated release qualifier (CI, test-erosion, audit, smoketest). Emit a \`qualify_request\` field in your Section 6 problem_model update (a top-level JSON field alongside the model):
+\`\`\`json
+{
+  "qualify_request": {
+    "reason": "One sentence explaining why the version is ready to qualify now."
+  }
+}
+\`\`\`
+Only request qualification from the **stabilize** phase — it is ignored in **build**. If the version is not yet release-ready, do NOT emit \`qualify_request\` — omitting it means "not ready." \`version_phase_decision\` and \`qualify_request\` are independent: you may emit either, both, or neither.
+
+**Do NOT re-request while a qualification is in flight.** If the "Last qualification" line above shows \`status=pending\`, a qualification is already running for this version — the orchestrator has snapshotted a candidate and spawned the audit + smoketest. Do NOT emit \`qualify_request\` again; wait for the in-flight run to finalize (its status will change to \`promoted\`, \`not_promoted\`, \`dry_run\`, or an error). Re-requesting while \`status=pending\` is wasted work and is ignored.
+
+**Do NOT re-request after a dry-run of the same candidate.** If the "Last qualification" line shows \`status=dry_run\`, the qualifier already ran end-to-end (CI, test-erosion, audit, smoketest) on that candidate commit and recorded the result — a dry-run means the candidate would promote but promotion currently ships dark, so the version stays open in \`stabilize\`. Re-emitting \`qualify_request\` for the SAME candidate re-spawns two agent VMs to re-score an identical, already-evaluated commit; the orchestrator's already-dry-run guard ignores it. Only emit \`qualify_request\` again once new work has merged onto the integration branch since that dry-run — i.e. the candidate commit has actually changed. If nothing has merged since the \`dry_run\` line above, do NOT re-request.`);
+
+  return parts.join('\n');
+}
+
 // Portfolio-level view computed from per-direction data — surfaces imbalances
 // (category skew, system coverage gaps, concentration, age) as explicit
 // decision inputs for the strategic thinker.
@@ -903,6 +1027,7 @@ export interface ThinkerPromptParams {
   feedbackSection: string;
   threadSection: string;
   taskId: string;
+  versionPhaseSection: string;
 }
 
 export function buildThinkerPrompt(p: ThinkerPromptParams): string {
@@ -936,7 +1061,7 @@ ${p.userPausedSection}${p.rejectedProposalsSection}
 ## Portfolio Composition
 ${p.portfolioCompositionText}
 ${p.systemMaturitySection}${p.driftSection}
-${p.recentWorkSection}${p.feedbackSection}${p.threadSection}
+${p.recentWorkSection}${p.feedbackSection}${p.threadSection}${p.versionPhaseSection}
 # Your job
 
 You operate on a **problem model** — a structured representation of what the user wants (intent), what the project can do (capabilities), and what's between those (gaps). Directions are *moves* toward specific gaps. Friction is *obstacles* in the way.
@@ -2089,6 +2214,9 @@ point of self-repo. Just do it and tell the user in whats_changed.` : '';
     // ── Pass 1: Thinker — analyze freely, write prose ──
     // Let the agent do what it's good at: read code, reason about architecture,
     // write a strategic analysis. No API constraints, no JSON formatting.
+    const versionPhase = payload.version_phase && typeof payload.version_phase === 'object'
+      ? payload.version_phase as Record<string, unknown>
+      : undefined;
     const thinkerPrompt = buildThinkerPrompt({
       contextPrefix,
       projectName,
@@ -2118,6 +2246,7 @@ point of self-repo. Just do it and tell the user in whats_changed.` : '';
       feedbackSection,
       threadSection,
       taskId,
+      versionPhaseSection: buildVersionPhaseSection(versionPhase),
     });
 
     const thinkerGateResult = await runThinkerWithGate(
@@ -2217,7 +2346,7 @@ ${analysisText.slice(0, 50_000)}
 
 # Instructions
 
-1. **Problem model (REQUIRED).** Primary path: pass \`"$(cat /tmp/problem_model_${taskId}.json)"\` to \`./strategic set-problem-model\`. Don't summarize or re-emit — read-and-pass.
+1. **Problem model (REQUIRED).** First do step 5 below: if the Thinker emitted \`version_phase_decision\` and/or \`qualify_request\`, edit \`/tmp/problem_model_${taskId}.json\` IN PLACE to add those top-level sibling fields. Then pass \`"$(cat /tmp/problem_model_${taskId}.json)"\` to \`./strategic set-problem-model\` — the \`cat\` re-reads the file, so the sibling fields you added in step 5 are included. Don't summarize or re-emit the model's own content — read-and-pass; the only edit permitted is step 5's sibling fields.
 
    Fallback (use judgment): if the file is missing, empty, or the JSON is malformed, you may construct a corrected problem_model yourself — but ground it STRICTLY in the thinker's analysis below (Sections 1-6) and in the project described by CLAUDE.md. Verify findings against the analysis before writing. If even the analysis is insufficient, call \`./strategic pending-confirm\` with type "major_decision" to surface the gap rather than ship bad state. NEVER describe this execution environment, this prompt, your role, or the ./strategic / ./design-doc commands — the problem_model describes the managed project from CLAUDE.md.
 
@@ -2242,15 +2371,25 @@ ${analysisText.slice(0, 50_000)}
 
 4. **Retired-direction critique (REQUIRED).** From Section 3.5, call \`./strategic set-retirement-critiques\` with a JSON array of critique objects. If the Thinker wrote "No eligible retirements", pass \`'{"no_eligible_retirements": true}'\`. Never skip this call.
 
-5. **Self-reflection (optional).** If Section 5 has non-empty content, emit via \`./strategic reflect\`. If the Thinker wrote nothing (or wrote "none" / "N/A" / empty), SKIP — do not fabricate.
+5. **Version phase / qualify siblings (conditional — do this BEFORE step 1's \`set-problem-model\` call).** If the Thinker's analysis includes a \`version_phase_decision\` field (look in Section 6 and throughout the analysis), edit \`/tmp/problem_model_${taskId}.json\` IN PLACE to add it as a top-level sibling key, so the file becomes:
+   \`{"version_phase_decision": {"phase": "build" or "stabilize", "reasoning": "..."}, ...rest_of_problem_model}\`
+   If the Thinker did NOT emit \`version_phase_decision\`, SKIP — do not fabricate one, and do not add the field. Absence means "no phase change this cycle."
 
-6. **Pending confirmations (optional).** For each external blocker the Thinker identified in Section 4's blockers field (credentials, access, major pivots), emit one \`./strategic pending-confirm\`. Do NOT create these for coding questions.
+   Likewise, if the Thinker's analysis includes a \`qualify_request\` field (look in Section 6 and throughout the analysis), edit \`/tmp/problem_model_${taskId}.json\` IN PLACE to add it as a top-level sibling key too:
+   \`{"qualify_request": {"reason": "..."}, ...rest_of_problem_model}\`
+   If the Thinker did NOT emit \`qualify_request\`, SKIP — do not fabricate one, and do not add the field. Absence means "do not qualify this cycle." \`version_phase_decision\` and \`qualify_request\` are independent siblings; add whichever the Thinker emitted (either, both, or neither).
 
-7. **Messages.** Resolve any user messages the analysis addressed: \`./messages resolve <id> 'Answered — [summary]'\`. Check the conversation for your prior QUESTION messages — if a user reply answers one, resolve it. Do not post a cycle-summary message — the running_update is the voice now.
+   Because step 1 passes \`"$(cat /tmp/problem_model_${taskId}.json)"\` to \`./strategic set-problem-model\`, editing the file here is what carries these siblings through — step 1 will re-read the file and the fields will be included. If the file is missing/malformed and you took step 1's fallback (constructing the model inline), include these siblings in that inline JSON instead.
 
-8. **Guardrails.** Ensure at least 3 active directions remain after retires.
+6. **Self-reflection (optional).** If Section 5 has non-empty content, emit via \`./strategic reflect\`. If the Thinker wrote nothing (or wrote "none" / "N/A" / empty), SKIP — do not fabricate.
 
-9. Done. Do not write anything else.`;
+7. **Pending confirmations (optional).** For each external blocker the Thinker identified in Section 4's blockers field (credentials, access, major pivots), emit one \`./strategic pending-confirm\`. Do NOT create these for coding questions.
+
+8. **Messages.** Resolve any user messages the analysis addressed: \`./messages resolve <id> 'Answered — [summary]'\`. Check the conversation for your prior QUESTION messages — if a user reply answers one, resolve it. Do not post a cycle-summary message — the running_update is the voice now.
+
+9. **Guardrails.** Ensure at least 3 active directions remain after retires.
+
+10. Done. Do not write anything else.`;
 
     statusRef.value = 'Running strategic execution (pass 2: applying decisions)...';
     let { exitCode, allOutput, lastResultText } = await runClaudeCode(executorPrompt, ws, statusRef, model, effort, disallowedTools);

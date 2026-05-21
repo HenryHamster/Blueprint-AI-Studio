@@ -187,6 +187,259 @@ def _normalize_recommended_mode(value: object) -> str | None:
     return None
 
 
+_VALID_VERSION_PHASES = frozenset({"build", "stabilize"})
+
+# Cap on the persisted reasoning string carried with a version_phase_decision.
+# Matches release_version._PHASE_REASONING_MAX so the value the endpoint stores
+# in task.context and the value release_version persists agree on bounds.
+_VPD_REASONING_MAX = 500
+
+# The transient task.context key that carries an agent-emitted
+# version_phase_decision from the set_problem_model endpoint to the
+# strategic-completion handler's API path.  Single source of truth so the
+# producer (main.strategic_operation) and consumer (_handle_strategic_completion)
+# never drift.
+VERSION_PHASE_DECISION_CONTEXT_KEY = "_strategic_version_phase_decision"
+
+# Cap on the qualify_request reason string the endpoint stows in task.context.
+# Advisory only (logged, not stored on ReleaseVersion), so a generous cap is fine.
+_QUALIFY_REQUEST_REASON_MAX = 500
+
+# Transient task.context key carrying an agent-emitted qualify_request from the
+# set_problem_model endpoint to _handle_strategic_completion's API path. Mirrors
+# VERSION_PHASE_DECISION_CONTEXT_KEY — one source of truth so producer + consumer
+# never drift.
+QUALIFY_REQUEST_CONTEXT_KEY = "_strategic_qualify_request"
+
+
+def _normalize_version_phase(value: object) -> str | None:
+    """Return a canonical version phase string or None.
+
+    Lower-cases and trims input; rejects values outside _VALID_VERSION_PHASES
+    so storage stays bounded to the documented set (build | stabilize).
+    """
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip().lower()
+    if cleaned in _VALID_VERSION_PHASES:
+        return cleaned
+    return None
+
+
+def extract_version_phase_decision(raw: object) -> dict | None:
+    """Validate + normalize a raw ``version_phase_decision`` value.
+
+    Accepts the value the strategic agent embeds as a top-level sibling in the
+    ``set-problem-model`` payload — shape ``{phase, reasoning}`` — and returns a
+    clean ``{"phase": <build|stabilize>, "reasoning": <str>}`` dict, or ``None``
+    when the input is absent or unusable.
+
+    Returning a *sanitized* dict (canonical phase, trimmed/bounded reasoning)
+    rather than the raw value means the transient blob stored in ``task.context``
+    is already validated — ``_apply_version_phase_decision`` re-validates anyway,
+    so a bad value is defensively no-op'd, never raised.
+
+    Used by the ``set_problem_model`` endpoint to lift the field out of the
+    problem_model JSON *before* ``ProblemModel`` validation (which is
+    ``extra="forbid"`` and would otherwise reject the whole update).
+    """
+    if not isinstance(raw, dict):
+        return None
+    phase = _normalize_version_phase(raw.get("phase"))
+    if not phase:
+        return None
+    reasoning_raw = raw.get("reasoning")
+    reasoning = (
+        reasoning_raw.strip()[:_VPD_REASONING_MAX]
+        if isinstance(reasoning_raw, str)
+        else ""
+    )
+    return {"phase": phase, "reasoning": reasoning}
+
+
+def extract_qualify_request(raw: object) -> dict | None:
+    """Validate + normalize a raw ``qualify_request`` value.
+
+    Accepts the {reason} value the strategic agent embeds as a top-level sibling
+    in the ``set-problem-model`` payload and returns a clean ``{"reason": str}``
+    dict, or ``None`` when the input is absent or unusable. A qualify_request is
+    the agent's transient signal that an ``open`` version in ``stabilize`` is
+    release-ready and the heavy qualifier should run (automain-lts-plan-v1.md
+    Phase 3) — never durable model state.
+
+    Used by the ``set_problem_model`` endpoint to lift the field out of the
+    problem_model JSON *before* ``ProblemModel`` validation (``extra="forbid"``,
+    which would otherwise reject the whole update). ``_apply_qualify_request``
+    re-checks the phase gate, so a wrong-phase request is no-op'd, never raised.
+    """
+    if not isinstance(raw, dict):
+        return None
+    reason_raw = raw.get("reason")
+    reason = (
+        reason_raw.strip()[:_QUALIFY_REQUEST_REASON_MAX]
+        if isinstance(reason_raw, str)
+        else ""
+    )
+    return {"reason": reason}
+
+
+async def _apply_version_phase_decision(
+    decision: object,
+    task: Task,
+    project: Project,
+    session: AsyncSession,
+    *,
+    path: str,
+) -> None:
+    """Parse and apply an optional ``version_phase_decision`` from the strategic agent.
+
+    ``decision`` is the raw value from either:
+      - the fallback parse path: ``parsed.get("version_phase_decision")``
+      - the API path: ``task.context.get("_strategic_version_phase_decision")``
+
+    Expected shape: ``{phase: "build"|"stabilize", reasoning: str}``.
+
+    When a valid decision is present:
+      1. Looks up the project's current open ``ReleaseVersion``.
+      2. Calls ``release_version.set_version_phase`` which stamps ``phase``,
+         ``phase_changed_at``, and ``phase_reasoning`` on the row.
+      3. ``session.add``s the row — caller's surrounding ``await session.commit()``
+         persists it.
+
+    Silently no-ops when:
+      - ``decision`` is None / not a dict
+      - ``phase`` is missing or not in ``{build, stabilize}``
+      - The project has no open ``ReleaseVersion`` (pre-Phase-2a, or no version opened yet)
+
+    All errors are logged and swallowed — a bad or absent phase decision must never
+    block vision/direction writes.
+    """
+    if not decision or not isinstance(decision, dict):
+        return
+    phase = _normalize_version_phase(decision.get("phase"))
+    if not phase:
+        raw = decision.get("phase")
+        logger.warning(
+            "[STRATEGIC] Task %s (%s path): version_phase_decision has invalid/missing "
+            "phase=%r — skipping",
+            task.id,
+            path,
+            raw,
+        )
+        return
+    reasoning_raw = decision.get("reasoning")
+    reasoning: str | None = (
+        reasoning_raw.strip() or None if isinstance(reasoning_raw, str) else None
+    )
+    try:
+        from app import release_version as _rv
+
+        open_ver = await _rv.current_open_version(session, project.id)
+        if open_ver is None:
+            logger.debug(
+                "[STRATEGIC] Task %s (%s path): no open ReleaseVersion for project %s "
+                "— skipping version_phase_decision",
+                task.id,
+                path,
+                project.id,
+            )
+            return
+        _rv.set_version_phase(open_ver, phase, reasoning=reasoning)
+        session.add(open_ver)
+        logger.info(
+            "[STRATEGIC] Task %s (%s path): applied version_phase_decision "
+            "phase=%s for project %s version v%d",
+            task.id,
+            path,
+            phase,
+            project.id,
+            open_ver.version_number,
+        )
+    except Exception:
+        logger.exception(
+            "[STRATEGIC] Task %s (%s path): failed to apply version_phase_decision "
+            "(non-fatal)",
+            task.id,
+            path,
+        )
+
+
+async def _apply_qualify_request(
+    request: object,
+    task: Task,
+    project: Project,
+    session: AsyncSession,
+    *,
+    path: str,
+) -> None:
+    """Parse and apply an optional ``qualify_request`` from the strategic agent.
+
+    ``request`` is the raw {reason: str} value from either:
+      - the API path: ``task.context[QUALIFY_REQUEST_CONTEXT_KEY]``
+      - the fallback / log-parse path: ``parsed.get("qualify_request")``
+
+    It is the agent's signal that an ``open`` version in ``stabilize`` is
+    release-ready (automain-lts-plan-v1.md Phase 3). When valid, looks up the
+    open ``ReleaseVersion``, gates on
+    ``phase == "stabilize"``, and calls ``release_qualifier.run_qualification``
+    (which snapshots the candidate SHA + spawns the audit/smoketest children;
+    the caller's surrounding commit persists its version-row writes).
+
+    Silently no-ops when ``request`` is None/not a dict, there is no open
+    ``ReleaseVersion``, or that version is not in ``stabilize``. All errors are
+    logged and swallowed — a bad or absent request must never block the write.
+    """
+    if not request or not isinstance(request, dict):
+        return
+    reason_raw = request.get("reason")
+    reason = (
+        reason_raw.strip() or None if isinstance(reason_raw, str) else None
+    )
+    try:
+        from app import release_qualifier as _rq
+        from app import release_version as _rv
+
+        open_ver = await _rv.current_open_version(session, project.id)
+        if open_ver is None:
+            logger.debug(
+                "[STRATEGIC] Task %s (%s path): no open ReleaseVersion for project "
+                "%s — skipping qualify_request",
+                task.id,
+                path,
+                project.id,
+            )
+            return
+        if open_ver.phase != "stabilize":
+            logger.info(
+                "[STRATEGIC] Task %s (%s path): qualify_request for project %s "
+                "version v%d ignored — version is in phase=%s, not stabilize",
+                task.id,
+                path,
+                project.id,
+                open_ver.version_number,
+                open_ver.phase,
+            )
+            return
+        result = await _rq.run_qualification(session, project.id, open_ver)
+        logger.info(
+            "[STRATEGIC] Task %s (%s path): qualify_request ran qualification "
+            "for project %s version v%d — status=%s (reason=%r)",
+            task.id,
+            path,
+            project.id,
+            open_ver.version_number,
+            (result or {}).get("status"),
+            reason,
+        )
+    except Exception:
+        logger.exception(
+            "[STRATEGIC] Task %s (%s path): failed to apply qualify_request "
+            "(non-fatal)",
+            task.id,
+            path,
+        )
+
+
 def _extract_rationale_from_notes(direction: dict | None, prefix: str) -> str | None:
     """Return the latest note rationale matching prefix, or None."""
     if not direction:
@@ -313,7 +566,7 @@ def _build_retirement_metrics(direction: dict) -> Dict[str, Any]:
 def _collect_creation_predictions(
     project: Project, direction_ids: list
 ) -> Dict[str, Dict[str, Any]]:
-    from app.strategic_analysis import _compute_prediction_calibration_factor  # noqa: PLC0415
+    from app.strategic_analysis import _compute_prediction_calibration_factor
 
     calibration_factor = _compute_prediction_calibration_factor(project)
     by_id = {d.get("id"): d for d in (project.directions or []) if d.get("id")}
@@ -712,7 +965,7 @@ async def _check_direction_starvation(
                 if fallback_category:
                     fallback_dir["category"] = fallback_category
 
-                updated_directions = list(directions) + [fallback_dir]
+                updated_directions = [*list(directions), fallback_dir]
                 project.directions = updated_directions
                 flag_modified(project, "directions")
 
@@ -878,7 +1131,7 @@ async def _handle_strategic_completion(
             if _retirement_critiques is not None:
                 _extra["retirement_critiques"] = _retirement_critiques
             try:
-                from app.research_completion import query_findings_index  # noqa: PLC0415
+                from app.research_completion import query_findings_index
 
                 _finding_rows = await query_findings_index(
                     session, project.id, limit=20, days=30
@@ -888,7 +1141,7 @@ async def _handle_strategic_completion(
                     _extra["recent_research_findings_prompt"] = (
                         format_findings_for_prompt(_finding_rows)
                     )
-            except Exception:
+            except Exception:  # noqa: BLE001
                 logger.warning(
                     f"[STRATEGIC] Task {task.id}: failed to fetch findings index (non-fatal)",
                     exc_info=True,
@@ -929,6 +1182,24 @@ async def _handle_strategic_completion(
                 session,
                 f"{open_feedback_count} FEEDBACK message(s) remain unaddressed after strategic review — agent may be ignoring user requests",
             )
+        # Apply version_phase_decision if the agent supplied one via the API.
+        # The ``set_problem_model`` endpoint lifts the field out of the
+        # problem_model JSON (ProblemModel is extra="forbid") and stows the
+        # sanitized {phase, reasoning} dict under
+        # ``VERSION_PHASE_DECISION_CONTEXT_KEY`` in task.context.
+        _vpd_ctx = (task.context or {}).get(VERSION_PHASE_DECISION_CONTEXT_KEY)
+        await _apply_version_phase_decision(
+            _vpd_ctx, task, project, session, path="api"
+        )
+        # Apply qualify_request if the agent supplied one via the API. Same
+        # transport as version_phase_decision: the ``set_problem_model``
+        # endpoint lifts the field out of the problem_model JSON and stows the
+        # sanitized {reason} dict under ``QUALIFY_REQUEST_CONTEXT_KEY``. When the
+        # open ReleaseVersion is in ``stabilize`` this kicks off the release
+        # qualifier.
+        _qr_ctx = (task.context or {}).get(QUALIFY_REQUEST_CONTEXT_KEY)
+        await _apply_qualify_request(_qr_ctx, task, project, session, path="api")
+
         # Per-cycle message post removed: the strategic agent now maintains
         # project.running_update as a living markdown document it rewrites
         # each cycle. Replaces the previous one-message-per-cycle noise.
@@ -1026,7 +1297,7 @@ async def _handle_strategic_completion(
     # Audit W2/D7: full 3-way merge (user-bias, keep-both via _rejected_agent_edits ledger)
     # extends to systems/priorities/context lists, not just purpose/success_criteria.
     if new_vision and isinstance(new_vision, dict):
-        from app.vision_merge import append_rejected_edits, merge_vision  # noqa: PLC0415
+        from app.vision_merge import append_rejected_edits, merge_vision
 
         current_vision = dict(project.vision or {})
         payload_vision_rev = (task.first_payload.get("vision") or {}).get("revision", 0)
@@ -1586,6 +1857,22 @@ async def _handle_strategic_completion(
             project.directions = directions
             flag_modified(project, "directions")
 
+    # Apply version_phase_decision + qualify_request from the parsed output
+    # (fallback / log-parse path). In practice the agent emits both fields
+    # only through the set_problem_model API (which forces the API path
+    # above), so this fallback is effectively unreached today — but the two
+    # paths are kept symmetric so a future fallback-only emission path can't
+    # silently drop one signal. Shapes: version_phase_decision = {phase:
+    # "build"|"stabilize", reasoning: str}; qualify_request = {reason: str}.
+    _vpd_parsed = parsed.get("version_phase_decision")
+    await _apply_version_phase_decision(
+        _vpd_parsed, task, project, session, path="fallback"
+    )
+    _qr_parsed = parsed.get("qualify_request")
+    await _apply_qualify_request(
+        _qr_parsed, task, project, session, path="fallback"
+    )
+
     # Update cycle history with final outcome
     # Audit W2: cycle outcome lives on the StrategicCycle row.
     cycle_id = task.strategic_cycle_id or (task.context or {}).get("strategic_cycle_id")
@@ -1672,7 +1959,7 @@ async def _handle_strategic_completion(
         session.add(new_msg)
         _event_type = _msg_ctx.get("event_type") if isinstance(_msg_ctx, dict) else None
         if _event_type:
-            from app.routers.admin_notifications import (  # noqa: PLC0415
+            from app.routers.admin_notifications import (
                 ROUTINE_EVENT_TYPES as _ROUTINE_EVENT_TYPES,
                 append_routine_digest as _append_routine_digest,
             )
@@ -1726,11 +2013,11 @@ async def _handle_strategic_completion(
                             msg.resolution or "Addressed by strategic review",
                             task.id,
                         )
-                    except Exception as _e:
+                    except Exception as _e:  # noqa: BLE001
                         logger.warning(
                             f"[NOTIFY] Failed to post feedback acknowledgment: {_e}"
                         )
-        except (ValueError, TypeError):
+        except (ValueError, TypeError):  # noqa: PERF203
             pass
 
     # Audit: check for unaddressed FEEDBACK messages

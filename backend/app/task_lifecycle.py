@@ -1466,7 +1466,7 @@ async def _spawn_ci_auto_remediation_followup(
         {
             "type": "investigate",
             "prompt": "\n".join(prompt_lines)[:20000],
-            "base_branch": "main",
+            "base_branch": _runtime_config.get("integration_branch", "main"),
         },
         "task_lifecycle:ci_auto_remediation_followup",
     )
@@ -2523,11 +2523,17 @@ async def _process_post_commit(
                                 "backend/app/auth.py",
                                 "agent/src/index.ts",
                                 "CLAUDE.md",
+                                # Phase 4 trusted core — also in CRITICAL_FILES.
+                                "backend/promotion_policy.yaml",
                             }
                             CRITICAL_FILES = {
                                 "backend/app/security.py",
                                 "backend/app/auth.py",
                                 "CLAUDE.md",
+                                # The release-qualifier promotion rubric — the
+                                # human-owned trusted core. Autonomous changes to
+                                # it must be human-approved before merge.
+                                "backend/promotion_policy.yaml",
                             }
                             touched_infra = [
                                 f["filename"]
@@ -3092,9 +3098,29 @@ async def _process_post_commit(
                             await session.commit()
                             raise ValueError(f"Branch mismatch: {branch} vs {pr_head}")
 
-                        # Check CI status before merging (only for PRs targeting main)
+                        # Check CI status before merging the integration trunk.
+                        #
+                        # Pre-Phase-1 the integration branch IS "main", so this
+                        # was historically written as `base_branch == "main"`.
+                        # After the automain/LTS Phase 1 cutover rollup PRs
+                        # target `automain` (the resolved integration branch),
+                        # and a hard-coded "main" check would skip the pre-merge
+                        # CI gate for every rollup — the orchestrator would merge
+                        # rollups without waiting for CI.
+                        #
+                        # Gate on the resolved integration branch so the CI
+                        # check runs for whichever branch the pipeline currently
+                        # integrates onto. "main" is ALSO kept gated regardless:
+                        # post-cutover it is the promotion / hotfix-rollup
+                        # target, and a merge to main must never bypass CI.
                         head_sha = pr_data.get("head", {}).get("sha", "")
-                        is_main_merge = base_branch == "main"
+                        _integration_branch = _runtime_config.get(
+                            "integration_branch", "main"
+                        )
+                        is_ci_gated_merge = base_branch in (
+                            _integration_branch,
+                            "main",
+                        )
                         ci_status = (
                             await get_check_runs_cached(
                                 gh_token,
@@ -3103,7 +3129,7 @@ async def _process_post_commit(
                                 head_sha,
                                 project_id=str(task.project_id),
                             )
-                            if (head_sha and is_main_merge)
+                            if (head_sha and is_ci_gated_merge)
                             else None
                         )
 
@@ -3444,7 +3470,13 @@ async def _process_post_commit(
                                         await session.commit()
                                         # Clean up branches (staging + feature)
                                         await _cleanup_branches(orig, session)
-                                        # Spawn a smoketest after rollup merges to main
+                                        # Spawn a smoketest after rollup merges to main.
+                                        # After Phase 1 (automain/LTS), normal rollups target
+                                        # `automain`; only promotion PRs (automain → main) still
+                                        # merge to `main`. So base_branch == "main" here means a
+                                        # PROMOTION just landed — this smoketest acts as a
+                                        # post-promotion production health-check, not a routine
+                                        # integration check.
                                         # Supported runtime_config keys for smoketest:
                                         #   health_check_urls: list[str] — live URLs to probe with HTTP GET after local tests
                                         if (
@@ -3533,6 +3565,62 @@ async def _process_post_commit(
                                             except Exception as e:
                                                 logger.warning(
                                                     f"[SMOKETEST] Failed to spawn smoketest after rollup merge: {e}",
+                                                    exc_info=True,
+                                                )
+                                        # Back-merge: when a HOTFIX merges to main, open a
+                                        # main -> automain PR so the branches don't diverge.
+                                        # A hotfix is a `plan` task with base_branch="main" and
+                                        # hotfix:true in its payload.  A missed back-merge makes
+                                        # the next automain -> main promotion conflict.
+                                        # (automain/LTS plan Phase 5)
+                                        if (
+                                            is_rollup_merge
+                                            and base_branch == "main"
+                                            and bool(
+                                                orig.first_payload.get("hotfix")
+                                            )
+                                        ):
+                                            try:
+                                                from app import hotfix_backmerge
+
+                                                _merged_pr_url = (
+                                                    f"https://github.com/{owner}/{repo}/pull/{pr_number}"
+                                                    if owner and repo and pr_number
+                                                    else ""
+                                                )
+                                                await hotfix_backmerge.open_backmerge_pr(
+                                                    session,
+                                                    task.project_id,
+                                                    merged_pr_url=_merged_pr_url,
+                                                    hotfix_task_id=orig.id,
+                                                )
+                                                # open_backmerge_pr deliberately
+                                                # does NOT commit (its docstring:
+                                                # "the caller commits the
+                                                # session"). On a back-merge
+                                                # conflict / 405 it session.add +
+                                                # flush()es an operator-facing
+                                                # ERROR Alert and a high-priority
+                                                # conflict-resolution Task. After
+                                                # flush() the session is
+                                                # flushed-but-clean, so the
+                                                # function's final
+                                                # ``if session.dirty or
+                                                # session.new`` commit is SKIPPED
+                                                # and the ``async with`` exit
+                                                # would ROLL BACK that Alert/Task
+                                                # — leaving a back-merge conflict
+                                                # completely unsignalled. Commit
+                                                # here, mirroring the
+                                                # smoketest-spawn block above.
+                                                # The merged-PR work is already
+                                                # committed (~:3470); this commit
+                                                # only flushes the back-merge's
+                                                # own Alert/Task — safe.
+                                                await session.commit()
+                                            except Exception as _bm_exc:
+                                                logger.warning(
+                                                    f"[HOTFIX_BACKMERGE] Back-merge trigger failed for hotfix task {orig.id}: {_bm_exc!r}",
                                                     exc_info=True,
                                                 )
                                         # Spawn security rescan if merged task's parent was a security_audit
@@ -4552,6 +4640,76 @@ async def _process_post_commit(
         await _record_remediation_if_terminal(task, payload.status, session)
         await _record_regression_signal_if_matching(task, payload.status, session)
         await _handle_investigation_terminal_failure(task, payload.status, session)
+
+        # Release-qualifier finalization — fires from EVERY terminal path
+        # (COMPLETED / FAILED / CANCELLED) for BOTH a release_audit task and a
+        # qualifier-smoketest task. This deliberately lives in the terminal
+        # section (not the COMPLETED-only review-pipeline block above): a
+        # qualifier child that fails/cancels must still advance qualification,
+        # or the ReleaseVersion stays {status:"pending"} forever and the
+        # version is wedged.
+        #
+        # Why here and not in agent_status.py: this runs after the status
+        # endpoint's early commit, on a fresh post-commit session. The task's
+        # terminal status AND any SMOKETEST_RESULT / RELEASE_AUDIT_REPORT
+        # Artifact the agent posted are therefore already committed and visible
+        # to the finalize SELECT (_latest_artifact_logs). The old
+        # agent_status.py hook ran pre-flush with autoflush disabled and could
+        # not see its own just-added Artifact.
+        #
+        # maybe_finalize_qualification opens its OWN dedicated DB session
+        # (AsyncSessionLocal) for the entire finalize→promote chain — it does
+        # NOT use this post-commit ``session``. That decoupling is deliberate:
+        # promote() merges to production main and issues an intermediate
+        # commit() to release its row lock before 30-120s of GitHub I/O; on a
+        # caller's session that commit would prematurely commit this handler's
+        # unrelated dirty work (the completed task's terminal status,
+        # TaskHistory, Artifacts, remediation/regression records). Because it
+        # owns its session, this call also cannot self-deadlock against the
+        # Task-row lock this handler holds (it locks the ReleaseVersion row, a
+        # different row). It is idempotent (it FOR UPDATE-locks the version and
+        # no-ops unless last_qualification.status == "pending" and the required
+        # children are terminal) and a cheap O(1) no-op — no session opened, no
+        # I/O — for the overwhelming majority of tasks (those with no
+        # release_version_id in context). Keyed on context["release_version_id"]
+        # and/or task_type == "release_audit" / context["qualifier_smoketest"].
+        if payload.status in (
+            TaskStatus.COMPLETED,
+            TaskStatus.FAILED,
+            TaskStatus.CANCELLED,
+        ):
+            _qual_ctx = task.context or {}
+            _qual_first_payload = task.first_payload or {}
+            _is_qualifier_child = bool(
+                _qual_ctx.get("release_version_id")
+                or _qual_first_payload.get("type") == "release_audit"
+                or _qual_ctx.get("qualifier_smoketest")
+            )
+            if _is_qualifier_child:
+                try:
+                    from app import release_qualifier
+
+                    # maybe_finalize_qualification opens its OWN dedicated
+                    # session (see the comment above) — never this post-commit
+                    # ``session``. ``_session_factory`` is threaded through so
+                    # the dedicated session is opened from the SAME factory
+                    # this handler runs on: in production that is None →
+                    # AsyncSessionLocal (a genuine independent connection,
+                    # preserving the transaction-decoupling); under the test
+                    # harness it is the test-engine factory, so the finalize
+                    # sees the committed seed data and its commit is visible to
+                    # the test's assertions instead of opening an unrelated
+                    # connection on a different event loop.
+                    await release_qualifier.maybe_finalize_qualification(
+                        task, session_factory=_session_factory
+                    )
+                except Exception as _qual_exc:
+                    logger.error(
+                        f"[RELEASE_QUALIFIER] maybe_finalize_qualification failed "
+                        f"for terminal task {task.id} (status={payload.status}): "
+                        f"{_qual_exc!r}",
+                        exc_info=True,
+                    )
 
         # 7. Project State Aggregation
         # Only consider executable tasks (those with a VM) for aggregation.

@@ -19,6 +19,42 @@ import {
 import { resolveBuildConfig } from '../build-config.js';
 import { runCodeChangeTask } from './code-change.js';
 
+// ── Candidate-SHA helpers (release qualifier) ────────────────────────────────
+
+/** A full 40-char lowercase hex git commit SHA. */
+const FULL_SHA_RE = /^[0-9a-f]{40}$/;
+
+/**
+ * Resolve the pinned candidate commit SHA for a qualifier task.
+ *
+ * The release qualifier (backend/app/release_qualifier.py) snapshots
+ * `automain` HEAD as a full 40-char SHA and passes it as `candidate_sha`
+ * into BOTH the `release_audit` and qualifier-`smoketest` task payloads, so
+ * the agent scores the EXACT pinned commit rather than whatever `automain`
+ * has drifted to by the time the agent VM starts. The qualifier also stamps
+ * `task.context.candidate_sha`; we accept that as a fallback so the handler
+ * keeps working regardless of which field the backend populates.
+ *
+ * Returns the validated SHA, or null when no well-formed SHA is present.
+ */
+export function resolveCandidateSha(
+  payload: Record<string, unknown>,
+  task: Record<string, unknown>,
+): string | null {
+  const candidates: unknown[] = [payload.candidate_sha];
+  const ctx = task.context;
+  if (ctx && typeof ctx === 'object' && !Array.isArray(ctx)) {
+    candidates.push((ctx as Record<string, unknown>).candidate_sha);
+  }
+  for (const raw of candidates) {
+    if (typeof raw === 'string') {
+      const sha = raw.trim().toLowerCase();
+      if (FULL_SHA_RE.test(sha)) return sha;
+    }
+  }
+  return null;
+}
+
 // ── Handler: Security Audit (analyze codebase for vulnerabilities, output findings) ──
 export async function handleSecurityAudit(
   taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
@@ -275,14 +311,64 @@ export async function handleSmoketest(
   const rawBaseBranch = strVal(payload.base_branch, 'main');
   const baseBranch = validateBranchName(rawBaseBranch, 'base_branch');
 
-  // Clone (read-only — no work branch or push needed)
+  // CRITICAL (C4): the qualifier-smoketest must run against ONE pinned
+  // candidate commit, not whatever `automain` has drifted to by the time this
+  // VM starts. The release qualifier passes the snapshotted candidate as a
+  // full 40-char `candidate_sha` in the task payload. `git clone --branch <X>`
+  // (the path prepareWorkspaceForRole takes) accepts a branch/tag name, NOT a
+  // SHA — so we clone the branch normally, then fetch+checkout the exact SHA.
+  // A plain post-merge smoketest carries no candidate_sha and is unaffected.
+  const candidateSha = resolveCandidateSha(payload, task);
+
+  // Clone (read-only — no work branch or push needed). When pinning a
+  // candidate SHA, clone with FULL history (depth 0): the snapshotted commit
+  // may be older than a shallow clone's depth, and the SHA checkout below must
+  // be able to reach it.
   statusRef.value = `Cloning ${owner}/${repo}...`;
-  sendLog(ws, `Cloning ${owner}/${repo} @ ${baseBranch}...\n`);
+  sendLog(
+    ws,
+    candidateSha
+      ? `Cloning ${owner}/${repo} @ ${baseBranch}, pinning candidate ${candidateSha.slice(0, 12)}...\n`
+      : `Cloning ${owner}/${repo} @ ${baseBranch}...\n`,
+  );
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
   await prepareWorkspaceForRole({
     workspace: WORKSPACE, repoUrl: cloneUrl, githubToken: ghToken,
-    branch: baseBranch, baseBranch, depth: 100,
+    branch: baseBranch, baseBranch, depth: candidateSha ? 0 : 100,
   });
+
+  // Pin the workspace to the exact candidate commit. `git fetch origin <sha>`
+  // brings the precise object (GitHub permits fetching a SHA reachable from a
+  // ref; candidate_sha is the snapshotted `automain` HEAD, so it is reachable),
+  // then a detached checkout moves the working tree onto it. Fail loud if the
+  // SHA cannot be obtained — a smoketest of the wrong commit produces a
+  // meaningless qualifier signal.
+  if (candidateSha) {
+    sendLog(ws, `Fetching + checking out candidate commit ${candidateSha.slice(0, 12)}...\n`);
+    try {
+      execFileSync('git', ['fetch', 'origin', candidateSha], { cwd: WORKSPACE, stdio: ['ignore', 'pipe', 'pipe'] });
+      execFileSync('git', ['checkout', '--detach', candidateSha], { cwd: WORKSPACE, stdio: ['ignore', 'pipe', 'pipe'] });
+      sendLog(ws, `Checked out candidate commit ${candidateSha.slice(0, 12)} (detached HEAD).\n`);
+    } catch (e) {
+      const detail = e instanceof Error ? e.message : String(e);
+      sendLog(ws, `[ERROR] Could not check out candidate commit ${candidateSha}: ${detail}\n`);
+      await persistAndPostStatus(taskId, {
+        task_id: taskId,
+        status: 'FAILED',
+        artifact_type: 'ERROR_LOG',
+        failure_category: 'clone_failed',
+        logs: sanitize(
+          `Qualifier smoketest aborted: could not check out the pinned ` +
+          `candidate commit ${candidateSha}. The candidate must be the exact ` +
+          `commit the release qualifier snapshotted; running the smoketest ` +
+          `against a different commit would produce a meaningless signal. ` +
+          `Detail: ${detail}`,
+        ),
+      });
+      return;
+    }
+  }
+
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);
   const disallowedTools = configureAgentPermissions('smoketest');
@@ -925,6 +1011,244 @@ Rules:
     task_id: taskId,
     status: exitCode === 0 ? 'COMPLETED' : 'FAILED',
     ...(exitCode !== 0 ? { artifact_type: 'ERROR_LOG', failure_category: 'claude_code_failed' } : { artifact_type: 'SELF_AUDIT_REPORT' }),
+    logs,
+  });
+}
+
+// ── Handler: Release Audit (review main...<candidate_sha> diff against main's standards) ──
+export async function handleReleaseAudit(
+  taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
+  ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
+  model?: string, effort?: string
+) {
+  // CRITICAL: always clone base_branch (main), never automain. The audit must
+  // judge the incoming changes by main's standards, not the new code's standards.
+  const rawBaseBranch = strVal(payload.base_branch, 'main');
+  const baseBranch = validateBranchName(rawBaseBranch, 'base_branch');
+
+  // CRITICAL (C2/C4): the qualifier must score one PINNED candidate commit, not
+  // live `automain`. The bare branch name `automain` does NOT resolve as a
+  // revision after cloning `main` — `git fetch origin automain` only updates
+  // FETCH_HEAD, never a local `automain` ref — so a `main...automain` range can
+  // never resolve and the audit would ALWAYS fail "diff_range_unresolvable".
+  // The backend pins the candidate by passing a full 40-char `candidate_sha`
+  // (automain HEAD at snapshot time) in the task payload; we fetch that exact
+  // commit object and diff `main...<candidate_sha>`, which always resolves.
+  const candidateSha = resolveCandidateSha(payload, task);
+  if (!candidateSha) {
+    // No pinned candidate ⇒ nothing safe to audit. Fail loud rather than fall
+    // back to the bare `automain` name (which cannot resolve) or to live HEAD
+    // (which is not the snapshotted candidate). A missing candidate_sha is a
+    // real contract bug between the qualifier and the agent.
+    const rawSeen = strVal(payload.candidate_sha) || strVal(
+      (task.context && typeof task.context === 'object' && !Array.isArray(task.context)
+        ? (task.context as Record<string, unknown>).candidate_sha
+        : undefined),
+    );
+    sendLog(ws, `[ERROR] Release audit aborted: no valid candidate_sha in task payload.\n`);
+    await persistAndPostStatus(taskId, {
+      task_id: taskId,
+      status: 'FAILED',
+      artifact_type: 'ERROR_LOG',
+      failure_category: 'diff_range_unresolvable',
+      logs: sanitize(
+        `Release audit aborted: the task payload carries no valid candidate_sha. ` +
+        `The release qualifier must pin the candidate commit by passing a ` +
+        `full 40-char commit SHA as payload.candidate_sha. ` +
+        `Without it there is no commit to diff against ${baseBranch}. ` +
+        `Saw: ${rawSeen ? `"${rawSeen}"` : '(absent)'}`,
+      ),
+    });
+    return;
+  }
+  // Three-dot (merge-base) diff of the pinned candidate vs main.
+  const diffRange = `${baseBranch}...${candidateSha}`;
+
+  statusRef.value = `Cloning ${owner}/${repo} (${baseBranch}) for release audit...`;
+  sendLog(ws, `Starting release audit — cloning ${baseBranch} (reference branch), candidate ${candidateSha.slice(0, 12)}...\n`);
+  const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
+  // CRITICAL: a release audit runs `git diff main...<candidate_sha>` (three-dot
+  // = merge-base diff). On an LTS integration trunk the candidate routinely
+  // diverges from `main` by far more than DEFAULT_CLONE_DEPTH commits, so a
+  // shallow clone leaves the merge-base commit unreachable and `git diff`
+  // either errors or produces a wrong diff. A FULL clone (depth 0) is the only
+  // safe option — the merge-base must be reachable for the three-dot diff.
+  await prepareWorkspaceForRole({
+    workspace: WORKSPACE, repoUrl: cloneUrl, githubToken: ghToken,
+    branch: baseBranch, baseBranch, depth: 0,
+  });
+
+  // Fetch the EXACT candidate commit so git diff can compute the merge-base
+  // diff — but do NOT check it out. The working tree stays on baseBranch
+  // (main). GitHub permits fetching a SHA reachable from a ref, and the
+  // candidate_sha is `automain` HEAD at snapshot time, so it is reachable.
+  // After the fetch the SHA is a local object and `main...<candidate_sha>`
+  // resolves. (`git fetch origin <sha>` works where `git fetch origin
+  // automain` does not: a SHA fetch leaves a real commit object behind, a
+  // bare-branch fetch only updates FETCH_HEAD.)
+  let fetchOk = false;
+  let fetchFailDetail = '';
+  sendLog(ws, `Fetching candidate commit ${candidateSha.slice(0, 12)} (full history) for diff computation (staying on ${baseBranch})...\n`);
+  try {
+    execFileSync('git', ['fetch', 'origin', candidateSha], { cwd: WORKSPACE, stdio: ['ignore', 'pipe', 'pipe'] });
+    fetchOk = true;
+    sendLog(ws, `Fetched candidate commit ${candidateSha.slice(0, 12)} successfully.\n`);
+  } catch (e) {
+    fetchFailDetail = e instanceof Error ? e.message : String(e);
+    sendLog(ws, `[WARNING] git fetch origin ${candidateSha.slice(0, 12)} failed: ${fetchFailDetail}\n`);
+  }
+
+  // Pre-flight: verify the diff range actually resolves before invoking the
+  // agent. A successful-but-incomplete fetch can still leave the merge-base
+  // unreachable; if it is, `git diff ${diffRange}` errors and the agent can
+  // misread that as an "empty diff" and emit audit_score: 1.0 — a FALSE
+  // strong-promote signal to the release qualifier. Fail loud instead.
+  let diffRangeResolves = false;
+  let diffRangeFailDetail = '';
+  if (fetchOk) {
+    try {
+      // `git rev-parse --verify <sha>^{commit}` errors when the SHA is not a
+      // reachable commit object; `git rev-list --count main...<sha>` errors
+      // when either endpoint or the merge-base is unreachable. Run both so a
+      // genuinely unresolvable range fails loud, while a clean exit proves the
+      // symmetric-difference range is fully resolvable.
+      git(['rev-parse', '--verify', `${candidateSha}^{commit}`]);
+      git(['rev-list', '--count', diffRange]);
+      diffRangeResolves = true;
+      sendLog(ws, `Diff range ${diffRange} resolves — merge-base is reachable.\n`);
+    } catch (e) {
+      diffRangeFailDetail = e instanceof Error ? e.message : String(e);
+      sendLog(ws, `[ERROR] Diff range ${diffRange} does not resolve: ${diffRangeFailDetail}\n`);
+    }
+  } else {
+    diffRangeFailDetail = `git fetch origin ${candidateSha} failed (${fetchFailDetail || 'no detail'}); ${diffRange} cannot be resolved`;
+  }
+
+  if (!diffRangeResolves) {
+    // Never let the agent run an unaudited audit. A diff range that does not
+    // resolve makes every downstream audit_score meaningless — post a FAILED
+    // status with a clear failure category so the qualifier records a blocker
+    // rather than a false audit_score: 1.0.
+    sendLog(ws, `Aborting release audit: cannot compute ${diffRange} — refusing to emit an unaudited audit_score.\n`);
+    await persistAndPostStatus(taskId, {
+      task_id: taskId,
+      status: 'FAILED',
+      artifact_type: 'ERROR_LOG',
+      failure_category: 'diff_range_unresolvable',
+      logs: sanitize(
+        `Release audit aborted: diff range ${diffRange} does not resolve. ` +
+        `The candidate commit ${candidateSha} could not be fetched, or the ` +
+        `merge-base of ${baseBranch} and the candidate is unreachable, so ` +
+        `git diff would error or produce a wrong diff. ` +
+        `Detail: ${diffRangeFailDetail || '(no detail)'}`,
+      ),
+    });
+    return;
+  }
+
+  writePlaybookHelper(taskId);
+  writeMessagesHelper(taskId);
+  const disallowedTools = configureAgentPermissions('release_audit');
+
+  const contextPrefix = buildContextPrefix(task);
+  const claudeMd = readClaudeMd();
+  const codebaseSummary = claudeMd ? `## Codebase Instructions\n${claudeMd}\n\n` : '';
+  const fileTreeSection = buildFileTree(ws);
+  const playbookSection = formatPlaybook(task.playbook as Record<string, PlaybookEntry | string> | undefined);
+  const retryContext = buildRetryContext(task);
+  const firstTaskSection = task.first_task_on_repo ? FIRST_TASK_GUIDANCE : '';
+
+  const releaseAuditPrompt = `${codebaseSummary}${playbookSection}${retryContext}${contextPrefix}${fileTreeSection}You are a release audit agent. You have been cloned onto \`${baseBranch}\` — the last known-good LTS branch — and your job is to review the incoming diff range \`${diffRange}\` against \`${baseBranch}\`'s standards. \`${candidateSha}\` is the PINNED release candidate commit (a snapshot of the integration branch); it has already been fetched into this clone, so the diff range resolves.
+
+IMPORTANT: You are running on \`${baseBranch}\` intentionally. You must judge the incoming changes by \`${baseBranch}\`'s standards, NOT by the new code's standards. This asymmetry is the entire point of the audit.
+
+## Your task
+
+1. **Obtain the diff.** Run: \`git diff ${diffRange}\` to see what the candidate commit \`${candidateSha}\` adds relative to \`${baseBranch}\`. Also run \`git diff --stat ${diffRange}\` for a file summary and \`git log ${diffRange} --oneline\` for the commit list. Do NOT use the bare name \`automain\` — it is not a resolvable revision in this clone; always diff against the pinned SHA \`${candidateSha}\`.
+
+2. **Assess test erosion.** Identify:
+   - Any test files deleted in the diff (files under \`testing/\`, \`tests/\`, \`__tests__/\`, \`*.test.*\`, \`*.spec.*\` that appear as deleted).
+   - Net change in assertion count: search for \`assert \`, \`expect(\`, \`assertEqual\`, \`assertRaises\`, \`it(\`, \`describe(\` in the diff's added/removed lines.
+   - Net change in test function/case count: count added vs removed \`def test_\`, \`test(\`, \`it(\`, \`describe(\` patterns.
+
+3. **Review code quality** against \`${baseBranch}\`'s conventions (read CLAUDE.md for standards). Focus on:
+   - Correctness and logic errors introduced
+   - Security regressions (new hardcoded secrets, unsafe operations, auth bypasses)
+   - Architecture drift (patterns inconsistent with the existing codebase conventions)
+   - Test coverage gaps for new behavior
+   - Documentation / comment accuracy
+
+4. **Score and emit results.** Write your findings as a JSON object to \`/tmp/release_audit_report_${taskId}.json\` with EXACTLY this structure:
+
+\`\`\`json
+{
+  "audit_score": 0.85,
+  "test_erosion": {
+    "deleted_test_files": [],
+    "assertion_delta": 12,
+    "test_count_delta": 3
+  },
+  "findings": [
+    {
+      "severity": "high",
+      "summary": "One sentence describing the issue",
+      "file": "path/to/affected/file.py"
+    }
+  ]
+}
+\`\`\`
+
+Field semantics:
+- \`audit_score\`: float [0, 1] — 1.0 means no issues found; deduct per finding by severity (critical: -0.30, high: -0.15, medium: -0.07, low: -0.02). Clamp to [0, 1].
+- \`test_erosion.deleted_test_files\`: list of test file paths deleted in the diff. An empty list is good.
+- \`test_erosion.assertion_delta\`: integer — positive means more assertions added than removed (good), negative means erosion.
+- \`test_erosion.test_count_delta\`: integer — positive means more tests added than removed (good), negative means erosion.
+- \`findings\`: each entry has \`severity\` (critical|high|medium|low), \`summary\` (one sentence), and \`file\` (file path or empty string if cross-cutting).
+
+Rules:
+- Read the actual diff — do NOT speculate about code you haven't read.
+- If \`git diff ${diffRange}\` produces no output (empty diff), set \`audit_score: 1.0\`, \`findings: []\`, and note it in a single low-severity finding.
+- IMPORTANT: Write ONLY the JSON object to \`/tmp/release_audit_report_${taskId}.json\` — no markdown, no code fences, no extra text.
+- Also output the same JSON object as the final output in your logs.
+- Do NOT modify any files in the repository.`;
+
+  const buildConfig = resolveBuildConfig(task);
+  const promptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${strVal(payload.prompt_suffix)}` : '';
+  const typeHints = getTaskTypeHints(buildConfig);
+  const typeHint = typeHints['release_audit'] ? '\n\n' + typeHints['release_audit'] : '';
+  statusRef.value = 'Running release audit...';
+  const releaseAuditFingerprint = computePromptFingerprint('release_audit', buildConfig);
+  setCurrentPromptFingerprint(releaseAuditFingerprint);
+  sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: releaseAuditFingerprint });
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(
+    releaseAuditPrompt + typeHint + firstTaskSection + promptSuffix + PLAYBOOK_GUIDANCE + `\n\n${DEFAULT_TOOL_GUIDANCE}`,
+    ws, statusRef, model, effort, disallowedTools,
+  );
+
+  const handlerOutput = readHandlerOutput(taskId, 'release_audit_report', ws) as {
+    audit_score?: number;
+    test_erosion?: { deleted_test_files?: unknown[]; assertion_delta?: number; test_count_delta?: number };
+    findings?: unknown[];
+  } | null;
+
+  let logs = '';
+  if (handlerOutput !== null) {
+    logs = sanitize(JSON.stringify(handlerOutput));
+  } else {
+    const haystack = (allOutput || '') + '\n' + (lastResultText || '');
+    const objExtract = extractJsonObjectDetailed(haystack, 'audit_score', 'findings');
+    if (objExtract.ok) {
+      logs = sanitize(JSON.stringify(objExtract.value));
+    } else {
+      sendLog(ws, `[WARNING] Could not extract release audit JSON: ${describeJsonExtractionResult(objExtract)}\n`);
+      logs = sanitize(lastResultText || allOutput.slice(-50_000));
+    }
+  }
+
+  await persistAndPostStatus(taskId, {
+    task_id: taskId,
+    status: exitCode === 0 ? 'COMPLETED' : 'FAILED',
+    ...(exitCode !== 0 ? { artifact_type: 'ERROR_LOG', failure_category: 'claude_code_failed' } : { artifact_type: 'RELEASE_AUDIT_REPORT' }),
     logs,
   });
 }

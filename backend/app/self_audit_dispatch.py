@@ -186,7 +186,7 @@ async def _should_dispatch_self_audit(
     # systems even if their maturity rows look fresh.
     try:
         drift = await compute_direction_drift(session, project)
-    except Exception:  # noqa: BLE001 — drift is best-effort
+    except Exception:
         logger.exception(
             "[SELF_AUDIT] drift computation failed; skipping drift-driven dispatch",
         )
@@ -223,7 +223,7 @@ async def _should_dispatch_self_audit(
 
 async def _record_residual_audit_deferral(
     session: AsyncSession,
-    project_id: "uuid.UUID",
+    project_id: uuid.UUID,
     fingerprint: str,
     system_id: str,
 ) -> None:
@@ -344,7 +344,7 @@ async def _spawn_self_audit_task(
 
     payload: dict = {
         "type": "self_audit",
-        "base_branch": "main",
+        "base_branch": _runtime_config.get("integration_branch", "main"),
     }
     focus = audit_payload.get("focus_systems")
     if focus:

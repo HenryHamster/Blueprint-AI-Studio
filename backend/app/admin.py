@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks, R
 from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
-from typing import Optional, Dict, Any, List
+from typing import Dict, Any, List
 import os
 import uuid
 import json
@@ -37,9 +37,10 @@ from app.payload_schemas import (
 )
 from app.routers.admin_analytics import ON_DEMAND_RATE, SPOT_RATE
 from app.compute import _capture_serial_for_vm, get_vm_zone, get_vm_status
+from app import release_qualifier, release_version
 
 
-def _estimated_cost_usd(task: Task) -> Optional[float]:
+def _estimated_cost_usd(task: Task) -> float | None:
     """Return the VM cost for a task, or None when timing data is incomplete."""
     if not task.vm_provisioned_at or not task.vm_stopped_at:
         return None
@@ -56,8 +57,8 @@ _FIX_LOOP_SUCCESS_REASONS = frozenset({"passed", "early_unchanged"})
 
 
 def _fix_loop_summary(
-    history: Optional[Dict[str, Any]],
-) -> Optional[List[Dict[str, Any]]]:
+    history: Dict[str, Any] | None,
+) -> List[Dict[str, Any]] | None:
     """Return compact per-loop trouble entries from fix_loop_history, or None when healthy."""
     if not history:
         return None
@@ -88,8 +89,8 @@ logger = logging.getLogger(__name__)
 
 async def _terminal_cleanup_bg(
     parent_task_id: str,
-    parent_vm_id: Optional[str],
-    parent_acct_id: Optional[str],
+    parent_vm_id: str | None,
+    parent_acct_id: str | None,
     children_cleanup: List[tuple],
     force_kill: bool,
 ):
@@ -112,14 +113,14 @@ async def _terminal_cleanup_bg(
             await asyncio.sleep(5)
         try:
             await _ensure_vm_deleted(parent_vm_id, reason="admin_terminal")
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.warning(
                 f"[ADMIN] BG cleanup: VM delete failed for parent={parent_task_id} vm={parent_vm_id}: {exc}"
             )
     if parent_acct_id:
         try:
             await release_max_plan_account(parent_acct_id)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.warning(
                 f"[ADMIN] BG cleanup: account release failed for parent={parent_task_id} acct={parent_acct_id}: {exc}"
             )
@@ -128,14 +129,14 @@ async def _terminal_cleanup_bg(
         if child_vm_id:
             try:
                 await _ensure_vm_deleted(child_vm_id, reason="parent_cancelled")
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     f"[ADMIN] BG cleanup: VM delete failed for child={child_task_id} vm={child_vm_id}: {exc}"
                 )
         if child_acct_id:
             try:
                 await release_max_plan_account(child_acct_id)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     f"[ADMIN] BG cleanup: account release failed for child={child_task_id} acct={child_acct_id}: {exc}"
                 )
@@ -272,7 +273,7 @@ TERMINAL_STATUSES = [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELL
 
 # Hard cap on /admin/tasks page size. A fully-populated task row can carry
 # up to ~100KB of research_findings plus unbounded status_log, so 500 rows
-# × large-tail payload stays safely under Cloud Run's 32 MB response limit.
+# x large-tail payload stays safely under Cloud Run's 32 MB response limit.
 ADMIN_TASKS_MAX_LIMIT = 500
 
 
@@ -286,11 +287,11 @@ async def get_all_tasks(
     offset: int = Query(0, ge=0),
     status: List[TaskStatus] = Query(default=[]),
     terminal_only: bool = Query(False),
-    archived: Optional[bool] = Query(None),
-    search: Optional[str] = Query(None, max_length=200),
-    created_after: Optional[datetime] = Query(None),
-    direction_id: Optional[str] = Query(None),
-    task_type: Optional[str] = Query(None),
+    archived: bool | None = Query(None),
+    search: str | None = Query(None, max_length=200),
+    created_after: datetime | None = Query(None),
+    direction_id: str | None = Query(None),
+    task_type: str | None = Query(None),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
@@ -416,7 +417,7 @@ async def get_all_tasks(
             children_map[parent_key].append(str(t.id))
 
     # Return tasks with artifact data attached
-    from app.failure_classification import classify_failure  # noqa: PLC0415
+    from app.failure_classification import classify_failure
 
     result_list = []
     for t in tasks:
@@ -505,8 +506,8 @@ async def get_all_tasks(
 
 
 class BulkArchiveRequest(BaseModel):
-    task_ids: Optional[List[str]] = None
-    filter: Optional[str] = None  # 'completed' or 'terminal'
+    task_ids: List[str] | None = None
+    filter: str | None = None  # 'completed' or 'terminal'
 
 
 @router.post("/tasks/bulk-archive")
@@ -517,12 +518,13 @@ async def bulk_archive_tasks(
 ):
     user_project_ids = _user_project_ids(current_user["user_id"])
     if request.task_ids is not None:
-        valid_uuids = []
-        for raw_id in request.task_ids:
+        def _safe_uuid(raw: str) -> uuid.UUID | None:
             try:
-                valid_uuids.append(uuid.UUID(raw_id))
+                return uuid.UUID(raw)
             except (ValueError, AttributeError):
-                continue
+                return None
+
+        valid_uuids = [u for raw_id in request.task_ids if (u := _safe_uuid(raw_id))]
         if not valid_uuids:
             return {"archived_count": 0}
         # Use SKIP LOCKED to avoid contending with concurrent orchestrator transactions
@@ -586,7 +588,7 @@ class BulkActionRequest(BaseModel):
 async def _bulk_retry_one_task(
     task_id: uuid.UUID,
     request_session: AsyncSession,
-) -> Optional[str]:
+) -> str | None:
     """Run the retry mutation for a single task in its own short-lived session.
 
     Phase C2 (H-C3): the bulk-action retry path used to share the request
@@ -609,9 +611,9 @@ async def _bulk_retry_one_task(
     delete after commit, or ``None`` for parent-type tasks (which clone
     children rather than spinning a VM here).
     """
-    from sqlalchemy.ext.asyncio import async_sessionmaker  # noqa: PLC0415
-    from app.routers.agent import _terminated_task_ids  # noqa: PLC0415
-    from app.task_lifecycle import _requeue_parent_task  # noqa: PLC0415
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+    from app.routers.agent import _terminated_task_ids
+    from app.task_lifecycle import _requeue_parent_task
 
     scoped_factory = async_sessionmaker(
         request_session.bind,
@@ -646,7 +648,7 @@ async def _bulk_retry_one_task(
                     .scalars()
                     .all()
                 )
-            old_vm: Optional[str] = None
+            old_vm: str | None = None
             if children:
                 await _requeue_parent_task(task, scoped_session)
             else:
@@ -707,11 +709,18 @@ async def bulk_action_tasks(
     # Validate UUIDs and resolve membership in a single short transaction on
     # the shared request session. The pre-fetch returns light Task rows we
     # use to surface "not found" before falling through to per-task work.
+    def _parse_task_uuid(raw: str) -> uuid.UUID | None:
+        try:
+            return uuid.UUID(raw)
+        except (ValueError, AttributeError):
+            return None
+
     valid_map: dict[str, uuid.UUID] = {}  # raw_id -> parsed UUID
     for raw_id in body.task_ids:
-        try:
-            valid_map[raw_id] = uuid.UUID(raw_id)
-        except (ValueError, AttributeError):
+        parsed = _parse_task_uuid(raw_id)
+        if parsed is not None:
+            valid_map[raw_id] = parsed
+        else:
             results.append(
                 {"task_id": raw_id, "status": "error", "error": "Invalid task ID"}
             )
@@ -904,7 +913,7 @@ async def bulk_action_tasks(
                                         logger.info(
                                             f"[SMOKETEST] Spawned smoketest task {smoketest_task.id} after bulk rollup merge to {base_branch}"
                                         )
-                                    except Exception as e:
+                                    except Exception as e:  # noqa: BLE001
                                         logger.warning(
                                             f"[SMOKETEST] Failed to spawn smoketest after bulk rollup merge: {e}",
                                             exc_info=True,
@@ -1024,7 +1033,7 @@ async def bulk_action_tasks(
                                     task.latest_status_message = "Iteration cap reached — no follow-on task spawned"
                                     from app.failure_classification import (
                                         persist_failure_category,
-                                    )  # noqa: PLC0415
+                                    )
 
                                     persist_failure_category(task, "AGENT_TIMEOUT")
                                     _record_failure_result(task, "AGENT_TIMEOUT")
@@ -1365,16 +1374,21 @@ class CreateTaskPayload(BaseModel):
         default="main", max_length=255, pattern=r"^[a-zA-Z0-9_./-]*[a-zA-Z0-9_.-]$"
     )
     task_type: TaskType = Field(default=TaskType.create)
-    pr_number: Optional[int] = None
-    branch: Optional[str] = Field(
+    pr_number: int | None = None
+    branch: str | None = Field(
         default=None, max_length=255, pattern=r"^[a-zA-Z0-9_./-]*[a-zA-Z0-9_.-]$"
     )
-    model: Optional[str] = Field(default=None, min_length=1)
-    effort: Optional[str] = Field(default=None, pattern=r"^(low|medium|high|max)$")
+    model: str | None = Field(default=None, min_length=1)
+    effort: str | None = Field(default=None, pattern=r"^(low|medium|high|max)$")
+    # Hotfix path (Phase 5 / automain-LTS): set hotfix=True together with
+    # base_branch="main" to mark a plan task as an expedited fix off main.
+    # The agent handler branches hotfix/* off main and the orchestrator
+    # back-merges main → automain after the hotfix lands.
+    hotfix: bool = False
 
     @field_validator("base_branch", "branch")
     @classmethod
-    def validate_branch_name(cls, v: Optional[str]) -> Optional[str]:
+    def validate_branch_name(cls, v: str | None) -> str | None:
         if v is None:
             return v
         for part in v.split("/"):
@@ -1405,7 +1419,28 @@ async def create_task_manually(
 ):
     """
     Create a Claude Code task. Auto-creates a project for the repo if one doesn't exist.
+
+    Hotfix path: submit task_type="plan", base_branch="main", hotfix=true to
+    launch an expedited fix off main (Phase 5 / automain-LTS).  The hotfix
+    flag is stored in the task payload and picked up by the agent handler,
+    which branches hotfix/* off main; the orchestrator back-merges
+    main → automain after the hotfix lands.
     """
+    # Guard: hotfix is only meaningful for `plan` tasks. The Phase 5 back-merge
+    # trigger (task_lifecycle.py) only fires for a hotfix ROLLUP merge of a
+    # `plan` task → main. A create/fix hotfix has no plan and thus no rollup,
+    # so its PR would merge straight to main with NO back-merge — silently
+    # diverging `automain` from `main` and breaking the next promotion.
+    if payload.hotfix and payload.task_type != TaskType.plan:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "hotfix=true is only supported for task_type='plan' "
+                f"(got '{payload.task_type.value}'); a non-plan hotfix would "
+                "merge to main without the automain back-merge."
+            ),
+        )
+
     # Parse owner/repo
     github_owner, github_repo = payload.github_repo.split("/", 1)
 
@@ -1448,18 +1483,42 @@ async def create_task_manually(
         task_payload["model"] = payload.model
     if payload.effort is not None:
         task_payload["effort"] = payload.effort
+    if payload.hotfix:
+        task_payload["hotfix"] = True
     # Review/fix tasks need pr_number and branch
     if payload.task_type in ("review", "fix") and payload.pr_number:
         task_payload["pr_number"] = payload.pr_number
         task_payload["branch"] = payload.branch or ""
         if payload.task_type == "review":
             task_payload["original_prompt"] = payload.prompt
-    # Research tasks auto-include project directions
+    # Research tasks auto-include project directions. For ad-hoc manual
+    # spawns we ship lightweight direction summaries (id/text/priority/
+    # status/system + truncated research_context) — full
+    # research_context + research_history can be tens of KB per direction
+    # and easily blow past validate_task_payload's 190 KB cap on projects
+    # with many fat directions. The agent can fetch full direction state
+    # via ``./fetch direction <id>`` when it needs it.
     if payload.task_type == "research":
         active_directions = [
             d for d in (project.directions or []) if d.get("status") == "active"
         ]
-        task_payload["directions"] = active_directions
+        trimmed_directions = []
+        for d in active_directions:
+            if not isinstance(d, dict):
+                continue
+            ctx = d.get("research_context") or ""
+            entry = {
+                "id": d.get("id"),
+                "text": d.get("text"),
+                "priority": d.get("priority"),
+                "status": d.get("status"),
+            }
+            if d.get("system"):
+                entry["system"] = d.get("system")
+            if isinstance(ctx, str) and ctx:
+                entry["research_context"] = ctx[:2000]
+            trimmed_directions.append(entry)
+        task_payload["directions"] = trimmed_directions
 
     try:
         task_payload = validate_task_payload(task_payload)
@@ -1568,7 +1627,7 @@ async def request_changes(
 
     from app.review_pipeline import _spawn_pipeline_task
 
-    if payload.action == "fix":  # noqa: SIM108 — two distinct multi-line async calls, ternary unreadable
+    if payload.action == "fix":
         spawned, _ = await _spawn_pipeline_task(
             task,
             "fix",
@@ -1765,8 +1824,8 @@ async def modify_task(
             # sent, so the request handler doesn't hold its DB session through
             # 5s sleeps and serial GCE calls (which previously starved the
             # orchestrator's connection pool during bulk cancellations).
-            parent_vm_id_for_bg: Optional[str] = None
-            parent_acct_id_for_bg: Optional[str] = None
+            parent_vm_id_for_bg: str | None = None
+            parent_acct_id_for_bg: str | None = None
             if (
                 new_status in (TaskStatus.CANCELLED, TaskStatus.FAILED)
                 and task.vm_instance_id
@@ -2025,7 +2084,7 @@ async def modify_task(
                                 logger.info(
                                     f"[SMOKETEST] Spawned smoketest task {smoketest_task.id} after admin rollup merge to {base_branch}"
                                 )
-                            except Exception as e:
+                            except Exception as e:  # noqa: BLE001
                                 logger.warning(
                                     f"[SMOKETEST] Failed to spawn smoketest after admin rollup merge: {e}",
                                     exc_info=True,
@@ -2146,7 +2205,7 @@ async def modify_task(
                             )
                             from app.failure_classification import (
                                 persist_failure_category,
-                            )  # noqa: PLC0415
+                            )
 
                             persist_failure_category(task, "AGENT_TIMEOUT")
                             _record_failure_result(task, "AGENT_TIMEOUT")
@@ -2334,14 +2393,14 @@ class SelfAuditRequest(BaseModel):
     systems in round-robin order from the project design_doc.
     """
 
-    focus_systems: Optional[List[str]] = Field(default=None, max_length=20)
-    max_systems: Optional[int] = Field(default=None, ge=1, le=10)
+    focus_systems: List[str] | None = Field(default=None, max_length=20)
+    max_systems: int | None = Field(default=None, ge=1, le=10)
 
 
 @router.post("/projects/{project_id}/self-audit")
 async def trigger_self_audit(
     project_id: uuid.UUID,
-    body: Optional[SelfAuditRequest] = None,
+    body: SelfAuditRequest | None = None,
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
@@ -2353,7 +2412,12 @@ async def trigger_self_audit(
         project_id, current_user["user_id"], session, "member"
     )
 
-    payload_dict: dict = {"type": "self_audit", "base_branch": "main"}
+    from app.shared_state import runtime_config as _runtime_config
+
+    payload_dict: dict = {
+        "type": "self_audit",
+        "base_branch": _runtime_config.get("integration_branch", "main"),
+    }
     if body is not None:
         if body.focus_systems is not None:
             payload_dict["focus_systems"] = [
@@ -2394,6 +2458,35 @@ async def trigger_self_audit(
         "project_id": str(project.id),
         "status": new_task.status,
     }
+
+
+@router.post("/projects/{project_id}/qualify")
+async def trigger_qualify(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Manually trigger the release qualifier for this project's open version.
+
+    Members and above can trigger qualification on demand (used during the
+    Phase 4 dry-run calibration window).  Resolves the current open
+    ``ReleaseVersion``, runs ``release_qualifier.run_qualification``, and
+    returns its result dict.  Returns 404 when there is no open version.
+    """
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+
+    open_version = await release_version.current_open_version(session, project_id)
+    if open_version is None:
+        raise HTTPException(
+            status_code=404,
+            detail="No open release version found for this project.",
+        )
+
+    result = await release_qualifier.run_qualification(session, project_id, open_version)
+    await session.commit()
+    return result
 
 
 @router.post("/projects/{project_id}/clear-wave-deps")
@@ -2461,7 +2554,7 @@ async def trigger_rollup(
         .all()
     )
 
-    from app.rollup_management import _build_rollup_pr_body  # noqa: PLC0415
+    from app.rollup_management import _build_rollup_pr_body
 
     pr_title = f"[Blueprint] Rollup: {task.title}"
     _dir_id = task.first_payload.get("current_direction_id") or ctx.get("direction_id")
@@ -2524,7 +2617,7 @@ async def trigger_rollup(
             # specific reason (already merged / iteration cap / deferred behind
             # in-flight task / stuck cycle) and writes a SPAWN_REASON code into
             # context so callers can distinguish recoverable from terminal cases.
-            from app.review_pipeline import (  # noqa: PLC0415
+            from app.review_pipeline import (
                 SPAWN_REASON_KEY,
                 SPAWN_REASON_DEFERRED,
                 SPAWN_REASON_DEDUP,
@@ -2554,7 +2647,7 @@ async def trigger_rollup(
                     if spawn_reason_msg
                     else f"Rollup PR #{rollup_pr_number} created but review not spawned (unknown reason)"
                 )
-                from app.failure_classification import persist_failure_category  # noqa: PLC0415
+                from app.failure_classification import persist_failure_category
 
                 persist_failure_category(task, "AGENT_TIMEOUT")
                 _record_failure_result(task, "AGENT_TIMEOUT")
@@ -2573,7 +2666,7 @@ async def trigger_rollup(
 @router.get("/projects/{project_id}/findings")
 async def get_project_findings(
     project_id: uuid.UUID,
-    direction_id: Optional[str] = Query(None),
+    direction_id: str | None = Query(None),
     limit: int = Query(50, ge=1, le=200),
     days: int = Query(30, ge=1, le=365),
     session: AsyncSession = Depends(get_session),
@@ -2603,7 +2696,7 @@ def _get_zone_health_summary() -> dict:
         from app.compute import get_zone_health_summary
 
         return get_zone_health_summary()
-    except Exception:
+    except Exception:  # noqa: BLE001
         return {"total_zones": 0, "available": 0, "exhausted": []}
 
 

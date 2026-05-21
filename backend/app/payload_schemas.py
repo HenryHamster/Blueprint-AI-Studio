@@ -2,7 +2,7 @@
 Pydantic-based payload validation for all supported task types.
 
 Provides:
-  - TaskType enum listing all 18 handler types
+  - TaskType enum listing all 19 handler types
   - ALL_TASK_TYPES frozenset for backward-compat consumers
   - Per-type payload models with required-field enforcement
   - validate_task_payload()  — strict, raises ValueError on bad input
@@ -231,6 +231,9 @@ class StrategicReviewPayload(_SystemPopulated):
     # Short-window claim-vs-shipped drift signals; complements lifetime
     # prediction calibration with a fast-reacting drift detector.
     drift_signals: dict[str, Any] | None = None
+    # Current LTS version/phase context. Keys: version_number, phase,
+    # phase_changed_at, tasks_merged_this_version, last_qualification.
+    version_phase: dict[str, Any] | None = None
 
 
 class DesignDocUpdatePayload(_SystemPopulated):
@@ -253,6 +256,11 @@ class SelfAuditPayload(_SystemPopulated):
     focus_systems: list[str] | None = None
     # per-run cap for round-robin coverage across all systems
     max_systems: int | None = None
+
+
+class ReleaseAuditPayload(_SystemPopulated):
+    diff_range: str | None = None
+    prompt: str | None = None
 
 
 class QAPayload(_SystemPopulated):
@@ -306,6 +314,7 @@ _MODEL_FOR_TYPE: dict[TaskType, type[BasePayload]] = {
     TaskType.debug: DebugPayload,
     TaskType.perf: PerfPayload,
     TaskType.self_audit: SelfAuditPayload,
+    TaskType.release_audit: ReleaseAuditPayload,
 }
 
 

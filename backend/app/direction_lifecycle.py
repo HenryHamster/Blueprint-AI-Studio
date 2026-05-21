@@ -414,7 +414,11 @@ async def _spawn_direction_diagnosis(
         f"architectural issue), affected files, and a recommended fix."
     )
     payload = validate_internal_payload(
-        {"type": "investigate", "prompt": prompt, "base_branch": "main"},
+        {
+            "type": "investigate",
+            "prompt": prompt,
+            "base_branch": _runtime_config.get("integration_branch", "main"),
+        },
         "direction_lifecycle:auto_pause_diagnosis",
     )
     task_context = {

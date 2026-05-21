@@ -9,7 +9,7 @@ import asyncio
 import logging
 from collections import deque
 from datetime import datetime, timedelta
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 from slowapi import Limiter
 from slowapi.util import get_remote_address
@@ -31,7 +31,7 @@ DEFAULT_TASK_SCOPE = "small"
 _SCOPE_EFFORT_MAP = {"small": "low", "medium": "medium", "large": "high"}
 
 
-def scope_to_effort(scope: Optional[str]) -> str:
+def scope_to_effort(scope: str | None) -> str:
     """Return the baseline effort for a calibrated scope.
 
     Unknown / missing scopes fall back to "medium" so callers can safely take
@@ -371,6 +371,19 @@ runtime_config: Dict = {
     # window and the typical role transition cadence; tunable down for
     # tighter slot budgets.
     "next_role_poll_timeout_secs": 180,
+    # Integration trunk branch. Autonomous spawn-time base_branch defaults
+    # route through this value so Phase 1 can retarget all pipeline work
+    # from "main" to "automain" with a single config flip. Default "main"
+    # preserves existing behavior until Phase 1 activates.
+    # Operator-tunable via runtime_config_json; persisted across restarts.
+    "integration_branch": "main",
+    # Release qualifier (Phase 3+). promotion_enabled gates whether the
+    # qualifier may promote a qualified automain candidate to main — default
+    # False ships the qualifier in dry-run (score + log, never promote).
+    # smoketest_enabled gates smoketest task spawns. Operator-tunable via
+    # runtime_config_json; persisted across restarts.
+    "promotion_enabled": False,
+    "smoketest_enabled": False,
 }
 
 # Scope-aware per-class retry budgets. When a task's context includes a scope
@@ -506,7 +519,7 @@ async def sync_runtime_config_from_state(state) -> list[str]:
         return []
 
     # Lazy import to avoid module-level circular dependency with app.models
-    from app.models import DeploymentStatus  # noqa: PLC0415
+    from app.models import DeploymentStatus
 
     changed: list[str] = []
 
@@ -542,7 +555,7 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     "max_global_autonomous_tasks_per_hour",
                     int(state.runtime_max_global_autonomous_tasks_per_hour),
                 )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.warning(f"[CONFIG-SYNC] Could not sync scalar config cols: {e}")
 
         try:
@@ -559,7 +572,7 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     "autonomous_direction_cooldown_minutes",
                     int(state.runtime_autonomous_direction_cooldown_minutes),
                 )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.warning(f"[CONFIG-SYNC] Could not sync autonomous cols: {e}")
 
         try:
@@ -635,7 +648,19 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                         "reserved_slots_for_types",
                         config_json["reserved_slots_for_types"],
                     )
-        except Exception as e:
+                if "integration_branch" in config_json:
+                    _set("integration_branch", str(config_json["integration_branch"]))
+                if "promotion_enabled" in config_json:
+                    _set(
+                        "promotion_enabled",
+                        bool(config_json["promotion_enabled"]),
+                    )
+                if "smoketest_enabled" in config_json:
+                    _set(
+                        "smoketest_enabled",
+                        bool(config_json["smoketest_enabled"]),
+                    )
+        except Exception as e:  # noqa: BLE001
             logger.warning(f"[CONFIG-SYNC] Could not sync runtime_config_json: {e}")
 
         # PAUSED/HALTED always forces the dispatch cap to 0. (We already
@@ -644,7 +669,7 @@ async def sync_runtime_config_from_state(state) -> list[str]:
         try:
             if paused:
                 _set("max_concurrent_vms", 0)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.warning(f"[CONFIG-SYNC] Could not apply PAUSED override: {e}")
 
     return changed
@@ -661,8 +686,8 @@ async def runtime_config_sync_service():
     within ~15s regardless of which path reads runtime_config.
     """
     # Lazy imports avoid module-level circular deps.
-    from app.database import AsyncSessionLocal  # noqa: PLC0415
-    from app.models import DeploymentState  # noqa: PLC0415
+    from app.database import AsyncSessionLocal
+    from app.models import DeploymentState
 
     while True:
         try:
@@ -672,13 +697,13 @@ async def runtime_config_sync_service():
                 changed = await sync_runtime_config_from_state(state)
                 if changed:
                     logger.info(f"[CONFIG-SYNC] Applied DB changes: {changed}")
-        except asyncio.CancelledError:
+        except asyncio.CancelledError:  # noqa: PERF203
             raise
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.warning(f"[CONFIG-SYNC] sync cycle failed: {e}", exc_info=True)
 
 
-def resolve_retry_budget(failure_class: str, scope: Optional[str]) -> int:
+def resolve_retry_budget(failure_class: str, scope: str | None) -> int:
     """Return the retry budget for (failure_class, scope), falling back to the
     uniform retry_budgets_by_class value (or max_retries) if scope is not set
     or has no scope-specific override."""
@@ -692,7 +717,7 @@ def resolve_retry_budget(failure_class: str, scope: Optional[str]) -> int:
 
 # --- Autonomous Loop State ---
 autonomous_failure_counts: Dict[str, int] = {}  # project_id -> consecutive failures
-last_idle_check: Optional[datetime] = None
+last_idle_check: datetime | None = None
 
 # --- Persistent Anomaly Tracking ---
 # project_id -> { anomaly_key -> {first_seen, last_seen, occurrence_count, severity, latest_details} }
@@ -702,7 +727,7 @@ persistent_anomalies: Dict[str, Dict[str, Dict]] = {}
 # Used by /api/admin/anomaly-tracker/snapshot so operators can detect a silent
 # writer failure (corrupted shared_state, swallowed exception). Ephemeral —
 # not persisted across pod restarts.
-last_anomaly_detection_run_at: Optional[datetime] = None
+last_anomaly_detection_run_at: datetime | None = None
 
 # Key used inside Project.design_doc for anomaly fingerprint persistence.
 _ANOMALY_FINGERPRINTS_KEY = "_anomaly_fingerprints"
@@ -715,8 +740,8 @@ async def hydrate_persistent_anomalies(session) -> int:
     In-memory entries always win over stored ones (no clobber on concurrent startup).
     Returns the total number of anomaly entries loaded across all projects.
     """
-    from app.models import Project  # noqa: PLC0415
-    from sqlmodel import select  # noqa: PLC0415
+    from app.models import Project
+    from sqlmodel import select
 
     loaded = 0
     try:
@@ -731,7 +756,7 @@ async def hydrate_persistent_anomalies(session) -> int:
                 if key not in target:
                     target[key] = entry
             loaded += len(stored)
-    except Exception:
+    except Exception:  # noqa: BLE001
         logger.warning(
             "[ANOMALY_PERSIST] hydrate_persistent_anomalies failed", exc_info=True
         )
@@ -746,9 +771,9 @@ async def persist_anomaly_snapshot(
     Called after each anomaly detection cycle so the state survives the next
     pod restart. Safe to call within an already-open session (caller commits).
     """
-    from app.models import Project  # noqa: PLC0415
-    from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
-    import uuid as _uuid  # noqa: PLC0415
+    from app.models import Project
+    from sqlalchemy.orm.attributes import flag_modified
+    import uuid as _uuid
 
     try:
         pid = _uuid.UUID(project_id)
@@ -780,8 +805,8 @@ async def hydrate_regression_signal_state(session) -> int:
     In-memory entries always win over stored ones (no clobber on concurrent startup).
     Returns the total number of per-class entries loaded across all projects.
     """
-    from app.models import Project  # noqa: PLC0415
-    from sqlmodel import select  # noqa: PLC0415
+    from app.models import Project
+    from sqlmodel import select
 
     loaded = 0
     try:
@@ -796,7 +821,7 @@ async def hydrate_regression_signal_state(session) -> int:
                 if cls not in target:
                     target[cls] = iso_str
                     loaded += 1
-    except Exception:
+    except Exception:  # noqa: BLE001
         logger.warning(
             "[REGRESSION_SIGNAL] hydrate_regression_signal_state failed", exc_info=True
         )
@@ -812,9 +837,9 @@ async def persist_regression_signal_snapshot(
     Called after each spawn or recovery so timestamps survive pod restarts.
     Safe to call within an already-open session (caller commits).
     """
-    from app.models import Project  # noqa: PLC0415
-    from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
-    import uuid as _uuid  # noqa: PLC0415
+    from app.models import Project
+    from sqlalchemy.orm.attributes import flag_modified
+    import uuid as _uuid
 
     try:
         pid = _uuid.UUID(project_id)
@@ -1106,7 +1131,7 @@ def get_pipeline_health_snapshot() -> Dict[str, Any]:
     """Snapshot for /api/health/detailed: rolling counts, last-seen timestamps,
     thresholds, and which alert categories are currently above threshold."""
     counts: Dict[str, int] = {}
-    last_event_ts: Dict[str, Optional[str]] = {}
+    last_event_ts: Dict[str, str | None] = {}
     for et in PIPELINE_EVENT_TYPES:
         counts[et] = count_pipeline_events(et)
         last_event_ts[et] = None
@@ -1181,18 +1206,18 @@ def _post_pipeline_alert(category: str, count: int, threshold: int) -> None:
         },
     )
     try:
-        from app.main import _send_webhook_notification  # noqa: PLC0415
+        from app.main import _send_webhook_notification
 
         # Detached task — webhook is fire-and-forget by design.
         # asyncio.get_running_loop() raises RuntimeError outside an event loop;
         # that's the correct signal to skip dispatch (e.g. sync tests).
         loop = asyncio.get_running_loop()
-        loop.create_task(
+        loop.create_task(  # noqa: RUF006
             _send_webhook_notification("PIPELINE_HEALTH_THRESHOLD", title, message)
         )
     except RuntimeError:
         pass
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.warning(f"[PIPELINE_HEALTH] webhook dispatch skipped: {e}")
 
 
@@ -1596,7 +1621,7 @@ github_cache_hits: Dict[str, int] = {
 # making an active API call that competes for the shared connection pool.
 # Seed with current time so the first health check uses the passive path
 # instead of an active probe that can fail on cold start.
-last_github_success: Optional[datetime] = (
+last_github_success: datetime | None = (
     datetime.utcnow()
 )  # Module-level init, _utcnow not available here
 
@@ -1619,8 +1644,8 @@ def record_dispatcher_cycle(
     signals_evaluated: int,
     signals_tripped: int,
     spawns_emitted: int,
-    rejections_by_reason: Optional[Dict[str, int]] = None,
-    mttd_p50_sec: Optional[float] = None,
+    rejections_by_reason: Dict[str, int] | None = None,
+    mttd_p50_sec: float | None = None,
 ) -> None:
     """Append one dispatcher cycle record to the ring buffer.
 
@@ -1642,7 +1667,7 @@ def record_dispatcher_cycle(
 
 
 def get_dispatcher_cycles(
-    project_id: Optional[str] = None,
+    project_id: str | None = None,
     window_hours: int = 24,
 ) -> list[Dict]:
     """Return dispatcher cycle records within the trailing window.

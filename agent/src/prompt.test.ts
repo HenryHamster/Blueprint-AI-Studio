@@ -3698,7 +3698,10 @@ describe('writeCodeChangeHelpers — self-review fallback', () => {
 
     const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
     const realCp = await vi.importActual<typeof import('node:child_process')>('node:child_process');
-    const tmp = `/tmp/check_smoke_${process.pid}_${Date.now()}.sh`;
+    const realOs = await vi.importActual<typeof import('node:os')>('node:os');
+    // Use the real temp dir (forward-slashed) instead of a hardcoded /tmp so
+    // Node's writeFileSync and bash resolve to the same path on Windows.
+    const tmp = `${realOs.tmpdir().replace(/\\/g, '/')}/check_smoke_${process.pid}_${Date.now()}.sh`;
     realFs.writeFileSync(tmp, checkScript);
     try {
       realCp.execFileSync('bash', ['-n', tmp], { stdio: 'pipe' });
@@ -4315,9 +4318,9 @@ describe('getTaskTypeFocusBlock + CODE_CHANGE_HELPER_GUIDANCE independence', () 
 // create/fix/docs/deps focus blocks were added. If this test fails, bump the
 // version in prompt.ts and reset this assertion to the new value.
 describe('SELF_REVIEW_PROMPT_VERSION — regime version lock', () => {
-  it('is "5" (current pinned version)', async () => {
+  it('is "6" (current pinned version)', async () => {
     const { SELF_REVIEW_PROMPT_VERSION } = await import('./prompt.js');
-    expect(SELF_REVIEW_PROMPT_VERSION).toBe('5');
+    expect(SELF_REVIEW_PROMPT_VERSION).toBe('6');
   });
 
   it('is a non-empty string (used as prompt_version field in self-review JSON)', async () => {

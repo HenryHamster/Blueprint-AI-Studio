@@ -3075,6 +3075,57 @@ async def reaper_service():
                         logger.error(
                             f"[REAPER] Regression scan error: {e}", exc_info=True
                         )
+
+                # Step 9: Finalize release qualifications stuck "pending".
+                # The reaper's own task-kill path (Step 5) can mark a
+                # release_audit / qualifier-smoketest child FAILED directly,
+                # without routing through the task-completion handler that
+                # normally calls maybe_finalize_qualification. A reaper-killed
+                # qualifier child therefore leaves its ReleaseVersion wedged at
+                # last_qualification.status == "pending" forever. This sweep is
+                # the defense-in-depth backstop: it finds every version stuck
+                # pending (children all terminal, OR pending past the
+                # qualification timeout) and finalizes each. Idempotent and
+                # safe every cycle.
+                #
+                # Audit H5: sweep_stuck_qualifications finalizes EACH version in
+                # its OWN dedicated DB session — a real promotion lands a GitHub
+                # merge on `main`, and the per-version session makes that
+                # status="promoted" + N+1 row durable in isolation, so a later
+                # version raising can't roll it back. The `session` passed here
+                # is used only for the read-only scan that lists candidate
+                # versions; the sweep never writes through it. No end-of-step
+                # commit is needed here; the surrounding try/except still
+                # contains any unexpected sweep-level error.
+                #
+                # ``session_factory=AsyncSessionLocal`` is passed explicitly:
+                # the per-version dedicated finalize session must open against
+                # the SAME engine as this scan session. Without it the sweep
+                # falls back to ``release_qualifier``'s module-level
+                # ``app.database.AsyncSessionLocal`` — a different binding from
+                # the reaper's own ``app.reaper.AsyncSessionLocal`` that the
+                # ``reaper_db`` test fixture patches. In production both
+                # resolve to the real DB so it happens to work; under the test
+                # harness the unpatched factory points at the wrong engine and
+                # every finalize is silently swallowed by the sweep's
+                # per-version try/except. Passing the reaper's own factory
+                # keeps scan and finalize on one engine in both environments.
+                try:
+                    from app import release_qualifier
+
+                    _finalized = await release_qualifier.sweep_stuck_qualifications(
+                        session, session_factory=AsyncSessionLocal
+                    )
+                    if _finalized:
+                        logger.info(
+                            f"[REAPER] Finalized {_finalized} stuck release "
+                            f"qualification(s)"
+                        )
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Stuck qualification sweep error: {e}",
+                        exc_info=True,
+                    )
             consecutive_errors = 0
             # Liveness telemetry: only bump on the success path. If the
             # cycle body raised above, neither this counter nor the

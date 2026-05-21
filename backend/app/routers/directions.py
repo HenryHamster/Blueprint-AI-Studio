@@ -578,9 +578,9 @@ async def create_direction_research_task(
     if not direction:
         raise HTTPException(status_code=404, detail="Direction not found")
 
-    if not bypass_cooldown:
-        from app.shared_state import runtime_config as _runtime_config
+    from app.shared_state import runtime_config as _runtime_config
 
+    if not bypass_cooldown:
         cooldown_minutes = _runtime_config.get(
             "autonomous_direction_cooldown_minutes", 240
         )
@@ -606,7 +606,7 @@ async def create_direction_research_task(
         {
             "type": "research",
             "directions": [direction],
-            "base_branch": "main",
+            "base_branch": _runtime_config.get("integration_branch", "main"),
         },
         "directions:research",
     )
@@ -781,7 +781,7 @@ async def trigger_strategic_cycle(
                 "project_name": project.name,
                 "vision": project.vision or {},
                 "open_messages": open_msgs,
-                "base_branch": "main",
+                "base_branch": _runtime_config.get("integration_branch", "main"),
                 **({"model": doc_model} if doc_model else {}),
                 **({"effort": doc_effort} if doc_effort else {}),
             },
@@ -876,7 +876,7 @@ async def trigger_strategic_cycle(
                 "project_name": project.name,
                 "open_messages": open_msgs,
                 "conversation_thread": conversation_thread,
-                "base_branch": "main",
+                "base_branch": _runtime_config.get("integration_branch", "main"),
                 **({"model": review_model} if review_model else {}),
                 **({"effort": review_effort} if review_effort else {}),
             },

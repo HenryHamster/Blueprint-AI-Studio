@@ -3899,3 +3899,131 @@ async def test_close_loop_failure_no_status_message_leaves_summary_none(tl_db):
 
     assert case.last_failure_summary is None
     assert case.fast_track_next_spawn is True
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# _spawn_ci_auto_remediation_followup — integration_branch routing (R4-C2)
+#
+# The follow-up investigation is an autonomous Task (created_by=ORCHESTRATOR,
+# parent_task_id=None). Its spawn-time base_branch default MUST route through
+# runtime_config["integration_branch"] so that after the automain Phase-1
+# cutover the follow-up branches from automain, not the frozen LTS main.
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+async def _make_ci_remediation_task(session, project_id) -> Task:
+    """A failed CI auto-remediation task carrying the ci_failure_* context that
+    _spawn_ci_auto_remediation_followup reads. Built directly (not via
+    _make_task) so the ci_failure_* keys stay in `context`."""
+    task = Task(
+        project_id=project_id,
+        payloads=[{"type": "fix", "prompt": "auto-fix the failing CI check"}],
+        status=TaskStatus.FAILED,
+        created_by="ORCHESTRATOR",
+        parent_task_id=None,
+        context={
+            "spawned_by": "ci_auto_remediation",
+            "ci_failure_branch": "feature/some-pr-branch",
+            "ci_failure_type": "test_failure",
+            "ci_failure_checks": ["backend-tests"],
+        },
+        latest_status_message="auto-fix attempt failed",
+    )
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+    return task
+
+
+@pytest.mark.asyncio
+async def test_ci_auto_remediation_followup_uses_integration_branch(tl_db):
+    """When integration_branch is flipped to 'automain', the spawned follow-up
+    investigation must set base_branch='automain' (not the hardcoded 'main')."""
+    import app.shared_state as _shared_state
+    from app.task_lifecycle import _spawn_ci_auto_remediation_followup
+
+    session, _ = tl_db
+    project = await _make_project(session)
+    task = await _make_ci_remediation_task(session, project.id)
+
+    original = _shared_state.runtime_config.get("integration_branch")
+    _shared_state.runtime_config["integration_branch"] = "automain"
+    try:
+        spawned = await _spawn_ci_auto_remediation_followup(task, session)
+        await session.commit()
+    finally:
+        if original is None:
+            _shared_state.runtime_config.pop("integration_branch", None)
+        else:
+            _shared_state.runtime_config["integration_branch"] = original
+
+    assert spawned is True
+    result = await session.execute(
+        select(Task).where(
+            Task.project_id == project.id, Task.id != task.id
+        )
+    )
+    followup = result.scalars().one()
+    assert followup.created_by == "ORCHESTRATOR"
+    assert followup.parent_task_id is None
+    assert followup.first_payload.get("type") == "investigate"
+    assert followup.first_payload.get("base_branch") == "automain", (
+        "CI auto-remediation follow-up bypassed the integration_branch knob"
+    )
+
+
+@pytest.mark.asyncio
+async def test_ci_auto_remediation_followup_defaults_to_main(tl_db):
+    """With integration_branch at its default 'main', the follow-up branches
+    from 'main' — preserving pre-cutover behavior."""
+    import app.shared_state as _shared_state
+    from app.task_lifecycle import _spawn_ci_auto_remediation_followup
+
+    session, _ = tl_db
+    project = await _make_project(session)
+    task = await _make_ci_remediation_task(session, project.id)
+
+    original = _shared_state.runtime_config.get("integration_branch")
+    _shared_state.runtime_config["integration_branch"] = "main"
+    try:
+        spawned = await _spawn_ci_auto_remediation_followup(task, session)
+        await session.commit()
+    finally:
+        if original is None:
+            _shared_state.runtime_config.pop("integration_branch", None)
+        else:
+            _shared_state.runtime_config["integration_branch"] = original
+
+    assert spawned is True
+    result = await session.execute(
+        select(Task).where(
+            Task.project_id == project.id, Task.id != task.id
+        )
+    )
+    followup = result.scalars().one()
+    assert followup.first_payload.get("base_branch") == "main"
+
+
+def test_no_hardcoded_main_base_branch_in_task_lifecycle():
+    """Static guard: spawn payloads in task_lifecycle.py must never hardcode
+    {"base_branch": "main"} — they must route through
+    runtime_config.get("integration_branch", "main") so the automain cutover
+    takes effect. Inheritance reads `.get("base_branch", "main")` (a "(" or
+    "," precedes the key) are a different, correct pattern and are allowed.
+    """
+    import re
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[1] / "app" / "task_lifecycle.py"
+    hardcoded = re.compile(r'(?<![(,]\s)"base_branch":\s*"main"')
+    offenders = [
+        f"task_lifecycle.py:{lineno}: {line.strip()}"
+        for lineno, line in enumerate(
+            path.read_text(encoding="utf-8").splitlines(), start=1
+        )
+        if hardcoded.search(line)
+    ]
+    assert not offenders, (
+        "task_lifecycle.py spawn payloads hardcode base_branch='main' "
+        "instead of routing through integration_branch:\n" + "\n".join(offenders)
+    )

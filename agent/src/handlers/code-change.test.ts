@@ -43,9 +43,14 @@ describe('augmentSelfReview', () => {
     vi.mocked(git).mockReturnValue('');
   });
 
-  it('returns null when selfReview is null', () => {
+  it('synthesizes a stamped fallback when selfReview is null', () => {
+    // augmentSelfReview never returns null — for a null/skipped self-review it
+    // synthesizes an envelope and stamps prompt_version so catch-rate trends
+    // can still bucket by prompt regime.
     const result = augmentSelfReview(null, 'task-123', 'base-commit');
-    expect(result).toBeNull();
+    expect(result).not.toBeNull();
+    expect(result.verdict).toBe('unknown');
+    expect(result.prompt_version).toBeDefined();
   });
 
   it('returns selfReview unchanged when test baseline exists', () => {

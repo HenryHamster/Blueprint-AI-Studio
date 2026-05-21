@@ -1,0 +1,452 @@
+"""Tests for the hotfix back-merge (automain LTS Phase 5).
+
+After a hotfix merges to ``main``, ``main`` and ``automain`` diverge.
+``hotfix_backmerge.open_backmerge_pr`` opens + merges a ``main -> automain``
+back-merge PR to close that gap.  It is the exact inverse of
+``release_qualifier.promote()``.
+
+Covers:
+  * success — the back-merge PR is opened and merged.
+  * empty_diff — ``main == automain`` is a no-op (no merge attempted).
+  * conflict (409) — an ``Alert`` is raised AND a high-priority ``plan`` task
+    is spawned to resolve the conflict; the plan targets ``automain`` and does
+    NOT carry ``hotfix:true``; a second resolution plan is NOT spawned when one
+    is already open for the same hotfix.
+  * 405 / error — a non-merge or an exception raises an ``Alert`` (a failed
+    back-merge must never pass silently) and spawns no fix task.
+"""
+
+from __future__ import annotations
+
+import uuid
+from unittest.mock import AsyncMock
+
+import pytest
+from sqlmodel import select
+
+from app import hotfix_backmerge as hb
+from app.models import (
+    Alert,
+    AlertSeverity,
+    Project,
+    Task,
+    TaskHistory,
+    TaskStatus,
+)
+
+pytestmark = pytest.mark.asyncio
+
+
+# ===========================================================================
+# Fixtures / helpers
+# ===========================================================================
+
+
+async def _make_project(db_session) -> Project:
+    """Create a project with an authorized GitHub repo."""
+    project = Project(
+        name="Backmerge-Test",
+        user_id="bm-user",
+        github_owner="acme",
+        github_repo="widget",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    return project
+
+
+async def _alerts_for(db_session, project_id) -> list[Alert]:
+    return (
+        (await db_session.execute(select(Alert).where(Alert.project_id == project_id)))
+        .scalars()
+        .all()
+    )
+
+
+async def _tasks_for(db_session, project_id) -> list[Task]:
+    return (
+        (await db_session.execute(select(Task).where(Task.project_id == project_id)))
+        .scalars()
+        .all()
+    )
+
+
+def _patch_github(
+    mocker,
+    *,
+    create_return=None,
+    create_side_effect=None,
+    merge_return=None,
+    merge_side_effect=None,
+):
+    """Patch the three GitHub helpers open_backmerge_pr touches.
+
+    Returns ``(create_mock, merge_mock)`` so call assertions can be made.
+    """
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    create_kwargs: dict = {}
+    if create_side_effect is not None:
+        create_kwargs["side_effect"] = create_side_effect
+    else:
+        create_kwargs["return_value"] = create_return
+    create_mock = mocker.patch(
+        "app.github.create_pull_request", new=AsyncMock(**create_kwargs)
+    )
+    merge_kwargs: dict = {}
+    if merge_side_effect is not None:
+        merge_kwargs["side_effect"] = merge_side_effect
+    else:
+        merge_kwargs["return_value"] = merge_return
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request", new=AsyncMock(**merge_kwargs)
+    )
+    return create_mock, merge_mock
+
+
+# ===========================================================================
+# Success — PR opened + merged
+# ===========================================================================
+
+
+async def test_open_backmerge_pr_success(db_session, mocker):
+    """The happy path: open the main -> automain PR and merge it."""
+    project = await _make_project(db_session)
+    create_mock, merge_mock = _patch_github(
+        mocker,
+        create_return={"number": 12, "html_url": "http://pr/12"},
+        merge_return={"merged": True, "message": "Merged"},
+    )
+
+    result = await hb.open_backmerge_pr(
+        db_session,
+        project.id,
+        merged_pr_url="http://pr/hotfix-7",
+        hotfix_task_id=uuid.uuid4(),
+    )
+    await db_session.commit()
+
+    assert result["status"] == "merged"
+    assert result["pr_url"] == "http://pr/12"
+
+    # PR opened main -> automain (the inverse of promote's automain -> main).
+    assert create_mock.call_args.kwargs["head"] == "main"
+    assert create_mock.call_args.kwargs["base"] == "automain"
+    assert (
+        create_mock.call_args.kwargs["title"]
+        == "Back-merge: main -> automain after hotfix"
+    )
+
+    # Merge uses merge_method="merge" to preserve the hotfix history.
+    assert merge_mock.call_args.kwargs["merge_method"] == "merge"
+    assert merge_mock.call_args.args[3] == 12  # pr_number
+
+    # A clean back-merge raises no Alert and spawns no task.
+    assert await _alerts_for(db_session, project.id) == []
+    assert await _tasks_for(db_session, project.id) == []
+
+
+async def test_open_backmerge_pr_success_no_hotfix_metadata(db_session, mocker):
+    """The optional merged_pr_url / hotfix_task_id may be omitted entirely."""
+    project = await _make_project(db_session)
+    _patch_github(
+        mocker,
+        create_return={"number": 3, "html_url": "http://pr/3"},
+        merge_return={"merged": True},
+    )
+
+    result = await hb.open_backmerge_pr(db_session, project.id)
+    await db_session.commit()
+
+    assert result["status"] == "merged"
+    assert result["pr_url"] == "http://pr/3"
+
+
+# ===========================================================================
+# empty_diff — main == automain -> noop
+# ===========================================================================
+
+
+async def test_open_backmerge_pr_empty_diff_is_noop(db_session, mocker):
+    """When main == automain there is nothing to back-merge: create_pull_request
+    returns {empty_diff: True}; no merge is attempted and no Alert is raised."""
+    project = await _make_project(db_session)
+    _create_mock, merge_mock = _patch_github(
+        mocker,
+        create_return={"empty_diff": True, "merged": True, "html_url": ""},
+        merge_return={"merged": True},
+    )
+
+    result = await hb.open_backmerge_pr(db_session, project.id)
+    await db_session.commit()
+
+    assert result["status"] == "noop_empty_diff"
+    # No merge attempted on an empty diff.
+    merge_mock.assert_not_called()
+    # No Alert, no task.
+    assert await _alerts_for(db_session, project.id) == []
+    assert await _tasks_for(db_session, project.id) == []
+
+
+# ===========================================================================
+# conflict (409) — Alert + plan task spawned
+# ===========================================================================
+
+
+async def test_open_backmerge_pr_conflict_raises_alert_and_spawns_plan(
+    db_session, mocker
+):
+    """A 409 conflict raises an ERROR Alert AND spawns a high-priority plan
+    task targeting automain. The plan must NOT carry hotfix:true."""
+    project = await _make_project(db_session)
+    hotfix_id = uuid.uuid4()
+    _patch_github(
+        mocker,
+        create_return={"number": 55, "html_url": "http://pr/55"},
+        merge_return={
+            "merged": False,
+            "conflict": True,
+            "message": "merge conflict",
+        },
+    )
+
+    result = await hb.open_backmerge_pr(
+        db_session,
+        project.id,
+        merged_pr_url="http://pr/hotfix-9",
+        hotfix_task_id=hotfix_id,
+    )
+    await db_session.commit()
+
+    assert result["status"] == "conflict"
+    assert result["pr_url"] == "http://pr/55"
+
+    # An ERROR Alert was raised with the conflict title.
+    alerts = await _alerts_for(db_session, project.id)
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.ERROR
+    assert alerts[0].title == "Hotfix back-merge conflict: main -> automain"
+
+    # Exactly one plan task was spawned.
+    tasks = await _tasks_for(db_session, project.id)
+    assert len(tasks) == 1
+    plan = tasks[0]
+    payload = plan.first_payload
+    assert payload["type"] == "plan"
+    # The resolution plan targets automain — it is a normal automain fix.
+    assert payload["base_branch"] == "automain"
+    # It must NOT be marked as a hotfix.
+    assert "hotfix" not in payload
+    # The prompt instructs a git merge origin/main conflict resolution.
+    assert "git merge origin/main" in payload["prompt"]
+    # High priority (>= 90), so it is dispatched expedited.
+    assert plan.priority >= 90
+    assert plan.status == TaskStatus.QUEUED
+    # Context carries the dedup markers.
+    assert plan.context["backmerge_conflict"] is True
+    assert plan.context["hotfix_task_id"] == str(hotfix_id)
+    assert plan.context["backmerge_pr_number"] == 55
+
+    # A SPAWNED history row was written for the plan task.
+    history = (
+        (
+            await db_session.execute(
+                select(TaskHistory).where(TaskHistory.task_id == plan.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert any(h.action == "SPAWNED" for h in history)
+
+
+async def test_open_backmerge_pr_conflict_no_duplicate_plan(db_session, mocker):
+    """A second back-merge attempt for the SAME hotfix must raise another Alert
+    but must NOT spawn a second resolution plan (dedupe guard)."""
+    project = await _make_project(db_session)
+    hotfix_id = uuid.uuid4()
+    _patch_github(
+        mocker,
+        create_return={"number": 70, "html_url": "http://pr/70"},
+        merge_return={
+            "merged": False,
+            "conflict": True,
+            "message": "still conflicting",
+        },
+    )
+
+    # First attempt — spawns the resolution plan.
+    r1 = await hb.open_backmerge_pr(
+        db_session, project.id, hotfix_task_id=hotfix_id
+    )
+    await db_session.commit()
+    assert r1["status"] == "conflict"
+
+    # Second attempt for the same hotfix — the resolution plan is still open.
+    r2 = await hb.open_backmerge_pr(
+        db_session, project.id, hotfix_task_id=hotfix_id
+    )
+    await db_session.commit()
+    assert r2["status"] == "conflict"
+
+    # Still exactly ONE plan task — no duplicate spawned.
+    tasks = await _tasks_for(db_session, project.id)
+    assert len(tasks) == 1
+
+    # But both attempts raised an Alert (the operator sees the recurrence).
+    alerts = await _alerts_for(db_session, project.id)
+    assert len(alerts) == 2
+
+
+async def test_open_backmerge_pr_conflict_respawns_after_plan_terminal(
+    db_session, mocker
+):
+    """If the prior resolution plan has terminated (e.g. CANCELLED), a fresh
+    conflict for the same hotfix DOES spawn a new resolution plan — a terminal
+    task no longer counts as 'open'."""
+    project = await _make_project(db_session)
+    hotfix_id = uuid.uuid4()
+    _patch_github(
+        mocker,
+        create_return={"number": 80, "html_url": "http://pr/80"},
+        merge_return={"merged": False, "conflict": True, "message": "conflict"},
+    )
+
+    r1 = await hb.open_backmerge_pr(
+        db_session, project.id, hotfix_task_id=hotfix_id
+    )
+    await db_session.commit()
+    assert r1["status"] == "conflict"
+
+    # Mark the spawned plan terminal (as if it was cancelled / failed).
+    tasks = await _tasks_for(db_session, project.id)
+    assert len(tasks) == 1
+    tasks[0].status = TaskStatus.CANCELLED
+    db_session.add(tasks[0])
+    await db_session.commit()
+
+    # A fresh conflict for the same hotfix now spawns a NEW plan.
+    r2 = await hb.open_backmerge_pr(
+        db_session, project.id, hotfix_task_id=hotfix_id
+    )
+    await db_session.commit()
+    assert r2["status"] == "conflict"
+
+    tasks = await _tasks_for(db_session, project.id)
+    assert len(tasks) == 2
+
+
+# ===========================================================================
+# 405 / error — Alert raised, no fix task
+# ===========================================================================
+
+
+async def test_open_backmerge_pr_405_non_merge_raises_alert(db_session, mocker):
+    """A 405 non-merge (branch protection / checks) raises an ERROR Alert and
+    spawns NO fix task — a 405 is an operator-resolved CI problem, not a code
+    conflict."""
+    project = await _make_project(db_session)
+    _patch_github(
+        mocker,
+        create_return={"number": 41, "html_url": "http://pr/41"},
+        merge_return={
+            "merged": False,
+            "conflict": False,
+            "message": "required status check pending",
+        },
+    )
+
+    result = await hb.open_backmerge_pr(db_session, project.id)
+    await db_session.commit()
+
+    assert result["status"] == "blocked"
+    assert result["error"] == "merge_blocked"
+
+    # An ERROR Alert was raised (a failed back-merge is never silent).
+    alerts = await _alerts_for(db_session, project.id)
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.ERROR
+    assert alerts[0].title == "Hotfix back-merge failed: main -> automain"
+
+    # No fix task spawned for a 405.
+    assert await _tasks_for(db_session, project.id) == []
+
+
+async def test_open_backmerge_pr_merge_exception_raises_alert(db_session, mocker):
+    """An exception from merge_pull_request (e.g. a GitHub 5xx) is treated as a
+    blocked back-merge: an ERROR Alert is raised and no task is spawned."""
+    from fastapi import HTTPException
+
+    project = await _make_project(db_session)
+    _patch_github(
+        mocker,
+        create_return={"number": 60, "html_url": "http://pr/60"},
+        merge_side_effect=HTTPException(status_code=500, detail="GitHub 500"),
+    )
+
+    result = await hb.open_backmerge_pr(db_session, project.id)
+    await db_session.commit()
+
+    assert result["status"] == "blocked"
+    assert result["error"] == "merge_error"
+
+    alerts = await _alerts_for(db_session, project.id)
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.ERROR
+    assert await _tasks_for(db_session, project.id) == []
+
+
+async def test_open_backmerge_pr_pr_creation_failure_raises_alert(
+    db_session, mocker
+):
+    """An exception from create_pull_request raises an ERROR Alert and returns
+    blocked — the back-merge could not even be opened."""
+    from fastapi import HTTPException
+
+    project = await _make_project(db_session)
+    _patch_github(
+        mocker,
+        create_side_effect=HTTPException(status_code=422, detail="bad ref"),
+        merge_return={"merged": True},
+    )
+
+    result = await hb.open_backmerge_pr(db_session, project.id)
+    await db_session.commit()
+
+    assert result["status"] == "blocked"
+    assert result["error"] == "pr_creation_failed"
+
+    alerts = await _alerts_for(db_session, project.id)
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.ERROR
+    assert await _tasks_for(db_session, project.id) == []
+
+
+async def test_open_backmerge_pr_no_credentials_raises_alert(db_session, mocker):
+    """With no resolvable GitHub token the back-merge is blocked and an ERROR
+    Alert is raised — a missed back-merge must never pass silently."""
+    # Project with no github_owner/repo -> _resolve_github_with_session fails.
+    project = Project(name="Backmerge-NoCreds", user_id="bm-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    result = await hb.open_backmerge_pr(db_session, project.id)
+    await db_session.commit()
+
+    assert result["status"] == "blocked"
+    assert result["error"] == "no_credentials"
+
+    alerts = await _alerts_for(db_session, project.id)
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.ERROR
+
+
+async def test_open_backmerge_pr_missing_project_is_blocked(db_session):
+    """An unknown project id returns blocked without raising."""
+    result = await hb.open_backmerge_pr(db_session, uuid.uuid4())
+    assert result["status"] == "blocked"
+    assert result["error"] == "project_not_found"

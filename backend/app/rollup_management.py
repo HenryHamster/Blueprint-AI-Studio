@@ -40,6 +40,31 @@ from app.shared_state import runtime_config as _runtime_config
 logger = logging.getLogger(__name__)
 
 
+# Circuit-breaker: cap how many times the stale-PR rollup recovery in
+# ``_check_and_trigger_rollup`` respawns a review for one unmerged child.
+# Without a cap, a review that keeps failing fast — e.g. pre-empted at dispatch
+# — is respawned every rollup cycle unbounded (2026-05-09 incident: 795
+# SCOPE_EMPTY review tasks in 9.5h). Past the cap the rollup escalates the
+# parent to manual approval instead of looping.
+MAX_REVIEW_RESPAWNS = 5
+
+
+def _review_respawn_count(task: Task) -> int:
+    """Times the stale-PR rollup recovery has respawned a review for *task*.
+
+    Stored in ``context._review_respawn_count``; capped by ``MAX_REVIEW_RESPAWNS``.
+    The key is underscore-prefixed so ``_spawn_pipeline_task``'s context
+    propagation (which copies all non-underscore keys onto the spawned review
+    task) drops it — a non-prefixed key would leak a stale count onto every
+    review task spawned for this PR.
+    Tolerates a missing/None context or a non-numeric value (-> 0).
+    """
+    try:
+        return int((task.context or {}).get("_review_respawn_count", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 class _ParentMutatedDuringPRCreation(Exception):
     """Sentinel: parent row was mutated by a peer during create_pull_request.
 
@@ -314,8 +339,11 @@ async def _dispatch_rollup_approval_alert(
             or ""
         )
         scope = parent_ctx.get("scope") or parent_payload.get("scope") or ""
-        _asyncio.ensure_future(
-            dispatch_external_notification(  # noqa: RUF006
+        # Fire-and-forget best-effort external notification; losing the task
+        # on GC is acceptable and the call is already try/except-wrapped, so
+        # RUF006 (store-a-reference) is intentionally suppressed below.
+        _asyncio.ensure_future(  # noqa: RUF006
+            dispatch_external_notification(
                 parent.project_id,
                 "APPROVAL_NEEDED",
                 {
@@ -987,13 +1015,42 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                         f"[ROLLUP] Could not parse PR number from {pr_art.pr_url} for child {str(c.id)[:8]}"
                     )
                     continue
+
+                # Circuit-breaker: once a child's review has been respawned
+                # MAX_REVIEW_RESPAWNS times without the PR merging, stop looping
+                # and escalate to manual approval (mirrors the cap-exhaustion
+                # escalation below). Guards against a review that keeps failing
+                # fast — e.g. dispatch pre-emption — respawning every cycle.
+                respawn_count = _review_respawn_count(c)
+                if respawn_count >= MAX_REVIEW_RESPAWNS:
+                    if not parent.requires_approval:
+                        parent.requires_approval = True
+                        logger.warning(
+                            f"[ROLLUP] Child {str(c.id)[:8]} PR #{pr_number} — review "
+                            f"respawned {respawn_count}x without merging; escalating: "
+                            f"marked parent {parent.id} requires_approval"
+                        )
+                        try:
+                            await _maybe_create_failure_alert(
+                                parent,
+                                session,
+                                f"Rollup blocked: PR #{pr_number} review respawned "
+                                f"{respawn_count}x without merging — manual intervention required",
+                            )
+                        except Exception as _alert_err:
+                            logger.warning(
+                                f"[ROLLUP] Failed to create respawn-cap alert "
+                                f"for parent {parent.id}: {_alert_err}"
+                            )
+                    continue
+
                 c_payload = c.first_payload
                 branch = (c.context or {}).get(
                     "branch"
                 ) or f"blueprint/task-{str(c.id).replace('-', '')[:8]}"
                 base_branch = c_payload.get("base_branch", "main")
                 original_prompt = c_payload.get("prompt", c.description or "")
-                review_task, _ = await _spawn_pipeline_task(
+                review_task, was_spawned = await _spawn_pipeline_task(
                     c,
                     "review",
                     session,
@@ -1005,8 +1062,16 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                 )
                 if review_task and review_task.id != c.id:
                     respawned += 1
+                    if was_spawned:
+                        c.context = {
+                            **(c.context or {}),
+                            "_review_respawn_count": respawn_count + 1,
+                        }
+                        session.add(c)
                     logger.warning(
-                        f"[ROLLUP] Respawned review for stale child {str(c.id)[:8]} PR #{pr_number} → review {str(review_task.id)[:8]}"
+                        f"[ROLLUP] Respawned review for stale child {str(c.id)[:8]} "
+                        f"PR #{pr_number} → review {str(review_task.id)[:8]} "
+                        f"(respawn {_review_respawn_count(c)}/{MAX_REVIEW_RESPAWNS})"
                     )
                 elif review_task is None and c.requires_approval:
                     # Cap exhaustion: _spawn_pipeline_task sets requires_approval=True on

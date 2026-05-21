@@ -681,7 +681,17 @@ def cmd_failures(args):
         if a == "--limit" and i + 1 < len(args):
             limit = int(args[i + 1])
 
-    tasks = list_tasks(status="FAILED", limit=limit)
+    # The admin API caps each page at 500 rows; paginate to honour --limit.
+    tasks = []
+    offset = 0
+    while len(tasks) < limit:
+        batch = list_tasks(status="FAILED", limit=min(500, limit - len(tasks)), offset=offset)
+        if not batch:
+            break
+        tasks.extend(batch)
+        offset += len(batch)
+        if len(batch) < 500:
+            break
     if not tasks:
         print("No failed tasks.")
         return
@@ -710,6 +720,8 @@ def cmd_failures(args):
             cause = "ROLLUP_PR_FAILED"
         elif "review not spawned (iteration cap)" in msg:
             cause = "ITERATION_CAP"
+        elif "SCOPE_EMPTY" in msg or "SCOPE_EMPTY" in error:
+            cause = "SCOPE_EMPTY"
         elif "subtask(s) failed" in msg:
             cause = "SUBTASK_FAILURES"
         elif "Evaluation timeout" in msg or "did not complete within" in msg:

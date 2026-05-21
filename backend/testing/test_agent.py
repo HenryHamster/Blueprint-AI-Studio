@@ -5553,36 +5553,42 @@ async def test_playbook_admin_list_stale_flag(client: AsyncClient, db_session):
     """
     from app.models import ProjectMember
 
+    _now = datetime.utcnow()
+    _yesterday = (_now - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S")
+    _two_days_ago = (_now - timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%S")
+    _sixty_days_ago = (_now - timedelta(days=60)).strftime("%Y-%m-%dT%H:%M:%S")
+    _forty_five_days_ago = (_now - timedelta(days=45)).strftime("%Y-%m-%dT%H:%M:%S")
+
     project = Project(name="Playbook Stale Test", user_id="test-user-123")
     project.design_doc = {
         "playbook/fresh-entry": {
             "content": "fresh content",
-            "updated_at": "2026-04-10T00:00:00",
+            "updated_at": _two_days_ago,
             "confirmed_count": 3,
             "reference_count": 5,
-            "last_referenced_at": "2026-04-13T00:00:00",  # 1 day ago — not stale
-            "last_confirmed_at": "2026-04-12T00:00:00",
+            "last_referenced_at": _yesterday,  # 1 day ago — not stale
+            "last_confirmed_at": _two_days_ago,
             "effectiveness_score": 0.6,
         },
         "playbook/stale-entry": {
             "content": "old content",
-            "updated_at": "2025-12-01T00:00:00",  # >30 days ago, never referenced
+            "updated_at": _sixty_days_ago,  # >30 days ago, never referenced
             "confirmed_count": 0,
             "reference_count": 0,
         },
         "playbook/stale-ref-entry": {
             "content": "referenced long ago",
-            "updated_at": "2025-12-01T00:00:00",
+            "updated_at": _sixty_days_ago,
             "confirmed_count": 0,
             "reference_count": 3,
-            "last_referenced_at": "2025-12-15T00:00:00",  # >30 days ago
+            "last_referenced_at": _forty_five_days_ago,  # >30 days ago
         },
         "playbook/auto-archived-entry": {
             "content": "persistently ineffective",
-            "updated_at": "2026-04-01T00:00:00",
+            "updated_at": _two_days_ago,
             "confirmed_count": 0,
             "reference_count": 10,
-            "last_referenced_at": "2026-04-13T00:00:00",  # recent but stale=True stored
+            "last_referenced_at": _yesterday,  # recent but stale=True stored
             "stale": True,
             "effectiveness_score": 0.0,
         },
@@ -5603,8 +5609,8 @@ async def test_playbook_admin_list_stale_flag(client: AsyncClient, db_session):
 
     fresh = entries["fresh-entry"]
     assert fresh["reference_count"] == 5
-    assert fresh["last_referenced_at"] == "2026-04-13T00:00:00"
-    assert fresh["last_confirmed_at"] == "2026-04-12T00:00:00"
+    assert fresh["last_referenced_at"] == _yesterday
+    assert fresh["last_confirmed_at"] == _two_days_ago
     assert fresh["effectiveness_score"] == 0.6
     assert fresh["stale"] is False
 
@@ -6632,6 +6638,62 @@ async def test_smoketest_curated_failure_spawns_plan_task_priority_70(
     spawned = result.scalars().all()
     assert len(spawned) == 1
     assert spawned[0].priority == 70
+    assert spawned[0].first_payload.get("type") == "plan"
+
+
+@pytest.mark.asyncio
+async def test_smoketest_main_failure_post_cutover_spawns_hotfix(
+    client: AsyncClient, db_session, mocker
+):
+    """Post-cutover (integration_branch=automain), a base_branch=main smoketest
+    failure is a post-promotion production failure: the spawned plan task is a
+    hotfix at priority >= 90 even when only the curated suite failed."""
+    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+    mocker.patch.dict(
+        "app.shared_state.runtime_config", {"integration_branch": "automain"}
+    )
+
+    _, task = await _setup_smoketest_task(db_session, "agent-vm-smoke-hotfix")
+
+    import json as _json
+
+    smoketest_payload = {
+        "passed": False,
+        "tests": [
+            {"name": "login_flow", "status": "fail", "message": "assertion failed"}
+        ],
+        "suites": {
+            "startup": {"passed": True, "tests": []},
+            "curated": {
+                "passed": False,
+                "tests": [{"name": "login_flow", "status": "fail"}],
+            },
+        },
+    }
+    token = create_agent_token(str(task.id), "agent-vm-smoke-hotfix")
+    payload = {
+        "task_id": str(task.id),
+        "status": "FAILED",
+        "artifact_type": "SMOKETEST_RESULT",
+        "logs": _json.dumps(smoketest_payload),
+    }
+    resp = await client.post(
+        "/api/agent/status", json=payload, headers={"x-agent-token": token}
+    )
+    assert resp.status_code == 200
+
+    result = await db_session.execute(
+        select(Task).where(Task.parent_task_id == task.id)
+    )
+    spawned = result.scalars().all()
+    assert len(spawned) == 1
+    # A curated-only failure is normally priority 70; escalated to >= 90 here
+    # because post-cutover a base_branch=main smoketest is a post-promotion
+    # (production) failure, routed as a hotfix.
+    assert spawned[0].priority >= 90
+    assert spawned[0].first_payload.get("hotfix") is True
     assert spawned[0].first_payload.get("type") == "plan"
 
 
@@ -9071,7 +9133,7 @@ async def test_claim_injects_sr_recent_miss_examples_for_create_task(
     assert "security" in miss_ex
     assert "style-conventions" not in miss_ex
     # correctness ranked higher (weighted_miss_rate 0.45 > 0.35) → appears first
-    assert list(miss_ex.keys())[0] == "correctness"
+    assert next(iter(miss_ex.keys())) == "correctness"
     # Examples carry severity and desc fields
     assert miss_ex["correctness"][0]["severity"] == "CRITICAL"
     assert "Off-by-one" in miss_ex["correctness"][0]["desc"]
@@ -9430,7 +9492,7 @@ async def test_claim_sr_recent_miss_examples_prefers_direction_examples(
     assert "architecture" in miss_ex
     assert "correctness" not in miss_ex
     # scope-drift ranked first (miss_rate 0.80 > 0.60)
-    assert list(miss_ex.keys())[0] == "scope-drift"
+    assert next(iter(miss_ex.keys())) == "scope-drift"
     assert "Direction scope-drift example" in miss_ex["scope-drift"][0]["desc"]
 
 
@@ -9637,3 +9699,1022 @@ async def test_heartbeat_omits_api_call_summary_when_fields_absent(
 
     await db_session.refresh(task)
     assert task.api_call_summary is None
+
+
+# ===========================================================================
+# Release-qualifier finalization from EVERY terminal path (automain/LTS)
+#
+# A qualifier child (a release_audit task or a qualifier-smoketest) that goes
+# terminal must trigger maybe_finalize_qualification, regardless of whether it
+# COMPLETED, FAILED or was CANCELLED, and regardless of artifact_type. If the
+# failing/cancelled child is the LAST of the two to terminate and finalization
+# never fires, the ReleaseVersion stays {status:"pending"} forever and the
+# version is wedged.
+#
+# These tests drive _process_post_commit (where the finalize hook now lives,
+# in the terminal section so it runs for COMPLETED/FAILED/CANCELLED alike) and
+# the full /api/agent/status endpoint (for the unflushed-artifact regression).
+# ===========================================================================
+
+
+async def _make_qualifier_project_and_version(db_session):
+    """Create a self-repo project with an authorized GitHub repo + open v1."""
+    from app import release_version as _rv
+
+    project = Project(
+        name="Qualifier-Terminal-Path",
+        user_id="qualifier-user",
+        github_owner="acme",
+        github_repo="widget",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = await _rv.open_version(db_session, project.id, version_number=1)
+    await db_session.commit()
+    await db_session.refresh(version)
+    return project, version
+
+
+async def _seed_qualifier_children(
+    db_session,
+    project,
+    version,
+    *,
+    audit_status: TaskStatus,
+    smoke_status: TaskStatus,
+):
+    """Create the release_audit + qualifier-smoketest children in the requested
+    statuses and stamp version.last_qualification = 'pending' pointing at them,
+    mirroring the real run_qualification spawn shape."""
+    audit_task = Task(
+        project_id=project.id,
+        title="Release audit child",
+        payloads=[{"type": "release_audit", "base_branch": "main"}],
+        vm_instance_id=f"agent-vm-audit-{uuid.uuid4().hex[:8]}",
+        status=audit_status,
+        context={"release_version_id": str(version.id)},
+    )
+    smoke_task = Task(
+        project_id=project.id,
+        title="Qualifier smoketest child",
+        payloads=[{"type": "smoketest", "base_branch": "automain"}],
+        vm_instance_id=f"agent-vm-smoke-{uuid.uuid4().hex[:8]}",
+        status=smoke_status,
+        context={
+            "release_version_id": str(version.id),
+            "qualifier_smoketest": True,
+        },
+    )
+    db_session.add(audit_task)
+    db_session.add(smoke_task)
+    await db_session.commit()
+    await db_session.refresh(audit_task)
+    await db_session.refresh(smoke_task)
+
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": "abcd" * 10,
+        "ci_green": True,
+        "started_at": "2026-05-20T00:00:00",
+        "audit_task_id": str(audit_task.id),
+        "smoketest_task_id": str(smoke_task.id),
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+    return audit_task, smoke_task
+
+
+def _process_post_commit_factory(db_session):
+    from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession as _AS
+
+    return async_sessionmaker(db_session.bind, class_=_AS, expire_on_commit=False)
+
+
+@pytest.mark.asyncio
+async def test_failed_release_audit_last_child_triggers_finalization(
+    db_session, mocker
+):
+    """CRITICAL: a FAILED release_audit that is the LAST qualifier child to go
+    terminal must still finalize the qualification.
+
+    Previously the release_audit finalize hook sat inside the
+    `if payload.status == COMPLETED` block in _process_post_commit, so a FAILED
+    release_audit never reached it — the version stayed {status:"pending"}
+    forever. The hook now lives in the terminal section and fires for FAILED.
+    """
+    from app.task_lifecycle import _process_post_commit
+    from app.schemas import AgentStatusPayload
+    from app.models import ReleaseVersion
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+
+    project, version = await _make_qualifier_project_and_version(db_session)
+    # Smoketest sibling already terminal (COMPLETED); the release_audit is the
+    # second/last child and is going terminally FAILED now.
+    audit_task, _smoke = await _seed_qualifier_children(
+        db_session,
+        project,
+        version,
+        audit_status=TaskStatus.FAILED,
+        smoke_status=TaskStatus.COMPLETED,
+    )
+
+    payload = AgentStatusPayload(task_id=audit_task.id, status=TaskStatus.FAILED)
+    _factory = _process_post_commit_factory(db_session)
+    await _process_post_commit(audit_task.id, payload, _session_factory=_factory)
+
+    async with _factory() as fresh:
+        refetched = await fresh.get(ReleaseVersion, version.id)
+        qual = refetched.last_qualification or {}
+
+    # The version must no longer be wedged at "pending" — finalization ran.
+    assert qual.get("status") != "pending", (
+        f"FAILED release_audit (last child) left version wedged: {qual}"
+    )
+    # A failed/missing-artifact child degrades to a hard blocker → not_promoted.
+    assert qual.get("status") == "not_promoted"
+    assert refetched.phase == "stabilize"
+
+
+@pytest.mark.asyncio
+async def test_failed_qualifier_smoketest_no_artifact_triggers_finalization(
+    db_session, mocker
+):
+    """CRITICAL: a qualifier-smoketest that FAILS without posting a
+    SMOKETEST_RESULT artifact (harness ERROR_LOG, VM crash, reaper kill) must
+    still finalize the qualification when it is the last child.
+
+    The old agent_status.py hook was gated on
+    `artifact_type == SMOKETEST_RESULT`, so an artifact-less smoketest failure
+    never reached it. The relocated hook keys on context, not artifact_type.
+    """
+    from app.task_lifecycle import _process_post_commit
+    from app.schemas import AgentStatusPayload
+    from app.models import ReleaseVersion
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+
+    project, version = await _make_qualifier_project_and_version(db_session)
+    # Audit sibling already terminal; the qualifier-smoketest is the last child
+    # and fails terminally with NO artifact attached to the payload.
+    _audit, smoke_task = await _seed_qualifier_children(
+        db_session,
+        project,
+        version,
+        audit_status=TaskStatus.COMPLETED,
+        smoke_status=TaskStatus.FAILED,
+    )
+
+    # No artifact_type — this is the VM-crash / harness-ERROR_LOG case.
+    payload = AgentStatusPayload(task_id=smoke_task.id, status=TaskStatus.FAILED)
+    _factory = _process_post_commit_factory(db_session)
+    await _process_post_commit(smoke_task.id, payload, _session_factory=_factory)
+
+    async with _factory() as fresh:
+        refetched = await fresh.get(ReleaseVersion, version.id)
+        qual = refetched.last_qualification or {}
+
+    assert qual.get("status") != "pending", (
+        f"artifact-less FAILED qualifier-smoketest left version wedged: {qual}"
+    )
+    assert qual.get("status") == "not_promoted"
+    # A smoketest that produced no usable result is a startup-suite hard blocker.
+    assert qual.get("blocker") == "smoketest_startup_failed"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_release_audit_last_child_triggers_finalization(
+    db_session, mocker
+):
+    """CRITICAL: a CANCELLED release_audit child must also finalize — the hook
+    fires for COMPLETED / FAILED / CANCELLED, not just the first two."""
+    from app.task_lifecycle import _process_post_commit
+    from app.schemas import AgentStatusPayload
+    from app.models import ReleaseVersion
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+
+    project, version = await _make_qualifier_project_and_version(db_session)
+    audit_task, _smoke = await _seed_qualifier_children(
+        db_session,
+        project,
+        version,
+        audit_status=TaskStatus.CANCELLED,
+        smoke_status=TaskStatus.COMPLETED,
+    )
+
+    payload = AgentStatusPayload(task_id=audit_task.id, status=TaskStatus.CANCELLED)
+    _factory = _process_post_commit_factory(db_session)
+    await _process_post_commit(audit_task.id, payload, _session_factory=_factory)
+
+    async with _factory() as fresh:
+        refetched = await fresh.get(ReleaseVersion, version.id)
+        qual = refetched.last_qualification or {}
+
+    assert qual.get("status") != "pending", (
+        f"CANCELLED release_audit (last child) left version wedged: {qual}"
+    )
+    assert qual.get("status") == "not_promoted"
+
+
+@pytest.mark.asyncio
+async def test_failed_qualifier_child_does_not_finalize_while_sibling_runs(
+    db_session, mocker
+):
+    """A FAILED qualifier child must NOT finalize while its sibling is still
+    running — finalization waits for BOTH children to be terminal."""
+    from app.task_lifecycle import _process_post_commit
+    from app.schemas import AgentStatusPayload
+    from app.models import ReleaseVersion
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+
+    project, version = await _make_qualifier_project_and_version(db_session)
+    # Smoketest sibling still IN_PROGRESS — finalization must defer.
+    audit_task, _smoke = await _seed_qualifier_children(
+        db_session,
+        project,
+        version,
+        audit_status=TaskStatus.FAILED,
+        smoke_status=TaskStatus.IN_PROGRESS,
+    )
+
+    payload = AgentStatusPayload(task_id=audit_task.id, status=TaskStatus.FAILED)
+    _factory = _process_post_commit_factory(db_session)
+    await _process_post_commit(audit_task.id, payload, _session_factory=_factory)
+
+    async with _factory() as fresh:
+        refetched = await fresh.get(ReleaseVersion, version.id)
+        qual = refetched.last_qualification or {}
+
+    # Sibling still running — qualification stays pending (not yet finalized).
+    assert qual.get("status") == "pending"
+
+
+@pytest.mark.asyncio
+async def test_qualifier_smoketest_finalize_sees_own_artifact_via_endpoint(
+    client: AsyncClient, db_session, mocker
+):
+    """CRITICAL (unflushed-artifact regression): when a qualifier-smoketest is
+    the SECOND child to finish, finalization must see the SMOKETEST_RESULT
+    artifact posted in the SAME /api/agent/status request.
+
+    The status handler disables autoflush and only session.add(...)s the
+    artifact. The old in-handler finalize ran before the early commit, so its
+    SELECT could not see the pending artifact → _score_smoketest(None) → hard
+    blocker → a PASSING candidate wrongly recorded not_promoted. Finalization
+    now runs in _process_post_commit AFTER the early commit, so the artifact
+    and the task's terminal status are committed and visible.
+
+    Here the smoketest PASSES every test; with promotion shipping dark the
+    correct outcome is a dry-run with a non-zero smoketest sub-score — proving
+    the artifact was read, not seen as None.
+    """
+    import json as _json
+    from app import release_version as _rv
+    from app.models import ReleaseVersion, Artifact, ArtifactType
+
+    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.main._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch("app.main.fire_and_forget_vm_delete", return_value=None)
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    # promotion_enabled defaults False (dark) — a confident candidate dry-runs.
+
+    project = Project(
+        name="Qualifier-Flush-Regression",
+        user_id="qualifier-user",
+        github_owner="acme",
+        github_repo="widget",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    version = await _rv.open_version(db_session, project.id, version_number=1)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # The release_audit sibling already COMPLETED with a clean audit report
+    # (high audit score, no test erosion) so the only remaining input is the
+    # smoketest about to be posted.
+    audit_task = Task(
+        project_id=project.id,
+        title="Release audit child",
+        payloads=[{"type": "release_audit", "base_branch": "main"}],
+        vm_instance_id="agent-vm-audit-flush",
+        status=TaskStatus.COMPLETED,
+        context={"release_version_id": str(version.id)},
+    )
+    db_session.add(audit_task)
+    await db_session.commit()
+    await db_session.refresh(audit_task)
+    db_session.add(
+        Artifact(
+            task_id=audit_task.id,
+            artifact_type=ArtifactType.RELEASE_AUDIT_REPORT,
+            logs=_json.dumps(
+                {
+                    "audit_score": 1.0,
+                    "test_erosion": {
+                        "deleted_test_files": [],
+                        "test_count_delta": 0,
+                        "assertion_delta": 0,
+                    },
+                    "findings": [],
+                }
+            ),
+        )
+    )
+    await db_session.commit()
+
+    # The qualifier-smoketest is IN_PROGRESS and about to post its result.
+    smoke_task = Task(
+        project_id=project.id,
+        title="Qualifier smoketest child",
+        payloads=[{"type": "smoketest", "base_branch": "automain"}],
+        vm_instance_id="agent-vm-smoke-flush",
+        status=TaskStatus.IN_PROGRESS,
+        context={
+            "release_version_id": str(version.id),
+            "qualifier_smoketest": True,
+        },
+    )
+    db_session.add(smoke_task)
+    await db_session.commit()
+    await db_session.refresh(smoke_task)
+
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": "abcd" * 10,
+        "ci_green": True,
+        "started_at": "2026-05-20T00:00:00",
+        "audit_task_id": str(audit_task.id),
+        "smoketest_task_id": str(smoke_task.id),
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    # The smoketest passes every test — a healthy candidate.
+    smoketest_result = {
+        "passed": True,
+        "tests": [
+            {"name": "startup_probe", "status": "pass"},
+            {"name": "login_flow", "status": "pass"},
+        ],
+        "suites": {
+            "startup": {"passed": True, "tests": []},
+            "curated": {"passed": True, "tests": []},
+        },
+    }
+    token = create_agent_token(str(smoke_task.id), "agent-vm-smoke-flush")
+    resp = await client.post(
+        "/api/agent/status",
+        json={
+            "task_id": str(smoke_task.id),
+            "status": "COMPLETED",
+            "artifact_type": "SMOKETEST_RESULT",
+            "logs": _json.dumps(smoketest_result),
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+
+    async with _process_post_commit_factory(db_session)() as fresh:
+        refetched = await fresh.get(ReleaseVersion, version.id)
+        qual = refetched.last_qualification or {}
+
+    # Finalization ran and the smoketest artifact was visible: a passing
+    # smoketest yields a non-zero smoketest sub-score (not the 0.0 / hard
+    # blocker the unflushed-artifact bug produced).
+    assert qual.get("status") != "pending", f"version left wedged: {qual}"
+    assert qual.get("blocker") is None, (
+        f"passing candidate wrongly hard-blocked — artifact not visible: {qual}"
+    )
+    assert qual.get("sub_scores", {}).get("smoketest", 0.0) > 0.0
+    # Promotion ships dark (promotion_enabled False) → dry-run, not promoted.
+    assert qual.get("status") == "dry_run"
+
+
+@pytest.mark.asyncio
+async def test_non_qualifier_terminal_task_does_not_finalize(db_session, mocker):
+    """A normal (non-qualifier) task going terminal must NOT touch any
+    ReleaseVersion — the finalize hook is a cheap no-op for the common case."""
+    from app.task_lifecycle import _process_post_commit
+    from app.schemas import AgentStatusPayload
+    from app.models import ReleaseVersion
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+
+    project, version = await _make_qualifier_project_and_version(db_session)
+    # A pending qualification exists, but the task below is unrelated to it.
+    version.last_qualification = {"status": "pending", "candidate_sha": "x" * 40}
+    db_session.add(version)
+    await db_session.commit()
+
+    plain_task = Task(
+        project_id=project.id,
+        title="Ordinary create task",
+        payloads=[{"type": "create", "base_branch": "automain"}],
+        vm_instance_id="agent-vm-plain",
+        status=TaskStatus.FAILED,
+        context={},
+    )
+    db_session.add(plain_task)
+    await db_session.commit()
+    await db_session.refresh(plain_task)
+
+    payload = AgentStatusPayload(task_id=plain_task.id, status=TaskStatus.FAILED)
+    _factory = _process_post_commit_factory(db_session)
+    await _process_post_commit(plain_task.id, payload, _session_factory=_factory)
+
+    async with _factory() as fresh:
+        refetched = await fresh.get(ReleaseVersion, version.id)
+
+    # Untouched — a non-qualifier task must never advance qualification.
+    assert (refetched.last_qualification or {}).get("status") == "pending"
+
+
+# ===========================================================================
+# Phase 5 (automain/LTS): hotfix back-merge + hotfix marker propagation
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_hotfix_backmerge_runs_for_hotfix_merge_to_main(db_session, mocker):
+    """A hotfix that merged to main triggers the main -> automain back-merge:
+    open_backmerge_pr opens the PR and merges it.
+
+    The review-completion handler gates the back-merge on
+    `is_rollup_merge and base_branch == "main" and orig.first_payload["hotfix"]`
+    then calls hotfix_backmerge.open_backmerge_pr. This exercises that Phase 5
+    back-merge unit end-to-end (mocked GitHub)."""
+    from app import hotfix_backmerge
+
+    project = Project(
+        name="Hotfix-Backmerge",
+        user_id="hotfix-user",
+        github_owner="acme",
+        github_repo="widget",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    create_pr = mocker.patch(
+        "app.github.create_pull_request",
+        new=AsyncMock(
+            return_value={
+                "number": 4242,
+                "html_url": "https://github.com/acme/widget/pull/4242",
+            }
+        ),
+    )
+    merge_pr = mocker.patch(
+        "app.github.merge_pull_request",
+        new=AsyncMock(return_value={"merged": True}),
+    )
+    mocker.patch(
+        "app.hotfix_backmerge.broadcast_to_project", new_callable=AsyncMock
+    )
+
+    result = await hotfix_backmerge.open_backmerge_pr(
+        db_session,
+        project.id,
+        merged_pr_url="https://github.com/acme/widget/pull/99",
+        hotfix_task_id=uuid.uuid4(),
+    )
+
+    assert result["status"] == "merged"
+    # The back-merge opens a main -> automain PR (the inverse of promotion).
+    create_pr.assert_awaited_once()
+    _, create_kwargs = create_pr.call_args
+    assert create_kwargs["head"] == "main"
+    assert create_kwargs["base"] == "automain"
+    merge_pr.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_hotfix_backmerge_trigger_commits_conflict_alert_and_task(
+    db_session, mocker
+):
+    """CRITICAL: when the back-merge trigger inside _process_post_commit calls
+    open_backmerge_pr and that call takes its CONFLICT path (session.add + flush
+    of an operator-facing ERROR Alert and a high-priority conflict-resolution
+    Task, deliberately NOT committed — its docstring: "the caller commits the
+    session"), the trigger MUST commit so those rows survive.
+
+    The bug: the back-merge block ran after the merged-PR commit, and nothing
+    between it and the function's terminal `if session.dirty or session.new`
+    commit re-dirtied the session. After open_backmerge_pr's flush() the session
+    is flushed-but-clean, so the terminal commit was SKIPPED and the `async
+    with` exit ROLLED BACK the conflict Alert + resolution Task — a back-merge
+    conflict went completely unsignalled. The fix adds an explicit
+    `await session.commit()` after the open_backmerge_pr call, mirroring the
+    sibling smoketest-spawn block.
+
+    This drives a real hotfix rollup-merge through _process_post_commit (a
+    `review` task APPROVE verdict, original hotfix `plan` task EVALUATING so
+    is_rollup_merge is True, base_branch=="main", hotfix:true) with
+    open_backmerge_pr mocked to take the conflict path, then asserts — via a
+    fresh session — that the Alert + Task were COMMITTED. test_hotfix_backmerge.py
+    only tests open_backmerge_pr in isolation (and always commits itself), so
+    nothing else covers the trigger's own commit in _process_post_commit.
+    """
+    from app.task_lifecycle import _process_post_commit
+    from app.schemas import AgentStatusPayload
+    from app.models import Alert, AlertSeverity
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    # _cleanup_branches runs on the merged hotfix task — stub it (pure GitHub I/O,
+    # tangential to the commit contract under test).
+    mocker.patch("app.task_lifecycle._cleanup_branches", new_callable=AsyncMock)
+
+    project = Project(
+        name="Hotfix-Backmerge-Commit",
+        user_id="hotfix-user",
+        github_owner="acme",
+        github_repo="widget",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # The original hotfix task: a `plan` task with hotfix:true targeting main,
+    # parked EVALUATING (the rollup-merge state — is_rollup_merge is
+    # `orig.status == EVALUATING`).
+    orig_task = Task(
+        project_id=project.id,
+        title="Hotfix plan",
+        payloads=[
+            {
+                "type": "plan",
+                "prompt": "expedite the fix",
+                "hotfix": True,
+                "base_branch": "main",
+            }
+        ],
+        vm_instance_id=None,
+        status=TaskStatus.EVALUATING,
+    )
+    db_session.add(orig_task)
+    await db_session.commit()
+    await db_session.refresh(orig_task)
+
+    # The review task whose COMPLETED status drives the merge. Its review_loop
+    # carries the PR coordinates and points back at the hotfix task.
+    pr_number = 7777
+    branch = "blueprint/rollup-hotfix"
+    review_task = Task(
+        project_id=project.id,
+        title="Review of hotfix rollup PR",
+        payloads=[{"type": "review", "base_branch": "main"}],
+        vm_instance_id="agent-vm-review-hotfix",
+        status=TaskStatus.IN_PROGRESS,
+        context={
+            "review_loop": {
+                "iteration": 1,
+                "pr_number": pr_number,
+                "branch": branch,
+                "base_branch": "main",
+                "original_task_id": str(orig_task.id),
+            }
+        },
+    )
+    db_session.add(review_task)
+    await db_session.commit()
+    await db_session.refresh(review_task)
+
+    # GitHub mocks — patched at their source modules (the handler imports them
+    # locally from app.github / app.routers.agent at call time).
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new=AsyncMock(return_value=("gh-token", "acme", "widget")),
+    )
+    # PR head ref matches `branch` (no branch-mismatch abort); no head sha so the
+    # CI gate short-circuits (ci_status stays None) and the merge proceeds.
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={"state": "open", "merged": False, "head": {"ref": branch}}
+        ),
+    )
+    merge_pr = mocker.patch(
+        "app.github.merge_pull_request",
+        new=AsyncMock(return_value={"merged": True}),
+    )
+    mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
+    mocker.patch("app.github.get_pr_files", new=AsyncMock(return_value=[]))
+
+    # open_backmerge_pr mocked to REPLICATE its real conflict path: session.add
+    # an ERROR Alert + a high-priority conflict-resolution Task, then flush() —
+    # and deliberately do NOT commit (its contract: the caller commits).
+    conflict_alert_title = "Hotfix back-merge conflict: main -> automain"
+    resolution_task_title = "Resolve hotfix back-merge conflict (mock)"
+
+    async def _fake_open_backmerge_pr(session, project_id, **kwargs):
+        session.add(
+            Alert(
+                project_id=project_id,
+                severity=AlertSeverity.ERROR,
+                title=conflict_alert_title,
+                message="back-merge hit a merge conflict (test)",
+            )
+        )
+        session.add(
+            Task(
+                project_id=project_id,
+                title=resolution_task_title,
+                payloads=[{"type": "plan", "base_branch": "automain"}],
+                priority=95,
+                vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+                status=TaskStatus.QUEUED,
+                created_by="ORCHESTRATOR",
+                context={"backmerge_conflict": True},
+            )
+        )
+        # Flushed-but-NOT-committed — exactly what the real conflict path does.
+        await session.flush()
+        return {"status": "conflict"}
+
+    mocker.patch(
+        "app.hotfix_backmerge.open_backmerge_pr",
+        new=AsyncMock(side_effect=_fake_open_backmerge_pr),
+    )
+
+    payload = AgentStatusPayload(
+        task_id=review_task.id,
+        status=TaskStatus.COMPLETED,
+        verdict_json='{"verdict": "APPROVE", "feedback": "ok", "issues": []}',
+    )
+    _factory = _process_post_commit_factory(db_session)
+    await _process_post_commit(review_task.id, payload, _session_factory=_factory)
+
+    # The hotfix rollup PR must actually have merged (proves the path reached the
+    # post-merge block where the back-merge trigger lives).
+    merge_pr.assert_awaited()
+
+    # The crux: the conflict Alert + resolution Task must be COMMITTED and
+    # visible from a fresh session. Without the trigger's explicit commit the
+    # `async with` exit rolls them back and a back-merge conflict is silent.
+    async with _factory() as fresh:
+        alert = (
+            (
+                await fresh.execute(
+                    select(Alert).where(
+                        Alert.project_id == project.id,
+                        Alert.title == conflict_alert_title,
+                    )
+                )
+            )
+            .scalars()
+            .first()
+        )
+        resolution_task = (
+            (
+                await fresh.execute(
+                    select(Task).where(
+                        Task.project_id == project.id,
+                        Task.title == resolution_task_title,
+                    )
+                )
+            )
+            .scalars()
+            .first()
+        )
+
+    assert alert is not None, (
+        "back-merge conflict Alert was rolled back — the trigger never "
+        "committed open_backmerge_pr's flushed-but-uncommitted rows"
+    )
+    assert alert.severity == AlertSeverity.ERROR
+    assert resolution_task is not None, (
+        "back-merge conflict-resolution Task was rolled back — the trigger "
+        "never committed open_backmerge_pr's flushed-but-uncommitted rows"
+    )
+    assert resolution_task.status == TaskStatus.QUEUED
+
+
+@pytest.mark.asyncio
+async def test_hotfix_backmerge_gate_distinguishes_hotfix_rollup_and_promotion():
+    """The back-merge gate fires ONLY for a hotfix rollup merging to main.
+
+    Gate (task_lifecycle.py review-completion handler):
+        is_rollup_merge and base_branch == "main"
+        and bool(orig.first_payload.get("hotfix"))
+
+    A normal rollup to main (hotfix=False) and a promotion (which is opened by
+    the qualifier's promote(), not a rollup-merge review, so is_rollup_merge is
+    False) must BOTH leave the back-merge un-triggered."""
+
+    def _backmerge_should_fire(is_rollup_merge, base_branch, orig_payload):
+        # Mirrors the live gate so a regression in either operand is caught.
+        return (
+            is_rollup_merge
+            and base_branch == "main"
+            and bool((orig_payload or {}).get("hotfix"))
+        )
+
+    # Hotfix rollup merged to main → back-merge fires.
+    assert _backmerge_should_fire(True, "main", {"type": "plan", "hotfix": True})
+
+    # Normal (non-hotfix) rollup merged to main → no back-merge.
+    assert not _backmerge_should_fire(True, "main", {"type": "plan"})
+    assert not _backmerge_should_fire(
+        True, "main", {"type": "plan", "hotfix": False}
+    )
+
+    # Promotion: automain -> main is opened by release_qualifier.promote(), not
+    # a rollup-merge review task, so is_rollup_merge is False → no back-merge
+    # (and would be a pointless self-merge anyway).
+    assert not _backmerge_should_fire(False, "main", {"type": "plan", "hotfix": True})
+
+    # A hotfix rollup that targets automain (not main) → no back-merge.
+    assert not _backmerge_should_fire(
+        True, "automain", {"type": "plan", "hotfix": True}
+    )
+
+
+def test_ci_gate_runs_for_integration_trunk_and_main():
+    """The orchestrator's pre-merge CI gate must run for the resolved
+    integration branch AND for main.
+
+    Gate (task_lifecycle.py review-completion handler):
+        is_ci_gated_merge = base_branch in (integration_branch, "main")
+
+    Pre-Phase-1, integration_branch == "main", so a rollup to main is gated.
+    Post-cutover, integration_branch == "automain": a rollup to automain MUST
+    still be CI-gated (the bug: a hard-coded "main" check skipped it), and a
+    hotfix rollup / promotion to main MUST also remain gated."""
+
+    def _is_ci_gated_merge(base_branch, integration_branch):
+        # Mirrors the live gate so a regression in either operand is caught.
+        return base_branch in (integration_branch, "main")
+
+    # Pre-cutover: integration branch is main; rollup to main is gated.
+    assert _is_ci_gated_merge("main", "main")
+
+    # Post-cutover: a rollup PR targets automain (the integration trunk) — it
+    # MUST be CI-gated. This is the regression the hard-coded "main" caused.
+    assert _is_ci_gated_merge("automain", "automain")
+
+    # Post-cutover: a hotfix rollup / promotion targets main — still gated, so
+    # a merge to main never bypasses CI.
+    assert _is_ci_gated_merge("main", "automain")
+
+    # An intermediate branch (research/plan staging) is NOT the integration
+    # trunk and NOT main → not CI-gated by this path.
+    assert not _is_ci_gated_merge("research/abc123", "automain")
+    assert not _is_ci_gated_merge("plan/abc123", "main")
+
+
+@pytest.mark.asyncio
+async def test_hotfix_plan_subtasks_carry_hotfix_and_high_priority(
+    db_session, mocker
+):
+    """A hotfix plan task's subtasks carry hotfix:true and priority >= 90.
+
+    Exercises the Phase 5 propagation in plan_completion._handle_plan_completion:
+    when the parent plan payload has hotfix:true, every spawned subtask inherits
+    hotfix:true (payload + context) and its priority is floored to >= 90."""
+    import json as _json
+    from app.task_completion import _handle_plan_completion
+
+    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.task_completion.broadcast_to_project", new_callable=AsyncMock)
+
+    project = Project(name="Hotfix-Plan", user_id="hotfix-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    plan_task = Task(
+        project_id=project.id,
+        title="[HOTFIX] Fix post-promotion failure",
+        payloads=[
+            {
+                "type": "plan",
+                "prompt": "plan the hotfix",
+                "base_branch": "main",
+                "hotfix": True,
+            }
+        ],
+        vm_instance_id="agent-vm-hotfix-plan",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(plan_task)
+    await db_session.commit()
+    await db_session.refresh(plan_task)
+    # _ensure_branch is lazily imported inside _handle_plan_completion; patch
+    # the source module so the success path returns the (relocked) task.
+    mocker.patch(
+        "app.task_completion._ensure_branch",
+        new_callable=AsyncMock,
+        return_value=plan_task,
+    )
+
+    # A low-priority subtask — the hotfix floor must still lift it to >= 90.
+    plan_logs = _json.dumps(
+        {
+            "subtasks": [
+                {
+                    "title": "Patch the regression",
+                    "prompt": "fix it",
+                    "priority": "low",
+                    "scope": "small",
+                }
+            ]
+        }
+    )
+    await _handle_plan_completion(plan_task, plan_logs, db_session)
+
+    children = (
+        (
+            await db_session.execute(
+                select(Task).where(Task.parent_task_id == plan_task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1
+    child = children[0]
+    assert child.first_payload.get("hotfix") is True
+    assert (child.context or {}).get("hotfix") is True
+    assert child.priority >= 90, (
+        f"hotfix subtask priority not floored to >=90: {child.priority}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_non_hotfix_plan_subtasks_do_not_carry_hotfix(db_session, mocker):
+    """A normal plan task's subtasks must NOT carry hotfix:true and keep their
+    ordinary (non-floored) priority — control case for the hotfix propagation."""
+    import json as _json
+    from app.task_completion import _handle_plan_completion
+
+    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.task_completion.broadcast_to_project", new_callable=AsyncMock)
+
+    project = Project(name="Normal-Plan", user_id="hotfix-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    plan_task = Task(
+        project_id=project.id,
+        title="Ordinary plan",
+        payloads=[
+            {
+                "type": "plan",
+                "prompt": "plan it",
+                "base_branch": "automain",
+            }
+        ],
+        vm_instance_id="agent-vm-normal-plan",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(plan_task)
+    await db_session.commit()
+    await db_session.refresh(plan_task)
+    mocker.patch(
+        "app.task_completion._ensure_branch",
+        new_callable=AsyncMock,
+        return_value=plan_task,
+    )
+
+    plan_logs = _json.dumps(
+        {
+            "subtasks": [
+                {
+                    "title": "Small tweak",
+                    "prompt": "narrow fix",
+                    "priority": "low",
+                    "scope": "small",
+                }
+            ]
+        }
+    )
+    await _handle_plan_completion(plan_task, plan_logs, db_session)
+
+    children = (
+        (
+            await db_session.execute(
+                select(Task).where(Task.parent_task_id == plan_task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1
+    child = children[0]
+    assert "hotfix" not in child.first_payload
+    assert "hotfix" not in (child.context or {})
+    # A "low" subtask is priority 0 (TASK_PRIORITY_MAP) — well under the
+    # hotfix floor, confirming no floor was applied.
+    assert child.priority < 90
+
+
+@pytest.mark.asyncio
+async def test_review_spawned_for_hotfix_subtask_carries_hotfix(db_session, mocker):
+    """A review spawned for a hotfix subtask carries hotfix:true.
+
+    Exercises Phase 5 propagation in review_pipeline._spawn_pipeline_task: the
+    hotfix marker is read from the original task's payload and stamped onto the
+    spawned review task's payload."""
+    from app.review_pipeline import _spawn_pipeline_task
+
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    project = Project(name="Hotfix-Review-Spawn", user_id="hotfix-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # The original task is a hotfix subtask (carries hotfix:true in its payload).
+    original_task = Task(
+        project_id=project.id,
+        title="Hotfix subtask",
+        payloads=[
+            {
+                "type": "create",
+                "prompt": "patch the regression",
+                "base_branch": "main",
+                "hotfix": True,
+            }
+        ],
+        vm_instance_id="agent-vm-hotfix-subtask",
+        status=TaskStatus.COMPLETED,
+        context={},
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    review_task, was_created = await _spawn_pipeline_task(
+        original_task,
+        "review",
+        db_session,
+        7777,
+        "blueprint/task-hotfix01",
+        "main",
+        original_prompt="patch the regression",
+        original_task_id=str(original_task.id),
+    )
+
+    assert was_created is True
+    assert review_task is not None
+    assert review_task.first_payload.get("type") == "review"
+    assert review_task.first_payload.get("hotfix") is True
+
+
+@pytest.mark.asyncio
+async def test_review_spawned_for_normal_subtask_has_no_hotfix(db_session, mocker):
+    """A review spawned for a non-hotfix task must NOT carry hotfix:true —
+    control case for the review-spawn hotfix propagation."""
+    from app.review_pipeline import _spawn_pipeline_task
+
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    project = Project(name="Normal-Review-Spawn", user_id="hotfix-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    original_task = Task(
+        project_id=project.id,
+        title="Ordinary subtask",
+        payloads=[
+            {
+                "type": "create",
+                "prompt": "build a feature",
+                "base_branch": "automain",
+            }
+        ],
+        vm_instance_id="agent-vm-normal-subtask",
+        status=TaskStatus.COMPLETED,
+        context={},
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    review_task, was_created = await _spawn_pipeline_task(
+        original_task,
+        "review",
+        db_session,
+        8888,
+        "blueprint/task-normal01",
+        "automain",
+        original_prompt="build a feature",
+        original_task_id=str(original_task.id),
+    )
+
+    assert was_created is True
+    assert review_task is not None
+    assert "hotfix" not in review_task.first_payload

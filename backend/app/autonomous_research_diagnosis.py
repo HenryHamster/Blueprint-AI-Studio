@@ -282,7 +282,7 @@ async def _spawn_direction_diagnosis(
         "directions": [direction_summary],
         "current_direction_id": did,
         "design_doc": design_doc_summary,
-        "base_branch": "main",
+        "base_branch": _runtime_config.get("integration_branch", "main"),
         "pause_reason": pause_reason,
         "failed_task_signatures": failed_signatures,
         "failure_taxonomy_counts": taxonomy_counts,
@@ -447,7 +447,7 @@ async def _spawn_unproductive_diagnosis(
         {
             "type": "investigate",
             "prompt": prompt,
-            "base_branch": "main",
+            "base_branch": _runtime_config.get("integration_branch", "main"),
             "effort": "low",
             "recent_changes": recent_changes,
         },
@@ -558,7 +558,7 @@ async def _spawn_remediation_stall_diagnosis(
         {
             "type": "investigate",
             "prompt": prompt,
-            "base_branch": "main",
+            "base_branch": _runtime_config.get("integration_branch", "main"),
             "effort": "low",
             "recent_changes": recent_changes,
         },

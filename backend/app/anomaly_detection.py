@@ -1402,7 +1402,9 @@ async def _spawn_proactive_fingerprint_investigations(session: AsyncSession) -> 
                 {
                     "type": "investigate",
                     "prompt": prompt,
-                    "base_branch": "main",
+                    "base_branch": _shared_state.runtime_config.get(
+                        "integration_branch", "main"
+                    ),
                     "recent_changes": recent_changes or {},
                 },
                 "anomaly_detection:proactive_pattern_investigation",
@@ -1542,7 +1544,9 @@ async def _spawn_proactive_intra_direction_investigations(session: AsyncSession)
                 {
                     "type": "investigate",
                     "prompt": prompt,
-                    "base_branch": "main",
+                    "base_branch": _shared_state.runtime_config.get(
+                        "integration_branch", "main"
+                    ),
                     "recent_changes": recent_changes or {},
                 },
                 "anomaly_detection:proactive_intra_direction_investigation",
