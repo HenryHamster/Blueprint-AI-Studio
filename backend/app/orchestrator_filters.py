@@ -449,8 +449,9 @@ async def filter_scope_empty(
     When a QUEUED task carries ``auto_decomposed=True`` and a sibling task
     (same parent_task_id) has already reached COMPLETED status with overlapping
     related_files, the candidate's work was already done by the sibling.
-    Transition the candidate directly to FAILED with SCOPE_EMPTY so it does
-    NOT consume the retry budget and does NOT penalize direction health.
+    Transition the candidate directly to CANCELLED with SCOPE_EMPTY so it
+    does NOT consume the retry budget and does NOT penalize direction health
+    — a no-op exit (work already covered) is not a failure.
 
     Only the *original implementation task* of a cluster is pre-emptible.
     Review and fix tasks inherit ``auto_decomposed`` from the create-task they
@@ -530,7 +531,7 @@ async def filter_scope_empty(
         msg = "SCOPE_EMPTY: all declared files already covered by completed sibling" + (
             f" '{sibling_title[:60]}'" if sibling_title else ""
         )
-        candidate.status = TaskStatus.FAILED
+        candidate.status = TaskStatus.CANCELLED
         candidate.latest_status_message = msg
         persist_failure_category(candidate, SCOPE_EMPTY)
         session.add(candidate)
@@ -539,7 +540,7 @@ async def filter_scope_empty(
             await broadcast_fn(
                 str(candidate.project_id),
                 "task_updated",
-                {"task_id": str(candidate.id), "status": "FAILED", "message": msg},
+                {"task_id": str(candidate.id), "status": "CANCELLED", "message": msg},
             )
         except Exception:
             logger.debug(

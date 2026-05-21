@@ -994,13 +994,18 @@ async def _check_candidate_task_deps(
     any_failed = len(dep_tasks) < len(dep_uuids)  # Missing deps treated as failed
     deps_remapped: dict[str, str] = {}
 
-    # SCOPE_EMPTY-failed deps are a deliberate "scope already covered" exit,
-    # not a defect — they must not cascade-cancel dependents (see loop below).
+    # A SCOPE_EMPTY dependency is a deliberate "scope already covered" exit,
+    # not a defect — the branch is intact and dependent clusters (different
+    # files) must still run. Treat it as a satisfied, non-blocking dep
+    # wherever it surfaces, whether it landed CANCELLED (current) or FAILED
+    # (legacy rows pre-dating the CANCELLED relabel).
     from app.failure_classification import SCOPE_EMPTY
 
     for dt in dep_tasks:
         effective_dt = dt
         if dt.status == TaskStatus.CANCELLED:
+            if (dt.context or {}).get("failure_category") == SCOPE_EMPTY:
+                continue  # clean no-op exit — satisfied, do not cascade-cancel
             replacement_id_str = (dt.context or {}).get("_replaced_by_task_id")
             if replacement_id_str:
                 try:
@@ -1020,17 +1025,13 @@ async def _check_candidate_task_deps(
                 break
 
         if effective_dt.status == TaskStatus.FAILED:
-            # A SCOPE_EMPTY dependency exited cleanly — its scope was
-            # already covered elsewhere, the branch is intact, and
-            # dependent clusters (different files) must still run. Treat
-            # it as a satisfied, non-blocking dependency, not a cascade
-            # trigger (2026-05-21: cluster 4/4 was cancelled because
-            # cluster 3/4 exited SCOPE_EMPTY).
             if (effective_dt.context or {}).get("failure_category") == SCOPE_EMPTY:
-                continue
+                continue  # legacy FAILED+SCOPE_EMPTY rows — satisfied
             any_failed = True
             break
         if effective_dt.status == TaskStatus.CANCELLED:
+            if (effective_dt.context or {}).get("failure_category") == SCOPE_EMPTY:
+                continue
             any_failed = True
             break
         if effective_dt.status != TaskStatus.COMPLETED:

@@ -59,7 +59,7 @@ class TestFilterScopeEmpty:
         )
 
         assert result == []
-        assert candidate.status == TaskStatus.FAILED
+        assert candidate.status == TaskStatus.CANCELLED
         assert "SCOPE_EMPTY" in (candidate.latest_status_message or "")
         assert (candidate.context or {}).get("failure_category") == "SCOPE_EMPTY"
         broadcast.assert_awaited_once()
@@ -275,7 +275,7 @@ class TestFilterScopeEmpty:
         )
 
         assert result == []
-        assert candidate.status == TaskStatus.FAILED
+        assert candidate.status == TaskStatus.CANCELLED
         assert (candidate.context or {}).get("failure_category") == "SCOPE_EMPTY"
 
     @pytest.mark.asyncio

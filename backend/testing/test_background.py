@@ -2583,8 +2583,8 @@ async def test_check_deps_failed_dep_triggers_cascade(requeue_db, mocker):
 
 @pytest.mark.asyncio
 async def test_check_deps_scope_empty_dep_not_cascade(requeue_db, mocker):
-    """A dep that FAILED with failure_category SCOPE_EMPTY is a clean
-    'scope already covered' exit — it must NOT cascade-cancel dependents.
+    """A dep that ended CANCELLED with failure_category SCOPE_EMPTY is a
+    clean 'scope already covered' exit — it must NOT cascade-cancel dependents.
 
     Regression (2026-05-21): cluster 4/4 (a disjoint file) was CANCELLED
     because cluster 3/4 exited SCOPE_EMPTY. _check_candidate_task_deps must
@@ -2600,7 +2600,7 @@ async def test_check_deps_scope_empty_dep_not_cascade(requeue_db, mocker):
     scope_empty_dep = Task(
         project_id=project.id,
         payloads=[{"type": "create", "prompt": "scope empty dep"}],
-        status=TaskStatus.FAILED,
+        status=TaskStatus.CANCELLED,
         latest_status_message=(
             "SCOPE_EMPTY: all declared files already covered by completed sibling"
         ),
@@ -2647,7 +2647,7 @@ async def test_check_deps_scope_empty_plus_real_failure_still_cascades(
     scope_empty_dep = Task(
         project_id=project.id,
         payloads=[{"type": "create", "prompt": "scope empty dep"}],
-        status=TaskStatus.FAILED,
+        status=TaskStatus.CANCELLED,
         latest_status_message="SCOPE_EMPTY: covered by sibling",
         context={"failure_category": "SCOPE_EMPTY"},
     )
@@ -2688,6 +2688,47 @@ async def test_check_deps_scope_empty_plus_real_failure_still_cascades(
     assert result == "cascade_cancel", (
         "a genuine CODE_ERROR dep must still cascade even with a SCOPE_EMPTY sibling"
     )
+    assert not deps_remapped
+
+
+@pytest.mark.asyncio
+async def test_check_deps_legacy_failed_scope_empty_dep_not_cascade(requeue_db, mocker):
+    """Legacy rows: a SCOPE_EMPTY dep stored as FAILED (pre-dating the
+    CANCELLED relabel) must also be treated as satisfied, not cascade."""
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+
+    project = Project(name="Legacy ScopeEmpty Test", user_id="u1")
+    requeue_db.add(project)
+    await requeue_db.commit()
+    await requeue_db.refresh(project)
+
+    legacy_dep = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "legacy scope empty dep"}],
+        status=TaskStatus.FAILED,
+        latest_status_message="SCOPE_EMPTY: covered by sibling",
+        context={"failure_category": "SCOPE_EMPTY"},
+    )
+    requeue_db.add(legacy_dep)
+    await requeue_db.commit()
+    await requeue_db.refresh(legacy_dep)
+
+    external = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "downstream"}],
+        status=TaskStatus.QUEUED,
+        depends_on=[str(legacy_dep.id)],
+    )
+    requeue_db.add(external)
+    await requeue_db.commit()
+    await requeue_db.refresh(external)
+
+    dep_uuids = [uuid.UUID(str(legacy_dep.id))]
+    result, deps_remapped = await _check_candidate_task_deps(
+        external, [legacy_dep], dep_uuids, requeue_db, _noop_verify_pr_merged
+    )
+
+    assert result == "eligible"
     assert not deps_remapped
 
 
