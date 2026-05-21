@@ -125,7 +125,10 @@ build {
       "# tagged, as silent failures caused CODE_ERROR regressions at runtime.",
       "# playwright is not an agent dependency, so fetch the CLI via npx; pin the",
       "# version to admin-ui's playwright (keep in sync with check-viewport.sh).",
-      "sudo -u agent bash -c 'npx --yes playwright@1.59.1 install --with-deps chromium'"
+      "# Run as the agent user (-H sets HOME=/home/agent) from an agent-owned CWD:",
+      "# npx spawns a child process, and as the agent user it cannot reach",
+      "# /home/packer (the provisioner's default CWD), so that spawn fails EACCES.",
+      "sudo -u agent -H bash -c 'cd /opt/agent && npx --yes playwright@1.59.1 install --with-deps chromium'"
     ]
   }
 
@@ -133,7 +136,7 @@ build {
     inline = [
       "# Smoke-check: verify Playwright CLI and Chromium binary exist before tagging image.",
       "# Hard-fail here prevents shipping a broken VM that causes CODE_ERROR at runtime.",
-      "sudo -u agent bash -c 'npx --yes playwright@1.59.1 --version'",
+      "sudo -u agent -H bash -c 'cd /opt/agent && npx --yes playwright@1.59.1 --version'",
       "CHROMIUM=$(find /home/agent/.cache/ms-playwright -name 'chrome' -type f 2>/dev/null | head -1) && [ -n \"$CHROMIUM\" ] && echo \"Chromium binary found: $CHROMIUM\" || { echo 'PACKER_SMOKE_FAIL: Chromium binary not found after playwright install'; exit 1; }"
     ]
   }
