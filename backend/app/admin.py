@@ -1034,6 +1034,8 @@ async def bulk_action_tasks(
                                 if not review_task:
                                     task.requires_approval = True
                                     task.status = TaskStatus.FAILED
+                                    if task.vm_provisioned_at:
+                                        task.vm_stopped_at = _utcnow()
                                     task.latest_status_message = "Iteration cap reached — no follow-on task spawned"
                                     from app.failure_classification import (
                                         persist_failure_category,
@@ -1081,6 +1083,8 @@ async def bulk_action_tasks(
                     continue
 
                 task.status = TaskStatus.CANCELLED
+                if task.vm_provisioned_at:
+                    task.vm_stopped_at = _utcnow()
                 task.requires_approval = False
 
                 # Suppress low-priority tasks with finding_hash for 180 days
@@ -1145,6 +1149,8 @@ async def bulk_action_tasks(
                 )
                 for child in active_children:
                     child.status = TaskStatus.CANCELLED
+                    if child.vm_provisioned_at:
+                        child.vm_stopped_at = _utcnow()
                     child.requires_approval = False
                     session.add(child)
                 await session.commit()
@@ -1998,6 +2004,8 @@ async def modify_task(
                 )
                 for child in active_children:
                     child.status = TaskStatus.CANCELLED
+                    if child.vm_provisioned_at:
+                        child.vm_stopped_at = _utcnow()
                     child.requires_approval = False
                     children_cleanup_for_bg.append(
                         (
@@ -2321,6 +2329,8 @@ async def modify_task(
                             # Iteration cap reached — revert requires_approval and return error
                             task.requires_approval = True
                             task.status = TaskStatus.FAILED
+                            if task.vm_provisioned_at:
+                                task.vm_stopped_at = _utcnow()
                             task.latest_status_message = (
                                 "Iteration cap reached — no follow-on task spawned"
                             )
@@ -2765,6 +2775,8 @@ async def trigger_rollup(
                 # Terminal failure (iteration cap, stuck cycle, blocked repeat,
                 # or unknown). Operator must intervene.
                 task.status = TaskStatus.FAILED
+                if task.vm_provisioned_at:
+                    task.vm_stopped_at = _utcnow()
                 task.latest_status_message = (
                     f"Rollup PR #{rollup_pr_number} created but review not spawned — {spawn_reason_msg}"
                     if spawn_reason_msg

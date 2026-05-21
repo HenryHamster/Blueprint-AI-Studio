@@ -789,8 +789,7 @@ async def reaper_service():
                             < _progress_stale_cutoff(task, now)
                             and (
                                 task.started_at is None
-                                or task.started_at
-                                < _progress_stale_cutoff(task, now)
+                                or task.started_at < _progress_stale_cutoff(task, now)
                             )
                         ):
                             # Stalled-but-heartbeating: agent process is alive (fresh
@@ -811,10 +810,8 @@ async def reaper_service():
                             and task.last_heartbeat >= hb_cutoff
                             and task.last_tool_use_at is None
                             and task.started_at
-                            and task.started_at
-                            < _progress_stale_cutoff(task, now)
-                            and (task.context or {}).get("llm_provider")
-                            == "anthropic"
+                            and task.started_at < _progress_stale_cutoff(task, now)
+                            and (task.context or {}).get("llm_provider") == "anthropic"
                         ):
                             # Stalled-but-heartbeating with zero tool calls ever.
                             # Provider-gated to anthropic only because the agent
@@ -978,8 +975,7 @@ async def reaper_service():
                                 and t.last_tool_use_at is None
                                 and t.started_at
                                 and t.started_at < _progress_stale_cutoff(t, now)
-                                and (t.context or {}).get("llm_provider")
-                                == "anthropic"
+                                and (t.context or {}).get("llm_provider") == "anthropic"
                             ):
                                 # Verification-loop mirror of step-1 guard.
                                 # Provider-gated to anthropic only because the
@@ -1722,6 +1718,8 @@ async def reaper_service():
                             f"marking FAILED"
                         )
                         task.status = TaskStatus.FAILED
+                        if task.vm_provisioned_at:
+                            task.vm_stopped_at = _utcnow()
                         task.vm_instance_id = None
                         task.last_heartbeat = None
                         task.latest_status_message = (
@@ -2070,6 +2068,8 @@ async def reaper_service():
                             fail_reason = f"failed after {class_budget} retries ({reap_failure_class})"
                         logger.error(f"[REAPER] Task {task.id} {fail_reason}.")
                         task.status = TaskStatus.FAILED
+                        if task.vm_provisioned_at:
+                            task.vm_stopped_at = _utcnow()
                         if is_provision_failure:
                             ctx = task.context or {}
                             provision_zone = ctx.get("provision_zone", "unknown zone")
@@ -2420,10 +2420,15 @@ async def reaper_service():
                         children_snap = _children_snapshot_by_parent.get(parent.id, [])
                         if not children_snap:
                             continue
-                        if any(status not in _terminal for _, status, _ in children_snap):
+                        if any(
+                            status not in _terminal for _, status, _ in children_snap
+                        ):
                             # At least one child still running — not safe to rescue yet.
                             continue
-                        if any(status == TaskStatus.COMPLETED for _, status, _ in children_snap):
+                        if any(
+                            status == TaskStatus.COMPLETED
+                            for _, status, _ in children_snap
+                        ):
                             # Step 3 handles this; skip.
                             continue
                         # All children are terminal and none completed — attempt re-evaluation
@@ -2431,11 +2436,13 @@ async def reaper_service():
                         # guidance (up to MAX_PARENT_REQUEUES attempts).  If attempts are
                         # exhausted it marks the parent FAILED and fires a failure alert.
                         failed_children = [
-                            (cid, ctx) for cid, status, ctx in children_snap
+                            (cid, ctx)
+                            for cid, status, ctx in children_snap
                             if status == TaskStatus.FAILED
                         ]
                         cancelled_children = [
-                            cid for cid, status, _ in children_snap
+                            cid
+                            for cid, status, _ in children_snap
                             if status == TaskStatus.CANCELLED
                         ]
                         # Build a diagnostic message including child failure classes.
@@ -2452,7 +2459,9 @@ async def reaper_service():
                         if cancelled_children:
                             parts.append(f"{len(cancelled_children)} cancelled")
                         diag = (
-                            "; ".join(parts) if parts else f"{len(children_snap)} terminal"
+                            "; ".join(parts)
+                            if parts
+                            else f"{len(children_snap)} terminal"
                         )
                         parent.latest_status_message = (
                             f"All child tasks terminated without success: {diag}"

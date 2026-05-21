@@ -1330,6 +1330,8 @@ async def orchestrator_worker():
                             "max_provision_retries", 3
                         ):
                             fresh_t.status = TaskStatus.FAILED
+                            if fresh_t.vm_provisioned_at:
+                                fresh_t.vm_stopped_at = _utcnow()
                             fresh_t.latest_status_message = (
                                 f"Failed after {provision_failures} provision attempts"
                             )
@@ -1874,6 +1876,8 @@ async def orchestrator_worker():
                             cancel_task = await cancel_session.get(Task, task.id)
                             if cancel_task:
                                 cancel_task.status = TaskStatus.CANCELLED
+                                if cancel_task.vm_provisioned_at:
+                                    cancel_task.vm_stopped_at = _utcnow()
                                 cancel_task.latest_status_message = (
                                     "Cancelled: dependency task failed"
                                 )
@@ -1909,6 +1913,8 @@ async def orchestrator_worker():
                                 )
                                 for child in children:
                                     child.status = TaskStatus.CANCELLED
+                                    if child.vm_provisioned_at:
+                                        child.vm_stopped_at = _utcnow()
                                     child.latest_status_message = (
                                         "Cancelled: parent dependency failed"
                                     )
@@ -2901,6 +2907,8 @@ async def orchestrator_worker():
                                         f"Pool state: {_blockage}."
                                     )
                                     task.status = TaskStatus.FAILED
+                                    if task.vm_provisioned_at:
+                                        task.vm_stopped_at = _utcnow()
                                     task.latest_status_message = _exhaust_msg[:500]
                                     persist_failure_category(
                                         task, "retry_after_exhausted"
@@ -3853,6 +3861,8 @@ async def orchestrator_worker():
                                         f"[CI] {_pr_gone_msg} for task {ci_task.id}"
                                     )
                                     ci_task.status = TaskStatus.FAILED
+                                    if ci_task.vm_provisioned_at:
+                                        ci_task.vm_stopped_at = _utcnow()
                                     ci_task.latest_status_message = _pr_gone_msg
                                     from app.failure_classification import (
                                         persist_failure_category,
@@ -4013,6 +4023,8 @@ async def orchestrator_worker():
                                     and not ci_task.requires_approval
                                 ):
                                     ci_task.status = TaskStatus.FAILED
+                                    if ci_task.vm_provisioned_at:
+                                        ci_task.vm_stopped_at = _utcnow()
                                     ci_task.requires_approval = True
                                     ci_task.latest_status_message = (
                                         f"PR #{ci_pr_number} reopen failed {_reopen_attempts} times — "
@@ -4087,6 +4099,8 @@ async def orchestrator_worker():
                                 # parents don't silently report success.
                                 _closed_msg = f"PR #{ci_pr_number} was closed without being merged"
                                 ci_task.status = TaskStatus.FAILED
+                                if ci_task.vm_provisioned_at:
+                                    ci_task.vm_stopped_at = _utcnow()
                                 ci_task.latest_status_message = _closed_msg
                                 from app.failure_classification import (
                                     persist_failure_category as _pfc_closed,
@@ -4551,6 +4565,8 @@ async def orchestrator_worker():
                                     )
                                 else:
                                     ci_task.status = TaskStatus.FAILED
+                                    if ci_task.vm_provisioned_at:
+                                        ci_task.vm_stopped_at = _utcnow()
                                     ci_task.requires_approval = True
                                     ci_task.latest_status_message = f"PR #{ci_pr_number} has merge conflicts — fix iterations exhausted, requires manual intervention"
                                     logger.warning(
@@ -4777,6 +4793,8 @@ async def orchestrator_worker():
                             status_code = getattr(e, "status_code", None)
                             if status_code == 404:
                                 ci_task.status = TaskStatus.FAILED
+                                if ci_task.vm_provisioned_at:
+                                    ci_task.vm_stopped_at = _utcnow()
                                 ci_task.latest_status_message = "CI polling failed: PR not found (404) — PR may have been deleted"
                                 _pr_num_404 = (
                                     (ci_task.context or {})

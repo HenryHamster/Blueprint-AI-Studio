@@ -22,7 +22,7 @@ from app.efficiency_snapshot import (
     write_snapshot,
 )
 from app.models import TaskStatus
-from app.routers.admin_analytics import ON_DEMAND_RATE
+from app.routers.admin_analytics import ON_DEMAND_RATE, SPOT_RATE
 from testing.factories import _utcnow, make_membership, make_project, make_task
 
 
@@ -68,14 +68,20 @@ async def test_compute_current_axes_values(db_session):
     await db_session.refresh(project)
 
     # Two merged tasks, each 5min on-demand. 1 cold (12s), 1 warm (no cold sample).
+    # Warm signal lives in context['_timing']['warm_start'] (the column is only
+    # ever written False at cold-provision time); the cold task participates in
+    # the denominator via its vm_provisioned_at.
     db_session.add(_make_efficient_task(project.id))
     db_session.add(
         _make_efficient_task(
             project.id,
-            vm_warm_start=True,
             vm_cold_start_ms=None,
             api_call_summary={"llm_call_count": 80},
-            context={"pr_merged": True, "review_loop": {"iteration": 4}},
+            context={
+                "pr_merged": True,
+                "review_loop": {"iteration": 4},
+                "_timing": {"warm_start": True},
+            },
         )
     )
     await db_session.commit()
@@ -89,6 +95,74 @@ async def test_compute_current_axes_values(db_session):
     assert axes[AXIS_VM_REUSE_RATE] == 0.5
     assert axes[AXIS_MEDIAN_API_CALLS_PER_TASK] == 60.0
     assert axes[AXIS_MEDIAN_REVIEW_ITERATIONS] == 3.0
+
+
+@pytest.mark.asyncio
+async def test_vm_reuse_rate_reads_timing_warm_start(db_session):
+    """Regression: reuse rate must read context['_timing']['warm_start'], the
+    same source /pipeline-efficiency uses — NOT the vm_warm_start column, which
+    is only ever written False at cold-provision time. Production reality is a
+    column value of False with the warm signal carried in _timing.
+    """
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    # 2 warm: column False (production reality) but _timing.warm_start True.
+    for _ in range(2):
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                vm_warm_start=False,
+                vm_provisioned_at=now - timedelta(minutes=2),
+                vm_stopped_at=now,
+                context={"_timing": {"warm_start": True}},
+            )
+        )
+    # 2 cold: _timing.warm_start False + a vm_provisioned_at (participates).
+    for _ in range(2):
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                vm_warm_start=False,
+                vm_provisioned_at=now - timedelta(minutes=5),
+                vm_stopped_at=now,
+                context={"_timing": {"warm_start": False}},
+            )
+        )
+    await db_session.commit()
+
+    axes = await compute_current_axes(db_session, project.id)
+    # 2 warm / (2 warm + 2 cold) = 0.5, despite every column value being False.
+    assert axes[AXIS_VM_REUSE_RATE] == 0.5
+
+
+@pytest.mark.asyncio
+async def test_vm_reuse_rate_warm_without_column_or_provisioned(db_session):
+    """Edge case: only context['_timing'].warm_start is set (no vm_warm_start
+    column write, no vm_provisioned_at). The task still participates via its
+    non-empty _timing dict and counts as warm.
+    """
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            context={"_timing": {"warm_start": True}},
+        )
+    )
+    await db_session.commit()
+
+    axes = await compute_current_axes(db_session, project.id)
+    assert axes[AXIS_VM_REUSE_RATE] == 1.0
 
 
 @pytest.mark.asyncio
@@ -373,3 +447,43 @@ async def test_axis_constants_used_consistently():
     assert AXIS_VM_REUSE_RATE == "vm_reuse_rate"
     assert AXIS_MEDIAN_API_CALLS_PER_TASK == "median_api_calls_per_task"
     assert AXIS_MEDIAN_REVIEW_ITERATIONS == "median_review_iterations"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_task_with_vm_cost_included_in_cost_per_merged_pr(db_session):
+    """Regression test: cancelled tasks with vm_provisioned_at and vm_stopped_at
+    should include their VM cost in cost_per_merged_pr aggregation.
+    """
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    # One merged task: 5 min on-demand
+    db_session.add(
+        _make_efficient_task(
+            project.id,
+            vm_provisioned_at=now - timedelta(minutes=5),
+            vm_stopped_at=now,
+        )
+    )
+    # One cancelled task with VM: 3 min spot. Should be included in cost but not in merged count.
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.CANCELLED,
+            vm_provisioned_at=now - timedelta(minutes=3),
+            vm_stopped_at=now,
+            vm_spot=True,
+        )
+    )
+    await db_session.commit()
+
+    axes = await compute_current_axes(db_session, project.id)
+
+    # Total cost = 5*60*ON_DEMAND_RATE + 3*60*SPOT_RATE
+    # Merged count = 1 (only the completed task with pr_merged)
+    expected_cost = 5 * 60 * ON_DEMAND_RATE + 3 * 60 * SPOT_RATE
+    expected_cpm = round(expected_cost / 1, 4)
+    assert axes[AXIS_COST_PER_MERGED_PR] == expected_cpm

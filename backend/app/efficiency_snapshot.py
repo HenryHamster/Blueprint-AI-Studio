@@ -69,13 +69,22 @@ async def _load_recent_tasks(
     *,
     window_days: int = _AXIS_WINDOW_DAYS,
 ) -> list[Task]:
-    """Load tasks for the project that completed/failed within the window."""
+    """Load tasks for the project that reached a terminal state in the window.
+
+    Includes CANCELLED alongside COMPLETED/FAILED so VM cost incurred by
+    cancelled tasks (which now record ``vm_stopped_at`` on cancel) is counted
+    in ``cost_per_merged_pr``. The merged-PR denominator still only counts
+    COMPLETED tasks with ``pr_merged``, so cancelled tasks add cost without
+    inflating the merge count.
+    """
     cutoff = _utcnow() - timedelta(days=window_days)
     stmt = (
         select(Task)
         .where(
             Task.project_id == project_id,
-            Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
+            Task.status.in_(
+                [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
+            ),
             Task.updated_at >= cutoff,
         )
         .options(
@@ -119,15 +128,23 @@ def _compute_vm_cold_start_p50_ms(tasks: list[Task]) -> Optional[float]:
 
 
 def _compute_vm_reuse_rate(tasks: list[Task]) -> Optional[float]:
-    """warm_count / (warm_count + cold_count). None when no VMs were observed."""
+    """warm / participating. None when no VMs participated.
+
+    Reads ``context['_timing']['warm_start']`` — the same source the
+    ``/pipeline-efficiency`` endpoint uses. The ``vm_warm_start`` column is
+    only ever written ``False`` at cold-provision time; warm-claim and
+    next-role telemetry land in ``context['_timing']``, so reading the column
+    pinned this axis at 0%. A task participates when it has a non-empty
+    ``_timing`` dict OR a recorded ``vm_provisioned_at``.
+    """
     warm = 0
-    cold = 0
+    total = 0
     for t in tasks:
-        if t.vm_warm_start is True:
-            warm += 1
-        elif t.vm_warm_start is False and t.vm_provisioned_at is not None:
-            cold += 1
-    total = warm + cold
+        timing = (t.context or {}).get("_timing") or {}
+        if timing or t.vm_provisioned_at is not None:
+            total += 1
+            if timing.get("warm_start") is True:
+                warm += 1
     if not total:
         return None
     return round(warm / total, 4)
