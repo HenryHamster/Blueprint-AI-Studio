@@ -2,10 +2,10 @@ import { page } from 'vitest/browser';
 
 // Extract the *.viewport.test.tsx filename from the call stack so failures
 // embed the component reference that the backend regression classifier needs
-// (pattern: `(\w+)\.viewport\.test\.tsx`).
+// (pattern: `([\w-]+)\.viewport\.test\.tsx` — hyphens included for composed-page filenames).
 function _callerTestFile(): string {
   const stack = new Error().stack ?? '';
-  const m = stack.match(/(\w+\.viewport\.test\.tsx)/i);
+  const m = stack.match(/([\w-]+\.viewport\.test\.tsx)/i);
   return m ? m[1] : '';
 }
 

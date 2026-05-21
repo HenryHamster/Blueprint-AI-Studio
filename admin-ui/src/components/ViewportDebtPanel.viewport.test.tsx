@@ -115,6 +115,16 @@ describe('ViewportDebtPanel — viewport regression', () => {
       root = createRoot(host);
       await act(async () => { root?.render(<ViewportDebtPanel projectId="project-123" />); });
       await act(async () => { await new Promise((resolve) => setTimeout(resolve, 50)); });
+      // Mobile card layout uses inline field labels; their presence confirms the stacked-card
+      // path is active (not the wide table that previously forced horizontal scroll).
+      const text = host!.textContent ?? '';
+      if (!text.includes('MessagesPanel')) throw new Error('component name not rendered in mobile card layout at 375px');
+      if (!text.includes('eslint:')) throw new Error('eslint field label not rendered in mobile card layout at 375px');
+      if (!text.includes('overflow:')) throw new Error('overflow field label not rendered in mobile card layout at 375px');
+      // Confirm the escape hatch is no longer needed — no data-viewport-allow-overflow in this subtree.
+      if (host!.querySelector('[data-viewport-allow-overflow]')) {
+        throw new Error('data-viewport-allow-overflow escape hatch found — table should use responsive layout at 375px instead');
+      }
     });
   });
 

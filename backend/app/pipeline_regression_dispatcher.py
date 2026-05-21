@@ -2323,7 +2323,7 @@ async def _collect_viewport_failures(
         r"expect(?:NoOverflow|NoTextTruncation|MinTouchTarget)At\((\d+)\)",
         re.IGNORECASE,
     )
-    _component_re = re.compile(r"(\w+)\.viewport\.test\.tsx", re.IGNORECASE)
+    _component_re = re.compile(r"([\w-]+)\.viewport\.test\.tsx", re.IGNORECASE)
 
     grouped: dict[tuple[str, str], dict[str, Any]] = {}
     for task in rows:

@@ -10662,6 +10662,56 @@ class TestViewportRegressionEvaluator:
         # The oldest task (pr_number=100) should determine attribution
         assert trips[0]["introducing_pr_number"] == 100
 
+    @pytest.mark.asyncio
+    async def test_hyphenated_composed_filename_extracted_correctly(self, db_session):
+        """Hyphenated composed-page filenames are preserved in full, not truncated."""
+        from app.pipeline_regression_dispatcher import (
+            _VIEWPORT_REGRESSION_MIN_FAILURES,
+            _collect_viewport_failures,
+        )
+
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        composed_cases = [
+            (
+                "operator-home-composed",
+                "expectNoOverflowAt(375): overflow at width=375px\nFound in operator-home-composed.viewport.test.tsx",
+            ),
+            (
+                "kanban-composed",
+                "expectNoOverflowAt(375): overflow at width=375px\nFound in kanban-composed.viewport.test.tsx",
+            ),
+            (
+                "pipeline-composed",
+                "expectNoOverflowAt(375): overflow at width=375px\nFound in pipeline-composed.viewport.test.tsx",
+            ),
+        ]
+
+        for _component, msg in composed_cases:
+            for _ in range(_VIEWPORT_REGRESSION_MIN_FAILURES):
+                db_session.add(_make_viewport_task(project.id, status_message=msg))
+        await db_session.commit()
+
+        trips = await _collect_viewport_failures(db_session, project.id)
+        components = {t["component"] for t in trips}
+
+        # Each composed-page test must produce a distinct, fully-named component
+        assert "operator-home-composed" in components, (
+            f"expected operator-home-composed in {components}"
+        )
+        assert "kanban-composed" in components, (
+            f"expected kanban-composed in {components}"
+        )
+        assert "pipeline-composed" in components, (
+            f"expected pipeline-composed in {components}"
+        )
+        # Must be three distinct buckets, not collapsed to "composed"
+        assert len(components) == 3, f"expected 3 distinct components, got {components}"
+        assert "composed" not in components, "bare 'composed' token must not appear"
+
 
 # ---------------------------------------------------------------------------
 # viewport_coverage_drop signal tests
