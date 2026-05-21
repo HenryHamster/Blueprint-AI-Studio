@@ -1373,6 +1373,75 @@ async def post_direction_burn_pause_message(
     return msg
 
 
+async def post_direction_churn_pause_message(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    direction_text: str,
+    reason: str,
+    direction_id: Optional[str] = None,
+    evidence: Optional[dict[str, Any]] = None,
+    task_id: Optional[uuid.UUID] = None,
+) -> ProjectMessage:
+    """Post a BLOCKER-severity message when a direction is auto-paused by the churn guardrail.
+
+    Unlike the lifetime-burn pause, churn pauses auto-recover after a cooldown period and
+    do NOT require manual operator intervention. Still surfaced as BLOCKER so it reaches
+    the high-signal feed rather than being digested as routine ops noise.
+    """
+    ev = evidence or {}
+    ev_parts: list[str] = []
+    if "non_merge_finished" in ev:
+        ev_parts.append(f"non-merging={ev['non_merge_finished']}")
+    if "merged" in ev:
+        ev_parts.append(f"merged={ev['merged']}")
+    if "merge_rate" in ev:
+        rate = ev["merge_rate"]
+        ev_parts.append(
+            f"merge_rate={rate:.0%}"
+            if isinstance(rate, float)
+            else f"merge_rate={rate}"
+        )
+    if "window_cycles" in ev:
+        ev_parts.append(f"window={ev['window_cycles']} cycles")
+    ev_str = f" ({', '.join(ev_parts)})" if ev_parts else ""
+    summary = (
+        f"Direction auto-paused by churn guardrail — will auto-recover after cooldown: "
+        f"'{direction_text[:80]}'{ev_str} — {reason}"
+    )
+    ctx: dict[str, Any] = {
+        "event_type": "direction_churn_pause",
+        "direction_text": direction_text[:120],
+        "reason": reason,
+        "direction_id": direction_id,
+    }
+    if evidence:
+        ctx["evidence"] = evidence
+    msg = ProjectMessage(
+        project_id=project_id,
+        message_type=MessageType.BLOCKER,
+        from_type="system",
+        from_task_id=task_id,
+        content=summary,
+        context=ctx,
+    )
+    session.add(msg)
+    asyncio.ensure_future(
+        dispatch_external_notification(
+            project_id,
+            "DIRECTION_CHURN_PAUSE",
+            {
+                "direction_text": direction_text[:120],
+                "reason": reason,
+                "direction_id": direction_id,
+                "evidence": evidence or {},
+                "severity": "blocker",
+                "summary": summary,
+            },
+        )
+    )
+    return msg
+
+
 async def post_issue_implementation_spawned_message(
     session: AsyncSession,
     project_id: uuid.UUID,

@@ -19,6 +19,7 @@ export const ESCALATION_EVENT_TYPES: ReadonlySet<string> = new Set([
   'residual_fix_audit_deferred',
   'remediation_escalated',
   'direction_burn_pause',
+  'direction_churn_pause',
 ]);
 
 // Per-event-type label and Tailwind class for the ContextBadges escalation badge.
@@ -30,6 +31,7 @@ export const ESCALATION_BADGE_LABELS: Readonly<Record<string, string>> = {
   residual_fix_audit_deferred: 'Audit Deferred',
   remediation_escalated: 'Remediation Escalated',
   direction_burn_pause: 'Burn Pause',
+  direction_churn_pause: 'Churn Pause',
 };
 
 export const HIGH_SIGNAL_NOTE_EVENTS: ReadonlySet<string> = new Set([

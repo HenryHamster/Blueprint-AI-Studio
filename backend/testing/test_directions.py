@@ -2461,13 +2461,20 @@ async def test_auto_recovery_after_cooldown(db_session):
 
 
 @pytest.mark.asyncio
-async def test_auto_recovery_stays_paused_when_still_unhealthy(db_session):
-    """Auto-paused direction stays paused when still unhealthy at cooldown."""
-    direction = _make_paused_direction(
-        "d-unhlt001", hours_ago=50, healthy_after_cooldown=False
+async def test_auto_recovery_blocked_by_needs_manual_intervention(db_session):
+    """Direction flagged needs_manual_intervention stays paused even after cooldown expires."""
+    direction = _make_paused_direction("d-manint01", hours_ago=50)
+    direction["needs_manual_intervention"] = True
+    direction["needs_manual_intervention_at"] = (
+        datetime.utcnow() - timedelta(hours=50)
+    ).isoformat()
+    # Simulate a lifetime-burn pause (the only pause type that sets needs_manual_intervention)
+    direction["paused_reason"] = (
+        "Lifetime burn backstop: 150 tasks finished without merging lifetime, "
+        "0 merged (lifetime merge rate 0%)"
     )
     project = Project(
-        name="Still Unhealthy Test",
+        name="Manual Intervention Test",
         user_id="test-user-123",
         autonomous_enabled=True,
         directions=[direction],
@@ -2480,9 +2487,75 @@ async def test_auto_recovery_stays_paused_when_still_unhealthy(db_session):
     await _spawn_research_task(project, db_session)
 
     await db_session.refresh(project)
-    d = next(x for x in project.directions if x["id"] == "d-unhlt001")
-    assert d["status"] == "paused", "Still-unhealthy direction must remain paused"
+    d = next(x for x in project.directions if x["id"] == "d-manint01")
+    assert d["status"] == "paused", (
+        "Direction with needs_manual_intervention must stay paused after cooldown"
+    )
     assert d.get("auto_paused") is True, "auto_paused flag must be preserved"
+    assert d.get("needs_manual_intervention") is True, (
+        "needs_manual_intervention flag must be preserved"
+    )
+
+
+@pytest.mark.asyncio
+async def test_auto_recovery_with_frozen_churn_history(db_session):
+    """Churn-paused direction with frozen unhealthy history recovers after cooldown.
+
+    A direction paused by the rolling-window churn guardrail accumulates no new
+    cycles while paused, so its history is frozen. Previously, the recovery gate
+    re-ran the health check against this frozen history, which always fired the
+    same rule → direction was stuck paused forever.
+
+    After the fix, the recovery gate is needs_manual_intervention (only set by
+    the lifetime-burn backstop). Windowed-rule pauses recover after cooldown;
+    the active-direction pass will re-pause if fresh evidence still trips a rule.
+    The observable difference: auto_pause_count goes from 1 → 2 (recover + re-pause),
+    rather than staying at 1 (original pause just extended).
+    """
+    # Build the frozen churn history that triggered the pause:
+    # 5 cycles × 5 completed tasks, 0 merged → 25 non-merge finished, merge rate 0%
+    # This will still fire the churn guardrail when the active-direction pass re-checks.
+    churn_history = [
+        {"tasks_created": 5, "tasks_completed": 5, "prs_merged": 0, "tasks_failed": 0}
+        for _ in range(5)
+    ]
+    direction = {
+        "id": "d-churn001",
+        "text": "Churn-paused direction",
+        "status": "paused",
+        "auto_paused": True,
+        "paused_reason": (
+            "Churn guardrail: 25 tasks finished without merging, 0 merged "
+            "in last 5 cycles (merge rate 0%)"
+        ),
+        "paused_at": (datetime.utcnow() - timedelta(hours=50)).isoformat(),
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": churn_history,
+        "auto_pause_count": 1,
+    }
+    project = Project(
+        name="Frozen Churn History Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    await db_session.refresh(project)
+    d = next(x for x in project.directions if x["id"] == "d-churn001")
+    # Recovery + re-pause cycle: count goes 1 → 2, proving the direction recovered
+    # rather than the original pause being silently extended.
+    assert d.get("auto_pause_count") == 2, (
+        "Direction should have been recovered and re-paused (auto_pause_count=2), "
+        "not stuck at original pause (auto_pause_count=1)"
+    )
 
 
 @pytest.mark.asyncio
@@ -6298,8 +6371,7 @@ async def test_research_endpoint_uses_integration_branch(
         )
     )
     research_tasks = [
-        t for t in result.scalars().all()
-        if t.first_payload.get("type") == "research"
+        t for t in result.scalars().all() if t.first_payload.get("type") == "research"
     ]
     assert len(research_tasks) == 1, "expected exactly one research task to be created"
     for t in research_tasks:
@@ -6335,8 +6407,7 @@ async def test_research_endpoint_defaults_to_main(
         )
     )
     research_tasks = [
-        t for t in result.scalars().all()
-        if t.first_payload.get("type") == "research"
+        t for t in result.scalars().all() if t.first_payload.get("type") == "research"
     ]
     assert len(research_tasks) == 1, "expected exactly one research task to be created"
     for t in research_tasks:
@@ -6359,9 +6430,7 @@ async def test_strategic_cycle_endpoint_uses_integration_branch(
     import app.shared_state as _shared_state
 
     monkeypatch.setitem(_shared_state.runtime_config, "integration_branch", "automain")
-    project = await _make_strategic_project(
-        db_session, f"automain strategic {phase}"
-    )
+    project = await _make_strategic_project(db_session, f"automain strategic {phase}")
 
     resp = await client.post(
         f"/api/admin/projects/{project.id}/strategic-cycle",
@@ -6369,16 +6438,13 @@ async def test_strategic_cycle_endpoint_uses_integration_branch(
     )
     assert resp.status_code == 200, resp.text
 
-    result = await db_session.execute(
-        select(Task).where(Task.project_id == project.id)
-    )
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
     tasks = result.scalars().all()
     assert tasks, "expected a strategic task to be created"
     for t in tasks:
         assert t.first_payload.get("type") == expected_type
         assert t.first_payload.get("base_branch") == "automain", (
-            f"manual /strategic-cycle ({phase}) bypassed the "
-            f"integration_branch knob"
+            f"manual /strategic-cycle ({phase}) bypassed the integration_branch knob"
         )
 
 
@@ -6400,9 +6466,7 @@ async def test_strategic_cycle_endpoint_defaults_to_main(
     )
     assert resp.status_code == 200, resp.text
 
-    result = await db_session.execute(
-        select(Task).where(Task.project_id == project.id)
-    )
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
     tasks = result.scalars().all()
     assert tasks, "expected a strategic task to be created"
     for t in tasks:
@@ -6419,9 +6483,7 @@ def test_no_hardcoded_main_base_branch_in_directions_router():
     import re
     from pathlib import Path
 
-    path = (
-        Path(__file__).resolve().parents[1] / "app" / "routers" / "directions.py"
-    )
+    path = Path(__file__).resolve().parents[1] / "app" / "routers" / "directions.py"
     hardcoded = re.compile(r'(?<![(,]\s)"base_branch":\s*"main"')
     offenders = [
         f"routers/directions.py:{lineno}: {line.strip()}"

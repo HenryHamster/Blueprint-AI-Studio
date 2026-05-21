@@ -557,10 +557,19 @@ async def _process_direction_lifecycle(
     # which only gets set on a successful remediation merge. If remediation keeps
     # failing, the flag (and operator alert) persists forever — clear it here
     # once enough time has passed without a monitor ever starting.
+    #
+    # EXCEPTION: lifetime-burn pauses set needs_manual_intervention but never set
+    # a remediation monitor (they are not code-failure remediation cases). They require
+    # manual operator action (retire or reset) and should persist until resolved,
+    # not expire via this TTL safety net designed for remediation-stuck scenarios.
     for d in project.directions or []:
         if not d.get("needs_manual_intervention"):
             continue
         if d.get("remediation_monitor_started_at"):
+            continue
+        # Skip TTL clear for lifetime-burn pauses — they require manual operator
+        # intervention and should not auto-expire.
+        if (d.get("paused_reason") or "").startswith("Lifetime burn backstop:"):
             continue
         flagged_at = d.get("needs_manual_intervention_at")
         if not flagged_at:
@@ -594,28 +603,10 @@ async def _process_direction_lifecycle(
         ).total_seconds() / 3600
         if hours < recovery_hours:
             continue
-        if _check_direction_health(d) is None:
+        if not d.get("needs_manual_intervention"):
             d["status"] = "active"
             for k in ("auto_paused", "paused_reason", "paused_at"):
                 d.pop(k, None)
-            # Clear stale manual-intervention alert if the last pause's dominant error
-            # fingerprint differs from what we last remediated. A different fingerprint
-            # means the original root cause is gone; the UI alert should reflect that
-            # rather than persisting indefinitely.
-            current_fp = d.get("error_fingerprint")
-            last_rem_fp = d.get("last_remediation_fingerprint")
-            if (
-                d.get("needs_manual_intervention")
-                and current_fp
-                and last_rem_fp
-                and str(current_fp) != str(last_rem_fp)
-            ):
-                d.pop("needs_manual_intervention", None)
-                d.pop("needs_manual_intervention_at", None)
-                logger.info(
-                    f"[AUTONOMOUS] Cleared needs_manual_intervention on {d.get('id')}: "
-                    f"fingerprint changed since remediation"
-                )
             # Start remediation-effectiveness monitoring when recovering a direction whose
             # remediation task merged. Subsequent failures with the same error fingerprint
             # during this window signal the fix did not hold; escalation is triggered below
@@ -627,9 +618,12 @@ async def _process_direction_lifecycle(
             )
             directions_modified = True
         else:
+            # Lifetime-burn backstop pauses require manual operator action (retire or reset)
+            # because the cumulative metric won't drop on its own. Keep the pause active
+            # until the operator reactivates the direction or the TTL fallback clears the flag.
             d["paused_at"] = _utcnow().isoformat()
             logger.info(
-                f"[AUTONOMOUS] Direction {d.get('id')} still unhealthy, extending pause"
+                f"[AUTONOMOUS] Direction {d.get('id')} requires manual intervention, extending pause"
             )
             directions_modified = True
     active_directions = []
@@ -1079,6 +1073,19 @@ async def _process_direction_lifecycle(
                         reason=pause_reason,
                         direction_id=did,
                         evidence=d.get("lifetime_burn_pause_evidence"),
+                    )
+                elif pause_reason.startswith("Churn guardrail:"):
+                    from app.notification_dispatch import (
+                        post_direction_churn_pause_message,
+                    )  # noqa: PLC0415
+
+                    await post_direction_churn_pause_message(
+                        session,
+                        project.id,
+                        direction_text=d.get("text", ""),
+                        reason=pause_reason,
+                        direction_id=did,
+                        evidence=d.get("churn_pause_evidence"),
                     )
                 else:
                     from app.notification_dispatch import (

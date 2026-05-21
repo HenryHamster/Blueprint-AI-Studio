@@ -1857,9 +1857,13 @@ async def _make_intervention_project(db_session, direction: dict) -> Project:
 
 
 @pytest.mark.asyncio
-async def test_auto_recovery_clears_intervention_when_fingerprint_differs(db_session):
-    """Auto-recovery drops needs_manual_intervention when the last pause's fingerprint
-    differs from the last remediation fingerprint — original problem is gone."""
+async def test_manual_intervention_blocks_auto_recovery_when_fingerprint_differs(
+    db_session,
+):
+    """A direction needing manual intervention does NOT auto-recover after cooldown,
+    even when the last pause's fingerprint differs from the last remediation. Recovery
+    is gated solely on needs_manual_intervention now — the fingerprint no longer clears
+    the flag during auto-recovery (that branch was removed)."""
     direction = {
         "id": "d-clear-fp-diff",
         "text": "Recovering direction",
@@ -1886,13 +1890,17 @@ async def test_auto_recovery_clears_intervention_when_fingerprint_differs(db_ses
     )
     await db_session.refresh(project)
     d = project.directions[0]
-    assert d["status"] == "active"
-    assert "needs_manual_intervention" not in d
+    assert d["status"] == "paused"
+    assert d.get("needs_manual_intervention") is True
 
 
 @pytest.mark.asyncio
-async def test_auto_recovery_keeps_intervention_when_fingerprints_match(db_session):
-    """Same fingerprint on recovery means the original problem may recur — keep the flag."""
+async def test_manual_intervention_blocks_auto_recovery_when_fingerprints_match(
+    db_session,
+):
+    """Matching fingerprints produce the same outcome as differing ones: a
+    manual-intervention direction stays paused after cooldown. needs_manual_intervention,
+    not the fingerprint, is what gates auto-recovery."""
     direction = {
         "id": "d-keep-fp-match",
         "text": "Recovering same-problem direction",
@@ -1919,7 +1927,7 @@ async def test_auto_recovery_keeps_intervention_when_fingerprints_match(db_sessi
     )
     await db_session.refresh(project)
     d = project.directions[0]
-    assert d["status"] == "active"
+    assert d["status"] == "paused"
     assert d.get("needs_manual_intervention") is True
 
 
