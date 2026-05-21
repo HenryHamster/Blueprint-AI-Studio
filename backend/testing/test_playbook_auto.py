@@ -12192,3 +12192,316 @@ async def test_compute_sr_catch_rate_trends_miss_mode_breakdown(
     assert breakdown["coverage_gap"] == 2
     # Both judgment_gap and coverage_gap tied at 2; dominant is one of them
     assert breakdown["dominant_mode"] in ("judgment_gap", "coverage_gap")
+
+
+@pytest.mark.asyncio
+async def test_below_floor_flag_persisted_to_design_doc(db_session: AsyncSession):
+    """below_floor=True is stored in design_doc categories when a category has
+    been below the floor threshold for >= _FLOOR_MIN_CONSECUTIVE_WINDOWS windows.
+    The dispatcher's _evaluate_sr_below_floor_signal reads this field directly."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project = await _make_project(db_session)
+    # Pre-seed one prior below-floor rate_history entry so two consecutive
+    # below-floor windows are reached after a single compute call.
+    project.design_doc = {
+        "sr_catch_rate_trends": {
+            "computed_at": (_utcnow() - timedelta(days=15)).isoformat(),
+            "categories": {
+                "correctness": {"rate_history": [0.3]},
+            },
+        }
+    }
+    flag_modified(project, "design_doc")
+    await db_session.flush()
+
+    tasks = []
+    # Current window: 5 tasks — all SR misses (hit_rate=0.0, below 50% floor).
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=[],  # SR passes → miss
+        )
+        db_session.add(t)
+        tasks.append(t)
+    # Previous window: 5 tasks with low hit rate (also below floor).
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+    await db_session.flush()
+
+    stored = (project.design_doc or {}).get("sr_catch_rate_trends", {})
+    cat = stored.get("categories", {}).get("correctness", {})
+    assert cat.get("below_floor") is True, (
+        "below_floor must be True after two consecutive below-floor windows; "
+        "dispatcher reads this field from design_doc"
+    )
+    assert cat.get("current_hit_rate") is not None, (
+        "current_hit_rate required by dispatcher"
+    )
+    assert isinstance(cat.get("rate_history"), list) and len(cat["rate_history"]) >= 2
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_false_attestation_no_duplicate_alerts(
+    db_session: AsyncSession,
+):
+    """Calling compute_sr_false_attestation_trends twice with the same elevated
+    categories must not create duplicate Alert rows (defense-in-depth dedup)."""
+    from app.playbook_learning import compute_sr_false_attestation_trends
+
+    project = await _make_project(db_session)
+
+    def _fa_task():
+        """Task where SR claimed tests_executed_cleanly=PASS but CI failed."""
+        t = Task(
+            project_id=project.id,
+            title="false attestation task",
+            payloads=[{"type": "create", "prompt": "p"}],
+            status=TaskStatus.COMPLETED,
+            context={
+                "_self_review_outcome": {
+                    "check_results": {
+                        "tests_executed_cleanly": {
+                            "passed": True,
+                            "evidence": "exit_code=0",
+                        }
+                    }
+                },
+                "review_loop": {"ci_passed": False},
+            },
+        )
+        t.created_at = _utcnow() - timedelta(days=2)
+        return t
+
+    tasks = [_fa_task() for _ in range(5)]
+    for t in tasks:
+        db_session.add(t)
+    await db_session.flush()
+
+    await compute_sr_false_attestation_trends(project.id, db_session, tasks)
+    await db_session.flush()
+    await compute_sr_false_attestation_trends(project.id, db_session, tasks)
+    await db_session.flush()
+
+    alerts = (
+        (
+            await db_session.execute(
+                _sql_select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.dismissed_at.is_(None),
+                    Alert.title.like("SR false attestation rate elevated%"),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1, (
+        f"expected exactly 1 false-attestation alert, got {len(alerts)}; "
+        "duplicate-alert dedup guard must be active"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests for engagement_thinning flag in compute_sr_catch_rate_trends
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_engagement_thinning_flag_set_when_below_threshold(
+    db_session: AsyncSession,
+):
+    """engagement_thinning=True when rate < threshold and total >= min_passes."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    # 10 current-window PASS tasks for correctness: 0 have reasoning → rate = 0.0
+    for _ in range(10):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=[],
+            sr_passed_cats_with_reasoning={"correctness": ""},
+        )
+        db_session.add(t)
+        tasks.append(t)
+    # Previous window tasks to establish a history entry
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+    assert result is not None
+    cat = result["categories"].get("correctness")
+    assert cat is not None
+    assert cat["reasoning_engagement_total"] == 10
+    assert cat["reasoning_engagement_rate"] == 0.0  # below 0.5 threshold
+    assert cat["engagement_thinning"] is True
+
+
+@pytest.mark.asyncio
+async def test_engagement_thinning_flag_false_when_insufficient_passes(
+    db_session: AsyncSession,
+):
+    """engagement_thinning=False when total < min_passes (default 10), even if rate is low."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    # Only 5 PASS tasks (below the default min_passes=10) in current window
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=[],
+            sr_passed_cats_with_reasoning={"correctness": ""},
+        )
+        db_session.add(t)
+        tasks.append(t)
+    # Previous-window tasks to ensure the function can compute trends (non-None result)
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+    assert result is not None
+    cat = result["categories"].get("correctness")
+    assert cat is not None
+    assert cat["reasoning_engagement_total"] == 5
+    assert cat["reasoning_engagement_rate"] == 0.0
+    # Too few samples — thinning flag must be False
+    assert cat["engagement_thinning"] is False
+
+
+@pytest.mark.asyncio
+async def test_engagement_thinning_flag_set_for_regressing_category(
+    db_session: AsyncSession,
+):
+    """engagement_thinning=True even for a regressing category (no exclusion)."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    # Current window: 10 hits (SR catches human) + 10 no-reasoning PASS tasks
+    # → category is NOT regressing by miss_rate, but engagement rate = 0.0
+    # Make it regressing by having a decreasing hit rate vs previous window.
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    # 10 PASS tasks with no reasoning in current window
+    for _ in range(10):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=[],
+            sr_passed_cats_with_reasoning={"correctness": ""},
+        )
+        db_session.add(t)
+        tasks.append(t)
+    # Previous window: all hits → current window has lower hit rate → regressing
+    for _ in range(10):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+    assert result is not None
+    cat = result["categories"].get("correctness")
+    assert cat is not None
+    # The category should be regressing (below 0.5 threshold) or have trend decreasing
+    assert cat["reasoning_engagement_total"] == 10
+    assert cat["reasoning_engagement_rate"] == 0.0
+    # thinning flag applies even for regressing categories
+    assert cat["engagement_thinning"] is True
+
+
+@pytest.mark.asyncio
+async def test_engagement_thinning_honors_design_doc_overrides(
+    db_session: AsyncSession,
+):
+    """engagement_thinning respects sr_engagement_threshold / sr_engagement_min_passes from design_doc."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    # Override threshold=0.8, min_passes=5 so that 5 passes at 0.0 rate qualifies.
+    project = await _make_project(
+        db_session,
+        design_doc={
+            "sr_engagement_threshold": 0.8,
+            "sr_engagement_min_passes": 5,
+        },
+    )
+    tasks = []
+    # 5 PASS tasks with no reasoning — rate=0.0, total=5
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=[],
+            sr_passed_cats_with_reasoning={"correctness": ""},
+        )
+        db_session.add(t)
+        tasks.append(t)
+    # Previous-window tasks to ensure the function can compute trends (non-None result)
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+    assert result is not None
+    cat = result["categories"].get("correctness")
+    assert cat is not None
+    assert cat["reasoning_engagement_total"] == 5
+    assert cat["reasoning_engagement_rate"] == 0.0
+    # With overrides: threshold=0.8, min_passes=5 → 5 passes at 0.0 qualifies
+    assert cat["engagement_thinning"] is True

@@ -11,6 +11,7 @@ from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, Query, HTTPException
+from pydantic import BaseModel, Field as _Field
 from sqlalchemy import or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
@@ -9269,3 +9270,138 @@ async def get_canonical_regression_layers(
             for layer in LAYER_DISPLAY_ORDER
         ]
     }
+
+
+_SR_INVESTIGATION_ACTIVE_STATUSES = (
+    TaskStatus.QUEUED,
+    TaskStatus.IN_PROGRESS,
+    TaskStatus.EVALUATING,
+)
+_SR_INVESTIGATION_SPAWNED_BY = "operator_sr_investigation"
+
+
+class SpawnSrInvestigationRequest(BaseModel):
+    category: str = _Field(..., min_length=1, max_length=100)
+    current_hit_rate: float | None = None
+    previous_hit_rate: float | None = None
+    sample_size: int | None = None
+    signals: list[str] = _Field(default_factory=list)
+
+
+@router.post("/projects/{project_id}/sr-investigation")
+async def spawn_sr_investigation(
+    project_id: uuid.UUID,
+    req: SpawnSrInvestigationRequest,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Spawn an operator-triggered SR investigation task for a category.
+
+    Deduplicates: if an open investigation for the same category already exists,
+    returns the existing task id without creating a new one.
+    Requires at least member role on the project — this spawns a billable
+    agent task, consistent with request_fresh_reviewer and other task-spawning
+    admin endpoints.
+    """
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+
+    dedup_stmt = (
+        select(Task)
+        .where(
+            Task.project_id == project_id,
+            Task.status.in_(_SR_INVESTIGATION_ACTIVE_STATUSES),
+            Task.context["spawned_by"].as_string() == _SR_INVESTIGATION_SPAWNED_BY,
+            Task.context["sr_category"].as_string() == req.category,
+        )
+        .options(load_only(Task.id, Task.status))
+        .limit(1)
+    )
+    existing = (await session.execute(dedup_stmt)).scalars().first()
+    if existing:
+        return {"task_id": str(existing.id), "created": False}
+
+    signals_str = ", ".join(req.signals) if req.signals else "no specific signal"
+    rate_info = ""
+    if req.current_hit_rate is not None:
+        rate_info = f" (current hit-rate: {req.current_hit_rate:.0%}"
+        if req.previous_hit_rate is not None:
+            rate_info += f", previous: {req.previous_hit_rate:.0%}"
+        rate_info += f", n={req.sample_size or '?'})"
+
+    prompt = (
+        f"Operator-requested SR investigation for category '{req.category}'{rate_info}.\n"
+        f"Signals that tripped: {signals_str}.\n\n"
+        f"Investigate why the self-review catch-rate for this category has regressed. "
+        f"Identify root causes (e.g. prompt gaps, task patterns, reviewer hallucinations) "
+        f"and propose concrete fixes."
+    )
+
+    new_task = Task(
+        project_id=project_id,
+        title=f"Investigate SR catch-rate: {req.category}"[:200],
+        description=f"Operator-triggered SR investigation for category '{req.category}'"[
+            :500
+        ],
+        payloads=[
+            {
+                "type": "investigate",
+                "prompt": prompt,
+                "base_branch": _runtime_config.get("integration_branch", "main"),
+                "effort": "low",
+            }
+        ],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.QUEUED,
+        created_by="USER",
+        launched_by_user_id=current_user["user_id"],
+        context={
+            "spawned_by": _SR_INVESTIGATION_SPAWNED_BY,
+            "sr_category": req.category,
+            "signals": req.signals,
+            "current_hit_rate": req.current_hit_rate,
+            "previous_hit_rate": req.previous_hit_rate,
+            "sample_size": req.sample_size,
+        },
+    )
+    session.add(new_task)
+    await session.commit()
+    await session.refresh(new_task)
+
+    return {"task_id": str(new_task.id), "created": True}
+
+
+@router.get("/projects/{project_id}/sr-investigation-task-ids")
+async def get_sr_investigation_task_ids(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Return a map of category → task_id for open operator-spawned SR investigations.
+
+    Used by the UI to deduplicate investigation spawning and surface existing task ids
+    inline on category cards.
+    """
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "viewer"
+    )
+
+    stmt = (
+        select(Task)
+        .where(
+            Task.project_id == project_id,
+            Task.status.in_(_SR_INVESTIGATION_ACTIVE_STATUSES),
+            Task.context["spawned_by"].as_string() == _SR_INVESTIGATION_SPAWNED_BY,
+        )
+        .options(load_only(Task.id, Task.context))
+    )
+    tasks = (await session.execute(stmt)).scalars().all()
+
+    task_ids: Dict[str, str] = {}
+    for t in tasks:
+        cat = (t.context or {}).get("sr_category")
+        if cat:
+            task_ids[str(cat)] = str(t.id)
+
+    return {"task_ids": task_ids}

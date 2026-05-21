@@ -3837,10 +3837,11 @@ async def test_claim_injects_self_review_catch_rate_with_fp_calibration(
 async def test_claim_injects_self_review_catch_rate_failure_mode_fields(
     client: AsyncClient, db_session
 ):
-    """Claim endpoint forwards trend, below_floor, and miss_mode_breakdown.
+    """Claim endpoint forwards trend, below_floor, engagement_thinning, and miss_mode_breakdown.
 
-    These three fields drive the agent-side failure-mode hint
-    (self-review.ts:formatFailureModeHintForSrPrompt). If _cat_entry drops
+    These fields drive the agent-side failure-mode hint
+    (self-review.ts:formatFailureModeHintForSrPrompt) and the thinning
+    reasoning gate (standard.ts:getThinningCategories). If _cat_entry drops
     them at the backend->agent boundary, the hint never renders.
     """
     from sqlalchemy.orm.attributes import flag_modified
@@ -3852,6 +3853,7 @@ async def test_claim_injects_self_review_catch_rate_failure_mode_fields(
                     "miss_rate": 0.30,
                     "trend": "decreasing",
                     "below_floor": True,
+                    "engagement_thinning": True,
                     "miss_mode_breakdown": {
                         "reading_gap": 5,
                         "judgment_gap": 1,
@@ -3913,6 +3915,7 @@ async def test_claim_injects_self_review_catch_rate_failure_mode_fields(
     sec = sr["categories"]["security"]
     assert sec["trend"] == "decreasing"
     assert sec["below_floor"] is True
+    assert sec["engagement_thinning"] is True
     assert sec["miss_mode_breakdown"] == {
         "reading_gap": 5,
         "judgment_gap": 1,
@@ -3924,6 +3927,7 @@ async def test_claim_injects_self_review_catch_rate_failure_mode_fields(
     corr = sr["categories"]["correctness"]
     assert "trend" not in corr
     assert "below_floor" not in corr
+    assert "engagement_thinning" not in corr
     assert "miss_mode_breakdown" not in corr
 
     # for_task_type passthrough preserves the same fields.

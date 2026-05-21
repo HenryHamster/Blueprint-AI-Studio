@@ -3969,6 +3969,22 @@ async def compute_sr_catch_rate_trends(
         categories[cat]["reasoning_engagement_with"] = cat_eng["with_reasoning"]
         categories[cat]["reasoning_engagement_total"] = cat_eng["total_passes"]
 
+    # Attach engagement_thinning flag for each category.
+    # Mirrors the thinning Alert predicate (lines ~4918) but also fires for regressing
+    # categories — the agent gate consumer takes the union of regressing+thinning itself.
+    _eng_threshold: float = float(
+        doc.get("sr_engagement_threshold") or _SR_ENGAGEMENT_THRESHOLD
+    )
+    _eng_min_passes: int = int(
+        doc.get("sr_engagement_min_passes") or _SR_ENGAGEMENT_MIN_PASSES
+    )
+    for cat, data in categories.items():
+        _rate = data.get("reasoning_engagement_rate")
+        _total = data.get("reasoning_engagement_total") or 0
+        data["engagement_thinning"] = bool(
+            _rate is not None and _rate < _eng_threshold and _total >= _eng_min_passes
+        )
+
     # Attach false-positive stats: SR flagged but reviewer didn't independently flag.
     # Both windows use _compute_cat_fp_stats so reviewer_findings count as confirmations
     # consistently — without this, previous_fp_rate overcounts FPs and can trigger the
@@ -6242,18 +6258,18 @@ async def compute_sr_false_attestation_trends(
                 .scalars()
                 .all()
             )
-            for a in existing_alerts:
-                if a.title != new_title:
+            if not any(a.title == new_title for a in existing_alerts):
+                for a in existing_alerts:
                     a.dismissed_at = now
                     session.add(a)
-            session.add(
-                Alert(
-                    project_id=project_id,
-                    severity=AlertSeverity.WARNING,
-                    title=new_title,
-                    message=description,
+                session.add(
+                    Alert(
+                        project_id=project_id,
+                        severity=AlertSeverity.WARNING,
+                        title=new_title,
+                        message=description,
+                    )
                 )
-            )
         except Exception:
             logger.exception(
                 "[SR_FALSE_ATTESTATION] alert emission failed (non-critical)"

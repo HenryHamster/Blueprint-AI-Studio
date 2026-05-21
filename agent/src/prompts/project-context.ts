@@ -416,6 +416,7 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
     false_positive_rate?: number;
     precision?: number;
     sr_flag_sample_size?: number;
+    engagement_thinning?: boolean;
     below_floor?: boolean;
     miss_mode_breakdown?: {
       reading_gap?: number;
@@ -434,8 +435,14 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
   const srSource = (forTaskType && Object.keys(forTaskType).length > 0) ? forTaskType : srCatchRate?.categories;
   const srIsTypeFiltered = srSource === forTaskType && !!forTaskType;
   if (srSource && Object.keys(srSource).length > 0) {
+    // Qualifying = categories with active misses OR engagement thinning (reasoning rate dropping).
+    // Thinning categories carry the same reasoning requirement as regressing ones — preventive,
+    // before the miss-rate officially regresses.
     const qualifying = Object.entries(srSource)
-      .filter(([, data]) => typeof data.miss_rate === 'number' && data.miss_rate > 0)
+      .filter(([, data]) =>
+        (typeof data.miss_rate === 'number' && data.miss_rate > 0) ||
+        data.engagement_thinning === true
+      )
       // sort by severity-weighted miss rate when available, so high-impact misses surface over trivial ones
       .sort((a, b) => (b[1].weighted_miss_rate ?? b[1].miss_rate) - (a[1].weighted_miss_rate ?? a[1].miss_rate))
       .slice(0, 5);
@@ -460,15 +467,16 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
       const buildCatLines = (withExamples: boolean): string[] => {
         const lines: string[] = [
           '### Self-Review Blind Spots',
-          `Your past self-reviews missed issues in these categories${scopeNote} — apply extra scrutiny. For EACH of these categories, add a \`reasoning\` field to your \`check_results\` entry (~1 sentence: what you inspected and what evidence supports the pass/fail call). Required for both pass and fail outcomes. Examples from recent tasks:`,
+          `Your past self-reviews missed issues in these categories${scopeNote} — apply extra scrutiny. For EACH of these categories, add a \`reasoning\` field to your \`check_results\` entry (~1 sentence: what you inspected and what evidence supports the pass/fail call). Required for both pass and fail outcomes. Categories marked ⚠ Thinning carry the same requirement preventively — their reasoning engagement is dropping and they are at risk of becoming regressing before the next measurement cycle. Examples from recent tasks:`,
         ];
         for (const [cat, data] of qualifying) {
           const rawPct = Math.round(data.miss_rate * 100);
           const trajectoryHint = buildTrajectoryHint(data);
           const trendWarning = data.trend === 'decreasing' ? ' ⚠ Regression: scrutinize extra carefully.' : '';
+          const thinningWarning = data.engagement_thinning === true && data.trend !== 'decreasing' ? ' ⚠ Thinning: reasoning engagement dropping — treat same as regressing.' : '';
           const suffix = data.weighted_miss_rate !== undefined
-            ? ` (${rawPct}% missed, ${Math.round(data.weighted_miss_rate * 100)}% severity-weighted${trajectoryHint}):${trendWarning}`
-            : ` (${rawPct}% missed${trajectoryHint}):${trendWarning}`;
+            ? ` (${rawPct}% missed, ${Math.round(data.weighted_miss_rate * 100)}% severity-weighted${trajectoryHint}):${trendWarning}${thinningWarning}`
+            : ` (${rawPct}% missed${trajectoryHint}):${trendWarning}${thinningWarning}`;
           lines.push(`- ${cat}${suffix}`);
           if (withExamples && data.examples && data.examples.length > 0) {
             for (const ex of data.examples) {

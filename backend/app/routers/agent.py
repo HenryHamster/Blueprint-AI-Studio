@@ -2785,6 +2785,9 @@ async def claim_task(
                     below_floor = data.get("below_floor")
                     if isinstance(below_floor, bool):
                         entry["below_floor"] = below_floor
+                    engagement_thinning = data.get("engagement_thinning")
+                    if isinstance(engagement_thinning, bool):
+                        entry["engagement_thinning"] = engagement_thinning
                     miss_mode_breakdown = data.get("miss_mode_breakdown")
                     if isinstance(miss_mode_breakdown, dict):
                         entry["miss_mode_breakdown"] = miss_mode_breakdown
@@ -4191,3 +4194,72 @@ async def agent_fetch_gap(
                     "from_archive": archived_flag,
                 }
     raise HTTPException(status_code=404, detail="Gap not found")
+
+
+class ReviewerMergeRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    reviewer_findings: list[dict]
+    reviewer_edges_considered: list[dict] = []
+
+
+@router.post("/tasks/{original_task_id}/reviewer-merge")
+@limiter.limit("30/minute")
+async def merge_operator_reviewer_findings(
+    request: Request,
+    original_task_id: uuid.UUID,
+    req: ReviewerMergeRequest,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Merge operator-requested fresh-reviewer findings into an existing task's SR outcome."""
+    requesting_task_id = token.get("sub")
+    if not requesting_task_id:
+        raise HTTPException(status_code=403, detail="No task in token")
+
+    requesting_task = await session.get(Task, uuid.UUID(requesting_task_id))
+    if not requesting_task:
+        raise HTTPException(status_code=404, detail="Requesting task not found")
+
+    ctx = requesting_task.context or {}
+    if str(ctx.get("operator_requested_review_for")) != str(original_task_id):
+        raise HTTPException(
+            status_code=403, detail="Not authorized for this target task"
+        )
+
+    original_task = await session.get(Task, original_task_id)
+    if not original_task:
+        raise HTTPException(status_code=404, detail="Original task not found")
+
+    orig_ctx = dict(original_task.context or {})
+    sr = dict(orig_ctx.get("_self_review_outcome") or {})
+    sr["reviewer_findings"] = req.reviewer_findings
+    sr["reviewer_recovery_origin"] = "operator_requested_recovery"
+
+    check_results = dict(sr.get("check_results") or {})
+    for finding in req.reviewer_findings:
+        cat = finding.get("category")
+        if cat:
+            existing = check_results.get(cat)
+            if not existing or existing.get("passed") is True:
+                check_results[cat] = {
+                    "passed": False,
+                    "issue": f"[reviewer] {finding.get('description', '')}",
+                    "origin": "operator_requested_recovery",
+                }
+    sr["check_results"] = check_results
+
+    if req.reviewer_edges_considered:
+        sr["reviewer_edges_considered"] = req.reviewer_edges_considered
+
+    orig_ctx["_self_review_outcome"] = sr
+    original_task.context = orig_ctx
+    flag_modified(original_task, "context")
+    session.add(original_task)
+    await session.commit()
+
+    await broadcast_to_project(
+        str(original_task.project_id),
+        "task_updated",
+        {"task_id": str(original_task_id)},
+    )
+    return {"status": "merged", "finding_count": len(req.reviewer_findings)}

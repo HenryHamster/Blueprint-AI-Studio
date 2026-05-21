@@ -4,7 +4,7 @@ import { getHeartbeatStatus, isSafeUrl, useElapsedTime, linkifyStatusMessage, Re
 import type { Task } from './TaskCard';
 import { formatAbsolute, parseTimestamp, timeAgo } from '../utils/time';
 import { hasTransitiveCycle } from '../utils/taskGraph';
-import { authGet, API_BASE_URL, fetchTaskSerialConsole } from '../api';
+import { authGet, API_BASE_URL, fetchTaskSerialConsole, apiFetch } from '../api';
 import type { SerialConsoleResponse } from '../types/task';
 import { TaskFixLoopPanel } from './TaskFixLoopPanel';
 
@@ -508,6 +508,28 @@ function SelfReviewPanel({ task }: { task: Task }) {
   const outcome = ctx?._self_review_outcome as SelfReviewOutcome | undefined;
   const humanCategories = ctx?._first_attempt_rejection_categories as Record<string, unknown> | undefined;
   const [open, setOpen] = useState(false);
+  const [requestingFreshReview, setRequestingFreshReview] = useState(false);
+  const [freshReviewResult, setFreshReviewResult] = useState<'success' | 'cooldown' | string | null>(null);
+
+  const handleRequestFreshReview = async () => {
+    setRequestingFreshReview(true);
+    setFreshReviewResult(null);
+    try {
+      const res = await apiFetch(`/api/admin/tasks/${task.id}/request-fresh-reviewer`, { method: 'POST' });
+      if (res.ok) {
+        setFreshReviewResult('success');
+      } else if (res.status === 429) {
+        setFreshReviewResult('cooldown');
+      } else {
+        const data = await res.json().catch(() => ({}));
+        setFreshReviewResult((data as { detail?: string }).detail ?? `Error ${res.status}`);
+      }
+    } catch {
+      setFreshReviewResult('Request failed');
+    } finally {
+      setRequestingFreshReview(false);
+    }
+  };
 
   if (!outcome) return null;
 
@@ -733,6 +755,29 @@ function SelfReviewPanel({ task }: { task: Task }) {
                       {missedCount} human-flagged {missedCount === 1 ? 'category' : 'categories'} not caught by agent
                     </p>
                   )}
+                </div>
+              )}
+
+              {task.status === 'COMPLETED' && (
+                <div className="border-t border-neutral-700/50 pt-3">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <button
+                      onClick={handleRequestFreshReview}
+                      disabled={requestingFreshReview || freshReviewResult === 'success'}
+                      className="text-xs px-2.5 py-1.5 rounded border border-blue-700/50 bg-blue-950/30 text-blue-400 hover:bg-blue-950/50 hover:border-blue-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                    >
+                      {requestingFreshReview ? 'Requesting…' : 'Request fresh review'}
+                    </button>
+                    {freshReviewResult === 'success' && (
+                      <span className="text-xs text-emerald-400">Queued — findings will appear here when complete.</span>
+                    )}
+                    {freshReviewResult === 'cooldown' && (
+                      <span className="text-xs text-amber-400">Cooldown active — a fresh-reviewer pass was recently run.</span>
+                    )}
+                    {freshReviewResult && freshReviewResult !== 'success' && freshReviewResult !== 'cooldown' && (
+                      <span className="text-xs text-red-400">{freshReviewResult}</span>
+                    )}
+                  </div>
                 </div>
               )}
             </>

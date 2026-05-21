@@ -392,7 +392,7 @@ async def get_dispatcher_cycle_records(
     On an empty table, returns ``[]`` — never raises — so the health
     endpoint can render 'no data' on cold start.
     """
-    from app.models import DispatcherCycleRecord  # noqa: PLC0415
+    from app.models import DispatcherCycleRecord
 
     stmt = select(DispatcherCycleRecord)
     if project_id is not None:
@@ -428,7 +428,7 @@ def compute_mtti_p50_sec(cases: list) -> float | None:
     ``operator_acknowledged_at`` are set.  Returns ``None`` when no acked
     cases are present in the input.  Uses ``statistics.median`` — no numpy.
     """
-    import statistics  # noqa: PLC0415
+    import statistics
 
     deltas = [
         (c.operator_acknowledged_at - c.needs_manual_intervention_at).total_seconds()
@@ -446,8 +446,8 @@ async def _prune_old_dispatcher_cycle_records(session: AsyncSession) -> int:
     a prune error cannot mask a successful spawn commit.  Returns the count
     of rows deleted (0 when nothing matches).
     """
-    from sqlalchemy import delete as sql_delete  # noqa: PLC0415
-    from app.models import DispatcherCycleRecord  # noqa: PLC0415
+    from sqlalchemy import delete as sql_delete
+    from app.models import DispatcherCycleRecord
 
     cutoff = _utcnow() - _DISPATCHER_CYCLE_TTL
     try:
@@ -1396,7 +1396,7 @@ def compute_class_layer_defense_counts(
     canonical order (including layers with zero fixes) so the UI renders a
     stable six-row table.
     """
-    counts: dict[str, int] = {layer: 0 for layer in LAYER_DISPLAY_ORDER}
+    counts: dict[str, int] = dict.fromkeys(LAYER_DISPLAY_ORDER, 0)
     for entry in fix_logs or []:
         if not isinstance(entry, dict):
             continue
@@ -1645,7 +1645,11 @@ def _signal_higher_is_better(regression_class: str) -> bool:
         "sr_catch_rate:"
     ):
         return True
-    if regression_class == "pipeline_success_rate":
+    if regression_class in (
+        "pipeline_success_rate",
+        "sr_catch_rate_below_floor",
+        "sr_pass_engagement_thinning",
+    ):
         return True
     return False
 
@@ -2681,7 +2685,7 @@ def _classify_layers_from_paths(paths: list[str]) -> list[str]:
         ``backend/app/source_ref_validation.py``, ``check`` script,
         ``backend/app/fix_loop_telemetry.py`` → BASELINE_GATE
     """
-    from app.regression_layer_classifier import (  # noqa: PLC0415
+    from app.regression_layer_classifier import (
         LAYER_AGENT_VERB,
         LAYER_AGENT_VM,
         LAYER_BASELINE_GATE,
@@ -2780,10 +2784,10 @@ async def _backfill_layers_targeted_once(
     rest of the dispatcher tick. GitHub auth / API failures are logged and
     skipped — never raised — so a transient outage never breaks recovery.
     """
-    from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
+    from sqlalchemy.orm.attributes import flag_modified
 
-    from app.github import get_pr_files, get_repo_installation_token  # noqa: PLC0415
-    from app.models import Project  # noqa: PLC0415
+    from app.github import get_pr_files, get_repo_installation_token
+    from app.models import Project
 
     project = await session.get(Project, project_id)
     if project is None or not project.github_owner or not project.github_repo:
@@ -3447,7 +3451,7 @@ async def _maybe_spawn(
     # contains observations on >=2 distinct layers within the 48h window. The
     # regression_class itself is unchanged so the existing 6h cooldown still
     # applies and a cross-layer escalation occupies exactly one spawn slot.
-    from app.regression_layer_classifier import classify_layers  # noqa: PLC0415
+    from app.regression_layer_classifier import classify_layers
 
     obs_failure_class, obs_message, obs_stage = _derive_observation_for_layer_classify(
         signal_name=signal_name,
@@ -3459,7 +3463,7 @@ async def _maybe_spawn(
     obs_fingerprint = ""
     if obs_message:
         try:
-            from app.anomaly_detection import _error_fingerprint  # noqa: PLC0415
+            from app.anomaly_detection import _error_fingerprint
 
             obs_fingerprint = _error_fingerprint(obs_message, obs_stage or None)
         except Exception:  # noqa: BLE001
@@ -3985,6 +3989,266 @@ async def _evaluate_sr_catch_rate_direction_signals(
     return _spawned
 
 
+async def _evaluate_sr_below_floor_signal(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    project_design_doc: dict | None,
+    spawn_budget_left: int,
+) -> int:
+    """Trip when any SR category sits below the floor for min-windows consecutively."""
+    if spawn_budget_left <= 0:
+        return 0
+    from app.playbook_learning import (
+        _SR_FLOOR_THRESHOLD,
+        _FLOOR_MIN_CONSECUTIVE_WINDOWS,
+    )
+
+    categories = ((project_design_doc or {}).get("sr_catch_rate_trends") or {}).get(
+        "categories"
+    ) or {}
+    if not isinstance(categories, dict):
+        return 0
+
+    floor_threshold = float(
+        (project_design_doc or {}).get("sr_floor_threshold") or _SR_FLOOR_THRESHOLD
+    )
+    floor_min_windows = int(
+        (project_design_doc or {}).get("sr_floor_min_windows")
+        or _FLOOR_MIN_CONSECUTIVE_WINDOWS
+    )
+
+    tripped: list[tuple[str, dict]] = []
+    for cat, data in sorted(categories.items()):
+        if not isinstance(data, dict):
+            continue
+        if not data.get("below_floor"):
+            continue
+        rate = data.get("current_hit_rate")
+        history = data.get("rate_history") or []
+        if rate is None or len(history) < floor_min_windows:
+            continue
+        tripped.append((cat, data))
+
+    if not tripped:
+        return 0
+
+    cats_label = ", ".join(cat for cat, _ in tripped)
+    lines = [
+        "Pipeline quality signal: SR catch-rate sustained below floor "
+        "(sub-signal=below_floor / class=sr_catch_rate_below_floor).",
+        f"Categories stuck below {floor_threshold:.0%} floor for "
+        f"{floor_min_windows}+ consecutive windows: {cats_label}.",
+        "",
+        "Sub-signal: below_floor — the hit-rate is chronically low (not just declining).",
+        "The category has been stuck at a low catch-rate without getting worse, so the "
+        "delta-trend signal has not fired. Investigate why the baseline is low and what "
+        "structural changes to the self-review prompt or process could lift it.",
+        "",
+    ]
+    for cat, data in tripped:
+        rate = data.get("current_hit_rate")
+        history = data.get("rate_history") or []
+        rate_str = f"{rate:.0%}" if rate is not None else "N/A"
+        hist_str = ", ".join(f"{r:.0%}" for r in history[-floor_min_windows:])
+        lines.append(
+            f"  • {cat}: current={rate_str}, last {floor_min_windows} windows: [{hist_str}]"
+        )
+    lines.append("")
+    lines.append(
+        "FIRST: triage whether this signal actually represents a regression. "
+        "Set `verdict` to 'not_a_regression' when the low rate is intentional or "
+        "the sample is too small. Otherwise produce the structured diagnosis JSON."
+    )
+    prompt = "\n".join(lines)
+
+    _rep_cat, rep_data = tripped[0]
+    spawn = await _maybe_spawn(
+        session,
+        project_id,
+        signal_name="sr_catch_rate_below_floor",
+        regression_class="sr_catch_rate_below_floor",
+        prior_rate=floor_threshold,
+        current_rate=rep_data.get("current_hit_rate"),
+        sample_size=int(rep_data.get("current_human_count") or 0),
+        magnitude=round(floor_threshold - (rep_data.get("current_hit_rate") or 0), 3),
+        title_hint=f"SR catch-rate below floor ({cats_label})",
+        prompt_override=prompt,
+        extra_context_fields={"categories": [cat for cat, _ in tripped]},
+    )
+    return 1 if spawn is not None else 0
+
+
+async def _evaluate_sr_pass_engagement_thinning_signal(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    project_design_doc: dict | None,
+    spawn_budget_left: int,
+) -> int:
+    """Trip when PASS reasoning engagement drops below threshold for a category."""
+    if spawn_budget_left <= 0:
+        return 0
+    from app.playbook_learning import (
+        _SR_ENGAGEMENT_THRESHOLD,
+        _SR_ENGAGEMENT_MIN_PASSES,
+    )
+
+    categories = ((project_design_doc or {}).get("sr_catch_rate_trends") or {}).get(
+        "categories"
+    ) or {}
+    if not isinstance(categories, dict):
+        return 0
+
+    eng_threshold = float(
+        (project_design_doc or {}).get("sr_engagement_threshold")
+        or _SR_ENGAGEMENT_THRESHOLD
+    )
+    eng_min_passes = int(
+        (project_design_doc or {}).get("sr_engagement_min_passes")
+        or _SR_ENGAGEMENT_MIN_PASSES
+    )
+
+    thinning: list[tuple[str, dict]] = []
+    for cat, data in sorted(categories.items()):
+        if not isinstance(data, dict):
+            continue
+        rate = data.get("reasoning_engagement_rate")
+        total = data.get("reasoning_engagement_total") or 0
+        if rate is None or total < eng_min_passes:
+            continue
+        if rate < eng_threshold:
+            thinning.append((cat, data))
+
+    if not thinning:
+        return 0
+
+    cats_label = ", ".join(cat for cat, _ in thinning)
+    lines = [
+        "Pipeline quality signal: SR PASS reasoning engagement thinning "
+        "(sub-signal=pass_engagement_thinning / class=sr_pass_engagement_thinning).",
+        f"Categories with PASS engagement below {eng_threshold:.0%}: {cats_label}.",
+        "",
+        "Sub-signal: pass_engagement_thinning — the agent is rubber-stamping PASS "
+        "verdicts without substantive reasoning. This is an early indicator that "
+        "precedes catch-rate regressions.",
+        "",
+    ]
+    for cat, data in thinning:
+        rate = data.get("reasoning_engagement_rate")
+        total = data.get("reasoning_engagement_total") or 0
+        rate_str = f"{rate:.0%}" if rate is not None else "N/A"
+        lines.append(f"  • {cat}: engagement={rate_str} (n={total} PASS verdicts)")
+    lines.append("")
+    lines.append(
+        "Investigate why PASS reasoning is thin for these categories. "
+        "Check the self-review prompt wording — does it make it too easy to "
+        "skip substantive reasoning for PASS verdicts? Produce the structured "
+        "diagnosis JSON ({summary, root_cause, recommended_fix, severity, "
+        "confidence, affected_files, verdict, verdict_reason})."
+    )
+    prompt = "\n".join(lines)
+
+    _rep_cat, rep_data = thinning[0]
+    rep_rate = rep_data.get("reasoning_engagement_rate") or 0.0
+    rep_total = int(rep_data.get("reasoning_engagement_total") or 0)
+    spawn = await _maybe_spawn(
+        session,
+        project_id,
+        signal_name="sr_pass_engagement_thinning",
+        regression_class="sr_pass_engagement_thinning",
+        prior_rate=eng_threshold,
+        current_rate=rep_rate,
+        sample_size=rep_total,
+        magnitude=round(eng_threshold - rep_rate, 3),
+        title_hint=f"SR PASS engagement thinning ({cats_label})",
+        prompt_override=prompt,
+        extra_context_fields={"categories": [cat for cat, _ in thinning]},
+    )
+    return 1 if spawn is not None else 0
+
+
+async def _evaluate_sr_false_attestation_signal(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    project_design_doc: dict | None,
+    spawn_budget_left: int,
+) -> int:
+    """Trip when SR false-attestation rate exceeds threshold for any category."""
+    if spawn_budget_left <= 0:
+        return 0
+    from app.playbook_learning import _FALSE_ATTESTATION_RATE_THRESHOLD
+
+    per_category = (
+        (project_design_doc or {}).get("sr_false_attestation_trends") or {}
+    ).get("per_category") or {}
+    if not isinstance(per_category, dict):
+        return 0
+
+    elevated: list[tuple[str, dict]] = []
+    for cat, data in sorted(per_category.items()):
+        if not isinstance(data, dict):
+            continue
+        rate = data.get("false_attestation_rate")
+        if rate is not None and rate > _FALSE_ATTESTATION_RATE_THRESHOLD:
+            elevated.append((cat, data))
+
+    if not elevated:
+        return 0
+
+    cats_label = ", ".join(cat for cat, _ in elevated)
+    lines = [
+        "Pipeline quality signal: SR false attestation elevated "
+        "(sub-signal=sr_false_attestation / class=sr_false_attestation).",
+        f"Categories where SR claimed passed but CI recorded failure: {cats_label}.",
+        "",
+        "Sub-signal: sr_false_attestation — SR claimed tests_executed_cleanly, "
+        "lint_executed_cleanly, or typecheck_executed_cleanly passed but CI "
+        "recorded ci_passed=False for the same task. This indicates the agent "
+        "is attesting to clean execution without actually running the checks.",
+        "",
+    ]
+    for cat, data in elevated:
+        rate = data.get("false_attestation_rate")
+        n = data.get("false_attested", 0)
+        total = (data.get("ci_confirmed") or 0) + n
+        rate_str = f"{rate:.0%}" if rate is not None else "N/A"
+        prev_rate = data.get("previous_false_attestation_rate")
+        prev_str = f"{prev_rate:.0%}" if prev_rate is not None else "N/A"
+        lines.append(
+            f"  • {cat}: false_attestation_rate={rate_str} ({n}/{total}), "
+            f"prior window={prev_str}"
+        )
+    lines.append("")
+    lines.append(
+        "Investigate why the agent is attesting to clean execution without "
+        "running the checks. Check whether the self-review prompt adequately "
+        "enforces that execution evidence must come from an actual run on the "
+        "current VM. Produce the structured diagnosis JSON ({summary, root_cause, "
+        "recommended_fix, severity, confidence, affected_files, verdict, verdict_reason})."
+    )
+    prompt = "\n".join(lines)
+
+    _rep_cat, rep_data = elevated[0]
+    rep_rate = rep_data.get("false_attestation_rate") or 0.0
+    prev_rate = rep_data.get("previous_false_attestation_rate") or 0.0
+    rep_total = int(
+        (rep_data.get("false_attested") or 0) + (rep_data.get("ci_confirmed") or 0)
+    )
+    spawn = await _maybe_spawn(
+        session,
+        project_id,
+        signal_name="sr_false_attestation",
+        regression_class="sr_false_attestation",
+        prior_rate=prev_rate,
+        current_rate=rep_rate,
+        sample_size=rep_total,
+        magnitude=round(rep_rate - prev_rate, 3),
+        title_hint=f"SR false attestation elevated ({cats_label})",
+        prompt_override=prompt,
+        extra_context_fields={"categories": [cat for cat, _ in elevated]},
+    )
+    return 1 if spawn is not None else 0
+
+
 async def _evaluate_fix_loop_divergence_signal(
     session: AsyncSession,
     project_id: uuid.UUID,
@@ -4130,14 +4394,8 @@ async def _evaluate_viewport_regression_signal(
                     session, project_id, regression_class
                 )
                 if case is not None:
-                    setattr(
-                        case, "introducing_pr_number", trip.get("introducing_pr_number")
-                    )
-                    setattr(
-                        case,
-                        "introducing_commit_sha",
-                        trip.get("introducing_commit_sha"),
-                    )
+                    case.introducing_pr_number = trip.get("introducing_pr_number")
+                    case.introducing_commit_sha = trip.get("introducing_commit_sha")
                     session.add(case)
     return spawned
 
@@ -4224,7 +4482,7 @@ async def update_viewport_coverage_snapshot_from_diff(
     Called by the PR-merge hook (rollup_management) each time a PR merges.
     Skips silently when the project has no admin-ui directory in the diff.
     """
-    from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
+    from sqlalchemy.orm.attributes import flag_modified
 
     if "admin-ui/" not in diff_text:
         return
@@ -5948,7 +6206,7 @@ async def _persist_recovery_cycle_record(
     confirmed_closed: int,
 ) -> None:
     """Persist a recovery cycle record with marginal/confirmed recovery counts."""
-    from app.models import DispatcherCycleRecord  # noqa: PLC0415
+    from app.models import DispatcherCycleRecord
 
     try:
         session.add(
@@ -7205,6 +7463,24 @@ async def run_once(session: AsyncSession, project_id: uuid.UUID) -> int:
             project_id,
             spawn_budget - _spawned,
         )
+        _spawned += await _evaluate_sr_below_floor_signal(
+            session,
+            project_id,
+            project.design_doc,
+            spawn_budget - _spawned,
+        )
+        _spawned += await _evaluate_sr_pass_engagement_thinning_signal(
+            session,
+            project_id,
+            project.design_doc,
+            spawn_budget - _spawned,
+        )
+        _spawned += await _evaluate_sr_false_attestation_signal(
+            session,
+            project_id,
+            project.design_doc,
+            spawn_budget - _spawned,
+        )
 
         if _spawned or stale_alerts_created:
             await session.commit()
@@ -7219,7 +7495,7 @@ async def run_once(session: AsyncSession, project_id: uuid.UUID) -> int:
         # ``finally``-block semantics: the record is written even when
         # run_once short-circuits early (deploy-monitoring defer, project not
         # found, exception inside an evaluator).
-        from app.models import DispatcherCycleRecord  # noqa: PLC0415
+        from app.models import DispatcherCycleRecord
 
         try:
             session.add(
@@ -7261,8 +7537,8 @@ async def get_regression_mtta_data(
     p50 distribution.  Active cases whose p50 has been exceeded carry a negative
     ETA (overdue indicator).
     """
-    from collections import defaultdict  # noqa: PLC0415
-    from datetime import datetime  # noqa: PLC0415
+    from collections import defaultdict
+    from datetime import datetime
 
     cutoff = _utcnow() - timedelta(days=window_days)
     where: list[Any] = [RegressionRemediationCase.first_seen_at >= cutoff]
@@ -7444,7 +7720,7 @@ async def get_sr_persistent_blind_spot_hint(
     consecutive 7-day windows.  Returns None when no persistent categories
     exist (i.e. below-threshold or insufficient sample size).
     """
-    from app.sr_blind_spots import compute_persistent_sr_blind_spot_hint  # noqa: PLC0415
+    from app.sr_blind_spots import compute_persistent_sr_blind_spot_hint
 
     now = _utcnow()
     tasks = (

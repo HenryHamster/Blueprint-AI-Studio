@@ -1,10 +1,11 @@
 import { useState, useEffect, useCallback } from 'react';
-import { AlertTriangle, X, ExternalLink, ChevronDown, ChevronUp, Activity, Wrench, Search } from 'lucide-react';
+import { AlertTriangle, X, ExternalLink, ChevronDown, ChevronUp, Activity, Wrench, Search, Loader2, Zap } from 'lucide-react';
 import { apiFetch } from '../api';
 
 export type { Alert } from '../types/alert';
 import type { Alert } from '../types/alert';
 import type { PipelineRegression } from './DashboardHome';
+import type { SrInvestigationSignal } from './SrTrendBreakdown';
 
 export type { PipelineRegression };
 
@@ -90,9 +91,13 @@ interface AlertsBannerProps {
   regressions?: PipelineRegression[];
   manualInterventionCount?: number;
   projectId?: string;
+  /** Called when operator requests an SR investigation for categories in an alert. Returns spawned task id on success. */
+  onSpawnSrInvestigation?: (signal: SrInvestigationSignal) => Promise<string | null>;
+  /** Map from category id → open investigation task id; used to surface dedup. */
+  activeInvestigationTaskIds?: Record<string, string> | null;
 }
 
-export function AlertsBanner({ alerts, onDismiss, onDismissAll, onViewTask, regressions, manualInterventionCount = 0, projectId }: AlertsBannerProps) {
+export function AlertsBanner({ alerts, onDismiss, onDismissAll, onViewTask, regressions, manualInterventionCount = 0, projectId, onSpawnSrInvestigation, activeInvestigationTaskIds }: AlertsBannerProps) {
   const [expanded, setExpanded] = useState(false);
   const [fetchedInterventionCount, setFetchedInterventionCount] = useState(0);
   const [fetchedStalledCount, setFetchedStalledCount] = useState(0);
@@ -100,6 +105,8 @@ export function AlertsBanner({ alerts, onDismiss, onDismissAll, onViewTask, regr
   const [drilldownRows, setDrilldownRows] = useState<DrilldownRow[]>([]);
   const [drilldownLoading, setDrilldownLoading] = useState(false);
   const [expandedFindings, setExpandedFindings] = useState<Set<string>>(new Set());
+  const [spawningSrAlertId, setSpawningSrAlertId] = useState<string | null>(null);
+  const [spawnedSrTaskIds, setSpawnedSrTaskIds] = useState<Record<string, string>>({});
 
   const fetchInterventionCount = useCallback(async () => {
     if (!projectId) return;
@@ -128,6 +135,18 @@ export function AlertsBanner({ alerts, onDismiss, onDismissAll, onViewTask, regr
       setDrilldownLoading(false);
     }
   }, [projectId, drilldownId]);
+
+  const handleSrInvestigate = useCallback(async (alert: Alert, srInfo: { alertType: 'trends' | 'floor'; categories: string[] }) => {
+    if (!onSpawnSrInvestigation || spawningSrAlertId === alert.id) return;
+    const cat = srInfo.categories.find(c => !activeInvestigationTaskIds?.[c]);
+    if (!cat) return;
+    setSpawningSrAlertId(alert.id);
+    try {
+      const signals = srInfo.alertType === 'floor' ? ['below_floor'] : ['thinning'];
+      const id = await onSpawnSrInvestigation({ category: cat, signals });
+      if (id) setSpawnedSrTaskIds(prev => ({ ...prev, [alert.id]: id }));
+    } finally { setSpawningSrAlertId(null); }
+  }, [onSpawnSrInvestigation, spawningSrAlertId, activeInvestigationTaskIds]);
 
   const fetchStalledCount = useCallback(async () => {
     if (!projectId) return;
@@ -204,6 +223,25 @@ export function AlertsBanner({ alerts, onDismiss, onDismissAll, onViewTask, regr
                   <span className="hidden md:inline">Why?</span>
                 </button>
               )}
+              {srInfo && onSpawnSrInvestigation && (() => {
+                const existingTaskId = srInfo.categories.map(c => activeInvestigationTaskIds?.[c]).find(Boolean) ?? spawnedSrTaskIds[alert.id];
+                const isSpawning = spawningSrAlertId === alert.id;
+                return existingTaskId ? (
+                  <span className="font-mono text-[9px] text-cyan-600 shrink-0 tabular-nums" title={`SR investigation: ${existingTaskId}`}>{existingTaskId.slice(0, 8)}</span>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => void handleSrInvestigate(alert, srInfo)}
+                    disabled={isSpawning}
+                    className="shrink-0 opacity-60 hover:opacity-100 disabled:opacity-30 transition-opacity text-xs flex items-center justify-center gap-1 min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto px-2 md:px-0"
+                    title={`Spawn SR investigation for: ${srInfo.categories.join(', ')}`}
+                    aria-label={`Spawn SR investigation for ${srInfo.categories.join(', ')}`}
+                  >
+                    {isSpawning ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Zap className="w-3.5 h-3.5" />}
+                    <span className="hidden md:inline">Investigate</span>
+                  </button>
+                );
+              })()}
               {alert.task_id && onViewTask && (() => {
                 const taskId = alert.task_id;
                 return (

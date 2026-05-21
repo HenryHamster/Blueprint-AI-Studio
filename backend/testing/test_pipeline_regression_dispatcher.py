@@ -14315,3 +14315,216 @@ class TestComputeRecoveryLayerMismatch:
         assert result["unaddressed_layers"] == ["AGENT_VM"]
         assert set(result["fix_layers"]) == {"CI_WORKFLOW", "REVIEWER_PASS"}
         assert set(result["symptom_layers"]) == {"CI_WORKFLOW", "AGENT_VM"}
+
+
+# ---------------------------------------------------------------------------
+# SR below-floor signal
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_sr_below_floor_spawns_investigation(db_session):
+    """Spawns an investigation when a category is below the floor with sufficient history."""
+    # Keep delta tiny (0.01) so the delta-trend signal does NOT trip.
+    # below_floor=True + 2 history windows satisfies the floor check.
+    design_doc = {
+        "sr_catch_rate_trends": {
+            "categories": {
+                "correctness": {
+                    "current_hit_rate": 0.30,
+                    "previous_hit_rate": 0.31,
+                    "current_human_count": 10,
+                    "trend": "stable",
+                    "below_floor": True,
+                    "rate_history": [0.31, 0.30],
+                }
+            }
+        }
+    }
+    project = make_project(design_doc=design_doc)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 1
+
+    task = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .first()
+    )
+    assert task is not None
+    ctx = task.context or {}
+    assert ctx["regression_class"] == "sr_catch_rate_below_floor"
+    assert ctx["signal_name"] == "sr_catch_rate_below_floor"
+    prompt = (task.first_payload or {}).get("prompt", "")
+    assert "below_floor" in prompt
+    assert "sub-signal=below_floor" in prompt
+
+
+@pytest.mark.asyncio
+async def test_sr_below_floor_no_spawn_insufficient_history(db_session):
+    """No spawn when below_floor=True but rate_history has fewer than min-windows entries."""
+    design_doc = {
+        "sr_catch_rate_trends": {
+            "categories": {
+                "correctness": {
+                    "current_hit_rate": 0.30,
+                    "previous_hit_rate": 0.31,
+                    "current_human_count": 10,
+                    "trend": "stable",
+                    "below_floor": True,
+                    "rate_history": [
+                        0.30
+                    ],  # only 1 window — below _FLOOR_MIN_CONSECUTIVE_WINDOWS=2
+                }
+            }
+        }
+    }
+    project = make_project(design_doc=design_doc)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 0
+
+
+# ---------------------------------------------------------------------------
+# SR pass-engagement thinning signal
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_sr_pass_engagement_thinning_spawns_investigation(db_session):
+    """Spawns an investigation when PASS reasoning engagement is below threshold."""
+    # Keep hit-rate delta tiny so the delta-trend signal does NOT trip.
+    # reasoning_engagement_rate=0.20 < threshold=0.50, total=15 >= min_passes=10.
+    design_doc = {
+        "sr_catch_rate_trends": {
+            "categories": {
+                "correctness": {
+                    "current_hit_rate": 0.80,
+                    "previous_hit_rate": 0.81,
+                    "current_human_count": 15,
+                    "trend": "stable",
+                    "reasoning_engagement_rate": 0.20,
+                    "reasoning_engagement_total": 15,
+                }
+            }
+        }
+    }
+    project = make_project(design_doc=design_doc)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 1
+
+    task = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .first()
+    )
+    assert task is not None
+    ctx = task.context or {}
+    assert ctx["regression_class"] == "sr_pass_engagement_thinning"
+    assert ctx["signal_name"] == "sr_pass_engagement_thinning"
+    prompt = (task.first_payload or {}).get("prompt", "")
+    assert "pass_engagement_thinning" in prompt
+    assert "sub-signal=pass_engagement_thinning" in prompt
+
+
+@pytest.mark.asyncio
+async def test_sr_pass_engagement_thinning_no_spawn_below_min_passes(db_session):
+    """No spawn when engagement rate is low but sample count is below min_passes."""
+    design_doc = {
+        "sr_catch_rate_trends": {
+            "categories": {
+                "correctness": {
+                    "current_hit_rate": 0.80,
+                    "previous_hit_rate": 0.81,
+                    "current_human_count": 15,
+                    "trend": "stable",
+                    "reasoning_engagement_rate": 0.20,
+                    "reasoning_engagement_total": 5,  # below _SR_ENGAGEMENT_MIN_PASSES=10
+                }
+            }
+        }
+    }
+    project = make_project(design_doc=design_doc)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 0
+
+
+# ---------------------------------------------------------------------------
+# SR false-attestation signal
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_sr_false_attestation_spawns_investigation(db_session):
+    """Spawns an investigation when false_attestation_rate exceeds the threshold."""
+    # _FALSE_ATTESTATION_RATE_THRESHOLD=0.10; set rate=0.30 to clearly exceed it.
+    design_doc = {
+        "sr_false_attestation_trends": {
+            "per_category": {
+                "correctness": {
+                    "false_attestation_rate": 0.30,
+                    "previous_false_attestation_rate": 0.05,
+                    "false_attested": 3,
+                    "ci_confirmed": 7,
+                }
+            }
+        }
+    }
+    project = make_project(design_doc=design_doc)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 1
+
+    task = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .first()
+    )
+    assert task is not None
+    ctx = task.context or {}
+    assert ctx["regression_class"] == "sr_false_attestation"
+    assert ctx["signal_name"] == "sr_false_attestation"
+    prompt = (task.first_payload or {}).get("prompt", "")
+    assert "sr_false_attestation" in prompt
+    assert "sub-signal=sr_false_attestation" in prompt
+
+
+@pytest.mark.asyncio
+async def test_sr_false_attestation_no_spawn_below_threshold(db_session):
+    """No spawn when false_attestation_rate is at or below the threshold (0.10)."""
+    design_doc = {
+        "sr_false_attestation_trends": {
+            "per_category": {
+                "correctness": {
+                    "false_attestation_rate": 0.08,  # below _FALSE_ATTESTATION_RATE_THRESHOLD=0.10
+                    "previous_false_attestation_rate": 0.05,
+                    "false_attested": 1,
+                    "ci_confirmed": 11,
+                }
+            }
+        }
+    }
+    project = make_project(design_doc=design_doc)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 0

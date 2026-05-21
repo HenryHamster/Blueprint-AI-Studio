@@ -31,7 +31,7 @@ import { DriftSignalsCard } from './DriftSignalsCard';
 import { PoolAccountHealthPanel, type AccountHealthEntry } from './PoolAccountHealthPanel';
 import { SystemMaturityCard, type SystemMaturityRow } from './SystemMaturityCard';
 import { DirectionPortfolioSection, type DirectionProgress } from './DirectionPortfolioSection';
-import { SrTrendBreakdown, SrMissedRetrospective, SrReviewerDisagreementsPanel, SrUnhandledEdgesRetrospective, EdgesTrendBreakdown, DirectionSrBreakdownPanel, type SrTrendData, type SrMissedTask, type SrReviewerDisagreementsData, type EdgesTrend, type DirectionSrEntry } from './SrTrendBreakdown'; // EdgesTrend used in DigestData
+import { SrTrendBreakdown, SrMissedRetrospective, SrReviewerDisagreementsPanel, SrUnhandledEdgesRetrospective, EdgesTrendBreakdown, DirectionSrBreakdownPanel, type SrTrendData, type SrMissedTask, type SrReviewerDisagreementsData, type EdgesTrend, type DirectionSrEntry, type SrInvestigationSignal } from './SrTrendBreakdown'; // EdgesTrend used in DigestData
 import { TAXONOMY_COLORS, TAXONOMY_LABELS, TAXONOMY_ORDER } from './dashboardConstants';
 import { ManualInterventionPanel, AutoRecoveredPanel, AnomalyTrackerPanel } from './PipelineRegressionsPanel';
 import { RecentlyResolvedRegressionsPanel } from './RecentlyResolvedRegressionsPanel';
@@ -712,6 +712,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
   const [srReviewerDisagreements, setSrReviewerDisagreements] = useState<SrReviewerDisagreementsData | null>(null);
   const [directionSrBreakdown, setDirectionSrBreakdown] = useState<DirectionSrBreakdownData | null>(null);
   const [fingerprintAnalytics, setFingerprintAnalytics] = useState<PromptFingerprintAnalyticsResponse | null>(null);
+  const [srInvestigationTaskIds, setSrInvestigationTaskIds] = useState<Record<string, string>>({});
   const [srTrendDrilldownOpen, setSrTrendDrilldownOpen] = useState(false);
   const [srTrendDrilldownRows, setSrTrendDrilldownRows] = useState<{ task_id: string; title: string; missed_categories: string[]; sr_verdict: string | null }[]>([]);
   const [srTrendDrilldownLoading, setSrTrendDrilldownLoading] = useState(false);
@@ -758,6 +759,23 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
     // Parent (App.tsx) is responsible for implementing the navigation to settings
     // For now, this is a no-op callback that can be enhanced to navigate or show a modal
   }, []);
+
+  const handleSpawnSrInvestigation = useCallback(async (signal: SrInvestigationSignal): Promise<string | null> => {
+    if (!selectedProjectId) return null;
+    try {
+      const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(selectedProjectId)}/sr-investigation`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(signal),
+      });
+      if (!res.ok) return null;
+      const data = (await res.json()) as { task_id: string; created: boolean };
+      setSrInvestigationTaskIds(prev => ({ ...prev, [signal.category]: data.task_id }));
+      return data.task_id;
+    } catch {
+      return null;
+    }
+  }, [selectedProjectId]);
 
   // Fetch data
   const fetchData = useCallback(async () => {
@@ -879,6 +897,15 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
           try {
             const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(selectedProjectId)}/prompt-fingerprint-analytics`);
             if (res.ok) setFingerprintAnalytics(await res.json());
+          } catch { /* silent */ }
+        })(),
+        (async () => {
+          try {
+            const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(selectedProjectId)}/sr-investigation-task-ids`);
+            if (res.ok) {
+              const data = (await res.json()) as { task_ids?: Record<string, string> };
+              setSrInvestigationTaskIds(data.task_ids ?? {});
+            }
           } catch { /* silent */ }
         })(),
       );
@@ -1396,6 +1423,8 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
                   onCategoryClick={handleCategoryClick}
                   srCatchRateTargets={srCatchRateTargets}
                   onConfigureTargets={handleConfigureTargets}
+                  onSpawnSrInvestigation={selectedProjectId ? handleSpawnSrInvestigation : undefined}
+                  activeInvestigationTaskIds={srInvestigationTaskIds}
                 />
                 <FixIterationBreakdown trends={digest?.self_review_prediction_accuracy_trends} />
                 <EdgesTrendBreakdown trend={digest?.edges_trend} />

@@ -12,7 +12,7 @@ import { PipelineView } from './components/PipelineView';
 import { ProjectDashboard } from './components/ProjectDashboard';
 import { auth, signInWithGoogle, signOut } from './firebase';
 import { fetchTask, apiFetch, API_BASE_URL, fetchSrMissedRetrospectives } from './api';
-import { SrMissedRetrospective, type SrMissedTask } from './components/SrTrendBreakdown';
+import { SrMissedRetrospective, type SrMissedTask, type SrInvestigationSignal } from './components/SrTrendBreakdown';
 import { TaskDetailDrawer } from './components/TaskDetailDrawer';
 import { ToastContainer } from './components/Toasts';
 import { AlertsBanner } from './components/AlertsBanner';
@@ -172,6 +172,42 @@ export default function App() {
       .catch(() => {})
       .finally(() => setSrMissedLoading(false));
   }, [showSrMissed, selectedProjectId]);
+
+  // Open operator-spawned SR investigations, keyed by category — used to dedup spawning.
+  const [srInvestigationTaskIds, setSrInvestigationTaskIds] = useState<Record<string, string>>({});
+  useEffect(() => {
+    if (!selectedProjectId) { setSrInvestigationTaskIds({}); return; }
+    const pid = selectedProjectId;
+    let cancelled = false;
+    async function fetchIds() {
+      try {
+        const res = await apiFetch(`${API_BASE_URL}/api/admin/projects/${encodeURIComponent(pid)}/sr-investigation-task-ids`);
+        if (!res.ok || cancelled) return;
+        const data = (await res.json()) as { task_ids?: Record<string, string> };
+        if (!cancelled) setSrInvestigationTaskIds(data.task_ids ?? {});
+      } catch { /* ignore */ }
+    }
+    fetchIds();
+    const interval = setInterval(fetchIds, 30_000);
+    return () => { cancelled = true; clearInterval(interval); };
+  }, [selectedProjectId]);
+
+  const handleSpawnSrInvestigation = useCallback(async (signal: SrInvestigationSignal): Promise<string | null> => {
+    if (!selectedProjectId) return null;
+    try {
+      const res = await apiFetch(`${API_BASE_URL}/api/admin/projects/${encodeURIComponent(selectedProjectId)}/sr-investigation`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(signal),
+      });
+      if (!res.ok) return null;
+      const data = (await res.json()) as { task_id: string; created: boolean };
+      setSrInvestigationTaskIds(prev => ({ ...prev, [signal.category]: data.task_id }));
+      return data.task_id;
+    } catch {
+      return null;
+    }
+  }, [selectedProjectId]);
 
   const zoneHealthAlerts = useMemo(() => {
     if (!s.zoneHealth) return [];
@@ -553,6 +589,8 @@ export default function App() {
         }}
         onViewTask={handleViewTask}
         projectId={s.selectedProjectId ?? undefined}
+        onSpawnSrInvestigation={s.selectedProjectId ? handleSpawnSrInvestigation : undefined}
+        activeInvestigationTaskIds={srInvestigationTaskIds}
       />
 
       {!s.showArchive && !s.showUserManagement && (
