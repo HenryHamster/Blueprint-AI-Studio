@@ -17,6 +17,8 @@
     "MetricsDashboard",
     "OrchestratorHealthBar",
     "PipelineRegressionsPanel",
-    "SearchFilterBar"
+    "SearchFilterBar",
+    "PlaybookPanel",
+    "CatchUpPanel"
   ]
 }

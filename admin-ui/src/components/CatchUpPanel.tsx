@@ -1154,9 +1154,8 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
                       <AlertTriangle className="w-3 h-3" />
                       <span className="flex-1">Needs attention ({countLabel})</span>
                       {onBulkApprove && visibleItems.filter(i => i.reason === 'approval_required').length >= 2 && (
-                        // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
                         <button
-                          className="text-[10px] font-semibold px-2 py-0.5 rounded border flex items-center gap-1 bg-emerald-500/10 text-emerald-500 hover:bg-emerald-500/20 border-emerald-500/20 normal-case tracking-normal"
+                          className="text-[10px] font-semibold px-2 py-4 rounded border flex items-center gap-1 bg-emerald-500/10 text-emerald-500 hover:bg-emerald-500/20 border-emerald-500/20 normal-case tracking-normal"
                           onClick={() => handleBulkApprove(visibleItems.filter(i => i.reason === 'approval_required').map(i => i.task_id))}
                         >
                           <Check className="w-3 h-3" />
@@ -1164,9 +1163,8 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
                         </button>
                       )}
                       {onBulkRetry && visibleItems.filter(i => i.reason === 'failed').length >= 2 && (
-                        // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
                         <button
-                          className="text-[10px] font-semibold px-2 py-0.5 rounded border flex items-center gap-1 bg-blue-500/10 text-blue-500 hover:bg-blue-500/20 border-blue-500/20 normal-case tracking-normal"
+                          className="text-[10px] font-semibold px-2 py-4 rounded border flex items-center gap-1 bg-blue-500/10 text-blue-500 hover:bg-blue-500/20 border-blue-500/20 normal-case tracking-normal"
                           onClick={() => handleBulkRetry(visibleItems.filter(i => i.reason === 'failed').map(i => i.task_id))}
                         >
                           <RotateCcw className="w-3 h-3" />
@@ -1238,9 +1236,8 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
                             )}
                             <WaitingBadge hours={item.waiting_hours} />
                             {item.reason === 'approval_required' && onApprove && (
-                              // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
                               <button
-                                className="text-[9px] font-semibold px-1.5 py-0.5 rounded border flex items-center gap-0.5 bg-emerald-500/10 text-emerald-500 hover:bg-emerald-500/20 border-emerald-500/20"
+                                className="text-[9px] font-semibold px-2 py-4 rounded border flex items-center gap-0.5 bg-emerald-500/10 text-emerald-500 hover:bg-emerald-500/20 border-emerald-500/20"
                                 onClick={e => { e.stopPropagation(); handleApprove(item.task_id); }}
                               >
                                 <Check className="w-2.5 h-2.5" />
@@ -1248,9 +1245,8 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
                               </button>
                             )}
                             {item.reason === 'failed' && onRetry && (
-                              // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
                               <button
-                                className="text-[9px] font-semibold px-1.5 py-0.5 rounded border flex items-center gap-0.5 bg-blue-500/10 text-blue-500 hover:bg-blue-500/20 border-blue-500/20"
+                                className="text-[9px] font-semibold px-2 py-4 rounded border flex items-center gap-0.5 bg-blue-500/10 text-blue-500 hover:bg-blue-500/20 border-blue-500/20"
                                 onClick={e => { e.stopPropagation(); handleRetry(item.task_id); }}
                               >
                                 <RotateCcw className="w-2.5 h-2.5" />

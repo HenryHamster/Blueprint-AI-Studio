@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { PlaybookPanel } from './PlaybookPanel';
-import { expectNoOverflowAt } from '../test/viewport';
+import { expectNoOverflowAt, expectNoTextTruncationAt, expectMinTouchTargetAt } from '../test/viewport';
 
 const MOCK_ENTRIES = {
   'success-create-small': {
@@ -102,6 +102,30 @@ describe('PlaybookPanel — viewport regression', () => {
         root?.render(<PlaybookPanel selectedProjectId="proj-1" />);
       });
       await act(async () => { await new Promise((resolve) => setTimeout(resolve, 50)); });
-    });
+    }, { waitMs: 50 });
+  });
+
+  test('playbook entry text does not silently truncate at 375px', async () => {
+    await expectNoTextTruncationAt(375, async () => {
+      host = document.createElement('div');
+      document.body.appendChild(host);
+      root = createRoot(host);
+      await act(async () => {
+        root?.render(<PlaybookPanel selectedProjectId="proj-1" />);
+      });
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 50)); });
+    }, { waitMs: 50 });
+  });
+
+  test('curate action buttons meet 44px touch target at 375px', async () => {
+    await expectMinTouchTargetAt(375, async () => {
+      host = document.createElement('div');
+      document.body.appendChild(host);
+      root = createRoot(host);
+      await act(async () => {
+        root?.render(<PlaybookPanel selectedProjectId="proj-1" />);
+      });
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 50)); });
+    }, { selector: 'button', waitMs: 50 });
   });
 });

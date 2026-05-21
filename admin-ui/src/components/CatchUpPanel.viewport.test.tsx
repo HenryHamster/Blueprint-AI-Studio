@@ -2,7 +2,7 @@ import { afterEach, describe, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { CatchUpPanel } from './CatchUpPanel';
-import { expectNoOverflowAt, expectNoTextTruncationAt } from '../test/viewport';
+import { expectNoOverflowAt, expectNoTextTruncationAt, expectMinTouchTargetAt } from '../test/viewport';
 import { apiFetch } from '../api';
 
 // Mock the api module so CatchUpPanel doesn't try to fetch real data.
@@ -248,5 +248,34 @@ describe('CatchUpPanel — viewport regression', () => {
         await new Promise<void>((resolve) => setTimeout(resolve, 50));
       });
     });
+  });
+
+  test('primary triage actions (Approve/Retry buttons) meet 44px touch target at 375px', async () => {
+    await expectMinTouchTargetAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <CatchUpPanel
+            selectedProjectId="project-123"
+            lastVisitTimestamp={Date.now() - 24 * 60 * 60 * 1000}
+            refreshInterval={60000}
+            onSelectTask={() => {}}
+            onOpenActivityFeed={() => {}}
+            needsAttentionCount={2}
+            onApprove={() => {}}
+            onRetry={() => {}}
+            onBulkApprove={() => {}}
+            onBulkRetry={() => {}}
+          />,
+        );
+      });
+      await act(async () => {
+        await new Promise<void>((resolve) => setTimeout(resolve, 50));
+      });
+    }, { selector: 'button:is(.bg-emerald-500\\/10, .bg-blue-500\\/10)', waitMs: 50 });
   });
 });
