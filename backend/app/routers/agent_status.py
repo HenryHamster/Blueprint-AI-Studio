@@ -697,6 +697,61 @@ async def _persist_post_commit_pending(factory, task_id, reason: str, payload_du
         raise last_exc
 
 
+async def _clear_post_commit_pending(factory, task_id) -> None:
+    """Clear the write-ahead post_commit_pending marker after a clean run.
+
+    Paired with the write-ahead set in ``update_agent_status``: the marker is
+    persisted *before* ``_process_post_commit`` runs, so a mid-flight instance
+    kill (Cloud Run scale-in / "user disabled instance" SIGKILL) that bypasses
+    the except handler still leaves a retry marker for
+    ``_sweep_post_commit_pending``. On the happy path we clear it here.
+
+    Best-effort: a clear failure is self-healing because the sweep age-gates
+    ``reason="inline_running"`` markers and its ``_process_post_commit`` retry
+    is idempotent — the worst case is one redundant post-commit pass.
+    """
+    for attempt in range(3):
+        try:
+            async with factory() as s:
+                locked = (
+                    (
+                        await s.execute(
+                            select(Task)
+                            .where(Task.id == task_id)
+                            .with_for_update(skip_locked=True)
+                        )
+                    )
+                    .scalars()
+                    .first()
+                )
+                if locked is None:
+                    exists = (
+                        await s.execute(select(Task.id).where(Task.id == task_id))
+                    ).first()
+                    if exists is None:
+                        return
+                    await asyncio.sleep(1 + attempt)
+                    continue
+                if not locked.post_commit_pending and "_post_commit_pending_meta" not in (
+                    locked.context or {}
+                ):
+                    return  # already clear
+                locked.post_commit_pending = False
+                new_ctx = dict(locked.context or {})
+                new_ctx.pop("_post_commit_pending_meta", None)
+                locked.context = new_ctx
+                flag_modified(locked, "context")
+                s.add(locked)
+                await s.commit()
+                return
+        except Exception as e:
+            logger.warning(
+                f"[PIPELINE] Failed to clear post_commit_pending for task "
+                f"{task_id} (attempt {attempt + 1}/3): {e}"
+            )
+            await asyncio.sleep(1 + attempt)
+
+
 async def _propagate_pipeline_failure_to_original(
     task: Task, session: AsyncSession
 ) -> None:
@@ -3079,6 +3134,41 @@ async def update_agent_status(
                 f"before early commit — an upstream swallow-point leaked"
             )
             session.add(task)
+
+        # Write-ahead the post-commit retry marker. _process_post_commit can be
+        # killed mid-flight by an instance shutdown — a Cloud Run scale-in or
+        # "user disabled instance" SIGKILL that bypasses BOTH the 240s asyncio
+        # timeout AND the except handler below, so the failure-path
+        # _persist_post_commit_pending never runs and the task orphans with no
+        # retry marker (incident 2026-05-21: cluster PR #4775 completed but its
+        # research-branch auto-merge was killed ~90s in, stranding the dep
+        # chain — eefbed05 sat QUEUED indefinitely). Persisting the marker
+        # BEFORE post-commit runs — committed atomically with the terminal
+        # status by the early commit below — means any death short of a clean
+        # return leaves a marker for _sweep_post_commit_pending to recover.
+        # The happy path clears it via _clear_post_commit_pending once
+        # _process_post_commit returns; the sweep age-gates reason=
+        # "inline_running" markers so a still-running inline pass is never
+        # double-processed. Scoped to COMPLETED/FAILED — the only statuses the
+        # sweep retries.
+        try:
+            _payload_dump = payload.model_dump(mode="json")
+        except Exception:
+            _payload_dump = None
+        if payload.status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
+            task.post_commit_pending = True
+            task.context = {
+                **(task.context or {}),
+                "_post_commit_pending_meta": {
+                    "at": _utcnow().isoformat(),
+                    "reason": "inline_running",
+                    "payload": _payload_dump,
+                    "attempts": 0,
+                },
+            }
+            flag_modified(task, "context")
+            session.add(task)
+
         try:
             # Commit unconditionally if a transaction is open. The earlier
             # `if session.dirty or session.new` was unsafe: autoflush from any
@@ -3128,14 +3218,12 @@ async def update_agent_status(
         # check, merge attempts) that each retry with up to 3x120s backoff on
         # 403 rate-limit. A single stalled retry chain can exceed 300s and
         # Cloud Run kills the request mid-execution, bypassing the except
-        # handler below — _post_commit_pending never gets set, the agent's
-        # idempotency guard then blocks retries, and the task's state is
-        # silently lost (reviews approved but never propagated, creates
-        # completed but never spawned follow-up).
-        # Explicit 240s budget inside our own timeout so we catch the
-        # timeout in Python and set the pending marker before giving up.
+        # handler below. The 240s budget catches an in-Python timeout before
+        # that 300s ceiling and routes through the except handler; the
+        # write-ahead marker set above is what survives a *hard* kill
+        # (instance shutdown) the except handler can never reach.
         try:
-            return await asyncio.wait_for(
+            _pc_result = await asyncio.wait_for(
                 _process_post_commit(task.id, payload, _session_factory=_factory),
                 timeout=240,
             )
@@ -3161,10 +3249,9 @@ async def update_agent_status(
             # down the transaction) and the task row may still be held by a
             # peer. Use a fresh session with skip_locked + retry so the pending
             # marker lands even when the request session can't commit.
-            try:
-                _payload_dump = payload.model_dump(mode="json")
-            except Exception:
-                _payload_dump = None
+            # ``_payload_dump`` was already computed for the write-ahead marker;
+            # _persist_post_commit_pending re-stamps the marker with the
+            # specific failure reason and bumps its attempt counter.
             _persist_err: Exception | None = None
             try:
                 await _persist_post_commit_pending(
@@ -3183,3 +3270,9 @@ async def update_agent_status(
             if _persist_err is not None:
                 raise e from _persist_err
             raise
+
+        # _process_post_commit returned cleanly. Clear the write-ahead marker
+        # so _sweep_post_commit_pending doesn't re-run an already-finished
+        # post-commit. Best-effort — see _clear_post_commit_pending.
+        await _clear_post_commit_pending(_factory, task.id)
+        return _pc_result

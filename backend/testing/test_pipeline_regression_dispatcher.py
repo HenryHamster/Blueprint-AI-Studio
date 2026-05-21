@@ -7660,6 +7660,71 @@ async def test_sr_blind_spot_theme_disallowed_no_spawn(db_session):
 
 
 @pytest.mark.asyncio
+async def test_sr_blind_spot_slipping_variant_disallowed_no_spawn(db_session):
+    """No-test-noun variant that themes to the truncated form → no spawn.
+
+    Regression test for the production bug behind the recurring
+    ``sr_blind_spot:theme:did not run the full backend`` cases. The entry
+    "did not run the full backend suite" carries no "test suite"/"pytest"/
+    "tests" noun, so the original suffix-anchored pattern did not match it;
+    the entry survived the entry-level filter, themed to its first 6 tokens
+    ("did not run the full backend"), and once 5+ such entries accumulated it
+    tripped the spawn floor. With the test-noun made optional, the entry is
+    filtered before aggregation and no investigate task is spawned.
+    """
+    from app.sr_blind_spots import aggregate_sr_blind_spot_themes
+    from app.time_utils import _utcnow as _ts_now
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _ts_now()
+    # No "test suite"/"pytest"/"tests" noun — the variant that slipped through.
+    slipping_text = "did not run the full backend suite"
+    for _ in range(7):  # well above the floor of 5
+        sro = {
+            "verdict": "pass",
+            "check_results": {"correctness": {"passed": True}},
+            "blind_spots": [slipping_text],
+            "reviewer_findings": [],
+        }
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create", "prompt": "x", "base_branch": "main"}],
+                context={"_self_review_outcome": sro},
+                created_at=now - timedelta(days=3),
+            )
+        )
+    await db_session.commit()
+
+    # The entry-level filter strips it — the truncated theme never reaches
+    # the dispatcher loop.
+    themes = await aggregate_sr_blind_spot_themes(
+        db_session, project.id, days=14, limit=100
+    )
+    assert all("did not run the full backend" not in t["theme"] for t in themes)
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 0
+
+    all_tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    investigate_tasks = [
+        t for t in all_tasks if (t.first_payload or {}).get("type") == "investigate"
+    ]
+    assert investigate_tasks == [], (
+        "no investigate task should be spawned for the slipping disallowed variant"
+    )
+
+
+@pytest.mark.asyncio
 async def test_sr_blind_spot_theme_allowed_spawns(db_session):
     """Allowed theme at count >= floor → investigate task is spawned normally."""
     from app.pipeline_regression_dispatcher import _SR_BLIND_SPOT_THEME_FLOOR

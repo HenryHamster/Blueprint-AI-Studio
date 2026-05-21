@@ -1944,7 +1944,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                     if head_sha:
                         try:
                             target_tip_sha = await get_branch_sha(
-                                gh_token, owner, repo, target_branch, project_id=project_id_str,
+                                gh_token, owner, repo, target_branch,
                             )
                         except Exception as tip_err:
                             logger.warning(f"[ROLLUP] Failed to fetch target tip for PR #{rollup_pr_number}: {tip_err}")

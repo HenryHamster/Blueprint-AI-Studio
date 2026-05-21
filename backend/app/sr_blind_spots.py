@@ -28,29 +28,51 @@ from app.models import Task, TaskStatus
 
 _SR_SKIP_BLIND_SPOT_MARKERS = ("self-review skipped", "self-review JSON parsing failed")
 
-# Patterns matching blind_spot entries that agents must NOT emit (per prompt.ts:2057).
-# Lenient matching covers wording variants: didn't/skipped/did not execute +
-# full/entire/whole + backend/docker/viewport/playwright + pytest/test suite/tests.
+# Patterns matching blind_spot entries that agents must NOT emit (per prompt.ts).
+# These describe the intended-design pipeline split — agents run a targeted
+# ``./check``; CI runs the full backend/docker/viewport/playwright suite — so
+# "I did not run the full <X> suite" is never a regression, in any phrasing.
+#
+# Pattern 1 deliberately makes the trailing test-noun OPTIONAL. The dispatcher
+# checks ``is_disallowed_blind_spot`` against the blind-spot *theme*, which
+# ``_scan_blind_spot_counts`` truncates to its first 6 tokens — e.g. "did not
+# run the full backend test suite" themes to "did not run the full backend".
+# The original pattern required a "test suite"/"pytest"/"tests" suffix that the
+# truncation drops, so the truncated theme never matched and intended-skip
+# themes still tripped the spawn floor; entry variants with no test-noun at all
+# ("did not run the full backend suite") slipped the entry-level filter too.
+# Once the qualifier (full/entire/whole/complete) + a suite subject appear, the
+# entry is an intended skip regardless of what noun — if any — follows.
 DISALLOWED_BLIND_SPOT_PATTERNS: List[re.Pattern] = [
     re.compile(
         r"(did\s+not\s+run|didn.t\s+run|skipped|did\s+not\s+execute)\s+"
-        r"(the\s+)?(full|entire|whole)\s+"
-        r"(backend|docker|viewport|playwright)\s+"
-        r"(test\s+suite|pytest|tests?)",
+        r"(the\s+|a\s+)?"
+        r"(full|entire|whole|complete)\s+"
+        r"(backend|frontend|docker|viewport|playwright|integration|e2e|test)",
         re.IGNORECASE,
     ),
-    # Shorter variant without "full/entire/whole": "did not run docker pytest"
+    # Shorter variant without a full/entire/whole/complete qualifier: an
+    # explicit suite subject followed (optionally via one intervening word)
+    # by a test-noun — "did not run docker pytest", "did not run integration
+    # tests", "did not run the docker integration tests".
     re.compile(
         r"(did\s+not\s+run|didn.t\s+run|skipped|did\s+not\s+execute)\s+"
-        r"(docker|viewport|playwright)\s+"
-        r"(pytest|tests?)",
+        r"(the\s+|a\s+)?"
+        r"(docker|viewport|playwright|integration|e2e)\s+"
+        r"(\w+\s+)?"
+        r"(pytest|tests?|suite)",
         re.IGNORECASE,
     ),
 ]
 
-# Human-readable examples from the prompt — used by contract tests to verify parity.
+# Human-readable examples from the prompt — used by contract tests to verify
+# parity. Includes the truncated 6-token theme form ("did not run the full
+# backend") and a no-test-noun variant ("did not run the full backend suite")
+# that the original suffix-anchored pattern missed.
 DISALLOWED_BLIND_SPOT_EXAMPLES: List[str] = [
     "did not run the full backend test suite",
+    "did not run the full backend",
+    "did not run the full backend suite",
     "did not run docker pytest",
     "did not run viewport tests",
 ]
@@ -113,9 +135,7 @@ def is_skipped_sr_outcome(sro: Dict[str, Any] | None) -> bool:
             m in entry for m in _SR_SKIP_BLIND_SPOT_MARKERS
         ):
             return True
-    if sro.get("verdict") == "unknown" and not (sro.get("check_results") or {}):
-        return True
-    return False
+    return sro.get("verdict") == "unknown" and not (sro.get("check_results") or {})
 
 
 async def _scan_blind_spot_counts(
@@ -139,7 +159,7 @@ async def _scan_blind_spot_counts(
     result = await session.execute(stmt)
     all_tasks = result.scalars().all()
 
-    from app.regression_layer_classifier import classify_layers  # noqa: PLC0415
+    from app.regression_layer_classifier import classify_layers
 
     theme_data: Dict[str, dict] = {}
     for t in all_tasks:
@@ -153,11 +173,13 @@ async def _scan_blind_spot_counts(
             if not isinstance(entry, str) or not entry.strip():
                 continue
             # Apply disallow patterns to the *full* entry, not the 6-token
-            # theme. Patterns require a "(test suite|pytest|tests?)" suffix
-            # that the truncation drops (e.g. "did not run the full backend
-            # test suite" → "did not run the full backend"), so a per-theme
-            # check downstream in the dispatcher always missed and noisy
-            # intentional-skip themes still tripped the spawn floor.
+            # theme. The full entry carries more context (e.g. a trailing
+            # "... on the VM"), so entry-level matching is strictly more
+            # reliable. Pattern 1 now also matches the truncated theme form
+            # directly (the trailing test-noun is optional), so the
+            # dispatcher's per-theme defense-in-depth check works too — but
+            # filtering here keeps disallowed entries out of the theme
+            # aggregator entirely.
             if is_disallowed_blind_spot(entry):
                 continue
             theme = " ".join(entry.lower().split()[:6])
@@ -625,7 +647,7 @@ def _count_reviewer_disagreement_directions(tasks) -> Dict[tuple, dict]:
             "miss_coverage_gap": 0,
             "tp": 0,
             "fp": 0,
-            "severity": {s: 0 for s in _SEVERITY_LEVELS},
+            "severity": dict.fromkeys(_SEVERITY_LEVELS, 0),
             "examples": [],
         }
     )
@@ -963,7 +985,7 @@ def classify_theme_example_layers(examples: list) -> list:
     separately lets callers record per-example layer observations in
     ``symptoms_by_layer`` independently from the signal-level observation.
     """
-    from app.regression_layer_classifier import classify_layers  # noqa: PLC0415
+    from app.regression_layer_classifier import classify_layers
 
     layers: set = set()
     for ex in examples or []:

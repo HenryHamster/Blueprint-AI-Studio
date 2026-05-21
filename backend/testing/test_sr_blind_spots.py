@@ -62,6 +62,19 @@ def _make_fa_task(
         "did not execute the whole viewport tests",
         "did not run the full playwright tests",
         "skipped docker pytest",
+        # Truncated 6-token theme form — the dispatcher checks this directly,
+        # and the original suffix-anchored pattern never matched it.
+        "did not run the full backend",
+        # No-test-noun variants that slipped the original entry-level filter
+        # but still theme to "did not run the full backend".
+        "did not run the full backend suite",
+        "did not run the full backend integration tests",
+        "did not run the full backend docker tests",
+        "skipped the complete e2e suite",
+        "did not run the entire frontend test suite",
+        # Shorter no-qualifier variants picked up by pattern 2.
+        "did not run integration tests",
+        "did not run the docker integration tests",
     ],
 )
 def test_is_disallowed_matches_forbidden_entries(entry):
@@ -76,6 +89,10 @@ def test_is_disallowed_matches_forbidden_entries(entry):
         "no test for the empty-list edge case I added handling for",
         "self-review skipped",
         "did not run all unit tests",  # "all" not in full/entire/whole, no docker/viewport
+        # Genuine "did not run X" blind spots must still survive — X is not a
+        # full suite, so the broadened pattern 1 must not over-match.
+        "did not run the linter on the changed file",
+        "did not run the new migration against a fresh db",
     ],
 )
 def test_is_disallowed_leaves_valid_entries_alone(entry):

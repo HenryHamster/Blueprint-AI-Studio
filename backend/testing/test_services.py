@@ -355,7 +355,7 @@ async def deploy_db(mocker):
 @pytest.mark.asyncio
 async def test_persist_circuit_breakers_saves_open_breaker(deploy_db, mocker):
     """An OPEN circuit breaker (failure_count > 0) must be persisted to DeploymentState."""
-    session, _Session = deploy_db
+    _session, _Session = deploy_db
     opened_at = _naive_utcnow()
 
     saved_breakers = _shared_state.circuit_breakers.copy()
@@ -397,7 +397,7 @@ async def test_persist_circuit_breakers_prunes_closed_with_no_failures(
     deploy_db, mocker
 ):
     """CLOSED breakers with failure_count=0 are default state and must NOT be persisted."""
-    session, _Session = deploy_db
+    _session, _Session = deploy_db
 
     saved_breakers = _shared_state.circuit_breakers.copy()
     _shared_state.circuit_breakers.clear()
@@ -463,7 +463,7 @@ async def test_persist_circuit_breakers_handles_missing_deploy_state(deploy_db, 
 @pytest.mark.asyncio
 async def test_persist_zone_health_serializes_datetimes(deploy_db, mocker):
     """Zone health datetime fields (e.g. cooldown_expires_at) must be ISO-stringified."""
-    session, _Session = deploy_db
+    _session, _Session = deploy_db
 
     expires_at = _naive_utcnow() + timedelta(minutes=30)
     fake_zone_health = {
@@ -1462,6 +1462,137 @@ async def test_post_commit_sweep_still_retries_completed_and_failed(svc_db, mock
 
     # Both retried.
     assert mock_process.call_count == 2
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# _sweep_post_commit_pending — write-ahead marker age-gate (incident 2026-05-21)
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_post_commit_sweep_skips_recent_inline_running_marker(svc_db, mocker):
+    """A reason="inline_running" marker is written-ahead BEFORE
+    _process_post_commit runs. A *recent* one may still be a live inline pass,
+    so the sweep must NOT retry it — retrying would double-process the
+    post-commit (double review-spawn / double merge)."""
+    project = await _make_project(svc_db)
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "x"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        post_commit_pending=True,
+        context={
+            "_post_commit_pending_meta": {
+                "at": _naive_utcnow().isoformat(),  # just now — run still live
+                "reason": "inline_running",
+                "payload": {"task_id": "x", "status": "COMPLETED", "logs": "{}"},
+                "attempts": 0,
+            }
+        },
+    )
+    svc_db.add(task)
+    await svc_db.commit()
+
+    mock_process = AsyncMock(
+        side_effect=AssertionError("must not retry a live inline_running marker")
+    )
+    mocker.patch("app.routers.agent_status._process_post_commit", mock_process)
+
+    await _sweep_post_commit_pending()
+
+    mock_process.assert_not_called()
+    await svc_db.refresh(task)
+    assert task.post_commit_pending is True, "marker must persist — run in flight"
+
+
+@pytest.mark.asyncio
+async def test_post_commit_sweep_retries_stale_inline_running_marker(svc_db, mocker):
+    """Orphan recovery for incident 2026-05-21: when _process_post_commit is
+    killed mid-flight by an instance shutdown, the except handler never runs,
+    so the write-ahead marker stays reason="inline_running" forever. Once it
+    ages past the grace window the sweep MUST retry it — without this the task
+    orphans permanently (cluster PR #4775 / be15c811 stranded eefbed05)."""
+    import uuid as _uuid
+
+    project = await _make_project(svc_db)
+    task_id = _uuid.uuid4()
+    task = Task(
+        id=task_id,
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "x"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        post_commit_pending=True,
+        context={
+            "_post_commit_pending_meta": {
+                # 20 min old — well past the 600s grace; the inline pass that
+                # set this is provably dead.
+                "at": (_naive_utcnow() - timedelta(minutes=20)).isoformat(),
+                "reason": "inline_running",
+                "payload": {
+                    "task_id": str(task_id),
+                    "status": "COMPLETED",
+                    "logs": "{}",
+                },
+                "attempts": 0,
+            }
+        },
+    )
+    svc_db.add(task)
+    await svc_db.commit()
+
+    mock_process = AsyncMock()  # succeeds
+    mocker.patch("app.routers.agent_status._process_post_commit", mock_process)
+
+    await _sweep_post_commit_pending()
+
+    mock_process.assert_called_once()
+    await svc_db.refresh(task)
+    assert task.post_commit_pending is False, "recovered marker must be cleared"
+    assert "_post_commit_pending_meta" not in (task.context or {})
+
+
+@pytest.mark.asyncio
+async def test_clear_post_commit_pending_clears_write_ahead_marker(svc_db):
+    """_clear_post_commit_pending is the happy-path counterpart to the sweep:
+    after a clean _process_post_commit run, update_agent_status calls it to
+    drop the write-ahead marker so the sweep never re-runs a finished
+    post-commit."""
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+    from app.routers.agent_status import _clear_post_commit_pending
+
+    project = await _make_project(svc_db)
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "x"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        post_commit_pending=True,
+        context={
+            "keep_me": "untouched",
+            "_post_commit_pending_meta": {
+                "at": _naive_utcnow().isoformat(),
+                "reason": "inline_running",
+                "payload": {"task_id": "x", "status": "COMPLETED", "logs": "{}"},
+                "attempts": 0,
+            },
+        },
+    )
+    svc_db.add(task)
+    await svc_db.commit()
+
+    factory = async_sessionmaker(
+        svc_db.bind, class_=AsyncSession, expire_on_commit=False
+    )
+    await _clear_post_commit_pending(factory, task.id)
+
+    await svc_db.refresh(task)
+    assert task.post_commit_pending is False
+    assert "_post_commit_pending_meta" not in (task.context or {})
+    assert (task.context or {}).get("keep_me") == "untouched", (
+        "unrelated context keys must survive the clear"
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
