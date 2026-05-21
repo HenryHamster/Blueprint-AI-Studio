@@ -2904,9 +2904,7 @@ async def claim_task(
                     Task.created_at > _utcnow() - timedelta(days=14),
                 )
                 .options(
-                    load_only(
-                        Task.id, Task.context, Task.payloads, Task.created_at
-                    )
+                    load_only(Task.id, Task.context, Task.payloads, Task.created_at)
                 )
                 .order_by(Task.created_at.desc())
                 .limit(2000)
@@ -3480,6 +3478,91 @@ async def vm_heartbeat(
     return Response(status_code=204)
 
 
+async def _finalize_warm_claim(
+    session: AsyncSession,
+    task: Task,
+    vm_instance_id: str,
+    *,
+    origin: str,
+) -> dict:
+    """Flip a locked QUEUED task to IN_PROGRESS for a warm VM and build the
+    /next-role claim response.
+
+    Shared by the chain-continuity (``origin="next_role_endpoint"``) and the
+    backlog-reuse (``origin="backlog_reuse"``) paths so both stamp warm
+    telemetry identically. Sets ``context._timing.warm_start`` and resets
+    ``vm_provisioned_at`` to now so the task is counted as warm (and pays ~0
+    cold-start) by the efficiency snapshot, mints a fresh task-scoped JWT,
+    commits, and broadcasts the status change. On JWT-mint failure it rolls
+    back (restoring QUEUED) and raises 500.
+    """
+    from app.compute import VM_PROVISIONING_MODEL
+
+    task.vm_instance_id = vm_instance_id
+    task.status = TaskStatus.IN_PROGRESS
+    task.last_heartbeat = _utcnow()
+    # vm_provisioned_at marks when the VM was made available to the task. For
+    # warm-start we set it to "now" so claim_latency / reaper logic operates on
+    # a fresh window — and so the subsequent idempotent /claim never stamps a
+    # cold-start sample (the warm task stays vm_cold_start_ms=NULL).
+    task.vm_provisioned_at = _utcnow()
+    task.vm_spot = VM_PROVISIONING_MODEL == "SPOT"
+    if task.started_at is None:
+        task.started_at = _utcnow()
+    # Carry warm-start signal forward into context._timing. setdefault keeps
+    # this server-side write idempotent; the agent's status update remains the
+    # authoritative source and may overwrite warm_start. warm_claim_origin
+    # distinguishes chain continuity from backlog reuse for post-mortem and
+    # telemetry (efficiency direction d-91d8dede).
+    ctx = dict(task.context or {})
+    existing_timing = dict(ctx.get("_timing") or {})
+    existing_timing.setdefault("warm_start", True)
+    existing_timing["warm_claim_origin"] = origin
+    existing_timing["prior_role_vm_id"] = vm_instance_id
+    ctx["_timing"] = existing_timing
+    task.context = ctx
+    flag_modified(task, "context")
+    # Mint the new JWT BEFORE committing the IN_PROGRESS transition. If mint
+    # raises, the rollback restores QUEUED so a retry can succeed instead of
+    # leaving the task stuck IN_PROGRESS with no live agent.
+    task_type = ""
+    try:
+        payloads = task.payloads or []
+        if payloads and isinstance(payloads[0], dict):
+            task_type = str(payloads[0].get("type") or "")
+    except Exception:  # noqa: BLE001 — task_type is best-effort metadata
+        task_type = ""
+    try:
+        agent_token = create_agent_token(
+            task_id=str(task.id),
+            vm_instance_id=vm_instance_id,
+            task_type=task_type,
+            project_id=str(task.project_id) if task.project_id else "",
+        )
+    except Exception as exc:
+        await session.rollback()
+        logger.exception("[NEXT-ROLE] JWT mint failed; rolling back warm-claim")
+        raise HTTPException(status_code=500, detail="token_mint_failed") from exc
+
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+
+    # Broadcast AFTER the commit so a rollback path doesn't fire a spurious
+    # event.
+    await broadcast_to_project(
+        str(task.project_id),
+        "task_updated",
+        {"task_id": str(task.id), "status": TaskStatus.IN_PROGRESS},
+    )
+    return {
+        "action": "claim",
+        "task_id": str(task.id),
+        "warm_start": True,
+        "agent_token": agent_token,
+    }
+
+
 @router.post("/next-role")
 @limiter.limit("600/minute")
 async def next_role(
@@ -3556,85 +3639,56 @@ async def next_role(
     task = (await session.execute(stmt)).scalars().first()
 
     if task is not None:
-        from app.compute import VM_PROVISIONING_MODEL
-
-        task.vm_instance_id = req.vm_instance_id
-        task.status = TaskStatus.IN_PROGRESS
-        task.last_heartbeat = _utcnow()
-        # vm_provisioned_at marks when the VM was made available to the
-        # task. For warm-start we set it to "now" so existing
-        # claim_latency / reaper logic operates on a fresh window.
-        task.vm_provisioned_at = _utcnow()
-        # vm_spot mirrors orchestrator-mode for cost accounting; warm-start VMs
-        # are spawned by orchestrator with the same provisioning model as cold.
-        task.vm_spot = VM_PROVISIONING_MODEL == "SPOT"
-        if task.started_at is None:
-            task.started_at = _utcnow()
-        # Carry warm-start signal forward into context._timing so the
-        # status-update path can add the agent-side setup_secs to the
-        # same record on completion.
-        #
-        # Issue H3 (warm-VM rev, deferred): the agent's status update is the
-        # authoritative source for warm_start (task_lifecycle._process_post_commit
-        # runs existing.update(_timing_payload), so an explicit False from the
-        # agent would correctly overwrite a stale True written here). Use
-        # setdefault so this server-side write is idempotent — preserving any
-        # prior value if a warm-claim already happened — and add a sibling
-        # warm_claim_origin marker so post-mortem inspection can distinguish
-        # server-side seeded values from agent-reported ones.
-        ctx = dict(task.context or {})
-        existing_timing = dict(ctx.get("_timing") or {})
-        existing_timing.setdefault("warm_start", True)
-        existing_timing["warm_claim_origin"] = "next_role_endpoint"
-        existing_timing["prior_role_vm_id"] = req.vm_instance_id
-        ctx["_timing"] = existing_timing
-        task.context = ctx
-        flag_modified(task, "context")
-        # Mint the new JWT BEFORE committing the IN_PROGRESS transition. If
-        # mint raises, the rollback below restores the task to QUEUED so a
-        # retry can succeed instead of leaving it stuck IN_PROGRESS with no
-        # live agent (Phase 2 issue #5).
-        task_type = ""
-        try:
-            payloads = task.payloads or []
-            if payloads and isinstance(payloads[0], dict):
-                task_type = str(payloads[0].get("type") or "")
-        except Exception:  # noqa: BLE001 — task_type is best-effort metadata
-            task_type = ""
-        try:
-            agent_token = create_agent_token(
-                task_id=str(task.id),
-                vm_instance_id=req.vm_instance_id,
-                task_type=task_type,
-                project_id=str(task.project_id) if task.project_id else "",
-            )
-        except Exception as exc:
-            await session.rollback()
-            logger.exception("[NEXT-ROLE] JWT mint failed; rolling back warm-claim")
-            raise HTTPException(status_code=500, detail="token_mint_failed") from exc
-
-        session.add(task)
-        await session.commit()
-        await session.refresh(task)
-
-        # Broadcast status change to frontend so the UI doesn't lag until
-        # the next status update (Phase 2 issue #10). Placed AFTER the
-        # commit so a rollback path doesn't fire a spurious event.
-        await broadcast_to_project(
-            str(task.project_id),
-            "task_updated",
-            {"task_id": str(task.id), "status": TaskStatus.IN_PROGRESS},
+        result = await _finalize_warm_claim(
+            session, task, req.vm_instance_id, origin="next_role_endpoint"
         )
         logger.info(
-            f"[NEXT-ROLE] Warm-start claim: task={task.id} vm={req.vm_instance_id} "
-            f"prior_task={req.prior_task_id} prior_pr={req.prior_pr_number}"
+            f"[NEXT-ROLE] Warm-start claim (chain): task={result['task_id']} "
+            f"vm={req.vm_instance_id} prior_task={req.prior_task_id} "
+            f"prior_pr={req.prior_pr_number}"
         )
-        return {
-            "action": "claim",
-            "task_id": str(task.id),
-            "warm_start": True,
-            "agent_token": agent_token,
-        }
+        return result
+
+    # Backlog-reuse branch (efficiency direction d-91d8dede). When the flag is
+    # enabled an idle VM with no chain-pinned follow-on may claim the next
+    # eligible QUEUED task from its project's general backlog and run it warm.
+    # Attempted BEFORE the chain-fork exit below so a forked chain doesn't
+    # strand an otherwise reusable VM. When the flag is OFF this whole block is
+    # skipped and behavior is byte-for-byte the pre-existing chain-only path —
+    # including, on no claim, the chain-fork exit / 204 so no idle VM is kept
+    # alive when there is no genuine pending work to reuse it for.
+    if _shared_state.runtime_config.get("warm_backlog_reuse_enabled", False):
+        _project_claim = token.get("project_id")
+        _project_uuid = None
+        if _project_claim:
+            try:
+                _project_uuid = uuid.UUID(str(_project_claim))
+            except (ValueError, TypeError):
+                _project_uuid = None
+        if _project_uuid is not None:
+            # Refresh the project's first-refusal window so the orchestrator
+            # holds off cold-provisioning eligible backlog tasks while this VM
+            # polls — biasing the race toward reuse. The SKIP-LOCKED claim
+            # below still guarantees no double-provision if both race.
+            _shared_state.register_backlog_first_refusal(str(_project_uuid))
+            from app.warm_backlog_reuse import select_backlog_reuse_candidate
+
+            backlog_task = await select_backlog_reuse_candidate(
+                session, _project_uuid, req.vm_instance_id
+            )
+            if backlog_task is not None:
+                result = await _finalize_warm_claim(
+                    session,
+                    backlog_task,
+                    req.vm_instance_id,
+                    origin="backlog_reuse",
+                )
+                logger.info(
+                    f"[NEXT-ROLE] Warm-start claim (backlog_reuse): "
+                    f"task={result['task_id']} vm={req.vm_instance_id} "
+                    f"project={_project_uuid}"
+                )
+                return result
 
     # No matching warm-pinned task. Check whether another VM owns an
     # IN_PROGRESS task for this PR — if so, the warm chain has already

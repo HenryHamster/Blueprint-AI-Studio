@@ -86,6 +86,9 @@ _REGRESSION_STALL_THRESHOLD_HOURS = (
 _SIGNAL_STALENESS_TITLE_PREFIX = "Signal staleness: "
 _SR_CATCH_RATE_TARGET_ALERT_PREFIX = "SR catch-rate below target: "
 _SR_CATCH_RATE_TARGET_MIN_WINDOWS = 2
+_SR_CATCH_RATE_MIN_FINDINGS = (
+    10  # minimum reviewer findings to treat a rate as reliable
+)
 _LONE_CHECKER_ALERT_TITLE = "SR lone-checker blind spot: ≥2 categories uncorroborated"
 _LONE_CHECKER_MIN_CATEGORIES = 2
 
@@ -141,6 +144,11 @@ async def _evaluate_sr_catch_rate_targets(
                 existing.dismissed_at = _utcnow()
                 await session.commit()
             continue
+        # Gate on finding count (true denominator) not task count to avoid spurious
+        # alerts when the window clears the task-count bar but rests on a handful of findings.
+        current_human_count = cat_data.get("current_human_count") or 0
+        if current_human_count < _SR_CATCH_RATE_MIN_FINDINGS:
+            continue
         rate_history = cat_data.get("rate_history") or []
         if len(rate_history) < _SR_CATCH_RATE_TARGET_MIN_WINDOWS:
             continue
@@ -155,7 +163,8 @@ async def _evaluate_sr_catch_rate_targets(
         message = (
             f"Self-review catch-rate for '{cat}' has been below the configured target "
             f"({target_float:.0%}) for the last {_SR_CATCH_RATE_TARGET_MIN_WINDOWS} "
-            f"measurement windows. Current: {curr_str}. Trend: {trend}. "
+            f"measurement windows. Current: {curr_str} (n={current_human_count} reviewer findings). "
+            f"Trend: {trend}. "
             f"Review the SR Trend Breakdown in the admin dashboard."
         )
         session.add(

@@ -1393,6 +1393,62 @@ describe('DashboardHome', () => {
     expect(card).toBeInTheDocument();
     expect(card).toHaveTextContent('75%');
     expect(card).toHaveTextContent('+5pp');
+    // n= shows reviewer finding count (10+5+5=20), not task count
+    expect(card).toHaveTextContent('n=20 findings');
+  });
+
+  it('SR Catch Rate card shows too small when reviewer finding count is below threshold', async () => {
+    setupApiMocks({
+      digest: {
+        failed_count: 0,
+        pending_approval_count: 0,
+        completed_count: 5,
+        failure_groups: [],
+        direction_progress: [],
+        recent_completions: [],
+        self_review_prediction_accuracy: {
+          prediction_hit_rate: 0.75,
+          miss_rate: 0.25,
+          false_alarm_rate: 0.1,
+          sample_size: 20,
+        },
+        self_review_prediction_accuracy_trends: {
+          overall_hit_rate: 0.75,
+          previous_overall_hit_rate: 0.70,
+          computed_at: '2026-05-20T00:00:00Z',
+          categories: {
+            correctness: {
+              current_hit_rate: 0.80,
+              previous_hit_rate: 0.60,
+              current_human_count: 2,
+              previous_human_count: 8,
+            },
+            type_safety: {
+              current_hit_rate: 0.70,
+              previous_hit_rate: 0.80,
+              current_human_count: 2,
+              previous_human_count: 6,
+            },
+          },
+        },
+      },
+      diagnostics: makeDiagnostics(),
+    });
+
+    render(
+      <DashboardHome
+        tasks={[]}
+        selectedProjectId="proj1"
+        onViewTask={vi.fn()}
+      />,
+    );
+
+    const card = await screen.findByText('SR Catch Rate').then((el) => el.closest('div[class*="rounded-lg"]'));
+    expect(card).toBeInTheDocument();
+    expect(card).toHaveTextContent('too small');
+    // Shows finding count, not task count
+    expect(card).toHaveTextContent('n=4 findings');
+    expect(card).not.toHaveTextContent('75%');
   });
 
   it('SR Unfixed Flags tile shows the self-flagged shipped-unfixed rate, not the catch hit rate', async () => {

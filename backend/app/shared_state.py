@@ -380,6 +380,14 @@ runtime_config: Dict = {
     # /api/agent/next-role. Defaults to False — feature ships dark and is
     # only enabled per-deployment via runtime_config_json.
     "warm_continuity_enabled": False,
+    # Phase 2 backlog reuse (efficiency direction d-91d8dede): when True, an
+    # agent VM that just went idle (its task reached a terminal state with no
+    # chain follow-on) may claim the next eligible QUEUED task from the SAME
+    # project's general backlog via /api/agent/next-role and run it warm —
+    # not only a PR-chain-pinned follow-on. Independently switchable from
+    # warm_continuity_enabled so it can be enabled, observed, and rolled back
+    # on its own. Defaults to False — feature ships dark.
+    "warm_backlog_reuse_enabled": False,
     # Maximum seconds the agent waits in /api/agent/next-role polling before
     # falling through to the normal exit path. Bounded by the warm-handoff
     # window and the typical role transition cadence; tunable down for
@@ -638,6 +646,11 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     _set(
                         "warm_continuity_enabled",
                         bool(config_json["warm_continuity_enabled"]),
+                    )
+                if "warm_backlog_reuse_enabled" in config_json:
+                    _set(
+                        "warm_backlog_reuse_enabled",
+                        bool(config_json["warm_backlog_reuse_enabled"]),
                     )
                 for int_key in (
                     "max_provision_retries",
@@ -1040,6 +1053,45 @@ def count_recent_warm_pin_clears(window_seconds: int = 3600) -> int:
     """Distinct clear-out events in the trailing window."""
     cutoff = _utcnow() - timedelta(seconds=window_seconds)
     return sum(1 for ts, _, _ in warm_pin_clear_events if ts >= cutoff)
+
+
+# --- Warm backlog-reuse first-refusal (efficiency direction d-91d8dede) ---
+# project_id (str) -> first-refusal deadline (naive UTC). While a project has
+# an unexpired entry, the orchestrator's cold-dispatch loop holds off
+# cold-provisioning eligible backlog tasks for that project so an idle warm VM
+# polling /api/agent/next-role gets first claim. Set/refreshed on each idle-VM
+# poll (and when a COMPLETED task's teardown is deferred). The atomic
+# SKIP-LOCKED claim in /next-role still guarantees no double-provision if both
+# race — this only biases the race toward reuse. Bounded: entries are short
+# (WARM_BACKLOG_FIRST_REFUSAL_SECS) and pruned by sweep_stale_in_memory_state.
+WARM_BACKLOG_FIRST_REFUSAL_SECS = 20
+warm_backlog_first_refusal: Dict[str, datetime] = {}
+
+
+def register_backlog_first_refusal(
+    project_id: str, window_seconds: int = WARM_BACKLOG_FIRST_REFUSAL_SECS
+) -> None:
+    """Mark project_id as having an idle warm VM that wants backlog work.
+
+    Sets the first-refusal deadline to now + window_seconds. Called from the
+    /next-role poll path so the orchestrator holds off cold-provisioning the
+    project's eligible backlog while a warm VM is actively polling.
+    """
+    if not project_id:
+        return
+    warm_backlog_first_refusal[str(project_id)] = _utcnow() + timedelta(
+        seconds=window_seconds
+    )
+
+
+def is_backlog_first_refusal_active(project_id: str) -> bool:
+    """True iff project_id has an unexpired backlog first-refusal window."""
+    if not project_id:
+        return False
+    deadline = warm_backlog_first_refusal.get(str(project_id))
+    if deadline is None:
+        return False
+    return _utcnow() <= deadline
 
 
 # --- Background Tasks (populated by lifespan, used by admin restart endpoint) ---
@@ -1542,6 +1594,14 @@ def sweep_stale_in_memory_state() -> Dict[str, int]:
     while warm_pin_clear_events and warm_pin_clear_events[0][0] < warm_clear_cutoff:
         warm_pin_clear_events.popleft()
         pruned["warm_pin_clear_events"] += 1
+
+    # Backlog first-refusal: entries are short-lived (≈20s); drop anything
+    # already expired so the map can't grow on a long-lived instance.
+    pruned["warm_backlog_first_refusal"] = 0
+    for pid, deadline in list(warm_backlog_first_refusal.items()):
+        if deadline < now:
+            del warm_backlog_first_refusal[pid]
+            pruned["warm_backlog_first_refusal"] += 1
 
     return pruned
 

@@ -12,8 +12,11 @@ const emptyState: WarmVmStateResponse = {
     clears_last_24h: 0,
     active_pinned_queued_total: 0,
     active_warm_chains: 0,
+    active_backlog_reuse_claims: 0,
+    active_chain_continuity_claims: 0,
   },
   warm_continuity_enabled: true,
+  warm_backlog_reuse_enabled: false,
   next_role_poll_timeout_secs: 30,
 };
 
@@ -29,6 +32,7 @@ const populatedState: WarmVmStateResponse = {
         task_type: 'create',
         status: 'IN_PROGRESS',
         warm_start: true,
+        warm_claim_origin: 'backlog_reuse',
         prior_role_vm_id: 'vm-prior-eeeeeeee-1234',
         setup_secs: 12.5,
         started_at: new Date(Date.now() - 60_000).toISOString(),
@@ -49,8 +53,11 @@ const populatedState: WarmVmStateResponse = {
     clears_last_24h: 24,
     active_pinned_queued_total: 1,
     active_warm_chains: 1,
+    active_backlog_reuse_claims: 1,
+    active_chain_continuity_claims: 0,
   },
   warm_continuity_enabled: true,
+  warm_backlog_reuse_enabled: true,
   next_role_poll_timeout_secs: 30,
 };
 

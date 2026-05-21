@@ -49,6 +49,10 @@ export interface SrCategoryTrend {
   time_to_miss_detect_sample_count?: number | null;
   /** True when sample_count >= 2 AND p95 > 7 days — SR is effectively the sole checker. */
   time_to_miss_detect_lone_checker?: boolean | null;
+  /** Number of reviewer findings (category-level flags) backing the catch rate in the current window — the true denominator of the rate. */
+  current_finding_count?: number | null;
+  /** Number of reviewer findings in the previous window — used to gate cycle-over-cycle delta confidence. */
+  previous_finding_count?: number | null;
   /** Severity calibration: how often agent severity matched/under-rated/over-rated reviewer severity for the same category. */
   severity_calibration?: {
     under_rated: number;
@@ -1168,7 +1172,12 @@ function CategoryRow({
   } : {};
 
   const sparklineTitle = c.prompt_version_changed ? 'prompt version changed mid-window — attribution may differ' : undefined;
-  const sampleTooSmall = isSampleTooSmall(c.current_human_count);
+  // Gate confidence on reviewer finding count (true denominator of the catch rate).
+  // Fall back to current_human_count for backward compat with older backend payloads.
+  const findingCount = c.current_finding_count ?? c.current_human_count;
+  const prevFindingCount = c.previous_finding_count ?? c.previous_human_count;
+  const sampleTooSmall = isSampleTooSmall(findingCount);
+  const deltaLowConfidence = sampleTooSmall || isSampleTooSmall(prevFindingCount);
 
   const activeSignals: string[] = [
     ...(c.below_floor ? ['below_floor'] : []),
@@ -1205,7 +1214,7 @@ function CategoryRow({
         <span className="text-neutral-300 truncate flex-1" title={cat}>{cat}</span>
         {sampleTooSmall ? (
           <span className="font-mono tabular-nums text-neutral-500">
-            {miss != null ? `${Math.round(miss * 100)}/${c.current_human_count} — too small` : '–'}
+            {miss != null ? `${Math.round(miss * 100)}/${findingCount} — too small` : '–'}
           </span>
         ) : (
           <span className={`font-mono font-bold tabular-nums ${color}`}>
@@ -1217,7 +1226,7 @@ function CategoryRow({
             {`all:${Math.round(allIterMiss * 100)}%`}
           </span>
         )}
-        {delta != null && (
+        {delta != null && !deltaLowConfidence && (
           <span className={`font-mono tabular-nums text-xs ${deltaColor}`} title="cycle-over-cycle change">
             {formatDelta(delta)}
           </span>
@@ -1354,7 +1363,7 @@ function CategoryRow({
       <span className="text-neutral-300">{cat}</span>
       {sampleTooSmall ? (
         <span className="font-mono text-neutral-500">
-          {miss != null ? `${Math.round(miss * 100)}/${c.current_human_count} — too small` : '–'} miss
+          {miss != null ? `${Math.round(miss * 100)}/${findingCount} — too small` : '–'} miss
         </span>
       ) : (
         <span className={`font-mono ${color}`}>
@@ -1366,7 +1375,7 @@ function CategoryRow({
           {`all:${Math.round(allIterMiss * 100)}%`}
         </span>
       )}
-      {delta != null && (
+      {delta != null && !deltaLowConfidence && (
         <span className={`font-mono text-xs ${deltaColor}`} title="cycle-over-cycle change">
           {formatDelta(delta)}
         </span>

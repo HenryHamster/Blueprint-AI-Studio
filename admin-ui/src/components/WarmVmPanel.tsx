@@ -77,11 +77,15 @@ export function WarmVmPanel({ onViewTask }: Props) {
     localStorage.setItem(STORAGE_KEY, String(next));
   };
 
-  const flipFlag = useCallback(async (currentValue: boolean) => {
+  const flipFlag = useCallback(async (
+    configKey: 'warm_continuity_enabled' | 'warm_backlog_reuse_enabled',
+    label: string,
+    currentValue: boolean,
+  ) => {
     const target = !currentValue;
     const verb = target ? 'ENABLE' : 'DISABLE';
     const ok = window.confirm(
-      `${verb} warm-VM continuity globally?\n\n` +
+      `${verb} ${label} globally?\n\n` +
       `Current: ${currentValue ? 'enabled' : 'disabled'}\n` +
       `New:     ${target ? 'enabled' : 'disabled'}\n\n` +
       `Effect propagates within ~15s via runtime-config sync. ` +
@@ -92,7 +96,7 @@ export function WarmVmPanel({ onViewTask }: Props) {
     try {
       const res = await apiFetch(`${API_BASE_URL}/api/admin/settings`, {
         method: 'PATCH',
-        body: JSON.stringify({ warm_continuity_enabled: target }),
+        body: JSON.stringify({ [configKey]: target }),
       });
       if (!res.ok) {
         const detail = await res.text().catch(() => '');
@@ -112,6 +116,9 @@ export function WarmVmPanel({ onViewTask }: Props) {
   const clearsHour = data?.warm_pin_metrics.clears_last_hour ?? 0;
   const pinnedQueued = data?.warm_pin_metrics.active_pinned_queued_total ?? 0;
   const flagOn = data?.warm_continuity_enabled ?? false;
+  const backlogReuseOn = data?.warm_backlog_reuse_enabled ?? false;
+  const backlogClaims = data?.warm_pin_metrics.active_backlog_reuse_claims ?? 0;
+  const chainClaims = data?.warm_pin_metrics.active_chain_continuity_claims ?? 0;
   const overThreshold = clearsHour > 5;
 
   return (
@@ -126,7 +133,7 @@ export function WarmVmPanel({ onViewTask }: Props) {
           VM Fleet
         </button>
         <button
-          onClick={() => { void flipFlag(flagOn); }}
+          onClick={() => { void flipFlag('warm_continuity_enabled', 'warm-VM continuity', flagOn); }}
           disabled={flipping || !data}
           className={
             (flagOn
@@ -146,6 +153,28 @@ export function WarmVmPanel({ onViewTask }: Props) {
           }
         >
           {flipping ? '…' : (flagOn ? 'WARM' : 'COLD')}
+        </button>
+        <button
+          onClick={() => { void flipFlag('warm_backlog_reuse_enabled', 'backlog VM reuse', backlogReuseOn); }}
+          disabled={flipping || !data}
+          className={
+            (backlogReuseOn
+              ? 'bg-sky-500/20 border border-sky-500/40 text-sky-400 hover:bg-sky-500/30'
+              : 'bg-neutral-700/40 border border-neutral-600/40 text-neutral-400 hover:bg-neutral-700/60'
+            ) +
+            ' text-[10px] font-bold px-1.5 py-0.5 rounded leading-none transition-colors' +
+            (flipping ? ' opacity-50 cursor-wait' : ' cursor-pointer') +
+            (!data ? ' opacity-50 cursor-not-allowed' : '')
+          }
+          title={
+            flipping
+              ? 'flipping…'
+              : (backlogReuseOn
+                  ? 'Click to DISABLE same-project backlog VM reuse'
+                  : 'Click to ENABLE same-project backlog VM reuse globally')
+          }
+        >
+          {flipping ? '…' : (backlogReuseOn ? 'REUSE' : 'NO-REUSE')}
         </button>
         <button
           onClick={toggle}
@@ -182,6 +211,8 @@ export function WarmVmPanel({ onViewTask }: Props) {
               <div className="flex flex-wrap gap-x-4 gap-y-1 mb-3 text-[10px] text-neutral-400">
                 <span><span className="text-neutral-500">VMs</span>: <span className="font-mono text-neutral-300">{vmCount}</span></span>
                 <span><span className="text-neutral-500">warm chains</span>: <span className="font-mono text-neutral-300">{warmChains}</span></span>
+                <span><span className="text-neutral-500">backlog reuse</span>: <span className="font-mono text-sky-400">{backlogClaims}</span></span>
+                <span><span className="text-neutral-500">chain claims</span>: <span className="font-mono text-orange-400">{chainClaims}</span></span>
                 <span><span className="text-neutral-500">pinned queued</span>: <span className="font-mono text-neutral-300">{pinnedQueued}</span></span>
                 <span><span className="text-neutral-500">clears/hr</span>: <span className={`font-mono ${overThreshold ? 'text-red-400' : 'text-neutral-300'}`}>{clearsHour}</span></span>
                 <span><span className="text-neutral-500">clears/24h</span>: <span className="font-mono text-neutral-300">{data.warm_pin_metrics.clears_last_24h}</span></span>
@@ -276,6 +307,12 @@ function VmRow({ vm, onViewTask }: { vm: WarmVmRow; onViewTask?: (taskId: string
             <div className="text-[10px] text-neutral-500 font-mono mt-0.5">
               {cur.task_type}
               {cur.pr_number !== null && <> · PR #{cur.pr_number}</>}
+              {cur.warm_start && cur.warm_claim_origin === 'backlog_reuse' && (
+                <> · <span className="text-sky-400">backlog</span></>
+              )}
+              {cur.warm_start && cur.warm_claim_origin !== 'backlog_reuse' && cur.prior_role_vm_id && (
+                <> · <span className="text-orange-400">chain</span></>
+              )}
               {cur.warm_start && cur.prior_role_vm_id && (
                 <> · from <span title={cur.prior_role_vm_id}>{shortVm(cur.prior_role_vm_id)}</span></>
               )}

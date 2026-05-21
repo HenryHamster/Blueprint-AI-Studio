@@ -2715,6 +2715,32 @@ async def orchestrator_worker():
                     else:
                         _pending_warm_pin_clear = None
 
+                    # Backlog-reuse first-refusal (efficiency direction d-91d8dede):
+                    # if an idle warm VM is actively polling /next-role for this
+                    # project, hold off cold-provisioning this eligible backlog task
+                    # for a bounded window so the warm VM can claim it first. Scoped
+                    # to no-dependency, non-chain-pinned tasks — exactly the set
+                    # /next-role's backlog branch will claim — so dependency-bearing
+                    # or chain work is never starved. The atomic SKIP-LOCKED claim in
+                    # /next-role still guarantees no double-provision if both race;
+                    # this only biases the race toward reuse. The window auto-expires,
+                    # so a VM that dies mid-poll delays this task by at most that bound.
+                    if (
+                        _runtime_config.get("warm_backlog_reuse_enabled", False)
+                        and not _warm_target_vm_id
+                        and not task.depends_on
+                        and _shared_state.is_backlog_first_refusal_active(
+                            str(task.project_id)
+                        )
+                    ):
+                        logger.info(
+                            f"[ORCHESTRATOR] Backlog-reuse first-refusal: holding off "
+                            f"cold-provision of task {task.id} (project {task.project_id}) "
+                            f"— idle warm VM has first claim"
+                        )
+                        await session.rollback()
+                        continue
+
                     # Ensure VM ID exists (cleared during stale PROVISIONING recovery
                     # OR set to None for warm-pinned tasks whose pin was just cleared).
                     if not task.vm_instance_id:

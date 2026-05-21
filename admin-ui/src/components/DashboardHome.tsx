@@ -1146,7 +1146,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
               <ConversionRateCard rate={digest?.pipeline_conversion_rate} loading={loading} />
               <AcceptanceRateCard rate={digest?.pipeline_acceptance_rate} loading={loading} />
               <CostCard totalCost={digest?.total_estimated_cost_usd} trendHistory={digest?.trend_history} loading={loading} />
-              <SrCatchRateCard rate={digest?.self_review_prediction_accuracy?.prediction_hit_rate} trends={digest?.self_review_prediction_accuracy_trends} sampleSize={digest?.self_review_prediction_accuracy?.sample_size} loading={loading} onScrollToReviewQuality={handleScrollToReviewQuality} />
+              <SrCatchRateCard rate={digest?.self_review_prediction_accuracy?.prediction_hit_rate} trends={digest?.self_review_prediction_accuracy_trends} loading={loading} onScrollToReviewQuality={handleScrollToReviewQuality} />
             </div>
           </section>
 
@@ -2532,20 +2532,28 @@ function CostCard({ totalCost, trendHistory, loading }: {
   );
 }
 
-function SrCatchRateCard({ rate, trends, sampleSize, loading, onScrollToReviewQuality }: {
+const MIN_SR_CATCH_FINDINGS = 5;
+
+function deriveReviewerFindingCount(trends: SrTrendWithFixIterations | null | undefined): number {
+  const categories = trends?.categories;
+  if (!categories) return 0;
+  return Object.values(categories).reduce((sum, cat) => sum + (cat.current_human_count ?? 0), 0);
+}
+
+function SrCatchRateCard({ rate, trends, loading, onScrollToReviewQuality }: {
   rate?: number | null;
   trends?: SrTrendWithFixIterations | null;
-  sampleSize?: number | null;
   loading: boolean;
   onScrollToReviewQuality?: () => void;
 }) {
   if (loading) return <Skeleton className="h-20" />;
-  if (rate == null || sampleSize == null || (sampleSize ?? 0) < 5) {
+  const reviewerFindingCount = deriveReviewerFindingCount(trends);
+  if (rate == null || reviewerFindingCount < MIN_SR_CATCH_FINDINGS) {
     return (
       <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 sm:p-4 cursor-pointer hover:border-neutral-700/80 transition-colors" onClick={onScrollToReviewQuality}>
         <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">SR Catch Rate</p>
         <p className="text-2xl font-bold font-mono text-neutral-500">too small</p>
-        <p className="text-[10px] text-neutral-600 mt-1">n={sampleSize ?? 0}</p>
+        <p className="text-[10px] text-neutral-600 mt-1">n={reviewerFindingCount} findings</p>
       </div>
     );
   }
@@ -2570,7 +2578,7 @@ function SrCatchRateCard({ rate, trends, sampleSize, loading, onScrollToReviewQu
           </span>
         )}
       </div>
-      <p className="text-[10px] text-neutral-600 mt-1">n={sampleSize}</p>
+      <p className="text-[10px] text-neutral-600 mt-1">n={reviewerFindingCount} findings</p>
     </div>
   );
 }

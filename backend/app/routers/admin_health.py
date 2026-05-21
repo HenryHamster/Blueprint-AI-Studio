@@ -663,6 +663,7 @@ async def _compute_warm_vm_state(*, session: AsyncSession) -> Dict[str, Any]:
                 if hasattr(cur.status, "value")
                 else str(cur.status),
                 "warm_start": bool(timing.get("warm_start", False)),
+                "warm_claim_origin": timing.get("warm_claim_origin"),
                 "prior_role_vm_id": timing.get("prior_role_vm_id"),
                 "setup_secs": timing.get("setup_secs"),
                 "started_at": cur.started_at.isoformat() if cur.started_at else None,
@@ -716,6 +717,19 @@ async def _compute_warm_vm_state(*, session: AsyncSession) -> Dict[str, Any]:
         for t in in_progress_tasks
         if (t.context or {}).get("_timing", {}).get("warm_start") is True
     )
+    # Origin attribution: split the warm-start population into backlog-reuse
+    # claims (a VM picked up an unrelated QUEUED task from the same project's
+    # backlog) vs chain-continuity claims (the existing PR-chain follow-on
+    # path, origin "next_role_endpoint" or legacy unset). The two sum to
+    # active_warm_chains so operators can attribute the reuse lift.
+    active_backlog_reuse_claims = sum(
+        1
+        for t in in_progress_tasks
+        if (t.context or {}).get("_timing", {}).get("warm_start") is True
+        and (t.context or {}).get("_timing", {}).get("warm_claim_origin")
+        == "backlog_reuse"
+    )
+    active_chain_continuity_claims = active_warm_chains - active_backlog_reuse_claims
 
     return {
         "active_vms": active_vms_out,
@@ -724,9 +738,14 @@ async def _compute_warm_vm_state(*, session: AsyncSession) -> Dict[str, Any]:
             "clears_last_24h": _shared_state.count_recent_warm_pin_clears(86400),
             "active_pinned_queued_total": sum(len(v) for v in pinned_by_vm.values()),
             "active_warm_chains": active_warm_chains,
+            "active_backlog_reuse_claims": active_backlog_reuse_claims,
+            "active_chain_continuity_claims": active_chain_continuity_claims,
         },
         "warm_continuity_enabled": bool(
             _shared_state.runtime_config.get("warm_continuity_enabled", False)
+        ),
+        "warm_backlog_reuse_enabled": bool(
+            _shared_state.runtime_config.get("warm_backlog_reuse_enabled", False)
         ),
         "next_role_poll_timeout_secs": int(
             _shared_state.runtime_config.get("next_role_poll_timeout_secs", 180)

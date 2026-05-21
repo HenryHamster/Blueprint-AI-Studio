@@ -2329,6 +2329,12 @@ async def compute_review_effectiveness(
 # rejection categories required per window.  Half the human-review threshold
 # since SR data is sparser.
 _MIN_SR_SAMPLE = 5
+# Minimum total reviewer findings (across categories in a window) required for
+# the catch-rate and its cycle-over-cycle trend to be considered well-sampled.
+# Matches _MIN_SR_SAMPLE so the gate is on the true catch-rate denominator
+# (finding count) rather than task count; a window with ≥_MIN_SR_SAMPLE tasks
+# may still have fewer findings when most tasks flag zero or one category.
+_MIN_SR_FINDINGS = 5
 # Minimum total reviewer findings (across tasks in a window) required to emit
 # a hallucination-rate value; prevents noisy rates on tiny windows.
 _HALLUCINATION_RATE_MIN_FINDINGS = 10
@@ -3743,7 +3749,16 @@ async def compute_sr_catch_rate_trends(
         current_window_tasks = cal_current
         previous_window_tasks = cal_previous
 
-    if current_count < _MIN_SR_SAMPLE or previous_count < _MIN_SR_SAMPLE:
+    # Gate on finding count (true catch-rate denominator), not task count.
+    # finding_count = total reviewer-flagged (task, category) pairs in the window.
+    current_finding_count = sum(s.get("human_count", 0) for s in current_stats.values())
+    previous_finding_count = sum(
+        s.get("human_count", 0) for s in previous_stats.values()
+    )
+    if (
+        current_finding_count < _MIN_SR_FINDINGS
+        or previous_finding_count < _MIN_SR_FINDINGS
+    ):
         return None
 
     all_cats = (
@@ -3792,7 +3807,16 @@ async def compute_sr_catch_rate_trends(
             else None
         )
 
-        if current_hit_rate is not None and previous_hit_rate is not None:
+        # Only compute trend when both windows have enough findings for the
+        # delta to be meaningful; fewer findings make the delta pure noise.
+        _curr_findings = curr.get("human_count", 0)
+        _prev_findings = prev.get("human_count", 0)
+        if (
+            current_hit_rate is not None
+            and previous_hit_rate is not None
+            and _curr_findings >= _MIN_SR_FINDINGS
+            and _prev_findings >= _MIN_SR_FINDINGS
+        ):
             delta = current_hit_rate - previous_hit_rate
             if delta >= _TREND_DELTA_THRESHOLD:
                 trend = "increasing"
@@ -3885,6 +3909,7 @@ async def compute_sr_catch_rate_trends(
             "previous_hit_rate": previous_hit_rate,
             "current_human_count": int(curr.get("human_count") or 0),
             "previous_human_count": int(prev.get("human_count") or 0),
+            "low_confidence_finding_count": _curr_findings < _MIN_SR_FINDINGS,
             "sr_alone_hit_count": int(curr.get("sr_alone_hit_count") or 0),
             "reviewer_save_hit_count": int(curr.get("reviewer_save_hit_count") or 0),
             "sr_alone_hit_rate": sr_alone_hit_rate,
@@ -4287,6 +4312,8 @@ async def compute_sr_catch_rate_trends(
         "sr_skip_reason_distribution": sr_skip_dist if sr_skip_dist is not None else {},
         "overall_hit_rate": overall_hit_rate,
         "previous_overall_hit_rate": previous_overall_hit_rate,
+        "current_finding_count": current_finding_count,
+        "previous_finding_count": previous_finding_count,
     }
     if current_prompt_version is not None:
         result["prompt_version"] = current_prompt_version

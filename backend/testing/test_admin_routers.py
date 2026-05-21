@@ -1520,6 +1520,37 @@ class TestNotificationConfigSettings:
         assert bad2.status_code == 400
 
     @pytest.mark.asyncio
+    async def test_patch_warm_backlog_reuse_enabled(self, client: AsyncClient):
+        """warm_backlog_reuse_enabled accepts booleans, rejects non-booleans,
+        round-trips on GET, and is independent of warm_continuity_enabled."""
+        resp = await client.patch(
+            "/api/admin/settings", json={"warm_backlog_reuse_enabled": True}
+        )
+        assert resp.status_code == 200
+        get_resp = await client.get("/api/admin/settings")
+        body = get_resp.json()
+        assert body["warm_backlog_reuse_enabled"] is True
+        # Independently switchable: flipping backlog reuse must not touch the
+        # chain-continuity flag.
+        assert "warm_continuity_enabled" in body
+
+        resp = await client.patch(
+            "/api/admin/settings", json={"warm_backlog_reuse_enabled": False}
+        )
+        assert resp.status_code == 200
+        get_resp = await client.get("/api/admin/settings")
+        assert get_resp.json()["warm_backlog_reuse_enabled"] is False
+
+        bad = await client.patch(
+            "/api/admin/settings", json={"warm_backlog_reuse_enabled": "true"}
+        )
+        assert bad.status_code == 400
+        bad2 = await client.patch(
+            "/api/admin/settings", json={"warm_backlog_reuse_enabled": 1}
+        )
+        assert bad2.status_code == 400
+
+    @pytest.mark.asyncio
     async def test_release_flags_round_trip_on_get(self, client: AsyncClient):
         """The automain/LTS release-control flags — integration_branch,
         promotion_enabled, smoketest_enabled — are settable via PATCH and

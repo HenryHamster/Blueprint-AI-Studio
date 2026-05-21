@@ -194,6 +194,9 @@ async def get_settings(
         "warm_continuity_enabled": bool(
             _runtime_config.get("warm_continuity_enabled", False)
         ),
+        "warm_backlog_reuse_enabled": bool(
+            _runtime_config.get("warm_backlog_reuse_enabled", False)
+        ),
         "next_role_poll_timeout_secs": int(
             _runtime_config.get("next_role_poll_timeout_secs", 180)
         ),
@@ -532,6 +535,14 @@ async def _apply_settings(
                 status_code=400, detail="warm_continuity_enabled must be a boolean"
             )
         _runtime_config["warm_continuity_enabled"] = val
+    if "warm_backlog_reuse_enabled" in payload:
+        val = payload["warm_backlog_reuse_enabled"]
+        if not isinstance(val, bool):
+            raise HTTPException(
+                status_code=400,
+                detail="warm_backlog_reuse_enabled must be a boolean",
+            )
+        _runtime_config["warm_backlog_reuse_enabled"] = val
     if "drift_over_claim_min_claims" in payload:
         try:
             val = int(payload["drift_over_claim_min_claims"])
@@ -1447,6 +1458,9 @@ async def _apply_settings(
                     ),
                     "warm_continuity_enabled": bool(
                         _runtime_config.get("warm_continuity_enabled", False)
+                    ),
+                    "warm_backlog_reuse_enabled": bool(
+                        _runtime_config.get("warm_backlog_reuse_enabled", False)
                     ),
                     "next_role_poll_timeout_secs": int(
                         _runtime_config.get("next_role_poll_timeout_secs", 180)

@@ -322,6 +322,75 @@ def fire_and_forget_vm_delete(
     bg.add_done_callback(_background_vm_deletes.discard)
 
 
+async def _deferred_backlog_teardown(vm_id: str, reason: str) -> None:
+    """Hold a just-idle VM's teardown briefly so it can claim backlog work.
+
+    Backlog reuse (efficiency direction d-91d8dede): when a COMPLETED task's
+    VM has eligible QUEUED backlog work in its project, this defers teardown
+    for WARM_BACKLOG_TEARDOWN_DEFER_SECS so the agent's /next-role poll can
+    claim that work and run it warm. After the window, the VM is deleted iff
+    it never claimed anything.
+
+    Crucially this does NOT pre-record the orchestrator-deleted marker (unlike
+    fire_and_forget_vm_delete): that marker makes is_orchestrator_initiated_delete
+    return True, and the /next-role doomed-VM guard would then refuse the VM's
+    own warm claim. The marker is only written if/when we actually delete.
+    """
+    from app.warm_backlog_reuse import WARM_BACKLOG_TEARDOWN_DEFER_SECS
+
+    await asyncio.sleep(WARM_BACKLOG_TEARDOWN_DEFER_SECS)
+    try:
+        async with AsyncSessionLocal() as s:
+            claimed = (
+                await s.execute(
+                    select(Task.id)
+                    .where(
+                        Task.vm_instance_id == vm_id,
+                        Task.status.in_(
+                            [
+                                TaskStatus.PROVISIONING,
+                                TaskStatus.IN_PROGRESS,
+                                TaskStatus.EVALUATING,
+                            ]
+                        ),
+                    )
+                    .limit(1)
+                )
+            ).first()
+    except Exception:
+        # If the re-check query fails, fall through to teardown — never leak a
+        # VM by assuming it was reused.
+        logger.exception(
+            "[BACKLOG-REUSE] Deferred-teardown re-check failed for VM %s — "
+            "tearing down",
+            vm_id,
+        )
+        claimed = None
+    if claimed is not None:
+        logger.info(
+            "[BACKLOG-REUSE] VM %s claimed backlog work during defer window — "
+            "skipping teardown",
+            vm_id,
+        )
+        return
+    logger.info(
+        "[BACKLOG-REUSE] VM %s claimed nothing within defer window — tearing down",
+        vm_id,
+    )
+    await _ensure_vm_deleted(vm_id, reason=reason)
+
+
+def schedule_deferred_backlog_teardown(
+    vm_id: str, *, reason: str = "agent_completion"
+) -> None:
+    """Fire-and-forget the deferred-teardown coroutine (see above)."""
+    if not vm_id:
+        return
+    bg = asyncio.create_task(_deferred_backlog_teardown(vm_id, reason))
+    _background_vm_deletes.add(bg)
+    bg.add_done_callback(_background_vm_deletes.discard)
+
+
 async def _get_actual_gcp_vm_count() -> int:
     """Count actual agent-vm-* instances across all GCP zones.
     Cached for _GCP_VM_CHECK_INTERVAL seconds to avoid API spam.

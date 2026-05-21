@@ -15337,6 +15337,7 @@ async def test_evaluate_sr_catch_rate_targets_fires_after_2_windows(db_session):
             "categories": {
                 "correctness": {
                     "current_hit_rate": 0.60,
+                    "current_human_count": 15,
                     "rate_history": [0.62, 0.60],
                     "trend": "decreasing",
                 }
@@ -15364,6 +15365,48 @@ async def test_evaluate_sr_catch_rate_targets_fires_after_2_windows(db_session):
     )
     assert len(alerts) == 1
     assert "0.80" in alerts[0].message or "80%" in alerts[0].message
+    assert "n=15" in alerts[0].message
+
+
+@pytest.mark.asyncio
+async def test_evaluate_sr_catch_rate_targets_suppressed_on_low_findings(db_session):
+    """Alert is NOT emitted when current_human_count is below the minimum finding floor."""
+    from app.routers.admin_digest import _evaluate_sr_catch_rate_targets
+    from app.models import Alert
+
+    project = make_project()
+    project.sr_catch_rate_targets = {"correctness": 0.80}
+    project.design_doc = {
+        "sr_catch_rate_trends": {
+            "categories": {
+                "correctness": {
+                    "current_hit_rate": 0.50,
+                    "current_human_count": 4,  # below _SR_CATCH_RATE_MIN_FINDINGS=10
+                    "rate_history": [0.52, 0.50],
+                    "trend": "decreasing",
+                }
+            }
+        }
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _evaluate_sr_catch_rate_targets(db_session, project.id)
+
+    alerts = (
+        (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.title == "SR catch-rate below target: correctness",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 0
 
 
 @pytest.mark.asyncio

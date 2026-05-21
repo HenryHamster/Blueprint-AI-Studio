@@ -3915,7 +3915,7 @@ def _make_sr_task(
 async def test_compute_sr_catch_rate_trends_returns_none_below_sample_size(
     db_session: AsyncSession,
 ):
-    """Returns None when either window has fewer than 5 tasks with both fields."""
+    """Returns None when either window has fewer than _MIN_SR_FINDINGS reviewer findings."""
     from app.playbook_learning import compute_sr_catch_rate_trends
 
     project = await _make_project(db_session)
@@ -3943,6 +3943,90 @@ async def test_compute_sr_catch_rate_trends_returns_none_below_sample_size(
     result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
 
     assert result is None
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_exposes_finding_counts(
+    db_session: AsyncSession,
+):
+    """result contains current_finding_count / previous_finding_count (true denominator)
+    and per-category low_confidence_finding_count flag."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id, age_days=2, human_cats={"test-coverage": 1}, sr_failed_cats=[]
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id, age_days=20, human_cats={"test-coverage": 1}, sr_failed_cats=[]
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    assert result["current_finding_count"] == 5
+    assert result["previous_finding_count"] == 5
+    cat = result["categories"]["test-coverage"]
+    assert cat["current_human_count"] == 5
+    # 5 findings == _MIN_SR_FINDINGS, so not low-confidence
+    assert cat["low_confidence_finding_count"] is False
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_low_confidence_suppresses_trend(
+    db_session: AsyncSession,
+):
+    """Categories with fewer than _MIN_SR_FINDINGS findings are flagged low-confidence
+    and their trend is suppressed to 'stable' even when hit rates diverge."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    # Current window: 6 tasks — 5 flag 'correctness', 1 flags 'test-coverage' (low-finding cat)
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    t = _make_sr_task(
+        project.id, age_days=2, human_cats={"test-coverage": 1}, sr_failed_cats=[]
+    )
+    db_session.add(t)
+    tasks.append(t)
+    # Previous window: 5 tasks all flag 'correctness' (hit rate differs); 'test-coverage' absent
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=[],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    # 'test-coverage' has only 1 finding in current window — low-confidence, trend suppressed
+    tc = result["categories"]["test-coverage"]
+    assert tc["low_confidence_finding_count"] is True
+    assert tc["trend"] == "stable"
+    # 'correctness' has 5 current + 5 previous = enough findings, not low-confidence
+    corr = result["categories"]["correctness"]
+    assert corr["low_confidence_finding_count"] is False
 
 
 @pytest.mark.asyncio
