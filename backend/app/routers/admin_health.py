@@ -173,6 +173,7 @@ async def _compute_health_overview(
     active_filters = [Task.status.in_(active_statuses), Task.archived.is_(False)]
     if project_id:
         active_filters.append(Task.project_id == project_id)
+    _ACTIVE_TASKS_LIMIT = 5000
     active_result = await session.execute(
         select(Task)
         .where(*active_filters)
@@ -189,8 +190,16 @@ async def _compute_health_overview(
                 Task.depends_on,
             )
         )
+        .limit(_ACTIVE_TASKS_LIMIT)
     )
     active_tasks = active_result.scalars().all()
+    if len(active_tasks) >= _ACTIVE_TASKS_LIMIT:
+        logger.warning(
+            "[HEALTH-OVERVIEW] active-tasks scan hit cap=%d rows — "
+            "stuck-task diagnostics and queue-depth counts are truncated; "
+            "consider filtering by project_id to reduce result size",
+            _ACTIVE_TASKS_LIMIT,
+        )
 
     # Zone health (needed for remediation hints)
     try:

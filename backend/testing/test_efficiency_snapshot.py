@@ -240,6 +240,89 @@ async def test_subsequent_snapshots_do_not_clobber_baseline(db_session):
 
 
 @pytest.mark.asyncio
+async def test_write_snapshot_migrates_stale_cold_start_baseline(db_session):
+    """Existing baselines without _schema_version had cold-start captured from
+    boot beacons (pre-fix). write_snapshot must clear that axis and mark the
+    baseline as schema_version=1 so the next snapshot re-seeds with honest data.
+    """
+    stale_cold_start = 500  # artificially low — was a beacon time, not claim latency
+    project = make_project(
+        design_doc={
+            DESIGN_DOC_KEY: {
+                "baseline": {
+                    "captured_at": "2026-01-01T00:00:00",
+                    AXIS_VM_COLD_START_P50_MS: stale_cold_start,
+                    AXIS_COST_PER_MERGED_PR: 0.01,
+                    # No _schema_version — simulates a pre-fix baseline.
+                },
+                "snapshots": [{"captured_at": "2026-01-01T00:00:00"}],
+                "last_run_at": "2026-01-01T00:00:00",
+            }
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Add a task so the snapshot has real cold-start data (~15s).
+    db_session.add(_make_efficient_task(project.id, vm_cold_start_ms=15000))
+    await db_session.commit()
+
+    await write_snapshot(db_session, project.id)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    container = project.design_doc[DESIGN_DOC_KEY]
+    baseline = container["baseline"]
+
+    # Old stale value must be gone; re-seeded from the new snapshot.
+    assert baseline[AXIS_VM_COLD_START_P50_MS] != stale_cold_start
+    assert baseline[AXIS_VM_COLD_START_P50_MS] == 15000.0
+    # Migration marker applied.
+    assert baseline["_schema_version"] == 1
+    # Other baseline axes must not be clobbered.
+    assert baseline[AXIS_COST_PER_MERGED_PR] == 0.01
+
+
+@pytest.mark.asyncio
+async def test_write_snapshot_reseeds_cleared_baseline_axis(db_session):
+    """An axis explicitly cleared to None in the baseline must be re-seeded by
+    the next write_snapshot call when a valid current value is available.
+    """
+    project = make_project(
+        design_doc={
+            DESIGN_DOC_KEY: {
+                "baseline": {
+                    "captured_at": "2026-01-01T00:00:00",
+                    AXIS_VM_COLD_START_P50_MS: None,  # cleared axis
+                    AXIS_COST_PER_MERGED_PR: 0.02,
+                    "_schema_version": 1,  # already migrated, no re-clear
+                },
+                "snapshots": [{"captured_at": "2026-01-01T00:00:00"}],
+                "last_run_at": "2026-01-01T00:00:00",
+            }
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(_make_efficient_task(project.id, vm_cold_start_ms=20000))
+    await db_session.commit()
+
+    await write_snapshot(db_session, project.id)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    container = project.design_doc[DESIGN_DOC_KEY]
+    baseline = container["baseline"]
+    # Cleared axis re-seeded from the fresh snapshot.
+    assert baseline[AXIS_VM_COLD_START_P50_MS] == 20000.0
+    # Non-cleared axes unchanged.
+    assert baseline[AXIS_COST_PER_MERGED_PR] == 0.02
+
+
+@pytest.mark.asyncio
 async def test_read_baseline_with_drift_returns_drift_pct(db_session):
     project = make_project(design_doc={})
     db_session.add(project)

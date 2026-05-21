@@ -986,9 +986,7 @@ async def test_recently_completed_tasks_include_outcome_context(
 
 
 @pytest.mark.asyncio
-async def test_agent_claim_injects_sr_co_failure_pairs(
-    client: AsyncClient, db_session
-):
+async def test_agent_claim_injects_sr_co_failure_pairs(client: AsyncClient, db_session):
     """The claim response injects sr_co_failure_pairs from recent completed tasks.
 
     Regression: the scan once filtered + ordered by a non-existent
@@ -9773,6 +9771,65 @@ async def test_claim_records_vm_cold_start_ms_once(client: AsyncClient, db_sessi
     assert hb_resp.status_code == 200
     await db_session.refresh(task)
     assert task.vm_cold_start_ms == initial_cold_start
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_beacon_does_not_set_vm_cold_start_ms(
+    client: AsyncClient, db_session
+):
+    """Pre-claim provisioning beacons must NOT set vm_cold_start_ms.
+
+    Boot beacon heartbeats arrive long before the agent process exists and
+    therefore before any /claim call. The IS-NULL-guarded heartbeat fallback
+    was removed so that beacon timing no longer corrupts this metric. The claim
+    endpoint remains the sole writer. Warm-claimed tasks must stay unmeasured.
+    """
+    project = Project(name="Beacon Cold Start", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    provisioned = datetime.utcnow() - timedelta(seconds=8)
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "ls"}],
+        vm_instance_id="agent-vm-beacon-test",
+        status=TaskStatus.QUEUED,
+        vm_provisioned_at=provisioned,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    assert task.vm_cold_start_ms is None
+
+    token = create_agent_token(str(task.id), "agent-vm-beacon-test")
+
+    # Simulate several provisioning-phase beacon heartbeats before /claim.
+    for beacon_msg in (
+        "PROVISION_CREDENTIALS_FETCHED",
+        "PROVISION_ENV_MATERIALIZED",
+        "PROVISION_PAYLOAD_DOWNLOADED",
+        "AGENT_BOOTED",
+    ):
+        hb_resp = await client.post(
+            "/api/agent/heartbeat",
+            json={"task_id": str(task.id), "status_message": beacon_msg},
+            headers={"x-agent-token": token},
+        )
+        assert hb_resp.status_code == 200
+
+    await db_session.refresh(task)
+    # Beacons must not set vm_cold_start_ms — that field belongs to /claim.
+    assert task.vm_cold_start_ms is None
+
+    # Now claim; cold-start should be recorded from dispatch-to-claim latency.
+    claim_resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert claim_resp.status_code == 200
+
+    await db_session.refresh(task)
+    assert task.vm_cold_start_ms is not None
+    # ~8s elapsed, so cold-start should be ≥6s and ≤20s (test slack).
+    assert 6_000 <= task.vm_cold_start_ms <= 20_000
 
 
 @pytest.mark.asyncio

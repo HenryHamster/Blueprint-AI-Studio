@@ -3226,16 +3226,6 @@ async def agent_heartbeat(
     if task.vm_started_at is None:
         task.vm_started_at = _utcnow()
 
-    # Cold-start fallback: /claim is the canonical first-contact site that
-    # writes vm_cold_start_ms, but if a heartbeat ever lands before a claim
-    # row was committed (or for the warm-VM continuity path), derive it here
-    # too. Guard with IS NULL so a re-provision restamp of vm_provisioned_at
-    # cannot overwrite a real first-heartbeat measurement.
-    if task.vm_cold_start_ms is None and task.vm_provisioned_at is not None:
-        cold_start_ms = (
-            task.last_heartbeat - task.vm_provisioned_at
-        ).total_seconds() * 1000
-        task.vm_cold_start_ms = max(0, int(cold_start_ms))
     if req.status_message:
         task.latest_status_message = req.status_message
         # Log interesting lifecycle beacons so they're visible in Cloud

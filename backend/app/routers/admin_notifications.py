@@ -360,21 +360,32 @@ async def list_messages(
     guaranteed_msgs: list = []
     if status != "resolved":
         pid_uuid = uuid.UUID(project_id) if project_id else None
-        hs_q = select(ProjectMessage).where(
-            ProjectMessage.project_id.in_(user_pids),
-            ProjectMessage.status == "open",
-            or_(
-                ProjectMessage.from_type == "user",
-                ProjectMessage.message_type.in_(["FEEDBACK", "BLOCKER", "BUG_REPORT"]),
-                and_(
-                    ProjectMessage.message_type == MessageType.NOTE,
-                    ProjectMessage.from_type == "system",
-                    ProjectMessage.context["event_type"]
-                    .as_string()
-                    .in_(list(HIGH_SIGNAL_NOTE_EVENT_TYPES)),
+        # Cap at 100 to prevent unbounded result sets when high-signal volume is abnormally
+        # high. Clients should treat the returned list as "up to 100 most recent" rather
+        # than a guaranteed-complete set.
+        _HS_LIMIT = 100
+        hs_q = (
+            select(ProjectMessage)
+            .where(
+                ProjectMessage.project_id.in_(user_pids),
+                ProjectMessage.status == "open",
+                or_(
+                    ProjectMessage.from_type == "user",
+                    ProjectMessage.message_type.in_(
+                        ["FEEDBACK", "BLOCKER", "BUG_REPORT"]
+                    ),
+                    and_(
+                        ProjectMessage.message_type == MessageType.NOTE,
+                        ProjectMessage.from_type == "system",
+                        ProjectMessage.context["event_type"]
+                        .as_string()
+                        .in_(list(HIGH_SIGNAL_NOTE_EVENT_TYPES)),
+                    ),
                 ),
-            ),
-            *([ProjectMessage.project_id == pid_uuid] if pid_uuid else []),
+                *([ProjectMessage.project_id == pid_uuid] if pid_uuid else []),
+            )
+            .order_by(ProjectMessage.created_at.desc())
+            .limit(_HS_LIMIT)
         )
         guaranteed_msgs = list((await session.execute(hs_q)).scalars().all())
 

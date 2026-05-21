@@ -212,6 +212,21 @@ async def write_snapshot(
 
     if not container.get("baseline"):
         container["baseline"] = dict(snapshot)
+    else:
+        baseline = dict(container["baseline"])
+        # One-time migration: baselines captured before the heartbeat-beacon fix
+        # (schema_version 0) stored vm_cold_start_p50_ms from the first boot
+        # beacon rather than true dispatch-to-claim latency. Clear it so the
+        # next snapshot re-seeds with accurate data.
+        if not baseline.get("_schema_version"):
+            baseline[AXIS_VM_COLD_START_P50_MS] = None
+            baseline["_schema_version"] = 1
+        # Re-seed any individual axes that were cleared (e.g. by the migration
+        # above) once a valid current value is available.
+        for axis in ALL_AXES:
+            if baseline.get(axis) is None and snapshot.get(axis) is not None:
+                baseline[axis] = snapshot[axis]
+        container["baseline"] = baseline
 
     snapshots = list(container.get("snapshots") or [])
     snapshots.append(snapshot)
