@@ -65,7 +65,7 @@ describe('RunningUpdatePanel — viewport regression', () => {
   });
 
   test('populated document renders without horizontal overflow at 375px', async () => {
-    const mdContent = `# Strategic Update\n\n## Current Focus\n\nThe pipeline is processing 12 active directions across 3 repositories.\n\n## Recent Activity\n\n- Merged 4 PRs improving test coverage in the authentication module\n- Identified a recurring regression in the CI workflow layer\n- Research cycle completed for performance optimization direction\n\n## Next Steps\n\nScheduled architecture review in 2 cycles.`;
+    const mdContent = `# Strategic Update\n\n## Current Focus\n\nThe pipeline is processing 12 active directions across 3 repositories. See the full dashboard at https://github.com/HenryHamster/BlueprintAIStudio/actions/runs/12345678901234567890/job/99887766554433221100 for the latest CI status.\n\n## Recent Activity\n\n- Merged 4 PRs improving test coverage in the authentication module\n- Identified a recurring regression in the CI workflow layer\n- Research cycle completed for performance optimization direction\n- Modified \`admin-ui/src/components/MetricsDashboardEfficiencySnapshotSection.tsx\` to fix the overflow\n\n## Code Sample\n\n\`\`\`typescript\nconst result = await apiFetch(\`/api/projects/\${projectId}/efficiency-snapshot\`);\nif (!result.ok) throw new Error(\`fetch failed: \${result.status}\`);\n\`\`\`\n\n## Next Steps\n\nScheduled architecture review in 2 cycles.`;
 
     await expectNoOverflowAt(375, async () => {
       host = document.createElement('div');
@@ -88,7 +88,7 @@ describe('RunningUpdatePanel — viewport regression', () => {
   });
 
   test('populated document text is not silently clipped at 375px', async () => {
-    const mdContent = `# Running Update\n\nThis is the strategic agent's current-state snapshot of the project. It is rewritten each cycle.`;
+    const mdContent = `# Running Update\n\nThis is the strategic agent's current-state snapshot of the project. It is rewritten each cycle.\n\nSee https://github.com/HenryHamster/BlueprintAIStudio/actions/runs/12345678901234567890/job/99887766554433221100 for CI history.\n\nKey file: \`admin-ui/src/components/MetricsDashboardEfficiencySnapshotSection.tsx\`\n\n\`\`\`\nnpm run build --workspace=admin-ui --if-present\n\`\`\``;
 
     await expectNoTextTruncationAt(375, async () => {
       host = document.createElement('div');

@@ -149,6 +149,54 @@ describe('TaskDetailDrawer — viewport regression', () => {
     });
   });
 
+  test('approval footer renders without horizontal overflow at 375px', async () => {
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <TaskDetailDrawer
+            task={makeTask({ requires_approval: true })}
+            logLines={[]}
+            onClose={() => {}}
+            onApprove={() => {}}
+            onRequestChanges={() => {}}
+            onCancel={() => {}}
+            onRetry={() => {}}
+            onEditPrompt={() => {}}
+            onDismiss={() => {}}
+          />,
+        );
+      });
+    });
+  });
+
+  test('failed task footer renders without horizontal overflow at 375px', async () => {
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <TaskDetailDrawer
+            task={makeTask({ status: 'FAILED' })}
+            logLines={[]}
+            onClose={() => {}}
+            onApprove={() => {}}
+            onRequestChanges={() => {}}
+            onCancel={() => {}}
+            onRetry={() => {}}
+            onEditPrompt={() => {}}
+            onDismiss={() => {}}
+          />,
+        );
+      });
+    });
+  });
+
   test('renders without horizontal overflow at 768px (tablet width)', async () => {
     await expectNoOverflowAt(768, async () => {
       host = document.createElement('div');

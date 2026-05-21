@@ -304,7 +304,7 @@ export function TaskDetailDrawer({
           <div className="border-t border-neutral-800 p-4 shrink-0 flex items-center gap-2">
             {showApproval && (
               <div className="flex flex-col gap-2 w-full">
-                <div className="flex gap-2">
+                <div className="flex flex-wrap gap-2">
                   <button
                     onClick={() => onApprove(task.id)}
                     disabled={!!actionLoading}

@@ -1,7 +1,7 @@
 import { afterEach, describe, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
-import { DispatcherHealthPanel, LayerCoverageHistogramPanel, ManualInterventionPanel, RegressionRateTrendPanel, LayerDefenseDensityPanel, EscalationOutcomePanel, FirstAttemptComplianceTrendPanel } from './PipelineRegressionsPanel';
+import { DispatcherHealthPanel, LayerCoverageHistogramPanel, ManualInterventionPanel, RegressionRateTrendPanel, LayerDefenseDensityPanel, EscalationOutcomePanel, FirstAttemptComplianceTrendPanel, ClassKpisPanel } from './PipelineRegressionsPanel';
 import { expectNoOverflowAt, expectMinTouchTargetAt, expectNoTextTruncationAt } from '../test/viewport';
 
 vi.mock('recharts', () => ({
@@ -81,6 +81,17 @@ vi.mock('../api', () => ({
           { layer: 'AGENT_VERB', fix_count: 3, last_fix_at: new Date(Date.now() - 172800_000).toISOString(), sample_case_ids: ['case-3'], avg_hold_days: 4.1, still_holding_count: 0, held_gt_7d_count: 0, retripped_within_48h_count: 1 },
           { layer: 'BASELINE_GATE', fix_count: 1, last_fix_at: new Date(Date.now() - 604800_000).toISOString(), sample_case_ids: ['case-4'], avg_hold_days: null, still_holding_count: 1, held_gt_7d_count: 1, retripped_within_48h_count: 0 },
           { layer: 'REVIEWER_PASS', fix_count: 5, last_fix_at: new Date(Date.now() - 43200_000).toISOString(), sample_case_ids: ['case-5'], avg_hold_days: 2.5, still_holding_count: 0, held_gt_7d_count: 0, retripped_within_48h_count: 3 },
+        ],
+      }), { status: 200 });
+    }
+    if (url.includes('regression-class-kpis')) {
+      return new Response(JSON.stringify({
+        window_hours: 168,
+        class_count: 3,
+        classes: [
+          { regression_class: 'sr_regression_pipeline_success_rate', cases_opened: 2, cases_closed: 1, dispatch_attempt_count: 3, remediation_success_rate: 0.67, mean_time_to_detect_seconds: 3600, mean_time_to_remediate_seconds: 7200 },
+          { regression_class: 'fix_loop_divergence', cases_opened: 5, cases_closed: 3, dispatch_attempt_count: 8, remediation_success_rate: 0.4, mean_time_to_detect_seconds: 1800, mean_time_to_remediate_seconds: 14400 },
+          { regression_class: 'viewport_regression:MessagesPanel@375', cases_opened: 1, cases_closed: 1, dispatch_attempt_count: 1, remediation_success_rate: 1.0, mean_time_to_detect_seconds: 900, mean_time_to_remediate_seconds: 3600 },
         ],
       }), { status: 200 });
     }
@@ -272,6 +283,22 @@ describe('ManualInterventionPanel — viewport regression', () => {
       await act(async () => { root?.render(<ManualInterventionPanel projectId="project-123" />); });
       await act(async () => { await new Promise((resolve) => setTimeout(resolve, 50)); });
     }, { waitMs: 50 });
+  });
+});
+
+describe('ClassKpisPanel — viewport regression', () => {
+  let root: Root | null = null;
+  let host: HTMLDivElement | null = null;
+  afterEach(() => { if (root) act(() => root?.unmount()); root = null; host?.remove(); host = null; });
+  test('renders populated per-class KPIs table without overflow at 375px', async () => {
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      root = createRoot(host);
+      await act(async () => { root?.render(<ClassKpisPanel projectId="project-123" />); });
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 50)); });
+    });
   });
 });
 

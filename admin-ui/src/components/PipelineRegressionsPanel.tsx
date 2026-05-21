@@ -172,13 +172,13 @@ export function ClassKpisPanel({ projectId, filterClass, onClassSelect }: Props)
           <option value={720}>30d</option>
         </select>
       </div>
-      <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg overflow-hidden">
+      <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg overflow-x-auto">
         <table className="w-full text-[10px]">
           <thead>
             <tr className="border-b border-neutral-800/50 text-neutral-500">
               <th className="text-left px-3 py-1.5 font-medium">Class</th>
-              <th className="text-right px-2 py-1.5 font-medium">Opened</th>
-              <th className="text-right px-2 py-1.5 font-medium">Closed</th>
+              <th className="text-right px-2 py-1.5 font-medium hidden sm:table-cell">Opened</th>
+              <th className="text-right px-2 py-1.5 font-medium hidden sm:table-cell">Closed</th>
               <th className="text-right px-2 py-1.5 font-medium">MTTD</th>
               <th className="text-right px-2 py-1.5 font-medium">MTTR</th>
               <th className="text-right px-3 py-1.5 font-medium">Success</th>
@@ -194,8 +194,8 @@ export function ClassKpisPanel({ projectId, filterClass, onClassSelect }: Props)
                   className={`transition-colors ${onClassSelect ? 'cursor-pointer' : ''} ${active ? 'bg-blue-950/30' : onClassSelect ? 'hover:bg-neutral-800/30' : ''}`}
                 >
                   <td className="px-3 py-1.5 max-w-[160px] overflow-hidden"><RegressionClassLabel cls={row.regression_class} /></td>
-                  <td className="px-2 py-1.5 text-right text-white">{row.cases_opened}</td>
-                  <td className="px-2 py-1.5 text-right text-emerald-400">{row.cases_closed}</td>
+                  <td className="px-2 py-1.5 text-right text-white hidden sm:table-cell">{row.cases_opened}</td>
+                  <td className="px-2 py-1.5 text-right text-emerald-400 hidden sm:table-cell">{row.cases_closed}</td>
                   <td className="px-2 py-1.5 text-right text-neutral-400">{formatMttd(row.mean_time_to_detect_seconds)}</td>
                   <td className="px-2 py-1.5 text-right text-neutral-400">{formatMttd(row.mean_time_to_remediate_seconds)}</td>
                   <td className="px-3 py-1.5 text-right">

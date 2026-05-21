@@ -3,6 +3,52 @@ import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import MetricsDashboard from './MetricsDashboard';
 import { expectNoOverflowAt, expectMinTouchTargetAt, expectNoTextTruncationAt } from '../test/viewport';
+import type { Task } from '../types/task';
+
+const now = Date.now();
+const POPULATED_TASKS: Task[] = [
+  {
+    id: 'task-done-1',
+    title: 'feat: add mobile-responsive grid layout to MetricsDashboard operator page',
+    description: 'Refactor the MetricsDashboard grid to use Tailwind responsive breakpoints.',
+    status: 'COMPLETED',
+    created_by: 'agent',
+    requires_approval: false,
+    created_at: new Date(now - 3_200_000).toISOString(),
+    started_at: new Date(now - 3_000_000).toISOString(),
+  },
+  {
+    id: 'task-done-2',
+    title: 'fix: vm-reuse-rate widget overflows at 375px',
+    description: 'Clamp the VM reuse rate widget width so it does not exceed the viewport.',
+    status: 'COMPLETED',
+    created_by: 'agent',
+    requires_approval: false,
+    created_at: new Date(now - 2_400_000).toISOString(),
+    started_at: new Date(now - 2_200_000).toISOString(),
+  },
+  {
+    id: 'task-fail-1',
+    title: 'fix: cost-per-merged-pr chart clips labels at mobile widths',
+    description: 'Ensure X-axis labels in the cost chart do not clip below the chart boundary.',
+    status: 'FAILED',
+    created_by: 'agent',
+    requires_approval: false,
+    created_at: new Date(now - 1_800_000).toISOString(),
+    started_at: new Date(now - 1_600_000).toISOString(),
+    failure_class: 'CODE_ERROR',
+  },
+  {
+    id: 'task-active-1',
+    title: 'perf: batch efficiency snapshot queries to reduce API call count',
+    description: 'Combine the three separate efficiency snapshot fetches into one batched request.',
+    status: 'IN_PROGRESS',
+    created_by: 'agent',
+    requires_approval: false,
+    created_at: new Date(now - 900_000).toISOString(),
+    started_at: new Date(now - 800_000).toISOString(),
+  },
+];
 
 vi.mock('recharts', () => ({
   ResponsiveContainer: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
@@ -86,7 +132,7 @@ describe('MetricsDashboard — viewport regression', () => {
             cumulativeCost={0}
             cumulativeVmHours={0}
             maxConcurrentVMs={4}
-            tasks={[]}
+            tasks={POPULATED_TASKS}
             metricsWindow="1h"
             onWindowChange={() => {}}
           />,
@@ -109,7 +155,7 @@ describe('MetricsDashboard — viewport regression', () => {
             cumulativeCost={12.34}
             cumulativeVmHours={5.67}
             maxConcurrentVMs={4}
-            tasks={[]}
+            tasks={POPULATED_TASKS}
             metricsWindow="1h"
             onWindowChange={() => {}}
           />,
@@ -132,7 +178,7 @@ describe('MetricsDashboard — viewport regression', () => {
             cumulativeCost={0}
             cumulativeVmHours={0}
             maxConcurrentVMs={4}
-            tasks={[]}
+            tasks={POPULATED_TASKS}
             metricsWindow="1h"
             onWindowChange={() => {}}
           />,
@@ -155,7 +201,7 @@ describe('MetricsDashboard — viewport regression', () => {
             cumulativeCost={0}
             cumulativeVmHours={0}
             maxConcurrentVMs={4}
-            tasks={[]}
+            tasks={POPULATED_TASKS}
             metricsWindow="1h"
             onWindowChange={() => {}}
             projectId="test-project-id"

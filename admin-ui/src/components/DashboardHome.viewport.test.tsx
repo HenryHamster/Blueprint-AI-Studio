@@ -3,6 +3,63 @@ import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { DashboardHome } from './DashboardHome';
 import { expectNoOverflowAt, expectNoTextTruncationAt, expectMinTouchTargetAt } from '../test/viewport';
+import type { Task } from '../types/task';
+
+const now = Date.now();
+// 'task-abc' matches the task_id in the mocked /digest recent_completions payload.
+const POPULATED_TASKS: Task[] = [
+  {
+    id: 'task-abc',
+    title: 'feat: add mobile-responsive grid layout to DashboardHome operator page',
+    description: 'Refactor the DashboardHome grid to use Tailwind responsive breakpoints.',
+    status: 'COMPLETED',
+    created_by: 'agent',
+    requires_approval: false,
+    created_at: new Date(now - 3_600_000).toISOString(),
+    started_at: new Date(now - 3_500_000).toISOString(),
+  },
+  {
+    id: 'task-fail-1',
+    title: 'fix: digest failure-group pill overflows at 375px',
+    description: 'Ensure failure class pills wrap rather than overflow at mobile widths.',
+    status: 'FAILED',
+    created_by: 'agent',
+    requires_approval: false,
+    created_at: new Date(now - 2_700_000).toISOString(),
+    started_at: new Date(now - 2_600_000).toISOString(),
+    failure_class: 'CODE_ERROR',
+  },
+  {
+    id: 'task-fail-2',
+    title: 'fix: direction progress card clips title text at 375px',
+    description: 'Apply text-wrap and min-w-0 to prevent direction title clipping.',
+    status: 'FAILED',
+    created_by: 'agent',
+    requires_approval: false,
+    created_at: new Date(now - 1_900_000).toISOString(),
+    started_at: new Date(now - 1_800_000).toISOString(),
+    failure_class: 'AGENT_TIMEOUT',
+  },
+  {
+    id: 'task-active-1',
+    title: 'perf: reduce digest fetch latency by caching direction_progress',
+    description: 'Cache the direction_progress field in Redis to reduce p95 digest latency.',
+    status: 'IN_PROGRESS',
+    created_by: 'agent',
+    requires_approval: false,
+    created_at: new Date(now - 1_000_000).toISOString(),
+    started_at: new Date(now - 900_000).toISOString(),
+  },
+  {
+    id: 'task-queued-1',
+    title: 'create: add pipeline conversion rate trend sparkline to DashboardHome',
+    description: 'Render a 30-day sparkline next to the conversion rate metric.',
+    status: 'QUEUED',
+    created_by: 'agent',
+    requires_approval: false,
+    created_at: new Date(now - 300_000).toISOString(),
+  },
+];
 
 // DashboardHome (and its sub-components) transitively import apiFetch from
 // '../api', which pulls in Firebase. Mock the module so the test does not
@@ -157,7 +214,7 @@ describe('DashboardHome — viewport regression', () => {
       await act(async () => {
         r.render(
           <DashboardHome
-            tasks={[]}
+            tasks={POPULATED_TASKS}
             selectedProjectId={null}
             onViewTask={() => {}}
           />,
@@ -180,7 +237,7 @@ describe('DashboardHome — viewport regression', () => {
       await act(async () => {
         r.render(
           <DashboardHome
-            tasks={[]}
+            tasks={POPULATED_TASKS}
             selectedProjectId="proj-abc"
             onViewTask={() => {}}
           />,
@@ -202,7 +259,7 @@ describe('DashboardHome — viewport regression', () => {
       await act(async () => {
         r.render(
           <DashboardHome
-            tasks={[]}
+            tasks={POPULATED_TASKS}
             selectedProjectId={null}
             onViewTask={() => {}}
           />,
@@ -224,7 +281,7 @@ describe('DashboardHome — viewport regression', () => {
       await act(async () => {
         r.render(
           <DashboardHome
-            tasks={[]}
+            tasks={POPULATED_TASKS}
             selectedProjectId={null}
             onViewTask={() => {}}
           />,
@@ -246,7 +303,7 @@ describe('DashboardHome — viewport regression', () => {
       await act(async () => {
         r.render(
           <DashboardHome
-            tasks={[]}
+            tasks={POPULATED_TASKS}
             selectedProjectId={null}
             onViewTask={() => {}}
           />,
