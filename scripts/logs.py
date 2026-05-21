@@ -1,7 +1,9 @@
 """Cloud Run log viewer.
 
-Fetches logs from the Blueprint orchestrator via the Cloud Logging REST API.
-Handles auth token retrieval and filter construction.
+Fetches logs from the Blueprint orchestrator by shelling out to
+`gcloud logging read`. gcloud handles auth, project, and quota internally —
+unlike a hand-extracted `gcloud auth print-access-token`, which the Cloud
+Logging REST API rejects as ACCESS_TOKEN_TYPE_UNSUPPORTED.
 
 Usage:
     python scripts/logs.py errors [--minutes N] [--limit N]
@@ -12,8 +14,6 @@ Usage:
 import json
 import os
 import sys
-import urllib.request
-import urllib.error
 import subprocess
 from datetime import datetime, timezone, timedelta
 
@@ -30,57 +30,67 @@ _candidates = [
 ]
 for path in _candidates:
     try:
-        env = {**os.environ, "CLOUDSDK_PYTHON": "python3"}
-        subprocess.run([path, "--version"], capture_output=True, timeout=5, env=env)
-        GCLOUD_BIN = path
-        break
+        # No CLOUDSDK_PYTHON override — forcing it to "python3" fails on
+        # Windows (no such executable; the Store alias is not a real python).
+        # gcloud's own bundled-python detection works. Require returncode 0
+        # so a candidate that launches but errors isn't accepted.
+        probe = subprocess.run(
+            [path, "--version"], capture_output=True, timeout=15
+        )
+        if probe.returncode == 0:
+            GCLOUD_BIN = path
+            break
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         continue
 
 
-def _get_access_token():
-    """Get a GCP access token via gcloud."""
+def _fetch_logs(filter_str, limit=20):
+    """Fetch logs from Cloud Logging via `gcloud logging read`.
+
+    gcloud's own auth path works where a raw `print-access-token` does not, and
+    `--format=json` emits the same LogEntry schema the REST API returns, so
+    `_format_entry` consumes the result unchanged. Entries come back newest-first
+    (`--order=desc`), matching the previous `orderBy: "timestamp desc"`.
+    """
     if not GCLOUD_BIN:
         print("ERROR: gcloud not found. Install Google Cloud SDK.")
         sys.exit(1)
-    import os
-    env = {**os.environ, "CLOUDSDK_PYTHON": "python3"}
-    result = subprocess.run(
-        [GCLOUD_BIN, "auth", "print-access-token"],
-        capture_output=True, text=True, timeout=15, env=env
-    )
-    token = result.stdout.strip().split("\n")[-1]  # Last line, skip Windows noise
-    if not token or len(token) < 20:
-        print(f"ERROR: Could not get access token. Run: gcloud auth login")
-        print(f"  stdout length: {len(result.stdout)} chars")
-        print(f"  stderr: {result.stderr[:200]}")
-        sys.exit(1)
-    return token
-
-
-def _fetch_logs(filter_str, limit=20):
-    """Fetch logs from Cloud Logging REST API."""
-    token = _get_access_token()
-    body = {
-        "resourceNames": [f"projects/{GCP_PROJECT}"],
-        "filter": filter_str,
-        "orderBy": "timestamp desc",
-        "pageSize": min(limit, 100),
-    }
-    req = urllib.request.Request(
-        "https://logging.googleapis.com/v2/entries:list",
-        data=json.dumps(body).encode(),
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        },
-    )
+    cmd = [
+        GCLOUD_BIN, "logging", "read", filter_str,
+        f"--project={GCP_PROJECT}",
+        f"--limit={limit}",
+        "--format=json",
+        "--order=desc",
+    ]
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.loads(resp.read()).get("entries", [])
-    except urllib.error.HTTPError as e:
-        print(f"API error {e.code}: {e.read().decode()[:500]}")
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=90
+        )
+    except subprocess.TimeoutExpired:
+        print("ERROR: `gcloud logging read` timed out after 90s.")
+        return []
+    if result.returncode != 0:
+        stderr = (result.stderr or "").strip()
+        print(f"ERROR: `gcloud logging read` failed (exit {result.returncode}):")
+        print(f"  {stderr[:500]}")
+        if "auth" in stderr.lower() or "credential" in stderr.lower():
+            print("  Run: gcloud auth login")
+        return []
+    out = (result.stdout or "").strip()
+    if not out:
+        return []
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError:
+        # --format=json should emit pure JSON on stdout; if a banner leaked in,
+        # salvage the array.
+        start = out.find("[")
+        if start != -1:
+            try:
+                return json.loads(out[start:])
+            except json.JSONDecodeError:
+                pass
+        print(f"ERROR: could not parse gcloud output as JSON:\n  {out[:300]}")
         return []
 
 
@@ -148,8 +158,8 @@ def cmd_errors(args):
             print()
         elif "Traceback" in text:
             lines = text.split("\n")
-            error_lines = [l for l in lines if l.strip() and not l.startswith("  File")]
-            last_file = [l for l in lines if l.strip().startswith("File ")]
+            error_lines = [ln for ln in lines if ln.strip() and not ln.startswith("  File")]
+            last_file = [ln for ln in lines if ln.strip().startswith("File ")]
             summary = error_lines[-1] if error_lines else text[:300]
             location = last_file[-1].strip() if last_file else ""
             print(f"  {ts}  {location}")
