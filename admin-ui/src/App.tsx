@@ -12,7 +12,7 @@ import { PipelineView } from './components/PipelineView';
 import { ProjectDashboard } from './components/ProjectDashboard';
 import { auth, signInWithGoogle, signOut } from './firebase';
 import { fetchTask, apiFetch, API_BASE_URL, fetchSrMissedRetrospectives } from './api';
-import { countHighSignalMessages } from './components/MessagesPanel.utils';
+import { countHighSignalMessages, countNewSinceLastVisit, loadLastSeen } from './components/MessagesPanel.utils';
 import { SrMissedRetrospective, type SrMissedTask, type SrInvestigationSignal } from './components/SrTrendBreakdown';
 import { TaskDetailDrawer } from './components/TaskDetailDrawer';
 import { ToastContainer } from './components/Toasts';
@@ -64,6 +64,7 @@ export default function App() {
   const searchInputRef = useRef<HTMLInputElement>(null);
   const [drawerWidth, setDrawerWidth] = useState(0);
   const [openMessageCount, setOpenMessageCount] = useState(0);
+  const [newSinceLastVisit, setNewSinceLastVisit] = useState(0);
   const handleMessageCountChange = useCallback((count: number) => setOpenMessageCount(count), []);
   const [sortBy, setSortBy] = useState<SortBy>(() => {
     try {
@@ -93,6 +94,7 @@ export default function App() {
   useEffect(() => {
     if (showMessages) {
       setOpenMessageCount(0);
+      setNewSinceLastVisit(0);
     }
   }, [showMessages]);
   useEffect(() => {
@@ -105,14 +107,18 @@ export default function App() {
         const res = await apiFetch(`${API_BASE_URL}/api/admin/messages?${params}`);
         if (!res.ok || cancelled) return;
         const data = await res.json();
-        const msgs: Array<{ message_type: string; from_type: string; status: string; context: Record<string, unknown> }> = data.messages ?? [];
-        if (!cancelled) setOpenMessageCount(countHighSignalMessages(msgs));
+        const msgs: Array<{ message_type: string; from_type: string; status: string; context: Record<string, unknown>; created_at?: string | null }> = data.messages ?? [];
+        if (!cancelled) {
+          setOpenMessageCount(countHighSignalMessages(msgs));
+          const lastSeenTs = loadLastSeen(s.user?.email, pid);
+          setNewSinceLastVisit(countNewSinceLastVisit(msgs, lastSeenTs));
+        }
       } catch { /* ignore */ }
     }
     fetchCount();
     const interval = setInterval(fetchCount, 30_000);
     return () => { cancelled = true; clearInterval(interval); };
-  }, [selectedProjectId, showMessages]);
+  }, [selectedProjectId, showMessages, s.user?.email]);
 
   useEffect(() => {
     function handleSearchShortcut(e: KeyboardEvent) {
@@ -415,6 +421,7 @@ export default function App() {
         showMessages={s.showMessages}
         onToggleMessages={() => s.setShowMessages(prev => !prev)}
         openMessageCount={openMessageCount}
+        newSinceLastVisitCount={newSinceLastVisit}
         needsAttentionCount={s.needsAttentionCount}
         onOpenNewTaskModal={s.openNewTaskModal}
         onShowDirections={() => s.setShowDirections(true)}

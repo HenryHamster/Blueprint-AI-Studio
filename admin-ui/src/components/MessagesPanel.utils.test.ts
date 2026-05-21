@@ -35,6 +35,7 @@ import {
   saveServerSavedViews,
   resolveServerSavedViews,
   countHighSignalMessages,
+  countNewSinceLastVisit,
 } from './MessagesPanel.utils';
 
 vi.mock('../api', () => ({
@@ -974,5 +975,72 @@ describe('countHighSignalMessages — high-signal NOTE flood survival', () => {
 
   test('routine flood alone counts zero', () => {
     expect(countHighSignalMessages(makeRoutineFlood(100))).toBe(0);
+  });
+});
+
+// ── countNewSinceLastVisit ────────────────────────────────────────────────────
+
+describe('countNewSinceLastVisit', () => {
+  const base = Date.now();
+  const tsOld = new Date(base - 10000).toISOString();
+  const tsNew = new Date(base + 10000).toISOString();
+
+  const makeMsg = (opts: {
+    event_type?: string;
+    message_type?: string;
+    from_type?: string;
+    status?: string;
+    created_at?: string | null;
+  }) => ({
+    message_type: opts.message_type ?? 'NOTE',
+    from_type: opts.from_type ?? 'system',
+    status: opts.status ?? 'open',
+    context: { event_type: opts.event_type ?? 'failure_alert' },
+    created_at: opts.created_at !== undefined ? opts.created_at : tsNew,
+  });
+
+  test('returns 0 when lastSeenTs is null (no baseline)', () => {
+    const msgs = [makeMsg({ event_type: 'failure_alert' })];
+    expect(countNewSinceLastVisit(msgs, null)).toBe(0);
+  });
+
+  test('returns 0 when all high-signal messages predate lastSeenTs', () => {
+    const msgs = [makeMsg({ event_type: 'failure_alert', created_at: tsOld })];
+    expect(countNewSinceLastVisit(msgs, base)).toBe(0);
+  });
+
+  test('counts high-signal messages newer than lastSeenTs', () => {
+    const msgs = [makeMsg({ event_type: 'failure_alert', created_at: tsNew })];
+    expect(countNewSinceLastVisit(msgs, base)).toBe(1);
+  });
+
+  test('excludes routine-signal messages even if newer than lastSeenTs', () => {
+    const msgs = [makeMsg({ event_type: 'pr_merged', created_at: tsNew })];
+    expect(countNewSinceLastVisit(msgs, base)).toBe(0);
+  });
+
+  test('excludes resolved messages even if high-signal and newer', () => {
+    const msgs = [makeMsg({ event_type: 'failure_alert', status: 'resolved', created_at: tsNew })];
+    expect(countNewSinceLastVisit(msgs, base)).toBe(0);
+  });
+
+  test('excludes messages with no created_at', () => {
+    const msgs = [makeMsg({ event_type: 'failure_alert', created_at: null })];
+    expect(countNewSinceLastVisit(msgs, base)).toBe(0);
+  });
+
+  test('counts user messages as high-signal when newer than lastSeenTs', () => {
+    const msgs = [makeMsg({ message_type: 'FEEDBACK', from_type: 'user', created_at: tsNew })];
+    expect(countNewSinceLastVisit(msgs, base)).toBe(1);
+  });
+
+  test('mixed messages: only counts open high-signal newer items', () => {
+    const msgs = [
+      makeMsg({ event_type: 'failure_alert', created_at: tsNew }),   // counts
+      makeMsg({ event_type: 'failure_alert', created_at: tsOld }),   // too old
+      makeMsg({ event_type: 'pr_merged', created_at: tsNew }),        // routine
+      makeMsg({ event_type: 'failure_alert', status: 'resolved', created_at: tsNew }), // resolved
+    ];
+    expect(countNewSinceLastVisit(msgs, base)).toBe(1);
   });
 });

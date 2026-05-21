@@ -383,6 +383,15 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
         if (backendTs !== null && backendTs > (dividerTimeRef.current ?? 0)) {
           setDividerTime(backendTs);
           dividerTimeRef.current = backendTs;
+        } else if (dividerTimeRef.current === null) {
+          // Cold-start bootstrap: operator has no prior last-seen (neither localStorage
+          // nor backend). Record "now" so the since-last-visit feed activates on the
+          // next visit. Does NOT fire if either source already has a baseline.
+          const now = Date.now();
+          setDividerTime(now);
+          dividerTimeRef.current = now;
+          saveLastSeen(auth.currentUser?.email, selectedProjectId, now);
+          void postBackendLastSeen(selectedProjectId, now);
         }
       });
       // Prefer server noise prefs over localStorage — picks up prefs set on another device.
@@ -1744,7 +1753,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
             )}
 
             {/* Divider: show before first new message if divider time is set and not dismissed */}
-            {dividerTime && newHighSignalCount > 0 && !dividerDismissedRef.current && (
+            {dividerTime && totalNewCount > 0 && !dividerDismissedRef.current && (
               <div data-divider-marker className="flex items-center gap-2 px-2 py-3 text-[11px] text-blue-300/70">
                 <div className="flex-1 border-t border-blue-500/40" />
                 <div className="flex items-center gap-2 whitespace-nowrap font-medium">

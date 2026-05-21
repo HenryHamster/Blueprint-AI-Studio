@@ -1617,6 +1617,128 @@ describe('MessagesPanel critical-only severity filter', () => {
   });
 });
 
+describe('MessagesPanel since-last-visit divider', () => {
+  let root: Root | null = null;
+  let host: HTMLDivElement | null = null;
+
+  beforeEach(() => {
+    // Set up a last-seen timestamp so the divider will render
+    const dividerKey = 'messages_panel_last_seen:test-user@example.com:proj-1';
+    localStorage.setItem(dividerKey, String(Date.now() - 60000)); // 1 minute ago
+  });
+
+  afterEach(() => {
+    const r = root;
+    if (r) act(() => r.unmount());
+    root = null;
+    host?.remove();
+    host = null;
+    localStorage.clear();
+    vi.clearAllMocks();
+    vi.useRealTimers();
+  });
+
+  async function renderPanel(messages: ReturnType<typeof makeMsg>[]) {
+    // URL-keyed: the panel fires GET last-seen on mount BEFORE the messages
+    // fetch, so a one-shot mock would feed the messages to the wrong call and
+    // leave the list empty. Return null last-seen (tests seed localStorage) and
+    // serve the messages payload for every other endpoint.
+    (apiFetch as ReturnType<typeof vi.fn>).mockImplementation(async (url: unknown, init?: unknown) => {
+      const urlStr = url as string;
+      const initObj = init as RequestInit | undefined;
+      if (urlStr.includes('/api/admin/messages/last-seen') && initObj?.method !== 'PUT') {
+        return new Response(JSON.stringify({ last_seen_at: null }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ messages }), { status: 200 });
+    });
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <MessagesPanel
+          selectedProjectId="proj-1"
+          onClose={() => {}}
+          addToast={() => {}}
+          onMessageCountChange={() => {}}
+        />,
+      );
+    });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 50)); });
+    return host as HTMLDivElement;
+  }
+
+  test('divider renders when there are only routine new messages (no high-signal)', async () => {
+    const routineMsg = makeMsg({ id: 'r1', from_type: 'system', context: { event_type: 'pr_merged' } });
+    const el = await renderPanel([routineMsg]);
+    const divider = el.querySelector('[data-divider-marker]');
+    expect(divider).toBeTruthy();
+    expect(el.textContent).toContain('NEW since');
+  });
+
+  test('divider renders when there are both high-signal and routine new messages', async () => {
+    const blocker = makeMsg({ id: 'b1', message_type: 'BLOCKER', from_type: 'agent', content: 'blocker' });
+    const routine = makeMsg({ id: 'r1', from_type: 'system', context: { event_type: 'pr_merged' } });
+    const el = await renderPanel([blocker, routine]);
+    const divider = el.querySelector('[data-divider-marker]');
+    expect(divider).toBeTruthy();
+    expect(el.textContent).toContain('NEW since');
+  });
+
+  test('divider does not render when there are no new messages', async () => {
+    // Create a last-seen timestamp very recent
+    const recentKey = 'messages_panel_last_seen:test-user@example.com:proj-1';
+    localStorage.setItem(recentKey, String(Date.now()));
+
+    const routineMsg = makeMsg({ id: 'r1', from_type: 'system', context: { event_type: 'pr_merged' }, created_at: new Date(Date.now() - 120000).toISOString() });
+    const el = await renderPanel([routineMsg]);
+    const divider = el.querySelector('[data-divider-marker]');
+    expect(divider).toBeFalsy();
+  });
+
+  test('scroll-to-dismiss works when divider is visible (routine-only new)', async () => {
+    const routineMsg = makeMsg({ id: 'r1', from_type: 'system', context: { event_type: 'pr_merged' } });
+    const el = await renderPanel([routineMsg]);
+    const scrollContainer = el.querySelector('[class*="overflow-y-auto"]') as HTMLElement;
+    expect(scrollContainer).toBeTruthy();
+
+    // Divider should be present before scroll
+    let divider = el.querySelector('[data-divider-marker]') as HTMLElement;
+    expect(divider).toBeTruthy();
+
+    // The dismissal handler is synchronous (no timers) and dismisses when the
+    // divider's getBoundingClientRect().bottom < 0. jsdom returns all-zero rects
+    // by default, so stub the rect to place the divider above the viewport.
+    divider.getBoundingClientRect = () =>
+      ({ bottom: -10, top: -20, left: 0, right: 0, width: 0, height: 10, x: 0, y: -20, toJSON: () => ({}) }) as DOMRect;
+
+    await act(async () => {
+      scrollContainer.dispatchEvent(new Event('scroll', { bubbles: true }));
+    });
+
+    // After dismissal, the divider should no longer appear
+    divider = el.querySelector('[data-divider-marker]') as HTMLElement;
+    expect(divider).toBeFalsy();
+  });
+
+  test('Mark all read button dismisses divider', async () => {
+    const routineMsg = makeMsg({ id: 'r1', from_type: 'system', context: { event_type: 'pr_merged' } });
+    const el = await renderPanel([routineMsg]);
+
+    // Find the "All caught up" button on the divider
+    const buttons = [...el.querySelectorAll('button')].filter(b => b.textContent?.includes('All caught up'));
+    expect(buttons.length).toBeGreaterThan(0);
+
+    const dividerButton = buttons[0] as HTMLButtonElement;
+    await act(async () => { dividerButton.click(); });
+
+    // Divider should be gone
+    const divider = el.querySelector('[data-divider-marker]');
+    expect(divider).toBeFalsy();
+  });
+});
+
 describe('MessagesPanel feedback acknowledgment reply context', () => {
   let root: Root | null = null;
   let host: HTMLDivElement | null = null;
@@ -2161,13 +2283,17 @@ describe('MessagesPanel showOnlyNew filter', () => {
     vi.clearAllMocks();
   });
 
-  test('showOnlyNew toggle is disabled when dividerTime is null', async () => {
+  test('showOnlyNew toggle is enabled after cold-start bootstrap sets dividerTime', async () => {
     const el = await renderForProject('proj-1');
-    const showOnlyNewBtn = [...el.querySelectorAll('button')].find(b =>
-      b.title?.includes('No messages to filter') || b.title?.includes('Only new since')
-    );
-    expect(showOnlyNewBtn).toBeTruthy();
-    expect((showOnlyNewBtn as HTMLButtonElement).disabled).toBe(true);
+    // Cold-start bootstrap (#4974) records a divider baseline even on a first
+    // visit with no prior last-seen, so the toggle is enabled rather than disabled.
+    await waitFor(() => {
+      const showOnlyNewBtn = [...el.querySelectorAll('button')].find(b =>
+        b.title?.includes('No messages to filter') || b.title?.includes('Only new since')
+      );
+      expect(showOnlyNewBtn).toBeTruthy();
+      expect((showOnlyNewBtn as HTMLButtonElement).disabled).toBe(false);
+    });
   });
 
   test('showOnlyNew toggle becomes enabled after dividerTime is set', async () => {
@@ -2643,7 +2769,7 @@ describe('MessagesPanel summary card', () => {
     expect(el.textContent).not.toContain('No new since');
   });
 
-  test('caught-up indicator does not show when dividerTime is null', async () => {
+  test('caught-up indicator shows after cold-start bootstrap sets dividerTime', async () => {
     const msgs = [
       {
         id: 'm1',
@@ -2655,12 +2781,15 @@ describe('MessagesPanel summary card', () => {
         status: 'open',
         resolution: null,
         resolved_at: null,
-        created_at: new Date().toISOString(),
+        created_at: new Date(Date.now() - 5000).toISOString(),
       },
     ];
     const el = await renderPanelWithDivider(msgs, null);
-    // Should not show caught-up indicator when divider time is null
-    expect(el.textContent).not.toContain('No new since');
+    // Cold-start bootstrap (#4974) records "now" as the divider baseline even with
+    // no prior last-seen, so the single older BLOCKER reads as caught-up.
+    await waitFor(() => {
+      expect(el.textContent).toContain('No new since');
+    });
   });
 });
 
@@ -2832,6 +2961,50 @@ describe('MessagesPanel backend last-seen', () => {
       const calls = vi.mocked(apiFetch).mock.calls.map(c => c[0] as string);
       expect(calls.some(url => url.includes('/api/admin/messages/last-seen'))).toBe(true);
     }
+  });
+
+  test('bootstraps dividerTime on first visit when both localStorage and backend return null', async () => {
+    vi.mocked(apiFetch).mockImplementation(async (url: unknown, init?: unknown) => {
+      const urlStr = url as string;
+      const initObj = init as RequestInit | undefined;
+      if (urlStr.includes('/api/admin/messages/last-seen') && initObj?.method !== 'PUT') {
+        return new Response(JSON.stringify({ last_seen_at: null }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ messages: [] }), { status: 200 });
+    });
+
+    await renderPanel();
+
+    const LAST_SEEN_KEY = 'messages_panel_last_seen:test-user@example.com:proj-1';
+    const storedValue = localStorage.getItem(LAST_SEEN_KEY);
+    expect(storedValue).not.toBeNull();
+    expect(Number(storedValue)).toBeGreaterThan(0);
+
+    const putCalls = vi.mocked(apiFetch).mock.calls.filter(
+      c => (c[1] as RequestInit | undefined)?.method === 'PUT' && (c[0] as string).includes('/api/admin/messages/last-seen'),
+    );
+    expect(putCalls.length).toBeGreaterThan(0);
+  });
+
+  test('does not bootstrap when localStorage already has a last-seen value', async () => {
+    const existingTs = Date.now() - 60_000;
+    localStorage.setItem('messages_panel_last_seen:test-user@example.com:proj-1', String(existingTs));
+    vi.mocked(apiFetch).mockImplementation(async (url: unknown, init?: unknown) => {
+      const urlStr = url as string;
+      const initObj = init as RequestInit | undefined;
+      if (urlStr.includes('/api/admin/messages/last-seen') && initObj?.method !== 'PUT') {
+        return new Response(JSON.stringify({ last_seen_at: null }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ messages: [] }), { status: 200 });
+    });
+
+    await renderPanel();
+
+    const putCalls = vi.mocked(apiFetch).mock.calls.filter(
+      c => (c[1] as RequestInit | undefined)?.method === 'PUT' && (c[0] as string).includes('/api/admin/messages/last-seen'),
+    );
+    // No bootstrap PUT — localStorage value was loaded, dividerTimeRef is non-null
+    expect(putCalls.length).toBe(0);
   });
 });
 

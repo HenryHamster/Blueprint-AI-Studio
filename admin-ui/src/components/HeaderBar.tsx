@@ -28,6 +28,7 @@ export interface HeaderBarProps {
   showMessages: boolean;
   onToggleMessages: () => void;
   openMessageCount: number;
+  newSinceLastVisitCount?: number;
   needsAttentionCount?: number;
   onOpenNewTaskModal: () => void;
   onShowDirections: () => void;
@@ -561,6 +562,11 @@ export function HeaderBar(props: HeaderBarProps) {
                 {props.openMessageCount > 9 ? '9+' : props.openMessageCount}
               </span>
             )}
+            {!showMessages && (props.newSinceLastVisitCount ?? 0) > 0 && (
+              <span className="ml-0.5 bg-amber-500 text-black text-[8px] font-bold w-4 h-4 rounded-full leading-none flex items-center justify-center" title={`${props.newSinceLastVisitCount} new since last visit`}>
+                {(props.newSinceLastVisitCount ?? 0) > 9 ? '9+' : props.newSinceLastVisitCount}
+              </span>
+            )}
           </button>
           {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
           <button
@@ -649,6 +655,11 @@ export function HeaderBar(props: HeaderBarProps) {
                 {props.openMessageCount > 0 && (
                   <span className="ml-auto bg-blue-500 text-white text-[9px] font-bold px-1.5 py-0.5 rounded-full leading-none">
                     {props.openMessageCount > 9 ? '9+' : props.openMessageCount}
+                  </span>
+                )}
+                {!showMessages && (props.newSinceLastVisitCount ?? 0) > 0 && (
+                  <span className="ml-auto bg-amber-500 text-black text-[9px] font-bold px-1.5 py-0.5 rounded-full leading-none">
+                    {(props.newSinceLastVisitCount ?? 0) > 9 ? '9+' : props.newSinceLastVisitCount} new
                   </span>
                 )}
               </button>

@@ -584,6 +584,24 @@ export function countHighSignalMessages(messages: Array<{ message_type: string; 
   ).length;
 }
 
+// Count high-signal open messages that arrived after the operator's last panel visit.
+// Returns 0 when lastSeenTs is null (new operator with no baseline yet) so we never
+// mislabel all messages as new. Only counts messages with a valid created_at timestamp
+// that is strictly newer than lastSeenTs.
+export function countNewSinceLastVisit(
+  messages: Array<{ message_type: string; from_type: string; status: string; context: Record<string, unknown>; created_at?: string | null }>,
+  lastSeenTs: number | null,
+): number {
+  if (lastSeenTs === null) return 0;
+  return messages.filter(m => {
+    if (m.status !== 'open') return false;
+    if (classifySignalLevel(m) !== 'high') return false;
+    if (!m.created_at) return false;
+    const ts = new Date(m.created_at.endsWith('Z') || m.created_at.includes('+') ? m.created_at : m.created_at + 'Z').getTime();
+    return !isNaN(ts) && ts > lastSeenTs;
+  }).length;
+}
+
 // Collapses stale routine rows (older than STALE_ROUTINE_COLLAPSE_AGE_MS) into per-day digest
 // entries. Failing groups and high-signal events are never collapsed.
 export function collapseStaleRoutineRows<T extends { id: string; context: Record<string, unknown>; created_at?: string | null }>(
