@@ -525,11 +525,11 @@ async def test_reconcile_empty_diff_is_noop(db_session, mocker):
 # ===========================================================================
 
 
-async def test_periodic_block_raises_no_alert(db_session, mocker):
-    """A periodic back-merge that cannot merge yet (CI pending / 405) must NOT
-    raise an Alert — the reconciler retries every cycle and an Alert per cycle
-    would storm the operator. Contrast test_open_backmerge_pr_405... which
-    expects an Alert for the one-shot (periodic=False) caller."""
+async def test_periodic_block_raises_one_deduped_alert(db_session, mocker):
+    """A periodic back-merge stuck on a non-conflict block (CI pending / 405)
+    raises exactly ONE Alert no matter how many cycles run — the first stuck
+    cycle escalates, the rest dedupe against the still-open Alert. Not a storm,
+    but not silent either: a persistently stuck back-merge is surfaced once."""
     project = await _make_project(db_session)
     _patch_github(
         mocker,
@@ -541,13 +541,20 @@ async def test_periodic_block_raises_no_alert(db_session, mocker):
         },
     )
 
-    result = await hb.open_backmerge_pr(db_session, project.id, periodic=True)
-    await db_session.commit()
+    # Three reconciler cycles, all hitting the same non-conflict block.
+    for _ in range(3):
+        result = await hb.open_backmerge_pr(
+            db_session, project.id, periodic=True
+        )
+        await db_session.commit()
+        assert result["status"] == "blocked"
+        assert result["error"] == "merge_blocked"
 
-    assert result["status"] == "blocked"
-    assert result["error"] == "merge_blocked"
-    # The crux: a periodic caller stays quiet on a transient block.
-    assert await _alerts_for(db_session, project.id) == []
+    # Exactly one Alert — escalated once, deduped across the rest. No fix task.
+    alerts = await _alerts_for(db_session, project.id)
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.ERROR
+    assert alerts[0].title == "Back-merge failed: main -> automain"
     assert await _tasks_for(db_session, project.id) == []
 
 

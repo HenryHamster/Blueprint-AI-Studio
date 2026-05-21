@@ -33,17 +33,17 @@ It deliberately reuses ``promote``'s structure and the same GitHub helpers
 (``release_qualifier._resolve_github_with_session``).
 
 Failure philosophy (design doc §6 gotcha 6 — "the back-merge conflict-alert is
-mandatory, not optional"): a back-merge conflict must never pass silently — it
-raises an :class:`~app.models.Alert` and spawns a high-priority ``plan`` task
-to resolve the merge by hand.  The behaviour differs by caller:
+mandatory, not optional"): a back-merge that does not complete must never pass
+silently.  The behaviour differs by caller:
 
   * ``periodic=False`` (a one-shot hotfix back-merge) — every non-merge raises
     an Alert; the operator must see a stuck one-shot back-merge.
-  * ``periodic=True`` (the reconciler, which retries every cycle) — a transient
-    non-merge (CI still pending) is logged and retried next cycle instead of
-    storming the operator with an Alert each cycle.  A genuine conflict still
-    alerts and spawns a resolution plan, but BOTH are deduped project-wide so
-    a persistent conflict produces exactly one Alert and one plan.
+  * ``periodic=True`` (the reconciler, which retries every cycle) — alerting is
+    deduped, never suppressed: a blocked back-merge raises exactly one
+    unresolved Alert per project (the first stuck cycle escalates; later cycles
+    stay quiet until it is dismissed), and a genuine conflict's Alert +
+    resolution plan are likewise deduped project-wide.  So a persistent failure
+    surfaces once — not never, and not every cycle.
 
 ``open_backmerge_pr`` is idempotent: ``github.create_pull_request`` returns the
 existing open PR on a 422 "already exists", so calling it repeatedly (the
@@ -171,10 +171,10 @@ async def open_backmerge_pr(
          pass silently — and return ``{"status": "blocked"}``.
 
     ``periodic`` — set ``True`` by :func:`reconcile_main_into_automain`, which
-    calls this every scheduler cycle.  A periodic caller treats a transient
-    non-merge (step 7 — CI still pending) as "retry next cycle" and does NOT
-    raise an Alert (raising one every cycle would storm the operator); the
-    conflict path (step 6) still alerts, but deduped to one Alert + one plan.
+    calls this every scheduler cycle.  A periodic caller dedups its alerting so
+    it neither storms (an Alert every cycle) nor goes silent: a blocked
+    non-merge (step 7) raises one unresolved Alert per project until dismissed,
+    and the conflict path (step 6) raises one Alert + one plan, both deduped.
 
     ``merged_pr_url`` / ``hotfix_task_id`` describe the hotfix that triggered
     this back-merge, when there was one; the periodic reconciler passes
@@ -340,9 +340,9 @@ async def open_backmerge_pr(
         )
         return {"status": "conflict", "pr_url": pr_url}
 
-    # 7. Any other non-merge (405 — checks/reviews block).  For a one-shot
-    #    caller this must never pass silently; for the periodic reconciler it
-    #    is a transient state (CI still pending) — retried next cycle.
+    # 7. Any other non-merge (405 — checks/reviews block).  _raise_blocked_alert
+    #    escalates: always for a one-shot caller, once-deduped for the periodic
+    #    reconciler — so a persistently stuck back-merge surfaces without a storm.
     logger.warning(
         "[BACKMERGE] back-merge PR #%s for project %s did not merge: %s",
         pr_number,
@@ -442,8 +442,15 @@ async def _handle_conflict(
         raised so the operator sees a recurrence of a one-shot back-merge.
       * ``periodic=True`` (the reconciler retries every cycle) — when a
         resolution plan is already open NEITHER a duplicate Alert NOR a
-        duplicate plan is created, so a persistent conflict yields exactly one
-        of each instead of one per cycle.
+        duplicate plan is created, so a persistent conflict yields one of each
+        instead of one per cycle.
+
+    Concurrency note: the dedup reads committed state, so two genuinely
+    concurrent callers — the promotion-conflict hook and the periodic
+    reconciler ticking in the same instant — can each pass the check before
+    either commits and both spawn.  Accepted as benign: the window is tiny and
+    both resolution plans run the same ``git merge origin/main``, so a
+    duplicate is redundant, never destructive.
     """
     already_open = await _resolution_plan_already_open(session, project_id)
 
@@ -612,27 +619,51 @@ async def _raise_blocked_alert(
     """Surface a non-conflict back-merge failure (missing creds, PR-creation
     failure, merge exception, 405 non-merge).
 
-    ``periodic=False`` (a one-shot hotfix back-merge) — create an ERROR Alert:
-    a failed one-shot back-merge must never pass silently (design doc §6
-    gotcha 6).  No fix task is spawned — a 405 is a branch-protection / CI
-    problem the operator resolves, not a code conflict.
+    ``periodic=False`` (a one-shot hotfix back-merge) — always create an ERROR
+    Alert: a failed one-shot back-merge must never pass silently (design doc §6
+    gotcha 6).
 
-    ``periodic=True`` (the reconciler) — do NOT raise an Alert: the reconciler
-    re-attempts the back-merge every cycle, so a transient block (CI pending)
-    clears on its own and an Alert per cycle would storm the operator.  The
-    failure is logged at WARNING (visible in Cloud Logging) and the in-flight
-    PR is visible on GitHub, so it is surfaced, just not escalated.  A genuine
-    conflict — which is never transient — still escalates via
-    :func:`_handle_conflict`.
+    ``periodic=True`` (the reconciler, which retries every cycle) — create an
+    ERROR Alert too, but DEDUPED: only when no unresolved back-merge-blocked
+    Alert is already open for the project.  A periodic caller must not go
+    silent on a persistently stuck back-merge (CI red forever, revoked
+    credentials) — that would leave main and automain diverged with no signal
+    — but it must not stack an Alert every 10-minute cycle either.  So the
+    first stuck cycle escalates with exactly one Alert; later cycles log at
+    WARNING and stay quiet until that Alert is dismissed.
+
+    No fix task is spawned either way — a 405 is a branch-protection / CI
+    problem the operator resolves, not a code conflict.
     """
     if periodic:
+        existing = (
+            (
+                await session.execute(
+                    select(Alert).where(
+                        Alert.project_id == project_id,
+                        Alert.title == _BLOCKED_ALERT_TITLE,
+                        Alert.dismissed_at.is_(None),
+                    )
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if existing is not None:
+            logger.warning(
+                "[BACKMERGE] periodic back-merge for project %s still "
+                "blocked: %s — an unresolved Alert is already open; staying "
+                "quiet until it is dismissed",
+                project_id,
+                reason,
+            )
+            return
         logger.warning(
-            "[BACKMERGE] periodic back-merge for project %s did not complete: "
-            "%s — will retry next cycle",
+            "[BACKMERGE] periodic back-merge for project %s blocked: %s — "
+            "raising one Alert (will not repeat until dismissed)",
             project_id,
             reason,
         )
-        return
 
     trigger_clause = f" (triggered by {trigger_desc})" if trigger_desc else ""
     message = (
