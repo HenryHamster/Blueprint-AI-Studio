@@ -336,6 +336,23 @@ class TestClassifyFailureViewportGateInfra:
         t = _task("expectnooverflowat( failed at 375px width")
         assert classify_failure(t) == VIEWPORT_REGRESSION
 
+    def test_text_truncation_routes_to_viewport_regression(self):
+        t = _task(
+            "expectNoTextTruncationAt(375) detected clipped text in MessagesPanel"
+        )
+        assert classify_failure(t) == VIEWPORT_REGRESSION
+
+    def test_text_truncation_in_logs_routes_to_viewport_regression(self):
+        t = _task("")
+        result = classify_failure(
+            t, logs="expectNoTextTruncationAt(375): silent truncation detected"
+        )
+        assert result == VIEWPORT_REGRESSION
+
+    def test_text_truncation_not_code_error(self):
+        t = _task("expectNoTextTruncationAt(375) failed at DashboardHome")
+        assert classify_failure(t) != CODE_ERROR
+
 
 class TestClassifyFailureProvision:
     @pytest.mark.parametrize(

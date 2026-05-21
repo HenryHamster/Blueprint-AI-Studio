@@ -1,4 +1,4 @@
-import { afterEach, describe, test, vi } from 'vitest';
+import { afterEach, describe, expect, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { OrchestratorHealthBar } from '../components/OrchestratorHealthBar';
@@ -299,6 +299,11 @@ describe('operator home — composed viewport regression', () => {
         await new Promise<void>((resolve) => setTimeout(resolve, 75));
       });
     });
+
+    // Positive content: confirm panels rendered real content (not ErrorBoundary fallbacks).
+    // A silent crash would fail both the error-boundary sentinel above and these checks.
+    expect(host!.textContent).toContain('fix: resolve viewport overflow issue on dashboard');
+    expect(host!.textContent).toContain('feat: a sufficiently long stuck-task title');
 
     localStorage.removeItem('projectDashboardCollapsed');
   });

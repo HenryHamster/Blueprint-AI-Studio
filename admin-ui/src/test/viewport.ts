@@ -23,6 +23,26 @@ async function _captureBaselineIfEnabled(callerFile: string, width: number): Pro
 }
 
 /**
+ * Internal guard: if an ErrorBoundary fallback is present in the rendered tree,
+ * throw immediately with a descriptive [assertion_type:error_boundary] message.
+ * Called by each exported assertion function after layout settles, so a crashed
+ * panel can never produce a false-green by presenting a tiny fallback box that
+ * doesn't overflow, isn't truncated, and has no controls.
+ */
+function _assertNoErrorBoundaryFallback(width: number, callerFile: string): void {
+  const fallbacks = document.querySelectorAll<HTMLElement>('[data-error-boundary-fallback]');
+  if (fallbacks.length === 0) return;
+  const excerpts = Array.from(fallbacks)
+    .slice(0, 3)
+    .map((el) => el.outerHTML.slice(0, 200))
+    .join('\n');
+  const fileTag = callerFile ? ` [${callerFile}]` : '';
+  throw new Error(
+    `[assertion_type:error_boundary]${fileTag}: ${fallbacks.length} ErrorBoundary fallback(s) found at width=${width}px — component did not render real content:\n${excerpts}`,
+  );
+}
+
+/**
  * Options for `expectNoOverflowAt`.
  *
  * - `tolerance`: pixels of slack allowed past the viewport's right edge
@@ -77,6 +97,8 @@ export async function expectNoOverflowAt(
   if (waitMs > 0) {
     await new Promise<void>((resolve) => setTimeout(resolve, waitMs));
   }
+
+  _assertNoErrorBoundaryFallback(width, callerFile);
 
   const limit = width + tolerance;
   const docScrollWidth = document.documentElement.scrollWidth;
@@ -173,6 +195,8 @@ export async function expectNoTextTruncationAt(
     await new Promise<void>((resolve) => setTimeout(resolve, waitMs));
   }
 
+  _assertNoErrorBoundaryFallback(width, callerFile);
+
   const truncated: { tag: string; overflow: number; html: string }[] = [];
   const all = document.querySelectorAll<HTMLElement>(selector);
   for (const el of all) {
@@ -257,6 +281,8 @@ export async function expectMinTouchTargetAt(
   if (waitMs > 0) {
     await new Promise<void>((resolve) => setTimeout(resolve, waitMs));
   }
+
+  _assertNoErrorBoundaryFallback(width, callerFile);
 
   const undersized: { tag: string; width: number; height: number; html: string }[] = [];
   const all = document.querySelectorAll<HTMLElement>(selector);

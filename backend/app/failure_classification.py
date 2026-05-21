@@ -145,8 +145,9 @@ SCOPE_EMPTY = "SCOPE_EMPTY"
 # separately from crash/OOM regressions. Lowercase to match the literal string
 # the reaper writes into failure_category context.
 AGENT_STALLED = "agent_stalled"
-# Viewport rendering regression — npm run test:viewport reported overflow or
-# touch-target violations (expectNoOverflowAt / expectMinTouchTargetAt).
+# Viewport rendering regression — npm run test:viewport reported overflow,
+# text-truncation, or touch-target violations (expectNoOverflowAt /
+# expectNoTextTruncationAt / expectMinTouchTargetAt).
 # Distinct from CODE_ERROR so the regression dispatcher and operator panels can
 # track mobile-rendering regressions separately from unit-test or build breaks.
 VIEWPORT_REGRESSION = "VIEWPORT_REGRESSION"
@@ -157,11 +158,13 @@ VIEWPORT_REGRESSION = "VIEWPORT_REGRESSION"
 VIEWPORT_COVERAGE_DROP = "viewport_coverage_drop"
 
 
-# Substrings emitted by expectNoOverflowAt() / expectMinTouchTargetAt() in
-# admin-ui/src/test/viewport.ts. Kept narrow so only true viewport-suite
-# failures get this class rather than any test mentioning "viewport".
+# Substrings emitted by expectNoOverflowAt() / expectNoTextTruncationAt() /
+# expectMinTouchTargetAt() in admin-ui/src/test/viewport.ts. Kept narrow so
+# only true viewport-suite failures get this class rather than any test
+# mentioning "viewport".
 _VIEWPORT_PATTERNS: tuple[str, ...] = (
     "expectnooverflowat(",
+    "expectnotexttruncationat(",
     "expectmintouchtargetat(",
 )
 
