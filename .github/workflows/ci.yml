@@ -6,7 +6,7 @@ name: CI
 # issues from merge-time semantic conflicts start slipping past PR CI.
 on:
   pull_request:
-    branches: [main]
+    branches: [main, automain]
     types: [opened, synchronize, reopened, edited]
   workflow_dispatch:
 
