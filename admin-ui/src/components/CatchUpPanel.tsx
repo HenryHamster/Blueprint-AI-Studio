@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import type { RefObject } from 'react';
 import { Clock, ChevronDown, ChevronUp, AlertTriangle, CheckCircle, XCircle, Loader2, Check, RotateCcw, DollarSign, Compass } from 'lucide-react';
 import { apiFetch } from '../api';
@@ -565,13 +565,26 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
     saveDismissed(next);
   };
 
-  const isHidden = (taskId: string): boolean => {
+  const isHidden = useCallback((taskId: string): boolean => {
     const entry = dismissed[taskId];
     if (!entry) return false;
     if (entry.type === 'dismiss') return true;
     if (entry.type === 'snooze') return Date.now() < entry.until;
     return false;
-  };
+  }, [dismissed]);
+
+  const visibleItems = useMemo(
+    () => (digest?.needs_attention ?? []).filter(item => !isHidden(item.task_id)),
+    [digest?.needs_attention, isHidden]
+  );
+  const approvalItems = useMemo(
+    () => visibleItems.filter(i => i.reason === 'approval_required'),
+    [visibleItems]
+  );
+  const failedItems = useMemo(
+    () => visibleItems.filter(i => i.reason === 'failed'),
+    [visibleItems]
+  );
 
   const toggle = () => {
     const next = !collapsed;
@@ -1143,7 +1156,6 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
 
               {/* Needs attention */}
               {(digest.needs_attention ?? []).length > 0 && (() => {
-                const visibleItems = digest.needs_attention.filter(item => !isHidden(item.task_id));
                 const hiddenItems = digest.needs_attention.filter(item => isHidden(item.task_id));
                 const countLabel = hiddenItems.length > 0
                   ? `${visibleItems.length} visible / ${digest.needs_attention.length} total`
@@ -1153,22 +1165,22 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
                     <div className="flex items-center gap-1.5 text-[11px] font-bold text-amber-400 uppercase tracking-widest">
                       <AlertTriangle className="w-3 h-3" />
                       <span className="flex-1">Needs attention ({countLabel})</span>
-                      {onBulkApprove && visibleItems.filter(i => i.reason === 'approval_required').length >= 2 && (
+                      {onBulkApprove && approvalItems.length >= 2 && (
                         <button
                           className="text-[10px] font-semibold px-2 py-4 rounded border flex items-center gap-1 bg-emerald-500/10 text-emerald-500 hover:bg-emerald-500/20 border-emerald-500/20 normal-case tracking-normal"
-                          onClick={() => handleBulkApprove(visibleItems.filter(i => i.reason === 'approval_required').map(i => i.task_id))}
+                          onClick={() => handleBulkApprove(approvalItems.map(i => i.task_id))}
                         >
                           <Check className="w-3 h-3" />
-                          Approve all ({visibleItems.filter(i => i.reason === 'approval_required').length})
+                          Approve all ({approvalItems.length})
                         </button>
                       )}
-                      {onBulkRetry && visibleItems.filter(i => i.reason === 'failed').length >= 2 && (
+                      {onBulkRetry && failedItems.length >= 2 && (
                         <button
                           className="text-[10px] font-semibold px-2 py-4 rounded border flex items-center gap-1 bg-blue-500/10 text-blue-500 hover:bg-blue-500/20 border-blue-500/20 normal-case tracking-normal"
-                          onClick={() => handleBulkRetry(visibleItems.filter(i => i.reason === 'failed').map(i => i.task_id))}
+                          onClick={() => handleBulkRetry(failedItems.map(i => i.task_id))}
                         >
                           <RotateCcw className="w-3 h-3" />
-                          Retry all ({visibleItems.filter(i => i.reason === 'failed').length})
+                          Retry all ({failedItems.length})
                         </button>
                       )}
                     </div>

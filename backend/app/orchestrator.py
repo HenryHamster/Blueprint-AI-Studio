@@ -395,8 +395,7 @@ async def _emit_all_accounts_blocked_stall(
             "[ORCHESTRATOR] Failed to broadcast all_accounts_blocked throttle"
         )
     try:
-        projects = (await session.execute(select(Project))).scalars().all()
-        project_ids = [p.id for p in projects]
+        project_ids = list((await session.execute(select(Project.id))).scalars().all())
         # Dedup across the "Pipeline stalled — ..." family, not the exact
         # title: with dynamic copy a new stall episode could otherwise stack
         # a second alert if its blockage shape (rate-limit vs capacity) flips.
@@ -416,23 +415,23 @@ async def _emit_all_accounts_blocked_stall(
             else []
         )
         projects_with_alert = {row[0] for row in existing_rows}
-        for proj in projects:
-            if proj.id not in projects_with_alert:
+        for proj_id in project_ids:
+            if proj_id not in projects_with_alert:
                 alert = Alert(
-                    project_id=proj.id,
+                    project_id=proj_id,
                     severity=AlertSeverity.ERROR,
                     title=title,
                     message=msg,
                 )
                 session.add(alert)
                 await broadcast_to_project(
-                    str(proj.id),
+                    str(proj_id),
                     "alert_created",
                     {"alert_id": str(alert.id), "severity": "ERROR", "title": title},
                 )
             asyncio.ensure_future(
                 dispatch_external_notification(  # noqa: RUF006
-                    proj.id,
+                    proj_id,
                     "PIPELINE_STALLED",
                     {
                         "reason": "all_accounts_blocked",
@@ -2564,15 +2563,17 @@ async def orchestrator_worker():
                                 "Each type has >70% failure rate in the last 15 minutes. The pipeline will not dispatch "
                                 "new tasks until failure rates drop."
                             )
-                            _projects = (
-                                (await session.execute(select(Project))).scalars().all()
+                            _all_project_ids = list(
+                                (await session.execute(select(Project.id)))
+                                .scalars()
+                                .all()
                             )
-                            for _proj in _projects:
+                            for _proj_id in _all_project_ids:
                                 _existing_alert = (
                                     (
                                         await session.execute(
                                             select(Alert).where(
-                                                Alert.project_id == _proj.id,
+                                                Alert.project_id == _proj_id,
                                                 Alert.task_id.is_(None),
                                                 Alert.severity == AlertSeverity.ERROR,
                                                 Alert.dismissed_at.is_(None),
@@ -2585,14 +2586,14 @@ async def orchestrator_worker():
                                 )
                                 if _existing_alert is None:
                                     _alert = Alert(
-                                        project_id=_proj.id,
+                                        project_id=_proj_id,
                                         severity=AlertSeverity.ERROR,
                                         title=_all_blocked_title,
                                         message=_all_blocked_msg,
                                     )
                                     session.add(_alert)
                                     await broadcast_to_project(
-                                        str(_proj.id),
+                                        str(_proj_id),
                                         "alert_created",
                                         {
                                             "alert_id": str(_alert.id),

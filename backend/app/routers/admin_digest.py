@@ -6115,9 +6115,13 @@ async def _compute_digest(
     remediations_merged = sum(1 for t in _rem_tasks if t.status == TaskStatus.COMPLETED)
     remediations_failed = sum(1 for t in _rem_tasks if t.status == TaskStatus.FAILED)
 
-    _held_projects_q = select(Project)
+    _held_projects_q = select(Project).options(
+        load_only(Project.id, Project.directions)
+    )
     if project_id:
         _held_projects_q = _held_projects_q.where(Project.id == project_id)
+    else:
+        _held_projects_q = _held_projects_q.where(Project.directions.isnot(None))
     _held_projects = (await session.execute(_held_projects_q)).scalars().all()
     fixes_held = 0
     _window_iso = window_start.isoformat()
@@ -9135,7 +9139,9 @@ async def get_viewport_debt(
     # Shallow-copy cached rows: the scan result is a process-wide cache and
     # we annotate per-project below. Without the copy, concurrent requests
     # for different projects would race on regression_case_count / source_url.
-    top_rows, top_untested, coverage_summary = _scan_viewport_debt_rows()
+    top_rows, top_untested, coverage_summary = await asyncio.to_thread(
+        _scan_viewport_debt_rows
+    )
     rows = [dict(r) for r in top_rows]
     untested_rows = [dict(r) for r in top_untested]
 

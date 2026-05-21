@@ -409,10 +409,12 @@ async def _check_monitoring_window():
                 session.add(state)
                 # Create ERROR alert on all projects
                 rollback_title = f"Rollback recommended: {reason}"
-                projects = (await session.execute(select(Project))).scalars().all()
-                for project in projects:
+                project_ids = (
+                    (await session.execute(select(Project.id))).scalars().all()
+                )
+                for project_id in project_ids:
                     alert = Alert(
-                        project_id=project.id,
+                        project_id=project_id,
                         severity=AlertSeverity.ERROR,
                         title=rollback_title,
                         message=(
@@ -422,7 +424,7 @@ async def _check_monitoring_window():
                     )
                     session.add(alert)
                     await broadcast_to_project(
-                        str(project.id),
+                        str(project_id),
                         "alert_created",
                         {
                             "alert_id": str(alert.id),
@@ -436,7 +438,7 @@ async def _check_monitoring_window():
                         )  # noqa: PLC0415
 
                         await post_rollback_recommendation_message(
-                            session, project.id, reason
+                            session, project_id, reason
                         )
                     except Exception as _me:
                         logger.warning(
@@ -457,10 +459,10 @@ async def _check_monitoring_window():
                     import asyncio as _asyncio  # noqa: PLC0415
                     from app.notification_dispatch import dispatch_external_notification  # noqa: PLC0415
 
-                    for project in projects:
+                    for project_id in project_ids:
                         _asyncio.ensure_future(
                             dispatch_external_notification(
-                                project.id,
+                                project_id,
                                 "ROLLBACK_RECOMMENDED",
                                 {"reason": reason, "revision": state.current_revision},
                             )
@@ -665,13 +667,13 @@ async def _create_auto_pause_alerts(session: AsyncSession, failed_deps: list) ->
         f"Pipeline auto-paused: external dependencies down — {', '.join(failed_deps)}{rl_suffix}{dispatch_suffix}. "
         "Will auto-resume when healthy."
     )
-    projects = (await session.execute(select(Project))).scalars().all()
-    for project in projects:
+    project_ids = (await session.execute(select(Project.id))).scalars().all()
+    for project_id in project_ids:
         existing = (
             (
                 await session.execute(
                     select(Alert).where(
-                        Alert.project_id == project.id,
+                        Alert.project_id == project_id,
                         Alert.task_id.is_(None),
                         Alert.severity == AlertSeverity.WARNING,
                         Alert.dismissed_at.is_(None),
@@ -685,14 +687,14 @@ async def _create_auto_pause_alerts(session: AsyncSession, failed_deps: list) ->
         if existing is not None:
             continue
         alert = Alert(
-            project_id=project.id,
+            project_id=project_id,
             severity=AlertSeverity.WARNING,
             title=title,
             message=msg,
         )
         session.add(alert)
         await broadcast_to_project(
-            str(project.id),
+            str(project_id),
             "alert_created",
             {"alert_id": str(alert.id), "severity": "WARNING", "title": alert.title},
         )
@@ -701,10 +703,10 @@ async def _create_auto_pause_alerts(session: AsyncSession, failed_deps: list) ->
         import asyncio as _asyncio  # noqa: PLC0415
         from app.notification_dispatch import dispatch_external_notification  # noqa: PLC0415
 
-        for project in projects:
+        for project_id in project_ids:
             _asyncio.ensure_future(
                 dispatch_external_notification(
-                    project.id,
+                    project_id,
                     "DEPLOY_HEALTH_ALERT",
                     {
                         "failed_deps": failed_deps,
@@ -753,13 +755,13 @@ async def _create_forced_resume_alerts(
             "Resuming with reduced VM count (1) — operators should investigate."
         )
     now = _utcnow()
-    projects = (await session.execute(select(Project))).scalars().all()
-    for project in projects:
+    project_ids = (await session.execute(select(Project.id))).scalars().all()
+    for project_id in project_ids:
         existing_warnings = (
             (
                 await session.execute(
                     select(Alert).where(
-                        Alert.project_id == project.id,
+                        Alert.project_id == project_id,
                         Alert.severity == AlertSeverity.WARNING,
                         Alert.dismissed_at.is_(None),
                         Alert.title == pause_title,
@@ -773,14 +775,14 @@ async def _create_forced_resume_alerts(
             w.dismissed_at = now
             session.add(w)
         alert = Alert(
-            project_id=project.id,
+            project_id=project_id,
             severity=AlertSeverity.ERROR,
             title=title,
             message=msg,
         )
         session.add(alert)
         await broadcast_to_project(
-            str(project.id),
+            str(project_id),
             "alert_created",
             {"alert_id": str(alert.id), "severity": "ERROR", "title": alert.title},
         )
@@ -789,10 +791,10 @@ async def _create_forced_resume_alerts(
         import asyncio as _asyncio  # noqa: PLC0415
         from app.notification_dispatch import dispatch_external_notification  # noqa: PLC0415
 
-        for project in projects:
+        for project_id in project_ids:
             _asyncio.ensure_future(
                 dispatch_external_notification(
-                    project.id,
+                    project_id,
                     "FORCED_RESUME",
                     {
                         "pause_duration_seconds": int(pause_duration_seconds),
@@ -823,14 +825,14 @@ async def _create_auto_resume_alerts(
         resume_title = "Pipeline auto-resumed: all external dependencies healthy."
         severity = AlertSeverity.INFO
     now = _utcnow()
-    projects = (await session.execute(select(Project))).scalars().all()
-    for project in projects:
+    project_ids = (await session.execute(select(Project.id))).scalars().all()
+    for project_id in project_ids:
         # Dismiss existing auto-pause WARNING alerts for this project
         existing_warnings = (
             (
                 await session.execute(
                     select(Alert).where(
-                        Alert.project_id == project.id,
+                        Alert.project_id == project_id,
                         Alert.severity == AlertSeverity.WARNING,
                         Alert.dismissed_at.is_(None),
                         Alert.title == pause_title,
@@ -844,14 +846,14 @@ async def _create_auto_resume_alerts(
             w.dismissed_at = now
             session.add(w)
         alert = Alert(
-            project_id=project.id,
+            project_id=project_id,
             severity=severity,
             title=resume_title,
             message=resume_title,
         )
         session.add(alert)
         await broadcast_to_project(
-            str(project.id),
+            str(project_id),
             "alert_created",
             {
                 "alert_id": str(alert.id),
@@ -882,10 +884,10 @@ async def _create_auto_resume_alerts(
             import asyncio as _asyncio  # noqa: PLC0415
             from app.notification_dispatch import dispatch_external_notification  # noqa: PLC0415
 
-            for project in projects:
+            for project_id in project_ids:
                 _asyncio.ensure_future(
                     dispatch_external_notification(
-                        project.id,
+                        project_id,
                         "FLAPPING_RESUME",
                         flap_payload,
                     )
