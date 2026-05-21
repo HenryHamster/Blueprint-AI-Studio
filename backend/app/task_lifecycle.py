@@ -1630,6 +1630,7 @@ async def _process_post_commit(
         _handle_perf_completion,
         _handle_self_audit_completion,
         _handle_investigation_completion,
+        _handle_memo_completion,
         _record_remediation_if_terminal,
         _handle_investigation_terminal_failure,
         _record_regression_signal_if_matching,
@@ -3576,9 +3577,7 @@ async def _process_post_commit(
                                         if (
                                             is_rollup_merge
                                             and base_branch == "main"
-                                            and bool(
-                                                orig.first_payload.get("hotfix")
-                                            )
+                                            and bool(orig.first_payload.get("hotfix"))
                                         ):
                                             try:
                                                 from app import hotfix_backmerge
@@ -3588,11 +3587,13 @@ async def _process_post_commit(
                                                     if owner and repo and pr_number
                                                     else ""
                                                 )
-                                                await hotfix_backmerge.open_backmerge_pr(
-                                                    session,
-                                                    task.project_id,
-                                                    merged_pr_url=_merged_pr_url,
-                                                    hotfix_task_id=orig.id,
+                                                await (
+                                                    hotfix_backmerge.open_backmerge_pr(
+                                                        session,
+                                                        task.project_id,
+                                                        merged_pr_url=_merged_pr_url,
+                                                        hotfix_task_id=orig.id,
+                                                    )
                                                 )
                                                 # open_backmerge_pr deliberately
                                                 # does NOT commit (its docstring:
@@ -4539,6 +4540,10 @@ async def _process_post_commit(
                 elif task_type == "self_audit":
                     self_audit_logs = payload.logs or task.latest_status_message or ""
                     await _handle_self_audit_completion(task, self_audit_logs, session)
+
+                elif task_type == "memo":
+                    memo_logs = payload.logs or task.latest_status_message or ""
+                    await _handle_memo_completion(task, memo_logs, session)
 
                 elif payload.artifact_type == ArtifactType.INVESTIGATION_REPORT:
                     await _handle_investigation_completion(task, payload, session)

@@ -2694,3 +2694,61 @@ class TestViewportDebt:
             "https://github.com/acme/repo/blob/main/"
             "admin-ui/src/components/QuickFilterPresets.tsx"
         )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# admin_settings.py — integration_branch validation
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestIntegrationBranchValidation:
+    """PATCH /api/admin/settings integration_branch must reject shell metacharacters."""
+
+    @pytest.mark.asyncio
+    async def test_integration_branch_rejects_shell_injection(
+        self, client: AsyncClient
+    ):
+        """integration_branch=main\";id;\" must be rejected with HTTP 400."""
+        resp = await client.patch(
+            "/api/admin/settings", json={"integration_branch": 'main";id;"'}
+        )
+        assert resp.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_integration_branch_accepts_valid(self, client: AsyncClient):
+        """Valid branch names (e.g. main, feature/foo-bar) must be accepted."""
+        resp = await client.patch(
+            "/api/admin/settings", json={"integration_branch": "main"}
+        )
+        assert resp.status_code == 200
+
+        resp2 = await client.patch(
+            "/api/admin/settings", json={"integration_branch": "feature/foo-bar"}
+        )
+        assert resp2.status_code == 200
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "bad_branch",
+        [
+            'main";id;"',  # double-quote + semicolon
+            "main;id",  # semicolon
+            "branch$HOME",  # dollar
+            "branch`id`",  # backtick
+            "branch|cat",  # pipe
+            "branch&id",  # ampersand
+            "branch(id)",  # parentheses
+            ".hidden",  # leading dot
+            "a/..b",  # dotdot
+            "a/.git/b",  # reserved component
+        ],
+    )
+    async def test_integration_branch_rejects_bad_names(
+        self, client: AsyncClient, bad_branch: str
+    ):
+        resp = await client.patch(
+            "/api/admin/settings", json={"integration_branch": bad_branch}
+        )
+        assert resp.status_code == 400, (
+            f"Expected 400 for branch {bad_branch!r}, got {resp.status_code}"
+        )

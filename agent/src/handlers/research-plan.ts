@@ -744,6 +744,32 @@ Only request qualification from the **stabilize** phase — it is ignored in **b
   return parts.join('\n');
 }
 
+/**
+ * Builds the memo-citations block for the strategic thinker prompt.
+ * Memos are terminal reasoning artifacts spawned from research findings the
+ * packer dropped under budget pressure; the backend surfaces a digest of the
+ * recent ones so the strategic reviewer can cite them by task id. Returns ''
+ * when there are no memos for this cycle window.
+ */
+export function buildMemoCitationsSection(memoCitations: unknown): string {
+  if (!Array.isArray(memoCitations) || memoCitations.length === 0) return '';
+  const lines: string[] = ['\n## Memo Citations (recent terminal reasoning artifacts)'];
+  lines.push(
+    'Memos are short reasoning notes spawned from research findings dropped ' +
+    'under budget pressure in earlier cycles. Each is a completed, terminal ' +
+    'artifact. When a memo informs a gap or direction, cite it by task id ' +
+    '(e.g. "memo <task_id>") so the reasoning thread stays traceable.',
+  );
+  for (const m of memoCitations) {
+    if (!m || typeof m !== 'object') continue;
+    const rec = m as Record<string, unknown>;
+    const taskId = typeof rec.task_id === 'string' && rec.task_id ? rec.task_id : '?';
+    const excerpt = typeof rec.summary_excerpt === 'string' ? rec.summary_excerpt.trim() : '';
+    lines.push(`- memo ${taskId}: ${excerpt || '(no summary)'}`);
+  }
+  return lines.join('\n');
+}
+
 // Portfolio-level view computed from per-direction data — surfaces imbalances
 // (category skew, system coverage gaps, concentration, age) as explicit
 // decision inputs for the strategic thinker.
@@ -1028,6 +1054,7 @@ export interface ThinkerPromptParams {
   threadSection: string;
   taskId: string;
   versionPhaseSection: string;
+  memoCitationsSection: string;
 }
 
 export function buildThinkerPrompt(p: ThinkerPromptParams): string {
@@ -1061,7 +1088,7 @@ ${p.userPausedSection}${p.rejectedProposalsSection}
 ## Portfolio Composition
 ${p.portfolioCompositionText}
 ${p.systemMaturitySection}${p.driftSection}
-${p.recentWorkSection}${p.feedbackSection}${p.threadSection}${p.versionPhaseSection}
+${p.recentWorkSection}${p.feedbackSection}${p.threadSection}${p.versionPhaseSection}${p.memoCitationsSection}
 # Your job
 
 You operate on a **problem model** — a structured representation of what the user wants (intent), what the project can do (capabilities), and what's between those (gaps). Directions are *moves* toward specific gaps. Friction is *obstacles* in the way.
@@ -2247,6 +2274,7 @@ point of self-repo. Just do it and tell the user in whats_changed.` : '';
       threadSection,
       taskId,
       versionPhaseSection: buildVersionPhaseSection(versionPhase),
+      memoCitationsSection: buildMemoCitationsSection(payload.memo_citations),
     });
 
     const thinkerGateResult = await runThinkerWithGate(

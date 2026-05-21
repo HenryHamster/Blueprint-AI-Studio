@@ -319,7 +319,33 @@ async def test_efficiency_axes_endpoint_returns_shape(client: AsyncClient, db_se
     for axis in ALL_AXES:
         assert axis in data["axes"]
         entry = data["axes"][axis]
-        assert set(entry.keys()) == {"current", "baseline", "drift_pct"}
+        assert set(entry.keys()) == {"current", "baseline", "drift_pct", "history"}
+        assert isinstance(entry["history"], list)
+
+
+@pytest.mark.asyncio
+async def test_read_baseline_with_drift_history_reflects_snapshots(db_session):
+    """history[] per axis must contain one entry per stored snapshot."""
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(_make_efficient_task(project.id))
+    await db_session.commit()
+
+    await write_snapshot(db_session, project.id)
+    await db_session.commit()
+    await write_snapshot(db_session, project.id)
+    await db_session.commit()
+
+    result = await read_baseline_with_drift(db_session, project.id)
+    for axis in ALL_AXES:
+        hist = result["axes"][axis]["history"]
+        assert len(hist) == 2, f"{axis}: expected 2 history entries, got {len(hist)}"
+        for entry in hist:
+            assert "captured_at" in entry
+            assert "value" in entry
 
 
 @pytest.mark.asyncio

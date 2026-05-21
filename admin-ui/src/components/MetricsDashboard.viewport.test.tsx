@@ -23,10 +23,25 @@ vi.mock('../api', () => ({
     ok: true,
     json: async () => ({
       axes: {
-        cost_per_merged_pr: { current: 45.2, baseline: 50.0, drift_pct: -9.6 },
-        vm_cold_start_p50_ms: { current: 3200, baseline: 3500, drift_pct: -8.6 },
-        vm_reuse_rate: { current: 72, baseline: 68, drift_pct: 5.9 },
-        median_api_calls_per_task: { current: 12, baseline: 15, drift_pct: -20.0 },
+        cost_per_merged_pr: {
+          current: 45.2, baseline: 50.0, drift_pct: -9.6,
+          history: [
+            { captured_at: '2026-03-01T00:00:00Z', value: 54.0 },
+            { captured_at: '2026-03-08T00:00:00Z', value: 51.0 },
+            { captured_at: '2026-04-01T00:00:00Z', value: 50.0 },
+            { captured_at: '2026-05-01T00:00:00Z', value: 45.2 },
+          ],
+        },
+        vm_cold_start_p50_ms: {
+          current: 3200, baseline: 3500, drift_pct: -8.6,
+          history: [
+            { captured_at: '2026-03-01T00:00:00Z', value: 3600 },
+            { captured_at: '2026-04-01T00:00:00Z', value: 3500 },
+            { captured_at: '2026-05-01T00:00:00Z', value: 3200 },
+          ],
+        },
+        vm_reuse_rate: { current: 72, baseline: 68, drift_pct: 5.9, history: [] },
+        median_api_calls_per_task: { current: 12, baseline: 15, drift_pct: -20.0, history: [{ captured_at: '2026-05-01T00:00:00Z', value: 12 }] },
         median_review_iterations: { current: 2.1, baseline: 2.5, drift_pct: -16.0 },
       },
       baseline_captured_at: '2026-05-01T00:00:00Z',

@@ -121,7 +121,7 @@ from app.strategic_constants import (
 
 # Expected schema revision — must match the latest alembic migration.
 # Update this when adding new migrations.
-EXPECTED_SCHEMA_REVISION = "0100"
+EXPECTED_SCHEMA_REVISION = "0101"
 
 # --- Task Priority Map ---
 # Maps priority string labels to integer values stored on Task.priority.
@@ -1308,10 +1308,12 @@ async def debug_orchestrator(
         }
 
     hung = False
-    if _orch._orchestrator_cycle_started and _orch._orchestrator_last_cycle and _orch._orchestrator_cycle_started > _orch._orchestrator_last_cycle:
-        hung_seconds = (
-            _utcnow() - _orch._orchestrator_cycle_started
-        ).total_seconds()
+    if (
+        _orch._orchestrator_cycle_started
+        and _orch._orchestrator_last_cycle
+        and _orch._orchestrator_cycle_started > _orch._orchestrator_last_cycle
+    ):
+        hung_seconds = (_utcnow() - _orch._orchestrator_cycle_started).total_seconds()
         hung = hung_seconds > 300  # 5 minutes without completing a cycle
 
     return {
@@ -1640,10 +1642,12 @@ async def health_check():
 
     # Detect hung orchestrator (cycle started but not completed in 5+ minutes)
     orchestrator_hung = False
-    if _orch._orchestrator_cycle_started and _orch._orchestrator_last_cycle and _orch._orchestrator_cycle_started > _orch._orchestrator_last_cycle:
-        hung_seconds = (
-            _utcnow() - _orch._orchestrator_cycle_started
-        ).total_seconds()
+    if (
+        _orch._orchestrator_cycle_started
+        and _orch._orchestrator_last_cycle
+        and _orch._orchestrator_cycle_started > _orch._orchestrator_last_cycle
+    ):
+        hung_seconds = (_utcnow() - _orch._orchestrator_cycle_started).total_seconds()
         orchestrator_hung = hung_seconds > 300
 
     # Only DB is critical for 503 — provider or external API outages shouldn't remove us from LB.
@@ -3213,9 +3217,7 @@ async def strategic_operation(
         version_phase_decision = extract_version_phase_decision(
             pm_data.pop("version_phase_decision", None)
         )
-        qualify_request = extract_qualify_request(
-            pm_data.pop("qualify_request", None)
-        )
+        qualify_request = extract_qualify_request(pm_data.pop("qualify_request", None))
         try:
             new_pm_raw, pm_diff = apply_agent_update(
                 current_raw=project.problem_model,

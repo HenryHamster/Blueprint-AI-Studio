@@ -55,10 +55,11 @@ EXPECTED_TYPES = {
     "investigate",
     "self_audit",
     "release_audit",
+    "memo",
 }
 
 
-def test_task_type_enum_has_all_19_types():
+def test_task_type_enum_has_all_20_types():
     values = {t.value for t in TaskType}
     assert values == EXPECTED_TYPES
 
@@ -74,10 +75,10 @@ def test_model_for_type_covers_all_task_types():
     assert set(_MODEL_FOR_TYPE.keys()) == set(TaskType)
 
 
-def test_model_for_type_count_is_19():
+def test_model_for_type_count_is_20():
     from app.payload_schemas import _MODEL_FOR_TYPE
 
-    assert len(_MODEL_FOR_TYPE) == 19
+    assert len(_MODEL_FOR_TYPE) == 20
 
 
 # ---------------------------------------------------------------------------
@@ -380,7 +381,11 @@ def test_internal_payload_raises_on_missing_required_field():
     through, and the agent died with ``Fatal error: Fix task missing prompt``
     after burning 3 retries.
     """
-    raw = {"type": "fix", "pr_number": 42, "branch": "blueprint/task-x"}  # missing prompt
+    raw = {
+        "type": "fix",
+        "pr_number": 42,
+        "branch": "blueprint/task-x",
+    }  # missing prompt
     with pytest.raises(ValueError, match="prompt"):
         validate_internal_payload(raw, "my_context")
 

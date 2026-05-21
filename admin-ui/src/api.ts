@@ -687,10 +687,16 @@ export async function onboardProject(
   return res.json();
 }
 
+export interface EfficiencyHistoryPoint {
+  captured_at: string | null;
+  value: number | null;
+}
+
 export interface EfficiencyAxis {
   current: number | null;
   baseline: number | null;
   drift_pct: number | null;
+  history: EfficiencyHistoryPoint[];
 }
 
 export interface EfficiencyAxesResponse {

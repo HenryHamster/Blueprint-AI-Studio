@@ -120,6 +120,7 @@ export const TASK_TYPES_WITHOUT_HINT: ReadonlySet<string> = new Set([
   'strategic_review', // Reuses research handler with research_mode branch; uses bespoke assembly
   'smoketest',        // Uses specialized.ts bespoke prompt assembly
   'design_doc_update', // Uses design-doc.ts bespoke prompt assembly
+  'memo',             // Uses memo.ts bespoke prompt assembly (no-clone reasoning artifact)
 ]);
 
 // ── Dynamic Task Type Hints (based on project build configuration) ───────────

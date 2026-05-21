@@ -2229,6 +2229,74 @@ async def test_retirement_critiques_persisted_via_context_injection(db_session, 
 
 
 @pytest.mark.asyncio
+async def test_memo_citations_persisted_in_cycle_metadata(db_session, mocker):
+    """A COMPLETED memo task in the project window populates
+    cycle_metadata['memo_citations'] with {task_id, summary_excerpt} entries."""
+    from unittest.mock import AsyncMock
+    from app.models import TaskStatus
+    from app.strategic_completion import _handle_strategic_completion
+    from app import strategic_cycle
+
+    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="Memo-Cite",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # A COMPLETED memo task with a parseable summary in plan_output.
+    memo_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "memo", "topic": "Dropped finding X"}],
+        status=TaskStatus.COMPLETED,
+        plan_output={
+            "memo": {
+                "summary": "Summary of dropped finding X reasoning.",
+                "reasoning": "Detail.",
+                "citations": [],
+                "tags": [],
+            }
+        },
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(memo_task)
+    await db_session.commit()
+    await db_session.refresh(memo_task)
+
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={"_strategic_vision_set": True, "strategic_cycle_id": cycle.id},
+        strategic_cycle_id=cycle.id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    await _handle_strategic_completion(task, "", db_session)
+
+    await db_session.refresh(cycle)
+    meta = cycle.cycle_metadata or {}
+    assert "memo_citations" in meta, (
+        "memo_citations must be persisted in cycle_metadata"
+    )
+    cites = meta["memo_citations"]
+    assert len(cites) == 1
+    assert cites[0]["task_id"] == str(memo_task.id)
+    assert cites[0]["summary_excerpt"].startswith("Summary of dropped finding X")
+
+
+@pytest.mark.asyncio
 async def test_retirement_critiques_persisted_via_fallback_path(db_session, mocker):
     """Fallback (log-parse) path: retired_direction_critiques from JSON output ends up in cycle metadata."""
     import json
@@ -3547,9 +3615,7 @@ async def test_version_phase_decision_flows_end_to_end(client, db_session, mocke
     await db_session.commit()
     await db_session.refresh(task)
 
-    token = create_agent_token(
-        str(task.id), "vm-vpd-e2e", task_type="strategic_review"
-    )
+    token = create_agent_token(str(task.id), "vm-vpd-e2e", task_type="strategic_review")
 
     # The agent embeds version_phase_decision as a TOP-LEVEL SIBLING of the
     # problem_model fields — exactly what the research-plan executor prompt
@@ -3700,9 +3766,7 @@ async def test_set_problem_model_ignores_invalid_version_phase_decision(
     await db_session.commit()
     await db_session.refresh(task)
 
-    token = create_agent_token(
-        str(task.id), "vm-vpd-bad", task_type="strategic_review"
-    )
+    token = create_agent_token(str(task.id), "vm-vpd-bad", task_type="strategic_review")
     resp = await client.post(
         "/api/agent/strategic",
         json={
@@ -3792,9 +3856,7 @@ async def test_qualify_request_flows_end_to_end(client, db_session, mocker):
     await db_session.commit()
     await db_session.refresh(task)
 
-    token = create_agent_token(
-        str(task.id), "vm-qr-e2e", task_type="strategic_review"
-    )
+    token = create_agent_token(str(task.id), "vm-qr-e2e", task_type="strategic_review")
 
     # The agent embeds qualify_request as a TOP-LEVEL SIBLING of the
     # problem_model fields — exactly what the research-plan executor prompt
@@ -3932,9 +3994,7 @@ async def test_qualify_request_skipped_when_version_not_in_stabilize(
 
 
 @pytest.mark.asyncio
-async def test_set_problem_model_with_qualify_request_does_not_400(
-    client, db_session
-):
+async def test_set_problem_model_with_qualify_request_does_not_400(client, db_session):
     """Embedding qualify_request in set_problem_model must not break the
     problem_model write itself.
 

@@ -239,6 +239,54 @@ async def mark_phase2_completed(
     return cycle
 
 
+async def query_recent_memo_citations(
+    session: AsyncSession,
+    project_id,
+    *,
+    cap: int = 25,
+) -> list[dict[str, Any]]:
+    """Citable memo summaries for the current strategic cycle window.
+
+    Window: COMPLETED memo tasks created since the *previous* strategic cycle
+    started for this project (the cycle before the most recent one). When the
+    project has fewer than two cycles the lower bound is unbounded.
+
+    Returns ``[{"task_id": str, "summary_excerpt": str}]`` newest-first, capped
+    at ``cap`` (oldest dropped). ``summary_excerpt`` is the first ~200 chars of
+    ``plan_output['memo']['summary']`` — empty string when the memo has no
+    parseable summary.
+    """
+    from app.models import Task, TaskStatus  # noqa: PLC0415
+
+    recent_starts = (
+        await session.execute(
+            select(StrategicCycle.phase1_started_at)
+            .where(StrategicCycle.project_id == project_id)
+            .order_by(desc(StrategicCycle.phase1_started_at))
+            .limit(2)
+        )
+    ).all()
+    window_start = recent_starts[1][0] if len(recent_starts) >= 2 else None
+
+    stmt = select(Task).where(
+        Task.project_id == project_id,
+        Task.status == TaskStatus.COMPLETED,
+        Task.payloads[0]["type"].as_string() == "memo",
+    )
+    if window_start is not None:
+        stmt = stmt.where(Task.created_at >= window_start)
+    stmt = stmt.order_by(desc(Task.created_at)).limit(cap)
+    rows = (await session.execute(stmt)).scalars().all()
+
+    citations: list[dict[str, Any]] = []
+    for t in rows:
+        plan = t.plan_output if isinstance(t.plan_output, dict) else {}
+        memo = plan.get("memo") if isinstance(plan.get("memo"), dict) else {}
+        summary = str((memo or {}).get("summary") or "")
+        citations.append({"task_id": str(t.id), "summary_excerpt": summary[:200]})
+    return citations
+
+
 def baseline_vision(cycle: StrategicCycle) -> dict[str, Any]:
     """Read the snapshot of vision taken at cycle start. Used for 3-way
     merge when phase 2 lands."""

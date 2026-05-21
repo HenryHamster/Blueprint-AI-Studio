@@ -71,6 +71,7 @@ import {
   readProgressArtifact,
   buildPortfolioComposition,
   buildVersionPhaseSection,
+  buildMemoCitationsSection,
   buildThinkerPrompt,
   runThinkerWithGate,
   type ThinkerPromptParams,
@@ -1232,6 +1233,49 @@ describe('buildVersionPhaseSection', () => {
   });
 });
 
+describe('buildMemoCitationsSection', () => {
+  it('returns empty string when memo citations are absent', () => {
+    expect(buildMemoCitationsSection(undefined)).toBe('');
+    expect(buildMemoCitationsSection(null)).toBe('');
+  });
+
+  it('returns empty string for a non-array value', () => {
+    expect(buildMemoCitationsSection({ task_id: 'x' })).toBe('');
+    expect(buildMemoCitationsSection('memo')).toBe('');
+  });
+
+  it('returns empty string for an empty array', () => {
+    expect(buildMemoCitationsSection([])).toBe('');
+  });
+
+  it('renders a header and one bullet per memo with task id and excerpt', () => {
+    const result = buildMemoCitationsSection([
+      { task_id: 'memo-aaa', summary_excerpt: 'Caching layer is the bottleneck.' },
+      { task_id: 'memo-bbb', summary_excerpt: 'Auth retries mask a real timeout.' },
+    ]);
+    expect(result).toContain('## Memo Citations');
+    expect(result).toContain('memo memo-aaa: Caching layer is the bottleneck.');
+    expect(result).toContain('memo memo-bbb: Auth retries mask a real timeout.');
+  });
+
+  it('instructs the reviewer to cite memos by task id', () => {
+    const result = buildMemoCitationsSection([
+      { task_id: 'memo-aaa', summary_excerpt: 'A finding.' },
+    ]);
+    expect(result).toMatch(/cite it by task id/i);
+  });
+
+  it('falls back gracefully when an entry is missing fields', () => {
+    const result = buildMemoCitationsSection([
+      { task_id: 'memo-ccc' },
+      { summary_excerpt: 'no id here' },
+      'not-an-object',
+    ]);
+    expect(result).toContain('memo memo-ccc: (no summary)');
+    expect(result).toContain('memo ?: no id here');
+  });
+});
+
 describe('buildThinkerPrompt', () => {
   const base: ThinkerPromptParams = {
     contextPrefix: '',
@@ -1263,6 +1307,7 @@ describe('buildThinkerPrompt', () => {
     threadSection: '',
     taskId: 'test-task-123',
     versionPhaseSection: '',
+    memoCitationsSection: '',
   };
 
   it('includes required structural headers when inputs are populated', () => {
@@ -1395,6 +1440,29 @@ describe('buildThinkerPrompt', () => {
     expect(phaseIdx).toBeGreaterThan(-1);
     expect(jobIdx).toBeGreaterThan(-1);
     expect(phaseIdx).toBeLessThan(jobIdx);
+  });
+
+  it('memoCitationsSection rendered only when non-empty', () => {
+    const withMemos = buildThinkerPrompt({
+      ...base,
+      memoCitationsSection: '\n## Memo Citations\n- memo memo-xyz: a finding\n',
+    });
+    expect(withMemos).toContain('## Memo Citations');
+    expect(withMemos).toContain('memo memo-xyz: a finding');
+
+    const withoutMemos = buildThinkerPrompt({ ...base, memoCitationsSection: '' });
+    expect(withoutMemos).not.toContain('## Memo Citations');
+  });
+
+  it('renders the memo citations digest produced by buildMemoCitationsSection', () => {
+    const memoCitationsSection = buildMemoCitationsSection([
+      { task_id: 'memo-digest-1', summary_excerpt: 'The provisioning path leaks VMs.' },
+    ]);
+    const prompt = buildThinkerPrompt({ ...base, memoCitationsSection });
+    expect(prompt).toContain('## Memo Citations');
+    expect(prompt).toContain('memo memo-digest-1: The provisioning path leaks VMs.');
+    // Digest must land before the output instructions so the reviewer sees it.
+    expect(prompt.indexOf('## Memo Citations')).toBeLessThan(prompt.indexOf('# Your job'));
   });
 
   it('does not contain banned legacy directive phrases', () => {

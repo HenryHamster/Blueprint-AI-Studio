@@ -1,3 +1,5 @@
+import re
+
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
@@ -427,11 +429,28 @@ async def _apply_settings(
     # runtime_config_json below and synced back into runtime_config every ~15s.
     if "integration_branch" in payload:
         val = str(payload["integration_branch"] or "").strip()
-        if not val or len(val) > 200 or any(c.isspace() for c in val):
+        _branch_pattern = re.compile(r"^[a-zA-Z0-9_./-]*[a-zA-Z0-9_.-]$")
+        if not val or len(val) > 200 or not _branch_pattern.match(val):
             raise HTTPException(
                 status_code=400,
-                detail="integration_branch must be a non-empty branch name",
+                detail="integration_branch must be a valid branch name",
             )
+        for part in val.split("/"):
+            if part in (".git", ".lock"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"integration_branch contains reserved component: {part}",
+                )
+            if part.startswith("."):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"integration_branch component cannot start with a dot: {part}",
+                )
+            if ".." in part:
+                raise HTTPException(
+                    status_code=400,
+                    detail="integration_branch component cannot contain '..'",
+                )
         _runtime_config["integration_branch"] = val
     if "promotion_enabled" in payload:
         _runtime_config["promotion_enabled"] = bool(payload["promotion_enabled"])

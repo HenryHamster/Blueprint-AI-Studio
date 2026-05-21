@@ -2663,6 +2663,23 @@ _AWAITING_BACKFILL_AGE_THRESHOLD = timedelta(days=3)
 _AWAITING_BACKFILL_WINDOW = timedelta(days=30)
 _AWAITING_BACKFILL_ALERT_TITLE = "Cross-layer awaiting_backfill backlog stuck"
 
+# Second-stage escalation for observation-only alerts that stay open past SLA.
+# When an alert with one of the monitored titles has been open continuously for
+# longer than the threshold, the dispatcher opens a RegressionRemediationCase and
+# spawns one investigate task so the autonomous loop can remediate the root cause.
+# Reuses case dedup (unique regression_class per project) so a single escalation
+# is opened per stuck alert regardless of how many dispatcher cycles fire.
+_OBSERVATION_ALERT_SLA_HOURS_DEFAULT = 72
+# Per-title overrides — key is the alert title, value is SLA hours. Falls back
+# to _OBSERVATION_ALERT_SLA_HOURS_DEFAULT when a title is not listed here.
+_OBSERVATION_ALERT_SLA_HOURS: dict[str, int] = {}
+# Titles of observation-only alerts that are eligible for second-stage escalation.
+# admin_digest alert titles are imported lazily inside the function to avoid cycles.
+_OBSERVATION_ONLY_ALERT_TITLES = [
+    _PATH_CLASSIFIER_COVERAGE_ALERT_TITLE,
+    _AWAITING_BACKFILL_ALERT_TITLE,
+]
+
 
 def _classify_layers_from_paths(paths: list[str]) -> list[str]:
     """Map a list of changed file paths to canonical infrastructure-layer tags.
@@ -3148,6 +3165,158 @@ async def _evaluate_awaiting_backfill_alert(
         )
     )
     await session.commit()
+
+
+async def _escalate_stale_observation_alerts(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> int:
+    """Second-stage escalation for observation-only alerts open past SLA.
+
+    For each WARNING alert whose title appears in ``_OBSERVATION_ONLY_ALERT_TITLES``
+    (or is imported from admin_digest) and which has been open continuously for
+    longer than ``_OBSERVATION_ALERT_SLA_HOURS_DEFAULT`` (or its per-title override),
+    the dispatcher opens a RegressionRemediationCase and spawns one investigate task.
+    Uses case dedup via a stable ``regression_class`` derived from the alert title so
+    exactly one escalation is opened per stuck alert. Records ``source_alert_id`` in
+    ``signal_snapshot_at_spawn`` so downstream consumers can dismiss the alert when the
+    case closes. Returns the number of new investigate tasks spawned.
+    """
+    from app.routers.admin_digest import (  # noqa: PLC0415
+        _LONE_CHECKER_ALERT_TITLE,
+    )
+
+    monitored_titles = set(_OBSERVATION_ONLY_ALERT_TITLES) | {_LONE_CHECKER_ALERT_TITLE}
+    now = _utcnow()
+
+    open_alerts = (
+        (
+            await session.execute(
+                select(Alert).where(
+                    Alert.project_id == project_id,
+                    Alert.task_id.is_(None),
+                    Alert.severity == AlertSeverity.WARNING,
+                    Alert.dismissed_at.is_(None),
+                    Alert.title.in_(list(monitored_titles)),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    spawned = 0
+    for alert in open_alerts:
+        sla_hours = _OBSERVATION_ALERT_SLA_HOURS.get(
+            alert.title, _OBSERVATION_ALERT_SLA_HOURS_DEFAULT
+        )
+        elapsed = now - alert.created_at
+        if elapsed < timedelta(hours=sla_hours):
+            continue
+
+        regression_class = f"observation_alert_sla:{alert.title}"[:512]
+        existing_case = (
+            (
+                await session.execute(
+                    select(RegressionRemediationCase).where(
+                        RegressionRemediationCase.project_id == project_id,
+                        RegressionRemediationCase.regression_class == regression_class,
+                        RegressionRemediationCase.status.in_(
+                            [
+                                RegressionCaseStatus.ACTIVE,
+                                RegressionCaseStatus.REMEDIATING,
+                                RegressionCaseStatus.MERGED,
+                                RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION,
+                            ]
+                        ),
+                    )
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if existing_case is not None:
+            continue
+
+        elapsed_hours = elapsed.total_seconds() / 3600
+        prompt = (
+            f"Observation-only alert '{alert.title}' has been open for "
+            f"{elapsed_hours:.1f}h (SLA: {sla_hours}h) without operator remediation.\n\n"
+            f"Alert message:\n{alert.message}\n\n"
+            f"Diagnose the root cause and ship a fix so this alert clears. "
+            f"Do NOT simply dismiss the alert — resolve the underlying condition."
+        )
+        payload = validate_internal_payload(
+            {
+                "type": "investigate",
+                "prompt": prompt,
+                "base_branch": _runtime_config.get("integration_branch", "main"),
+                "effort": "low",
+            },
+            "pipeline_regression_dispatcher:observation_alert_sla_escalation",
+        )
+        context: dict[str, Any] = {
+            "spawned_by": "pipeline_regression_dispatcher_observation_sla",
+            "regression_class": regression_class,
+            "signal_name": "observation_alert_sla",
+            "source_alert_id": str(alert.id),
+            "alert_title": alert.title,
+            "elapsed_hours": round(elapsed_hours, 1),
+        }
+        new_task = Task(
+            project_id=project_id,
+            title=f"Investigate stuck alert: {alert.title}"[:200],
+            description=(
+                f"Observation-only alert open {elapsed_hours:.1f}h past "
+                f"{sla_hours}h SLA — autonomous escalation."
+            )[:500],
+            payloads=[payload],
+            context=context,
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+            status=TaskStatus.QUEUED,
+            created_by="ORCHESTRATOR",
+        )
+        session.add(new_task)
+        await session.flush()
+
+        signal_snapshot: dict[str, Any] = {
+            "signal_name": "observation_alert_sla",
+            "source_alert_id": str(alert.id),
+            "alert_title": alert.title,
+            "elapsed_hours": round(elapsed_hours, 1),
+            "sla_hours": sla_hours,
+            "captured_at": now.isoformat(),
+        }
+        session.add(
+            RegressionRemediationCase(
+                project_id=project_id,
+                regression_class=regression_class,
+                status=RegressionCaseStatus.ACTIVE,
+                signal_snapshot_at_spawn=signal_snapshot,
+                last_remediation_task_id=new_task.id,
+                last_seen_at=now,
+                hit_count=1,
+                signal_first_crossed_at=alert.created_at,
+                signal_first_seen_at=alert.created_at,
+                investigate_spawned_at=now,
+            )
+        )
+        session.add(
+            Alert(
+                project_id=project_id,
+                severity=AlertSeverity.INFO,
+                title=f"Escalating stuck observation alert: {alert.title}"[:200],
+                message=(
+                    f"Alert '{alert.title}' open {elapsed_hours:.1f}h. "
+                    f"Spawned investigate task {new_task.id}."
+                )[:1000],
+            )
+        )
+        spawned += 1
+
+    if spawned:
+        await session.commit()
+    return spawned
 
 
 async def _get_remediation_case(
@@ -5870,6 +6039,19 @@ async def run_recovery_once(session: AsyncSession, project_id: uuid.UUID) -> int
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "[REGRESSION_DISPATCHER] compliance-followup raised for project=%s: %s",
+            project_id,
+            exc,
+        )
+
+    # Second-stage escalation: promote observation-only alerts that have been
+    # open past SLA into RegressionRemediationCases with investigate tasks so
+    # the autonomous loop can remediate the underlying condition.
+    try:
+        await _escalate_stale_observation_alerts(session, project_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[REGRESSION_DISPATCHER] observation-alert SLA escalation raised "
+            "for project=%s: %s",
             project_id,
             exc,
         )

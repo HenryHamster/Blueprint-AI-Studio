@@ -924,3 +924,49 @@ def _compute_prediction_calibration(
         note = f"Predictions have been running ~{pct}% conservative — factor {factor} applied to future merge estimates."
 
     return {"factor": factor, "note": note, "sample_count": sample_count}
+
+
+def _build_retired_approaches_block(
+    retired_directions_summary: list | None = None,
+    max_entries: int = 30,
+    per_entry_char_cap: int = 80,
+) -> str | None:
+    """Build a prompt block listing failed approaches from retired directions.
+
+    Extracts failed_approaches from each retired direction and formats them
+    with direction IDs as a "Do not re-propose" block for the strategic prompt.
+    Caps total entries at max_entries, with each entry truncated to
+    per_entry_char_cap characters.
+
+    Returns the formatted prompt block as a string, or None if no approaches
+    exist. The block includes a header and is ready to append to prompt_suffix.
+    """
+    if not retired_directions_summary:
+        return None
+
+    entries: list[str] = []
+    for direction in retired_directions_summary:
+        direction_id = direction.get("id", "unknown")
+        direction_text = direction.get("text", "")[:40]
+        failed_approaches = direction.get("failed_approaches") or []
+
+        for approach in failed_approaches:
+            # Truncate approach text and tag with direction
+            approach_text = str(approach)[:per_entry_char_cap]
+            entry = f"- {approach_text} (from {direction_id}: {direction_text})"
+            entries.append(entry)
+
+            if len(entries) >= max_entries:
+                break
+
+        if len(entries) >= max_entries:
+            break
+
+    if not entries:
+        return None
+
+    block = (
+        "## Do not re-propose these — already attempted under retired directions\n"
+        + "\n".join(entries)
+    )
+    return block

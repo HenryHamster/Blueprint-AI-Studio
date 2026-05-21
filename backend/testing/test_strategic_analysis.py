@@ -6,6 +6,7 @@ from app.strategic_analysis import (
     _compute_prediction_calibration,
     _build_retired_directions_summary,
     _index_findings_by_direction,
+    _build_retired_approaches_block,
     _RETIRED_MAX_COUNT,
     _RETIRED_PER_ENTRY_CHAR_CAP,
 )
@@ -2213,3 +2214,188 @@ def test_recent_diagnosis_omits_missing_optional_fields():
     assert "summary" in d["recent_diagnosis"]
     assert "diagnosed_at" not in d["recent_diagnosis"]
     assert "affected_files" not in d["recent_diagnosis"]
+
+
+# ---------------------------------------------------------------------------
+# _build_retired_approaches_block tests
+# ---------------------------------------------------------------------------
+
+
+def test_retired_approaches_block_empty_when_no_summary():
+    """Block is None when retired_directions_summary is empty or None."""
+    assert _build_retired_approaches_block(None) is None
+    assert _build_retired_approaches_block([]) is None
+
+
+def test_retired_approaches_block_empty_when_no_failed_approaches():
+    """Block is None when no retired direction has failed_approaches."""
+    summary = [
+        {
+            "id": "dir-1",
+            "text": "Direction A",
+            "status": "retired",
+            "prs_merged": 2,
+        },
+        {
+            "id": "dir-2",
+            "text": "Direction B",
+            "status": "completed",
+            "prs_merged": 1,
+        },
+    ]
+    assert _build_retired_approaches_block(summary) is None
+
+
+def test_retired_approaches_block_includes_header_when_present():
+    """Block includes header when there are failed approaches."""
+    summary = [
+        {
+            "id": "dir-ret",
+            "text": "Improve logging",
+            "status": "retired",
+            "failed_approaches": ["Approach X", "Approach Y"],
+        }
+    ]
+    block = _build_retired_approaches_block(summary)
+    assert block is not None
+    assert "Do not re-propose these" in block
+    assert "already attempted under retired directions" in block
+
+
+def test_retired_approaches_block_tags_with_direction_id():
+    """Each approach is tagged with the direction ID it came from."""
+    summary = [
+        {
+            "id": "dir-auth",
+            "text": "Auth flow",
+            "status": "retired",
+            "failed_approaches": ["OAuth attempt", "SAML attempt"],
+        }
+    ]
+    block = _build_retired_approaches_block(summary)
+    assert "dir-auth" in block
+    assert "Auth flow" in block
+    assert "OAuth attempt" in block
+    assert "SAML attempt" in block
+
+
+def test_retired_approaches_block_truncates_long_approaches():
+    """Each approach is truncated to per_entry_char_cap (default 80)."""
+    long_approach = "A" * 100
+    summary = [
+        {
+            "id": "dir-1",
+            "text": "Dir",
+            "status": "retired",
+            "failed_approaches": [long_approach],
+        }
+    ]
+    block = _build_retired_approaches_block(summary, per_entry_char_cap=20)
+    assert "A" * 20 in block
+    assert "A" * 21 not in block
+
+
+def test_retired_approaches_block_caps_total_entries():
+    """Total entries are capped at max_entries (default 30)."""
+    summary = [
+        {
+            "id": "dir-1",
+            "text": "Dir",
+            "status": "retired",
+            "failed_approaches": [f"Approach {i}" for i in range(40)],
+        }
+    ]
+    block = _build_retired_approaches_block(summary, max_entries=10)
+    assert block is not None
+    # Count the number of "- Approach" lines
+    approach_count = block.count("- Approach")
+    assert approach_count == 10
+
+
+def test_retired_approaches_block_across_multiple_directions():
+    """Block aggregates approaches from multiple retired directions."""
+    summary = [
+        {
+            "id": "dir-1",
+            "text": "First",
+            "status": "retired",
+            "failed_approaches": ["Approach A", "Approach B"],
+        },
+        {
+            "id": "dir-2",
+            "text": "Second",
+            "status": "retired",
+            "failed_approaches": ["Approach C"],
+        },
+    ]
+    block = _build_retired_approaches_block(summary)
+    assert block is not None
+    assert "Approach A" in block
+    assert "Approach B" in block
+    assert "Approach C" in block
+    assert "dir-1" in block
+    assert "dir-2" in block
+
+
+def test_retired_approaches_block_truncates_direction_text():
+    """Direction text is truncated to 40 chars."""
+    long_text = "A" * 100
+    summary = [
+        {
+            "id": "dir-1",
+            "text": long_text,
+            "status": "retired",
+            "failed_approaches": ["Some approach"],
+        }
+    ]
+    block = _build_retired_approaches_block(summary)
+    assert block is not None
+    # Check that only the first 40 chars of direction text are in the block
+    assert "A" * 40 in block
+    # But not the full 100 chars
+    assert "A" * 50 not in block
+
+
+def test_retired_approaches_block_skips_directions_without_approaches():
+    """Directions without failed_approaches are skipped (no empty entries)."""
+    summary = [
+        {
+            "id": "dir-1",
+            "text": "No approaches",
+            "status": "retired",
+        },
+        {
+            "id": "dir-2",
+            "text": "Has approaches",
+            "status": "retired",
+            "failed_approaches": ["Approach X"],
+        },
+    ]
+    block = _build_retired_approaches_block(summary)
+    assert block is not None
+    assert "dir-2" in block
+    assert "Approach X" in block
+    # dir-1 should not appear since it has no approaches
+    assert "dir-1" not in block
+
+
+def test_retired_approaches_block_respects_max_entries_across_directions():
+    """max_entries cap applies across all directions combined."""
+    summary = [
+        {
+            "id": "dir-1",
+            "text": "D1",
+            "status": "retired",
+            "failed_approaches": ["Approach 1", "Approach 2"],
+        },
+        {
+            "id": "dir-2",
+            "text": "D2",
+            "status": "retired",
+            "failed_approaches": ["Approach 3", "Approach 4"],
+        },
+    ]
+    block = _build_retired_approaches_block(summary, max_entries=3)
+    # Should have at most 3 entries
+    entry_count = block.count("\n- ") + (1 if block.startswith("- ") else 0)
+    assert entry_count <= 3

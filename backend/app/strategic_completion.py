@@ -392,9 +392,7 @@ async def _apply_qualify_request(
     if not request or not isinstance(request, dict):
         return
     reason_raw = request.get("reason")
-    reason = (
-        reason_raw.strip() or None if isinstance(reason_raw, str) else None
-    )
+    reason = reason_raw.strip() or None if isinstance(reason_raw, str) else None
     try:
         from app import release_qualifier as _rq
         from app import release_version as _rv
@@ -1146,6 +1144,17 @@ async def _handle_strategic_completion(
                     f"[STRATEGIC] Task {task.id}: failed to fetch findings index (non-fatal)",
                     exc_info=True,
                 )
+            try:
+                _memo_citations = await strategic_cycle.query_recent_memo_citations(
+                    session, project.id
+                )
+                if _memo_citations:
+                    _extra["memo_citations"] = _memo_citations
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    f"[STRATEGIC] Task {task.id}: failed to fetch memo citations (non-fatal)",
+                    exc_info=True,
+                )
             await strategic_cycle.mark_phase2_completed(
                 session,
                 cycle_id,
@@ -1869,9 +1878,7 @@ async def _handle_strategic_completion(
         _vpd_parsed, task, project, session, path="fallback"
     )
     _qr_parsed = parsed.get("qualify_request")
-    await _apply_qualify_request(
-        _qr_parsed, task, project, session, path="fallback"
-    )
+    await _apply_qualify_request(_qr_parsed, task, project, session, path="fallback")
 
     # Update cycle history with final outcome
     # Audit W2: cycle outcome lives on the StrategicCycle row.

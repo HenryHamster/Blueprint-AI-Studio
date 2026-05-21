@@ -373,6 +373,8 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     # LTS version/phase context — present only on self-repo projects. High priority
     # so it survives budget pressure (the agent needs it for phase-transition decisions).
     "version_phase": {"priority": "high"},
+    # Citable memo digest — supplementary context, dropped first under budget pressure.
+    "memo_citations": {"priority": "low"},
 }
 
 
@@ -1430,6 +1432,7 @@ async def _spawn_strategic_review(
         _build_outcome_evaluation,
         _build_retired_directions_summary,
         _compute_prediction_calibration,
+        _build_retired_approaches_block,
     )
 
     # Audit W2: cycle history is in the StrategicCycle table; pre-fetch once
@@ -1469,7 +1472,11 @@ async def _spawn_strategic_review(
     _version_phase_block: dict | None = None
     if project.is_self_repo:
         try:
-            from app.release_version import count_merged_since, current_open_version, to_phase_block
+            from app.release_version import (
+                count_merged_since,
+                current_open_version,
+                to_phase_block,
+            )
 
             _open_version = await current_open_version(session, project.id)
             if _open_version is not None:
@@ -1481,9 +1488,18 @@ async def _spawn_strategic_review(
                     "tasks_merged_this_version": _tasks_merged,
                 }
         except Exception:
-            logger.exception(
-                "[STRATEGIC] version_phase block build failed; continuing"
-            )
+            logger.exception("[STRATEGIC] version_phase block build failed; continuing")
+    # Citable memo digest: terminal reasoning artifacts spawned from dropped
+    # research findings since the previous cycle. Surfaced so the reviewer can
+    # cite memos by task_id. Low priority in the pack schema — dropped first
+    # under budget pressure.
+    try:
+        memo_citations = await strategic_cycle.query_recent_memo_citations(
+            session, project.id
+        )
+    except Exception:
+        logger.exception("[STRATEGIC] memo citation fetch failed; continuing")
+        memo_citations = []
     # Stabilize phase directive — when the open version is in stabilize, bias the
     # strategic agent's work-mix toward audit/cleanup/hardening so the version
     # converges toward qualification rather than accumulating net-new feature work.
@@ -1497,6 +1513,17 @@ async def _spawn_strategic_review(
         prompt_suffix = (
             f"{prompt_suffix}\n{_stabilize_hint}" if prompt_suffix else _stabilize_hint
         )
+    # Inject explicit list of failed approaches from retired directions so the
+    # agent has a clear "do not re-propose" block in the prompt.
+    _retired_summary = _build_retired_directions_summary(project)
+    if _retired_summary:
+        _approaches_block = _build_retired_approaches_block(_retired_summary)
+        if _approaches_block:
+            prompt_suffix = (
+                f"{prompt_suffix}\n{_approaches_block}"
+                if prompt_suffix
+                else _approaches_block
+            )
     payload: dict = pack_under_budget(
         {
             "type": "strategic_review",
@@ -1552,9 +1579,8 @@ async def _spawn_strategic_review(
                 else {}
             ),
             **({"drift_signals": drift_summary} if drift_summary else {}),
-            **(
-                {"version_phase": _version_phase_block} if _version_phase_block else {}
-            ),
+            **({"version_phase": _version_phase_block} if _version_phase_block else {}),
+            **({"memo_citations": memo_citations} if memo_citations else {}),
             **(
                 {"past_retirement_critiques": _past_critiques}
                 if (_past_critiques := _build_past_retirement_critiques(cycle_history))
@@ -1562,7 +1588,7 @@ async def _spawn_strategic_review(
             ),
             **(
                 {"retired_directions_summary": _retired_summary}
-                if (_retired_summary := _build_retired_directions_summary(project))
+                if _retired_summary
                 else {}
             ),
             "base_branch": _runtime_config.get("integration_branch", "main"),

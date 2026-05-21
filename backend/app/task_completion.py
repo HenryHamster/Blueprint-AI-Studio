@@ -2372,6 +2372,167 @@ async def _handle_perf_completion(task: Task, logs: str, session: AsyncSession):
 
 
 # ---------------------------------------------------------------------------
+# Memo completion — persist a terminal reasoning artifact, no PR, no children
+# ---------------------------------------------------------------------------
+
+
+_MEMO_REQUIRED_KEYS = ("summary", "reasoning", "citations", "tags")
+
+
+def _parse_memo_output(text: str) -> Optional[Dict[str, Any]]:
+    """Best-effort extract the structured memo object from agent ``logs``.
+
+    The agent's contract is to emit a JSON object with the keys
+    ``summary``, ``reasoning``, ``citations`` (list[str]), ``tags``
+    (list[str]). We accept either a bare JSON object as the entire
+    payload, or an object embedded in surrounding text.
+    """
+    if not text:
+        return None
+    snippet = text[:500_000]
+    candidates: List[str] = []
+    # Direct decode — common case where the agent passes a clean JSON
+    # string up as the artifact body. Only accept the bare decode when
+    # the required schema keys are present; otherwise fall through to
+    # the scan so we don't surface unrelated objects as memos.
+    try:
+        parsed = json.loads(snippet)
+    except (json.JSONDecodeError, ValueError):
+        parsed = None
+    if isinstance(parsed, dict) and "summary" in parsed and "reasoning" in parsed:
+        candidates.append(snippet)
+
+    # Fallback: scan for a balanced JSON object containing "summary"
+    # and "reasoning" keys.
+    if not candidates and '"summary"' in snippet and '"reasoning"' in snippet:
+        start = snippet.find("{")
+        while start != -1:
+            depth = 0
+            in_string = False
+            escape_next = False
+            for i in range(start, len(snippet)):
+                c = snippet[i]
+                if escape_next:
+                    escape_next = False
+                    continue
+                if c == "\\" and in_string:
+                    escape_next = True
+                    continue
+                if c == '"':
+                    in_string = not in_string
+                    continue
+                if in_string:
+                    continue
+                if c == "{":
+                    depth += 1
+                elif c == "}":
+                    depth -= 1
+                    if depth == 0:
+                        candidate = snippet[start : i + 1]
+                        if all(f'"{k}"' in candidate for k in ("summary", "reasoning")):
+                            candidates.append(candidate)
+                        break
+            start = snippet.find("{", start + 1)
+            if candidates:
+                break
+
+    for candidate in candidates:
+        try:
+            obj = json.loads(candidate)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(obj, dict):
+            return obj
+    return None
+
+
+def _normalize_memo(obj: Dict[str, Any]) -> Dict[str, Any]:
+    """Coerce raw memo fields into a stable shape for persistence."""
+    summary = obj.get("summary")
+    reasoning = obj.get("reasoning")
+    citations = obj.get("citations") or []
+    tags = obj.get("tags") or []
+    if not isinstance(citations, list):
+        citations = []
+    if not isinstance(tags, list):
+        tags = []
+    return {
+        "summary": str(summary) if summary is not None else "",
+        "reasoning": str(reasoning) if reasoning is not None else "",
+        "citations": [str(c) for c in citations[:50]],
+        "tags": [str(t) for t in tags[:20]],
+    }
+
+
+async def _handle_memo_completion(task: Task, logs: str, session: AsyncSession):
+    """Persist a memo task's reasoning artifact.
+
+    Memo tasks are terminal — they produce a single ``Artifact`` row of
+    type ``MEMO`` and do NOT spawn child tasks or open a PR. Strategic
+    review and downstream reasoning consumers can cite the artifact by id.
+
+    Behaviour:
+      * On parseable output: create one ``Artifact`` (artifact_type=MEMO,
+        task_id=task.id, logs=serialized JSON), mirror the parsed object
+        into ``task.plan_output['memo']``, and mark the task ``COMPLETED``.
+        Memo tasks spawn no children and open no PR, so no lifecycle path
+        promotes a childless, PR-less ``EVALUATING`` memo to ``COMPLETED`` —
+        it must be marked terminal here directly, like the other terminal
+        read-only handlers. ``query_recent_memo_citations`` reads only
+        ``COMPLETED`` memos, so this is also the reader/writer contract.
+      * On unparseable output: leave the task without an artifact, set
+        ``latest_status_message`` so the operator sees why, and mark it
+        ``COMPLETED`` (terminal, uncitable) rather than raising — failing
+        here would re-queue an inherently invalid agent output.
+    """
+    # Local import keeps the module-level import surface stable and
+    # avoids pulling Artifact into the strategic-completion re-export
+    # chain (other handlers use the same lazy-import pattern).
+    from app.models import Artifact, ArtifactType  # noqa: PLC0415
+
+    parsed = _parse_memo_output(logs)
+    if parsed is None:
+        task.latest_status_message = (
+            "Memo task completed with no parseable reasoning JSON"
+        )
+        task.status = TaskStatus.COMPLETED
+        session.add(task)
+        await session.commit()
+        return
+
+    memo = _normalize_memo(parsed)
+    serialized = json.dumps(memo)
+
+    artifact = Artifact(
+        task_id=task.id,
+        artifact_type=ArtifactType.MEMO,
+        logs=serialized,
+    )
+    session.add(artifact)
+
+    plan_output = task.plan_output if isinstance(task.plan_output, dict) else {}
+    plan_output = dict(plan_output)
+    plan_output["memo"] = memo
+    task.plan_output = plan_output
+    flag_modified(task, "plan_output")
+    task.status = TaskStatus.COMPLETED
+    task.latest_status_message = (
+        f"Memo recorded ({len(memo['citations'])} citation(s), "
+        f"{len(memo['tags'])} tag(s))"
+    )
+    session.add(task)
+    await session.commit()
+    await session.refresh(artifact)
+
+    await broadcast_to_project(
+        str(task.project_id),
+        "task_updated",
+        {"task_id": str(task.id), "status": TaskStatus.COMPLETED},
+    )
+    logger.info(f"[MEMO] Persisted memo artifact {artifact.id} for task {task.id}")
+
+
+# ---------------------------------------------------------------------------
 # Self audit completion — ingest SELF_AUDIT_REPORT into SystemMaturity rows
 # ---------------------------------------------------------------------------
 
@@ -3016,9 +3177,7 @@ async def _mark_regression_case_false_positive(
         Alert(
             project_id=task.project_id,
             severity=AlertSeverity.INFO,
-            title=(
-                f"Regression case marked FALSE_POSITIVE: {regression_class}"
-            )[:200],
+            title=(f"Regression case marked FALSE_POSITIVE: {regression_class}")[:200],
             message=(
                 f"Investigation {task.id} concluded the signal is not a real "
                 f"regression. Suppressing dispatcher spawns for class "
@@ -3181,10 +3340,7 @@ async def _handle_investigation_completion(
     # this before the remediation-spawn branches below, otherwise a verdict
     # disagreement would still spawn a fix and undo the suppression.
     spawned_by = (task.context or {}).get("spawned_by")
-    if (
-        verdict == "not_a_regression"
-        and spawned_by == "pipeline_regression_dispatcher"
-    ):
+    if verdict == "not_a_regression" and spawned_by == "pipeline_regression_dispatcher":
         await _mark_regression_case_false_positive(
             task=task,
             verdict_reason=verdict_reason or summary or "(no reason provided)",

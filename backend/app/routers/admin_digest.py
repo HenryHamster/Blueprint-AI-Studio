@@ -9081,20 +9081,26 @@ async def get_efficiency_axes(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ) -> Dict[str, Any]:
-    """Return per-axis current/baseline/drift for the project's efficiency baseline.
+    """Return per-axis current/baseline/drift/history for the project's efficiency baseline.
 
     Reads ``project.design_doc["efficiency_baseline"]`` (populated weekly by
     the ``_efficiency_snapshot_service``) and returns each of the five
     foundational axes — ``cost_per_merged_pr``, ``vm_cold_start_p50_ms``,
     ``vm_reuse_rate``, ``median_api_calls_per_task``,
     ``median_review_iterations`` — with the latest snapshot value, the
-    immutable baseline value, and percentage drift from baseline.
+    immutable baseline value, percentage drift from baseline, and a
+    time-series of up to 26 weekly snapshots for trend rendering.
 
     Response shape::
 
         {
           "axes": {
-            "<axis>": {"current": float|None, "baseline": float|None, "drift_pct": float|None},
+            "<axis>": {
+              "current": float|None,
+              "baseline": float|None,
+              "drift_pct": float|None,
+              "history": [{"captured_at": iso8601, "value": float|None}, ...]
+            },
             ...
           },
           "baseline_captured_at": iso8601|None,
@@ -9102,6 +9108,7 @@ async def get_efficiency_axes(
         }
 
     ``drift_pct`` is None whenever either side is missing or baseline is 0.
+    ``history`` is ordered oldest-first; before any snapshot fires it is ``[]``.
     Before the first snapshot fires, all axis values are None and both
     timestamps are None.
     """

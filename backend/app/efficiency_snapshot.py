@@ -237,7 +237,7 @@ async def read_baseline_with_drift(
     snapshots = container.get("snapshots") or []
     latest = snapshots[-1] if snapshots else {}
 
-    axes: Dict[str, Dict[str, Optional[float]]] = {}
+    axes: Dict[str, Dict[str, Any]] = {}
     for axis in ALL_AXES:
         cur = latest.get(axis)
         base = baseline.get(axis)
@@ -252,10 +252,15 @@ async def read_baseline_with_drift(
             drift_pct = None
         else:
             drift_pct = round(((cur - base) / base) * 100.0, 2)
+        history = [
+            {"captured_at": snap.get("captured_at"), "value": snap.get(axis)}
+            for snap in snapshots
+        ]
         axes[axis] = {
             "current": cur,
             "baseline": base,
             "drift_pct": drift_pct,
+            "history": history,
         }
 
     return {

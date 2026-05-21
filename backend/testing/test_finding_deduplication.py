@@ -12,10 +12,12 @@ from app.finding_deduplication import (
     _extract_normalized_claims,
     _extract_source_refs,
     _find_retired_approach_match,
+    _find_archived_diagnosis_match,
     _jaccard_overlap,
     _normalize_source_ref,
     build_dedup_state,
     deduplicate_findings,
+    extract_archived_diagnoses,
     extract_retired_failed_approaches,
     finding_hash,
     is_duplicate,
@@ -843,3 +845,59 @@ def test_deduplicate_findings_distinct_finding_passes_through_both_filters():
     assert outcome.deduplicated[0][2] == fhash
     assert outcome.retired_approach_count == 0
     assert outcome.hash_dedup_count == 0
+
+
+def test_extract_archived_diagnoses_from_design_doc():
+    design_doc = {
+        "retired_diagnoses_archive": [
+            {
+                "direction_id": "d-1",
+                "diagnosis": "caching optimization attempts exhausted",
+            },
+            {
+                "direction_id": "d-2",
+                "diagnosis": "build performance improvements tested",
+            },
+        ]
+    }
+    diagnoses = extract_archived_diagnoses(design_doc)
+    assert len(diagnoses) == 2
+    assert "caching optimization attempts exhausted" in diagnoses
+    assert "build performance improvements tested" in diagnoses
+
+
+def test_find_archived_diagnosis_match_with_word_overlap():
+    archived_diagnoses = [
+        "caching optimization attempts exhausted performance",
+        "build system complexity issues explored",
+    ]
+    # 3-word overlap: "caching optimization exhausted" - should match
+    title = "caching optimization issues exhausted after investigation"
+    match = _find_archived_diagnosis_match(title, archived_diagnoses)
+    assert match is not None
+    assert "caching optimization" in match
+
+
+def test_deduplicate_findings_filters_archived_diagnosis_match():
+    finding = {
+        "title": "fix caching optimization performance memory issues",
+        "description": "Improve cache hit rate",
+        "priority": "medium",
+        "direction_id": "dir-1",
+    }
+    archived_diagnoses = [
+        "caching optimization performance attempts were exhausted in prior cycles"
+    ]
+    outcome = deduplicate_findings(
+        [finding],
+        task_context=None,
+        recent_finding_hashes=set(),
+        failed_hashes={},
+        existing_tasks_with_dirs=[],
+        open_pr_files=set(),
+        archived_diagnoses=archived_diagnoses,
+    )
+    assert outcome.archived_diagnoses_count == 1
+    assert len(outcome.deduplicated) == 0
+    assert len(outcome.filtered) == 1
+    assert outcome.filtered[0]["reason"].startswith("archived diagnosis:")

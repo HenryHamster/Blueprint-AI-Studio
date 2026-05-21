@@ -94,6 +94,7 @@ class ArtifactType(str, Enum):
     INVESTIGATION_REPORT = "INVESTIGATION_REPORT"
     SELF_AUDIT_REPORT = "SELF_AUDIT_REPORT"
     RELEASE_AUDIT_REPORT = "RELEASE_AUDIT_REPORT"
+    MEMO = "MEMO"
 
 
 class LLMProviderName(str, Enum):
@@ -1852,7 +1853,10 @@ class RegressionRemediationCase(SQLModel, table=True):
         if spawn_was_cross_layer:
             log_entry["spawn_was_cross_layer"] = True
             log_entry["spawn_layers_enumerated"] = list(spawn_layers_enumerated or [])
-        self.fingerprint_to_fix_log = [*list(self.fingerprint_to_fix_log or []), log_entry]
+        self.fingerprint_to_fix_log = [
+            *list(self.fingerprint_to_fix_log or []),
+            log_entry,
+        ]
         self.status = RegressionCaseStatus.MERGED
 
     def mark_closed(
@@ -1877,7 +1881,10 @@ class RegressionRemediationCase(SQLModel, table=True):
                 "recovered_at": recovered_at or _utcnow().isoformat(),
                 "post_merge_value": post_merge_value,
             }
-            self.fingerprint_to_fix_log = [*list(self.fingerprint_to_fix_log or []), entry]
+            self.fingerprint_to_fix_log = [
+                *list(self.fingerprint_to_fix_log or []),
+                entry,
+            ]
 
     def prior_attempt_context_suffix(self) -> str:
         """Return a formatted prior-attempt context block for re-spawned prompts.

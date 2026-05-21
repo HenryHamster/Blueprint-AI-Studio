@@ -33,6 +33,7 @@ class TaskType(str, Enum):
     investigate = "investigate"
     self_audit = "self_audit"
     release_audit = "release_audit"
+    memo = "memo"
 
 
 AgentMode = Literal["write", "read_only"]
@@ -187,6 +188,20 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         "Release Audit",
         "read_only",
         description="Audit the main...automain diff for the release qualifier.",
+    ),
+    TaskCapability(
+        TaskType.memo,
+        "Memo",
+        "read_only",
+        default_category="strategic",
+        user_launchable=False,
+        provider_configurable=True,
+        filter_visible=True,
+        description=(
+            "Terminal reasoning artifact: persist structured reasoning about a "
+            "topic without opening a PR or spawning follow-up tasks. Strategic "
+            "review can cite the resulting Artifact by id."
+        ),
     ),
 )
 
