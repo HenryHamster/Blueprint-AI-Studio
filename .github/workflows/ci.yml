@@ -71,7 +71,7 @@ jobs:
 
       - name: Install dependencies
         working-directory: ./admin-ui
-        run: npm ci
+        run: npm ci || { echo "::warning::npm ci failed (esbuild ETXTBSY postinstall race) - retrying once"; sleep 5; npm ci; }
 
       - name: Install Playwright Chromium + system deps
         # Required for the viewport suite (vitest browser-mode + chromium).
@@ -394,7 +394,7 @@ jobs:
 
       - name: Install dependencies
         working-directory: ./agent
-        run: npm ci
+        run: npm ci || { echo "::warning::npm ci failed (esbuild ETXTBSY postinstall race) - retrying once"; sleep 5; npm ci; }
 
       - name: Type check
         id: typecheck
