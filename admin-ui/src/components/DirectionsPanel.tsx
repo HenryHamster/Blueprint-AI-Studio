@@ -126,6 +126,14 @@ export interface Direction {
     threshold_usd?: number;
     cost_by_provider_model?: Record<string, { cost_usd: number; share_pct: number }> | null;
   } | null;
+  churn_metrics?: {
+    window_cycles: number;
+    merged: number;
+    non_merge_finished: number;
+    merge_rate: number;
+    threshold: number;
+    min_merge_rate: number;
+  } | null;
 }
 
 

@@ -644,6 +644,39 @@ def format_findings_for_prompt(
     return "\n".join(lines)
 
 
+def _compute_churn_metrics(direction: dict) -> dict | None:
+    """Return windowed churn metrics for a direction, or None if history is insufficient.
+
+    Counts finished tasks that did not result in a merged PR over the rolling
+    window: completed-but-unmerged tasks plus code failures. Infra failures are
+    excluded because they are uncorrelated with direction quality. The count is
+    operator-facing (pause reason string and churn badge), so it reports the real
+    non-merging finished-task volume with no baseline adjustment. research/
+    investigate/memo children that legitimately finish without a PR are absorbed
+    conservatively by the pause threshold instead.
+    """
+    history = direction.get("research_history") or []
+    churn_window = int(_runtime_config.get("direction_churn_window_cycles", 5) or 5)
+    if len(history) < 3 or churn_window <= 0:
+        return None
+    window = history[-churn_window:]
+    merged = sum(e.get("prs_merged", 0) for e in window)
+    tasks_complete = sum(e.get("tasks_completed", 0) for e in window)
+    code_failed = sum(
+        max(0, e.get("tasks_failed", 0) - e.get("tasks_failed_infra", 0))
+        for e in window
+    )
+    non_merge_finished = max(0, tasks_complete + code_failed - merged)
+    total_finished = merged + non_merge_finished
+    merge_rate = merged / total_finished if total_finished > 0 else 0.0
+    return {
+        "window_cycles": len(window),
+        "merged": merged,
+        "non_merge_finished": non_merge_finished,
+        "merge_rate": round(merge_rate, 3),
+    }
+
+
 def _check_direction_health(direction: dict) -> str | None:
     """Return a pause reason if this direction should be auto-paused, else None."""
     history = direction.get("research_history") or []
@@ -698,6 +731,27 @@ def _check_direction_health(direction: dict) -> str | None:
             return (
                 "Recent stall: last 3 research cycles all failed or produced no merges"
             )
+
+    # Rule 5: High non-merge churn — rolling window of finished tasks that did not merge.
+    # Only fires when non-merging volume is both absolutely high AND merge rate is very low,
+    # to avoid pausing productive high-throughput directions that simply have many tasks.
+    # research/investigate children are excluded conservatively by the default threshold.
+    churn_threshold = int(
+        _runtime_config.get("direction_churn_non_merge_threshold", 15) or 15
+    )
+    churn_min_merge_rate = float(
+        _runtime_config.get("direction_churn_min_merge_rate", 0.10) or 0.10
+    )
+    if churn_threshold > 0:
+        metrics = _compute_churn_metrics(direction)
+        if metrics and metrics["non_merge_finished"] >= churn_threshold:
+            if metrics["merge_rate"] < churn_min_merge_rate:
+                return (
+                    f"Churn guardrail: {metrics['non_merge_finished']} tasks finished "
+                    f"without merging, {metrics['merged']} merged in last "
+                    f"{metrics['window_cycles']} cycles "
+                    f"(merge rate {metrics['merge_rate']:.0%})"
+                )
 
     return None
 

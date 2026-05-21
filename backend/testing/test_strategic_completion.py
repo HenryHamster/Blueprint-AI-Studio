@@ -32,6 +32,7 @@ from app.strategic_completion import (
     _collect_rationales,
     _extract_cycle_reasoning,
     _extract_rationale_from_notes,
+    _compute_churn_metrics,
     _CREATED_NOTE_PREFIX,
     _RETIRED_NOTE_PREFIX,
 )
@@ -293,6 +294,202 @@ class TestCheckDirectionHealth:
         result = _check_direction_health({"possibly_saturated": False})
         assert result is None
 
+    # --- Rule 5: High non-merge churn ---
+
+    def test_rule5_churn_guardrail_fires_at_default_threshold(self):
+        # 5 cycles: 3 completed, 0 merged each
+        # non_merge_finished = max(0, 15+0-0) = 15 == threshold, merge_rate = 0%
+        d = _direction(
+            research_history=_history(
+                5, tasks_created=5, tasks_completed=3, tasks_failed=0, prs_merged=0
+            )
+        )
+        result = _check_direction_health(d)
+        assert result is not None
+        assert "Churn guardrail" in result
+        assert "15" in result
+        assert "0%" in result
+
+    def test_rule5_not_triggered_when_merge_rate_adequate(self):
+        # 5 cycles: 8 completed, 3 merged → merge_rate ≈ 38%, well above 10% minimum
+        # non_merge_finished = max(0, 40+0-15) = 25 >= 15, but merge_rate is too high
+        d = _direction(
+            research_history=_history(
+                5, tasks_created=10, tasks_completed=8, tasks_failed=0, prs_merged=3
+            )
+        )
+        result = _check_direction_health(d)
+        assert result is None
+
+    def test_rule5_not_triggered_below_non_merge_threshold(self):
+        # 5 cycles: 2 completed, 0 merged → non_merge_finished = max(0,10+0-0) = 10 < 15
+        # tasks_created=4 with tasks_completed=2 → still in-flight guard also prevents Rule 2
+        d = _direction(
+            research_history=_history(
+                5, tasks_created=4, tasks_completed=2, tasks_failed=0, prs_merged=0
+            )
+        )
+        result = _check_direction_health(d)
+        assert result is None
+
+    def test_rule5_config_threshold_honored(self, mocker):
+        # Lower threshold to 5; direction with non_merge_finished=15 now fires
+        mocker.patch.dict(
+            "app.strategic_completion._runtime_config",
+            {"direction_churn_non_merge_threshold": 5},
+            clear=False,
+        )
+        d = _direction(
+            research_history=_history(
+                5, tasks_created=4, tasks_completed=3, tasks_failed=0, prs_merged=0
+            )
+        )
+        result = _check_direction_health(d)
+        assert result is not None
+        assert "Churn guardrail" in result
+
+    def test_rule5_config_window_honored(self, mocker):
+        # window=3 focuses on last 3 bad cycles, ignoring earlier good ones that
+        # would raise the merge rate high enough to suppress the rule
+        mocker.patch.dict(
+            "app.strategic_completion._runtime_config",
+            {"direction_churn_window_cycles": 3},
+            clear=False,
+        )
+        good = _history(
+            7, tasks_created=5, tasks_completed=4, tasks_failed=0, prs_merged=3
+        )
+        bad = _history(
+            3, tasks_created=7, tasks_completed=6, tasks_failed=0, prs_merged=0
+        )
+        d = _direction(research_history=good + bad)
+        # With window=3 (bad only): non_merge_finished=18, merge_rate=0% → fires
+        # With default window=5 (2 good + 3 bad): merge_rate≈23% → would not fire
+        result = _check_direction_health(d)
+        assert result is not None
+        assert "Churn guardrail" in result
+
+    def test_rule5_pause_reason_includes_machine_readable_counts(self):
+        # Verify the reason includes window_cycles and merged count for operator tooling
+        d = _direction(
+            research_history=_history(
+                5, tasks_created=5, tasks_completed=4, tasks_failed=0, prs_merged=0
+            )
+        )
+        result = _check_direction_health(d)
+        assert result is not None
+        # non_merge_finished=20, merged=0, window_cycles=5
+        assert "0 merged" in result
+        assert "5 cycles" in result
+
+
+# ── _compute_churn_metrics ────────────────────────────────────────────────────
+
+
+class TestComputeChurnMetrics:
+    def test_returns_none_when_fewer_than_3_cycles(self):
+        d = _direction(
+            research_history=_history(
+                2, tasks_completed=5, tasks_failed=0, prs_merged=0
+            )
+        )
+        assert _compute_churn_metrics(d) is None
+
+    def test_returns_none_for_empty_history(self):
+        assert _compute_churn_metrics(_direction(research_history=[])) is None
+
+    def test_basic_non_merge_computation(self):
+        # 3 cycles: 5 completed, 0 merged each
+        # non_merge_finished = max(0, 15+0-0) = 15
+        d = _direction(
+            research_history=_history(
+                3, tasks_completed=5, tasks_failed=0, prs_merged=0
+            )
+        )
+        m = _compute_churn_metrics(d)
+        assert m is not None
+        assert m["non_merge_finished"] == 15
+        assert m["merged"] == 0
+        assert m["window_cycles"] == 3
+        assert m["merge_rate"] == 0.0
+
+    def test_non_merge_finished_floored_at_zero(self):
+        # No completed or failed tasks at all — floor prevents negative values
+        d = _direction(
+            research_history=_history(
+                3, tasks_completed=0, tasks_failed=0, prs_merged=0
+            )
+        )
+        m = _compute_churn_metrics(d)
+        assert m is not None
+        assert m["non_merge_finished"] == 0
+
+    def test_code_failed_tasks_counted_as_finished_non_merge(self):
+        # 3 cycles: 0 completed, 4 code-failed, 0 merged
+        # code_failed = 12; non_merge_finished = max(0, 0+12-0) = 12
+        d = _direction(
+            research_history=_history(
+                3, tasks_completed=0, tasks_failed=4, tasks_failed_infra=0, prs_merged=0
+            )
+        )
+        m = _compute_churn_metrics(d)
+        assert m is not None
+        assert m["non_merge_finished"] == 12
+
+    def test_infra_failures_excluded_from_non_merge_count(self):
+        # 3 cycles: all 4 failures are infra → code_failed=0 → non_merge_finished=0
+        d = _direction(
+            research_history=_history(
+                3, tasks_completed=0, tasks_failed=4, tasks_failed_infra=4, prs_merged=0
+            )
+        )
+        m = _compute_churn_metrics(d)
+        assert m is not None
+        assert m["non_merge_finished"] == 0
+
+    def test_merge_rate_computed_correctly(self):
+        # 3 cycles: 4 completed, 1 merged each
+        # merged=3, non_merge_finished=max(0,12+0-3)=9
+        # total_finished=12, merge_rate=3/12=0.25
+        d = _direction(
+            research_history=_history(
+                3, tasks_completed=4, tasks_failed=0, prs_merged=1
+            )
+        )
+        m = _compute_churn_metrics(d)
+        assert m is not None
+        assert m["merged"] == 3
+        assert m["non_merge_finished"] == 9
+        assert abs(m["merge_rate"] - 0.25) < 0.001
+
+    def test_zero_total_finished_gives_zero_merge_rate(self):
+        # No completed or failed tasks → total_finished=0, no division by zero
+        d = _direction(
+            research_history=_history(
+                3, tasks_completed=0, tasks_failed=0, prs_merged=0
+            )
+        )
+        m = _compute_churn_metrics(d)
+        # non_merge_finished=0, total_finished=0 → merge_rate=0.0
+        assert m is not None
+        assert m["merge_rate"] == 0.0
+
+    def test_uses_rolling_window(self, mocker):
+        # window=3: only last 3 "bad" cycles counted, not the 3 "clean" ones before
+        mocker.patch.dict(
+            "app.strategic_completion._runtime_config",
+            {"direction_churn_window_cycles": 3},
+            clear=False,
+        )
+        clean = _history(3, tasks_completed=1, tasks_failed=0, prs_merged=0)
+        bad = _history(3, tasks_completed=5, tasks_failed=0, prs_merged=0)
+        d = _direction(research_history=clean + bad)
+        m = _compute_churn_metrics(d)
+        # Only last 3 "bad" cycles: non_merge_finished=max(0,15-0)=15
+        assert m is not None
+        assert m["window_cycles"] == 3
+        assert m["non_merge_finished"] == 15
+
 
 # ── _is_code_failure_pause_reason ────────────────────────────────────────────
 
@@ -342,6 +539,19 @@ class TestIsCodeFailurePauseReason:
         )
         reason = _check_direction_health(d)
         assert reason is not None
+        assert _is_code_failure_pause_reason(reason) is False
+
+    def test_rule5_churn_guardrail_not_classified_as_code_failure(self):
+        # Rule 5 (churn) is an unproductive-volume signal, not a code error;
+        # it must NOT trigger a root-cause investigation.
+        d = _direction(
+            research_history=_history(
+                5, tasks_created=5, tasks_completed=4, tasks_failed=0, prs_merged=0
+            )
+        )
+        reason = _check_direction_health(d)
+        assert reason is not None
+        assert "Churn guardrail" in reason
         assert _is_code_failure_pause_reason(reason) is False
 
     def test_none_reason_returns_false(self):

@@ -476,6 +476,7 @@ async def _process_direction_lifecycle(
     from app.strategic_completion import (
         _check_direction_health,
         _check_direction_completion,
+        _compute_churn_metrics,
     )
 
     directions_modified = False
@@ -923,6 +924,12 @@ async def _process_direction_lifecycle(
             d.pop(
                 "diagnosis_stall_retry_count", None
             )  # Reset retries for this pause event
+            # Store structured evidence for churn guardrail pauses so the operator
+            # can see the windowed counts (not just the reason string).
+            if pause_reason.startswith("Churn guardrail:"):
+                churn_ev = _compute_churn_metrics(d)
+                if churn_ev:
+                    d["churn_pause_evidence"] = churn_ev
             # Only code-failure pauses (Rules 3/4) count toward auto-retirement.
             # Infrastructure-driven pauses (saturation, unproductive) shouldn't
             # permanently retire an otherwise healthy direction.

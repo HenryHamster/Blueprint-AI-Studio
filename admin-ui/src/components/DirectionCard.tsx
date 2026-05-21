@@ -867,6 +867,22 @@ function DirectionCardImpl({
                 </span>
               );
             })()}
+            {/* Churn warning badge — non-merge volume approaching or at auto-pause threshold */}
+            {d.churn_metrics && (() => {
+              const { non_merge_finished, merged, merge_rate, threshold, min_merge_rate, window_cycles } = d.churn_metrics;
+              const atThreshold = non_merge_finished >= threshold && merge_rate < min_merge_rate;
+              const approaching = non_merge_finished >= Math.floor(threshold * 0.5) && merge_rate < min_merge_rate * 2;
+              if (!approaching && !atThreshold) return null;
+              const color = atThreshold ? 'red' : 'amber';
+              return (
+                <span
+                  title={`Non-merge churn: ${non_merge_finished} tasks finished without merging, ${merged} merged in last ${window_cycles} cycles — ${Math.round(merge_rate * 100)}% merge rate (pause threshold: ${threshold} tasks at <${Math.round(min_merge_rate * 100)}% rate)`}
+                  className={`text-[10px] px-1.5 py-0.5 rounded border font-medium bg-${color}-950/40 border-${color}-900/50 text-${color}-400`}
+                >
+                  {non_merge_finished}/{threshold} non-merge · {Math.round(merge_rate * 100)}%
+                </span>
+              );
+            })()}
             <span className="text-[10px] text-neutral-600 ml-auto">
               {d.added_at ? parseTimestamp(d.added_at).toLocaleDateString() : ''}
             </span>

@@ -261,6 +261,14 @@ runtime_config: Dict = {
     "autonomous_direction_cooldown_minutes": 240,
     "productive_direction_cooldown_minutes": 45,
     "direction_auto_recovery_hours": 48,
+    # Non-merge churn guardrail (Rule 5 in _check_direction_health).
+    # window_cycles: how many recent research cycles to evaluate (rolling window).
+    # non_merge_threshold: minimum non-merging finished tasks to trigger the guardrail.
+    # min_merge_rate: merge rate below this AND above threshold triggers the pause.
+    # Conservative defaults prevent pausing productive high-throughput directions.
+    "direction_churn_window_cycles": 5,
+    "direction_churn_non_merge_threshold": 15,
+    "direction_churn_min_merge_rate": 0.10,
     "strategic_research_frequency": 6,  # Every Nth research cycle is a strategic vision review
     "architecture_review_frequency": 3,  # Every Nth strategic cycle includes architecture (design doc) review
     "max_active_directions": 10,
@@ -640,9 +648,16 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     "evaluating_fail_hours",
                     "max_total_research_per_project",
                     "next_role_poll_timeout_secs",
+                    "direction_churn_window_cycles",
+                    "direction_churn_non_merge_threshold",
                 ):
                     if int_key in config_json:
                         _set(int_key, int(config_json[int_key]))
+                if "direction_churn_min_merge_rate" in config_json:
+                    _set(
+                        "direction_churn_min_merge_rate",
+                        float(config_json["direction_churn_min_merge_rate"]),
+                    )
                 if "reserved_slots_for_types" in config_json:
                     _set(
                         "reserved_slots_for_types",
