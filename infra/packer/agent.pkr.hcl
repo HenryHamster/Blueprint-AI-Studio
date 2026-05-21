@@ -137,7 +137,9 @@ build {
       "# Smoke-check: verify Playwright CLI and Chromium binary exist before tagging image.",
       "# Hard-fail here prevents shipping a broken VM that causes CODE_ERROR at runtime.",
       "sudo -u agent -H bash -c 'cd /opt/agent && npx --yes playwright@1.59.1 --version'",
-      "CHROMIUM=$(find /home/agent/.cache/ms-playwright -name 'chrome' -type f 2>/dev/null | head -1) && [ -n \"$CHROMIUM\" ] && echo \"Chromium binary found: $CHROMIUM\" || { echo 'PACKER_SMOKE_FAIL: Chromium binary not found after playwright install'; exit 1; }"
+      "# The find runs as the agent user too — the browser cache lives under",
+      "# /home/agent and is not readable by the packer provisioner user.",
+      "sudo -u agent -H bash -c 'find /home/agent/.cache/ms-playwright -name chrome -type f | grep . && echo PACKER_SMOKE_OK || { echo PACKER_SMOKE_FAIL: Chromium binary not found after playwright install; exit 1; }'"
     ]
   }
 }
