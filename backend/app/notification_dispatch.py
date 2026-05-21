@@ -1586,6 +1586,60 @@ async def post_version_calcification_message(
     return msg
 
 
+async def post_version_build_stalled_message(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    version_number: int,
+    version_id: str,
+    age_days: int,
+    tasks_merged: int,
+) -> ProjectMessage:
+    """Post a build-stall alert when a release version sits too long in build.
+
+    Called when an open version has been in the ``build`` phase well past a
+    healthy window without advancing to ``stabilize`` (``build → stabilize`` is
+    agent-driven and has no automatic cadence, so a version can accumulate
+    merged tasks in build indefinitely without ever reaching qualify/promote).
+    Also fires the RELEASE_VERSION_BUILD_STALLED external webhook so operators
+    can route the alert to their incident channel.
+
+    Does NOT commit — the caller owns the transaction.
+    """
+    summary = (
+        f"v{version_number} has been building for {age_days} day(s) with "
+        f"{tasks_merged} merged task(s) and has not advanced to stabilize. "
+        f"Consider moving it to the stabilize phase to drive it toward "
+        f"qualification."
+    )
+    msg = await post_event_message(
+        session,
+        project_id,
+        event_type="release_build_stalled",
+        summary=summary,
+        context={
+            "version_number": version_number,
+            "version_id": version_id,
+            "age_days": age_days,
+            "tasks_merged": tasks_merged,
+        },
+    )
+    asyncio.ensure_future(
+        dispatch_external_notification(
+            project_id,
+            "RELEASE_VERSION_BUILD_STALLED",
+            {
+                "version_number": version_number,
+                "version_id": version_id,
+                "age_days": age_days,
+                "tasks_merged": tasks_merged,
+                "summary": summary,
+            },
+        )
+    )
+    return msg
+
+
 async def post_fix_loop_divergence_regression_message(
     session: AsyncSession,
     project_id: uuid.UUID,

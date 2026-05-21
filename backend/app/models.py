@@ -2345,6 +2345,24 @@ class ReleaseVersion(SQLModel, table=True):
         sa_column=Column(String(128), nullable=True),
     )
 
+    # Durable deduplication anchor for build-stall alerting.
+    # Set to the build-phase START reference time (phase_changed_at, falling
+    # back to opened_at) when the build-stall sweep posts an alert for a version
+    # sitting too long in the 'build' phase without advancing. The next sweep
+    # compares this field against the current build-phase reference time: if
+    # they match, the alert has already been posted for this stall and is
+    # skipped; if they differ (or the field is NULL), a new alert is warranted.
+    # Because a version can move build → stabilize → build again (each
+    # transition re-stamps phase_changed_at), storing the reference time lets
+    # the dedup reset naturally when a fresh build phase begins while never
+    # re-firing for the same stall. Storing the dedup state here avoids relying
+    # solely on Alert row existence (which can be lost when an operator clears
+    # alerts).
+    build_stall_alerted_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+
     created_at: datetime = Field(
         default_factory=_utcnow,
         sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
@@ -2365,5 +2383,114 @@ class ReleaseVersion(SQLModel, table=True):
             "project_id",
             "version_number",
             name="uq_releaseversion_project_version",
+        ),
+    )
+
+
+class QualificationVerdict(SQLModel, table=True):
+    """Immutable per-verdict history of release-qualifier finalize outcomes.
+
+    Phase 4 ("Calibration") of the automain LTS design.  ``ReleaseVersion.
+    last_qualification`` is OVERWRITTEN on every finalize, so only the latest
+    verdict survives there — and while ``promotion_enabled`` is False the open
+    version is never closed, so cross-version history cannot be reconstructed.
+    This table appends ONE row per finalized qualification verdict that is never
+    overwritten, so the dry-run track record is durably retained and can be
+    aggregated into a promotion-readiness recommendation
+    (``release_qualifier.compute_promotion_readiness``).
+
+    Additive only: it lives ALONGSIDE ``last_qualification`` and does not change
+    how that field is written.  Writes are best-effort — a failure to record
+    must never break or roll back a qualification or promotion.
+    """
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+
+    project_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("project.id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        ),
+    )
+
+    release_version_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("releaseversion.id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        ),
+    )
+
+    # The automain HEAD SHA that was scored.  Nullable per migration linter rules.
+    candidate_sha: str | None = Field(
+        default=None,
+        sa_column=Column(String(40), nullable=True),
+    )
+
+    # Composite promotion confidence in [0,1].
+    confidence: float = Field(
+        default=0.0,
+        sa_column=Column(Float, nullable=False, server_default=text("0")),
+    )
+
+    # Per-dimension sub-scores: {audit, test_erosion, smoketest}.
+    sub_scores: Dict[str, Any] | None = Field(
+        default=None,
+        sa_column=Column(JSONB, nullable=True),
+    )
+
+    # Hard-blocker code (compute_composite), or NULL when none fired.
+    blocker: str | None = Field(
+        default=None,
+        sa_column=Column(String(64), nullable=True),
+    )
+
+    # Whether the candidate cleared the promotion threshold.
+    would_promote: bool = Field(
+        default=False,
+        sa_column=Column(Boolean, nullable=False, server_default=text("false")),
+    )
+
+    # The runtime_config["promotion_enabled"] state AT THE TIME of this verdict.
+    promotion_enabled: bool = Field(
+        default=False,
+        sa_column=Column(Boolean, nullable=False, server_default=text("false")),
+    )
+
+    # Terminal outcome: dry_run | not_promoted | promoted | promotion_failed.
+    terminal_status: str = Field(
+        default="",
+        sa_column=Column(String(32), nullable=False, server_default=""),
+    )
+
+    # The promotion threshold in force when this verdict was scored.
+    threshold: float | None = Field(
+        default=None,
+        sa_column=Column(Float, nullable=True),
+    )
+
+    # When the qualification started / finalized (carried from the verdict).
+    started_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+    finalized_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+
+    __table_args__ = (
+        Index(
+            "ix_qualificationverdict_project_created",
+            "project_id",
+            "created_at",
         ),
     )

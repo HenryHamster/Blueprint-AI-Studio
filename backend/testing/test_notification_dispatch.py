@@ -31,6 +31,7 @@ from app.notification_dispatch import (
     post_residual_fix_result_message,
     post_residual_fix_spawned_message,
     post_review_feedback_message,
+    post_version_build_stalled_message,
     post_version_calcification_message,
 )
 from app.models import (
@@ -1833,3 +1834,77 @@ async def test_post_version_calcification_message_not_fired_for_dry_run(
     # Builder always creates the message; caller is responsible for the guard
     assert msg is not None
     dispatch_mock.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# post_version_build_stalled_message
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_post_version_build_stalled_message_creates_message(
+    db_session,
+):
+    """post_version_build_stalled_message posts a ProjectMessage with
+    event_type 'release_build_stalled' and the correct context fields."""
+    project = Project(name="Build Stall Test", user_id="u1")
+    db_session.add(project)
+    await db_session.commit()
+
+    version_id = str(uuid.uuid4())
+    msg = await post_version_build_stalled_message(
+        db_session,
+        project.id,
+        version_number=4,
+        version_id=version_id,
+        age_days=21,
+        tasks_merged=55,
+    )
+    await db_session.commit()
+
+    assert msg.context["event_type"] == "release_build_stalled"
+    assert msg.context["version_number"] == 4
+    assert msg.context["version_id"] == version_id
+    assert msg.context["age_days"] == 21
+    assert msg.context["tasks_merged"] == 55
+    assert "building for 21 day(s)" in msg.content
+    assert "55 merged task(s)" in msg.content
+    assert "stabilize" in msg.content
+
+
+@pytest.mark.asyncio
+async def test_post_version_build_stalled_message_fires_external_webhook(
+    db_session,
+):
+    """post_version_build_stalled_message fires RELEASE_VERSION_BUILD_STALLED
+    external webhook with the correct payload so external subscribers can act."""
+    project = Project(name="Build Stall Webhook", user_id="u1")
+    db_session.add(project)
+    await db_session.commit()
+
+    dispatch_mock = AsyncMock()
+    with patch(
+        "app.notification_dispatch.dispatch_external_notification", new=dispatch_mock
+    ):
+        await post_version_build_stalled_message(
+            db_session,
+            project.id,
+            version_number=2,
+            version_id="vid-789",
+            age_days=15,
+            tasks_merged=42,
+        )
+        import asyncio as _asyncio
+
+        await _asyncio.sleep(0)
+
+    dispatch_mock.assert_called_once()
+    args = dispatch_mock.call_args.args
+    assert args[0] == project.id
+    assert args[1] == "RELEASE_VERSION_BUILD_STALLED"
+    payload = args[2]
+    assert payload["version_number"] == 2
+    assert payload["version_id"] == "vid-789"
+    assert payload["age_days"] == 15
+    assert payload["tasks_merged"] == 42
+    assert "summary" in payload and "building" in payload["summary"]

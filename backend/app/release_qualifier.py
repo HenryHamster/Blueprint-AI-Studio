@@ -80,12 +80,14 @@ from app.models import (
     Artifact,
     ArtifactType,
     Project,
+    QualificationVerdict,
     Task,
     TaskHistory,
     TaskStatus,
 )
 from app.notification_dispatch import (
     post_event_message,
+    post_version_build_stalled_message,
     post_version_calcification_message,
 )
 from app.payload_schemas import PayloadTooLargeError, validate_internal_payload
@@ -209,6 +211,32 @@ _MAX_QUALIFICATION_DURATION_SECONDS = 6 * 60 * 60
 # alert.  Conservative: three failures on the same blocker strongly suggest
 # the issue is not transient and the version is genuinely stuck.
 _MIN_CALCIFICATION_ATTEMPTS = 3
+
+# Build-phase calcification thresholds — the backstop for the OTHER end of the
+# lifecycle from _check_version_calcification.  build→stabilize is entirely
+# agent-driven (the strategic agent must emit a version_phase_decision); there
+# is no cadence and no automatic backstop, so a conservative or distracted
+# strategic agent can leave an open version accumulating merged tasks in the
+# 'build' phase indefinitely, never reaching qualify/promote.  A build-phase
+# version that has sat for this many days OR accumulated this many merged tasks
+# since the phase started has likely stalled.  EITHER trigger fires the alert.
+# These are deliberately CONSERVATIVE: the goal is to catch a genuine stall,
+# not nag a normally-progressing build.
+_BUILD_STALL_AGE_DAYS = 14
+_BUILD_STALL_MERGED_TASKS = 40
+
+
+def _is_build_stalled(age_days: int, merged_count: int) -> bool:
+    """Return True iff a build-phase version's age OR merged-task count is past
+    the conservative build-stall threshold.
+
+    Shared by ``_check_version_calcification``'s build-phase sibling
+    (``_check_version_build_stall``) and the strategic build-stall nudge so both
+    judge a stall by the exact same rule.
+    """
+    return (
+        age_days >= _BUILD_STALL_AGE_DAYS or merged_count >= _BUILD_STALL_MERGED_TASKS
+    )
 
 
 async def _qualification_in_flight(
@@ -1251,6 +1279,94 @@ async def _notify_operator(
         )
 
 
+def _parse_iso_dt(raw: Any) -> datetime | None:
+    """Parse an ISO-8601 timestamp string to a datetime, or None.
+
+    Used to coerce the ``started_at`` / ``finalized_at`` ISO strings carried in
+    a qualification ``base_record`` into datetime columns on the verdict-history
+    row.  Returns None on a missing / non-string / unparseable value — recording
+    is best-effort, so a bad timestamp must never raise.
+    """
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+
+
+async def _record_qualification_verdict(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+    base_record: dict[str, Any],
+    *,
+    terminal_status: str,
+    would_promote: bool,
+    promotion_enabled: bool,
+) -> None:
+    """Best-effort: append ONE immutable ``QualificationVerdict`` history row.
+
+    Phase 4 (calibration) durable evidence trail.  ``last_qualification`` is
+    OVERWRITTEN on every finalize, so this appends a never-overwritten per-verdict
+    row that ``compute_promotion_readiness`` reads across versions to reconstruct
+    the dry-run track record.  Purely additive — ``last_qualification`` is still
+    written exactly as before; this does not touch it.
+
+    CRITICAL: recording must NEVER break or roll back a qualification/promotion.
+    The verdict INSERT runs inside a SAVEPOINT (``begin_nested``) wrapped in
+    try/except.  Before opening the savepoint the caller's already-staged
+    mutations (``last_qualification`` etc.) are flushed into the OUTER
+    transaction, so the savepoint contains ONLY the verdict INSERT — a rollback
+    of that savepoint can never drop the qualification's own write.  Any failure
+    (a malformed row, or — until the sibling Alembic migration lands — a missing
+    ``qualificationverdict`` table) surfaces inside the savepoint, is rolled back
+    to the savepoint leaving the outer transaction intact, and is logged and
+    swallowed.  Purely additive: ``last_qualification`` is written exactly as
+    before and the surrounding qualification/promotion is unaffected.
+    """
+    try:
+        sub_scores = base_record.get("sub_scores")
+        confidence = base_record.get("confidence")
+        threshold = base_record.get("threshold")
+        verdict = QualificationVerdict(
+            project_id=version.project_id,
+            release_version_id=version.id,
+            candidate_sha=base_record.get("candidate_sha"),
+            confidence=(
+                float(confidence)
+                if isinstance(confidence, (int, float))
+                and not isinstance(confidence, bool)
+                else 0.0
+            ),
+            sub_scores=sub_scores if isinstance(sub_scores, dict) else None,
+            blocker=base_record.get("blocker"),
+            would_promote=bool(would_promote),
+            promotion_enabled=bool(promotion_enabled),
+            terminal_status=terminal_status,
+            threshold=(
+                float(threshold)
+                if isinstance(threshold, (int, float))
+                and not isinstance(threshold, bool)
+                else None
+            ),
+            started_at=_parse_iso_dt(base_record.get("started_at")),
+            finalized_at=_parse_iso_dt(base_record.get("finalized_at")),
+        )
+        # Flush the caller's staged mutations into the outer transaction first,
+        # so the savepoint below isolates ONLY the verdict INSERT.
+        await session.flush()
+        async with session.begin_nested():
+            session.add(verdict)
+            await session.flush()
+    except Exception as exc:  # noqa: BLE001 — recording is best-effort, never fatal
+        logger.warning(
+            "[RELEASE_QUALIFIER] failed to record qualification verdict for v%s "
+            "(non-fatal — additive history only): %s",
+            getattr(version, "version_number", "?"),
+            exc,
+        )
+
+
 async def _finalize_qualification(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
@@ -1391,6 +1507,14 @@ async def _finalize_qualification(
             )
         release_version.set_version_phase(version, "stabilize", reasoning=reason)
         session.add(version)
+        await _record_qualification_verdict(
+            session,
+            version,
+            record,
+            terminal_status="not_promoted",
+            would_promote=False,
+            promotion_enabled=promotion_enabled,
+        )
         scores_str = _fmt_sub_scores(
             composite["sub_scores"], smoketest_enabled=smoketest_enabled
         )
@@ -1437,6 +1561,14 @@ async def _finalize_qualification(
         version.last_qualification = record
         flag_modified(version, "last_qualification")
         session.add(version)
+        await _record_qualification_verdict(
+            session,
+            version,
+            record,
+            terminal_status="dry_run",
+            would_promote=True,
+            promotion_enabled=False,
+        )
         logger.info(
             "[RELEASE_QUALIFIER] v%d would promote (confidence=%.4f) but "
             "promotion_enabled=False — dry-run, not promoting",
@@ -2123,6 +2255,122 @@ async def _check_version_calcification(
     return True
 
 
+async def _check_version_build_stall(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+) -> bool:
+    """Post a deduplicated build-stall alert when a version sits too long in
+    the ``build`` phase without advancing to ``stabilize``.
+
+    This is the sibling backstop to ``_check_version_calcification``: that guard
+    covers a version repeatedly failing qualification in the ``stabilize`` phase,
+    while this one covers the OTHER end of the lifecycle.  ``build → stabilize``
+    is entirely agent-driven (the strategic agent must emit a
+    ``version_phase_decision``); there is no cadence or automatic backstop, so a
+    conservative or distracted strategic agent can leave an open version
+    accumulating merged tasks in ``build`` for many cycles, never reaching
+    qualify/promote — the lifecycle silently failing to advance.
+
+    Fires when an open ``build``-phase version's phase age (days since the build
+    phase started) OR its merged-task count since the phase started crosses the
+    conservative ``_is_build_stalled`` threshold.  Phase age derives from
+    ``phase_changed_at`` falling back to ``opened_at`` (a freshly-opened build
+    version has ``phase_changed_at = None``) — exactly as
+    ``_check_version_calcification`` derives its age.  The merged-task count uses
+    ``release_version.count_merged_since`` from that same build-phase-start
+    reference time.
+
+    Deduplication: compares the version's durable ``build_stall_alerted_at``
+    column against the current build-phase-start reference time.  If they match,
+    the alert has already been posted for this stall and is skipped; a new alert
+    is posted only when the reference differs (or the field is NULL).  Because a
+    version can move ``build → stabilize → build`` again (each transition
+    re-stamps ``phase_changed_at``), storing the reference time lets the dedup
+    reset naturally for a fresh build phase while never re-firing for the same
+    stall.
+
+    All messaging is best-effort wrapped so it can NEVER break the qualifier
+    sweep.  Does NOT commit the session — the caller must commit after a ``True``
+    return.
+    """
+    if version.status != "open" or version.phase != "build":
+        return False
+
+    ref_time = version.phase_changed_at or version.opened_at
+    if ref_time is None:
+        return False
+
+    age_days = max(0, (_utcnow() - ref_time).days)
+
+    try:
+        merged_count = await release_version.count_merged_since(
+            session, version.project_id, ref_time
+        )
+    except Exception as exc:  # noqa: BLE001 — a count failure must not break the sweep
+        logger.warning(
+            "[RELEASE_QUALIFIER] build-stall merged-task count failed for v%d "
+            "(non-fatal): %s",
+            version.version_number,
+            exc,
+        )
+        merged_count = 0
+
+    if not _is_build_stalled(age_days, merged_count):
+        return False
+
+    # Durable dedup: the version remembers the build-phase reference time it
+    # last alerted on.  Same reference → already notified for this stall; skip.
+    if version.build_stall_alerted_at == ref_time:
+        return False
+
+    session.add(
+        Alert(
+            project_id=version.project_id,
+            severity=AlertSeverity.WARNING,
+            title=f"Release v{version.version_number} stalled in build phase",
+            message=(
+                f"Release v{version.version_number} has been in the build phase "
+                f"for {age_days} day(s) with {merged_count} merged task(s) and "
+                f"has not advanced to stabilize. build→stabilize is agent-driven "
+                f"with no automatic cadence — the strategic agent may need to "
+                f"emit a version_phase_decision to move it to stabilize so it can "
+                f"progress toward qualification and promotion."
+            ),
+        )
+    )
+    # post_version_build_stalled_message is itself defensive, but wrap the whole
+    # messaging block so a transient failure can never abort the sweep.
+    try:
+        await post_version_build_stalled_message(
+            session,
+            version.project_id,
+            version_number=version.version_number,
+            version_id=str(version.id),
+            age_days=age_days,
+            tasks_merged=merged_count,
+        )
+    except Exception as exc:  # noqa: BLE001 — messaging must never break the sweep
+        logger.warning(
+            "[RELEASE_QUALIFIER] failed to post build-stall message for v%d "
+            "(non-fatal): %s",
+            version.version_number,
+            exc,
+        )
+
+    # Record the durable dedup anchor so subsequent sweeps don't re-alert for
+    # the same stall (survives an operator clearing the Alert row).
+    version.build_stall_alerted_at = ref_time
+    session.add(version)
+    logger.warning(
+        "[RELEASE_QUALIFIER] build-stall alert for v%d: %d day(s), %d merged "
+        "task(s) in build phase without advancing",
+        version.version_number,
+        age_days,
+        merged_count,
+    )
+    return True
+
+
 async def sweep_stuck_qualifications(
     session: AsyncSession,
     *,
@@ -2217,22 +2465,27 @@ async def sweep_stuck_qualifications(
             finalized,
         )
 
-    # Calcification check: alert when an open version has accumulated enough
-    # hard-blocker failures to be considered stuck.  Each version gets its own
-    # dedicated session (same isolation pattern as the finalize loop above) so
-    # a messaging failure on one version can't affect another.
+    # Lifecycle-stall checks: alert when an open version is stuck at either end
+    # of the lifecycle — calcifying in stabilize (repeated hard-blocker
+    # failures) or stalled in build (sitting too long without advancing).  The
+    # two checks are mutually exclusive per version (each early-returns on the
+    # wrong phase) but both run so whichever applies fires.  Each version gets
+    # its own dedicated session (same isolation pattern as the finalize loop
+    # above) so a messaging failure on one version can't affect another.
     factory = session_factory or AsyncSessionLocal
     for version in open_versions:
         try:
             async with factory() as alert_session:
                 v = await alert_session.get(release_version.ReleaseVersion, version.id)
-                if v is not None and await _check_version_calcification(
-                    alert_session, v
-                ):
+                if v is None:
+                    continue
+                alerted = await _check_version_calcification(alert_session, v)
+                alerted = await _check_version_build_stall(alert_session, v) or alerted
+                if alerted:
                     await alert_session.commit()
         except Exception:
             logger.exception(
-                "[RELEASE_QUALIFIER] calcification check failed for version %s",
+                "[RELEASE_QUALIFIER] lifecycle-stall check failed for version %s",
                 version.id,
             )
 
@@ -3123,6 +3376,17 @@ async def _record_promotion_failure(
             ),
         )
     session.add(version)
+    # Phase 4: durable verdict-history row.  A promotion_failed candidate DID
+    # clear the qualifier (would_promote=True) — the failure is in the merge
+    # infrastructure, not the score — and promotion only ever runs when enabled.
+    await _record_qualification_verdict(
+        session,
+        version,
+        record,
+        terminal_status="promotion_failed",
+        would_promote=True,
+        promotion_enabled=True,
+    )
     logger.warning(
         "[RELEASE_QUALIFIER] promotion of v%d failed (%s) — version stays open, "
         "phase=stabilize",
@@ -3254,6 +3518,16 @@ async def _record_promotion_success(
     version.promoted_at = now
     version.promoted_sha = effective_sha
     session.add(version)
+    # Phase 4: durable verdict-history row for a successful promotion.  This
+    # only ever runs with promotion enabled (the dry_run branch returns earlier).
+    await _record_qualification_verdict(
+        session,
+        version,
+        record,
+        terminal_status="promoted",
+        would_promote=True,
+        promotion_enabled=True,
+    )
 
     # Open the next version (build phase) — base_sha is the freshly-promoted SHA
     # (the real main HEAD after the merge, not the now-superseded candidate).
@@ -3357,4 +3631,197 @@ def format_qualification_for_api(qual: dict[str, Any]) -> dict[str, Any]:
         "blocker": qual.get("blocker"),
         "started_at": qual.get("started_at"),
         "finalized_at": qual.get("finalized_at"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Promotion-readiness aggregation — the calibration evidence (design Phase 4).
+# ---------------------------------------------------------------------------
+#
+# These constants gate the human-facing recommendation only.  Per design
+# decision D2 the recommendation NEVER auto-flips runtime_config["promotion_
+# enabled"] — it summarizes the durable dry-run track record so an operator can
+# answer "is the qualifier trustworthy enough to enable autonomous promotion
+# yet?" from real data and flip the switch themselves.  Kept deliberately
+# CONSERVATIVE: signalling ready prematurely is the costly error (it invites a
+# human to hand the qualifier the keys to production main).
+
+# How many most-recent dry-run-regime verdicts to consider.
+_READINESS_HISTORY_WINDOW = 50
+# Minimum number of evaluated dry-run-regime verdicts before any "ready" signal.
+# A handful of passes is not yet a track record.
+_READINESS_MIN_VERDICTS = 5
+# Minimum run of the MOST-RECENT consecutive clean would-promote verdicts (no
+# blocker) — recent stability matters more than a good-then-bad history.
+_READINESS_MIN_CLEAN_STREAK = 3
+# Minimum would-promote rate across the evaluated window.
+_READINESS_MIN_WOULD_PROMOTE_RATE = 0.80
+# A blocker code seen at least this many times in the window is "recurring" —
+# the qualifier keeps tripping on the same hard problem, so NOT ready.
+_READINESS_RECURRING_BLOCKER_MIN = 2
+# Confidence-spread ceiling for the advisory "stable" flag (evidence only — not
+# a hard readiness gate).
+_READINESS_CONFIDENCE_STDEV_MAX = 0.15
+
+
+def _empty_readiness(thresholds: dict[str, Any]) -> dict[str, Any]:
+    """The not-ready summary returned when there is no verdict history yet."""
+    return {
+        "ready": False,
+        "reason": "no qualification verdicts recorded yet — nothing to evaluate",
+        "verdicts_evaluated": 0,
+        "would_promote_count": 0,
+        "would_promote_rate": 0.0,
+        "consecutive_clean_passes": 0,
+        "confidence": {
+            "mean": None,
+            "stdev": None,
+            "min": None,
+            "max": None,
+            "stable": False,
+        },
+        "recurring_blockers": {},
+        "blocker_counts": {},
+        "thresholds": thresholds,
+    }
+
+
+async def compute_promotion_readiness(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> dict[str, Any]:
+    """Summarize the dry-run qualification track record into a readiness verdict.
+
+    Reads the durable :class:`QualificationVerdict` history (the most recent
+    ``_READINESS_HISTORY_WINDOW`` verdicts recorded while promotion was DISABLED
+    — the dry-run regime, where every finalize lands as ``dry_run`` /
+    ``not_promoted``) and returns a conservative ``ready`` / not-ready
+    recommendation plus the supporting evidence.
+
+    EVIDENCE + RECOMMENDATION ONLY (design decision D2): this NEVER flips
+    ``promotion_enabled``.  ``ready=True`` requires ALL of:
+
+      * at least ``_READINESS_MIN_VERDICTS`` evaluated verdicts, AND
+      * a most-recent consecutive-clean would-promote streak of at least
+        ``_READINESS_MIN_CLEAN_STREAK``, AND
+      * a would-promote rate >= ``_READINESS_MIN_WOULD_PROMOTE_RATE``, AND
+      * NO recurring hard blocker (a blocker code seen
+        >= ``_READINESS_RECURRING_BLOCKER_MIN`` times in the window).
+
+    Returns a dict with ``ready``, a human-readable ``reason``, the raw evidence
+    (``verdicts_evaluated``, ``would_promote_count``, ``would_promote_rate``,
+    ``consecutive_clean_passes``, a ``confidence`` distribution + advisory
+    ``stable`` flag, ``blocker_counts`` and the subset that is ``recurring_
+    blockers``) and the ``thresholds`` used so the recommendation is auditable.
+    """
+    thresholds: dict[str, Any] = {
+        "min_verdicts": _READINESS_MIN_VERDICTS,
+        "min_clean_streak": _READINESS_MIN_CLEAN_STREAK,
+        "min_would_promote_rate": _READINESS_MIN_WOULD_PROMOTE_RATE,
+        "recurring_blocker_min": _READINESS_RECURRING_BLOCKER_MIN,
+        "history_window": _READINESS_HISTORY_WINDOW,
+    }
+
+    # Only the dry-run regime (promotion_enabled is False) is evidence for
+    # whether to flip the switch — verdicts recorded after promotion was enabled
+    # are post-decision and excluded.  Newest-first so the leading run is the
+    # most-recent consecutive-clean streak.
+    stmt = (
+        select(QualificationVerdict)
+        .where(
+            QualificationVerdict.project_id == project_id,
+            QualificationVerdict.promotion_enabled.is_(False),
+        )
+        .order_by(QualificationVerdict.created_at.desc())
+        .limit(_READINESS_HISTORY_WINDOW)
+    )
+    verdicts = list((await session.execute(stmt)).scalars().all())
+
+    evaluated = len(verdicts)
+    if evaluated == 0:
+        return _empty_readiness(thresholds)
+
+    would_promote_count = sum(1 for v in verdicts if v.would_promote)
+    would_promote_rate = round(would_promote_count / evaluated, 4)
+
+    # Leading run of clean would-promote passes (would_promote AND no blocker).
+    consecutive_clean = 0
+    for v in verdicts:
+        if v.would_promote and not v.blocker:
+            consecutive_clean += 1
+        else:
+            break
+
+    # Blocker frequency across the window (only non-promote verdicts carry one).
+    blocker_counts: dict[str, int] = {}
+    for v in verdicts:
+        if v.blocker:
+            blocker_counts[v.blocker] = blocker_counts.get(v.blocker, 0) + 1
+    recurring_blockers = {
+        code: n
+        for code, n in blocker_counts.items()
+        if n >= _READINESS_RECURRING_BLOCKER_MIN
+    }
+
+    # Confidence distribution + an advisory stability measure (population stdev).
+    confidences = [float(v.confidence) for v in verdicts]
+    conf_mean = round(sum(confidences) / evaluated, 4)
+    conf_min = round(min(confidences), 4)
+    conf_max = round(max(confidences), 4)
+    if evaluated > 1:
+        variance = sum((c - conf_mean) ** 2 for c in confidences) / evaluated
+        conf_stdev = round(variance**0.5, 4)
+    else:
+        conf_stdev = 0.0
+    conf_stable = conf_stdev <= _READINESS_CONFIDENCE_STDEV_MAX
+
+    reasons: list[str] = []
+    if evaluated < _READINESS_MIN_VERDICTS:
+        reasons.append(
+            f"only {evaluated} dry-run verdict(s) evaluated "
+            f"(need >= {_READINESS_MIN_VERDICTS})"
+        )
+    if consecutive_clean < _READINESS_MIN_CLEAN_STREAK:
+        reasons.append(
+            f"consecutive-clean streak is {consecutive_clean} "
+            f"(need >= {_READINESS_MIN_CLEAN_STREAK})"
+        )
+    if would_promote_rate < _READINESS_MIN_WOULD_PROMOTE_RATE:
+        reasons.append(
+            f"would-promote rate is {would_promote_rate:.2f} "
+            f"(need >= {_READINESS_MIN_WOULD_PROMOTE_RATE:.2f})"
+        )
+    if recurring_blockers:
+        formatted = ", ".join(
+            f"{code}x{n}" for code, n in sorted(recurring_blockers.items())
+        )
+        reasons.append(f"recurring hard blocker(s): {formatted}")
+
+    ready = not reasons
+    if ready:
+        reason = (
+            f"qualifier looks trustworthy: {would_promote_count}/{evaluated} "
+            f"would-promote (rate {would_promote_rate:.2f}), {consecutive_clean} "
+            f"consecutive clean passes, no recurring blockers"
+        )
+    else:
+        reason = "; ".join(reasons)
+
+    return {
+        "ready": ready,
+        "reason": reason,
+        "verdicts_evaluated": evaluated,
+        "would_promote_count": would_promote_count,
+        "would_promote_rate": would_promote_rate,
+        "consecutive_clean_passes": consecutive_clean,
+        "confidence": {
+            "mean": conf_mean,
+            "stdev": conf_stdev,
+            "min": conf_min,
+            "max": conf_max,
+            "stable": conf_stable,
+        },
+        "recurring_blockers": recurring_blockers,
+        "blocker_counts": blocker_counts,
+        "thresholds": thresholds,
     }

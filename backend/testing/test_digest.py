@@ -15782,6 +15782,78 @@ async def test_version_lifecycle_history(client: AsyncClient, db_session):
     assert data["recent_versions"][0]["last_qualification"]["confidence"] == 0.95
 
 
+@pytest.mark.asyncio
+async def test_version_lifecycle_promotion_fields_present(
+    client: AsyncClient, db_session
+):
+    """promotion_enabled and promotion_readiness are always present in the response."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(make_membership(project.id))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/projects/{project.id}/version-lifecycle")
+    assert response.status_code == 200
+    data = response.json()
+
+    assert isinstance(data["promotion_enabled"], bool)
+    pr = data["promotion_readiness"]
+    assert pr is not None
+    assert "ready" in pr
+    assert "reason" in pr
+    assert "verdicts_evaluated" in pr
+
+
+@pytest.mark.asyncio
+async def test_version_lifecycle_promotion_enabled_true(
+    client: AsyncClient, db_session
+):
+    """When promotion_enabled is True in runtime_config, the endpoint reflects it."""
+    import app.shared_state as _ss
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(make_membership(project.id))
+    await db_session.commit()
+
+    original = _ss.runtime_config.get("promotion_enabled", False)
+    try:
+        _ss.runtime_config["promotion_enabled"] = True
+        response = await client.get(
+            f"/api/admin/projects/{project.id}/version-lifecycle"
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["promotion_enabled"] is True
+    finally:
+        _ss.runtime_config["promotion_enabled"] = original
+
+
+@pytest.mark.asyncio
+async def test_version_lifecycle_promotion_readiness_not_ready(
+    client: AsyncClient, db_session
+):
+    """With no dry-run verdicts the readiness summary reports not-ready."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(make_membership(project.id))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/projects/{project.id}/version-lifecycle")
+    assert response.status_code == 200
+    data = response.json()
+
+    pr = data["promotion_readiness"]
+    assert pr["ready"] is False
+    assert pr["verdicts_evaluated"] == 0
+
+
 # ---------------------------------------------------------------------------
 # Memo-pathway exit count in digest
 # ---------------------------------------------------------------------------

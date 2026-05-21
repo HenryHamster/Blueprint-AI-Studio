@@ -9536,6 +9536,7 @@ async def get_version_lifecycle(
     and an empty ``recent_versions`` list.
     """
     from app.release_version import count_merged_since  # noqa: PLC0415
+    from app.release_qualifier import compute_promotion_readiness  # noqa: PLC0415
 
     await _get_user_project_with_role(
         project_id, current_user["user_id"], session, min_role="viewer"
@@ -9589,6 +9590,8 @@ async def get_version_lifecycle(
         .all()
     )
 
+    promotion_readiness = await compute_promotion_readiness(session, project_id)
+
     return {
         "current_version": current_version_out,
         "recent_versions": [
@@ -9604,4 +9607,6 @@ async def get_version_lifecycle(
             }
             for v in history_rows
         ],
+        "promotion_enabled": bool(_runtime_config.get("promotion_enabled", False)),
+        "promotion_readiness": promotion_readiness,
     }

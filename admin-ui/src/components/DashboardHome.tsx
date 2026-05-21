@@ -11,7 +11,7 @@ import {
   Search,
 } from 'lucide-react';
 import { ResponsiveContainer, AreaChart, Area } from 'recharts';
-import { apiFetch, fetchSrUnhandledEdgesRetrospectives, type PromptFingerprintAnalyticsResponse, type SrUnhandledEdgesTask, type VersionLifecycleResponse, type VersionQualification } from '../api';
+import { apiFetch, fetchSrUnhandledEdgesRetrospectives, type PromptFingerprintAnalyticsResponse, type SrUnhandledEdgesTask, type VersionLifecycleResponse, type VersionQualification, type PromotionReadiness } from '../api';
 import { useEfficiencySnapshot, fmtEffSecs, fmtEffRate, fmtEffIter } from '../hooks/useEfficiencySnapshot';
 import { timeAgo, formatDurationSec, parseTimestamp } from '../utils/time';
 import { isSafeUrl } from './TaskCard';
@@ -428,14 +428,55 @@ function QualSummary({ q }: { q: VersionQualification | null }) {
   );
 }
 
+function PromotionReadinessSummary({ readiness }: { readiness: PromotionReadiness | null | undefined }) {
+  if (!readiness) return null;
+  const { ready, reason, verdicts_evaluated, would_promote_rate, consecutive_clean_passes, recurring_blockers } = readiness;
+  const hasBlockers = Object.keys(recurring_blockers ?? {}).length > 0;
+  return (
+    <div className="mt-1 pt-1 border-t border-neutral-700/50 space-y-0.5">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border ${ready ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400' : 'bg-amber-500/10 border-amber-500/30 text-amber-400'}`}>
+          {ready ? 'ready to promote' : 'not ready'}
+        </span>
+        {verdicts_evaluated > 0 && (
+          <span className="text-[10px] text-neutral-500">{verdicts_evaluated} dry-run{verdicts_evaluated !== 1 ? 's' : ''}</span>
+        )}
+        {verdicts_evaluated > 0 && (
+          <span className="text-[10px] text-neutral-500">{Math.round(would_promote_rate * 100)}% pass rate</span>
+        )}
+        {consecutive_clean_passes > 0 && (
+          <span className="text-[10px] text-neutral-500">{consecutive_clean_passes} clean streak</span>
+        )}
+      </div>
+      {!ready && reason && (
+        <p className="text-[10px] text-neutral-400 line-clamp-2">{reason}</p>
+      )}
+      {hasBlockers && (
+        <p className="text-[10px] text-red-400 truncate">
+          recurring: {Object.entries(recurring_blockers).map(([k, n]) => `${k}×${n}`).join(', ')}
+        </p>
+      )}
+    </div>
+  );
+}
+
 function VersionLifecyclePanel({ data, loading }: { data: VersionLifecycleResponse | null; loading: boolean }) {
   if (loading || !data || (!data.current_version && data.recent_versions.length === 0)) return null;
   const cv = data.current_version;
   const recent = data.recent_versions;
+  const promotionEnabled = data.promotion_enabled ?? false;
+  const readiness = data.promotion_readiness;
   return (
     <section data-testid="version-lifecycle-panel">
       <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Version Lifecycle</h2>
       <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 space-y-2 text-xs">
+        <div className="flex flex-wrap items-center gap-2">
+          {data.promotion_enabled !== undefined && (
+            <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border ${promotionEnabled ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400' : 'bg-neutral-500/10 border-neutral-500/30 text-neutral-400'}`}>
+              {promotionEnabled ? 'LIVE' : 'DRY-RUN'}
+            </span>
+          )}
+        </div>
         {cv && (
           <div className="space-y-1">
             <div className="flex flex-wrap items-center gap-2">
@@ -462,6 +503,7 @@ function VersionLifecyclePanel({ data, loading }: { data: VersionLifecycleRespon
             )}
           </div>
         )}
+        {readiness !== undefined && <PromotionReadinessSummary readiness={readiness} />}
         {recent.length > 0 && (
           <div>
             <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">History</p>

@@ -36,13 +36,13 @@ export const ESCALATION_BADGE_LABELS: Readonly<Record<string, string>> = {
 
 export const HIGH_SIGNAL_NOTE_EVENTS: ReadonlySet<string> = new Set([
   'failure_alert', 'rollback_recommended', 'fix_loop_divergence_regressed',
-  'release_calcifying',
+  'release_calcifying', 'release_build_stalled',
   ...ESCALATION_EVENT_TYPES,
 ]);
 
 export const CRITICAL_NOTE_EVENTS: ReadonlySet<string> = new Set([
   'failure_alert', 'rollback_recommended', 'fix_loop_divergence_regressed',
-  'release_calcifying',
+  'release_calcifying', 'release_build_stalled',
   ...ESCALATION_EVENT_TYPES,
 ]);
 

@@ -49,6 +49,7 @@ from app.models import (
     ArtifactType,
     Project,
     ProjectMessage,
+    QualificationVerdict,
     Task,
     TaskStatus,
 )
@@ -5786,6 +5787,242 @@ async def test_sweep_triggers_calcification_check(db_session):
     assert "calcifying" in alerts[0].title
 
 
+# ===========================================================================
+# Build-phase stall alerting — _check_version_build_stall
+# ===========================================================================
+
+
+async def _make_merged_task(db_session, project_id, *, updated_at):
+    """Create a COMPLETED + pr_merged task so count_merged_since counts it."""
+    task = Task(
+        project_id=project_id,
+        title="merged-task",
+        payloads=[{"type": "create", "prompt": "x"}],
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        updated_at=updated_at,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    return task
+
+
+@pytest.mark.asyncio
+async def test_build_stall_alert_fires_for_old_build_version(db_session):
+    """An open build-phase version older than _BUILD_STALL_AGE_DAYS posts one
+    Alert and one release_build_stalled message."""
+    from datetime import timedelta
+
+    from app.models import Alert as _Alert
+
+    project, version = await _make_project_and_version(db_session, phase="build")
+    # Build phase started well beyond the healthy window; phase_changed_at is
+    # None for a freshly-opened build version, so the age derives from opened_at.
+    version.opened_at = rq._utcnow() - timedelta(days=rq._BUILD_STALL_AGE_DAYS + 6)
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    alerted = await rq._check_version_build_stall(db_session, version)
+    await db_session.commit()
+
+    assert alerted is True
+    alerts = (
+        (
+            await db_session.execute(
+                select(_Alert).where(_Alert.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+    assert "build phase" in alerts[0].title
+    assert "stabilize" in alerts[0].message
+
+    msgs = await _messages_for(db_session, project.id, "release_build_stalled")
+    assert len(msgs) == 1
+
+
+@pytest.mark.asyncio
+async def test_build_stall_alert_fires_for_high_merged_count(db_session, mocker):
+    """An open build-phase version that has accumulated merged tasks past the
+    threshold fires even when the phase age is young."""
+    from app.models import Alert as _Alert
+
+    # Keep age well below threshold so only the merged-count trigger can fire,
+    # and lower the merged-count threshold so the test stays fast.
+    mocker.patch.object(rq, "_BUILD_STALL_AGE_DAYS", 365)
+    mocker.patch.object(rq, "_BUILD_STALL_MERGED_TASKS", 2)
+
+    project, version = await _make_project_and_version(db_session, phase="build")
+    now = rq._utcnow()
+    await _make_merged_task(db_session, project.id, updated_at=now)
+    await _make_merged_task(db_session, project.id, updated_at=now)
+    await db_session.refresh(version)
+
+    alerted = await rq._check_version_build_stall(db_session, version)
+    await db_session.commit()
+
+    assert alerted is True
+    alerts = (
+        (
+            await db_session.execute(
+                select(_Alert).where(_Alert.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+    assert "build phase" in alerts[0].title
+
+
+@pytest.mark.asyncio
+async def test_build_stall_alert_not_fired_for_young_build_version(db_session):
+    """A freshly-opened build version with no merged tasks does not alert —
+    a normally-progressing build must not be nagged."""
+    from app.models import Alert as _Alert
+
+    project, version = await _make_project_and_version(db_session, phase="build")
+    # opened_at defaults to now; no merged tasks.
+    alerted = await rq._check_version_build_stall(db_session, version)
+    assert alerted is False
+    alerts = (
+        (
+            await db_session.execute(
+                select(_Alert).where(_Alert.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 0
+
+
+@pytest.mark.asyncio
+async def test_build_stall_alert_not_fired_for_stabilize_version(db_session):
+    """A stabilize-phase version is never a build stall — wrong phase, no-op,
+    even when old."""
+    from datetime import timedelta
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.opened_at = rq._utcnow() - timedelta(days=rq._BUILD_STALL_AGE_DAYS + 30)
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    alerted = await rq._check_version_build_stall(db_session, version)
+    assert alerted is False
+
+
+@pytest.mark.asyncio
+async def test_build_stall_alert_deduplicated(db_session):
+    """A second call for the same build-phase stall is a no-op — the alert is
+    posted only once per distinct build phase."""
+    from datetime import timedelta
+
+    from app.models import Alert as _Alert
+
+    project, version = await _make_project_and_version(db_session, phase="build")
+    version.opened_at = rq._utcnow() - timedelta(days=rq._BUILD_STALL_AGE_DAYS + 6)
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    first = await rq._check_version_build_stall(db_session, version)
+    await db_session.commit()
+    second = await rq._check_version_build_stall(db_session, version)
+    await db_session.commit()
+
+    assert first is True
+    assert second is False
+    alerts = (
+        (
+            await db_session.execute(
+                select(_Alert).where(_Alert.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+
+
+@pytest.mark.asyncio
+async def test_build_stall_alert_refires_after_build_phase_restarts(db_session):
+    """When the version re-enters build later (phase_changed_at re-stamped to a
+    new reference), the dedup resets and a fresh stall can alert again."""
+    from datetime import timedelta
+
+    from app.models import Alert as _Alert
+
+    project, version = await _make_project_and_version(db_session, phase="build")
+    version.opened_at = rq._utcnow() - timedelta(days=rq._BUILD_STALL_AGE_DAYS + 16)
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    first = await rq._check_version_build_stall(db_session, version)
+    await db_session.commit()
+    assert first is True
+
+    # Simulate a build → stabilize → build round-trip: phase_changed_at is
+    # re-stamped to a newer (but still stalled) reference time.
+    version.phase_changed_at = rq._utcnow() - timedelta(
+        days=rq._BUILD_STALL_AGE_DAYS + 1
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    second = await rq._check_version_build_stall(db_session, version)
+    await db_session.commit()
+    assert second is True
+
+    alerts = (
+        (
+            await db_session.execute(
+                select(_Alert).where(_Alert.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 2
+
+
+@pytest.mark.asyncio
+async def test_sweep_triggers_build_stall_check(db_session):
+    """The sweep runs the build-stall check — an open build version old enough
+    to be stalled gets an alert."""
+    from datetime import timedelta
+
+    from app.models import Alert as _Alert
+
+    project, version = await _make_project_and_version(db_session, phase="build")
+    version.opened_at = rq._utcnow() - timedelta(days=rq._BUILD_STALL_AGE_DAYS + 6)
+    db_session.add(version)
+    await db_session.commit()
+
+    await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    alerts = (
+        (
+            await db_session.execute(
+                select(_Alert).where(_Alert.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+    assert "build phase" in alerts[0].title
+
+
 class TestFormatQualificationForApi:
     """format_qualification_for_api returns a normalized, operator-facing dict."""
 
@@ -5845,3 +6082,363 @@ class TestFormatQualificationForApi:
         assert out["blocker"] == "ci_not_green"
         assert out["started_at"] == "2026-05-21T10:00:00"
         assert out["finalized_at"] == "2026-05-21T10:30:00"
+
+
+# ===========================================================================
+# QualificationVerdict recording — the durable per-verdict history (Phase 4)
+# ===========================================================================
+
+
+async def _ensure_verdict_table(db_session):
+    """Create the ``qualificationverdict`` table on the test DB if absent.
+
+    The Alembic migration for this table is authored by a sibling task and is
+    not yet applied, so on the Postgres CI engine (whose schema is built from
+    migrations) the table does not exist.  Create it idempotently so the
+    verdict-history and readiness tests have a real table to exercise; on SQLite
+    the per-test ``create_all`` already built it and ``checkfirst`` makes this a
+    no-op there (and once the real migration lands).
+    """
+    from app.models import QualificationVerdict as _QV
+
+    conn = await db_session.connection()
+    await conn.run_sync(lambda c: _QV.__table__.create(c, checkfirst=True))
+    await db_session.commit()
+
+
+async def _verdict_rows(db_session, project_id):
+    """Return all QualificationVerdict rows for a project, oldest-first."""
+    rows = (
+        (
+            await db_session.execute(
+                select(QualificationVerdict)
+                .where(QualificationVerdict.project_id == project_id)
+                .order_by(QualificationVerdict.created_at.asc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return list(rows)
+
+
+@pytest.mark.asyncio
+async def test_finalize_dry_run_records_verdict_row(db_session, mocker):
+    """A dry-run finalize appends ONE immutable verdict-history row capturing
+    the would-promote outcome, confidence, sub-scores and the promotion_enabled
+    state at the time — additive history alongside last_qualification."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session)
+    await _ensure_verdict_table(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 5,
+                "test_count_delta": 2,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    assert result["status"] == "dry_run"
+
+    rows = await _verdict_rows(db_session, project.id)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.terminal_status == "dry_run"
+    assert row.would_promote is True
+    assert row.promotion_enabled is False
+    assert row.release_version_id == version.id
+    assert row.confidence == pytest.approx(1.0)
+    assert row.blocker is None
+    assert row.sub_scores is not None and "audit" in row.sub_scores
+
+
+@pytest.mark.asyncio
+async def test_finalize_not_promoted_records_blocker_verdict_row(db_session):
+    """A blocked (not-promoted) finalize records a would_promote=False verdict
+    row carrying the hard-blocker code."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session)
+    await _ensure_verdict_table(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": ["testing/test_deleted.py"],
+                "assertion_delta": 0,
+                "test_count_delta": -3,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    assert result["status"] == "not_promoted"
+
+    rows = await _verdict_rows(db_session, project.id)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.terminal_status == "not_promoted"
+    assert row.would_promote is False
+    assert row.blocker == "test_file_deleted"
+
+
+@pytest.mark.asyncio
+async def test_verdict_recording_failure_does_not_propagate(db_session, mocker):
+    """Recording is best-effort: a failure constructing/staging the verdict row
+    must NEVER break or roll back the qualification — the dry-run still finalizes
+    and last_qualification is written, just with no history row."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session)
+    await _ensure_verdict_table(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 5,
+                "test_count_delta": 2,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    # Make the verdict-row construction blow up — recording must swallow it.
+    mocker.patch(
+        "app.release_qualifier.QualificationVerdict",
+        side_effect=RuntimeError("boom — cannot build verdict row"),
+    )
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    # The qualification itself is unaffected: it still reports dry_run and
+    # last_qualification persists.
+    assert result["status"] == "dry_run"
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "dry_run"
+    assert version.status == "open"
+
+    # ...but no history row was written (recording failed and was swallowed).
+    rows = await _verdict_rows(db_session, project.id)
+    assert rows == []
+
+
+# ===========================================================================
+# compute_promotion_readiness — the calibration aggregation (Phase 4)
+# ===========================================================================
+
+
+async def _seed_verdict(
+    db_session,
+    project_id,
+    version_id,
+    *,
+    seq: int,
+    would_promote: bool,
+    blocker: str | None = None,
+    confidence: float = 0.95,
+    promotion_enabled: bool = False,
+):
+    """Insert ONE QualificationVerdict row with a deterministic created_at.
+
+    ``seq`` orders rows in time (higher seq = more recent) so the newest-first
+    consecutive-clean-streak walk in compute_promotion_readiness is
+    deterministic regardless of insert timing.
+    """
+    from datetime import timedelta
+
+    from app.time_utils import _utcnow
+
+    row = QualificationVerdict(
+        project_id=project_id,
+        release_version_id=version_id,
+        candidate_sha="ab" * 20,
+        confidence=confidence,
+        sub_scores={"audit": 1.0, "test_erosion": 1.0, "smoketest": 0.9},
+        blocker=blocker,
+        would_promote=would_promote,
+        promotion_enabled=promotion_enabled,
+        terminal_status="dry_run" if would_promote else "not_promoted",
+        threshold=0.9,
+        created_at=_utcnow() + timedelta(minutes=seq),
+    )
+    db_session.add(row)
+    await db_session.commit()
+    return row
+
+
+@pytest.mark.asyncio
+async def test_readiness_empty_history_not_ready(db_session):
+    """No verdict history → not ready, with an explanatory reason."""
+    project, version = await _make_project_and_version(db_session)
+    await _ensure_verdict_table(db_session)
+
+    out = await rq.compute_promotion_readiness(db_session, project.id)
+
+    assert out["ready"] is False
+    assert out["verdicts_evaluated"] == 0
+    assert "nothing to evaluate" in out["reason"]
+    assert out["confidence"]["mean"] is None
+
+
+@pytest.mark.asyncio
+async def test_readiness_insufficient_dry_runs_not_ready(db_session):
+    """Fewer than the minimum evaluated verdicts → not ready even when every
+    one would have promoted."""
+    project, version = await _make_project_and_version(db_session)
+    await _ensure_verdict_table(db_session)
+    # Two clean would-promote verdicts — below _READINESS_MIN_VERDICTS (5).
+    for i in range(2):
+        await _seed_verdict(
+            db_session, project.id, version.id, seq=i, would_promote=True
+        )
+
+    out = await rq.compute_promotion_readiness(db_session, project.id)
+
+    assert out["ready"] is False
+    assert out["verdicts_evaluated"] == 2
+    assert out["consecutive_clean_passes"] == 2
+    assert "dry-run verdict" in out["reason"]
+
+
+@pytest.mark.asyncio
+async def test_readiness_healthy_streak_ready(db_session):
+    """A long consecutive-clean streak of high-confidence would-promote verdicts
+    above all thresholds → ready."""
+    project, version = await _make_project_and_version(db_session)
+    await _ensure_verdict_table(db_session)
+    # Six clean, high-confidence, low-variance would-promote verdicts.
+    confidences = [0.95, 0.96, 0.94, 0.97, 0.95, 0.96]
+    for i, conf in enumerate(confidences):
+        await _seed_verdict(
+            db_session,
+            project.id,
+            version.id,
+            seq=i,
+            would_promote=True,
+            confidence=conf,
+        )
+
+    out = await rq.compute_promotion_readiness(db_session, project.id)
+
+    assert out["ready"] is True, out["reason"]
+    assert out["verdicts_evaluated"] == 6
+    assert out["would_promote_count"] == 6
+    assert out["would_promote_rate"] == pytest.approx(1.0)
+    assert out["consecutive_clean_passes"] == 6
+    assert out["recurring_blockers"] == {}
+    assert out["confidence"]["stable"] is True
+
+
+@pytest.mark.asyncio
+async def test_readiness_recurring_blocker_not_ready(db_session):
+    """A recurring hard blocker in the history blocks readiness even when the
+    most-recent streak, evaluated count and would-promote rate all clear their
+    thresholds."""
+    project, version = await _make_project_and_version(db_session)
+    await _ensure_verdict_table(db_session)
+    # Two older not-promoted verdicts on the SAME blocker (recurring), then a
+    # run of eight recent clean would-promote passes.  evaluated=10,
+    # streak=8, rate=0.80 (boundary, passes) — only the recurring blocker fails.
+    await _seed_verdict(
+        db_session,
+        project.id,
+        version.id,
+        seq=0,
+        would_promote=False,
+        blocker="audit_missing",
+        confidence=0.4,
+    )
+    await _seed_verdict(
+        db_session,
+        project.id,
+        version.id,
+        seq=1,
+        would_promote=False,
+        blocker="audit_missing",
+        confidence=0.4,
+    )
+    for i in range(8):
+        await _seed_verdict(
+            db_session,
+            project.id,
+            version.id,
+            seq=2 + i,
+            would_promote=True,
+            confidence=0.95,
+        )
+
+    out = await rq.compute_promotion_readiness(db_session, project.id)
+
+    assert out["ready"] is False
+    assert out["verdicts_evaluated"] == 10
+    assert out["consecutive_clean_passes"] == 8
+    assert out["would_promote_rate"] == pytest.approx(0.8)
+    assert out["recurring_blockers"] == {"audit_missing": 2}
+    assert "recurring hard blocker" in out["reason"]
+
+
+@pytest.mark.asyncio
+async def test_readiness_excludes_promotion_enabled_verdicts(db_session):
+    """Verdicts recorded after promotion was enabled are post-decision and must
+    NOT count toward the dry-run readiness evidence."""
+    project, version = await _make_project_and_version(db_session)
+    await _ensure_verdict_table(db_session)
+    # Five clean dry-run-regime verdicts (would qualify as ready)...
+    for i in range(5):
+        await _seed_verdict(
+            db_session, project.id, version.id, seq=i, would_promote=True
+        )
+    # ...plus a promotion-enabled verdict that must be ignored.
+    await _seed_verdict(
+        db_session,
+        project.id,
+        version.id,
+        seq=99,
+        would_promote=True,
+        promotion_enabled=True,
+    )
+
+    out = await rq.compute_promotion_readiness(db_session, project.id)
+
+    assert out["verdicts_evaluated"] == 5
+    assert out["ready"] is True, out["reason"]

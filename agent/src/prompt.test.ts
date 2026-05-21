@@ -4897,3 +4897,64 @@ describe('writeCodeChangeHelpers — thinning categories gate', () => {
     expect(doneScript).toContain('file:line anchor');
   });
 });
+
+// ── writeCodeChangeHelpers — shell injection validation ───────────────────────
+describe('writeCodeChangeHelpers — shell injection validation', () => {
+  const validCfg = {
+    taskId: 'task-abc123',
+    workBranch: 'blueprint/task-abc123',
+    baseBranch: 'main',
+    owner: 'acme-org',
+    repo: 'my-repo',
+    testsOnMainBranch: false,
+  };
+
+  beforeEach(() => {
+    vi.mocked(fs.writeFileSync).mockImplementation(() => {});
+  });
+
+  it('accepts valid cfg fields without throwing', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    expect(() => { writeCodeChangeHelpers(validCfg); }).not.toThrow();
+  });
+
+  it('rejects taskId with shell metacharacters', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    expect(() => { writeCodeChangeHelpers({ ...validCfg, taskId: 'task;rm -rf /' }); }).toThrow(/taskId/);
+  });
+
+  it('rejects taskId with dollar sign', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    expect(() => { writeCodeChangeHelpers({ ...validCfg, taskId: 'task$VAR' }); }).toThrow(/taskId/);
+  });
+
+  it('rejects workBranch with shell metacharacters', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    expect(() => { writeCodeChangeHelpers({ ...validCfg, workBranch: 'branch`whoami`' }); }).toThrow(/workBranch/);
+  });
+
+  it('rejects baseBranch with newline', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    expect(() => { writeCodeChangeHelpers({ ...validCfg, baseBranch: 'main\nevil' }); }).toThrow(/baseBranch/);
+  });
+
+  it('rejects owner with shell metacharacters', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    expect(() => { writeCodeChangeHelpers({ ...validCfg, owner: 'owner$(id)' }); }).toThrow(/owner/);
+  });
+
+  it('rejects repo with shell metacharacters', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    expect(() => { writeCodeChangeHelpers({ ...validCfg, repo: 'repo&&evil' }); }).toThrow(/repo/);
+  });
+
+  it('accepts branch names with slashes and dots', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    expect(() => { writeCodeChangeHelpers({ ...validCfg, workBranch: 'feat/my-feature.v2', baseBranch: 'release/1.0' }); }).not.toThrow();
+  });
+
+  it('accepts owner/repo with dots and hyphens', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    expect(() => { writeCodeChangeHelpers({ ...validCfg, owner: 'my.org-123', repo: 'my-repo.v2' }); }).not.toThrow();
+  });
+});

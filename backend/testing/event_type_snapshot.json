@@ -132,6 +132,11 @@
       "source_fn": "post_version_calcification_message"
     },
     {
+      "name": "release_build_stalled",
+      "classification": "high_signal",
+      "source_fn": "post_version_build_stalled_message"
+    },
+    {
       "name": "direction_burn_pause",
       "classification": "escalation",
       "message_type": "BLOCKER",

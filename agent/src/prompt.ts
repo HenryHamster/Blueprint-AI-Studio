@@ -528,6 +528,7 @@ export function writeCodeChangeHelpers(cfg: CodeChangeHelperConfig): void {
 }
 
 function writeCheckHelper(cfg: CodeChangeHelperConfig): void {
+  validateCfgShellSafety(cfg);
   // Auto-detects which stacks were touched (admin-ui / agent / backend) by
   // inspecting `git diff --name-only` against the base branch + uncommitted.
   // Runs the corresponding lint/build commands plus the admin-ui browser-mode
@@ -881,7 +882,30 @@ function loadSrSectionScriptB64(): string {
   }
 }
 
+const BRANCH_RE = /^[A-Za-z0-9._/-]+$/;
+const OWNER_REPO_RE = /^[A-Za-z0-9._-]+$/;
+const TASK_ID_RE = /^[A-Za-z0-9-]+$/;
+
+function validateCfgShellSafety(cfg: CodeChangeHelperConfig): void {
+  if (!TASK_ID_RE.test(cfg.taskId)) {
+    throw new Error(`taskId contains unsafe characters for shell interpolation: ${cfg.taskId}`);
+  }
+  if (!BRANCH_RE.test(cfg.workBranch)) {
+    throw new Error(`workBranch contains unsafe characters for shell interpolation: ${cfg.workBranch}`);
+  }
+  if (!BRANCH_RE.test(cfg.baseBranch)) {
+    throw new Error(`baseBranch contains unsafe characters for shell interpolation: ${cfg.baseBranch}`);
+  }
+  if (!OWNER_REPO_RE.test(cfg.owner)) {
+    throw new Error(`owner contains unsafe characters for shell interpolation: ${cfg.owner}`);
+  }
+  if (!OWNER_REPO_RE.test(cfg.repo)) {
+    throw new Error(`repo contains unsafe characters for shell interpolation: ${cfg.repo}`);
+  }
+}
+
 function writePrHelper(cfg: CodeChangeHelperConfig): void {
+  validateCfgShellSafety(cfg);
   // Idempotent push + PR creation/update. Gates on ./check first.
   // Writes /tmp/pr_url_<task_id> on success so the wrapper + ./done can
   // pick up the URL without re-querying GitHub.
@@ -1269,6 +1293,7 @@ echo "[pr] Next: ./done   (or call ./pr again if you push more commits)"
 }
 
 function writeDoneHelper(cfg: CodeChangeHelperConfig): void {
+  validateCfgShellSafety(cfg);
   // Posts COMPLETED to the orchestrator with the PR URL from /tmp/pr_url_<task_id>.
   // Also writes /tmp/done_<task_id> as a marker for the wrapper to detect on
   // exit and skip its fallback push.
@@ -1568,6 +1593,7 @@ echo "[done] OK — wrapper will exit cleanly. PR: $PR_URL"
 }
 
 function writeFailHelper(cfg: CodeChangeHelperConfig): void {
+  validateCfgShellSafety(cfg);
   // Explicit failure signal — Claude calls this when it determines the task
   // can't be completed (e.g. scope is wrong, blocker found, conflicting
   // requirements). Posts FAILED with the reason. Wrapper sees the marker
@@ -1624,6 +1650,7 @@ echo "[fail] Posted FAILED status. Reason: $REASON"
 }
 
 function writeBlockedHelper(cfg: CodeChangeHelperConfig): void {
+  validateCfgShellSafety(cfg);
   // Explicit precondition-blocked signal — Claude calls this when a real
   // code change has been made and ./check still fails identically (or the
   // failure is at the toolchain/system-library layer, where no code edit

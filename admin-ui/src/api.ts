@@ -745,9 +745,32 @@ export interface RecentVersion {
   last_qualification: VersionQualification | null;
 }
 
+export interface PromotionReadinessConfidence {
+  mean: number;
+  stdev: number;
+  min: number;
+  max: number;
+  stable: boolean;
+}
+
+export interface PromotionReadiness {
+  ready: boolean;
+  reason: string;
+  verdicts_evaluated: number;
+  would_promote_count: number;
+  would_promote_rate: number;
+  consecutive_clean_passes: number;
+  confidence: PromotionReadinessConfidence;
+  recurring_blockers: Record<string, number>;
+  blocker_counts: Record<string, number>;
+  thresholds: Record<string, number>;
+}
+
 export interface VersionLifecycleResponse {
   current_version: CurrentVersion | null;
   recent_versions: RecentVersion[];
+  promotion_enabled?: boolean;
+  promotion_readiness?: PromotionReadiness | null;
 }
 
 export async function fetchVersionLifecycle(projectId: string): Promise<VersionLifecycleResponse> {

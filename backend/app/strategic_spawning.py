@@ -1567,6 +1567,46 @@ async def _spawn_strategic_review(
         prompt_suffix = (
             f"{prompt_suffix}\n{_stabilize_hint}" if prompt_suffix else _stabilize_hint
         )
+    # Build-stall directive — when the open version is in build and has stalled
+    # past the same threshold the qualifier backstop uses, explicitly tell the
+    # strategic agent the version has been building for N days / M merged tasks
+    # without advancing and should consider stabilizing it.  build→stabilize is
+    # agent-driven with no cadence, so this nudge is the only thing prompting
+    # the agent to move a parked version forward.  Best-effort — never block the
+    # payload build.
+    elif _open_version is not None and _open_version.phase == "build":
+        try:
+            from app.release_qualifier import _is_build_stalled
+
+            _build_ref = _open_version.phase_changed_at or _open_version.opened_at
+            _build_age_days = max(0, (_utcnow() - _build_ref).days) if _build_ref else 0
+            _build_merged = (
+                _version_phase_block.get("tasks_merged_this_version", 0)
+                if _version_phase_block
+                else 0
+            )
+            if _is_build_stalled(_build_age_days, _build_merged):
+                _build_stall_hint = (
+                    f"Version phase: BUILD — STALLED. v{_open_version.version_number} "
+                    f"has been in the build phase for {_build_age_days} day(s) with "
+                    f"{_build_merged} merged task(s) without advancing to stabilize. "
+                    f"build→stabilize is agent-driven and has no automatic cadence — "
+                    f"consider emitting a version_phase_decision to move it to "
+                    f"'stabilize' so it can progress toward qualification and "
+                    f"promotion."
+                )
+                prompt_suffix = (
+                    f"{prompt_suffix}\n{_build_stall_hint}"
+                    if prompt_suffix
+                    else _build_stall_hint
+                )
+                if _version_phase_block is not None:
+                    _version_phase_block["build_stall"] = {
+                        "age_days": _build_age_days,
+                        "tasks_merged": _build_merged,
+                    }
+        except Exception:
+            logger.exception("[STRATEGIC] build-stall hint build failed; continuing")
     # Inject explicit list of failed approaches from retired directions so the
     # agent has a clear "do not re-propose" block in the prompt.
     _retired_summary = _build_retired_directions_summary(project)
