@@ -2766,6 +2766,28 @@ async def claim_task(
                     sev_cal = data.get("severity_calibration")
                     if isinstance(sev_cal, dict):
                         entry["severity_calibration"] = sev_cal
+                    quadrant = data.get("precision_recall_quadrant")
+                    if isinstance(quadrant, str) and quadrant:
+                        entry["precision_recall_quadrant"] = quadrant
+                    p_delta = data.get("precision_delta")
+                    if isinstance(p_delta, (int, float)):
+                        entry["precision_delta"] = p_delta
+                    r_delta = data.get("recall_delta")
+                    if isinstance(r_delta, (int, float)):
+                        entry["recall_delta"] = r_delta
+                    # Regression signals consumed by the agent-side
+                    # failure-mode hint (self-review.ts:formatFailureModeHintForSrPrompt):
+                    # it renders only when below_floor/trend marks the category
+                    # regressing AND miss_mode_breakdown carries a dominant_mode.
+                    trend = data.get("trend")
+                    if isinstance(trend, str) and trend:
+                        entry["trend"] = trend
+                    below_floor = data.get("below_floor")
+                    if isinstance(below_floor, bool):
+                        entry["below_floor"] = below_floor
+                    miss_mode_breakdown = data.get("miss_mode_breakdown")
+                    if isinstance(miss_mode_breakdown, dict):
+                        entry["miss_mode_breakdown"] = miss_mode_breakdown
                     return entry
 
                 cats = {

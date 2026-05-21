@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { formatSrBlindSpotThemesForSrPrompt, formatExecutionEvidenceForSrPrompt, formatSrRecentMissExamplesForSrPrompt, formatPersistentBlindSpotHintForSrPrompt, formatHighFpRateLoosenHintForSrPrompt, formatSrCoFailurePairsForSrPrompt, formatSeverityCalibrationHintForSrPrompt } from './self-review.js';
+import { formatSrBlindSpotThemesForSrPrompt, formatExecutionEvidenceForSrPrompt, formatSrRecentMissExamplesForSrPrompt, formatPersistentBlindSpotHintForSrPrompt, formatHighFpRateLoosenHintForSrPrompt, formatSrCoFailurePairsForSrPrompt, formatSeverityCalibrationHintForSrPrompt, formatFailureModeHintForSrPrompt, formatPrecisionRecallQuadrantHintForSrPrompt } from './self-review.js';
 
 describe('formatHighFpRateLoosenHintForSrPrompt', () => {
   it('returns empty string for null, undefined, and empty object', () => {
@@ -70,6 +70,108 @@ describe('formatHighFpRateLoosenHintForSrPrompt', () => {
     });
     expect(result).toContain('concrete');
     expect(result).toContain('evidence');
+  });
+});
+
+describe('formatPrecisionRecallQuadrantHintForSrPrompt', () => {
+  it('returns empty string for null, undefined, and empty object', () => {
+    expect(formatPrecisionRecallQuadrantHintForSrPrompt(null)).toBe('');
+    expect(formatPrecisionRecallQuadrantHintForSrPrompt(undefined)).toBe('');
+    expect(formatPrecisionRecallQuadrantHintForSrPrompt({})).toBe('');
+  });
+
+  it('returns empty string when no categories have a quadrant field', () => {
+    expect(
+      formatPrecisionRecallQuadrantHintForSrPrompt({
+        correctness: { precision_delta: 0.1, recall_delta: -0.1 },
+      }),
+    ).toBe('');
+  });
+
+  it('excludes healthy, flat, and mixed quadrants', () => {
+    const result = formatPrecisionRecallQuadrantHintForSrPrompt({
+      a: { precision_recall_quadrant: 'healthy', precision_delta: 0.1, recall_delta: 0.1 },
+      b: { precision_recall_quadrant: 'flat', precision_delta: 0.0, recall_delta: 0.0 },
+      c: { precision_recall_quadrant: 'mixed', precision_delta: 0.1, recall_delta: 0.0 },
+    });
+    expect(result).toBe('');
+  });
+
+  it('emits conservative_shift guidance with "lean toward flagging"', () => {
+    const result = formatPrecisionRecallQuadrantHintForSrPrompt({
+      correctness: { precision_recall_quadrant: 'conservative_shift', precision_delta: 0.02, recall_delta: -0.15 },
+    });
+    expect(result).toContain('## Precision/recall directional calibration');
+    expect(result).toContain('correctness');
+    expect(result).toContain('precision held, recall down');
+    expect(result).toContain('15pp');
+    expect(result).toContain('lean toward flagging');
+    expect(result).toContain('under-flagging');
+  });
+
+  it('emits noisy_shift guidance with "stronger, concrete evidence"', () => {
+    const result = formatPrecisionRecallQuadrantHintForSrPrompt({
+      'scope-drift': { precision_recall_quadrant: 'noisy_shift', precision_delta: -0.20, recall_delta: 0.03 },
+    });
+    expect(result).toContain('scope-drift');
+    expect(result).toContain('recall held, precision down');
+    expect(result).toContain('20pp');
+    expect(result).toContain('concrete evidence');
+    expect(result).toContain('not being confirmed');
+  });
+
+  it('emits both_declining guidance to recalibrate from scratch', () => {
+    const result = formatPrecisionRecallQuadrantHintForSrPrompt({
+      security: { precision_recall_quadrant: 'both_declining', precision_delta: -0.12, recall_delta: -0.18 },
+    });
+    expect(result).toContain('security');
+    expect(result).toContain('both precision and recall down');
+    expect(result).toContain('12pp');
+    expect(result).toContain('18pp');
+    expect(result).toContain('Recalibrate from scratch');
+  });
+
+  it('surfaces both deltas in pp format', () => {
+    const result = formatPrecisionRecallQuadrantHintForSrPrompt({
+      correctness: { precision_recall_quadrant: 'conservative_shift', precision_delta: 0.05, recall_delta: -0.22 },
+    });
+    expect(result).toContain('Δprecision');
+    expect(result).toContain('Δrecall');
+    expect(result).toContain('22pp');
+    expect(result).toContain('5pp');
+  });
+
+  it('omits categories whose quadrant field is missing while including those that match', () => {
+    const result = formatPrecisionRecallQuadrantHintForSrPrompt({
+      correctness: { precision_recall_quadrant: 'conservative_shift', precision_delta: 0.01, recall_delta: -0.20 },
+      'no-quadrant': { precision_delta: 0.5, recall_delta: -0.5 },
+      healthy: { precision_recall_quadrant: 'healthy', precision_delta: 0.10, recall_delta: 0.10 },
+    });
+    expect(result).toContain('correctness');
+    expect(result).not.toContain('no-quadrant');
+    expect(result).not.toContain('healthy:');
+  });
+
+  it('ranks rows by max(|precision_delta|, |recall_delta|) descending and caps at 5', () => {
+    const cats: Record<string, { precision_recall_quadrant?: string; precision_delta?: number; recall_delta?: number }> = {};
+    // 6 categories — top one is `big` with recall_delta=-0.50
+    for (let i = 0; i < 6; i++) {
+      cats[`cat${i}`] = { precision_recall_quadrant: 'conservative_shift', precision_delta: 0.01, recall_delta: -(0.05 + i * 0.01) };
+    }
+    cats['big'] = { precision_recall_quadrant: 'conservative_shift', precision_delta: 0.01, recall_delta: -0.50 };
+    const result = formatPrecisionRecallQuadrantHintForSrPrompt(cats);
+    expect(result).toContain('big');
+    expect(result).toContain('50pp');
+    // Exactly 5 bullet rows (lines starting with '- **')
+    const rowLines = result.split('\n').filter(l => l.startsWith('- **'));
+    expect(rowLines.length).toBe(5);
+  });
+
+  it('ends with double newline when populated', () => {
+    const result = formatPrecisionRecallQuadrantHintForSrPrompt({
+      correctness: { precision_recall_quadrant: 'conservative_shift', precision_delta: 0.02, recall_delta: -0.15 },
+    });
+    expect(result.endsWith('\n\n')).toBe(true);
   });
 });
 
@@ -523,5 +625,68 @@ describe('formatSeverityCalibrationHintForSrPrompt', () => {
       },
     });
     expect(result).toContain('MINOR');
+  });
+});
+
+describe('formatFailureModeHintForSrPrompt', () => {
+  it('returns empty string for null, undefined, and empty object', () => {
+    expect(formatFailureModeHintForSrPrompt(null)).toBe('');
+    expect(formatFailureModeHintForSrPrompt(undefined)).toBe('');
+    expect(formatFailureModeHintForSrPrompt({})).toBe('');
+  });
+
+  it('returns empty string when no categories are regressing', () => {
+    const result = formatFailureModeHintForSrPrompt({
+      correctness: { trend: 'stable', below_floor: false, miss_mode_breakdown: { reading_gap: 3, judgment_gap: 0, coverage_gap: 0, dominant_mode: 'reading_gap' } },
+    });
+    expect(result).toBe('');
+  });
+
+  it('returns empty string when regressing category has no miss_mode_breakdown', () => {
+    const result = formatFailureModeHintForSrPrompt({
+      correctness: { trend: 'decreasing' },
+    });
+    expect(result).toBe('');
+  });
+
+  it('surfaces reading_gap hint for below_floor category', () => {
+    const result = formatFailureModeHintForSrPrompt({
+      correctness: { below_floor: true, miss_mode_breakdown: { reading_gap: 5, judgment_gap: 1, coverage_gap: 0, dominant_mode: 'reading_gap' } },
+    });
+    expect(result).toContain('correctness');
+    expect(result).toContain('reading_gap');
+    expect(result).toContain('re-read all changed files');
+  });
+
+  it('surfaces judgment_gap hint for decreasing trend category', () => {
+    const result = formatFailureModeHintForSrPrompt({
+      security: { trend: 'decreasing', miss_mode_breakdown: { reading_gap: 0, judgment_gap: 4, coverage_gap: 1, dominant_mode: 'judgment_gap' } },
+    });
+    expect(result).toContain('security');
+    expect(result).toContain('judgment_gap');
+    expect(result).toContain('calibration');
+  });
+
+  it('surfaces coverage_gap hint when dominant mode is coverage_gap', () => {
+    const result = formatFailureModeHintForSrPrompt({
+      'test-coverage': { below_floor: true, miss_mode_breakdown: { reading_gap: 0, judgment_gap: 0, coverage_gap: 3, dominant_mode: 'coverage_gap' } },
+    });
+    expect(result).toContain('test-coverage');
+    expect(result).toContain('coverage_gap');
+    expect(result).toContain('score this category');
+  });
+
+  it('skips categories with null dominant_mode', () => {
+    const result = formatFailureModeHintForSrPrompt({
+      correctness: { below_floor: true, miss_mode_breakdown: { reading_gap: 0, judgment_gap: 0, coverage_gap: 0, dominant_mode: null } },
+    });
+    expect(result).toBe('');
+  });
+
+  it('ends with double newline when populated', () => {
+    const result = formatFailureModeHintForSrPrompt({
+      correctness: { below_floor: true, miss_mode_breakdown: { reading_gap: 3, judgment_gap: 0, coverage_gap: 0, dominant_mode: 'reading_gap' } },
+    });
+    expect(result.endsWith('\n\n')).toBe(true);
   });
 });

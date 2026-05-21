@@ -374,3 +374,85 @@ describe('formatSrCatchRateForSrPrompt', () => {
     expect(formatSrCatchRateForSrPrompt({ self_review_catch_rate: null })).toBe('');
   });
 });
+
+describe('formatProjectContext — Failure-Mode Hints', () => {
+  it('renders failure-mode hints when a regressing category has miss_mode_breakdown', () => {
+    const ctx = {
+      self_review_catch_rate: {
+        categories: {
+          correctness: {
+            miss_rate: 0.4,
+            trend: 'decreasing',
+            miss_mode_breakdown: {
+              reading_gap: 8,
+              judgment_gap: 2,
+              coverage_gap: 1,
+              dominant_mode: 'reading_gap',
+            },
+          },
+        },
+      },
+    };
+    const result = formatProjectContext(ctx, 'create');
+    expect(result).toContain('Failure-mode hints for regressing categories');
+    expect(result).toContain('correctness');
+    expect(result).toContain('reading_gap');
+    expect(result).toContain('re-read all changed files before scoring');
+  });
+
+  it('omits the failure-mode section when no category has miss_mode_breakdown', () => {
+    const ctx = {
+      self_review_catch_rate: {
+        categories: {
+          correctness: { miss_rate: 0.4, trend: 'decreasing' },
+        },
+      },
+    };
+    const result = formatProjectContext(ctx, 'create');
+    expect(result).not.toContain('Failure-mode hints for regressing categories');
+  });
+
+  it('omits the failure-mode section when no category is regressing', () => {
+    const ctx = {
+      self_review_catch_rate: {
+        categories: {
+          correctness: {
+            miss_rate: 0.2,
+            miss_mode_breakdown: {
+              reading_gap: 2,
+              judgment_gap: 1,
+              coverage_gap: 0,
+              dominant_mode: 'reading_gap',
+            },
+          },
+        },
+      },
+    };
+    const result = formatProjectContext(ctx, 'create');
+    expect(result).not.toContain('Failure-mode hints for regressing categories');
+  });
+
+  it('places failure-mode hints after blind-spots section', () => {
+    const ctx = {
+      self_review_catch_rate: {
+        categories: {
+          correctness: {
+            miss_rate: 0.4,
+            trend: 'decreasing',
+            miss_mode_breakdown: {
+              reading_gap: 5,
+              judgment_gap: 1,
+              coverage_gap: 0,
+              dominant_mode: 'reading_gap',
+            },
+          },
+        },
+      },
+    };
+    const result = formatProjectContext(ctx, 'create');
+    const blindIdx = result.indexOf('Self-Review Blind Spots');
+    const hintIdx = result.indexOf('Failure-mode hints');
+    expect(blindIdx).toBeGreaterThanOrEqual(0);
+    expect(hintIdx).toBeGreaterThan(blindIdx);
+  });
+});

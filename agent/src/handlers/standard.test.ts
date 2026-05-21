@@ -112,7 +112,7 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports under test ────────────────────────────────────────────────────────
-import { handleCreate, handleRefactor, handleDocs, handleQA, handleDeps, extractSelfReviewJson, needsMigrationGeneration, buildSmallScopeCallerNote, runFreshReviewerPass, SR_SKIP_REASONS, computeRegressionRiskHeuristic, loneCheckerCategoriesForTask } from './standard.js';
+import { handleCreate, handleRefactor, handleDocs, handleQA, handleDeps, extractSelfReviewJson, needsMigrationGeneration, buildSmallScopeCallerNote, runFreshReviewerPass, SR_SKIP_REASONS, computeRegressionRiskHeuristic, loneCheckerCategoriesForTask, pickFreshReviewerEffort } from './standard.js';
 import { setupWorkspace, captureTestBaseline, runClaudeCode } from '../index.js';
 import { extractModuleInterfaces, discoverAffectedConsumers, parseAnalysisPlanFiles, parseAnalysisPlanTestFiles, parseAnalysisPlanVerifyFiles, buildAnalysisPrompt } from '../prompt.js';
 import { runCodeChangeTask } from './code-change.js';
@@ -1393,6 +1393,116 @@ describe('runCodeChangeTask marker detection', () => {
   });
 });
 
+// ── pickFreshReviewerEffort ────────────────────────────────────────────────────
+describe('pickFreshReviewerEffort', () => {
+  it('returns "low" for default case (small diff, no recovery flags, no sensitive files)', () => {
+    const effort = pickFreshReviewerEffort({
+      changedLineCount: 50,
+      changedFiles: ['src/utils.ts', 'src/helpers.ts'],
+    });
+    expect(effort).toBe('low');
+  });
+
+  it('returns "medium" when loneCheckerRecovery is true', () => {
+    const effort = pickFreshReviewerEffort({
+      loneCheckerRecovery: true,
+      changedLineCount: 50,
+      changedFiles: ['src/utils.ts'],
+    });
+    expect(effort).toBe('medium');
+  });
+
+  it('returns "medium" when incompleteSrRecovery is true', () => {
+    const effort = pickFreshReviewerEffort({
+      incompleteSrRecovery: true,
+      changedLineCount: 50,
+      changedFiles: ['src/utils.ts'],
+    });
+    expect(effort).toBe('medium');
+  });
+
+  it('returns "medium" when changedLineCount exceeds threshold', () => {
+    const effort = pickFreshReviewerEffort({
+      changedLineCount: 301,
+      changedFiles: ['src/utils.ts'],
+    });
+    expect(effort).toBe('medium');
+  });
+
+  it('returns "low" when changedLineCount equals threshold', () => {
+    const effort = pickFreshReviewerEffort({
+      changedLineCount: 300,
+      changedFiles: ['src/utils.ts'],
+    });
+    expect(effort).toBe('low');
+  });
+
+  it('returns "low" when changedLineCount is just below threshold', () => {
+    const effort = pickFreshReviewerEffort({
+      changedLineCount: 299,
+      changedFiles: ['src/utils.ts'],
+    });
+    expect(effort).toBe('low');
+  });
+
+  it('returns "medium" when a sensitive auth file is touched', () => {
+    const effort = pickFreshReviewerEffort({
+      changedLineCount: 50,
+      changedFiles: ['backend/app/auth.py', 'src/helpers.ts'],
+    });
+    expect(effort).toBe('medium');
+  });
+
+  it('returns "medium" when a sensitive security file is touched', () => {
+    const effort = pickFreshReviewerEffort({
+      changedLineCount: 50,
+      changedFiles: ['backend/app/security_utils.py', 'src/helpers.ts'],
+    });
+    expect(effort).toBe('medium');
+  });
+
+  it('returns "medium" when the agent router file is touched', () => {
+    const effort = pickFreshReviewerEffort({
+      changedLineCount: 50,
+      changedFiles: ['backend/app/routers/agent.py', 'src/helpers.ts'],
+    });
+    expect(effort).toBe('medium');
+  });
+
+  it('returns "medium" when jwt_revocation file is touched', () => {
+    const effort = pickFreshReviewerEffort({
+      changedLineCount: 50,
+      changedFiles: ['backend/app/jwt_revocation.py', 'src/helpers.ts'],
+    });
+    expect(effort).toBe('medium');
+  });
+
+  it('returns "low" when non-sensitive backend files are touched', () => {
+    const effort = pickFreshReviewerEffort({
+      changedLineCount: 50,
+      changedFiles: ['backend/app/models.py', 'backend/app/schemas.py'],
+    });
+    expect(effort).toBe('low');
+  });
+
+  it('returns "medium" when multiple risk signals fire (large diff + sensitive file)', () => {
+    const effort = pickFreshReviewerEffort({
+      changedLineCount: 350,
+      changedFiles: ['backend/app/auth.py', 'src/helpers.ts'],
+    });
+    expect(effort).toBe('medium');
+  });
+
+  it('returns "medium" for recovery path even with small diff', () => {
+    const effort = pickFreshReviewerEffort({
+      incompleteSrRecovery: true,
+      changedLineCount: 25,
+      changedFiles: ['src/utils.ts'],
+    });
+    expect(effort).toBe('medium');
+  });
+});
+
 // ── runFreshReviewerPass ──────────────────────────────────────────────────────
 describe('runFreshReviewerPass', () => {
   const BIG_DIFF = Array.from({ length: 25 }, (_, i) => `+line ${i}`).join('\n');
@@ -1579,6 +1689,59 @@ describe('runFreshReviewerPass', () => {
     const prompt = vi.mocked(idx.runClaudeCode).mock.calls.at(-1)?.[0];
     if (typeof prompt !== 'string') throw new Error('expected reviewer prompt');
     expect(prompt).toContain('60% of past flags were not confirmed by review (40% precision; sample size 12) — apply lighter scrutiny unless evidence is concrete.');
+  });
+
+  it('passes "low" effort for small diffs with no recovery flags', async () => {
+    const idx = await import('../index.js');
+    const smallDiff = Array.from({ length: 25 }, (_, i) => `+line ${i}`).join('\n');
+    vi.mocked(idx.git).mockReturnValue(smallDiff);
+    vi.mocked(idx.runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '{"reviewer_findings":[]}' });
+    await runFreshReviewerPass('t9', 'Title', 'Desc', ['src/utils.ts'], null, { value: '' });
+    const effortArg = vi.mocked(idx.runClaudeCode).mock.calls.at(-1)?.[4];
+    expect(effortArg).toBe('low');
+  });
+
+  it('passes "medium" effort when loneCheckerRecovery is true', async () => {
+    const idx = await import('../index.js');
+    vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
+    vi.mocked(idx.runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '{"reviewer_findings":[]}' });
+    await runFreshReviewerPass(
+      't10', 'Title', 'Desc', ['src/utils.ts'], null, { value: '' },
+      undefined, undefined, false, true, // incompleteSrRecovery=false, loneCheckerRecovery=true
+    );
+    const effortArg = vi.mocked(idx.runClaudeCode).mock.calls.at(-1)?.[4];
+    expect(effortArg).toBe('medium');
+  });
+
+  it('passes "medium" effort when incompleteSrRecovery is true', async () => {
+    const idx = await import('../index.js');
+    vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
+    vi.mocked(idx.runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '{"reviewer_findings":[]}' });
+    await runFreshReviewerPass(
+      't11', 'Title', 'Desc', ['src/utils.ts'], null, { value: '' },
+      undefined, undefined, true, // incompleteSrRecovery=true
+    );
+    const effortArg = vi.mocked(idx.runClaudeCode).mock.calls.at(-1)?.[4];
+    expect(effortArg).toBe('medium');
+  });
+
+  it('passes "medium" effort for large diffs (>300 lines)', async () => {
+    const idx = await import('../index.js');
+    const largeDiff = Array.from({ length: 350 }, (_, i) => `+line ${i}`).join('\n');
+    vi.mocked(idx.git).mockReturnValue(largeDiff);
+    vi.mocked(idx.runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '{"reviewer_findings":[]}' });
+    await runFreshReviewerPass('t12', 'Title', 'Desc', ['src/utils.ts'], null, { value: '' });
+    const effortArg = vi.mocked(idx.runClaudeCode).mock.calls.at(-1)?.[4];
+    expect(effortArg).toBe('medium');
+  });
+
+  it('passes "medium" effort when sensitive auth file is touched', async () => {
+    const idx = await import('../index.js');
+    vi.mocked(idx.git).mockReturnValue(BIG_DIFF + '\ndiff --git a/backend/app/auth.py b/backend/app/auth.py\n+sensitive code');
+    vi.mocked(idx.runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '{"reviewer_findings":[]}' });
+    await runFreshReviewerPass('t13', 'Title', 'Desc', ['backend/app/auth.py'], null, { value: '' });
+    const effortArg = vi.mocked(idx.runClaudeCode).mock.calls.at(-1)?.[4];
+    expect(effortArg).toBe('medium');
   });
 });
 
@@ -2173,6 +2336,109 @@ describe('runFreshReviewerPass phantom file ref filtering', () => {
     // Should log: 1 grounded, 2 filtered
     const logs = sendLogMock.mock.calls.map(c => c[1] as string).join('\n');
     expect(logs).toContain('1 grounded finding(s), 2 filtered (phantom file refs)');
+  });
+});
+
+// ── reviewer_findings_filtered persistence ───────────────────────────────────
+describe('runFreshReviewerPass reviewer_findings_filtered', () => {
+  const BIG_DIFF = 'diff --git a/src/app.ts b/src/app.ts\n'
+    + Array.from({ length: 15 }, (_, i) => `+export const appLine${i} = ${i};`).join('\n') + '\n'
+    + 'diff --git a/src/utils.ts b/src/utils.ts\n'
+    + Array.from({ length: 15 }, (_, i) => `+export const utilLine${i} = ${i};`).join('\n') + '\n';
+  let fsModule: typeof import('fs');
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    fsModule = (await import('fs')).default;
+  });
+
+  it('persists reviewer_findings_filtered with correct counts when hallucinations exist', async () => {
+    const idx = await import('../index.js');
+    vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
+    let captured: Record<string, unknown> | null = null;
+    vi.mocked(fsModule.writeFileSync).mockImplementation((_p: unknown, data: unknown) => {
+      captured = JSON.parse(data as string) as Record<string, unknown>;
+    });
+    vi.mocked(idx.runClaudeCode).mockResolvedValue({
+      exitCode: 0, allOutput: '',
+      lastResultText: JSON.stringify({
+        reviewer_findings: [
+          { category: 'correctness', severity: 'HIGH', description: 'Real issue without file path' },
+          { category: 'scope-drift', severity: 'MEDIUM', description: 'Modified backend/models.py which is off-scope' },
+          { category: 'architecture', severity: 'LOW', description: 'Bad pattern in other/config.ts' },
+        ],
+      }),
+    });
+
+    await runFreshReviewerPass('rff-1', 'Title', 'Desc', [], null, { value: '' });
+    const json = captured as unknown as Record<string, unknown>;
+    const rff = json.reviewer_findings_filtered as Record<string, unknown>;
+    expect(rff).toBeDefined();
+    expect(rff.total_reviewer_findings).toBe(3);
+    expect(rff.filtered_count).toBe(2);
+    expect(Array.isArray(rff.sampled_phantom_paths)).toBe(true);
+    const paths = rff.sampled_phantom_paths as string[];
+    // At least one phantom path should be captured from the filtered findings
+    expect(paths.length).toBeGreaterThan(0);
+    expect(paths.some(p => p.includes('backend/models.py') || p.includes('other/config.ts'))).toBe(true);
+  });
+
+  it('persists reviewer_findings_filtered with filtered_count=0 when no hallucinations', async () => {
+    const idx = await import('../index.js');
+    vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
+    let captured: Record<string, unknown> | null = null;
+    vi.mocked(fsModule.writeFileSync).mockImplementation((_p: unknown, data: unknown) => {
+      captured = JSON.parse(data as string) as Record<string, unknown>;
+    });
+    vi.mocked(idx.runClaudeCode).mockResolvedValue({
+      exitCode: 0, allOutput: '',
+      lastResultText: JSON.stringify({
+        reviewer_findings: [
+          { category: 'correctness', severity: 'HIGH', description: 'Off-by-one in loop' },
+          { category: 'test-coverage', severity: 'MEDIUM', description: 'Missing tests for new path' },
+        ],
+      }),
+    });
+
+    await runFreshReviewerPass('rff-2', 'Title', 'Desc', [], null, { value: '' });
+    const json = captured as unknown as Record<string, unknown>;
+    const rff = json.reviewer_findings_filtered as Record<string, unknown>;
+    expect(rff).toBeDefined();
+    expect(rff.total_reviewer_findings).toBe(2);
+    expect(rff.filtered_count).toBe(0);
+    expect((rff.sampled_phantom_paths as string[]).length).toBe(0);
+  });
+
+  it('caps sampled_phantom_paths at 5 entries', async () => {
+    const idx = await import('../index.js');
+    vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
+    let captured: Record<string, unknown> | null = null;
+    vi.mocked(fsModule.writeFileSync).mockImplementation((_p: unknown, data: unknown) => {
+      captured = JSON.parse(data as string) as Record<string, unknown>;
+    });
+    // 7 hallucinated findings each referencing a different phantom file
+    vi.mocked(idx.runClaudeCode).mockResolvedValue({
+      exitCode: 0, allOutput: '',
+      lastResultText: JSON.stringify({
+        reviewer_findings: [
+          { category: 'correctness', severity: 'HIGH', description: 'Issue in phantom/file1.ts' },
+          { category: 'correctness', severity: 'HIGH', description: 'Issue in phantom/file2.ts' },
+          { category: 'correctness', severity: 'HIGH', description: 'Issue in phantom/file3.ts' },
+          { category: 'correctness', severity: 'HIGH', description: 'Issue in phantom/file4.ts' },
+          { category: 'correctness', severity: 'HIGH', description: 'Issue in phantom/file5.ts' },
+          { category: 'correctness', severity: 'HIGH', description: 'Issue in phantom/file6.ts' },
+          { category: 'correctness', severity: 'HIGH', description: 'Issue in phantom/file7.ts' },
+        ],
+      }),
+    });
+
+    await runFreshReviewerPass('rff-3', 'Title', 'Desc', [], null, { value: '' });
+    const json = captured as unknown as Record<string, unknown>;
+    const rff = json.reviewer_findings_filtered as Record<string, unknown>;
+    expect(rff.total_reviewer_findings).toBe(7);
+    expect(rff.filtered_count).toBe(7);
+    const paths = rff.sampled_phantom_paths as string[];
+    expect(paths.length).toBeLessThanOrEqual(5);
   });
 });
 

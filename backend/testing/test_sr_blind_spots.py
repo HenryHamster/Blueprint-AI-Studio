@@ -793,3 +793,119 @@ def test_persistent_hint_fix_task_type_tracked_separately():
     task_types = {c["task_type"] for c in result["categories"]}
     assert "fix" in task_types
     assert "create" not in task_types
+
+
+# ---------------------------------------------------------------------------
+# Unit: _count_reviewer_disagreement_directions — per-origin sub-counters
+# ---------------------------------------------------------------------------
+
+
+def _make_origin_task(project_id, *, origin: str | None, category: str = "correctness"):
+    """Task where the reviewer rescued *category* via a structured origin."""
+    check_results: dict = {}
+    if origin is not None:
+        check_results[category] = {"passed": True, "origin": origin}
+    else:
+        # No check_results entry → coverage gap (agent omitted the category)
+        pass
+    return make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "x"}],
+        context={
+            "_self_review_outcome": {
+                "check_results": check_results,
+                "reviewer_findings": [
+                    {
+                        "category": category,
+                        "severity": "HIGH",
+                        "description": "reviewer caught it",
+                    }
+                ],
+            }
+        },
+    )
+
+
+def test_origin_recovery_incomplete_increments_miss_recovery_incomplete():
+    """origin='reviewer_recovery_after_incomplete_sr' → miss_recovery_incomplete += 1."""
+    from app.sr_blind_spots import _count_reviewer_disagreement_directions
+
+    pid = uuid.uuid4()
+    task = _make_origin_task(
+        pid, origin="reviewer_recovery_after_incomplete_sr", category="correctness"
+    )
+    counts = _count_reviewer_disagreement_directions([task])
+    bucket = counts[("correctness", "create")]
+    assert bucket["miss"] == 1
+    assert bucket["miss_recovery_incomplete"] == 1
+    assert bucket["miss_disagreement"] == 0
+    assert bucket["miss_coverage_gap"] == 0
+
+
+def test_origin_disagreement_increments_miss_disagreement():
+    """origin='reviewer_disagreement' → miss_disagreement += 1."""
+    from app.sr_blind_spots import _count_reviewer_disagreement_directions
+
+    pid = uuid.uuid4()
+    task = _make_origin_task(
+        pid, origin="reviewer_disagreement", category="correctness"
+    )
+    counts = _count_reviewer_disagreement_directions([task])
+    bucket = counts[("correctness", "create")]
+    assert bucket["miss"] == 1
+    assert bucket["miss_disagreement"] == 1
+    assert bucket["miss_recovery_incomplete"] == 0
+    assert bucket["miss_coverage_gap"] == 0
+
+
+def test_origin_absent_entry_increments_miss_coverage_gap():
+    """No check_results entry for the category → miss_coverage_gap += 1."""
+    from app.sr_blind_spots import _count_reviewer_disagreement_directions
+
+    pid = uuid.uuid4()
+    # origin=None → no check_results entry → falls through to coverage_gap
+    task = _make_origin_task(pid, origin=None, category="correctness")
+    counts = _count_reviewer_disagreement_directions([task])
+    bucket = counts[("correctness", "create")]
+    assert bucket["miss"] == 1
+    assert bucket["miss_coverage_gap"] == 1
+    assert bucket["miss_recovery_incomplete"] == 0
+    assert bucket["miss_disagreement"] == 0
+
+
+def test_origin_plain_reviewer_increments_miss_coverage_gap():
+    """origin='reviewer' (pre-breakdown legacy) → miss_coverage_gap += 1."""
+    from app.sr_blind_spots import _count_reviewer_disagreement_directions
+
+    pid = uuid.uuid4()
+    task = _make_origin_task(pid, origin="reviewer", category="scope-drift")
+    counts = _count_reviewer_disagreement_directions([task])
+    bucket = counts[("scope-drift", "create")]
+    assert bucket["miss"] == 1
+    assert bucket["miss_coverage_gap"] == 1
+    assert bucket["miss_recovery_incomplete"] == 0
+    assert bucket["miss_disagreement"] == 0
+
+
+def test_origin_sub_counters_sum_to_aggregate_miss():
+    """miss_recovery_incomplete + miss_disagreement + miss_coverage_gap == miss."""
+    from app.sr_blind_spots import _count_reviewer_disagreement_directions
+
+    pid = uuid.uuid4()
+    tasks = [
+        _make_origin_task(
+            pid, origin="reviewer_recovery_after_incomplete_sr", category="correctness"
+        ),
+        _make_origin_task(pid, origin="reviewer_disagreement", category="correctness"),
+        _make_origin_task(pid, origin=None, category="correctness"),
+    ]
+    counts = _count_reviewer_disagreement_directions(tasks)
+    bucket = counts[("correctness", "create")]
+    assert bucket["miss"] == 3
+    total_sub = (
+        bucket["miss_recovery_incomplete"]
+        + bucket["miss_disagreement"]
+        + bucket["miss_coverage_gap"]
+    )
+    assert total_sub == bucket["miss"]

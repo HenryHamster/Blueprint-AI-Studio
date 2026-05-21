@@ -231,6 +231,75 @@ export function formatHighFpRateLoosenHintForSrPrompt(
   );
 }
 
+// Format a precision/recall directional hint for categories whose
+// precision_recall_quadrant signals a directional miscalibration cycle-over-cycle.
+// Quadrants come from playbook_learning.py:
+//   - conservative_shift: precision held, recall down — agent has become too cautious; lean toward flagging
+//   - noisy_shift: recall held, precision down — agent's flags are not being confirmed; require stronger evidence
+//   - both_declining: both precision and recall down — full recalibration needed
+// Skips healthy/flat/mixed/null. Ranks remaining categories by combined |delta| magnitude
+// (max of |precision_delta|, |recall_delta|), caps to top 5, and bounds the section
+// under ~1500 chars by dropping trailing rows. Returns '' when no categories qualify.
+export function formatPrecisionRecallQuadrantHintForSrPrompt(
+  categories: Record<string, {
+    precision_recall_quadrant?: string;
+    precision_delta?: number;
+    recall_delta?: number;
+  }> | null | undefined,
+): string {
+  if (!categories || typeof categories !== 'object') return '';
+
+  const TARGET_QUADRANTS = new Set(['conservative_shift', 'noisy_shift', 'both_declining']);
+  const MAX_ROWS = 5;
+  const MAX_TOTAL_CHARS = 1500;
+
+  type Row = { cat: string; quadrant: string; pDelta: number; rDelta: number; magnitude: number };
+  const rows: Row[] = [];
+  for (const [cat, data] of Object.entries(categories)) {
+    const q = data.precision_recall_quadrant;
+    if (typeof q !== 'string' || !TARGET_QUADRANTS.has(q)) continue;
+    const pDelta = typeof data.precision_delta === 'number' ? data.precision_delta : 0;
+    const rDelta = typeof data.recall_delta === 'number' ? data.recall_delta : 0;
+    rows.push({ cat, quadrant: q, pDelta, rDelta, magnitude: Math.max(Math.abs(pDelta), Math.abs(rDelta)) });
+  }
+  if (rows.length === 0) return '';
+
+  rows.sort((a, b) => b.magnitude - a.magnitude);
+  const top = rows.slice(0, MAX_ROWS);
+
+  const fmtPp = (delta: number): string => {
+    const pp = Math.round(Math.abs(delta) * 100);
+    return `${pp}pp`;
+  };
+
+  const renderRow = (r: Row): string => {
+    if (r.quadrant === 'conservative_shift') {
+      return `- **${r.cat}** — precision held, recall down ${fmtPp(r.rDelta)} (Δprecision ${(r.pDelta >= 0 ? '+' : '−')}${fmtPp(r.pDelta)}, Δrecall −${fmtPp(r.rDelta)}). You may be under-flagging — review borderline cases and lean toward flagging when in doubt.`;
+    }
+    if (r.quadrant === 'noisy_shift') {
+      return `- **${r.cat}** — recall held, precision down ${fmtPp(r.pDelta)} (Δprecision −${fmtPp(r.pDelta)}, Δrecall ${(r.rDelta >= 0 ? '+' : '−')}${fmtPp(r.rDelta)}). Your past flags are not being confirmed — require stronger, concrete evidence before flagging.`;
+    }
+    // both_declining
+    return `- **${r.cat}** — both precision and recall down (Δprecision −${fmtPp(r.pDelta)}, Δrecall −${fmtPp(r.rDelta)}). Recalibrate from scratch on this category: re-read evidence carefully and reset your flag threshold.`;
+  };
+
+  const header =
+    `## Precision/recall directional calibration\n` +
+    `These categories shifted on the precision/recall plane cycle-over-cycle. Adjust your flagging direction accordingly:\n`;
+
+  const lines: string[] = [];
+  let totalChars = header.length;
+  for (const r of top) {
+    const line = renderRow(r);
+    if (totalChars + line.length + 1 > MAX_TOTAL_CHARS) break;
+    lines.push(line);
+    totalChars += line.length + 1;
+  }
+  if (lines.length === 0) return '';
+
+  return header + lines.join('\n') + '\n\n';
+}
+
 // Format blind-spot themes for injection into the agent's own self-review prompt.
 // Unlike formatProjectBlindSpotSummary (which addresses a reviewer reading the diff),
 // this section is written TO the agent — framing themes as categories it has historically
@@ -267,6 +336,52 @@ export function formatSrCoFailurePairsForSrPrompt(
     `## Co-failure pairs — re-check before marking PASS\n` +
     `These categories frequently miss together. After you finish one, revisit its partner:\n` +
     `${rows}\n\n`
+  );
+}
+
+// Format failure-mode hints for injection into the agent's self-review prompt.
+// Surfaces the dominant miss origin for regressing categories so the agent
+// knows what kind of fix is needed: re-reading files (reading_gap), improving
+// judgment on an examined category (judgment_gap), or ensuring all categories
+// are scored (coverage_gap). Returns '' when no regressing categories have
+// breakdown data. Only called for code-change task types.
+export function formatFailureModeHintForSrPrompt(
+  categories: Record<string, {
+    miss_rate?: number | null;
+    below_floor?: boolean;
+    trend?: string;
+    miss_mode_breakdown?: {
+      reading_gap?: number;
+      judgment_gap?: number;
+      coverage_gap?: number;
+      dominant_mode?: string | null;
+    } | null;
+  }> | null | undefined,
+): string {
+  if (!categories || typeof categories !== 'object') return '';
+
+  const MODE_LABELS: Record<string, string> = {
+    reading_gap: 're-read all changed files before scoring (past misses were due to incomplete file coverage)',
+    judgment_gap: 'apply calibration and evidence-anchor work — reviewer disagreed after you examined the category',
+    coverage_gap: 'ensure you score this category — past misses had no SR entry for it at all',
+  };
+
+  const rows: string[] = [];
+  for (const [cat, data] of Object.entries(categories)) {
+    const isRegressing = data.below_floor === true || data.trend === 'decreasing';
+    if (!isRegressing) continue;
+    const breakdown = data.miss_mode_breakdown;
+    if (!breakdown || !breakdown.dominant_mode) continue;
+    const label = MODE_LABELS[breakdown.dominant_mode];
+    if (!label) continue;
+    rows.push(`- **${cat}** (dominant miss mode: ${breakdown.dominant_mode}): ${label}`);
+  }
+  if (rows.length === 0) return '';
+
+  return (
+    `## Failure-mode hints for regressing categories\n` +
+    `These categories are below the catch-rate floor or declining. The dominant reviewer-rescue pattern tells you what to fix:\n` +
+    rows.join('\n') + `\n\n`
   );
 }
 

@@ -3834,6 +3834,106 @@ async def test_claim_injects_self_review_catch_rate_with_fp_calibration(
 
 
 @pytest.mark.asyncio
+async def test_claim_injects_self_review_catch_rate_failure_mode_fields(
+    client: AsyncClient, db_session
+):
+    """Claim endpoint forwards trend, below_floor, and miss_mode_breakdown.
+
+    These three fields drive the agent-side failure-mode hint
+    (self-review.ts:formatFailureModeHintForSrPrompt). If _cat_entry drops
+    them at the backend->agent boundary, the hint never renders.
+    """
+    from sqlalchemy.orm.attributes import flag_modified
+
+    design_doc = {
+        "sr_catch_rate_trends": {
+            "categories": {
+                "security": {
+                    "miss_rate": 0.30,
+                    "trend": "decreasing",
+                    "below_floor": True,
+                    "miss_mode_breakdown": {
+                        "reading_gap": 5,
+                        "judgment_gap": 1,
+                        "coverage_gap": 0,
+                        "dominant_mode": "reading_gap",
+                    },
+                },
+                "correctness": {
+                    "miss_rate": 0.10,
+                    # No regression signals — fields should be omitted.
+                },
+            },
+            "by_task_type": {
+                "create": {
+                    "security": {
+                        "miss_rate": 0.25,
+                        "trend": "stable",
+                        "below_floor": False,
+                        "miss_mode_breakdown": {
+                            "reading_gap": 0,
+                            "judgment_gap": 3,
+                            "coverage_gap": 1,
+                            "dominant_mode": "judgment_gap",
+                        },
+                    },
+                },
+            },
+        },
+    }
+    project = Project(
+        name="SR Failure Mode Test",
+        user_id="test-user-123",
+        design_doc=design_doc,
+    )
+    flag_modified(project, "design_doc")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "Add feature"}],
+        vm_instance_id="agent-vm-sr-failure-mode",
+        context={"related_files": ["backend/app/foo.py"]},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-sr-failure-mode")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+    project_ctx = resp.json().get("project_context", {})
+    sr = project_ctx.get("self_review_catch_rate")
+    assert sr is not None, (
+        f"expected self_review_catch_rate in project_context, got {list(project_ctx.keys())}"
+    )
+
+    sec = sr["categories"]["security"]
+    assert sec["trend"] == "decreasing"
+    assert sec["below_floor"] is True
+    assert sec["miss_mode_breakdown"] == {
+        "reading_gap": 5,
+        "judgment_gap": 1,
+        "coverage_gap": 0,
+        "dominant_mode": "reading_gap",
+    }
+
+    # Category without regression signals: fields must be absent.
+    corr = sr["categories"]["correctness"]
+    assert "trend" not in corr
+    assert "below_floor" not in corr
+    assert "miss_mode_breakdown" not in corr
+
+    # for_task_type passthrough preserves the same fields.
+    type_sec = sr["for_task_type"]["security"]
+    assert type_sec["trend"] == "stable"
+    assert type_sec["below_floor"] is False
+    assert type_sec["miss_mode_breakdown"]["dominant_mode"] == "judgment_gap"
+
+
+@pytest.mark.asyncio
 async def test_claim_injects_architecture_context_for_create_task(
     client: AsyncClient, db_session
 ):
@@ -10179,9 +10279,7 @@ async def test_hotfix_backmerge_runs_for_hotfix_merge_to_main(db_session, mocker
         "app.github.merge_pull_request",
         new=AsyncMock(return_value={"merged": True}),
     )
-    mocker.patch(
-        "app.hotfix_backmerge.broadcast_to_project", new_callable=AsyncMock
-    )
+    mocker.patch("app.hotfix_backmerge.broadcast_to_project", new_callable=AsyncMock)
 
     result = await hotfix_backmerge.open_backmerge_pr(
         db_session,
@@ -10425,9 +10523,7 @@ async def test_hotfix_backmerge_gate_distinguishes_hotfix_rollup_and_promotion()
 
     # Normal (non-hotfix) rollup merged to main → no back-merge.
     assert not _backmerge_should_fire(True, "main", {"type": "plan"})
-    assert not _backmerge_should_fire(
-        True, "main", {"type": "plan", "hotfix": False}
-    )
+    assert not _backmerge_should_fire(True, "main", {"type": "plan", "hotfix": False})
 
     # Promotion: automain -> main is opened by release_qualifier.promote(), not
     # a rollup-merge review task, so is_rollup_merge is False → no back-merge
@@ -10474,9 +10570,7 @@ def test_ci_gate_runs_for_integration_trunk_and_main():
 
 
 @pytest.mark.asyncio
-async def test_hotfix_plan_subtasks_carry_hotfix_and_high_priority(
-    db_session, mocker
-):
+async def test_hotfix_plan_subtasks_carry_hotfix_and_high_priority(db_session, mocker):
     """A hotfix plan task's subtasks carry hotfix:true and priority >= 90.
 
     Exercises the Phase 5 propagation in plan_completion._handle_plan_completion:

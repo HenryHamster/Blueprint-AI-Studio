@@ -1,6 +1,6 @@
 import { strVal } from '../prompt.js';
 import { MEDIUM_ANALYSIS_PLAN_FILE_LIMIT } from '../constants.js';
-import { formatProjectBlindSpotSummary, formatSrRecentMissExamplesForSrPrompt } from './self-review.js';
+import { formatProjectBlindSpotSummary, formatSrRecentMissExamplesForSrPrompt, formatFailureModeHintForSrPrompt } from './self-review.js';
 
 type SRCatData = {
   miss_rate: number;
@@ -416,6 +416,13 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
     false_positive_rate?: number;
     precision?: number;
     sr_flag_sample_size?: number;
+    below_floor?: boolean;
+    miss_mode_breakdown?: {
+      reading_gap?: number;
+      judgment_gap?: number;
+      coverage_gap?: number;
+      dominant_mode?: string | null;
+    } | null;
   };
   const srCatchRate = ctx.self_review_catch_rate as {
     categories?: Record<string, SRCatchRateCategory>;
@@ -484,6 +491,21 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
           budget -= candidate.length;
           break;
         }
+      }
+    }
+  }
+
+  // Build failure-mode hint block — surfaces dominant miss origin for regressing categories
+  // so agents know what to fix: re-reading files, calibration, or category coverage.
+  let failureModeHintLines: string[] = [];
+  if (srSource && Object.keys(srSource).length > 0) {
+    const rendered = formatFailureModeHintForSrPrompt(srSource);
+    if (rendered) {
+      const candidateLines = rendered.split('\n');
+      const candidate = candidateLines.join('\n');
+      if (candidate.length <= budget) {
+        failureModeHintLines = candidateLines;
+        budget -= candidate.length;
       }
     }
   }
@@ -748,6 +770,6 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
     footerLines.push('');
   }
 
-  const allLines = [...header, ...activeLines, ...lessonsLines, ...queuedLines, ...directionRecentLines, ...recentLines, ...healthLines, ...reviewIssueLines, ...srBlindSpotLines, ...srForDirectionLines, ...srFPCalibrationLines, ...srReviewerDisagreementLines, ...srBlindSpotThemesLines, ...srRecentMissLines, ...moduleFeedbackLines, ...dirQualityLines, ...prLines, ...siblingLines, ...cochangeLines, ...footerLines];
+  const allLines = [...header, ...activeLines, ...lessonsLines, ...queuedLines, ...directionRecentLines, ...recentLines, ...healthLines, ...reviewIssueLines, ...srBlindSpotLines, ...failureModeHintLines, ...srForDirectionLines, ...srFPCalibrationLines, ...srReviewerDisagreementLines, ...srBlindSpotThemesLines, ...srRecentMissLines, ...moduleFeedbackLines, ...dirQualityLines, ...prLines, ...siblingLines, ...cochangeLines, ...footerLines];
   return allLines.join('\n');
 }

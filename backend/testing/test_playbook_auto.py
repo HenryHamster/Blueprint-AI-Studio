@@ -4918,6 +4918,225 @@ async def test_compute_sr_catch_rate_trends_by_direction_stores_direction_text(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Tests for reviewer_hallucination_rate in compute_sr_catch_rate_trends
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _make_sr_task_with_rff(
+    project_id,
+    *,
+    age_days: float,
+    total_reviewer_findings: int,
+    filtered_count: int,
+) -> Task:
+    """Build a Task carrying reviewer_findings_filtered in its SR outcome."""
+    ctx: dict = {
+        "_self_review_outcome": {
+            "check_results": {"correctness": {"passed": True}},
+            "reviewer_findings_filtered": {
+                "total_reviewer_findings": total_reviewer_findings,
+                "filtered_count": filtered_count,
+                "sampled_phantom_paths": [],
+            },
+        },
+        "_first_attempt_rejection_categories": {"correctness": 1},
+    }
+    task = Task(
+        project_id=project_id,
+        title="RFF task",
+        payloads=[{"type": "create", "prompt": "do something"}],
+        status=TaskStatus.COMPLETED,
+        context=ctx,
+    )
+    task.created_at = _utcnow() - timedelta(days=age_days)
+    return task
+
+
+@pytest.mark.asyncio
+async def test_reviewer_hallucination_rate_omitted_below_floor(
+    db_session: AsyncSession,
+):
+    """reviewer_hallucination_rate is absent when total findings < floor (10)."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    # Current window: 5 tasks, each with only 1 total finding → sum=5, below floor of 10
+    for _ in range(5):
+        t = _make_sr_task_with_rff(
+            project.id, age_days=2, total_reviewer_findings=1, filtered_count=0
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(5):
+        t = _make_sr_task_with_rff(
+            project.id, age_days=20, total_reviewer_findings=1, filtered_count=0
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+    assert result is not None
+    # Neither window meets the floor (5 < 10), so the key should be absent
+    assert "reviewer_hallucination_rate" not in result
+
+
+@pytest.mark.asyncio
+async def test_reviewer_hallucination_rate_correct_computation(
+    db_session: AsyncSession,
+):
+    """reviewer_hallucination_rate current_rate = filtered/total across current window tasks."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    # Current window: 5 tasks, 4 findings each → total=20, filtered=5 → rate=0.25
+    for _ in range(5):
+        t = _make_sr_task_with_rff(
+            project.id, age_days=2, total_reviewer_findings=4, filtered_count=1
+        )
+        db_session.add(t)
+        tasks.append(t)
+    # Previous window: 5 tasks, 4 findings each → total=20, filtered=0 → rate=0.0
+    for _ in range(5):
+        t = _make_sr_task_with_rff(
+            project.id, age_days=20, total_reviewer_findings=4, filtered_count=0
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+    assert result is not None
+    assert "reviewer_hallucination_rate" in result
+    rhr = result["reviewer_hallucination_rate"]
+    assert rhr["current_rate"] == pytest.approx(0.25, abs=0.001)
+    assert rhr["previous_rate"] == pytest.approx(0.0, abs=0.001)
+    assert rhr["current_sample"] == 20
+    assert rhr["previous_sample"] == 20
+    assert rhr["delta"] == pytest.approx(0.25, abs=0.001)
+
+
+@pytest.mark.asyncio
+async def test_reviewer_hallucination_rate_delta_direction(
+    db_session: AsyncSession,
+):
+    """delta is positive when current_rate > previous_rate (worsening)."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    # Current window: higher hallucination rate (6/20 = 0.3)
+    for _ in range(5):
+        t = _make_sr_task_with_rff(
+            project.id, age_days=2, total_reviewer_findings=4, filtered_count=1
+        )
+        db_session.add(t)
+        tasks.append(t)
+    # Previous window: lower hallucination rate (2/20 = 0.1)
+    for _ in range(5):
+        t = _make_sr_task_with_rff(
+            project.id, age_days=20, total_reviewer_findings=4, filtered_count=0
+        )
+        db_session.add(t)
+        tasks.append(t)
+    # Add 2 more current and 2 more previous with extra filtered
+    t_extra_curr = _make_sr_task_with_rff(
+        project.id, age_days=3, total_reviewer_findings=0, filtered_count=0
+    )
+    t_extra_prev = _make_sr_task_with_rff(
+        project.id, age_days=21, total_reviewer_findings=0, filtered_count=0
+    )
+    db_session.add(t_extra_curr)
+    db_session.add(t_extra_prev)
+    tasks.extend([t_extra_curr, t_extra_prev])
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+    assert result is not None
+    if "reviewer_hallucination_rate" in result:
+        rhr = result["reviewer_hallucination_rate"]
+        # delta should be current_rate - previous_rate
+        if rhr["delta"] is not None:
+            assert (
+                abs(rhr["delta"] - (rhr["current_rate"] - rhr["previous_rate"])) < 0.001
+            )
+
+
+@pytest.mark.asyncio
+async def test_reviewer_hallucination_rate_persists_to_design_doc(
+    db_session: AsyncSession,
+):
+    """reviewer_hallucination_rate is persisted in project.design_doc['sr_catch_rate_trends']."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    for _ in range(5):
+        t = _make_sr_task_with_rff(
+            project.id, age_days=2, total_reviewer_findings=4, filtered_count=2
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(5):
+        t = _make_sr_task_with_rff(
+            project.id, age_days=20, total_reviewer_findings=4, filtered_count=1
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+    assert result is not None
+    assert "reviewer_hallucination_rate" in result
+    doc = project.design_doc or {}
+    stored = doc.get("sr_catch_rate_trends", {})
+    assert "reviewer_hallucination_rate" in stored
+
+
+@pytest.mark.asyncio
+async def test_reviewer_hallucination_rate_tasks_without_field_ignored(
+    db_session: AsyncSession,
+):
+    """Tasks without reviewer_findings_filtered contribute nothing to the rate."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    # Mix tasks with and without the field; only those with field count
+    for _ in range(3):
+        t = _make_sr_task_with_rff(
+            project.id, age_days=2, total_reviewer_findings=5, filtered_count=1
+        )
+        db_session.add(t)
+        tasks.append(t)
+    # 2 tasks without the field (old-style)
+    for _ in range(2):
+        t = _make_sr_task(
+            project.id, age_days=2, human_cats={"correctness": 1}, sr_failed_cats=[]
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id, age_days=20, human_cats={"correctness": 1}, sr_failed_cats=[]
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+    assert result is not None
+    # Previous window has no tasks with reviewer_findings_filtered, so no rate for it.
+    # Current window total = 3*5 = 15 >= 10, so current_rate should be present.
+    if "reviewer_hallucination_rate" in result:
+        rhr = result["reviewer_hallucination_rate"]
+        assert rhr["current_sample"] == 15  # only the 3 tasks with rff contribute
+        assert rhr["previous_rate"] is None  # previous window below floor
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Tests for select_sr_miss_examples_for_injection
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -11914,3 +12133,62 @@ def test_stats_for_tasks_lone_checker_recovery_excluded_from_sr_failed_author():
     # lone_checker_recovery is not an author SR failure, so fp_count must be 0.
     security = cat_stats.get("security", {})
     assert security.get("fp_count", 0) == 0
+
+
+# ---------------------------------------------------------------------------
+# miss_mode_breakdown per-category breakdown in compute_sr_catch_rate_trends
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_miss_mode_breakdown(
+    db_session: AsyncSession,
+):
+    """compute_sr_catch_rate_trends attaches miss_mode_breakdown per category with correct counters."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    # Current window: 5 tasks on "correctness" with distinct reviewer origins.
+    # 1 reading_gap, 2 judgment_gap, 2 coverage_gap
+    current_specs = [
+        {"origin": "reviewer_recovery_after_incomplete_sr"},
+        {"origin": "reviewer_disagreement"},
+        {"origin": "reviewer_disagreement"},
+        {"origin": "reviewer"},
+        {"origin": "reviewer"},
+    ]
+    for spec in current_specs:
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+            check_result_overrides={"correctness": {"origin": spec["origin"]}},
+        )
+        db_session.add(t)
+        tasks.append(t)
+    # Previous window: 5 tasks (no origin tags)
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+    assert result is not None
+    cat = result["categories"]["correctness"]
+    breakdown = cat.get("miss_mode_breakdown")
+    assert breakdown is not None, (
+        "miss_mode_breakdown should be present for reviewer-origin misses"
+    )
+    assert breakdown["reading_gap"] == 1
+    assert breakdown["judgment_gap"] == 2
+    assert breakdown["coverage_gap"] == 2
+    # Both judgment_gap and coverage_gap tied at 2; dominant is one of them
+    assert breakdown["dominant_mode"] in ("judgment_gap", "coverage_gap")

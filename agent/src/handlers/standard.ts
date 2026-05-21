@@ -18,7 +18,7 @@ import {
 import { resolveBuildConfig } from '../build-config.js';
 import { SCOPE_OVERFLOW_THRESHOLDS, MEDIUM_ANALYSIS_PLAN_FILE_LIMIT } from '../constants.js';
 import { runCodeChangeTask } from './code-change.js';
-import { formatExecutionEvidenceForSrPrompt, formatHighFpRateLoosenHintForSrPrompt, formatSrCoFailurePairsForSrPrompt, formatSeverityCalibrationHintForSrPrompt } from '../prompts/self-review.js';
+import { formatExecutionEvidenceForSrPrompt, formatHighFpRateLoosenHintForSrPrompt, formatSrCoFailurePairsForSrPrompt, formatSeverityCalibrationHintForSrPrompt, formatPrecisionRecallQuadrantHintForSrPrompt } from '../prompts/self-review.js';
 
 // ── Standard Handler Helper ───────────────────────────────────────────────
 
@@ -164,6 +164,49 @@ export function buildSmallScopeCallerNote(relatedFiles: string[]): string {
 }
 
 const FRESH_REVIEWER_MIN_LINES = 20;
+const FRESH_REVIEWER_MEDIUM_EFFORT_THRESHOLD = 300;
+const SENSITIVE_PATHS = [
+  'backend/app/auth',
+  'backend/app/security',
+  'backend/app/routers/agent',
+  'backend/app/jwt_revocation',
+];
+
+/**
+ * Determines the fresh-reviewer effort level based on risk signals.
+ * Returns 'medium' when (a) loneCheckerRecovery=true, (b) incompleteSrRecovery=true,
+ * (c) diff exceeds threshold (>300 changed lines), or (d) any sensitive file is touched.
+ * Otherwise returns 'low'.
+ */
+export function pickFreshReviewerEffort(opts: {
+  loneCheckerRecovery?: boolean;
+  incompleteSrRecovery?: boolean;
+  changedLineCount?: number;
+  changedFiles?: string[];
+}): 'low' | 'medium' {
+  const { loneCheckerRecovery, incompleteSrRecovery, changedLineCount = 0, changedFiles = [] } = opts;
+
+  // Escalate on recovery paths
+  if (loneCheckerRecovery || incompleteSrRecovery) {
+    return 'medium';
+  }
+
+  // Escalate on large diffs
+  if (changedLineCount > FRESH_REVIEWER_MEDIUM_EFFORT_THRESHOLD) {
+    return 'medium';
+  }
+
+  // Escalate if any sensitive file is touched
+  for (const file of changedFiles) {
+    for (const sensitivePrefix of SENSITIVE_PATHS) {
+      if (file.startsWith(sensitivePrefix)) {
+        return 'medium';
+      }
+    }
+  }
+
+  return 'low';
+}
 
 const VIEWPORT_INFRA_SKIP_GUIDANCE = `## Viewport gate: infra-skip sentinel
 
@@ -386,8 +429,16 @@ Output ONLY a JSON object:
 Category IDs: correctness, error-handling, security, type-safety, scope-drift, regression_risk, architecture, test-coverage, test_assertion_quality
 If no issues found: {"reviewer_findings": [], "reviewer_edges_considered": []}`;
 
+  const changedFiles = extractChangedFilesFromDiff(diff);
+  const effort = pickFreshReviewerEffort({
+    loneCheckerRecovery,
+    incompleteSrRecovery,
+    changedLineCount: changed,
+    changedFiles: Array.from(changedFiles),
+  });
+
   const { exitCode, lastResultText } = await runClaudeCode(
-    prompt, ws, statusRef, model, 'low',
+    prompt, ws, statusRef, model, effort,
     ['Write', 'Edit', 'NotebookEdit'],
   );
   statusRef.value = prevStatus;
@@ -406,13 +457,20 @@ If no issues found: {"reviewer_findings": [], "reviewer_edges_considered": []}`;
   }
 
   const findings = parsed.reviewer_findings as Array<{ category: string; severity: string; description: string }>;
-  const changedFiles = extractChangedFilesFromDiff(diff);
   const groundedFindings: typeof findings = [];
   let hallucinatedCount = 0;
+  const phantomPaths: string[] = [];
 
   for (const f of findings) {
     if (isHallucinatedFinding(f, changedFiles)) {
       hallucinatedCount++;
+      if (phantomPaths.length < 5) {
+        for (const p of extractCandidateFilePaths(f.description)) {
+          if (!changedFiles.has(p) && phantomPaths.length < 5) {
+            phantomPaths.push(p);
+          }
+        }
+      }
     } else {
       groundedFindings.push(f);
     }
@@ -545,6 +603,12 @@ If no issues found: {"reviewer_findings": [], "reviewer_edges_considered": []}`;
       }
     }
   }
+
+  sr.reviewer_findings_filtered = {
+    total_reviewer_findings: findings.length,
+    filtered_count: hallucinatedCount,
+    sampled_phantom_paths: phantomPaths,
+  };
 
   try {
     fs.writeFileSync(srPath, JSON.stringify(sr, null, 2), { mode: 0o644 });
@@ -687,12 +751,13 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   const taskTypeFocusBlock = getTaskTypeFocusBlock(taskTypeKey);
   const executionEvidenceSection = formatExecutionEvidenceForSrPrompt();
   const projectCtxForSr = task.project_context as Record<string, unknown> | undefined;
-  const srCategories = (projectCtxForSr?.self_review_catch_rate as { categories?: Record<string, { false_positive_rate?: number; precision?: number; sr_flag_sample_size?: number; severity_calibration?: Record<string, unknown> }> } | null | undefined)?.categories;
+  const srCategories = (projectCtxForSr?.self_review_catch_rate as { categories?: Record<string, { false_positive_rate?: number; precision?: number; sr_flag_sample_size?: number; severity_calibration?: Record<string, unknown>; precision_recall_quadrant?: string; precision_delta?: number; recall_delta?: number }> } | null | undefined)?.categories;
   const loosenHintSection = formatHighFpRateLoosenHintForSrPrompt(srCategories);
   const coFailurePairs = projectCtxForSr?.sr_co_failure_pairs as Array<{ cat_a: string; cat_b: string; lift: number }> | null | undefined;
   const coFailurePairsSection = formatSrCoFailurePairsForSrPrompt(coFailurePairs);
   const severityCalibrationHintSection = formatSeverityCalibrationHintForSrPrompt(srCategories);
-  const finalPrompt = claudeMdPrefix + playbookSection + retryContext + buildPrompt({ contextPrefix, parentCtx, rawPrompt }) + taskTypeHint + firstTaskSection + CODE_CHANGE_HELPER_GUIDANCE + taskTypeFocusBlock + loosenHintSection + coFailurePairsSection + severityCalibrationHintSection + executionEvidenceSection + PLAYBOOK_GUIDANCE + `\nNote: If lint or test fixes required non-obvious steps, save them to the playbook (e.g., ./playbook set "lint-gotcha" "description").\n` + assembleFailureGuidanceBlocks() + VIEWPORT_INFRA_SKIP_GUIDANCE + `\n\n${DEFAULT_TOOL_GUIDANCE}` + promptSuffix;
+  const precisionRecallQuadrantHintSection = formatPrecisionRecallQuadrantHintForSrPrompt(srCategories);
+  const finalPrompt = claudeMdPrefix + playbookSection + retryContext + buildPrompt({ contextPrefix, parentCtx, rawPrompt }) + taskTypeHint + firstTaskSection + CODE_CHANGE_HELPER_GUIDANCE + taskTypeFocusBlock + loosenHintSection + coFailurePairsSection + severityCalibrationHintSection + precisionRecallQuadrantHintSection + executionEvidenceSection + PLAYBOOK_GUIDANCE + `\nNote: If lint or test fixes required non-obvious steps, save them to the playbook (e.g., ./playbook set "lint-gotcha" "description").\n` + assembleFailureGuidanceBlocks() + VIEWPORT_INFRA_SKIP_GUIDANCE + `\n\n${DEFAULT_TOOL_GUIDANCE}` + promptSuffix;
 
   const { workBranch } = await setupWorkspace(owner, repo, ghToken, baseBranch, branchPrefix, taskId, ws, statusRef, buildConfig);
   writePlaybookHelper(taskId);

@@ -2329,6 +2329,9 @@ async def compute_review_effectiveness(
 # rejection categories required per window.  Half the human-review threshold
 # since SR data is sparser.
 _MIN_SR_SAMPLE = 5
+# Minimum total reviewer findings (across tasks in a window) required to emit
+# a hallucination-rate value; prevents noisy rates on tiny windows.
+_HALLUCINATION_RATE_MIN_FINDINGS = 10
 _MIN_DIRECTION_SR_SAMPLE = 3
 
 # Example-collection caps for miss-example surfacing in the agent prompt.
@@ -4274,10 +4277,81 @@ async def compute_sr_catch_rate_trends(
     exec_evidence = _compute_execution_evidence_miss_rates(current_window_tasks)
     result["execution_evidence_miss_rates"] = exec_evidence or {}
 
-    from app.sr_blind_spots import aggregate_sr_co_failure_pairs  # noqa: PLC0415
+    from app.sr_blind_spots import (
+        aggregate_sr_co_failure_pairs,
+        _count_reviewer_disagreement_directions,
+    )  # noqa: PLC0415
 
     co_pairs = aggregate_sr_co_failure_pairs(current_window_tasks)
     result["co_failure_pairs"] = co_pairs or []
+
+    # Attach per-category failure-mode breakdown (reading_gap / judgment_gap / coverage_gap).
+    # Uses origin tags set by the fresh-reviewer pass in standard.ts:441-457.
+    failure_mode_dir_counts = _count_reviewer_disagreement_directions(
+        current_window_tasks
+    )
+    cat_failure_modes: dict[str, dict[str, int]] = {}
+    for (cat, _ttype), bucket in failure_mode_dir_counts.items():
+        if cat not in cat_failure_modes:
+            cat_failure_modes[cat] = {
+                "reading_gap": 0,
+                "judgment_gap": 0,
+                "coverage_gap": 0,
+            }
+        cat_failure_modes[cat]["reading_gap"] += bucket["miss_recovery_incomplete"]
+        cat_failure_modes[cat]["judgment_gap"] += bucket["miss_disagreement"]
+        cat_failure_modes[cat]["coverage_gap"] += bucket["miss_coverage_gap"]
+    for cat, data in categories.items():
+        modes = cat_failure_modes.get(cat)
+        if modes and sum(modes.values()) > 0:
+            dominant = max(modes.items(), key=lambda x: x[1])
+            data["miss_mode_breakdown"] = {**modes, "dominant_mode": dominant[0]}
+
+    # Reviewer hallucination rate: proportion of reviewer findings filtered as phantom file refs.
+    # Uses reviewer_findings_filtered written by the fresh-reviewer pass in standard.ts.
+    curr_hall_total = 0
+    curr_hall_filtered = 0
+    for _t in current_window_tasks:
+        _sro = (getattr(_t, "context", None) or {}).get("_self_review_outcome") or {}
+        _rff = _sro.get("reviewer_findings_filtered") or {}
+        _t_total = _rff.get("total_reviewer_findings")
+        _t_filtered = _rff.get("filtered_count")
+        if isinstance(_t_total, int) and isinstance(_t_filtered, int):
+            curr_hall_total += _t_total
+            curr_hall_filtered += _t_filtered
+    prev_hall_total = 0
+    prev_hall_filtered = 0
+    for _t in previous_window_tasks:
+        _sro = (getattr(_t, "context", None) or {}).get("_self_review_outcome") or {}
+        _rff = _sro.get("reviewer_findings_filtered") or {}
+        _t_total = _rff.get("total_reviewer_findings")
+        _t_filtered = _rff.get("filtered_count")
+        if isinstance(_t_total, int) and isinstance(_t_filtered, int):
+            prev_hall_total += _t_total
+            prev_hall_filtered += _t_filtered
+    curr_hall_rate: Optional[float] = (
+        round(curr_hall_filtered / curr_hall_total, 3)
+        if curr_hall_total >= _HALLUCINATION_RATE_MIN_FINDINGS
+        else None
+    )
+    prev_hall_rate: Optional[float] = (
+        round(prev_hall_filtered / prev_hall_total, 3)
+        if prev_hall_total >= _HALLUCINATION_RATE_MIN_FINDINGS
+        else None
+    )
+    if curr_hall_rate is not None or prev_hall_rate is not None:
+        hall_delta: Optional[float] = (
+            round(curr_hall_rate - prev_hall_rate, 3)
+            if curr_hall_rate is not None and prev_hall_rate is not None
+            else None
+        )
+        result["reviewer_hallucination_rate"] = {
+            "current_rate": curr_hall_rate,
+            "previous_rate": prev_hall_rate,
+            "current_sample": curr_hall_total,
+            "previous_sample": prev_hall_total,
+            "delta": hall_delta,
+        }
 
     doc["sr_catch_rate_trends"] = result
     project.design_doc = doc
