@@ -3039,26 +3039,75 @@ async def reaper_service():
                 # lifecycle backstop missed it (e.g. orchestrator restart between
                 # task termination and post-commit). Mark them stalled so the
                 # strategic agent can see the failure on the next run.
+                #
+                # Reconciliation with linked task state (R-SC1):
+                # Before declaring a cycle stalled we inspect the linked task:
+                #   - Terminal task → mark stalled (crashed-chain case, original intent)
+                #   - Non-terminal + stale heartbeat → terminate task first so the
+                #     spawn gate (_has_active_strategic_task) clears, then mark stalled
+                #   - Non-terminal + fresh heartbeat → skip; the cycle is slow, not
+                #     stalled, and falsely killing a live task would corrupt state
                 try:
                     from app import strategic_cycle
                     from app.models import Alert, AlertSeverity
                     from app.broadcast import broadcast_to_project as _bcast
 
                     stalled = await strategic_cycle.find_stalled(session)
+                    _step7_now = _utcnow()
+                    actually_stalled: list = []
                     for c in stalled:
+                        # Determine which phase (and linked task) before mutating outcome
                         if c.outcome in (
                             strategic_cycle.OUTCOME_IN_PROGRESS,
                             strategic_cycle.OUTCOME_PHASE1_RUNNING,
                             strategic_cycle.OUTCOME_PHASE1_DONE,
                         ):
-                            c.outcome = strategic_cycle.OUTCOME_STALLED_PHASE1
                             stalled_phase = "phase1"
+                            linked_task_id = c.phase1_task_id
+                        else:
+                            stalled_phase = "phase2"
+                            linked_task_id = c.phase2_task_id
+
+                        # Reconcile with the linked task's real status
+                        if linked_task_id is not None:
+                            linked_task = await session.get(Task, linked_task_id)
+                            if linked_task is not None and linked_task.status in (
+                                TaskStatus.QUEUED,
+                                TaskStatus.PROVISIONING,
+                                TaskStatus.IN_PROGRESS,
+                            ):
+                                hb = linked_task.last_heartbeat
+                                hb_cutoff = _heartbeat_stale_cutoff(
+                                    linked_task, _step7_now
+                                )
+                                if hb is not None and hb >= hb_cutoff:
+                                    # Task is genuinely alive — cycle is slow, not stalled
+                                    logger.info(
+                                        f"[REAPER] Cycle {c.id} in {stalled_phase} >3h "
+                                        f"but linked task {linked_task_id} has fresh "
+                                        f"heartbeat ({hb}) — skipping stall declaration"
+                                    )
+                                    continue
+                                # Task is dead/stale — terminate it so spawn gate clears
+                                linked_task.status = TaskStatus.FAILED
+                                linked_task.latest_status_message = (
+                                    f"Force-terminated by stalled-cycle reaper — "
+                                    f"cycle {c.id} declared stalled after >3h"
+                                )
+                                session.add(linked_task)
+                                logger.info(
+                                    f"[REAPER] Force-terminated stale task "
+                                    f"{linked_task_id} linked to stalled cycle {c.id}"
+                                )
+
+                        if stalled_phase == "phase1":
+                            c.outcome = strategic_cycle.OUTCOME_STALLED_PHASE1
                         else:
                             c.outcome = strategic_cycle.OUTCOME_STALLED_PHASE2
-                            stalled_phase = "phase2"
                         if c.failure_reason is None:
                             c.failure_reason = f"reaper_stall: cycle in {stalled_phase} >3h with no completion"
                         session.add(c)
+                        actually_stalled.append(c)
                         try:
                             alert = Alert(
                                 project_id=c.project_id,
@@ -3085,10 +3134,10 @@ async def reaper_service():
                             logger.exception(
                                 f"[REAPER] Failed to create stalled-cycle alert for {c.id}"
                             )
-                    if stalled:
+                    if actually_stalled:
                         await session.commit()
                         logger.info(
-                            f"[REAPER] Marked {len(stalled)} strategic cycle(s) stalled"
+                            f"[REAPER] Marked {len(actually_stalled)} strategic cycle(s) stalled"
                         )
                 except Exception as e:
                     logger.error(

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -70,22 +70,25 @@ def _make_fix_loop_divergence_task(
     error_tail: str,
     related_files: list[str],
     scope: str = "small",
+    loop: str = "lint",
+    created_at: datetime | None = None,
 ) -> Task:
     now = _utcnow()
+    created = created_at if created_at is not None else now - timedelta(hours=1)
     return make_task(
         project_id=project_id,
         status=TaskStatus.COMPLETED,
-        created_at=now - timedelta(hours=1),
+        created_at=created,
         context={"scope": scope, "related_files": related_files},
         fix_loop_history={
-            "lint": [
+            loop: [
                 {
-                    "loop": "lint",
+                    "loop": loop,
                     "iteration": 1,
                     "error_tail": error_tail,
                     "exit_reason": "divergence_detected",
-                    "started_at": (now - timedelta(minutes=2)).isoformat(),
-                    "ended_at": now.isoformat(),
+                    "started_at": (created - timedelta(minutes=2)).isoformat(),
+                    "ended_at": created.isoformat(),
                 }
             ],
         },
@@ -5560,6 +5563,126 @@ async def test_strategic_stall_respects_cooldown(db_session):
         .all()
     )
     assert len(rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_strategic_stall_prompt_with_payload_bloat_marker(db_session):
+    """Stall prompt redirects toward compaction when payload_bloat_skip marker is set."""
+    from app.pipeline_regression_dispatcher import (
+        _STRATEGIC_CYCLE_STALL_HOURS,
+        _format_strategic_stall_prompt,
+    )
+
+    bloat_marker = {
+        "skipped_at": "2026-05-20T10:00:00",
+        "size": 300000,
+        "top_contributors": [
+            {"key": "design_doc", "size": 200000},
+            {"key": "problem_model", "size": 80000},
+        ],
+    }
+    prompt = _format_strategic_stall_prompt(
+        stall_hours=_STRATEGIC_CYCLE_STALL_HOURS,
+        recent_task_count=5,
+        failed_strategic=[],
+        payload_bloat_skip=bloat_marker,
+    )
+
+    # Should surface the bloat root cause and redirect toward compaction.
+    assert "ROOT CAUSE IDENTIFIED" in prompt
+    assert "compaction" in prompt.lower() or "compact" in prompt.lower()
+    assert "design_doc" in prompt
+    assert "300000" in prompt
+    # Must NOT steer toward stuck/failed tasks — that's the wrong diagnosis path.
+    assert "stuck in QUEUED" not in prompt
+    assert "repeated FAILED outcomes" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_strategic_stall_prompt_without_bloat_marker(db_session):
+    """Standard stall prompt (no bloat marker) steers toward stuck/failed task diagnosis."""
+    from app.pipeline_regression_dispatcher import (
+        _STRATEGIC_CYCLE_STALL_HOURS,
+        _format_strategic_stall_prompt,
+    )
+
+    prompt = _format_strategic_stall_prompt(
+        stall_hours=_STRATEGIC_CYCLE_STALL_HOURS,
+        recent_task_count=3,
+        failed_strategic=[],
+        payload_bloat_skip=None,
+    )
+
+    # Standard guidance: investigate stuck/failed tasks and scheduling.
+    assert "stuck in QUEUED" in prompt
+    assert "repeated FAILED outcomes" in prompt
+    # Must NOT show compaction guidance when there's no bloat marker.
+    assert "ROOT CAUSE IDENTIFIED" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_strategic_stall_spawns_with_bloat_marker_in_prompt(db_session):
+    """run_once() spawns a stall task whose prompt contains compaction guidance when bloat marker is set."""
+    from app.pipeline_regression_dispatcher import _STRATEGIC_CYCLE_STALL_HOURS
+
+    bloat_marker = {
+        "skipped_at": "2026-05-20T12:00:00",
+        "size": 310000,
+        "top_contributors": [{"key": "design_doc", "size": 270000}],
+    }
+    project = make_project(
+        design_doc={}, vision={"_strategic_payload_bloat_skip": bloat_marker}
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    prior_strategic = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "strategic_review", "prompt": "x", "base_branch": "main"}],
+        context={},
+    )
+    db_session.add(prior_strategic)
+    active_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "x", "base_branch": "main"}],
+        context={},
+    )
+    db_session.add(active_task)
+    await db_session.commit()
+
+    prior_strategic.created_at = _utcnow() - timedelta(
+        hours=_STRATEGIC_CYCLE_STALL_HOURS + 2
+    )
+    active_task.created_at = _utcnow() - timedelta(
+        hours=_STRATEGIC_CYCLE_STALL_HOURS - 1
+    )
+    db_session.add(prior_strategic)
+    db_session.add(active_task)
+    await db_session.commit()
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 1
+
+    tasks = (
+        (
+            await db_session.execute(
+                select(Task).where(
+                    Task.project_id == project.id,
+                    Task.context["regression_class"].as_string()
+                    == "strategic_cycle_stall",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(tasks) == 1
+    prompt = (tasks[0].first_payload or {}).get("prompt", "")
+    assert "ROOT CAUSE IDENTIFIED" in prompt
+    assert "310000" in prompt
 
 
 # ---------------------------------------------------------------------------
@@ -14799,3 +14922,311 @@ def test_first_attempt_compliance_trend_awaiting_backfill():
     assert last_window["first_attempt_compliant"] == 0
     assert last_window["followup_rescued"] == 0
     assert last_window["rate"] is None
+
+
+@pytest.mark.asyncio
+async def test_pipeline_success_rate_signal_trips_on_declining_trend(db_session):
+    """Pipeline success-rate signal spawns when 24h trend declines with sufficient sample."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    # Create 7 completed and 3 failed tasks in the last 24h (70% success rate)
+    for i in range(7):
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                created_at=now - timedelta(hours=12 - i),
+            )
+        )
+    for i in range(3):
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.FAILED,
+                created_at=now - timedelta(hours=12 + i),
+            )
+        )
+    await db_session.commit()
+
+    # Create previous window tasks (25-49h ago): 8 completed, 2 failed (80% success rate)
+    for i in range(8):
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                created_at=now - timedelta(hours=36 - i),
+            )
+        )
+    for i in range(2):
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.FAILED,
+                created_at=now - timedelta(hours=36 + i),
+            )
+        )
+    await db_session.commit()
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 1
+
+    investigate = (
+        (
+            await db_session.execute(
+                select(Task).where(
+                    Task.project_id == project.id,
+                    Task.context["regression_class"].as_string()
+                    == "pipeline_success_rate",
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    assert investigate is not None
+    assert investigate.first_payload is not None
+    assert "success-rate" in investigate.first_payload.get("prompt", "")
+
+
+@pytest.mark.asyncio
+async def test_pipeline_success_rate_signal_does_not_trip_with_stable_trend(db_session):
+    """Pipeline success-rate signal does not spawn when trend is stable."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    # Create 8 completed and 2 failed tasks in the last 24h (80% success rate)
+    for i in range(8):
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                created_at=now - timedelta(hours=12 - i),
+            )
+        )
+    for i in range(2):
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.FAILED,
+                created_at=now - timedelta(hours=12 + i),
+            )
+        )
+    await db_session.commit()
+
+    # Create previous window tasks (25-49h ago): also 8 completed, 2 failed (80%)
+    for i in range(8):
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                created_at=now - timedelta(hours=36 - i),
+            )
+        )
+    for i in range(2):
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.FAILED,
+                created_at=now - timedelta(hours=36 + i),
+            )
+        )
+    await db_session.commit()
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 0
+
+
+@pytest.mark.asyncio
+async def test_pipeline_success_rate_signal_does_not_trip_below_min_sample(db_session):
+    """Pipeline success-rate signal does not spawn when current window is below 10-task minimum."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    # Create only 5 completed and 3 failed tasks in the last 24h (8 total, below 10 minimum)
+    for i in range(5):
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                created_at=now - timedelta(hours=12 - i),
+            )
+        )
+    for i in range(3):
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.FAILED,
+                created_at=now - timedelta(hours=12 + i),
+            )
+        )
+    await db_session.commit()
+
+    # Create previous window tasks with sufficient sample
+    for i in range(8):
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                created_at=now - timedelta(hours=36 - i),
+            )
+        )
+    for i in range(2):
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.FAILED,
+                created_at=now - timedelta(hours=36 + i),
+            )
+        )
+    await db_session.commit()
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 0
+
+
+@pytest.mark.asyncio
+async def test_fix_loop_divergence_non_fingerprint_trips_on_divergence_rate_increase(
+    db_session,
+):
+    """Non-fingerprint fix-loop divergence signal spawns when divergence rate increases."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    curr_at = now - timedelta(days=3)
+    prev_at = now - timedelta(days=10)
+    # Current window (last 7 days): 6 lint tasks, 5 divergent → rate 5/6.
+    # The signal needs >= _MIN_SR_SAMPLE (5) tasks in BOTH windows, so each
+    # window carries 6 lint tasks and the divergent ones are placed in the
+    # right window via created_at (the helper would otherwise backdate to 1h).
+    for i in range(6):
+        is_divergent = i < 5
+        db_session.add(
+            _make_fix_loop_divergence_task(
+                project.id,
+                error_tail=f"lint error {i}",
+                related_files=["backend/app/test.py"],
+                scope="small",
+                created_at=curr_at,
+            )
+            if is_divergent
+            else make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                created_at=curr_at,
+                fix_loop_history={"lint": [{"exit_reason": "success"}]},
+            )
+        )
+    await db_session.commit()
+
+    # Previous window (7-14 days ago): 6 lint tasks, 1 divergent → rate 1/6.
+    for i in range(6):
+        is_divergent = i == 0
+        db_session.add(
+            _make_fix_loop_divergence_task(
+                project.id,
+                error_tail=f"lint error prev {i}",
+                related_files=["backend/app/test.py"],
+                scope="small",
+                created_at=prev_at,
+            )
+            if is_divergent
+            else make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                created_at=prev_at,
+                fix_loop_history={"lint": [{"exit_reason": "success"}]},
+            )
+        )
+    await db_session.commit()
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 1
+
+    investigate = (
+        (
+            await db_session.execute(
+                select(Task).where(
+                    Task.project_id == project.id,
+                    Task.context["regression_class"].as_string()
+                    == "fix_loop_divergence",
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    assert investigate is not None
+    assert investigate.first_payload is not None
+    assert "divergence" in investigate.first_payload.get("prompt", "").lower()
+
+
+@pytest.mark.asyncio
+async def test_fix_loop_divergence_non_fingerprint_does_not_trip_with_stable_rate(
+    db_session,
+):
+    """Non-fingerprint fix-loop divergence signal does not spawn when rate is stable."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    curr_at = now - timedelta(days=3)
+    prev_at = now - timedelta(days=10)
+    # Current window (last 7 days): 6 lint tasks, 2 divergent → rate 2/6.
+    for i in range(6):
+        is_divergent = i < 2
+        db_session.add(
+            _make_fix_loop_divergence_task(
+                project.id,
+                error_tail=f"lint error {i}",
+                related_files=["backend/app/test.py"],
+                scope="small",
+                created_at=curr_at,
+            )
+            if is_divergent
+            else make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                created_at=curr_at,
+                fix_loop_history={"lint": [{"exit_reason": "success"}]},
+            )
+        )
+    await db_session.commit()
+
+    # Previous window (7-14 days ago): also 6 lint tasks, 2 divergent (stable 2/6).
+    for i in range(6):
+        is_divergent = i < 2
+        db_session.add(
+            _make_fix_loop_divergence_task(
+                project.id,
+                error_tail=f"lint error prev {i}",
+                related_files=["backend/app/test.py"],
+                scope="small",
+                created_at=prev_at,
+            )
+            if is_divergent
+            else make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                created_at=prev_at,
+                fix_loop_history={"lint": [{"exit_reason": "success"}]},
+            )
+        )
+    await db_session.commit()
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 0

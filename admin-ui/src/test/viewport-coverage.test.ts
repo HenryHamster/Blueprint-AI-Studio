@@ -187,6 +187,47 @@ ${missing.map(m => `  ${m}`).join('\n')}
     expect(missing, errorMessage).toEqual([]);
   });
 
+  it('python _VIEWPORT_PATTERNS strings match exported viewport helper names', () => {
+    // backend/app/failure_classification.py routes viewport-suite failures to
+    // VIEWPORT_REGRESSION by lowercasing the error message and checking for these
+    // substrings.  If a helper is renamed in viewport.ts without updating the Python
+    // patterns, viewport failures silently dissolve into CODE_ERROR residuals instead
+    // of routing to VIEWPORT_REGRESSION — misclassification that undermines the
+    // self-healing loop's diagnosis quality.
+    //
+    // Cross-language contract: kept in sync with _VIEWPORT_PATTERNS in
+    // backend/app/failure_classification.py.  Verified by
+    // TestCrossLanguageClassificationContracts in backend/testing/test_failure_classification.py.
+    const backendSrc = fs.readFileSync(
+      path.join(__dirname, '../../../backend/app/failure_classification.py'),
+      'utf-8',
+    ).toLowerCase();
+
+    // Each pattern is the lowercase function-call prefix emitted by that helper
+    // in its thrown Error message (e.g. `expectNoOverflowAt(375) ...`).
+    const patterns: string[] = [
+      'expectnooverflowat(',
+      'expectnotexttruncationat(',
+      'expectmintouchtargetat(',
+    ];
+
+    const missing = patterns.filter(p => !backendSrc.includes(p));
+
+    const errorMessage =
+      missing.length > 0
+        ? `
+The following viewport helper name patterns are no longer found in
+backend/app/failure_classification.py (_VIEWPORT_PATTERNS).
+Either update _VIEWPORT_PATTERNS to match the current viewport.ts export names,
+or update viewport.ts to keep the original names:
+
+${missing.map(p => `  "${p}"`).join('\n')}
+        `.trim()
+        : '';
+
+    expect(missing, errorMessage).toEqual([]);
+  });
+
   it('fails CI when escape-hatch debt exceeds the per-component or total budget', () => {
     const budgetPath = path.join(__dirname, 'viewport-escape-hatch-budget.json');
     const { total: totalBudget, perComponent } = JSON.parse(fs.readFileSync(budgetPath, 'utf-8')) as {

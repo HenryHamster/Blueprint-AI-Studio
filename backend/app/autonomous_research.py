@@ -63,7 +63,7 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
 
 # Re-export the self_audit helpers for backwards compat with callers /
 # tests that patch them under ``app.autonomous_research``.
-from app.self_audit_dispatch import (
+from app.self_audit_dispatch import (  # noqa: E402 — re-export block follows conditional imports above
     _record_residual_audit_deferral,
     _should_dispatch_self_audit,
     _spawn_self_audit_task,
@@ -726,6 +726,22 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                         ),
                     )
                 )
+            # Write a machine-readable marker so the strategic-stall signal
+            # can distinguish a payload-bloat stall from a scheduling stall
+            # and redirect diagnosis toward compaction rather than stuck tasks.
+            project.vision = {
+                **(project.vision or {}),
+                "_strategic_payload_bloat_skip": {
+                    "skipped_at": _utcnow().isoformat(),
+                    "size": e.size,
+                    "top_contributors": [
+                        {"key": k, "size": n} for k, n in e.top_keys[:5]
+                    ],
+                },
+            }
+            flag_modified(project, "vision")
+            session.add(project)
+            await session.commit()
 
         if spawned:
             research_spawn_count += 1

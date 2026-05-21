@@ -1,4 +1,4 @@
-import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { vi, describe, it, expect, beforeEach, afterEach, beforeAll } from 'vitest';
 
 // ── Pre-import setup (hoisted before any module loads) ───────────────────────
 // index.ts guards main() and process event handlers behind an isMain check,
@@ -3518,5 +3518,59 @@ describe('LLM telemetry counters', () => {
       total_input_tokens: 0,
       total_output_tokens: 0,
     });
+  });
+});
+
+// ── Cross-language classification contracts ───────────────────────────────────
+// Assert that backend/app/failure_classification.py still contains the patterns
+// that match what this agent emits. If one fails, update the matching side:
+// either the string in agent/src/index.ts or the corresponding pattern in
+// failure_classification._AGENT_LIVE_WORK_PATTERNS / _VIEWPORT_PATTERNS.
+//
+// Complements backend/testing/test_failure_classification.py
+// TestCrossLanguageClassificationContracts, which checks the reverse direction
+// (Python reads agent/src/index.ts and admin-ui/src/test/viewport.ts).
+describe('cross-language classification contracts', () => {
+  let classifierSrc = '';
+
+  beforeAll(async () => {
+    // vi.importActual bypasses the vi.mock('fs', ...) at the top of this file
+    // so we can read real source files for the contract assertions.
+    const realFs = await vi.importActual<typeof import('fs')>('fs');
+    const nodePath = await import('node:path');
+    const dir = new URL('.', import.meta.url).pathname;
+    classifierSrc = realFs.readFileSync(
+      nodePath.join(dir, '..', '..', 'backend', 'app', 'failure_classification.py'),
+      'utf-8',
+    ).toLowerCase();
+  });
+
+  it('_AGENT_LIVE_WORK_PATTERNS still matches PR-push heartbeat prefix', () => {
+    // agent/src/index.ts emits: sendHeartbeatSync(taskId, `Creating pull request for ${workBranch}...`)
+    // where workBranch is a blueprint/ branch. If this fails, update either the
+    // agent string or the classifier pattern so both stay in sync.
+    expect(classifierSrc).toContain('"creating pull request for blueprint/"');
+  });
+
+  it('_AGENT_LIVE_WORK_PATTERNS still matches tool-call heartbeat prefix', () => {
+    // agent/src/index.ts emits: statusRef.value = `Using tool: ${toolName}`
+    // If this fails, update either the agent string or the classifier pattern.
+    expect(classifierSrc).toContain('"using tool: "');
+  });
+
+  it('_VIEWPORT_PATTERNS still matches expectNoOverflowAt function name', () => {
+    // viewport.ts throws errors containing 'expectNoOverflowAt(...)'.
+    // If this fails, update either the viewport helper name or the classifier pattern.
+    expect(classifierSrc).toContain('"expectnooverflowat("');
+  });
+
+  it('_VIEWPORT_PATTERNS still matches expectNoTextTruncationAt function name', () => {
+    // viewport.ts throws errors containing 'expectNoTextTruncationAt(...)'.
+    expect(classifierSrc).toContain('"expectnotexttruncationat("');
+  });
+
+  it('_VIEWPORT_PATTERNS still matches expectMinTouchTargetAt function name', () => {
+    // viewport.ts throws errors containing 'expectMinTouchTargetAt(...)'.
+    expect(classifierSrc).toContain('"expectmintouchtargetat("');
   });
 });

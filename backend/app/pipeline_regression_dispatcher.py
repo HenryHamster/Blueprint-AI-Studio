@@ -5861,6 +5861,7 @@ def _format_strategic_stall_prompt(
     stall_hours: int,
     recent_task_count: int,
     failed_strategic: list[Task],
+    payload_bloat_skip: dict | None = None,
 ) -> str:
     lines = [
         "Pipeline regression detected (strategic_cycle_stall).",
@@ -5873,20 +5874,46 @@ def _format_strategic_stall_prompt(
         "missed signal patterns, and direction drift.",
         "",
     ]
-    if failed_strategic:
-        lines.append("Recent FAILED strategic tasks in this window:")
-        for t in failed_strategic:
-            ptype = (t.first_payload or {}).get("type", "unknown")
-            lines.append(f"  - {ptype} task {t.id} FAILED")
-        lines.append("")
+    if payload_bloat_skip:
+        skipped_at = payload_bloat_skip.get("skipped_at", "unknown")
+        size = payload_bloat_skip.get("size", 0)
+        top = payload_bloat_skip.get("top_contributors", [])
+        top_str = (
+            ", ".join(f"{c['key']}={c['size']}B" for c in top[:3]) if top else "unknown"
+        )
+        lines += [
+            "ROOT CAUSE IDENTIFIED: strategic spawn was skipped because the assembled",
+            f"strategic payload exceeded the 256 KB size budget (last skip: {skipped_at},",
+            f"size: {size} bytes, top contributors: {top_str}).",
+            "",
+            "No strategic task was ever created — so there is no stuck or failed strategic",
+            "task to find. The true cause is an over-budget strategic context (design_doc,",
+            "problem_model, or vision) that must be compacted before strategic spawns resume.",
+            "",
+            "Investigate: which strategic context field(s) are driving the payload over budget?",
+            "  - Identify the largest fields listed above in top_contributors",
+            "  - Check design_doc and problem_model for redundant, verbose, or stale content",
+            "  - Propose targeted compaction: trim or summarize oversized sections",
+            "  - Do NOT look for stuck/failed strategic tasks — none exist",
+            "",
+        ]
+    else:
+        if failed_strategic:
+            lines.append("Recent FAILED strategic tasks in this window:")
+            for t in failed_strategic:
+                ptype = (t.first_payload or {}).get("type", "unknown")
+                lines.append(f"  - {ptype} task {t.id} FAILED")
+            lines.append("")
+        lines += [
+            "Investigate: why has the strategic engine not completed a cycle? Look for:",
+            "  - strategic_review or design_doc_update tasks stuck in QUEUED/IN_PROGRESS",
+            "  - repeated FAILED outcomes on strategic tasks",
+            "  - orchestrator scheduling not spawning strategic tasks",
+            "  - research slot exhaustion (max_total_research_per_project cap) blocking spawns",
+            "  - recent deploy changes that may correlate with the stall onset",
+            "",
+        ]
     lines += [
-        "Investigate: why has the strategic engine not completed a cycle? Look for:",
-        "  - strategic_review or design_doc_update tasks stuck in QUEUED/IN_PROGRESS",
-        "  - repeated FAILED outcomes on strategic tasks",
-        "  - orchestrator scheduling not spawning strategic tasks",
-        "  - research slot exhaustion (max_total_research_per_project cap) blocking spawns",
-        "  - recent deploy changes that may correlate with the stall onset",
-        "",
         "\nDiagnose the underlying root cause of this regression and produce "
         "the structured diagnosis JSON report ({summary, root_cause, "
         "recommended_fix, severity, confidence, affected_files}). "
@@ -5900,6 +5927,7 @@ async def _evaluate_strategic_cycle_stall_signal(
     session: AsyncSession,
     project_id: uuid.UUID,
     spawn_budget_left: int,
+    project_vision: dict | None = None,
 ) -> int:
     """Trip strategic_cycle_stall when no strategic task completed in stall window.
 
@@ -5969,6 +5997,7 @@ async def _evaluate_strategic_cycle_stall_signal(
         if (t.first_payload or {}).get("type") in _STRATEGIC_TASK_TYPES
         and t.status == TaskStatus.FAILED
     ]
+    payload_bloat_skip = (project_vision or {}).get("_strategic_payload_bloat_skip")
     spawn = await _maybe_spawn(
         session,
         project_id,
@@ -5983,6 +6012,7 @@ async def _evaluate_strategic_cycle_stall_signal(
             stall_hours=_STRATEGIC_CYCLE_STALL_HOURS,
             recent_task_count=len(recent_tasks),
             failed_strategic=failed_strategic,
+            payload_bloat_skip=payload_bloat_skip,
         ),
     )
     return 1 if spawn is not None else 0
@@ -7743,6 +7773,7 @@ async def run_once(session: AsyncSession, project_id: uuid.UUID) -> int:
             session,
             project_id,
             spawn_budget - _spawned,
+            project.vision,
         )
         _spawned += await _evaluate_telemetry_staleness_signal(
             session,

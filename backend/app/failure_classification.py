@@ -177,6 +177,19 @@ _VIEWPORT_INFRA_UNAVAILABLE_PATTERNS: tuple[str, ...] = (
 )
 
 
+# Agent heartbeat substrings (lowercased) emitted by agent/src/index.ts when the
+# agent is in a live-work state — mid-PR-push (sendHeartbeatSync) or mid-tool-call
+# (statusRef.value).  Tasks reaped in these states (OOM, SIGKILL, VM kill) leave
+# the stale heartbeat as latest_status_message; they are infrastructure deaths, not
+# code defects and must NOT fall through to CODE_ERROR.
+# Cross-language contract: must stay in sync with agent/src/index.ts emissions.
+# Verified by TestCrossLanguageClassificationContracts in test_failure_classification.py.
+_AGENT_LIVE_WORK_PATTERNS: tuple[str, ...] = (
+    "creating pull request for blueprint/",  # sendHeartbeatSync() during PR push
+    "using tool: ",  # statusRef.value during tool calls
+)
+
+
 # Substrings that uniquely identify migration-related failures. Kept narrow so
 # generic database connectivity errors stay in EXTERNAL_API.
 _MIGRATION_PATTERNS: tuple[str, ...] = (
@@ -1656,12 +1669,7 @@ def _classify_failure_class(task: "Task", logs: str | None = None) -> str:
     # "[fatal:" matches agent _crashReport() labels: [FATAL:uncaughtException], [FATAL:unhandledRejection], etc.
     # NOTE: "timed out" and "killed" intentionally omitted — too broad and cause misclassification.
     # Only use specific forms: "execution timed out", "node process killed", "oom killer".
-    # "creating pull request for blueprint/" is the agent's heartbeat during PR push — never an error
-    # message. Tasks that die in this state (OOM, SIGKILL) leave this stale heartbeat as
-    # latest_status_message; they must not create CODE_ERROR fingerprints in the residual store.
-    # "using tool: " is the agent's heartbeat during a Claude Code tool call (Grep, Read, Edit, etc.).
-    # Tasks reaped mid-tool-call (VM kill, network drop, OOM of the Claude subprocess) leave this
-    # as latest_status_message; they are infrastructure deaths, not code defects.
+    # Live-work heartbeats (_AGENT_LIVE_WORK_PATTERNS) route here too — see module-level comment.
     if any(
         kw in combined
         for kw in [
@@ -1685,8 +1693,7 @@ def _classify_failure_class(task: "Task", logs: str | None = None) -> str:
             "[fatal:",
             "fatal error",
             "process crashed",
-            "creating pull request for blueprint/",
-            "using tool: ",
+            *_AGENT_LIVE_WORK_PATTERNS,
         ]
     ):
         return "AGENT_TIMEOUT"

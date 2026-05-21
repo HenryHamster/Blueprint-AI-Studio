@@ -29,6 +29,7 @@ from app.models import (
     ArtifactType,
     Project,
     ReleaseVersion,
+    StrategicCycle,
     Task,
     TaskStatus,
 )
@@ -3986,3 +3987,174 @@ async def test_step9_calcification_alert_not_fired_for_dry_run_hold(
         .all()
     )
     assert len(alerts) == 0
+
+
+# ── Step 7: stalled-cycle reaper + linked task reconciliation ────────────────
+
+
+def _make_cycle_id() -> str:
+    return str(_uuid_mod.uuid4())
+
+
+@pytest.mark.asyncio
+async def test_step7_stalled_cycle_cancels_linked_phase1_task(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """Phase1 task IN_PROGRESS with stale heartbeat → task FAILED, cycle STALLED_PHASE1."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_project(reaper_db)
+    task = Task(
+        project_id=project.id,
+        title="strategic-phase1",
+        payloads=[{"type": "design_doc_update", "scope": "medium"}],
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=datetime.utcnow() - timedelta(hours=1),
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+
+    cycle = StrategicCycle(
+        id=_make_cycle_id(),
+        project_id=project.id,
+        outcome="phase1_running",
+        phase1_task_id=task.id,
+        phase1_started_at=datetime.utcnow() - timedelta(hours=4),
+    )
+    reaper_db.add(cycle)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+
+    await reaper_db.refresh(task)
+    await reaper_db.refresh(cycle)
+
+    assert task.status == TaskStatus.FAILED, (
+        "stale linked task must be force-terminated"
+    )
+    assert "stalled-cycle reaper" in (task.latest_status_message or "")
+    assert cycle.outcome == "stalled_phase1"
+
+
+@pytest.mark.asyncio
+async def test_step7_stalled_cycle_cancels_linked_phase2_task(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """Phase2 task IN_PROGRESS with stale heartbeat → task FAILED, cycle STALLED_PHASE2."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_project(reaper_db)
+    task = Task(
+        project_id=project.id,
+        title="strategic-phase2",
+        payloads=[{"type": "strategic_review", "scope": "medium"}],
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=datetime.utcnow() - timedelta(hours=1),
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+
+    cycle = StrategicCycle(
+        id=_make_cycle_id(),
+        project_id=project.id,
+        outcome="phase2_running",
+        phase2_task_id=task.id,
+        phase1_started_at=datetime.utcnow() - timedelta(hours=4),
+        phase2_started_at=datetime.utcnow() - timedelta(hours=4),
+    )
+    reaper_db.add(cycle)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+
+    await reaper_db.refresh(task)
+    await reaper_db.refresh(cycle)
+
+    assert task.status == TaskStatus.FAILED, (
+        "stale linked task must be force-terminated"
+    )
+    assert "stalled-cycle reaper" in (task.latest_status_message or "")
+    assert cycle.outcome == "stalled_phase2"
+
+
+@pytest.mark.asyncio
+async def test_step7_stalled_cycle_live_task_not_declared_stalled(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """Cycle >3h but linked task has a fresh heartbeat — cycle must NOT be declared stalled."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_project(reaper_db)
+    task = Task(
+        project_id=project.id,
+        title="strategic-live",
+        payloads=[{"type": "design_doc_update", "scope": "medium"}],
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=datetime.utcnow() - timedelta(seconds=30),
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+
+    cycle = StrategicCycle(
+        id=_make_cycle_id(),
+        project_id=project.id,
+        outcome="phase1_running",
+        phase1_task_id=task.id,
+        phase1_started_at=datetime.utcnow() - timedelta(hours=4),
+    )
+    reaper_db.add(cycle)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+
+    await reaper_db.refresh(task)
+    await reaper_db.refresh(cycle)
+
+    assert task.status == TaskStatus.IN_PROGRESS, "live task must not be terminated"
+    assert cycle.outcome == "phase1_running", (
+        "slow-but-live cycle must not be declared stalled"
+    )
+
+
+@pytest.mark.asyncio
+async def test_step7_stalled_cycle_already_terminal_task_untouched(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """Linked task already FAILED — cycle is declared stalled without re-mutating the task."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_project(reaper_db)
+    task = Task(
+        project_id=project.id,
+        title="strategic-already-failed",
+        payloads=[{"type": "design_doc_update", "scope": "medium"}],
+        status=TaskStatus.FAILED,
+        latest_status_message="crashed earlier",
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+
+    cycle = StrategicCycle(
+        id=_make_cycle_id(),
+        project_id=project.id,
+        outcome="phase1_running",
+        phase1_task_id=task.id,
+        phase1_started_at=datetime.utcnow() - timedelta(hours=4),
+    )
+    reaper_db.add(cycle)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+
+    await reaper_db.refresh(task)
+    await reaper_db.refresh(cycle)
+
+    assert task.status == TaskStatus.FAILED, "already-terminal task must not be mutated"
+    assert task.latest_status_message == "crashed earlier", (
+        "task message must not be overwritten"
+    )
+    assert cycle.outcome == "stalled_phase1", "cycle must be declared stalled"

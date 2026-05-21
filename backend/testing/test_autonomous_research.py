@@ -10386,3 +10386,58 @@ async def test_followed_count_not_incremented_when_no_impl_spawned(db_session, m
     assert shown["followed_count"] == 3, (
         "followed_count must not change when no impl tasks are spawned"
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PayloadTooLargeError: strategic payload bloat marker
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_payload_too_large_writes_vision_bloat_marker(db_session, mocker):
+    """When PayloadTooLargeError fires during strategic spawn, project.vision gets a
+    _strategic_payload_bloat_skip marker with skipped_at, size, and top_contributors."""
+    from app.payload_schemas import PayloadTooLargeError
+
+    # Project with no purpose → force_strategic fires without active directions.
+    project = Project(
+        name="Bloat Test Project",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[],
+        vision={},  # no "purpose" key → force_strategic=True
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    bloat_error = PayloadTooLargeError(
+        size=310000,
+        limit=262144,
+        top_keys=[("design_doc", 250000), ("problem_model", 50000), ("vision", 10000)],
+    )
+
+    # Patch both strategic spawner paths so PayloadTooLargeError is raised
+    # regardless of which cycle type is selected.
+    mocker.patch(
+        "app.strategic_spawning._spawn_design_doc_update",
+        side_effect=bloat_error,
+    )
+    mocker.patch(
+        "app.strategic_spawning._spawn_strategic_review",
+        side_effect=bloat_error,
+    )
+
+    await _spawn_research_task(project, db_session)
+
+    await db_session.refresh(project)
+    marker = (project.vision or {}).get("_strategic_payload_bloat_skip")
+    assert marker is not None, (
+        "Expected _strategic_payload_bloat_skip to be set in vision"
+    )
+    assert marker["size"] == 310000
+    assert "skipped_at" in marker
+    contributors = marker["top_contributors"]
+    assert len(contributors) >= 1
+    assert contributors[0]["key"] == "design_doc"
+    assert contributors[0]["size"] == 250000
