@@ -2,7 +2,7 @@ import { afterEach, describe, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import RunningUpdatePanel from './RunningUpdatePanel';
-import { expectNoOverflowAt, expectNoTextTruncationAt } from '../test/viewport';
+import { expectNoOverflowAt, expectNoTextTruncationAt, expectMinTouchTargetAt } from '../test/viewport';
 
 // RunningUpdatePanel imports apiFetch from ../api (transitively pulls in firebase).
 vi.mock('../api', () => ({
@@ -103,8 +103,23 @@ describe('RunningUpdatePanel — viewport regression', () => {
     });
   });
 
-  // Note: expectMinTouchTargetAt is intentionally omitted for the Acknowledge button.
-  // The button uses `px-3 py-1.5 text-xs` (~28px height) — below the 44px guideline.
-  // This is a known design trade-off for the compact header layout (dense panel UX).
-  // A future UI pass should either increase padding or use a larger touch target variant.
+  test('Acknowledge button meets 44px touch target at 375px', async () => {
+    await expectMinTouchTargetAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '16px';
+      host.style.height = '400px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <RunningUpdatePanel
+            {...BASE_PROPS}
+            document="Test content"
+            acknowledgedAt={new Date(Date.now() - 3_600_000).toISOString()}
+          />,
+        );
+      });
+    });
+  });
 });

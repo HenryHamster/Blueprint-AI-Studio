@@ -442,7 +442,7 @@ function TaskOverrideTable({
         </div>
       )}
       {entries.map(([taskType, entry]) => (
-        <div key={taskType} className="px-3 py-2 flex items-center gap-3">
+        <div key={taskType} className="px-3 py-2 flex flex-wrap items-start gap-3">
           <code className="text-[11px] text-neutral-200 w-28 shrink-0 font-mono truncate">{taskType}</code>
           <div className="flex items-center gap-1.5">
             <span className="text-[10px] text-neutral-500">providers:</span>
